@@ -1,0 +1,812 @@
+{
+  "upstream_versions": {
+    "lightning": "0.2.7",
+    "ldk-node": "0.7.0"
+  },
+  "differences": [
+    {
+      "crate": "lightning",
+      "path": "BITSOV-PATCH.md",
+      "upstream_sha256": null,
+      "local_sha256": "80a43e4674fd8ec435abf79ba8e9bab5facd54fa39a299a430d69b675bb0d56f"
+    },
+    {
+      "crate": "lightning",
+      "path": "Cargo.lock",
+      "upstream_sha256": null,
+      "local_sha256": "d9686272759f08c950a833f9c5ba68e3f20d9c2b81762ba91a2fb309d6a3d4e3"
+    },
+    {
+      "crate": "lightning",
+      "path": "Cargo.toml",
+      "upstream_sha256": "263564ab6755b4aaacf019b1bc6f21fcc1214e8e3f4296fe45e02fb75d33d63d",
+      "local_sha256": "8eed15f3ddc2327f532422bf38774aef141e6ec1ee5f12d1524aafd8ca40076d"
+    },
+    {
+      "crate": "lightning",
+      "path": "LICENSE-APACHE",
+      "upstream_sha256": null,
+      "local_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "crate": "lightning",
+      "path": "LICENSE-MIT",
+      "upstream_sha256": null,
+      "local_sha256": "638da3722c9e102ccd8011d82f61ae3b611174e4a0f8da185c582df137b60a8c"
+    },
+    {
+      "crate": "lightning",
+      "path": "src/chain/chainmonitor.rs",
+      "upstream_sha256": "5600776b0ed26cb9405e4170ba5a9ff365afae74c07f794e09fc3aa91bdb7c9f",
+      "local_sha256": "86d34ee808c5e1a6465cab71b7dc910f7433b52cdc545b6e46f71244ad7c2331"
+    },
+    {
+      "crate": "lightning",
+      "path": "src/chain/channelmonitor.rs",
+      "upstream_sha256": "05ffc47d5a5559a15157a096cd27b08d8bbd8d5da63deea290b2d5b66989c13e",
+      "local_sha256": "f982c334093e4dcf0879887f824ba611764536ab542d588dd806884724cfad63"
+    },
+    {
+      "crate": "lightning",
+      "path": "src/ln/channel.rs",
+      "upstream_sha256": "ad5d2a1b4efc3328c120fbe4c41adee3e2947dabb5199839e23709076d21aeef",
+      "local_sha256": "186179561cf568d5b4513a59d064a267b4a1ac1779b4b518225a4783881279d1"
+    },
+    {
+      "crate": "lightning",
+      "path": "src/ln/channel_state.rs",
+      "upstream_sha256": "99c0fc3ac1b17c037edb25a0c4386eedbb28e73dcbd0b221dd57de5941942b4b",
+      "local_sha256": "d3347a3fb2d757ccf904e5db44b1a376ccdd37ec1673a439c02d1c216a2a51aa"
+    },
+    {
+      "crate": "lightning",
+      "path": "src/ln/channelmanager.rs",
+      "upstream_sha256": "57e4b4d22b72d552e35c08a1c2c8754d1a1201073457b274c4e4fd1fb0764aa0",
+      "local_sha256": "65e3f59e2654b2c55335dccb4f6a755980a24296d7cf36b894b8088e7936a43f"
+    },
+    {
+      "crate": "lightning",
+      "path": "src/ln/monitor_tests.rs",
+      "upstream_sha256": "8c6b66aa66fe006a0a12768cd9338af4df1a2c9abe8380b4f537f19d945d3318",
+      "local_sha256": "4fe515c559d51a0c2d824ed0bf7d0f74d7a4701400fc5246c5a2c1826297d7d7"
+    },
+    {
+      "crate": "lightning",
+      "path": "src/ln/shutdown_tests.rs",
+      "upstream_sha256": "4a180029cc55e0d3b500bcd5b6db60990d36a85fd6c378add65534f77db972af",
+      "local_sha256": "009d77f3f378545288da4b557b7a15b88a7d31bb339e9726316ff8b7e10396c0"
+    },
+    {
+      "crate": "lightning",
+      "path": "src/routing/router.rs",
+      "upstream_sha256": "e6d92a2c7761d67a411a832a025b5b031605fc0a4c3ab3c70d00499555aa4bb6",
+      "local_sha256": "f46c600db41cde77fb69568ba4f007e71f94b528f3ea970099f2d6af2aae6f86"
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".cargo_vcs_info.json",
+      "upstream_sha256": "f1ad6de468c1f95088e838b5f8b59b350e10019e6e57ab3b089aad6cac03c680",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".clippy.toml",
+      "upstream_sha256": "aa07b5b75fda713b82c4edfe0730f95ef8e9294ee92cfc31599d903752632042",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".github/workflows/audit.yml",
+      "upstream_sha256": "793cd31ef684b9e7fcae328f825ecf9d917953ab33499e64772f8ee34f52156a",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".github/workflows/benchmarks.yml",
+      "upstream_sha256": "a354706dbc14e5271a352c26276a9801600643c4432c7efdddfcff7de39ed645",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".github/workflows/cln-integration.yml",
+      "upstream_sha256": "49b947de8a3d6017b19a5d6883077be5c6ac2ff0cc4dcd7cc21401502e4502e0",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".github/workflows/cron-weekly-rustfmt.yml",
+      "upstream_sha256": "a69d7bc9f19a1afe7eb95c20fb4ba1162db1504a6603e0e92cdc958b1298522e",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".github/workflows/kotlin.yml",
+      "upstream_sha256": "9b634056be09c344aa11b7df2187c5e2633d1f20115647702221dd865b391116",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".github/workflows/lnd-integration.yml",
+      "upstream_sha256": "c4fd1fdc8a30e5fdbcfe2f69f58c680177affe24798682aef7bf5fd30b3d9db3",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".github/workflows/python.yml",
+      "upstream_sha256": "ffad8fb7966ca938ffe4e9c14f3769d739ab812dfe6c793be8f813fbd09fbe07",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".github/workflows/rust.yml",
+      "upstream_sha256": "c74fc653f4f2c9754aaf8459e2b5f35bc84f923a6c43e0e5813d1e4360b0575d",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".github/workflows/semver.yml",
+      "upstream_sha256": "577f238050a77bae48afeb99e99cabc164cbd0eb832aa35b9ed518522eefedc6",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".github/workflows/swift.yml",
+      "upstream_sha256": "6202d975f8767848d7fdc49135b29cb7b9f4d4e840ed82e40d53c8c7c39a7901",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".github/workflows/vss-integration.yml",
+      "upstream_sha256": "be231001e4045df76741e5b979451a89def2651e74a97295e4ff1e27ef8f6942",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": ".gitignore",
+      "upstream_sha256": "33787b09a3a4cf1638db2c8eb1b75b858e5cdf6609db3d64af8ac8a813549202",
+      "local_sha256": "306fd52e74fca6746e12acc750f232de15e71da917756a1270d74c91f5eb7368"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "BITSOV-PATCH.md",
+      "upstream_sha256": null,
+      "local_sha256": "2a598d49324379971da16189e4dfd076c54daaf53c5057967aacd1d0b7bdafeb"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "CHANGELOG.md",
+      "upstream_sha256": "9507c42e3b1457f889a48c9ac97ce0df855afec0bef5cb0373a84ac11b85367b",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "Cargo.lock",
+      "upstream_sha256": "4e0be7b6d58c1fbc77ff93413e92b072d488fd45f70e5cb2c364ddb7d3ab9844",
+      "local_sha256": "3562bc81702d04d47b2e62e61d29a725f08375d84aba15d6cbd2e732539c918e"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "Cargo.toml",
+      "upstream_sha256": "ff354c69ab346a6ccaa933f2324005de57e58e07f72ee870a4989454f351bcd5",
+      "local_sha256": "e72702c80c5cba84b1521230798059d774a2db978bd8773a840c7ca6810b6dc0"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "Package.swift",
+      "upstream_sha256": "09e088fb21d800be39af9d6f2b8f5e37e31e3d51479fcd3437ef4a6bb340a666",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "benches/payments.rs",
+      "upstream_sha256": "d6c05f8d37c636f33d82b9ae3944e11cf853711a4d8883a0c254c2ddf707b92b",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-android/.gitattributes",
+      "upstream_sha256": "79e37eda80a9c368c631ad00b168bca508ebc6bc33684e57faba9b79ea100e55",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-android/.gitignore",
+      "upstream_sha256": "db0a6577b955583791c2313de81b4cb41914bbc3234fa6ab86b28d15f9f2a922",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-android/build.gradle.kts",
+      "upstream_sha256": "6f1c46e635e15cca146fa24d5f66a1fc3b9fa1b6e76fb264332c6f9646777225",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-android/gradle.properties",
+      "upstream_sha256": "e9f46b0d8d0d044659277a77530dd44f2f57dcc41056e06fe1148a1d76172fb9",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-android/gradle/wrapper/gradle-wrapper.jar",
+      "upstream_sha256": "c5a643cf80162e665cc228f7b16f343fef868e47d3a4836f62e18b7e17ac018a",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-android/gradle/wrapper/gradle-wrapper.properties",
+      "upstream_sha256": "a076dcadb20e1c8f1588c530051dc1dad33e935a2b185defc66575482dcfe618",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-android/gradlew",
+      "upstream_sha256": "638c2862d623c302f3029f5bd1441276be484c5b79909b706a614ebe8e7a409b",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-android/gradlew.bat",
+      "upstream_sha256": "8e327fcb99d29ce0fe3ee2fec6e6a25de815a2df83a6a44a553dea89ffc92955",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-android/lib/build.gradle.kts",
+      "upstream_sha256": "824971d326cda562b89060024d4af3b66960c017fcf9b062625cc2b65055cf6c",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-android/lib/src/androidTest/kotlin/org/lightningdevkit/ldknode/AndroidLibTest.kt",
+      "upstream_sha256": "a5149025bc66fe24c671d6ae4257eb4633de5629cf8a78b98ad78fb6a230eed1",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-android/lib/src/main/AndroidManifest.xml",
+      "upstream_sha256": "f1553e49d9b73404ed5140919a412a1d081353d8fe123eae072f4f956ad6ac23",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-android/lib/src/main/kotlin/org/lightningdevkit/ldknode/Library.kt",
+      "upstream_sha256": "66dc9c645331ea4563b80cda5439cb16dc96553711c220d60d4f99daacff2d24",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-android/settings.gradle.kts",
+      "upstream_sha256": "74bfa463d72486da1c3ec8805bb5ffcd42d731ad127f6b77b264bcd7320a618e",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-jvm/.gitattributes",
+      "upstream_sha256": "79e37eda80a9c368c631ad00b168bca508ebc6bc33684e57faba9b79ea100e55",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-jvm/.gitignore",
+      "upstream_sha256": "db0a6577b955583791c2313de81b4cb41914bbc3234fa6ab86b28d15f9f2a922",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-jvm/build.gradle.kts",
+      "upstream_sha256": "04bb97f3f703c858fbfb3fefc3ff55a8d30b9077d2c9626ebb29707d77ad6e31",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-jvm/gradle.properties",
+      "upstream_sha256": "9aee6dc71f01781f7b73f55e261d6212db227be9835f9f37a6ce4e78ae5489bb",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-jvm/gradle/wrapper/gradle-wrapper.jar",
+      "upstream_sha256": "c5a643cf80162e665cc228f7b16f343fef868e47d3a4836f62e18b7e17ac018a",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-jvm/gradle/wrapper/gradle-wrapper.properties",
+      "upstream_sha256": "a076dcadb20e1c8f1588c530051dc1dad33e935a2b185defc66575482dcfe618",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-jvm/gradlew",
+      "upstream_sha256": "638c2862d623c302f3029f5bd1441276be484c5b79909b706a614ebe8e7a409b",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-jvm/gradlew.bat",
+      "upstream_sha256": "8e327fcb99d29ce0fe3ee2fec6e6a25de815a2df83a6a44a553dea89ffc92955",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-jvm/lib/build.gradle.kts",
+      "upstream_sha256": "3d6d019181c715824dcaa7f04707207f11b9fed715e5eb5d0e403a02c1494de7",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-jvm/lib/src/main/kotlin/org/lightningdevkit/ldknode/Library.kt",
+      "upstream_sha256": "66dc9c645331ea4563b80cda5439cb16dc96553711c220d60d4f99daacff2d24",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-jvm/lib/src/test/kotlin/org/lightningdevkit/ldknode/LibraryTest.kt",
+      "upstream_sha256": "e20030d8d19dd6a41be743dc3de9950ee57608a4aab2252b3fdc2d2dc4cfb600",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/kotlin/ldk-node-jvm/settings.gradle.kts",
+      "upstream_sha256": "5f4eb67f5d356b44915dcb25b3084f340db6d1518524fe48a2e79195465b889b",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/ldk_node.udl",
+      "upstream_sha256": "1a54000c09661c24daf08331721f12fe2f8d5330db563d8791b698925c046c01",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/python/pyproject.toml",
+      "upstream_sha256": "9a002a870a8b1e260cad005e73ba6372c77c7bcb3b2e652d50f491229039a467",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/python/setup.cfg",
+      "upstream_sha256": "0b7708d2cf39636b61aca99e3b2c6c442e7ec2eba5ed5a11e5346d101ab015bb",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/python/src/ldk_node/__init__.py",
+      "upstream_sha256": "3c09ae9ad69ec34ee2e2f6ff5cd8e457f028736e633d0d56956c6be449422e93",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/python/src/ldk_node/test_ldk_node.py",
+      "upstream_sha256": "8f795edb1f65fb88633984c6bb0023d5dcbc9caea2ce7a16a87aaea8c40c8130",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/swift/LDKNodeFFI.xcframework/Info.plist",
+      "upstream_sha256": "b24d0c0cf85548eae9ec0e44fcdd7e9920608f160c756664f83b83882eb7acbc",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/swift/LDKNodeFFI.xcframework/ios-arm64/LDKNodeFFI.framework/Headers/LDKNodeFFI-umbrella.h",
+      "upstream_sha256": "233d2fe9bbde1502d1cad11beaf44eef3e55d4c4652be09eaa48fc3d0b93385c",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/swift/LDKNodeFFI.xcframework/ios-arm64/LDKNodeFFI.framework/Info.plist",
+      "upstream_sha256": "6c4316f6da75e6930c7c144043715bee1e1e1f28081ea3b0101c5bfa56579ec2",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/swift/LDKNodeFFI.xcframework/ios-arm64/LDKNodeFFI.framework/Modules/module.modulemap",
+      "upstream_sha256": "29a069878c396772addae2a64c1a6ea25807770a222b93b1e0d352fa591d38ef",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/swift/LDKNodeFFI.xcframework/ios-arm64_x86_64-simulator/LDKNodeFFI.framework/Headers/LDKNodeFFI-umbrella.h",
+      "upstream_sha256": "233d2fe9bbde1502d1cad11beaf44eef3e55d4c4652be09eaa48fc3d0b93385c",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/swift/LDKNodeFFI.xcframework/ios-arm64_x86_64-simulator/LDKNodeFFI.framework/Info.plist",
+      "upstream_sha256": "6f2fe60e2cd0fb7db5ce38d0698d854758ef9f6974d503baf9a94f358f4d10ef",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/swift/LDKNodeFFI.xcframework/ios-arm64_x86_64-simulator/LDKNodeFFI.framework/Modules/module.modulemap",
+      "upstream_sha256": "29a069878c396772addae2a64c1a6ea25807770a222b93b1e0d352fa591d38ef",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/swift/LDKNodeFFI.xcframework/macos-arm64_x86_64/LDKNodeFFI.framework/Headers/LDKNodeFFI-umbrella.h",
+      "upstream_sha256": "233d2fe9bbde1502d1cad11beaf44eef3e55d4c4652be09eaa48fc3d0b93385c",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/swift/LDKNodeFFI.xcframework/macos-arm64_x86_64/LDKNodeFFI.framework/Info.plist",
+      "upstream_sha256": "d21d6f58d8d2c2d00126c66d69579b7f99707e19dd2cc1b607bc6927f08f8a83",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/swift/LDKNodeFFI.xcframework/macos-arm64_x86_64/LDKNodeFFI.framework/Modules/module.modulemap",
+      "upstream_sha256": "29a069878c396772addae2a64c1a6ea25807770a222b93b1e0d352fa591d38ef",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/swift/Package.swift",
+      "upstream_sha256": "0f4c8189c3aa5efee1889fbcde9789ac7599ebc3010b8511c8d16891afff75e7",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "bindings/swift/Sources/LDKNode/LDKNode.swift",
+      "upstream_sha256": "7a9756c306da1d004ae7b32b88330b254b0e29ee1368eb319d212bd26b7e0b26",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "docker-compose-cln.yml",
+      "upstream_sha256": "aa78827f703ddd505683430ad4bbd92230fd944f4a1d3982c106b9c4f2619bd5",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "docker-compose-lnd.yml",
+      "upstream_sha256": "26e89eb3c6fbb93558206868ebf0d33ed41b806c38864130480b69a7fbd065f1",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "docker-compose.yml",
+      "upstream_sha256": "b4b62655683674c4ac759f4a3a7ef06d5ea0ee3d5de7b657d473fbb494a30d89",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "rustfmt.toml",
+      "upstream_sha256": "9e75083081f5994857622bc02ad9b849b5341a0e959960ab363018df86da3f2f",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "scripts/download_bitcoind_electrs.sh",
+      "upstream_sha256": "132c0d1c00861f8418756a6cc2181dd802d8e0d9e5c1b42c2514b5d439d06836",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "scripts/format_kotlin.sh",
+      "upstream_sha256": "679a520bffa39850ec95250ff88d53503606d2437ece24cdf596d7f72f7f877b",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "scripts/generate_checksum_files.sh",
+      "upstream_sha256": "e9d6b2504c03ef899a163ea6c7ac30ffab74aee2c4663bc2af4adb7a782b5b73",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "scripts/python_create_package.sh",
+      "upstream_sha256": "d1e58c88ef1579165da0a79d60f1875a95dfde77c5f870a11f54ddf2ab8265d4",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "scripts/swift_create_xcframework_archive.sh",
+      "upstream_sha256": "93bdc58d2b50784e01e0602b49d4989c51cb4e76d5a8f5ed1771be59a81aaa8e",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "scripts/swift_update_package_checksum.py",
+      "upstream_sha256": "612de521272609bdf24220ec6f933e18f12ef5161f366f97939d8d49371a1890",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "scripts/uniffi_bindgen_generate.sh",
+      "upstream_sha256": "4afb4af56b3b15f15a9cf210febd1d74cea52dee37c94044b34d58384e724ac5",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "scripts/uniffi_bindgen_generate_kotlin.sh",
+      "upstream_sha256": "2fce821b921692d57402fc062f5303f6541d984f545b4b408ac44b0dcb01a019",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "scripts/uniffi_bindgen_generate_kotlin_android.sh",
+      "upstream_sha256": "7d242ec0283be7724eb7f831825d2f18a49302c25c9a64b1443bf5c997617fd7",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "scripts/uniffi_bindgen_generate_python.sh",
+      "upstream_sha256": "4054b02d5442bf40f3c49072e537679b462203e7db980a232d3f601a0ab852cb",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "scripts/uniffi_bindgen_generate_swift.sh",
+      "upstream_sha256": "252c4244a42cfece82b9f776cad50038ebbd9622df7996935c255d9341605e74",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/balance.rs",
+      "upstream_sha256": "e207bdfaf4481b8a1e467508020d209ffcfdbd1d23860ddd8d9e76b2b4965143",
+      "local_sha256": "35c0c96b23e428fed7c4df50bb1b7dfd3236f3c0c134968b2a85ad5ee0c381c0"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/builder.rs",
+      "upstream_sha256": "77bfc6261b2974dc5a8ce17fcdf15afd9a5de66d08945a7d181f98d5849711c5",
+      "local_sha256": "b3db4d5eee572bd973da9498c6e3f975c0317140208846a7b77cb03e687ff408"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/chain/bitcoind.rs",
+      "upstream_sha256": "86b7ac8e32f78380096667bc40178d674bbf1a0c40b9f49210f3c53d7cb2c22f",
+      "local_sha256": "2b12206af567a57cb0c4ea55110c9f60eb4444f460eed90f0b5ca9ec670800ab"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/chain/broadcast.rs",
+      "upstream_sha256": null,
+      "local_sha256": "4940ae39831bb455c2b6eb8a5c1292c136254d13809488ed4e8d703003914152"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/chain/electrum.rs",
+      "upstream_sha256": "7dbbc72dcce0c537aaa95334f5eddd52dfec27fae2cfbb359468febb91b4e9ac",
+      "local_sha256": "dbfe2632673d2e9e42c094a0297c9f7ee0c56e3e713c4aa9ae6b7fd5dae53b10"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/chain/esplora.rs",
+      "upstream_sha256": "21dbe7601d9546a95f561fdb565fd96de6c2887734546186b58661616a6d06dd",
+      "local_sha256": "e4c75bc9b5346affcee40246681db6fc7e9e2d4cdeea4b678044b5c6f2578be0"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/chain/mod.rs",
+      "upstream_sha256": "756f460b17503a951ca642b7b7e8cfd65852b9633f23daf4a0476abbffada2fd",
+      "local_sha256": "b0f74dbc392551fb69c91d24f72b969187e96002743a36a4e44fc51b83d41207"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/chain/rate_limit.rs",
+      "upstream_sha256": null,
+      "local_sha256": "43766c72a9e07bc9e45b30e76e8194ec4290f581f3f49706e2a498fa364e2b3f"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/chain/sync_health.rs",
+      "upstream_sha256": null,
+      "local_sha256": "2a16106772663e2798f3379c7ac0151fb2c9171f5a11ce487a817ce2297c0a7d"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/chain/sync_retry.rs",
+      "upstream_sha256": null,
+      "local_sha256": "e7bc4dcbe2ae71279424ae5e474c4a2348c37d0c6549c3b5952de57269fca2d4"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/channel_limits.rs",
+      "upstream_sha256": null,
+      "local_sha256": "88e734e1a9fb3559cfc2f8efd9cab565dd4609dcee66e60053604b10f44a9681"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/config.rs",
+      "upstream_sha256": "17ae06d369d5e8ad2f93abc25c0874041db3c8d5c7bf60e66285bce4c4692252",
+      "local_sha256": "7d64769e07632259dcab59c5dafadf8d07ba66ebc169910fd881fa877b7dce2c"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/error.rs",
+      "upstream_sha256": "aa2475f8473dd7c940ae2ea8f096879e5f6d5869bf0ee915fef98b122755ef6f",
+      "local_sha256": "f90cbc35885c7645a4e4401e49ce29f58522e6adab7e40d992bc6d663451acc5"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/event.rs",
+      "upstream_sha256": "36d61ad57d06cb84fbe5814034485ef5cac8122b26fc95a68e6885075324a922",
+      "local_sha256": "99ff106517d9a0c244b9c043f0bc4afedbea700698a82d5795941d5b017f9e60"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/fee_estimator.rs",
+      "upstream_sha256": "e495d5f87b591bf85a85168aa87d9bb9629a88d755f2ee8eb3147df6f53ab6f4",
+      "local_sha256": "33316c379042c2b531c23b5e0495fd42962c77a2e3f5c4f8e12926da32f81424"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/funding.rs",
+      "upstream_sha256": null,
+      "local_sha256": "32721557bdc37e39fd5c92a525aa61d908752559c1c49029d2cb70798b77ad2a"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/lib.rs",
+      "upstream_sha256": "9ef8c952da913bdf90980d42b8202a2815e594dc2bb0d11f02ee055776121514",
+      "local_sha256": "1db210b942a0534d6eaf7dd35e97cc5a3147a174026a784fb74aa0097870f84b"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/liquidity.rs",
+      "upstream_sha256": "0543848aa1b9dc2545363be3cbc6961bdaa9ca2fce6cc155f0d8a72a787e2fb5",
+      "local_sha256": "c035e886c045b11801f9a6f1ab497bc3d9abf3d8b547e8bbb6ab9c55a3ba7292"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/liquidity/jit.rs",
+      "upstream_sha256": null,
+      "local_sha256": "7d5602810ec8184429288c165c2f224bac657e962cbcd231047df23e8a4b873b"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/lsps2_open.rs",
+      "upstream_sha256": null,
+      "local_sha256": "7acdb39a283a5ab0b2001b627ff8ce4b4e5d25ec8f7b0888b5c7e8b159cf60bb"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/payment/bolt11.rs",
+      "upstream_sha256": "072129b5a598e8d89b22df6549c7f906ce5b983487a663cf6c8ec16190a44a31",
+      "local_sha256": "961a9c3459b3df38a351b6cfbfb0890b0212182a1a5fe3352d397ae16a650f54"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/payment/mod.rs",
+      "upstream_sha256": "c84f4ffbae6ea28a3e5cd3a12dd063e8a6b2f89ecc36fdd9903c028a516e4114",
+      "local_sha256": "f13a0563a86935159424e8d78ae98cb6690d47666cfb8b5fda89fc7b009cc353"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/tests/bitsov_channel_peers.rs",
+      "upstream_sha256": null,
+      "local_sha256": "13da72e4ad90d30992814a390a6255cc6a249f449f864a886e41b6acf09d3cbd"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/tests/bitsov_jit.rs",
+      "upstream_sha256": null,
+      "local_sha256": "9f83962cdf9b8ec70a3867f49aa45cba19746e7cccd66c6342564c33cc10b06a"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/tower_hook.rs",
+      "upstream_sha256": null,
+      "local_sha256": "678f1f8f0c8558f9d1181d3a9d3ced24a0e8dcb158166f4edf4a82e066bad514"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/tower_hook/bounded.rs",
+      "upstream_sha256": null,
+      "local_sha256": "4dcfbbcdf0e971feb1b687566b2f052eda7dbf84bc267dca961a184c0d580fc9"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/tower_hook/tests.rs",
+      "upstream_sha256": null,
+      "local_sha256": "47c064f173caa507845ce6cf120702a7b859c7c6a4c6618ca2bc135f3338c38c"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/tx_broadcaster.rs",
+      "upstream_sha256": "7a63fcd4c4fa2e77ddf82fd1d66fab441d5a9dbdc6671a5d1347e311d0bf95b1",
+      "local_sha256": "5b5546a69a8cd7dbb3087b873ecf004302d96c9f53b5e9fc8c77fda3e8614126"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/types.rs",
+      "upstream_sha256": "ebb186e5ecad29379b789913a5365f93f648f7f8194372265302bd5a6195c913",
+      "local_sha256": "635a9f6520d63970f812e2f5378655621bf2f62b345110251cc8e057ac59ee66"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/wallet/bump.rs",
+      "upstream_sha256": null,
+      "local_sha256": "f050d7d26b36494bc291472912b79780bb95c979c0b1708be047c52247dc8f5d"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/wallet/local_spends.rs",
+      "upstream_sha256": null,
+      "local_sha256": "091783f7541632783482fee6a11f666d1a29a455730d11ac7bcc49c09780a4cd"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/wallet/mod.rs",
+      "upstream_sha256": "482679bcd7d2d0d634e93267cd7637efd0332f3efd78d3c43a53076fe4b08b97",
+      "local_sha256": "870853723840a3032094c0d634aa357550972d2a21d919d2e20fee8955028c1b"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/wallet/money_tests.rs",
+      "upstream_sha256": null,
+      "local_sha256": "8cfbe9bdc9f0da4488e40faefd0675a5dda8f546c5888eecaef2407eee9b00d8"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/wallet/move_home.rs",
+      "upstream_sha256": null,
+      "local_sha256": "303bffbbde691322a34973568c736d11994153c0d74653d89d1903fe7513ecb5"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "src/wallet/persist.rs",
+      "upstream_sha256": "0f85a40a0ea532b33b2dfec62813f639b7f5c0f6965b01757d8dcaf48c49d63f",
+      "local_sha256": "4f40c3dd8ad4f6a417bec6e007ce038d25518c3bc48209f1ce1398d1b6ff5ea2"
+    },
+    {
+      "crate": "ldk-node",
+      "path": "tests/common/logging.rs",
+      "upstream_sha256": "ec35da9f50e31a65968c72dbe4de86cf3916c7aa40287c90a7f91a2fd56a3264",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "tests/common/mod.rs",
+      "upstream_sha256": "d11547f93e3c1ac8f68a2daed4d08def7c03fc3222e097e1cb8663fab15abc56",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "tests/integration_tests_cln.rs",
+      "upstream_sha256": "617a7d3a49f88f1c40e36462003308f83d1e9ac70fbed092d0da6f79256794e3",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "tests/integration_tests_lnd.rs",
+      "upstream_sha256": "6d141d5bfb245e12483391c6b1d6e7eb3061f857860753c09caae2b2faa53fb0",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "tests/integration_tests_rust.rs",
+      "upstream_sha256": "68ecd75da71cb91dbc3b47b4751bf5048264be5dda7fd8f947fdb48310f66307",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "tests/integration_tests_vss.rs",
+      "upstream_sha256": "3d619a18fc1a6d79ec3d1f594846f528dbf12339a6a546467c83d5abc7ba5caf",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "tests/reorg_test.rs",
+      "upstream_sha256": "b4965620e6884b2f56f393644d5df4ad001cb68954808255d127eacd94b9d7be",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "uniffi-android.toml",
+      "upstream_sha256": "2489a73f6b087f0299f97173e16834aec6d011adde8feeeeed05976c98b737b1",
+      "local_sha256": null
+    },
+    {
+      "crate": "ldk-node",
+      "path": "uniffi.toml",
+      "upstream_sha256": "fa0cafdbca5d4efef7fe87b26ce7ddabc24c82eb10ef50633cc661c4ccc5ce83",
+      "local_sha256": null
+    }
+  ]
+}

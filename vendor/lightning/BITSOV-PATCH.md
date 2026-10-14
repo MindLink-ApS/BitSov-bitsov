@@ -25,8 +25,8 @@ Local changes (plus rustfmt on these files):
 - `chain/chainmonitor.rs`: pending event visibility through queueing, processing,
   ReplayEvent, and acknowledgement.
 - `Cargo.toml`: declare upstream cfg names for local linting.
-- Whitespace-only cleanup of three archive lines in `ln/channel.rs`,
-  `ln/monitor_tests.rs`, and `ln/reload_tests.rs` for `git diff --check`.
+- Whitespace-only cleanup of two archive lines in `ln/channel.rs` and
+  `ln/monitor_tests.rs` for `git diff --check`.
 - Include standard MIT/Apache license texts and a standalone test lockfile using
   the workspace Bitcoin/Lightning-types versions.
 
