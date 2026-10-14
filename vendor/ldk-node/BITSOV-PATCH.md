@@ -735,3 +735,15 @@ Validation:
 Standalone Clippy emits 281 existing warnings on both the base commit and this
 patch; none are introduced here. Workspace affected-crate Clippy passes with
 `-D warnings` (dependency lints are not promoted by that workspace invocation).
+
+## October 2026 LDK security dependencies
+
+Production sources remain unchanged from node-repo base `9fdb1480`. The manifest
+now requires Lightning, lightning-liquidity and lightning-transaction-sync 0.2.7,
+plus background-processor 0.2.3 for its compatible liquidity persistence API.
+Both workspace and standalone lockfiles also select lightning-types 0.3.5,
+required by Lightning 0.2.7. Original `Cargo.toml.orig` remains the 0.7.0 archive
+manifest. See `../../docs/security/ldk-0.2.7/README.md` for commit provenance,
+local patch inventories and offline verification. Updating Lightning alone does
+not fix the LSPS2 service or Electrum sync issue. Already-queued old-version JIT
+HTLCs retain their unvalidated amounts under the upstream fix.

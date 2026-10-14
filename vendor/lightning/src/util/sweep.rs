@@ -473,12 +473,18 @@ where
 			return Ok(());
 		}
 
-		let result = self.regenerate_and_broadcast_spend_if_necessary_internal().await;
+		// Use an RAII guard so the flag is released even if this future is dropped mid-await
+		// (e.g. cancelled by `tokio::time::timeout` or `select!`). A bare `store(false)` after
+		// the await would never run on cancellation, leaving the sweeper permanently disabled.
+		struct PendingSweepGuard<'a>(&'a AtomicBool);
+		impl<'a> Drop for PendingSweepGuard<'a> {
+			fn drop(&mut self) {
+				self.0.store(false, Ordering::Release);
+			}
+		}
+		let _guard = PendingSweepGuard(&self.pending_sweep);
 
-		// Release the pending sweep flag again, regardless of result.
-		self.pending_sweep.store(false, Ordering::Release);
-
-		result
+		self.regenerate_and_broadcast_spend_if_necessary_internal().await
 	}
 
 	/// Regenerates and broadcasts the spending transaction for any outputs that are pending
@@ -707,13 +713,19 @@ where
 		&self, header: &Header, txdata: &chain::transaction::TransactionData, height: u32,
 	) {
 		let mut state_lock = self.sweeper_state.lock().unwrap();
-		assert_eq!(state_lock.best_block.block_hash, header.prev_blockhash,
-			"Blocks must be connected in chain-order - the connected header must build on the last connected header");
-		assert_eq!(state_lock.best_block.height, height - 1,
-			"Blocks must be connected in chain-order - the connected block height must be one greater than the previous height");
+		let is_rescan = state_lock.best_block.block_hash == header.block_hash()
+			&& state_lock.best_block.height == height;
+		if !is_rescan {
+			assert_eq!(state_lock.best_block.block_hash, header.prev_blockhash,
+				"Blocks must be connected in chain-order - the connected header must build on the last connected header");
+			assert_eq!(state_lock.best_block.height, height - 1,
+				"Blocks must be connected in chain-order - the connected block height must be one greater than the previous height");
+		}
 
 		self.transactions_confirmed_internal(&mut state_lock, header, txdata, height);
-		self.best_block_updated_internal(&mut state_lock, header, height);
+		if !is_rescan {
+			self.best_block_updated_internal(&mut state_lock, header, height);
+		}
 	}
 
 	fn blocks_disconnected(&self, fork_point: BestBlock) {
@@ -1109,5 +1121,205 @@ where
 		let (best_block, sweeper) =
 			<(BestBlock, OutputSweeper<_, _, _, _, _, _, _>)>::read(reader, args)?;
 		Ok((best_block, OutputSweeperSync { sweeper }))
+	}
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+	use super::*;
+	use crate::chain::transaction::OutPoint;
+	use crate::sign::{ChangeDestinationSource, OutputSpender};
+	use crate::util::async_poll::dummy_waker;
+	use crate::util::logger::Record;
+
+	use bitcoin::hashes::Hash as _;
+	use bitcoin::secp256k1::All;
+	use bitcoin::transaction::Version;
+	use bitcoin::{Amount, BlockHash, ScriptBuf, Transaction, TxOut, Txid};
+
+	use core::future as core_future;
+	use core::sync::atomic::Ordering;
+	use core::task::Poll;
+
+	struct DummyBroadcaster;
+	impl BroadcasterInterface for DummyBroadcaster {
+		fn broadcast_transactions(&self, _: &[&Transaction]) {}
+	}
+
+	struct DummyFeeEstimator;
+	impl FeeEstimator for DummyFeeEstimator {
+		fn get_est_sat_per_1000_weight(&self, _: ConfirmationTarget) -> u32 {
+			1000
+		}
+	}
+
+	struct DummyFilter;
+	impl Filter for DummyFilter {
+		fn register_tx(&self, _: &Txid, _: &bitcoin::Script) {}
+		fn register_output(&self, _: WatchedOutput) {}
+	}
+
+	struct DummyLogger;
+	impl Logger for DummyLogger {
+		fn log(&self, _: Record) {}
+	}
+
+	struct DummyOutputSpender;
+	impl OutputSpender for DummyOutputSpender {
+		fn spend_spendable_outputs(
+			&self, _: &[&SpendableOutputDescriptor], _: Vec<TxOut>, _: ScriptBuf, _: u32,
+			_: Option<LockTime>, _: &Secp256k1<All>,
+		) -> Result<Transaction, ()> {
+			Ok(Transaction {
+				version: Version::TWO,
+				lock_time: LockTime::ZERO,
+				input: Vec::new(),
+				output: Vec::new(),
+			})
+		}
+	}
+
+	struct DummyChangeDestSource;
+	impl ChangeDestinationSource for DummyChangeDestSource {
+		fn get_change_destination_script<'a>(&'a self) -> AsyncResult<'a, ScriptBuf, ()> {
+			Box::pin(core_future::ready(Ok(ScriptBuf::new())))
+		}
+	}
+
+	struct PendingKVStore;
+	impl KVStore for PendingKVStore {
+		fn read(&self, _: &str, _: &str, _: &str) -> AsyncResult<'static, Vec<u8>, io::Error> {
+			Box::pin(core_future::ready(Err(io::Error::new(io::ErrorKind::NotFound, ""))))
+		}
+		fn write(
+			&self, _: &str, _: &str, _: &str, _: Vec<u8>,
+		) -> AsyncResult<'static, (), io::Error> {
+			Box::pin(core_future::pending())
+		}
+		fn remove(
+			&self, _: &str, _: &str, _: &str, _: bool,
+		) -> AsyncResult<'static, (), io::Error> {
+			Box::pin(core_future::ready(Ok(())))
+		}
+		fn list(&self, _: &str, _: &str) -> AsyncResult<'static, Vec<String>, io::Error> {
+			Box::pin(core_future::ready(Ok(Vec::new())))
+		}
+	}
+
+	#[test]
+	fn pending_sweep_flag_resets_after_future_drop() {
+		let best_block = BestBlock::new(BlockHash::all_zeros(), 1_000);
+
+		let sweeper: OutputSweeper<_, _, _, _, _, _, _> = OutputSweeper::new(
+			best_block,
+			&DummyBroadcaster,
+			&DummyFeeEstimator,
+			None::<&DummyFilter>,
+			&DummyOutputSpender,
+			Box::new(DummyChangeDestSource),
+			&PendingKVStore,
+			&DummyLogger,
+		);
+
+		// Inject a tracked output directly so the sweep loop has work to do.
+		let descriptor = SpendableOutputDescriptor::StaticOutput {
+			outpoint: OutPoint { txid: Txid::all_zeros(), index: 0 },
+			output: TxOut { value: Amount::from_sat(100_000), script_pubkey: ScriptBuf::new() },
+			channel_keys_id: None,
+		};
+		sweeper.sweeper_state.lock().unwrap().outputs.push(TrackedSpendableOutput {
+			descriptor,
+			channel_id: None,
+			status: OutputSpendStatus::PendingInitialBroadcast { delayed_until_height: None },
+		});
+
+		// Start a sweep, poll once (the persist step stays Pending because our KVStore's
+		// `write` future is `future::pending()`), then drop the future to mimic
+		// cancellation - the sort of thing a `tokio::time::timeout` wrapper produces.
+		{
+			let mut fut = Box::pin(sweeper.regenerate_and_broadcast_spend_if_necessary());
+			let waker = dummy_waker();
+			let mut ctx = task::Context::from_waker(&waker);
+			assert!(matches!(fut.as_mut().poll(&mut ctx), Poll::Pending));
+		}
+
+		// Once the future has been dropped, `pending_sweep` must be cleared. The bug
+		// is that the flag is only ever cleared after the inner future returns, so a
+		// dropped future leaves it stuck `true` and every subsequent call to
+		// `regenerate_and_broadcast_spend_if_necessary` short-circuits with `Ok(())`,
+		// permanently disabling the sweeper.
+		assert!(
+			!sweeper.pending_sweep.load(Ordering::Acquire),
+			"pending_sweep flag was not reset when the future was dropped",
+		);
+	}
+
+	#[test]
+	fn filtered_block_connected_allows_same_block_rescan() {
+		let best_block = BestBlock::new(BlockHash::all_zeros(), 0);
+		let sweeper: OutputSweeper<
+			&DummyBroadcaster,
+			Box<DummyChangeDestSource>,
+			&DummyFeeEstimator,
+			&DummyFilter,
+			&PendingKVStore,
+			&DummyLogger,
+			&DummyOutputSpender,
+		> = OutputSweeper::new(
+			best_block.clone(),
+			&DummyBroadcaster,
+			&DummyFeeEstimator,
+			None,
+			&DummyOutputSpender,
+			Box::new(DummyChangeDestSource),
+			&PendingKVStore,
+			&DummyLogger,
+		);
+
+		let header = Header {
+			version: bitcoin::block::Version::NO_SOFT_FORK_SIGNALLING,
+			prev_blockhash: best_block.block_hash,
+			merkle_root: bitcoin::hash_types::TxMerkleNode::all_zeros(),
+			time: 1,
+			bits: bitcoin::pow::CompactTarget::from_consensus(42),
+			nonce: 42,
+		};
+		let tracked_outpoint = bitcoin::OutPoint { txid: Txid::all_zeros(), vout: 0 };
+		let spending_tx = Transaction {
+			version: Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: vec![bitcoin::TxIn { previous_output: tracked_outpoint, ..Default::default() }],
+			output: Vec::new(),
+		};
+		let descriptor = SpendableOutputDescriptor::StaticOutput {
+			outpoint: OutPoint { txid: tracked_outpoint.txid, index: tracked_outpoint.vout as u16 },
+			output: TxOut { value: Amount::from_sat(100_000), script_pubkey: ScriptBuf::new() },
+			channel_keys_id: None,
+		};
+		sweeper.sweeper_state.lock().unwrap().outputs.push(TrackedSpendableOutput {
+			descriptor,
+			channel_id: None,
+			status: OutputSpendStatus::PendingFirstConfirmation {
+				first_broadcast_hash: best_block.block_hash,
+				latest_broadcast_height: best_block.height,
+				latest_spending_tx: spending_tx.clone(),
+			},
+		});
+
+		sweeper.filtered_block_connected(&header, &[], 1);
+		let txdata = [(0, &spending_tx)];
+		sweeper.filtered_block_connected(&header, &txdata, 1);
+
+		let current_best_block = sweeper.current_best_block();
+		assert_eq!(current_best_block.block_hash, header.block_hash());
+		assert_eq!(current_best_block.height, 1);
+		assert!(matches!(
+			sweeper.tracked_spendable_outputs()[0].status,
+			OutputSpendStatus::PendingThresholdConfirmations {
+				confirmation_height: 1,
+				confirmation_hash,
+				..
+			} if confirmation_hash == header.block_hash()
+		));
 	}
 }
