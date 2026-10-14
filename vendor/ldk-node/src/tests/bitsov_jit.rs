@@ -265,3 +265,6 @@ async fn zero_fee_retry_replaces_failed_attempt_skim_and_survives_restart() {
     assert_eq!(fee, 0, "zero-fee settlement must not report the failed attempt's skim");
     assert_eq!(receipt.amount_msat.unwrap() + fee, 100_000, "gross funding excludes the failed attempt's fee");
 }
+
+#[path = "security_071_events.rs"]
+mod security_071_tests;
