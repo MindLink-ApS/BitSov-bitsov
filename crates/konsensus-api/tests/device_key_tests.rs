@@ -301,6 +301,174 @@ fn malformed_keys_and_names_are_refused() {
 
 // ─── Step 2: signed relation intents ───────────────────────────────
 
+// IDs must identify an accepted approval, not the reusable grant or its terms.
+#[test]
+fn relation_envelope_identity_replaces_only_its_recipient_and_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _, client, device, key_id) = registered(tmp.path());
+    let apply = |peer| {
+        let i = intent(&key_id, peer, 80_000, 20_000);
+        let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+        service
+            .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
+            .unwrap()
+    };
+    let a = serde_json::to_value(apply(PEER)).unwrap();
+    let a_id = a["envelope_id"]
+        .as_str()
+        .expect("accepted approval has an ID");
+    assert!(!a_id.is_empty());
+    let other = serde_json::to_value(apply(OTHER)).unwrap();
+    let b = serde_json::to_value(apply(PEER)).unwrap();
+    assert_ne!(b["envelope_id"], a["envelope_id"]);
+    assert_ne!(b["envelope_id"], other["envelope_id"]);
+    assert_eq!(a["grant"]["op_id"], b["grant"]["op_id"]);
+    assert_eq!(
+        b["grant"]["envelope_id_by_recipient"][PEER],
+        b["envelope_id"]
+    );
+    assert_eq!(
+        b["grant"]["envelope_id_by_recipient"][OTHER],
+        other["envelope_id"]
+    );
+    drop(service);
+    let (restarted, _) = owner_run(tmp.path());
+    let view = serde_json::to_value(restarted.grant_view_for(&client.client_id).unwrap()).unwrap();
+    assert_eq!(
+        view["envelope_id_by_recipient"],
+        b["grant"]["envelope_id_by_recipient"]
+    );
+}
+
+#[test]
+fn relation_envelope_identity_legacy_migration_keeps_unknown_ids_null() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _, client, device, key_id) = registered(tmp.path());
+    for peer in [PEER, OTHER] {
+        let i = intent(&key_id, peer, 80_000, 20_000);
+        let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+        service
+            .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
+            .unwrap();
+    }
+    drop(service);
+    let path = tmp.path().join("pairing/clients.json");
+    let mut file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    file["version"] = 7.into();
+    file["grants"][0]["budget"]
+        .as_object_mut()
+        .unwrap()
+        .remove("envelope_id_by_recipient");
+    std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    let (service, _) = owner_run(tmp.path());
+    let view = serde_json::to_value(service.grant_view_for(&client.client_id).unwrap()).unwrap();
+    assert_eq!(
+        view["envelope_id_by_recipient"],
+        serde_json::json!({PEER: null, OTHER: null})
+    );
+    // A new approval gives only this recipient an identity; write upgrades to v8.
+    let i = intent(&key_id, PEER, 80_000, 20_000);
+    let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let accepted = serde_json::to_value(
+        service
+            .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(accepted["envelope_id"].is_string());
+    let file: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(file["version"], 8);
+    drop(service);
+    let (restarted, _) = owner_run(tmp.path());
+    let view = serde_json::to_value(restarted.grant_view_for(&client.client_id).unwrap()).unwrap();
+    assert_eq!(
+        view["envelope_id_by_recipient"][PEER],
+        accepted["envelope_id"]
+    );
+    assert_eq!(
+        view["envelope_id_by_recipient"].get(OTHER),
+        Some(&serde_json::Value::Null)
+    );
+}
+
+#[test]
+fn relation_envelope_identity_failed_write_and_replay_preserve_current_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _, client, device, key_id) = registered(tmp.path());
+    let a = intent(&key_id, PEER, 80_000, 20_000);
+    let a_sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &a));
+    let accepted = serde_json::to_value(
+        service
+            .apply_relation_intent(&client.client_id, client.epoch, &a, &a_sig)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(accepted["envelope_id"].is_string());
+    let before = std::fs::read(service.dir().join("clients.json")).unwrap();
+    let b = intent(&key_id, PEER, 80_000, 20_000);
+    let b_sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &b));
+    // A directory at the temp-file path forces persistence to fail before rename.
+    let blocked = service.dir().join("clients.json.tmp");
+    std::fs::create_dir(&blocked).unwrap();
+    assert!(matches!(
+        service.apply_relation_intent(&client.client_id, client.epoch, &b, &b_sig),
+        Err(PairingError::Io(_))
+    ));
+    std::fs::remove_dir(&blocked).unwrap();
+    assert_eq!(
+        std::fs::read(service.dir().join("clients.json")).unwrap(),
+        before
+    );
+    let current = serde_json::to_value(service.grant_view_for(&client.client_id).unwrap()).unwrap();
+    assert_eq!(
+        current["envelope_id_by_recipient"][PEER],
+        accepted["envelope_id"]
+    );
+    assert!(matches!(
+        service.apply_relation_intent(&client.client_id, client.epoch, &a, &a_sig),
+        Err(PairingError::BadProof)
+    ));
+    // A failed write did not consume B's nonce; retry accepts a new ID.
+    let b = serde_json::to_value(
+        service
+            .apply_relation_intent(&client.client_id, client.epoch, &b, &b_sig)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(b["envelope_id"], accepted["envelope_id"]);
+    drop(service);
+    let (restarted, _) = owner_run(tmp.path());
+    assert!(matches!(
+        restarted.apply_relation_intent(&client.client_id, client.epoch, &a, &a_sig),
+        Err(PairingError::BadProof)
+    ));
+    let current =
+        serde_json::to_value(restarted.grant_view_for(&client.client_id).unwrap()).unwrap();
+    assert_eq!(current["envelope_id_by_recipient"][PEER], b["envelope_id"]);
+}
+
+#[test]
+fn relation_envelope_identity_console_recipient_has_no_approval_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, console, client, _, _) = registered(tmp.path());
+    let op = service
+        .create_elevation_request(&client.client_id, vec![Scope::Spend])
+        .unwrap();
+    service
+        .grant_elevation(
+            &op.op_id,
+            &console.owner_code(&op.op_id),
+            konsensus_api::spend_budget::GrantTerms::new(100_000).recipient(PEER, 80_000),
+        )
+        .unwrap();
+    let view = serde_json::to_value(service.grant_view_for(&client.client_id).unwrap()).unwrap();
+    assert_eq!(
+        view["envelope_id_by_recipient"],
+        serde_json::json!({PEER: null})
+    );
+}
+
 #[test]
 fn a_signed_intent_opens_a_recipient_bound_envelope() {
     let tmp = tempfile::tempdir().unwrap();
@@ -309,7 +477,8 @@ fn a_signed_intent_opens_a_recipient_bound_envelope() {
     let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
     let view = service
         .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
-        .unwrap();
+        .unwrap()
+        .grant;
     assert!(view.recipients_only);
     assert_eq!(view.per_recipient_msat.get(PEER), Some(&80_000));
     assert_eq!(view.per_act_max_by_recipient.get(PEER), Some(&20_000));

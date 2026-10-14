@@ -12,6 +12,23 @@ For nodes skipping releases, apply the earlier procedures first, then
 rc13 → rc14. Historical sections describe their release's behavior; the rc14
 pairing schema and recovery guidance supersede those descriptions.
 
+## Unreleased: pairing storage v8
+
+Relation-envelope identity support (`relation_envelope_id_v1`) writes
+`pairing/clients.json` as **v8**. v2–v7 stores remain readable and migrate on
+the next successful pairing-store write. Existing budgets, accounting, replay
+nonces, breakers and expiries are preserved; envelopes without an identity
+stay unknown (`null` in the API) until explicitly approved again. Each new
+approval/renewal writes a fresh random ID atomically with its terms and nonce,
+and retains that binding across restart.
+
+This is **forward-only**, with no reverse migration. Older binaries refuse v8;
+keep the latest store and upgrade forward. Do not lower the version, strip
+identity fields or restore an older pairing file to bypass the fence. The
+node package version remains the current unreleased rc14 line; this change
+bumps the pairing file schema, not the SQL database schema. API details:
+[per-approval envelope identity](security/device-keys.md#per-approval-envelope-identity).
+
 ## rc13 → rc14 procedure
 
 1. **Prepare the retained node.** Reconcile pending payments, channel opens
