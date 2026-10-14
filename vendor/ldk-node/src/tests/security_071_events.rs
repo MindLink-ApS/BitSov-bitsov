@@ -1,4 +1,7 @@
 //! Runtime regressions for the 0.7.1 security backports. No node is started.
+#[path = "security_071_payment_status.rs"]
+mod payment_status;
+
 use super::*;
 use bitcoin::hashes::{sha256, Hash};
 use lightning::blinded_path::payment::Bolt12OfferContext;
