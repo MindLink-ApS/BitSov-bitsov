@@ -37,3 +37,26 @@ Before the fix, the success regression failed because status changed from
 `Succeeded` to `Failed`; the replay control passed. Both pass with the backport.
 They run under the existing `ldk-node-security` CI job's unfiltered vendored
 `--lib` command. Full follow-up validation is recorded below when completed.
+
+## Circular inbound HTLC using an outbound hash
+
+Exact release commit:
+[`ad36b93c3567dfd8609c3fe662f45363eb850ca2`](https://github.com/lightningdevkit/ldk-node/commit/ad36b93c3567dfd8609c3fe662f45363eb850ca2),
+backport of mainline
+[`c49b86dd50214e3b4cb759fe48794d0144b6f92f`](https://github.com/lightningdevkit/ldk-node/commit/c49b86dd50214e3b4cb759fe48794d0144b6f92f)
+(part of PR #1157). Verified the actual Git commit/diff and ancestry in the
+same `v0.7.1` tag.
+
+The single production hunk is applied verbatim: keep `fail_htlc_backwards`,
+then return without touching the outbound payment. Matching an outbound hash
+can be a loop or an unrelated HTLC using that hash; it does not prove that
+the outbound payment failed. A genuine outbound failure remains handled by
+`PaymentFailed`.
+
+`security_071_circular.rs` drives the real `PaymentClaimable` handler for
+pending and succeeded outbound records. It checks complete record equality,
+absence of preimage claiming/application events, and persisted records after
+restart. Before the fix it failed on the pending record becoming `Failed`;
+after the fix it passes for both statuses. It uses the same existing CI job.
+The synthetic event has no corresponding live ChannelManager HTLC; failure
+propagation on a funded network is not exercised.

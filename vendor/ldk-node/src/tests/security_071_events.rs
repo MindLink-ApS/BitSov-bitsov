@@ -182,3 +182,6 @@ async fn successful_send_keeps_preimage_in_receipt_but_never_logs_it() {
         node.event_queue.event_handled().await.unwrap();
     }
 }
+
+#[path = "security_071_circular.rs"]
+mod circular_payment;
