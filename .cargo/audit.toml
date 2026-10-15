@@ -77,5 +77,44 @@ ignore = [
   "RUSTSEC-2026-0098",
   "RUSTSEC-2026-0099",
   "RUSTSEC-2026-0104",
+  # Applicability triage 2026-10-15 — rustls 0.21.12 via sqlx-core 0.8.0,
+  # held by the SQLite dependency conflict above. rustls 0.23 is patched to
+  # 0.23.46 in both the root and vendor/ldk-node lockfiles; these exceptions
+  # accept ONLY the legacy rustls island. cargo-audit ignores advisory IDs,
+  # not package versions: do not downgrade 0.23 or treat this as its waiver.
+  # The lockfile also has a test-feature-gated minreq 2.14.1 path via
+  # corepc/electrsd (optional dependencies, absent from the default build).
+  #
+  # TLS IS COMPILED AND REACHABLE: Cargo.toml enables runtime-tokio-rustls
+  # and postgres. StorageConfig::Postgres -> PostgresStorage::connect(url)
+  # -> PgPoolOptions::connect passes through sslmode; SQLx defaults to Prefer
+  # and negotiates TLS when offered, and Require/VerifyCa/VerifyFull need it.
+  # Disabling TLS would silently remove encryption with Prefer and break
+  # TLS-required deployments. SQLite opens no database TLS connection; that
+  # does NOT make Postgres-over-TLS unaffected. Input size caps do not help.
+  #
+  # RUSTSEC-2026-0346 — session-value Debug output can disclose TLS secrets.
+  # SQLx's net/tls/tls_rustls.rs uses ClientConfig's built-in session cache;
+  # neither SQLx nor our code installs a custom ClientSessionStore or formats
+  # Tls12ClientSessionValue/Tls13ClientSessionValue. Test-only minreq also uses
+  # the built-in cache. The advisory excludes ordinary connection/cache Debug
+  # output. No current secret-logging path was found, even with Postgres TLS.
+  # RESIDUAL RISK: the vulnerable Debug impls remain compiled; adding session
+  # value logging/custom cache instrumentation could expose master secrets or
+  # resumption PSKs to log readers. Recheck any TLS/session/logging changes;
+  # remove this exception when the sqlx/ldk-node island can be upgraded (#59).
+  "RUSTSEC-2026-0346",
+  # RUSTSEC-2026-0349 — unauthenticated ServerHello poisons the cached key-share
+  # hint for later connections. SQLx constructs a fresh ClientConfig (and
+  # session cache) per handshake, so hints are not reused across connections.
+  # rustls 0.21.12's safe defaults offer only X25519/P-256/P-384: no hybrid/PQ
+  # group exists to lose. Test-only minreq DOES share a config/cache and can
+  # retain poisoned classical-group hints, but also has no PQ group to lose.
+  # RESIDUAL RISK: the pre-authentication hint write remains in this legacy
+  # client, and Postgres TLS already provides classical-only confidentiality;
+  # this is not a claim of post-quantum protection or a patched dependency.
+  # Recheck shared-config/cache changes, key-exchange policy, or promotion of
+  # minreq to runtime use. Remove on the sqlx/ldk-node island upgrade (#59).
+  "RUSTSEC-2026-0349",
   "RUSTSEC-2025-0134", # rustls-pemfile 1.0.4 UNMAINTAINED via sqlx-core 0.8.0 island (same pin); no known vuln. Remove on sqlx bump (#59).
 ]
