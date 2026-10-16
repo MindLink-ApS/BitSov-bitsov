@@ -38,10 +38,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 /// Capability advertised on `/api/v1/status` once this node meters grants.
 pub const CAPABILITY: &str = "spend_budget_grant_v1";
+
+/// Per-approval identity in relation-intent responses and recipient grant views.
+pub const RELATION_ENVELOPE_ID_CAPABILITY: &str = "relation_envelope_id_v1";
 
 /// `GET /api/v1/status` advertises this when a paired client can pay a first
 /// contact through a one-time first-contact grant (see [`FirstContactGrant`]).
@@ -373,6 +377,9 @@ pub struct GrantBudget {
     /// Relation grants: when each recipient's envelope ends, unix seconds.
     #[serde(default)]
     pub recipient_expires_at: BTreeMap<String, i64>,
+    /// Latest accepted envelope identity per recipient. Missing legacy IDs stay unknown.
+    #[serde(default)]
+    pub envelope_id_by_recipient: BTreeMap<String, String>,
 }
 
 /// Durable, bounded reset audit metadata. Signed terms stay in the approval operation.
@@ -405,6 +412,7 @@ impl GrantBudget {
             recipients_only: false,
             per_act_max_by_recipient: BTreeMap::new(),
             recipient_expires_at: BTreeMap::new(),
+            envelope_id_by_recipient: BTreeMap::new(),
         }
     }
 
@@ -418,14 +426,20 @@ impl GrantBudget {
 
     /// Open (or renew) one recipient's envelope: `budget_msat` more than it has
     /// already used, at most `per_act_max_msat` per act, until `expires_at`.
-    /// Never lowers what another recipient may still spend.
+    /// Never lowers what another recipient may still spend. Returns a fresh random
+    /// approval identity, replacing only this recipient's previous identity.
     pub fn open_envelope(
         &mut self,
         recipient: &str,
         budget_msat: u64,
         per_act_max_msat: u64,
         expires_at: i64,
-    ) {
+    ) -> String {
+        let mut random_id = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut random_id);
+        let envelope_id = hex::encode(random_id);
+        self.envelope_id_by_recipient
+            .insert(recipient.to_string(), envelope_id.clone());
         let used = self.used_by_recipient.get(recipient).copied().unwrap_or(0);
         let old_left = self
             .per_recipient_msat
@@ -444,6 +458,7 @@ impl GrantBudget {
             .saturating_sub(old_left)
             .saturating_add(budget_msat);
         self.per_call_max_msat = self.budget_msat;
+        envelope_id
     }
 
     /// Relation grants: refuse any charge outside a live envelope, or above
@@ -939,6 +954,10 @@ pub struct GrantView {
     /// Relation grants: when each recipient's envelope ends, unix seconds.
     #[serde(default)]
     pub recipient_expires_at: BTreeMap<String, i64>,
+    /// Current envelope identity for each recipient cap, or null if unknown.
+    /// The aggregate `op_id` is not an envelope identity.
+    #[serde(default)]
+    pub envelope_id_by_recipient: BTreeMap<String, Option<String>>,
 }
 
 /// Render terms for a human before they approve them.

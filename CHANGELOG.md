@@ -7,6 +7,15 @@ also live on the corresponding GitHub pre-release pages.
 
 ### Node / Security
 
+- Add `relation_envelope_id_v1`: every accepted contact relation intent returns
+  a fresh random `envelope_id`; pair/grant exposes the current identity in
+  `grant.envelope_id_by_recipient`. Replacement/renewal A→B reports B without
+  changing other peers' identities, and bindings survive restart. Pairing
+  storage v8 migrates v2–v7 on write, leaving legacy/unknown identities null.
+  The migration is forward-only; older binaries refuse v8. See
+  [envelope identity](docs/security/device-keys.md#per-approval-envelope-identity)
+  and [upgrade guidance](docs/UPGRADING.md#unreleased-pairing-storage-v8).
+
 - Add `POST /api/v1/messages/operations/{id}/abandon`, advertised by
   `message_operation_abandon_v1`. Under the compose lock, unused IDs and
   prepared/released operations without payment evidence become durable
