@@ -39,6 +39,8 @@ tracing.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# Exercise the default-feature OS-randomness path used by Lightning hash tables.
+possiblyrandom = { version = "0.2", default-features = false }
 mockall.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -747,3 +747,19 @@ manifest. See `../../docs/security/ldk-0.2.7/README.md` for commit provenance,
 local patch inventories and offline verification. Updating Lightning alone does
 not fix the LSPS2 service or Electrum sync issue. Already-queued old-version JIT
 HTLCs retain their unvalidated amounts under the upstream fix.
+
+## Selected ldk-node 0.7.1 security backports (2026-10-14)
+
+Baseline remains 0.7.0 with all prior local patches. `builder.rs` now creates a
+fresh ChannelManager only on NotFound and returns ReadFailed for other store
+errors (#1032). `event.rs` rejects nonzero skims on every unregistered receive
+(#899), rejects unknown even custom TLVs before exposing claimability (#1157),
+and omits preimages from successful-send logs (#1035). Receipt/event APIs still
+retain preimages. The fixed JIT net minimum, retry/duplicate handling, stateless
+quote authentication/expiry and work-admission patches are preserved.
+
+Tests are in `src/tests/security_071_{builder,events}.rs`. CI now runs the full
+vendored library test target as a separate job. Both standalone locks and the
+workspace lock select possiblyrandom 0.2.1 (#4719); no other version changes.
+See `../../docs/security/ldk-node-0.7.1/README.md` for exact upstream commits,
+before/after inventories, preservation evidence and validation limits.
