@@ -681,6 +681,10 @@ pub(crate) enum ChannelMonitorUpdateStep {
 		/// If set to false, we shouldn't broadcast the latest holder commitment transaction as we
 		/// think we've fallen behind!
 		should_broadcast: bool,
+		/// HTLCs which the counterparty failed but whose failures had not been handled when the
+		/// channel was closed. Those which are no longer in any commitment transaction we track
+		/// are failed once this update is applied.
+		counterparty_failed_htlcs: Vec<(HTLCSource, PaymentHash)>,
 	},
 	ShutdownScript {
 		scriptpubkey: ScriptBuf,
@@ -754,6 +758,7 @@ impl_writeable_tlv_based_enum_upgradable!(ChannelMonitorUpdateStep,
 	},
 	(4, ChannelForceClosed) => {
 		(0, should_broadcast, required),
+		(1, counterparty_failed_htlcs, optional_vec),
 	},
 	(5, ShutdownScript) => {
 		(0, scriptpubkey, required),
@@ -2183,7 +2188,15 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 	/// Get the list of HTLCs who's status has been updated on chain. This should be called by
 	/// ChannelManager via [`chain::Watch::release_pending_monitor_events`].
 	pub fn get_and_clear_pending_monitor_events(&self) -> Vec<MonitorEvent> {
-		self.inner.lock().unwrap().get_and_clear_pending_monitor_events()
+		self.inner.lock().unwrap().get_and_clear_pending_monitor_events_filtered(|_| true)
+	}
+
+	/// Returns only non-HTLC-failure monitor events, retaining HTLC failures until monitor
+	/// updates have been durably persisted.
+	pub(super) fn get_and_clear_pending_non_htlc_fail_events(&self) -> Vec<MonitorEvent> {
+		self.inner.lock().unwrap().get_and_clear_pending_monitor_events_filtered(
+			|ev| !matches!(ev, MonitorEvent::HTLCEvent(upd) if upd.payment_preimage.is_none()),
+		)
 	}
 
 	/// Processes [`SpendableOutputs`] events produced from each [`ChannelMonitor`] upon maturity.
@@ -2667,10 +2680,12 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 			&& is_all_funds_claimed
 			&& !inner.funding_spend_seen
 		{
-			// We closed the channel without ever advancing it and didn't have any funds in it.
-			// We should immediately archive this monitor as there's nothing for us to ever do with
-			// it.
-			return (true, false);
+			// We closed the channel without ever advancing it and didn't have any funds in it. There's
+			// nothing for us to ever do with this monitor, so we archive it as soon as any pending
+			// `MonitorEvent`s have been processed. This may be necessary in the case that the monitor
+			// initiated the channel close -- archiving now may leave the `ChannelManager` with a
+			// `Channel` that has no corresponding monitor, which is not allowed on restart.
+			return (inner.pending_monitor_events.is_empty(), false);
 		}
 
 		if is_all_funds_claimed && !inner.funding_spend_seen {
@@ -4356,9 +4371,10 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 						ret = Err(());
 					}
 				},
-				ChannelMonitorUpdateStep::ChannelForceClosed { should_broadcast } => {
+				ChannelMonitorUpdateStep::ChannelForceClosed { should_broadcast, counterparty_failed_htlcs } => {
 					log_trace!(logger, "Updating ChannelMonitor: channel force closed, should broadcast: {}", should_broadcast);
 					self.lockdown_from_offchain = true;
+					self.fail_counterparty_failed_htlcs(counterparty_failed_htlcs, logger);
 					if *should_broadcast {
 						// There's no need to broadcast our commitment transaction if we've seen one
 						// confirmed (even with 1 confirmation) as it'll be rejected as
@@ -4447,6 +4463,68 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 		self.funding_spend_seen || self.lockdown_from_offchain || self.holder_tx_signed
 	}
 
+	/// Fails HTLCs which the counterparty failed off-chain but whose failures were not handled
+	/// before the channel was closed.
+	///
+	/// HTLCs still in a commitment transaction we track are skipped: we may not have been given
+	/// the revocation of the counterparty commitment transaction containing them, in which case
+	/// the counterparty can still claim them on-chain. They are instead resolved on-chain or, for
+	/// forwarded HTLCs, failed backwards as the inbound HTLCs approach expiry, like any other HTLC
+	/// we track.
+	fn fail_counterparty_failed_htlcs<L: Deref>(
+		&mut self, htlcs: &[(HTLCSource, PaymentHash)], logger: &WithContext<L>,
+	) where
+		L::Target: Logger,
+	{
+		let in_counterparty_commitment = |source: &HTLCSource| {
+			[
+				self.funding.current_counterparty_commitment_txid,
+				self.funding.prev_counterparty_commitment_txid,
+			]
+			.into_iter()
+			.flatten()
+			.filter_map(|txid| self.funding.counterparty_claimable_outpoints.get(&txid))
+			.flatten()
+			.any(|(_, source_opt)| source_opt.as_deref() == Some(source))
+		};
+		for (source, payment_hash) in htlcs {
+			let logger = WithContext::from(&logger, None, None, Some(*payment_hash));
+			if in_counterparty_commitment(source) {
+				log_trace!(
+					logger,
+					"Not failing HTLC as it is still in a counterparty commitment transaction"
+				);
+				continue;
+			}
+			// An HTLC the counterparty failed is removed from our commitment transaction before
+			// it is removed from theirs, so it can't be in ours if it is in neither of their
+			// unrevoked ones.
+			debug_assert!(!holder_commitment_htlcs!(self, CURRENT_WITH_SOURCES)
+				.any(|(_, s)| s == Some(source)));
+			let duplicate_event =
+				self.pending_monitor_events.iter().any(
+					|event| match event {
+						MonitorEvent::HTLCEvent(upd) => upd.source == *source,
+						_ => false,
+					},
+				);
+			if duplicate_event {
+				continue;
+			}
+			// The HTLC can't have been failed on-chain, as the counterparty revoked the commitment
+			// transaction containing it and we'd have swept it ourselves had it been broadcast.
+			let newly_failed = self.failed_back_htlc_ids.insert(SentHTLCId::from_source(source));
+			debug_assert!(newly_failed);
+			log_trace!(logger, "Failing HTLC the counterparty failed before the channel closed");
+			self.pending_monitor_events.push(MonitorEvent::HTLCEvent(HTLCUpdate {
+				source: source.clone(),
+				payment_preimage: None,
+				payment_hash: *payment_hash,
+				htlc_value_satoshis: None,
+			}));
+		}
+	}
+
 	fn get_latest_update_id(&self) -> u64 {
 		self.latest_update_id
 	}
@@ -4479,10 +4557,24 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 		&self.outputs_to_watch
 	}
 
-	fn get_and_clear_pending_monitor_events(&mut self) -> Vec<MonitorEvent> {
-		let mut ret = Vec::new();
-		mem::swap(&mut ret, &mut self.pending_monitor_events);
-		ret
+	/// Drains and returns the pending monitor events for which `predicate` returns true. Events that
+	/// don't match the predicate stay in `pending_monitor_events` so they're eligible for release on
+	/// a later call.
+	fn get_and_clear_pending_monitor_events_filtered<F: FnMut(&MonitorEvent) -> bool>(
+		&mut self, mut predicate: F,
+	) -> Vec<MonitorEvent> {
+		let mut released = Vec::new();
+		let mut retained = Vec::new();
+		// Note: we can use Vec::extract_if here once MSRV reaches 1.87
+		for entry in self.pending_monitor_events.drain(..) {
+			if predicate(&entry) {
+				released.push(entry);
+			} else {
+				retained.push(entry);
+			}
+		}
+		self.pending_monitor_events = retained;
+		released
 	}
 
 	/// Gets the set of events that are repeated regularly (e.g. those which RBF bump
@@ -6169,18 +6261,6 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 			macro_rules! log_claim {
 				($tx_info: expr, $holder_tx: expr, $htlc: expr, $source_avail: expr) => {
 					let outbound_htlc = $holder_tx == $htlc.offered;
-					// HTLCs must either be claimed by a matching script type or through the
-					// revocation path:
-					#[cfg(not(fuzzing))] // Note that the fuzzer is not bound by pesky things like "signatures"
-					debug_assert!(!$htlc.offered || offered_preimage_claim || offered_timeout_claim || revocation_sig_claim);
-					#[cfg(not(fuzzing))] // Note that the fuzzer is not bound by pesky things like "signatures"
-					debug_assert!($htlc.offered || accepted_preimage_claim || accepted_timeout_claim || revocation_sig_claim);
-					// Further, only exactly one of the possible spend paths should have been
-					// matched by any HTLC spend:
-					#[cfg(not(fuzzing))] // Note that the fuzzer is not bound by pesky things like "signatures"
-					debug_assert_eq!(accepted_preimage_claim as u8 + accepted_timeout_claim as u8 +
-					                 offered_preimage_claim as u8 + offered_timeout_claim as u8 +
-					                 revocation_sig_claim as u8, 1);
 					if ($holder_tx && revocation_sig_claim) ||
 							(outbound_htlc && !$source_avail && (accepted_preimage_claim || offered_preimage_claim)) {
 						log_error!(logger, "Input spending {} ({}:{}) in {} resolves {} HTLC with payment hash {} with {}!",
@@ -6193,13 +6273,25 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 							if outbound_htlc { "outbound" } else { "inbound" }, &$htlc.payment_hash,
 							if revocation_sig_claim { "revocation sig" } else if accepted_preimage_claim || offered_preimage_claim { "preimage" } else { "timeout" });
 					}
+					// HTLCs must either be claimed by a matching script type or through the
+					// revocation path:
+					#[cfg(not(fuzzing))] // Note that the fuzzer is not bound by pesky things like "signatures"
+					assert!(!$htlc.offered || offered_preimage_claim || offered_timeout_claim || revocation_sig_claim, "offered {htlc_claim:?}");
+					#[cfg(not(fuzzing))] // Note that the fuzzer is not bound by pesky things like "signatures"
+					assert!($htlc.offered || accepted_preimage_claim || accepted_timeout_claim || revocation_sig_claim, "!offered {htlc_claim:?}");
+					// Further, only exactly one of the possible spend paths should have been
+					// matched by any HTLC spend:
+					#[cfg(not(fuzzing))] // Note that the fuzzer is not bound by pesky things like "signatures"
+					assert_eq!(accepted_preimage_claim as u8 + accepted_timeout_claim as u8 +
+					                 offered_preimage_claim as u8 + offered_timeout_claim as u8 +
+					                 revocation_sig_claim as u8, 1);
 				}
 			}
 
 			macro_rules! check_htlc_valid_counterparty {
 				($htlc_output: expr, $per_commitment_data: expr) => {
 						for &(ref pending_htlc, ref pending_source) in $per_commitment_data {
-							if pending_htlc.payment_hash == $htlc_output.payment_hash && pending_htlc.amount_msat == $htlc_output.amount_msat {
+							if pending_htlc.offered == $htlc_output.offered && pending_htlc.payment_hash == $htlc_output.payment_hash && pending_htlc.amount_msat == $htlc_output.amount_msat {
 								if let &Some(ref source) = pending_source {
 									log_claim!("revoked counterparty commitment tx", false, pending_htlc, true);
 									payment_data = Some(((**source).clone(), $htlc_output.payment_hash, $htlc_output.amount_msat));
@@ -6211,7 +6303,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 			}
 
 			macro_rules! scan_commitment {
-				($funding_spent: expr, $htlcs: expr, $tx_info: expr, $holder_tx: expr) => {
+				($funding_spent: expr, $htlcs: expr, $tx_info: expr, $holder_tx: expr, $spent_counterparty_revoked: expr) => {
 					for (ref htlc_output, source_option) in $htlcs {
 						if Some(input.previous_output.vout) == htlc_output.transaction_output_index {
 							if let Some(ref source) = source_option {
@@ -6222,7 +6314,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 								// has timed out, or we screwed up. In any case, we should now
 								// resolve the source HTLC with the original sender.
 								payment_data = Some(((*source).clone(), htlc_output.payment_hash, htlc_output.amount_msat));
-							} else if !$holder_tx {
+							} else if $spent_counterparty_revoked {
 								if let Some(current_counterparty_commitment_txid) = &$funding_spent.current_counterparty_commitment_txid {
 									check_htlc_valid_counterparty!(htlc_output, $funding_spent.counterparty_claimable_outpoints.get(current_counterparty_commitment_txid).unwrap());
 								}
@@ -6259,65 +6351,51 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 			if input.previous_output.txid == funding_spent.current_holder_commitment_tx.trust().txid() {
 				scan_commitment!(
 					funding_spent, holder_commitment_htlcs!(self, CURRENT_WITH_SOURCES),
-					"our latest holder commitment tx", true
+					"our latest holder commitment tx", true, false
 				);
 			}
 			if let Some(prev_holder_commitment_tx) = funding_spent.prev_holder_commitment_tx.as_ref() {
 				if input.previous_output.txid == prev_holder_commitment_tx.trust().txid() {
 					scan_commitment!(
 						funding_spent, holder_commitment_htlcs!(self, PREV_WITH_SOURCES).unwrap(),
-						"our previous holder commitment tx", true
+						"our previous holder commitment tx", true, false
 					);
 				}
 			}
 			if let Some(ref htlc_outputs) = funding_spent.counterparty_claimable_outpoints.get(&input.previous_output.txid) {
+				let mut spent_counterparty_revoked = true;
+				if funding_spent.current_counterparty_commitment_txid == Some(input.previous_output.txid) {
+					spent_counterparty_revoked = false;
+				}
+				if funding_spent.prev_counterparty_commitment_txid == Some(input.previous_output.txid) {
+					spent_counterparty_revoked = false;
+				}
 				let htlcs = htlc_outputs.iter()
 					.map(|&(ref a, ref b)| (a, b.as_ref().map(|boxed| &**boxed)));
-				scan_commitment!(funding_spent, htlcs, "counterparty commitment tx", false);
+				scan_commitment!(funding_spent, htlcs, "counterparty commitment tx", false, spent_counterparty_revoked);
 			}
 
 			// Check that scan_commitment, above, decided there is some source worth relaying an
 			// HTLC resolution backwards to and figure out whether we learned a preimage from it.
 			if let Some((source, payment_hash, amount_msat)) = payment_data {
-				if accepted_preimage_claim {
+				if accepted_preimage_claim || offered_preimage_claim {
+					// Record the spend as resolving the HTLC output regardless of whether a claim event
+					// for this HTLC is still queued below, as a reorg may have removed a prior record of
+					// the spend while leaving that event queued.
+					self.onchain_events_awaiting_threshold_conf.push(OnchainEventEntry {
+						txid: tx.compute_txid(),
+						height,
+						block_hash: Some(*block_hash),
+						transaction: Some(tx.clone()),
+						event: OnchainEvent::HTLCSpendConfirmation {
+							commitment_tx_output_idx: input.previous_output.vout,
+							preimage: Some(payment_preimage),
+							on_to_local_output_csv: None,
+						},
+					});
+					self.counterparty_fulfilled_htlcs.insert(SentHTLCId::from_source(&source), payment_preimage);
 					if !self.pending_monitor_events.iter().any(
 						|update| if let &MonitorEvent::HTLCEvent(ref upd) = update { upd.source == source } else { false }) {
-						self.onchain_events_awaiting_threshold_conf.push(OnchainEventEntry {
-							txid: tx.compute_txid(),
-							height,
-							block_hash: Some(*block_hash),
-							transaction: Some(tx.clone()),
-							event: OnchainEvent::HTLCSpendConfirmation {
-								commitment_tx_output_idx: input.previous_output.vout,
-								preimage: Some(payment_preimage),
-								on_to_local_output_csv: None,
-							},
-						});
-						self.counterparty_fulfilled_htlcs.insert(SentHTLCId::from_source(&source), payment_preimage);
-						self.pending_monitor_events.push(MonitorEvent::HTLCEvent(HTLCUpdate {
-							source,
-							payment_preimage: Some(payment_preimage),
-							payment_hash,
-							htlc_value_satoshis: Some(amount_msat / 1000),
-						}));
-					}
-				} else if offered_preimage_claim {
-					if !self.pending_monitor_events.iter().any(
-						|update| if let &MonitorEvent::HTLCEvent(ref upd) = update {
-							upd.source == source
-						} else { false }) {
-						self.onchain_events_awaiting_threshold_conf.push(OnchainEventEntry {
-							txid: tx.compute_txid(),
-							transaction: Some(tx.clone()),
-							height,
-							block_hash: Some(*block_hash),
-							event: OnchainEvent::HTLCSpendConfirmation {
-								commitment_tx_output_idx: input.previous_output.vout,
-								preimage: Some(payment_preimage),
-								on_to_local_output_csv: None,
-							},
-						});
-						self.counterparty_fulfilled_htlcs.insert(SentHTLCId::from_source(&source), payment_preimage);
 						self.pending_monitor_events.push(MonitorEvent::HTLCEvent(HTLCUpdate {
 							source,
 							payment_preimage: Some(payment_preimage),
