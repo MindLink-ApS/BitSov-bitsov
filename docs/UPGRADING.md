@@ -6,8 +6,8 @@ retained data directory without re-running `konsensus init`.
 **rc15 preparation (2026-10-14):** six merged PRs after `v0.3.0-rc14`
 (`d55a88e4`): #301, #302, #303, #304, #306 and #307, plus
 `fix/ldk-0.2.7-security`, `fix/ldk-node-071-backports` and
-`fix/ldk-node-late-failure`. The candidate is late-failure head
-`be3b00ac535582262157535a5139a7d812939474` plus the reviewed release/upgrade
+`fix/ldk-node-late-failure`. The candidate is `main` at
+`3088c53cbb3f6b609545e93844f3d1eec84cbdea` plus the reviewed release/upgrade
 docs and this security update on `docs/rc15-release-notes-security`. This
 update changes documentation only; versions remain rc14. Rasmus will select
 the final rc15 release commit and tag/sign separately. See the
