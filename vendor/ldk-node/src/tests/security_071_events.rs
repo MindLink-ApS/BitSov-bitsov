@@ -1,4 +1,7 @@
 //! Runtime regressions for the 0.7.1 security backports. No node is started.
+#[path = "security_071_payment_status.rs"]
+mod payment_status;
+
 use super::*;
 use bitcoin::hashes::{sha256, Hash};
 use lightning::blinded_path::payment::Bolt12OfferContext;
@@ -179,3 +182,6 @@ async fn successful_send_keeps_preimage_in_receipt_but_never_logs_it() {
         node.event_queue.event_handled().await.unwrap();
     }
 }
+
+#[path = "security_071_circular.rs"]
+mod circular_payment;

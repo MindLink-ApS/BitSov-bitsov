@@ -680,18 +680,7 @@ where
 							payment_id
 						);
 						self.channel_manager.fail_htlc_backwards(&payment_hash);
-
-						let update = PaymentDetailsUpdate {
-							status: Some(PaymentStatus::Failed),
-							..PaymentDetailsUpdate::new(payment_id)
-						};
-						match self.payment_store.update(&update) {
-							Ok(_) => return Ok(()),
-							Err(e) => {
-								log_error!(self.logger, "Failed to access payment store: {}", e);
-								return Err(ReplayEvent());
-							},
-						};
+						return Ok(());
 					}
 
 					if info.status == PaymentStatus::Succeeded
@@ -1161,6 +1150,22 @@ where
 				};
 			},
 			LdkEvent::PaymentFailed { payment_id, payment_hash, reason, .. } => {
+				// LDK may emit PaymentFailed after PaymentSent. Ignore the entire late failure so
+				// it cannot alter payment metadata or emit a contradictory event.
+				if let Some(payment) = self.payment_store.get(&payment_id) {
+					if payment.direction == PaymentDirection::Outbound
+						&& payment.kind.is_lightning_payment()
+						&& payment.status == PaymentStatus::Succeeded
+					{
+						log_info!(
+							self.logger,
+							"Ignoring late payment failure for already-succeeded payment with ID {}.",
+							payment_id
+						);
+						return Ok(());
+					}
+				}
+
 				log_info!(
 					self.logger,
 					"Failed to send payment with ID {} due to {:?}.",
