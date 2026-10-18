@@ -1,4 +1,5 @@
 [advisories]
+# RUSTSEC-2024-0436: allow paste's unmaintained warning via sqlx-core 0.8.0; paste-free SQLx 0.8.6 needs libsqlite3-sys ^0.30, conflicting with LDK's ^0.28 pin (#59).
 # Accepted dependency debt: the ldk-node/sqlx SQLite island and test-only zip.
 #
 # Context:
