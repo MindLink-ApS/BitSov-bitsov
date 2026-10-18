@@ -5,6 +5,31 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+## [0.3.0-rc16] — 2026-10-17 (prep; not tagged yet)
+
+**Pre-release.** Not for production use. Includes the rc15 content and security
+updates described in the [rc15 release notes](docs/releases/v0.3.0-rc15.md),
+plus the zip advisory triage below. The rc15 release build was skipped after
+Cargo Audit failed. The [rc16 signing checklist](docs/releases/v0.3.0-rc16.md)
+tracks the remaining release gates. Pilots on rc14 upgrade directly to rc16;
+rc15's **no downgrade to rc14 after running with embedded LDK** rule still applies.
+
+### Audit triage
+
+- Document and mirror the accepted risk for RUSTSEC-2026-0367, -0368 and -0369
+  across Cargo Audit, cargo-deny and OSV. `zip 0.6.6` is confined to optional
+  test-harness build dependencies and is absent from the shipped binary.
+  Pinned archives are SHA-256 checked before extraction; the harnesses do not
+  use bulk extraction, archive symlinks or archive-derived permissions. The
+  dependency remains vulnerable; no compatible harness upgrade removes it.
+  See [applicability, residual risk and recheck triggers](.cargo/audit.toml).
+- Mirror the existing rustls 0.21 / SQLx exceptions for RUSTSEC-2026-0346 and
+  -0349, including their GHSA aliases, into cargo-deny and OSV. This preserves
+  the existing per-advisory triage; it does not patch the legacy dependency.
+  The transitive `paste` unmaintained warning remains documented pending the
+  SQLx/LDK SQLite dependency update (#59).
+- Bump all 14 workspace packages to `0.3.0-rc16`; dependency versions are unchanged.
+
 ### Node / Security
 
 - Add `POST /api/v1/messages/operations/{id}/abandon`, advertised by

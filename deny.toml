@@ -94,6 +94,15 @@ ignore = [
     # Tracking: docs/security/supply-chain-audit-scope.md (known-debt table).
     { id = "RUSTSEC-2024-0363", reason = "sqlx =0.8.0 pinned by ldk-node 0.7 rusqlite/libsqlite3-sys 0.28. NOT \"SQLite so unaffected\": sqlx-postgres ships in the binary and StorageConfig::Postgres is a supported backend. Unreachable because the exploit needs a bound parameter >4 GiB and inputs cap at 16 MiB (wire) / 2 MiB (API) — recheck if those caps change. Fix 0.8.1 needs libsqlite3-sys >=0.30. Tracked in supply-chain-audit-scope.md." },
 
+    # Legacy rustls 0.21.12 via sqlx-core 0.8.0; full per-advisory triage:
+    # .cargo/audit.toml (2026-10-15, #59). Postgres TLS is reachable; SQLite
+    # deployment defaults and input size caps do not waive TLS vulnerabilities.
+    # These exceptions do not cover rustls 0.23, already patched to 0.23.46.
+    # RUSTSEC-2026-0346 / GHSA-c8m5-c952-6cm4 — session-value Debug secrets.
+    { id = "RUSTSEC-2026-0346", reason = "rustls 0.21.12 via sqlx-core 0.8.0, pinned by the ldk-node/sqlx SQLite dependency conflict (#59), plus test-only minreq. SQLx and minreq use the built-in session cache; no custom ClientSessionStore or session-value Debug logging path was found. Vulnerable Debug impls remain compiled. Recheck TLS/session/logging changes; remove on the sqlx/ldk-node island upgrade. Full triage: .cargo/audit.toml; alias GHSA-c8m5-c952-6cm4." },
+    # RUSTSEC-2026-0349 / GHSA-w44r-93j7-qv28 — pre-auth key-share hints.
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.21.12 via sqlx-core 0.8.0, pinned by the ldk-node/sqlx SQLite dependency conflict (#59). SQLx creates a fresh ClientConfig/cache per handshake; safe defaults offer only classical groups. Test-only minreq shares a cache and can retain poisoned classical-group hints, but has no PQ group to lose. Vulnerable hint writes remain; no PQ protection is claimed. Recheck shared config/cache, key-exchange policy or runtime minreq use; remove on the sqlx/ldk-node island upgrade. Full triage: .cargo/audit.toml; alias GHSA-w44r-93j7-qv28." },
+
     # RUSTSEC-2026-0098 — rustls-webpki 0.101.7: URI-name constraints incorrectly
     # accepted. The 0.101.7 copy rides rustls 0.21 via sqlx-core 0.8.0 (same sqlx
     # pin above) and dev-only electrsd→minreq. Reachable only AFTER signature
