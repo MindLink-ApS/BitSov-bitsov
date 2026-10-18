@@ -3,6 +3,25 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## rc15 → rc16
+
+rc16 is rc15 (`87b02bc`) plus the test-only zip advisory triage. The rc15 tag
+exists, but Cargo Audit failed and its release build was skipped; rc16 is the
+first signed build of this content once the [signing checklist](releases/v0.3.0-rc16.md)
+is completed. `paste` remains an allowed unmaintained warning; dependencies,
+storage formats and migrations are unchanged from rc15. There is no additional
+operator impact beyond the [rc15 release notes](releases/v0.3.0-rc15.md).
+
+**Pilots still on rc14 upgrade directly to rc16.** Follow the complete
+[rc14 → rc15 procedure](#rc14--rc15-procedure) below, including the retained-Pi
+checks, using the signed rc16 artifact/checksums and expecting
+`konsensus 0.3.0-rc16` wherever that procedure says rc15. All startup, backup
+and rollback cutoffs apply equally to rc16: **no downgrade to rc14 after
+running rc16 with embedded LDK**; preserve the latest state and roll forward.
+There is no intermediate rc15 installation step.
+
+### Historical rc15 preparation
+
 **rc15 preparation (2026-10-14):** six merged PRs after `v0.3.0-rc14`
 (`d55a88e4`): #301, #302, #303, #304, #306 and #307, plus
 `fix/ldk-0.2.7-security`, `fix/ldk-node-071-backports` and
