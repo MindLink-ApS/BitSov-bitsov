@@ -1,4 +1,28 @@
 [[IgnoredVulns]]
+id = "RUSTSEC-2026-0367"
+reason = "zip 0.6.6 is test-harness build tooling only, never in the shipped konsensus binary. Pinned downloads have bundled SHA-256 checks before extraction; no bulk extract API or archive permission bits used. No fixed harness release available. Recheck harness/fixture/extraction/feature/release changes; remove when zip is dropped or >=9.0.0. Full triage: .cargo/audit.toml (2026-10-17)."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0368"
+reason = "zip 0.6.6 is test-harness build tooling only, never in the shipped konsensus binary. Pinned downloads have bundled SHA-256 checks before extraction; individual entry copies do not create archive symlinks. No fixed harness release available. Recheck harness/fixture/extraction/feature/release changes; remove when zip is dropped or >=9.0.0. Full triage: .cargo/audit.toml (2026-10-17)."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0369"
+reason = "zip 0.6.6 is test-harness build tooling only, never in the shipped konsensus binary. Pinned downloads have bundled SHA-256 checks before extraction; no bulk extract API or archive-derived chmod. Local output directories remain trusted. No fixed harness release available. Recheck harness/fixture/extraction/feature/release changes; remove when zip is dropped or >=9.0.0. Full triage: .cargo/audit.toml (2026-10-17)."
+
+[[IgnoredVulns]]
+id = "GHSA-vv5m-jxxh-4627"
+reason = "Alias of RUSTSEC-2026-0367; same test-only zip risk acceptance and recheck triggers in .cargo/audit.toml."
+
+[[IgnoredVulns]]
+id = "GHSA-4v9h-p7m9-rh26"
+reason = "Alias of RUSTSEC-2026-0368; same test-only zip risk acceptance and recheck triggers in .cargo/audit.toml."
+
+[[IgnoredVulns]]
+id = "GHSA-4684-h2q9-2vcp"
+reason = "Alias of RUSTSEC-2026-0369; same test-only zip risk acceptance and recheck triggers in .cargo/audit.toml."
+
+[[IgnoredVulns]]
 id = "RUSTSEC-2024-0436"
 reason = "Unmaintained paste 1.0.15 is transitive through sqlx-core 0.8.0; tracked as known dependency-island debt until the sqlx/ldk-node bump."
 
