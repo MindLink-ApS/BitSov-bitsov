@@ -2,9 +2,16 @@
 
 `konsensus init --password-fd <n>` encrypts the new recovery phrase without
 putting the password in argv, environment variables, or a plaintext file.
-`konsensus start --password-fd <n>` unlocks that encrypted seed. Descriptor `0`
-selects stdin; other inherited descriptors are supported on Unix (including
-macOS). On other platforms only `0` is supported.
+`konsensus start --password-fd <n>` unlocks that encrypted seed.
+`konsensus sign-challenge --password-fd <n>` uses the same descriptor to
+decrypt `mnemonic.enc` before signing a live `/api/v1/auth/challenge` string.
+`--password` and `--password-file` follow the same rules as `start` (the file
+must be a regular chmod-600 file). With none of those flags, an `.enc`
+mnemonic prompts on the terminal and the password is not echoed.
+`docs/ops/owner-token.sh` forwards `KONSENSUS_PASSWORD_FD`,
+`KONSENSUS_PASSWORD_FILE`, or `KONSENSUS_PASSWORD` (set only one).
+Descriptor `0` selects stdin; other inherited descriptors are supported on
+Unix (including macOS). On other platforms only `0` is supported.
 
 For a Keychain-backed Mac launcher:
 

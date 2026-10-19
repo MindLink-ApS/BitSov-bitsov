@@ -13,6 +13,13 @@
 #                     must be http://127.0.0.1:PORT or http://[::1]:PORT
 #                     with optional trailing /api/v1 (and optional trailing /)
 #   KONSENSUS_BIN     default: konsensus on PATH
+#   Encrypted mnemonic (.enc) — same inputs as `konsensus start`. Set only one:
+#   KONSENSUS_PASSWORD_FD    descriptor (0 = stdin) → sign-challenge --password-fd
+#   KONSENSUS_PASSWORD_FILE  chmod-600 regular file → sign-challenge --password-file
+#   KONSENSUS_PASSWORD       → sign-challenge --password (visible in process
+#                            arguments; prefer a descriptor or file)
+#   With none of these, an .enc seed prompts on the terminal. The password is
+#   never echoed, logged, or written to disk.
 #
 # On success sets OWNER_TOKEN in the current shell (plain variable, not exported).
 # Never writes the token or mnemonic to disk; never prints the mnemonic.
@@ -81,6 +88,22 @@ _bitsov_owner_token_mint() {
     return 1
   fi
 
+  # Mutually exclusive, matching `konsensus sign-challenge` / `start`.
+  if [[ -n "${KONSENSUS_PASSWORD_FD:-}" && -n "${KONSENSUS_PASSWORD_FILE:-}" ]] \
+    || [[ -n "${KONSENSUS_PASSWORD_FD:-}" && -n "${KONSENSUS_PASSWORD:-}" ]] \
+    || [[ -n "${KONSENSUS_PASSWORD_FILE:-}" && -n "${KONSENSUS_PASSWORD:-}" ]]; then
+    echo "owner-token: set only one of KONSENSUS_PASSWORD_FD, KONSENSUS_PASSWORD_FILE, KONSENSUS_PASSWORD" >&2
+    _bitsov_owner_token_restore_xtrace
+    return 1
+  fi
+  if [[ -n "${KONSENSUS_PASSWORD_FD:-}" ]]; then
+    sign_args+=(--password-fd "$KONSENSUS_PASSWORD_FD")
+  elif [[ -n "${KONSENSUS_PASSWORD_FILE:-}" ]]; then
+    sign_args+=(--password-file "$KONSENSUS_PASSWORD_FILE")
+  elif [[ -n "${KONSENSUS_PASSWORD:-}" ]]; then
+    sign_args+=(--password "$KONSENSUS_PASSWORD")
+  fi
+
   challenge_json="$(curl -fsS "$api_root/auth/challenge" 2>/dev/null)" || {
     echo "owner-token: failed to fetch $api_root/auth/challenge" >&2
     _bitsov_owner_token_restore_xtrace
@@ -94,7 +117,9 @@ _bitsov_owner_token_mint() {
   fi
 
   bin="${KONSENSUS_BIN:-konsensus}"
-  signature="$("$bin" sign-challenge --challenge "$challenge" "${sign_args[@]}" 2>/dev/null)" || {
+  # Leave stderr attached so an encrypted seed can prompt without echoing
+  # the password. The signature itself is stdout only.
+  signature="$("$bin" sign-challenge --challenge "$challenge" "${sign_args[@]}")" || {
     echo "owner-token: sign-challenge failed" >&2
     _bitsov_owner_token_restore_xtrace
     return 1

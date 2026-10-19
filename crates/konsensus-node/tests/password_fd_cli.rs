@@ -3,10 +3,14 @@
 
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::{net::UnixStream, process::CommandExt};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+use ed25519_dalek::Verifier;
+use konsensus_core::NodeId;
 
 const PASSWORD: &str = "  Keychain-test-secret-é  ";
 
@@ -307,4 +311,252 @@ fn local_owner_unavailable_verifier_refuses_start_without_writing_files() {
             "{case}: refused startup wrote files"
         );
     }
+}
+
+const AUTH_CHALLENGE: &str =
+    "bitsov-auth-v1:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff:1700000000";
+
+fn node_id_from_init(stdout: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Node ID:"))
+        .expect("init prints the node id")
+        .trim()
+        .to_owned()
+}
+
+fn assert_owner_signature(node_id_hex: &str, challenge: &str, signature_hex: &str) {
+    let node_id = NodeId::from_hex(node_id_hex).expect("node id hex");
+    let key = node_id.to_verifying_key().expect("verifying key");
+    let signature = ed25519_dalek::Signature::from_slice(
+        &hex::decode(signature_hex.trim()).expect("hex signature"),
+    )
+    .expect("ed25519 signature");
+    key.verify(challenge.as_bytes(), &signature)
+        .expect("signature must verify for the initialized node");
+}
+
+fn sign_challenge(mnemonic: &Path, password: &[u8]) -> Output {
+    let mut cmd = bin();
+    cmd.args([
+        "sign-challenge",
+        "--mnemonic",
+        mnemonic.to_str().unwrap(),
+        "--challenge",
+        AUTH_CHALLENGE,
+    ]);
+    // `input` supplies `--password-fd 0` and the password bytes.
+    input(cmd, password, false)
+}
+
+#[test]
+fn sign_challenge_encrypted_mnemonic_via_password_fd() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = init(dir.path(), false);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let node_id = node_id_from_init(&String::from_utf8_lossy(&out.stdout));
+    let mnemonic = dir.path().join("mnemonic.enc");
+    assert!(mnemonic.is_file());
+    assert!(!dir.path().join("mnemonic.txt").exists());
+
+    let out = sign_challenge(&mnemonic, format!("{PASSWORD}\r\n").as_bytes());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let signature = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(signature.trim().len(), 128, "{signature}");
+    assert!(
+        signature.trim().chars().all(|c| c.is_ascii_hexdigit()),
+        "{signature}"
+    );
+    assert_owner_signature(&node_id, AUTH_CHALLENGE, signature.trim());
+    assert!(!signature.to_lowercase().contains("abandon"));
+}
+
+#[test]
+fn sign_challenge_wrong_password_fd_is_a_clear_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = init(dir.path(), false);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mnemonic = dir.path().join("mnemonic.enc");
+    let out = sign_challenge(&mnemonic, b"wrong-password\n");
+    assert!(!out.status.success());
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "wrong password must return an error, not panic"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("decryption failed"),
+        "expected a decryption error, got {err}"
+    );
+    assert!(!err.contains("panicked at"), "{err}");
+    assert!(out.stdout.is_empty(), "no signature on failure");
+}
+
+#[test]
+fn sign_challenge_plaintext_mnemonic_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["init", "--non-interactive", "--tier", "light", "--dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let node_id = node_id_from_init(&String::from_utf8_lossy(&out.stdout));
+    let mnemonic = dir.path().join("mnemonic.txt");
+    assert!(mnemonic.is_file());
+    assert!(!dir.path().join("mnemonic.enc").exists());
+
+    let out = bin()
+        .args([
+            "sign-challenge",
+            "--mnemonic",
+            mnemonic.to_str().unwrap(),
+            "--challenge",
+            AUTH_CHALLENGE,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let signature = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(signature.trim().len(), 128, "{signature}");
+    assert_owner_signature(&node_id, AUTH_CHALLENGE, signature.trim());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.to_lowercase().contains("password"),
+        "plaintext sign-challenge must not ask for a password: {err}"
+    );
+}
+
+#[test]
+fn sign_challenge_password_file_rejects_group_readable_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let mnemonic = dir.path().join("mnemonic.enc");
+    std::fs::write(&mnemonic, b"unused").unwrap();
+    let pw_path = dir.path().join("pw");
+    std::fs::write(&pw_path, b"correct horse\n").unwrap();
+    std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let out = bin()
+        .args([
+            "sign-challenge",
+            "--mnemonic",
+            mnemonic.to_str().unwrap(),
+            "--challenge",
+            AUTH_CHALLENGE,
+            "--password-file",
+            pw_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_ne!(out.status.code(), Some(101), "mode refusal must not panic");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("chmod 600"),
+        "expected a permission error, got {err}"
+    );
+    assert!(!err.contains("panicked at"), "{err}");
+    assert!(!err.contains("correct horse"), "{err}");
+    assert!(out.stdout.is_empty(), "no signature on failure");
+}
+
+#[test]
+fn sign_challenge_inherited_password_fd_3_decrypts() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = init(dir.path(), false);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let node_id = node_id_from_init(&String::from_utf8_lossy(&out.stdout));
+    let mnemonic = dir.path().join("mnemonic.enc");
+
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    writer
+        .write_all(format!("{PASSWORD}\n").as_bytes())
+        .unwrap();
+    drop(writer);
+    let fd = reader.as_raw_fd();
+    let mut cmd = bin();
+    cmd.args([
+        "sign-challenge",
+        "--mnemonic",
+        mnemonic.to_str().unwrap(),
+        "--challenge",
+        AUTH_CHALLENGE,
+        "--password-fd",
+        "3",
+    ])
+    .stdin(Stdio::null());
+    // SAFETY: fd stays open through spawn; dup2 and fcntl are async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(fd, 3) == -1 || libc::fcntl(3, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    no_secret(&out.stdout);
+    no_secret(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let signature = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(signature.trim().len(), 128, "{signature}");
+    assert_owner_signature(&node_id, AUTH_CHALLENGE, signature.trim());
+}
+
+#[test]
+fn sign_challenge_password_fd_rejects_over_limit_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let mnemonic = dir.path().join("mnemonic.enc");
+    std::fs::write(&mnemonic, b"unused").unwrap();
+    let mut cmd = bin();
+    cmd.args([
+        "sign-challenge",
+        "--mnemonic",
+        mnemonic.to_str().unwrap(),
+        "--challenge",
+        AUTH_CHALLENGE,
+    ]);
+    let out = input(cmd, &vec![b'x'; 4097], false);
+    assert!(!out.status.success());
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "over-limit input must not panic"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("password exceeds 4096 bytes"),
+        "expected the size limit, got {err}"
+    );
+    assert!(!err.contains("panicked at"), "{err}");
+    assert!(out.stdout.is_empty(), "no signature on failure");
 }
