@@ -3,6 +3,7 @@
 
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::{net::UnixStream, process::CommandExt};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -445,4 +446,117 @@ fn sign_challenge_plaintext_mnemonic_unchanged() {
         !err.to_lowercase().contains("password"),
         "plaintext sign-challenge must not ask for a password: {err}"
     );
+}
+
+#[test]
+fn sign_challenge_password_file_rejects_group_readable_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let mnemonic = dir.path().join("mnemonic.enc");
+    std::fs::write(&mnemonic, b"unused").unwrap();
+    let pw_path = dir.path().join("pw");
+    std::fs::write(&pw_path, b"correct horse\n").unwrap();
+    std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let out = bin()
+        .args([
+            "sign-challenge",
+            "--mnemonic",
+            mnemonic.to_str().unwrap(),
+            "--challenge",
+            AUTH_CHALLENGE,
+            "--password-file",
+            pw_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_ne!(out.status.code(), Some(101), "mode refusal must not panic");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("chmod 600"),
+        "expected a permission error, got {err}"
+    );
+    assert!(!err.contains("panicked at"), "{err}");
+    assert!(!err.contains("correct horse"), "{err}");
+    assert!(out.stdout.is_empty(), "no signature on failure");
+}
+
+#[test]
+fn sign_challenge_inherited_password_fd_3_decrypts() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = init(dir.path(), false);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let node_id = node_id_from_init(&String::from_utf8_lossy(&out.stdout));
+    let mnemonic = dir.path().join("mnemonic.enc");
+
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    writer
+        .write_all(format!("{PASSWORD}\n").as_bytes())
+        .unwrap();
+    drop(writer);
+    let fd = reader.as_raw_fd();
+    let mut cmd = bin();
+    cmd.args([
+        "sign-challenge",
+        "--mnemonic",
+        mnemonic.to_str().unwrap(),
+        "--challenge",
+        AUTH_CHALLENGE,
+        "--password-fd",
+        "3",
+    ])
+    .stdin(Stdio::null());
+    // SAFETY: fd stays open through spawn; dup2 and fcntl are async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(fd, 3) == -1 || libc::fcntl(3, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    no_secret(&out.stdout);
+    no_secret(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let signature = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(signature.trim().len(), 128, "{signature}");
+    assert_owner_signature(&node_id, AUTH_CHALLENGE, signature.trim());
+}
+
+#[test]
+fn sign_challenge_password_fd_rejects_over_limit_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let mnemonic = dir.path().join("mnemonic.enc");
+    std::fs::write(&mnemonic, b"unused").unwrap();
+    let mut cmd = bin();
+    cmd.args([
+        "sign-challenge",
+        "--mnemonic",
+        mnemonic.to_str().unwrap(),
+        "--challenge",
+        AUTH_CHALLENGE,
+    ]);
+    let out = input(cmd, &vec![b'x'; 4097], false);
+    assert!(!out.status.success());
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "over-limit input must not panic"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("password exceeds 4096 bytes"),
+        "expected the size limit, got {err}"
+    );
+    assert!(!err.contains("panicked at"), "{err}");
+    assert!(out.stdout.is_empty(), "no signature on failure");
 }

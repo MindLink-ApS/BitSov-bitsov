@@ -144,6 +144,8 @@ async fn main() -> Result<()> {
             remote_unlock,
             home,
         } => {
+            // Wrap before any fallible step so a later error still zeroizes it.
+            let password = password.map(Zeroizing::new);
             // Home mode is the existing remote state machine plus device authority.
             // Console authority remains exclusively controlled by --owner-control.
             let local_owner_device = local_owner_device || home;
@@ -285,6 +287,8 @@ async fn main() -> Result<()> {
             password_file,
             password_fd,
         } => {
+            // Wrap before resolve_mnemonic_path so a config error still zeroizes it.
+            let password = password.map(Zeroizing::new);
             let mnemonic_path = resolve_mnemonic_path(mnemonic, config)?;
             let password = supplied_seed_password(password, password_file.as_deref(), password_fd)?;
             cmd_sign_challenge(&mnemonic_path, &passphrase, &challenge, password)?;
@@ -811,7 +815,7 @@ fn cmd_node_id(mnemonic_path: &Path, passphrase: &str) -> Result<()> {
 /// file). `--password-fd` uses [`password::read_password_fd`] (one read to EOF,
 /// trailing CR/LF stripped, 4096-byte maximum).
 fn supplied_seed_password(
-    password: Option<String>,
+    password: Option<Zeroizing<String>>,
     password_file: Option<&Path>,
     password_fd: Option<i32>,
 ) -> Result<Option<Zeroizing<String>>> {
@@ -827,7 +831,7 @@ fn supplied_seed_password(
     if let Some(fd) = password_fd {
         return Ok(Some(password::read_password_fd(fd)?));
     }
-    Ok(password.map(Zeroizing::new))
+    Ok(password)
 }
 
 /// Interactive prompt used when an `.enc` mnemonic has no password flag.
