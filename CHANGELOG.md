@@ -26,7 +26,8 @@ older refuse the pairing store. Upgrade forward only.
 - Fix `konsensus sign-challenge` with an encrypted `mnemonic.enc` (#317). It
   previously always decrypted with an empty password and failed, so no owner
   could mint the full-scope `/api/v1/auth/token` that `open-channel`,
-  `send-onchain`, `close-channel`, `/peers` and `/invites` require. It now
+  `send-onchain`, `close-channel` and the admin (write) operations on `/peers`
+  and `/invites` require; read-only `GET` calls already worked. It now
   takes the password like `start`: terminal prompt (not echoed),
   `--password-fd`, `--password-file` (regular chmod-600 file) or `--password`.
   `docs/ops/owner-token.sh` forwards `KONSENSUS_PASSWORD_FD`,
