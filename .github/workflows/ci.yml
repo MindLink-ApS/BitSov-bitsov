@@ -159,6 +159,28 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace -- -D warnings
 
+  ldk-node-security:
+    name: Vendored LDK Node Security Regressions
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vendor/ldk-node
+          shared-key: ldk-node-security-${{ hashFiles('vendor/ldk-node/Cargo.lock') }}
+      # The vendor crate is excluded from --workspace and -p konsensus-*.
+      # Run its private-handler regressions plus all existing local patch tests.
+      - name: Test vendored ldk-node library
+        run: cargo test --locked --manifest-path vendor/ldk-node/Cargo.toml --lib
+
   audit:
     name: Cargo Audit
     needs: changes
@@ -223,7 +245,7 @@ jobs:
   release-cli:
     name: Release CLI (${{ matrix.target }})
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, audit, semgrep]
+    needs: [check, ldk-node-security, audit, semgrep]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write

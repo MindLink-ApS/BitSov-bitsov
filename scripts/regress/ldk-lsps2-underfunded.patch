@@ -1,0 +1,53 @@
+--- a/tests/lsps2_integration_tests.rs
++++ b/tests/lsps2_integration_tests.rs
+@@ -333,15 +333,20 @@
+ 
+ #[test]
+ fn channel_open_failed() {
+-	do_channel_open_failed(false);
++	do_channel_open_failed(false, false);
+ }
+ 
+ #[test]
+ fn stale_intercept_cannot_open_channel() {
+-	do_channel_open_failed(true);
++	do_channel_open_failed(true, false);
+ }
+ 
+-fn do_channel_open_failed(stale_intercept: bool) {
++#[test]
++fn underfunded_intercept_cannot_open_channel_and_preserves_scid() {
++    do_channel_open_failed(false, true);
++}
++
++fn do_channel_open_failed(stale_intercept: bool, underfunded: bool) {
+ 	let chanmon_cfgs = create_chanmon_cfgs(3);
+ 	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+ 	let mut service_config = test_default_channel_config();
+@@ -426,6 +431,26 @@
+ 	};
+ 	let (intercept_id, payment_hash, amount_msat) = send_payment(0);
+ 	let second_payment = if stale_intercept { None } else { Some(send_payment(1)) };
++    if underfunded {
++        let inbound = service_node.node.intercepted_htlc_inbound_amount_msat(intercept_id).unwrap();
++        let result = service_handler.htlc_intercepted(
++            intercept_scid, intercept_id, inbound + 1, payment_hash,
++        );
++        assert!(matches!(result, Err(APIError::APIMisuseError { .. })),
++            "An onion amount greater than the real inbound HTLC must fail before channel opening");
++        assert!(matches!(service_node.node.get_and_clear_pending_events().as_slice(),
++            [Event::HTLCHandlingFailed { .. }]));
++        assert_eq!(service_node.node.intercepted_htlc_inbound_amount_msat(intercept_id), None);
++        assert!(service_node.liquidity_manager.next_event().is_none());
++        // A legitimate payment still uses the same negotiated intercept SCID.
++        let (next_id, next_hash, next_amount) = second_payment.unwrap();
++        service_handler.htlc_intercepted(intercept_scid, next_id, next_amount, next_hash).unwrap();
++        assert!(matches!(service_node.liquidity_manager.next_event(),
++            Some(LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::OpenChannel {
++                intercept_scid: scid, ..
++            })) if scid == intercept_scid));
++        return;
++    }
+ 	if stale_intercept {
+ 		service_node.node.fail_intercepted_htlc(intercept_id).unwrap();
+ 		assert!(matches!(

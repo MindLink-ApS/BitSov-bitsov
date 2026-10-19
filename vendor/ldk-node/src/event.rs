@@ -19,7 +19,7 @@ use lightning::events::{
 	ClosureReason, Event as LdkEvent, PaymentFailureReason, PaymentPurpose, ReplayEvent,
 };
 use lightning::impl_writeable_tlv_based_enum;
-use lightning::ln::channelmanager::PaymentId;
+use lightning::ln::channelmanager::{FailureCode, PaymentId};
 use lightning::ln::types::ChannelId;
 use lightning::routing::gossip::NodeId;
 use lightning::util::config::{
@@ -656,6 +656,22 @@ where
                     return Ok(());
                 }
 				let payment_id = PaymentId(payment_hash.0);
+
+				if let Some((tlv_type, _)) = onion_fields
+					.as_ref()
+					.and_then(|fields| fields.custom_tlvs().iter().find(|(id, _)| id % 2 == 0))
+				{
+					log_info!(
+						self.logger,
+						"Refusing inbound payment with hash {} as the sender included unknown required TLVs (incl {})",
+						hex_utils::to_string(&payment_hash.0),
+						tlv_type,
+					);
+					let error_code = FailureCode::InvalidOnionPayload(Some((*tlv_type, 0)));
+					self.channel_manager.fail_htlc_backwards_with_reason(&payment_hash, error_code);
+					return Ok(());
+				}
+
 				if let Some(info) = self.payment_store.get(&payment_id) {
 					if info.direction == PaymentDirection::Outbound {
 						log_info!(
@@ -664,18 +680,7 @@ where
 							payment_id
 						);
 						self.channel_manager.fail_htlc_backwards(&payment_hash);
-
-						let update = PaymentDetailsUpdate {
-							status: Some(PaymentStatus::Failed),
-							..PaymentDetailsUpdate::new(payment_id)
-						};
-						match self.payment_store.update(&update) {
-							Ok(_) => return Ok(()),
-							Err(e) => {
-								log_error!(self.logger, "Failed to access payment store: {}", e);
-								return Err(ReplayEvent());
-							},
-						};
+						return Ok(());
 					}
 
 					if info.status == PaymentStatus::Succeeded
@@ -817,11 +822,16 @@ where
 						},
 						_ => {},
 					}
-				} else if matches!(&purpose, PaymentPurpose::Bolt11InvoicePayment { .. })
-					&& counterparty_skimmed_fee_msat > 0
-				{
-					// A stateless quote is never a JIT invoice and grants no LSP
-					// fee allowance. Apply the same zero-skim rule as stored Bolt11.
+				} else if counterparty_skimmed_fee_msat > 0 {
+					// We only ever authorize an LSP to withhold a fee for JIT-channel payments we
+					// previously registered. Any other payment (e.g., BOLT12 offer or spontaneous
+					// payments, for which no record exists yet) must not have fees skimmed.
+					log_info!(
+						self.logger,
+						"Refusing inbound payment with hash {} as the counterparty withheld {}msat without a corresponding JIT-channel payment authorizing it",
+						hex_utils::to_string(&payment_hash.0),
+						counterparty_skimmed_fee_msat,
+					);
 					self.channel_manager.fail_htlc_backwards(&payment_hash);
 					return Ok(());
 				}
@@ -1114,8 +1124,7 @@ where
 				self.payment_store.get(&payment_id).map(|payment| {
 					log_info!(
 						self.logger,
-						"Successfully sent payment of {}msat{} from \
-						payment hash {:?} with preimage {:?}",
+						"Successfully sent payment of {}msat{} with payment hash {}",
 						payment.amount_msat.unwrap(),
 						if let Some(fee) = fee_paid_msat {
 							format!(" (fee {} msat)", fee)
@@ -1123,7 +1132,6 @@ where
 							"".to_string()
 						},
 						hex_utils::to_string(&payment_hash.0),
-						hex_utils::to_string(&payment_preimage.0)
 					);
 				});
 				let event = Event::PaymentSuccessful {
@@ -1142,6 +1150,22 @@ where
 				};
 			},
 			LdkEvent::PaymentFailed { payment_id, payment_hash, reason, .. } => {
+				// LDK may emit PaymentFailed after PaymentSent. Ignore the entire late failure so
+				// it cannot alter payment metadata or emit a contradictory event.
+				if let Some(payment) = self.payment_store.get(&payment_id) {
+					if payment.direction == PaymentDirection::Outbound
+						&& payment.kind.is_lightning_payment()
+						&& payment.status == PaymentStatus::Succeeded
+					{
+						log_info!(
+							self.logger,
+							"Ignoring late payment failure for already-succeeded payment with ID {}.",
+							payment_id
+						);
+						return Ok(());
+					}
+				}
+
 				log_info!(
 					self.logger,
 					"Failed to send payment with ID {} due to {:?}.",

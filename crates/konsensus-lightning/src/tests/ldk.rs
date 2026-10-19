@@ -1351,3 +1351,6 @@ fn offline_safety_checkpoint_never_uses_partial_best_block() {
     status.is_running = false;
     assert!(offline_synced_block(&status).is_none());
 }
+
+#[path = "ldk_late_failure.rs"]
+mod late_failure;

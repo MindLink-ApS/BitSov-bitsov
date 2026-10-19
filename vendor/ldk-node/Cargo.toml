@@ -114,11 +114,11 @@ default-features = false
 version = "0.2"
 
 [dependencies.lightning]
-version = "0.2.0"
+version = "0.2.7"
 features = ["std"]
 
 [dependencies.lightning-background-processor]
-version = "0.2.0"
+version = "0.2.3"
 
 [dependencies.lightning-block-sync]
 version = "0.2.0"
@@ -133,7 +133,7 @@ version = "0.34.0"
 features = ["std"]
 
 [dependencies.lightning-liquidity]
-version = "0.2.0"
+version = "0.2.7"
 features = ["std"]
 
 [dependencies.lightning-macros]
@@ -150,7 +150,7 @@ features = ["tokio"]
 version = "0.2.0"
 
 [dependencies.lightning-transaction-sync]
-version = "0.2.0"
+version = "0.2.7"
 features = [
     "esplora-async-https",
     "time",

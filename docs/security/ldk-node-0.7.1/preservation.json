@@ -1,0 +1,1088 @@
+{
+  "base": "26e0b7e5e3be3064867626b87c43c120d7895d04",
+  "unchanged_count": 207,
+  "changed": [
+    {
+      "path": "vendor/ldk-node/BITSOV-PATCH.md",
+      "before_sha256": "2a598d49324379971da16189e4dfd076c54daaf53c5057967aacd1d0b7bdafeb",
+      "after_sha256": "ac412c9de2940feaff0fa282f72440d524ffa30f74a4fdb4797a254f00ba6062"
+    },
+    {
+      "path": "vendor/ldk-node/Cargo.lock",
+      "before_sha256": "3562bc81702d04d47b2e62e61d29a725f08375d84aba15d6cbd2e732539c918e",
+      "after_sha256": "2e3930857ab24d9d29f9b292ee0e2a04458466cb0e075aad7cd907f53ec128b0"
+    },
+    {
+      "path": "vendor/ldk-node/src/builder.rs",
+      "before_sha256": "b3db4d5eee572bd973da9498c6e3f975c0317140208846a7b77cb03e687ff408",
+      "after_sha256": "c81a4afadb530991b6aaf55b2b6b67d0bdc0336c495d50e5c917f083bce681dd"
+    },
+    {
+      "path": "vendor/ldk-node/src/event.rs",
+      "before_sha256": "99ff106517d9a0c244b9c043f0bc4afedbea700698a82d5795941d5b017f9e60",
+      "after_sha256": "36d8f3aa5c2015a25a3c3dcf696d287ea0174c14b9191d4793f1eb4afabd6878"
+    },
+    {
+      "path": "vendor/ldk-node/src/tests/bitsov_jit.rs",
+      "before_sha256": "9f83962cdf9b8ec70a3867f49aa45cba19746e7cccd66c6342564c33cc10b06a",
+      "after_sha256": "0e684f9edbbce759338569383cf14f6c6380f78bc1d8f031f87da0e5aace68ec"
+    },
+    {
+      "path": "vendor/lightning/BITSOV-PATCH.md",
+      "before_sha256": "80a43e4674fd8ec435abf79ba8e9bab5facd54fa39a299a430d69b675bb0d56f",
+      "after_sha256": "d94ac417a3243917c447c2e0c69e4a250a29371d6d09deebff8fdda16d5991d7"
+    },
+    {
+      "path": "vendor/lightning/Cargo.lock",
+      "before_sha256": "d9686272759f08c950a833f9c5ba68e3f20d9c2b81762ba91a2fb309d6a3d4e3",
+      "after_sha256": "142f79078c92a2db5a9b380354767a367aeb9cfe8bd0178725435f2887b2d591"
+    }
+  ],
+  "added": [
+    {
+      "path": "vendor/ldk-node/src/tests/security_071_builder.rs",
+      "sha256": "2303b40362e1273344e6f313f58c788fe7c8a7ad0ea4676a6765d5e4013ae9da"
+    },
+    {
+      "path": "vendor/ldk-node/src/tests/security_071_events.rs",
+      "sha256": "b960802a14f6219578418060670a200f689ceabb91a4b279a0414f3eefedefdc"
+    }
+  ],
+  "unchanged": [
+    {
+      "path": "vendor/ldk-node/.gitignore",
+      "before_sha256": "306fd52e74fca6746e12acc750f232de15e71da917756a1270d74c91f5eb7368",
+      "after_sha256": "306fd52e74fca6746e12acc750f232de15e71da917756a1270d74c91f5eb7368"
+    },
+    {
+      "path": "vendor/ldk-node/Cargo.toml",
+      "before_sha256": "e72702c80c5cba84b1521230798059d774a2db978bd8773a840c7ca6810b6dc0",
+      "after_sha256": "e72702c80c5cba84b1521230798059d774a2db978bd8773a840c7ca6810b6dc0"
+    },
+    {
+      "path": "vendor/ldk-node/Cargo.toml.orig",
+      "before_sha256": "899175e4f2bd511dfa33861e7cae0bf799b174d468b5b502df85d81873ae32aa",
+      "after_sha256": "899175e4f2bd511dfa33861e7cae0bf799b174d468b5b502df85d81873ae32aa"
+    },
+    {
+      "path": "vendor/ldk-node/LICENSE-APACHE",
+      "before_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "after_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "vendor/ldk-node/LICENSE-MIT",
+      "before_sha256": "638da3722c9e102ccd8011d82f61ae3b611174e4a0f8da185c582df137b60a8c",
+      "after_sha256": "638da3722c9e102ccd8011d82f61ae3b611174e4a0f8da185c582df137b60a8c"
+    },
+    {
+      "path": "vendor/ldk-node/LICENSE.md",
+      "before_sha256": "437462a699a2c34c46a0b566b06f041ea5f54652a10e73e8ac13e9c6becbd1d0",
+      "after_sha256": "437462a699a2c34c46a0b566b06f041ea5f54652a10e73e8ac13e9c6becbd1d0"
+    },
+    {
+      "path": "vendor/ldk-node/README.md",
+      "before_sha256": "30175b0a8d277ccc3d69ce3791eb8deb6cafe27dc7f729bfb5ad1f74207c5e51",
+      "after_sha256": "30175b0a8d277ccc3d69ce3791eb8deb6cafe27dc7f729bfb5ad1f74207c5e51"
+    },
+    {
+      "path": "vendor/ldk-node/build.rs",
+      "before_sha256": "ac2576ed00a96d6fed711e9a17003bd74922733ef5e29d11bc9208ec01e586dd",
+      "after_sha256": "ac2576ed00a96d6fed711e9a17003bd74922733ef5e29d11bc9208ec01e586dd"
+    },
+    {
+      "path": "vendor/ldk-node/src/balance.rs",
+      "before_sha256": "35c0c96b23e428fed7c4df50bb1b7dfd3236f3c0c134968b2a85ad5ee0c381c0",
+      "after_sha256": "35c0c96b23e428fed7c4df50bb1b7dfd3236f3c0c134968b2a85ad5ee0c381c0"
+    },
+    {
+      "path": "vendor/ldk-node/src/chain/bitcoind.rs",
+      "before_sha256": "2b12206af567a57cb0c4ea55110c9f60eb4444f460eed90f0b5ca9ec670800ab",
+      "after_sha256": "2b12206af567a57cb0c4ea55110c9f60eb4444f460eed90f0b5ca9ec670800ab"
+    },
+    {
+      "path": "vendor/ldk-node/src/chain/broadcast.rs",
+      "before_sha256": "4940ae39831bb455c2b6eb8a5c1292c136254d13809488ed4e8d703003914152",
+      "after_sha256": "4940ae39831bb455c2b6eb8a5c1292c136254d13809488ed4e8d703003914152"
+    },
+    {
+      "path": "vendor/ldk-node/src/chain/electrum.rs",
+      "before_sha256": "dbfe2632673d2e9e42c094a0297c9f7ee0c56e3e713c4aa9ae6b7fd5dae53b10",
+      "after_sha256": "dbfe2632673d2e9e42c094a0297c9f7ee0c56e3e713c4aa9ae6b7fd5dae53b10"
+    },
+    {
+      "path": "vendor/ldk-node/src/chain/esplora.rs",
+      "before_sha256": "e4c75bc9b5346affcee40246681db6fc7e9e2d4cdeea4b678044b5c6f2578be0",
+      "after_sha256": "e4c75bc9b5346affcee40246681db6fc7e9e2d4cdeea4b678044b5c6f2578be0"
+    },
+    {
+      "path": "vendor/ldk-node/src/chain/mod.rs",
+      "before_sha256": "b0f74dbc392551fb69c91d24f72b969187e96002743a36a4e44fc51b83d41207",
+      "after_sha256": "b0f74dbc392551fb69c91d24f72b969187e96002743a36a4e44fc51b83d41207"
+    },
+    {
+      "path": "vendor/ldk-node/src/chain/rate_limit.rs",
+      "before_sha256": "43766c72a9e07bc9e45b30e76e8194ec4290f581f3f49706e2a498fa364e2b3f",
+      "after_sha256": "43766c72a9e07bc9e45b30e76e8194ec4290f581f3f49706e2a498fa364e2b3f"
+    },
+    {
+      "path": "vendor/ldk-node/src/chain/sync_health.rs",
+      "before_sha256": "2a16106772663e2798f3379c7ac0151fb2c9171f5a11ce487a817ce2297c0a7d",
+      "after_sha256": "2a16106772663e2798f3379c7ac0151fb2c9171f5a11ce487a817ce2297c0a7d"
+    },
+    {
+      "path": "vendor/ldk-node/src/chain/sync_retry.rs",
+      "before_sha256": "e7bc4dcbe2ae71279424ae5e474c4a2348c37d0c6549c3b5952de57269fca2d4",
+      "after_sha256": "e7bc4dcbe2ae71279424ae5e474c4a2348c37d0c6549c3b5952de57269fca2d4"
+    },
+    {
+      "path": "vendor/ldk-node/src/channel_limits.rs",
+      "before_sha256": "88e734e1a9fb3559cfc2f8efd9cab565dd4609dcee66e60053604b10f44a9681",
+      "after_sha256": "88e734e1a9fb3559cfc2f8efd9cab565dd4609dcee66e60053604b10f44a9681"
+    },
+    {
+      "path": "vendor/ldk-node/src/config.rs",
+      "before_sha256": "7d64769e07632259dcab59c5dafadf8d07ba66ebc169910fd881fa877b7dce2c",
+      "after_sha256": "7d64769e07632259dcab59c5dafadf8d07ba66ebc169910fd881fa877b7dce2c"
+    },
+    {
+      "path": "vendor/ldk-node/src/connection.rs",
+      "before_sha256": "4f14612e78d37c6df134b268ef27e76edf8ec286cf82b57e0711ad62e097af0c",
+      "after_sha256": "4f14612e78d37c6df134b268ef27e76edf8ec286cf82b57e0711ad62e097af0c"
+    },
+    {
+      "path": "vendor/ldk-node/src/data_store.rs",
+      "before_sha256": "2275112463c5b47825752b161da0bbf4a7dc5d93f500371601f986472ce6779c",
+      "after_sha256": "2275112463c5b47825752b161da0bbf4a7dc5d93f500371601f986472ce6779c"
+    },
+    {
+      "path": "vendor/ldk-node/src/error.rs",
+      "before_sha256": "f90cbc35885c7645a4e4401e49ce29f58522e6adab7e40d992bc6d663451acc5",
+      "after_sha256": "f90cbc35885c7645a4e4401e49ce29f58522e6adab7e40d992bc6d663451acc5"
+    },
+    {
+      "path": "vendor/ldk-node/src/fee_estimator.rs",
+      "before_sha256": "33316c379042c2b531c23b5e0495fd42962c77a2e3f5c4f8e12926da32f81424",
+      "after_sha256": "33316c379042c2b531c23b5e0495fd42962c77a2e3f5c4f8e12926da32f81424"
+    },
+    {
+      "path": "vendor/ldk-node/src/ffi/mod.rs",
+      "before_sha256": "d8054a8b5e69e881bc1f184bd8e5414ae40d7f991d225658a6ba26d04c31ba6c",
+      "after_sha256": "d8054a8b5e69e881bc1f184bd8e5414ae40d7f991d225658a6ba26d04c31ba6c"
+    },
+    {
+      "path": "vendor/ldk-node/src/ffi/types.rs",
+      "before_sha256": "9bdd83ae3b511a90838b1bd41c8ae93d1ec984feeae991f2b3604e09e5e4cc71",
+      "after_sha256": "9bdd83ae3b511a90838b1bd41c8ae93d1ec984feeae991f2b3604e09e5e4cc71"
+    },
+    {
+      "path": "vendor/ldk-node/src/funding.rs",
+      "before_sha256": "32721557bdc37e39fd5c92a525aa61d908752559c1c49029d2cb70798b77ad2a",
+      "after_sha256": "32721557bdc37e39fd5c92a525aa61d908752559c1c49029d2cb70798b77ad2a"
+    },
+    {
+      "path": "vendor/ldk-node/src/gossip.rs",
+      "before_sha256": "47976382a1cac9d7f0966c5e2d6b6899e1d36ae9cc2d470cedde83bd2a0c6e98",
+      "after_sha256": "47976382a1cac9d7f0966c5e2d6b6899e1d36ae9cc2d470cedde83bd2a0c6e98"
+    },
+    {
+      "path": "vendor/ldk-node/src/graph.rs",
+      "before_sha256": "ef8ababf3d08d88e7b04e68568e3f6fab8accf247e434722a4083f1232d9ae49",
+      "after_sha256": "ef8ababf3d08d88e7b04e68568e3f6fab8accf247e434722a4083f1232d9ae49"
+    },
+    {
+      "path": "vendor/ldk-node/src/hex_utils.rs",
+      "before_sha256": "b242b944983ff9a95c0dee265fad64f2c72991565719ccb2bd15ede147889cb2",
+      "after_sha256": "b242b944983ff9a95c0dee265fad64f2c72991565719ccb2bd15ede147889cb2"
+    },
+    {
+      "path": "vendor/ldk-node/src/io/mod.rs",
+      "before_sha256": "226ebddb5683dd07fa9a6bd4182c8984e1113e0afa54f4d63b865c1e4a5a42ce",
+      "after_sha256": "226ebddb5683dd07fa9a6bd4182c8984e1113e0afa54f4d63b865c1e4a5a42ce"
+    },
+    {
+      "path": "vendor/ldk-node/src/io/sqlite_store/migrations.rs",
+      "before_sha256": "78cee952811ac3915f0d9b972d6ab226a15e40dcc048e72b745531bee40c601d",
+      "after_sha256": "78cee952811ac3915f0d9b972d6ab226a15e40dcc048e72b745531bee40c601d"
+    },
+    {
+      "path": "vendor/ldk-node/src/io/sqlite_store/mod.rs",
+      "before_sha256": "2becbff3e83b2b4a899a14ede69e6cde0cb2404a11c955a543ce09c65e47cbdf",
+      "after_sha256": "2becbff3e83b2b4a899a14ede69e6cde0cb2404a11c955a543ce09c65e47cbdf"
+    },
+    {
+      "path": "vendor/ldk-node/src/io/test_utils.rs",
+      "before_sha256": "138d453ef98d79237c0a69059c4a019872985cb47ae828fc9ec7a0f415b874b1",
+      "after_sha256": "138d453ef98d79237c0a69059c4a019872985cb47ae828fc9ec7a0f415b874b1"
+    },
+    {
+      "path": "vendor/ldk-node/src/io/utils.rs",
+      "before_sha256": "ecf22af989ebe075bf3321573abf2d71ebabd3bf34001f0e940fa3dbfda2fb84",
+      "after_sha256": "ecf22af989ebe075bf3321573abf2d71ebabd3bf34001f0e940fa3dbfda2fb84"
+    },
+    {
+      "path": "vendor/ldk-node/src/io/vss_store.rs",
+      "before_sha256": "ef8d0709b00e68b8aac84e5033588b16142aae31d5a536599caea9f3ab9df476",
+      "after_sha256": "ef8d0709b00e68b8aac84e5033588b16142aae31d5a536599caea9f3ab9df476"
+    },
+    {
+      "path": "vendor/ldk-node/src/lib.rs",
+      "before_sha256": "1db210b942a0534d6eaf7dd35e97cc5a3147a174026a784fb74aa0097870f84b",
+      "after_sha256": "1db210b942a0534d6eaf7dd35e97cc5a3147a174026a784fb74aa0097870f84b"
+    },
+    {
+      "path": "vendor/ldk-node/src/liquidity.rs",
+      "before_sha256": "c035e886c045b11801f9a6f1ab497bc3d9abf3d8b547e8bbb6ab9c55a3ba7292",
+      "after_sha256": "c035e886c045b11801f9a6f1ab497bc3d9abf3d8b547e8bbb6ab9c55a3ba7292"
+    },
+    {
+      "path": "vendor/ldk-node/src/liquidity/jit.rs",
+      "before_sha256": "7d5602810ec8184429288c165c2f224bac657e962cbcd231047df23e8a4b873b",
+      "after_sha256": "7d5602810ec8184429288c165c2f224bac657e962cbcd231047df23e8a4b873b"
+    },
+    {
+      "path": "vendor/ldk-node/src/logger.rs",
+      "before_sha256": "1f979a8ac78f0e790c4c94b00dc2d8dda4b7e13608d57674ca4920f1b728dec3",
+      "after_sha256": "1f979a8ac78f0e790c4c94b00dc2d8dda4b7e13608d57674ca4920f1b728dec3"
+    },
+    {
+      "path": "vendor/ldk-node/src/lsps2_open.rs",
+      "before_sha256": "7acdb39a283a5ab0b2001b627ff8ce4b4e5d25ec8f7b0888b5c7e8b159cf60bb",
+      "after_sha256": "7acdb39a283a5ab0b2001b627ff8ce4b4e5d25ec8f7b0888b5c7e8b159cf60bb"
+    },
+    {
+      "path": "vendor/ldk-node/src/message_handler.rs",
+      "before_sha256": "89a385b3710ba5b21519a47517554f3b6d85b6fefa37c87e2fbcf6386001eb5b",
+      "after_sha256": "89a385b3710ba5b21519a47517554f3b6d85b6fefa37c87e2fbcf6386001eb5b"
+    },
+    {
+      "path": "vendor/ldk-node/src/payment/asynchronous/mod.rs",
+      "before_sha256": "f54b7d28dcb00d70744dc211abafb36b1ebcd106890e033561df6a88b78bcb6e",
+      "after_sha256": "f54b7d28dcb00d70744dc211abafb36b1ebcd106890e033561df6a88b78bcb6e"
+    },
+    {
+      "path": "vendor/ldk-node/src/payment/asynchronous/om_mailbox.rs",
+      "before_sha256": "00f7f1b7a384272a0953fa3f9151725066f71e7a411b890e8b6a80f9041bfacb",
+      "after_sha256": "00f7f1b7a384272a0953fa3f9151725066f71e7a411b890e8b6a80f9041bfacb"
+    },
+    {
+      "path": "vendor/ldk-node/src/payment/asynchronous/rate_limiter.rs",
+      "before_sha256": "4f1c00f8726a7be43beb688914795cfd4945f67b4908f2b2565dd72735b2763f",
+      "after_sha256": "4f1c00f8726a7be43beb688914795cfd4945f67b4908f2b2565dd72735b2763f"
+    },
+    {
+      "path": "vendor/ldk-node/src/payment/asynchronous/static_invoice_store.rs",
+      "before_sha256": "2d669c900ac4c042705e85ee67fd7a38a9c10a44a15ca22449b681ff3fec148f",
+      "after_sha256": "2d669c900ac4c042705e85ee67fd7a38a9c10a44a15ca22449b681ff3fec148f"
+    },
+    {
+      "path": "vendor/ldk-node/src/payment/bolt11.rs",
+      "before_sha256": "961a9c3459b3df38a351b6cfbfb0890b0212182a1a5fe3352d397ae16a650f54",
+      "after_sha256": "961a9c3459b3df38a351b6cfbfb0890b0212182a1a5fe3352d397ae16a650f54"
+    },
+    {
+      "path": "vendor/ldk-node/src/payment/bolt12.rs",
+      "before_sha256": "fe775444cafff80412e6beb9ac5f5b103e29429a057a9edac1fc97c6bf89298a",
+      "after_sha256": "fe775444cafff80412e6beb9ac5f5b103e29429a057a9edac1fc97c6bf89298a"
+    },
+    {
+      "path": "vendor/ldk-node/src/payment/mod.rs",
+      "before_sha256": "f13a0563a86935159424e8d78ae98cb6690d47666cfb8b5fda89fc7b009cc353",
+      "after_sha256": "f13a0563a86935159424e8d78ae98cb6690d47666cfb8b5fda89fc7b009cc353"
+    },
+    {
+      "path": "vendor/ldk-node/src/payment/onchain.rs",
+      "before_sha256": "2b665bb137ace8c55ebc6a626412c0c07c2a16dbee28003d8bfbef4a0f562cae",
+      "after_sha256": "2b665bb137ace8c55ebc6a626412c0c07c2a16dbee28003d8bfbef4a0f562cae"
+    },
+    {
+      "path": "vendor/ldk-node/src/payment/spontaneous.rs",
+      "before_sha256": "003eb77e39e887e6160fadb0c862534efcd23e27572b42a3ea4d38953d7799c0",
+      "after_sha256": "003eb77e39e887e6160fadb0c862534efcd23e27572b42a3ea4d38953d7799c0"
+    },
+    {
+      "path": "vendor/ldk-node/src/payment/store.rs",
+      "before_sha256": "ecedb37d0801f8c39604ddce75b705c2b622ea6ed4f34aee6934c512552e4132",
+      "after_sha256": "ecedb37d0801f8c39604ddce75b705c2b622ea6ed4f34aee6934c512552e4132"
+    },
+    {
+      "path": "vendor/ldk-node/src/payment/unified_qr.rs",
+      "before_sha256": "b2088180842340d8f4aad8fb37097a21c023a7bf61eab9174e2852bdca196937",
+      "after_sha256": "b2088180842340d8f4aad8fb37097a21c023a7bf61eab9174e2852bdca196937"
+    },
+    {
+      "path": "vendor/ldk-node/src/peer_store.rs",
+      "before_sha256": "b59dba0c01c428ea2c707bf64c0f28a4853e6c456903cae1457512ddfe2ed068",
+      "after_sha256": "b59dba0c01c428ea2c707bf64c0f28a4853e6c456903cae1457512ddfe2ed068"
+    },
+    {
+      "path": "vendor/ldk-node/src/runtime.rs",
+      "before_sha256": "3305eee5b37072469668c9cc8293cfe13ab15f7f2923f1d97cb049de06cdf6fe",
+      "after_sha256": "3305eee5b37072469668c9cc8293cfe13ab15f7f2923f1d97cb049de06cdf6fe"
+    },
+    {
+      "path": "vendor/ldk-node/src/scoring.rs",
+      "before_sha256": "01c0af18180f1db7046ca867d0dfa8999a1599889b01d3a7ed7ceab8abebf8c0",
+      "after_sha256": "01c0af18180f1db7046ca867d0dfa8999a1599889b01d3a7ed7ceab8abebf8c0"
+    },
+    {
+      "path": "vendor/ldk-node/src/tests/bitsov_channel_peers.rs",
+      "before_sha256": "13da72e4ad90d30992814a390a6255cc6a249f449f864a886e41b6acf09d3cbd",
+      "after_sha256": "13da72e4ad90d30992814a390a6255cc6a249f449f864a886e41b6acf09d3cbd"
+    },
+    {
+      "path": "vendor/ldk-node/src/tower_hook.rs",
+      "before_sha256": "678f1f8f0c8558f9d1181d3a9d3ced24a0e8dcb158166f4edf4a82e066bad514",
+      "after_sha256": "678f1f8f0c8558f9d1181d3a9d3ced24a0e8dcb158166f4edf4a82e066bad514"
+    },
+    {
+      "path": "vendor/ldk-node/src/tower_hook/bounded.rs",
+      "before_sha256": "4dcfbbcdf0e971feb1b687566b2f052eda7dbf84bc267dca961a184c0d580fc9",
+      "after_sha256": "4dcfbbcdf0e971feb1b687566b2f052eda7dbf84bc267dca961a184c0d580fc9"
+    },
+    {
+      "path": "vendor/ldk-node/src/tower_hook/tests.rs",
+      "before_sha256": "47c064f173caa507845ce6cf120702a7b859c7c6a4c6618ca2bc135f3338c38c",
+      "after_sha256": "47c064f173caa507845ce6cf120702a7b859c7c6a4c6618ca2bc135f3338c38c"
+    },
+    {
+      "path": "vendor/ldk-node/src/tx_broadcaster.rs",
+      "before_sha256": "5b5546a69a8cd7dbb3087b873ecf004302d96c9f53b5e9fc8c77fda3e8614126",
+      "after_sha256": "5b5546a69a8cd7dbb3087b873ecf004302d96c9f53b5e9fc8c77fda3e8614126"
+    },
+    {
+      "path": "vendor/ldk-node/src/types.rs",
+      "before_sha256": "635a9f6520d63970f812e2f5378655621bf2f62b345110251cc8e057ac59ee66",
+      "after_sha256": "635a9f6520d63970f812e2f5378655621bf2f62b345110251cc8e057ac59ee66"
+    },
+    {
+      "path": "vendor/ldk-node/src/wallet/bump.rs",
+      "before_sha256": "f050d7d26b36494bc291472912b79780bb95c979c0b1708be047c52247dc8f5d",
+      "after_sha256": "f050d7d26b36494bc291472912b79780bb95c979c0b1708be047c52247dc8f5d"
+    },
+    {
+      "path": "vendor/ldk-node/src/wallet/local_spends.rs",
+      "before_sha256": "091783f7541632783482fee6a11f666d1a29a455730d11ac7bcc49c09780a4cd",
+      "after_sha256": "091783f7541632783482fee6a11f666d1a29a455730d11ac7bcc49c09780a4cd"
+    },
+    {
+      "path": "vendor/ldk-node/src/wallet/mod.rs",
+      "before_sha256": "870853723840a3032094c0d634aa357550972d2a21d919d2e20fee8955028c1b",
+      "after_sha256": "870853723840a3032094c0d634aa357550972d2a21d919d2e20fee8955028c1b"
+    },
+    {
+      "path": "vendor/ldk-node/src/wallet/money_tests.rs",
+      "before_sha256": "8cfbe9bdc9f0da4488e40faefd0675a5dda8f546c5888eecaef2407eee9b00d8",
+      "after_sha256": "8cfbe9bdc9f0da4488e40faefd0675a5dda8f546c5888eecaef2407eee9b00d8"
+    },
+    {
+      "path": "vendor/ldk-node/src/wallet/move_home.rs",
+      "before_sha256": "303bffbbde691322a34973568c736d11994153c0d74653d89d1903fe7513ecb5",
+      "after_sha256": "303bffbbde691322a34973568c736d11994153c0d74653d89d1903fe7513ecb5"
+    },
+    {
+      "path": "vendor/ldk-node/src/wallet/persist.rs",
+      "before_sha256": "4f40c3dd8ad4f6a417bec6e007ce038d25518c3bc48209f1ce1398d1b6ff5ea2",
+      "after_sha256": "4f40c3dd8ad4f6a417bec6e007ce038d25518c3bc48209f1ce1398d1b6ff5ea2"
+    },
+    {
+      "path": "vendor/ldk-node/src/wallet/ser.rs",
+      "before_sha256": "2e925e9478487c2bb14664e397146a259e050cf889fb5b48e31e0a4c1e2d2c56",
+      "after_sha256": "2e925e9478487c2bb14664e397146a259e050cf889fb5b48e31e0a4c1e2d2c56"
+    },
+    {
+      "path": "vendor/lightning/Cargo.toml",
+      "before_sha256": "8eed15f3ddc2327f532422bf38774aef141e6ec1ee5f12d1524aafd8ca40076d",
+      "after_sha256": "8eed15f3ddc2327f532422bf38774aef141e6ec1ee5f12d1524aafd8ca40076d"
+    },
+    {
+      "path": "vendor/lightning/Cargo.toml.orig",
+      "before_sha256": "a0e11c9fd0ecc3005083988dd5ae7e01246e25b7cc0633042d53f84f4936d805",
+      "after_sha256": "a0e11c9fd0ecc3005083988dd5ae7e01246e25b7cc0633042d53f84f4936d805"
+    },
+    {
+      "path": "vendor/lightning/LICENSE-APACHE",
+      "before_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "after_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "vendor/lightning/LICENSE-MIT",
+      "before_sha256": "638da3722c9e102ccd8011d82f61ae3b611174e4a0f8da185c582df137b60a8c",
+      "after_sha256": "638da3722c9e102ccd8011d82f61ae3b611174e4a0f8da185c582df137b60a8c"
+    },
+    {
+      "path": "vendor/lightning/README.md",
+      "before_sha256": "12a7fa712361926d43481bceb1eb6a8bda6cc5b33c3f1f9f16e95c56061d717f",
+      "after_sha256": "12a7fa712361926d43481bceb1eb6a8bda6cc5b33c3f1f9f16e95c56061d717f"
+    },
+    {
+      "path": "vendor/lightning/src/blinded_path/message.rs",
+      "before_sha256": "6ca86fde63d3eccc5e1208520b2e5f6da7b6242b5746bc2fcc2adee1e974b53a",
+      "after_sha256": "6ca86fde63d3eccc5e1208520b2e5f6da7b6242b5746bc2fcc2adee1e974b53a"
+    },
+    {
+      "path": "vendor/lightning/src/blinded_path/mod.rs",
+      "before_sha256": "82e3df522dc934de970b9e2c55c2b7ca52f43a779952dab1807f108c6de3ae56",
+      "after_sha256": "82e3df522dc934de970b9e2c55c2b7ca52f43a779952dab1807f108c6de3ae56"
+    },
+    {
+      "path": "vendor/lightning/src/blinded_path/payment.rs",
+      "before_sha256": "dfe52861dae69bbfbad52df4e7ffc4527d3058492826f7312b7a20bae62839c8",
+      "after_sha256": "dfe52861dae69bbfbad52df4e7ffc4527d3058492826f7312b7a20bae62839c8"
+    },
+    {
+      "path": "vendor/lightning/src/blinded_path/utils.rs",
+      "before_sha256": "747807d7b59158b36d6aa888e16f8fd7d03989df136d7d325fbafc3a4076ff1b",
+      "after_sha256": "747807d7b59158b36d6aa888e16f8fd7d03989df136d7d325fbafc3a4076ff1b"
+    },
+    {
+      "path": "vendor/lightning/src/chain/chaininterface.rs",
+      "before_sha256": "1e92ebb0e3d13437a13737bf53ff66f6281a726eeb66c168a0e2e1d820869eea",
+      "after_sha256": "1e92ebb0e3d13437a13737bf53ff66f6281a726eeb66c168a0e2e1d820869eea"
+    },
+    {
+      "path": "vendor/lightning/src/chain/chainmonitor.rs",
+      "before_sha256": "86d34ee808c5e1a6465cab71b7dc910f7433b52cdc545b6e46f71244ad7c2331",
+      "after_sha256": "86d34ee808c5e1a6465cab71b7dc910f7433b52cdc545b6e46f71244ad7c2331"
+    },
+    {
+      "path": "vendor/lightning/src/chain/channelmonitor.rs",
+      "before_sha256": "f982c334093e4dcf0879887f824ba611764536ab542d588dd806884724cfad63",
+      "after_sha256": "f982c334093e4dcf0879887f824ba611764536ab542d588dd806884724cfad63"
+    },
+    {
+      "path": "vendor/lightning/src/chain/mod.rs",
+      "before_sha256": "4c36f57ed4415ba9b96bef63b9750f549e66307be6f6db0d07c334ea4a2fee9a",
+      "after_sha256": "4c36f57ed4415ba9b96bef63b9750f549e66307be6f6db0d07c334ea4a2fee9a"
+    },
+    {
+      "path": "vendor/lightning/src/chain/onchaintx.rs",
+      "before_sha256": "dd78dbcc4f2f2456190854ad25c85dc51ecaffa77d3c207059254fc7f79fd7f8",
+      "after_sha256": "dd78dbcc4f2f2456190854ad25c85dc51ecaffa77d3c207059254fc7f79fd7f8"
+    },
+    {
+      "path": "vendor/lightning/src/chain/package.rs",
+      "before_sha256": "4e6541fe5432167d00effde83859efe9acb4294c4ecd6d318fa31707d9e9ec2a",
+      "after_sha256": "4e6541fe5432167d00effde83859efe9acb4294c4ecd6d318fa31707d9e9ec2a"
+    },
+    {
+      "path": "vendor/lightning/src/chain/transaction.rs",
+      "before_sha256": "6ebd5afb943f2ec729d833719ad0248668cafd27a82f2030eae72148af6a7926",
+      "after_sha256": "6ebd5afb943f2ec729d833719ad0248668cafd27a82f2030eae72148af6a7926"
+    },
+    {
+      "path": "vendor/lightning/src/crypto/chacha20.rs",
+      "before_sha256": "f908f67135f21d6de7b208bbdc5a21053600dac415dc41c88772ecce300b03e7",
+      "after_sha256": "f908f67135f21d6de7b208bbdc5a21053600dac415dc41c88772ecce300b03e7"
+    },
+    {
+      "path": "vendor/lightning/src/crypto/chacha20poly1305rfc.rs",
+      "before_sha256": "fa310ae8b809f3bc7ab7c75e7e5c8be7c48e053b576345f267c66b29f132c56f",
+      "after_sha256": "fa310ae8b809f3bc7ab7c75e7e5c8be7c48e053b576345f267c66b29f132c56f"
+    },
+    {
+      "path": "vendor/lightning/src/crypto/mod.rs",
+      "before_sha256": "38ea6445d2830869c1817d3de8cda8303b659cac862af701e8c26193b2aac44e",
+      "after_sha256": "38ea6445d2830869c1817d3de8cda8303b659cac862af701e8c26193b2aac44e"
+    },
+    {
+      "path": "vendor/lightning/src/crypto/poly1305.rs",
+      "before_sha256": "f2a357972ec44f9d569a1f0659e8d45680fd75e35344c0df2c33eefb6ce0f823",
+      "after_sha256": "f2a357972ec44f9d569a1f0659e8d45680fd75e35344c0df2c33eefb6ce0f823"
+    },
+    {
+      "path": "vendor/lightning/src/crypto/streams.rs",
+      "before_sha256": "1ae7a211ab693d0a6aecad82d435c839595ea56cce906e44ca7c42234270c7e9",
+      "after_sha256": "1ae7a211ab693d0a6aecad82d435c839595ea56cce906e44ca7c42234270c7e9"
+    },
+    {
+      "path": "vendor/lightning/src/crypto/utils.rs",
+      "before_sha256": "33c9b80adf9a7a229fea0d03d5e9cc84f75e37389d7b750f724ada64a195db36",
+      "after_sha256": "33c9b80adf9a7a229fea0d03d5e9cc84f75e37389d7b750f724ada64a195db36"
+    },
+    {
+      "path": "vendor/lightning/src/events/bump_transaction/mod.rs",
+      "before_sha256": "e0b1eb5b0993e777dc005384658813414e14d4ffbb7de3a05cdf9ce7160acc51",
+      "after_sha256": "e0b1eb5b0993e777dc005384658813414e14d4ffbb7de3a05cdf9ce7160acc51"
+    },
+    {
+      "path": "vendor/lightning/src/events/bump_transaction/sync.rs",
+      "before_sha256": "d5cdd7a8eddd6435fd9093e5ea5a9cc213376288b0bb39af0a5849585989a538",
+      "after_sha256": "d5cdd7a8eddd6435fd9093e5ea5a9cc213376288b0bb39af0a5849585989a538"
+    },
+    {
+      "path": "vendor/lightning/src/events/mod.rs",
+      "before_sha256": "03ddc17c69374c5737b4405b8d6e68ca99f2c33756ffe2cb477b4d21bae59ce6",
+      "after_sha256": "03ddc17c69374c5737b4405b8d6e68ca99f2c33756ffe2cb477b4d21bae59ce6"
+    },
+    {
+      "path": "vendor/lightning/src/io/mod.rs",
+      "before_sha256": "92569794570258d99aca7fe3949e0f903ee79b56667842cc13bcc7c1907cf8dd",
+      "after_sha256": "92569794570258d99aca7fe3949e0f903ee79b56667842cc13bcc7c1907cf8dd"
+    },
+    {
+      "path": "vendor/lightning/src/lib.rs",
+      "before_sha256": "fc5f19fa5ad11f91b91b48bb7665068e9e194b8e5f92b26789fc328bbb29db6f",
+      "after_sha256": "fc5f19fa5ad11f91b91b48bb7665068e9e194b8e5f92b26789fc328bbb29db6f"
+    },
+    {
+      "path": "vendor/lightning/src/ln/async_payments_tests.rs",
+      "before_sha256": "4d6b12950217383b061be776edbebfd4fc35f94a498868fa78cc21280bd079d6",
+      "after_sha256": "4d6b12950217383b061be776edbebfd4fc35f94a498868fa78cc21280bd079d6"
+    },
+    {
+      "path": "vendor/lightning/src/ln/async_signer_tests.rs",
+      "before_sha256": "2f63c8217ac882dfc43efb1ce269cfd814a99df49f24aa8f58f39a2fab0b3647",
+      "after_sha256": "2f63c8217ac882dfc43efb1ce269cfd814a99df49f24aa8f58f39a2fab0b3647"
+    },
+    {
+      "path": "vendor/lightning/src/ln/blinded_payment_tests.rs",
+      "before_sha256": "bdca98fdb69a223539bd23f541e189cb365b25811f9a0421bb50df1fdb2bab1a",
+      "after_sha256": "bdca98fdb69a223539bd23f541e189cb365b25811f9a0421bb50df1fdb2bab1a"
+    },
+    {
+      "path": "vendor/lightning/src/ln/bolt11_payment_tests.rs",
+      "before_sha256": "cef22aa0ab25355b6b6eb964c3474b41839dc6900bca4aa3bfe01cb2726fb6c5",
+      "after_sha256": "cef22aa0ab25355b6b6eb964c3474b41839dc6900bca4aa3bfe01cb2726fb6c5"
+    },
+    {
+      "path": "vendor/lightning/src/ln/chan_utils.rs",
+      "before_sha256": "bf6747c93e183dea88f83d71010eac0667e9eb49be6080b6a3bcb044257b816b",
+      "after_sha256": "bf6747c93e183dea88f83d71010eac0667e9eb49be6080b6a3bcb044257b816b"
+    },
+    {
+      "path": "vendor/lightning/src/ln/chanmon_update_fail_tests.rs",
+      "before_sha256": "4590197dd4410cd93d60f027976a27cc00a51639683f74e9f474170cc29dc7d4",
+      "after_sha256": "4590197dd4410cd93d60f027976a27cc00a51639683f74e9f474170cc29dc7d4"
+    },
+    {
+      "path": "vendor/lightning/src/ln/channel.rs",
+      "before_sha256": "186179561cf568d5b4513a59d064a267b4a1ac1779b4b518225a4783881279d1",
+      "after_sha256": "186179561cf568d5b4513a59d064a267b4a1ac1779b4b518225a4783881279d1"
+    },
+    {
+      "path": "vendor/lightning/src/ln/channel_keys.rs",
+      "before_sha256": "0f28c531459207dff071cf0783c70de3496c8eeb0bdde46c9fcf87d38bd8cbbf",
+      "after_sha256": "0f28c531459207dff071cf0783c70de3496c8eeb0bdde46c9fcf87d38bd8cbbf"
+    },
+    {
+      "path": "vendor/lightning/src/ln/channel_open_tests.rs",
+      "before_sha256": "acf05231483ff6e37c6958ac3f563b27a3c62937c6bbee82c7e627d32dfc0680",
+      "after_sha256": "acf05231483ff6e37c6958ac3f563b27a3c62937c6bbee82c7e627d32dfc0680"
+    },
+    {
+      "path": "vendor/lightning/src/ln/channel_state.rs",
+      "before_sha256": "d3347a3fb2d757ccf904e5db44b1a376ccdd37ec1673a439c02d1c216a2a51aa",
+      "after_sha256": "d3347a3fb2d757ccf904e5db44b1a376ccdd37ec1673a439c02d1c216a2a51aa"
+    },
+    {
+      "path": "vendor/lightning/src/ln/channel_type_tests.rs",
+      "before_sha256": "9714aa971aa60b11e3ff4ad43c38bbc31fab04efff4978cadff65493c4147093",
+      "after_sha256": "9714aa971aa60b11e3ff4ad43c38bbc31fab04efff4978cadff65493c4147093"
+    },
+    {
+      "path": "vendor/lightning/src/ln/channelmanager.rs",
+      "before_sha256": "65e3f59e2654b2c55335dccb4f6a755980a24296d7cf36b894b8088e7936a43f",
+      "after_sha256": "65e3f59e2654b2c55335dccb4f6a755980a24296d7cf36b894b8088e7936a43f"
+    },
+    {
+      "path": "vendor/lightning/src/ln/dual_funding_tests.rs",
+      "before_sha256": "ca317e29bd3e5befebe41b0ac25cbf816318eb3c2d6ec2374328e74b9ffa9411",
+      "after_sha256": "ca317e29bd3e5befebe41b0ac25cbf816318eb3c2d6ec2374328e74b9ffa9411"
+    },
+    {
+      "path": "vendor/lightning/src/ln/features.rs",
+      "before_sha256": "8e1e50591da38f0748de74da03003c9011df13240572472b14ce9f2cd11eeaad",
+      "after_sha256": "8e1e50591da38f0748de74da03003c9011df13240572472b14ce9f2cd11eeaad"
+    },
+    {
+      "path": "vendor/lightning/src/ln/functional_test_utils.rs",
+      "before_sha256": "e631762d415a4785d98622d8a593018c6b98f7e435549e8da865b1fd3f6f7431",
+      "after_sha256": "e631762d415a4785d98622d8a593018c6b98f7e435549e8da865b1fd3f6f7431"
+    },
+    {
+      "path": "vendor/lightning/src/ln/functional_tests.rs",
+      "before_sha256": "b97cbfb2110e19bf21bf3eb6799ed0681d04d2249c79694e14ddc7cd667d09f9",
+      "after_sha256": "b97cbfb2110e19bf21bf3eb6799ed0681d04d2249c79694e14ddc7cd667d09f9"
+    },
+    {
+      "path": "vendor/lightning/src/ln/funding.rs",
+      "before_sha256": "b85d0c0cef685225d4bff540d3a0ae187f858703b44f063960dc7ba4c89c118f",
+      "after_sha256": "b85d0c0cef685225d4bff540d3a0ae187f858703b44f063960dc7ba4c89c118f"
+    },
+    {
+      "path": "vendor/lightning/src/ln/htlc_reserve_unit_tests.rs",
+      "before_sha256": "46daa4a3bdbdc30b5fefc50bb97975fcf08c6fd9721662e733a1fbd36b8176d5",
+      "after_sha256": "46daa4a3bdbdc30b5fefc50bb97975fcf08c6fd9721662e733a1fbd36b8176d5"
+    },
+    {
+      "path": "vendor/lightning/src/ln/inbound_payment.rs",
+      "before_sha256": "5cec5a63f29dd1e56d2cdf3124bf968da96a67d8f51dd54c4d7fe6f01f9072a0",
+      "after_sha256": "5cec5a63f29dd1e56d2cdf3124bf968da96a67d8f51dd54c4d7fe6f01f9072a0"
+    },
+    {
+      "path": "vendor/lightning/src/ln/interactivetxs.rs",
+      "before_sha256": "87ede131515e84e7daacc885a0058e227c335497d114928bb5ffd02d77ee93b8",
+      "after_sha256": "87ede131515e84e7daacc885a0058e227c335497d114928bb5ffd02d77ee93b8"
+    },
+    {
+      "path": "vendor/lightning/src/ln/invoice_utils.rs",
+      "before_sha256": "6cd0f7b81eea04a780c01250712758120c17a1914a5ddcee98ece1dd022bde24",
+      "after_sha256": "6cd0f7b81eea04a780c01250712758120c17a1914a5ddcee98ece1dd022bde24"
+    },
+    {
+      "path": "vendor/lightning/src/ln/max_payment_path_len_tests.rs",
+      "before_sha256": "91f72a3bc5a594f948b5fa77bff0a2b40c466073c919e165a3fd08ad93c67177",
+      "after_sha256": "91f72a3bc5a594f948b5fa77bff0a2b40c466073c919e165a3fd08ad93c67177"
+    },
+    {
+      "path": "vendor/lightning/src/ln/mod.rs",
+      "before_sha256": "bc577777d444ad6df8d0f670037541aa9351e33c299bcdbcac4654b0078a72d6",
+      "after_sha256": "bc577777d444ad6df8d0f670037541aa9351e33c299bcdbcac4654b0078a72d6"
+    },
+    {
+      "path": "vendor/lightning/src/ln/monitor_tests.rs",
+      "before_sha256": "4fe515c559d51a0c2d824ed0bf7d0f74d7a4701400fc5246c5a2c1826297d7d7",
+      "after_sha256": "4fe515c559d51a0c2d824ed0bf7d0f74d7a4701400fc5246c5a2c1826297d7d7"
+    },
+    {
+      "path": "vendor/lightning/src/ln/msgs.rs",
+      "before_sha256": "9b8a2d5149f0df19d5fe5f3d1cfd80e7e93feecc5503bc9f8aec5bf81f5ca395",
+      "after_sha256": "9b8a2d5149f0df19d5fe5f3d1cfd80e7e93feecc5503bc9f8aec5bf81f5ca395"
+    },
+    {
+      "path": "vendor/lightning/src/ln/offers_tests.rs",
+      "before_sha256": "eb454b45d80b5b5663b7a6ba282fe3fcb8c03ed737b46942cfaf20e2dd4fc8dd",
+      "after_sha256": "eb454b45d80b5b5663b7a6ba282fe3fcb8c03ed737b46942cfaf20e2dd4fc8dd"
+    },
+    {
+      "path": "vendor/lightning/src/ln/onion_payment.rs",
+      "before_sha256": "18588a3a9adda414a773b2865effef6fefea447581d520dec81bf2b9288a802f",
+      "after_sha256": "18588a3a9adda414a773b2865effef6fefea447581d520dec81bf2b9288a802f"
+    },
+    {
+      "path": "vendor/lightning/src/ln/onion_route_tests.rs",
+      "before_sha256": "f824dac701a98cf1bb876d5598494e6d59d6a521571b4f724e816f28f25eeeba",
+      "after_sha256": "f824dac701a98cf1bb876d5598494e6d59d6a521571b4f724e816f28f25eeeba"
+    },
+    {
+      "path": "vendor/lightning/src/ln/onion_utils.rs",
+      "before_sha256": "17110904b97928cf53dee58ecb8af495248c5bfadbcb6229eed172ce47f3c53c",
+      "after_sha256": "17110904b97928cf53dee58ecb8af495248c5bfadbcb6229eed172ce47f3c53c"
+    },
+    {
+      "path": "vendor/lightning/src/ln/our_peer_storage.rs",
+      "before_sha256": "ef6764711ab600bc6ee2e5a6f38a32c63f333904c7806c90a0500071cdcd9d65",
+      "after_sha256": "ef6764711ab600bc6ee2e5a6f38a32c63f333904c7806c90a0500071cdcd9d65"
+    },
+    {
+      "path": "vendor/lightning/src/ln/outbound_payment.rs",
+      "before_sha256": "fc0ccedf1e8ccbd848afa4368f65ca80f24fc226477d5e0534ac41ce41703d04",
+      "after_sha256": "fc0ccedf1e8ccbd848afa4368f65ca80f24fc226477d5e0534ac41ce41703d04"
+    },
+    {
+      "path": "vendor/lightning/src/ln/payment_tests.rs",
+      "before_sha256": "95c6e35c3598f88869ff21ab401535e3348d626eff701a9437e537f6fc8c768a",
+      "after_sha256": "95c6e35c3598f88869ff21ab401535e3348d626eff701a9437e537f6fc8c768a"
+    },
+    {
+      "path": "vendor/lightning/src/ln/peer_channel_encryptor.rs",
+      "before_sha256": "019439e08e088de0afafe54a215240ee076c9e99fb1c6d2046508ccf5556bb86",
+      "after_sha256": "019439e08e088de0afafe54a215240ee076c9e99fb1c6d2046508ccf5556bb86"
+    },
+    {
+      "path": "vendor/lightning/src/ln/peer_handler.rs",
+      "before_sha256": "2043ab72e3a390b9926c502d008c658e7c5c254a44f9e7ee40f780c97302dbe2",
+      "after_sha256": "2043ab72e3a390b9926c502d008c658e7c5c254a44f9e7ee40f780c97302dbe2"
+    },
+    {
+      "path": "vendor/lightning/src/ln/priv_short_conf_tests.rs",
+      "before_sha256": "dc66925fea449c2d94af04aa74c152ad26f4c14ed5a9eef6675d6a19f6d9ba7b",
+      "after_sha256": "dc66925fea449c2d94af04aa74c152ad26f4c14ed5a9eef6675d6a19f6d9ba7b"
+    },
+    {
+      "path": "vendor/lightning/src/ln/quiescence_tests.rs",
+      "before_sha256": "c61cffb99a058e0d780fb8d96f59203f0d93eca00682e092659f56eeebb8f5fd",
+      "after_sha256": "c61cffb99a058e0d780fb8d96f59203f0d93eca00682e092659f56eeebb8f5fd"
+    },
+    {
+      "path": "vendor/lightning/src/ln/reload_tests.rs",
+      "before_sha256": "c4feef2246a54722355f134938743c6cd0090b9f73f8eb2651e380a807b7a95a",
+      "after_sha256": "c4feef2246a54722355f134938743c6cd0090b9f73f8eb2651e380a807b7a95a"
+    },
+    {
+      "path": "vendor/lightning/src/ln/reorg_tests.rs",
+      "before_sha256": "108d368aa1b609624c7ba133f5382541a5ba27d392e4871de53ab023761399ee",
+      "after_sha256": "108d368aa1b609624c7ba133f5382541a5ba27d392e4871de53ab023761399ee"
+    },
+    {
+      "path": "vendor/lightning/src/ln/script.rs",
+      "before_sha256": "ff467b2de278dfad300f083f871e5a859529f14d8d4f2a8e49fdb18d2e9b33db",
+      "after_sha256": "ff467b2de278dfad300f083f871e5a859529f14d8d4f2a8e49fdb18d2e9b33db"
+    },
+    {
+      "path": "vendor/lightning/src/ln/shutdown_tests.rs",
+      "before_sha256": "009d77f3f378545288da4b557b7a15b88a7d31bb339e9726316ff8b7e10396c0",
+      "after_sha256": "009d77f3f378545288da4b557b7a15b88a7d31bb339e9726316ff8b7e10396c0"
+    },
+    {
+      "path": "vendor/lightning/src/ln/splicing_tests.rs",
+      "before_sha256": "5b6d247e03adc5f4ee7cce88f79f1725ac5b10780ec58ea62efaea0c030f9695",
+      "after_sha256": "5b6d247e03adc5f4ee7cce88f79f1725ac5b10780ec58ea62efaea0c030f9695"
+    },
+    {
+      "path": "vendor/lightning/src/ln/types.rs",
+      "before_sha256": "e3c47f41b9a0cd8b2861a24641f0bc13908991d85d361c907c8c2594e736a1bc",
+      "after_sha256": "e3c47f41b9a0cd8b2861a24641f0bc13908991d85d361c907c8c2594e736a1bc"
+    },
+    {
+      "path": "vendor/lightning/src/ln/update_fee_tests.rs",
+      "before_sha256": "7e9b346a5a84b8af8db006b6fe2ff8d8beefef75b85c0a84bab9c9ef02cf1dad",
+      "after_sha256": "7e9b346a5a84b8af8db006b6fe2ff8d8beefef75b85c0a84bab9c9ef02cf1dad"
+    },
+    {
+      "path": "vendor/lightning/src/ln/wire.rs",
+      "before_sha256": "e8056859966a4f7aa90530a672ba6651c51a730e2b334a5459e84e8058660fe6",
+      "after_sha256": "e8056859966a4f7aa90530a672ba6651c51a730e2b334a5459e84e8058660fe6"
+    },
+    {
+      "path": "vendor/lightning/src/ln/zero_fee_commitment_tests.rs",
+      "before_sha256": "0d4cdec12898434305a996865b1953a6bd730104fa754382bf7d3d64547c9e70",
+      "after_sha256": "0d4cdec12898434305a996865b1953a6bd730104fa754382bf7d3d64547c9e70"
+    },
+    {
+      "path": "vendor/lightning/src/offers/async_receive_offer_cache.rs",
+      "before_sha256": "e838aacadc3805e859a9c1c6affb708b66cf7603c5db31303ea6aa2d9c8ea0e6",
+      "after_sha256": "e838aacadc3805e859a9c1c6affb708b66cf7603c5db31303ea6aa2d9c8ea0e6"
+    },
+    {
+      "path": "vendor/lightning/src/offers/flow.rs",
+      "before_sha256": "0bfeebb05db11dd99e6241bbb012d1fcfe7e3c159c09b7a9a6dc449ff9e44424",
+      "after_sha256": "0bfeebb05db11dd99e6241bbb012d1fcfe7e3c159c09b7a9a6dc449ff9e44424"
+    },
+    {
+      "path": "vendor/lightning/src/offers/invoice.rs",
+      "before_sha256": "9fe8c0579f3242cce82ec2df99067e6c38fae32fb7e13d11921393189a9b53ee",
+      "after_sha256": "9fe8c0579f3242cce82ec2df99067e6c38fae32fb7e13d11921393189a9b53ee"
+    },
+    {
+      "path": "vendor/lightning/src/offers/invoice_error.rs",
+      "before_sha256": "77cca32df90dba03cbd09e9b13a91b7ed937c660f68f3679f5ebbd8d0eddbb09",
+      "after_sha256": "77cca32df90dba03cbd09e9b13a91b7ed937c660f68f3679f5ebbd8d0eddbb09"
+    },
+    {
+      "path": "vendor/lightning/src/offers/invoice_macros.rs",
+      "before_sha256": "a09f1875b0e6d47e6cf8bb4a2bb467444ef7f207cb15c9001b27fd37945de2e8",
+      "after_sha256": "a09f1875b0e6d47e6cf8bb4a2bb467444ef7f207cb15c9001b27fd37945de2e8"
+    },
+    {
+      "path": "vendor/lightning/src/offers/invoice_request.rs",
+      "before_sha256": "3cc59d1678c9aab360a6fd420560f6a6277d94f96ecf0b86e91a2605c9c158af",
+      "after_sha256": "3cc59d1678c9aab360a6fd420560f6a6277d94f96ecf0b86e91a2605c9c158af"
+    },
+    {
+      "path": "vendor/lightning/src/offers/merkle.rs",
+      "before_sha256": "b0030748ff3bcecdec79bf73a0488689cd6e0c2b89b73f7fd68c8e6d45e14a6c",
+      "after_sha256": "b0030748ff3bcecdec79bf73a0488689cd6e0c2b89b73f7fd68c8e6d45e14a6c"
+    },
+    {
+      "path": "vendor/lightning/src/offers/mod.rs",
+      "before_sha256": "c3e9d388ca40f2176e2c16f7865051b5e7339729c4a04ba93b9b7b906282578e",
+      "after_sha256": "c3e9d388ca40f2176e2c16f7865051b5e7339729c4a04ba93b9b7b906282578e"
+    },
+    {
+      "path": "vendor/lightning/src/offers/nonce.rs",
+      "before_sha256": "89b941eab409cc046d3d78aa395c4e3cf70e22058486644500330e5700899838",
+      "after_sha256": "89b941eab409cc046d3d78aa395c4e3cf70e22058486644500330e5700899838"
+    },
+    {
+      "path": "vendor/lightning/src/offers/offer.rs",
+      "before_sha256": "bb785894652a41d7b86aa9aebde49f350cfed8a6ba783af583e359793bda2e64",
+      "after_sha256": "bb785894652a41d7b86aa9aebde49f350cfed8a6ba783af583e359793bda2e64"
+    },
+    {
+      "path": "vendor/lightning/src/offers/parse.rs",
+      "before_sha256": "e4c88349b4b96a5b64671f1bdc01eeae0cd169ac6a5fbe00f7e4bb5c9c36f5e2",
+      "after_sha256": "e4c88349b4b96a5b64671f1bdc01eeae0cd169ac6a5fbe00f7e4bb5c9c36f5e2"
+    },
+    {
+      "path": "vendor/lightning/src/offers/payer.rs",
+      "before_sha256": "a90f63ce2cb3e146677636d59ee4bf3071c7f66abca92bd5c41ae3321339317e",
+      "after_sha256": "a90f63ce2cb3e146677636d59ee4bf3071c7f66abca92bd5c41ae3321339317e"
+    },
+    {
+      "path": "vendor/lightning/src/offers/refund.rs",
+      "before_sha256": "c4f3de863e9eb0ee417780e40d3b2910a2ff156ee9a1966adad538d4880549c0",
+      "after_sha256": "c4f3de863e9eb0ee417780e40d3b2910a2ff156ee9a1966adad538d4880549c0"
+    },
+    {
+      "path": "vendor/lightning/src/offers/signer.rs",
+      "before_sha256": "171d92b0b09f7cc6226364a88fb20b951dee368cb86b84789be8bdba9f095695",
+      "after_sha256": "171d92b0b09f7cc6226364a88fb20b951dee368cb86b84789be8bdba9f095695"
+    },
+    {
+      "path": "vendor/lightning/src/offers/static_invoice.rs",
+      "before_sha256": "e0a06209d73e3feb6d166d301ab920891dc356427505896830e85fdc7dcd76da",
+      "after_sha256": "e0a06209d73e3feb6d166d301ab920891dc356427505896830e85fdc7dcd76da"
+    },
+    {
+      "path": "vendor/lightning/src/offers/test_utils.rs",
+      "before_sha256": "9a69eefdc8d531666d5fcd9f786e0be6ae9b6b88124d41f9af2ed3d25eb02651",
+      "after_sha256": "9a69eefdc8d531666d5fcd9f786e0be6ae9b6b88124d41f9af2ed3d25eb02651"
+    },
+    {
+      "path": "vendor/lightning/src/onion_message/async_payments.rs",
+      "before_sha256": "86e181073c22d7dbec0b5d4ce90bab0e06591a4b1d5acd74045e0294a76b49f6",
+      "after_sha256": "86e181073c22d7dbec0b5d4ce90bab0e06591a4b1d5acd74045e0294a76b49f6"
+    },
+    {
+      "path": "vendor/lightning/src/onion_message/dns_resolution.rs",
+      "before_sha256": "e041dc9f637445a38afab4bed9885e7c7f73eba5e727fb4177c5db4bcaacec41",
+      "after_sha256": "e041dc9f637445a38afab4bed9885e7c7f73eba5e727fb4177c5db4bcaacec41"
+    },
+    {
+      "path": "vendor/lightning/src/onion_message/functional_tests.rs",
+      "before_sha256": "6a471c4a42eef88b88ff026168f991277951bae1ca52b2c582c219bbd2a20b5f",
+      "after_sha256": "6a471c4a42eef88b88ff026168f991277951bae1ca52b2c582c219bbd2a20b5f"
+    },
+    {
+      "path": "vendor/lightning/src/onion_message/messenger.rs",
+      "before_sha256": "d388b95f0caed00dd7d0338c23c4a081bc3b8859167c9cfd801a8951271c217c",
+      "after_sha256": "d388b95f0caed00dd7d0338c23c4a081bc3b8859167c9cfd801a8951271c217c"
+    },
+    {
+      "path": "vendor/lightning/src/onion_message/mod.rs",
+      "before_sha256": "e9d273be62943a887c677542333f6ded7c406f8f5bbd4a53f6432bbcf328bf73",
+      "after_sha256": "e9d273be62943a887c677542333f6ded7c406f8f5bbd4a53f6432bbcf328bf73"
+    },
+    {
+      "path": "vendor/lightning/src/onion_message/offers.rs",
+      "before_sha256": "3bc2205ad49ef019a18c068fdac9329f035db9821afdc22d6f9a971768bacd43",
+      "after_sha256": "3bc2205ad49ef019a18c068fdac9329f035db9821afdc22d6f9a971768bacd43"
+    },
+    {
+      "path": "vendor/lightning/src/onion_message/packet.rs",
+      "before_sha256": "dc3077c571854488a38c0f2e458fb8b80442c5fc90940b584a449e1e55af695f",
+      "after_sha256": "dc3077c571854488a38c0f2e458fb8b80442c5fc90940b584a449e1e55af695f"
+    },
+    {
+      "path": "vendor/lightning/src/routing/gossip.rs",
+      "before_sha256": "1b2e98f7b395fcbd94fdd1b247a942cfe15dddbf7bf370b25e8f851ae2feea6a",
+      "after_sha256": "1b2e98f7b395fcbd94fdd1b247a942cfe15dddbf7bf370b25e8f851ae2feea6a"
+    },
+    {
+      "path": "vendor/lightning/src/routing/log_approx.rs",
+      "before_sha256": "0855e57acf2036d2bc9d9547832df5d638861cd347432f2d3e00b290bc8047b7",
+      "after_sha256": "0855e57acf2036d2bc9d9547832df5d638861cd347432f2d3e00b290bc8047b7"
+    },
+    {
+      "path": "vendor/lightning/src/routing/mod.rs",
+      "before_sha256": "a0193b994c9813c3b29644fdfc352d550f478d68d0518d027f63c0377df82f67",
+      "after_sha256": "a0193b994c9813c3b29644fdfc352d550f478d68d0518d027f63c0377df82f67"
+    },
+    {
+      "path": "vendor/lightning/src/routing/router.rs",
+      "before_sha256": "f46c600db41cde77fb69568ba4f007e71f94b528f3ea970099f2d6af2aae6f86",
+      "after_sha256": "f46c600db41cde77fb69568ba4f007e71f94b528f3ea970099f2d6af2aae6f86"
+    },
+    {
+      "path": "vendor/lightning/src/routing/scoring.rs",
+      "before_sha256": "9335be2f61a12053453124d8bdba1363ec28213319d3da8d6dcad11628424fee",
+      "after_sha256": "9335be2f61a12053453124d8bdba1363ec28213319d3da8d6dcad11628424fee"
+    },
+    {
+      "path": "vendor/lightning/src/routing/test_utils.rs",
+      "before_sha256": "21aa71c439072f9d749f955ff51773f74684db794eedd96d45d8faf81d23890b",
+      "after_sha256": "21aa71c439072f9d749f955ff51773f74684db794eedd96d45d8faf81d23890b"
+    },
+    {
+      "path": "vendor/lightning/src/routing/utxo.rs",
+      "before_sha256": "e7fb4fbb58931a99776695a4f4abe5a2f953ffbeb157c69a0898c9ed5fac62dc",
+      "after_sha256": "e7fb4fbb58931a99776695a4f4abe5a2f953ffbeb157c69a0898c9ed5fac62dc"
+    },
+    {
+      "path": "vendor/lightning/src/sign/ecdsa.rs",
+      "before_sha256": "5bb1cfcad8a3d3575758f16800b1b448bcf25faf3ba9516c4312dd231642b102",
+      "after_sha256": "5bb1cfcad8a3d3575758f16800b1b448bcf25faf3ba9516c4312dd231642b102"
+    },
+    {
+      "path": "vendor/lightning/src/sign/mod.rs",
+      "before_sha256": "2911bf45da16001e9ff1e5f576cb25d4be3996b8c22f5357a8899f06504bdb1d",
+      "after_sha256": "2911bf45da16001e9ff1e5f576cb25d4be3996b8c22f5357a8899f06504bdb1d"
+    },
+    {
+      "path": "vendor/lightning/src/sign/taproot.rs",
+      "before_sha256": "b33101b5e1da44c1eb46eecb2dc8d9c8b56508ac7308ce4a6313f59a9442375f",
+      "after_sha256": "b33101b5e1da44c1eb46eecb2dc8d9c8b56508ac7308ce4a6313f59a9442375f"
+    },
+    {
+      "path": "vendor/lightning/src/sign/tx_builder.rs",
+      "before_sha256": "3d79969a461773e85f0f3ee6d879cc32d9d0d6741bbd7d53f15cbc7e2a28b848",
+      "after_sha256": "3d79969a461773e85f0f3ee6d879cc32d9d0d6741bbd7d53f15cbc7e2a28b848"
+    },
+    {
+      "path": "vendor/lightning/src/sign/type_resolver.rs",
+      "before_sha256": "c8e4dee9be786a4fe3a6d1748484e7891afcf36afd8ae450f93f6acf8b700fd4",
+      "after_sha256": "c8e4dee9be786a4fe3a6d1748484e7891afcf36afd8ae450f93f6acf8b700fd4"
+    },
+    {
+      "path": "vendor/lightning/src/sync/debug_sync.rs",
+      "before_sha256": "4937a4420d59a3753d258d7ae52b6cdfe58ae6c209d64b356bd2b504d5d39eab",
+      "after_sha256": "4937a4420d59a3753d258d7ae52b6cdfe58ae6c209d64b356bd2b504d5d39eab"
+    },
+    {
+      "path": "vendor/lightning/src/sync/fairrwlock.rs",
+      "before_sha256": "872efe5a7c153f838ba52f3c294ddbde85b1ee8dd4650a5f94418670dd8f1694",
+      "after_sha256": "872efe5a7c153f838ba52f3c294ddbde85b1ee8dd4650a5f94418670dd8f1694"
+    },
+    {
+      "path": "vendor/lightning/src/sync/mod.rs",
+      "before_sha256": "1473810eb4be151eab9a5dfd972623370d4ea6e67a33f72b00ef28df15f2487c",
+      "after_sha256": "1473810eb4be151eab9a5dfd972623370d4ea6e67a33f72b00ef28df15f2487c"
+    },
+    {
+      "path": "vendor/lightning/src/sync/nostd_sync.rs",
+      "before_sha256": "cf12ff1ee4198c2a18f21dea97f0508b6a3c154084dd72ceeac0e4e82c555587",
+      "after_sha256": "cf12ff1ee4198c2a18f21dea97f0508b6a3c154084dd72ceeac0e4e82c555587"
+    },
+    {
+      "path": "vendor/lightning/src/sync/test_lockorder_checks.rs",
+      "before_sha256": "c99babb857b4a2522f024e71194b2068961aa207d79672ea9c406d351c73d830",
+      "after_sha256": "c99babb857b4a2522f024e71194b2068961aa207d79672ea9c406d351c73d830"
+    },
+    {
+      "path": "vendor/lightning/src/util/anchor_channel_reserves.rs",
+      "before_sha256": "2050db62884a07e12dc3365e2c047c8fee3e17c90d68ced80f2e3a24ae97ece8",
+      "after_sha256": "2050db62884a07e12dc3365e2c047c8fee3e17c90d68ced80f2e3a24ae97ece8"
+    },
+    {
+      "path": "vendor/lightning/src/util/async_poll.rs",
+      "before_sha256": "6f299f9f895934848fa4daad890592917699fde1a16891bc8385336906544412",
+      "after_sha256": "6f299f9f895934848fa4daad890592917699fde1a16891bc8385336906544412"
+    },
+    {
+      "path": "vendor/lightning/src/util/atomic_counter.rs",
+      "before_sha256": "d52d07154b6cdd6325265c31ce2f77d1f39f0aa0e4ffbf93c02e0ff90eac21ae",
+      "after_sha256": "d52d07154b6cdd6325265c31ce2f77d1f39f0aa0e4ffbf93c02e0ff90eac21ae"
+    },
+    {
+      "path": "vendor/lightning/src/util/base32.rs",
+      "before_sha256": "9072ea9627d7ffde85853a18a8bf35f571191c9a3ee170fedfb0310586ea7ca5",
+      "after_sha256": "9072ea9627d7ffde85853a18a8bf35f571191c9a3ee170fedfb0310586ea7ca5"
+    },
+    {
+      "path": "vendor/lightning/src/util/byte_utils.rs",
+      "before_sha256": "2119bc7db2817198af2135390d020bcd36d44069ed6f88fe6dc0e78486032ed4",
+      "after_sha256": "2119bc7db2817198af2135390d020bcd36d44069ed6f88fe6dc0e78486032ed4"
+    },
+    {
+      "path": "vendor/lightning/src/util/config.rs",
+      "before_sha256": "69d0e82408ffbf6ab1a8ff6f285f731528a7d63196a09c029fe9d67ceceddbda",
+      "after_sha256": "69d0e82408ffbf6ab1a8ff6f285f731528a7d63196a09c029fe9d67ceceddbda"
+    },
+    {
+      "path": "vendor/lightning/src/util/dyn_signer.rs",
+      "before_sha256": "0ecd36e962a326c454827d7b364ede5e9a8332f51211b1c54bf96858f4707c0c",
+      "after_sha256": "0ecd36e962a326c454827d7b364ede5e9a8332f51211b1c54bf96858f4707c0c"
+    },
+    {
+      "path": "vendor/lightning/src/util/errors.rs",
+      "before_sha256": "650c1eb70dbf3b62c11be7ee013c1a00d44cacc5773d98c5746a9aa4ddb58196",
+      "after_sha256": "650c1eb70dbf3b62c11be7ee013c1a00d44cacc5773d98c5746a9aa4ddb58196"
+    },
+    {
+      "path": "vendor/lightning/src/util/fuzz_wrappers.rs",
+      "before_sha256": "dca8f0adee959494e0743345708b8161eb03aa1c8347baa91d75e2947b4921a7",
+      "after_sha256": "dca8f0adee959494e0743345708b8161eb03aa1c8347baa91d75e2947b4921a7"
+    },
+    {
+      "path": "vendor/lightning/src/util/hash_tables.rs",
+      "before_sha256": "4be02a44168e771ad6a3a35866b3d2c24e05a819e0b3fc7136e20193326f014b",
+      "after_sha256": "4be02a44168e771ad6a3a35866b3d2c24e05a819e0b3fc7136e20193326f014b"
+    },
+    {
+      "path": "vendor/lightning/src/util/indexed_map.rs",
+      "before_sha256": "8ab0d381c4e34b4ca92ec62d1fc318a6e7e08e515819010e33ade58026f378f7",
+      "after_sha256": "8ab0d381c4e34b4ca92ec62d1fc318a6e7e08e515819010e33ade58026f378f7"
+    },
+    {
+      "path": "vendor/lightning/src/util/logger.rs",
+      "before_sha256": "f27c1534912b0007593f553c8555f4114a467772686f732fe577acea6350cb61",
+      "after_sha256": "f27c1534912b0007593f553c8555f4114a467772686f732fe577acea6350cb61"
+    },
+    {
+      "path": "vendor/lightning/src/util/macro_logger.rs",
+      "before_sha256": "944b01c3af69539884e2882bae4bb74d8cb789d35327b99a9ee614ad70e9cbd6",
+      "after_sha256": "944b01c3af69539884e2882bae4bb74d8cb789d35327b99a9ee614ad70e9cbd6"
+    },
+    {
+      "path": "vendor/lightning/src/util/message_signing.rs",
+      "before_sha256": "c6cd6c2f1bf6a79911d5d30ddf217d810af5dde42a688be62a298bf58e0b6418",
+      "after_sha256": "c6cd6c2f1bf6a79911d5d30ddf217d810af5dde42a688be62a298bf58e0b6418"
+    },
+    {
+      "path": "vendor/lightning/src/util/mod.rs",
+      "before_sha256": "205c3ad1119bdc71fbcc9a2ecc4b53b8b940d68b0de3c44faea931857a86ce60",
+      "after_sha256": "205c3ad1119bdc71fbcc9a2ecc4b53b8b940d68b0de3c44faea931857a86ce60"
+    },
+    {
+      "path": "vendor/lightning/src/util/mut_global.rs",
+      "before_sha256": "d7c51dc4d9b50bf35c3ce50b9e7c0e9112ad0852d42b30988c47985c0ff8313d",
+      "after_sha256": "d7c51dc4d9b50bf35c3ce50b9e7c0e9112ad0852d42b30988c47985c0ff8313d"
+    },
+    {
+      "path": "vendor/lightning/src/util/native_async.rs",
+      "before_sha256": "3a0047cbc78f503b6160c4239548200709c8f845a69bd933fbcdbf8bf6775396",
+      "after_sha256": "3a0047cbc78f503b6160c4239548200709c8f845a69bd933fbcdbf8bf6775396"
+    },
+    {
+      "path": "vendor/lightning/src/util/persist.rs",
+      "before_sha256": "db45a2bb1b7065881fe440095292150cc8c43483c0d21ab12a6be613d9d761eb",
+      "after_sha256": "db45a2bb1b7065881fe440095292150cc8c43483c0d21ab12a6be613d9d761eb"
+    },
+    {
+      "path": "vendor/lightning/src/util/scid_utils.rs",
+      "before_sha256": "b91b3b3fd32f74042796fff80d7437a2915da5c515dc90137b6fd9f5035ffec0",
+      "after_sha256": "b91b3b3fd32f74042796fff80d7437a2915da5c515dc90137b6fd9f5035ffec0"
+    },
+    {
+      "path": "vendor/lightning/src/util/ser.rs",
+      "before_sha256": "adc369c34cbac2f5b6bb49f27a647db0e1609efbc743ecb3857caf9c4e7e5f02",
+      "after_sha256": "adc369c34cbac2f5b6bb49f27a647db0e1609efbc743ecb3857caf9c4e7e5f02"
+    },
+    {
+      "path": "vendor/lightning/src/util/ser_macros.rs",
+      "before_sha256": "3e48a366b7d309af2a4ca383dc6fe482a8372512e370d1048a073b1aee60b6e6",
+      "after_sha256": "3e48a366b7d309af2a4ca383dc6fe482a8372512e370d1048a073b1aee60b6e6"
+    },
+    {
+      "path": "vendor/lightning/src/util/sweep.rs",
+      "before_sha256": "11b32d5608a0474a63bb39f6e0255e7f2ef9c9ccd026a1c28564d00fda7a198a",
+      "after_sha256": "11b32d5608a0474a63bb39f6e0255e7f2ef9c9ccd026a1c28564d00fda7a198a"
+    },
+    {
+      "path": "vendor/lightning/src/util/test_channel_signer.rs",
+      "before_sha256": "ee31fa8cf40f536f7d0ae3a38b29ec058fde021370d900ea6f5a0fa5e50c666a",
+      "after_sha256": "ee31fa8cf40f536f7d0ae3a38b29ec058fde021370d900ea6f5a0fa5e50c666a"
+    },
+    {
+      "path": "vendor/lightning/src/util/test_utils.rs",
+      "before_sha256": "68b42806b89b71a35e9f1866dc135972ec32dd76084ad53db77008e5edf9c396",
+      "after_sha256": "68b42806b89b71a35e9f1866dc135972ec32dd76084ad53db77008e5edf9c396"
+    },
+    {
+      "path": "vendor/lightning/src/util/time.rs",
+      "before_sha256": "bdca52df6a5837cec7fefb056df5bb28594714529aebed0f21c5918aa32d39d2",
+      "after_sha256": "bdca52df6a5837cec7fefb056df5bb28594714529aebed0f21c5918aa32d39d2"
+    },
+    {
+      "path": "vendor/lightning/src/util/transaction_utils.rs",
+      "before_sha256": "ee3b995a0f492e8344f3d897b989801eed850398cbdd38bda9db0eedfe4557af",
+      "after_sha256": "ee3b995a0f492e8344f3d897b989801eed850398cbdd38bda9db0eedfe4557af"
+    },
+    {
+      "path": "vendor/lightning/src/util/wakers.rs",
+      "before_sha256": "c71a09f6f3b74393326cd47b963acf6ed2a2aca9f8ad986d61c7938e4cbf90d0",
+      "after_sha256": "c71a09f6f3b74393326cd47b963acf6ed2a2aca9f8ad986d61c7938e4cbf90d0"
+    }
+  ]
+}

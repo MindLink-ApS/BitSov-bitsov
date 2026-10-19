@@ -1,4 +1,28 @@
 [[IgnoredVulns]]
+id = "RUSTSEC-2026-0367"
+reason = "zip 0.6.6 is test-harness build tooling only, never in the shipped konsensus binary. Pinned downloads have bundled SHA-256 checks before extraction; no bulk extract API or archive permission bits used. No fixed harness release available. Recheck harness/fixture/extraction/feature/release changes; remove when zip is dropped or >=9.0.0. Full triage: .cargo/audit.toml (2026-10-17)."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0368"
+reason = "zip 0.6.6 is test-harness build tooling only, never in the shipped konsensus binary. Pinned downloads have bundled SHA-256 checks before extraction; individual entry copies do not create archive symlinks. No fixed harness release available. Recheck harness/fixture/extraction/feature/release changes; remove when zip is dropped or >=9.0.0. Full triage: .cargo/audit.toml (2026-10-17)."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0369"
+reason = "zip 0.6.6 is test-harness build tooling only, never in the shipped konsensus binary. Pinned downloads have bundled SHA-256 checks before extraction; no bulk extract API or archive-derived chmod. Local output directories remain trusted. No fixed harness release available. Recheck harness/fixture/extraction/feature/release changes; remove when zip is dropped or >=9.0.0. Full triage: .cargo/audit.toml (2026-10-17)."
+
+[[IgnoredVulns]]
+id = "GHSA-vv5m-jxxh-4627"
+reason = "Alias of RUSTSEC-2026-0367; same test-only zip risk acceptance and recheck triggers in .cargo/audit.toml."
+
+[[IgnoredVulns]]
+id = "GHSA-4v9h-p7m9-rh26"
+reason = "Alias of RUSTSEC-2026-0368; same test-only zip risk acceptance and recheck triggers in .cargo/audit.toml."
+
+[[IgnoredVulns]]
+id = "GHSA-4684-h2q9-2vcp"
+reason = "Alias of RUSTSEC-2026-0369; same test-only zip risk acceptance and recheck triggers in .cargo/audit.toml."
+
+[[IgnoredVulns]]
 id = "RUSTSEC-2024-0436"
 reason = "Unmaintained paste 1.0.15 is transitive through sqlx-core 0.8.0; tracked as known dependency-island debt until the sqlx/ldk-node bump."
 
@@ -41,3 +65,19 @@ reason = "Duplicate OSV advisory for sqlx 0.8.0; same risk acceptance as RUSTSEC
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0363"
 reason = "sqlx 0.8.0 pinned by ldk-node 0.7 rusqlite/libsqlite3-sys dependency island; documented known debt in deny.toml."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0346"
+reason = "rustls 0.21.12 via pinned sqlx-core 0.8.0 plus test-only minreq. Built-in session caches are used; no custom cache/session-value Debug logging path was found, but vulnerable impls remain compiled. Recheck TLS/session/logging changes; remove on the sqlx/ldk-node island upgrade (#59). Does not waive patched rustls 0.23.46. Full triage: .cargo/audit.toml (2026-10-15), mirrored in deny.toml."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0349"
+reason = "rustls 0.21.12 via pinned sqlx-core 0.8.0. SQLx creates a fresh ClientConfig/cache per handshake and offers only classical groups. Test-only minreq shares a cache and can retain poisoned classical-group hints, but has no PQ group to lose. Vulnerable hint writes remain; no PQ protection is claimed. Recheck shared config/cache, key-exchange policy or runtime minreq use; remove on the sqlx/ldk-node island upgrade (#59). Does not waive patched rustls 0.23.46. Full triage: .cargo/audit.toml (2026-10-15), mirrored in deny.toml."
+
+[[IgnoredVulns]]
+id = "GHSA-c8m5-c952-6cm4"
+reason = "Alias of RUSTSEC-2026-0346; same legacy rustls 0.21 risk acceptance and recheck triggers in .cargo/audit.toml and deny.toml."
+
+[[IgnoredVulns]]
+id = "GHSA-w44r-93j7-qv28"
+reason = "Alias of RUSTSEC-2026-0349; same legacy rustls 0.21 risk acceptance and recheck triggers in .cargo/audit.toml and deny.toml."

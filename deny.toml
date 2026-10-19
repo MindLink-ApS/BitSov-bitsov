@@ -18,12 +18,12 @@
 #
 # GREEN-BUT-HONEST: trivially-fixable advisories are REMEDIATED, not silenced
 # (rand 0.8.5 → 0.8.6 closed RUSTSEC-2026-0097 in this PR). The handful that are
-# genuinely unfixable today — all gated by the single documented `sqlx = "=0.8.0"`
-# / ldk-node 0.7 rusqlite pin — are listed in `[advisories].ignore` below WITH a
+# gated by the documented `sqlx = "=0.8.0"` / ldk-node 0.7 rusqlite pin
+# are listed in `[advisories].ignore` below WITH a
 # per-entry `reason` (crate, path, why-deferred, tracking ref) and mirrored as the
-# explicit known-debt set in docs/security/supply-chain-audit-scope.md. The gate
-# therefore EXITS 0 on current main without hiding anything: the exception policy
-# IS the diff.
+# explicit known-debt set in docs/security/supply-chain-audit-scope.md. Test-only
+# zip exceptions have their full applicability triage in .cargo/audit.toml.
+# The exception policy remains explicit and reviewable in the diff.
 #
 # Schema target: cargo-deny >= 0.14 (the `vulnerability` / `severity-threshold`
 # fields were REMOVED upstream and now emit errors, so they are intentionally
@@ -63,7 +63,7 @@ yanked = "warn"
 unused-ignored-advisory = "warn"
 # Ignore list = the EXPLICIT, REVIEWED known-debt set.
 #
-# Every entry below is (a) genuinely reachable in the locked graph, (b) NOT
+# The sqlx/webpki entries below are (a) present in the locked graph, (b) NOT
 # remediable by a safe lockfile bump today, and (c) gated by a single documented
 # root constraint: the `sqlx = "=0.8.0"` pin in the root Cargo.toml, forced by
 # `ldk-node 0.7.0` → `rusqlite 0.31` → `libsqlite3-sys 0.28` (sqlx 0.8.1+ needs
@@ -75,6 +75,12 @@ unused-ignored-advisory = "warn"
 # closed RUSTSEC-2026-0097 in this same PR). We ignore ONLY the unfixable-now set.
 # Each entry carries a `reason` per cargo-deny schema; no bare IDs.
 ignore = [
+    # Test-harness build dependencies only; full source/hash verification and
+    # release-graph evidence: .cargo/audit.toml (triage 2026-10-17).
+    { id = "RUSTSEC-2026-0367", reason = "zip 0.6.6 via optional corepc-node/electrsd test harnesses; absent from the shipped konsensus binary. Pinned fixture URLs and bundled SHA-256 checks precede extraction; no bulk extract API or archive SUID/SGID permissions used. corepc-node 0.12.0 and electrsd/bitcoind 0.42.0 still require zip 0.6. Recheck harness upgrades, fixture/extraction and feature/release changes or new zip consumers; remove when zip is dropped or >=9.0.0. Full triage: .cargo/audit.toml." },
+    { id = "RUSTSEC-2026-0368", reason = "zip 0.6.6 via optional corepc-node/electrsd test harnesses; absent from the shipped konsensus binary. Pinned fixture URLs and bundled SHA-256 checks precede extraction; individual entry copies do not create archive symlinks. No fixed harness release available. Recheck harness upgrades, fixture/extraction and feature/release changes or new zip consumers; remove when zip is dropped or >=9.0.0. Full triage: .cargo/audit.toml." },
+    { id = "RUSTSEC-2026-0369", reason = "zip 0.6.6 via optional corepc-node/electrsd test harnesses; absent from the shipped konsensus binary. Pinned fixture URLs and bundled SHA-256 checks precede extraction; no bulk extract API, archive symlink creation or archive-derived chmod. Local output directories remain trusted. No fixed harness release available. Recheck harness upgrades, fixture/extraction and feature/release changes or new zip consumers; remove when zip is dropped or >=9.0.0. Full triage: .cargo/audit.toml." },
+
     # RUSTSEC-2024-0363 — sqlx 0.8.0: protocol-level SQL smuggling via a length-
     # prefix overflow on values > 4 GiB. Reaches konsensus-storage. Deferred: the
     # `=0.8.0` pin is forced by ldk-node 0.7's rusqlite/libsqlite3-sys 0.28
@@ -87,6 +93,15 @@ ignore = [
     # either cap changes. Clear when ldk-node bumps rusqlite to >=0.32.
     # Tracking: docs/security/supply-chain-audit-scope.md (known-debt table).
     { id = "RUSTSEC-2024-0363", reason = "sqlx =0.8.0 pinned by ldk-node 0.7 rusqlite/libsqlite3-sys 0.28. NOT \"SQLite so unaffected\": sqlx-postgres ships in the binary and StorageConfig::Postgres is a supported backend. Unreachable because the exploit needs a bound parameter >4 GiB and inputs cap at 16 MiB (wire) / 2 MiB (API) — recheck if those caps change. Fix 0.8.1 needs libsqlite3-sys >=0.30. Tracked in supply-chain-audit-scope.md." },
+
+    # Legacy rustls 0.21.12 via sqlx-core 0.8.0; full per-advisory triage:
+    # .cargo/audit.toml (2026-10-15, #59). Postgres TLS is reachable; SQLite
+    # deployment defaults and input size caps do not waive TLS vulnerabilities.
+    # These exceptions do not cover rustls 0.23, already patched to 0.23.46.
+    # RUSTSEC-2026-0346 / GHSA-c8m5-c952-6cm4 — session-value Debug secrets.
+    { id = "RUSTSEC-2026-0346", reason = "rustls 0.21.12 via sqlx-core 0.8.0, pinned by the ldk-node/sqlx SQLite dependency conflict (#59), plus test-only minreq. SQLx and minreq use the built-in session cache; no custom ClientSessionStore or session-value Debug logging path was found. Vulnerable Debug impls remain compiled. Recheck TLS/session/logging changes; remove on the sqlx/ldk-node island upgrade. Full triage: .cargo/audit.toml; alias GHSA-c8m5-c952-6cm4." },
+    # RUSTSEC-2026-0349 / GHSA-w44r-93j7-qv28 — pre-auth key-share hints.
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.21.12 via sqlx-core 0.8.0, pinned by the ldk-node/sqlx SQLite dependency conflict (#59). SQLx creates a fresh ClientConfig/cache per handshake; safe defaults offer only classical groups. Test-only minreq shares a cache and can retain poisoned classical-group hints, but has no PQ group to lose. Vulnerable hint writes remain; no PQ protection is claimed. Recheck shared config/cache, key-exchange policy or runtime minreq use; remove on the sqlx/ldk-node island upgrade. Full triage: .cargo/audit.toml; alias GHSA-w44r-93j7-qv28." },
 
     # RUSTSEC-2026-0098 — rustls-webpki 0.101.7: URI-name constraints incorrectly
     # accepted. The 0.101.7 copy rides rustls 0.21 via sqlx-core 0.8.0 (same sqlx

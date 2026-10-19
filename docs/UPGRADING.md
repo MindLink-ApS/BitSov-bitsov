@@ -3,14 +3,284 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## rc15 → rc16
+
+rc16 is rc15 (`87b02bc`) plus the test-only zip advisory triage. The rc15 tag
+exists, but Cargo Audit failed and its release build was skipped; rc16 is the
+first signed build of this content once the [signing checklist](releases/v0.3.0-rc16.md)
+is completed. `paste` remains an allowed unmaintained warning; dependencies,
+storage formats and migrations are unchanged from rc15. There is no additional
+operator impact beyond the [rc15 release notes](releases/v0.3.0-rc15.md).
+
+**Pilots still on rc14 upgrade directly to rc16.** Follow the complete
+[rc14 → rc15 procedure](#rc14--rc15-procedure) below, including the retained-Pi
+checks, using the signed rc16 artifact/checksums and expecting
+`konsensus 0.3.0-rc16` wherever that procedure says rc15. All startup, backup
+and rollback cutoffs apply equally to rc16: **no downgrade to rc14 after
+running rc16 with embedded LDK**; preserve the latest state and roll forward.
+There is no intermediate rc15 installation step.
+
+### Historical rc15 preparation
+
+**rc15 preparation (2026-10-14):** six merged PRs after `v0.3.0-rc14`
+(`d55a88e4`): #301, #302, #303, #304, #306 and #307, plus
+`fix/ldk-0.2.7-security`, `fix/ldk-node-071-backports` and
+`fix/ldk-node-late-failure`. The candidate is `main` at
+`3088c53cbb3f6b609545e93844f3d1eec84cbdea` plus the reviewed release/upgrade
+docs and this security update on `docs/rc15-release-notes-security`. This
+update changes documentation only; versions remain rc14. Rasmus will select
+the final rc15 release commit and tag/sign separately. See the
+[signing checklist](releases/v0.3.0-rc15.md).
+For nodes skipping releases, apply the earlier procedures first, then
+rc14 → rc15. Historical sections describe their release's behavior; the rc15
+pairing v7 and independent owner-device reset guidance supersede rc14's v6
+and console-only reset descriptions.
+
+## rc14 → rc15 procedure
+
+**Read these security changes before replacing the binary:**
+
+- Vendored `lightning` moves from **0.2.2 to 0.2.7**, bringing the funds-theft
+  fixes **#5057** (commitment rollback) and **#5042** (underfunded LSPS2
+  forwarding), and the **#4867 Electrum DoS fix**. The locked liquidity and
+  transaction-sync companions also move to 0.2.7; both core and liquidity
+  changes are required for LSPS2. See [Lightning evidence](security/ldk-0.2.7/README.md).
+- Vendored `ldk-node` remains **0.7.0 with selected 0.7.1 backports**:
+  **#1032** fails closed on ChannelManager read errors other than `NotFound`;
+  **#899** rejects unauthorized nonzero skims on unregistered receives;
+  **#1157** rejects unknown required custom TLVs before exposing claimability;
+  **#1035** removes preimages from successful-send logs (receipts/events retain
+  them). **possiblyrandom 0.2.1** restores default-feature OS entropy on
+  supported targets; unsupported targets or OS failure can still yield zeros.
+  See [backport evidence](security/ldk-node-0.7.1/README.md).
+- Late `PaymentFailed` events no longer overwrite a successful outbound
+  Lightning receipt or emit a contradictory failure event. Circular inbound
+  HTLCs using an outbound hash are still rejected without changing that
+  outbound payment's status. This includes the circular-payment part of
+  **#1157**. A stale failure notification is not permission to repay; reconcile
+  the persisted receipt. See [payment-status evidence](security/ldk-node-0.7.1/PAYMENT-STATUS.md).
+
+**No downgrade to rc14 after running rc15 with embedded LDK.** New optional
+fields persisted by Lightning 0.2.7 are skipped by 0.2.2 and dropped if it
+rewrites the state. Read compatibility does not mean safe downgrade; the
+existing LDK rollback rule already forbids it. Keep the latest state and roll
+forward. Step 8's reviewed cutoff and narrow restoration exception for a
+failed start before LDK remain unchanged; generation 3 does not make a
+downgrade safe.
+A `ReadFailed` / "Failed to read channel manager from store" start always
+occurs after storage has opened and migrations have run, past step 8's
+cutoff, so it never qualifies for this exception and you must never restore
+the pre-swap backup because of it.
+
+**If startup now fails closed:** look for
+`Failed to read channel manager from store: <error>` in the LDK log
+`ldk_node.log` in the storage directory. This
+returns `BuildError::ReadFailed`; BitSov surfaces
+`lightning backend error: failed to build LDK node: Failed to read from store.`
+The latter can also
+refer to other store reads, so use the log to identify the failing component.
+Stop, preserve the latest state, and diagnose storage availability,
+permissions or corruption. **Do not delete or replace the ChannelManager to
+"fix" the error**, copy in an older manager, or initialize fresh state.
+Only `NotFound` permits fresh manager creation; making retained state look
+missing bypasses the protection and can endanger channel funds.
+
+**On the hub, drain or inspect old queued LSPS2/JIT HTLCs before relying on
+the fix.** HTLCs queued by the old LSPS2 code keep their unchecked amounts;
+upgrading/restarting does not retroactively validate them. Account for these
+flows during step 1's reconciliation. No deployed queue inspection or live
+upgrade is recorded by the security evidence.
+
+1. **Prepare the retained node and pre-swap backup.** Complete any seed
+   encryption or rc14 maintenance described in step 4 before the final shutdown.
+   Reconcile pending payments, message operations, channel opens and top-ups.
+   Verify the released
+   rc15 artifact and signed checksums under the [release policy](ops/RELEASE_POLICY.md),
+   then stop the node cleanly. Before replacing or starting it, take a coherent
+   pre-swap backup of the config and complete retained state, including pairing
+   and grant records, transport pins, the database (including any SQLite WAL),
+   current LDK state, heartbeat and safety markers. Include separately located
+   database/state paths; PostgreSQL needs its own consistent database backup.
+   Keep the verified rc14 binary with this backup. Protect the backup as secret
+   node state; it is not a second runnable node. Do not start either binary
+   between this final backup and replacement. If any node starts in between,
+   stop cleanly and take a new pre-swap backup. Keep the live config/data on
+   the same host/filesystem, and do not re-run `init`.
+2. **Plan for pairing file v7 (#304).** rc15 reads v2–v6 stores and migrates
+   `pairing/clients.json` to v7 on its first write, including device-reset
+   history/generation and observed rolling refusals. Once written, **rc14 refuses v7**. There is no
+   reverse migration: do not lower the file version, remove security fields,
+   or restore an older pairing file by itself. For a v7 file, **do not follow
+   rc14's refusal hint “remove the file to re-pair from scratch”**; preserve
+   the file and use rc15. Existing grants and their restrictions are retained; upgrading does not replace a legacy grant.
+3. **Keep embedded migrations enabled (#306).** Migration
+   `029_operation_abandon.sql` is **forward-only** for SQLite and PostgreSQL.
+   It adds `abandoned` operations and retention support; SQLite rebuilds the
+   table while copying receipt metadata, CAS versions and opaque recovery bytes.
+   Leave **`KONSENSUS_SQLITE_MIGRATIONS_DIR` unset**, including in the service
+   environment, so the release binary applies its embedded migrations. An old
+   override missing 029 fails validation; do not point at an rc14 migration
+   tree, edit migration history or attempt a hand-written down migration.
+4. **Check seed encryption and approval readiness (#302, #303).** New
+   mnemonic-file encryption passwords cannot be empty or whitespace-only;
+   init, restore, seed encryption and encrypted bootstrap reject them before
+   mnemonic writes. Existing plaintext/encrypted files remain readable.
+   Upgrading alone does not encrypt the seed. Before running `seed encrypt`,
+   confirm your offline recovery-phrase backup is complete and readable, and
+   record the new encryption password somewhere safe. The command shreds the
+   plaintext seed file (overwrites, flushes and deletes it). If encryption is
+   needed, stop the service and use `konsensus seed encrypt --config <path>`
+   before step 1's final backup.
+   For owner-console approval checks after installing rc15 in step 7, start
+   with `--owner-control` and **type the seed password at startup**.
+   The seed must be encrypted with no adjacent plaintext `.txt` copy.
+   `GET /api/v1/pair/device-keys` exposes `device_approvals`: expect `enabled`;
+   `seed_not_encrypted` means plaintext seed/copy, and
+   `seed_password_not_typed` means an ineligible password source. Capability
+   flags alone do not establish readiness. The explicit local-owner exception
+   also permits `--password-fd` or authenticated remote unlock with
+   `--local-owner-device` (`--home` includes it); `--password` and
+   `--password-file` still do not qualify. Invalid explicit local-owner starts
+   refuse before startup proceeds. Follow the
+   [owner-console runbook](operations/home-node.md#enroll-your-first-owner-device)
+   and [password-input guide](operations/password-input.md); never run console
+   maintenance alongside the home service.
+5. **Use independent owner-device authority (#301, #303, #304).** With client
+   support, an enrolled owner can add another device over its own unlocked
+   Noise tunnel using signed, five-minute, single-use tickets, owner-only SAS
+   inspection and v2 delegation. Tickets are limited to five per rolling
+   15 minutes node-wide. Keep an independent owner device available.
+   `owner_device_approval_v1` allows spend-window and one-use first-contact
+   requests, approved only by a different pairing's enrolled owner device on
+   its own token and matching Noise session. Display/sign the exact node
+   terms; a request grants nothing. Refresh the requester's token after spend
+   approval to obtain spend scope. Pending requests expire and are lost on
+   restart. Check the separate `owner_device_approval_breaker_reset_v1` flag
+   before offering reset: a pairing cannot reset itself. Device resets require
+   a current signed snapshot and are limited to three successful resets per
+   grant per rolling day across restart. Reset preserves spent budget,
+   pending/unknown reservations, expiry, payee restrictions and dedupe; it
+   cannot authorize retrying an uncertain payment. Console reset remains
+   available. See [owner approvals](v2/OWNER-APPROVALS.md#owner-device-approvals-v1).
+6. **Reconcile abandoned operations (#306).** Clients supporting
+   `message_operation_abandon_v1` can use
+   `POST /api/v1/messages/operations/{id}/abandon` to fence an unused ID or a
+   prepared/released operation proven unpaid. Late compose returns
+   `operation_abandoned`; the tombstone survives recovery and compaction.
+   Payment, admission-journal and wallet evidence prevent unsafe abandonment.
+   A 409 contains the current receipt, including for an already abandoned ID:
+   inspect it rather than assuming no money moved or retrying with a new ID.
+   Proven-unpaid linked budget and orphan call reservations are released by
+   recovery without reopening abandoned operations. See
+   [durable operations](v2/EXACTLY-ONCE-OPERATIONS.md#abandoning-an-unused-operation-id).
+7. **Replace, restart and inspect.** Install the verified rc15 binary and
+   check `konsensus --version` reports `konsensus 0.3.0-rc15`. This docs branch
+   itself still reports rc14; wait for the separately prepared release.
+   Restart the same service, reconnect with the existing owner device/pins and
+   unlock. Check owner status, chain sync, balances, channels, `channel_safety`,
+   offline-safety diagnostics, grant/breaker views and `device_approvals`.
+   Confirm migration 029 applied with this read-only query, using the actual
+   SQLite database file resolved from the service's `[storage].path` (not a
+   SQLite connection URL or the backup):
+
+   ```sh
+   sqlite3 -readonly /absolute/path/to/live/database.sqlite 'SELECT version FROM _sqlx_migrations WHERE version = 29 AND success = 1;'
+   ```
+
+   Expect `29`. No row or a query error is not evidence that rollback is safe;
+   apply step 8. Inspect `pairing/clients.json`: a retained v6 file can remain
+   v6 until its first write; the first write persists v7 (including an expiry
+   cleanup write). Do not force a pairing mutation merely to change its version.
+   #307 updates locked `quinn-proto` from 0.11.15 to 0.11.18; it needs no
+   operator config change. No backend switch, fresh seed or recovery drill is part of this upgrade.
+8. **Rollback is a matched restore, not a binary swap.** Stop the node and
+   preserve the failed-upgrade state for diagnosis. Rollback means restoring
+   the coherent **pre-swap backup together with the rc14 binary**, including
+   its pre-029 database and pre-v7 pairing store. Never run rc14 against the
+   upgraded store or mix old pairing/accounting files with new state.
+   **For embedded LDK, conservatively treat LDK as started and never restore
+   the pre-swap backup if any of these is true:** rc15 ever reached `UNLOCKED`;
+   rc15 was ever started with a descriptor (`--password-fd`) or `--home`
+   password; migration 029 is recorded as applied; or you cannot tell.
+   Check the live SQLite database read-only:
+
+   ```sh
+   sqlite3 -readonly /absolute/path/to/live/database.sqlite 'SELECT version FROM _sqlx_migrations WHERE version = 29 AND success = 1;'
+   ```
+
+   `29` closes the rollback window. No row/error alone does not open it.
+   In all four cases, **keep the latest state and roll forward**. Restoration
+   is allowed only when none applies and you can establish that rc15 stopped
+   while still `LOCKED` or failed before storage opened. Storage opening
+   applies 029 and is immediately followed by Lightning provider construction;
+   do not wait for a payment or channel change as evidence. Descriptor starts
+   skip the remote `LOCKED` wait; `--home` waits for remote unlock, after which
+   construction proceeds. An active service alone does not prove it is still
+   `LOCKED`.
+   **After the first rc15 unlock**, rename the pre-swap backup's `ldk/` to
+   `ldk.STALE-DO-NOT-RESTORE/` (or quarantine it separately), and add a note
+   with the unlock time and “Stale after rc15 unlock; never restore or run
+   this channel state; keep latest state and roll forward.” Mark it stale
+   likewise if another cutoff above applies. Change only the backup's `ldk/`,
+   never the live directory. External Lightning backends need their own
+   reconciliation and recovery policy. Generation 3 and host/volume fences
+   do not prove freshness. Do not delete/lower `STATE_GENERATION`, `ldk/INSTANCE`
+   or recovery/move-home journals to force startup. See
+   [rollback safety](#state-generation-and-rollback-safety).
+
+### Test Pi: retained rc14 → rc15 upgrade
+
+This is an operator procedure, **not a completed Pi smoke test**. Keep the
+retained rc14 node's identity, funds, channels, owner enrollment and pins.
+For the system unit in the [home-node guide](operations/home-node.md#install-the-system-service),
+confirm `uname -m` is `aarch64`, inspect `systemctl cat bitsov.service`, and use
+its actual account, binary/config paths and environment. Check unit drop-ins
+and environment files too: `KONSENSUS_SQLITE_MIGRATIONS_DIR` must be unset.
+Do not run a user unit and system unit together.
+
+Independently verify the published Linux aarch64 artifact and signed checksums,
+check its `--version`, reconcile outstanding work, then stop the service and
+confirm it is inactive with no node process left running. Complete and verify
+the protected pre-swap backup in step 1 **before** installing the new binary.
+Only then replace `/usr/bin/konsensus` (or the unit's actual binary path),
+verify the installed version, start the service and inspect its status/logs.
+For a remote-unlock/`--home` unit, wait for LOCKED, reconnect with existing
+pins, and unlock into UNLOCKED. A descriptor-password start skips that wait;
+treat it as past the rollback cutoff from startup. After the first rc15
+unlock, mark the backup's `ldk/` stale as in step 8.
+Perform step 7's checks; exercise enrollment, independent approval/reset and
+abandonment only with a compatible client and deliberate test operations.
+Record artifact checksum, version, backup location, migration/pairing versions
+and smoke result in the release evidence.
+
+**On refusal**, retain the latest state and follow step 8. Treat LDK as started
+and never restore the pre-swap backup if rc15 ever reached `UNLOCKED`, ever
+started with a descriptor (`--password-fd`) or `--home` password, migration
+029 is recorded as applied, or you cannot tell. Against the actual live SQLite
+database file, use the read-only command:
+
+```sh
+sqlite3 -readonly /absolute/path/to/live/database.sqlite 'SELECT version FROM _sqlx_migrations WHERE version = 29 AND success = 1;'
+```
+
+`29` closes the rollback window; no row/error alone does not prove safety.
+In all four cases keep the latest state and roll forward. Restore only if none
+applies and rc15 stopped while `LOCKED` or failed before storage opened. After
+the first rc15 unlock (or another cutoff), rename the backup's `ldk/` to
+`ldk.STALE-DO-NOT-RESTORE/` or quarantine it, with a dated note saying it is
+stale and must never be restored/run; do not rename the live `ldk/`. For v7
+pairing files, ignore rc14's “remove the file to re-pair from scratch” hint.
+Neither a wipe nor an old SD-image restore is authorized.
+
 **rc14 preparation (2026-10-09):** seven merged PRs after `v0.3.0-rc13`
 (`d625e85`): #289–#293, #295 and #297. CLN receive/read (#297) is included
 at integration commit `8644edacd9b4231ad72006605b8a6d1daf457f48`. The release
 commit is the `main` HEAD after this docs/version PR merges, recorded
 at signing time. See the [signing checklist](releases/v0.3.0-rc14.md).
 For nodes skipping releases, apply the earlier procedures first, then
-rc13 → rc14. Historical sections describe their release's behavior; the rc14
-pairing schema and recovery guidance supersede those descriptions.
+rc13 → rc14, then the rc14 → rc15 procedure above. This retained rc14 section
+describes rc14 behavior; rc15 supersedes its pairing schema and device-reset
+authority guidance.
 
 ## Unreleased: pairing storage v8
 

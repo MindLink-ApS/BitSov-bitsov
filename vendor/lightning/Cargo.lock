@@ -430,7 +430,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "lightning"
-version = "0.2.2"
+version = "0.2.7"
 dependencies = [
  "backtrace",
  "bech32",
@@ -472,9 +472,9 @@ dependencies = [
 
 [[package]]
 name = "lightning-types"
-version = "0.3.1"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb1aac93f22f2c2eac8a0ee83bb1a1ea58673caa2c82847302710b83364d04e6"
+checksum = "c77c676d4a34cceb2ae3756916e446b4d17f9430a24107e099981f0f9aec77e6"
 dependencies = [
  "bitcoin",
 ]
@@ -558,9 +558,9 @@ dependencies = [
 
 [[package]]
 name = "possiblyrandom"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b122a615d72104fb3d8b26523fdf9232cd8ee06949fb37e4ce3ff964d15dffd"
+checksum = "9c564dbf654befd49035528299f1208a40508f6e07efb11c163444e304e4484f"
 dependencies = [
  "getrandom",
 ]

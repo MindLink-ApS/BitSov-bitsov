@@ -1,10 +1,11 @@
 # BitSov pinned Lightning patch — issue #157
 
-This directory is the crates.io **lightning 0.2.2** archive, SHA-256
-`4c90397b635e3ece6b9a723fb470a46cb9b3592f217d72e40540a5fada00289d`
-(the original root Cargo.lock checksum). The patch does not upgrade the pinned
-LDK version. Original `Cargo.toml.orig` is retained. Upstream:
-https://github.com/lightningdevkit/rust-lightning/tree/v0.2.2/lightning
+This directory is the crates.io **lightning 0.2.7** archive, SHA-256
+`982ffb82e8362ea95e03a5de8a6004bceb7a577fc1f07d5b02cfc3fc7c930a90`.
+Rebased from 0.2.2 for the October 2026 security fixes; all local patches below
+are retained. See `../../docs/security/ldk-0.2.7/README.md` for provenance,
+companion dependency updates, patch inventory and validation. Original `Cargo.toml.orig` is retained. Upstream:
+https://github.com/lightningdevkit/rust-lightning/tree/v0.2.7/lightning
 
 Local changes (plus rustfmt on these files):
 
@@ -24,8 +25,8 @@ Local changes (plus rustfmt on these files):
 - `chain/chainmonitor.rs`: pending event visibility through queueing, processing,
   ReplayEvent, and acknowledgement.
 - `Cargo.toml`: declare upstream cfg names for local linting.
-- Whitespace-only cleanup of three archive lines in `ln/channel.rs`,
-  `ln/monitor_tests.rs`, and `ln/reload_tests.rs` for `git diff --check`.
+- Whitespace-only cleanup of two archive lines in `ln/channel.rs` and
+  `ln/monitor_tests.rs` for `git diff --check`.
 - Include standard MIT/Apache license texts and a standalone test lockfile using
   the workspace Bitcoin/Lightning-types versions.
 

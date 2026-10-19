@@ -1566,12 +1566,21 @@ fn build_with_store_internal(
 
 	// Initialize the ChannelManager
 	let channel_manager = {
-		if let Ok(res) = KVStoreSync::read(
+		let channel_manager_bytes = match KVStoreSync::read(
 			&*kv_store,
 			CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
 			CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
 			CHANNEL_MANAGER_PERSISTENCE_KEY,
 		) {
+			Ok(res) => Some(res),
+			Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => None,
+			Err(e) => {
+				log_error!(logger, "Failed to read channel manager from store: {}", e);
+				return Err(BuildError::ReadFailed);
+			},
+		};
+
+		if let Some(res) = channel_manager_bytes {
 			let mut reader = Cursor::new(res);
 			let channel_monitor_references =
 				channel_monitors.iter().map(|(_, chanmon)| chanmon).collect();
@@ -2036,3 +2045,7 @@ mod tests {
 		assert_eq!(node.err().unwrap(), BuildError::InvalidNodeAlias);
 	}
 }
+
+#[cfg(test)]
+#[path = "tests/security_071_builder.rs"]
+mod security_071_tests;

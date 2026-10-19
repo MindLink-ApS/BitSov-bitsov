@@ -1,5 +1,6 @@
 [advisories]
-# Accepted until the ldk-node/sqlx SQLite dependency island is upgraded.
+# RUSTSEC-2024-0436: allow paste's unmaintained warning via sqlx-core 0.8.0; paste-free SQLx 0.8.6 needs libsqlite3-sys ^0.30, conflicting with LDK's ^0.28 pin (#59).
+# Accepted dependency debt: the ldk-node/sqlx SQLite island and test-only zip.
 #
 # Context:
 # - The workspace pins sqlx to 0.8.0 because sqlx 0.8.1+ moves to a
@@ -59,6 +60,46 @@
 # remaining island, and assess the SQL encoded-size argument. This file records
 # what is known; it does not stand in for those decisions.
 ignore = [
+  # Applicability triage 2026-10-17 — zip 0.6.6, build-dependency ONLY of
+  # corepc-node 0.10.1 and electrsd 0.36.1. The optional harnesses are enabled
+  # by konsensus-node/regtest-e2e and konsensus-lightning/ldk-integration-test.
+  # `cargo tree -i zip -e all --all-features --locked` confirms those two paths;
+  # `cargo tree -p konsensus-node -e normal,build --locked` contains no zip or
+  # harness. CI's release build enables neither feature: zip is never compiled
+  # into the shipped konsensus binary. cargo-audit still scans its lock entry.
+  #
+  # UPGRADE CHECK: crates.io release metadata on 2026-10-17 shows corepc-node
+  # 0.12.0 (Dependabot #230) still needs zip ^0.6.6; electrsd 0.42.0 still needs
+  # zip ^0.6 and bitcoind ^0.42.0, which also needs zip ^0.6.6. No released
+  # upgrade removes the affected zip dependency; the fix is zip >=9.0.0.
+  #
+  # INPUTS VERIFIED in the locked crates' build.rs and bundled hash files:
+  # corepc-node downloads Bitcoin Core 28.2 from
+  # https://bitcoincore.org/bin/bitcoin-core-28.2/<platform archive>;
+  # electrsd downloads electrs_<platform>_esplora_
+  # a33e97e1a1fc63fa9c20a116bb92579bbf43b254.zip from
+  # https://github.com/RCasatta/electrsd/releases/download/electrs_releases.
+  # Both assert the entire archive's SHA-256 against bundled checksums BEFORE
+  # parsing/extraction (corepc-node: sha256/bitcoin-core-28.2-SHA256SUMS;
+  # electrsd: sha256). Endpoint overrides and BITCOIND_TARBALL_FILE retain this
+  # check. The three-node-paid-e2e workflow separately pins the same URLs and
+  # hashes and runs sha256sum --check --strict before extraction.
+  #
+  # -0367 (SUID/SGID), -0368 (escaping symlinks), -0369 (chmod through symlinks):
+  # neither harness calls ZipArchive::extract or the stream extraction API.
+  # corepc-node uses tar.gz on Unix; on Windows it checks enclosed_name and
+  # copies only bitcoind.exe. electrsd copies entry zero to a constructed path
+  # and applies fixed 0755 permissions, not archive permission bits or symlinks.
+  # RESIDUAL RISK: zip remains vulnerable in test build tooling. Bundled hashes
+  # and pre-existing fixture files/output directories are trusted; these checks
+  # do not defend against a compromised crate/checksum or local build workspace.
+  # RECHECK TRIGGER: each corepc-node/electrsd/bitcoind upgrade, fixture URL/hash
+  # or extraction change, feature/release-build change, or runtime use of zip.
+  # Remove all three mirrored exceptions as soon as the harnesses drop zip or
+  # support >=9.0.0; this waiver does not cover any new zip consumer.
+  "RUSTSEC-2026-0367",
+  "RUSTSEC-2026-0368",
+  "RUSTSEC-2026-0369",
   # In Cargo.lock but NEVER COMPILED (the `mysql` feature is off, and neither rsa
   # nor sqlx-mysql appears in `cargo tree -e normal`). The ignore is still needed
   # because cargo-audit reads Cargo.lock and performs no feature resolution.

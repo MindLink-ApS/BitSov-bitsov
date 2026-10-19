@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "lightning"
-version = "0.2.2"
+version = "0.2.7"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -1189,9 +1189,9 @@ dependencies = [
 
 [[package]]
 name = "lightning-background-processor"
-version = "0.2.0"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abdc5450264184deba88b1dc61fa8d2ca905e21748bad556915757ac73d91103"
+checksum = "994fb200e17bbe125491cbe3f35602180a360484b9763837b9ea2130b7293b5f"
 dependencies = [
  "bitcoin",
  "bitcoin-io",
@@ -1229,9 +1229,9 @@ dependencies = [
 
 [[package]]
 name = "lightning-liquidity"
-version = "0.2.0"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58a6480d4d7726c49b4cd170b18a39563bbe897d0b8960be11d5e4a0cebd43b0"
+checksum = "75947be75873138097adb72c080a853ad576a295ac63f73d8fbeb07543c136b1"
 dependencies = [
  "bitcoin",
  "chrono",
@@ -1291,9 +1291,9 @@ dependencies = [
 
 [[package]]
 name = "lightning-transaction-sync"
-version = "0.2.1"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7260095a79a44b09ebd97e77855ec8b7996ab939223369f66244974a374bd2c"
+checksum = "dbcb06ccc3abb415465c396448562a811e4405ea3da893c52ccda31d3ed853ad"
 dependencies = [
  "bitcoin",
  "electrum-client",
@@ -1305,9 +1305,9 @@ dependencies = [
 
 [[package]]
 name = "lightning-types"
-version = "0.3.1"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb1aac93f22f2c2eac8a0ee83bb1a1ea58673caa2c82847302710b83364d04e6"
+checksum = "c77c676d4a34cceb2ae3756916e446b4d17f9430a24107e099981f0f9aec77e6"
 dependencies = [
  "bitcoin",
 ]
@@ -1471,9 +1471,9 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "possiblyrandom"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b122a615d72104fb3d8b26523fdf9232cd8ee06949fb37e4ce3ff964d15dffd"
+checksum = "9c564dbf654befd49035528299f1208a40508f6e07efb11c163444e304e4484f"
 dependencies = [
  "getrandom 0.2.17",
 ]
