@@ -3,7 +3,7 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
-## Unreleased: pairing storage v8
+## rc16 → rc17: pairing storage v8
 
 Relation-envelope identity support (`relation_envelope_id_v1`) writes
 `pairing/clients.json` as **v8**. v2–v7 stores remain readable and migrate on
@@ -15,9 +15,15 @@ and retains that binding across restart.
 
 This is **forward-only**, with no reverse migration. Older binaries refuse v8;
 keep the latest store and upgrade forward. Do not lower the version, strip
-identity fields or restore an older pairing file to bypass the fence. The
-node package version stays 0.3.0-rc16 until the next release candidate is
-cut; this change bumps the pairing file schema, not the SQL database schema.
+identity fields or restore an older pairing file to bypass the fence. rc17
+(`0.3.0-rc17`) is the first release that writes v8; this bumps the pairing
+file schema, not the SQL database schema. Replace the binary, keep the data
+directory, and start as before. A node on rc16 or older must not be started on
+a data directory that rc17 has already written.
+
+rc17 also fixes `konsensus sign-challenge` for encrypted seeds (#317), which
+is needed to mint the owner token for `open-channel`. No config change is
+required for either change.
 API details:
 [per-approval envelope identity](security/device-keys.md#per-approval-envelope-identity).
 

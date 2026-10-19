@@ -5,6 +5,14 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+## [0.3.0-rc17] — 2026-10-19 (prep; not tagged yet)
+
+**Pre-release.** Not for production use. rc17 is rc16 (`8c6565f`) plus the
+relation envelope identity (#312), the `sign-challenge` encrypted-seed fix
+(#317) and the LAW 02 floor docs (#316). See the [rc17 signing checklist](docs/releases/v0.3.0-rc17.md).
+**Pairing storage becomes v8 (forward-only):** after rc17 writes it, rc16 and
+older refuse the pairing store. Upgrade forward only.
+
 ### Node / Security
 
 - Add `relation_envelope_id_v1`: every accepted contact relation intent returns
@@ -14,7 +22,20 @@ also live on the corresponding GitHub pre-release pages.
   storage v8 migrates v2–v7 on write, leaving legacy/unknown identities null.
   The migration is forward-only; older binaries refuse v8. See
   [envelope identity](docs/security/device-keys.md#per-approval-envelope-identity)
-  and [upgrade guidance](docs/UPGRADING.md#unreleased-pairing-storage-v8).
+  and [upgrade guidance](docs/UPGRADING.md#rc16--rc17-pairing-storage-v8).
+- Fix `konsensus sign-challenge` with an encrypted `mnemonic.enc` (#317). It
+  previously always decrypted with an empty password and failed, so no owner
+  could mint the full-scope `/api/v1/auth/token` that `open-channel`,
+  `send-onchain`, `close-channel`, `/peers` and `/invites` require. It now
+  takes the password like `start`: terminal prompt (not echoed),
+  `--password-fd`, `--password-file` (regular chmod-600 file) or `--password`.
+  `docs/ops/owner-token.sh` forwards `KONSENSUS_PASSWORD_FD`,
+  `KONSENSUS_PASSWORD_FILE` or `KONSENSUS_PASSWORD`. Known gap: `konsensus
+  node-id` still cannot read an encrypted seed (fails closed, prints nothing).
+
+### Release metadata
+
+- Bump all 14 workspace packages to `0.3.0-rc17`; dependency versions are unchanged.
 
 ## [0.3.0-rc16] — 2026-10-17 (prep; not tagged yet)
 
