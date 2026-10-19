@@ -1,6 +1,10 @@
 //! Password handoff through stdin and an inherited Unix descriptor.
 #![cfg(unix)]
 
+#[allow(dead_code)] // The fixture reader does not use every production crypto entry point.
+#[path = "../src/mnemonic_crypto.rs"]
+mod mnemonic_crypto;
+
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::{net::UnixStream, process::CommandExt};
@@ -68,6 +72,136 @@ fn init(dir: &Path, inherited: bool) -> Output {
     cmd.args(["init", "--non-interactive", "--tier", "light", "--dir"])
         .arg(dir);
     input(cmd, format!("{PASSWORD}\r\n").as_bytes(), inherited)
+}
+
+const CHALLENGE: &str =
+    "bitsov-auth-v1:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff:1700000000";
+
+fn sign_challenge(path_flag: &str, path: &Path) -> Command {
+    let mut cmd = bin();
+    cmd.args(["sign-challenge", "--challenge", CHALLENGE, path_flag])
+        .arg(path);
+    cmd
+}
+
+#[test]
+fn sign_challenge_encrypted_seed_matches_plaintext_identity() {
+    use ed25519_dalek::Verifier;
+
+    let dir = tempfile::tempdir().unwrap();
+    assert!(init(dir.path(), false).status.success());
+    let encrypted = dir.path().join("mnemonic.enc");
+    let original = std::fs::read(&encrypted).unwrap();
+    let mnemonic = mnemonic_crypto::read_mnemonic(&encrypted, Some(PASSWORD)).unwrap();
+    let plaintext = dir.path().join("mnemonic.txt");
+    std::fs::write(&plaintext, mnemonic.as_str()).unwrap();
+    let identity = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, "").unwrap();
+    let plain = sign_challenge("--mnemonic", &plaintext)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(plain.status.success());
+    assert!(plain.stderr.is_empty(), "plaintext must not prompt");
+    let signature = ed25519_dalek::Signature::from_slice(
+        &hex::decode(String::from_utf8_lossy(&plain.stdout).trim()).unwrap(),
+    )
+    .unwrap();
+    identity
+        .ed25519_verifying_key()
+        .verify(CHALLENGE.as_bytes(), &signature)
+        .unwrap();
+
+    for inherited in [false, true] {
+        for (flag, path) in [
+            ("--mnemonic", encrypted.clone()),
+            ("--config", dir.path().join("konsensus.toml")),
+        ] {
+            let out = input(
+                sign_challenge(flag, &path),
+                format!("{PASSWORD}\r\n").as_bytes(),
+                inherited,
+            );
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(out.stdout, plain.stdout);
+            assert!(out.stderr.is_empty(), "descriptor input must not prompt");
+        }
+    }
+    assert_eq!(std::fs::read(&encrypted).unwrap(), original);
+    assert_eq!(
+        std::fs::read_to_string(&plaintext).unwrap(),
+        mnemonic.as_str()
+    );
+}
+
+#[test]
+fn sign_challenge_wrong_password_fails_without_signature_or_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(init(dir.path(), false).status.success());
+    let encrypted = dir.path().join("mnemonic.enc");
+    let original = std::fs::read(&encrypted).unwrap();
+    for inherited in [false, true] {
+        let out = input(
+            sign_challenge("--mnemonic", &encrypted),
+            b"wrong-signing-password",
+            inherited,
+        );
+        assert!(!out.status.success());
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("decryption failed"));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
+    }
+    assert_eq!(std::fs::read(&encrypted).unwrap(), original);
+}
+
+#[test]
+fn sign_challenge_encrypted_seed_requires_terminal_or_explicit_descriptor() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(init(dir.path(), false).status.success());
+    let encrypted = dir.path().join("mnemonic.enc");
+    let out = sign_challenge("--mnemonic", &encrypted)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("failed to read password from terminal"));
+
+    let out = sign_challenge("--mnemonic", &encrypted)
+        .args(["--password-fd", "2147483647"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("cannot read password descriptor"));
+    assert!(!error.contains("Enter password"));
+}
+
+#[test]
+fn sign_challenge_plaintext_needs_no_password_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about\n";
+    let path = dir.path().join("mnemonic.txt");
+    std::fs::write(&path, mnemonic).unwrap();
+    // An unusable descriptor must not be read for a plaintext mnemonic.
+    let out = sign_challenge("--mnemonic", &path)
+        .args(["--password-fd", "2147483647"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stderr.is_empty());
+    assert_eq!(out.stdout.len(), 129);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), mnemonic);
 }
 
 #[test]

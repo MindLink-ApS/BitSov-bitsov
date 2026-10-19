@@ -29,6 +29,14 @@ impl Drop for Terminal {
 
 impl Terminal {
     fn spawn(command: &str, dir: &std::path::Path) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_konsensus"));
+        cmd.args([command, "--dir"])
+            .arg(dir)
+            .args(["--tier", "full", "--encrypt"]);
+        Self::spawn_command(cmd, false)
+    }
+
+    fn spawn_command(mut cmd: Command, detached_stdin: bool) -> Self {
         let mut master = -1;
         let mut slave = -1;
         // SAFETY: openpty initializes both descriptors; optional settings are null.
@@ -59,18 +67,18 @@ impl Terminal {
             unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
             0
         );
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_konsensus"));
-        cmd.args([command, "--dir"])
-            .arg(dir)
-            .args(["--tier", "full", "--encrypt"])
-            .stdin(Stdio::from(slave.try_clone().unwrap()))
-            .stdout(Stdio::from(slave.try_clone().unwrap()))
-            .stderr(Stdio::from(slave.try_clone().unwrap()));
-        // SAFETY: only syscalls run after fork. Stdio has installed the slave on fd 0;
+        cmd.stdin(if detached_stdin {
+            Stdio::null()
+        } else {
+            Stdio::from(slave.try_clone().unwrap())
+        })
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()));
+        // SAFETY: only syscalls run after fork. Stdio has installed the slave on fd 2;
         // a new session plus TIOCSCTTY makes /dev/tty resolve to this isolated PTY.
         unsafe {
             cmd.pre_exec(|| {
-                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                if libc::setsid() == -1 || libc::ioctl(2, libc::TIOCSCTTY as _, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -141,7 +149,14 @@ impl Terminal {
     }
 
     fn enter_password(&mut self, password: &str) {
-        self.read_until("Enter a non-empty password to encrypt your mnemonic:");
+        self.enter_password_at(
+            "Enter a non-empty password to encrypt your mnemonic:",
+            password,
+        );
+    }
+
+    fn enter_password_at(&mut self, prompt: &str, password: &str) {
+        self.read_until(prompt);
         // The prompt is flushed just before rpassword disables echo. Synchronize
         // on terminal state instead of racing that transition with password input.
         // Still send on timeout so the regression also observes the actual echo.
@@ -151,6 +166,57 @@ impl Terminal {
         }
         writeln!(self.master.as_mut().unwrap(), "{password}").unwrap();
     }
+}
+
+#[test]
+fn sign_challenge_reads_controlling_terminal_without_echoing_password() {
+    const PASSWORD: &str = "  signing-tty-secret-é  ";
+    const CHALLENGE: &str =
+        "bitsov-auth-v1:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff:1700000000";
+    let temp = tempfile::tempdir().unwrap();
+    let mut init = Command::new(env!("CARGO_BIN_EXE_konsensus"))
+        .args(["init", "--non-interactive", "--tier", "light", "--dir"])
+        .arg(temp.path())
+        .args(["--password-fd", "0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(init.stdin.take().unwrap(), "{PASSWORD}").unwrap();
+    assert!(init.wait_with_output().unwrap().status.success());
+
+    let signing_command = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_konsensus"));
+        cmd.args(["sign-challenge", "--challenge", CHALLENGE, "--config"])
+            .arg(temp.path().join("konsensus.toml"));
+        cmd
+    };
+    let mut descriptor = signing_command()
+        .args(["--password-fd", "0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(descriptor.stdin.take().unwrap(), "{PASSWORD}").unwrap();
+    let expected = descriptor.wait_with_output().unwrap();
+    assert!(expected.status.success());
+    let signature = String::from_utf8(expected.stdout).unwrap();
+
+    // stdin is /dev/null: only the controlling terminal can supply the password.
+    let mut terminal = Terminal::spawn_command(signing_command(), true);
+    terminal.enter_password_at(
+        "Encrypted mnemonic file detected. Enter password:",
+        PASSWORD,
+    );
+    terminal.read_until(signature.trim());
+    assert!(!terminal.output.contains("signing-tty-secret"));
+    assert!(
+        terminal.echo_enabled(),
+        "signing must restore terminal echo"
+    );
+    assert!(terminal.child.wait().unwrap().success());
 }
 
 #[test]

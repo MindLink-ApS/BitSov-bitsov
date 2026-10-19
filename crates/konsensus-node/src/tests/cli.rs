@@ -317,7 +317,9 @@ fn parse_sign_challenge() {
             mnemonic,
             config,
             passphrase,
+            password_fd,
         } => {
+            assert!(password_fd.is_none());
             assert_eq!(challenge, "bitsov-auth-v1:ab:1");
             assert_eq!(mnemonic, Some(PathBuf::from("/keys/m.txt")));
             assert!(config.is_none());
@@ -343,7 +345,9 @@ fn parse_sign_challenge_with_config() {
             mnemonic,
             config,
             passphrase,
+            password_fd,
         } => {
+            assert!(password_fd.is_none());
             assert_eq!(challenge, "bitsov-auth-v1:cd:2");
             assert!(mnemonic.is_none());
             assert_eq!(config, Some(PathBuf::from("/data/konsensus.toml")));
@@ -371,7 +375,9 @@ fn parse_sign_challenge_with_passphrase() {
             mnemonic,
             config,
             passphrase,
+            password_fd,
         } => {
+            assert!(password_fd.is_none());
             assert_eq!(challenge, "bitsov-auth-v1:ef:3");
             assert_eq!(mnemonic, Some(PathBuf::from("/keys/m.txt")));
             assert!(config.is_none());

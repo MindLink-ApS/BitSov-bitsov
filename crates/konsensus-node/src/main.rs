@@ -296,9 +296,10 @@ async fn main() -> Result<()> {
             mnemonic,
             config,
             passphrase,
+            password_fd,
         } => {
             let mnemonic_path = resolve_mnemonic_path(mnemonic, config)?;
-            cmd_sign_challenge(&mnemonic_path, &passphrase, &challenge)?;
+            cmd_sign_challenge(&mnemonic_path, &passphrase, &challenge, password_fd)?;
         }
         Command::MoveHome(args) => move_home_cmd::run(args).await?,
         Command::Recover(args) => recover_cmd::run(args).await?,
@@ -817,8 +818,13 @@ fn cmd_node_id(mnemonic_path: &Path, passphrase: &str) -> Result<()> {
 /// `konsensus sign-challenge` — sign a live `/auth/challenge` string; print hex.
 ///
 /// The mnemonic file is read for key material only and is never written to stdout.
-fn cmd_sign_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) -> Result<()> {
-    let signature = sign_auth_challenge(mnemonic_path, passphrase, challenge)?;
+fn cmd_sign_challenge(
+    mnemonic_path: &Path,
+    passphrase: &str,
+    challenge: &str,
+    password_fd: Option<i32>,
+) -> Result<()> {
+    let signature = sign_auth_challenge(mnemonic_path, passphrase, challenge, password_fd)?;
     println!("{signature}");
     Ok(())
 }
@@ -842,7 +848,12 @@ fn is_well_formed_auth_challenge(challenge: &str) -> bool {
 }
 
 /// Produce the hex Ed25519 signature `/api/v1/auth/token` expects for `challenge`.
-fn sign_auth_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) -> Result<String> {
+fn sign_auth_challenge(
+    mnemonic_path: &Path,
+    passphrase: &str,
+    challenge: &str,
+    password_fd: Option<i32>,
+) -> Result<String> {
     let challenge = challenge.trim();
     if challenge.is_empty() {
         anyhow::bail!("challenge is required (from GET /api/v1/auth/challenge)");
@@ -854,8 +865,23 @@ fn sign_auth_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) 
         );
     }
 
-    let mnemonic = mnemonic_crypto::read_mnemonic(mnemonic_path, None)
-        .with_context(|| format!("failed to read mnemonic from {}", mnemonic_path.display()))?;
+    let password = if mnemonic_crypto::is_encrypted_path(mnemonic_path) {
+        Some(match password_fd {
+            Some(fd) => password::read_password_fd(fd)?,
+            None => {
+                eprintln!("Encrypted mnemonic file detected. Enter password:");
+                Zeroizing::new(
+                    rpassword::read_password().context("failed to read password from terminal")?,
+                )
+            }
+        })
+    } else {
+        None
+    };
+    let mnemonic =
+        mnemonic_crypto::read_mnemonic(mnemonic_path, password.as_deref().map(String::as_str))
+            .with_context(|| format!("failed to read mnemonic from {}", mnemonic_path.display()))?;
+    drop(password);
 
     let identity = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, passphrase)
         .context("failed to derive identity from mnemonic")?;

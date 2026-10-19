@@ -5,6 +5,10 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Fix `konsensus sign-challenge` with encrypted mnemonic files: prompt securely
+  on the controlling terminal or accept `--password-fd`, while plaintext files
+  continue to sign without a password prompt.
+
 ## [0.3.0-rc16] — 2026-10-17 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. Includes the rc15 content and security

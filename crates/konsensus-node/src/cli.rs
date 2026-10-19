@@ -197,6 +197,12 @@ pub enum Command {
         /// BIP-39 passphrase (optional).
         #[arg(short, long, default_value = "")]
         passphrase: String,
+
+        /// Read the mnemonic-file password once to EOF from an inherited descriptor
+        /// (0 = stdin). UTF-8, at most 4096 bytes; trailing CR/LF is removed.
+        /// Encrypted files prompt on the terminal if omitted; plaintext needs no password.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..))]
+        password_fd: Option<i32>,
     },
 
     /// Approve a first contact or sponsor gift on the owner's local node.
