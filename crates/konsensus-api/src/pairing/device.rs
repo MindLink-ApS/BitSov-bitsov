@@ -189,6 +189,14 @@ pub enum DeviceKeyStatus {
     Absent,
 }
 
+/// One accepted approval and its aggregate grant snapshot, captured under the
+/// same lock and returned only after the identity, terms and nonce are durable.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelationIntentOutcome {
+    pub envelope_id: String,
+    pub grant: GrantView,
+}
+
 /// The terms a device signs to open or renew one peer's envelope.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1110,7 +1118,7 @@ impl PairingService {
         epoch: u64,
         intent: &RelationIntent,
         signature_hex: &str,
-    ) -> Result<GrantView, PairingError> {
+    ) -> Result<RelationIntentOutcome, PairingError> {
         if !self.owner_control_enabled && !self.local_owner_device {
             return Err(PairingError::OwnerChannelUnavailable);
         }
@@ -1246,7 +1254,8 @@ impl PairingService {
             .budget
             .as_mut()
             .ok_or(PairingError::Io("grant vanished".into()))?;
-        budget.open_envelope(&peer, intent.budget_msat, intent.per_act_max_msat, expires);
+        let envelope_id =
+            budget.open_envelope(&peer, intent.budget_msat, intent.per_act_max_msat, expires);
         // A fresh signature renews the grant: it lives until its last envelope,
         // which is never more than 24 h from now.
         let last = budget
@@ -1278,7 +1287,10 @@ impl PairingService {
             window_secs = intent.window_secs,
             "device-signed relation envelope opened"
         );
-        Ok(view)
+        Ok(RelationIntentOutcome {
+            envelope_id,
+            grant: view,
+        })
     }
 
     /// The registered key an intent names, for this client at its current

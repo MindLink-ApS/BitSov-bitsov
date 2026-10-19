@@ -6,9 +6,9 @@ A paired client's `spend` now comes only from a **budget grant**: an absolute
 expiry (at most 24 h), a total budget, optional per-recipient budgets and a
 per-call maximum. The 30-day unmetered grant is gone. A pre-G1 grant without a
 budget is dropped when the pairing store is opened and is never honoured. The
-store is now version 7. Older nodes refuse to open it rather than ignore
-allowlists, payment deduplication, circuit breakers or device-reset limits;
-existing version 2–6 grants remain readable.
+store is now version 8. Older nodes refuse to open it rather than ignore
+allowlists, payment deduplication, circuit breakers, device-reset limits or
+envelope identities; existing version 2–7 grants remain readable.
 
 ## Owner flow (one command per budget window)
 
@@ -44,6 +44,12 @@ existing version 2–6 grants remain readable.
    grant (`budget_msat`, `used_msat`, `remaining_msat`, `per_call_max_msat`,
    `per_recipient_msat`, `used_by_recipient`, `granted_at`, `expires_at`), or
    `{"grant": null}`.
+
+Relation grant views also expose `envelope_id_by_recipient`: each recipient's
+current approval ID, or null when unknown/legacy. `POST /pair/relation-intent`
+returns the accepted `envelope_id` alongside `grant`. Renewing the same peer
+creates a new ID even when the aggregate `op_id` and terms are unchanged.
+See [the envelope identity contract](security/device-keys.md#per-approval-envelope-identity).
 
 Revoke now: `konsensus grant-revoke --client-id <id>` (or `--all`). The pairing
 stays with read+receive. Revoking, bumping or deleting a pairing, rotating its
