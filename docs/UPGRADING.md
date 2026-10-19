@@ -17,7 +17,8 @@ This is **forward-only**, with no reverse migration. Older binaries refuse v8;
 keep the latest store and upgrade forward. Do not lower the version, strip
 identity fields or restore an older pairing file to bypass the fence. The
 node package version stays 0.3.0-rc16 until the next release candidate is
-cut; this change bumps the pairing file schema, not the SQL database schema. API details:
+cut; this change bumps the pairing file schema, not the SQL database schema.
+API details:
 [per-approval envelope identity](security/device-keys.md#per-approval-envelope-identity).
 
 ## rc15 → rc16
