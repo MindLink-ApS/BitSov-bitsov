@@ -317,11 +317,17 @@ fn parse_sign_challenge() {
             mnemonic,
             config,
             passphrase,
+            password,
+            password_file,
+            password_fd,
         } => {
             assert_eq!(challenge, "bitsov-auth-v1:ab:1");
             assert_eq!(mnemonic, Some(PathBuf::from("/keys/m.txt")));
             assert!(config.is_none());
             assert_eq!(passphrase, "");
+            assert!(password.is_none());
+            assert!(password_file.is_none());
+            assert!(password_fd.is_none());
         }
         _ => panic!("expected SignChallenge command"),
     }
@@ -343,11 +349,17 @@ fn parse_sign_challenge_with_config() {
             mnemonic,
             config,
             passphrase,
+            password,
+            password_file,
+            password_fd,
         } => {
             assert_eq!(challenge, "bitsov-auth-v1:cd:2");
             assert!(mnemonic.is_none());
             assert_eq!(config, Some(PathBuf::from("/data/konsensus.toml")));
             assert_eq!(passphrase, "");
+            assert!(password.is_none());
+            assert!(password_file.is_none());
+            assert!(password_fd.is_none());
         }
         _ => panic!("expected SignChallenge command"),
     }
@@ -371,11 +383,17 @@ fn parse_sign_challenge_with_passphrase() {
             mnemonic,
             config,
             passphrase,
+            password,
+            password_file,
+            password_fd,
         } => {
             assert_eq!(challenge, "bitsov-auth-v1:ef:3");
             assert_eq!(mnemonic, Some(PathBuf::from("/keys/m.txt")));
             assert!(config.is_none());
             assert_eq!(passphrase, "my-pass");
+            assert!(password.is_none());
+            assert!(password_file.is_none());
+            assert!(password_fd.is_none());
         }
         _ => panic!("expected SignChallenge command"),
     }
@@ -449,6 +467,74 @@ fn parse_sign_challenge_missing_both_fails() {
 fn parse_sign_challenge_missing_challenge_fails() {
     let result = Cli::try_parse_from(["konsensus", "sign-challenge", "--mnemonic", "/keys/m.txt"]);
     assert!(result.is_err());
+}
+
+#[test]
+fn parse_sign_challenge_password_sources_match_start() {
+    let cli = Cli::parse_from([
+        "konsensus",
+        "sign-challenge",
+        "--challenge",
+        "bitsov-auth-v1:ab:1",
+        "--mnemonic",
+        "/keys/m.enc",
+        "--password-fd",
+        "3",
+    ]);
+    match cli.command {
+        Command::SignChallenge {
+            password,
+            password_file,
+            password_fd,
+            ..
+        } => {
+            assert!(password.is_none());
+            assert!(password_file.is_none());
+            assert_eq!(password_fd, Some(3));
+        }
+        _ => panic!("expected SignChallenge command"),
+    }
+    let cli = Cli::parse_from([
+        "konsensus",
+        "sign-challenge",
+        "--challenge",
+        "bitsov-auth-v1:ab:1",
+        "--mnemonic",
+        "/keys/m.enc",
+        "--password-file",
+        "/keys/pw",
+    ]);
+    match cli.command {
+        Command::SignChallenge {
+            password_file,
+            password,
+            password_fd,
+            ..
+        } => {
+            assert_eq!(password_file, Some(PathBuf::from("/keys/pw")));
+            assert!(password.is_none());
+            assert!(password_fd.is_none());
+        }
+        _ => panic!("expected SignChallenge command"),
+    }
+    for extra in ["--password", "--password-file"] {
+        assert!(
+            Cli::try_parse_from([
+                "konsensus",
+                "sign-challenge",
+                "--challenge",
+                "bitsov-auth-v1:ab:1",
+                "--mnemonic",
+                "/keys/m.enc",
+                "--password-fd",
+                "0",
+                extra,
+                "secret",
+            ])
+            .is_err(),
+            "{extra} must conflict with --password-fd"
+        );
+    }
 }
 
 #[test]

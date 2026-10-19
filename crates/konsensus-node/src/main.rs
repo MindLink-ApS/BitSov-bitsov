@@ -158,22 +158,7 @@ async fn main() -> Result<()> {
             } else {
                 PasswordSource::None
             };
-            let password = password.map(Zeroizing::new);
-            let password = match &password_file {
-                Some(path) => {
-                    eprintln!(
-                        "WARNING: reading the recovery-phrase password from {}. Any program running as \
-                         this user can read that file, so the seed is protected from other OS users \
-                         only. Prompting at start is the stronger setting.",
-                        path.display()
-                    );
-                    Some(seed_cmd::read_password_file(path)?)
-                }
-                None => match password_fd {
-                    Some(fd) => Some(password::read_password_fd(fd)?),
-                    None => password,
-                },
-            };
+            let password = supplied_seed_password(password, password_file.as_deref(), password_fd)?;
             cmd_start(
                 &config,
                 password,
@@ -296,9 +281,13 @@ async fn main() -> Result<()> {
             mnemonic,
             config,
             passphrase,
+            password,
+            password_file,
+            password_fd,
         } => {
             let mnemonic_path = resolve_mnemonic_path(mnemonic, config)?;
-            cmd_sign_challenge(&mnemonic_path, &passphrase, &challenge)?;
+            let password = supplied_seed_password(password, password_file.as_deref(), password_fd)?;
+            cmd_sign_challenge(&mnemonic_path, &passphrase, &challenge, password)?;
         }
         Command::MoveHome(args) => move_home_cmd::run(args).await?,
         Command::Recover(args) => recover_cmd::run(args).await?,
@@ -814,11 +803,78 @@ fn cmd_node_id(mnemonic_path: &Path, passphrase: &str) -> Result<()> {
     Ok(())
 }
 
+/// Password from `--password`, `--password-file`, or `--password-fd`.
+///
+/// The three inputs are mutually exclusive at the CLI. Absent all three,
+/// returns `None` so the caller can prompt. The password is never logged.
+/// `--password-file` uses [`seed_cmd::read_password_file`] (chmod 600, regular
+/// file). `--password-fd` uses [`password::read_password_fd`] (one read to EOF,
+/// trailing CR/LF stripped, 4096-byte maximum).
+fn supplied_seed_password(
+    password: Option<String>,
+    password_file: Option<&Path>,
+    password_fd: Option<i32>,
+) -> Result<Option<Zeroizing<String>>> {
+    if let Some(path) = password_file {
+        eprintln!(
+            "WARNING: reading the recovery-phrase password from {}. Any program running as \
+             this user can read that file, so the seed is protected from other OS users \
+             only. Prompting at start is the stronger setting.",
+            path.display()
+        );
+        return Ok(Some(seed_cmd::read_password_file(path)?));
+    }
+    if let Some(fd) = password_fd {
+        return Ok(Some(password::read_password_fd(fd)?));
+    }
+    Ok(password.map(Zeroizing::new))
+}
+
+/// Interactive prompt used when an `.enc` mnemonic has no password flag.
+/// The typed password is not echoed.
+fn prompt_encrypted_mnemonic_password() -> Result<Zeroizing<String>> {
+    eprintln!("Encrypted mnemonic file detected. Enter password:");
+    let password = rpassword::read_password().context("failed to read password from terminal")?;
+    Ok(Zeroizing::new(password))
+}
+
+/// Password `read_mnemonic` should use, and whether it was typed at the prompt.
+///
+/// Plaintext files drop a supplied password. Encrypted files use it, or prompt
+/// when none was given. `start` records a prompt as `PasswordSource::Typed`.
+fn mnemonic_password(
+    path: &Path,
+    password: Option<Zeroizing<String>>,
+) -> Result<(Option<Zeroizing<String>>, bool)> {
+    if mnemonic_crypto::is_encrypted_path(path) {
+        match password {
+            Some(password) => Ok((Some(password), false)),
+            None => Ok((Some(prompt_encrypted_mnemonic_password()?), true)),
+        }
+    } else {
+        drop(password);
+        Ok((None, false))
+    }
+}
+
 /// `konsensus sign-challenge` — sign a live `/auth/challenge` string; print hex.
 ///
 /// The mnemonic file is read for key material only and is never written to stdout.
-fn cmd_sign_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) -> Result<()> {
-    let signature = sign_auth_challenge(mnemonic_path, passphrase, challenge)?;
+/// `password` is zeroized after the signature is produced.
+fn cmd_sign_challenge(
+    mnemonic_path: &Path,
+    passphrase: &str,
+    challenge: &str,
+    password: Option<Zeroizing<String>>,
+) -> Result<()> {
+    let (password, _) = mnemonic_password(mnemonic_path, password)?;
+    let signature = sign_auth_challenge(
+        mnemonic_path,
+        passphrase,
+        challenge,
+        password.as_deref().map(String::as_str),
+    )?;
+    drop(password);
     println!("{signature}");
     Ok(())
 }
@@ -842,7 +898,12 @@ fn is_well_formed_auth_challenge(challenge: &str) -> bool {
 }
 
 /// Produce the hex Ed25519 signature `/api/v1/auth/token` expects for `challenge`.
-fn sign_auth_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) -> Result<String> {
+fn sign_auth_challenge(
+    mnemonic_path: &Path,
+    passphrase: &str,
+    challenge: &str,
+    password: Option<&str>,
+) -> Result<String> {
     let challenge = challenge.trim();
     if challenge.is_empty() {
         anyhow::bail!("challenge is required (from GET /api/v1/auth/challenge)");
@@ -854,7 +915,7 @@ fn sign_auth_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) 
         );
     }
 
-    let mnemonic = mnemonic_crypto::read_mnemonic(mnemonic_path, None)
+    let mnemonic = mnemonic_crypto::read_mnemonic(mnemonic_path, password)
         .with_context(|| format!("failed to read mnemonic from {}", mnemonic_path.display()))?;
 
     let identity = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, passphrase)
@@ -1126,21 +1187,11 @@ async fn cmd_start(
     // If the mnemonic file is encrypted and no password was provided via CLI,
     // prompt interactively. This avoids silently using an empty password which
     // would produce a decryption error.
-    let mnemonic_password = if mnemonic_crypto::is_encrypted_path(&config.identity.mnemonic_file) {
-        match password {
-            Some(pw) => Some(pw),
-            None => {
-                eprintln!("Encrypted mnemonic file detected. Enter password:");
-                let password =
-                    rpassword::read_password().context("failed to read password from terminal")?;
-                password_source = PasswordSource::Typed;
-                Some(Zeroizing::new(password))
-            }
-        }
-    } else {
-        drop(password);
-        None
-    };
+    let (mnemonic_password, prompted) =
+        mnemonic_password(&config.identity.mnemonic_file, password)?;
+    if prompted {
+        password_source = PasswordSource::Typed;
+    }
 
     // Validate explicit local authority before file logging, state-generation
     // markers, wallet/storage construction or listeners can write/start.

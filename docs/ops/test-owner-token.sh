@@ -216,6 +216,74 @@ else
   bad "xtrace leaked token: $trace_leaks"
 fi
 
+# --- 5) encrypted seed: forward one password flag, never echo the secret ---
+args_file="$WORK/sign-args"
+cat >"$WORK/konsensus" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "${OWNER_TOKEN_ARGS_FILE:?}"
+printf '%s\n' "$(printf 'ab%.0s' {1..64})"
+EOF
+chmod +x "$WORK/konsensus"
+
+password_probe() {
+  local label="$1"
+  shift
+  rm -f "$args_file"
+  local out
+  out="$(
+    env -u KONSENSUS_PASSWORD -u KONSENSUS_PASSWORD_FILE -u KONSENSUS_PASSWORD_FD \
+      PATH="$WORK:$PATH" \
+      OWNER_TOKEN_ARGS_FILE="$args_file" \
+      BITSOV_API_BASE="$TEST_API_BASE" \
+      KONSENSUS_MNEMONIC="$WORK/mnemonic.enc" \
+      KONSENSUS_BIN="$WORK/konsensus" \
+      "$@" \
+      bash --norc -c '
+        set +eu
+        # shellcheck disable=SC1090
+        source "'"$SCRIPT"'"
+        echo rc=$?
+      ' 2>"$WORK/stderr-pw"
+  )" || true
+  local args="" stderr=""
+  [[ -f "$args_file" ]] && args="$(cat "$args_file")"
+  stderr="$(cat "$WORK/stderr-pw")"
+  if echo "$out" | grep -q 'rc=0' && [[ "$args" == *"$label"* ]]; then
+    ok "forwards $label"
+  else
+    bad "expected $label in sign-challenge args, got args=[$args] out=[$out]"
+  fi
+  if echo "$stderr" | grep -q 'super-secret-pw'; then
+    bad "password echoed on stderr: $stderr"
+  else
+    ok "password not echoed for $label"
+  fi
+}
+
+password_probe "--password-fd 3" KONSENSUS_PASSWORD_FD=3
+password_probe "--password-file $WORK/pw" KONSENSUS_PASSWORD_FILE="$WORK/pw"
+password_probe "--password super-secret-pw" KONSENSUS_PASSWORD=super-secret-pw
+
+conflict="$(
+  PATH="$WORK:$PATH" \
+  BITSOV_API_BASE="$TEST_API_BASE" \
+  KONSENSUS_MNEMONIC="$WORK/mnemonic.enc" \
+  KONSENSUS_PASSWORD_FD=3 \
+  KONSENSUS_PASSWORD_FILE="$WORK/pw" \
+  KONSENSUS_BIN="$WORK/konsensus" \
+  bash --norc -c '
+    set +eu
+    # shellcheck disable=SC1090
+    source "'"$SCRIPT"'"
+    echo rc=$?
+  ' 2>&1
+)" || true
+if echo "$conflict" | grep -q 'set only one' && echo "$conflict" | grep -q 'rc=1'; then
+  ok "rejects combined password sources"
+else
+  bad "combined password sources: $conflict"
+fi
+
 echo
 echo "owner-token tests: $PASS passed, $FAIL failed (root=$ROOT)"
 [[ "$FAIL" -eq 0 ]]
