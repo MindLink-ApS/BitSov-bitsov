@@ -300,7 +300,7 @@ async fn relation_intent(
     Json(body): Json<RelationIntentRequest>,
 ) -> Result<Json<RelationIntentResponse>, ApiError> {
     let binding = binding(&auth)?;
-    let grant = service(&state)?
+    let accepted = service(&state)?
         .apply_relation_intent(
             &binding.client_id,
             binding.epoch,
@@ -308,12 +308,17 @@ async fn relation_intent(
             &body.signature,
         )
         .map_err(map_err)?;
-    Ok(Json(RelationIntentResponse { grant }))
+    Ok(Json(RelationIntentResponse {
+        envelope_id: accepted.envelope_id,
+        grant: accepted.grant,
+    }))
 }
 
 /// `POST /api/v1/pair/relation-intent` response: the client's relation grant.
 #[derive(Debug, Serialize)]
 pub struct RelationIntentResponse {
+    /// Identity of this accepted approval, independent of the aggregate grant.
+    pub envelope_id: String,
     /// The grant as `GET /api/v1/pair/grant` reports it.
     pub grant: GrantView,
 }

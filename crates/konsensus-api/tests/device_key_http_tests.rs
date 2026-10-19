@@ -442,6 +442,18 @@ async fn register_device_over_http(headless: bool, remote: bool) {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["grant"]["recipients_only"], true);
+    let envelope_a = body["envelope_id"]
+        .as_str()
+        .expect("relation-intent envelope_id");
+    assert_eq!(body["grant"]["envelope_id_by_recipient"][PEER], envelope_a);
+    let (status, status_body) =
+        call(&state, "GET", "/api/v1/status", None, Some(&read_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(status_body["api_capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "relation_envelope_id_v1"));
 
     // A fresh token now carries spend, and GET /pair/grant shows the envelope.
     let spend = token().await;
@@ -468,6 +480,22 @@ async fn register_device_over_http(headless: bool, remote: bool) {
     assert_eq!(
         grant["grant"]["per_act_max_by_recipient"][PEER], 20_000,
         "{grant}"
+    );
+
+    assert_eq!(grant["grant"]["envelope_id_by_recipient"][PEER], envelope_a);
+    let mut renewal = intent.clone();
+    renewal.nonce = "10".repeat(16);
+    let (status, renewed) = call(&state, "POST", "/api/v1/pair/relation-intent",
+        Some(json!({"intent": renewal, "signature": sign(&intent_message(&fp, &client.client_id, &renewal))})),
+        Some(&read_token)).await;
+    assert_eq!(status, StatusCode::OK, "{renewed}");
+    assert!(renewed["envelope_id"].is_string());
+    assert_ne!(renewed["envelope_id"], envelope_a);
+    assert_eq!(renewed["grant"]["op_id"], body["grant"]["op_id"]);
+    let (_, current) = call(&state, "GET", "/api/v1/pair/grant", None, Some(&read_token)).await;
+    assert_eq!(
+        current["grant"]["envelope_id_by_recipient"][PEER],
+        renewed["envelope_id"]
     );
 
     // Cancel: a new registration request, withdrawn by the client.

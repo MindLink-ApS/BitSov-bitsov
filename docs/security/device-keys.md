@@ -240,6 +240,54 @@ A relation grant is the client's one budget grant, marked `recipients_only`:
   may dispatch in the new window. Its amount was counted in the used total
   that the renewal builds on.
 
+### Per-approval envelope identity
+
+`GET /api/v1/status.api_capabilities` advertises `relation_envelope_id_v1`.
+Each accepted contact intent creates a fresh, node-generated random
+`envelope_id`, including renewal with identical terms. It is an opaque string,
+independent of the signed nonce and the aggregate relation grant's `op_id`.
+The node persists it atomically with the envelope and replay nonce before
+returning success:
+
+```json
+{
+  "envelope_id": "<approval B>",
+  "grant": {
+    "op_id": "<aggregate relation grant>",
+    "envelope_id_by_recipient": {
+      "<peer node id>": "<approval B>",
+      "<legacy peer node id>": null
+    }
+  }
+}
+```
+
+The abbreviated `grant` above retains all existing budget/expiry fields.
+`GET /api/v1/pair/grant` exposes the same `grant.envelope_id_by_recipient` map,
+keyed like `per_recipient_msat`. Replacing A with B reports B for that recipient
+while preserving other recipients' identities and the aggregate `op_id`.
+Restart preserves B. Reads, spending and token refresh do not mint IDs.
+Known recipient caps without recorded envelope identity (including legacy and
+console grants) serialize as explicit null; an absent recipient is unknown and
+must also be treated as null. No ID is inferred from terms, expiry or `op_id`.
+Expiry and the existing grant/budget checks still govern whether an envelope
+can be used; the ID alone conveys no authority.
+
+An app can bind a waiting "approve and send" message to the exact ID returned
+by its approval and compare that ID with the recipient's current envelope.
+It must not substitute B for A or infer a match from unchanged amounts. This
+identity contract does not add a send-time compare-and-swap check; existing
+reservation/dispatch semantics above remain in force. Signed intent bytes and
+nonce replay refusal are unchanged.
+
+Pairing storage **v8** adds the per-recipient identity map. v2–v7 files load
+missing identities as unknown and migrate on the next successful write;
+legacy approvals never acquire fabricated IDs. A fresh approval gives only
+its recipient a new ID. This migration is forward-only: older binaries refuse
+v8. Preserve the latest store and roll forward; do not lower its version,
+strip fields or restore stale authority to downgrade. See
+[upgrade guidance](../UPGRADING.md#unreleased-pairing-storage-v8).
+
 An intent is refused, and nothing is written, when any of these holds:
 
 - the node was neither started in owner-run mode nor started with

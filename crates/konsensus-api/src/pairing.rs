@@ -497,7 +497,9 @@ impl PairingFile {
 /// 5: optional payee allowlists and durable payment deduplication.
 /// 6: durable circuit breaker limits, rolling history and failure pauses.
 /// 7: durable device-reset quota, reset generation and observed rolling refusals.
-pub const PAIRING_FILE_VERSION: u32 = 7;
+/// 8: per-approval relation envelope identities. Older envelopes remain unknown;
+/// migration on write is forward-only so old nodes cannot drop the binding.
+pub const PAIRING_FILE_VERSION: u32 = 8;
 
 /// A pending pairing request. Held in memory; the challenge itself lives in the
 /// protected file under `data_dir`, which is the actual control.
@@ -3949,6 +3951,11 @@ fn grant_view(g: &SpendGrant) -> Option<GrantView> {
         recipients_only: b.recipients_only,
         per_act_max_by_recipient: b.per_act_max_by_recipient.clone(),
         recipient_expires_at: b.recipient_expires_at.clone(),
+        envelope_id_by_recipient: b
+            .per_recipient_msat
+            .keys()
+            .map(|peer| (peer.clone(), b.envelope_id_by_recipient.get(peer).cloned()))
+            .collect(),
     })
 }
 

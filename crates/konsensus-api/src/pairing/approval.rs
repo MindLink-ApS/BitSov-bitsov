@@ -1507,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn breaker_reset_v6_defaults_and_v7_persistence_retain_security_state() {
+    fn breaker_reset_v6_defaults_and_current_persistence_retain_security_state() {
         let f = Fixture::new();
         f.paused();
         let mut old = serde_json::to_value(f.svc.lock().file.clone()).unwrap();
@@ -1526,7 +1526,7 @@ mod tests {
         let op = f.reset_request();
         f.approve(&op).unwrap();
         let disk = f.svc.reload_from_disk().unwrap();
-        assert_eq!(disk.version, 7);
+        assert_eq!(disk.version, super::super::PAIRING_FILE_VERSION);
         let b = disk.grants[0].budget.as_ref().unwrap();
         assert_eq!(b.device_breaker_resets.len(), 1);
         assert_eq!(b.breaker_reset_generation, 1);
