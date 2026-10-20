@@ -61,3 +61,20 @@ plaintext to log events. Rotation is retention control, not secret redaction.
 Regression tests cover actual file rotation, strict total bounds, oversized
 writes, concurrent clones, restart with legacy logs, old/partial configurations,
 LDK invoice filtering, and plaintext rejection in a subprocess.
+
+## Security audit log and contact labels
+
+The security audit log is separate from the bounded diagnostic logs above. It
+contains append-only JSON lines and is not rotated or truncated by the node.
+
+`peer.added` records include `detail.peer_node_id`, `detail.addr`, `detail.label`,
+`detail.source` (`http_admin` or `owner_control`) and `detail.connected`. The label
+is the owner's free-text contact name, stored in plaintext (or JSON `null` when
+absent). Validation rejects control, bidi and zero-width formatting characters;
+it does not redact names or other personal information. `peer.updated` also
+records the resulting contact label.
+
+Treat audit files and their backups as sensitive contact metadata. Restrict who
+can read them and redact labels in copies shared for support or diagnostics.
+Changing a label or deleting a peer does not erase earlier audit entries; audit
+retention is managed by the operator, separately from diagnostic log rotation.

@@ -154,6 +154,9 @@ async fn http_admission_uses_shared_persistence_and_audit_without_immediate_dial
         .find(|e| e["event"] == "peer.added")
         .unwrap();
     assert_eq!(event["detail"]["source"], "http_admin");
+    assert_eq!(event["detail"]["label"], "Dad");
+    assert_eq!(event["detail"]["peer_node_id"], "ab".repeat(32));
+    assert_eq!(event["detail"]["addr"], "127.0.0.1:9735");
     assert_eq!(event["detail"]["connected"], false);
 }
 

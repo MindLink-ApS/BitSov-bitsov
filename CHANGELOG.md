@@ -5,6 +5,9 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Document free-text contact labels in `peer.added` audit entries and the
+  associated plaintext metadata, retention and support-sharing considerations.
+
 - Reject unspecified, multicast and port-zero peer dial targets with HTTP 400,
   including IPv4-mapped IPv6; preflight imports before writing any contacts.
 
