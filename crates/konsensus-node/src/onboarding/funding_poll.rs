@@ -300,6 +300,8 @@ mod tests {
 
     fn channel(peer_pubkey: &str, active: bool) -> ChannelInfo {
         ChannelInfo {
+            user_channel_id: None,
+            funding_txo: None,
             channel_id: "1".to_string(),
             peer_pubkey: peer_pubkey.to_string(),
             capacity_msat: 50_000_000,

@@ -41,6 +41,32 @@ async fn funding_address_reports_configured_signet_network() {
     assert!(body["address"].is_string());
 }
 
+#[tokio::test]
+async fn status_reports_configured_signet_network() {
+    let config: crate::config::LightningConfig =
+        toml::from_str("backend = 'ldk'\nnetwork = 'signet'").unwrap();
+    let mut state = test_state();
+    // The node passes this configured network into API state at startup.
+    Arc::get_mut(&mut state).unwrap().introduction.network = config.bitcoin_network();
+    let auth = auth_header(&state);
+    let response = test_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/status")
+                .header("authorization", auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["network"], "signet");
+}
+
 #[derive(Default)]
 struct FundingBackend {
     opens: AtomicUsize,
@@ -111,6 +137,8 @@ impl LightningProvider for FundingBackend {
         );
         self.opens.fetch_add(1, Ordering::SeqCst);
         Ok(ChannelOpenResult {
+            user_channel_id: None,
+            funding_txo: None,
             channel_id: "channel".into(),
             funding_txid: Some("ab".repeat(32)),
             status: ChannelOpenStatus::PendingVisibility,

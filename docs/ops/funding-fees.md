@@ -47,7 +47,8 @@ money readiness and owner spend authorization; it does not connect the peer,
 reserve coins, sign, or broadcast. Set `dry_run: false` (or omit it) to open.
 Opening selects the **current cached estimate**, so compare the cap with the amount you are
 willing to pay. The preview is not a quote token or a reservation. The ordinary
-open response retains `channel_id`, `funding_txid`, and visibility `status`, and
+open response includes `user_channel_id`, `channel_id`, `funding_txo`,
+`funding_txid`, and visibility `status`, and
 adds `funding_fee` with the estimate actually selected for an explicit priority
 or cap. Legacy opens without these options leave `funding_fee` unset. An
 `opening` or `pending_visibility` response is not evidence of confirmation.
@@ -146,3 +147,41 @@ Tests cover HTTP preview/owner/refusal behavior, target/rate mapping, stale and
 missing estimates, durable policy after restart, missing/corrupt policy refusal,
 and the actual BDK unsigned fee-cap boundary. They use disposable wallets and
 synthetic funds, without starting a node or opening sockets.
+
+## Channel identifiers and closing
+
+For LDK, successful `POST /api/v1/payments/open-channel` (HTTP 200) and
+`GET /api/v1/payments/channels` use the same identifiers:
+
+| Field | Encoding and meaning |
+| --- | --- |
+| `user_channel_id` | Stable LDK-local u128, as a plain decimal **string** (e.g. `"88160000000000000000000000000000000001"`). Never convert to a JavaScript number. |
+| `channel_id` | 32-byte Lightning channel ID, as 64 hex characters. It may change during negotiation before funding is assigned. |
+| `funding_txo` | Funding outpoint, `"<64-character txid>:<output index>"`; null before assignment. |
+| `funding_txid` | Open response only: the funding transaction's 64-character hex ID. |
+| `short_channel_id` | List response only: routing SCID, or null before assignment; **not** a close identifier. |
+
+Previously LDK returned `UserChannelId(n)` in `channel_id`. Clients should now
+store `user_channel_id` as the stable identifier. `channel_id` for CLN remains
+its hex channel ID; LND retains its native `chan_id`. Other providers expose
+null for `user_channel_id` and for unavailable `funding_txo` values.
+
+Close an LDK channel using either listed identifier in the request's
+`channel_id` field:
+
+```json
+{"channel_id":"88160000000000000000000000000000000001","force":false}
+```
+
+Send this to `POST /api/v1/payments/close-channel`. The 64-character hex
+`channel_id` also works; legacy `UserChannelId(n)` values remain accepted.
+Owner Spend authorization and close safety checks are unchanged.
+
+Both `opening` and `pending_visibility` mean the open has been dispatched;
+do not retry either response to wait for readiness. Poll the channel list.
+A transport failure or uncertain backend error still requires inspecting
+channels/events before retrying; this endpoint does not provide idempotent opens.
+
+Owner `GET /api/v1/status` reports `network` from the configured Lightning
+network, matching `/api/v1/payments/funding-address` (for example `"signet"`).
+It is null only when no network is available in that backend's configuration.

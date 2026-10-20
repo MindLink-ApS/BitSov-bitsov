@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn channel_funding_and_close_resolve_ldk_display_ids() {
-    // open/list return Display IDs; also preserve close's bare-decimal support.
+    // Preserve old wrapped IDs as well as the canonical decimal form.
     // Include values beyond u64 so parsing cannot silently narrow the ID.
     for value in [0, 42, u128::MAX] {
         let id = ldk_node::UserChannelId(value);
@@ -21,10 +21,8 @@ fn channel_funding_and_close_resolve_ldk_display_ids() {
     }
 }
 
-#[test]
-fn offline_safety_window_uses_our_to_self_delay() {
-    let our_to_self_delay = 2016;
-    let channel = ldk_node::ChannelDetails {
+fn test_channel_details() -> ldk_node::ChannelDetails {
+    ldk_node::ChannelDetails {
         channel_id: ldk_node::lightning::ln::types::ChannelId::new_zero(),
         counterparty_node_id: bitcoin::secp256k1::PublicKey::from_slice(&[2; 33]).unwrap(),
         funding_txo: Some(bitcoin::OutPoint::null()),
@@ -53,11 +51,16 @@ fn offline_safety_window_uses_our_to_self_delay() {
         next_outbound_htlc_limit_msat: 0,
         next_outbound_htlc_minimum_msat: 0,
         force_close_spend_delay: Some(144),
-        counterparty_force_close_spend_delay: Some(our_to_self_delay),
+        counterparty_force_close_spend_delay: Some(2016),
         inbound_htlc_minimum_msat: 0,
         inbound_htlc_maximum_msat: None,
         config: Default::default(),
-    };
+    }
+}
+
+#[test]
+fn offline_safety_window_uses_our_to_self_delay() {
+    let channel = test_channel_details();
     let windows = offline_channel_windows(vec![channel]);
     assert_eq!(windows.len(), 1);
     assert_eq!(windows[0].window_blocks, Some(2016));
@@ -1150,7 +1153,7 @@ fn channel_fee_announcement_selects_ldk_method_and_preserves_args() {
             None,
         )
         .unwrap();
-        assert_eq!(id, ldk_node::UserChannelId(42).to_string());
+        assert_eq!(id.0.to_string(), "42");
     }
 }
 
@@ -1462,9 +1465,102 @@ fn channel_push_reaches_opener_with_and_without_funding_policy() {
                     policy,
                     Some(10_000_000)
                 )
-                .unwrap(),
-                "UserChannelId(42)"
+                .unwrap()
+                .0
+                .to_string(),
+                "42"
             );
         }
     }
+}
+
+#[test]
+fn listed_ldk_ids_are_canonical_and_resolve_for_close() {
+    let mut channel = test_channel_details();
+    channel.user_channel_id = ldk_node::UserChannelId(u128::MAX);
+    channel.channel_id = ldk_node::lightning::ln::types::ChannelId([0xab; 32]);
+    channel.funding_txo = Some(bitcoin::OutPoint {
+        txid: "cd".repeat(32).parse().unwrap(),
+        vout: 1,
+    });
+    let listed = channel_info(channel.clone());
+    assert_eq!(
+        listed.user_channel_id.as_deref(),
+        Some("340282366920938463463374607431768211455")
+    );
+    assert_eq!(listed.channel_id, "ab".repeat(32));
+    assert_eq!(listed.funding_txo, Some(format!("{}:1", "cd".repeat(32))));
+    assert!(listed.short_channel_id.is_none());
+    for id in [
+        listed.user_channel_id.unwrap(),
+        listed.channel_id.clone(),
+        listed.channel_id.to_uppercase(),
+        "UserChannelId(340282366920938463463374607431768211455)".into(),
+    ] {
+        assert_eq!(
+            resolve_channel_id(std::slice::from_ref(&channel), &id).unwrap(),
+            channel.user_channel_id
+        );
+    }
+    assert!(resolve_channel_id(std::slice::from_ref(&channel), &"ef".repeat(32)).is_err());
+    channel.funding_txo = None;
+    assert!(channel_info(channel).funding_txo.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn successful_ldk_dispatch_reconciles_real_ids_without_502_parse_error() {
+    // rc17 converted this returned ID to `UserChannelId(n)` then parsed it as
+    // u128 AFTER dispatch. rc18 accepted that wrapper; keep the whole successful
+    // dispatch -> pending -> broadcast-result path covered, including >u64 IDs.
+    let mut opener = MockChannelOpener::new();
+    opener
+        .expect_open_channel()
+        .times(1)
+        .returning(|_, _, _, _, _| {
+            Ok(ldk_node::UserChannelId(
+                88160000000000000000000000000000000001,
+            ))
+        });
+    let id = open_ldk_channel(
+        &opener,
+        CHANNEL_PEER,
+        "127.0.0.1:9735",
+        100_000,
+        false,
+        None,
+    )
+    .unwrap();
+    let mut polls = 0;
+    let result = finish_ldk_channel_open(
+        id,
+        |pending_id| {
+            assert_eq!(pending_id.0, 88160000000000000000000000000000000001);
+            polls += 1;
+            let mut channel = test_channel_details();
+            channel.user_channel_id = pending_id;
+            channel.channel_id = ldk_node::lightning::ln::types::ChannelId([0xab; 32]);
+            channel.funding_txo = (polls > 1).then(|| bitcoin::OutPoint {
+                txid: "cd".repeat(32).parse().unwrap(),
+                vout: 1,
+            });
+            Ok(channel)
+        },
+        |txid| async move {
+            assert_eq!(txid, "cd".repeat(32));
+            Ok(true)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.user_channel_id.as_deref(),
+        Some("88160000000000000000000000000000000001")
+    );
+    assert_eq!(result.channel_id, "ab".repeat(32));
+    assert_eq!(result.funding_txo, Some(format!("{}:1", "cd".repeat(32))));
+    assert_eq!(result.funding_txid, Some("cd".repeat(32)));
+    assert_eq!(
+        result.status,
+        konsensus_core::traits::lightning::ChannelOpenStatus::Opening
+    );
 }

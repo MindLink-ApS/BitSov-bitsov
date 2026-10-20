@@ -545,9 +545,12 @@ pub(crate) fn resolve_payment(
 /// Channel info response.
 #[derive(Serialize)]
 pub struct ChannelResponse {
-    /// Provider-local channel id — the string `close_channel` accepts. Required
-    /// so the client can close/inspect a channel it listed without re-deriving it.
+    /// LDK/CLN: hex Lightning channel ID; LND: native chan_id.
     pub channel_id: String,
+    /// LDK user channel ID as a decimal string, without a Display/Debug wrapper.
+    pub user_channel_id: Option<String>,
+    /// Funding outpoint as `txid:vout`, or null if not assigned/available.
+    pub funding_txo: Option<String>,
     /// Remote peer's public key (hex).
     pub peer_pubkey: String,
     /// Total channel capacity in millisatoshis.
@@ -586,6 +589,8 @@ async fn list_channels(
                 .into_iter()
                 .map(|ch| ChannelResponse {
                     channel_id: ch.channel_id,
+                    user_channel_id: ch.user_channel_id,
+                    funding_txo: ch.funding_txo,
                     peer_pubkey: ch.peer_pubkey,
                     capacity_msat: ch.capacity_msat,
                     local_balance_msat: ch.local_balance_msat,
@@ -783,11 +788,12 @@ pub struct OpenChannelRequest {
     pub fee_rate_sat_per_vb: Option<f32>,
 }
 
-/// Close a Lightning channel by user channel ID.
+/// Close a Lightning channel by a listed channel ID.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloseChannelRequest {
-    /// User channel ID returned by `open_channel`.
+    /// LDK: decimal user_channel_id or hex channel_id from open/list.
+    /// Legacy UserChannelId(n) values are also accepted.
     pub channel_id: String,
     /// Whether to force-close the channel.
     #[serde(default)]
@@ -874,6 +880,8 @@ async fn open_channel(
 
     Ok(Json(serde_json::json!({
         "channel_id": result.channel_id,
+        "user_channel_id": result.user_channel_id,
+        "funding_txo": result.funding_txo,
         "funding_txid": result.funding_txid,
         "funding_fee": result.funding_fee,
         "warning": "Confirmation targets are estimates, not guarantees of confirmation or channel_ready. Funding fees will not be automatically raised.",
