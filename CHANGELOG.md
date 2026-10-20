@@ -5,6 +5,9 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Dial newly admitted peers outside the registry lock; generation checks keep
+  concurrent removal or replacement authoritative without stalling message gates.
+
 - Fix `konsensus node-id` with encrypted mnemonics: reuse the terminal prompt,
   `--password-fd`, `--password-file` and `--password` inputs from `sign-challenge`.
 - Report the configured Bitcoin network from `GET /api/v1/payments/funding-address`,

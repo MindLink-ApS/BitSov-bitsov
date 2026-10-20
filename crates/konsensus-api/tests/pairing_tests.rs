@@ -1635,6 +1635,7 @@ async fn owner_peer_add_requires_matching_services_and_audits_admission() {
             finish_dial: Default::default(),
             live: Default::default(),
             dial: "refused",
+            supervised_addrs: Default::default(),
         });
         let state = Arc::new(AppState {
             transport: transport.clone(),

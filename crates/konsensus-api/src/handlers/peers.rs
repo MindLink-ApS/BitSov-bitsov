@@ -268,28 +268,10 @@ pub async fn admit_peer(
         .map_err(|e| ApiError::Internal(format!("failed to persist peer: {e}")))?;
 
     registry.add(entry.clone());
-    // Reads remain available during the bounded first dial, but a DELETE or
-    // another add must wait until supervision is installed. Otherwise a late
-    // dial could resurrect a connection/supervisor after successful removal.
-    let admission = tokio::sync::RwLockWriteGuard::downgrade(registry);
+    let generation = registry.generation(&node_id).expect("just admitted");
     state.transport.add_to_whitelist(&node_id).await;
-    let dialed = if dial_now {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            state.transport.connect(&node_id, &addr.to_string()),
-        )
-        .await
-        {
-            Ok(result) => result.map_err(|e| e.to_string()),
-            Err(_) => Err("connection timed out after 10 seconds".into()),
-        }
-    } else {
-        Ok(())
-    };
-    state
-        .transport
-        .supervise_peer(&node_id, &addr.to_string())
-        .await;
+    drop(registry);
+    let dialed = dial_and_supervise(state, &entry, generation, dial_now).await;
     state.audit_log.record(
         events::PEER_ADDED,
         actor,
@@ -301,8 +283,55 @@ pub async fn admit_peer(
             "connected": state.transport.is_connected(&node_id).await,
         })),
     );
-    drop(admission);
     Ok(AdmitPeerOutcome { entry, dialed })
+}
+
+/// Network I/O never holds the registry lock. Revalidate the admission before
+/// installing retries, serialized with DELETE and replacement admissions.
+async fn dial_and_supervise(
+    state: &Arc<AppState>,
+    entry: &PeerEntry,
+    generation: u64,
+    dial_now: bool,
+) -> Result<(), String> {
+    let node_id = &entry.node_id;
+    let dialed = if dial_now {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            state.transport.connect(node_id, &entry.addr.to_string()),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_) => Err("connection timed out after 10 seconds".into()),
+        }
+    } else {
+        Ok(())
+    };
+    let registry = state.peer_registry.write().await;
+    if registry.generation(node_id) != Some(generation) {
+        if let Some(current) = registry.get(node_id) {
+            // connect() can remember its dial target internally. Restore the
+            // current target, never the stale one, without revoking a re-add.
+            state
+                .transport
+                .supervise_peer(node_id, &current.addr.to_string())
+                .await;
+        } else {
+            // A transport may finish its handshake after DELETE disconnected.
+            // Clear any late connection and transport-internal retry tracking.
+            state.transport.remove_from_whitelist(node_id).await;
+            if let Err(e) = state.transport.disconnect(node_id).await {
+                tracing::warn!(peer = %node_id, error = %e, "failed to disconnect stale dial");
+            }
+        }
+        return Err("peer removed or replaced during connection attempt".into());
+    }
+    state
+        .transport
+        .supervise_peer(node_id, &entry.addr.to_string())
+        .await;
+    dialed
 }
 
 /// `DELETE /api/v1/peers/:node_id` — remove a peer from the registry.
@@ -332,7 +361,10 @@ async fn remove_peer(
     }
 
     // Removal must survive restart, or startup supervision would dial it again.
-    state.storage.delete_peer(&node_id).await
+    state
+        .storage
+        .delete_peer(&node_id)
+        .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 
     state.audit_log.record(
@@ -419,7 +451,10 @@ async fn update_peer(
 
     registry.add(updated);
     drop(registry);
-    state.transport.supervise_peer(&node_id, &new_addr.to_string()).await;
+    state
+        .transport
+        .supervise_peer(&node_id, &new_addr.to_string())
+        .await;
 
     // P3-2: persist the update so address/label/auto_connect edits survive
     // restart (merge_persisted_peers reloads the durable row at boot).
@@ -455,7 +490,12 @@ async fn update_peer(
         label: new_label,
         auto_connect: new_auto_connect,
     };
-    Ok(Json(peer_response(&result_entry, is_connected, local_id, info)))
+    Ok(Json(peer_response(
+        &result_entry,
+        is_connected,
+        local_id,
+        info,
+    )))
 }
 
 /// `POST /api/v1/peers/:node_id/connect` — connect to a peer.
@@ -497,7 +537,10 @@ async fn connect_peer(
 
     let connected = state.transport.connect(&node_id, &addr.to_string()).await;
     // Start retries after the explicit dial finishes, including on failure.
-    state.transport.supervise_peer(&node_id, &addr.to_string()).await;
+    state
+        .transport
+        .supervise_peer(&node_id, &addr.to_string())
+        .await;
     connected.map_err(|e| ApiError::Transport(e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "connected": true })))
@@ -635,7 +678,10 @@ async fn import_peers(
         // Add to transport whitelist (Principle 3)
         state.transport.add_to_whitelist(&node_id).await;
 
-        state.transport.supervise_peer(&node_id, &addr.to_string()).await;
+        state
+            .transport
+            .supervise_peer(&node_id, &addr.to_string())
+            .await;
 
         // P3-2: persist so imported peers survive restart.
         let mut persisted = konsensus_storage::Peer::new(node_id);
@@ -691,7 +737,11 @@ mod reconnect_tests {
     fn owner_added_contact_defaults_to_auto_connect() {
         let req: AddPeerRequest = serde_json::from_value(serde_json::json!({
             "node_id": "unused by deserialization", "addr": "127.0.0.1:9735"
-        })).unwrap();
-        assert!(req.auto_connect, "owner-added contacts should connect without a hidden opt-in");
+        }))
+        .unwrap();
+        assert!(
+            req.auto_connect,
+            "owner-added contacts should connect without a hidden opt-in"
+        );
     }
 }

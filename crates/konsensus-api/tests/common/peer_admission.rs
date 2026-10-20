@@ -16,6 +16,7 @@ pub struct AdmissionTransport {
     pub dial_started: tokio::sync::Notify,
     pub finish_dial: tokio::sync::Notify,
     pub live: Mutex<(bool, bool, bool)>, // whitelist, connection, supervision
+    pub supervised_addrs: Mutex<Vec<String>>,
     pub dial: &'static str,
 }
 #[async_trait]
@@ -41,7 +42,10 @@ impl MessageTransport for AdmissionTransport {
             self.storage.get_peer(peer).await.unwrap().is_some(),
             "persist before whitelist"
         );
-        assert!(self.registry.read().await.get(peer).is_some());
+        assert!(
+            self.registry.try_read().is_err(),
+            "live changes must hold the registry write lock"
+        );
         self.live.lock().unwrap().0 = true;
         self.calls.lock().unwrap().push("whitelist");
     }
@@ -62,7 +66,12 @@ impl MessageTransport for AdmissionTransport {
             "gate" => {
                 self.dial_started.notify_one();
                 self.finish_dial.notified().await;
-                self.live.lock().unwrap().1 = true;
+                // NoiseTransport::connect remembers the dial target itself,
+                // before the handler's generation check runs.
+                self.supervised_addrs.lock().unwrap().push(addr.to_string());
+                let mut live = self.live.lock().unwrap();
+                live.1 = true;
+                live.2 = true;
                 Ok(())
             }
             "ok" => Ok(()),
@@ -77,7 +86,8 @@ impl MessageTransport for AdmissionTransport {
         live.0 = false;
         live.2 = false;
     }
-    async fn supervise_peer(&self, _: &NodeId, _: &str) {
+    async fn supervise_peer(&self, _: &NodeId, addr: &str) {
+        self.supervised_addrs.lock().unwrap().push(addr.to_string());
         self.live.lock().unwrap().2 = true;
         self.calls.lock().unwrap().push("supervise");
     }

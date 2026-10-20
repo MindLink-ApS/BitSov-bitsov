@@ -30,6 +30,7 @@ fn state(
         finish_dial: Default::default(),
         live: Default::default(),
         dial,
+        supervised_addrs: Default::default(),
     });
     (
         Arc::new(AppState {
@@ -197,18 +198,81 @@ async fn removal_during_first_dial_cannot_leave_connection_or_supervision() {
         .header("authorization", common::auth_header(&state))
         .body(Body::empty())
         .unwrap();
-    let mut remove = tokio::spawn(common::test_router(state.clone()).oneshot(req));
-    // Old code completes DELETE here, then the late dial resurrects live state.
-    // Serialized mutations wait for the dial; either schedule must end removed.
-    let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut remove).await;
+    let remove = tokio::spawn(common::test_router(state.clone()).oneshot(req));
+    // DELETE and the per-message gate snapshot must complete while the dial
+    // remains parked. A downgraded read guard blocks both behind the writer.
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), remove)
+        .await
+        .expect("DELETE waited for the network dial")
+        .unwrap()
+        .unwrap();
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        state.peer_registry.read().await.whitelist_arc()
+    })
+    .await
+    .expect("message gate reader blocked behind DELETE");
+    assert!(snapshot.is_empty());
     transport.finish_dial.notify_one();
-    add.await.unwrap().unwrap();
-    let response = match early {
-        Ok(result) => result.unwrap().unwrap(),
-        Err(_) => remove.await.unwrap().unwrap(),
-    };
+    let outcome = add.await.unwrap().unwrap();
+    assert!(
+        outcome.dialed.is_err(),
+        "a removed admission must not report dial success"
+    );
     assert_eq!(response.status(), StatusCode::OK);
     assert!(state.storage.list_peers().await.unwrap().is_empty());
     assert!(state.peer_registry.read().await.all().is_empty());
     assert_eq!(*transport.live.lock().unwrap(), (false, false, false));
+}
+
+#[tokio::test]
+async fn stale_dial_does_not_replace_readded_contact_supervision() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let (state, transport) = state(Arc::new(common::MemStorage::new()), "gate");
+    let adding = state.clone();
+    let add = tokio::spawn(async move {
+        admit_peer(&adding, "owner", "owner_control", request(), true).await
+    });
+    transport.dial_started.notified().await;
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/v1/peers/{}", request().node_id))
+        .header("authorization", common::auth_header(&state))
+        .body(Body::empty())
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        common::test_router(state.clone()).oneshot(req),
+    )
+    .await
+    .expect("DELETE blocked by dial")
+    .unwrap();
+    let mut replacement = request();
+    replacement.addr = "127.0.0.1:9736".into();
+    admit_peer(&state, "owner", "owner_control", replacement, false)
+        .await
+        .unwrap();
+    transport.finish_dial.notify_one();
+    assert!(add.await.unwrap().unwrap().dialed.is_err());
+    let id = NodeId::from_hex(&request().node_id).unwrap();
+    assert_eq!(
+        state.peer_registry.read().await.addr(&id).unwrap().port(),
+        9736
+    );
+    assert_eq!(
+        state
+            .storage
+            .get_peer(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .address
+            .as_deref(),
+        Some("127.0.0.1:9736")
+    );
+    assert_eq!(
+        transport.supervised_addrs.lock().unwrap().last().unwrap(),
+        "127.0.0.1:9736"
+    );
+    assert_eq!(*transport.live.lock().unwrap(), (true, true, true));
 }
