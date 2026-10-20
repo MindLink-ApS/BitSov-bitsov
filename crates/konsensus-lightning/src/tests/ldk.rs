@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn channel_funding_and_close_resolve_ldk_display_ids() {
+    // open/list return Display IDs; also preserve close's bare-decimal support.
+    // Include values beyond u64 so parsing cannot silently narrow the ID.
+    for value in [0, 42, u128::MAX] {
+        let id = ldk_node::UserChannelId(value);
+        assert_eq!(parse_user_channel_id(&id.to_string()).unwrap(), id);
+        assert_eq!(parse_user_channel_id(&value.to_string()).unwrap(), id);
+    }
+    for invalid in [
+        "",
+        "UserChannelId()",
+        "UserChannelId(42",
+        "42)",
+        "-1",
+        "340282366920938463463374607431768211456",
+    ] {
+        assert!(parse_user_channel_id(invalid).is_err(), "{invalid}");
+    }
+}
+
+#[test]
 fn offline_safety_window_uses_our_to_self_delay() {
     let our_to_self_delay = 2016;
     let channel = ldk_node::ChannelDetails {
