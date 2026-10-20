@@ -5,6 +5,24 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Document free-text contact labels in `peer.added` audit entries and the
+  associated plaintext metadata, retention and support-sharing considerations.
+
+- Reject unspecified, multicast and port-zero peer dial targets with HTTP 400,
+  including IPv4-mapped IPv6; preflight imports before writing any contacts.
+
+- Share peer-label validation across console, admission, PUT and import: reject
+  control, bidi and zero-width formatting characters, and prevent self-ID updates.
+
+- Serialize peer updates, connect admission and imports with deletion; persist
+  first so failed writes and concurrent DELETEs cannot resurrect contacts.
+
+- Persist peer deletion before revoking live admission, so storage errors leave
+  registry, transport and restart state consistent.
+
+- Dial newly admitted peers outside the registry lock; generation checks keep
+  concurrent removal or replacement authoritative without stalling message gates.
+
 - Fix `konsensus node-id` with encrypted mnemonics: reuse the terminal prompt,
   `--password-fd`, `--password-file` and `--password` inputs from `sign-challenge`.
 - Report the configured Bitcoin network from `GET /api/v1/payments/funding-address`,

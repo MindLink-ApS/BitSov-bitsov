@@ -170,6 +170,11 @@ async fn invalid_inputs_never_connect() {
     for (id, addr, label) in [
         ("bad", "127.0.0.1:9735", "Dad".to_string()),
         (ID, "example.com:9735", "Dad".to_string()),
+        (ID, "0.0.0.0:9735", "Dad".to_string()),
+        (ID, "[::]:9735", "Dad".to_string()),
+        (ID, "127.0.0.1:0", "Dad".to_string()),
+        (ID, "224.0.0.1:9735", "Dad".to_string()),
+        (ID, "[ff02::1]:9735", "Dad".to_string()),
         (ID, "127.0.0.1:9735", "a".repeat(257)),
         (ID, "127.0.0.1:9735", "é".repeat(129)),
         (ID, "127.0.0.1:9735", "Dad\nspoof".to_string()),
