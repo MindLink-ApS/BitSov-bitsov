@@ -249,3 +249,57 @@ The production [hub LSPS2 regression](three-node-paid-e2e.md#hub-lsps2-provider)
 now exercises actual JIT service/client negotiation, overprovisioning and
 stateless admission with a configured positive forwarding tariff. It is separate
 from the legacy routing-only service fixture and the #225 opt-in control above.
+
+## Option A Phase 0: starter liquidity PASS markers
+
+Four ignored `regtest-e2e` tests in `three_node::lsps2_service::phase0_*`
+exercise production `LdkProvider` selection and push funding with fresh clients.
+Only the hub receives on-chain funds. Run with the same Core/electrs prerequisites
+and isolated runner described above:
+
+```sh
+BITCOIND_EXE=/path/to/bitcoind ELECTRS_EXE=/path/to/electrs \
+REGTEST_TEST=regtest_e2e::three_node::lsps2_service::phase0_ \
+  scripts/regress/regtest_e2e.sh
+```
+
+Acceptance target: **4 passed, 0 failed**, with these `PHASE0 PASS` markers:
+
+- `push-zero-conf`: a private 100,000-sat channel pushes 10,000 sats to a
+  zero-sat on-chain wallet. Both ends are usable with zero required/actual
+  confirmations and funding still in Core's mempool. Spendable outbound is
+  approximately 10,000 sats, less the negotiated channel punishment reserve;
+  outbound plus that reserve equals the push exactly.
+- `connect-reuse`: the client has no listener and initiates the LN connection.
+  The hub opens using `127.0.0.1:0`, which fails to connect before the client's
+  connection exists. `vendor/ldk-node/src/lib.rs::open_channel_inner` already
+  calls `connection.rs::connect_peer_if_necessary`, which returns before
+  dialing an already connected peer. **No vendor patch is needed.**
+- `spend-push`: the client pays the hub 1,000 sats from its pushed balance,
+  settling at both ends with zero routing fee before any confirmation.
+- `reject-opt-out`, `reject-non-selected`, `reject-above-cap`: fresh empty
+  clients reject for insufficient anchor reserves when trust is false, the
+  opener is not selected (even with its own trust flag true), or the selected
+  trusted opener offers 200,001 sats. Each asserts the explicit reserve refusal,
+  no surviving channel and no funding broadcast.
+
+No blocks are mined after opening in any scenario. This is a regtest proof for
+the signet-first design, not a signet deployment or an app/message test. Startup
+provider connection (N2), N3 and hub H1–H6 remain out of scope; production defaults
+are unchanged.
+
+**Observed on 2026-10-20: NOT-READY — 1 passed, 3 failed.** The push, connection
+reuse and payment markers pass (9,000 sats spendable plus 1,000 sats punishment
+reserve). All three negative controls reject the initial anchor offer, but LDK's
+`ChannelManager::handle_error` retries with fewer channel-type features via
+`maybe_downgrade_channel_features`. A non-anchor channel is then accepted and
+funded. The anchor-reserve waiver itself remains bounded; absolute channel
+rejection does not hold. The tests deliberately retain the ticket's rejection
+assertions. A policy decision is needed: permit this fallback and revise the
+acceptance criteria, or separately authorize an explicit rejection policy.
+
+The run also exposed a funding-result bug: the production opener returns
+`UserChannelId(n)` but reconciliation parsed it as bare decimal. Reconciliation
+now shares close's existing ID parser, with a round-trip regression test. This
+fix enables the production push API to report its actual funding outcome; it
+does not change channel selection, reserve policy or vendor code.
