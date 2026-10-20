@@ -5,17 +5,31 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
-- Document recovery's fresh-channel requirement: a visible 25,000-sat on-chain
-  reserve in the verification store, or explicit selected-provider
+## [0.3.0-rc18] — 2026-10-20 (prep; not tagged yet)
+
+**Pre-release.** Not for production use. rc18 is rc17 (`ce7fb53`) plus
+#321, #322, #323, #324, #326, #327 and #329: encrypted-seed node identity, live
+peer admission and hardening, starter-channel doctrine, opt-in channel
+pushes with bounded reserve trust (Option-A N1/N4/N5, signet), and the Option-A
+Phase 0 regtest proof with anchor-only inbound admission and recovery
+reserve/waiver requirements. See the
+[rc18 signing checklist](docs/releases/v0.3.0-rc18.md) and
+[rc17 → rc18 upgrade guidance](docs/UPGRADING.md#rc17--rc18).
+No new storage schema migration; existing forward-only fences still apply.
+
+### Node / Security
+
+- Document recovery's fresh-channel requirement (#329): a visible 25,000-sat
+  on-chain reserve in the verification store, or explicit selected-provider
   `trust_no_reserve = true` for an inbound anchor channel of at most 200,000 sats;
   otherwise recovery and normal startup remain fenced.
-- Refuse all non-anchor inbound channels, including LDK downgrade retries, so
-  a rejected anchor request cannot bypass the selected-provider reserve-waiver
+- Refuse all non-anchor inbound channels (#329), including LDK downgrade retries,
+  so a rejected anchor request cannot bypass the selected-provider reserve-waiver
   policy. Every inbound or JIT channel must be an anchor channel and either have
   the on-chain anchor reserve available (default 25,000 sats per channel) or come
   from the selected provider with `trust_no_reserve=true` and funding of at most
-  200,000 sats. An empty-wallet node must qualify for that waiver or fund its
-  reserve first; otherwise the channel is refused. Previously LDK could fall
+  200,000 sats per channel. An empty-wallet node must qualify for that waiver
+  or fund its reserve first; otherwise the channel is refused. Previously LDK could fall
   back to a non-anchor channel. External peers that can only open non-anchor
   channels are now refused by every BitSov node, including the hub. Outbound
   channel defaults remain anchored.
@@ -27,7 +41,9 @@ also live on the corresponding GitHub pre-release pages.
   200,000 sats per channel (`MAX_TRUSTED_NO_RESERVE_INBOUND_SATS`), including
   for an empty-wallet acceptor. This is not an aggregate cap per trusted peer.
   Larger inbound channels and all outbound channels
-  require the normal reserve; 200,001 sats is refused on an empty wallet.
+  require the normal reserve; a 200,001-sat inbound anchor channel is refused
+  on an empty wallet by the reserve check, and any non-anchor downgrade retry
+  is also refused (#329).
   Force-close still requests broadcasting our latest commitment transaction.
   Close fee-bumping is skipped only while live channel details prove waiver
   eligibility; closed channels are usually no longer listed, so missing details
@@ -71,6 +87,17 @@ also live on the corresponding GitHub pre-release pages.
   without a restart. HTTP and console admission share self-ID and control-label
   rejection; console adds are audited as `owner_control`. The CLI warns when a
   matching `[[peers]]` entry will override the saved address at restart.
+
+### Documentation
+
+- Record the operator-funded starter channel as the T4a labelled departure
+  from principle 3 (#323): opt-in, exit-able and never the only path. Pushed
+  sats belong to the recipient; the 1,000 msat admission floor is unchanged.
+  The starter policy is for signet; mainnet sizes and policy remain out of scope.
+
+### Release metadata
+
+- Bump all 14 workspace packages to `0.3.0-rc18`; dependency versions are unchanged.
 
 ## [0.3.0-rc17] — 2026-10-19 (prep; not tagged yet)
 
