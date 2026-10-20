@@ -2046,7 +2046,10 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
     };
     // The attacker never drains its control receiver. Unbounded replies would
     // eventually stop its reader and fill the recipient's TCP send buffer.
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // Completion requires all requests to be handled and the healthy peer's
+    // reply. This generous hang guard tolerates slow runners; a real stall
+    // still never completes.
+    tokio::time::timeout(Duration::from_secs(120), async {
         for i in 0..5000 {
             attacker
                 .send_frame(

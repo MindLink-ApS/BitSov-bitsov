@@ -5,6 +5,8 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Deflake locked-mode shutdown and unpaid-request flood tests with independent,
+  generous hang guards for slow CI runners. Fixes #325.
 - Make `POST /api/v1/payments/open-channel` idempotent with an optional UUIDv4
   `operation_id` (#331, capability `channel_open_operations_v1`): recorded
   before dispatch (migration 030), a retry with the same id returns the recorded
