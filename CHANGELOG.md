@@ -7,6 +7,8 @@ also live on the corresponding GitHub pre-release pages.
 
 - Fix `konsensus node-id` with encrypted mnemonics: reuse the terminal prompt,
   `--password-fd`, `--password-file` and `--password` inputs from `sign-challenge`.
+- Report the configured Bitcoin network from `GET /api/v1/payments/funding-address`,
+  including signet, instead of always reporting `bitcoin`.
 
 ## [0.3.0-rc17] — 2026-10-19 (prep; not tagged yet)
 
