@@ -15,10 +15,8 @@ use crate::audit::events;
 use crate::error::ApiError;
 use crate::freshness::DataFreshness;
 use crate::handlers::list_diagnostics::ListDiagnostics;
+use crate::peer_validation::{validate_peer_id, validate_peer_label};
 use crate::state::AppState;
-
-/// Maximum length for peer labels (bytes).
-const MAX_PEER_LABEL_LEN: usize = 256;
 
 /// Peer in API response format.
 #[derive(Serialize)]
@@ -227,26 +225,11 @@ pub async fn admit_peer(
 ) -> Result<AdmitPeerOutcome, ApiError> {
     let node_id = NodeId::from_hex(&req.node_id)
         .map_err(|e| ApiError::BadRequest(format!("invalid node ID: {e}")))?;
-    if &node_id == state.identity.node_id() {
-        return Err(ApiError::BadRequest(
-            "cannot add this node as its own peer".into(),
-        ));
-    }
+    validate_peer_id(&node_id, state.identity.node_id())?;
     let addr: std::net::SocketAddr = req.addr.parse().map_err(|e| {
         ApiError::BadRequest(format!("invalid address (IP address and port only): {e}"))
     })?;
-    if let Some(ref label) = req.label {
-        if label.len() > MAX_PEER_LABEL_LEN {
-            return Err(ApiError::BadRequest(format!(
-                "peer label exceeds {MAX_PEER_LABEL_LEN} bytes"
-            )));
-        }
-        if label.chars().any(char::is_control) {
-            return Err(ApiError::BadRequest(
-                "peer label must not contain control characters".into(),
-            ));
-        }
-    }
+    validate_peer_label(req.label.as_deref())?;
     let entry = PeerEntry {
         node_id,
         addr,
@@ -411,6 +394,9 @@ async fn update_peer(
     let node_id = NodeId::from_hex(&node_id_hex)
         .map_err(|e| ApiError::BadRequest(format!("invalid node ID: {e}")))?;
 
+    validate_peer_id(&node_id, state.identity.node_id())?;
+    validate_peer_label(req.label.as_deref())?;
+
     let connected = state.transport.connected_peers().await;
 
     let mut registry = state.peer_registry.write().await;
@@ -428,14 +414,7 @@ async fn update_peer(
 
     let new_label = match req.label {
         Some(ref l) if l.is_empty() => None,
-        Some(ref l) => {
-            if l.len() > MAX_PEER_LABEL_LEN {
-                return Err(ApiError::BadRequest(format!(
-                    "peer label exceeds {MAX_PEER_LABEL_LEN} bytes"
-                )));
-            }
-            Some(l.clone())
-        }
+        Some(ref l) => Some(l.clone()),
         None => existing.label.clone(),
     };
 
@@ -624,7 +603,7 @@ async fn import_peers(
         };
 
         // Don't import self
-        if &node_id == local_id {
+        if validate_peer_id(&node_id, local_id).is_err() {
             skipped += 1;
             continue;
         }
@@ -646,15 +625,9 @@ async fn import_peers(
             continue;
         }
 
-        // Validate label length (same check as add_peer/update_peer).
-        if let Some(ref label) = entry.label {
-            if label.len() > MAX_PEER_LABEL_LEN {
-                errors.push(format!(
-                    "{}: peer label exceeds {MAX_PEER_LABEL_LEN} bytes",
-                    entry.node_id
-                ));
-                continue;
-            }
+        if let Err(e) = validate_peer_label(entry.label.as_deref()) {
+            errors.push(format!("{}: {e}", entry.node_id));
+            continue;
         }
 
         let peer_entry = PeerEntry {

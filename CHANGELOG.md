@@ -5,6 +5,9 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Share peer-label validation across console, admission, PUT and import: reject
+  control, bidi and zero-width formatting characters, and prevent self-ID updates.
+
 - Serialize peer updates, connect admission and imports with deletion; persist
   first so failed writes and concurrent DELETEs cannot resurrect contacts.
 

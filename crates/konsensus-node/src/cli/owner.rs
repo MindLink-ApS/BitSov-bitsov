@@ -2193,13 +2193,7 @@ pub async fn cmd_peer_add(
     let address: std::net::SocketAddr = addr
         .parse()
         .context("invalid address: IP address and port only (no hostnames)")?;
-    if let Some(label) = &label {
-        anyhow::ensure!(label.len() <= 256, "peer label exceeds 256 bytes");
-        anyhow::ensure!(
-            !label.chars().any(char::is_control) && terminal_safe(label) == *label,
-            "peer label must not contain control or invisible formatting characters"
-        );
-    }
+    konsensus_api::peer_validation::validate_peer_label(label.as_deref())?;
     if config_path.try_exists()? {
         let config = NodeConfig::load_before_identity_validation(config_path)?;
         if config

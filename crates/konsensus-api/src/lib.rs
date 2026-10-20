@@ -68,6 +68,7 @@ pub mod locked;
 pub mod metered;
 pub mod metrics;
 pub mod pairing;
+pub mod peer_validation;
 pub mod rate_limit;
 pub mod remote_access;
 pub mod room_binding;
