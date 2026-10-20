@@ -286,7 +286,7 @@ legacy approvals never acquire fabricated IDs. A fresh approval gives only
 its recipient a new ID. This migration is forward-only: older binaries refuse
 v8. Preserve the latest store and roll forward; do not lower its version,
 strip fields or restore stale authority to downgrade. See
-[upgrade guidance](../UPGRADING.md#unreleased-pairing-storage-v8).
+[upgrade guidance](../UPGRADING.md#rc16--rc17-pairing-storage-v8).
 
 An intent is refused, and nothing is written, when any of these holds:
 
