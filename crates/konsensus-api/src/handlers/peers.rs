@@ -448,13 +448,6 @@ async fn update_peer(
         auto_connect: new_auto_connect,
     };
 
-    registry.add(updated);
-    drop(registry);
-    state
-        .transport
-        .supervise_peer(&node_id, &new_addr.to_string())
-        .await;
-
     // P3-2: persist the update so address/label/auto_connect edits survive
     // restart (merge_persisted_peers reloads the durable row at boot).
     let mut persisted = konsensus_storage::Peer::new(node_id);
@@ -465,6 +458,13 @@ async fn update_peer(
         .upsert_peer(&persisted)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to persist peer update: {e}")))?;
+
+    registry.add(updated);
+    state
+        .transport
+        .supervise_peer(&node_id, &new_addr.to_string())
+        .await;
+    drop(registry);
 
     state.audit_log.record(
         events::PEER_UPDATED,
@@ -510,37 +510,32 @@ async fn connect_peer(
     let node_id = NodeId::from_hex(&node_id_hex)
         .map_err(|e| ApiError::BadRequest(format!("invalid node ID: {e}")))?;
 
-    // Look up address + label from registry
-    let (addr, label) = {
-        let registry = state.peer_registry.read().await;
-        let entry = registry
-            .get(&node_id)
-            .ok_or_else(|| ApiError::NotFound(format!("peer {node_id_hex} not in registry")))?;
-        (entry.addr, entry.label.clone())
-    };
-
-    // Ensure peer is whitelisted — user clicked Connect, that's explicit consent
-    state.transport.add_to_whitelist(&node_id).await;
+    // Serialize lookup, durable admission and live changes with DELETE.
+    let registry = state.peer_registry.write().await;
+    let entry = registry
+        .get(&node_id)
+        .ok_or_else(|| ApiError::NotFound(format!("peer {node_id_hex} not in registry")))?
+        .clone();
+    let generation = registry.generation(&node_id).expect("registered peer");
+    let addr = entry.addr;
 
     // P3-2: persist this explicit-consent admission so it survives restart.
     // connect_peer admits gossip-discovered peers that were registry-only;
     // without persistence they drop off both whitelists on the next boot.
     let mut persisted = konsensus_storage::Peer::new(node_id);
     persisted.address = Some(addr.to_string());
-    persisted.display_name = label;
+    persisted.display_name = entry.label.clone();
     state
         .storage
         .upsert_peer(&persisted)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to persist connected peer: {e}")))?;
 
-    let connected = state.transport.connect(&node_id, &addr.to_string()).await;
-    // Start retries after the explicit dial finishes, including on failure.
-    state
-        .transport
-        .supervise_peer(&node_id, &addr.to_string())
-        .await;
-    connected.map_err(|e| ApiError::Transport(e.to_string()))?;
+    state.transport.add_to_whitelist(&node_id).await;
+    drop(registry);
+    dial_and_supervise(&state, &entry, generation, true)
+        .await
+        .map_err(ApiError::Transport)?;
 
     Ok(Json(serde_json::json!({ "connected": true })))
 }
@@ -643,13 +638,12 @@ async fn import_peers(
             }
         };
 
-        // Check if peer exists when skip_existing is true
-        if req.skip_existing {
-            let registry = state.peer_registry.read().await;
-            if registry.get(&node_id).is_some() {
-                skipped += 1;
-                continue;
-            }
+        // The existence check belongs to the same write transaction as the
+        // upsert, so simultaneous skip-existing imports cannot both admit.
+        let mut registry = state.peer_registry.write().await;
+        if req.skip_existing && registry.get(&node_id).is_some() {
+            skipped += 1;
+            continue;
         }
 
         // Validate label length (same check as add_peer/update_peer).
@@ -670,28 +664,20 @@ async fn import_peers(
             auto_connect: entry.auto_connect,
         };
 
-        {
-            let mut registry = state.peer_registry.write().await;
-            registry.add(peer_entry);
-        }
-        // Add to transport whitelist (Principle 3)
-        state.transport.add_to_whitelist(&node_id).await;
-
-        state
-            .transport
-            .supervise_peer(&node_id, &addr.to_string())
-            .await;
-
         // P3-2: persist so imported peers survive restart.
         let mut persisted = konsensus_storage::Peer::new(node_id);
         persisted.address = Some(addr.to_string());
         persisted.display_name = entry.label.clone();
         if let Err(e) = state.storage.upsert_peer(&persisted).await {
-            errors.push(format!(
-                "{}: added to whitelist but failed to persist: {e}",
-                entry.node_id
-            ));
+            errors.push(format!("{}: failed to persist peer: {e}", entry.node_id));
+            continue;
         }
+        registry.add(peer_entry);
+        state.transport.add_to_whitelist(&node_id).await;
+        state
+            .transport
+            .supervise_peer(&node_id, &addr.to_string())
+            .await;
         imported += 1;
     }
 

@@ -5,6 +5,9 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Serialize peer updates, connect admission and imports with deletion; persist
+  first so failed writes and concurrent DELETEs cannot resurrect contacts.
+
 - Persist peer deletion before revoking live admission, so storage errors leave
   registry, transport and restart state consistent.
 
