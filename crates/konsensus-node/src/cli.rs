@@ -253,6 +253,12 @@ pub enum Command {
         command: ScbCommand,
     },
 
+    /// Manage contacts through the running node's owner control socket.
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommand,
+    },
+
     /// Whitelist (peers + accepted invites) backup/restore for fresh-hardware recovery.
     Whitelist {
         #[command(subcommand)]
@@ -413,6 +419,29 @@ pub enum Command {
     Repair {
         #[command(subcommand)]
         command: RepairCommand,
+    },
+}
+
+/// Owner-managed live contact admission.
+#[derive(Subcommand)]
+pub enum PeerCommand {
+    /// Persist, whitelist and connect to a contact without restarting.
+    Add {
+        /// Peer node ID (64 hex characters).
+        #[arg(long)]
+        node_id: String,
+        /// IP address and port (IPv6: [address]:port); no hostnames.
+        #[arg(long)]
+        addr: String,
+        /// Optional display label, at most 256 bytes.
+        #[arg(long)]
+        label: Option<String>,
+        /// Skip the Enter confirmation for scripts.
+        #[arg(long)]
+        yes: bool,
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
     },
 }
 

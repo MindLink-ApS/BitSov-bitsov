@@ -42,7 +42,7 @@
 //! when headless; replacement remains terminal-only. HTTP and socket replies
 //! expose no nonce. Headless elevation trusts the node's OS account and files;
 //! terminal-delivered codes remain unavailable through same-uid socket access.
-//! First-contact and gift commands instead take the complete
+//! First-contact, gift and peer-add commands instead take the complete
 //! owner-reviewed tuple as consent; they require an owner-managed node and OS
 //! account outside the paired app's control, as the owner-key HTTP paths do.
 
@@ -65,6 +65,16 @@ pub const SOCKET_FILE: &str = "control.sock";
 #[derive(Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControlRequest {
+    /// Admit an owner-typed contact. The complete tuple is consent.
+    AddPeer {
+        /// Peer node id, 64 hex characters.
+        node_id: String,
+        /// IP address and port; no hostnames.
+        addr: String,
+        /// Display label, at most 256 bytes and without control characters.
+        #[serde(default)]
+        label: Option<String>,
+    },
     /// List pairings, pending elevations and pending approvals.
     Status,
     /// Render one pending operation so the CLI can show it before asking.
@@ -559,6 +569,9 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
             },
             Err(e) => ControlResponse::Error { message: e.to_string() },
         },
+        ControlRequest::AddPeer { .. } => ControlResponse::Error {
+            message: "peer admission requires the running node's services".into(),
+        },
         ControlRequest::ApproveGift { .. } => ControlResponse::Error {
             message: "gift approval requires the running node's sponsor service".into(),
         },
@@ -1042,6 +1055,11 @@ fn encode_request(req: &ControlRequest) -> Result<Zeroizing<Vec<u8>>, serde_json
         }};
     }
     match req {
+        ControlRequest::AddPeer {
+            node_id,
+            addr,
+            label,
+        } => fields!("add-peer", node_id, addr, label),
         ControlRequest::Status => fields!("status"),
         ControlRequest::Describe { op_id } => fields!("describe", op_id),
         ControlRequest::Grant {
@@ -1146,6 +1164,61 @@ async fn handle_local(
     state: Option<&Arc<crate::state::AppState>>,
     req: ControlRequest,
 ) -> ControlResponse {
+    if let ControlRequest::AddPeer {
+        node_id,
+        addr,
+        label,
+    } = req
+    {
+        let Some(state) = state.filter(|state| {
+            ctx.service.owner_control_enabled()
+                && state
+                    .pairing
+                    .as_ref()
+                    .is_some_and(|service| Arc::ptr_eq(service, &ctx.service))
+        }) else {
+            return ControlResponse::Error {
+                message: "peer admission requires the running node's services".into(),
+            };
+        };
+        let body = crate::handlers::peers::AddPeerRequest {
+            node_id,
+            addr,
+            label,
+            auto_connect: true,
+        };
+        return match crate::handlers::peers::admit_peer(
+            state,
+            &state.identity.node_id().to_hex(),
+            "owner_control",
+            body,
+            true,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                let entry = outcome.entry;
+                let name = entry.label.as_deref().unwrap_or("contact");
+                let status = match outcome.dialed {
+                    Ok(()) => "connected".to_string(),
+                    Err(error) => format!(
+                        "not reachable yet ({error}); the node keeps retrying. Check the address and that the peer has whitelisted {}.",
+                        state.identity.node_id().to_hex(),
+                    ),
+                };
+                ControlResponse::Ok {
+                    detail: format!(
+                        "added {name} ({}) at {} — {status}",
+                        entry.node_id.short_fingerprint(),
+                        entry.addr,
+                    ),
+                }
+            }
+            Err(e) => ControlResponse::Error {
+                message: e.to_string(),
+            },
+        };
+    }
     let ControlRequest::ApproveGift {
         intro_id,
         newcomer,
@@ -1195,8 +1268,28 @@ mod wire_tests {
     use super::*;
 
     #[test]
+    fn add_peer_allows_omitted_label_and_rejects_unknown_fields() {
+        let request: ControlRequest =
+            serde_json::from_str(r#"{"op":"add-peer","node_id":"ab","addr":"127.0.0.1:9735"}"#)
+                .unwrap();
+        assert!(matches!(
+            &request,
+            ControlRequest::AddPeer { label: None, .. }
+        ));
+        let round_trip: ControlRequest =
+            serde_json::from_slice(&encode_request(&request).unwrap()).unwrap();
+        assert!(request == round_trip);
+        assert!(serde_json::from_str::<ControlRequest>(
+            r#"{"op":"add-peer","node_id":"ab","addr":"127.0.0.1:9735","yes":true}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn transport_encoding_preserves_all_request_variants() {
         let fixtures = [
+            r#"{"op":"add-peer","node_id":"abababababababababababababababababababababababababababababababab","addr":"127.0.0.1:9735","label":"Dad"}"#,
+            r#"{"op":"add-peer","node_id":"abababababababababababababababababababababababababababababababab","addr":"127.0.0.1:9735","label":null}"#,
             r#"{"op":"status"}"#,
             r#"{"op":"describe","op_id":"test"}"#,
             r#"{"op":"grant","op_id":"test","confirmation":"yes","terms":{"breakers":{"max_payments_per_minute":10,"max_payments_per_hour":60,"max_consecutive_failures":5,"max_msat_per_10_minutes":1000000},"allow_liquidity_fees":false,"budget_msat":1000,"per_call_max_msat":100,"per_recipient_msat":{},"ttl_secs":60}}"#,

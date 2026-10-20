@@ -5,6 +5,12 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Add `konsensus peer add --node-id <64hex> --addr <ip:port> [--label <text>] [--yes]`
+  over the owner control socket: persist, whitelist, dial and supervise contacts
+  without a restart. HTTP and console admission share self-ID and control-label
+  rejection; console adds are audited as `owner_control`. The CLI warns when a
+  matching `[[peers]]` entry will override the saved address at restart.
+
 ## [0.3.0-rc17] — 2026-10-19 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. rc17 is rc16 (`8c6565f`) plus the
