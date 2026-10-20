@@ -29,6 +29,14 @@ impl Drop for Terminal {
 
 impl Terminal {
     fn spawn(command: &str, dir: &std::path::Path) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_konsensus"));
+        cmd.args([command, "--dir"])
+            .arg(dir)
+            .args(["--tier", "full", "--encrypt"]);
+        Self::spawn_command(cmd)
+    }
+
+    fn spawn_command(mut cmd: Command) -> Self {
         let mut master = -1;
         let mut slave = -1;
         // SAFETY: openpty initializes both descriptors; optional settings are null.
@@ -59,11 +67,7 @@ impl Terminal {
             unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
             0
         );
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_konsensus"));
-        cmd.args([command, "--dir"])
-            .arg(dir)
-            .args(["--tier", "full", "--encrypt"])
-            .stdin(Stdio::from(slave.try_clone().unwrap()))
+        cmd.stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave.try_clone().unwrap()));
         // SAFETY: only syscalls run after fork. Stdio has installed the slave on fd 0;
@@ -142,6 +146,10 @@ impl Terminal {
 
     fn enter_password(&mut self, password: &str) {
         self.read_until("Enter a non-empty password to encrypt your mnemonic:");
+        self.type_password(password);
+    }
+
+    fn type_password(&mut self, password: &str) {
         // The prompt is flushed just before rpassword disables echo. Synchronize
         // on terminal state instead of racing that transition with password input.
         // Still send on timeout so the regression also observes the actual echo.
@@ -151,6 +159,35 @@ impl Terminal {
         }
         writeln!(self.master.as_mut().unwrap(), "{password}").unwrap();
     }
+}
+
+#[test]
+fn node_id_prompts_for_encrypted_mnemonic_without_echoing() {
+    const PASSWORD: &str = "node-id-terminal-secret";
+    let dir = tempfile::tempdir().unwrap();
+    let initialized = Command::new(env!("CARGO_BIN_EXE_konsensus"))
+        .args(["init", "--non-interactive", "--tier", "light", "--dir"])
+        .arg(dir.path())
+        .args(["--encrypt", PASSWORD])
+        .output()
+        .unwrap();
+    assert!(initialized.status.success());
+    let stdout = String::from_utf8(initialized.stdout).unwrap();
+    let expected = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Node ID:"))
+        .unwrap()
+        .trim();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_konsensus"));
+    cmd.args(["node-id", "--mnemonic"])
+        .arg(dir.path().join("mnemonic.enc"));
+    let mut terminal = Terminal::spawn_command(cmd);
+    terminal.read_until("Encrypted mnemonic file detected. Enter password:");
+    terminal.type_password(PASSWORD);
+    terminal.read_until(expected);
+    assert!(!terminal.output.contains(PASSWORD));
+    assert!(terminal.echo_enabled());
+    assert!(terminal.child.wait().unwrap().success());
 }
 
 #[test]

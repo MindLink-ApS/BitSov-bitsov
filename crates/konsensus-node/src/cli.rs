@@ -145,9 +145,33 @@ pub enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
 
-        /// BIP-39 passphrase (optional).
+        /// BIP-39 passphrase (optional). Distinct from the encryption password.
         #[arg(short, long, default_value = "")]
         passphrase: String,
+
+        /// Password to decrypt an encrypted mnemonic file (`.enc`).
+        /// If the mnemonic file has `.enc` extension and no password is
+        /// provided, prompts interactively (the password is not echoed).
+        #[arg(long, conflicts_with = "password_file")]
+        password: Option<String>,
+
+        /// Read that password from a file instead of prompting. Opt-in: only a
+        /// regular file readable by its owner alone (chmod 600) is accepted.
+        /// Any program running as you can read it, including a paired app, so
+        /// it protects the seed from other OS users only.
+        #[arg(long)]
+        password_file: Option<PathBuf>,
+
+        /// Read the password once to EOF from an inherited descriptor (0 = stdin).
+        /// UTF-8, at most 4096 bytes; trailing CR/LF is removed.
+        /// Nonzero descriptors require Unix.
+        #[arg(
+            long,
+            value_name = "N",
+            value_parser = clap::value_parser!(i32).range(0..),
+            conflicts_with_all = ["password", "password_file"]
+        )]
+        password_fd: Option<i32>,
     },
 
     /// Restore a node from an existing 24-word mnemonic.

@@ -29,6 +29,41 @@ fn test_txid() -> String {
 }
 
 #[tokio::test]
+async fn funding_address_reports_network_from_node_settings() {
+    for network in [
+        Some("bitcoin"),
+        Some("signet"),
+        Some("testnet"),
+        Some("regtest"),
+        None,
+    ] {
+        let mut state = test_state();
+        Arc::get_mut(&mut state).unwrap().introduction.network = network.map(str::to_owned);
+        let auth = auth_header(&state);
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/payments/funding-address")
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["network"], serde_json::json!(network));
+        assert_eq!(
+            body["address"],
+            "bcrt1qstubfundingaddress0000000000000000000000"
+        );
+    }
+}
+
+#[tokio::test]
 async fn payments_balance() {
     let state = test_state();
     let auth = auth_header(&state);

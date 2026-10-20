@@ -204,6 +204,7 @@ fn parse_node_id() {
             mnemonic,
             config,
             passphrase,
+            ..
         } => {
             assert_eq!(mnemonic, Some(PathBuf::from("/keys/m.txt")));
             assert!(config.is_none());
@@ -221,6 +222,7 @@ fn parse_node_id_with_config() {
             mnemonic,
             config,
             passphrase,
+            ..
         } => {
             assert!(mnemonic.is_none());
             assert_eq!(config, Some(PathBuf::from("/data/konsensus.toml")));
@@ -245,6 +247,7 @@ fn parse_node_id_with_passphrase() {
             mnemonic,
             config,
             passphrase,
+            ..
         } => {
             assert_eq!(mnemonic, Some(PathBuf::from("/keys/m.txt")));
             assert!(config.is_none());

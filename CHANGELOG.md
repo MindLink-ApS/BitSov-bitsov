@@ -5,6 +5,13 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Fix `konsensus node-id` with encrypted mnemonics: reuse the terminal prompt,
+  `--password-fd`, `--password-file` and `--password` inputs from `sign-challenge`.
+- Report the configured Bitcoin network from `GET /api/v1/payments/funding-address`,
+  including signet, instead of always reporting `bitcoin`.
+- Allow `GET /api/v1/peers/export` with Read scope: its peer fields are already
+  exposed by `GET /peers`, with no additional secrets or private addresses.
+
 ## [0.3.0-rc17] — 2026-10-19 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. rc17 is rc16 (`8c6565f`) plus the

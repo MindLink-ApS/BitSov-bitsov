@@ -988,7 +988,7 @@ async fn get_funding_address(
     match state.lightning.get_funding_address().await {
         Some(address) => Ok(Json(serde_json::json!({
             "address": address,
-            "network": "bitcoin",
+            "network": state.introduction.network,
             "note": "Send on-chain BTC to this address to fund the LDK wallet. Funds become available for opening Lightning channels after 1 confirmation."
         }))),
         None => Err(ApiError::BadRequest(
