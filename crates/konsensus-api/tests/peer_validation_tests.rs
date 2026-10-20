@@ -193,6 +193,7 @@ async fn all_peer_writers_accept_ordinary_unicode_labels() {
 async fn reject_unusable_addresses(operation: &str) {
     for addr in [
         "0.0.0.0:9735",
+        "255.255.255.255:9735",
         "[::]:9735",
         "127.0.0.1:0",
         "[::1]:0",
@@ -200,6 +201,7 @@ async fn reject_unusable_addresses(operation: &str) {
         "239.255.255.255:9735",
         "[ff02::1]:9735",
         "[::ffff:0.0.0.0]:9735",
+        "[::ffff:255.255.255.255]:9735",
         "[::ffff:224.0.0.1]:9735",
     ] {
         let (state, transport) = probe::state(Arc::new(common::MemStorage::new()), "ok");

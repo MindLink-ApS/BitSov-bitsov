@@ -98,7 +98,8 @@ pub struct PeerBackup {
 pub struct ImportPeersRequest {
     /// The backup data (same format as export).
     pub backup: PeerBackup,
-    /// Legacy option accepted for compatibility. Existing peers are always skipped.
+    /// Legacy no-op accepted for compatibility, regardless of its value.
+    /// Import never overwrites an existing peer; existing peers are always skipped.
     #[serde(default)]
     pub skip_existing: bool,
 }
@@ -329,11 +330,9 @@ async fn dial_and_supervise(
                     .supervise_peer(node_id, &current.addr.to_string())
                     .await;
             } else {
-                // An inbound-only re-import has no retry target. Clear the
-                // stale dial's tracking, then restore transport admission.
-                // Whitelist removal leaves the authenticated connection open.
-                state.transport.remove_from_whitelist(node_id).await;
-                state.transport.add_to_whitelist(node_id).await;
+                // The inbound-only sentinel cancels stale retry tracking
+                // without a remove/add gap in the restored whitelist entry.
+                state.transport.supervise_peer(node_id, "0.0.0.0:0").await;
             }
         } else {
             // A transport may finish its handshake after DELETE disconnected.

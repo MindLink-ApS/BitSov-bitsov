@@ -84,13 +84,18 @@ impl MessageTransport for AdmissionTransport {
         }
     }
     async fn remove_from_whitelist(&self, _: &NodeId) {
+        self.calls.lock().unwrap().push("unwhitelist");
         let mut live = self.live.lock().unwrap();
         live.0 = false;
         live.2 = false;
     }
     async fn supervise_peer(&self, _: &NodeId, addr: &str) {
-        self.supervised_addrs.lock().unwrap().push(addr.to_string());
-        self.live.lock().unwrap().2 = true;
+        // Match NoiseTransport: the inbound-only sentinel cancels tracking.
+        let dialable = addr != "0.0.0.0:0";
+        if dialable {
+            self.supervised_addrs.lock().unwrap().push(addr.to_string());
+        }
+        self.live.lock().unwrap().2 = dialable;
         self.calls.lock().unwrap().push("supervise");
     }
 }

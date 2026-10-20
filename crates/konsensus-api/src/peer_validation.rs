@@ -44,7 +44,11 @@ pub fn validate_peer_label(label: Option<&str>) -> Result<(), ApiError> {
 pub fn validate_peer_addr(addr: &std::net::SocketAddr) -> Result<(), ApiError> {
     // IPv4-mapped IPv6 must obey the same rules as native IPv4.
     let ip = addr.ip().to_canonical();
-    if addr.port() == 0 || ip.is_unspecified() || ip.is_multicast() {
+    if addr.port() == 0
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast())
+    {
         return Err(ApiError::BadRequest(
             "peer address must be a unicast IP address with a nonzero port".into(),
         ));

@@ -115,9 +115,11 @@ async fn write_racing_delete(operation: &str, fail: bool) {
         } else {
             assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }
-        assert!(
-            transport.calls.lock().unwrap().is_empty(),
-            "failed write changed live state"
+        let expected: &[&str] = if operation == "import" { &[] } else { &["unwhitelist"] };
+        assert_eq!(
+            transport.calls.lock().unwrap().as_slice(),
+            expected,
+            "only the queued DELETE may change live state after a failed write"
         );
     } else if operation == "connect" {
         // DELETE queues before post-dial revalidation, invalidating admission.

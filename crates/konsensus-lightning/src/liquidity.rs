@@ -21,6 +21,7 @@ pub struct LspConfig {
     pub token: Option<String>,
     /// Trust the selected provider for inbound channels funded with at most 200,000 sats.
     /// These channels may omit our anchor reserve; larger and outbound channels may not.
+    /// The limit is per channel, not an aggregate cap across this provider's channels.
     #[serde(default)]
     pub trust_no_reserve: bool,
 }
