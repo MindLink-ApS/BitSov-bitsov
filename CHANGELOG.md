@@ -5,6 +5,18 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+## [0.3.0-rc18] — 2026-10-20 (prep; not tagged yet)
+
+**Pre-release.** Not for production use. rc18 is rc17 (`ce7fb53`) plus
+#321, #322, #323, #324, #326 and #327: encrypted-seed node identity, live
+peer admission and hardening, starter-channel doctrine, and opt-in channel
+pushes with bounded reserve trust (Option-A N1/N4/N5, signet). See the
+[rc18 signing checklist](docs/releases/v0.3.0-rc18.md) and
+[rc17 → rc18 upgrade guidance](docs/UPGRADING.md#rc17--rc18).
+No new storage schema migration; existing forward-only fences still apply.
+
+### Node / Security
+
 - Add opt-in `trust_no_reserve` for the selected liquidity provider, default
   false. This trusts the hub to confirm closing transactions and waives its
   local anchor emergency reserve only for inbound channels funded with at most
@@ -55,6 +67,17 @@ also live on the corresponding GitHub pre-release pages.
   without a restart. HTTP and console admission share self-ID and control-label
   rejection; console adds are audited as `owner_control`. The CLI warns when a
   matching `[[peers]]` entry will override the saved address at restart.
+
+### Documentation
+
+- Record the operator-funded starter channel as the T4a labelled departure
+  from principle 3 (#323): opt-in, exit-able and never the only path. Pushed
+  sats belong to the recipient; the 1,000 msat admission floor is unchanged.
+  The starter policy is for signet; mainnet sizes and policy remain out of scope.
+
+### Release metadata
+
+- Bump all 14 workspace packages to `0.3.0-rc18`; dependency versions are unchanged.
 
 ## [0.3.0-rc17] — 2026-10-19 (prep; not tagged yet)
 

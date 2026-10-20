@@ -3,6 +3,71 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## rc17 → rc18
+
+rc18 is rc17 (`ce7fb53`) plus #321, #322, #323, #324, #326 and #327.
+Replace the binary, retain the data directory and config, and start as before.
+No SQL, pairing-store or peer-store schema version changes, data migration or
+required config edits are introduced. Pairing storage remains **v8**. The
+existing fences still apply: no rc16 or older on a v8 pairing store, and no
+rc14 after running with embedded LDK. See the
+[rc18 signing and beta-node checklist](releases/v0.3.0-rc18.md).
+
+### Optional liquidity and channel-push settings
+
+The new `trust_no_reserve` key belongs to each
+`[[lightning.liquidity.providers]]` entry and defaults to `false`. Existing
+configs keep their behavior. Set it to `true` only when you trust that provider
+to confirm closing transactions. It takes effect at startup only when liquidity
+is enabled and that provider is selected. Switching providers requires restart.
+
+The waiver applies only to inbound anchor channels whose **full funding amount
+is at most 200,000 sats per channel**, not an aggregate cap per peer. Larger
+inbound channels and all outbound channels retain the normal local reserve
+(default 25,000 sats). A 200,001-sat inbound channel is refused on an empty
+wallet. Force-close still requests broadcasting the latest commitment;
+fee-bumping is skipped only while live channel details prove eligibility.
+Missing details fall back to local fee-bumping, even for a previously waived
+channel, so the waiver does not promise that local close fees are never spent.
+See [liquidity configuration](LSPS2-LIQUIDITY.md).
+
+The owner channel-open API also accepts optional `push_sats`, capped at half
+the channel amount. Omitted or null means no push; explicit pushes, including
+zero, are rejected by unsupported backends before dispatch. This is an API
+request field, not a config key. Existing unpaired Spend authorization still
+applies; paired budget grants cannot open or push. No automatic onboarding
+opens are enabled. Option-A N1/N4/N5 and the T4a starter policy target the signet
+lane; this release does not approve mainnet sizes or policy. See
+[initial balance push](ops/funding-fees.md#initial-balance-push).
+
+### Contacts and encrypted seeds
+
+`konsensus node-id` can now decrypt `mnemonic.enc` using the same terminal,
+`--password-fd`, `--password-file` or `--password` sources as `sign-challenge`.
+The funding-address API reports the configured network, including signet;
+`GET /api/v1/peers/export` now accepts Read scope.
+
+For live admission, start with `--owner-control` and use `konsensus peer add`
+under the same OS account with the running node's config. The contact is saved,
+whitelisted and supervised without restart; an unreachable peer remains saved
+and retried. A matching `[[peers]]` config entry overrides its saved address
+at restart. Imports never overwrite existing peers (`skip_existing` is a
+compatibility no-op); invalid entries are reported individually. Labels are
+plaintext audit metadata. See [owner console admission](operations/home-node.md#add-a-contact-from-the-owner-console)
+and [audit retention guidance](operations/LOGGING.md).
+
+### Rollback to rc17
+
+Keep the previous rc17 binary beside the staged rc18 binary. There is no new
+schema downgrade fence between these two releases. Stop BitSov before switching
+back and retain its latest data directory; do not restore an old wallet/channel
+or pairing snapshot. Remove `trust_no_reserve` from provider entries before
+starting rc17, even if set to false: rc17 rejects this unknown config field.
+rc17 also lacks the new push API and restores its normal reserve policy; check
+available on-chain reserve for channels admitted using the rc18 waiver before
+rollback. Earlier forward-only fences remain in force. On Umbrel, operate only
+on BitSov's binary, service and data: never touch Umbrel's own LND or wallet.
+
 ## rc16 → rc17: pairing storage v8
 
 Relation-envelope identity support (`relation_envelope_id_v1`) writes
