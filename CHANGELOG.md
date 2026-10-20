@@ -5,6 +5,11 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Finish channel-open operation recording after HTTP disconnects; reconcile
+  crash-left `pending` operations older than ten minutes against the node's
+  channels on retry, without dispatching again. Proven LDK pre-dispatch refusals
+  release the operation ID. Uses the existing migration 030 schema.
+
 - Make `POST /api/v1/payments/open-channel` idempotent with an optional UUIDv4
   `operation_id` (#331, capability `channel_open_operations_v1`): recorded
   before dispatch (migration 030), a retry with the same id returns the recorded
