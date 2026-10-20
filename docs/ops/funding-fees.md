@@ -180,7 +180,47 @@ Owner Spend authorization and close safety checks are unchanged.
 Both `opening` and `pending_visibility` mean the open has been dispatched;
 do not retry either response to wait for readiness. Poll the channel list.
 A transport failure or uncertain backend error still requires inspecting
-channels/events before retrying; this endpoint does not provide idempotent opens.
+channels/events before retrying, unless the open carried an `operation_id`
+(below).
+
+## Idempotent opens with `operation_id` (#331)
+
+Nodes advertising `channel_open_operations_v1` in `/api/v1/status`
+`api_capabilities` accept an optional `operation_id` on
+`POST /api/v1/payments/open-channel`: a client-generated UUIDv4, as for message
+compose. Generate it before the first request and keep it through timeouts,
+502s and restarts.
+
+```json
+{
+  "peer_pubkey": "<compressed Lightning public key>",
+  "peer_addr": "<IP address>:9735",
+  "amount_sats": 100000,
+  "operation_id": "6f1c9a52-6c8e-4c1e-9f3b-2d6a0e7b5c41"
+}
+```
+
+The node records the id and a digest of the request parameters (`peer_pubkey`,
+`peer_addr`, `amount_sats`, `push_sats`, `announce`, `funding_priority`,
+`max_funding_fee_sats`, `fee_rate_sat_per_vb`) in `channel_open_operations`
+(migration 030, SQLite and PostgreSQL; the request and response are encrypted
+at rest) **before** dispatch. A request carrying a recorded id never opens again:
+
+| Recorded state | Same id, same parameters |
+| --- | --- |
+| `opened` | HTTP 200 with the original open response, plus `operation_id` and `replayed: true`. |
+| `uncertain` (the first attempt returned a timeout, connection or backend error) | HTTP 202 `status: "outcome_uncertain"`, `last_error`, and `peer_channels` (this peer's current channels, or null if Lightning cannot list them). Inspect them; to try again, use a **new** `operation_id`. |
+| `pending` (dispatch in flight, or the node stopped before recording the outcome) | HTTP 202 `status: "pending"` with the same fields. |
+
+The same id with any different parameter returns `409 operation_mismatch`
+before dispatch. A proven non-dispatch (`400 not_dispatched`, or `503 not_ready`
+from the backend) removes the record, so the same id may be retried. A replay
+does not require `money_ready`. `operation_id` cannot be combined with
+`dry_run` (`400 not_dispatched`); an invalid id is HTTP 400. The first
+successful response also includes `operation_id`.
+
+Without `operation_id`, behaviour is unchanged: nothing is recorded and every
+request may open a channel.
 
 Owner `GET /api/v1/status` reports `network` from the configured Lightning
 network, matching `/api/v1/payments/funding-address` (for example `"signet"`).

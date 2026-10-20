@@ -313,6 +313,7 @@ async fn status(
             "offline_readiness_v1",
             "message_operations_v1",
             "message_operation_abandon_v1",
+            "channel_open_operations_v1",
             super::messages::caps::CAPABILITY,
             super::messages::caps::QUOTED_READMISSION_CAPABILITY,
             super::messages::caps::ROOM_CAPABILITY,

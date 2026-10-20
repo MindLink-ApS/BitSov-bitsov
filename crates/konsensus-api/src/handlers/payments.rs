@@ -786,6 +786,88 @@ pub struct OpenChannelRequest {
     /// Must be finite and within 1–10,000 sat/vB if provided.
     #[serde(default)]
     pub fee_rate_sat_per_vb: Option<f32>,
+    /// Optional idempotency key (UUIDv4), as for message compose (#331).
+    /// Recorded before dispatch: a retry with the same id and parameters
+    /// returns the recorded channel or status and never opens again; the same
+    /// id with different parameters is `409 operation_mismatch`.
+    #[serde(default)]
+    pub operation_id: Option<String>,
+}
+
+/// Canonical digest and record of the parameters an `operation_id` binds.
+fn open_channel_fingerprint(req: &OpenChannelRequest) -> Result<(String, Vec<u8>), ApiError> {
+    use sha2::{Digest, Sha256};
+    let request = serde_json::to_vec(&serde_json::json!({
+        "peer_pubkey": req.peer_pubkey.to_ascii_lowercase(),
+        "peer_addr": req.peer_addr,
+        "amount_sats": req.amount_sats,
+        "push_sats": req.push_sats,
+        "announce": req.announce,
+        "funding_priority": req.funding_priority,
+        "max_funding_fee_sats": req.max_funding_fee_sats,
+        "fee_rate_sat_per_vb_bits": req.fee_rate_sat_per_vb.map(f32::to_bits),
+    }))
+    .map_err(|e| ApiError::Internal(format!("open-channel fingerprint: {e}")))?;
+    Ok((hex::encode(Sha256::digest(&request)), request))
+}
+
+fn channel_open_storage(e: impl std::fmt::Display) -> ApiError {
+    ApiError::Storage(format!("channel open operation: {e}"))
+}
+
+/// Answer a retry from its record without dispatching. A different request
+/// under the same id is a conflict; an unresolved one reports the peer's
+/// current channels so the owner can inspect before choosing a new id.
+async fn replay_channel_open(
+    state: &AppState,
+    op: konsensus_storage::ChannelOpenOperation,
+    request_hash: &str,
+    peer_pubkey: &str,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    use konsensus_storage::channel_open::{CHANNEL_OPEN_OPENED, CHANNEL_OPEN_UNCERTAIN};
+    if op.request_hash != request_hash {
+        return Err(ApiError::OperationConflict("operation_mismatch"));
+    }
+    if op.state == CHANNEL_OPEN_OPENED {
+        let mut body: serde_json::Value =
+            serde_json::from_slice(op.result.as_deref().unwrap_or_default())
+                .map_err(channel_open_storage)?;
+        body["operation_id"] = op.operation_id.into();
+        body["replayed"] = true.into();
+        return Ok((StatusCode::OK, Json(body)));
+    }
+    let peer = peer_pubkey.to_ascii_lowercase();
+    // Best effort: an unavailable backend still answers without dispatching.
+    let channels = state.lightning.list_channels().await.ok().map(|all| {
+        all.into_iter()
+            .filter(|c| c.peer_pubkey.eq_ignore_ascii_case(&peer))
+            .map(|c| {
+                serde_json::json!({
+                    "channel_id": c.channel_id,
+                    "user_channel_id": c.user_channel_id,
+                    "funding_txo": c.funding_txo,
+                    "capacity_msat": c.capacity_msat,
+                    "active": c.active,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let status = if op.state == CHANNEL_OPEN_UNCERTAIN {
+        "outcome_uncertain"
+    } else {
+        "pending"
+    };
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": status,
+            "operation_id": op.operation_id,
+            "replayed": true,
+            "last_error": op.last_error,
+            "peer_channels": channels,
+            "warning": "Not opened again. The first attempt's outcome is not recorded as final; inspect this peer's channels before retrying with a new operation_id.",
+        })),
+    ))
 }
 
 /// Close a Lightning channel by a listed channel ID.
@@ -804,7 +886,30 @@ async fn open_channel(
     State(state): State<Arc<AppState>>,
     _user: ScopedAuth<Spend>,
     Json(req): Json<OpenChannelRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // #331: a recorded operation answers from its record, without dispatch
+    // (and without requiring Lightning to be ready again).
+    let operation = match req.operation_id.as_deref() {
+        Some(_) if req.dry_run => {
+            return Err(ApiError::NotDispatched(
+                "operation_id cannot be combined with dry_run".into(),
+            ));
+        }
+        Some(id) => {
+            let id = crate::handlers::messages::operations::operation_id(Some(id))?;
+            let (hash, request) = open_channel_fingerprint(&req)?;
+            if let Some(op) = state
+                .storage
+                .get_channel_open_operation(&id)
+                .await
+                .map_err(channel_open_storage)?
+            {
+                return replay_channel_open(&state, op, &hash, &req.peer_pubkey).await;
+            }
+            Some((id, hash, request))
+        }
+        None => None,
+    };
     crate::error::require_money_ready(&state).await?;
     // L0a: shared validator rejects NaN/Inf and enforces 1.0–10_000.0 sat/vB.
     // The naive `<= 0.0` check accepts NaN (NaN compares false everywhere) and
@@ -847,10 +952,38 @@ async fn open_channel(
             .funding_fee_quote(options)
             .await
             .map_err(ApiError::from)?;
-        return Ok(Json(
-            serde_json::json!({"status": "preview", "funding_fee": quote,
+        return Ok((
+            StatusCode::OK,
+            Json(
+                serde_json::json!({"status": "preview", "funding_fee": quote,
             "warning": "Estimate only; opening obtains a fresh estimate. Confirmation and channel_ready times are not guaranteed."}),
+            ),
         ));
+    }
+    // #331: record the operation before dispatch. Losing the insert race means
+    // another request owns this id; answer from its record.
+    if let Some((id, hash, request)) = &operation {
+        let pending = konsensus_storage::ChannelOpenOperation::pending(
+            id.clone(),
+            hash.clone(),
+            request.clone(),
+        );
+        if !state
+            .storage
+            .insert_channel_open_operation(&pending)
+            .await
+            .map_err(channel_open_storage)?
+        {
+            let op = state
+                .storage
+                .get_channel_open_operation(id)
+                .await
+                .map_err(channel_open_storage)?
+                .ok_or_else(|| {
+                    ApiError::Conflict("operation changed concurrently; retry".into())
+                })?;
+            return replay_channel_open(&state, op, hash, &req.peer_pubkey).await;
+        }
     }
     let result = if explicit {
         state
@@ -875,10 +1008,38 @@ async fn open_channel(
                 req.fee_rate_sat_per_vb,
             )
             .await
-    }
-    .map_err(ApiError::from)?;
+    };
+    let result = match (result, &operation) {
+        (Ok(result), _) => result,
+        (Err(e), None) => return Err(ApiError::from(e)),
+        (Err(e), Some((id, _, _))) => {
+            use konsensus_core::traits::lightning::LightningError as E;
+            // Only proven non-dispatch frees the id; anything else may have
+            // opened a channel and stays recorded as uncertain.
+            let recorded = if matches!(e, E::PaymentNotDispatched(_) | E::NotReady) {
+                state
+                    .storage
+                    .delete_pending_channel_open_operation(id)
+                    .await
+            } else {
+                state
+                    .storage
+                    .resolve_channel_open_operation(
+                        id,
+                        konsensus_storage::channel_open::CHANNEL_OPEN_UNCERTAIN,
+                        None,
+                        Some(&e.to_string()),
+                    )
+                    .await
+            };
+            if let Err(storage) = recorded {
+                tracing::warn!(operation_id = %id, "channel open outcome not recorded: {storage}");
+            }
+            return Err(ApiError::from(e));
+        }
+    };
 
-    Ok(Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "channel_id": result.channel_id,
         "user_channel_id": result.user_channel_id,
         "funding_txo": result.funding_txo,
@@ -888,7 +1049,30 @@ async fn open_channel(
         "peer_pubkey": req.peer_pubkey,
         "amount_sats": req.amount_sats,
         "status": result.status
-    })))
+    });
+    if let Some((id, _, _)) = &operation {
+        // A failed write leaves the record pending: a retry still never
+        // reopens, it reports the peer's channels instead.
+        match serde_json::to_vec(&body) {
+            Ok(bytes) => {
+                if let Err(e) = state
+                    .storage
+                    .resolve_channel_open_operation(
+                        id,
+                        konsensus_storage::channel_open::CHANNEL_OPEN_OPENED,
+                        Some(&bytes),
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(operation_id = %id, "opened channel not recorded: {e}");
+                }
+            }
+            Err(e) => tracing::warn!(operation_id = %id, "opened channel not recorded: {e}"),
+        }
+        body["operation_id"] = id.clone().into();
+    }
+    Ok((StatusCode::OK, Json(body)))
 }
 
 #[derive(Deserialize)]

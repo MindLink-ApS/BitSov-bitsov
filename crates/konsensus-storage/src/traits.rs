@@ -121,6 +121,35 @@ pub trait Storage: Send + Sync {
     async fn get_outbox_operation(&self, _id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
+
+    // ── open-channel idempotency (#331) ────────────────────────────────
+    // Defaults refuse: a backend without durable records cannot honour an
+    // operation_id, and the handler must not open without one.
+
+    /// Insert once, before dispatch. False when the id already exists; a
+    /// duplicate never overwrites the request binding.
+    async fn insert_channel_open_operation(&self, _op: &crate::ChannelOpenOperation) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("channel open operations".into()))
+    }
+    async fn get_channel_open_operation(&self, _id: &str) -> Result<Option<crate::ChannelOpenOperation>, StorageError> {
+        Err(StorageError::Unsupported("channel open operations".into()))
+    }
+    /// Move a `pending` record to `state` (`opened` or `uncertain`). Records
+    /// already resolved are never rewritten; false writes nothing.
+    async fn resolve_channel_open_operation(
+        &self,
+        _id: &str,
+        _state: &str,
+        _result: Option<&[u8]>,
+        _last_error: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("channel open operations".into()))
+    }
+    /// Remove a `pending` record after a proven non-dispatch, so the same id
+    /// may be retried. Resolved records are never removed.
+    async fn delete_pending_channel_open_operation(&self, _id: &str) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("channel open operations".into()))
+    }
     /// Complete recovery authority: never silently truncate unpaid/paid work.
     /// Select unresolved accounting/payment intents and undelivered envelopes
     /// through the recovery index; resolved terminal history is excluded.

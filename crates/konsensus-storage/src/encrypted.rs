@@ -464,6 +464,25 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         encrypted.recovery = self.encrypt(&op.recovery)?;
         self.inner.update_outbox_operation(&encrypted).await
     }
+    async fn insert_channel_open_operation(&self, op: &crate::ChannelOpenOperation) -> Result<bool, StorageError> {
+        let mut encrypted = op.clone();
+        encrypted.request = self.encrypt(&op.request)?;
+        encrypted.result = op.result.as_deref().map(|r| self.encrypt(r)).transpose()?;
+        self.inner.insert_channel_open_operation(&encrypted).await
+    }
+    async fn get_channel_open_operation(&self, id: &str) -> Result<Option<crate::ChannelOpenOperation>, StorageError> {
+        let Some(mut op) = self.inner.get_channel_open_operation(id).await? else { return Ok(None) };
+        op.request = self.decrypt(&op.request)?;
+        op.result = op.result.as_deref().map(|r| self.decrypt(r)).transpose()?;
+        Ok(Some(op))
+    }
+    async fn resolve_channel_open_operation(&self, id: &str, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
+        let result = result.map(|r| self.encrypt(r)).transpose()?;
+        self.inner.resolve_channel_open_operation(id, state, result.as_deref(), last_error).await
+    }
+    async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
+        self.inner.delete_pending_channel_open_operation(id).await
+    }
     async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
         let mut op = self.inner.get_outbox_operation(id).await?;
         if let Some(op) = &mut op { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
