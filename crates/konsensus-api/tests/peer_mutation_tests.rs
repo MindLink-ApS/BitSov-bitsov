@@ -217,3 +217,86 @@ async fn simultaneous_skip_existing_imports_admit_only_once() {
     assert_eq!(body["imported"], 0);
     assert_eq!(*transport.calls.lock().unwrap(), ["whitelist", "supervise"]);
 }
+
+#[tokio::test]
+async fn metadata_put_during_connect_does_not_invalidate_successful_dial() {
+    for update in [
+        serde_json::json!({"label":"Renamed"}),
+        serde_json::json!({"label":"Renamed", "addr":"127.0.0.1:9735"}),
+        serde_json::json!({"auto_connect":false}),
+    ] {
+        let (state, transport) = probe::state(Arc::new(common::MemStorage::new()), "gate");
+        let id = seed(&state).await;
+        transport.calls.lock().unwrap().clear();
+        let connecting =
+            tokio::spawn(common::test_router(state.clone()).oneshot(request(&state, "connect")));
+        transport.dial_started.notified().await;
+        let response = common::test_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/v1/peers/{id}"))
+                    .header("authorization", common::auth_header(&state))
+                    .header("content-type", "application/json")
+                    .body(Body::from(update.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        transport.finish_dial.notify_one();
+        assert_eq!(
+            connecting.await.unwrap().unwrap().status(),
+            StatusCode::OK,
+            "{update}"
+        );
+        assert_eq!(*transport.live.lock().unwrap(), (true, true, true));
+        if update.get("label").is_some() {
+            assert_eq!(
+                state
+                    .storage
+                    .get_peer(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .display_name
+                    .as_deref(),
+                Some("Renamed")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn address_put_during_connect_invalidates_the_old_dial_target() {
+    let (state, transport) = probe::state(Arc::new(common::MemStorage::new()), "gate");
+    let id = seed(&state).await;
+    transport.calls.lock().unwrap().clear();
+    let connecting =
+        tokio::spawn(common::test_router(state.clone()).oneshot(request(&state, "connect")));
+    transport.dial_started.notified().await;
+    let updated = common::test_router(state.clone())
+        .oneshot(request(&state, "put"))
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    transport.finish_dial.notify_one();
+    assert_eq!(
+        connecting.await.unwrap().unwrap().status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        state
+            .peer_registry
+            .read()
+            .await
+            .addr(&id)
+            .unwrap()
+            .to_string(),
+        "127.0.0.1:9736"
+    );
+    assert_eq!(
+        transport.supervised_addrs.lock().unwrap().last().unwrap(),
+        "127.0.0.1:9736"
+    );
+}

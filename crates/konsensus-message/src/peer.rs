@@ -141,6 +141,21 @@ impl PeerRegistry {
         Arc::make_mut(&mut self.whitelist_cache).insert(node_id);
     }
 
+    /// Update an admitted contact, invalidating in-flight dials only when its
+    /// address changes. Returns false if the contact is not admitted.
+    pub fn update(&mut self, entry: PeerEntry) -> bool {
+        let node_id = entry.node_id;
+        let Some(existing) = self.peers.get_mut(&node_id) else {
+            return false;
+        };
+        let address_changed = existing.addr != entry.addr;
+        *existing = entry;
+        if address_changed {
+            self.advance_generation(node_id);
+        }
+        true
+    }
+
     /// Remove a peer from the registry.
     ///
     /// The whitelist cache is kept in sync so the gate hot path stays consistent.

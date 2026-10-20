@@ -479,11 +479,13 @@ async fn update_peer(
         .await
         .map_err(|e| ApiError::Internal(format!("failed to persist peer update: {e}")))?;
 
-    registry.add(updated);
-    state
-        .transport
-        .supervise_peer(&node_id, &new_addr.to_string())
-        .await;
+    registry.update(updated);
+    if validate_peer_addr(&new_addr).is_ok() {
+        state
+            .transport
+            .supervise_peer(&node_id, &new_addr.to_string())
+            .await;
+    }
     drop(registry);
 
     state.audit_log.record(

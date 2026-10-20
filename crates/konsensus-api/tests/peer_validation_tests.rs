@@ -284,7 +284,7 @@ async fn connect_rejects_legacy_unspecified_address_before_persistence() {
 
 #[tokio::test]
 async fn metadata_only_put_keeps_an_inbound_only_contacts_sentinel_address() {
-    let (state, _) = probe::state(Arc::new(common::MemStorage::new()), "ok");
+    let (state, transport) = probe::state(Arc::new(common::MemStorage::new()), "ok");
     let id = NodeId::from_hex(&"ab".repeat(32)).unwrap();
     state
         .peer_registry
@@ -310,6 +310,7 @@ async fn metadata_only_put_keeps_an_inbound_only_contacts_sentinel_address() {
     assert_eq!(response.status(), StatusCode::OK);
     let row = state.storage.get_peer(&id).await.unwrap().unwrap();
     assert_eq!(row.display_name.as_deref(), Some("Inbound contact"));
+    assert!(transport.supervised_addrs.lock().unwrap().is_empty());
     assert_eq!(
         state
             .peer_registry
