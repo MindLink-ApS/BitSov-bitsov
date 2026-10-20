@@ -5,6 +5,15 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Fix LDK open-channel identifiers at the source: retain the typed user ID
+  through funding reconciliation, avoiding the rc17 post-dispatch parse error
+  that could return HTTP 502 after opening a channel. rc18's wrapper parser was
+  a partial fix; open/list now return decimal `user_channel_id`, hex `channel_id`,
+  and `funding_txo` (`txid:vout`). Close accepts either listed ID and legacy
+  `UserChannelId(n)` values. Clients should use `user_channel_id` for a stable ID.
+- Report the configured Bitcoin `network` in owner `/api/v1/status`, including
+  LDK signet, using the same configuration as funding-address (#321).
+
 ## [0.3.0-rc18] — 2026-10-20 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. rc18 is rc17 (`ce7fb53`) plus

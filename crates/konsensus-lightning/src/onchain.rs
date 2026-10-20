@@ -191,7 +191,9 @@ where
         Err(_) => ChannelOpenStatus::PendingVisibility,
     };
     Ok(ChannelOpenResult {
-            funding_fee: None,
+        user_channel_id: None,
+        funding_txo: None,
+        funding_fee: None,
         channel_id,
         funding_txid: Some(txid),
         status,

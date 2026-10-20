@@ -27,6 +27,8 @@ impl OpenRecorder {
     fn record(&self, peer: &str) -> ChannelOpenResult {
         self.opened.lock().unwrap().push(peer.to_string());
         ChannelOpenResult {
+            user_channel_id: None,
+            funding_txo: None,
             channel_id: "channel".into(),
             funding_txid: None,
             status: ChannelOpenStatus::Opening,

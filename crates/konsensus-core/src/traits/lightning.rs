@@ -171,7 +171,14 @@ pub struct FundingFeeEstimate {
 pub struct ChannelOpenResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funding_fee: Option<FundingFeeEstimate>,
+    /// LDK's 32-byte Lightning channel ID in hex; provider-native ID otherwise.
     pub channel_id: String,
+    /// LDK's stable user ID as a decimal string (u128); null for other providers.
+    #[serde(default)]
+    pub user_channel_id: Option<String>,
+    /// Funding outpoint as `txid:vout`, when assigned.
+    #[serde(default)]
+    pub funding_txo: Option<String>,
     pub funding_txid: Option<String>,
     pub status: ChannelOpenStatus,
 }
@@ -192,12 +199,15 @@ pub struct LocalSpendReservation {
 /// Information about a Lightning channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInfo {
-    /// Provider-local channel identifier — the SAME string `open_channel` returns
-    /// and `close_channel` accepts (LDK: the `user_channel_id`; LND: `chan_id`).
-    /// Required so a client that lists channels can close/inspect one without
-    /// having to remember the id from the open call. Distinct from
-    /// `short_channel_id` (the routing scid, only assigned after confirmation).
+    /// LDK/CLN: 32-byte Lightning channel ID in hex. LND: native `chan_id`.
+    /// LDK close accepts this or `user_channel_id`; distinct from the routing scid.
     pub channel_id: String,
+    /// LDK's stable user ID as a decimal string (u128); null for other providers.
+    #[serde(default)]
+    pub user_channel_id: Option<String>,
+    /// Funding outpoint as `txid:vout`; null before assignment or if unavailable.
+    #[serde(default)]
+    pub funding_txo: Option<String>,
     /// Remote peer's public key (hex).
     pub peer_pubkey: String,
     /// Total channel capacity in millisatoshis.
@@ -839,7 +849,7 @@ pub trait LightningProvider: Send + Sync {
     ///   If either cannot be enforced, return `PaymentNotDispatched` before
     ///   initiating the channel; never silently fall back to backend defaults.
     ///
-    /// Returns the temporary channel ID on success.
+    /// Returns the provider-local ID on success (LDK: decimal user channel ID).
     async fn open_channel(
         &self,
         _peer_pubkey: &str,
@@ -869,6 +879,8 @@ pub trait LightningProvider: Send + Sync {
             .await?;
         Ok(ChannelOpenResult {
             funding_fee: None,
+            user_channel_id: None,
+            funding_txo: None,
             channel_id,
             funding_txid: None,
             status: ChannelOpenStatus::Opening,

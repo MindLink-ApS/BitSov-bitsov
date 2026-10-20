@@ -1370,6 +1370,8 @@ mod tests {
             ..Default::default()
         });
         *lightning.channels.lock().await = vec![ChannelInfo {
+            user_channel_id: None,
+            funding_txo: None,
             channel_id: "1".to_string(),
             peer_pubkey: LN_PUBKEY.to_string(),
             capacity_msat: 50_000_000,

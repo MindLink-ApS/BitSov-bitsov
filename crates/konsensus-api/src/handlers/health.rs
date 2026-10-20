@@ -22,6 +22,8 @@ use crate::state::AppState;
 /// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
 #[derive(Serialize)]
 pub struct HealthResponse {
+    /// Configured Bitcoin network; null when the backend configuration has none.
+    pub network: Option<String>,
     /// Sanitized restore journal diagnostics, owner-only and read-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<konsensus_lightning::recover::Status>,
@@ -289,6 +291,7 @@ async fn status(
     let chain_sync = state.lightning.chain_sync_status();
     let storage_health = state.storage.storage_read_health();
     Ok(Json(HealthResponse {
+        network: state.introduction.network.clone(),
         recovery,
         channel_safety: state.lightning.channel_safety(),
         offline_safety: state

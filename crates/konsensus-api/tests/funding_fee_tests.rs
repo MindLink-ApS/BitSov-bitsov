@@ -71,6 +71,8 @@ impl LightningProvider for FundingBackend {
         self.pushes.lock().unwrap().push(push_msat);
         self.opens.fetch_add(1, Ordering::SeqCst);
         Ok(ChannelOpenResult {
+            user_channel_id: None,
+            funding_txo: None,
             channel_id: "channel".into(),
             funding_txid: Some("ab".repeat(32)),
             status: ChannelOpenStatus::PendingVisibility,

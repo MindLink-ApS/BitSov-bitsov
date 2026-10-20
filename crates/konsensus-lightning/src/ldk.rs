@@ -1828,24 +1828,7 @@ impl LightningProvider for LdkProvider {
             .node
             .list_channels()
             .into_iter()
-            .map(|ch| {
-                let capacity_sats = ch.channel_value_sats;
-                let outbound_msat = ch.outbound_capacity_msat;
-                let inbound_msat = ch.inbound_capacity_msat;
-                let scid = ch.short_channel_id.map(|id| id.to_string());
-
-                ChannelInfo {
-                    // Same formatting `open_channel` returns and `close_channel`
-                    // parses back (UserChannelId Display).
-                    channel_id: format!("{}", ch.user_channel_id),
-                    peer_pubkey: ch.counterparty_node_id.to_string(),
-                    capacity_msat: capacity_sats * 1000,
-                    local_balance_msat: outbound_msat,
-                    remote_balance_msat: inbound_msat,
-                    active: ch.is_usable,
-                    short_channel_id: scid,
-                }
-            })
+            .map(channel_info)
             .collect();
 
         Ok(channels)
@@ -2116,7 +2099,7 @@ impl LightningProvider for LdkProvider {
         announce: bool,
         fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<String, LightningError> {
-        Ok(self
+        let result = self
             .open_channel_with_status(
                 peer_pubkey,
                 peer_addr,
@@ -2124,8 +2107,8 @@ impl LightningProvider for LdkProvider {
                 announce,
                 fee_rate_sat_per_vb,
             )
-            .await?
-            .channel_id)
+            .await?;
+        Ok(result.user_channel_id.unwrap_or(result.channel_id))
     }
 
     async fn open_channel_with_status(
@@ -2145,14 +2128,13 @@ impl LightningProvider for LdkProvider {
             let channel_id = tokio::task::spawn_blocking(move || open_ldk_channel(
                 opener.as_ref(), &peer_pubkey, &peer_addr, amount_sats, announce, fee_rate_sat_per_vb,
             )).await.map_err(|e| LightningError::Backend(format!("open_channel worker failed: {e}")))??;
-            let pending_id = channel_id.clone();
-            crate::onchain::finish_channel_open(channel_id, || {
+            finish_ldk_channel_open(channel_id, |pending_id| {
                 let channel = node.list_channels().into_iter()
-                    .find(|ch| ch.user_channel_id.to_string() == pending_id)
+                    .find(|ch| ch.user_channel_id == pending_id)
                     .ok_or_else(|| LightningError::Backend(format!(
                         "channel {pending_id} disappeared before funding was verified; inspect channel events before retrying"
                     )))?;
-                Ok(channel.funding_txo.map(|outpoint| outpoint.txid.to_string()))
+                Ok(channel)
             }, |id| {
                 let chain = &chain;
                 let node = &node;
@@ -2200,19 +2182,17 @@ impl LightningProvider for LdkProvider {
             let channel_id = tokio::task::spawn_blocking(move || open_ldk_channel_with_policy(
                 opener.as_ref(), &peer_pubkey, &peer_addr, amount_sats, announce, Some(policy), push_msat,
             )).await.map_err(|e| LightningError::Backend(format!("open_channel worker failed: {e}")))??;
-            let pending_id = channel_id.clone();
-            let mut result = crate::onchain::finish_channel_open(channel_id, || {
-                let id = parse_user_channel_id(&pending_id)?;
-                if let Some(reason) = node.channel_funding_failure(id)
+            let mut result = finish_ldk_channel_open(channel_id, |pending_id| {
+                if let Some(reason) = node.channel_funding_failure(pending_id)
                     .map_err(|e| LightningError::Backend(format!("funding outcome unavailable: {e}")))? {
                     return Err(LightningError::PaymentNotDispatched(format!("channel {pending_id}: {reason}; funding not dispatched")));
                 }
                 let channel = node.list_channels().into_iter()
-                    .find(|ch| ch.user_channel_id.to_string() == pending_id)
+                    .find(|ch| ch.user_channel_id == pending_id)
                     .ok_or_else(|| LightningError::Backend(format!(
                         "channel {pending_id} disappeared before funding was verified; inspect channel events before retrying"
                     )))?;
-                Ok(channel.funding_txo.map(|outpoint| outpoint.txid.to_string()))
+                Ok(channel)
             }, |id| {
                 let chain = &chain;
                 let node = &node;
@@ -2268,7 +2248,7 @@ impl LightningProvider for LdkProvider {
         channel_id: &str,
         force: bool,
     ) -> Result<Option<String>, LightningError> {
-        let user_channel_id = parse_user_channel_id(channel_id)?;
+        let user_channel_id = resolve_channel_id(&self.node.list_channels(), channel_id)?;
 
         let node = self.node.clone();
         let channel_id = channel_id.to_owned();
@@ -2969,8 +2949,71 @@ impl ChannelOpener for LdkNode {
     }
 }
 
-// LDK's Display (used by open/list) is `UserChannelId(n)`, not bare decimal.
-// Funding reconciliation and close must resolve the same provider-local ID.
+/// Convert LDK identifiers at the provider boundary, never through Display parsing.
+fn channel_info(ch: ldk_node::ChannelDetails) -> ChannelInfo {
+    ChannelInfo {
+        channel_id: ch.channel_id.to_string(),
+        user_channel_id: Some(ch.user_channel_id.0.to_string()),
+        funding_txo: ch.funding_txo.map(|outpoint| outpoint.to_string()),
+        peer_pubkey: ch.counterparty_node_id.to_string(),
+        capacity_msat: ch.channel_value_sats * 1000,
+        local_balance_msat: ch.outbound_capacity_msat,
+        remote_balance_msat: ch.inbound_capacity_msat,
+        active: ch.is_usable,
+        short_channel_id: ch.short_channel_id.map(|id| id.to_string()),
+    }
+}
+
+fn resolve_channel_id(
+    channels: &[ldk_node::ChannelDetails],
+    id: &str,
+) -> Result<ldk_node::UserChannelId, LightningError> {
+    // Decimal u128 IDs have at most 39 digits, so a 64-digit hex ID is unambiguous.
+    if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        channels
+            .iter()
+            .find(|ch| ch.channel_id.to_string().eq_ignore_ascii_case(id))
+            .map(|ch| ch.user_channel_id)
+            .ok_or_else(|| LightningError::Backend(format!("channel not found: {id}")))
+    } else {
+        parse_user_channel_id(id)
+    }
+}
+
+/// A successful dispatch already owns a typed user ID. Preserve it while waiting
+/// for funding so serialization cannot turn a successful open into a retryable 502.
+async fn finish_ldk_channel_open<F, V, Fut>(
+    user_id: ldk_node::UserChannelId,
+    mut lookup: F,
+    visible: V,
+) -> Result<konsensus_core::traits::lightning::ChannelOpenResult, LightningError>
+where
+    F: FnMut(ldk_node::UserChannelId) -> Result<ldk_node::ChannelDetails, LightningError>,
+    V: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+{
+    let mut channel_id = String::new();
+    let mut funding_txo = None;
+    let mut result = crate::onchain::finish_channel_open(
+        user_id.0.to_string(),
+        || {
+            let channel = lookup(user_id)?;
+            channel_id = channel.channel_id.to_string();
+            funding_txo = channel.funding_txo.map(|outpoint| outpoint.to_string());
+            Ok(channel
+                .funding_txo
+                .map(|outpoint| outpoint.txid.to_string()))
+        },
+        visible,
+    )
+    .await?;
+    result.channel_id = channel_id;
+    result.user_channel_id = Some(user_id.0.to_string());
+    result.funding_txo = funding_txo;
+    Ok(result)
+}
+
+// Compatibility for clients holding IDs returned before decimal serialization.
 fn parse_user_channel_id(channel_id: &str) -> Result<ldk_node::UserChannelId, LightningError> {
     channel_id
         .strip_prefix("UserChannelId(")
@@ -2988,7 +3031,7 @@ fn open_ldk_channel(
     amount_sats: u64,
     announce: bool,
     fee_rate_sat_per_vb: Option<f32>,
-) -> Result<String, LightningError> {
+) -> Result<ldk_node::UserChannelId, LightningError> {
     refuse_exact_funding_rate(fee_rate_sat_per_vb)?;
     open_ldk_channel_with_policy(
         node,
@@ -3009,7 +3052,7 @@ fn open_ldk_channel_with_policy(
     announce: bool,
     policy: Option<ldk_node::funding::FundingPolicy>,
     push_msat: Option<u64>,
-) -> Result<String, LightningError> {
+) -> Result<ldk_node::UserChannelId, LightningError> {
     validate_channel_announcement(node, announce)?;
     use std::str::FromStr;
     let node_pubkey = ldk_node::bitcoin::secp256k1::PublicKey::from_str(peer_pubkey)
@@ -3060,9 +3103,9 @@ fn open_ldk_channel_with_policy(
         _ => LightningError::Backend(format!("open_channel failed: {e}")),
     })?;
 
-    let channel_id = format!("{}", user_channel_id);
+    let channel_id = user_channel_id.0.to_string();
     tracing::info!(channel_id = %channel_id, amount_sats, peer = %peer_pubkey, "Lightning channel opening initiated");
-    Ok(channel_id)
+    Ok(user_channel_id)
 }
 
 fn select_funding_policy(
