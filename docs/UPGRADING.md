@@ -5,7 +5,7 @@ retained data directory without re-running `konsensus init`.
 
 ## rc17 → rc18
 
-rc18 is rc17 (`ce7fb53`) plus #321, #322, #323, #324, #326 and #327.
+rc18 is rc17 (`ce7fb53`) plus #321, #322, #323, #324, #326, #327 and #329.
 Replace the binary, retain the data directory and config, and start as before.
 No SQL, pairing-store or peer-store schema version changes, data migration or
 required config edits are introduced. Pairing storage remains **v8**. The
@@ -17,15 +17,23 @@ rc14 after running with embedded LDK. See the
 
 The new `trust_no_reserve` key belongs to each
 `[[lightning.liquidity.providers]]` entry and defaults to `false`. Existing
-configs keep their behavior. Set it to `true` only when you trust that provider
+configs keep reserve trust off. Set it to `true` only when you trust that provider
 to confirm closing transactions. It takes effect at startup only when liquidity
 is enabled and that provider is selected. Switching providers requires restart.
 
 The waiver applies only to inbound anchor channels whose **full funding amount
 is at most 200,000 sats per channel**, not an aggregate cap per peer. Larger
 inbound channels and all outbound channels retain the normal local reserve
-(default 25,000 sats). A 200,001-sat inbound channel is refused on an empty
-wallet. Force-close still requests broadcasting the latest commitment;
+(default 25,000 sats per channel). With #329, **every inbound or JIT channel
+must be an anchor channel**, including on the hub: it must have the reserve
+available or qualify for the selected-provider `trust_no_reserve = true`
+waiver. A 200,001-sat inbound anchor channel exceeds the waiver cap, so the
+reserve check refuses it on an empty wallet; LDK's non-anchor downgrade retry
+is also refused by anchor-only admission. External peers that can only open
+non-anchor channels are refused. See the
+[inbound handler](../vendor/ldk-node/src/event.rs) and
+[anchor-only patch notes](../vendor/ldk-node/BITSOV-PATCH.md#anchor-only-inbound-admission-2026-10-20).
+Force-close still requests broadcasting the latest commitment;
 fee-bumping is skipped only while live channel details prove eligibility.
 Missing details fall back to local fee-bumping, even for a previously waived
 channel, so the waiver does not promise that local close fees are never spent.
@@ -39,6 +47,17 @@ applies; paired budget grants cannot open or push. No automatic onboarding
 opens are enabled. Option-A N1/N4/N5 and the T4a starter policy target the signet
 lane; this release does not approve mainnet sizes or policy. See
 [initial balance push](ops/funding-fees.md#initial-balance-push).
+
+### Recovery verification
+
+#329's Option-A Phase 0 regtest proof accompanies the anchor-only fix and the
+recovery reserve/waiver requirements. Recovery must verify a fresh channel
+before normal startup: the verification store must see at least 25,000 sats of
+available on-chain reserve, or the selected provider must have
+`trust_no_reserve = true` for an inbound anchor channel funded with at most
+200,000 sats per channel. Without visible reserve or a qualifying waiver,
+verification cannot complete and normal startup remains fenced. See
+[recovery verification requirements](v2/RECOVERY.md#4-verify-a-fresh-channel-before-normal-startup).
 
 ### Contacts and encrypted seeds
 
