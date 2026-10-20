@@ -44,6 +44,302 @@ async fn fee_source(upstream: String) -> (String, FeeSource) {
     (url, FeeSource(task))
 }
 
+// Option A Phase 0 uses the production provider selection and push plumbing.
+// Only the hub is funded. In particular, do not use confirm_channel here:
+// mining after open would hide a regression in zero-conf acceptance.
+struct StarterChannel {
+    hub: LdkProvider,
+    client: LdkProvider,
+    chain: infra::Chain,
+    _fees: FeeSource,
+    dirs: [tempfile::TempDir; 2],
+    height_before_open: u64,
+}
+
+impl StarterChannel {
+    async fn new(trust_no_reserve: bool, hub_selected: bool) -> Self {
+        let chain = infra::Chain::start().await;
+        let dirs = [(); 2].map(|_| tempfile::tempdir().unwrap());
+        let (fee_url, fees) = fee_source(chain.url.clone()).await;
+        let hub_config = infra::lightning_config(dirs[0].path(), &fee_url);
+        let hub_addr = hub_config.listening_address.clone().unwrap();
+        let hub = LdkProvider::new(hub_config).await.unwrap();
+        chain.fund(hub.node()).await;
+
+        let hub_id = hub.node().node_id().to_string();
+        let mut client_config = infra::lightning_config(dirs[1].path(), &fee_url);
+        // The client cannot accept an inbound TCP connection at any address.
+        client_config.listening_address = None;
+        let other_id = ldk_node::bitcoin::secp256k1::PublicKey::from_secret_key(
+            &ldk_node::bitcoin::secp256k1::Secp256k1::new(),
+            &ldk_node::bitcoin::secp256k1::SecretKey::from_slice(&[42; 32]).unwrap(),
+        )
+        .to_string();
+        client_config.liquidity = LiquidityConfig {
+            enabled: true,
+            selected_provider: Some(if hub_selected {
+                hub_id.clone()
+            } else {
+                other_id.clone()
+            }),
+            providers: vec![
+                LspConfig {
+                    node_id: hub_id,
+                    address: hub_addr.clone(),
+                    token: None,
+                    trust_no_reserve,
+                },
+                // A configured opt-in on a NON-selected provider must not waive
+                // its reserve. No connection to this dummy provider is needed.
+                LspConfig {
+                    node_id: other_id,
+                    address: "127.0.0.1:0".into(),
+                    token: None,
+                    trust_no_reserve: true,
+                },
+            ],
+        };
+        let client = LdkProvider::new(client_config).await.unwrap();
+        client.node().sync_wallets().unwrap();
+        assert_eq!(client.node().list_balances().total_onchain_balance_sats, 0);
+        assert!(client.node().list_channels().is_empty());
+        assert!(client.node().config().listening_addresses.is_none());
+
+        // Establish that the supplied address cannot connect before the
+        // client initiates. lib.rs::open_channel_inner calls
+        // connection.rs::connect_peer_if_necessary, whose connected-peer check
+        // must return BEFORE attempting this same bogus address again.
+        assert_eq!(
+            hub.node().connect(
+                client.node().node_id(),
+                "127.0.0.1:0".parse().unwrap(),
+                false,
+            ),
+            Err(ldk_node::NodeError::ConnectionFailed),
+        );
+        client
+            .node()
+            .connect(hub.node().node_id(), hub_addr.parse().unwrap(), false)
+            .unwrap();
+        wait("client-initiated LN connection on both ends", || async {
+            [(hub.node(), client.node()), (client.node(), hub.node())]
+                .iter()
+                .all(|(node, peer)| {
+                    node.list_peers()
+                        .iter()
+                        .any(|p| p.node_id == peer.node_id() && p.is_connected)
+                })
+        })
+        .await;
+        let height_before_open = chain.bitcoin.client.call("getblockcount", &[]).unwrap();
+        Self {
+            hub,
+            client,
+            chain,
+            _fees: fees,
+            dirs,
+            height_before_open,
+        }
+    }
+
+    async fn open(
+        &self,
+        amount_sats: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::ChannelOpenResult,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        use konsensus_core::traits::lightning::{FundingOptions, FundingPriority};
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            self.hub.open_channel_with_funding(
+                &self.client.node().node_id().to_string(),
+                "127.0.0.1:0",
+                amount_sats,
+                false,
+                FundingOptions {
+                    priority: FundingPriority::Economy,
+                    max_funding_fee_sats: Some(2_000),
+                },
+                Some(10_000_000),
+            ),
+        )
+        .await
+        .expect("starter open must finish without dialing the client")
+    }
+
+    fn assert_no_blocks_or_client_funds(&self) {
+        let height: u64 = self
+            .chain
+            .bitcoin
+            .client
+            .call("getblockcount", &[])
+            .unwrap();
+        assert_eq!(
+            height, self.height_before_open,
+            "no blocks mined after open"
+        );
+        assert_eq!(
+            self.client
+                .node()
+                .list_balances()
+                .total_onchain_balance_sats,
+            0
+        );
+    }
+
+    async fn rejected(self, amount_sats: u64, marker: &str) {
+        let outcome = self.open(amount_sats).await;
+        let log_path = self.dirs[1].path().join("ldk/ldk_node.log");
+        let expected = format!(
+            "Rejecting inbound Anchor channel from peer {} due to insufficient available on-chain reserves. Available: 0/25000sats",
+            self.hub.node().node_id()
+        );
+        wait("explicit client anchor-reserve rejection", || async {
+            std::fs::read_to_string(&log_path)
+                .unwrap()
+                .contains(&expected)
+        })
+        .await;
+        println!("PHASE0 OBSERVED {marker}: anchor offer rejected for reserve 0/25000");
+        // A refused anchor offer alone is insufficient: LDK may retry with a
+        // non-anchor type. Such an accepted/funded fallback must fail this test.
+        let error = outcome.expect_err("reserve refusal must not become a funded fallback channel");
+        wait("rejected channel removed on both ends", || async {
+            self.hub.node().list_channels().is_empty()
+                && self.client.node().list_channels().is_empty()
+        })
+        .await;
+        let mempool: Vec<String> = self
+            .chain
+            .bitcoin
+            .client
+            .call("getrawmempool", &[])
+            .unwrap();
+        assert!(mempool.is_empty(), "rejection must not broadcast funding");
+        self.assert_no_blocks_or_client_funds();
+        println!("PHASE0 PASS {marker}: {amount_sats} sat, anchor reserve 0/25000; {error}");
+        self.client.shutdown().await.unwrap();
+        self.hub.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local Bitcoin Core and electrs; scripts/regress/regtest_e2e.sh"]
+async fn phase0_push_zero_conf_connection_reuse_and_payment() {
+    let fixture = StarterChannel::new(true, true).await;
+    let opened = fixture.open(100_000).await.unwrap();
+    let txid = opened.funding_txid.expect("real funding transaction");
+    wait(
+        "starter channel usable at both endpoints without mining",
+        || async {
+            fixture.client.node().sync_wallets().unwrap();
+            [fixture.hub.node(), fixture.client.node()]
+                .iter()
+                .all(|node| {
+                    let channels = node.list_channels();
+                    channels.len() == 1 && channels[0].is_usable
+                })
+        },
+    )
+    .await;
+    for node in [fixture.hub.node(), fixture.client.node()] {
+        let channels = node.list_channels();
+        let channel = &channels[0];
+        assert_eq!(channel.channel_value_sats, 100_000);
+        assert!(!channel.is_announced);
+        assert!(channel.is_channel_ready && channel.is_usable);
+        assert_eq!(channel.confirmations_required, Some(0));
+        assert_eq!(channel.confirmations.unwrap_or(0), 0);
+        assert_eq!(channel.funding_txo.unwrap().txid.to_string(), txid);
+    }
+    let before = capacity(fixture.client.node());
+    // The push is exactly 10k sats. Spendable outbound excludes the negotiated
+    // punishment reserve (normally 1% = 1k sats); it is not an on-chain top-up.
+    let client_channel = fixture.client.node().list_channels().remove(0);
+    assert!(!client_channel.is_outbound);
+    assert!(
+        (9_000_000..=10_000_000).contains(&before),
+        "outbound: {before} msat"
+    );
+    assert_eq!(
+        before + client_channel.unspendable_punishment_reserve.unwrap() * 1_000,
+        10_000_000,
+    );
+    let mempool: Vec<String> = fixture
+        .chain
+        .bitcoin
+        .client
+        .call("getrawmempool", &[])
+        .unwrap();
+    assert_eq!(mempool, vec![txid.clone()]);
+    fixture.assert_no_blocks_or_client_funds();
+    println!("PHASE0 PASS push-zero-conf: 100000 sat / 10000 sat push, outbound {before} msat, empty wallet, funding in mempool");
+    println!("PHASE0 PASS connect-reuse: client has no listener; hub opens over client's connection with 127.0.0.1:0");
+
+    let invoice = fixture
+        .hub
+        .create_invoice(1_000_000, "Phase 0 pushed balance", 600)
+        .await
+        .unwrap();
+    fixture
+        .client
+        .pay_invoice_with_fee_limit(&invoice.bolt11, 0)
+        .await
+        .unwrap();
+    settle(&fixture.client, &invoice.payment_hash).await;
+    settle(&fixture.hub, &invoice.payment_hash).await;
+    let payment = fixture
+        .client
+        .get_payment_status(&invoice.payment_hash)
+        .await
+        .unwrap();
+    assert_eq!(payment.amount_msat, 1_000_000);
+    assert_eq!(payment.fee_msat, Some(0));
+    wait("starter payment deducted from pushed balance", || async {
+        capacity(fixture.client.node()) == before - 1_000_000
+    })
+    .await;
+    fixture.assert_no_blocks_or_client_funds();
+    let mempool: Vec<String> = fixture
+        .chain
+        .bitcoin
+        .client
+        .call("getrawmempool", &[])
+        .unwrap();
+    assert_eq!(mempool, vec![txid]);
+    println!("PHASE0 PASS spend-push: client paid hub 1000000 msat, zero fee, both settled before confirmation");
+    fixture.client.shutdown().await.unwrap();
+    fixture.hub.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local Bitcoin Core and electrs; scripts/regress/regtest_e2e.sh"]
+async fn phase0_reject_without_reserve_opt_in() {
+    StarterChannel::new(false, true)
+        .await
+        .rejected(100_000, "reject-opt-out")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local Bitcoin Core and electrs; scripts/regress/regtest_e2e.sh"]
+async fn phase0_reject_non_selected_provider() {
+    StarterChannel::new(true, false)
+        .await
+        .rejected(100_000, "reject-non-selected")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local Bitcoin Core and electrs; scripts/regress/regtest_e2e.sh"]
+async fn phase0_reject_above_reserve_waiver_cap() {
+    StarterChannel::new(true, true)
+        .await
+        .rejected(200_001, "reject-above-cap")
+        .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires local Bitcoin Core and electrs; scripts/regress/three_node_paid_e2e.sh"]
 async fn hub_jit_then_stateless_admission() {

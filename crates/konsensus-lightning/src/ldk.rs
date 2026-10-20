@@ -2202,8 +2202,7 @@ impl LightningProvider for LdkProvider {
             )).await.map_err(|e| LightningError::Backend(format!("open_channel worker failed: {e}")))??;
             let pending_id = channel_id.clone();
             let mut result = crate::onchain::finish_channel_open(channel_id, || {
-                let id = pending_id.parse::<u128>().map(ldk_node::UserChannelId)
-                    .map_err(|e| LightningError::Backend(format!("invalid channel id: {e}")))?;
+                let id = parse_user_channel_id(&pending_id)?;
                 if let Some(reason) = node.channel_funding_failure(id)
                     .map_err(|e| LightningError::Backend(format!("funding outcome unavailable: {e}")))? {
                     return Err(LightningError::PaymentNotDispatched(format!("channel {pending_id}: {reason}; funding not dispatched")));
@@ -2269,17 +2268,7 @@ impl LightningProvider for LdkProvider {
         channel_id: &str,
         force: bool,
     ) -> Result<Option<String>, LightningError> {
-        let user_channel_id_num = if let Some(inner) = channel_id
-            .strip_prefix("UserChannelId(")
-            .and_then(|s| s.strip_suffix(')'))
-        {
-            inner
-        } else {
-            channel_id
-        }
-        .parse::<u128>()
-        .map_err(|e| LightningError::Backend(format!("invalid channel_id: {e}")))?;
-        let user_channel_id = ldk_node::UserChannelId(user_channel_id_num);
+        let user_channel_id = parse_user_channel_id(channel_id)?;
 
         let node = self.node.clone();
         let channel_id = channel_id.to_owned();
@@ -2978,6 +2967,18 @@ impl ChannelOpener for LdkNode {
     ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError> {
         LdkNode::open_announced_channel(self, peer, addr, amount_sats, push_msat, config)
     }
+}
+
+// LDK's Display (used by open/list) is `UserChannelId(n)`, not bare decimal.
+// Funding reconciliation and close must resolve the same provider-local ID.
+fn parse_user_channel_id(channel_id: &str) -> Result<ldk_node::UserChannelId, LightningError> {
+    channel_id
+        .strip_prefix("UserChannelId(")
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(channel_id)
+        .parse::<u128>()
+        .map(ldk_node::UserChannelId)
+        .map_err(|e| LightningError::Backend(format!("invalid channel_id: {e}")))
 }
 
 fn open_ldk_channel(

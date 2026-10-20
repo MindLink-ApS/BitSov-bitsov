@@ -182,6 +182,49 @@ new canonical LDK store for Lightning verification, keeping normal startup
 fenced. **Keep this new live store**, including `RECOVERY_STORE` and the journal,
 across interruptions; never replace it with a snapshot.
 
+Before paying the verification invoice, arrange the inbound anchor reserve.
+With the default `trust_no_reserve = false`, the **new verification store** must
+see at least 25,000 sats of available on-chain reserve for the fresh channel.
+The selected hub and an external paying wallet alone are not sufficient.
+Sweeping with `--destination` to another wallet or recovering less than 25,000
+sats may leave no reserve. Even a larger same-seed sweep is not enough with a
+fresh bitcoind-backed verification store: its BDK wallet starts at the current
+tip and does not automatically discover those earlier funds.
+
+The supported config route for an empty verification wallet is to opt in to
+trusting the selected hub. In the restored `konsensus.toml`, edit the existing
+provider entry whose `node_id` matches `lightning.liquidity.selected_provider`:
+
+```toml
+[lightning.liquidity]
+enabled = true
+selected_provider = "<selected hub's lowercase compressed Lightning public key>"
+
+[[lightning.liquidity.providers]]
+node_id = "<same selected hub public key>"
+address = "<selected hub host:port>"
+trust_no_reserve = true
+# Keep this provider's existing token if required, and retain the other hubs.
+```
+
+Replace the placeholders with the configured hub's values; do not duplicate its
+entry. Set this before running `recover`, or Ctrl-C to pause, edit the config,
+and resume the same `konsensus recover --config /absolute/path/recovered-node/konsensus.toml --confirm`
+command with all previous plan options (including `--backup` and `--destination`
+if used). Config is read on each invocation; this is not a live toggle or a
+`recover` CLI flag. Keep the same selected hub once verification has begun.
+
+This waives the reserve only for that selected provider's inbound **anchor**
+channel with a full funding amount of **at most 200,000 sats**. Arrange that
+capacity with the hub operator: `--self-test-funding-sats` sets the invoice
+amount, not the channel capacity. Larger channels still need the reserve.
+Trusting the hub here means trusting it to confirm closes for these small
+starter channels. The default remains false. `recover` provides no on-chain
+funding-address command or API for its verification store; the regtest funds
+that store through an internal node handle, not an operator CLI. If the store
+has no visible reserve and the selected hub cannot provide a qualifying trusted
+channel, verification cannot complete and `konsensus start` remains fenced.
+
 The selected LSPS2 hub must offer a fresh channel. The command previews a
 funding quote and asks for `SELF TEST FUND … FEE … HUB …` before displaying an
 invoice. Pay that invoice **from another wallet**; it does not spend recovered
@@ -220,8 +263,12 @@ The command may fail with `waiting for hub; recovery remains open`, or wait for
 confirmed close outputs. No outputs is not success. Keep the journal, seed and
 backups, contact the hub operator with the original node identity, and arrange
 closure from the hub's side. Resume the same command when connectivity and the
-hub close are available. Completion also needs the selected LSPS2 hub and an
-external wallet for the fresh-channel verification above.
+hub close are available. Completion also needs the selected LSPS2 hub, an
+external paying wallet, and either a visible 25,000-sat on-chain reserve in the
+new verification store or the selected-provider `trust_no_reserve = true`
+opt-in for a channel of at most 200,000 sats. Follow the exact config and resume
+instructions in [step 4](#4-verify-a-fresh-channel-before-normal-startup);
+without either reserve or a qualifying waiver, recovery remains fenced.
 
 There is no backup-based force-close fallback, timeout override or automatic
 completion for an empty scan. If the hub never closes, seed-only recovery cannot

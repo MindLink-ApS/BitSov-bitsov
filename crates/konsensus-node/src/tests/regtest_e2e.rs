@@ -142,9 +142,11 @@ async fn real_ldk_regtest_e2e() {
     let (c, addr_c) = infra::router(dirs[2].path(), &chain).await;
     let c_pubkey = c.node_id().to_string();
     steps.pass("chain + 3 real LDK nodes started");
+    // The inbound anchor acceptor must hold its reserve on-chain.
+    chain.fund(b.node()).await;
     chain.fund(a.node()).await;
     chain.fund(&c).await;
-    steps.pass("A and C funded 3,000,000 sat each from regtest coinbase");
+    steps.pass("A, B and C funded 3,000,000 sat each from regtest coinbase");
 
     chain.refuse_explicit_rate(&a, &c_pubkey, &addr_c).await;
     steps.pass("explicit per-channel funding fee rate refused (#101), no channel, no broadcast");
@@ -152,10 +154,16 @@ async fn real_ldk_regtest_e2e() {
     // Regression #190: regtest Esplora has no fee estimates. Explicit quotes
     // must refuse, while the default open below must still fund and confirm.
     let estimates: Value = reqwest::get(format!("{}/fee-estimates", chain.url))
-        .await.unwrap().json().await.unwrap();
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(estimates, json!({}));
-    assert!(matches!(a.funding_fee_quote(Default::default()).await,
-        Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(_))));
+    assert!(matches!(
+        a.funding_fee_quote(Default::default()).await,
+        Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(_))
+    ));
     // A opens through the product's supported path (no explicit rate).
     a.open_channel(&c_pubkey, &addr_c, 1_000_000, false, None)
         .await
@@ -483,13 +491,27 @@ async fn real_ldk_regtest_e2e() {
 }
 
 /// One call signal through `from`'s real compose API.
-async fn signal(from: &app::App, to: &str, kind: u16, plaintext: String) -> (axum::http::StatusCode, Value) {
-    from.post("/api/v1/messages/compose", json!({"recipient": to, "kind": kind, "plaintext": plaintext}), false).await
+async fn signal(
+    from: &app::App,
+    to: &str,
+    kind: u16,
+    plaintext: String,
+) -> (axum::http::StatusCode, Value) {
+    from.post(
+        "/api/v1/messages/compose",
+        json!({"recipient": to, "kind": kind, "plaintext": plaintext}),
+        false,
+    )
+    .await
 }
 
 /// Wait for `app` to receive a signal of `kind` from `from` (its feed also
 /// echoes its own sends).
-async fn recv_kind(app: &mut app::App, from: &konsensus_core::NodeId, kind: u16) -> Arc<konsensus_api::state::WsMessage> {
+async fn recv_kind(
+    app: &mut app::App,
+    from: &konsensus_core::NodeId,
+    kind: u16,
+) -> Arc<konsensus_api::state::WsMessage> {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let m = app.received.recv().await.unwrap();
@@ -522,9 +544,11 @@ async fn real_ldk_regtest_calls() {
     let (c, addr_c) = infra::router(dirs[2].path(), &chain).await;
     let c_pubkey = c.node_id().to_string();
     steps.pass("chain + 3 real LDK nodes started");
+    // The inbound anchor acceptor must hold its reserve on-chain.
+    chain.fund(b.node()).await;
     chain.fund(a.node()).await;
     chain.fund(&c).await;
-    steps.pass("A and C funded 3,000,000 sat each from regtest coinbase");
+    steps.pass("A, B and C funded 3,000,000 sat each from regtest coinbase");
 
     chain.refuse_explicit_rate(&a, &c_pubkey, &addr_c).await;
     steps.pass("explicit per-channel funding fee rate refused (#101), no channel, no broadcast");
@@ -725,10 +749,21 @@ async fn real_ldk_regtest_calls() {
     let bob_id = *bob.state.identity.node_id();
     let alice_id = *alice.state.identity.node_id();
     // A asks B for its call price (PriceQuery 400 -> PriceResponse); nothing is paid.
-    let price = konsensus_api::calls::peer_call_price(&alice.state, &bob_id).await.unwrap();
+    let price = konsensus_api::calls::peer_call_price(&alice.state, &bob_id)
+        .await
+        .unwrap();
     assert_eq!(price, 10_000);
-    let entry = alice.state.peer_prices.get_peer_entry(&bob_id).await.unwrap();
-    println!("A asked B's call price: kind:400={:?}; realtime_signaling={:?}", entry.prices.get("kind:400"), entry.prices.get("realtime_signaling"));
+    let entry = alice
+        .state
+        .peer_prices
+        .get_peer_entry(&bob_id)
+        .await
+        .unwrap();
+    println!(
+        "A asked B's call price: kind:400={:?}; realtime_signaling={:?}",
+        entry.prices.get("kind:400"),
+        entry.prices.get("realtime_signaling")
+    );
     steps.pass("A asks B's live call price (10000 msat), nothing paid");
 
     let (a_used0, b_used0) = (alice.used(), bob.used());
@@ -747,7 +782,10 @@ async fn real_ldk_regtest_calls() {
     assert_eq!(body["amount_msat"], 10_000, "{body}");
     let rung = recv_kind(&mut bob, &alice_id, 400).await;
     assert_eq!(rung.plaintext.as_deref(), Some(offer.as_str()));
-    println!("offer paid 10000 msat and rang B in {:?}: {body}", started.elapsed());
+    println!(
+        "offer paid 10000 msat and rang B in {:?}: {body}",
+        started.elapsed()
+    );
     steps.pass("call offer paid at call_msat and forwarded to B's WS");
 
     // The same call id again: A's node refuses before any quote or payment.
@@ -759,16 +797,32 @@ async fn real_ldk_regtest_calls() {
     let (status, body) = signal(&alice, &bob_hex, 401, answer.clone()).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["reason"], "call_not_live", "{body}");
-    assert_eq!(a.list_payments(200).await.unwrap().len(), a_pay0 + 1, "refusals pay nothing");
+    assert_eq!(
+        a.list_payments(200).await.unwrap().len(),
+        a_pay0 + 1,
+        "refusals pay nothing"
+    );
     steps.pass("reused call id and caller-side answer refused before paying");
 
     // B answers; A receives it. ICE flows while live; B hangs up.
     let started = std::time::Instant::now();
     let (status, body) = signal(&bob, &alice_hex, 401, answer.clone()).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-    assert_eq!(recv_kind(&mut alice, &bob_id, 401).await.plaintext.as_deref(), Some(answer.as_str()));
-    println!("answer paid {} msat, reached A in {:?}", body["amount_msat"], started.elapsed());
-    let ice = format!(r#"{{"v":1,"call_id":"{call_id}","candidate":"candidate:1 1 udp 2122260223 127.0.0.1 54321 typ host","sdp_mid":"0","sdp_mline_index":0}}"#);
+    assert_eq!(
+        recv_kind(&mut alice, &bob_id, 401)
+            .await
+            .plaintext
+            .as_deref(),
+        Some(answer.as_str())
+    );
+    println!(
+        "answer paid {} msat, reached A in {:?}",
+        body["amount_msat"],
+        started.elapsed()
+    );
+    let ice = format!(
+        r#"{{"v":1,"call_id":"{call_id}","candidate":"candidate:1 1 udp 2122260223 127.0.0.1 54321 typ host","sdp_mid":"0","sdp_mline_index":0}}"#
+    );
     let (status, body) = signal(&alice, &bob_hex, 402, ice.clone()).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
     recv_kind(&mut bob, &alice_id, 402).await;
@@ -786,7 +840,11 @@ async fn real_ldk_regtest_calls() {
 
     // msat-exact: A paid offer 10000 + ICE 1000; B paid answer 1000 + hangup 1000,
     // each plus C's forwarding fee on its hop.
-    let (fee_b10k, fee_b1k, fee_a1k) = (hop_fee(to_b, 10_000), hop_fee(to_b, 1_000), hop_fee(to_a, 1_000));
+    let (fee_b10k, fee_b1k, fee_a1k) = (
+        hop_fee(to_b, 10_000),
+        hop_fee(to_b, 1_000),
+        hop_fee(to_a, 1_000),
+    );
     let a_paid = 10_000 + 1_000 + fee_b10k + fee_b1k;
     let b_paid = 2 * (1_000 + fee_a1k);
     wait("exact channel deltas after the call", || async {
@@ -795,8 +853,16 @@ async fn real_ldk_regtest_calls() {
             && capacity(&c) == c_cap0 + fee_b10k + fee_b1k + 2 * fee_a1k
     })
     .await;
-    assert_eq!(alice.used() - a_used0, a_paid, "A budget = principals + actual fees");
-    assert_eq!(bob.used() - b_used0, b_paid, "B budget = principals + actual fees");
+    assert_eq!(
+        alice.used() - a_used0,
+        a_paid,
+        "A budget = principals + actual fees"
+    );
+    assert_eq!(
+        bob.used() - b_used0,
+        b_paid,
+        "B budget = principals + actual fees"
+    );
     println!(
         "CALL RECONCILED: A paid {a_paid} msat (offer 10000 + ICE 1000 + fees {}), B paid {b_paid} msat (answer + hangup 2x1000 + fees {}), C earned {} msat",
         fee_b10k + fee_b1k, 2 * fee_a1k, fee_b10k + fee_b1k + 2 * fee_a1k
@@ -807,20 +873,62 @@ async fn real_ldk_regtest_calls() {
     // call price query. Observed on real LDK: the uncapped (owner) call asks
     // B's call price, re-admits the new connection through the existing flow
     // (reported separately as readmission_msat), then pays the call once.
-    alice.transport.disconnect(bob.state.identity.node_id()).await.unwrap();
-    wait("disconnected", || async { !bob.transport.is_connected(alice.state.identity.node_id()).await }).await;
-    alice.transport.connect(bob.state.identity.node_id(), &bob.transport.listen_addr().unwrap().to_string()).await.unwrap();
-    wait("reconnected", || bob.transport.is_connected(alice.state.identity.node_id())).await;
+    alice
+        .transport
+        .disconnect(bob.state.identity.node_id())
+        .await
+        .unwrap();
+    wait("disconnected", || async {
+        !bob.transport
+            .is_connected(alice.state.identity.node_id())
+            .await
+    })
+    .await;
+    alice
+        .transport
+        .connect(
+            bob.state.identity.node_id(),
+            &bob.transport.listen_addr().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+    wait("reconnected", || {
+        bob.transport.is_connected(alice.state.identity.node_id())
+    })
+    .await;
     let pays = a.list_payments(200).await.unwrap().len();
     let fresh = format!("{:032x}", rand::random::<u128>());
     let offer2 = format!(r#"{{"v":1,"call_id":"{fresh}","media":"audio","sdp":"{sdp}"}}"#);
     let (status, body) = signal(&alice, &bob_hex, 400, offer2.clone()).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-    assert_eq!((body["amount_msat"].as_u64(), body["readmission_msat"].as_u64()), (Some(10_000), Some(2_001)), "{body}");
-    assert_eq!(recv_kind(&mut bob, &alice_id, 400).await.plaintext.as_deref(), Some(offer2.as_str()));
+    assert_eq!(
+        (
+            body["amount_msat"].as_u64(),
+            body["readmission_msat"].as_u64()
+        ),
+        (Some(10_000), Some(2_001)),
+        "{body}"
+    );
+    assert_eq!(
+        recv_kind(&mut bob, &alice_id, 400)
+            .await
+            .plaintext
+            .as_deref(),
+        Some(offer2.as_str())
+    );
     assert!(a.list_payments(200).await.unwrap().len() > pays);
-    let entry = alice.state.storage.call_get(&bob_id, &fresh).await.unwrap().unwrap();
-    assert_eq!((entry.phase, entry.pending), (konsensus_core::payloads::call::Phase::Ringing, None), "committed only once paid");
+    let entry = alice
+        .state
+        .storage
+        .call_get(&bob_id, &fresh)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (entry.phase, entry.pending),
+        (konsensus_core::payloads::call::Phase::Ringing, None),
+        "committed only once paid"
+    );
     println!("call after reconnect: {body}");
     steps.pass("call after reconnect re-admitted once (2001 msat), then paid the call and rang B");
     drop(alice);
@@ -854,32 +962,71 @@ async fn real_ldk_regtest_meeting() {
     let (c, addr_c) = infra::lightning(dirs[2].path(), &chain).await;
     let (r, addr_r) = infra::router(dirs[3].path(), &chain).await;
     steps.pass("chain + 4 real LDK nodes started (apps A, B, C; router R)");
+    // The inbound anchor acceptor must hold its reserve on-chain.
+    chain.fund(b.node()).await;
     chain.fund(a.node()).await;
+    chain.fund(c.node()).await;
     chain.fund(&r).await;
-    a.open_channel(&r.node_id().to_string(), &addr_r, 1_000_000, false, None).await.unwrap();
-    chain.confirm_channel(a.node(), &r, &[b.node(), c.node()]).await;
-    r.open_channel(b.node().node_id(), addr_b.parse().unwrap(), 1_000_000, None, None).unwrap();
-    chain.confirm_channel(&r, b.node(), &[a.node(), c.node()]).await;
-    r.open_channel(c.node().node_id(), addr_c.parse().unwrap(), 1_000_000, None, None).unwrap();
-    chain.confirm_channel(&r, c.node(), &[a.node(), b.node()]).await;
+    a.open_channel(&r.node_id().to_string(), &addr_r, 1_000_000, false, None)
+        .await
+        .unwrap();
+    chain
+        .confirm_channel(a.node(), &r, &[b.node(), c.node()])
+        .await;
+    r.open_channel(
+        b.node().node_id(),
+        addr_b.parse().unwrap(),
+        1_000_000,
+        None,
+        None,
+    )
+    .unwrap();
+    chain
+        .confirm_channel(&r, b.node(), &[a.node(), c.node()])
+        .await;
+    r.open_channel(
+        c.node().node_id(),
+        addr_c.parse().unwrap(),
+        1_000_000,
+        None,
+        None,
+    )
+    .unwrap();
+    chain
+        .confirm_channel(&r, c.node(), &[a.node(), b.node()])
+        .await;
     steps.pass("channels A->R, R->B, R->C opened and usable");
 
     wait("R's channel_updates reach A, B and C", || async {
-        hop_policy(a.node(), &r).is_some() && hop_policy(b.node(), &r).is_some() && hop_policy(c.node(), &r).is_some()
+        hop_policy(a.node(), &r).is_some()
+            && hop_policy(b.node(), &r).is_some()
+            && hop_policy(c.node(), &r).is_some()
     })
     .await;
     // R's fee on its hop towards each app.
-    let (to_a, to_b, to_c) = (hop_policy(a.node(), &r).unwrap(), hop_policy(b.node(), &r).unwrap(), hop_policy(c.node(), &r).unwrap());
+    let (to_a, to_b, to_c) = (
+        hop_policy(a.node(), &r).unwrap(),
+        hop_policy(b.node(), &r).unwrap(),
+        hop_policy(c.node(), &r).unwrap(),
+    );
     // B and C need outbound liquidity to answer, hang up and (B) place a leg.
     for (to, node, policy) in [(&b, "B", to_b), (&c, "C", to_c)] {
         let liquidity = 50_000_000;
-        let inv = to.create_invoice(liquidity, "regtest meeting liquidity", 600).await.unwrap();
-        a.pay_invoice_with_fee_limit(&inv.bolt11, hop_fee(policy, liquidity)).await.unwrap();
+        let inv = to
+            .create_invoice(liquidity, "regtest meeting liquidity", 600)
+            .await
+            .unwrap();
+        a.pay_invoice_with_fee_limit(&inv.bolt11, hop_fee(policy, liquidity))
+            .await
+            .unwrap();
         settle(&a, &inv.payment_hash).await;
         settle(to, &inv.payment_hash).await;
         println!("liquidity to {node} settled");
     }
-    wait("liquidity committed", || async { capacity(b.node()) > 10_000_000 && capacity(c.node()) > 10_000_000 }).await;
+    wait("liquidity committed", || async {
+        capacity(b.node()) > 10_000_000 && capacity(c.node()) > 10_000_000
+    })
+    .await;
     steps.pass("routed liquidity A->R->B and A->R->C settled");
 
     let mut alice = app::App::start(dirs[0].path(), &chain, a.clone()).await;
@@ -894,19 +1041,32 @@ async fn real_ldk_regtest_meeting() {
     contacts(&mut carol, &mut alice).await;
     steps.pass("A-B, A-C, B-C are paid contacts with E2EE sessions");
 
-    let (a_id, b_id, c_id) = (*alice.state.identity.node_id(), *bob.state.identity.node_id(), *carol.state.identity.node_id());
+    let (a_id, b_id, c_id) = (
+        *alice.state.identity.node_id(),
+        *bob.state.identity.node_id(),
+        *carol.state.identity.node_id(),
+    );
     let (a_hex, b_hex, c_hex) = (a_id.to_hex(), b_id.to_hex(), c_id.to_hex());
     let meeting = format!("{:032x}", rand::random::<u128>());
     let sdp = r"v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
     let leg = |call_id: &str| {
-        format!(r#"{{"v":1,"call_id":"{call_id}","media":"audio","sdp":"{sdp}","meeting":{{"id":"{meeting}","roster":["{a_hex}","{b_hex}","{c_hex}"]}}}}"#)
+        format!(
+            r#"{{"v":1,"call_id":"{call_id}","media":"audio","sdp":"{sdp}","meeting":{{"id":"{meeting}","roster":["{a_hex}","{b_hex}","{c_hex}"]}}}}"#
+        )
     };
     let answer = |call_id: &str| format!(r#"{{"v":1,"call_id":"{call_id}","sdp":"{sdp}"}}"#);
     let hangup = |call_id: &str| format!(r#"{{"v":1,"call_id":"{call_id}","reason":"hangup"}}"#);
-    let (ab, ac, bc) = [(); 3].map(|_| format!("{:032x}", rand::random::<u128>())).into();
+    let (ab, ac, bc) = [(); 3]
+        .map(|_| format!("{:032x}", rand::random::<u128>()))
+        .into();
 
     let (a_used0, b_used0, c_used0) = (alice.used(), bob.used(), carol.used());
-    let (a_cap0, b_cap0, c_cap0, r_cap0) = (capacity(a.node()), capacity(b.node()), capacity(c.node()), capacity(&r));
+    let (a_cap0, b_cap0, c_cap0, r_cap0) = (
+        capacity(a.node()),
+        capacity(b.node()),
+        capacity(c.node()),
+        capacity(&r),
+    );
     let pays = |n: &Arc<LdkProvider>| {
         let n = n.clone();
         async move { n.list_payments(500).await.unwrap().len() }
@@ -924,7 +1084,10 @@ async fn real_ldk_regtest_meeting() {
     steps.pass("out-of-order leg (C->A) refused by C's own node, nothing paid");
 
     // Host invites: one leg to each invitee, each paid once at the callee's call price.
-    for (to, to_hex, to_id, call) in [(&mut bob, &b_hex, b_id, &ab), (&mut carol, &c_hex, c_id, &ac)] {
+    for (to, to_hex, to_id, call) in [
+        (&mut bob, &b_hex, b_id, &ab),
+        (&mut carol, &c_hex, c_id, &ac),
+    ] {
         to.received = to.state.ws_broadcast.subscribe();
         let (status, body) = signal(&alice, to_hex, 400, leg(call)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -937,7 +1100,11 @@ async fn real_ldk_regtest_meeting() {
 
     // The same leg again: refused before paying (single-use per leg).
     let (status, body) = signal(&alice, &b_hex, 400, leg(&ab)).await;
-    assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("call_id_used")), "{body}");
+    assert_eq!(
+        (status, body["reason"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("call_id_used")),
+        "{body}"
+    );
 
     // B joins: answers the host's leg, then places its own leg to the later C.
     alice.received = alice.state.ws_broadcast.subscribe();
@@ -963,7 +1130,11 @@ async fn real_ldk_regtest_meeting() {
     assert_eq!(status, StatusCode::OK, "{body2}");
     recv_from(&mut alice, &c_id, 401).await;
     recv_from(&mut bob, &c_id, 401).await;
-    for (x, y, call) in [(&alice, &b_id, &ab), (&alice, &c_id, &ac), (&bob, &c_id, &bc)] {
+    for (x, y, call) in [
+        (&alice, &b_id, &ab),
+        (&alice, &c_id, &ac),
+        (&bob, &c_id, &bc),
+    ] {
         let e = x.state.storage.call_get(y, call).await.unwrap().unwrap();
         assert_eq!(e.phase, konsensus_core::payloads::call::Phase::Live);
     }
@@ -978,10 +1149,24 @@ async fn real_ldk_regtest_meeting() {
     }
     recv_from(&mut alice, &c_id, 403).await;
     recv_from(&mut bob, &c_id, 403).await;
-    assert_eq!(alice.state.storage.call_get(&b_id, &ab).await.unwrap().unwrap().phase, konsensus_core::payloads::call::Phase::Live);
+    assert_eq!(
+        alice
+            .state
+            .storage
+            .call_get(&b_id, &ab)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        konsensus_core::payloads::call::Phase::Live
+    );
     // An ended leg takes no more signals, even from a participant.
     let (status, body) = signal(&bob, &c_hex, 403, hangup(&bc)).await;
-    assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("call_not_live")), "{body}");
+    assert_eq!(
+        (status, body["reason"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("call_not_live")),
+        "{body}"
+    );
     steps.pass("C left (2 paid hangups); A-B still live; ended leg refused");
 
     // A ends the meeting's last leg.
@@ -1008,9 +1193,21 @@ async fn real_ldk_regtest_meeting() {
             && capacity(&r) == r_cap0 + r_earned
     })
     .await;
-    assert_eq!(alice.used() - a_used0, a_paid, "A budget = principals + actual fees");
-    assert_eq!(bob.used() - b_used0, b_paid, "B budget = principals + actual fees");
-    assert_eq!(carol.used() - c_used0, c_paid, "C budget = principals + actual fees");
+    assert_eq!(
+        alice.used() - a_used0,
+        a_paid,
+        "A budget = principals + actual fees"
+    );
+    assert_eq!(
+        bob.used() - b_used0,
+        b_paid,
+        "B budget = principals + actual fees"
+    );
+    assert_eq!(
+        carol.used() - c_used0,
+        c_paid,
+        "C budget = principals + actual fees"
+    );
     println!(
         "MEETING RECONCILED: A paid {a_paid} got {a_got}; B paid {b_paid} got {b_got}; C paid {c_paid} got {c_got}; R earned {r_earned} msat"
     );
@@ -1052,34 +1249,79 @@ async fn real_ldk_regtest_room() {
     let (d, addr_d) = infra::lightning(dirs[3].path(), &chain).await;
     let (r, addr_r) = infra::router(dirs[4].path(), &chain).await;
     steps.pass("chain + 5 real LDK nodes started (apps A, B, C, D; router R)");
+    // The inbound anchor acceptor must hold its reserve on-chain.
+    chain.fund(b.node()).await;
+    chain.fund(d.node()).await;
     chain.fund(a.node()).await;
+    chain.fund(c.node()).await;
     chain.fund(&r).await;
-    a.open_channel(&r.node_id().to_string(), &addr_r, 1_000_000, false, None).await.unwrap();
-    chain.confirm_channel(a.node(), &r, &[b.node(), c.node(), d.node()]).await;
-    r.open_channel(b.node().node_id(), addr_b.parse().unwrap(), 800_000, None, None).unwrap();
-    chain.confirm_channel(&r, b.node(), &[a.node(), c.node(), d.node()]).await;
-    r.open_channel(c.node().node_id(), addr_c.parse().unwrap(), 800_000, None, None).unwrap();
-    chain.confirm_channel(&r, c.node(), &[a.node(), b.node(), d.node()]).await;
-    r.open_channel(d.node().node_id(), addr_d.parse().unwrap(), 800_000, None, None).unwrap();
-    chain.confirm_channel(&r, d.node(), &[a.node(), b.node(), c.node()]).await;
+    a.open_channel(&r.node_id().to_string(), &addr_r, 1_000_000, false, None)
+        .await
+        .unwrap();
+    chain
+        .confirm_channel(a.node(), &r, &[b.node(), c.node(), d.node()])
+        .await;
+    r.open_channel(
+        b.node().node_id(),
+        addr_b.parse().unwrap(),
+        800_000,
+        None,
+        None,
+    )
+    .unwrap();
+    chain
+        .confirm_channel(&r, b.node(), &[a.node(), c.node(), d.node()])
+        .await;
+    r.open_channel(
+        c.node().node_id(),
+        addr_c.parse().unwrap(),
+        800_000,
+        None,
+        None,
+    )
+    .unwrap();
+    chain
+        .confirm_channel(&r, c.node(), &[a.node(), b.node(), d.node()])
+        .await;
+    r.open_channel(
+        d.node().node_id(),
+        addr_d.parse().unwrap(),
+        800_000,
+        None,
+        None,
+    )
+    .unwrap();
+    chain
+        .confirm_channel(&r, d.node(), &[a.node(), b.node(), c.node()])
+        .await;
     steps.pass("channels A->R, R->B, R->C, R->D opened and usable");
 
     wait("R's channel_updates reach A, B, C and D", || async {
-        [a.node(), b.node(), c.node(), d.node()].iter().all(|n| hop_policy(n, &r).is_some())
+        [a.node(), b.node(), c.node(), d.node()]
+            .iter()
+            .all(|n| hop_policy(n, &r).is_some())
     })
     .await;
-    let [to_a, to_b, to_c, to_d] = [a.node(), b.node(), c.node(), d.node()].map(|n| hop_policy(n, &r).unwrap());
+    let [to_a, to_b, to_c, to_d] =
+        [a.node(), b.node(), c.node(), d.node()].map(|n| hop_policy(n, &r).unwrap());
     // Members need outbound liquidity to reply as contacts (and B to pay A).
     for (to, node, policy) in [(&b, "B", to_b), (&c, "C", to_c), (&d, "D", to_d)] {
         let liquidity = 50_000_000;
-        let inv = to.create_invoice(liquidity, "regtest room liquidity", 600).await.unwrap();
-        a.pay_invoice_with_fee_limit(&inv.bolt11, hop_fee(policy, liquidity)).await.unwrap();
+        let inv = to
+            .create_invoice(liquidity, "regtest room liquidity", 600)
+            .await
+            .unwrap();
+        a.pay_invoice_with_fee_limit(&inv.bolt11, hop_fee(policy, liquidity))
+            .await
+            .unwrap();
         settle(&a, &inv.payment_hash).await;
         settle(to, &inv.payment_hash).await;
         println!("liquidity to {node} settled");
     }
     wait("liquidity committed", || async {
-        [b.node(), c.node(), d.node()].iter().all(|n| capacity(n) > 10_000_000)
+        [b.node(), c.node(), d.node()]
+            .iter()
+            .all(|n| capacity(n) > 10_000_000)
     })
     .await;
     steps.pass("routed liquidity A->R->{B,C,D} settled");
@@ -1096,18 +1338,39 @@ async fn real_ldk_regtest_room() {
     contacts(&mut alice, &mut dave).await;
     steps.pass("A-B, A-C, A-D are paid contacts with E2EE sessions");
 
-    let (a_id, b_id, c_id, d_id) = (*alice.state.identity.node_id(), *bob.state.identity.node_id(), *carol.state.identity.node_id(), *dave.state.identity.node_id());
+    let (a_id, b_id, c_id, d_id) = (
+        *alice.state.identity.node_id(),
+        *bob.state.identity.node_id(),
+        *carol.state.identity.node_id(),
+        *dave.state.identity.node_id(),
+    );
     for peer in [b_id, c_id, d_id] {
         let info = alice.transport.peer_info(&peer).await.expect("connected");
-        assert!(info.capabilities.iter().any(|c| c == r#"Custom("room_binding_v1")"#), "{:?}", info.capabilities);
+        assert!(
+            info.capabilities
+                .iter()
+                .any(|c| c == r#"Custom("room_binding_v1")"#),
+            "{:?}",
+            info.capabilities
+        );
     }
     use konsensus_core::payloads::room::RoomBinding;
     let room_of = |ids: &[konsensus_core::NodeId]| RoomBinding::create(ids).unwrap();
     let room_chat = |room: &RoomBinding, text: &str| {
         json!({"v": 1, "room": room, "msg": format!("{:032x}", rand::random::<u128>()), "text": text}).to_string()
     };
-    async fn send_room(alice: &app::App, room: &RoomBinding, plaintext: String) -> (StatusCode, Value) {
-        alice.post("/api/v1/messages/compose", json!({"recipient": room.id, "is_room": true, "kind": 0, "plaintext": plaintext}), false).await
+    async fn send_room(
+        alice: &app::App,
+        room: &RoomBinding,
+        plaintext: String,
+    ) -> (StatusCode, Value) {
+        alice
+            .post(
+                "/api/v1/messages/compose",
+                json!({"recipient": room.id, "is_room": true, "kind": 0, "plaintext": plaintext}),
+                false,
+            )
+            .await
     }
     let pays = |n: &Arc<LdkProvider>| {
         let n = n.clone();
@@ -1115,25 +1378,47 @@ async fn real_ldk_regtest_room() {
     };
     let chat_msat: u64 = 2_001;
     let (a_used0, b_used0) = (alice.used(), bob.used());
-    let caps0 = [capacity(a.node()), capacity(b.node()), capacity(c.node()), capacity(d.node()), capacity(&r)];
+    let caps0 = [
+        capacity(a.node()),
+        capacity(b.node()),
+        capacity(c.node()),
+        capacity(d.node()),
+        capacity(&r),
+    ];
     let a_pays0 = pays(&a).await;
 
     // Refused by A's own node before any quote or payment.
     let full = room_of(&[a_id, b_id, c_id, d_id]);
     let not_mine = room_of(&[b_id, c_id, d_id]);
     let (status, body) = send_room(&alice, &not_mine, room_chat(&not_mine, "not mine")).await;
-    assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("room_sender_not_member")), "{body}");
+    assert_eq!(
+        (status, body["reason"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("room_sender_not_member")),
+        "{body}"
+    );
     let (status, body) = alice
         .post("/api/v1/messages/compose", json!({"recipient": d_id.to_hex(), "kind": 0, "plaintext": room_chat(&room_of(&[a_id, b_id, c_id]), "not yours")}), false)
         .await;
-    assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("room_recipient_not_member")), "{body}");
+    assert_eq!(
+        (status, body["reason"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("room_recipient_not_member")),
+        "{body}"
+    );
     // The room id of [A, B, C, D] with D swapped for an outsider.
     let outsider = NodeIdentity::generate().unwrap().1;
     let mut swapped = full.clone();
     swapped.roster = room_of(&[a_id, b_id, c_id, *outsider.node_id()]).roster;
     let (status, body) = send_room(&alice, &full, room_chat(&swapped, "swapped")).await;
-    assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("room_binding_invalid")), "{body}");
-    assert_eq!((pays(&a).await, alice.used()), (a_pays0, a_used0), "nothing paid");
+    assert_eq!(
+        (status, body["reason"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("room_binding_invalid")),
+        "{body}"
+    );
+    assert_eq!(
+        (pays(&a).await, alice.used()),
+        (a_pays0, a_used0),
+        "nothing paid"
+    );
     steps.pass("roster without A, a 1:1 room chat to a non-member, a swapped roster: refused by A's node, nothing paid");
 
     // Fan-out to 3 members: each paid once, on its own envelope.
@@ -1147,12 +1432,20 @@ async fn real_ldk_regtest_room() {
     let outcomes = body["member_outcomes"].as_array().unwrap();
     assert_eq!(outcomes.len(), 3, "{body}");
     for o in outcomes {
-        assert_eq!((o["status"].as_str(), o["amount_msat"].as_u64()), (Some("settled"), Some(chat_msat)), "{o}");
+        assert_eq!(
+            (o["status"].as_str(), o["amount_msat"].as_u64()),
+            (Some("settled"), Some(chat_msat)),
+            "{o}"
+        );
     }
     for app in [&mut bob, &mut carol, &mut dave] {
         let got = recv_from(app, &a_id, 0).await;
         assert_eq!(got.plaintext.as_deref(), Some(text.as_str()));
-        assert_eq!(got.envelope.recipient, konsensus_core::Recipient::Node(*app.state.identity.node_id()), "addressed to the member");
+        assert_eq!(
+            got.envelope.recipient,
+            konsensus_core::Recipient::Node(*app.state.identity.node_id()),
+            "addressed to the member"
+        );
         assert_eq!(got.envelope.payment_proof.amount_msat, chat_msat);
     }
     steps.pass("A -> {B, C, D}: 3 paid envelopes, 2001 msat each, all delivered");
@@ -1164,20 +1457,42 @@ async fn real_ldk_regtest_room() {
     let reply = bob.compose(&mut alice, &reply_text).await;
     assert_eq!(reply["amount_msat"], chat_msat, "{reply}");
     let reply_paid = bob.used() - b_used_reply;
-    let (status, thread) = alice.get(&format!("/api/v1/messages?room={}", full.id), true).await;
+    let (status, thread) = alice
+        .get(&format!("/api/v1/messages?room={}", full.id), true)
+        .await;
     assert_eq!(status, StatusCode::OK, "{thread}");
     let thread = thread.as_array().unwrap();
     assert_eq!(thread.len(), 2, "{thread:?}");
-    let ours = thread.iter().find(|m| m["sender"] == a_id.to_hex()).expect("A's own room message");
-    assert_eq!((ours["recipient"].as_str(), ours["payment_amount_msat"].as_u64()), (Some(full.id.as_str()), Some(3 * chat_msat)), "{ours}");
-    let copies: Vec<&str> = ours["copies"].as_array().unwrap().iter().map(|c| c["recipient"].as_str().unwrap()).collect();
+    let ours = thread
+        .iter()
+        .find(|m| m["sender"] == a_id.to_hex())
+        .expect("A's own room message");
+    assert_eq!(
+        (
+            ours["recipient"].as_str(),
+            ours["payment_amount_msat"].as_u64()
+        ),
+        (Some(full.id.as_str()), Some(3 * chat_msat)),
+        "{ours}"
+    );
+    let copies: Vec<&str> = ours["copies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["recipient"].as_str().unwrap())
+        .collect();
     let mut members = vec![b_id.to_hex(), c_id.to_hex(), d_id.to_hex()];
     members.sort();
     assert_eq!(copies, members, "{ours}");
-    let theirs = thread.iter().find(|m| m["sender"] == b_id.to_hex()).expect("B's room reply");
+    let theirs = thread
+        .iter()
+        .find(|m| m["sender"] == b_id.to_hex())
+        .expect("B's room reply");
     assert_eq!(theirs["plaintext"].as_str(), Some(reply_text.as_str()));
     assert_eq!(theirs["room"]["id"].as_str(), Some(full.id.as_str()));
-    steps.pass("B's 1:1 room leg (2001 msat) reaches A; A's thread: B's reply + A's 3 copies as one");
+    steps.pass(
+        "B's 1:1 room leg (2001 msat) reaches A; A's thread: B's reply + A's 3 copies as one",
+    );
 
     // A member whose node does not advertise room_binding_v1 (here: a node
     // A is not connected to) is skipped before any quote, paid nothing.
@@ -1188,9 +1503,25 @@ async fn real_ldk_regtest_room() {
     let (status, body) = send_room(&alice, &partial_room, partial.clone()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["amount_msat"], chat_msat, "{body}");
-    let skipped = body["member_outcomes"].as_array().unwrap().iter().find(|o| o["recipient"] == absent.node_id().to_hex()).unwrap().clone();
-    assert_eq!((skipped["status"].as_str(), skipped["amount_msat"].as_u64(), skipped["code"].as_str()), (Some("refused"), Some(0), Some("room_binding_unsupported")));
-    assert_eq!(recv_from(&mut bob, &a_id, 0).await.plaintext.as_deref(), Some(partial.as_str()));
+    let skipped = body["member_outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["recipient"] == absent.node_id().to_hex())
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (
+            skipped["status"].as_str(),
+            skipped["amount_msat"].as_u64(),
+            skipped["code"].as_str()
+        ),
+        (Some("refused"), Some(0), Some("room_binding_unsupported"))
+    );
+    assert_eq!(
+        recv_from(&mut bob, &a_id, 0).await.plaintext.as_deref(),
+        Some(partial.as_str())
+    );
     steps.pass("unsupported member skipped (0 msat); B paid 2001 msat");
 
     // Receive side: B pays A for room chats only a modified node would send
@@ -1202,25 +1533,56 @@ async fn real_ldk_regtest_room() {
     let mut swapped_in = full.clone();
     swapped_in.roster = room_of(&[a_id, b_id, c_id, *outsider.node_id()]).roster;
     for (rogue, code) in [
-        (room_chat(&room_of(&[a_id, c_id, d_id]), "let me in"), "room_sender_not_member:"),
-        (room_chat(&swapped_in, "new roster, same room"), "room_binding_invalid:"),
+        (
+            room_chat(&room_of(&[a_id, c_id, d_id]), "let me in"),
+            "room_sender_not_member:",
+        ),
+        (
+            room_chat(&swapped_in, "new roster, same room"),
+            "room_binding_invalid:",
+        ),
     ] {
-        let invoice = a.create_invoice(price, "rogue room chat", 600).await.unwrap();
-        b.pay_invoice_with_fee_limit(&invoice.bolt11, hop_fee(to_a, price)).await.unwrap();
+        let invoice = a
+            .create_invoice(price, "rogue room chat", 600)
+            .await
+            .unwrap();
+        b.pay_invoice_with_fee_limit(&invoice.bolt11, hop_fee(to_a, price))
+            .await
+            .unwrap();
         settle(&b, &invoice.payment_hash).await;
-        let preimage = b.get_payment_status(&invoice.payment_hash).await.unwrap().preimage.expect("preimage");
-        let ratchet = bob.state.session_manager.encrypt(&a_id, rogue.as_bytes()).await.unwrap();
+        let preimage = b
+            .get_payment_status(&invoice.payment_hash)
+            .await
+            .unwrap()
+            .preimage
+            .expect("preimage");
+        let ratchet = bob
+            .state
+            .session_manager
+            .encrypt(&a_id, rogue.as_bytes())
+            .await
+            .unwrap();
         let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
             0,
             b_id,
             konsensus_core::Recipient::Node(a_id),
             konsensus_crypto::ratchet_message_to_bytes(&ratchet),
-            konsensus_core::PaymentProof::new(hex32(&invoice.payment_hash), hex32(&preimage), price),
+            konsensus_core::PaymentProof::new(
+                hex32(&invoice.payment_hash),
+                hex32(&preimage),
+                price,
+            ),
         )
         .build();
-        envelope.signature = konsensus_core::Signature::from_ed25519(&bob.state.identity.sign(&envelope.signable_bytes()));
+        envelope.signature = konsensus_core::Signature::from_ed25519(
+            &bob.state.identity.sign(&envelope.signable_bytes()),
+        );
         bob.state.storage.store_message(&envelope).await.unwrap();
-        bob.state.storage.prepare_delivery(&envelope.id, &a_id).await.unwrap();
+        bob.state
+            .storage
+            .prepare_delivery(&envelope.id, &a_id)
+            .await
+            .unwrap();
         let mut b_delivery = bob.state.ws_delivery_broadcast.subscribe();
         alice.received = alice.state.ws_broadcast.subscribe();
         bob.transport.send(&a_id, &envelope).await.unwrap();
@@ -1235,13 +1597,39 @@ async fn real_ldk_regtest_room() {
         .await
         .expect("A answered the rogue room chat");
         assert_eq!(status.status, "failed_paid", "terminal: {status:?}");
-        assert!(status.reason.as_deref().unwrap_or_default().starts_with(code), "{status:?}");
-        assert!(alice.state.storage.get_message(&envelope.id).await.unwrap().is_none(), "withdrawn on A");
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with(code),
+            "{status:?}"
+        );
+        assert!(
+            alice
+                .state
+                .storage
+                .get_message(&envelope.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "withdrawn on A"
+        );
         while let Ok(m) = alice.received.try_recv() {
-            assert_ne!(m.envelope.id, envelope.id, "the refused room chat reached A's app");
+            assert_ne!(
+                m.envelope.id, envelope.id,
+                "the refused room chat reached A's app"
+            );
         }
         let (_, listed) = alice.get("/api/v1/messages?limit=1000", true).await;
-        assert!(listed.as_array().unwrap().iter().all(|m| m["id"] != envelope.id.to_hex()), "listed on A");
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["id"] != envelope.id.to_hex()),
+            "listed on A"
+        );
     }
     steps.pass("A refused B's paid room chats (roster without B; swapped roster under the room id), withdrawn");
 
@@ -1249,7 +1637,14 @@ async fn real_ldk_regtest_room() {
     //   A paid 3 fan-out legs + 1 partial leg; B paid A its room reply and
     //   two refused rogue chats.
     let f = hop_fee;
-    let a_paid = chat_msat + f(to_b, chat_msat) + chat_msat + f(to_c, chat_msat) + chat_msat + f(to_d, chat_msat) + chat_msat + f(to_b, chat_msat);
+    let a_paid = chat_msat
+        + f(to_b, chat_msat)
+        + chat_msat
+        + f(to_c, chat_msat)
+        + chat_msat
+        + f(to_d, chat_msat)
+        + chat_msat
+        + f(to_b, chat_msat);
     let b_paid = 3 * (price + f(to_a, price));
     let (a_got, b_got, c_got, d_got) = (3 * price, 2 * chat_msat, chat_msat, chat_msat);
     let r_earned = (a_paid - 4 * chat_msat) + (b_paid - 3 * price);
@@ -1261,9 +1656,21 @@ async fn real_ldk_regtest_room() {
             && capacity(&r) == caps0[4] + r_earned
     })
     .await;
-    assert_eq!(alice.used() - a_used0, a_paid, "A budget = principals + actual fees");
-    assert_eq!(reply_paid, price + f(to_a, price), "B's reply leg: price + actual fee");
-    assert_eq!(bob.used() - b_used0, reply_paid, "B's rogue payments bypassed its app budget");
+    assert_eq!(
+        alice.used() - a_used0,
+        a_paid,
+        "A budget = principals + actual fees"
+    );
+    assert_eq!(
+        reply_paid,
+        price + f(to_a, price),
+        "B's reply leg: price + actual fee"
+    );
+    assert_eq!(
+        bob.used() - b_used0,
+        reply_paid,
+        "B's rogue payments bypassed its app budget"
+    );
     println!(
         "ROOM RECONCILED: A paid {a_paid} got {a_got}; B paid {b_paid} got {b_got}; C got {c_got}; D got {d_got}; R earned {r_earned} msat"
     );
@@ -1340,9 +1747,24 @@ async fn contacts(x: &mut app::App, y: &mut app::App) -> Value {
     use axum::http::StatusCode;
     use konsensus_core::traits::transport::MessageTransport;
     let y_hex = y.state.identity.node_id().to_hex();
-    x.transport.connect(y.state.identity.node_id(), &y.transport.listen_addr().unwrap().to_string()).await.unwrap();
-    wait("Noise connected", || y.transport.is_connected(x.state.identity.node_id())).await;
-    let (status, quote) = x.post("/api/v1/messages/first-contact/quote", json!({"recipient": y_hex}), false).await;
+    x.transport
+        .connect(
+            y.state.identity.node_id(),
+            &y.transport.listen_addr().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+    wait("Noise connected", || {
+        y.transport.is_connected(x.state.identity.node_id())
+    })
+    .await;
+    let (status, quote) = x
+        .post(
+            "/api/v1/messages/first-contact/quote",
+            json!({"recipient": y_hex}),
+            false,
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{quote}");
     let grant = x.service.grant_view_for(&x.client).unwrap();
     let (status, body) = x
@@ -1448,7 +1870,9 @@ impl<'n> Books<'n> {
 }
 
 /// Settled outgoing payments `node` made, largest first.
-async fn settled_outgoing(node: &LdkProvider) -> Vec<konsensus_core::traits::lightning::PaymentDetails> {
+async fn settled_outgoing(
+    node: &LdkProvider,
+) -> Vec<konsensus_core::traits::lightning::PaymentDetails> {
     let mut settled: Vec<_> = node
         .list_payments(200)
         .await
@@ -1486,6 +1910,8 @@ async fn mexico_demo_rehearsal() {
     let (b, addr_b) = infra::lightning(dirs[1].path(), &chain).await;
     let (c, addr_c) = infra::router(dirs[2].path(), &chain).await;
     let c_pubkey = c.node_id().to_string();
+    // The inbound anchor acceptor must hold its reserve on-chain.
+    chain.fund(b.node()).await;
     chain.fund(a.node()).await;
     chain.fund(&c).await;
 
@@ -1580,7 +2006,10 @@ async fn mexico_demo_rehearsal() {
     let link = door["link"].as_str().unwrap().to_owned();
     assert!(link.starts_with("bitsov://front-door#"), "{link}");
     assert_eq!(door["qr_payload"], door["link"]);
-    assert_eq!((&door["verified"], &door["fresh"]), (&json!(true), &json!(true)));
+    assert_eq!(
+        (&door["verified"], &door["fresh"]),
+        (&json!(true), &json!(true))
+    );
     let card = &door["card"];
     assert_eq!(card["node_id"], peer);
     assert_eq!(card["network"], "regtest");
@@ -1598,9 +2027,15 @@ async fn mexico_demo_rehearsal() {
         .post("/api/v1/front-door/verify", json!({"card": link}), false)
         .await;
     assert_eq!(status, StatusCode::OK, "{seen}");
-    assert_eq!((&seen["verified"], &seen["fresh"]), (&json!(true), &json!(true)));
+    assert_eq!(
+        (&seen["verified"], &seen["fresh"]),
+        (&json!(true), &json!(true))
+    );
     assert_eq!(&seen["card"], card);
-    assert!(!alice.transport.is_connected(&bob_id).await, "verify never dials");
+    assert!(
+        !alice.transport.is_connected(&bob_id).await,
+        "verify never dials"
+    );
     beats.pass("front-door card verified");
 
     // Beat 3: A knocks. Open dials B unprivileged (A consents to the displayed
@@ -1614,7 +2049,10 @@ async fn mexico_demo_rehearsal() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{opened}");
-    assert_eq!((&opened["node_id"], &opened["connected"]), (&json!(peer), &json!(true)));
+    assert_eq!(
+        (&opened["node_id"], &opened["connected"]),
+        (&json!(peer), &json!(true))
+    );
     wait("Noise connected via front door", || {
         bob.transport.is_connected(&alice_id)
     })
@@ -1631,8 +2069,14 @@ async fn mexico_demo_rehearsal() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{quote}");
-    assert_eq!(quote["admission_msat"], card["prices"]["admission_msat"], "{quote}");
-    assert_eq!(quote["message_msat"], card["prices"]["message_msat"], "{quote}");
+    assert_eq!(
+        quote["admission_msat"], card["prices"]["admission_msat"],
+        "{quote}"
+    );
+    assert_eq!(
+        quote["message_msat"], card["prices"]["message_msat"],
+        "{quote}"
+    );
     let paid_before = settled_outgoing(&a).await.len();
     let grant = alice.service.grant_view_for(&alice.client).unwrap();
     let (status, body) = alice
@@ -1731,7 +2175,10 @@ async fn mexico_demo_rehearsal() {
     let file_msat = 1_000;
     assert_eq!(sent["amount_msat"], file_msat, "{sent}");
     let got = recv_from(&mut bob, &alice_id, konsensus_core::kind::KIND_FILE_REF).await;
-    assert_eq!(got.plaintext.as_deref(), Some(format!("[file: {name}]").as_str()));
+    assert_eq!(
+        got.plaintext.as_deref(),
+        Some(format!("[file: {name}]").as_str())
+    );
     let (status, files) = bob.get("/api/v1/files", false).await;
     assert_eq!(status, StatusCode::OK, "{files}");
     let record = files
@@ -1745,7 +2192,10 @@ async fn mexico_demo_rehearsal() {
     assert_eq!(record["sender"], alice_id.to_hex());
     assert_eq!(record["blake3_hash"], staged["blake3_hash"]);
     let (status, download) = bob
-        .get(&format!("/api/v1/files/{}", record["id"].as_str().unwrap()), false)
+        .get(
+            &format!("/api/v1/files/{}", record["id"].as_str().unwrap()),
+            false,
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -1759,7 +2209,11 @@ async fn mexico_demo_rehearsal() {
         .reconcile(
             "voice note",
             (&alice, &bob),
-            (-((file_msat + fee_file) as i64), file_msat as i64, fee_file as i64),
+            (
+                -((file_msat + fee_file) as i64),
+                file_msat as i64,
+                fee_file as i64,
+            ),
             (file_msat + fee_file, 0),
         )
         .await;
@@ -1785,7 +2239,11 @@ async fn mexico_demo_rehearsal() {
         let (status, body) = call_signal(&alice, &bob_id, 400, &offer).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["reason"], "call_id_used", "{body}");
-        assert_eq!(settled_outgoing(&a).await.len(), paid, "refusal pays nothing");
+        assert_eq!(
+            settled_outgoing(&a).await.len(),
+            paid,
+            "refusal pays nothing"
+        );
 
         let answer = format!(r#"{{"v":1,"call_id":"{call_id}","sdp":"{sdp}"}}"#);
         let (status, body) = call_signal(&bob, &alice_id, 401, &answer).await;
@@ -1869,12 +2327,9 @@ async fn mexico_demo_rehearsal() {
     let mut sent_a: Vec<u64> = [vec![liquidity, 2_001, 2_001, 2_001, file_msat], call_a].concat();
     let mut sent_b: Vec<u64> = [vec![2_001], call_b].concat();
     let mut spent = [0u64; 2];
-    for ((node, amounts, towards), spent) in [
-        (&a, &mut sent_a, to_b),
-        (&b, &mut sent_b, to_a),
-    ]
-    .into_iter()
-    .zip(&mut spent)
+    for ((node, amounts, towards), spent) in [(&a, &mut sent_a, to_b), (&b, &mut sent_b, to_a)]
+        .into_iter()
+        .zip(&mut spent)
     {
         amounts.sort_by_key(|&m| std::cmp::Reverse(m));
         let settled = settled_outgoing(node).await;
@@ -1903,8 +2358,16 @@ async fn mexico_demo_rehearsal() {
     assert_eq!(end.a, start.a - spent[0] + received_a);
     assert_eq!(end.b, start.b - spent[1] + received_b);
     assert_eq!(end.c, start.c + fees);
-    assert_eq!(end.used_a - start.used_a, spent[0], "A budget = principals + fees");
-    assert_eq!(end.used_b - start.used_b, spent[1], "B budget = principals + fees");
+    assert_eq!(
+        end.used_a - start.used_a,
+        spent[0],
+        "A budget = principals + fees"
+    );
+    assert_eq!(
+        end.used_b - start.used_b,
+        spent[1],
+        "B budget = principals + fees"
+    );
     println!(
         "reconciled: A {}->{} ({:+}), B {}->{} ({:+}), C {}->{} ({:+}) msat",
         start.a,
@@ -1937,18 +2400,43 @@ async fn bitcoind_chain_source_pruned_and_full() {
         conf.wallet = None;
         conf.network = "regtest";
         conf.p2p = corepc_node::P2P::No;
-        conf.args = vec!["-regtest", "-fallbackfee=0.0001", "-networkactive=0", "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1", "-dnsseed=0", "-discover=0"];
-        conf.args.push(if pruned { "-prune=550" } else { "-txindex=1" });
-        let bitcoin = corepc_node::Node::with_conf(std::env::var("BITCOIND_EXE").expect("offline BITCOIND_EXE"), &conf).unwrap();
-        let _: Value = bitcoin.client.call("createwallet", &[json!("chain-source")]).unwrap();
+        conf.args = vec![
+            "-regtest",
+            "-fallbackfee=0.0001",
+            "-networkactive=0",
+            "-rpcbind=127.0.0.1",
+            "-rpcallowip=127.0.0.1",
+            "-dnsseed=0",
+            "-discover=0",
+        ];
+        conf.args
+            .push(if pruned { "-prune=550" } else { "-txindex=1" });
+        let bitcoin = corepc_node::Node::with_conf(
+            std::env::var("BITCOIND_EXE").expect("offline BITCOIND_EXE"),
+            &conf,
+        )
+        .unwrap();
+        let _: Value = bitcoin
+            .client
+            .call("createwallet", &[json!("chain-source")])
+            .unwrap();
         let address: Value = bitcoin.client.call("getnewaddress", &[]).unwrap();
-        let blocks: Value = bitcoin.client.call("generatetoaddress", &[json!(101), address]).unwrap();
-        let block: Value = bitcoin.client.call("getblock", &[blocks[100].clone()]).unwrap();
+        let blocks: Value = bitcoin
+            .client
+            .call("generatetoaddress", &[json!(101), address])
+            .unwrap();
+        let block: Value = bitcoin
+            .client
+            .call("getblock", &[blocks[100].clone()])
+            .unwrap();
         let txid = block["tx"][0].as_str().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut rpc = BitcoindConfig {
-            rpc_host: "127.0.0.1".into(), rpc_port: bitcoin.params.rpc_socket.port(),
-            cookie_file: Some(bitcoin.params.cookie_file.clone()), rpc_user: None, rpc_password_file: None,
+            rpc_host: "127.0.0.1".into(),
+            rpc_port: bitcoin.params.rpc_socket.port(),
+            cookie_file: Some(bitcoin.params.cookie_file.clone()),
+            rpc_user: None,
+            rpc_password_file: None,
         };
         if !pruned {
             let cookie = std::fs::read_to_string(&bitcoin.params.cookie_file).unwrap();
@@ -1988,10 +2476,14 @@ async fn bitcoind_chain_source_pruned_and_full() {
         wait("bitcoind LDK wallet synchronization", || ldk.money_ready()).await;
         assert_eq!(ldk.node().status().current_best_block.height, 101);
         let address: Value = bitcoin.client.call("getnewaddress", &[]).unwrap();
-        let _: Value = bitcoin.client.call("generatetoaddress", &[json!(1), address]).unwrap();
+        let _: Value = bitcoin
+            .client
+            .call("generatetoaddress", &[json!(1), address])
+            .unwrap();
         wait("bitcoind LDK follows new blocks", || async {
             ldk.node().status().current_best_block.height == 102
-        }).await;
+        })
+        .await;
         assert!(provider.is_tx_confirmed(txid, 2).await.unwrap());
         ldk.shutdown().await.unwrap();
     }
