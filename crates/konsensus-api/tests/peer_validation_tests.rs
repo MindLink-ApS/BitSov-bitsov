@@ -61,8 +61,9 @@ async fn seed(state: &Arc<AppState>) {
 async fn reject_unsafe_labels(operation: &str) {
     for c in [
         '\0', '\n', '\r', '\t', '\u{1b}', '\u{7f}', '\u{85}', '\u{ad}', '\u{61c}', '\u{180e}',
-        '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}',
-        '\u{202a}', '\u{202e}', '\u{2060}', '\u{2066}', '\u{2069}', '\u{feff}',
+        '\u{200b}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}', '\u{202a}', '\u{202b}',
+        '\u{202c}', '\u{202d}', '\u{202e}', '\u{2060}', '\u{2066}', '\u{2067}', '\u{2068}',
+        '\u{2069}', '\u{feff}',
     ] {
         let (state, transport) = probe::state(Arc::new(common::MemStorage::new()), "ok");
         if operation == "put" {
@@ -158,28 +159,34 @@ async fn put_rejects_self_even_if_a_legacy_registry_entry_exists() {
 
 #[tokio::test]
 async fn all_peer_writers_accept_ordinary_unicode_labels() {
-    for operation in ["add", "put", "import"] {
-        let (state, _) = probe::state(Arc::new(common::MemStorage::new()), "ok");
-        if operation == "put" {
-            seed(&state).await;
+    for label in [
+        "👩‍💻",
+        "👨‍👩‍👧",
+        "🏳️‍🌈",
+        "می\u{200c}روم",
+        "æøå ÆØÅ",
+        "家族 中文 日本語",
+    ] {
+        for operation in ["add", "put", "import"] {
+            let (state, _) = probe::state(Arc::new(common::MemStorage::new()), "ok");
+            if operation == "put" {
+                seed(&state).await;
+            }
+            let response = common::test_router(state.clone())
+                .oneshot(request(
+                    &state,
+                    operation,
+                    &"ab".repeat(32),
+                    "[::1]:9735",
+                    label,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{operation}: {label}");
+            let rows = state.storage.list_peers().await.unwrap();
+            assert_eq!(rows.len(), 1, "{operation}: {label}");
+            assert_eq!(rows[0].display_name.as_deref(), Some(label));
         }
-        let response = common::test_router(state.clone())
-            .oneshot(request(
-                &state,
-                operation,
-                &"ab".repeat(32),
-                "[::1]:9735",
-                "Familie — København 家族 👋",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            state.storage.list_peers().await.unwrap()[0]
-                .display_name
-                .as_deref(),
-            Some("Familie — København 家族 👋")
-        );
     }
 }
 

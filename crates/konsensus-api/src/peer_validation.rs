@@ -15,7 +15,8 @@ pub(crate) fn validate_peer_id(node_id: &NodeId, local_id: &NodeId) -> Result<()
 }
 
 /// Reject labels that can inject terminal controls or hide/reorder visible text.
-/// Ordinary Unicode text is accepted; the limit is measured in UTF-8 bytes.
+/// Unicode text, including ZWJ/ZWNJ needed by emoji and scripts, is accepted;
+/// the limit is measured in UTF-8 bytes.
 pub fn validate_peer_label(label: Option<&str>) -> Result<(), ApiError> {
     let Some(label) = label else {
         return Ok(());
@@ -28,7 +29,7 @@ pub fn validate_peer_label(label: Option<&str>) -> Result<(), ApiError> {
     if label.chars().any(|c| {
         c.is_control()
             || matches!(c,
-        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}' | '\u{200E}' | '\u{200F}'
         | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
     }) {
         return Err(ApiError::BadRequest(
