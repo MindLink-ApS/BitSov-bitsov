@@ -199,6 +199,8 @@ pub trait MessageTransport: Send + Sync {
     /// Spawns a background task that monitors the connection to `peer` and
     /// automatically reconnects with exponential backoff if the connection
     /// drops. Connection liveness is independent of supervision.
+    /// The inbound-only sentinel `0.0.0.0:0` cancels existing retry tracking
+    /// without changing whitelist admission or terminating a live connection.
     ///
     /// Called when a peer is added dynamically (e.g. via invite redemption)
     /// so that the peer gets the same reconnection resilience as peers

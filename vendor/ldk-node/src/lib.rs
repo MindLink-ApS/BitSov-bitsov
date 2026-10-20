@@ -1735,9 +1735,11 @@ impl Node {
 	/// Force-closing channels also more costly in terms of on-chain fees. So cooperative closure
 	/// should always be preferred (and tried first).
 	///
-	/// Broadcasting the closing transactions will be omitted for Anchor channels if we trust the
-	/// counterparty to broadcast for us (see [`AnchorChannelsConfig::trusted_peers_no_reserve`]
-	/// for more information).
+	/// BitSov always requests broadcasting our latest commitment transaction, including for
+	/// Anchor channels with a counterparty in [`AnchorChannelsConfig::trusted_peers_no_reserve`].
+	/// That setting waives the local reserve only for eligible bounded inbound channels; it does
+	/// not suppress this broadcast. Close fee-bumping is skipped only if live channel details
+	/// still prove eligibility. Missing details fall back to local fee-bumping.
 	///
 	/// [`AnchorChannelsConfig::trusted_peers_no_reserve`]: crate::config::AnchorChannelsConfig::trusted_peers_no_reserve
 	pub fn force_close_channel(

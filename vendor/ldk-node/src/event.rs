@@ -1754,8 +1754,9 @@ where
 						..
 					} => {
 						// Skip only when channel details prove the bounded inbound waiver applies.
-						// Closed channels may no longer be listed; missing details must not
-						// grant a peer-wide exemption to larger or outbound channels.
+						// Closed channels are usually no longer listed, so this skip rarely
+						// applies. Missing details fail safe to the local bump handler below,
+						// even for a previously waived channel; never infer a peer-wide exemption.
 						if let Some(anchor_channels_config) =
 							self.config.anchor_channels_config.as_ref()
 						{

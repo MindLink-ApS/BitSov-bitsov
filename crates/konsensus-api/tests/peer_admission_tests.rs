@@ -257,3 +257,73 @@ async fn stale_dial_does_not_replace_readded_contact_supervision() {
     );
     assert_eq!(*transport.live.lock().unwrap(), (true, true, true));
 }
+
+#[tokio::test]
+async fn stale_dial_keeps_readded_inbound_only_contact_whitelisted_without_a_gap() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let (state, transport) = state(Arc::new(common::MemStorage::new()), "gate");
+    let id = NodeId::from_hex(&request().node_id).unwrap();
+    let adding = state.clone();
+    let add = tokio::spawn(async move {
+        admit_peer(&adding, "owner", "owner_control", request(), true).await
+    });
+    transport.dial_started.notified().await;
+    assert!(transport.live.lock().unwrap().0);
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/v1/peers/{id}"))
+        .header("authorization", common::auth_header(&state))
+        .body(Body::empty())
+        .unwrap();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        common::test_router(state.clone()).oneshot(req),
+    )
+    .await
+    .expect("DELETE blocked by dial")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*transport.live.lock().unwrap(), (false, false, false));
+    assert!(!state.peer_registry.read().await.whitelist_set().contains(&id));
+    assert!(state.storage.get_peer(&id).await.unwrap().is_none());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/peers/import")
+        .header("authorization", common::auth_header(&state))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({
+            "backup": {
+                "version": 1, "exported_at": "test", "exported_by": "owner",
+                "peers": [{
+                    "node_id": id.to_hex(), "addr": "0.0.0.0:0",
+                    "label": "Inbound only", "auto_connect": false
+                }]
+            }
+        }).to_string()))
+        .unwrap();
+    let response = common::test_router(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*transport.live.lock().unwrap(), (true, false, false));
+    assert!(state.peer_registry.read().await.whitelist_set().contains(&id));
+
+    transport.finish_dial.notify_one();
+    assert!(add.await.unwrap().unwrap().dialed.is_err());
+    assert_eq!(*transport.live.lock().unwrap(), (true, true, false));
+    assert!(state.peer_registry.read().await.whitelist_set().contains(&id));
+    assert_eq!(
+        state.storage.get_peer(&id).await.unwrap().unwrap().address.as_deref(),
+        Some("0.0.0.0:0")
+    );
+    // DELETE revokes admission once; stale cleanup must never revoke it again,
+    // even briefly, after import has restored the inbound-only contact.
+    assert_eq!(
+        *transport.calls.lock().unwrap(),
+        ["whitelist", "dial", "unwhitelist", "whitelist", "supervise"]
+    );
+}

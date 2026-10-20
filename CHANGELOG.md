@@ -8,9 +8,14 @@ also live on the corresponding GitHub pre-release pages.
 - Add opt-in `trust_no_reserve` for the selected liquidity provider, default
   false. This trusts the hub to confirm closing transactions and waives its
   local anchor emergency reserve only for inbound channels funded with at most
-  200,000 sats (`MAX_TRUSTED_NO_RESERVE_INBOUND_SATS`), including for an
-  empty-wallet acceptor. Larger inbound channels and all outbound channels
+  200,000 sats per channel (`MAX_TRUSTED_NO_RESERVE_INBOUND_SATS`), including
+  for an empty-wallet acceptor. This is not an aggregate cap per trusted peer.
+  Larger inbound channels and all outbound channels
   require the normal reserve; 200,001 sats is refused on an empty wallet.
+  Force-close still requests broadcasting our latest commitment transaction.
+  Close fee-bumping is skipped only while live channel details prove waiver
+  eligibility; closed channels are usually no longer listed, so missing details
+  fail safe to local fee-bumping, even for previously waived channels.
 - Thread optional channel pushes through the Lightning funding interface and
   LDK opener. Unsupported backends refuse explicit pushes before dispatch.
 - Add owner API `push_sats` to channel opens, capped at half the channel amount,
@@ -19,11 +24,14 @@ also live on the corresponding GitHub pre-release pages.
 - Document free-text contact labels in `peer.added` audit entries and the
   associated plaintext metadata, retention and support-sharing considerations.
 
-- Reject unspecified, multicast and port-zero peer dial targets with HTTP 400,
-  including IPv4-mapped IPv6; preflight imports before writing any contacts.
+- Reject unspecified, IPv4 broadcast (`255.255.255.255`), multicast and port-zero
+  peer dial targets with HTTP 400, including IPv4-mapped IPv6. Import validates
+  per entry and reports each outcome in `results`; it never overwrites an
+  existing peer. `skip_existing` remains accepted as a compatibility no-op.
 
-- Share peer-label validation across console, admission, PUT and import: reject
-  control, bidi and zero-width formatting characters, and prevent self-ID updates.
+- Share peer-label validation across console, admission, PUT and import: allow
+  U+200C/U+200D (ZWNJ/ZWJ) in labels while blocking U+200B/U+200E/U+200F,
+  control characters and bidi controls, and prevent self-ID updates.
 
 - Serialize peer updates, connect admission and imports with deletion; persist
   first so failed writes and concurrent DELETEs cannot resurrect contacts.
@@ -33,6 +41,8 @@ also live on the corresponding GitHub pre-release pages.
 
 - Dial newly admitted peers outside the registry lock; generation checks keep
   concurrent removal or replacement authoritative without stalling message gates.
+  Cancel stale retries for re-added inbound-only contacts without temporarily
+  revoking their restored transport whitelist entry.
 
 - Fix `konsensus node-id` with encrypted mnemonics: reuse the terminal prompt,
   `--password-fd`, `--password-file` and `--password` inputs from `sign-challenge`.

@@ -262,6 +262,36 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn inbound_only_supervision_cancels_stale_retry_without_revoking_whitelist() {
+        use konsensus_core::traits::transport::MessageTransport;
+        let identity = super::super::tests::make_identity(super::super::tests::TEST_MNEMONIC_A);
+        let peer = *identity.node_id();
+        let transport = NoiseTransport::new(identity, Default::default());
+        transport.add_to_whitelist(&peer).await;
+        // A parked worker represents retry tracking installed by a stale dial.
+        let worker = tokio::spawn(std::future::pending::<()>());
+        transport.supervision.lock().unwrap().insert(
+            peer,
+            Supervision {
+                addr: "127.0.0.1:9735".parse().unwrap(),
+                interest: Arc::new(Mutex::new(Interest::default())),
+                task: worker.abort_handle(),
+            },
+        );
+        // Keep a whitelist read guard: cleanup must not even attempt a write.
+        let whitelist = transport.whitelist.read().await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.supervise_peer(&peer, "0.0.0.0:0"),
+        )
+        .await
+        .expect("inbound-only cleanup tried to modify the whitelist");
+        assert!(whitelist.contains(&peer));
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(transport.supervision.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn shutdown_prevents_late_supervision_and_dials() {
         use konsensus_core::traits::transport::MessageTransport;
         let identity = super::super::tests::make_identity(super::super::tests::TEST_MNEMONIC_A);

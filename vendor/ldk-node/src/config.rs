@@ -30,6 +30,7 @@ const DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER: u64 = 3;
 const DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS: u64 = 25_000;
 
 /// Maximum funding amount for an inbound channel eligible for the trusted reserve waiver.
+/// Applied per channel, not to the aggregate funding from a trusted peer.
 pub const MAX_TRUSTED_NO_RESERVE_INBOUND_SATS: u64 = 200_000;
 
 /// The default log level.
@@ -282,9 +283,14 @@ pub struct AnchorChannelsConfig {
 	/// on-chain.
 	///
 	/// Only inbound channels funded with at most [`MAX_TRUSTED_NO_RESERVE_INBOUND_SATS`]
-	/// qualify for the waiver. Larger inbound channels and all outbound channels retain the
-	/// normal reserve. Close fee-bumping is skipped only while channel details prove eligibility;
-	/// missing details conservatively fall back to local fee-bumping.
+	/// qualify for the waiver. This limit is per channel, not an aggregate cap per trusted peer.
+	/// Larger inbound channels and all outbound channels retain the normal reserve.
+	///
+	/// Close fee-bumping is skipped only while live channel details prove eligibility. A closed
+	/// channel is usually no longer listed when a bump event arrives, so the skip rarely applies:
+	/// missing details fail safe to local fee-bumping, even for a previously waived channel.
+	/// The waiver therefore does not guarantee that local on-chain funds will never be spent
+	/// on close fees.
 	///
 	/// **Note:** Trusting the channel counterparty to take the necessary actions to get the
 	/// required Anchor spending transactions confirmed on-chain is potentially insecure
