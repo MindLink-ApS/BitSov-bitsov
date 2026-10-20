@@ -151,7 +151,7 @@ removed.
 ## Steps and assertions
 
 1. **#101 refusal:** `open_channel(.., Some(3.0))` returns
-   `PaymentNotDispatched("LDK cannot enforce a per-channel funding fee rate")`,
+   `PaymentNotDispatched("LDK cannot enforce an exact caller-supplied funding fee rate; use funding_priority")`,
    with no channel and an empty mempool.
 2. **Channels:** A→C and C→B at 1,000,000 sat via the estimator (156 sat /
    153 vB each), six confirmations, usable on both ends; on-chain change checked.

@@ -444,7 +444,25 @@ is optional and supplies metadata only, never live channel state.
 each sweep. Completion requires confirmed sweeps, a fresh LSPS2 channel funded
 from another wallet, and a settled 1-sat hub payment. It retains the new live
 verification store and marks the journal done only after the final chain
-recheck. Normal startup stays fenced until completion; resume with the same
+recheck. That fresh store must also see at least 25,000 sats of available
+on-chain anchor reserve, unless the selected provider is explicitly trusted:
+set `trust_no_reserve = true` in its existing
+`[[lightning.liquidity.providers]]` entry, with
+`lightning.liquidity.enabled = true` and
+`lightning.liquidity.selected_provider` matching its `node_id`. The default
+remains false. This permits only inbound anchor channels with full funding of
+at most 200,000 sats; the self-test invoice amount does not set channel capacity.
+Trusting the hub means trusting it to confirm closes for small starter channels.
+Set the key before recovery, or Ctrl-C, edit the same config, and resume
+`konsensus recover --config <new-config> --confirm` with all previous plan
+options and the same selected hub. There is no corresponding recovery CLI flag.
+An external `--destination` or a balance below 25,000 sats may leave no reserve;
+a fresh bitcoind-backed verification wallet also starts at the current tip and
+does not automatically see earlier same-seed sweep funds. The recovery console
+has no on-chain funding-address command/API for that store. Follow
+[the verification requirements and config example](v2/RECOVERY.md#4-verify-a-fresh-channel-before-normal-startup).
+Without visible reserve or a qualifying waiver, verification cannot complete.
+Normal startup stays fenced until completion; resume with the same
 plan after interruption. An unreachable hub means waiting/contacting its
 operator, never force-closing from a backup. Preserve the journal, seed and
 report; a seed-only scan cannot prove all old channels have closed.

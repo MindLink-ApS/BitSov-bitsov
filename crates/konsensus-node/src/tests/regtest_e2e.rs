@@ -146,7 +146,7 @@ async fn real_ldk_regtest_e2e() {
     chain.fund(b.node()).await;
     chain.fund(a.node()).await;
     chain.fund(&c).await;
-    steps.pass("A and C funded 3,000,000 sat each from regtest coinbase");
+    steps.pass("A, B and C funded 3,000,000 sat each from regtest coinbase");
 
     chain.refuse_explicit_rate(&a, &c_pubkey, &addr_c).await;
     steps.pass("explicit per-channel funding fee rate refused (#101), no channel, no broadcast");
@@ -548,7 +548,7 @@ async fn real_ldk_regtest_calls() {
     chain.fund(b.node()).await;
     chain.fund(a.node()).await;
     chain.fund(&c).await;
-    steps.pass("A and C funded 3,000,000 sat each from regtest coinbase");
+    steps.pass("A, B and C funded 3,000,000 sat each from regtest coinbase");
 
     chain.refuse_explicit_rate(&a, &c_pubkey, &addr_c).await;
     steps.pass("explicit per-channel funding fee rate refused (#101), no channel, no broadcast");

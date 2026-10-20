@@ -56,6 +56,14 @@ is **not** evidence its funds are available. It retains all wallet funds until
 there are no open channels, Lightning claims, pending LDK sweeps or anchor
 reserves. The journal also makes ordinary `konsensus start` refuse this store.
 
+Even after a closing output's sweep confirms, LDK may retain it as
+`AwaitingThresholdConfirmations` until `PRUNE_DELAY_BLOCKS` confirmations.
+Migration waits for that pending sweep to be pruned before offering the final
+destination sweep. The pinned horizon is 4,038 blocks (roughly four weeks at
+ten minutes per block); the regtest mines this horizon when it encounters that
+state. Keep the current live store and journal and allow chain synchronization
+to continue; a confirmed close alone does not end this wait.
+
 When funds are spendable, it previews the **exact** destination amount, mining
 fee, and transaction ID. Type the separate `SEND … FEE … TO …` line to approve
 that sweep. There is exactly one output, to the given address; no change output.

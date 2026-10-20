@@ -5,6 +5,10 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Document recovery's fresh-channel requirement: a visible 25,000-sat on-chain
+  reserve in the verification store, or explicit selected-provider
+  `trust_no_reserve = true` for an inbound anchor channel of at most 200,000 sats;
+  otherwise recovery and normal startup remain fenced.
 - Refuse all non-anchor inbound channels, including LDK downgrade retries, so
   a rejected anchor request cannot bypass the selected-provider reserve-waiver
   policy. Every inbound or JIT channel must be an anchor channel and either have
