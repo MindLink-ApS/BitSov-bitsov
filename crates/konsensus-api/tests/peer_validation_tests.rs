@@ -182,3 +182,148 @@ async fn all_peer_writers_accept_ordinary_unicode_labels() {
         );
     }
 }
+
+async fn reject_unusable_addresses(operation: &str) {
+    for addr in [
+        "0.0.0.0:9735",
+        "[::]:9735",
+        "127.0.0.1:0",
+        "[::1]:0",
+        "224.0.0.1:9735",
+        "239.255.255.255:9735",
+        "[ff02::1]:9735",
+        "[::ffff:0.0.0.0]:9735",
+        "[::ffff:224.0.0.1]:9735",
+    ] {
+        let (state, transport) = probe::state(Arc::new(common::MemStorage::new()), "ok");
+        if operation == "put" {
+            seed(&state).await;
+        }
+        transport.calls.lock().unwrap().clear();
+        let response = common::test_router(state.clone())
+            .oneshot(request(&state, operation, &"ab".repeat(32), addr, "Dad"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{operation} accepted {addr}"
+        );
+        assert!(transport.calls.lock().unwrap().is_empty());
+        let rows = state.storage.list_peers().await.unwrap();
+        let registry = state.peer_registry.read().await;
+        if operation == "put" {
+            assert_eq!(rows[0].address.as_deref(), Some("127.0.0.1:9735"));
+            assert_eq!(registry.all()[0].addr.to_string(), "127.0.0.1:9735");
+        } else {
+            assert!(rows.is_empty());
+            assert!(registry.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn admission_rejects_unusable_addresses_with_400() {
+    reject_unusable_addresses("add").await;
+}
+#[tokio::test]
+async fn put_rejects_unusable_addresses_with_400() {
+    reject_unusable_addresses("put").await;
+}
+#[tokio::test]
+async fn import_rejects_unusable_addresses_with_400() {
+    reject_unusable_addresses("import").await;
+}
+
+#[tokio::test]
+async fn import_checks_all_addresses_before_writing_any_rows() {
+    let (state, transport) = probe::state(Arc::new(common::MemStorage::new()), "ok");
+    let body = serde_json::json!({"backup":{"version":1,"exported_at":"test","exported_by":"owner","peers":[
+        {"node_id":"ab".repeat(32),"addr":"127.0.0.1:9735","label":"Valid","auto_connect":true},
+        {"node_id":"cd".repeat(32),"addr":"[ff02::1]:9735","label":"Invalid","auto_connect":true}
+    ]}});
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/peers/import")
+        .header("authorization", common::auth_header(&state))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = common::test_router(state.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(transport.calls.lock().unwrap().is_empty());
+    assert!(state.storage.list_peers().await.unwrap().is_empty());
+    assert!(state.peer_registry.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn connect_rejects_legacy_unspecified_address_before_persistence() {
+    let (state, transport) = probe::state(Arc::new(common::MemStorage::new()), "ok");
+    let id = NodeId::from_hex(&"ab".repeat(32)).unwrap();
+    state
+        .peer_registry
+        .write()
+        .await
+        .add(konsensus_message::PeerEntry {
+            node_id: id,
+            addr: "0.0.0.0:0".parse().unwrap(),
+            label: None,
+            auto_connect: false,
+        });
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/peers/{id}/connect"))
+        .header("authorization", common::auth_header(&state))
+        .body(Body::empty())
+        .unwrap();
+    let response = common::test_router(state.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(transport.calls.lock().unwrap().is_empty());
+    assert!(state.storage.list_peers().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn metadata_only_put_keeps_an_inbound_only_contacts_sentinel_address() {
+    let (state, _) = probe::state(Arc::new(common::MemStorage::new()), "ok");
+    let id = NodeId::from_hex(&"ab".repeat(32)).unwrap();
+    state
+        .peer_registry
+        .write()
+        .await
+        .add(konsensus_message::PeerEntry {
+            node_id: id,
+            addr: "0.0.0.0:0".parse().unwrap(),
+            label: None,
+            auto_connect: false,
+        });
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/peers/{id}"))
+        .header("authorization", common::auth_header(&state))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"label":"Inbound contact"}"#))
+        .unwrap();
+    let response = common::test_router(state.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let row = state.storage.get_peer(&id).await.unwrap().unwrap();
+    assert_eq!(row.display_name.as_deref(), Some("Inbound contact"));
+    assert_eq!(
+        state
+            .peer_registry
+            .read()
+            .await
+            .addr(&id)
+            .unwrap()
+            .to_string(),
+        "0.0.0.0:0"
+    );
+}

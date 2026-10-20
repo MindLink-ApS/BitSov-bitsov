@@ -2193,6 +2193,7 @@ pub async fn cmd_peer_add(
     let address: std::net::SocketAddr = addr
         .parse()
         .context("invalid address: IP address and port only (no hostnames)")?;
+    konsensus_api::peer_validation::validate_peer_addr(&address)?;
     konsensus_api::peer_validation::validate_peer_label(label.as_deref())?;
     if config_path.try_exists()? {
         let config = NodeConfig::load_before_identity_validation(config_path)?;

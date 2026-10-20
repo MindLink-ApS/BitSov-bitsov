@@ -38,6 +38,19 @@ pub fn validate_peer_label(label: Option<&str>) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// A dial target must identify a unicast host and a nonzero service port.
+/// Loopback, private and link-local hosts remain valid owner-supplied targets.
+pub fn validate_peer_addr(addr: &std::net::SocketAddr) -> Result<(), ApiError> {
+    // IPv4-mapped IPv6 must obey the same rules as native IPv4.
+    let ip = addr.ip().to_canonical();
+    if addr.port() == 0 || ip.is_unspecified() || ip.is_multicast() {
+        return Err(ApiError::BadRequest(
+            "peer address must be a unicast IP address with a nonzero port".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

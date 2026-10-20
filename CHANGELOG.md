@@ -5,6 +5,9 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Reject unspecified, multicast and port-zero peer dial targets with HTTP 400,
+  including IPv4-mapped IPv6; preflight imports before writing any contacts.
+
 - Share peer-label validation across console, admission, PUT and import: reject
   control, bidi and zero-width formatting characters, and prevent self-ID updates.
 

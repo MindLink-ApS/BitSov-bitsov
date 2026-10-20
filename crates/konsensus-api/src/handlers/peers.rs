@@ -15,7 +15,7 @@ use crate::audit::events;
 use crate::error::ApiError;
 use crate::freshness::DataFreshness;
 use crate::handlers::list_diagnostics::ListDiagnostics;
-use crate::peer_validation::{validate_peer_id, validate_peer_label};
+use crate::peer_validation::{validate_peer_addr, validate_peer_id, validate_peer_label};
 use crate::state::AppState;
 
 /// Peer in API response format.
@@ -229,6 +229,7 @@ pub async fn admit_peer(
     let addr: std::net::SocketAddr = req.addr.parse().map_err(|e| {
         ApiError::BadRequest(format!("invalid address (IP address and port only): {e}"))
     })?;
+    validate_peer_addr(&addr)?;
     validate_peer_label(req.label.as_deref())?;
     let entry = PeerEntry {
         node_id,
@@ -406,9 +407,15 @@ async fn update_peer(
         .clone();
 
     let new_addr = match &req.addr {
-        Some(addr_str) => addr_str
-            .parse()
-            .map_err(|e| ApiError::BadRequest(format!("invalid address: {e}")))?,
+        Some(addr_str) => {
+            let addr = addr_str
+                .parse()
+                .map_err(|e| ApiError::BadRequest(format!("invalid address: {e}")))?;
+            validate_peer_addr(&addr)?;
+            addr
+        }
+        // Inbound-only contacts have a nondialable sentinel. Metadata edits
+        // need not invent an address; only newly supplied targets are checked.
         None => existing.addr,
     };
 
@@ -497,6 +504,7 @@ async fn connect_peer(
         .clone();
     let generation = registry.generation(&node_id).expect("registered peer");
     let addr = entry.addr;
+    validate_peer_addr(&addr)?;
 
     // P3-2: persist this explicit-consent admission so it survives restart.
     // connect_peer admits gossip-discovered peers that were registry-only;
@@ -584,6 +592,14 @@ async fn import_peers(
             "too many peers in import: {} (max {MAX_IMPORT_PEERS})",
             req.backup.peers.len()
         )));
+    }
+
+    // Reject prohibited dial targets before applying any part of a backup.
+    // Malformed strings retain the existing per-entry import error reporting.
+    for entry in &req.backup.peers {
+        if let Ok(addr) = entry.addr.parse() {
+            validate_peer_addr(&addr)?;
+        }
     }
 
     let mut imported = 0usize;
