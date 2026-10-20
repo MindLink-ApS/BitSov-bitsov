@@ -150,7 +150,7 @@ pub enum Scope {
     /// the hole by another door.
     Spend,
     /// Change node configuration and relationships: peers, pricing, gossip, invites,
-    /// content, bulk export of the relationship graph.
+    /// content, full data bundle export.
     Admin,
     /// Key material and identity replacement: reveal mnemonic, restore, verify.
     Identity,

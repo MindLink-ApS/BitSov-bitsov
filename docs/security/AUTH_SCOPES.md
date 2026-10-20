@@ -51,7 +51,7 @@ holds the key — which is why pairing (ticket 2) exists.
 
 ### read
 Observation only. Every authenticated handler not listed under another scope requires `read`:
-status, chain status, identity display, payment history/balance/channels/price, peers list,
+status, chain status, identity display, payment history/balance/channels/price, peers list/export,
 pricing, rooms list/get/members, sessions list/status/prekey, routing, gossip status,
 onboarding state, invites list/capabilities, message get/list/search/plaintext, content
 list/read/manifest, file download/list, hosting contracts list + ledger, calendar event list.
@@ -78,7 +78,7 @@ the administrative branch raises it, because the tier is only known from the bod
 Anything that changes configuration, relationships, or stored content:
 
 `POST /peers` (add) · `PUT /peers/:id` · `DELETE /peers/:id` · `POST /peers/:node_id/connect` ·
-`/peers/:node_id/discover` · `/peers/import` · `GET /peers/export` · `GET /export/bundle` ·
+`/peers/:node_id/discover` · `/peers/import` · `GET /export/bundle` ·
 `POST /gossip/publish` · `/invites` · `/invites/accept` ·
 `DELETE` an invite (revoke) · `POST /rooms` (create) · `DELETE /rooms/:id` ·
 `POST /rooms/:id/members` · `DELETE` a room member · calendar event create/update/delete +
@@ -86,8 +86,10 @@ Anything that changes configuration, relationships, or stored content:
 `POST /files` (upload) · `DELETE` a file · `/messages/resync` · `DELETE` a message ·
 hosting contract creation · session initiate/accept.
 
-`/peers/export` and `/export/bundle` are `admin` rather than `read`: they emit the user's
-relationship graph in bulk, which is a different exposure from reading one record.
+`/peers/export` requires `read`: it exports the same public node IDs, addresses, labels
+and auto-connect flags already returned in bulk by `GET /peers`, plus the format version,
+export timestamp and local public node ID. It adds no keys, tokens or private addresses
+beyond the peer list. `/export/bundle` remains `admin` for the full data bundle.
 
 Session initiate/accept are `admin` rather than `read` because they establish durable
 relationship state with a peer. This is the local owner API, not the wire admission path —
