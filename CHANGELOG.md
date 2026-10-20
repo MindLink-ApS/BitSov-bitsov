@@ -5,6 +5,11 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Refuse all non-anchor inbound channels, including LDK downgrade retries, so
+  a rejected anchor request cannot bypass the selected-provider reserve-waiver
+  policy. Outbound channel defaults remain anchored.
+- Fix funding-result reconciliation for displayed `UserChannelId(n)` IDs by
+  sharing the existing channel-close parser, while retaining bare decimal IDs.
 - Add opt-in `trust_no_reserve` for the selected liquidity provider, default
   false. This trusts the hub to confirm closing transactions and waives its
   local anchor emergency reserve only for inbound channels funded with at most

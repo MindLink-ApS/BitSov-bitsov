@@ -285,21 +285,32 @@ Acceptance target: **4 passed, 0 failed**, with these `PHASE0 PASS` markers:
 
 No blocks are mined after opening in any scenario. This is a regtest proof for
 the signet-first design, not a signet deployment or an app/message test. Startup
-provider connection (N2), N3 and hub H1–H6 remain out of scope; production defaults
-are unchanged.
+provider connection (N2), N3 and hub H1–H6 remain out of scope.
 
-**Observed on 2026-10-20: NOT-READY — 1 passed, 3 failed.** The push, connection
-reuse and payment markers pass (9,000 sats spendable plus 1,000 sats punishment
-reserve). All three negative controls reject the initial anchor offer, but LDK's
-`ChannelManager::handle_error` retries with fewer channel-type features via
-`maybe_downgrade_channel_features`. A non-anchor channel is then accepted and
-funded. The anchor-reserve waiver itself remains bounded; absolute channel
-rejection does not hold. The tests deliberately retain the ticket's rejection
-assertions. A policy decision is needed: permit this fallback and revise the
-acceptance criteria, or separately authorize an explicit rejection policy.
+**Observed on 2026-10-20 after the Atlas ruling: 4 passed, 0 failed.** All four
+Phase 0 items pass, including all three negative controls' unchanged final
+rejection, no-surviving-channel and no-funding-broadcast assertions. The positive
+scenario has 9,000 sats spendable plus 1,000 sats punishment reserve.
+
+BitSov now refuses every non-anchor inbound channel in the vendored
+`OpenChannelRequest` handler, next to the anchor-reserve check. This includes
+originally non-anchor requests and LDK's `maybe_downgrade_channel_features`
+retries after an anchor refusal: the retry cannot bypass the reserve-waiver
+gate. The rule applies to clients and services alike. The 200,000-sat cap,
+selected-provider `trust_no_reserve` semantics, zero-conf trust and outbound
+anchor defaults are unchanged. This inbound rule is the only production-default
+change.
+
+The full `regtest_e2e::three_node::lsps2_service::` module also passes:
+**5 passed, 0 failed**, including hub JIT funding, disconnect/restart recovery
+and stateless admission. No service exception or fixture changes were needed.
+The vendored LDK Node library suite passes **166 tests**, including a new
+runtime regression that rejects non-anchor requests from trusted peers, removes
+the pending request and preserves anchor acceptance with and without zero-conf
+trust.
 
 The run also exposed a funding-result bug: the production opener returns
 `UserChannelId(n)` but reconciliation parsed it as bare decimal. Reconciliation
 now shares close's existing ID parser, with a round-trip regression test. This
 fix enables the production push API to report its actual funding outcome; it
-does not change channel selection, reserve policy or vendor code.
+does not change channel selection or reserve policy.

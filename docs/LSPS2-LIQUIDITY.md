@@ -61,6 +61,7 @@ to the full funding amount, not the pushed balance or invoice amount. A
 200,001-sat or larger inbound channel requires the normal anchor reserve
 (default 25,000 sats) and is rejected on an empty wallet. Outbound channels
 and unselected providers receive no reserve waiver, even when their flag is true.
+Non-anchor inbound channels are refused, including downgrade retries after an anchor-reserve rejection.
 Switching providers requires restart and updates this trust list; it does not move existing funds.
 The waiver gives up the local emergency reserve for qualifying inbound channels,
 so closing transaction confirmation depends on the trusted hub. Larger inbound

@@ -1314,6 +1314,22 @@ where
 				}
 
 				let anchor_channel = channel_type.requires_anchors_zero_fee_htlc_tx();
+				// BITSOV-PATCH: require anchors for every inbound channel. Otherwise LDK's
+				// non-anchor retry can bypass a rejected anchor-reserve check.
+				if !anchor_channel {
+					log_info!(self.logger, "Rejecting non-anchor inbound channel from peer {}", counterparty_node_id);
+					// Unaccepted request: no funding transaction exists yet.
+					self.channel_manager
+						.force_close_broadcasting_latest_txn(
+							&temporary_channel_id,
+							&counterparty_node_id,
+							"Inbound channels require anchors".to_string(),
+						)
+						.unwrap_or_else(|e| {
+							log_error!(self.logger, "Failed to reject non-anchor channel: {:?}", e)
+						});
+					return Ok(());
+				}
 				if anchor_channel {
 					if let Some(anchor_channels_config) =
 						self.config.anchor_channels_config.as_ref()
