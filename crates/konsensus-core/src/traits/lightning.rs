@@ -858,21 +858,54 @@ pub trait LightningProvider: Send + Sync {
         &self, peer_pubkey: &str, peer_addr: &str, amount_sats: u64,
         announce: bool, fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<ChannelOpenResult, LightningError> {
-        let channel_id = self.open_channel(peer_pubkey, peer_addr, amount_sats, announce, fee_rate_sat_per_vb).await?;
-        Ok(ChannelOpenResult { funding_fee: None, channel_id, funding_txid: None, status: ChannelOpenStatus::Opening })
+        let channel_id = self
+            .open_channel(
+                peer_pubkey,
+                peer_addr,
+                amount_sats,
+                announce,
+                fee_rate_sat_per_vb,
+            )
+            .await?;
+        Ok(ChannelOpenResult {
+            funding_fee: None,
+            channel_id,
+            funding_txid: None,
+            status: ChannelOpenStatus::Opening,
+        })
     }
 
     /// Read-only preview. Unsupported backends must refuse, never invent a quote.
-    async fn funding_fee_quote(&self, _options: FundingOptions) -> Result<FundingFeeEstimate, LightningError> {
-        Err(LightningError::PaymentNotDispatched("funding priority/fee cap not supported by this provider".into()))
+    async fn funding_fee_quote(
+        &self,
+        _options: FundingOptions,
+    ) -> Result<FundingFeeEstimate, LightningError> {
+        Err(LightningError::PaymentNotDispatched(
+            "funding priority/fee cap not supported by this provider".into(),
+        ))
     }
 
     /// Explicit funding preferences must survive asynchronous transaction construction.
+    /// `push_msat` gifts this initial balance to the counterparty. `None` keeps
+    /// the existing zero-push behavior. Unsupported backends must refuse any
+    /// `Some` value before dispatch, including `Some(0)`.
     async fn open_channel_with_funding(
-        &self, _peer_pubkey: &str, _peer_addr: &str, _amount_sats: u64,
-        _announce: bool, _options: FundingOptions,
+        &self,
+        _peer_pubkey: &str,
+        _peer_addr: &str,
+        _amount_sats: u64,
+        _announce: bool,
+        _options: FundingOptions,
+        push_msat: Option<u64>,
     ) -> Result<ChannelOpenResult, LightningError> {
-        Err(LightningError::PaymentNotDispatched("funding priority/fee cap not supported by this provider".into()))
+        if push_msat.is_some() {
+            return Err(LightningError::PaymentNotDispatched(
+                "channel push not supported by this provider".into(),
+            ));
+        }
+        Err(LightningError::PaymentNotDispatched(
+            "funding priority/fee cap not supported by this provider".into(),
+        ))
     }
 
     fn local_spend_diagnostics(&self) -> LocalSpendDiagnostics {

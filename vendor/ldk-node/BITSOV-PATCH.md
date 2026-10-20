@@ -763,3 +763,21 @@ vendored library test target as a separate job. Both standalone locks and the
 workspace lock select possiblyrandom 0.2.1 (#4719); no other version changes.
 See `../../docs/security/ldk-node-0.7.1/README.md` for exact upstream commits,
 before/after inventories, preservation evidence and validation limits.
+
+## Optional initial channel push
+
+`Node::open_channel_with_funding_policy` now accepts optional
+`push_to_counterparty_msat` and passes it to `open_channel_inner`, preserving the
+pinned funding policy and its fee cap. Existing callers pass `None`. The node
+owner API bounds the push; no auto-open policy is enabled by this extension.
+
+The in-memory regtest-network admission test
+`empty_wallet_accepts_anchor_only_from_reserve_trusted_opener` exchanges real
+channel messages with the production event handler. It verifies an empty-wallet
+acceptor refuses an anchor channel under the default 25,000-sat reserve and
+accepts it when the opener is in `trusted_peers_no_reserve`. It does not require
+bitcoind, fund wallets, or assert confirmation/spendability.
+
+```sh
+cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib empty_wallet_accepts_anchor
+```

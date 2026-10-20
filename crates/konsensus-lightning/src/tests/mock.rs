@@ -622,3 +622,24 @@ async fn routing_fee_limit_refuses_before_debit_and_settles_actual_fee() {
     assert_eq!(keysend_paid.fee_msat, Some(700));
     assert_eq!(mock.get_balance_msat().await.unwrap(), before - 3400);
 }
+
+#[tokio::test]
+async fn unsupported_channel_push_is_never_dispatched() {
+    let provider = MockLightningProvider::new();
+    for push in [0, 10_000_000] {
+        let error = provider
+            .open_channel_with_funding(
+                "peer",
+                "unused",
+                50_000,
+                false,
+                Default::default(),
+                Some(push),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, LightningError::PaymentNotDispatched(ref message) if message.contains("push") && message.contains("not supported"))
+        );
+    }
+}

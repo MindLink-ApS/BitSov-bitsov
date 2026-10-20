@@ -159,7 +159,19 @@ impl LdkConfig {
         &self,
         admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> ldk_node::config::Config {
+        let mut anchors = ldk_node::config::AnchorChannelsConfig::default();
+        if let Some(peer) = self
+            .liquidity
+            .selected()
+            .ok()
+            .flatten()
+            .filter(|provider| provider.trust_no_reserve)
+            .and_then(|provider| provider.node_id.parse().ok())
+        {
+            anchors.trusted_peers_no_reserve.push(peer);
+        }
         ldk_node::config::Config {
+            anchor_channels_config: Some(anchors),
             channel_limits: Some(ldk_node::channel_limits::ChannelLimits::new(
                 self.channel_capacity_limits.max_channel_capacity_sats,
                 self.channel_capacity_limits.max_total_channel_capacity_sats,
@@ -2174,6 +2186,7 @@ impl LightningProvider for LdkProvider {
         amount_sats: u64,
         announce: bool,
         options: konsensus_core::traits::lightning::FundingOptions,
+        push_msat: Option<u64>,
     ) -> Result<konsensus_core::traits::lightning::ChannelOpenResult, LightningError> {
         let node = self.node.clone();
         let chain = self.chain_visibility();
@@ -2185,7 +2198,7 @@ impl LightningProvider for LdkProvider {
             let estimate = funding_estimate(&policy);
             let opener = node.clone();
             let channel_id = tokio::task::spawn_blocking(move || open_ldk_channel_with_policy(
-                opener.as_ref(), &peer_pubkey, &peer_addr, amount_sats, announce, Some(policy),
+                opener.as_ref(), &peer_pubkey, &peer_addr, amount_sats, announce, Some(policy), push_msat,
             )).await.map_err(|e| LightningError::Backend(format!("open_channel worker failed: {e}")))??;
             let pending_id = channel_id.clone();
             let mut result = crate::onchain::finish_channel_open(channel_id, || {
@@ -2902,6 +2915,7 @@ trait ChannelOpener {
         amount_sats: u64,
         announce: bool,
         policy: ldk_node::funding::FundingPolicy,
+        push_msat: Option<u64>,
     ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError>;
 
     fn open_channel(
@@ -2939,8 +2953,9 @@ impl ChannelOpener for LdkNode {
         amount_sats: u64,
         announce: bool,
         policy: ldk_node::funding::FundingPolicy,
+        push_msat: Option<u64>,
     ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError> {
-        self.open_channel_with_funding_policy(peer, addr, amount_sats, announce, policy)
+        self.open_channel_with_funding_policy(peer, addr, amount_sats, announce, policy, push_msat)
     }
 
     fn open_channel(
@@ -2974,7 +2989,15 @@ fn open_ldk_channel(
     fee_rate_sat_per_vb: Option<f32>,
 ) -> Result<String, LightningError> {
     refuse_exact_funding_rate(fee_rate_sat_per_vb)?;
-    open_ldk_channel_with_policy(node, peer_pubkey, peer_addr, amount_sats, announce, None)
+    open_ldk_channel_with_policy(
+        node,
+        peer_pubkey,
+        peer_addr,
+        amount_sats,
+        announce,
+        None,
+        None,
+    )
 }
 
 fn open_ldk_channel_with_policy(
@@ -2984,6 +3007,7 @@ fn open_ldk_channel_with_policy(
     amount_sats: u64,
     announce: bool,
     policy: Option<ldk_node::funding::FundingPolicy>,
+    push_msat: Option<u64>,
 ) -> Result<String, LightningError> {
     validate_channel_announcement(node, announce)?;
     use std::str::FromStr;
@@ -3007,11 +3031,18 @@ fn open_ldk_channel_with_policy(
 
     // Open channel (connect + open in one call)
     let user_channel_id = if let Some(policy) = policy {
-        node.open_with_funding_policy(node_pubkey, ldk_addr, amount_sats, announce, policy)
+        node.open_with_funding_policy(
+            node_pubkey,
+            ldk_addr,
+            amount_sats,
+            announce,
+            policy,
+            push_msat,
+        )
     } else if announce {
-        node.open_announced_channel(node_pubkey, ldk_addr, amount_sats, None, None)
+        node.open_announced_channel(node_pubkey, ldk_addr, amount_sats, push_msat, None)
     } else {
-        node.open_channel(node_pubkey, ldk_addr, amount_sats, None, None)
+        node.open_channel(node_pubkey, ldk_addr, amount_sats, push_msat, None)
     }
     .map_err(|e| match e {
         // In vendored ldk-node 0.7 this means announcement preflight failed or

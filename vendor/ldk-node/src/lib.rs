@@ -1331,11 +1331,20 @@ impl Node {
 		amount_sats: u64,
 		announce: bool,
 		policy: funding::FundingPolicy,
+		push_to_counterparty_msat: Option<u64>,
 	) -> Result<UserChannelId, Error> {
 		if announce {
 			may_announce_channel(&self.config).map_err(|_| Error::ChannelCreationFailed)?;
 		}
-		self.open_channel_inner(node_id, address, amount_sats, None, None, announce, Some(policy))
+		self.open_channel_inner(
+			node_id,
+			address,
+			amount_sats,
+			push_to_counterparty_msat,
+			None,
+			announce,
+			Some(policy),
+		)
 	}
 
 	fn check_sufficient_funds_for_channel(

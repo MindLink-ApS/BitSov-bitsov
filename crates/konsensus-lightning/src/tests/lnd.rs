@@ -1285,3 +1285,31 @@ async fn get_node_pubkey_from_mock_lnd() {
     assert!(pubkey.is_some());
     assert_eq!(pubkey.unwrap(), mock_identity_pubkey());
 }
+
+#[tokio::test]
+async fn unsupported_channel_push_is_never_dispatched() {
+    let provider = LndProvider::with_client(
+        LndConfig {
+            api_url: "http://127.0.0.1:9".into(),
+            macaroon_hex: "00".into(),
+            tls_cert_path: None,
+        },
+        Client::new(),
+    );
+    for push in [0, 10_000_000] {
+        let error = provider
+            .open_channel_with_funding(
+                "peer",
+                "unused",
+                50_000,
+                false,
+                Default::default(),
+                Some(push),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, LightningError::PaymentNotDispatched(ref message) if message.contains("push") && message.contains("not supported"))
+        );
+    }
+}

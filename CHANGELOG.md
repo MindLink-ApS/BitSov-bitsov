@@ -5,6 +5,14 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Add opt-in `trust_no_reserve` for the selected liquidity provider, default
+  false. This trusts the hub to confirm closing transactions and waives its
+  local anchor emergency reserve, including for an empty-wallet acceptor.
+- Thread optional channel pushes through the Lightning funding interface and
+  LDK opener. Unsupported backends refuse explicit pushes before dispatch.
+- Add owner API `push_sats` to channel opens, capped at half the channel amount,
+  with unchanged owner/unpaired Spend authorization and no push by default.
+
 - Fix `konsensus node-id` with encrypted mnemonics: reuse the terminal prompt,
   `--password-fd`, `--password-file` and `--password` inputs from `sign-challenge`.
 - Report the configured Bitcoin network from `GET /api/v1/payments/funding-address`,

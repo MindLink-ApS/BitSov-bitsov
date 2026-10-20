@@ -87,6 +87,42 @@ conversion/floor behavior remains unchanged. In particular, empty Esplora fee
 estimates on regtest/signet retain the legacy funding fallback, but cannot be
 used for an explicit quote or capped opening.
 
+## Initial balance push
+
+The same owner API accepts optional `push_sats` to give the counterparty an
+initial balance from the channel funding. Omitted or `null` means no push and
+preserves existing behavior. For example:
+
+```json
+{
+  "peer_pubkey": "<compressed Lightning public key>",
+  "peer_addr": "<IP address>:9735",
+  "amount_sats": 100000,
+  "push_sats": 10000,
+  "funding_priority": "economy",
+  "max_funding_fee_sats": 2000
+}
+```
+
+`push_sats` must be at most `amount_sats / 2` (rounded down). Larger values
+return HTTP 400 before opening or previewing; amounts that cannot be converted
+safely to millisatoshis also return 400. The push is a gift to the peer, not an
+additional funding fee or additional channel capacity. `0` is an explicit push
+request, and unsupported backends refuse it as well as positive pushes.
+
+Push uses the funding-policy path, with normal priority when no priority is
+specified, and requires a fresh cached LDK fee estimate. It can be combined
+with the absolute funding fee cap, but not with `fee_rate_sat_per_vb` (HTTP 400).
+`dry_run` validates the push and only previews the funding fee; it never opens
+or transfers a balance and does not guarantee that the peer will accept.
+Backends that cannot enforce a push return HTTP 400 `not_dispatched` when
+opening; they never silently discard it.
+
+Authorization is unchanged: the endpoint requires unpaired Spend authority.
+Full owner tokens include this scope; Admin alone does not substitute for it.
+A paired client's budget-scoped spend grant cannot open a channel or push funds.
+An explicit push does not enable any automatic onboarding opens.
+
 ## Why there is no funding bump command
 
 Verified against the pinned vendored LDK Node 0.7.0 / lightning 0.2.2 source and

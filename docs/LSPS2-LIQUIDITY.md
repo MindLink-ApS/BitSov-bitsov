@@ -30,6 +30,7 @@ selected_provider = "<lowercase compressed Lightning public key of LSP A>"
 [[lightning.liquidity.providers]]
 node_id = "<lowercase compressed Lightning public key of LSP A>"
 address = "lsp-a.example:9735"
+trust_no_reserve = false # opt in only if this hub is trusted to confirm closing transactions
 # token = "<provider-issued token, only if required>"
 
 [[lightning.liquidity.providers]]
@@ -48,6 +49,17 @@ and HTLCs, stop the node, change `selected_provider`, restart using the same dat
 directory. Existing channels remain. This is provider portability, not live
 per-invoice choice or automatic failover. Funded channels with independent peers
 are needed for outage resilience; changing a name cannot move trapped liquidity.
+
+`trust_no_reserve` defaults to `false` for each provider. Set it to `true`
+only if you trust that hub to confirm closing transactions. With liquidity
+enabled and that provider selected, its key is added to LDK's
+`anchor_channels_config.trusted_peers_no_reserve`: the node can accept an
+anchor channel from it even with an empty on-chain wallet. Unselected providers
+receive no reserve waiver, even when their flag is true. Switching providers
+requires restart and updates this trust list; it does not move existing funds.
+The waiver gives up the local emergency reserve for that peer, so closing
+transaction confirmation depends on the trusted hub. This does not waive
+payment, channel-capacity, or owner authorization requirements.
 
 ## App/API contract
 
@@ -145,8 +157,10 @@ or contact graph is written on-chain; no global provider graph is introduced.
 
 - A no-channel wallet still needs funding and chain synchronization. LDK's default
   anchor emergency reserve (25,000 sats per applicable channel) is preserved.
-  No `trusted_peers_no_reserve` waiver is enabled. An entirely empty wallet may
-  reject the channel; this is not an unconditional minute-one onboarding claim.
+  By default no reserve waiver is enabled and an entirely empty wallet may
+  reject the channel. The per-provider `trust_no_reserve` opt-in above waives
+  this reserve only for the selected provider; connectivity, chain sync and
+  the other channel acceptance checks still apply.
 - Selecting an LSPS2 peer opts into LDK's trusted zero-conf peer behavior. Until
   confirmation the LSP can withhold/double-spend funding. The LSP observes the
   client's Lightning key, connection address, timing, amounts and payment metadata.

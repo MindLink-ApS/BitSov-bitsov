@@ -370,11 +370,19 @@ impl LightningProvider for GuardedLightning {
         amount_sats: u64,
         announce: bool,
         options: FundingOptions,
+        push_msat: Option<u64>,
     ) -> Result<ChannelOpenResult, LightningError> {
         self.channel_peers.check(peer_pubkey)?;
         self.disk.check()?;
         self.inner
-            .open_channel_with_funding(peer_pubkey, peer_addr, amount_sats, announce, options)
+            .open_channel_with_funding(
+                peer_pubkey,
+                peer_addr,
+                amount_sats,
+                announce,
+                options,
+                push_msat,
+            )
             .await
     }
     async fn close_channel(

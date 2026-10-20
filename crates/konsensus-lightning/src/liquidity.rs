@@ -19,6 +19,9 @@ pub struct LspConfig {
     pub address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Trust this provider to confirm closing transactions without our anchor reserve.
+    #[serde(default)]
+    pub trust_no_reserve: bool,
 }
 
 // Keep credentials out of diagnostics, including nested and pretty Debug output.
@@ -28,6 +31,7 @@ impl std::fmt::Debug for LspConfig {
             .field("node_id", &self.node_id)
             .field("address", &self.address)
             .field("token", &"<redacted>")
+            .field("trust_no_reserve", &self.trust_no_reserve)
             .finish()
     }
 }
@@ -344,12 +348,30 @@ mod tests {
         assert_ne!(a.unwrap().is_ok(), b.unwrap().is_ok());
     }
     #[test]
+    fn reserve_trust_config_round_trip_and_legacy_default() {
+        let legacy = serde_json::json!({
+            "node_id": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            "address": "127.0.0.1:9735"
+        });
+        let old: LspConfig = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(old).unwrap()["trust_no_reserve"],
+            false
+        );
+        let mut opted_in = legacy;
+        opted_in["trust_no_reserve"] = true.into();
+        let provider: LspConfig = serde_json::from_value(opted_in.clone()).unwrap();
+        assert_eq!(serde_json::to_value(provider).unwrap(), opted_in);
+    }
+
+    #[test]
     fn provider_registry_is_off_by_default_and_requires_explicit_valid_selection() {
         assert!(LiquidityConfig::default().selected().unwrap().is_none());
         let key = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         let mut config = LiquidityConfig {
             enabled: true,
             providers: vec![LspConfig {
+                trust_no_reserve: false,
                 node_id: key.into(),
                 address: "127.0.0.1:9735".into(),
                 token: None,

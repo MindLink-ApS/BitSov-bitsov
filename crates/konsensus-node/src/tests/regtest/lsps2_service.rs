@@ -73,6 +73,7 @@ async fn hub_jit_then_stateless_admission() {
         enabled: true,
         selected_provider: Some(hub_id.to_string()),
         providers: vec![LspConfig {
+            trust_no_reserve: false,
             node_id: hub_id.to_string(),
             address: hub_addr.clone(),
             token: Some("regtest-private-pilot".into()),

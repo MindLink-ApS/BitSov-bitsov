@@ -769,6 +769,9 @@ pub struct OpenChannelRequest {
     pub peer_addr: String,
     /// Channel capacity in satoshis.
     pub amount_sats: u64,
+    /// Initial gift to the counterparty, at most half the channel capacity.
+    #[serde(default)]
+    pub push_sats: Option<u64>,
     /// Whether to announce the channel publicly.
     #[serde(default)]
     pub announce: bool,
@@ -811,9 +814,22 @@ async fn open_channel(
             "max_funding_fee_sats must be between 1 and 2100000000000000".into(),
         ));
     }
-    let explicit = req.funding_priority.is_some() || req.max_funding_fee_sats.is_some();
+    let push_msat = req
+        .push_sats
+        .map(|push| {
+            if push > req.amount_sats / 2 {
+                return Err(ApiError::NotDispatched(
+                    "push_sats must not exceed amount_sats / 2".into(),
+                ));
+            }
+            push.checked_mul(1000)
+                .ok_or_else(|| ApiError::NotDispatched("push_sats overflows millisatoshis".into()))
+        })
+        .transpose()?;
+    let explicit =
+        req.funding_priority.is_some() || req.max_funding_fee_sats.is_some() || push_msat.is_some();
     if req.fee_rate_sat_per_vb.is_some() && (explicit || req.dry_run) {
-        return Err(ApiError::NotDispatched("exact fee_rate_sat_per_vb cannot be combined with funding priority, fee cap, or preview".into()));
+        return Err(ApiError::NotDispatched("exact fee_rate_sat_per_vb cannot be combined with funding priority, fee cap, push, or preview".into()));
     }
     let options = konsensus_core::traits::lightning::FundingOptions {
         priority: req.funding_priority.unwrap_or_default(),
@@ -839,6 +855,7 @@ async fn open_channel(
                 req.amount_sats,
                 req.announce,
                 options,
+                push_msat,
             )
             .await
     } else {
