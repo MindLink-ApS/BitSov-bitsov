@@ -1616,3 +1616,120 @@ async fn headless_device_and_replacement_without_delivery_return_conflict() {
         }
     }
 }
+
+#[cfg(unix)]
+#[path = "common/peer_admission.rs"]
+mod peer_admission_probe;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owner_peer_add_requires_matching_services_and_audits_admission() {
+    for mode in ["no-state", "disabled", "mismatch", "admit"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, service, _console) = state_with_pairing(tmp.path(), mode != "disabled");
+        let transport = Arc::new(peer_admission_probe::AdmissionTransport {
+            storage: base.storage.clone(),
+            registry: base.peer_registry.clone(),
+            calls: std::sync::Mutex::new(vec![]),
+            dial_started: Default::default(),
+            finish_dial: Default::default(),
+            live: Default::default(),
+            dial: "refused",
+            supervised_addrs: Default::default(),
+        });
+        let state = Arc::new(AppState {
+            transport: transport.clone(),
+            audit_log: Arc::new(
+                konsensus_api::audit::AuditLog::open(tmp.path().join("audit.jsonl")).unwrap(),
+            ),
+            ..(*base).clone()
+        });
+        let context_service = if mode == "mismatch" {
+            let other = tempfile::tempdir().unwrap();
+            state_with_pairing(other.path(), true).1
+        } else {
+            service
+        };
+        let ctx = Arc::new(control::ControlContext {
+            identity_fingerprint: context_service.bound_fingerprint(),
+            service: context_service,
+            data_dir: tmp.path().to_path_buf(),
+            mnemonic_path: tmp.path().join("mnemonic.txt"),
+            replacement_guard: control::ReplacementGuard {
+                layout: konsensus_api::bootstrap::DataDirLayout::new(tmp.path()),
+                uses_identity_derived_keys: false,
+                has_identity_passphrase: false,
+            },
+        });
+        let request = || control::ControlRequest::AddPeer {
+            node_id: "ab".repeat(32),
+            addr: "127.0.0.1:9735".into(),
+            label: Some("Dad".into()),
+        };
+        assert!(
+            matches!(control::handle(&ctx, request()), control::ControlResponse::Error { message } if message.contains("requires the running node"))
+        );
+        let server = control::ControlServer::bind(tmp.path(), ctx).unwrap();
+        let path = server.path().to_path_buf();
+        let server = if mode == "no-state" {
+            server
+        } else {
+            server.with_approval_state(state.clone())
+        };
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(server.serve(rx));
+        let response = control::send(&path, &request()).await.unwrap();
+        stop.send(true).unwrap();
+        task.await.unwrap();
+        if mode != "admit" {
+            assert!(
+                matches!(response, control::ControlResponse::Error { message } if message.contains("requires the running node"))
+            );
+            assert!(state.storage.list_peers().await.unwrap().is_empty());
+            assert!(transport.calls.lock().unwrap().is_empty());
+            continue;
+        }
+        assert!(
+            matches!(response, control::ControlResponse::Ok { detail } if detail.contains("not reachable yet") && detail.contains("keeps retrying") && detail.contains(&state.identity.node_id().to_hex()))
+        );
+        assert_eq!(
+            *transport.calls.lock().unwrap(),
+            ["whitelist", "dial", "supervise"]
+        );
+        let audit = std::fs::read_to_string(state.audit_log.path()).unwrap();
+        let event: serde_json::Value = audit
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|e| e["event"] == "peer.added")
+            .unwrap();
+        assert_eq!(event["actor"], state.identity.node_id().to_hex());
+        assert_eq!(event["detail"]["source"], "owner_control");
+        assert_eq!(event["detail"]["peer_node_id"], "ab".repeat(32));
+        assert_eq!(event["detail"]["label"], "Dad");
+        assert_eq!(event["detail"]["connected"], false);
+        let app = test_router(state.clone());
+        let (_, token) = pair_and_token(
+            &app,
+            state.pairing.as_ref().unwrap(),
+            &SigningKey::from_bytes(&[61; 32]),
+        )
+        .await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/peers")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let peers: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(peers[0]["node_id"], "ab".repeat(32));
+        assert_eq!(peers[0]["connected"], false);
+    }
+}

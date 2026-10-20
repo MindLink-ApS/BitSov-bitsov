@@ -1,6 +1,6 @@
 //! Peer management endpoints — list, add, remove, connect.
 
-use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::auth::scoped::{Admin, Read, ScopedAuth};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -14,11 +14,9 @@ use konsensus_message::PeerEntry;
 use crate::audit::events;
 use crate::error::ApiError;
 use crate::freshness::DataFreshness;
-use crate::state::AppState;
 use crate::handlers::list_diagnostics::ListDiagnostics;
-
-/// Maximum length for peer labels (bytes).
-const MAX_PEER_LABEL_LEN: usize = 256;
+use crate::peer_validation::{validate_peer_addr, validate_peer_id, validate_peer_label};
+use crate::state::AppState;
 
 /// Peer in API response format.
 #[derive(Serialize)]
@@ -62,7 +60,9 @@ pub struct AddPeerRequest {
     pub auto_connect: bool,
 }
 
-fn default_auto_connect() -> bool { true }
+fn default_auto_connect() -> bool {
+    true
+}
 
 /// A single peer in an export/import backup.
 #[derive(Serialize, Deserialize, Clone)]
@@ -98,7 +98,7 @@ pub struct PeerBackup {
 pub struct ImportPeersRequest {
     /// The backup data (same format as export).
     pub backup: PeerBackup,
-    /// If true, skip peers that already exist (default: false = upsert).
+    /// Legacy option accepted for compatibility. Existing peers are always skipped.
     #[serde(default)]
     pub skip_existing: bool,
 }
@@ -106,12 +106,38 @@ pub struct ImportPeersRequest {
 /// Response from peer import.
 #[derive(Serialize)]
 pub struct ImportPeersResponse {
-    /// Number of peers imported (added or updated).
+    /// Number of peers imported.
     pub imported: usize,
-    /// Number of peers skipped (already existed and skip_existing=true).
+    /// Number of peers skipped (self or already existing).
     pub skipped: usize,
-    /// Peer IDs that had invalid format and were rejected.
+    /// Entry validation or persistence errors, prefixed by peer ID.
     pub errors: Vec<String>,
+    /// One outcome per backup entry, in input order.
+    pub results: Vec<ImportPeerResult>,
+}
+
+/// Outcome of importing a single contact.
+#[derive(Serialize)]
+pub struct ImportPeerResult {
+    /// Node ID as supplied in the backup.
+    pub node_id: String,
+    /// Whether this entry was imported, skipped, or rejected.
+    pub status: ImportPeerStatus,
+    /// Explanation for a skipped or rejected entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Disposition of a contact in an import.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportPeerStatus {
+    /// Contact restored.
+    Imported,
+    /// Self or existing contact left unchanged.
+    Skipped,
+    /// Invalid entry or failed persistence.
+    Rejected,
 }
 
 /// Request to update a peer's mutable fields.
@@ -157,7 +183,10 @@ async fn list_peers(
 ) -> Result<(DataFreshness, ListDiagnostics, Json<Vec<PeerResponse>>), ApiError> {
     let read_at = DataFreshness::now();
     // Registry owns live connection data; scan storage to disclose unreadable persisted peers.
-    let stored = state.storage.list_peers_with_diagnostics().await
+    let stored = state
+        .storage
+        .list_peers_with_diagnostics()
+        .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
     let diagnostics = (&stored).into();
     let registry = state.peer_registry.read().await;
@@ -194,62 +223,133 @@ async fn add_peer(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddPeerRequest>,
 ) -> Result<Json<PeerResponse>, ApiError> {
+    let outcome = admit_peer(&state, &_auth.node_id, "http_admin", req, false).await?;
+    Ok(Json(peer_response(
+        &outcome.entry,
+        false,
+        state.identity.node_id(),
+        None,
+    )))
+}
+
+/// A durable admission and the result of its optional first dial.
+pub struct AdmitPeerOutcome {
+    /// The admitted contact.
+    pub entry: PeerEntry,
+    /// `Ok` if the first dial succeeded or no immediate dial was requested.
+    pub dialed: Result<(), String>,
+}
+
+/// Validate and persist before admitting to the live registry and transport.
+/// A failed first dial does not undo admission: supervision keeps retrying.
+pub async fn admit_peer(
+    state: &Arc<AppState>,
+    actor: &str,
+    source: &'static str,
+    req: AddPeerRequest,
+    dial_now: bool,
+) -> Result<AdmitPeerOutcome, ApiError> {
     let node_id = NodeId::from_hex(&req.node_id)
         .map_err(|e| ApiError::BadRequest(format!("invalid node ID: {e}")))?;
-
-    let addr = req
-        .addr
-        .parse()
-        .map_err(|e| ApiError::BadRequest(format!("invalid address: {e}")))?;
-
-    if let Some(ref label) = req.label {
-        if label.len() > MAX_PEER_LABEL_LEN {
-            return Err(ApiError::BadRequest(format!(
-                "peer label exceeds {MAX_PEER_LABEL_LEN} bytes"
-            )));
-        }
-    }
-
+    validate_peer_id(&node_id, state.identity.node_id())?;
+    let addr: std::net::SocketAddr = req.addr.parse().map_err(|e| {
+        ApiError::BadRequest(format!("invalid address (IP address and port only): {e}"))
+    })?;
+    validate_peer_addr(&addr)?;
+    validate_peer_label(req.label.as_deref())?;
     let entry = PeerEntry {
         node_id,
         addr,
         label: req.label,
         auto_connect: req.auto_connect,
     };
-
-    {
-        let mut registry = state.peer_registry.write().await;
-        registry.add(entry.clone());
-    }
-
-    // Add to transport whitelist so the peer can connect (Principle 3)
-    state.transport.add_to_whitelist(&node_id).await;
-
-    // Owner-added contacts reconnect even with a legacy false auto_connect flag.
-    state.transport.supervise_peer(&node_id, &addr.to_string()).await;
-
-    // P3-2: persist so the gate whitelist survives restart (the PeerRegistry is
-    // reloaded from the durable `peers` table at boot, not just config.peers).
+    // Serialize admission with other registry mutations, including removal.
+    // Keep persistence in this ordering so concurrent adds cannot install an
+    // older address in the registry after a newer row has reached storage.
+    let mut registry = state.peer_registry.write().await;
     let mut persisted = konsensus_storage::Peer::new(node_id);
     persisted.address = Some(addr.to_string());
     persisted.display_name = entry.label.clone();
+    persisted.metadata = serde_json::json!({"whitelist_source": source});
     state
         .storage
         .upsert_peer(&persisted)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to persist peer: {e}")))?;
 
+    registry.add(entry.clone());
+    let generation = registry.generation(&node_id).expect("just admitted");
+    state.transport.add_to_whitelist(&node_id).await;
+    drop(registry);
+    let dialed = dial_and_supervise(state, &entry, generation, dial_now).await;
     state.audit_log.record(
         events::PEER_ADDED,
-        &_auth.node_id,
+        actor,
         Some(serde_json::json!({
             "peer_node_id": node_id.to_hex(),
             "addr": addr.to_string(),
+            "label": entry.label,
+            "source": source,
+            "connected": state.transport.is_connected(&node_id).await,
         })),
     );
+    Ok(AdmitPeerOutcome { entry, dialed })
+}
 
-    let local_id = state.identity.node_id();
-    Ok(Json(peer_response(&entry, false, local_id, None)))
+/// Network I/O never holds the registry lock. Revalidate the admission before
+/// installing retries, serialized with DELETE and replacement admissions.
+async fn dial_and_supervise(
+    state: &Arc<AppState>,
+    entry: &PeerEntry,
+    generation: u64,
+    dial_now: bool,
+) -> Result<(), String> {
+    let node_id = &entry.node_id;
+    let dialed = if dial_now {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            state.transport.connect(node_id, &entry.addr.to_string()),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_) => Err("connection timed out after 10 seconds".into()),
+        }
+    } else {
+        Ok(())
+    };
+    let registry = state.peer_registry.write().await;
+    if registry.generation(node_id) != Some(generation) {
+        if let Some(current) = registry.get(node_id) {
+            // connect() can remember its dial target internally. Restore the
+            // current target, never the stale one.
+            if validate_peer_addr(&current.addr).is_ok() {
+                state
+                    .transport
+                    .supervise_peer(node_id, &current.addr.to_string())
+                    .await;
+            } else {
+                // An inbound-only re-import has no retry target. Clear the
+                // stale dial's tracking, then restore transport admission.
+                // Whitelist removal leaves the authenticated connection open.
+                state.transport.remove_from_whitelist(node_id).await;
+                state.transport.add_to_whitelist(node_id).await;
+            }
+        } else {
+            // A transport may finish its handshake after DELETE disconnected.
+            // Clear any late connection and transport-internal retry tracking.
+            state.transport.remove_from_whitelist(node_id).await;
+            if let Err(e) = state.transport.disconnect(node_id).await {
+                tracing::warn!(peer = %node_id, error = %e, "failed to disconnect stale dial");
+            }
+        }
+        return Err("peer removed or replaced during connection attempt".into());
+    }
+    state
+        .transport
+        .supervise_peer(node_id, &entry.addr.to_string())
+        .await;
+    dialed
 }
 
 /// `DELETE /api/v1/peers/:node_id` — remove a peer from the registry.
@@ -261,17 +361,22 @@ async fn remove_peer(
     let node_id = NodeId::from_hex(&node_id_hex)
         .map_err(|e| ApiError::BadRequest(format!("invalid node ID: {e}")))?;
 
-    let removed = {
-        let mut registry = state.peer_registry.write().await;
-        registry.remove(&node_id).is_some()
-    };
-
-    if !removed {
+    // Keep removal ordered with admission through transport and durable cleanup.
+    let mut registry = state.peer_registry.write().await;
+    if registry.get(&node_id).is_none() {
         return Err(ApiError::NotFound(format!("peer {node_id_hex} not found")));
     }
 
+    // Commit removal before touching live state. On a storage error the
+    // contact and its supervision remain intact, matching restart behavior.
+    state
+        .storage
+        .delete_peer(&node_id)
+        .await
+        .map_err(|e| ApiError::Storage(e.to_string()))?;
+    registry.remove(&node_id);
+
     // Remove from transport whitelist and disconnect (Principle 3).
-    // Stop retries even if removing the durable record below fails.
     state.transport.remove_from_whitelist(&node_id).await;
     if state.transport.is_connected(&node_id).await {
         if let Err(e) = state.transport.disconnect(&node_id).await {
@@ -279,16 +384,13 @@ async fn remove_peer(
         }
     }
 
-    // Removal must survive restart, or startup supervision would dial it again.
-    state.storage.delete_peer(&node_id).await
-        .map_err(|e| ApiError::Storage(e.to_string()))?;
-
     state.audit_log.record(
         events::PEER_REMOVED,
         &_auth.node_id,
         Some(serde_json::json!({"peer_node_id": node_id_hex})),
     );
 
+    drop(registry);
     Ok(Json(serde_json::json!({ "removed": true })))
 }
 
@@ -327,6 +429,9 @@ async fn update_peer(
     let node_id = NodeId::from_hex(&node_id_hex)
         .map_err(|e| ApiError::BadRequest(format!("invalid node ID: {e}")))?;
 
+    validate_peer_id(&node_id, state.identity.node_id())?;
+    validate_peer_label(req.label.as_deref())?;
+
     let connected = state.transport.connected_peers().await;
 
     let mut registry = state.peer_registry.write().await;
@@ -336,22 +441,21 @@ async fn update_peer(
         .clone();
 
     let new_addr = match &req.addr {
-        Some(addr_str) => addr_str
-            .parse()
-            .map_err(|e| ApiError::BadRequest(format!("invalid address: {e}")))?,
+        Some(addr_str) => {
+            let addr = addr_str
+                .parse()
+                .map_err(|e| ApiError::BadRequest(format!("invalid address: {e}")))?;
+            validate_peer_addr(&addr)?;
+            addr
+        }
+        // Inbound-only contacts have a nondialable sentinel. Metadata edits
+        // need not invent an address; only newly supplied targets are checked.
         None => existing.addr,
     };
 
     let new_label = match req.label {
         Some(ref l) if l.is_empty() => None,
-        Some(ref l) => {
-            if l.len() > MAX_PEER_LABEL_LEN {
-                return Err(ApiError::BadRequest(format!(
-                    "peer label exceeds {MAX_PEER_LABEL_LEN} bytes"
-                )));
-            }
-            Some(l.clone())
-        }
+        Some(ref l) => Some(l.clone()),
         None => existing.label.clone(),
     };
 
@@ -364,10 +468,6 @@ async fn update_peer(
         auto_connect: new_auto_connect,
     };
 
-    registry.add(updated);
-    drop(registry);
-    state.transport.supervise_peer(&node_id, &new_addr.to_string()).await;
-
     // P3-2: persist the update so address/label/auto_connect edits survive
     // restart (merge_persisted_peers reloads the durable row at boot).
     let mut persisted = konsensus_storage::Peer::new(node_id);
@@ -378,6 +478,15 @@ async fn update_peer(
         .upsert_peer(&persisted)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to persist peer update: {e}")))?;
+
+    registry.update(updated);
+    if validate_peer_addr(&new_addr).is_ok() {
+        state
+            .transport
+            .supervise_peer(&node_id, &new_addr.to_string())
+            .await;
+    }
+    drop(registry);
 
     state.audit_log.record(
         events::PEER_UPDATED,
@@ -402,7 +511,12 @@ async fn update_peer(
         label: new_label,
         auto_connect: new_auto_connect,
     };
-    Ok(Json(peer_response(&result_entry, is_connected, local_id, info)))
+    Ok(Json(peer_response(
+        &result_entry,
+        is_connected,
+        local_id,
+        info,
+    )))
 }
 
 /// `POST /api/v1/peers/:node_id/connect` — connect to a peer.
@@ -418,34 +532,33 @@ async fn connect_peer(
     let node_id = NodeId::from_hex(&node_id_hex)
         .map_err(|e| ApiError::BadRequest(format!("invalid node ID: {e}")))?;
 
-    // Look up address + label from registry
-    let (addr, label) = {
-        let registry = state.peer_registry.read().await;
-        let entry = registry
-            .get(&node_id)
-            .ok_or_else(|| ApiError::NotFound(format!("peer {node_id_hex} not in registry")))?;
-        (entry.addr, entry.label.clone())
-    };
-
-    // Ensure peer is whitelisted — user clicked Connect, that's explicit consent
-    state.transport.add_to_whitelist(&node_id).await;
+    // Serialize lookup, durable admission and live changes with DELETE.
+    let registry = state.peer_registry.write().await;
+    let entry = registry
+        .get(&node_id)
+        .ok_or_else(|| ApiError::NotFound(format!("peer {node_id_hex} not in registry")))?
+        .clone();
+    let generation = registry.generation(&node_id).expect("registered peer");
+    let addr = entry.addr;
+    validate_peer_addr(&addr)?;
 
     // P3-2: persist this explicit-consent admission so it survives restart.
     // connect_peer admits gossip-discovered peers that were registry-only;
     // without persistence they drop off both whitelists on the next boot.
     let mut persisted = konsensus_storage::Peer::new(node_id);
     persisted.address = Some(addr.to_string());
-    persisted.display_name = label;
+    persisted.display_name = entry.label.clone();
     state
         .storage
         .upsert_peer(&persisted)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to persist connected peer: {e}")))?;
 
-    let connected = state.transport.connect(&node_id, &addr.to_string()).await;
-    // Start retries after the explicit dial finishes, including on failure.
-    state.transport.supervise_peer(&node_id, &addr.to_string()).await;
-    connected.map_err(|e| ApiError::Transport(e.to_string()))?;
+    state.transport.add_to_whitelist(&node_id).await;
+    drop(registry);
+    dial_and_supervise(&state, &entry, generation, true)
+        .await
+        .map_err(ApiError::Transport)?;
 
     Ok(Json(serde_json::json!({ "connected": true })))
 }
@@ -504,6 +617,59 @@ async fn export_peers(
 /// Maximum number of peers in a single import request.
 const MAX_IMPORT_PEERS: usize = 1000;
 
+/// Restore one contact, or return a reason for skipping it.
+async fn import_peer_entry(
+    state: &Arc<AppState>,
+    entry: &PeerBackupEntry,
+) -> Result<Option<&'static str>, ApiError> {
+    let node_id = NodeId::from_hex(&entry.node_id)
+        .map_err(|e| ApiError::BadRequest(format!("invalid node ID: {e}")))?;
+    if validate_peer_id(&node_id, state.identity.node_id()).is_err() {
+        return Ok(Some("self: cannot import this node as its own peer"));
+    }
+
+    // The existence check and durable/live admission share one transaction,
+    // so concurrent imports cannot overwrite each other or race removal.
+    let mut registry = state.peer_registry.write().await;
+    if registry.get(&node_id).is_some() {
+        return Ok(Some("existing peer left unchanged"));
+    }
+    let addr: std::net::SocketAddr = entry
+        .addr
+        .parse()
+        .map_err(|e| ApiError::BadRequest(format!("invalid address: {e}")))?;
+    // This exact sentinel is exported for inbound-only invite contacts. Keep
+    // the exported startup flag, but never invent an outbound dial target.
+    let inbound_only = addr == std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+    if !inbound_only {
+        validate_peer_addr(&addr)?;
+    }
+    validate_peer_label(entry.label.as_deref())?;
+
+    let mut persisted = konsensus_storage::Peer::new(node_id);
+    persisted.address = Some(addr.to_string());
+    persisted.display_name = entry.label.clone();
+    state
+        .storage
+        .upsert_peer(&persisted)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to persist peer: {e}")))?;
+    registry.add(PeerEntry {
+        node_id,
+        addr,
+        label: entry.label.clone(),
+        auto_connect: entry.auto_connect,
+    });
+    state.transport.add_to_whitelist(&node_id).await;
+    if !inbound_only {
+        state
+            .transport
+            .supervise_peer(&node_id, &addr.to_string())
+            .await;
+    }
+    Ok(None)
+}
+
 /// `POST /api/v1/peers/import` — import peers from a JSON backup.
 async fn import_peers(
     _auth: ScopedAuth<Admin>,
@@ -520,81 +686,28 @@ async fn import_peers(
     let mut imported = 0usize;
     let mut skipped = 0usize;
     let mut errors = Vec::new();
-
-    let local_id = state.identity.node_id();
+    let mut results = Vec::with_capacity(req.backup.peers.len());
 
     for entry in &req.backup.peers {
-        // Validate node ID
-        let node_id = match NodeId::from_hex(&entry.node_id) {
-            Ok(id) => id,
-            Err(e) => {
-                errors.push(format!("{}: invalid node ID — {e}", entry.node_id));
-                continue;
+        let (status, reason) = match import_peer_entry(&state, entry).await {
+            Ok(None) => {
+                imported += 1;
+                (ImportPeerStatus::Imported, None)
             }
-        };
-
-        // Don't import self
-        if &node_id == local_id {
-            skipped += 1;
-            continue;
-        }
-
-        // Validate address
-        let addr = match entry.addr.parse() {
-            Ok(a) => a,
-            Err(e) => {
-                errors.push(format!("{}: invalid address — {e}", entry.node_id));
-                continue;
-            }
-        };
-
-        // Check if peer exists when skip_existing is true
-        if req.skip_existing {
-            let registry = state.peer_registry.read().await;
-            if registry.get(&node_id).is_some() {
+            Ok(Some(reason)) => {
                 skipped += 1;
-                continue;
+                (ImportPeerStatus::Skipped, Some(reason.to_string()))
             }
-        }
-
-        // Validate label length (same check as add_peer/update_peer).
-        if let Some(ref label) = entry.label {
-            if label.len() > MAX_PEER_LABEL_LEN {
-                errors.push(format!(
-                    "{}: peer label exceeds {MAX_PEER_LABEL_LEN} bytes",
-                    entry.node_id
-                ));
-                continue;
+            Err(e) => {
+                errors.push(format!("{}: {e}", entry.node_id));
+                (ImportPeerStatus::Rejected, Some(e.to_string()))
             }
-        }
-
-        let peer_entry = PeerEntry {
-            node_id,
-            addr,
-            label: entry.label.clone(),
-            auto_connect: entry.auto_connect,
         };
-
-        {
-            let mut registry = state.peer_registry.write().await;
-            registry.add(peer_entry);
-        }
-        // Add to transport whitelist (Principle 3)
-        state.transport.add_to_whitelist(&node_id).await;
-
-        state.transport.supervise_peer(&node_id, &addr.to_string()).await;
-
-        // P3-2: persist so imported peers survive restart.
-        let mut persisted = konsensus_storage::Peer::new(node_id);
-        persisted.address = Some(addr.to_string());
-        persisted.display_name = entry.label.clone();
-        if let Err(e) = state.storage.upsert_peer(&persisted).await {
-            errors.push(format!(
-                "{}: added to whitelist but failed to persist: {e}",
-                entry.node_id
-            ));
-        }
-        imported += 1;
+        results.push(ImportPeerResult {
+            node_id: entry.node_id.clone(),
+            status,
+            reason,
+        });
     }
 
     state.audit_log.record(
@@ -612,6 +725,7 @@ async fn import_peers(
         imported,
         skipped,
         errors,
+        results,
     }))
 }
 
@@ -638,7 +752,11 @@ mod reconnect_tests {
     fn owner_added_contact_defaults_to_auto_connect() {
         let req: AddPeerRequest = serde_json::from_value(serde_json::json!({
             "node_id": "unused by deserialization", "addr": "127.0.0.1:9735"
-        })).unwrap();
-        assert!(req.auto_connect, "owner-added contacts should connect without a hidden opt-in");
+        }))
+        .unwrap();
+        assert!(
+            req.auto_connect,
+            "owner-added contacts should connect without a hidden opt-in"
+        );
     }
 }

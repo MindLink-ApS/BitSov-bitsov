@@ -2179,3 +2179,59 @@ mod owner_signing_tests {
         );
     }
 }
+
+/// Add a durable contact using only the owner-managed control socket.
+pub async fn cmd_peer_add(
+    config_path: &Path,
+    node_id: &str,
+    addr: &str,
+    label: Option<String>,
+    yes: bool,
+) -> Result<()> {
+    let id = konsensus_core::types::NodeId::from_hex(node_id)
+        .context("invalid node ID (expected 64 hex characters)")?;
+    let address: std::net::SocketAddr = addr
+        .parse()
+        .context("invalid address: IP address and port only (no hostnames)")?;
+    konsensus_api::peer_validation::validate_peer_addr(&address)?;
+    konsensus_api::peer_validation::validate_peer_label(label.as_deref())?;
+    if config_path.try_exists()? {
+        let config = NodeConfig::load_before_identity_validation(config_path)?;
+        if config
+            .peers
+            .iter()
+            .any(|peer| konsensus_core::types::NodeId::from_hex(&peer.node_id).ok() == Some(id))
+        {
+            eprintln!("Warning: this node id is also in [[peers]] in {}; the config entry wins at the next restart — remove it there if you want this address to stick.", terminal_safe(&config_path.display().to_string()));
+        }
+    }
+    println!("Add contact");
+    println!("  node id:        {}", id.to_hex());
+    println!("  fingerprint:    {}", id.short_fingerprint());
+    println!("  address:        {address}");
+    if let Some(label) = &label {
+        println!("  label:          {label:?}");
+    }
+    println!("This node will accept paid traffic from that key and keep a connection to it.");
+    if !yes {
+        println!("Press Enter to continue, or Ctrl-C to cancel.");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        let read = std::io::stdin().read_line(&mut line)?;
+        anyhow::ensure!(
+            read > 0 && line.trim().is_empty(),
+            "peer add cancelled; press Enter to confirm or use --yes"
+        );
+    }
+    report(
+        send(
+            config_path,
+            ControlRequest::AddPeer {
+                node_id: id.to_hex(),
+                addr: address.to_string(),
+                label,
+            },
+        )
+        .await?,
+    )
+}

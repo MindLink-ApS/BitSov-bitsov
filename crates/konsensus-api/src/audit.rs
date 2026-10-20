@@ -6,6 +6,12 @@
 //!
 //! Each entry includes a monotonic sequence number, ISO 8601 timestamp,
 //! event type, actor (node ID), and event-specific details.
+//!
+//! Peer admission (`peer.added`) records the owner-supplied free-text label in
+//! `detail.label` as plaintext (or null), along with peer ID, address, source and
+//! connection status. `peer.updated` also records labels. These are sensitive
+//! contact metadata, not redacted by validation or erased on peer deletion.
+//! See `docs/operations/LOGGING.md` for audit retention and sharing guidance.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -126,13 +132,13 @@ impl AuditLog {
     /// Returns an error if the file cannot be opened.
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        
+
         // Read the last sequence number from the existing file (if any)
         let last_seq = if path.exists() {
             let file = File::open(&path)?;
             let reader = BufReader::new(file);
             let mut max_seq = 0u64;
-            
+
             for line in reader.lines().map_while(Result::ok) {
                 if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
                     if let Some(seq) = entry.get("seq").and_then(|s| s.as_u64()) {
@@ -144,11 +150,8 @@ impl AuditLog {
         } else {
             0
         };
-        
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         let writer = BufWriter::new(file);
 

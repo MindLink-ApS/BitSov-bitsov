@@ -36,7 +36,31 @@ use konsensus_api::state::AppState;
 
 // ─── Stub: In-memory Storage ────────────────────────────────────────
 
+/// Park one peer write to exercise handler ordering, optionally failing it.
+#[derive(Default)]
+pub struct PeerWriteGate {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+    pub fail: bool,
+}
+
+impl PeerWriteGate {
+    async fn run(&self) -> Result<(), StorageError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        if self.fail {
+            Err(StorageError::Database(sqlx::Error::Protocol(
+                "injected peer write failure".into(),
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 pub struct MemStorage {
+    pub peer_upsert_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub peer_delete_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     outbox: Mutex<HashMap<String, konsensus_storage::OutboxOperation>>,
     calendar: Mutex<HashMap<String, konsensus_storage::calendar::CalendarEventRecord>>,
     messages: Mutex<HashMap<String, UkmEnvelope>>,
@@ -56,6 +80,8 @@ pub struct MemStorage {
 impl MemStorage {
     pub fn new() -> Self {
         Self {
+            peer_upsert_gate: Mutex::new(None),
+            peer_delete_gate: Mutex::new(None),
             outbox: Mutex::new(HashMap::new()),
             calendar: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
@@ -346,6 +372,10 @@ impl Storage for MemStorage {
     }
 
     async fn upsert_peer(&self, peer: &Peer) -> Result<(), StorageError> {
+        let gate = self.peer_upsert_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.run().await?;
+        }
         self.peers
             .lock()
             .unwrap()
@@ -362,6 +392,10 @@ impl Storage for MemStorage {
     }
 
     async fn delete_peer(&self, id: &NodeId) -> Result<bool, StorageError> {
+        let gate = self.peer_delete_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.run().await?;
+        }
         Ok(self.peers.lock().unwrap().remove(&id.to_hex()).is_some())
     }
 

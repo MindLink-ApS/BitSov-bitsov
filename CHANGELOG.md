@@ -16,12 +16,35 @@ also live on the corresponding GitHub pre-release pages.
 - Add owner API `push_sats` to channel opens, capped at half the channel amount,
   with unchanged owner/unpaired Spend authorization and no push by default.
 
+- Document free-text contact labels in `peer.added` audit entries and the
+  associated plaintext metadata, retention and support-sharing considerations.
+
+- Reject unspecified, multicast and port-zero peer dial targets with HTTP 400,
+  including IPv4-mapped IPv6; preflight imports before writing any contacts.
+
+- Share peer-label validation across console, admission, PUT and import: reject
+  control, bidi and zero-width formatting characters, and prevent self-ID updates.
+
+- Serialize peer updates, connect admission and imports with deletion; persist
+  first so failed writes and concurrent DELETEs cannot resurrect contacts.
+
+- Persist peer deletion before revoking live admission, so storage errors leave
+  registry, transport and restart state consistent.
+
+- Dial newly admitted peers outside the registry lock; generation checks keep
+  concurrent removal or replacement authoritative without stalling message gates.
+
 - Fix `konsensus node-id` with encrypted mnemonics: reuse the terminal prompt,
   `--password-fd`, `--password-file` and `--password` inputs from `sign-challenge`.
 - Report the configured Bitcoin network from `GET /api/v1/payments/funding-address`,
   including signet, instead of always reporting `bitcoin`.
 - Allow `GET /api/v1/peers/export` with Read scope: its peer fields are already
   exposed by `GET /peers`, with no additional secrets or private addresses.
+- Add `konsensus peer add --node-id <64hex> --addr <ip:port> [--label <text>] [--yes]`
+  over the owner control socket: persist, whitelist, dial and supervise contacts
+  without a restart. HTTP and console admission share self-ID and control-label
+  rejection; console adds are audited as `owner_control`. The CLI warns when a
+  matching `[[peers]]` entry will override the saved address at restart.
 
 ## [0.3.0-rc17] — 2026-10-19 (prep; not tagged yet)
 

@@ -83,6 +83,9 @@ pub struct PeerConfig {
 pub struct PeerRegistry {
     /// Known peers indexed by NodeId.
     peers: HashMap<NodeId, PeerEntry>,
+    // Tokens are unique across removal/re-add, without retaining tombstones.
+    generations: HashMap<NodeId, u64>,
+    next_generation: u64,
     /// Cached whitelist (set of known peer NodeIds), kept in sync with `peers`
     /// on every add/remove so the payment gate hot path avoids an O(N) per-message
     /// `HashSet` rebuild. Always equal to `peers.keys().copied().collect()`.
@@ -111,6 +114,8 @@ impl PeerRegistry {
     pub fn new() -> Self {
         Self {
             peers: HashMap::new(),
+            generations: HashMap::new(),
+            next_generation: 0,
             whitelist_cache: Arc::new(HashSet::new()),
             discovered: HashMap::new(),
         }
@@ -131,8 +136,24 @@ impl PeerRegistry {
     /// whitelist cache is kept in sync so the gate hot path stays consistent.
     pub fn add(&mut self, entry: PeerEntry) {
         let node_id = entry.node_id;
+        self.advance_generation(node_id);
         self.peers.insert(node_id, entry);
         Arc::make_mut(&mut self.whitelist_cache).insert(node_id);
+    }
+
+    /// Update an admitted contact, invalidating in-flight dials only when its
+    /// address changes. Returns false if the contact is not admitted.
+    pub fn update(&mut self, entry: PeerEntry) -> bool {
+        let node_id = entry.node_id;
+        let Some(existing) = self.peers.get_mut(&node_id) else {
+            return false;
+        };
+        let address_changed = existing.addr != entry.addr;
+        *existing = entry;
+        if address_changed {
+            self.advance_generation(node_id);
+        }
+        true
     }
 
     /// Remove a peer from the registry.
@@ -141,9 +162,24 @@ impl PeerRegistry {
     pub fn remove(&mut self, node_id: &NodeId) -> Option<PeerEntry> {
         let removed = self.peers.remove(node_id);
         if removed.is_some() {
+            self.generations.remove(node_id);
             Arc::make_mut(&mut self.whitelist_cache).remove(node_id);
         }
         removed
+    }
+
+    /// Revision of an admitted contact. A replacement or address change gets a
+    /// fresh token; a removed contact has none, even if it remains discovered.
+    pub fn generation(&self, node_id: &NodeId) -> Option<u64> {
+        self.generations.get(node_id).copied()
+    }
+
+    fn advance_generation(&mut self, node_id: NodeId) {
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("peer generation exhausted");
+        self.generations.insert(node_id, self.next_generation);
     }
 
     /// Look up a peer by NodeId.
@@ -283,6 +319,7 @@ impl PeerRegistry {
     pub fn update_addr(&mut self, node_id: &NodeId, addr: SocketAddr) -> bool {
         if let Some(entry) = self.peers.get_mut(node_id) {
             entry.addr = addr;
+            self.advance_generation(*node_id);
             true
         } else {
             false
@@ -543,10 +580,7 @@ mod tests {
     #[test]
     fn from_config() {
         let config = PeerConfig {
-            peers: vec![
-                make_entry(1, 9735, true),
-                make_entry(2, 9736, false),
-            ],
+            peers: vec![make_entry(1, 9735, true), make_entry(2, 9736, false)],
         };
 
         let reg = PeerRegistry::from_config(&config);
@@ -624,13 +658,19 @@ mod tests {
     fn peer_entry_deny_unknown_fields() {
         let json = r#"{"node_id":"0101010101010101010101010101010101010101010101010101010101010101","addr":"127.0.0.1:9735","label":null,"auto_connect":true,"extra_field":"oops"}"#;
         let result: Result<PeerEntry, _> = serde_json::from_str(json);
-        assert!(result.is_err(), "unknown fields on PeerEntry should be rejected");
+        assert!(
+            result.is_err(),
+            "unknown fields on PeerEntry should be rejected"
+        );
     }
 
     #[test]
     fn peer_config_deny_unknown_fields() {
         let json = r#"{"peers":[],"unknown_key":"value"}"#;
         let result: Result<PeerConfig, _> = serde_json::from_str(json);
-        assert!(result.is_err(), "unknown fields on PeerConfig should be rejected");
+        assert!(
+            result.is_err(),
+            "unknown fields on PeerConfig should be rejected"
+        );
     }
 }

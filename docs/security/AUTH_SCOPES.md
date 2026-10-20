@@ -202,3 +202,16 @@ The flag is absent by default and has no config equivalent. Console-only
 operations and the remote router's allowlist and scope rules are unchanged.
 No control socket is bound. Restarting without the flag restores the existing
 sidecar read/receive restrictions. See [device keys](device-keys.md).
+
+
+## Owner-console peer admission
+
+`konsensus peer add` uses the local `0600` owner control socket's `add-peer`
+operation, available only with `--owner-control`. The owner supplies the whole
+node-ID/address/label tuple; no pending requester or nonce is involved. The
+Enter/`--yes` CLI confirmation is a courtesy, not socket authentication. This
+admits paid traffic and reconnects a contact, without granting spend authority.
+The shared admission handler also serves Admin-only `POST /peers`; both reject
+self IDs and control-character labels and persist before live admission.
+Console audit entries and peer metadata identify `owner_control` as the source.
+See [operator instructions](../operations/home-node.md#add-a-contact-from-the-owner-console).
