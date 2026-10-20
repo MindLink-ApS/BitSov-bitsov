@@ -517,8 +517,11 @@ async fn discover_peers(
 }
 
 /// `GET /api/v1/peers/export` — export all peers as a JSON backup.
+///
+/// Read scope suffices: peer fields match `GET /peers`; the remaining metadata
+/// is the format version, export time and local public node ID. No secrets.
 async fn export_peers(
-    _auth: ScopedAuth<Admin>,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Json<PeerBackup> {
     let registry = state.peer_registry.read().await;

@@ -2234,3 +2234,81 @@ async fn peer_admission_rejects_self_and_control_labels() {
         assert!(state.peer_registry.read().await.all().is_empty());
     }
 }
+
+#[tokio::test]
+async fn peers_export_read_scope_contains_only_listed_peer_fields() {
+    use konsensus_api::auth::{create_token, Scope};
+    let state = test_state();
+    let node_id = NodeId::from_bytes([42; 32]);
+    state
+        .peer_registry
+        .write()
+        .await
+        .add(konsensus_message::PeerEntry {
+            node_id,
+            addr: "10.0.0.1:9735".parse().unwrap(),
+            label: Some("Private peer".into()),
+            auto_connect: false,
+        });
+    let read_token = create_token(
+        &state.identity.node_id().to_hex(),
+        &state.jwt_secret,
+        vec![Scope::Read],
+    )
+    .unwrap();
+    let app = build_router(Arc::clone(&state));
+    let mut responses = Vec::new();
+    for path in ["/api/v1/peers", "/api/v1/peers/export"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("authorization", format!("Bearer {read_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{path} must accept Read alone"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        responses.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+    }
+    let listed = &responses[0][0];
+    let backup = &responses[1];
+    assert_eq!(backup["version"], 1);
+    assert_eq!(backup["exported_by"], state.identity.node_id().to_hex());
+    chrono::DateTime::parse_from_rfc3339(backup["exported_at"].as_str().unwrap()).unwrap();
+    assert_eq!(backup.as_object().unwrap().len(), 4);
+    assert_eq!(backup["peers"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        backup["peers"][0],
+        serde_json::json!({
+            "node_id": listed["node_id"], "addr": listed["addr"],
+            "label": listed["label"], "auto_connect": listed["auto_connect"],
+        })
+    );
+    let receive_token = create_token(
+        &state.identity.node_id().to_hex(),
+        &state.jwt_secret,
+        vec![Scope::Receive],
+    )
+    .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/peers/export")
+                .header("authorization", format!("Bearer {receive_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}

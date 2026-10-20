@@ -5,6 +5,12 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Fix `konsensus node-id` with encrypted mnemonics: reuse the terminal prompt,
+  `--password-fd`, `--password-file` and `--password` inputs from `sign-challenge`.
+- Report the configured Bitcoin network from `GET /api/v1/payments/funding-address`,
+  including signet, instead of always reporting `bitcoin`.
+- Allow `GET /api/v1/peers/export` with Read scope: its peer fields are already
+  exposed by `GET /peers`, with no additional secrets or private addresses.
 - Add `konsensus peer add --node-id <64hex> --addr <ip:port> [--label <text>] [--yes]`
   over the owner control socket: persist, whitelist, dial and supervise contacts
   without a restart. HTTP and console admission share self-ID and control-label

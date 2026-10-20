@@ -2,7 +2,7 @@
 //!
 //! The claim these tests support is narrow and deliberate: *a token minted by
 //! `POST /auth/local` cannot pay, open channels, restore an identity, reveal a mnemonic, or
-//! export the relationship graph.* They do not show that local malware "can only read the
+//! export the full data bundle.* They do not show that local malware "can only read the
 //! balance" — any process may still call `/auth/local` and obtain `read` + `receive`, which
 //! includes reading message history and generating addresses. The blast radius is smaller;
 //! it is not gone, and nothing here should be quoted as saying otherwise.
@@ -47,13 +47,16 @@ const PAID_MESSAGE_ROUTES: &[Route] = &[
 /// `http_restore_after_owner_approval_has_no_effect` assert its absence instead.
 const IDENTITY_ROUTES: &[Route] = &[
     ("POST", "/api/v1/identity/mnemonic", "{}"),
-    ("POST", "/api/v1/identity/verify-mnemonic", r#"{"mnemonic":"x"}"#),
+    (
+        "POST",
+        "/api/v1/identity/verify-mnemonic",
+        r#"{"mnemonic":"x"}"#,
+    ),
 ];
 
-/// Bulk relationship export and node reconfiguration.
+/// Full data bundle export and node reconfiguration.
 const ADMIN_ROUTES: &[Route] = &[
     ("GET", "/api/v1/export/bundle", ""),
-    ("GET", "/api/v1/peers/export", ""),
     ("POST", "/api/v1/peers/import", r#"{"peers":[]}"#),
     ("POST", "/api/v1/gossip/publish", "{}"),
 ];
@@ -139,7 +142,7 @@ async fn loopback_token_cannot_administer() {
     assert_all_forbidden(
         ADMIN_ROUTES,
         &loopback_token(&secret, &node_id),
-        "bulk export and reconfiguration",
+        "full data bundle export and reconfiguration",
     )
     .await;
 }

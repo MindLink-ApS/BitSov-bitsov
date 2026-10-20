@@ -29,7 +29,6 @@ const IDENTITY: &[&str] = &["reveal_mnemonic", "verify_mnemonic"];
 
 const ADMIN: &[&str] = &[
     "import_peers",
-    "export_peers",
     "export_bundle",
     "connect_peer",
     "publish_gossip",

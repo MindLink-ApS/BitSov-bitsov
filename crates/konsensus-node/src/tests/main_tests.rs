@@ -278,7 +278,7 @@ fn node_id_prints_hex() -> Result<()> {
     let mnemonic_path = write_test_mnemonic(tmp.path())?;
 
     // cmd_node_id prints to stdout — just verify it doesn't error
-    cmd_node_id(&mnemonic_path, "")?;
+    cmd_node_id(&mnemonic_path, "", None)?;
     Ok(())
 }
 
@@ -305,7 +305,7 @@ fn node_id_passphrase_changes_identity() -> Result<()> {
 
 #[test]
 fn node_id_missing_file_errors() {
-    let err = cmd_node_id(Path::new("/nonexistent/mnemonic.txt"), "").unwrap_err();
+    let err = cmd_node_id(Path::new("/nonexistent/mnemonic.txt"), "", None).unwrap_err();
     assert!(
         format!("{err}").contains("failed to read mnemonic"),
         "expected file read error"
