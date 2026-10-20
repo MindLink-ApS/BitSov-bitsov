@@ -161,6 +161,34 @@ fn ldk_config_construction() {
         assert!(node_config.node_alias.is_none());
         assert!(node_config.announcement_addresses.is_none());
     }
+    // Trust is scoped to the enabled, selected provider, never the registry.
+    let other = "0379be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    for (enabled, selected, trust, other_trust, expected) in [
+        (true, CHANNEL_PEER, false, false, vec![]),
+        (true, CHANNEL_PEER, true, false, vec![CHANNEL_PEER]),
+        (true, other, true, false, vec![]),
+        (true, other, true, true, vec![other]),
+        (false, CHANNEL_PEER, true, true, vec![]),
+    ] {
+        config.liquidity = serde_json::from_value(serde_json::json!({
+            "enabled":enabled, "selected_provider":selected,
+            "providers":[
+                {"node_id":CHANNEL_PEER,"address":"127.0.0.1:9735","trust_no_reserve":trust},
+                {"node_id":other,"address":"127.0.0.1:9736","trust_no_reserve":other_trust}
+            ]
+        }))
+        .unwrap();
+        let anchors = config.node_config(None).anchor_channels_config.unwrap();
+        assert_eq!(anchors.per_channel_reserve_sats, 25_000);
+        assert_eq!(
+            anchors
+                .trusted_peers_no_reserve
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
     assert_eq!(config.node_config(None).our_to_self_delay, None);
     for delay in [288, 500, 2016] {
         config.our_to_self_delay_blocks = Some(delay);
@@ -1354,3 +1382,68 @@ fn offline_safety_checkpoint_never_uses_partial_best_block() {
 
 #[path = "ldk_late_failure.rs"]
 mod late_failure;
+
+#[test]
+fn channel_push_reaches_opener_with_and_without_funding_policy() {
+    // Obtain the opaque policy through the real estimator; its fields are private.
+    let mut server = mockito::Server::new();
+    let _fees = server
+        .mock("GET", "/fee-estimates")
+        .with_body(r#"{"1":2.0,"6":2.0,"144":2.0}"#)
+        .create();
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ldk_node::Builder::new();
+    builder.set_network(bitcoin::Network::Regtest);
+    builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+    builder.set_chain_source_esplora(server.url(), None);
+    let estimator = builder.build().unwrap();
+    estimator.start().unwrap();
+    let funding_policy = estimator
+        .funding_fee_quote(ldk_node::funding::FundingPriority::Economy, Some(1000))
+        .unwrap();
+    estimator.stop().unwrap();
+    for announce in [false, true] {
+        for use_policy in [false, true] {
+            let mut node = MockChannelOpener::new();
+            node.expect_has_node_alias().return_const(true);
+            node.expect_has_listening_addresses().return_const(true);
+            let policy = use_policy.then(|| funding_policy.clone());
+            if use_policy {
+                node.expect_open_with_funding_policy()
+                    .times(1)
+                    .withf(move |peer, _, amount, public, policy, push| {
+                        policy.priority() == ldk_node::funding::FundingPriority::Economy
+                            && policy.max_fee_sats() == Some(1000)
+                            && peer.to_string() == CHANNEL_PEER
+                            && *amount == 50_000
+                            && *public == announce
+                            && *push == Some(10_000_000)
+                    })
+                    .returning(|_, _, _, _, _, _| Ok(ldk_node::UserChannelId(42)));
+            } else if announce {
+                node.expect_open_announced_channel()
+                    .times(1)
+                    .withf(|_, _, amount, push, _| *amount == 50_000 && *push == Some(10_000_000))
+                    .returning(|_, _, _, _, _| Ok(ldk_node::UserChannelId(42)));
+            } else {
+                node.expect_open_channel()
+                    .times(1)
+                    .withf(|_, _, amount, push, _| *amount == 50_000 && *push == Some(10_000_000))
+                    .returning(|_, _, _, _, _| Ok(ldk_node::UserChannelId(42)));
+            }
+            assert_eq!(
+                open_ldk_channel_with_policy(
+                    &node,
+                    CHANNEL_PEER,
+                    "127.0.0.1:9735",
+                    50_000,
+                    announce,
+                    policy,
+                    Some(10_000_000)
+                )
+                .unwrap(),
+                "UserChannelId(42)"
+            );
+        }
+    }
+}

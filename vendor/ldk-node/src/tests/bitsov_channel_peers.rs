@@ -44,17 +44,32 @@ fn node_with_trusted_peers(
 	limits: Option<crate::channel_limits::ChannelLimits>,
 	trusted_peers_0conf: Vec<PublicKey>,
 ) -> (tempfile::TempDir, crate::Node, Arc<Log>) {
+	node_with_anchor_config(
+		seed,
+		allowlist,
+		limits,
+		trusted_peers_0conf,
+		AnchorChannelsConfig {
+			per_channel_reserve_sats: 0,
+			..Default::default()
+		},
+	)
+}
+
+fn node_with_anchor_config(
+	seed: u8,
+	allowlist: Option<Vec<PublicKey>>,
+	limits: Option<crate::channel_limits::ChannelLimits>,
+	trusted_peers_0conf: Vec<PublicKey>,
+	anchors: AnchorChannelsConfig,
+) -> (tempfile::TempDir, crate::Node, Arc<Log>) {
 	let dir = tempfile::tempdir().unwrap();
 	let log = Arc::new(Log::default());
 	let mut builder = crate::Builder::from_config(crate::Config {
 		channel_peer_allowlist: allowlist,
 		channel_limits: limits,
 		trusted_peers_0conf,
-		// No on-chain reserve, so an unfunded node's decision rests on the allowlist alone.
-		anchor_channels_config: Some(AnchorChannelsConfig {
-			per_channel_reserve_sats: 0,
-			..Default::default()
-		}),
+		anchor_channels_config: Some(anchors),
 		..Default::default()
 	});
 	builder.set_custom_logger(log.clone());
@@ -249,6 +264,7 @@ async fn allowlist_refuses_unlisted_outbound_opens_before_connecting() {
 				None,
 			)
 			.unwrap(),
+			None,
 		),
 	] {
 		assert!(
@@ -354,7 +370,8 @@ async fn capacity_refusal_precedes_outbound_connection_and_splicing() {
 				bitcoin::FeeRate::from_sat_per_kwu(1_000),
 				None
 			)
-			.unwrap()
+			.unwrap(),
+			None,
 		),
 		Err(crate::Error::ChannelCapacityExceeded)
 	);
@@ -536,4 +553,104 @@ async fn restored_funded_channel_counts_after_lowering_caps() {
 		),
 		Err(crate::Error::TotalChannelCapacityExceeded)
 	);
+}
+
+/// Real regtest-network channel messages and production admission, no bitcoind required.
+#[tokio::test]
+async fn empty_wallet_accepts_anchor_only_from_reserve_trusted_opener() {
+	for (trust, amount, expected) in [
+		(false, 200_000, false),
+		(true, 200_000, true),
+		(true, 200_001, false),
+	] {
+		for zero_conf in [false, true] {
+			let (_opener_dir, opener, _) = node(81, None);
+			let anchors = AnchorChannelsConfig {
+				trusted_peers_no_reserve: if trust {
+					vec![opener.node_id()]
+				} else {
+					Vec::new()
+				},
+				..Default::default()
+			};
+			assert_eq!(anchors.per_channel_reserve_sats, 25_000);
+			let (_home_dir, home, _) = node_with_anchor_config(
+				82,
+				Some(vec![opener.node_id()]),
+				None,
+				if zero_conf {
+					vec![opener.node_id()]
+				} else {
+					Vec::new()
+				},
+				anchors,
+			);
+			assert_eq!(home.wallet.get_spendable_amount_sats(0).unwrap(), 0);
+			let (_, events) = request_amount(&opener, &home, amount);
+			assert!(
+				matches!(&events[0], LdkEvent::OpenChannelRequest { channel_type, .. }
+                if channel_type.supports_anchors_zero_fee_htlc_tx())
+			);
+			for event in events {
+				handler(&home).handle_event(event).await.unwrap();
+			}
+			assert_eq!(
+				has_channel_with(&home, &opener),
+				expected,
+				"trust={trust}, amount={amount}, zero_conf={zero_conf}"
+			);
+			let accepted = home
+				.channel_manager
+				.get_and_clear_pending_msg_events()
+				.into_iter()
+				.any(|event| matches!(event, MessageSendEvent::SendAcceptChannel { .. }));
+			assert_eq!(accepted, expected);
+		}
+	}
+}
+
+/// Reserve accounting must retain funds for larger inbound and all outbound channels.
+#[tokio::test]
+async fn reserve_trust_is_scoped_to_small_inbound_channels() {
+	for (amount, expected_inbound_reserve) in [(200_000, 0), (200_001, 25_000)] {
+		let (_opener_dir, opener, _) = node(83, None);
+		let (_home_dir, home, _) = node_with_anchor_config(
+			84,
+			None,
+			None,
+			Vec::new(),
+			AnchorChannelsConfig {
+				trusted_peers_no_reserve: vec![opener.node_id()],
+				// Admit without wallet funding, then test accounting with the normal reserve.
+				per_channel_reserve_sats: 0,
+			},
+		);
+		propose_amount(&opener, &home, amount).await;
+		let accept = home
+			.channel_manager
+			.get_and_clear_pending_msg_events()
+			.into_iter()
+			.find_map(|event| match event {
+				MessageSendEvent::SendAcceptChannel { msg, .. } => Some(msg),
+				_ => None,
+			})
+			.expect("accepted channel with sufficient (zero) reserve requirement");
+		opener
+			.channel_manager
+			.handle_accept_channel(home.node_id(), &accept);
+		for (node, peer, expected) in [
+			(&home, opener.node_id(), expected_inbound_reserve),
+			(&opener, home.node_id(), 25_000),
+		] {
+			let mut config = (*node.config).clone();
+			config.anchor_channels_config = Some(AnchorChannelsConfig {
+				trusted_peers_no_reserve: vec![peer],
+				..Default::default()
+			});
+			assert_eq!(
+				crate::total_anchor_channels_reserve_sats(&node.channel_manager, &config),
+				expected
+			);
+		}
+	}
 }

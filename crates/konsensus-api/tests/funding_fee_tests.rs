@@ -9,7 +9,7 @@ use common::*;
 use konsensus_core::traits::lightning::*;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use tower::ServiceExt;
 
@@ -17,6 +17,7 @@ use tower::ServiceExt;
 struct FundingBackend {
     opens: AtomicUsize,
     quotes: AtomicUsize,
+    pushes: Mutex<Vec<Option<u64>>>,
 }
 fn estimate(options: FundingOptions) -> FundingFeeEstimate {
     let (blocks, rate) = match options.priority {
@@ -63,11 +64,11 @@ impl LightningProvider for FundingBackend {
         amount: u64,
         announce: bool,
         options: FundingOptions,
+        push_msat: Option<u64>,
     ) -> Result<ChannelOpenResult, LightningError> {
-        assert_eq!(
-            (peer, addr, amount, announce),
-            ("peer", "unused", 50000, true)
-        );
+        assert_eq!((peer, addr, announce), ("peer", "unused", true));
+        assert!([50000, 50001].contains(&amount));
+        self.pushes.lock().unwrap().push(push_msat);
         self.opens.fetch_add(1, Ordering::SeqCst);
         Ok(ChannelOpenResult {
             channel_id: "channel".into(),
@@ -82,20 +83,32 @@ async fn call(
     extra: serde_json::Value,
     owner: bool,
 ) -> (StatusCode, serde_json::Value) {
+    call_scoped(
+        backend,
+        extra,
+        if owner {
+            konsensus_api::auth::Scope::all()
+        } else {
+            konsensus_api::auth::Scope::loopback_only()
+        },
+    )
+    .await
+}
+async fn call_scoped(
+    backend: Arc<dyn LightningProvider>,
+    extra: serde_json::Value,
+    scopes: Vec<konsensus_api::auth::Scope>,
+) -> (StatusCode, serde_json::Value) {
     let state = test_state_with_lightning(backend);
-    let auth = if owner {
-        auth_header(&state)
-    } else {
-        format!(
-            "Bearer {}",
-            konsensus_api::auth::create_token(
-                &state.identity.node_id().to_hex(),
-                &state.jwt_secret,
-                konsensus_api::auth::Scope::loopback_only()
-            )
-            .unwrap()
+    let auth = format!(
+        "Bearer {}",
+        konsensus_api::auth::create_token(
+            &state.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            scopes,
         )
-    };
+        .unwrap()
+    );
     let mut body = serde_json::json!({"peer_pubkey":"peer","peer_addr":"unused","amount_sats":50000,"announce":true});
     body.as_object_mut()
         .unwrap()
@@ -176,6 +189,8 @@ async fn unsupported_backends_refuse_priorities_caps_and_preview() {
         serde_json::json!({"funding_priority":"normal"}),
         serde_json::json!({"dry_run":true}),
         serde_json::json!({"max_funding_fee_sats":1000}),
+        serde_json::json!({"push_sats":10000}),
+        serde_json::json!({"push_sats":0}),
     ] {
         let (status, body) = call(Arc::new(StubLightning), extra, true).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -197,4 +212,91 @@ async fn funding_controls_require_owner_spend_scope_including_preview() {
     }
     assert_eq!(backend.opens.load(Ordering::SeqCst), 0);
     assert_eq!(backend.quotes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn push_cap_refuses_before_open_or_preview() {
+    let backend = Arc::new(FundingBackend::default());
+    for extra in [
+        serde_json::json!({"push_sats":25001}),
+        serde_json::json!({"push_sats":25001,"dry_run":true}),
+        serde_json::json!({"amount_sats":50001,"push_sats":25001}),
+        serde_json::json!({"amount_sats":u64::MAX,"push_sats":u64::MAX / 2}),
+    ] {
+        let (status, _) = call(backend.clone(), extra, true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(backend.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.quotes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn push_at_cap_is_converted_and_dispatched_with_default_or_explicit_funding() {
+    let backend = Arc::new(FundingBackend::default());
+    for extra in [
+        serde_json::json!({"push_sats":25000}),
+        serde_json::json!({"push_sats":25000,"amount_sats":50001}),
+        serde_json::json!({"push_sats":10000,"funding_priority":"economy","max_funding_fee_sats":1000}),
+        serde_json::json!({"push_sats":0}),
+        serde_json::json!({"funding_priority":"normal"}),
+        serde_json::json!({"push_sats":null,"funding_priority":"normal"}),
+    ] {
+        let (status, _) = call(backend.clone(), extra, true).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(
+        *backend.pushes.lock().unwrap(),
+        vec![
+            Some(25_000_000),
+            Some(25_000_000),
+            Some(10_000_000),
+            Some(0),
+            None,
+            None
+        ]
+    );
+}
+
+#[tokio::test]
+async fn push_preview_and_scope_preserve_owner_controls() {
+    let backend = Arc::new(FundingBackend::default());
+    for dry_run in [false, true] {
+        let (status, _) = call(
+            backend.clone(),
+            serde_json::json!({"push_sats":10000,"dry_run":dry_run}),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (status, _) = call(
+        backend.clone(),
+        serde_json::json!({"push_sats":10000,"fee_rate_sat_per_vb":2}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = call(
+        backend.clone(),
+        serde_json::json!({"push_sats":10000,"dry_run":true}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "preview");
+    assert_eq!(backend.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.quotes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn unpaired_spend_can_push() {
+    let backend = Arc::new(FundingBackend::default());
+    let (status, _) = call_scoped(
+        backend.clone(),
+        serde_json::json!({"push_sats":10000}),
+        vec![konsensus_api::auth::Scope::Spend],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(*backend.pushes.lock().unwrap(), vec![Some(10_000_000)]);
 }

@@ -763,3 +763,40 @@ vendored library test target as a separate job. Both standalone locks and the
 workspace lock select possiblyrandom 0.2.1 (#4719); no other version changes.
 See `../../docs/security/ldk-node-0.7.1/README.md` for exact upstream commits,
 before/after inventories, preservation evidence and validation limits.
+
+## Optional initial channel push
+
+`Node::open_channel_with_funding_policy` now accepts optional
+`push_to_counterparty_msat` and passes it to `open_channel_inner`, preserving the
+pinned funding policy and its fee cap. Existing callers pass `None`. The node
+owner API bounds the push; no auto-open policy is enabled by this extension.
+
+The in-memory regtest-network admission test
+`empty_wallet_accepts_anchor_only_from_reserve_trusted_opener` exchanges real
+channel messages with the production event handler. It verifies an empty-wallet
+acceptor refuses an anchor channel under the default 25,000-sat reserve and
+accepts it when the opener is in `trusted_peers_no_reserve`. It does not require
+bitcoind, fund wallets, or assert confirmation/spendability.
+
+```sh
+cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib empty_wallet_accepts_anchor
+```
+
+## Bounded inbound reserve waiver (N1)
+
+`config::MAX_TRUSTED_NO_RESERVE_INBOUND_SATS = 200_000` caps the reserve
+waiver. Membership in `trusted_peers_no_reserve` now exempts only inbound
+channels whose full funding amount is at most that cap. Konsensus populates
+this list only from the enabled, selected provider's `trust_no_reserve` opt-in.
+`OpenChannelRequest` enforces the limit before either normal or 0conf
+acceptance: larger channels require the normal reserve and an empty wallet
+rejects them. Outbound funding checks always require the anchor reserve.
+Reserve accounting uses the same peer/amount/direction predicate, including
+for restored channels. Close fee-bumping skips only channels whose available
+details prove eligibility; missing channel details fall back to local bumping.
+
+The in-memory regtest above now covers 200,000-sat acceptance and 200,001-sat
+refusal with an empty wallet, with and without 0conf trust.
+`reserve_trust_is_scoped_to_small_inbound_channels` additionally checks the
+reserve total for both boundary amounts and both directions. These tests use
+real channel messages and production admission/accounting without bitcoind.

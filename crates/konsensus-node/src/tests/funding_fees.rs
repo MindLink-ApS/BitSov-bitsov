@@ -86,7 +86,7 @@ impl LightningProvider for FundingBackend {
         rate: Option<f32>,
     ) -> Result<ChannelOpenResult, LightningError> {
         assert_eq!(rate, None);
-        self.open_channel_with_funding(peer, addr, amount, announce, Default::default())
+        self.open_channel_with_funding(peer, addr, amount, announce, Default::default(), None)
             .await
     }
     async fn funding_fee_quote(
@@ -103,6 +103,7 @@ impl LightningProvider for FundingBackend {
         amount: u64,
         announce: bool,
         options: FundingOptions,
+        _push_msat: Option<u64>,
     ) -> Result<ChannelOpenResult, LightningError> {
         assert_eq!(
             (peer, addr, amount, announce),
@@ -308,7 +309,7 @@ async fn disk_admission_blocks_all_funding_entry_points_before_backend() {
             .await
             .map(|_| ()),
         provider
-            .open_channel_with_funding("peer", "unused", 50000, true, Default::default())
+            .open_channel_with_funding("peer", "unused", 50000, true, Default::default(), None)
             .await
             .map(|_| ()),
         provider

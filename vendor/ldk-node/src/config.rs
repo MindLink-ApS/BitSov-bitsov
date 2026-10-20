@@ -29,6 +29,9 @@ const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
 const DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER: u64 = 3;
 const DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS: u64 = 25_000;
 
+/// Maximum funding amount for an inbound channel eligible for the trusted reserve waiver.
+pub const MAX_TRUSTED_NO_RESERVE_INBOUND_SATS: u64 = 200_000;
+
 /// The default log level.
 pub const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Debug;
 
@@ -278,20 +281,22 @@ pub struct AnchorChannelsConfig {
 	/// A list of peers that we trust to get the required channel closing transactions confirmed
 	/// on-chain.
 	///
-	/// Channels with these peers won't count towards the retained on-chain reserve and we won't
-	/// take any action to get the required channel closing transactions confirmed ourselves.
+	/// Only inbound channels funded with at most [`MAX_TRUSTED_NO_RESERVE_INBOUND_SATS`]
+	/// qualify for the waiver. Larger inbound channels and all outbound channels retain the
+	/// normal reserve. Close fee-bumping is skipped only while channel details prove eligibility;
+	/// missing details conservatively fall back to local fee-bumping.
 	///
 	/// **Note:** Trusting the channel counterparty to take the necessary actions to get the
 	/// required Anchor spending transactions confirmed on-chain is potentially insecure
 	/// as the channel may not be closed if they refuse to do so.
 	pub trusted_peers_no_reserve: Vec<PublicKey>,
-	/// The amount of satoshis per anchors-negotiated channel with an untrusted peer that we keep
-	/// as an emergency reserve in our on-chain wallet.
+	/// The emergency reserve in satoshis retained in our on-chain wallet for each
+	/// anchors-negotiated channel that does not qualify for the bounded inbound waiver.
 	///
 	/// This allows for having the required Anchor output spending and HTLC transactions confirmed
 	/// when the channel is closed.
 	///
-	/// If the channel peer is not marked as trusted via
+	/// If the channel does not qualify for the bounded inbound waiver via
 	/// [`AnchorChannelsConfig::trusted_peers_no_reserve`], we will always try to spend the Anchor
 	/// outputs with *any* on-chain funds available, i.e., the total reserve value as well as any
 	/// spendable funds available in the on-chain wallet. Therefore, this per-channel multiplier is
@@ -304,6 +309,20 @@ pub struct AnchorChannelsConfig {
 	/// might not suffice to successfully spend the Anchor output and have the HTLC transactions
 	/// confirmed on-chain, i.e., you may want to adjust this value accordingly.
 	pub per_channel_reserve_sats: u64,
+}
+
+impl AnchorChannelsConfig {
+	/// Whether this channel qualifies for the bounded inbound reserve waiver.
+	pub(crate) fn waives_reserve(
+		&self,
+		peer: &PublicKey,
+		funding_sats: u64,
+		is_outbound: bool,
+	) -> bool {
+		!is_outbound
+			&& funding_sats <= MAX_TRUSTED_NO_RESERVE_INBOUND_SATS
+			&& self.trusted_peers_no_reserve.contains(peer)
+	}
 }
 
 impl Default for AnchorChannelsConfig {

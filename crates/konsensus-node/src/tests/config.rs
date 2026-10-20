@@ -3575,3 +3575,28 @@ minimum_version = "v26.06"
         .to_string()
         .contains("embedded LDK"));
 }
+
+#[test]
+fn provider_reserve_trust_is_opt_in_and_round_trips_toml() {
+    for (setting, expected) in [
+        ("", false),
+        ("trust_no_reserve = false", false),
+        ("trust_no_reserve = true", true),
+    ] {
+        let config: LightningConfig = toml::from_str(&format!(
+            "backend = 'ldk'\n[liquidity]\nenabled = true\nselected_provider = '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798'\n[[liquidity.providers]]\nnode_id = '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798'\naddress = '127.0.0.1:9735'\n{setting}"
+        )).unwrap();
+        let LightningConfig::Ldk { liquidity, .. } = &config else {
+            panic!("expected LDK config");
+        };
+        assert_eq!(liquidity.providers[0].trust_no_reserve, expected);
+        let restored: LightningConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        let LightningConfig::Ldk { liquidity, .. } = restored else {
+            panic!("expected LDK config after round trip");
+        };
+        assert_eq!(
+            liquidity.selected().unwrap().unwrap().trust_no_reserve,
+            expected
+        );
+    }
+}

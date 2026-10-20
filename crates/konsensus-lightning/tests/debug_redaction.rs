@@ -54,6 +54,7 @@ fn liquidity_debug_redacts_nested_provider_tokens() {
     let config = LiquidityConfig {
         enabled: true,
         providers: vec![LspConfig {
+            trust_no_reserve: false,
             node_id: "public-node-id".into(),
             address: "localhost:9735".into(),
             token: Some("private-provider-token".into()),

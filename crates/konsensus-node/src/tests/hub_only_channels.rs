@@ -18,6 +18,7 @@ const STRANGER: &str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09
 #[derive(Default)]
 struct OpenRecorder {
     opened: Mutex<Vec<String>>,
+    pushes: Mutex<Vec<Option<u64>>>,
 }
 impl OpenRecorder {
     fn opened(&self) -> Vec<String> {
@@ -77,7 +78,9 @@ impl LightningProvider for OpenRecorder {
         _amount: u64,
         _announce: bool,
         _options: FundingOptions,
+        push_msat: Option<u64>,
     ) -> Result<ChannelOpenResult, LightningError> {
+        self.pushes.lock().unwrap().push(push_msat);
         Ok(self.record(peer))
     }
 }
@@ -163,10 +166,23 @@ async fn hub_only_refuses_every_open_entry_point_including_auto_channel() {
     let (_dir, recovering, provider) = guarded(backend.clone(), hub_only()).await;
     // `open_channel` is the auto-channel worker's path; the other two serve the API.
     let refused = [
-        provider.open_channel(STRANGER, "127.0.0.1:9735", 50000, false, None).await.map(|_| ()),
-        provider.open_channel_with_status(STRANGER, "127.0.0.1:9735", 50000, false, None).await.map(|_| ()),
         provider
-            .open_channel_with_funding(STRANGER, "127.0.0.1:9735", 50000, false, Default::default())
+            .open_channel(STRANGER, "127.0.0.1:9735", 50000, false, None)
+            .await
+            .map(|_| ()),
+        provider
+            .open_channel_with_status(STRANGER, "127.0.0.1:9735", 50000, false, None)
+            .await
+            .map(|_| ()),
+        provider
+            .open_channel_with_funding(
+                STRANGER,
+                "127.0.0.1:9735",
+                50000,
+                false,
+                Default::default(),
+                Some(10_000_000),
+            )
             .await
             .map(|_| ()),
     ];
@@ -177,14 +193,33 @@ async fn hub_only_refuses_every_open_entry_point_including_auto_channel() {
         );
     }
     assert!(backend.opened().is_empty());
-    provider.open_channel(HUB, "127.0.0.1:9735", 50000, false, None).await.unwrap();
-    provider.open_channel_with_status(HUB, "127.0.0.1:9735", 50000, false, None).await.unwrap();
     provider
-        .open_channel_with_funding(HUB, "127.0.0.1:9735", 50000, false, Default::default())
+        .open_channel(HUB, "127.0.0.1:9735", 50000, false, None)
         .await
         .unwrap();
+    provider
+        .open_channel_with_status(HUB, "127.0.0.1:9735", 50000, false, None)
+        .await
+        .unwrap();
+    for push in [None, Some(0), Some(10_000_000)] {
+        provider
+            .open_channel_with_funding(
+                HUB,
+                "127.0.0.1:9735",
+                50000,
+                false,
+                Default::default(),
+                push,
+            )
+            .await
+            .unwrap();
+    }
     recovering.shutdown().await.unwrap();
-    assert_eq!(backend.opened(), vec![HUB.to_string(); 3]);
+    assert_eq!(backend.opened(), vec![HUB.to_string(); 5]);
+    assert_eq!(
+        *backend.pushes.lock().unwrap(),
+        vec![None, Some(0), Some(10_000_000)]
+    );
 }
 
 #[tokio::test]

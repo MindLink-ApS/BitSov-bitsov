@@ -564,6 +564,7 @@ async fn verify_lightning(
         enabled: true,
         selected_provider: Some(h.node_id().to_string()),
         providers: vec![konsensus_lightning::liquidity::LspConfig {
+            trust_no_reserve: false,
             node_id: h.node_id().to_string(),
             address: format!("127.0.0.1:{h_port}"),
             token: Some("recover-test".into()),
