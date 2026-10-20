@@ -58,7 +58,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
-use crate::cli::{Cli, Command, RepairCommand, ScbCommand, WhitelistCommand};
+use crate::cli::{Cli, Command, PeerCommand, RepairCommand, ScbCommand, WhitelistCommand};
 use crate::config::{LightningConfig, NodeConfig, NodeTier};
 use crate::node::KonsensusNode;
 use konsensus_core::traits::transport::MessageTransport;
@@ -254,6 +254,17 @@ async fn main() -> Result<()> {
         } => {
             ticket_cmd::cmd_pair_ticket(&config, qr, ttl, legacy)?;
         }
+        Command::Peer { command } => match command {
+            PeerCommand::Add {
+                node_id,
+                addr,
+                label,
+                yes,
+                config,
+            } => {
+                owner_cmd::cmd_peer_add(&config, &node_id, &addr, label, yes).await?;
+            }
+        },
         Command::PairWindow { seconds, config } => {
             owner_cmd::cmd_pair_window(&config, seconds).await?;
         }

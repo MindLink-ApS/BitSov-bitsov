@@ -1,6 +1,6 @@
 //! Peer management endpoints — list, add, remove, connect.
 
-use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::auth::scoped::{Admin, Read, ScopedAuth};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -14,8 +14,8 @@ use konsensus_message::PeerEntry;
 use crate::audit::events;
 use crate::error::ApiError;
 use crate::freshness::DataFreshness;
-use crate::state::AppState;
 use crate::handlers::list_diagnostics::ListDiagnostics;
+use crate::state::AppState;
 
 /// Maximum length for peer labels (bytes).
 const MAX_PEER_LABEL_LEN: usize = 256;
@@ -62,7 +62,9 @@ pub struct AddPeerRequest {
     pub auto_connect: bool,
 }
 
-fn default_auto_connect() -> bool { true }
+fn default_auto_connect() -> bool {
+    true
+}
 
 /// A single peer in an export/import backup.
 #[derive(Serialize, Deserialize, Clone)]
@@ -157,7 +159,10 @@ async fn list_peers(
 ) -> Result<(DataFreshness, ListDiagnostics, Json<Vec<PeerResponse>>), ApiError> {
     let read_at = DataFreshness::now();
     // Registry owns live connection data; scan storage to disclose unreadable persisted peers.
-    let stored = state.storage.list_peers_with_diagnostics().await
+    let stored = state
+        .storage
+        .list_peers_with_diagnostics()
+        .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
     let diagnostics = (&stored).into();
     let registry = state.peer_registry.read().await;
@@ -194,62 +199,110 @@ async fn add_peer(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddPeerRequest>,
 ) -> Result<Json<PeerResponse>, ApiError> {
+    let outcome = admit_peer(&state, &_auth.node_id, "http_admin", req, false).await?;
+    Ok(Json(peer_response(
+        &outcome.entry,
+        false,
+        state.identity.node_id(),
+        None,
+    )))
+}
+
+/// A durable admission and the result of its optional first dial.
+pub struct AdmitPeerOutcome {
+    /// The admitted contact.
+    pub entry: PeerEntry,
+    /// `Ok` if the first dial succeeded or no immediate dial was requested.
+    pub dialed: Result<(), String>,
+}
+
+/// Validate and persist before admitting to the live registry and transport.
+/// A failed first dial does not undo admission: supervision keeps retrying.
+pub async fn admit_peer(
+    state: &Arc<AppState>,
+    actor: &str,
+    source: &'static str,
+    req: AddPeerRequest,
+    dial_now: bool,
+) -> Result<AdmitPeerOutcome, ApiError> {
     let node_id = NodeId::from_hex(&req.node_id)
         .map_err(|e| ApiError::BadRequest(format!("invalid node ID: {e}")))?;
-
-    let addr = req
-        .addr
-        .parse()
-        .map_err(|e| ApiError::BadRequest(format!("invalid address: {e}")))?;
-
+    if &node_id == state.identity.node_id() {
+        return Err(ApiError::BadRequest(
+            "cannot add this node as its own peer".into(),
+        ));
+    }
+    let addr: std::net::SocketAddr = req.addr.parse().map_err(|e| {
+        ApiError::BadRequest(format!("invalid address (IP address and port only): {e}"))
+    })?;
     if let Some(ref label) = req.label {
         if label.len() > MAX_PEER_LABEL_LEN {
             return Err(ApiError::BadRequest(format!(
                 "peer label exceeds {MAX_PEER_LABEL_LEN} bytes"
             )));
         }
+        if label.chars().any(char::is_control) {
+            return Err(ApiError::BadRequest(
+                "peer label must not contain control characters".into(),
+            ));
+        }
     }
-
     let entry = PeerEntry {
         node_id,
         addr,
         label: req.label,
         auto_connect: req.auto_connect,
     };
-
-    {
-        let mut registry = state.peer_registry.write().await;
-        registry.add(entry.clone());
-    }
-
-    // Add to transport whitelist so the peer can connect (Principle 3)
-    state.transport.add_to_whitelist(&node_id).await;
-
-    // Owner-added contacts reconnect even with a legacy false auto_connect flag.
-    state.transport.supervise_peer(&node_id, &addr.to_string()).await;
-
-    // P3-2: persist so the gate whitelist survives restart (the PeerRegistry is
-    // reloaded from the durable `peers` table at boot, not just config.peers).
+    // Serialize admission with other registry mutations, including removal.
+    // Keep persistence in this ordering so concurrent adds cannot install an
+    // older address in the registry after a newer row has reached storage.
+    let mut registry = state.peer_registry.write().await;
     let mut persisted = konsensus_storage::Peer::new(node_id);
     persisted.address = Some(addr.to_string());
     persisted.display_name = entry.label.clone();
+    persisted.metadata = serde_json::json!({"whitelist_source": source});
     state
         .storage
         .upsert_peer(&persisted)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to persist peer: {e}")))?;
 
+    registry.add(entry.clone());
+    // Reads remain available during the bounded first dial, but a DELETE or
+    // another add must wait until supervision is installed. Otherwise a late
+    // dial could resurrect a connection/supervisor after successful removal.
+    let admission = tokio::sync::RwLockWriteGuard::downgrade(registry);
+    state.transport.add_to_whitelist(&node_id).await;
+    let dialed = if dial_now {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            state.transport.connect(&node_id, &addr.to_string()),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_) => Err("connection timed out after 10 seconds".into()),
+        }
+    } else {
+        Ok(())
+    };
+    state
+        .transport
+        .supervise_peer(&node_id, &addr.to_string())
+        .await;
     state.audit_log.record(
         events::PEER_ADDED,
-        &_auth.node_id,
+        actor,
         Some(serde_json::json!({
             "peer_node_id": node_id.to_hex(),
             "addr": addr.to_string(),
+            "label": entry.label,
+            "source": source,
+            "connected": state.transport.is_connected(&node_id).await,
         })),
     );
-
-    let local_id = state.identity.node_id();
-    Ok(Json(peer_response(&entry, false, local_id, None)))
+    drop(admission);
+    Ok(AdmitPeerOutcome { entry, dialed })
 }
 
 /// `DELETE /api/v1/peers/:node_id` — remove a peer from the registry.
@@ -261,10 +314,9 @@ async fn remove_peer(
     let node_id = NodeId::from_hex(&node_id_hex)
         .map_err(|e| ApiError::BadRequest(format!("invalid node ID: {e}")))?;
 
-    let removed = {
-        let mut registry = state.peer_registry.write().await;
-        registry.remove(&node_id).is_some()
-    };
+    // Keep removal ordered with admission through transport and durable cleanup.
+    let mut registry = state.peer_registry.write().await;
+    let removed = registry.remove(&node_id).is_some();
 
     if !removed {
         return Err(ApiError::NotFound(format!("peer {node_id_hex} not found")));
@@ -289,6 +341,7 @@ async fn remove_peer(
         Some(serde_json::json!({"peer_node_id": node_id_hex})),
     );
 
+    drop(registry);
     Ok(Json(serde_json::json!({ "removed": true })))
 }
 

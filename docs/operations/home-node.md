@@ -854,3 +854,38 @@ a claim code, enrollment without `sas_version` is refused, including legacy
 console/delegation pending operations. Already initialized legacy boxes without
 a claim code retain their existing path; this does not migrate a funded box. See [the SAS wire contract](../security/pairing.md#sas-v1-and-the-box-claim-code-n3)
 for the exact digest, signature domains and compatibility behavior.
+
+
+## Add a contact from the owner console
+
+On an owner-managed node started with `--owner-control`, run this in another
+terminal under the same OS account (use the running node's config path):
+
+```sh
+konsensus peer add --node-id <64hex> --addr 203.0.113.7:9735 --label Dad --config /path/to/konsensus.toml
+```
+
+Review the node ID, fingerprint, address and label, then press Enter. Use `--yes`
+to skip confirmation in scripts. Addresses must be an IP and port, with IPv6
+written as `[address]:port`; hostnames are not accepted. Labels are limited to
+256 bytes and cannot contain control characters. This admits the key for paid
+traffic and keeps a connection to it; it does not grant spend authority.
+
+The node saves the contact before whitelisting it, attempts a connection for up
+to 10 seconds, and keeps retrying in the background. Both `connected` and
+`not reachable yet` mean the contact was added successfully (exit status 0).
+For an unreachable contact, check the address and have the other node whitelist
+your node ID too. The saved contact is whitelisted and reconnected after restart
+without editing `konsensus.toml`.
+
+If that node ID also appears in `[[peers]]`, the CLI warns: **the config entry
+wins at the next restart**. Remove that entry from the config if you want the
+console-saved address to stick. This command does not edit the config.
+
+The socket is local and owner-only (`control.sock`, mode `0600`); it exists only
+with `--owner-control`, and packaged sidecars do not provide it. The complete
+owner-typed tuple is consent, as with other tuple-based console commands;
+Enter/`--yes` is a client courtesy, not a boundary against same-UID processes.
+Admissions appear in the audit log as `peer.added` with `source: owner_control`.
+See the [design note](../design/owner-console-peer-add.md) for the trust boundary
+and restart behavior.

@@ -11,6 +11,11 @@ also live on the corresponding GitHub pre-release pages.
   including signet, instead of always reporting `bitcoin`.
 - Allow `GET /api/v1/peers/export` with Read scope: its peer fields are already
   exposed by `GET /peers`, with no additional secrets or private addresses.
+- Add `konsensus peer add --node-id <64hex> --addr <ip:port> [--label <text>] [--yes]`
+  over the owner control socket: persist, whitelist, dial and supervise contacts
+  without a restart. HTTP and console admission share self-ID and control-label
+  rejection; console adds are audited as `owner_control`. The CLI warns when a
+  matching `[[peers]]` entry will override the saved address at restart.
 
 ## [0.3.0-rc17] — 2026-10-19 (prep; not tagged yet)
 

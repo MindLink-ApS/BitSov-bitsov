@@ -1936,8 +1936,8 @@ async fn peers_add_invalid_node_id_rejected() {
 }
 
 #[tokio::test]
-async fn peers_add_self_succeeds() {
-    // The peer handler does not reject self-adds — registry allows it
+async fn peers_add_self_rejected() {
+    // Both owner admission paths reject this node as its own contact.
     let state = test_state();
     let auth = auth_header(&state);
     let self_id = state.identity.node_id().to_hex();
@@ -1958,7 +1958,7 @@ async fn peers_add_self_succeeds() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -2211,6 +2211,28 @@ async fn contact_with_auto_connect_false_redials_and_removal_stops_it() {
     assert!(state.storage.get_peer(&peer).await.unwrap().is_none());
     transport.shutdown();
     remote.shutdown();
+}
+
+#[tokio::test]
+async fn peer_admission_rejects_self_and_control_labels() {
+    let state = test_state();
+    for body in [
+        serde_json::json!({"node_id": state.identity.node_id().to_hex(), "addr": "127.0.0.1:9735"}),
+        serde_json::json!({"node_id": "ab".repeat(32), "addr": "127.0.0.1:9735", "label": "Dad\nspoof"}),
+        serde_json::json!({"node_id": "ab".repeat(32), "addr": "127.0.0.1:9735", "label": "Dad\u{001b}[2J"}),
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/peers")
+            .header("authorization", auth_header(&state))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = build_router(Arc::clone(&state)).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.storage.list_peers().await.unwrap().is_empty());
+        assert!(state.peer_registry.read().await.all().is_empty());
+    }
 }
 
 #[tokio::test]
