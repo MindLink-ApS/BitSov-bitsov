@@ -1374,9 +1374,7 @@ impl Node {
 			.init_features;
 		let required_funds_sats = amount_sats
 			+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
-				if init_features.requires_anchors_zero_fee_htlc_tx()
-					&& !c.trusted_peers_no_reserve.contains(peer_node_id)
-				{
+				if init_features.requires_anchors_zero_fee_htlc_tx() {
 					c.per_channel_reserve_sats
 				} else {
 					0
@@ -2185,19 +2183,26 @@ pub(crate) fn total_anchor_channels_reserve_sats(
 	channel_manager: &ChannelManager,
 	config: &Config,
 ) -> u64 {
-	config.anchor_channels_config.as_ref().map_or(0, |anchor_channels_config| {
-		channel_manager
-			.list_channels()
-			.into_iter()
-			.filter(|c| {
-				!anchor_channels_config.trusted_peers_no_reserve.contains(&c.counterparty.node_id)
-					&& c.channel_shutdown_state
+	config
+		.anchor_channels_config
+		.as_ref()
+		.map_or(0, |anchor_channels_config| {
+			channel_manager
+				.list_channels()
+				.into_iter()
+				.filter(|c| {
+					!anchor_channels_config.waives_reserve(
+						&c.counterparty.node_id,
+						c.channel_value_satoshis,
+						c.is_outbound,
+					) && c
+						.channel_shutdown_state
 						.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
-					&& c.channel_type
-						.as_ref()
-						.map_or(false, |t| t.requires_anchors_zero_fee_htlc_tx())
-			})
-			.count() as u64
-			* anchor_channels_config.per_channel_reserve_sats
-	})
+						&& c.channel_type
+							.as_ref()
+							.map_or(false, |t| t.requires_anchors_zero_fee_htlc_tx())
+				})
+				.count() as u64
+				* anchor_channels_config.per_channel_reserve_sats
+		})
 }

@@ -7,7 +7,10 @@ also live on the corresponding GitHub pre-release pages.
 
 - Add opt-in `trust_no_reserve` for the selected liquidity provider, default
   false. This trusts the hub to confirm closing transactions and waives its
-  local anchor emergency reserve, including for an empty-wallet acceptor.
+  local anchor emergency reserve only for inbound channels funded with at most
+  200,000 sats (`MAX_TRUSTED_NO_RESERVE_INBOUND_SATS`), including for an
+  empty-wallet acceptor. Larger inbound channels and all outbound channels
+  require the normal reserve; 200,001 sats is refused on an empty wallet.
 - Thread optional channel pushes through the Lightning funding interface and
   LDK opener. Unsupported backends refuse explicit pushes before dispatch.
 - Add owner API `push_sats` to channel opens, capped at half the channel amount,

@@ -1327,10 +1327,11 @@ where
 							.get_spendable_amount_sats(cur_anchor_reserve_sats)
 							.unwrap_or(0);
 
-						let required_amount_sats = if anchor_channels_config
-							.trusted_peers_no_reserve
-							.contains(&counterparty_node_id)
-						{
+						let required_amount_sats = if anchor_channels_config.waives_reserve(
+							&counterparty_node_id,
+							funding_satoshis,
+							false,
+						) {
 							0
 						} else {
 							anchor_channels_config.per_channel_reserve_sats
@@ -1752,14 +1753,21 @@ where
 						ref counterparty_node_id,
 						..
 					} => {
-						// Skip bumping channel closes if our counterparty is trusted.
+						// Skip only when channel details prove the bounded inbound waiver applies.
+						// Closed channels may no longer be listed; missing details must not
+						// grant a peer-wide exemption to larger or outbound channels.
 						if let Some(anchor_channels_config) =
 							self.config.anchor_channels_config.as_ref()
 						{
-							if anchor_channels_config
-								.trusted_peers_no_reserve
-								.contains(counterparty_node_id)
-							{
+							if self.channel_manager.list_channels().iter().any(|channel| {
+								channel.channel_id == *channel_id
+									&& channel.counterparty.node_id == *counterparty_node_id
+									&& anchor_channels_config.waives_reserve(
+										counterparty_node_id,
+										channel.channel_value_satoshis,
+										channel.is_outbound,
+									)
+							}) {
 								log_debug!(self.logger,
 									"Ignoring BumpTransactionEvent::ChannelClose for channel {} due to trusted counterparty {}",
 									channel_id, counterparty_node_id

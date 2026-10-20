@@ -19,7 +19,8 @@ pub struct LspConfig {
     pub address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    /// Trust this provider to confirm closing transactions without our anchor reserve.
+    /// Trust the selected provider for inbound channels funded with at most 200,000 sats.
+    /// These channels may omit our anchor reserve; larger and outbound channels may not.
     #[serde(default)]
     pub trust_no_reserve: bool,
 }
