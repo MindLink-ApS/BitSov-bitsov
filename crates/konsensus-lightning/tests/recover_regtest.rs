@@ -172,6 +172,15 @@ async fn run(with_backup: bool) {
         json!([h.onchain_payment().new_address().unwrap().to_string(), 0.02]),
     )
     .await;
+    // Preserve the acceptor's 25,000-sat anchor reserve on-chain.
+    core.rpc(
+        "sendtoaddress",
+        json!([
+            b.onchain_payment().new_address().unwrap().to_string(),
+            0.0005
+        ]),
+    )
+    .await;
     core.mine(6, &[&h, &b]).await;
     h.open_channel(
         b.node_id(),
@@ -574,6 +583,36 @@ async fn verify_lightning(
     let recovered = LdkProvider::new_for_recovery_verification(cfg.clone(), &id)
         .await
         .unwrap();
+    // A fresh Bitcoind-backed wallet starts at the current tip, so old seed
+    // funds are not a synchronized reserve for this verification store.
+    println!(
+        "verification reserve before funding: {} sats",
+        recovered
+            .node()
+            .list_balances()
+            .spendable_onchain_balance_sats
+    );
+    core.rpc(
+        "sendtoaddress",
+        json!([
+            recovered
+                .node()
+                .onchain_payment()
+                .new_address()
+                .unwrap()
+                .to_string(),
+            0.0005
+        ]),
+    )
+    .await;
+    core.mine(6, &[h, &payer, recovered.node()]).await;
+    assert!(
+        recovered
+            .node()
+            .list_balances()
+            .spendable_onchain_balance_sats
+            >= 25_000
+    );
     println!("verification provider started; requesting LSPS2 quote");
     let quote = recovered
         .quote_liquidity("test-console", 20_000_000, 2_000_000)

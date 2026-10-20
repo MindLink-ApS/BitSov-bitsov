@@ -142,6 +142,8 @@ async fn real_ldk_regtest_e2e() {
     let (c, addr_c) = infra::router(dirs[2].path(), &chain).await;
     let c_pubkey = c.node_id().to_string();
     steps.pass("chain + 3 real LDK nodes started");
+    // The inbound anchor acceptor must hold its reserve on-chain.
+    chain.fund(b.node()).await;
     chain.fund(a.node()).await;
     chain.fund(&c).await;
     steps.pass("A and C funded 3,000,000 sat each from regtest coinbase");
@@ -542,6 +544,8 @@ async fn real_ldk_regtest_calls() {
     let (c, addr_c) = infra::router(dirs[2].path(), &chain).await;
     let c_pubkey = c.node_id().to_string();
     steps.pass("chain + 3 real LDK nodes started");
+    // The inbound anchor acceptor must hold its reserve on-chain.
+    chain.fund(b.node()).await;
     chain.fund(a.node()).await;
     chain.fund(&c).await;
     steps.pass("A and C funded 3,000,000 sat each from regtest coinbase");
@@ -958,7 +962,10 @@ async fn real_ldk_regtest_meeting() {
     let (c, addr_c) = infra::lightning(dirs[2].path(), &chain).await;
     let (r, addr_r) = infra::router(dirs[3].path(), &chain).await;
     steps.pass("chain + 4 real LDK nodes started (apps A, B, C; router R)");
+    // The inbound anchor acceptor must hold its reserve on-chain.
+    chain.fund(b.node()).await;
     chain.fund(a.node()).await;
+    chain.fund(c.node()).await;
     chain.fund(&r).await;
     a.open_channel(&r.node_id().to_string(), &addr_r, 1_000_000, false, None)
         .await
@@ -1242,7 +1249,11 @@ async fn real_ldk_regtest_room() {
     let (d, addr_d) = infra::lightning(dirs[3].path(), &chain).await;
     let (r, addr_r) = infra::router(dirs[4].path(), &chain).await;
     steps.pass("chain + 5 real LDK nodes started (apps A, B, C, D; router R)");
+    // The inbound anchor acceptor must hold its reserve on-chain.
+    chain.fund(b.node()).await;
+    chain.fund(d.node()).await;
     chain.fund(a.node()).await;
+    chain.fund(c.node()).await;
     chain.fund(&r).await;
     a.open_channel(&r.node_id().to_string(), &addr_r, 1_000_000, false, None)
         .await
@@ -1899,6 +1910,8 @@ async fn mexico_demo_rehearsal() {
     let (b, addr_b) = infra::lightning(dirs[1].path(), &chain).await;
     let (c, addr_c) = infra::router(dirs[2].path(), &chain).await;
     let c_pubkey = c.node_id().to_string();
+    // The inbound anchor acceptor must hold its reserve on-chain.
+    chain.fund(b.node()).await;
     chain.fund(a.node()).await;
     chain.fund(&c).await;
 

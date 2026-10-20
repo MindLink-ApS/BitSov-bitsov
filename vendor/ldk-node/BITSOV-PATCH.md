@@ -800,3 +800,24 @@ refusal with an empty wallet, with and without 0conf trust.
 `reserve_trust_is_scoped_to_small_inbound_channels` additionally checks the
 reserve total for both boundary amounts and both directions. These tests use
 real channel messages and production admission/accounting without bitcoind.
+
+## Anchor-only inbound admission (2026-10-20)
+
+- `event.rs`: reject every non-anchor `OpenChannelRequest` before reserve checks
+  or normal/zero-conf acceptance, including requests from trusted peers and LDK's
+  downgrade retry after an anchor-reserve refusal. This applies to clients and
+  services, including the hub; external non-anchor-only openers are refused.
+  Rejection removes the unaccepted request before any funding transaction exists.
+- Anchor channels retain the normal 25,000-sat reserve requirement and the bounded
+  selected-provider waiver above. With `anchor_channels_config = None`, every
+  inbound channel is refused; konsensus always configures anchors. The redundant
+  `if anchor_channel` is retained to minimize the upstream diff.
+- `event::bitsov_channel_peers_tests::inbound_anchor_only_refuses_non_anchor_even_from_trusted_peer`
+  exchanges real in-memory open messages with the production handler, checks
+  refusal without an accept message or surviving pending channel, and preserves
+  anchor acceptance with and without zero-conf trust. Legacy regtest fixtures
+  fund acceptors on-chain; Phase 0 retains its empty-wallet controls.
+
+Validation:
+
+    cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib

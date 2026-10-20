@@ -412,7 +412,10 @@ async fn three_node_paid_e2e() {
     let a = Arc::new(LdkProvider::new(configs[0].clone()).await.unwrap());
     let mut b = Arc::new(LdkProvider::new(configs[1].clone()).await.unwrap());
     let c = Arc::new(LdkProvider::new(configs[2].clone()).await.unwrap());
+    // Fund the acceptor reserve without granting any outbound Lightning balance.
+    chain.fund(b.node()).await;
     chain.fund(a.node()).await;
+    chain.fund(c.node()).await;
     let mut alice = start_app(
         dirs[0].path(),
         &chain,
@@ -1219,6 +1222,8 @@ async fn ghost_unfunded_channel_requires_pr200() {
     let b_config = infra::lightning_config(dirs[1].path(), &chain.url);
     let a = LdkProvider::new(a_config).await.unwrap();
     let b = LdkProvider::new(b_config.clone()).await.unwrap();
+    // Fund the acceptor reserve without granting any outbound Lightning balance.
+    chain.fund(b.node()).await;
     chain.fund(a.node()).await;
     eventually("ghost: wallets ready", || async {
         a.money_ready().await && b.money_ready().await

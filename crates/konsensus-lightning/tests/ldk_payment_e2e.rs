@@ -222,8 +222,12 @@ async fn ldk_two_node_channel_payment_and_gate_verification() {
         .expect("failed to get address for A");
 
     // Send 2.1M sats to node A via bitcoind RPC
-    let send_amounts =
-        serde_json::json!({ addr_a.to_string(): Amount::from_sat(2_100_000).to_btc() });
+    // B needs an on-chain anchor reserve even when A pushes Lightning balance.
+    let addr_b = provider_b.node().onchain_payment().new_address().unwrap();
+    let send_amounts = serde_json::json!({
+        addr_a.to_string(): Amount::from_sat(2_100_000).to_btc(),
+        addr_b.to_string(): Amount::from_sat(50_000).to_btc(),
+    });
     bitcoind
         .client
         .call::<serde_json::Value>("sendmany", &[serde_json::json!(""), send_amounts])
@@ -556,8 +560,12 @@ async fn ldk_keysend_payment() {
 
     // Fund node A
     let addr_a = provider_a.node().onchain_payment().new_address().unwrap();
-    let send_amounts =
-        serde_json::json!({ addr_a.to_string(): Amount::from_sat(2_100_000).to_btc() });
+    // B needs an on-chain anchor reserve even when A pushes Lightning balance.
+    let addr_b = provider_b.node().onchain_payment().new_address().unwrap();
+    let send_amounts = serde_json::json!({
+        addr_a.to_string(): Amount::from_sat(2_100_000).to_btc(),
+        addr_b.to_string(): Amount::from_sat(50_000).to_btc(),
+    });
     bitcoind
         .client
         .call::<serde_json::Value>("sendmany", &[serde_json::json!(""), send_amounts])
@@ -686,8 +694,12 @@ async fn ldk_keysend_with_binding_delivers_adr037_tlv_on_wire() {
 
     // Fund node A
     let addr_a = provider_a.node().onchain_payment().new_address().unwrap();
-    let send_amounts =
-        serde_json::json!({ addr_a.to_string(): Amount::from_sat(2_100_000).to_btc() });
+    // B needs an on-chain anchor reserve even when A pushes Lightning balance.
+    let addr_b = provider_b.node().onchain_payment().new_address().unwrap();
+    let send_amounts = serde_json::json!({
+        addr_a.to_string(): Amount::from_sat(2_100_000).to_btc(),
+        addr_b.to_string(): Amount::from_sat(50_000).to_btc(),
+    });
     bitcoind
         .client
         .call::<serde_json::Value>("sendmany", &[serde_json::json!(""), send_amounts])

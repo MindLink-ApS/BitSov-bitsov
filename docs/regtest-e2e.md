@@ -25,6 +25,8 @@ There is no A–B channel: every A↔B payment pays C's positive forwarding fee
 (LDK default 1,000 msat base, 0 ppm, read from C's channels at runtime and
 cross-checked with the policy A and B received). A opens A→C through
 `LdkProvider::open_channel` (supported path, no explicit rate); C opens C→B.
+All three wallets are funded on-chain before opening: B needs its anchor reserve
+even though C provides the Lightning channel capacity.
 
 C is built directly on `ldk-node`, not `LdkProvider`. Stock LDK refuses to
 forward into an unannounced channel (`PrivateChannelForward`) unless
@@ -189,7 +191,7 @@ so asynchronous wallet sync cannot turn the expected refusal into a 503.
 | Explicit funding rate | Refused pre-dispatch (#101); only the estimator path opens channels. |
 | Funding cost | Actual on-chain fee (156 sat / 153 vB per channel); absent from mock accounting. |
 | Channel readiness | Needs wallet/indexer sync, mined confirmations and `is_usable` on both ends. |
-| Inbound anchor channel | A node with no on-chain funds refuses an inbound anchor channel (`0/25000 sats` reserve); LDK then reopens it as non-anchor. |
+| Inbound anchor channel | An unfunded acceptor refuses an inbound anchor channel (`0/25000 sats` reserve) unless the selected-provider reserve waiver applies. The non-anchor retry is also refused; legacy fixtures must fund the acceptor before opening. |
 | Forwarding | Private-channel forwarding needs LSPS2-service/async-server mode on the router. |
 | Routing fees | Positive (1,000 msat per 2,001-msat payment through C); the mock routes at zero. |
 | Immediate payment result | `Pending`, no preimage/fee yet (`/payments/pay` returns `preimage: ""`); settlement must be polled. |
@@ -298,12 +300,14 @@ originally non-anchor requests and LDK's `maybe_downgrade_channel_features`
 retries after an anchor refusal: the retry cannot bypass the reserve-waiver
 gate. The rule applies to clients and services alike. The 200,000-sat cap,
 selected-provider `trust_no_reserve` semantics, zero-conf trust and outbound
-anchor defaults are unchanged. This inbound rule is the only production-default
-change.
+anchor defaults are unchanged. The global inbound rule removes the previous
+non-anchor fallback for empty-wallet clients and for external non-anchor-only peers.
 
 The full `regtest_e2e::three_node::lsps2_service::` module also passes:
 **5 passed, 0 failed**, including hub JIT funding, disconnect/restart recovery
-and stateless admission. No service exception or fixture changes were needed.
+and stateless admission. No service exception is used. Legacy routing, paid-flow,
+payment, wallet-move and recovery fixtures now fund acceptors on-chain before
+channel admission; the Phase 0 tests and existing LSPS2 service fixture are unchanged.
 The vendored LDK Node library suite passes **166 tests**, including a new
 runtime regression that rejects non-anchor requests from trusted peers, removes
 the pending request and preserves anchor acceptance with and without zero-conf

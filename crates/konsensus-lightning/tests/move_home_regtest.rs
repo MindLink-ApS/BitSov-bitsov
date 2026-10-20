@@ -138,6 +138,15 @@ async fn close_current_channel_restart_and_send_only_home() {
     let funding = a.onchain_payment().new_address().unwrap();
     core.rpc("sendtoaddress", json!([funding.to_string(), 0.02]))
         .await;
+    // Preserve the acceptor's 25,000-sat anchor reserve on-chain.
+    core.rpc(
+        "sendtoaddress",
+        json!([
+            b.onchain_payment().new_address().unwrap().to_string(),
+            0.0005
+        ]),
+    )
+    .await;
     core.mine(6, &[&a, &b]).await;
     a.open_channel(
         b.node_id(),
@@ -244,7 +253,28 @@ async fn close_current_channel_restart_and_send_only_home() {
                 restarted = true;
                 swept = true;
             }
-            Progress::Confirming { .. } | Progress::Waiting { .. } => {}
+            Progress::Confirming { .. } => {}
+            Progress::Waiting { .. } => {
+                let (balances, _) = a.move_home_balances().unwrap();
+                if balances
+                    .pending_balances_from_channel_closures
+                    .iter()
+                    .any(|balance| {
+                        matches!(
+                            balance,
+                            ldk_node::PendingSweepBalance::AwaitingThresholdConfirmations { .. }
+                        )
+                    })
+                {
+                    // Migration waits for confirmed closing outputs to leave LDK's
+                    // replay-safe tracking set. Advance its real pruning horizon.
+                    core.mine(
+                        ldk_node::lightning::util::sweep::PRUNE_DELAY_BLOCKS,
+                        &[&a, &b],
+                    )
+                    .await;
+                }
+            }
             Progress::Complete => {
                 completed = true;
                 break;
@@ -253,7 +283,11 @@ async fn close_current_channel_restart_and_send_only_home() {
         tokio::time::sleep(Duration::from_millis(500)).await;
         core.mine(1, &[&a, &b]).await;
     }
-    assert!(restarted && swept && completed);
+    assert!(
+        restarted && swept && completed,
+        "restarted={restarted}, swept={swept}, completed={completed}, snapshot={:?}",
+        LdkBackend { node: &a }.snapshot().unwrap()
+    );
     let received = core
         .rpc("getreceivedbyaddress", json!([destination, 6]))
         .await;

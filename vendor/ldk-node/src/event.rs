@@ -1349,6 +1349,7 @@ where
 				let anchor_channel = channel_type.requires_anchors_zero_fee_htlc_tx();
 				// BITSOV-PATCH: require anchors for every inbound channel. Otherwise LDK's
 				// non-anchor retry can bypass a rejected anchor-reserve check.
+				// anchor_channels_config = None now refuses every inbound channel (konsensus always sets it).
 				if !anchor_channel {
 					log_info!(
 						self.logger,
