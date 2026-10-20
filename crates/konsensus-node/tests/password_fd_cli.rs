@@ -560,3 +560,120 @@ fn sign_challenge_password_fd_rejects_over_limit_input() {
     assert!(!err.contains("panicked at"), "{err}");
     assert!(out.stdout.is_empty(), "no signature on failure");
 }
+
+#[test]
+fn node_id_encrypted_password_sources_and_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let initialized = init(dir.path(), false);
+    assert!(initialized.status.success());
+    let expected = node_id_from_init(&String::from_utf8_lossy(&initialized.stdout));
+    let mnemonic = dir.path().join("mnemonic.enc");
+    let config = dir.path().join("konsensus.toml");
+    let password_file = dir.path().join("password");
+    std::fs::write(&password_file, format!("{PASSWORD}\n")).unwrap();
+    std::fs::set_permissions(&password_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let before = directory_snapshot(dir.path());
+
+    for path_flag in ["--mnemonic", "--config"] {
+        let path = if path_flag == "--config" {
+            &config
+        } else {
+            &mnemonic
+        };
+        for source in ["stdin", "inherited", "file", "argument"] {
+            let mut cmd = bin();
+            cmd.args(["node-id", path_flag]).arg(path);
+            let out = match source {
+                "stdin" | "inherited" => input(
+                    cmd,
+                    format!("{PASSWORD}\r\n").as_bytes(),
+                    source == "inherited",
+                ),
+                "file" => cmd
+                    .arg("--password-file")
+                    .arg(&password_file)
+                    .output()
+                    .unwrap(),
+                _ => cmd.args(["--password", PASSWORD]).output().unwrap(),
+            };
+            assert!(
+                out.status.success(),
+                "{path_flag} {source}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("{expected}\n")
+            );
+            no_secret(&out.stderr);
+        }
+    }
+
+    for password in [b"wrong-password\n".to_vec(), Vec::new(), vec![b'x'; 4097]] {
+        let mut cmd = bin();
+        cmd.args(["node-id", "--mnemonic"]).arg(&mnemonic);
+        let out = input(cmd, &password, false);
+        assert!(!out.status.success());
+        assert_ne!(out.status.code(), Some(101));
+        assert!(out.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("password")
+                || String::from_utf8_lossy(&out.stderr).contains("decryption failed")
+        );
+    }
+    let out = bin()
+        .args(["node-id", "--mnemonic"])
+        .arg(&mnemonic)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "no terminal or password must fail closed"
+    );
+    assert!(out.stdout.is_empty());
+    assert_eq!(directory_snapshot(dir.path()), before);
+}
+
+#[test]
+fn node_id_plaintext_and_bip39_passphrase() {
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    let dir = tempfile::tempdir().unwrap();
+    let mnemonic = dir.path().join("mnemonic.txt");
+    std::fs::write(&mnemonic, MNEMONIC).unwrap();
+    for passphrase in ["", "separate BIP39 passphrase"] {
+        let out = bin()
+            .args(["node-id", "--mnemonic"])
+            .arg(&mnemonic)
+            .args(["--passphrase", passphrase])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let expected = konsensus_core::NodeIdentity::from_mnemonic(MNEMONIC, passphrase).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{}\n", expected.node_id().to_hex())
+        );
+    }
+}
+
+#[test]
+fn node_id_rejects_conflicting_password_sources() {
+    for flags in [
+        vec!["--password", "unused", "--password-file", "unused"],
+        vec!["--password", "unused", "--password-fd", "0"],
+        vec!["--password-file", "unused", "--password-fd", "0"],
+    ] {
+        let out = bin()
+            .args(["node-id", "--mnemonic", "unused.enc"])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be used with"));
+        assert!(out.stdout.is_empty());
+    }
+}

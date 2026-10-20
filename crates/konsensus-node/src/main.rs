@@ -274,9 +274,15 @@ async fn main() -> Result<()> {
             mnemonic,
             config,
             passphrase,
+            password,
+            password_file,
+            password_fd,
         } => {
+            // Wrap before resolve_mnemonic_path so a config error still zeroizes it.
+            let password = password.map(Zeroizing::new);
             let mnemonic_path = resolve_mnemonic_path(mnemonic, config)?;
-            cmd_node_id(&mnemonic_path, &passphrase)?;
+            let password = supplied_seed_password(password, password_file.as_deref(), password_fd)?;
+            cmd_node_id(&mnemonic_path, &passphrase, password)?;
         }
         Command::SignChallenge {
             challenge,
@@ -795,13 +801,20 @@ fn resolve_mnemonic_path(mnemonic: Option<PathBuf>, config: Option<PathBuf>) -> 
 }
 
 /// `konsensus node-id` — print the node ID from a mnemonic file.
-fn cmd_node_id(mnemonic_path: &Path, passphrase: &str) -> Result<()> {
-    let mnemonic = mnemonic_crypto::read_mnemonic(mnemonic_path, None)
-        .with_context(|| format!("failed to read mnemonic from {}", mnemonic_path.display()))?;
+fn cmd_node_id(
+    mnemonic_path: &Path,
+    passphrase: &str,
+    password: Option<Zeroizing<String>>,
+) -> Result<()> {
+    let (password, _) = mnemonic_password(mnemonic_path, password)?;
+    let mnemonic =
+        mnemonic_crypto::read_mnemonic(mnemonic_path, password.as_deref().map(String::as_str))
+            .with_context(|| format!("failed to read mnemonic from {}", mnemonic_path.display()))?;
 
     let identity = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, passphrase)
         .context("failed to derive identity from mnemonic")?;
 
+    drop(password);
     // Print just the hex node ID — designed for script consumption
     println!("{}", identity.node_id().to_hex());
     Ok(())
