@@ -1731,6 +1731,13 @@ impl LightningProvider for CountingLightning {
 /// `test_state()` with a caller-supplied Lightning provider, so a test can count
 /// money-moving calls. Mirrors the literal above; keep the two in step.
 pub fn test_state_with_lightning(lightning: Arc<dyn LightningProvider>) -> Arc<AppState> {
+    test_state_with_lightning_and_storage(lightning, Arc::new(MemStorage::new()))
+}
+
+pub fn test_state_with_lightning_and_storage(
+    lightning: Arc<dyn LightningProvider>,
+    storage: Arc<dyn Storage>,
+) -> Arc<AppState> {
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
@@ -1739,7 +1746,7 @@ pub fn test_state_with_lightning(lightning: Arc<dyn LightningProvider>) -> Arc<A
 
     Arc::new(AppState {
         identity: Arc::clone(&identity),
-        storage: Arc::new(MemStorage::new()),
+        storage,
         lightning,
         chain: Arc::new(StubChain),
         pricing: Arc::new(StubPricing),

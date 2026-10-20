@@ -441,6 +441,7 @@ impl PostgresStorage {
     (27, "call state", include_str!("../migrations/027_call_state.sql")),
     (28, "call request hold", include_str!("../migrations/028_call_request_hold.sql")),
     (29, "operation abandon", include_str!("../migrations/postgres/029_operation_abandon.sql")),
+    (30, "channel open operations", include_str!("../migrations/postgres/030_channel_open_operations.sql")),
         ]
     }
 
@@ -780,6 +781,35 @@ impl Storage for PostgresStorage {
 
     async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = $1").bind(id).fetch_optional(&self.pool).await?)
+    }
+    async fn insert_channel_open_operation(&self, op: &crate::ChannelOpenOperation) -> Result<bool, StorageError> {
+        Ok(sqlx::query("INSERT INTO channel_open_operations (operation_id, request_hash, state, request, result, last_error, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT(operation_id) DO NOTHING")
+            .bind(&op.operation_id)
+            .bind(&op.request_hash)
+            .bind(&op.state)
+            .bind(&op.request)
+            .bind(&op.result)
+            .bind(&op.last_error)
+            .bind(op.created_at)
+            .bind(op.updated_at)
+            .execute(&self.pool).await?.rows_affected() == 1)
+    }
+    async fn get_channel_open_operation(&self, id: &str) -> Result<Option<crate::ChannelOpenOperation>, StorageError> {
+        Ok(sqlx::query_as("SELECT operation_id, request_hash, state, request, result, last_error, created_at, updated_at FROM channel_open_operations WHERE operation_id = $1").bind(id).fetch_optional(&self.pool).await?)
+    }
+    async fn resolve_channel_open_operation(&self, id: &str, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
+        Ok(sqlx::query("UPDATE channel_open_operations SET state = $1, result = $2, last_error = $3, updated_at = $4 WHERE operation_id = $5 AND state = 'pending'")
+            .bind(state)
+            .bind(result)
+            .bind(last_error)
+            .bind(chrono::Utc::now().timestamp_millis())
+            .bind(id)
+            .execute(&self.pool).await?.rows_affected() == 1)
+    }
+    async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
+        Ok(sqlx::query("DELETE FROM channel_open_operations WHERE operation_id = $1 AND state = 'pending'")
+            .bind(id)
+            .execute(&self.pool).await?.rows_affected() == 1)
     }
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE (accounting_pending = TRUE OR state IN ('paying', 'payment_unknown', 'paid', 'sent', 'rejected_retryable')) ORDER BY created_at").fetch_all(&self.pool).await?)

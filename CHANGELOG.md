@@ -5,6 +5,11 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Make `POST /api/v1/payments/open-channel` idempotent with an optional UUIDv4
+  `operation_id` (#331, capability `channel_open_operations_v1`): recorded
+  before dispatch (migration 030), a retry with the same id returns the recorded
+  channel or its uncertain status without opening again; different parameters
+  return `409 operation_mismatch`. Requests without it are unchanged.
 - Fix LDK open-channel identifiers at the source: retain the typed user ID
   through funding reconciliation, avoiding the rc17 post-dispatch parse error
   that could return HTTP 502 after opening a channel. rc18's wrapper parser was

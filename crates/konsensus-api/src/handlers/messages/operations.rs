@@ -110,7 +110,7 @@ fn caller(auth: &MeteredSpend) -> Option<String> {
         .as_ref()
         .map(|p| format!("{}:{}", p.client_id, p.epoch))
 }
-pub(super) fn operation_id(id: Option<&str>) -> Result<String, ApiError> {
+pub(crate) fn operation_id(id: Option<&str>) -> Result<String, ApiError> {
     let id = match id {
         Some(s) => uuid::Uuid::parse_str(s)
             .map_err(|_| ApiError::BadRequest("operation_id must be a UUIDv4".into()))?,
