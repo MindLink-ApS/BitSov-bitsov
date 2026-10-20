@@ -98,7 +98,7 @@ pub struct PeerBackup {
 pub struct ImportPeersRequest {
     /// The backup data (same format as export).
     pub backup: PeerBackup,
-    /// If true, skip peers that already exist (default: false = upsert).
+    /// Legacy option accepted for compatibility. Existing peers are always skipped.
     #[serde(default)]
     pub skip_existing: bool,
 }
@@ -106,12 +106,38 @@ pub struct ImportPeersRequest {
 /// Response from peer import.
 #[derive(Serialize)]
 pub struct ImportPeersResponse {
-    /// Number of peers imported (added or updated).
+    /// Number of peers imported.
     pub imported: usize,
-    /// Number of peers skipped (already existed and skip_existing=true).
+    /// Number of peers skipped (self or already existing).
     pub skipped: usize,
-    /// Peer IDs that had invalid format and were rejected.
+    /// Entry validation or persistence errors, prefixed by peer ID.
     pub errors: Vec<String>,
+    /// One outcome per backup entry, in input order.
+    pub results: Vec<ImportPeerResult>,
+}
+
+/// Outcome of importing a single contact.
+#[derive(Serialize)]
+pub struct ImportPeerResult {
+    /// Node ID as supplied in the backup.
+    pub node_id: String,
+    /// Whether this entry was imported, skipped, or rejected.
+    pub status: ImportPeerStatus,
+    /// Explanation for a skipped or rejected entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Disposition of a contact in an import.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportPeerStatus {
+    /// Contact restored.
+    Imported,
+    /// Self or existing contact left unchanged.
+    Skipped,
+    /// Invalid entry or failed persistence.
+    Rejected,
 }
 
 /// Request to update a peer's mutable fields.
@@ -296,11 +322,19 @@ async fn dial_and_supervise(
     if registry.generation(node_id) != Some(generation) {
         if let Some(current) = registry.get(node_id) {
             // connect() can remember its dial target internally. Restore the
-            // current target, never the stale one, without revoking a re-add.
-            state
-                .transport
-                .supervise_peer(node_id, &current.addr.to_string())
-                .await;
+            // current target, never the stale one.
+            if validate_peer_addr(&current.addr).is_ok() {
+                state
+                    .transport
+                    .supervise_peer(node_id, &current.addr.to_string())
+                    .await;
+            } else {
+                // An inbound-only re-import has no retry target. Clear the
+                // stale dial's tracking, then restore transport admission.
+                // Whitelist removal leaves the authenticated connection open.
+                state.transport.remove_from_whitelist(node_id).await;
+                state.transport.add_to_whitelist(node_id).await;
+            }
         } else {
             // A transport may finish its handshake after DELETE disconnected.
             // Clear any late connection and transport-internal retry tracking.
@@ -581,6 +615,59 @@ async fn export_peers(
 /// Maximum number of peers in a single import request.
 const MAX_IMPORT_PEERS: usize = 1000;
 
+/// Restore one contact, or return a reason for skipping it.
+async fn import_peer_entry(
+    state: &Arc<AppState>,
+    entry: &PeerBackupEntry,
+) -> Result<Option<&'static str>, ApiError> {
+    let node_id = NodeId::from_hex(&entry.node_id)
+        .map_err(|e| ApiError::BadRequest(format!("invalid node ID: {e}")))?;
+    if validate_peer_id(&node_id, state.identity.node_id()).is_err() {
+        return Ok(Some("self: cannot import this node as its own peer"));
+    }
+
+    // The existence check and durable/live admission share one transaction,
+    // so concurrent imports cannot overwrite each other or race removal.
+    let mut registry = state.peer_registry.write().await;
+    if registry.get(&node_id).is_some() {
+        return Ok(Some("existing peer left unchanged"));
+    }
+    let addr: std::net::SocketAddr = entry
+        .addr
+        .parse()
+        .map_err(|e| ApiError::BadRequest(format!("invalid address: {e}")))?;
+    // This exact sentinel is exported for inbound-only invite contacts. Keep
+    // the exported startup flag, but never invent an outbound dial target.
+    let inbound_only = addr == std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+    if !inbound_only {
+        validate_peer_addr(&addr)?;
+    }
+    validate_peer_label(entry.label.as_deref())?;
+
+    let mut persisted = konsensus_storage::Peer::new(node_id);
+    persisted.address = Some(addr.to_string());
+    persisted.display_name = entry.label.clone();
+    state
+        .storage
+        .upsert_peer(&persisted)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to persist peer: {e}")))?;
+    registry.add(PeerEntry {
+        node_id,
+        addr,
+        label: entry.label.clone(),
+        auto_connect: entry.auto_connect,
+    });
+    state.transport.add_to_whitelist(&node_id).await;
+    if !inbound_only {
+        state
+            .transport
+            .supervise_peer(&node_id, &addr.to_string())
+            .await;
+    }
+    Ok(None)
+}
+
 /// `POST /api/v1/peers/import` — import peers from a JSON backup.
 async fn import_peers(
     _auth: ScopedAuth<Admin>,
@@ -594,80 +681,31 @@ async fn import_peers(
         )));
     }
 
-    // Reject prohibited dial targets before applying any part of a backup.
-    // Malformed strings retain the existing per-entry import error reporting.
-    for entry in &req.backup.peers {
-        if let Ok(addr) = entry.addr.parse() {
-            validate_peer_addr(&addr)?;
-        }
-    }
-
     let mut imported = 0usize;
     let mut skipped = 0usize;
     let mut errors = Vec::new();
-
-    let local_id = state.identity.node_id();
+    let mut results = Vec::with_capacity(req.backup.peers.len());
 
     for entry in &req.backup.peers {
-        // Validate node ID
-        let node_id = match NodeId::from_hex(&entry.node_id) {
-            Ok(id) => id,
+        let (status, reason) = match import_peer_entry(&state, entry).await {
+            Ok(None) => {
+                imported += 1;
+                (ImportPeerStatus::Imported, None)
+            }
+            Ok(Some(reason)) => {
+                skipped += 1;
+                (ImportPeerStatus::Skipped, Some(reason.to_string()))
+            }
             Err(e) => {
-                errors.push(format!("{}: invalid node ID — {e}", entry.node_id));
-                continue;
+                errors.push(format!("{}: {e}", entry.node_id));
+                (ImportPeerStatus::Rejected, Some(e.to_string()))
             }
         };
-
-        // Don't import self
-        if validate_peer_id(&node_id, local_id).is_err() {
-            skipped += 1;
-            continue;
-        }
-
-        // Validate address
-        let addr = match entry.addr.parse() {
-            Ok(a) => a,
-            Err(e) => {
-                errors.push(format!("{}: invalid address — {e}", entry.node_id));
-                continue;
-            }
-        };
-
-        // The existence check belongs to the same write transaction as the
-        // upsert, so simultaneous skip-existing imports cannot both admit.
-        let mut registry = state.peer_registry.write().await;
-        if req.skip_existing && registry.get(&node_id).is_some() {
-            skipped += 1;
-            continue;
-        }
-
-        if let Err(e) = validate_peer_label(entry.label.as_deref()) {
-            errors.push(format!("{}: {e}", entry.node_id));
-            continue;
-        }
-
-        let peer_entry = PeerEntry {
-            node_id,
-            addr,
-            label: entry.label.clone(),
-            auto_connect: entry.auto_connect,
-        };
-
-        // P3-2: persist so imported peers survive restart.
-        let mut persisted = konsensus_storage::Peer::new(node_id);
-        persisted.address = Some(addr.to_string());
-        persisted.display_name = entry.label.clone();
-        if let Err(e) = state.storage.upsert_peer(&persisted).await {
-            errors.push(format!("{}: failed to persist peer: {e}", entry.node_id));
-            continue;
-        }
-        registry.add(peer_entry);
-        state.transport.add_to_whitelist(&node_id).await;
-        state
-            .transport
-            .supervise_peer(&node_id, &addr.to_string())
-            .await;
-        imported += 1;
+        results.push(ImportPeerResult {
+            node_id: entry.node_id.clone(),
+            status,
+            reason,
+        });
     }
 
     state.audit_log.record(
@@ -685,6 +723,7 @@ async fn import_peers(
         imported,
         skipped,
         errors,
+        results,
     }))
 }
 

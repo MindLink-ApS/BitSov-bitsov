@@ -75,7 +75,11 @@ async fn seed(state: &Arc<AppState>) -> NodeId {
 async fn write_racing_delete(operation: &str, fail: bool) {
     let storage = Arc::new(common::MemStorage::new());
     let (state, transport) = probe::state(storage.clone(), "ok");
-    let id = seed(&state).await;
+    let id = if operation == "import" {
+        NodeId::from_hex(&"ab".repeat(32)).unwrap()
+    } else {
+        seed(&state).await
+    };
     transport.calls.lock().unwrap().clear();
     let gate = Arc::new(common::PeerWriteGate {
         fail,
@@ -121,7 +125,14 @@ async fn write_racing_delete(operation: &str, fail: bool) {
     } else {
         assert_eq!(response.status(), StatusCode::OK);
     }
-    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(
+        deleted.status(),
+        if fail && operation == "import" {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::OK
+        }
+    );
     assert!(
         serialized,
         "DELETE completed before persistence: {operation}"

@@ -211,11 +211,22 @@ async fn reject_unusable_addresses(operation: &str) {
             .oneshot(request(&state, operation, &"ab".repeat(32), addr, "Dad"))
             .await
             .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "{operation} accepted {addr}"
-        );
+        if operation == "import" {
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["imported"], 0, "import accepted {addr}");
+            assert_eq!(body["errors"].as_array().unwrap().len(), 1);
+            assert_eq!(body["results"][0]["status"], "rejected");
+        } else {
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{operation} accepted {addr}"
+            );
+        }
         assert!(transport.calls.lock().unwrap().is_empty());
         let rows = state.storage.list_peers().await.unwrap();
         let registry = state.peer_registry.read().await;
@@ -238,32 +249,8 @@ async fn put_rejects_unusable_addresses_with_400() {
     reject_unusable_addresses("put").await;
 }
 #[tokio::test]
-async fn import_rejects_unusable_addresses_with_400() {
+async fn import_reports_unusable_addresses_per_entry() {
     reject_unusable_addresses("import").await;
-}
-
-#[tokio::test]
-async fn import_checks_all_addresses_before_writing_any_rows() {
-    let (state, transport) = probe::state(Arc::new(common::MemStorage::new()), "ok");
-    let body = serde_json::json!({"backup":{"version":1,"exported_at":"test","exported_by":"owner","peers":[
-        {"node_id":"ab".repeat(32),"addr":"127.0.0.1:9735","label":"Valid","auto_connect":true},
-        {"node_id":"cd".repeat(32),"addr":"[ff02::1]:9735","label":"Invalid","auto_connect":true}
-    ]}});
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/peers/import")
-        .header("authorization", common::auth_header(&state))
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let response = common::test_router(state.clone())
-        .oneshot(req)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(transport.calls.lock().unwrap().is_empty());
-    assert!(state.storage.list_peers().await.unwrap().is_empty());
-    assert!(state.peer_registry.read().await.is_empty());
 }
 
 #[tokio::test]
