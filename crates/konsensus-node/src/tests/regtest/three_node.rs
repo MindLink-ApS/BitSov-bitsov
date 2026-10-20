@@ -485,9 +485,20 @@ async fn three_node_paid_e2e() {
 
     // Noise and Esplora are separate hops. Capture connection generations so
     // automatic reconnects cannot hide chain-triggered transport loss.
-    let ab = alice.transport.connected_since(bob.state.identity.node_id()).await.unwrap();
-    let ba = bob.transport.connected_since(alice.state.identity.node_id()).await.unwrap();
-    assert_ne!(fault.url, format!("http://{}", bob.transport.listen_addr().unwrap()));
+    let ab = alice
+        .transport
+        .connected_since(bob.state.identity.node_id())
+        .await
+        .unwrap();
+    let ba = bob
+        .transport
+        .connected_since(alice.state.identity.node_id())
+        .await
+        .unwrap();
+    assert_ne!(
+        fault.url,
+        format!("http://{}", bob.transport.listen_addr().unwrap())
+    );
     // No cache seeding: 429 travels through B's real chain provider and LDK.
     fault.set_limited(true);
     eventually(SYNC, || async {
@@ -515,12 +526,27 @@ async fn three_node_paid_e2e() {
     )
     .await
     .unwrap_or_else(|_| panic!("{SYNC}: recipient silently timed out"));
-    assert_eq!(alice.transport.connected_since(bob.state.identity.node_id()).await,
-        Some(ab), "{SYNC}: sender Noise connection changed during quote: {refusal}");
-    assert_eq!(bob.transport.connected_since(alice.state.identity.node_id()).await,
-        Some(ba), "{SYNC}: recipient Noise connection changed during quote: {refusal}");
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE,
-        "{SYNC}: Noise intact, quote/refusal hop failed: {refusal}; sync={:?}", b.chain_sync_status());
+    assert_eq!(
+        alice
+            .transport
+            .connected_since(bob.state.identity.node_id())
+            .await,
+        Some(ab),
+        "{SYNC}: sender Noise connection changed during quote: {refusal}"
+    );
+    assert_eq!(
+        bob.transport
+            .connected_since(alice.state.identity.node_id())
+            .await,
+        Some(ba),
+        "{SYNC}: recipient Noise connection changed during quote: {refusal}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{SYNC}: Noise intact, quote/refusal hop failed: {refusal}; sync={:?}",
+        b.chain_sync_status()
+    );
     assert_eq!(refusal["code"], "peer_not_ready", "{SYNC}: {refusal}");
     assert_eq!(refusal["retry_allowed"], true, "{SYNC}: {refusal}");
     assert_eq!(
@@ -717,8 +743,16 @@ async fn three_node_paid_e2e() {
     let first_c = quote(&alice, &carol, ROOM).await;
     let expires = first_c["expires_at"].as_u64().expect(SLOW_OWNER);
     let idle_started = std::time::Instant::now();
-    let ac = alice.transport.connected_since(carol.state.identity.node_id()).await.unwrap();
-    let ca = carol.transport.connected_since(alice.state.identity.node_id()).await.unwrap();
+    let ac = alice
+        .transport
+        .connected_since(carol.state.identity.node_id())
+        .await
+        .unwrap();
+    let ca = carol
+        .transport
+        .connected_since(alice.state.identity.node_id())
+        .await
+        .unwrap();
     let payments = settled_outgoing(&a).await.len();
     let used = alice.used();
     // Real wall clock: neither the signed quote nor the owner's clock is mocked.
@@ -730,11 +764,26 @@ async fn three_node_paid_e2e() {
     {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    assert!(idle_started.elapsed() > Duration::from_secs(30), "{SLOW_OWNER}: exercise the old read timeout");
-    assert_eq!(alice.transport.connected_since(carol.state.identity.node_id()).await,
-        Some(ac), "{SLOW_OWNER}: product keepalive must preserve the dialer's quote link");
-    assert_eq!(carol.transport.connected_since(alice.state.identity.node_id()).await,
-        Some(ca), "{SLOW_OWNER}: product keepalive must preserve the acceptor's quote link");
+    assert!(
+        idle_started.elapsed() > Duration::from_secs(30),
+        "{SLOW_OWNER}: exercise the old read timeout"
+    );
+    assert_eq!(
+        alice
+            .transport
+            .connected_since(carol.state.identity.node_id())
+            .await,
+        Some(ac),
+        "{SLOW_OWNER}: product keepalive must preserve the dialer's quote link"
+    );
+    assert_eq!(
+        carol
+            .transport
+            .connected_since(alice.state.identity.node_id())
+            .await,
+        Some(ca),
+        "{SLOW_OWNER}: product keepalive must preserve the acceptor's quote link"
+    );
     approve_contact(&alice, &carol, &first_c, None).await;
     paid(
         &alice,
@@ -793,7 +842,12 @@ async fn three_node_paid_e2e() {
             false,
         )
         .await;
-    log_reconnect(&alice, &carol, "compose without recipient allowance returned").await;
+    log_reconnect(
+        &alice,
+        &carol,
+        "compose without recipient allowance returned",
+    )
+    .await;
     println!("{READMISSION}: refusal status={status}, body={refusal}");
     assert_eq!(status, StatusCode::CONFLICT, "{READMISSION}: {refusal}");
     assert_eq!(
@@ -843,7 +897,12 @@ async fn three_node_paid_e2e() {
     .await;
     log_reconnect(&alice, &carol, "paid with recipient allowance").await;
     assert_eq!(alice.used() - used, 4_002, "{READMISSION}");
-    reconnect(&alice, &carol, "re-admission with standing recipient allowance").await;
+    reconnect(
+        &alice,
+        &carol,
+        "re-admission with standing recipient allowance",
+    )
+    .await;
     let used = alice.used();
     paid(
         &alice,
@@ -864,14 +923,29 @@ async fn three_node_paid_e2e() {
 
     // A height-zero table from an older recipient cannot destroy a usable
     // cached offer. Establish a known good offer, then inject the old wire form.
-    bob.transport.send_frame(alice.state.identity.node_id(), &Frame::PriceTable {
-        prices: std::collections::HashMap::from([("communication".to_owned(), 2_001)]),
-        block_height: tip, valid_blocks: 6, trust_discount: 0.0,
-    }).await.expect(SKEW);
+    bob.transport
+        .send_frame(
+            alice.state.identity.node_id(),
+            &Frame::PriceTable {
+                prices: std::collections::HashMap::from([("communication".to_owned(), 2_001)]),
+                block_height: tip,
+                valid_blocks: 6,
+                trust_discount: 0.0,
+            },
+        )
+        .await
+        .expect(SKEW);
     eventually(SKEW, || async {
-        alice.state.peer_prices.get_peer_entry(bob.state.identity.node_id()).await
-            .is_some_and(|entry| entry.block_height == tip && entry.prices.get("communication") == Some(&2_001))
-    }).await;
+        alice
+            .state
+            .peer_prices
+            .get_peer_entry(bob.state.identity.node_id())
+            .await
+            .is_some_and(|entry| {
+                entry.block_height == tip && entry.prices.get("communication") == Some(&2_001)
+            })
+    })
+    .await;
     let fence = std::time::Instant::now();
     bob.transport
         .send_frame(
@@ -885,21 +959,52 @@ async fn three_node_paid_e2e() {
         )
         .await
         .expect(SKEW);
-    bob.transport.send_frame(alice.state.identity.node_id(), &Frame::PriceResponse {
-        kind: 400, price_msat: 2_001, block_height: tip,
-    }).await.expect(SKEW);
+    bob.transport
+        .send_frame(
+            alice.state.identity.node_id(),
+            &Frame::PriceResponse {
+                kind: 400,
+                price_msat: 2_001,
+                block_height: tip,
+            },
+        )
+        .await
+        .expect(SKEW);
     eventually(SKEW, || async {
-        alice.state.peer_prices.kind_answered_at(bob.state.identity.node_id(), 400).await
+        alice
+            .state
+            .peer_prices
+            .kind_answered_at(bob.state.identity.node_id(), 400)
+            .await
             .is_some_and(|at| at >= fence)
-    }).await;
-    assert_eq!(alice.state.peer_prices.get_fresh_peer_price(
-        bob.state.identity.node_id(), 0, tip, Duration::from_secs(300),
-    ).await, Some(2_001), "{SKEW}: retain the valid cached price");
+    })
+    .await;
+    assert_eq!(
+        alice
+            .state
+            .peer_prices
+            .get_fresh_peer_price(
+                bob.state.identity.node_id(),
+                0,
+                tip,
+                Duration::from_secs(300),
+            )
+            .await,
+        Some(2_001),
+        "{SKEW}: retain the valid cached price"
+    );
     let (status, tables) = alice.get("/api/v1/pricing/peers", false).await;
     assert_eq!(status, StatusCode::OK, "{SKEW}: {tables}");
-    let entry = tables.as_array().unwrap().iter()
-        .find(|entry| entry["peer_id"] == bob.state.identity.node_id().to_hex()).expect(SKEW);
-    assert_eq!(entry["stale"], false, "{SKEW}: usable prior table remains fresh");
+    let entry = tables
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["peer_id"] == bob.state.identity.node_id().to_hex())
+        .expect(SKEW);
+    assert_eq!(
+        entry["stale"], false,
+        "{SKEW}: usable prior table remains fresh"
+    );
     assert_eq!(entry["block_height"], tip, "{SKEW}");
     let before = (
         alice.used(),
@@ -1204,9 +1309,16 @@ async fn ghost_unfunded_channel_requires_pr200() {
         "ghost claim excluded from node aggregate too"
     );
     let commitments = || {
-        fault.broadcast_attempts().into_iter()
-            .filter(|(_, tx)| tx.input.iter().any(|input| input.previous_output == funding))
-            .map(|(at, _)| at).collect::<Vec<_>>()
+        fault
+            .broadcast_attempts()
+            .into_iter()
+            .filter(|(_, tx)| {
+                tx.input
+                    .iter()
+                    .any(|input| input.previous_output == funding)
+            })
+            .map(|(at, _)| at)
+            .collect::<Vec<_>>()
     };
     // First test suppression with fresh absence evidence available. The first
     // close can race channel removal; allow it to finish, then cover the next
@@ -1216,15 +1328,28 @@ async fn ghost_unfunded_channel_requires_pr200() {
     let reads_before = fault.read_responses().len();
     tokio::time::sleep(Duration::from_secs(95)).await;
     let funding_path = format!("/tx/{}", funding.txid);
-    let evidence: Vec<_> = fault.read_responses()[reads_before..].iter()
-        .filter(|(path, _)| path == &funding_path).cloned().collect();
+    let evidence: Vec<_> = fault.read_responses()[reads_before..]
+        .iter()
+        .filter(|(path, _)| path == &funding_path)
+        .cloned()
+        .collect();
     println!("ghost: funding={}, listed_channels={}, raw_claim_sats={}, fresh_evidence={evidence:?}, commitment_posts_before={before}, after={}",
         funding, a.node().list_channels().len(), raw.total_lightning_balance_sats, commitments().len());
-    assert!(a.node().list_channels().is_empty(), "ghost: suppression requires a closed monitor");
-    assert!(evidence.iter().any(|(_, status)| *status == StatusCode::NOT_FOUND),
-        "ghost: no fresh funding absence lookup during rebroadcast window: {evidence:?}");
-    assert_eq!(commitments().len(), before,
-        "#200: fresh 404 + closed monitor must suppress commitment POSTs");
+    assert!(
+        a.node().list_channels().is_empty(),
+        "ghost: suppression requires a closed monitor"
+    );
+    assert!(
+        evidence
+            .iter()
+            .any(|(_, status)| *status == StatusCode::NOT_FOUND),
+        "ghost: no fresh funding absence lookup during rebroadcast window: {evidence:?}"
+    );
+    assert_eq!(
+        commitments().len(),
+        before,
+        "#200: fresh 404 + closed monitor must suppress commitment POSTs"
+    );
 
     // A 429 is UNKNOWN, not absence. #200 intentionally does not cache a 404:
     // funding may arrive later. Such packages remain eligible and POST retries
@@ -1232,47 +1357,80 @@ async fn ghost_unfunded_channel_requires_pr200() {
     // One POST in 95s was not that contract.
     let before = commitments().len();
     fault.set_limited(true);
-    eventually("ghost: UNKNOWN funding must still permit a commitment POST under 429", || async {
-        commitments().len() > before
-    }).await;
+    eventually(
+        "ghost: UNKNOWN funding must still permit a commitment POST under 429",
+        || async { commitments().len() > before },
+    )
+    .await;
     // Start observation at an actual commitment attempt, not an arbitrary LDK
     // tick. Queue cooldown and other HTTP work may delay its first attempt.
     let first = commitments()[before];
     tokio::time::sleep(Duration::from_secs(95).saturating_sub(first.elapsed())).await;
     let attempts = commitments();
-    let attempts: Vec<_> = attempts[before..].iter().copied()
-        .filter(|at| at.duration_since(first) <= Duration::from_secs(95)).collect();
-    let gaps: Vec<_> = attempts.windows(2).map(|pair| pair[1].duration_since(pair[0])).collect();
+    let attempts: Vec<_> = attempts[before..]
+        .iter()
+        .copied()
+        .filter(|at| at.duration_since(first) <= Duration::from_secs(95))
+        .collect();
+    let gaps: Vec<_> = attempts
+        .windows(2)
+        .map(|pair| pair[1].duration_since(pair[0]))
+        .collect();
     println!("ghost: unknown funding under 429; rejected={}, commitment_posts={}, gaps={gaps:?}, sync={:?}",
         fault.rejected(), attempts.len(), a.chain_sync_status());
-    assert!(fault.rejected() > 0, "ghost: backend fault must actually be exercised");
+    assert!(
+        fault.rejected() > 0,
+        "ghost: backend fault must actually be exercised"
+    );
     // Every retry waits at least 10s after its own 429. Concurrent packages can
     // extend a shared episode, so its exponent is NOT this transaction's retry
     // index. At most ten attempts fit in 95s even at the 10s floor.
-    assert!(!attempts.is_empty(), "ghost: UNKNOWN funding branch never exercised");
-    assert!(attempts.len() <= 10,
-        "#200: 95s 429 retry bound exceeded: posts={}, gaps={gaps:?}", attempts.len());
+    assert!(
+        !attempts.is_empty(),
+        "ghost: UNKNOWN funding branch never exercised"
+    );
+    assert!(
+        attempts.len() <= 10,
+        "#200: 95s 429 retry bound exceeded: posts={}, gaps={gaps:?}",
+        attempts.len()
+    );
     for (index, gap) in gaps.iter().enumerate() {
         // Proxy timestamps precede response processing; tolerate 1s scheduling skew.
         let minimum = Duration::from_secs(9);
-        assert!(*gap >= minimum,
-            "#200: commitment retry {} failed backoff: gap={gap:?}, minimum={minimum:?}", index + 1);
+        assert!(
+            *gap >= minimum,
+            "#200: commitment retry {} failed backoff: gap={gap:?}, minimum={minimum:?}",
+            index + 1
+        );
     }
     // Even if shared cooldown reached 300s before this POST, it must retain
     // the commitment and retry. Do not let one observed attempt mask its loss.
-    eventually("ghost: commitment retained for retry during 429 (300s cooldown cap)", || async {
-        commitments().len() >= before + 2
-    }).await;
+    eventually(
+        "ghost: commitment retained for retry during 429 (300s cooldown cap)",
+        || async { commitments().len() >= before + 2 },
+    )
+    .await;
     let retried = commitments();
     let retry_gap = retried[before + 1].duration_since(retried[before]);
     assert!((Duration::from_secs(9)..=Duration::from_secs(360)).contains(&retry_gap),
         "ghost: retained commitment retry outside 10s floor / 300s cap plus allowance: {retry_gap:?}");
     // This fixture closes one channel without mining/fee changes during the
     // observation: there must be only one commitment transaction stream.
-    let commitment_ids: std::collections::HashSet<_> = fault.broadcast_attempts().into_iter()
-        .filter(|(_, tx)| tx.input.iter().any(|input| input.previous_output == funding))
-        .map(|(_, tx)| tx.compute_txid()).collect();
-    assert_eq!(commitment_ids.len(), 1, "ghost: unexpected competing commitment transactions: {commitment_ids:?}");
+    let commitment_ids: std::collections::HashSet<_> = fault
+        .broadcast_attempts()
+        .into_iter()
+        .filter(|(_, tx)| {
+            tx.input
+                .iter()
+                .any(|input| input.previous_output == funding)
+        })
+        .map(|(_, tx)| tx.compute_txid())
+        .collect();
+    assert_eq!(
+        commitment_ids.len(),
+        1,
+        "ghost: unexpected competing commitment transactions: {commitment_ids:?}"
+    );
     fault.set_limited(false);
     for wallet in [&a, &b] {
         wallet.shutdown().await.unwrap();

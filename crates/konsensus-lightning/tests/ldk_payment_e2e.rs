@@ -40,9 +40,7 @@ fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
     let bitcoind_exe = std::env::var("BITCOIND_EXE")
         .ok()
         .or_else(|| corepc_node::downloaded_exe_path().ok())
-        .expect(
-            "Set BITCOIND_EXE env var or enable corepc-node download feature",
-        );
+        .expect("Set BITCOIND_EXE env var or enable corepc-node download feature");
 
     let mut bitcoind_conf = corepc_node::Conf::default();
     bitcoind_conf.network = "regtest";
@@ -73,10 +71,7 @@ fn random_port() -> u16 {
 /// Build and start an LDK node pointed at the given esplora URL.
 ///
 /// Returns the raw ldk_node::Node and a TempDir that must be kept alive.
-fn build_ldk_node(
-    esplora_url: &str,
-    listen_port: u16,
-) -> (ldk_node::Node, tempfile::TempDir) {
+fn build_ldk_node(esplora_url: &str, listen_port: u16) -> (ldk_node::Node, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
 
     let mut builder = Builder::new();
@@ -120,11 +115,7 @@ async fn mine_blocks_and_sync(
 
     // Wait for electrs to index the new blocks.
     // Poll the electrum client's block height until it catches up.
-    let target_height = bitcoind
-        .client
-        .get_blockchain_info()
-        .unwrap()
-        .blocks as usize;
+    let target_height = bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
 
     for _ in 0..40 {
         // electrsd exposes the esplora HTTP URL; use a simple height check
@@ -154,12 +145,9 @@ async fn mine_blocks_and_sync(
 
 /// Wait for an LDK event with a timeout. Panics on timeout.
 async fn expect_event(node: &ldk_node::Node, timeout_secs: u64) -> ldk_node::Event {
-    tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        node.next_event_async(),
-    )
-    .await
-    .expect("timed out waiting for LDK event")
+    tokio::time::timeout(Duration::from_secs(timeout_secs), node.next_event_async())
+        .await
+        .expect("timed out waiting for LDK event")
 }
 
 // ── The Test ─────────────────────────────────────────────────────────────────
@@ -193,8 +181,14 @@ async fn ldk_two_node_channel_payment_and_gate_verification() {
     let provider_b = LdkProvider::from_node(Arc::new(node_b_raw));
 
     // Verify both are running
-    assert!(provider_a.is_available().await, "Node A should be available");
-    assert!(provider_b.is_available().await, "Node B should be available");
+    assert!(
+        provider_a.is_available().await,
+        "Node A should be available"
+    );
+    assert!(
+        provider_b.is_available().await,
+        "Node B should be available"
+    );
 
     // Verify distinct pubkeys
     let pubkey_a = provider_a
@@ -343,7 +337,10 @@ async fn ldk_two_node_channel_payment_and_gate_verification() {
 
     assert_eq!(invoice.amount_msat, payment_amount_msat);
     assert!(!invoice.bolt11.is_empty(), "bolt11 should not be empty");
-    assert!(!invoice.payment_hash.is_empty(), "payment_hash should not be empty");
+    assert!(
+        !invoice.payment_hash.is_empty(),
+        "payment_hash should not be empty"
+    );
     println!("Invoice hash: {}", invoice.payment_hash);
 
     // ── 7. A pays the invoice via LightningProvider ─────────────────────
@@ -383,8 +380,14 @@ async fn ldk_two_node_channel_payment_and_gate_verification() {
         "Payment should be settled on sender"
     );
     assert_eq!(status_a.direction, PaymentDirection::Outgoing);
-    assert!(status_a.preimage.is_some(), "Settled outgoing payment should have preimage");
-    println!("A status: {:?}, fee: {:?} msat", status_a.status, status_a.fee_msat);
+    assert!(
+        status_a.preimage.is_some(),
+        "Settled outgoing payment should have preimage"
+    );
+    println!(
+        "A status: {:?}, fee: {:?} msat",
+        status_a.status, status_a.fee_msat
+    );
 
     // ── 9. Verify payment received on recipient (B) ─────────────────────
     let status_b = provider_b
@@ -398,7 +401,10 @@ async fn ldk_two_node_channel_payment_and_gate_verification() {
     );
     assert_eq!(status_b.direction, PaymentDirection::Incoming);
     assert_eq!(status_b.amount_msat, payment_amount_msat);
-    println!("B status: {:?}, amount: {} msat", status_b.status, status_b.amount_msat);
+    println!(
+        "B status: {:?}, amount: {} msat",
+        status_b.status, status_b.amount_msat
+    );
 
     // ── 10. PAYMENT GATE VERIFICATION ───────────────────────────────────
     // verify_payment() is the method PaymentGate uses to confirm Lightning
@@ -435,7 +441,9 @@ async fn ldk_two_node_channel_payment_and_gate_verification() {
         .await
         .expect("failed to list payments on A");
     assert!(
-        payments_a.iter().any(|p| p.payment_hash == invoice.payment_hash),
+        payments_a
+            .iter()
+            .any(|p| p.payment_hash == invoice.payment_hash),
         "Node A payment list should contain the payment"
     );
 
@@ -444,7 +452,9 @@ async fn ldk_two_node_channel_payment_and_gate_verification() {
         .await
         .expect("failed to list payments on B");
     assert!(
-        payments_b.iter().any(|p| p.payment_hash == invoice.payment_hash),
+        payments_b
+            .iter()
+            .any(|p| p.payment_hash == invoice.payment_hash),
         "Node B payment list should contain the payment"
     );
 
@@ -459,10 +469,8 @@ async fn ldk_two_node_channel_payment_and_gate_verification() {
     let mut channels_a_after = provider_a.list_channels().await.unwrap();
     let mut channels_b_after = provider_b.list_channels().await.unwrap();
     for _ in 0..40 {
-        let a_decreased =
-            channels_a_after[0].local_balance_msat < channels_a[0].local_balance_msat;
-        let b_increased =
-            channels_b_after[0].local_balance_msat > channels_b[0].local_balance_msat;
+        let a_decreased = channels_a_after[0].local_balance_msat < channels_a[0].local_balance_msat;
+        let b_increased = channels_b_after[0].local_balance_msat > channels_b[0].local_balance_msat;
         if a_decreased && b_increased {
             break;
         }
@@ -485,10 +493,26 @@ async fn ldk_two_node_channel_payment_and_gate_verification() {
     // Slice 1: inject post-gate storage failures, then lose the acceptance ACK.
     // All retries validate against this same real settled Lightning payment.
     paid_delivery_retries(&provider_b, &status_b).await;
-    assert_eq!(provider_a.list_payments(100).await.unwrap().iter()
-        .filter(|p| p.payment_hash == invoice.payment_hash).count(), 1);
-    assert_eq!(provider_b.list_payments(100).await.unwrap().iter()
-        .filter(|p| p.payment_hash == invoice.payment_hash).count(), 1);
+    assert_eq!(
+        provider_a
+            .list_payments(100)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|p| p.payment_hash == invoice.payment_hash)
+            .count(),
+        1
+    );
+    assert_eq!(
+        provider_b
+            .list_payments(100)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|p| p.payment_hash == invoice.payment_hash)
+            .count(),
+        1
+    );
 
     println!(
         "\n=== B8 LDK Payment Gate E2E Test PASSED ===\n\
@@ -718,7 +742,10 @@ async fn ldk_keysend_with_binding_delivers_adr037_tlv_on_wire() {
     let amount_msat: u64 = 50_000;
     let binding = b"r2-seam3c-envelope-binding-pointer".to_vec();
 
-    println!("A keysend_with_binding -> B ({pubkey_b}), {} byte binding...", binding.len());
+    println!(
+        "A keysend_with_binding -> B ({pubkey_b}), {} byte binding...",
+        binding.len()
+    );
     let payment = provider_a
         .keysend_with_binding(&pubkey_b, amount_msat, &binding)
         .await
@@ -759,7 +786,10 @@ async fn ldk_keysend_with_binding_delivers_adr037_tlv_on_wire() {
         "exactly one BitSov binding TLV must arrive (the send-side single-record \
          invariant the receiver's duplicate-guard relies on); got {} (all type_nums: {:?})",
         bitsov_records.len(),
-        custom_records.iter().map(|r| r.type_num).collect::<Vec<_>>()
+        custom_records
+            .iter()
+            .map(|r| r.type_num)
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         bitsov_records[0].value, binding,
@@ -774,48 +804,125 @@ async fn ldk_keysend_with_binding_delivers_adr037_tlv_on_wire() {
 }
 
 /// Real-settlement counterpart of the receive-loop and process-crash tests.
-async fn paid_delivery_retries(provider: &LdkProvider, payment: &konsensus_core::traits::lightning::PaymentDetails) {
-    use konsensus_core::{NodeIdentity, PaymentProof, Recipient, Signature, UkmEnvelopeBuilder};
+async fn paid_delivery_retries(
+    provider: &LdkProvider,
+    payment: &konsensus_core::traits::lightning::PaymentDetails,
+) {
     use konsensus_core::gate::{GateConfig, PaymentGate};
+    use konsensus_core::{NodeIdentity, PaymentProof, Recipient, Signature, UkmEnvelopeBuilder};
     use konsensus_storage::{PaidAcceptance, SqliteStorage, Storage};
     struct Price;
     #[async_trait::async_trait]
     impl konsensus_core::traits::pricing::PricingEngine for Price {
-        fn as_any(&self) -> &dyn std::any::Any { self }
-        async fn get_price_msat(&self, _: u16) -> Result<u64, konsensus_core::traits::pricing::PricingError> { Ok(1) }
-        async fn get_category_price_msat(&self, _: konsensus_core::kind::KindCategory) -> Result<u64, konsensus_core::traits::pricing::PricingError> { Ok(1) }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        async fn get_price_msat(
+            &self,
+            _: u16,
+        ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+            Ok(1)
+        }
+        async fn get_category_price_msat(
+            &self,
+            _: konsensus_core::kind::KindCategory,
+        ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+            Ok(1)
+        }
     }
-    let (_, alice) = NodeIdentity::generate().unwrap(); let alice = Arc::new(alice);
-    let (_, bob) = NodeIdentity::generate().unwrap(); let bob = Arc::new(bob);
+    let (_, alice) = NodeIdentity::generate().unwrap();
+    let alice = Arc::new(alice);
+    let (_, bob) = NodeIdentity::generate().unwrap();
+    let bob = Arc::new(bob);
     let sender_session = konsensus_crypto::SessionManager::new(alice.clone());
     let recipient_session = konsensus_crypto::SessionManager::new(bob.clone());
-    let init = sender_session.initiate_session(bob.node_id(), &recipient_session.prekey_bundle().await).await.unwrap();
-    recipient_session.accept_session(alice.node_id(), &init).await.unwrap();
-    let payload = sender_session.encrypt(bob.node_id(), b"one real Lightning payment").await.unwrap();
-    let proof = PaymentProof::new(hex::decode(&payment.payment_hash).unwrap().try_into().unwrap(),
-        hex::decode(payment.preimage.as_ref().unwrap()).unwrap().try_into().unwrap(), payment.amount_msat);
-    let mut env = UkmEnvelopeBuilder::new(0, *alice.node_id(), Recipient::Node(*bob.node_id()),
-        konsensus_crypto::ratchet_message_to_bytes(&payload), proof).build();
+    let init = sender_session
+        .initiate_session(bob.node_id(), &recipient_session.prekey_bundle().await)
+        .await
+        .unwrap();
+    recipient_session
+        .accept_session(alice.node_id(), &init)
+        .await
+        .unwrap();
+    let payload = sender_session
+        .encrypt(bob.node_id(), b"one real Lightning payment")
+        .await
+        .unwrap();
+    let proof = PaymentProof::new(
+        hex::decode(&payment.payment_hash)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        hex::decode(payment.preimage.as_ref().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        payment.amount_msat,
+    );
+    let mut env = UkmEnvelopeBuilder::new(
+        0,
+        *alice.node_id(),
+        Recipient::Node(*bob.node_id()),
+        konsensus_crypto::ratchet_message_to_bytes(&payload),
+        proof,
+    )
+    .build();
     env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
-    let gate = PaymentGate::with_config(GateConfig { verify_lightning_settlement: true, ..Default::default() });
+    let gate = PaymentGate::with_config(GateConfig {
+        verify_lightning_settlement: true,
+        ..Default::default()
+    });
     let db = SqliteStorage::in_memory().await.unwrap();
     let balance = provider.get_balance_msat().await.unwrap();
     for failure in ["ABORT", "ROLLBACK"] {
         sqlx::query(&format!("CREATE TRIGGER fail_message BEFORE INSERT ON messages BEGIN SELECT RAISE({failure}, 'injected post-gate failure'); END"))
             .execute(db.pool()).await.unwrap();
-        gate.validate_paid_envelope(&env, &Price, None, Some(provider), 0.0, Some(bob.node_id())).await.unwrap();
+        gate.validate_paid_envelope(&env, &Price, None, Some(provider), 0.0, Some(bob.node_id()))
+            .await
+            .unwrap();
         assert!(db.accept_paid_envelope(&env).await.is_err());
         assert!(!db.has_nonce(&env.nonce).await.unwrap());
-        sqlx::query("DROP TRIGGER fail_message").execute(db.pool()).await.unwrap();
+        sqlx::query("DROP TRIGGER fail_message")
+            .execute(db.pool())
+            .await
+            .unwrap();
     }
-    gate.validate_paid_envelope(&env, &Price, None, Some(provider), 0.0, Some(bob.node_id())).await.unwrap();
-    assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), PaidAcceptance::Accepted);
-    let readable = recipient_session.decrypt(alice.node_id(), &konsensus_crypto::ratchet_message_from_bytes(&env.ciphertext).unwrap()).await.unwrap();
+    gate.validate_paid_envelope(&env, &Price, None, Some(provider), 0.0, Some(bob.node_id()))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.accept_paid_envelope(&env).await.unwrap(),
+        PaidAcceptance::Accepted
+    );
+    let readable = recipient_session
+        .decrypt(
+            alice.node_id(),
+            &konsensus_crypto::ratchet_message_from_bytes(&env.ciphertext).unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(readable, b"one real Lightning payment");
     // Lost ACK: a full gate pass still yields a receipt, never a second insert/decrypt.
-    gate.validate_paid_envelope(&env, &Price, None, Some(provider), 0.0, Some(bob.node_id())).await.unwrap();
-    assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), PaidAcceptance::AlreadyAccepted);
-    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages").fetch_one(db.pool()).await.unwrap(), 1);
-    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM payment_receipts").fetch_one(db.pool()).await.unwrap(), 1);
+    gate.validate_paid_envelope(&env, &Price, None, Some(provider), 0.0, Some(bob.node_id()))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.accept_paid_envelope(&env).await.unwrap(),
+        PaidAcceptance::AlreadyAccepted
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM payment_receipts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        1
+    );
     assert_eq!(provider.get_balance_msat().await.unwrap(), balance);
 }

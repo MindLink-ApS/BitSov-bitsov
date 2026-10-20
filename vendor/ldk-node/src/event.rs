@@ -618,7 +618,9 @@ where
 						// create_funding_transaction abandons its reservation before
 						// returning a persistence error: no tx has reached LDK yet.
 						log_error!(self.logger, "Failed to create funding transaction: {}", err);
-						self.wallet.record_funding_failure(user_channel_id, err).map_err(|_| ReplayEvent())?;
+						self.wallet
+							.record_funding_failure(user_channel_id, err)
+							.map_err(|_| ReplayEvent())?;
 						self.channel_manager
 							.force_close_broadcasting_latest_txn(
 								&temporary_channel_id,
@@ -648,13 +650,13 @@ where
 				counterparty_skimmed_fee_msat,
 				..
 			} => {
-                // Refuse BEFORE releasing a preimage; no settlement on disk refusal.
-                // Claimed/replayed settlements use PaymentClaimed and remain recoverable.
-                if self.config.work_admission.as_ref().is_some_and(|check| !check.allowed()) {
-                    log_info!(self.logger, "disk_low: refusing unpaid incoming HTLC");
-                    self.channel_manager.fail_htlc_backwards(&payment_hash);
-                    return Ok(());
-                }
+				// Refuse BEFORE releasing a preimage; no settlement on disk refusal.
+				// Claimed/replayed settlements use PaymentClaimed and remain recoverable.
+				if self.config.work_admission.as_ref().is_some_and(|check| !check.allowed()) {
+					log_info!(self.logger, "disk_low: refusing unpaid incoming HTLC");
+					self.channel_manager.fail_htlc_backwards(&payment_hash);
+					return Ok(());
+				}
 				let payment_id = PaymentId(payment_hash.0);
 
 				if let Some((tlv_type, _)) = onion_fields
@@ -724,7 +726,8 @@ where
 					// receipts (which contain net) were rejected above as duplicates.
 					let below_jit_minimum = match &info.kind {
 						PaymentKind::Bolt11Jit { lsp_fee_limits, .. } => match info.amount_msat {
-							Some(gross) => gross.checked_sub(max_total_opening_fee_msat)
+							Some(gross) => gross
+								.checked_sub(max_total_opening_fee_msat)
 								.filter(|minimum| *minimum > 0)
 								.is_none_or(|minimum| amount_msat < minimum),
 							// A fixed fee ceiling without its gross is incomplete
@@ -734,7 +737,9 @@ where
 						_ => false,
 					};
 
-					if below_jit_minimum || counterparty_skimmed_fee_msat > max_total_opening_fee_msat {
+					if below_jit_minimum
+						|| counterparty_skimmed_fee_msat > max_total_opening_fee_msat
+					{
 						log_info!(
 							self.logger,
 							"Refusing inbound payment with hash {}: net {}msat / skim {}msat violates gross {:?}msat / fee limit {}msat",
@@ -764,7 +769,9 @@ where
 					// claim_funds can fail after a positive skim has been persisted.
 					// The successful-payment guard above keeps late attempts from
 					// overwriting an already settled receipt.
-					if counterparty_skimmed_fee_msat > 0 || matches!(info.kind, PaymentKind::Bolt11Jit { .. }) {
+					if counterparty_skimmed_fee_msat > 0
+						|| matches!(info.kind, PaymentKind::Bolt11Jit { .. })
+					{
 						match info.kind {
 							PaymentKind::Bolt11Jit { .. } => {
 								let update = PaymentDetailsUpdate {
@@ -836,22 +843,30 @@ where
 					return Ok(());
 				}
 
-                // Unknown BOLT11 payments are stateless quotes. LDK's inbound
-                // key expiry uses block-time tolerance, so enforce our signed
-                // wall-clock deadline before revealing the preimage/claiming.
-                if self.payment_store.get(&payment_id).is_none() {
-                    if let PaymentPurpose::Bolt11InvoicePayment { payment_secret, .. } = &purpose {
-                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-                        let metadata = onion_fields.as_ref().and_then(|f| f.payment_metadata.as_deref());
-                        if !now.is_ok_and(|now| crate::payment::bolt11::stateless_quote_valid(
-                            metadata, &payment_hash.0, &payment_secret.0, amount_msat,
-                            &self.channel_manager.get_our_node_id(), now.as_secs(),
-                        )) {
-                            self.channel_manager.fail_htlc_backwards(&payment_hash);
-                            return Ok(());
-                        }
-                    }
-                }
+				// Unknown BOLT11 payments are stateless quotes. LDK's inbound
+				// key expiry uses block-time tolerance, so enforce our signed
+				// wall-clock deadline before revealing the preimage/claiming.
+				if self.payment_store.get(&payment_id).is_none() {
+					if let PaymentPurpose::Bolt11InvoicePayment { payment_secret, .. } = &purpose {
+						let now =
+							std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+						let metadata =
+							onion_fields.as_ref().and_then(|f| f.payment_metadata.as_deref());
+						if !now.is_ok_and(|now| {
+							crate::payment::bolt11::stateless_quote_valid(
+								metadata,
+								&payment_hash.0,
+								&payment_secret.0,
+								amount_msat,
+								&self.channel_manager.get_our_node_id(),
+								now.as_secs(),
+							)
+						}) {
+							self.channel_manager.fail_htlc_backwards(&payment_hash);
+							return Ok(());
+						}
+					}
+				}
 
 				log_info!(
 					self.logger,
@@ -1002,13 +1017,22 @@ where
 				// Stateless BOLT11 quotes have no pending payment record. Construct
 				// their receipt only after LDK reports that the funds were claimed.
 				let stateless_receipt = match &purpose {
-					PaymentPurpose::Bolt11InvoicePayment { payment_preimage: Some(preimage), payment_secret, .. } => {
-						Some(PaymentDetails::new(
-							payment_id,
-							PaymentKind::Bolt11 { hash: payment_hash, preimage: Some(*preimage), secret: Some(*payment_secret) },
-							Some(amount_msat), None, PaymentDirection::Inbound, PaymentStatus::Succeeded,
-						))
-					},
+					PaymentPurpose::Bolt11InvoicePayment {
+						payment_preimage: Some(preimage),
+						payment_secret,
+						..
+					} => Some(PaymentDetails::new(
+						payment_id,
+						PaymentKind::Bolt11 {
+							hash: payment_hash,
+							preimage: Some(*preimage),
+							secret: Some(*payment_secret),
+						},
+						Some(amount_msat),
+						None,
+						PaymentDirection::Inbound,
+						PaymentStatus::Succeeded,
+					)),
 					_ => None,
 				};
 
@@ -1061,7 +1085,11 @@ where
 						if let Some(receipt) = stateless_receipt {
 							self.payment_store.insert(receipt).map_err(|_| ReplayEvent())?;
 						} else {
-							log_error!(self.logger, "Claimed payment with ID {} couldn't be found in store", payment_id);
+							log_error!(
+								self.logger,
+								"Claimed payment with ID {} couldn't be found in store",
+								payment_id
+							);
 						}
 					},
 					Err(e) => {
@@ -1228,50 +1256,55 @@ where
 				is_announced,
 				params: _,
 			} => {
-                if self.config.work_admission.as_ref().is_some_and(|check| !check.allowed()) {
-                    log_info!(self.logger, "disk_low: refusing inbound channel");
-                    // No funding transaction exists for this unaccepted request.
-                    if let Err(error) = self.channel_manager.force_close_broadcasting_latest_txn(
-                        &temporary_channel_id, &counterparty_node_id, "disk_low".into(),
-                    ) {
-                        log_error!(self.logger, "Failed to reject inbound channel: {:?}", error);
-                    }
-                    return Ok(());
-                }
-                if self.config.channel_peer_allowlist.as_ref().is_some_and(|peers| !peers.contains(&counterparty_node_id)) {
-                    log_info!(self.logger, "HUB_ONLY_WHILE_LOCKABLE: refusing inbound channel from peer {}", counterparty_node_id);
-                    // Unaccepted request: no funding transaction exists yet.
-                    if let Err(error) = self.channel_manager.force_close_broadcasting_latest_txn(
-                        &temporary_channel_id, &counterparty_node_id, "HUB_ONLY_WHILE_LOCKABLE".into(),
-                    ) {
-                        log_error!(self.logger, "Failed to reject inbound channel: {:?}", error);
-                    }
-                    return Ok(());
-                }
+				if self.config.work_admission.as_ref().is_some_and(|check| !check.allowed()) {
+					log_info!(self.logger, "disk_low: refusing inbound channel");
+					// No funding transaction exists for this unaccepted request.
+					if let Err(error) = self.channel_manager.force_close_broadcasting_latest_txn(
+						&temporary_channel_id,
+						&counterparty_node_id,
+						"disk_low".into(),
+					) {
+						log_error!(self.logger, "Failed to reject inbound channel: {:?}", error);
+					}
+					return Ok(());
+				}
+				if self
+					.config
+					.channel_peer_allowlist
+					.as_ref()
+					.is_some_and(|peers| !peers.contains(&counterparty_node_id))
+				{
+					log_info!(
+						self.logger,
+						"HUB_ONLY_WHILE_LOCKABLE: refusing inbound channel from peer {}",
+						counterparty_node_id
+					);
+					// Unaccepted request: no funding transaction exists yet.
+					if let Err(error) = self.channel_manager.force_close_broadcasting_latest_txn(
+						&temporary_channel_id,
+						&counterparty_node_id,
+						"HUB_ONLY_WHILE_LOCKABLE".into(),
+					) {
+						log_error!(self.logger, "Failed to reject inbound channel: {:?}", error);
+					}
+					return Ok(());
+				}
 				// The lock covers snapshot + accept and is shared with outbound/JIT opens.
 				// Unaccepted inbound requests are not in list_channels; accepted unfunded
 				// channels are, so acceptance reserves capacity immediately.
-				let admission = self
-					.config
-					.channel_limits
-					.as_ref()
-					.map(|limits| limits.lock())
-					.transpose();
+				let admission =
+					self.config.channel_limits.as_ref().map(|limits| limits.lock()).transpose();
 				let cap_result = match &admission {
 					Err(error) => Err(*error),
-					Ok(_) => self
-						.config
-						.channel_limits
-						.as_ref()
-						.map_or(Ok(()), |limits| {
-							limits.check(
-								funding_satoshis,
-								self.channel_manager
-									.list_channels()
-									.iter()
-									.map(|c| c.channel_value_satoshis),
-							)
-						}),
+					Ok(_) => self.config.channel_limits.as_ref().map_or(Ok(()), |limits| {
+						limits.check(
+							funding_satoshis,
+							self.channel_manager
+								.list_channels()
+								.iter()
+								.map(|c| c.channel_value_satoshis),
+						)
+					}),
 				};
 				if let Err(error) = cap_result {
 					log_info!(
@@ -1317,7 +1350,11 @@ where
 				// BITSOV-PATCH: require anchors for every inbound channel. Otherwise LDK's
 				// non-anchor retry can bypass a rejected anchor-reserve check.
 				if !anchor_channel {
-					log_info!(self.logger, "Rejecting non-anchor inbound channel from peer {}", counterparty_node_id);
+					log_info!(
+						self.logger,
+						"Rejecting non-anchor inbound channel from peer {}",
+						counterparty_node_id
+					);
 					// Unaccepted request: no funding transaction exists yet.
 					self.channel_manager
 						.force_close_broadcasting_latest_txn(
@@ -1693,12 +1730,7 @@ where
 						.map_err(|_| ReplayEvent())?;
 				}
 
-				log_info!(
-					self.logger,
-					"Channel {} closed due to: {}",
-					channel_id,
-					reason
-				);
+				log_info!(self.logger, "Channel {} closed due to: {}", channel_id, reason);
 
 				let event = Event::ChannelClosed {
 					channel_id,
@@ -2132,141 +2164,253 @@ mod tests {
 
 #[cfg(test)]
 mod bitsov_stateless_tests {
-    use super::*;
-    use bitcoin::hashes::Hash;
-    use crate::wallet::bump::BumpWallet as LdkWallet;
+	use super::*;
+	use crate::wallet::bump::BumpWallet as LdkWallet;
+	use bitcoin::hashes::Hash;
 
-    #[derive(Default)]
-    struct ClaimLog(std::sync::Mutex<Vec<String>>);
-    impl crate::logger::LogWriter for ClaimLog {
-        fn log<'a>(&self, record: crate::logger::LogRecord<'a>) {
-            self.0.lock().unwrap().push(record.args.to_string());
-        }
-    }
+	#[derive(Default)]
+	struct ClaimLog(std::sync::Mutex<Vec<String>>);
+	impl crate::logger::LogWriter for ClaimLog {
+		fn log<'a>(&self, record: crate::logger::LogRecord<'a>) {
+			self.0.lock().unwrap().push(record.args.to_string());
+		}
+	}
 
-    #[tokio::test]
-    async fn stateless_settlement_persists_and_duplicate_cannot_erase_receipt() {
-        let dir = tempfile::tempdir().unwrap();
-        let accept_work = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let check = accept_work.clone();
-        let mut builder = crate::Builder::from_config(crate::Config {
-            work_admission: Some(crate::config::WorkAdmissionCheck::new(Arc::new(move || check.load(std::sync::atomic::Ordering::SeqCst)))),
-            ..Default::default()
-        });
-        let claim_log = Arc::new(ClaimLog::default());
-        builder.set_custom_logger(claim_log.clone());
-        builder.set_network(bitcoin::Network::Regtest);
-        builder.set_entropy_seed_bytes([43; 64]);
-        builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
-        // No node.start(), listeners, chain RPC, HTLC or funds: feed the real
-        // production event handler a settlement event in disposable storage.
-        // Upstream cfg(test) SqliteStore drops delete their directory; use
-        // the production filesystem store so restart really reopens persisted data.
-        let node = builder.build_with_fs_store().unwrap();
-        let handler = EventHandler::new(
-            node.event_queue.clone(), node.wallet.clone(),
-            Arc::new(BumpTransactionEventHandler::new(node.tx_broadcaster.clone(),
-                Arc::new(LdkWallet::new(node.wallet.clone(), node.logger.clone())),
-                node.keys_manager.clone(), node.logger.clone())),
-            node.channel_manager.clone(), node.connection_manager.clone(), node.output_sweeper.clone(),
-            node.network_graph.clone(), None, node.payment_store.clone(), node.peer_store.clone(),
-            None, node.onion_messenger.clone(), None, node.runtime.clone(), node.logger.clone(), node.config.clone(),
-        );
-        let quote = node.bolt11_payment().receive_stateless(2000,
-            &lightning_invoice::Bolt11InvoiceDescription::Direct(lightning_invoice::Description::new("quote".into()).unwrap()), 55).unwrap();
-        let deadline = quote.expires_at().unwrap().as_secs();
-        let valid = |metadata: Option<&[u8]>, now| crate::payment::bolt11::stateless_quote_valid(
-            metadata, quote.payment_hash().as_byte_array(), &quote.payment_secret().0, 2000, &node.node_id(), now);
-        let metadata = quote.payment_metadata().unwrap();
-        assert!(quote.features().unwrap().requires_payment_metadata());
-        assert!(valid(Some(metadata), deadline - 1));
-        assert!(!valid(Some(metadata), deadline));
-        assert!(!valid(Some(metadata), deadline + 1));
-        assert!(!valid(None, deadline - 1));
-        for index in [0, 11, 19, 20, metadata.len() - 1] {
-            let mut tampered = metadata.clone(); tampered[index] ^= 1;
-            assert!(!valid(Some(&tampered), deadline - 1));
-        }
-        let mut wrong_hash = quote.payment_hash().to_byte_array(); wrong_hash[0] ^= 1;
-        assert!(!crate::payment::bolt11::stateless_quote_valid(Some(metadata), &wrong_hash,
-            &quote.payment_secret().0, 2000, &node.node_id(), deadline - 1));
-        let hash = PaymentHash(quote.payment_hash().to_byte_array());
-        let id = PaymentId(hash.0);
-        let preimage = node.channel_manager.get_payment_preimage(hash, *quote.payment_secret()).unwrap();
-        assert!(node.payment(&id).is_none());
-        let purpose = PaymentPurpose::Bolt11InvoicePayment {
-            payment_preimage: Some(preimage), payment_secret: *quote.payment_secret(),
-        };
-        // Exercise the actual receiving branch, including a positive control.
-        // The log is emitted only after validation and directly before claim_funds.
-        let claimable = |invoice: &lightning_invoice::Bolt11Invoice, metadata: Option<Vec<u8>>| {
-            let hash = PaymentHash(invoice.payment_hash().to_byte_array());
-            LdkEvent::PaymentClaimable {
-                payment_hash: hash,
-                purpose: PaymentPurpose::Bolt11InvoicePayment {
-                    payment_preimage: Some(node.channel_manager.get_payment_preimage(hash, *invoice.payment_secret()).unwrap()),
-                    payment_secret: *invoice.payment_secret(),
-                },
-                amount_msat: 2000, receiver_node_id: Some(node.node_id()),
-                receiving_channel_ids: Vec::new(), claim_deadline: None,
-                onion_fields: Some({
-                    let mut fields = lightning::ln::channelmanager::RecipientOnionFields::secret_only(*invoice.payment_secret());
-                    fields.payment_metadata = metadata;
-                    fields
-                }), counterparty_skimmed_fee_msat: 0, payment_id: Some(PaymentId(hash.0)),
-            }
-        };
-        // Disk pressure must refuse before releasing a preimage or creating a receipt.
-        accept_work.store(false, std::sync::atomic::Ordering::SeqCst);
-        claim_log.0.lock().unwrap().clear();
-        handler.handle_event(claimable(&quote, Some(metadata.clone()))).await.unwrap();
-        assert!(!claim_log.0.lock().unwrap().iter().any(|line| line.starts_with("Received payment from payment hash")));
-        assert!(node.list_payments().is_empty());
-        assert!(claim_log.0.lock().unwrap().iter().any(|line| line.contains("disk_low")));
-        accept_work.store(true, std::sync::atomic::Ordering::SeqCst);
-        let expired = node.bolt11_payment().receive_stateless(2000,
-            &lightning_invoice::Bolt11InvoiceDescription::Direct(lightning_invoice::Description::new("expired".into()).unwrap()), 0).unwrap();
-        let mut tampered = metadata.clone(); tampered[11] ^= 1;
-        for (invoice, metadata) in [(&expired, expired.payment_metadata().cloned()), (&quote, None), (&quote, Some(tampered))] {
-            claim_log.0.lock().unwrap().clear();
-            handler.handle_event(claimable(invoice, metadata)).await.unwrap();
-            assert!(!claim_log.0.lock().unwrap().iter().any(|line| line.starts_with("Received payment from payment hash")), "invalid/expired quote reached claim path");
-            assert!(node.list_payments().is_empty());
-        }
-        claim_log.0.lock().unwrap().clear();
-        handler.handle_event(claimable(&quote, Some(metadata.clone()))).await.unwrap();
-        assert!(claim_log.0.lock().unwrap().iter().any(|line| line.starts_with("Received payment from payment hash")), "valid quote must reach claim path");
-        assert!(node.list_payments().is_empty(), "claimable quote must not invent a settlement receipt");
-        let claimed = LdkEvent::PaymentClaimed {
-            payment_hash: hash, purpose: purpose.clone(), amount_msat: 2000,
-            receiver_node_id: Some(node.node_id()), htlcs: Vec::new(),
-            sender_intended_total_msat: Some(2000), onion_fields: None, payment_id: Some(id),
-        };
-        handler.handle_event(claimed.clone()).await.unwrap();
-        let receipt = node.payment(&id).unwrap();
-        assert_eq!(receipt.status, PaymentStatus::Succeeded);
-        assert_eq!(receipt.direction, PaymentDirection::Inbound);
-        assert_eq!(receipt.amount_msat, Some(2000));
-        assert!(matches!(receipt.kind, PaymentKind::Bolt11 { preimage: Some(p), .. } if p == preimage));
-        handler.handle_event(claimed).await.unwrap();
-        assert_eq!(node.list_payments().len(), 1, "event replay duplicated receipt");
-        let duplicate = LdkEvent::PaymentClaimable {
-            payment_hash: hash, purpose, amount_msat: 2000, receiver_node_id: Some(node.node_id()),
-            receiving_channel_ids: Vec::new(), claim_deadline: None,
-            onion_fields: None, counterparty_skimmed_fee_msat: 0, payment_id: Some(id),
-        };
-        for _ in 0..2 {
-            handler.handle_event(duplicate.clone()).await.unwrap();
-            assert_eq!(node.payment(&id).unwrap().status, PaymentStatus::Succeeded,
-                "duplicate erased successful receipt and reopened single-use guard");
-        }
-        drop(handler);
-        drop(node);
-        let restarted = builder.build_with_fs_store().unwrap();
-        assert_eq!(restarted.payment(&id).unwrap().status, PaymentStatus::Succeeded);
-        assert!(crate::payment::bolt11::stateless_quote_valid(Some(metadata), &hash.0,
-            &quote.payment_secret().0, 2000, &restarted.node_id(), deadline - 1));
-    }
+	#[tokio::test]
+	async fn stateless_settlement_persists_and_duplicate_cannot_erase_receipt() {
+		let dir = tempfile::tempdir().unwrap();
+		let accept_work = Arc::new(std::sync::atomic::AtomicBool::new(true));
+		let check = accept_work.clone();
+		let mut builder = crate::Builder::from_config(crate::Config {
+			work_admission: Some(crate::config::WorkAdmissionCheck::new(Arc::new(move || {
+				check.load(std::sync::atomic::Ordering::SeqCst)
+			}))),
+			..Default::default()
+		});
+		let claim_log = Arc::new(ClaimLog::default());
+		builder.set_custom_logger(claim_log.clone());
+		builder.set_network(bitcoin::Network::Regtest);
+		builder.set_entropy_seed_bytes([43; 64]);
+		builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+		// No node.start(), listeners, chain RPC, HTLC or funds: feed the real
+		// production event handler a settlement event in disposable storage.
+		// Upstream cfg(test) SqliteStore drops delete their directory; use
+		// the production filesystem store so restart really reopens persisted data.
+		let node = builder.build_with_fs_store().unwrap();
+		let handler = EventHandler::new(
+			node.event_queue.clone(),
+			node.wallet.clone(),
+			Arc::new(BumpTransactionEventHandler::new(
+				node.tx_broadcaster.clone(),
+				Arc::new(LdkWallet::new(node.wallet.clone(), node.logger.clone())),
+				node.keys_manager.clone(),
+				node.logger.clone(),
+			)),
+			node.channel_manager.clone(),
+			node.connection_manager.clone(),
+			node.output_sweeper.clone(),
+			node.network_graph.clone(),
+			None,
+			node.payment_store.clone(),
+			node.peer_store.clone(),
+			None,
+			node.onion_messenger.clone(),
+			None,
+			node.runtime.clone(),
+			node.logger.clone(),
+			node.config.clone(),
+		);
+		let quote = node
+			.bolt11_payment()
+			.receive_stateless(
+				2000,
+				&lightning_invoice::Bolt11InvoiceDescription::Direct(
+					lightning_invoice::Description::new("quote".into()).unwrap(),
+				),
+				55,
+			)
+			.unwrap();
+		let deadline = quote.expires_at().unwrap().as_secs();
+		let valid = |metadata: Option<&[u8]>, now| {
+			crate::payment::bolt11::stateless_quote_valid(
+				metadata,
+				quote.payment_hash().as_byte_array(),
+				&quote.payment_secret().0,
+				2000,
+				&node.node_id(),
+				now,
+			)
+		};
+		let metadata = quote.payment_metadata().unwrap();
+		assert!(quote.features().unwrap().requires_payment_metadata());
+		assert!(valid(Some(metadata), deadline - 1));
+		assert!(!valid(Some(metadata), deadline));
+		assert!(!valid(Some(metadata), deadline + 1));
+		assert!(!valid(None, deadline - 1));
+		for index in [0, 11, 19, 20, metadata.len() - 1] {
+			let mut tampered = metadata.clone();
+			tampered[index] ^= 1;
+			assert!(!valid(Some(&tampered), deadline - 1));
+		}
+		let mut wrong_hash = quote.payment_hash().to_byte_array();
+		wrong_hash[0] ^= 1;
+		assert!(!crate::payment::bolt11::stateless_quote_valid(
+			Some(metadata),
+			&wrong_hash,
+			&quote.payment_secret().0,
+			2000,
+			&node.node_id(),
+			deadline - 1
+		));
+		let hash = PaymentHash(quote.payment_hash().to_byte_array());
+		let id = PaymentId(hash.0);
+		let preimage =
+			node.channel_manager.get_payment_preimage(hash, *quote.payment_secret()).unwrap();
+		assert!(node.payment(&id).is_none());
+		let purpose = PaymentPurpose::Bolt11InvoicePayment {
+			payment_preimage: Some(preimage),
+			payment_secret: *quote.payment_secret(),
+		};
+		// Exercise the actual receiving branch, including a positive control.
+		// The log is emitted only after validation and directly before claim_funds.
+		let claimable = |invoice: &lightning_invoice::Bolt11Invoice, metadata: Option<Vec<u8>>| {
+			let hash = PaymentHash(invoice.payment_hash().to_byte_array());
+			LdkEvent::PaymentClaimable {
+				payment_hash: hash,
+				purpose: PaymentPurpose::Bolt11InvoicePayment {
+					payment_preimage: Some(
+						node.channel_manager
+							.get_payment_preimage(hash, *invoice.payment_secret())
+							.unwrap(),
+					),
+					payment_secret: *invoice.payment_secret(),
+				},
+				amount_msat: 2000,
+				receiver_node_id: Some(node.node_id()),
+				receiving_channel_ids: Vec::new(),
+				claim_deadline: None,
+				onion_fields: Some({
+					let mut fields =
+						lightning::ln::channelmanager::RecipientOnionFields::secret_only(
+							*invoice.payment_secret(),
+						);
+					fields.payment_metadata = metadata;
+					fields
+				}),
+				counterparty_skimmed_fee_msat: 0,
+				payment_id: Some(PaymentId(hash.0)),
+			}
+		};
+		// Disk pressure must refuse before releasing a preimage or creating a receipt.
+		accept_work.store(false, std::sync::atomic::Ordering::SeqCst);
+		claim_log.0.lock().unwrap().clear();
+		handler.handle_event(claimable(&quote, Some(metadata.clone()))).await.unwrap();
+		assert!(!claim_log
+			.0
+			.lock()
+			.unwrap()
+			.iter()
+			.any(|line| line.starts_with("Received payment from payment hash")));
+		assert!(node.list_payments().is_empty());
+		assert!(claim_log.0.lock().unwrap().iter().any(|line| line.contains("disk_low")));
+		accept_work.store(true, std::sync::atomic::Ordering::SeqCst);
+		let expired = node
+			.bolt11_payment()
+			.receive_stateless(
+				2000,
+				&lightning_invoice::Bolt11InvoiceDescription::Direct(
+					lightning_invoice::Description::new("expired".into()).unwrap(),
+				),
+				0,
+			)
+			.unwrap();
+		let mut tampered = metadata.clone();
+		tampered[11] ^= 1;
+		for (invoice, metadata) in [
+			(&expired, expired.payment_metadata().cloned()),
+			(&quote, None),
+			(&quote, Some(tampered)),
+		] {
+			claim_log.0.lock().unwrap().clear();
+			handler.handle_event(claimable(invoice, metadata)).await.unwrap();
+			assert!(
+				!claim_log
+					.0
+					.lock()
+					.unwrap()
+					.iter()
+					.any(|line| line.starts_with("Received payment from payment hash")),
+				"invalid/expired quote reached claim path"
+			);
+			assert!(node.list_payments().is_empty());
+		}
+		claim_log.0.lock().unwrap().clear();
+		handler.handle_event(claimable(&quote, Some(metadata.clone()))).await.unwrap();
+		assert!(
+			claim_log
+				.0
+				.lock()
+				.unwrap()
+				.iter()
+				.any(|line| line.starts_with("Received payment from payment hash")),
+			"valid quote must reach claim path"
+		);
+		assert!(
+			node.list_payments().is_empty(),
+			"claimable quote must not invent a settlement receipt"
+		);
+		let claimed = LdkEvent::PaymentClaimed {
+			payment_hash: hash,
+			purpose: purpose.clone(),
+			amount_msat: 2000,
+			receiver_node_id: Some(node.node_id()),
+			htlcs: Vec::new(),
+			sender_intended_total_msat: Some(2000),
+			onion_fields: None,
+			payment_id: Some(id),
+		};
+		handler.handle_event(claimed.clone()).await.unwrap();
+		let receipt = node.payment(&id).unwrap();
+		assert_eq!(receipt.status, PaymentStatus::Succeeded);
+		assert_eq!(receipt.direction, PaymentDirection::Inbound);
+		assert_eq!(receipt.amount_msat, Some(2000));
+		assert!(
+			matches!(receipt.kind, PaymentKind::Bolt11 { preimage: Some(p), .. } if p == preimage)
+		);
+		handler.handle_event(claimed).await.unwrap();
+		assert_eq!(node.list_payments().len(), 1, "event replay duplicated receipt");
+		let duplicate = LdkEvent::PaymentClaimable {
+			payment_hash: hash,
+			purpose,
+			amount_msat: 2000,
+			receiver_node_id: Some(node.node_id()),
+			receiving_channel_ids: Vec::new(),
+			claim_deadline: None,
+			onion_fields: None,
+			counterparty_skimmed_fee_msat: 0,
+			payment_id: Some(id),
+		};
+		for _ in 0..2 {
+			handler.handle_event(duplicate.clone()).await.unwrap();
+			assert_eq!(
+				node.payment(&id).unwrap().status,
+				PaymentStatus::Succeeded,
+				"duplicate erased successful receipt and reopened single-use guard"
+			);
+		}
+		drop(handler);
+		drop(node);
+		let restarted = builder.build_with_fs_store().unwrap();
+		assert_eq!(restarted.payment(&id).unwrap().status, PaymentStatus::Succeeded);
+		assert!(crate::payment::bolt11::stateless_quote_valid(
+			Some(metadata),
+			&hash.0,
+			&quote.payment_secret().0,
+			2000,
+			&restarted.node_id(),
+			deadline - 1
+		));
+	}
 }
 
 #[cfg(test)]
