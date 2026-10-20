@@ -1,7 +1,11 @@
 # Bounded LSPS2 funding pilot (L1)
 
 A fresh embedded-LDK node can request a funding invoice through a configured
-LSP, receive a JIT channel and spend the resulting usable Lightning balance.
+LSP and, subject to the inbound anchor/reserve requirements below, receive a JIT
+channel and spend the resulting usable Lightning balance. A fresh node with an
+empty on-chain wallet must use the selected provider with `trust_no_reserve=true`
+and an anchor channel funded with at most 200,000 sats, or first fund its on-chain
+anchor reserve (default 25,000 sats).
 Funding buys no communication rights: the first message and every later act
 still need their own settled, recipient-bound, single-use payment.
 
@@ -61,6 +65,12 @@ to the full funding amount, not the pushed balance or invoice amount. A
 200,001-sat or larger inbound channel requires the normal anchor reserve
 (default 25,000 sats) and is rejected on an empty wallet. Outbound channels
 and unselected providers receive no reserve waiver, even when their flag is true.
+Every inbound or JIT channel must be an anchor channel and either have the normal
+on-chain anchor reserve (default 25,000 sats per channel) available or qualify
+for the selected-provider waiver above. Otherwise it is refused. Previously,
+LDK could fall back to a non-anchor channel after an anchor-reserve rejection;
+that fallback is now refused too. External peers that can only open non-anchor
+channels are refused by every BitSov node, including the hub.
 Switching providers requires restart and updates this trust list; it does not move existing funds.
 The waiver gives up the local emergency reserve for qualifying inbound channels,
 so closing transaction confirmation depends on the trusted hub. Larger inbound
@@ -163,8 +173,8 @@ or contact graph is written on-chain; no global provider graph is introduced.
 
 - A no-channel wallet still needs funding and chain synchronization. LDK's default
   anchor emergency reserve (25,000 sats per applicable channel) is preserved.
-  By default no reserve waiver is enabled and an entirely empty wallet may
-  reject the channel. The per-provider `trust_no_reserve` opt-in above waives
+  By default no reserve waiver is enabled and an entirely empty wallet
+  rejects the channel. The per-provider `trust_no_reserve` opt-in above waives
   this reserve only for inbound channels of at most 200,000 sats from the selected
   provider; connectivity, chain sync and the other acceptance checks still apply.
 - Selecting an LSPS2 peer opts into LDK's trusted zero-conf peer behavior. Until
@@ -260,7 +270,8 @@ It is deducted only from the JIT **funding** payment. The example charges
 app. Overprovisioning of 1,000,000 ppm adds another 99,000,000 msat of hub capital
 to the channel, providing inbound capacity for later receipts, less reserves.
 Hub on-chain funds, transaction fees and applicable anchor reserves are required;
-app anchor reserves are not waived.
+the app anchor reserve is not waived in this example (`trust_no_reserve` defaults
+to `false`).
 
 LDK initially creates service channels with zero forwarding fees. After
 `ChannelReady`, BitSov applies the configured base and ppm with

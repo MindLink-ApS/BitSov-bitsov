@@ -125,6 +125,15 @@ fn request_amount(
 	home: &crate::Node,
 	amount: u64,
 ) -> (ChannelId, Vec<LdkEvent>) {
+	request_with_config(opener, home, amount, None)
+}
+
+fn request_with_config(
+	opener: &crate::Node,
+	home: &crate::Node,
+	amount: u64,
+	config: Option<lightning::util::config::UserConfig>,
+) -> (ChannelId, Vec<LdkEvent>) {
 	let init = |n: &crate::Node| Init {
 		features: n.channel_manager.init_features(),
 		networks: None,
@@ -139,7 +148,7 @@ fn request_amount(
 		.unwrap();
 	opener
 		.channel_manager
-		.create_channel(home.node_id(), amount, 0, 7, None, None)
+		.create_channel(home.node_id(), amount, 0, 7, None, config)
 		.unwrap();
 	let msg = opener
 		.channel_manager
@@ -164,6 +173,57 @@ fn request_amount(
 		"{events:?}"
 	);
 	(msg.common_fields.temporary_channel_id, events)
+}
+
+/// Removing the inbound anchor guard must fail even for a reserve/zero-conf trusted peer.
+#[tokio::test]
+async fn inbound_anchor_only_refuses_non_anchor_even_from_trusted_peer() {
+	for zero_conf in [false, true] {
+		for anchor in [false, true] {
+			let (_opener_dir, opener, _) = node(88, None);
+			let (_home_dir, home, _) = node_with_anchor_config(
+				89,
+				None,
+				None,
+				if zero_conf { vec![opener.node_id()] } else { Vec::new() },
+				AnchorChannelsConfig {
+					trusted_peers_no_reserve: vec![opener.node_id()],
+					..Default::default()
+				},
+			);
+			let config = if anchor {
+				None // Also prove the unchanged outbound default proposes anchors.
+			} else {
+				let mut config = opener.channel_manager.get_current_config();
+				config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = false;
+				Some(config)
+			};
+			let (id, events) = request_with_config(&opener, &home, 100_000, config);
+			assert!(matches!(&events[0], LdkEvent::OpenChannelRequest { channel_type, .. }
+				if channel_type.requires_anchors_zero_fee_htlc_tx() == anchor));
+			for event in events {
+				handler(&home).handle_event(event).await.unwrap();
+			}
+			assert_eq!(has_channel_with(&home, &opener), anchor);
+			let messages = home.channel_manager.get_and_clear_pending_msg_events();
+			assert_eq!(
+				messages.iter().any(|event| matches!(event, MessageSendEvent::SendAcceptChannel { .. })),
+				anchor
+			);
+			if !anchor {
+				assert!(messages.iter().any(|event| matches!(event,
+					MessageSendEvent::HandleError {
+						action: lightning::ln::msgs::ErrorAction::SendErrorMessage { msg }, ..
+					} if msg.channel_id == id)));
+				assert!(home.channel_manager
+					.accept_inbound_channel(&id, &opener.node_id(), 8, None).is_err(),
+					"refused request must be removed, not merely deferred");
+			} else {
+				let channels = home.channel_manager.list_channels();
+				assert_eq!(channels[0].confirmations_required == Some(0), zero_conf);
+			}
+		}
+	}
 }
 
 fn has_channel_with(home: &crate::Node, peer: &crate::Node) -> bool {

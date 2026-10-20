@@ -18,6 +18,8 @@ async fn production_hub_private_forwarding_is_opt_in() {
         for node in [a.node(), b.node(), hub.node()] {
             assert!(node.config().node_alias.is_none());
         }
+        // Every inbound anchor acceptor needs its on-chain reserve.
+        chain.fund(b.node()).await;
         chain.fund(a.node()).await;
         chain.fund(hub.node()).await;
         a.open_channel(&hub_id, &hub_addr, 1_000_000, false, None)

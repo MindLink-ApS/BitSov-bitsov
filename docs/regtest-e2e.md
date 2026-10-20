@@ -25,6 +25,8 @@ There is no A–B channel: every A↔B payment pays C's positive forwarding fee
 (LDK default 1,000 msat base, 0 ppm, read from C's channels at runtime and
 cross-checked with the policy A and B received). A opens A→C through
 `LdkProvider::open_channel` (supported path, no explicit rate); C opens C→B.
+All three wallets are funded on-chain before opening: B needs its anchor reserve
+even though C provides the Lightning channel capacity.
 
 C is built directly on `ldk-node`, not `LdkProvider`. Stock LDK refuses to
 forward into an unannounced channel (`PrivateChannelForward`) unless
@@ -149,7 +151,7 @@ removed.
 ## Steps and assertions
 
 1. **#101 refusal:** `open_channel(.., Some(3.0))` returns
-   `PaymentNotDispatched("LDK cannot enforce a per-channel funding fee rate")`,
+   `PaymentNotDispatched("LDK cannot enforce an exact caller-supplied funding fee rate; use funding_priority")`,
    with no channel and an empty mempool.
 2. **Channels:** A→C and C→B at 1,000,000 sat via the estimator (156 sat /
    153 vB each), six confirmations, usable on both ends; on-chain change checked.
@@ -189,7 +191,7 @@ so asynchronous wallet sync cannot turn the expected refusal into a 503.
 | Explicit funding rate | Refused pre-dispatch (#101); only the estimator path opens channels. |
 | Funding cost | Actual on-chain fee (156 sat / 153 vB per channel); absent from mock accounting. |
 | Channel readiness | Needs wallet/indexer sync, mined confirmations and `is_usable` on both ends. |
-| Inbound anchor channel | A node with no on-chain funds refuses an inbound anchor channel (`0/25000 sats` reserve); LDK then reopens it as non-anchor. |
+| Inbound anchor channel | An unfunded acceptor refuses an inbound anchor channel (`0/25000 sats` reserve) unless the selected-provider reserve waiver applies. The non-anchor retry is also refused; legacy fixtures must fund the acceptor before opening. |
 | Forwarding | Private-channel forwarding needs LSPS2-service/async-server mode on the router. |
 | Routing fees | Positive (1,000 msat per 2,001-msat payment through C); the mock routes at zero. |
 | Immediate payment result | `Pending`, no preimage/fee yet (`/payments/pay` returns `preimage: ""`); settlement must be polled. |
@@ -249,3 +251,70 @@ The production [hub LSPS2 regression](three-node-paid-e2e.md#hub-lsps2-provider)
 now exercises actual JIT service/client negotiation, overprovisioning and
 stateless admission with a configured positive forwarding tariff. It is separate
 from the legacy routing-only service fixture and the #225 opt-in control above.
+
+## Option A Phase 0: starter liquidity PASS markers
+
+Four ignored `regtest-e2e` tests in `three_node::lsps2_service::phase0_*`
+exercise production `LdkProvider` selection and push funding with fresh clients.
+Only the hub receives on-chain funds. Run with the same Core/electrs prerequisites
+and isolated runner described above:
+
+```sh
+BITCOIND_EXE=/path/to/bitcoind ELECTRS_EXE=/path/to/electrs \
+REGTEST_TEST=regtest_e2e::three_node::lsps2_service::phase0_ \
+  scripts/regress/regtest_e2e.sh
+```
+
+Acceptance target: **4 passed, 0 failed**, with these `PHASE0 PASS` markers:
+
+- `push-zero-conf`: a private 100,000-sat channel pushes 10,000 sats to a
+  zero-sat on-chain wallet. Both ends are usable with zero required/actual
+  confirmations and funding still in Core's mempool. Spendable outbound is
+  approximately 10,000 sats, less the negotiated channel punishment reserve;
+  outbound plus that reserve equals the push exactly.
+- `connect-reuse`: the client has no listener and initiates the LN connection.
+  The hub opens using `127.0.0.1:0`, which fails to connect before the client's
+  connection exists. `vendor/ldk-node/src/lib.rs::open_channel_inner` already
+  calls `connection.rs::connect_peer_if_necessary`, which returns before
+  dialing an already connected peer. **No vendor patch is needed.**
+- `spend-push`: the client pays the hub 1,000 sats from its pushed balance,
+  settling at both ends with zero routing fee before any confirmation.
+- `reject-opt-out`, `reject-non-selected`, `reject-above-cap`: fresh empty
+  clients reject for insufficient anchor reserves when trust is false, the
+  opener is not selected (even with its own trust flag true), or the selected
+  trusted opener offers 200,001 sats. Each asserts the explicit reserve refusal,
+  no surviving channel and no funding broadcast.
+
+No blocks are mined after opening in any scenario. This is a regtest proof for
+the signet-first design, not a signet deployment or an app/message test. Startup
+provider connection (N2), N3 and hub H1–H6 remain out of scope.
+
+**Observed on 2026-10-20 after the Atlas ruling: 4 passed, 0 failed.** All four
+Phase 0 items pass, including all three negative controls' unchanged final
+rejection, no-surviving-channel and no-funding-broadcast assertions. The positive
+scenario has 9,000 sats spendable plus 1,000 sats punishment reserve.
+
+BitSov now refuses every non-anchor inbound channel in the vendored
+`OpenChannelRequest` handler, next to the anchor-reserve check. This includes
+originally non-anchor requests and LDK's `maybe_downgrade_channel_features`
+retries after an anchor refusal: the retry cannot bypass the reserve-waiver
+gate. The rule applies to clients and services alike. The 200,000-sat cap,
+selected-provider `trust_no_reserve` semantics, zero-conf trust and outbound
+anchor defaults are unchanged. The global inbound rule removes the previous
+non-anchor fallback for empty-wallet clients and for external non-anchor-only peers.
+
+The full `regtest_e2e::three_node::lsps2_service::` module also passes:
+**5 passed, 0 failed**, including hub JIT funding, disconnect/restart recovery
+and stateless admission. No service exception is used. Legacy routing, paid-flow,
+payment, wallet-move and recovery fixtures now fund acceptors on-chain before
+channel admission; the Phase 0 tests and existing LSPS2 service fixture are unchanged.
+The vendored LDK Node library suite passes **166 tests**, including a new
+runtime regression that rejects non-anchor requests from trusted peers, removes
+the pending request and preserves anchor acceptance with and without zero-conf
+trust.
+
+The run also exposed a funding-result bug: the production opener returns
+`UserChannelId(n)` but reconciliation parsed it as bare decimal. Reconciliation
+now shares close's existing ID parser, with a round-trip regression test. This
+fix enables the production push API to report its actual funding outcome; it
+does not change channel selection or reserve policy.

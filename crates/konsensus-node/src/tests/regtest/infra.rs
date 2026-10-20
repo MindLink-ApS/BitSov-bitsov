@@ -192,7 +192,7 @@ impl Chain {
             matches!(
                 &error,
                 konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(m)
-                    if m.contains("per-channel funding fee rate")
+                    if m == "LDK cannot enforce an exact caller-supplied funding fee rate; use funding_priority"
             ),
             "{error}"
         );

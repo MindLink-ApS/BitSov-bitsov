@@ -26,7 +26,30 @@ works, use `move-home`. Keep the old node disabled throughout recovery.
    on-chain wallet balance are checked. Normal start remains fenced.
 7. The separate verification phase creates the **canonical new live store**,
    enables only the selected LSPS2 hub, and presents a fresh-channel funding
-   invoice. Pay it from another wallet. The default gross amount is 20,000 sats,
+   invoice. Before paying it, the new store must see at least 25,000 sats of
+   available on-chain anchor reserve, or you must opt in to the selected hub's
+   reserve waiver. The default is `trust_no_reserve = false`; an external sweep
+   destination or a recovered balance below 25,000 sats may leave no reserve.
+   A fresh bitcoind-backed verification wallet starts at the current tip, so
+   earlier same-seed sweep funds are not automatically visible either.
+
+   For the config route, set `trust_no_reserve = true` in the existing
+   `[[lightning.liquidity.providers]]` entry whose `node_id` matches
+   `lightning.liquidity.selected_provider`, keeping
+   `lightning.liquidity.enabled = true`. Do this before recovery, or Ctrl-C,
+   edit `NEW_DIRECTORY/konsensus.toml`, and resume
+   `konsensus recover --config NEW_DIRECTORY/konsensus.toml --confirm` with the
+   same backup/destination/fee and other plan options. Keep the same selected
+   hub and new live store. There is no equivalent `recover` CLI flag or live
+   config reload. The waiver requires an inbound anchor channel whose **full
+   funding amount is at most 200,000 sats**; arrange this with the hub operator.
+   The invoice amount does not control that capacity. Trusting the hub means
+   trusting it to confirm closes for these small starter channels.
+   `recover` exposes no on-chain funding-address command/API for this store.
+   Without visible reserve or a qualifying waiver, recovery and normal startup
+   stay fenced. See [the full config example](../v2/RECOVERY.md#4-verify-a-fresh-channel-before-normal-startup).
+
+   Pay the invoice from another wallet. The default gross amount is 20,000 sats,
    with a 2,000-sat fee cap; use `--self-test-funding-sats` and
    `--self-test-max-fee-sats` to change these bounds. The exact quote needs typed
    consent. These funds are not taken from the on-chain sweep. After it settles,
