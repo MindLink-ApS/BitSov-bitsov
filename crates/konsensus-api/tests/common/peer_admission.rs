@@ -1,5 +1,7 @@
 //! Transport probe for admission ordering. Storage and registry remain real.
+use crate::common;
 use async_trait::async_trait;
+use konsensus_api::state::AppState;
 use konsensus_core::{
     envelope::UkmEnvelope,
     traits::{MessageTransport, TransportError},
@@ -91,4 +93,29 @@ impl MessageTransport for AdmissionTransport {
         self.live.lock().unwrap().2 = true;
         self.calls.lock().unwrap().push("supervise");
     }
+}
+
+#[allow(dead_code)] // Pairing tests construct a custom state with this probe.
+pub fn state(
+    storage: Arc<dyn Storage>,
+    dial: &'static str,
+) -> (Arc<AppState>, Arc<AdmissionTransport>) {
+    let base = common::test_state_with_storage(storage);
+    let transport = Arc::new(AdmissionTransport {
+        storage: base.storage.clone(),
+        registry: base.peer_registry.clone(),
+        calls: Mutex::new(vec![]),
+        dial_started: Default::default(),
+        finish_dial: Default::default(),
+        live: Default::default(),
+        dial,
+        supervised_addrs: Default::default(),
+    });
+    (
+        Arc::new(AppState {
+            transport: transport.clone(),
+            ..(*base).clone()
+        }),
+        transport,
+    )
 }

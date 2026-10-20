@@ -345,27 +345,26 @@ async fn remove_peer(
 
     // Keep removal ordered with admission through transport and durable cleanup.
     let mut registry = state.peer_registry.write().await;
-    let removed = registry.remove(&node_id).is_some();
-
-    if !removed {
+    if registry.get(&node_id).is_none() {
         return Err(ApiError::NotFound(format!("peer {node_id_hex} not found")));
     }
 
+    // Commit removal before touching live state. On a storage error the
+    // contact and its supervision remain intact, matching restart behavior.
+    state
+        .storage
+        .delete_peer(&node_id)
+        .await
+        .map_err(|e| ApiError::Storage(e.to_string()))?;
+    registry.remove(&node_id);
+
     // Remove from transport whitelist and disconnect (Principle 3).
-    // Stop retries even if removing the durable record below fails.
     state.transport.remove_from_whitelist(&node_id).await;
     if state.transport.is_connected(&node_id).await {
         if let Err(e) = state.transport.disconnect(&node_id).await {
             tracing::warn!(peer = %node_id_hex, error = %e, "failed to disconnect removed peer");
         }
     }
-
-    // Removal must survive restart, or startup supervision would dial it again.
-    state
-        .storage
-        .delete_peer(&node_id)
-        .await
-        .map_err(|e| ApiError::Storage(e.to_string()))?;
 
     state.audit_log.record(
         events::PEER_REMOVED,

@@ -6,8 +6,8 @@ use konsensus_api::{
     state::AppState,
 };
 use konsensus_core::types::NodeId;
-use konsensus_storage::{SqliteStorage, Storage};
-use std::sync::{Arc, Mutex};
+use konsensus_storage::SqliteStorage;
+use std::sync::Arc;
 
 fn request() -> AddPeerRequest {
     AddPeerRequest {
@@ -17,29 +17,7 @@ fn request() -> AddPeerRequest {
         auto_connect: true,
     }
 }
-fn state(
-    storage: Arc<dyn Storage>,
-    dial: &'static str,
-) -> (Arc<AppState>, Arc<probe::AdmissionTransport>) {
-    let base = common::test_state_with_storage(storage);
-    let transport = Arc::new(probe::AdmissionTransport {
-        storage: base.storage.clone(),
-        registry: base.peer_registry.clone(),
-        calls: Mutex::new(vec![]),
-        dial_started: Default::default(),
-        finish_dial: Default::default(),
-        live: Default::default(),
-        dial,
-        supervised_addrs: Default::default(),
-    });
-    (
-        Arc::new(AppState {
-            transport: transport.clone(),
-            ..(*base).clone()
-        }),
-        transport,
-    )
-}
+use probe::state;
 
 #[tokio::test]
 async fn admission_persists_before_live_changes_and_supervises_after_dial() {

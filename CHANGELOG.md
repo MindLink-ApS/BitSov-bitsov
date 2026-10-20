@@ -5,6 +5,9 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Persist peer deletion before revoking live admission, so storage errors leave
+  registry, transport and restart state consistent.
+
 - Dial newly admitted peers outside the registry lock; generation checks keep
   concurrent removal or replacement authoritative without stalling message gates.
 
