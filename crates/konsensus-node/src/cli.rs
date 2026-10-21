@@ -654,10 +654,8 @@ impl Cli {
                     options.push("--encrypt");
                 }
             }
-            Command::ApproveReplacement { mnemonic, .. } => {
-                if mnemonic.is_some() {
-                    options.push("--mnemonic");
-                }
+            Command::ApproveReplacement { mnemonic, .. } if mnemonic.is_some() => {
+                options.push("--mnemonic");
             }
             _ => {}
         }
