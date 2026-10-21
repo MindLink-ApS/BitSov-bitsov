@@ -1972,8 +1972,10 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
     use konsensus_message::{ReachabilityMode, TransportConfig};
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
-        time::Duration,
+        time::{Duration, Instant},
     };
+    const FLOOD_REQUESTS: usize = 5000;
+    const MAX_HANDLING_TIME: Duration = Duration::from_secs(5);
     let make = || {
         let (_, identity) = NodeIdentity::generate().unwrap();
         let id = *identity.node_id();
@@ -2009,6 +2011,7 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
         tokio::spawn(async move {
             let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
             let mut limits = crate::invoice_refusals::RefusalLimits::default();
+            let mut max_handling_time = Duration::ZERO;
             while let Some(event) = target.recv_control().await {
                 if let ControlEvent::InvoiceRequested {
                     peer_id,
@@ -2019,6 +2022,7 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
                     source_ip,
                 } = event
                 {
+                    let started = Instant::now();
                     handle_invoice_requested_gated(
                         &peer_id,
                         &request_id,
@@ -2039,15 +2043,23 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
                         0,
                     )
                     .await;
-                    handled.fetch_add(1, Ordering::Release);
+                    max_handling_time = max_handling_time.max(started.elapsed());
+                    if handled.fetch_add(1, Ordering::Release) + 1 == FLOOD_REQUESTS + 1 {
+                        break;
+                    }
                 }
             }
+            max_handling_time
         })
     };
     // The attacker never drains its control receiver. Unbounded replies would
     // eventually stop its reader and fill the recipient's TCP send buffer.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        for i in 0..5000 {
+    // Completion requires all requests to be handled and the healthy peer's
+    // reply. The outer hang guard tolerates low throughput on slow runners;
+    // the separate per-call bound catches finite socket-write stalls (e.g. an
+    // inline send_frame waiting for its 30 s timeout instead of queueing).
+    let max_handling_time = tokio::time::timeout(Duration::from_secs(120), async {
+        for i in 0..FLOOD_REQUESTS {
             attacker
                 .send_frame(
                     &recipient,
@@ -2060,7 +2072,7 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
                 .await
                 .unwrap();
         }
-        while handled.load(Ordering::Acquire) < 5000 {
+        while handled.load(Ordering::Acquire) < FLOOD_REQUESTS {
             tokio::task::yield_now().await;
         }
         assert!(
@@ -2086,13 +2098,19 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
                 break;
             }
         }
+        // Join after the healthy reply so its handling time is included too,
+        // and a handler panic cannot silently pass the latency assertion.
+        handler.await.expect("invoice request handler panicked")
     })
     .await
     .expect("unpaid flood stalled the global control loop or another peer");
+    assert!(
+        max_handling_time < MAX_HANDLING_TIME,
+        "single invoice request stalled the global control loop: {max_handling_time:?} (limit {MAX_HANDLING_TIME:?})"
+    );
     let (events, totals) = membrane.read(None, 100);
     assert!(events.len() <= 1);
     assert!(totals.refused <= 1);
-    handler.abort();
     attacker.shutdown();
     healthy.shutdown();
     target.shutdown();
