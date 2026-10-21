@@ -47,7 +47,8 @@ recompiled on every test. The job then deleted `libldk_node-*` before
 ## What changed
 
 - Pull-request concurrency still cancels a superseded run. Pushes, tags, and
-  merge-queue runs are not cancelled.
+  merge-queue runs are not cancelled. Required CI does not subscribe to label
+  events; adding or removing labels cannot replace a required check result.
 - Docs-only and `pm/**` changes skip the Rust jobs. `Frontend Build` has no
   `if` and always runs, so a pull request still reports a completed check.
   Workflow-level `paths-ignore` is not used on `pull_request` (a skipped
@@ -59,13 +60,17 @@ recompiled on every test. The job then deleted `libldk_node-*` before
   builds without debuginfo (`CARGO_PROFILE_*_DEBUG=0`, assertions unchanged),
   and deletes `ldk-node` artifacts only when free disk drops under 10GB.
 - PostgreSQL tests run on storage-path pushes to `main`, the merge queue,
-  `workflow_dispatch`, and non-draft pull requests labeled `full-ci`. The job
-  name is unchanged. It is not a required check; a skipped run is not a pass.
+  `workflow_dispatch`, and when `full-ci` is added to a non-draft PR. Other
+  labels cannot restart or cancel the suite. The job name is unchanged. It is
+  not a required check; a skipped run is not a pass.
 - The release matrix stays on `v*` tags only.
 - `Cargo Audit` runs when `Cargo.lock`, `.cargo/audit.toml`, `SECURITY.md`, or
-  the security-key scripts change, on `v*` tags, in the merge queue, and with
-  `full-ci`. The daily security scan runs `cargo audit` against the default
-  branch every day at 06:00 UTC. The check name is unchanged.
+  the security-key scripts change, on every main push, on `v*` tags, in the
+  merge queue, and on PR code pushes with an existing `full-ci` label. The
+  daily security scan runs `cargo audit` against the default
+  branch every day at 06:00 UTC. The check name is unchanged. Both path-filter
+  steps are PR-only; main, tags, and the merge queue run all CI jobs without
+  classifying files. The release matrix remains tag-only.
 - Vendored `ldk-node` security regressions still run on Rust pull requests.
 
 ## Estimate
@@ -96,6 +101,14 @@ and **2 → 0** for PostgreSQL when that workflow used to run. About **9–11
 minutes saved per pull request**. A Dependabot pull request still runs Cargo
 Audit. A docs-only or `pm/`-only pull request stays near 4 minutes.
 
-Label a pull request `full-ci` to run PostgreSQL and Cargo Audit before merge.
-The label is created on the first pull-request run of this workflow; if that
-step cannot create it, add a label named `full-ci` by hand.
+Add `full-ci` to a non-draft pull request to run PostgreSQL and the separate
+`Full CI Cargo Audit (optional)` check before merge. These optional workflows
+only handle PR `labeled` events and start runners only when the added label
+is `full-ci`. Remove and re-add it to request another optional run. Keep both
+optional checks out of branch protection. Required CI is unaffected by label
+events and reads an existing `full-ci` label on its next code push.
+
+Create the repository label once manually if it does not already exist.
+CI does not create `full-ci`. No workflow grants `actions: write` or
+`issues: write`; the cache actions use the Actions runtime credentials.
+All sccache action references are pinned to the v0.0.11 commit SHA.

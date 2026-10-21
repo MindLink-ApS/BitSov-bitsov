@@ -7,11 +7,10 @@ name: PostgreSQL Tests
 # a required check (or fold it into ci.yml) once it has been green for a while.
 #
 # It runs on pushes to main that touch the storage paths below, on the merge
-# queue, on manual dispatch, and on non-draft pull requests labeled `full-ci`.
-# Ordinary pull requests schedule the workflow and skip the job, which reports
-# success and spends no runner minutes. That skip is not a passing Postgres
-# suite. If `PostgreSQL ignored tests` is a required check, remove it from
-# branch protection.
+# queue, on manual dispatch, and when `full-ci` is added to a non-draft PR.
+# Remove and re-add `full-ci` to request another PR run. Other labels skip
+# the job without cancelling an in-flight run. A skip is not a passing suite.
+# If `PostgreSQL ignored tests` is required, remove it from branch protection.
 #
 # Test selection is by name, not by list: every ignored konsensus-storage test
 # whose path contains `postgres` runs (e.g. everything in src/postgres.rs,
@@ -39,16 +38,16 @@ on:
   merge_group:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    types: [labeled]
   workflow_dispatch:
 
 permissions:
   contents: read
-  actions: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Isolate unrelated label events from an in-flight full-ci run.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.label.name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -56,14 +55,13 @@ env:
 jobs:
   postgres:
     name: PostgreSQL ignored tests
-    # Ordinary pull requests skip the job (no runner, no minutes). Merge queue,
-    # main pushes that matched the path filter, manual runs, and `full-ci`
-    # labels execute the suite. Drafts never do.
+    # Merge queue, matching main pushes, manual runs, and adding `full-ci`
+    # execute the suite. Other labels and draft PRs never do.
     if: >-
       (github.event_name == 'push' ||
        github.event_name == 'merge_group' ||
        github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci'))) &&
+       (github.event_name == 'pull_request' && github.event.label.name == 'full-ci')) &&
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -98,7 +96,7 @@ jobs:
           cache-workspace-crates: "true"
 
       - name: sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Enable sccache for Cargo
         run: |

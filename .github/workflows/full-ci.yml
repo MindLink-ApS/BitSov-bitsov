@@ -1,0 +1,51 @@
+name: Full CI extras
+
+# Optional label-triggered audit. Never add this job to required checks or
+# reuse the required Cargo Audit / Rust Check & Test names here.
+# PostgreSQL's optional label run lives in postgres.yml.
+on:
+  pull_request:
+    branches: [main]
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Unrelated labels cannot cancel or replace a pending full-ci run.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.label.name }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Full CI Cargo Audit (optional)
+    if: github.event.label.name == 'full-ci' && github.event.pull_request.draft == false
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Security key ↔ policy consistency
+        run: bash scripts/test-security-key.sh && bash scripts/check-security-key.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-audit-
+
+      - name: Install cargo-audit
+        run: |
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
+
+      - name: cargo audit
+        run: cargo audit

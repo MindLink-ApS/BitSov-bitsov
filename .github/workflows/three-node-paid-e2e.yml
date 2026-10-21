@@ -13,7 +13,6 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 concurrency:
   group: three-node-paid-regtest-${{ github.ref }}
@@ -49,7 +48,7 @@ jobs:
           cache-all-crates: "true"
           cache-workspace-crates: "true"
       - name: sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Enable sccache for Cargo
         run: |
           echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"

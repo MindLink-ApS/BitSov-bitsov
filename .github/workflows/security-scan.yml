@@ -2,9 +2,9 @@ name: Daily Security Scan
 
 # cargo audit, osv-scanner, and gitleaks. This is the scheduled advisory sweep.
 # Pull-request Cargo Audit (ci.yml) runs only when Cargo.lock or the security
-# policy changes, on tags, in the merge queue, or with the `full-ci` label.
-# A new advisory against an unchanged lockfile is caught here, daily, instead
-# of on every push.
+# policy changes or the PR already carries `full-ci`. Non-PR CI runs always
+# audit; adding `full-ci` starts a separate optional audit in full-ci.yml.
+# This daily sweep also catches new advisories when no code is being pushed.
 
 on:
   schedule:

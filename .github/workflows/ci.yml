@@ -4,26 +4,18 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'pm/**'
-      - 'LICENSE'
-      - '.gitignore'
+    # Every main push builds, including docs-only merges.
   pull_request:
     branches: [main]
-    # `labeled` / `unlabeled` re-run the workflow when `full-ci` is toggled.
+    # Label events belong to optional workflows, never to required checks.
     # Do not put paths-ignore here: a skipped workflow never reports status
     # checks, so branch protection would wait forever. Docs-only and `pm/`
     # skips are job-level; `Frontend Build` always runs.
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened]
   merge_group:
 
 permissions:
   contents: read
-  pull-requests: read
-  # rust-cache and sccache save to the Actions cache.
-  actions: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -40,30 +32,20 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-      # Create the `full-ci` label once. The cloud agent token cannot.
-      issues: write
     outputs:
       # Pushes, tags, and merge-queue runs always take the Rust path. A PR
       # takes it when any changed file is outside the docs/`pm/` set, when the
       # security policy changed, or when the PR carries `full-ci`.
       rust: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') || steps.filter.outputs.rust == 'true' || steps.filter.outputs.security_policy == 'true' }}
-      # Cargo Audit is not part of every push. It runs for lockfile and
-      # security-policy changes, release tags, the merge queue, and `full-ci`.
-      audit: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'full-ci') || steps.audit_paths.outputs.audit == 'true' || steps.filter.outputs.security_policy == 'true' }}
+      # Non-PR events run everything without querying changed files. PRs run
+      # Cargo Audit for advisory inputs or an existing `full-ci` label.
+      audit: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') || steps.audit_paths.outputs.audit == 'true' || steps.filter.outputs.security_policy == 'true' }}
     steps:
-      - name: Ensure full-ci label exists
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh label create "full-ci" \
-            --color "5319e7" \
-            --description "Run Postgres and Cargo Audit on this pull request" \
-            --repo "${{ github.repository }}" 2>/dev/null || true
-
+      # PR-only: paths-filter uses the PR files API. Other events would need
+      # a checkout; instead, both outputs above unconditionally enable CI.
       - name: Detect Rust-impacting changes
         id: filter
-        if: github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'merge_group'
+        if: github.event_name == 'pull_request'
         uses: dorny/paths-filter@v3
         with:
           # paths-filter defaults to 'some': a file matches a filter if it
@@ -94,7 +76,7 @@ jobs:
       # match every audit path at once. This step uses the default `some`.
       - name: Detect Cargo Audit inputs
         id: audit_paths
-        if: github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'merge_group'
+        if: github.event_name == 'pull_request'
         uses: dorny/paths-filter@v3
         with:
           filters: |
@@ -196,7 +178,7 @@ jobs:
           cache-workspace-crates: "true"
 
       - name: sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Enable sccache for Cargo
         run: |
@@ -258,7 +240,7 @@ jobs:
           shared-key: ldk-node-security-${{ hashFiles('vendor/ldk-node/Cargo.lock') }}
           cache-all-crates: "true"
       - name: sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Enable sccache for Cargo
         run: |
           echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
@@ -275,9 +257,9 @@ jobs:
     name: Cargo Audit
     needs: changes
     # Fail closed if classification did not succeed. Otherwise run only when
-    # the advisory inputs changed, on release tags, in the merge queue, or
-    # with the `full-ci` label. A daily run of security-scan.yml covers new
-    # advisories against an unchanged lockfile. A skipped required check
+    # the advisory inputs changed, on all non-PR events, or with an existing
+    # `full-ci` label. Adding the label runs the optional full-ci.yml instead.
+    # A daily security-scan.yml run covers new advisories on unchanged inputs. A skipped required check
     # still reports success, same as the docs-only path.
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.audit == 'true') }}
     runs-on: ubuntu-latest
@@ -345,7 +327,6 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-      actions: write
     strategy:
       fail-fast: false
       matrix:
@@ -388,7 +369,7 @@ jobs:
           cache-workspace-crates: "true"
 
       - name: sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Enable sccache for Cargo
         shell: bash
