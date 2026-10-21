@@ -6,6 +6,13 @@ name: PostgreSQL Tests
 # on main, so a red run here is visible but never blocks a merge. Promote it to
 # a required check (or fold it into ci.yml) once it has been green for a while.
 #
+# It runs on pushes to main that touch the storage paths below, on the merge
+# queue, on manual dispatch, and on non-draft pull requests labeled `full-ci`.
+# Ordinary pull requests schedule the workflow and skip the job, which reports
+# success and spends no runner minutes. That skip is not a passing Postgres
+# suite. If `PostgreSQL ignored tests` is a required check, remove it from
+# branch protection.
+#
 # Test selection is by name, not by list: every ignored konsensus-storage test
 # whose path contains `postgres` runs (e.g. everything in src/postgres.rs,
 # including `postgres::migration_recovery_tests::*`). New ignored PostgreSQL
@@ -29,19 +36,15 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/postgres.yml'
+  merge_group:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'crates/konsensus-storage/**'
-      - 'crates/konsensus-core/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/postgres.yml'
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -53,7 +56,15 @@ env:
 jobs:
   postgres:
     name: PostgreSQL ignored tests
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # Ordinary pull requests skip the job (no runner, no minutes). Merge queue,
+    # main pushes that matched the path filter, manual runs, and `full-ci`
+    # labels execute the suite. Drafts never do.
+    if: >-
+      (github.event_name == 'push' ||
+       github.event_name == 'merge_group' ||
+       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci'))) &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -83,6 +94,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: postgres-${{ hashFiles('Cargo.lock') }}
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Enable sccache for Cargo
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: cargo test (ignored PostgreSQL tests)
         run: |

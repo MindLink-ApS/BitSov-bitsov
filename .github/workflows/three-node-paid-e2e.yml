@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: three-node-paid-regtest-${{ github.ref }}
@@ -42,6 +43,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: three-node-${{ hashFiles('Cargo.lock') }}
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Enable sccache for Cargo
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Provision hash-pinned regtest fixtures
         shell: bash
         run: |
@@ -67,7 +79,7 @@ jobs:
           chmod 755 electrs
           echo "BITCOIND_EXE=$fixture_dir/bitcoin-${BITCOIN_VERSION}/bin/bitcoind" >> "$GITHUB_ENV"
           echo "ELECTRS_EXE=$fixture_dir/electrs" >> "$GITHUB_ENV"
-      - name: Cache Rust dependencies for the offline runner
+      - name: Fetch Rust dependencies for the offline runner
         run: cargo fetch --locked
       - name: Runner lifecycle tests
         run: python3 scripts/regress/test_regtest_e2e_runner.py -v
