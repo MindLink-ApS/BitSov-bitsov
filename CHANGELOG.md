@@ -5,6 +5,21 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+## [0.3.0-rc19] — 2026-10-21 (prep; not tagged yet)
+
+**Pre-release.** Not for production use. rc19 is rc18 (`20c6449e`) plus
+#330, #332, #333, #334, #335, #337, #339, #340, #341 and #342: stable channel
+IDs and idempotent channel opens with interrupted-operation reconciliation,
+CI test fixes, patched modern WebPKI dependencies, local API/permission/parser
+hardening, explicit opt-in for argv secrets, LND settlement amount checks,
+and release-signature validation with exact-tag host rebuilds. See the
+[rc19 signing checklist](docs/releases/v0.3.0-rc19.md) and
+[rc18 → rc19 upgrade guidance](docs/UPGRADING.md#rc18--rc19).
+SQL migration 030 adds channel-open operation storage; pairing remains v8.
+Existing forward-only fences still apply.
+
+### Node / Dependencies
+
 - Finish channel-open operation recording after HTTP disconnects; reconcile
   crash-left `pending` operations older than ten minutes against the node's
   channels on retry, without dispatching again. Proven LDK pre-dispatch refusals
@@ -48,6 +63,29 @@ also live on the corresponding GitHub pre-release pages.
   and refuses to start if it cannot. Keep the config inside a dedicated data dir
   (not `$HOME` directly) and make sure the node's user owns that directory,
   e.g. on container volumes.
+
+- Tighten CORS, omit query tokens from HTTP traces, prefer WebSocket subprotocol
+  tokens, reject zero channel amounts before dialing, and enforce canonical
+  Ed25519 signatures and exact invite lengths; add parser property tests (#337).
+- Require settled LND dispatch amounts to match the invoice; missing or
+  mismatched amounts fail without releasing the budget reservation. Reject
+  settled zero amounts and overflowing satoshi-to-msat conversions (#342).
+
+### Release signing
+
+- Validate the pinned primary fingerprint in field 10 of an anchored GnuPG
+  `VALIDSIG` status record, rejecting bad/expired/revoked signatures. Sign a
+  15-entry `SHA256SUMS` covering five binaries, five checksum files and five
+  SBOMs; retries allow only existing `SHA256SUMS`/`SHA256SUMS.asc` extras (#342).
+- Rebuild the exact tag commit for the signing host with the pinned release
+  recipe before signing artifacts. Retain mismatch evidence; proceeding after
+  investigation requires a logged `--accept-unverified-host` reason. Other
+  targets need explicit waivers; build failures still block signing (#341).
+
+### Release metadata
+
+- Bump all 14 workspace packages to `0.3.0-rc19`; this preparation changes no
+  third-party dependency versions beyond those already merged in #335.
 
 ## [0.3.0-rc18] — 2026-10-20 (prep; not tagged yet)
 
