@@ -17,7 +17,6 @@
 
 use std::collections::HashSet;
 
-use ed25519_dalek::Verifier;
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
@@ -584,9 +583,7 @@ impl PaymentGate {
                     .delivery_price_floor(envelope, settled.timestamp, now_ms / 1000)
                     .await
                     .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?;
-                let Some(required) =
-                    quoted.map(|price| self.price_with_floor_msat(price))
-                else {
+                let Some(required) = quoted.map(|price| self.price_with_floor_msat(price)) else {
                     return Err(rejection);
                 };
                 if envelope.payment_proof.amount_msat < required || settled.amount_msat < required {
@@ -632,11 +629,9 @@ impl PaymentGate {
         let signable = envelope.signable_bytes();
         let ed_sig = envelope.signature.to_ed25519();
 
-        verifying_key
-            .verify_strict(&signable, &ed_sig)
-            .map_err(|e: ed25519_dalek::SignatureError| {
-                GateRejection::InvalidSignature(e.to_string())
-            })
+        verifying_key.verify_strict(&signable, &ed_sig).map_err(
+            |e: ed25519_dalek::SignatureError| GateRejection::InvalidSignature(e.to_string()),
+        )
     }
 
     /// Accept a web service reply only when it matches and consumes an
@@ -3459,12 +3454,19 @@ mod tests {
                 ..Default::default()
             });
             let pricing = MockPricing { price_msat: base };
-            let (admission, message) =
-                crate::introduction::first_contact_prices(base, cost_floor);
+            let (admission, message) = crate::introduction::first_contact_prices(base, cost_floor);
             for paid in [admission, message] {
                 let envelope = make_signed_envelope(&identity, paid);
                 let result = gate
-                    .verify(&envelope, &MockNonceStore::new(), &pricing, None, None, 0.0, None)
+                    .verify(
+                        &envelope,
+                        &MockNonceStore::new(),
+                        &pricing,
+                        None,
+                        None,
+                        0.0,
+                        None,
+                    )
                     .await;
                 assert!(
                     result.is_ok(),

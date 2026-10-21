@@ -20,7 +20,7 @@
 //!
 //! And `signature` is 64 bytes (Ed25519 over `payload`).
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
