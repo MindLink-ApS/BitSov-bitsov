@@ -1,60 +1,114 @@
 # GitHub Actions minutes
 
-Measured 2026-10-06 from recent GitHub-hosted Ubuntu runs. Estimates use
-per-job whole-minute billing, so several short parallel jobs cost more than the
-workflow's wall-clock time.
+Measured from GitHub-hosted runs on 2026-10-21 (`gh run list` and per-job
+`actions/runs/.../jobs` timings). GitHub bills each job by rounding its
+duration up to the next minute. Linux runners are 1×. The release matrix is
+the exception: macOS is 10× and Windows is 2×, and it runs only on `v*` tags.
 
-## Before
+`BitSov-bitsov` is a public repository, so standard hosted minutes are not
+deducted from the org allowance. The org spending limit still disables Actions
+for every repository once private usage exceeds it. The same workflow shape is
+the recipe for a private consumer such as `bitsov-app`.
 
-| Lane | Observed runtime | Estimated billed minutes |
+## What a run costs
+
+| Job | Observed | Billed |
 | --- | ---: | ---: |
-| `Rust Check & Test` | 23–25 min | 23–25 |
-| Cargo Audit | 12–17 sec | 1 |
-| Semgrep | 29–31 sec | 1 |
-| Frontend sentinel | 6–7 sec | 1 |
-| Offline release signing | 11–12 sec | 1 |
-| PostgreSQL tests, when selected | 1 min 20 sec | 2 |
-| Nightly three-node regtest | about 13 min | 14 |
-| Weekly security scan | under 1 min | 1 |
+| `Rust Check & Test` (successful, registry cache hit) | 26 min, of which `cargo test` is ~22 min | 27 |
+| `Rust Check & Test` (mean, including failed runs) | 20 min | 21 |
+| `Vendored LDK Node Security Regressions` | 1.2 min | 2 |
+| Cargo Audit | 15–20 sec | 1 |
+| Semgrep | ~30 sec | 1 |
+| Frontend sentinel | ~6 sec | 1 |
+| Offline release signing | ~12 sec | 1 |
+| Classify changes | ~6 sec | 1 |
+| PostgreSQL tests, when the job runs | ~1.5 min | 2 |
+| Three-node paid regtest | ~14 min | 15 |
+| Security scan | under 1 min | 1 |
 
-Every PR, including docs-only ones, therefore consumed about 27–29 billed
-minutes in the main CI workflow, of which 23–25 were the Rust workspace job.
+A code pull request therefore costs about **28 billed minutes** in `CI`, plus
+**2** when PostgreSQL tests run (about 72% of recent pull requests). A push to
+`main` costs about **34**. Docs-only pull requests stay near **4** (classify,
+Semgrep, frontend, signing).
 
-## After
+Volume for 1–21 October 2026, scaled by 30/21 to a 30-day month: about 633
+pull-request CI runs and 189 pushes to `main`.
 
-- A path-classification job runs for every PR. `dorny/paths-filter` is set to
-  `predicate-quantifier: 'every'`, so a changed file counts as Rust-impacting
-  unless it matches a docs-only pattern: `docs/**`, Markdown files, `LICENSE`,
-  `.gitignore`, `CODEOWNERS`, or `.github/dependabot.yml`. `SECURITY.md` is
-  always Rust-impacting because Cargo Audit validates it. Only a PR whose every
-  changed file is docs-only skips Rust tests and Cargo Audit.
-- The skipped jobs retain the exact required check names. GitHub reports
-  job-level skips as successful, so branch protection still receives
-  `Rust Check & Test` and `Cargo Audit`; Semgrep and Frontend continue to run.
-- Classification fails closed. If the classification job fails, is skipped,
-  or produces no result, `Rust Check & Test` and `Cargo Audit` run anyway.
-  They are skipped only after classification succeeds and reports docs-only.
-- Draft PRs run the same checks as ready PRs. A draft is never skipped, so a
-  green required check on a code commit always means the check actually ran.
-- A new commit cancels an older in-progress run for the same PR. Main-branch
-  and tag runs are not cancelled by workflow concurrency, with one GitHub
-  limitation: a group holds at most one running and one pending run, so a
-  newer push to `main` replaces an older run that is still queued behind it.
-  The run for the latest `main` commit always executes, so the tip of `main`
-  is always validated; an intermediate commit may be skipped when pushes land
-  while a run is in progress.
-- Rust dependency build artifacts are restored with `Swatinem/rust-cache`,
-  whose key includes `Cargo.lock`, the compiler, runner platform, and job
-  settings. Cargo Audit, releases, and the weekly scan retain their existing
-  lockfile-keyed caches.
+## Why the Rust job stays long after a cache hit
 
-A docs-only PR is estimated at about 4 billed minutes: classification,
-Semgrep, Frontend, and offline release signing, instead of 27–29. The share of
-PRs that qualify has not been measured against the filter, so no overall
-percentage saving is claimed. A PR that touches any non-docs file still runs
-every required check; warm dependency caches should reduce its dominant Rust
-job, but the exact saving depends on cache population and which crates
-changed. Cancellation saves the unused remainder of superseded PR runs.
+`Swatinem/rust-cache` was already in use and did hit (`Cache Size: ~554 MB`),
+but with the defaults `cache-all-crates: false` and `cache-workspace-crates:
+false`. Path dependencies under `vendor/` (Lightning, `ldk-node`) were
+recompiled on every test. The job then deleted `libldk_node-*` before
+`cargo test`, so a restored library would have been thrown away. Test
+*execution* is a few minutes; the rest is codegen. `ubuntu-latest` had about
+100GB free at that step, so the deletion was not buying disk.
 
-Pushes to `main` and release tags retain full validation. The scheduled
-three-node paid regtest is intentionally unchanged.
+## What changed
+
+- Pull-request concurrency still cancels a superseded run. Pushes, tags, and
+  merge-queue runs are not cancelled. Required CI does not subscribe to label
+  events; adding or removing labels cannot replace a required check result.
+- Docs-only and `pm/**` changes skip the Rust jobs. `Frontend Build` has no
+  `if` and always runs, so a pull request still reports a completed check.
+  Workflow-level `paths-ignore` is not used on `pull_request` (a skipped
+  workflow never reports, and required checks stay pending).
+- `Rust Check & Test` still runs `cargo check`, `cargo test`, and `cargo
+  clippy` on every non-docs pull request. That required check is the merge
+  gate and is not moved behind the merge queue.
+- The Rust job caches path and workspace crates, wraps `rustc` with `sccache`,
+  builds without debuginfo (`CARGO_PROFILE_*_DEBUG=0`, assertions unchanged),
+  and deletes `ldk-node` artifacts only when free disk drops under 10GB.
+- PostgreSQL tests run on storage-path pushes to `main`, the merge queue,
+  `workflow_dispatch`, and when `full-ci` is added to a non-draft PR. Other
+  labels cannot restart or cancel the suite. The job name is unchanged. It is
+  not a required check; a skipped run is not a pass.
+- The release matrix stays on `v*` tags only.
+- `Cargo Audit` runs when `Cargo.lock`, `.cargo/audit.toml`, `SECURITY.md`, or
+  the security-key scripts change, on every main push, on `v*` tags, in the
+  merge queue, and on PR code pushes with an existing `full-ci` label. The
+  daily security scan runs `cargo audit` against the default
+  branch every day at 06:00 UTC. The check name is unchanged. Both path-filter
+  steps are PR-only; main, tags, and the merge queue run all CI jobs without
+  classifying files. The release matrix remains tag-only.
+- Vendored `ldk-node` security regressions still run on Rust pull requests.
+
+## Estimate
+
+Guaranteed cuts are jobs that no longer start. The Rust-job cut assumes a warm
+cache of the vendored crates (the 22 minute `cargo test` step falls to about
+12 minutes of rebuild-plus-execution). The first run after a lockfile change
+stays cold for `rust-cache`; `sccache` still covers crates whose versions did
+not move. Treat the Rust column as an estimate.
+
+| Lane | Runs / 30 days | Before min/run | After min/run | Before | After |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pull-request CI | 633 | 28 | 19 | 17,700 | 12,000 |
+| Push to `main` CI | 189 | 34 | 25 | 6,400 | 4,700 |
+| PostgreSQL on pull requests | 456 | 2 | 0 | 900 | 0 |
+| PostgreSQL on `main` | 91 | 2 | 2 | 180 | 180 |
+| Three-node regtest | 58 | 15 | 15 | 870 | 870 |
+| Security scan | 4 → 30 | 1 | 1 | 4 | 30 |
+| **Total** |  |  |  | **~26,100** | **~17,800** |
+
+About **8,000 billed minutes per month** (~30%), of which roughly **1,400** are
+guaranteed (PostgreSQL off ordinary pull requests, Cargo Audit skipped unless
+its inputs changed, minus the extra daily scans) and the rest is the smaller
+Rust job.
+
+Per ordinary code pull request (lockfile unchanged): about **28 → 19** in CI,
+and **2 → 0** for PostgreSQL when that workflow used to run. About **9–11
+minutes saved per pull request**. A Dependabot pull request still runs Cargo
+Audit. A docs-only or `pm/`-only pull request stays near 4 minutes.
+
+Add `full-ci` to a non-draft pull request to run PostgreSQL and the separate
+`Full CI Cargo Audit (optional)` check before merge. These optional workflows
+only handle PR `labeled` events and start runners only when the added label
+is `full-ci`. Remove and re-add it to request another optional run. Keep both
+optional checks out of branch protection. Required CI is unaffected by label
+events and reads an existing `full-ci` label on its next code push.
+
+Create the repository label once manually if it does not already exist.
+CI does not create `full-ci`. No workflow grants `actions: write` or
+`issues: write`; the cache actions use the Actions runtime credentials.
+All sccache action references are pinned to the v0.0.11 commit SHA.
