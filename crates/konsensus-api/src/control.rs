@@ -145,6 +145,17 @@ pub enum ControlRequest {
         /// Key id.
         key_id: String,
     },
+    /// Preview or confirm a transitive owner-console revocation.
+    RevokeDevices {
+        options: crate::pairing::console::RevokeOptions,
+        confirmation: Option<String>,
+    },
+    /// Reject a pending v2 operation and its provisional pairing.
+    CancelSecondDevice { op_id: String },
+    /// Clear v1 and v2 SAS failure counters.
+    ResetSas,
+    /// Check eligibility before publishing a console second-device QR.
+    SecondDeviceTicketReady,
     /// Owner-only reset of breaker history and pause on an exact grant.
     ResetGrantBreakers {
         client_id: String,
@@ -190,8 +201,15 @@ pub enum ControlRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "result", rename_all = "kebab-case")]
 pub enum ControlResponse {
+    /// Exact preview of a device revocation.
+    RevokePlan {
+        plan: crate::pairing::console::RevokePlan,
+    },
     /// Current pairing state.
     Status {
+        /// V2 console observations, omitted when the rollout flag is off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enrollment: Option<crate::pairing::console::EnrollmentStatus>,
         /// Late rescans never revoke an enrolled device; ask the owner to check.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         second_device_alerts: Vec<crate::pairing::second_device::ContestedAlert>,
@@ -286,6 +304,12 @@ pub struct DeviceKeySummary {
     pub name: String,
     /// Unix seconds it was approved.
     pub registered_at: i64,
+    /// Approval provenance, absent on older nodes and when rollout is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrolled_by: Option<String>,
+    /// Approver name if its key still exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver_name: Option<String>,
 }
 
 /// An observational summary, never an approval credential.
@@ -439,6 +463,7 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
         ControlRequest::Status => {
             let file = service.snapshot();
             ControlResponse::Status {
+                enrollment: service.second_device_enrollment_enabled().then(|| service.console_enrollment_status()),
                 second_device_alerts: service.second_device_alerts(),
                 clients: file
                     .clients
@@ -492,6 +517,11 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                     .device_keys()
                     .into_iter()
                     .map(|k| DeviceKeySummary {
+                        enrolled_by: service.second_device_enrollment_enabled().then(|| k.enrolled_by.clone()),
+                        approver_name: service.second_device_enrollment_enabled().then(|| {
+                            k.enrolled_by.strip_prefix("second_device:").or_else(|| k.enrolled_by.strip_prefix("device:"))
+                                .and_then(|id| file.device_keys.iter().find(|a| a.key_id == id)).map(|a| a.name.clone())
+                        }).flatten(),
                         fingerprint: crate::pairing::device::key_fingerprint(&k.key_id),
                         key_id: k.key_id,
                         client_id: k.client_id,
@@ -601,6 +631,24 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                     "revoked device key {key_id}; its client's relation envelopes stop on the next request"
                 ),
             },
+            Err(e) => error(e),
+        },
+        ControlRequest::RevokeDevices { options, confirmation } => {
+            match service.console_revoke_devices(&options, confirmation.as_deref()) {
+                Ok(plan) => ControlResponse::RevokePlan { plan },
+                Err(e) => error(e),
+            }
+        }
+        ControlRequest::CancelSecondDevice { op_id } => match service.console_cancel_second_device(&op_id) {
+            Ok(()) => ControlResponse::Ok { detail: "rejected v2 operation and revoked its provisional pairing".into() },
+            Err(e) => error(e),
+        },
+        ControlRequest::ResetSas => match service.console_reset_sas() {
+            Ok(()) => ControlResponse::Ok { detail: "cleared v1 SAS failures and v2 mismatch window".into() },
+            Err(e) => error(e),
+        },
+        ControlRequest::SecondDeviceTicketReady => match service.console_second_ticket_ready() {
+            Ok(()) => ControlResponse::Ok { detail: "second-device enrollment ready".into() },
             Err(e) => error(e),
         },
         ControlRequest::ResetGrantBreakers { client_id, grant_op_id } => {
@@ -1137,6 +1185,13 @@ fn encode_request(req: &ControlRequest) -> Result<Zeroizing<Vec<u8>>, serde_json
             owner_signature,
         } => fields!("approve-device-key", op_id, confirmation, owner_signature),
         ControlRequest::RevokeDeviceKey { key_id } => fields!("revoke-device-key", key_id),
+        ControlRequest::RevokeDevices {
+            options,
+            confirmation,
+        } => fields!("revoke-devices", options, confirmation),
+        ControlRequest::CancelSecondDevice { op_id } => fields!("cancel-second-device", op_id),
+        ControlRequest::ResetSas => fields!("reset-sas"),
+        ControlRequest::SecondDeviceTicketReady => fields!("second-device-ticket-ready"),
         ControlRequest::ResetGrantBreakers {
             client_id,
             grant_op_id,

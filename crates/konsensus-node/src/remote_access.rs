@@ -3138,7 +3138,8 @@ mod tests {
         };
         let path = dir.path().join("konsensus.toml");
         config.save(&path).unwrap();
-        crate::ticket_cmd::cmd_pair_ticket(&path, false, Duration::from_secs(60), false).unwrap();
+        crate::ticket_cmd::cmd_pair_ticket(&path, false, Duration::from_secs(60), false, false)
+            .unwrap();
         let uri = std::fs::read_to_string(pairing.remote_access_link_path()).unwrap();
         let link = PairLink::from_uri(&uri).unwrap();
         link.verify_endpoints(&node.node_id().to_hex()).unwrap();
@@ -3154,10 +3155,14 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
         document["endpoints_signature"] = URL_SAFE_NO_PAD.encode([0; 64]).into();
         std::fs::write(metadata, serde_json::to_vec(&document).unwrap()).unwrap();
-        assert!(
-            crate::ticket_cmd::cmd_pair_ticket(&path, false, Duration::from_secs(60), false)
-                .is_err()
-        );
+        assert!(crate::ticket_cmd::cmd_pair_ticket(
+            &path,
+            false,
+            Duration::from_secs(60),
+            false,
+            false
+        )
+        .is_err());
         assert_eq!(
             std::fs::read_to_string(pairing.remote_access_link_path()).unwrap(),
             uri

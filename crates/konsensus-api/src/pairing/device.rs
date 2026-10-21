@@ -1183,7 +1183,7 @@ impl PairingService {
         Ok(())
     }
 
-    fn end_relation_grants(inner: &mut Inner, client_id: &str) {
+    pub(super) fn end_relation_grants(inner: &mut Inner, client_id: &str) {
         for grant in &mut inner.file.grants {
             if grant.client_id == client_id
                 && grant.budget.as_ref().is_some_and(|b| b.recipients_only)

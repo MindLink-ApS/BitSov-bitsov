@@ -247,13 +247,23 @@ async fn main() -> Result<()> {
         } => {
             owner_cmd::cmd_pair_revoke(&config, &client_id, keep_pairing).await?;
         }
+        Command::PairCancel { op_id, config } => {
+            owner_cmd::cmd_pair_cancel(&config, &op_id).await?;
+        }
+        Command::PairResetSas { config } => {
+            owner_cmd::cmd_pair_reset_sas(&config).await?;
+        }
         Command::PairTicket {
+            second_device,
             config,
             qr,
             ttl,
             legacy,
         } => {
-            ticket_cmd::cmd_pair_ticket(&config, qr, ttl, legacy)?;
+            if second_device {
+                owner_cmd::check_second_device_ticket(&config).await?;
+            }
+            ticket_cmd::cmd_pair_ticket(&config, qr, ttl, legacy, second_device)?;
         }
         Command::Peer { command } => match command {
             PeerCommand::Add {
@@ -1143,6 +1153,10 @@ async fn cmd_start(
     )
     .with_context(|| format!("failed to prepare startup from {}", config_path.display()))?;
 
+    anyhow::ensure!(
+        !(owner_control && local_owner_device) || config.pairing.second_device_enrollment,
+        "combining --owner-control and --local-owner-device requires [pairing] second_device_enrollment = true"
+    );
     config.remote_access.apply_home(home);
 
     // ── First-run / partial-state gate (#76) ───────────────────────
