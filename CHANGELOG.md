@@ -8,8 +8,10 @@ also live on the corresponding GitHub pre-release pages.
 ## [0.3.0-rc19.1] — 2026-10-21 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. rc19.1 is the unpublished rc19 tag
-(`e8ed5874`) plus #355 only: the macOS release toolchain is pinned to Xcode
-27.1 (`27A9275`), and release builds and signing refuse early on a mismatch.
+(`e8ed5874`) plus the release-tooling fixes #355 and #358 only: the macOS
+release toolchain is pinned to Xcode 27.1 (`27A9275`), release builds and
+signing refuse early on a toolchain mismatch, and the signer accepts this
+dotted tag only from the exact `release/v0.3.0-rc19.1` head.
 No runtime code changes from rc19. Tagged from `release/v0.3.0-rc19.1`; main's
 later changes ship in rc20. See the
 [rc19.1 signing checklist](docs/releases/v0.3.0-rc19.1.md); upgrade guidance is
@@ -20,6 +22,8 @@ later changes ship in rc20. See the
 - Pin the macOS release toolchain (Xcode 27.1, build 27A9275) in CI and in
   `release-build.sh`/`release-sign.sh`, record per-asset toolchain evidence,
   and refuse early when the CI or signing host toolchain differs (#355).
+- Let `release-sign.sh` sign dotted point-release tags only from the exact
+  head of `release/<tag>`; other tags keep the main-ancestry check (#358).
 - Bump all 14 workspace packages to `0.3.0-rc19.1`.
 
 ## [0.3.0-rc19] — 2026-10-21 (prep; not tagged yet)
