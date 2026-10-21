@@ -5,6 +5,7 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Update shipped binary dependencies to bitcoin 0.32.102, zeroize 1.9.1, hyper 1.12.0, and tokio-rustls 0.26.6 (#338).
 - Return HTTP 400 with `code: "not_dispatched"` and the specific `reason` for
   call-rule refusals before an operation is created, quoted, or paid
   (`call_id_used`, `call_busy`, `call_signal_in_flight`, `call_signal_invalid`,
