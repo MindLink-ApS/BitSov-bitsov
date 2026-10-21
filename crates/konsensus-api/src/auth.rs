@@ -554,6 +554,51 @@ pub(crate) fn check_pairing_binding(
     Ok(Some(binding))
 }
 
+/// A read-capable pairing or a live provisional pairing on its own Noise session.
+/// Use only on the four own-operation enrollment routes.
+pub struct EnrollmentAuth(pub AuthUser);
+impl std::ops::Deref for EnrollmentAuth {
+    type Target = AuthUser;
+    fn deref(&self) -> &AuthUser {
+        &self.0
+    }
+}
+#[axum::async_trait]
+impl FromRequestParts<Arc<AppState>> for EnrollmentAuth {
+    type Rejection = Response;
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Response> {
+        let user = AuthUser::from_request_parts(parts, state).await?;
+        if user.has(Scope::Read) {
+            return Ok(Self(user));
+        }
+        let allowed = user.pairing.as_ref().is_some_and(|b| {
+            parts
+                .extensions
+                .get::<crate::rate_limit::AuthenticatedNoise>()
+                .is_some_and(|n| {
+                    n.client_id.as_ref() == b.client_id
+                        && state.pairing.as_ref().is_some_and(|s| {
+                            s.is_provisional(&b.client_id)
+                                || s.validate_remote_transport(&n.binding.client_static)
+                                    .is_ok_and(|c| {
+                                        c.client_id == b.client_id
+                                            && c.epoch == b.epoch
+                                            && c.scopes.contains(&Scope::Read)
+                                    })
+                        })
+                })
+        });
+        if allowed {
+            Ok(Self(user))
+        } else {
+            Err((StatusCode::FORBIDDEN, "enrollment authority required").into_response())
+        }
+    }
+}
+
 /// Scope-enforcing extractors (#72).
 ///
 /// A handler names the authority it needs in its own signature, so enforcement is a
@@ -669,6 +714,46 @@ pub mod scoped {
             })
         }
     }
+}
+
+/// Defense in depth for provisional Noise sessions, including otherwise public routes.
+pub(crate) async fn enrollment_routes_only(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(noise) = req
+        .extensions()
+        .get::<crate::rate_limit::AuthenticatedNoise>()
+    {
+        if state
+            .pairing
+            .as_ref()
+            .is_some_and(|p| p.is_provisional(&noise.client_id))
+        {
+            let path = req.uri().path();
+            let method = req.method().as_str();
+            let own = path.strip_prefix("/api/v1/pair/device-key/");
+            let allowed = matches!(
+                (method, path),
+                ("GET", "/api/v1/pair/challenge")
+                    | ("POST", "/api/v1/pair/token")
+                    | ("POST", "/api/v1/pair/device-key")
+            ) || own.is_some_and(|rest| {
+                let (op, tail) = rest.split_once('/').unwrap_or((rest, ""));
+                op.len() == 24
+                    && op.bytes().all(|b| b.is_ascii_hexdigit())
+                    && matches!(
+                        (method, tail),
+                        ("GET", "") | ("DELETE", "") | ("POST", "finalize")
+                    )
+            });
+            if !allowed {
+                return (StatusCode::FORBIDDEN, "provisional enrollment only").into_response();
+            }
+        }
+    }
+    next.run(req).await
 }
 
 #[cfg(test)]

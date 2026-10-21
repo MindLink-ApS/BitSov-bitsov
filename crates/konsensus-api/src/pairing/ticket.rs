@@ -20,7 +20,7 @@ pub(super) struct OwnerTickets {
     descriptor: Option<PairLink>,
     challenges: HashMap<String, Challenge>,
     tickets: HashMap<String, Ticket>,
-    issued: Vec<Instant>,
+    issued: Vec<(String, Instant)>,
     reads: Vec<Instant>,
 }
 struct Challenge {
@@ -29,11 +29,13 @@ struct Challenge {
     epoch: u64,
     deadline: Instant,
 }
+#[derive(Clone)]
 struct Ticket {
     client_id: String,
     key_id: String,
     epoch: u64,
     deadline: Instant,
+    second_device: bool,
 }
 
 fn random_hex() -> String {
@@ -153,7 +155,33 @@ impl PairingService {
         nonce: &str,
         signature: &str,
     ) -> Result<PairLink, PairingError> {
+        self.mint_owner_ticket_with_purpose(client, epoch, key, nonce, signature, None)
+    }
+
+    /// Purpose is covered by the v2 ticket signature; omission retains v1 bytes.
+    pub fn mint_owner_ticket_with_purpose(
+        &self,
+        client: &str,
+        epoch: u64,
+        key: &str,
+        nonce: &str,
+        signature: &str,
+        purpose: Option<&str>,
+    ) -> Result<PairLink, PairingError> {
+        if purpose.is_some_and(|p| p != "second_device") {
+            return Err(PairingError::BadProof);
+        }
+        let second_device = purpose.is_some();
         let mut inner = self.lock();
+        if second_device {
+            self.second_device_available()?;
+            if !inner.file.device_keys.iter().any(|k| {
+                self.intent_key(&inner, &k.client_id, k.epoch, &k.key_id)
+                    .is_ok()
+            }) {
+                return Err(PairingError::PairingInvalid("no_owner_device".into()));
+            }
+        }
         let owner = self.ticket_owner(&inner, client, epoch, key)?;
         let now = Instant::now();
         let challenge = inner
@@ -170,17 +198,32 @@ impl PairingService {
         }
         device::verify_p256(
             &device::parse_public_key(&owner.public_key)?,
-            format!(
-                "bitsov-ticket-v1\nnode:{}\nnonce:{nonce}",
-                inner.identity_fingerprint
-            )
+            if second_device {
+                format!(
+                    "bitsov-ticket-v2\nnode:{}\nnonce:{nonce}\npurpose:second_device",
+                    inner.identity_fingerprint
+                )
+            } else {
+                format!(
+                    "bitsov-ticket-v1\nnode:{}\nnonce:{nonce}",
+                    inner.identity_fingerprint
+                )
+            }
             .as_bytes(),
             signature,
         )?;
         let state = &mut inner.owner_tickets;
+        // Expired, unconsumed tickets refund their issue slots; consumed ones do not.
+        let refunds: Vec<_> = state
+            .tickets
+            .iter()
+            .filter(|(_, t)| t.deadline <= now)
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        state.tickets.retain(|_, t| t.deadline > now);
         state
             .issued
-            .retain(|t| now.duration_since(*t) < ISSUE_WINDOW);
+            .retain(|(hash, t)| now.duration_since(*t) < ISSUE_WINDOW && !refunds.contains(hash));
         if state.issued.len() >= MAX_ISSUES {
             return Err(PairingError::TooManyPending);
         }
@@ -190,18 +233,27 @@ impl PairingService {
             .ok_or(PairingError::OwnerChannelUnavailable)?;
         link.code = format!("{OWNER_TICKET_PREFIX}{}", random_hex());
         link.expires_at = chrono::Utc::now().timestamp() + TTL.as_secs() as i64;
+        let ticket_hash = blake3::hash(link.code.as_bytes()).to_hex().to_string();
         state.tickets.retain(|_, t| t.deadline > now);
         state.tickets.insert(
-            blake3::hash(link.code.as_bytes()).to_hex().to_string(),
+            ticket_hash.clone(),
             Ticket {
                 client_id: client.into(),
                 key_id: key.into(),
                 epoch,
                 deadline: now + TTL,
+                second_device,
             },
         );
         state.challenges.remove(client);
-        state.issued.push(now);
+        state.issued.push((ticket_hash, now));
+        if second_device {
+            self.enrollment_event(
+                "pair.second_device_ticket_issued",
+                client,
+                serde_json::json!({"epoch":epoch,"key_id":key}),
+            );
+        }
         Ok(link)
     }
 
@@ -215,16 +267,37 @@ impl PairingService {
         transport: &[u8; 32],
     ) -> Result<PairedClient, PairingError> {
         let mut inner = self.lock();
+        self.rescan_locked(&mut inner, code, public_key, transport)?;
+        let hash = blake3::hash(code.as_bytes()).to_hex().to_string();
         let ticket = inner
             .owner_tickets
             .tickets
-            .remove(&blake3::hash(code.as_bytes()).to_hex().to_string())
+            .get(&hash)
+            .cloned()
             .ok_or(PairingError::BadProof)?;
+        // Legacy tickets burn on any consumption attempt, including expiry or
+        // stale issuer authority. V2 keeps its eligibility-before-consume order.
+        if !ticket.second_device {
+            inner.owner_tickets.tickets.remove(&hash);
+        }
         if ticket.deadline <= Instant::now() {
             return Err(PairingError::Expired);
         }
         self.ticket_owner(&inner, &ticket.client_id, ticket.epoch, &ticket.key_id)?;
-        self.create_remote_pairing_locked(&mut inner, name, public_key, transport, false)
+        if ticket.second_device {
+            let client = self.create_second_device_locked(
+                &mut inner,
+                code,
+                name,
+                public_key,
+                transport,
+                &ticket.key_id,
+            )?;
+            inner.owner_tickets.tickets.remove(&hash);
+            Ok(client)
+        } else {
+            self.create_remote_pairing_locked(&mut inner, name, public_key, transport, false)
+        }
     }
 
     /// Only an enrolled owner on its authenticated tunnel may inspect another
@@ -244,7 +317,7 @@ impl PairingService {
             .iter()
             .find(|op| op.op_id == op_id)
             .ok_or(PairingError::UnknownOperation)?;
-        pending_device_view(&inner, op)
+        self.owner_device_view(&inner, client, epoch, key, op)
     }
 
     /// Discover live SAS requests without transferring operation ids between devices.
@@ -260,8 +333,34 @@ impl PairingService {
             .file
             .pending_device_keys
             .iter()
-            .filter_map(|op| pending_device_view(&inner, op).ok())
+            .filter_map(|op| self.owner_device_view(&inner, client, epoch, key, op).ok())
             .collect())
+    }
+    fn owner_device_view(
+        &self,
+        inner: &Inner,
+        client: &str,
+        epoch: u64,
+        key: &str,
+        op: &device::PendingDeviceKey,
+    ) -> Result<serde_json::Value, PairingError> {
+        let mut view = pending_device_view(inner, op)?;
+        if op.sas_version == Some(2) {
+            let p = self.provisional_locked(inner, &op.client_id)?;
+            let sas = op.sas.as_ref().ok_or(PairingError::UnknownOperation)?;
+            let object = view.as_object_mut().unwrap();
+            object.remove("delegation_message");
+            object.extend(serde_json::json!({
+                "approval":"owner_device", "issuer":p.issuer, "ticket_id":p.ticket_id,
+                "node":inner.identity_fingerprint,"approver_client":client,"approver_epoch":epoch,"approver_key":key,
+                "nonce":op.delegation_nonce,"client_pubkey":op.client_pubkey,"epoch":op.epoch,"device_key":op.public_key,"device_name":op.name,
+                "noise_handshake_hash":hex::encode(sas.binding.handshake_hash),"noise_client_static":hex::encode(sas.binding.client_static),"box_transport_pubkey":hex::encode(sas.binding.box_public_key),
+                "sas_digest":sas.digest.to_hex().to_string(),
+                "approval_message":if sas.confirmed {Some(Self::second_message_locked(inner,client,epoch,key,op,false)?)} else {None},
+                "reject_message":if sas.confirmed {Some(Self::second_message_locked(inner,client,epoch,key,op,true)?)} else {None}
+            }).as_object().unwrap().clone());
+        }
+        Ok(view)
     }
 }
 
@@ -272,10 +371,10 @@ fn pending_device_view(
     let sas = op
         .sas
         .as_ref()
-        .filter(|_| op.sas_version == Some(1))
+        .filter(|_| matches!(op.sas_version, Some(1) | Some(2)))
         .ok_or(PairingError::BadProof)?;
     if op.expires_at <= chrono::Utc::now().timestamp()
-        || sas.created_at.elapsed() >= Duration::from_secs(900)
+        || sas.created_at.elapsed() >= Duration::from_secs(op.sas_ttl_secs() as u64)
     {
         return Err(PairingError::Expired);
     }
@@ -287,7 +386,7 @@ fn pending_device_view(
     Ok(serde_json::json!({
         "op_id": op.op_id, "client_id": op.client_id, "name": op.name,
         "public_key": op.public_key, "expires_at": op.expires_at,
-        "sas_version": 1, "box_nonce": hex::encode(sas.nonce),
+        "sas_version": op.sas_version, "box_nonce": hex::encode(sas.nonce),
         "sas_words": crate::sas::words(&sas.digest),
         "delegation_message": sas.confirmed.then(|| device::delegation_message(&inner.identity_fingerprint, op)),
     }))
@@ -296,6 +395,41 @@ fn pending_device_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v1_owner_ticket_is_burned_on_expiry_or_invalid_approver() {
+        for expired in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let svc = PairingService::open(dir.path(), "node".into(), false).unwrap();
+            let code = "owner_legacy";
+            let hash = blake3::hash(code.as_bytes()).to_hex().to_string();
+            svc.lock().owner_tickets.tickets.insert(
+                hash.clone(),
+                Ticket {
+                    client_id: "revoked".into(),
+                    key_id: "revoked".into(),
+                    epoch: 1,
+                    deadline: if expired {
+                        Instant::now() - TTL
+                    } else {
+                        Instant::now() + TTL
+                    },
+                    second_device: false,
+                },
+            );
+            let first = svc.consume_owner_ticket(code, "phone", "", &[2; 32]);
+            if expired {
+                assert!(matches!(first, Err(PairingError::Expired)));
+            } else {
+                assert!(first.is_err());
+            }
+            assert!(!svc.lock().owner_tickets.tickets.contains_key(&hash));
+            assert!(matches!(
+                svc.consume_owner_ticket(code, "phone", "", &[2; 32]),
+                Err(PairingError::BadProof)
+            ));
+        }
+    }
 
     // Discovery must stop exposing a ceremony when either lifetime expires or
     // the target pairing changes, even if the in-memory SAS survived.
@@ -324,6 +458,7 @@ mod tests {
             public_key: "public".into(),
             name: "phone".into(),
             expires_at: chrono::Utc::now().timestamp() + 900,
+            created_at: 0,
             delegation_nonce: "nonce".into(),
             sas_version: Some(1),
             sas: Some(device::DeviceSas {
