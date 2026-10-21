@@ -5,6 +5,29 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Update shipped binary dependencies to bitcoin 0.32.102, zeroize 1.9.1, hyper 1.12.0, and tokio-rustls 0.26.6 (#338).
+
+## [0.3.0-rc19] — 2026-10-21 (prep; not tagged yet)
+
+**Pre-release.** Not for production use. rc19 is rc18 (`20c6449e`) plus
+#330, #332, #333, #334, #335, #337, #339, #340, #341 and #342: stable channel
+IDs and idempotent channel opens with interrupted-operation reconciliation,
+CI test fixes, patched modern WebPKI dependencies, local API/permission/parser
+hardening, explicit opt-in for argv secrets, LND settlement amount checks,
+and release-signature validation with exact-tag host rebuilds. See the
+[rc19 signing checklist](docs/releases/v0.3.0-rc19.md) and
+[rc18 → rc19 upgrade guidance](docs/UPGRADING.md#rc18--rc19).
+SQL migration 030 adds channel-open operation storage; pairing remains v8.
+Existing forward-only fences still apply.
+
+### Node / Dependencies
+
+- Finish channel-open operation recording after HTTP disconnects; reconcile
+  crash-left `pending` operations older than ten minutes against the node's
+  channels on retry, without dispatching again. Proven LDK pre-dispatch refusals
+  release the operation ID. Uses the existing migration 030 schema.
+- Deflake locked-mode shutdown and unpaid-request flood tests with independent,
+  generous hang guards for slow CI runners. Fixes #325.
 - Update rustls-webpki 0.103.15 to 0.103.16 and webpki-roots 1.0.6 to 1.0.10
   for RUSTSEC-2026-0382 / RUSTSEC-2026-0381 (distrusted emSign certificates).
   Vendor electrum-client 0.24.1 to use webpki-roots >=1.0.10 and the current
@@ -13,6 +36,7 @@ also live on the corresponding GitHub pre-release pages.
   bundle, including residual risk and removal on the sqlx/ldk-node island
   upgrade (#59). Mirror both exceptions and their shared CVE alias across
   the advisory scanner configurations; the patched modern lines stay required.
+
 - Make `POST /api/v1/payments/open-channel` idempotent with an optional UUIDv4
   `operation_id` (#331, capability `channel_open_operations_v1`): recorded
   before dispatch (migration 030), a retry with the same id returns the recorded
@@ -26,6 +50,44 @@ also live on the corresponding GitHub pre-release pages.
   `UserChannelId(n)` values. Clients should use `user_channel_id` for a stable ID.
 - Report the configured Bitcoin `network` in owner `/api/v1/status`, including
   LDK signet, using the same configuration as funding-address (#321).
+
+### Security
+
+- Validate Host and Origin before local token issuance and local-only reads/WebSocket admission to prevent browser DNS rebinding; preserve native clients without Origin.
+- **Breaking change (H2):** argv passwords and mnemonic phrases are deprecated,
+  warn on stderr, and refuse execution unless `--insecure-argv` is explicit.
+  This includes `--encrypt <password>` and nonempty BIP-39 `--passphrase` values.
+  Use `--password-fd`, `--password-file`, `--passphrase-fd` (BIP-39), or the
+  interactive prompt instead.
+  The owner-token helper now sends its legacy password variable through an fd.
+- **Behaviour change (#337):** the node forces its data directory (the folder
+  that holds `--config`) to 0700 and the control socket to 0600 before binding,
+  and refuses to start if it cannot. Keep the config inside a dedicated data dir
+  (not `$HOME` directly) and make sure the node's user owns that directory,
+  e.g. on container volumes.
+
+- Tighten CORS, omit query tokens from HTTP traces, prefer WebSocket subprotocol
+  tokens, reject zero channel amounts before dialing, and enforce canonical
+  Ed25519 signatures and exact invite lengths; add parser property tests (#337).
+- Require settled LND dispatch amounts to match the invoice; missing or
+  mismatched amounts fail without releasing the budget reservation. Reject
+  settled zero amounts and overflowing satoshi-to-msat conversions (#342).
+
+### Release signing
+
+- Validate the pinned primary fingerprint in field 10 of an anchored GnuPG
+  `VALIDSIG` status record, rejecting bad/expired/revoked signatures. Sign a
+  15-entry `SHA256SUMS` covering five binaries, five checksum files and five
+  SBOMs; retries allow only existing `SHA256SUMS`/`SHA256SUMS.asc` extras (#342).
+- Rebuild the exact tag commit for the signing host with the pinned release
+  recipe before signing artifacts. Retain mismatch evidence; proceeding after
+  investigation requires a logged `--accept-unverified-host` reason. Other
+  targets need explicit waivers; build failures still block signing (#341).
+
+### Release metadata
+
+- Bump all 14 workspace packages to `0.3.0-rc19`; this preparation changes no
+  third-party dependency versions beyond those already merged in #335.
 
 ## [0.3.0-rc18] — 2026-10-20 (prep; not tagged yet)
 

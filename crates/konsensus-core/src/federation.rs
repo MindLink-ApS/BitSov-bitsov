@@ -4,7 +4,6 @@
 //! Every federation message is signed with the sender's Ed25519 key and
 //! includes a unique nonce to prevent replay attacks.
 
-use ed25519_dalek::Verifier;
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
@@ -28,12 +27,7 @@ pub struct SignedMessage {
 
 impl SignedMessage {
     /// Compute the bytes to be signed: payload || sender || nonce || timestamp.
-    fn signable_bytes(
-        payload: &[u8],
-        sender: &NodeId,
-        nonce: &Nonce,
-        timestamp: u64,
-    ) -> Vec<u8> {
+    fn signable_bytes(payload: &[u8], sender: &NodeId, nonce: &Nonce, timestamp: u64) -> Vec<u8> {
         let mut buf = Vec::with_capacity(payload.len() + 32 + 24 + 8);
         buf.extend_from_slice(payload);
         buf.extend_from_slice(sender.as_bytes());
@@ -69,7 +63,7 @@ impl SignedMessage {
         let ed_sig = self.signature.to_ed25519();
 
         verifying_key
-            .verify(&signable, &ed_sig)
+            .verify_strict(&signable, &ed_sig)
             .map_err(|e| CoreError::InvalidSignature(e.to_string()))
     }
 
@@ -77,11 +71,7 @@ impl SignedMessage {
     ///
     /// `max_age_ms` is the maximum acceptable age of the message in milliseconds.
     /// `now_ms` is the current Unix timestamp in milliseconds.
-    pub fn verify_with_timestamp(
-        &self,
-        now_ms: u64,
-        max_age_ms: u64,
-    ) -> Result<(), CoreError> {
+    pub fn verify_with_timestamp(&self, now_ms: u64, max_age_ms: u64) -> Result<(), CoreError> {
         self.verify_signature()?;
 
         // Check message isn't too old
@@ -109,8 +99,7 @@ impl SignedMessage {
 mod tests {
     use super::*;
 
-    const TEST_MNEMONIC: &str =
-        "abandon abandon abandon abandon abandon abandon abandon abandon \
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon art";
 
@@ -164,9 +153,7 @@ mod tests {
         let signed = SignedMessage::sign(&identity, b"hello".to_vec(), now);
 
         // Verify 2 minutes later, with 60 second max age
-        assert!(signed
-            .verify_with_timestamp(now + 120_000, 60_000)
-            .is_err());
+        assert!(signed.verify_with_timestamp(now + 120_000, 60_000).is_err());
     }
 
     #[test]

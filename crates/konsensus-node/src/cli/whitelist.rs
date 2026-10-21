@@ -38,14 +38,20 @@ pub async fn cmd_whitelist_backup(
     let config = NodeConfig::load(config_path)
         .with_context(|| format!("failed to load config: {}", config_path.display()))?;
 
-    let mnemonic =
-        crate::mnemonic_crypto::read_mnemonic(&config.identity.mnemonic_file, mnemonic_password)
-            .with_context(|| {
-                format!(
-                    "failed to read mnemonic from {}",
-                    config.identity.mnemonic_file.display()
-                )
-            })?;
+    let (password, _) = crate::mnemonic_password(
+        &config.identity.mnemonic_file,
+        mnemonic_password.map(|value| zeroize::Zeroizing::new(value.to_owned())),
+    )?;
+    let mnemonic = crate::mnemonic_crypto::read_mnemonic(
+        &config.identity.mnemonic_file,
+        password.as_deref().map(String::as_str),
+    )
+    .with_context(|| {
+        format!(
+            "failed to read mnemonic from {}",
+            config.identity.mnemonic_file.display()
+        )
+    })?;
     let identity =
         konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, config.identity.passphrase.as_str())
             .context("failed to derive identity from mnemonic")?;
@@ -153,14 +159,20 @@ pub async fn cmd_whitelist_restore(
 ) -> Result<()> {
     let config = NodeConfig::load(config_path)
         .with_context(|| format!("failed to load config: {}", config_path.display()))?;
-    let mnemonic =
-        crate::mnemonic_crypto::read_mnemonic(&config.identity.mnemonic_file, mnemonic_password)
-            .with_context(|| {
-                format!(
-                    "failed to read mnemonic from {}",
-                    config.identity.mnemonic_file.display()
-                )
-            })?;
+    let (password, _) = crate::mnemonic_password(
+        &config.identity.mnemonic_file,
+        mnemonic_password.map(|value| zeroize::Zeroizing::new(value.to_owned())),
+    )?;
+    let mnemonic = crate::mnemonic_crypto::read_mnemonic(
+        &config.identity.mnemonic_file,
+        password.as_deref().map(String::as_str),
+    )
+    .with_context(|| {
+        format!(
+            "failed to read mnemonic from {}",
+            config.identity.mnemonic_file.display()
+        )
+    })?;
     let identity =
         konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, config.identity.passphrase.as_str())
             .context("failed to derive identity from mnemonic")?;

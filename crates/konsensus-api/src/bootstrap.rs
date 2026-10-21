@@ -340,7 +340,7 @@ fn repair_mark_initialized() -> String {
 
 fn repair_restore_mnemonic() -> String {
     "restore the recovery phrase for THIS node with \
-     `konsensus restore --dir <data-dir> --mnemonic \"<24 words>\"` (the same identity as \
+     `konsensus restore --dir <data-dir>` and enter the recovery phrase at the prompt (the same identity as \
      the existing state), or move the data directory aside if the funds are genuinely \
      abandoned. The node will not open first-run pairing on a directory that already holds \
      state."

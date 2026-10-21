@@ -77,6 +77,7 @@ pub mod state;
 pub mod ws;
 // N2 membrane ring (declared last to stay clear of neighbouring module additions).
 mod local_read;
+mod local_request;
 pub mod membrane;
 
 pub use audit::AuditLog;
@@ -113,8 +114,20 @@ async fn metrics_handler() -> impl IntoResponse {
 
 /// Build the Axum router with all routes and middleware.
 pub fn build_router(state: Arc<AppState>) -> Router {
+    build_router_for_addr(state, SocketAddr::from(([127, 0, 0, 1], 3141)))
+}
+
+/// Build a local router whose trusted Host values use this listener's address.
+/// Pass the bound address (not port zero) when serving an ephemeral listener.
+pub fn build_router_for_addr(state: Arc<AppState>, addr: SocketAddr) -> Router {
+    let origins = if state.cors_enabled {
+        cors_allowed_origins()
+    } else {
+        Vec::new()
+    };
+    let policy = local_request::LocalRequestPolicy::new(addr, origins);
     let limiter = Arc::clone(&state.rate_limiter);
-    build_router_with_options(state, limiter, true, false)
+    build_router_with_options(state, limiter, true, false).layer(axum::Extension(policy))
 }
 
 /// Build the ordinary API behind the encrypted remote tunnel, without the
@@ -205,7 +218,12 @@ fn build_router_with_options(
             rate_limiter,
             rate_limit::rate_limit_middleware,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                let target = traced_http_request(request.method(), request.uri());
+                tracing::info_span!("http", request = %target)
+            }),
+        )
         .layer(cors)
         .with_state(state)
 }
@@ -224,11 +242,21 @@ fn cors_allowed_origins() -> Vec<HeaderValue> {
     )
 }
 
+/// Method and path for HTTP traces. The query string is omitted because
+/// WebSocket clients may still pass `?token=`.
+pub(crate) fn traced_http_request(method: &axum::http::Method, uri: &axum::http::Uri) -> String {
+    format!("{method} {}", uri.path())
+}
+
+fn cors_origin_token_ok(origin: &str) -> bool {
+    !origin.is_empty() && origin != "*" && !origin.eq_ignore_ascii_case("null")
+}
+
 fn parse_cors_allowed_origins(raw: &str) -> Vec<HeaderValue> {
     raw.split(',')
         .filter_map(|origin| {
             let origin = origin.trim();
-            if origin.is_empty() {
+            if !cors_origin_token_ok(origin) {
                 return None;
             }
             HeaderValue::from_str(origin).ok()
@@ -294,9 +322,9 @@ pub async fn serve(
             }
         }
     });
-    let app = build_router(state).into_make_service_with_connect_info::<SocketAddr>();
-
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let app = build_router_for_addr(state, listener.local_addr()?)
+        .into_make_service_with_connect_info::<SocketAddr>();
     info!(%addr, "API server listening");
 
     axum::serve(listener, app)
@@ -322,6 +350,21 @@ mod tests {
         assert!(!origins
             .iter()
             .any(|origin| origin == HeaderValue::from_static("*")));
+    }
+
+    #[test]
+    fn cors_rejects_wildcard_and_null_origin() {
+        let origins = parse_cors_allowed_origins("*, null, NULL, http://localhost:1420");
+        assert_eq!(origins, vec![HeaderValue::from_static("http://localhost:1420")]);
+    }
+
+    #[test]
+    fn http_trace_omits_query_token() {
+        let uri: axum::http::Uri = "/api/v1/ws?token=super-secret-jwt".parse().unwrap();
+        let line = traced_http_request(&axum::http::Method::GET, &uri);
+        assert_eq!(line, "GET /api/v1/ws");
+        assert!(!line.contains("super-secret-jwt"));
+        assert!(!line.contains('?'));
     }
 }
 

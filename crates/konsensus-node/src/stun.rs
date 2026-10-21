@@ -1017,4 +1017,25 @@ mod tests {
         tx.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
     }
+
+    #[test]
+    fn malformed_stun_datagrams_do_not_panic() {
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        for _ in 0..200 {
+            let n = (next() as usize) % (MAX_REQUEST_LEN + 64);
+            let mut buf = vec![0u8; n];
+            for byte in &mut buf {
+                *byte = next() as u8;
+            }
+            let _ = parse_binding_request(&buf);
+            let _ = parse_binding_success(&buf, &TXID);
+        }
+        assert!(parse_binding_request(&[]).is_none());
+        assert!(parse_binding_request(&vec![0xff; MAX_REQUEST_LEN + 1]).is_none());
+        assert!(parse_binding_success(&[], &TXID).is_none());
+    }
 }

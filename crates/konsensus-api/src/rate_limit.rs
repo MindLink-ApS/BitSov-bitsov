@@ -124,7 +124,7 @@ impl Drop for RemoteTunnelRegistration {
 }
 
 #[derive(Clone)]
-struct RemotePairingRateLimitKey(Arc<str>);
+pub(crate) struct RemotePairingRateLimitKey(Arc<str>);
 
 /// Install outside the remote router's rate limiter. Unregistered connections
 /// fail closed, including direct local connections to the internal listener.

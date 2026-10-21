@@ -165,12 +165,17 @@ impl Terminal {
 fn node_id_prompts_for_encrypted_mnemonic_without_echoing() {
     const PASSWORD: &str = "node-id-terminal-secret";
     let dir = tempfile::tempdir().unwrap();
-    let initialized = Command::new(env!("CARGO_BIN_EXE_konsensus"))
+    let mut init = Command::new(env!("CARGO_BIN_EXE_konsensus"))
         .args(["init", "--non-interactive", "--tier", "light", "--dir"])
         .arg(dir.path())
-        .args(["--encrypt", PASSWORD])
-        .output()
+        .args(["--password-fd", "0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    writeln!(init.stdin.take().unwrap(), "{PASSWORD}").unwrap();
+    let initialized = init.wait_with_output().unwrap();
     assert!(initialized.status.success());
     let stdout = String::from_utf8(initialized.stdout).unwrap();
     let expected = stdout

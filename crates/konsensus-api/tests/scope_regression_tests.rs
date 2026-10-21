@@ -139,7 +139,7 @@ async fn ws_handshake_status(query: &str, protocol_header: Option<&str>) -> u16 
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = build_router(test_state());
+    let app = konsensus_api::build_router_for_addr(test_state(), addr);
     let server = tokio::spawn(async move {
         axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await

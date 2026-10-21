@@ -4,18 +4,18 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
+    # Every main push builds, including docs-only merges.
   pull_request:
     branches: [main]
+    # Label events belong to optional workflows, never to required checks.
+    # Do not put paths-ignore here: a skipped workflow never reports status
+    # checks, so branch protection would wait forever. Docs-only and `pm/`
+    # skips are job-level; `Frontend Build` always runs.
     types: [opened, synchronize, reopened]
+  merge_group:
 
 permissions:
   contents: read
-  pull-requests: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,11 +29,20 @@ jobs:
   changes:
     name: Classify changes
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
-      # Pushes and tags always receive the full validation path. Only PRs may
-      # use the lightweight required-check path.
-      rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' || steps.filter.outputs.security_policy == 'true' }}
+      # Pushes, tags, and merge-queue runs always take the Rust path. A PR
+      # takes it when any changed file is outside the docs/`pm/` set, when the
+      # security policy changed, or when the PR carries `full-ci`.
+      rust: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') || steps.filter.outputs.rust == 'true' || steps.filter.outputs.security_policy == 'true' }}
+      # Non-PR events run everything without querying changed files. PRs run
+      # Cargo Audit for advisory inputs or an existing `full-ci` label.
+      audit: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') || steps.audit_paths.outputs.audit == 'true' || steps.filter.outputs.security_policy == 'true' }}
     steps:
+      # PR-only: paths-filter uses the PR files API. Other events would need
+      # a checkout; instead, both outputs above unconditionally enable CI.
       - name: Detect Rust-impacting changes
         id: filter
         if: github.event_name == 'pull_request'
@@ -56,11 +65,30 @@ jobs:
             rust:
               - '**'
               - '!docs/**'
+              - '!pm/**'
               - '!**/*.md'
               - '!LICENSE'
               - '!.gitignore'
               - '!CODEOWNERS'
               - '!.github/dependabot.yml'
+
+      # Separate step: `predicate-quantifier: every` would require one file to
+      # match every audit path at once. This step uses the default `some`.
+      - name: Detect Cargo Audit inputs
+        id: audit_paths
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            audit:
+              - 'Cargo.lock'
+              - '**/Cargo.lock'
+              - '.cargo/audit.toml'
+              - 'SECURITY.md'
+              - 'scripts/check-security-key.sh'
+              - 'scripts/test-security-key.sh'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/security-scan.yml'
 
   release-sign-test:
     name: Offline Release Signing
@@ -79,6 +107,11 @@ jobs:
 
   frontend:
     name: Frontend Build
+    # Always-on sentinel. Docs-only and `pm/` pulls skip the heavy jobs, and a
+    # skipped job still reports under its required name. This job has no `if`,
+    # so a pull request always gets at least one completed check even when the
+    # Rust jobs are skipped. Workflow-level paths-ignore is intentionally not
+    # used on pull_request, because that would skip this job too.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -100,13 +133,17 @@ jobs:
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     env:
-      # Keep the hosted runner below disk/linker pressure during the core test
-      # phase. The workspace check builds heavy Lightning dependencies first;
-      # the test step then links many binaries. Lower parallelism and no
-      # incremental artifacts are slower but much less likely to exhaust
-      # ubuntu-latest.
+      # Keep the hosted runner below linker pressure. ubuntu-latest is 4 vCPU;
+      # two cargo jobs leave headroom for rustc and sccache. Incremental is off
+      # because sccache plus a restored target/ replaces it, and incremental
+      # caches blow the disk.
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
+      # Debuginfo, not debug assertions. `debug = 0` keeps `cfg(debug_assertions)`
+      # and shrinks ldk-node enough that the compiled artifacts fit in the
+      # Actions cache. Tests still run.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
 
@@ -131,11 +168,22 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev
 
-      # rust-cache includes dependency build artifacts in target/ and keys the
-      # cache on Cargo.lock, the compiler, the host, and relevant job settings.
+      # Cache registry crates and path/workspace crates (vendor/lightning,
+      # vendor/ldk-node). The default rust-cache mode skips those, so every
+      # test run recompiled them (~22 min) even after a "cache hit".
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-${{ hashFiles('Cargo.lock') }}
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Enable sccache for Cargo
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Check disk space
         run: df -h /
@@ -143,10 +191,20 @@ jobs:
       - name: cargo check
         run: cargo check --workspace
 
-      # Clean debug artifacts before test to free disk — ldk-node is ~5GB compiled
-      - name: Clean before test
+      # Only drop ldk-node artifacts when the runner is actually short on
+      # disk. Unconditional deletion threw away the restored rlibs and forced
+      # cargo test to recompile Lightning. Current ubuntu-latest images have
+      # ~100GB free at this step.
+      - name: Clean before test only under disk pressure
         run: |
-          rm -rf target/debug/build/ldk-node-* target/debug/deps/libldk_node-* target/debug/incremental/ 2>/dev/null || true
+          avail_kb=$(df -Pk / | awk 'NR==2 {print $4}')
+          echo "Available KiB: ${avail_kb}"
+          if [ "${avail_kb}" -lt 10485760 ]; then
+            rm -rf target/debug/build/ldk-node-* target/debug/deps/libldk_node-* target/debug/incremental/ 2>/dev/null || true
+            echo "Removed ldk-node debug artifacts to free disk."
+          else
+            echo "Disk headroom is sufficient; keeping compiled artifacts."
+          fi
           df -h /
 
       - name: cargo test (core crates only — ldk-node too large for CI runner)
@@ -158,6 +216,10 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --workspace -- -D warnings
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
   ldk-node-security:
     name: Vendored LDK Node Security Regressions
@@ -176,16 +238,30 @@ jobs:
         with:
           workspaces: vendor/ldk-node
           shared-key: ldk-node-security-${{ hashFiles('vendor/ldk-node/Cargo.lock') }}
+          cache-all-crates: "true"
+      - name: sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Enable sccache for Cargo
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       # The vendor crate is excluded from --workspace and -p konsensus-*.
       # Run its private-handler regressions plus all existing local patch tests.
       - name: Test vendored ldk-node library
         run: cargo test --locked --manifest-path vendor/ldk-node/Cargo.toml --lib
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
   audit:
     name: Cargo Audit
     needs: changes
-    # Same fail-closed condition as `Rust Check & Test`.
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
+    # Fail closed if classification did not succeed. Otherwise run only when
+    # the advisory inputs changed, on all non-PR events, or with an existing
+    # `full-ci` label. Adding the label runs the optional full-ci.yml instead.
+    # A daily security-scan.yml run covers new advisories on unchanged inputs. A skipped required check
+    # still reports success, same as the docs-only path.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.audit == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -273,8 +349,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read release toolchain pin
+        id: release-toolchain
+        shell: bash
+        run: echo "version=$(cat scripts/release-toolchain)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.release-toolchain.outputs.version }}
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools
@@ -283,22 +365,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-release-
-
+      # Tag-only matrix. It is not part of pull_request or main pushes: macOS
+      # runners are billed at 10× and Windows at 2×, so running the full
+      # matrix on every main push would spend more than it saves.
+      # Do not reuse compiled artifacts for a release reproducibility check
+      # (#341): no rust-cache or sccache in this job.
       - name: Build release binary
-        run: cargo build --locked --release -p konsensus-node --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        shell: bash
+        run: bash scripts/release-build.sh ${{ matrix.target }}
 
       # Unix (Linux + macOS): build output is `konsensus`. Linux keeps sha256sum (identical to
       # before); macOS has no sha256sum, so fall back to `shasum -a 256`, which emits the SAME

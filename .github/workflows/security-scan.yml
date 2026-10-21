@@ -1,13 +1,23 @@
-name: Weekly Security Scan
+name: Daily Security Scan
+
+# cargo audit, osv-scanner, and gitleaks. This is the scheduled advisory sweep.
+# Pull-request Cargo Audit (ci.yml) runs only when Cargo.lock or the security
+# policy changes or the PR already carries `full-ci`. Non-PR CI runs always
+# audit; adding `full-ci` starts a separate optional audit in full-ci.yml.
+# This daily sweep also catches new advisories when no code is being pushed.
 
 on:
   schedule:
-    - cron: '0 9 * * 3'  # Wednesdays 09:00 UTC
+    - cron: '0 6 * * *'  # every day 06:00 UTC
   workflow_dispatch:      # manual trigger for ad-hoc runs
 
 permissions:
   contents: write
   pull-requests: write
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   OSV_VERSION: v1.8.5
@@ -101,7 +111,7 @@ jobs:
         run: |
           gh label create "security-scanning" \
             --color "D93F0B" \
-            --description "Automated weekly security scan findings" \
+            --description "Automated daily security scan findings" \
             --repo "${{ github.repository }}" 2>/dev/null || true
 
       # ── Generate markdown report ───────────────────────────────────────────

@@ -3,6 +3,79 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## rc18 → rc19
+
+rc19 is rc18 (`20c6449e`) plus #330, #332, #333, #334, #335, #337, #339,
+#340, #341 and #342. See the [rc19 signing and beta-node checklist](releases/v0.3.0-rc19.md).
+Retain the latest data directory, config and encrypted seed; do not re-run
+`init`. Review the two startup changes below before replacing the binary.
+
+### Breaking change: argv secrets require explicit opt-in (H2, #340)
+
+Secret-valued `--password`, `init/restore --encrypt <password>`,
+`restore/approve-replacement --mnemonic <words>`, and nonempty
+`node-id/sign-challenge --passphrase <secret>` now refuse execution unless
+`--insecure-argv` is explicit. Even with opt-in, a warning is printed to stderr.
+Migrate launchers to `--password-fd N` (preferred), `--password-file PATH`
+(a regular mode-0600 file), or the interactive prompt. For BIP-39 passphrases,
+use `--passphrase-fd N`; use a separate descriptor from the seed password.
+Omitting a BIP-39 passphrase changes the derived identity, so do not drop it.
+For recovery phrases, omit the argv phrase and use the prompt. A
+`--mnemonic PATH` filename on `node-id`/`sign-challenge` is not an argv secret.
+The owner-token helper forwards its legacy password variable over stdin,
+not argv. See [password input](operations/password-input.md) for exact contracts.
+
+### Dedicated config parent directory required (#337)
+
+The config's parent directory must be a **dedicated directory owned by the
+node user**. On Unix it is forced to **0700** before the owner control socket
+is bound; the socket is restricted to **0600**. Startup refuses if the
+required permissions cannot be enforced. Do not put `konsensus.toml` directly
+in `$HOME` or a shared directory: the parent itself is restricted.
+Before restarting, check the service account and ownership of container or
+mounted volumes. If relocating the config, move the retained node directory
+as a unit and update the service's config path; preserve its seed, wallet,
+channels and stores. Do not initialize a fresh directory to bypass a refusal.
+
+### API, channel operations and storage
+
+Host/Origin checks now gate local token issuance, local-only reads and
+WebSocket admission (#339); native clients without Origin remain supported.
+Check browser/proxy Host and Origin configuration when local access is refused.
+Wildcard and `null` CORS origins are rejected; query tokens are omitted from
+HTTP traces and WebSocket subprotocol tokens are preferred (#337).
+
+For LDK, channel opens expose a decimal-string `user_channel_id`, hex
+`channel_id` and `funding_txo`; use `user_channel_id` as the stable identifier
+(#330). Other backends return null for `user_channel_id` and retain their
+native `channel_id` formats.
+SQLite and PostgreSQL migration **030** adds `channel_open_operations` (#332,
+implementing #331). Clients can send an optional UUIDv4 `operation_id` and
+reuse the same ID and parameters on retry; different parameters return
+`409 operation_mismatch`. Requests without an ID retain their prior behavior.
+Recording completes after HTTP disconnects; on retry, crash-left pending
+operations older than ten minutes are reconciled against channels without
+redispatch. Proven LDK pre-dispatch refusals release the ID (#334).
+Do not create a fresh operation ID to bypass an uncertain result: inspect
+channels and reconcile first. See [channel-open operations](ops/funding-fees.md).
+
+LND settled dispatch amounts must match the invoice; missing/mismatched amounts
+fail without releasing the budget reservation. Settled zero amounts and
+satoshi-to-msat overflows are rejected (#342). Reconcile an uncertain payment
+before retrying. #335 updates the modern WebPKI verifier/root lines and vendors
+electrum-client; documented legacy SQLx/test-only exceptions remain.
+
+### Rollback constraints
+
+Pairing remains **v8**, with no new pairing-store or peer-store schema version.
+Migration 030 is new SQL state; rc18 lacks channel-open operation tracking and
+interrupted-operation reconciliation. Do not assume safe rollback or replay
+pending opens against rc18. Preserve the latest state, resolve pending operations
+and prefer rolling forward. Never restore an older wallet/channel or pairing
+snapshot. Existing fences remain: **no rc16 or older on a v8 pairing store**,
+and **no rc14 after running with embedded LDK**. On Umbrel, touch only BitSov's
+binary/service/data, never Umbrel's own LND or wallet.
+
 ## rc17 → rc18
 
 rc18 is rc17 (`ce7fb53`) plus #321, #322, #323, #324, #326, #327 and #329.
@@ -62,7 +135,8 @@ verification cannot complete and normal startup remains fenced. See
 ### Contacts and encrypted seeds
 
 `konsensus node-id` can now decrypt `mnemonic.enc` using the same terminal,
-`--password-fd`, `--password-file` or `--password` sources as `sign-challenge`.
+`--password-fd` or `--password-file` sources as `sign-challenge`.
+Argv secrets now require `--insecure-argv`; see [password input](operations/password-input.md).
 The funding-address API reports the configured network, including signet;
 `GET /api/v1/peers/export` now accepts Read scope.
 

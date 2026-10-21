@@ -78,11 +78,9 @@ async fn ws_handler(
 }
 
 fn extract_ws_token(query_token: Option<&str>, headers: &HeaderMap) -> Option<String> {
-    if let Some(token) = query_token.filter(|token| !token.trim().is_empty()) {
-        return Some(token.to_string());
-    }
-
-    headers
+    // Prefer the subprotocol. A `?token=` value must not replace a token the
+    // client already sent in a header that proxies are less likely to log.
+    let from_protocol = headers
         .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|value| value.to_str().ok())
         .and_then(|protocols| {
@@ -92,6 +90,13 @@ fn extract_ws_token(query_token: Option<&str>, headers: &HeaderMap) -> Option<St
                 .find_map(|protocol| protocol.strip_prefix(WS_JWT_PROTOCOL_PREFIX))
         })
         .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned);
+    if from_protocol.is_some() {
+        return from_protocol;
+    }
+
+    query_token
+        .filter(|token| !token.trim().is_empty())
         .map(ToOwned::to_owned)
 }
 
@@ -257,13 +262,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_ws_token_prefers_query_for_legacy_clients() {
+    fn extract_ws_token_prefers_subprotocol_over_query() {
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::SEC_WEBSOCKET_PROTOCOL,
             "bitsov.v1, bitsov.jwt.header-token".parse().unwrap(),
         );
 
+        assert_eq!(
+            extract_ws_token(Some("query-token"), &headers).as_deref(),
+            Some("header-token")
+        );
+    }
+
+    #[test]
+    fn extract_ws_token_accepts_query_when_subprotocol_is_absent() {
+        let headers = HeaderMap::new();
         assert_eq!(
             extract_ws_token(Some("query-token"), &headers).as_deref(),
             Some("query-token")

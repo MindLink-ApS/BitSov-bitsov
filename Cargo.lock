@@ -2063,7 +2063,7 @@ dependencies = [
 
 [[package]]
 name = "konsensus-api"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
  "async-trait",
  "axum",
@@ -2112,8 +2112,9 @@ dependencies = [
 
 [[package]]
 name = "konsensus-bsx"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
+ "proptest",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2121,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "konsensus-chain"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
  "async-trait",
  "axum",
@@ -2150,7 +2151,7 @@ dependencies = [
 
 [[package]]
 name = "konsensus-core"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -2185,7 +2186,7 @@ dependencies = [
 
 [[package]]
 name = "konsensus-crypto"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -2213,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "konsensus-fiat"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2227,7 +2228,7 @@ dependencies = [
 
 [[package]]
 name = "konsensus-gossip"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
  "konsensus-core",
  "serde",
@@ -2239,7 +2240,7 @@ dependencies = [
 
 [[package]]
 name = "konsensus-lightning"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -2283,7 +2284,7 @@ dependencies = [
 
 [[package]]
 name = "konsensus-message"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2295,6 +2296,7 @@ dependencies = [
  "konsensus-crypto",
  "konsensus-storage",
  "mockall",
+ "proptest",
  "rand 0.8.6",
  "reqwest",
  "serde",
@@ -2311,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "konsensus-node"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2374,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "konsensus-pricing"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
  "async-trait",
  "konsensus-chain",
@@ -2389,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "konsensus-recovery"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -2409,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "konsensus-routing"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
  "criterion",
  "hex",
@@ -2423,7 +2425,7 @@ dependencies = [
 
 [[package]]
 name = "konsensus-storage"
-version = "0.3.0-rc18"
+version = "0.3.0-rc19"
 dependencies = [
  "aes-gcm",
  "async-trait",

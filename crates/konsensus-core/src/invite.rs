@@ -20,7 +20,7 @@
 //!
 //! And `signature` is 64 bytes (Ed25519 over `payload`).
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -125,6 +125,10 @@ pub enum InviteError {
     /// Ed25519 signature verification failed.
     #[error("invalid signature")]
     InvalidSignature,
+
+    /// Bytes follow the fixed-length signature.
+    #[error("trailing bytes after signature: {0}")]
+    TrailingBytes(usize),
 
     /// Token has expired.
     #[error("token expired at {0}")]
@@ -339,7 +343,7 @@ impl BitSovInvite {
         let signature = Signature::from_bytes(&self.signature);
         let canonical = self.canonical_bytes()?;
         verifying_key
-            .verify(&canonical, &signature)
+            .verify_strict(&canonical, &signature)
             .map_err(|_| InviteError::InvalidSignature)
     }
 }
@@ -469,7 +473,14 @@ impl InviteToken {
         );
         cursor += 8;
 
-        // Signature (64 bytes)
+        // Signature (64 bytes). Anything after it is not part of the token.
+        let sig_end = cursor.saturating_add(64);
+        if bytes.len() != sig_end {
+            if bytes.len() > sig_end {
+                return Err(InviteError::TrailingBytes(bytes.len() - sig_end));
+            }
+            return Err(InviteError::TooShort(bytes.len()));
+        }
         let sig_bytes: [u8; 64] = bytes[cursor..cursor + 64]
             .try_into()
             .map_err(|_| InviteError::TooShort(bytes.len()))?;
@@ -480,7 +491,7 @@ impl InviteToken {
         let verifying_key =
             VerifyingKey::from_bytes(&node_id_bytes).map_err(|_| InviteError::InvalidSignature)?;
         verifying_key
-            .verify(payload, &signature)
+            .verify_strict(payload, &signature)
             .map_err(|_| InviteError::InvalidSignature)?;
 
         // Check expiry (0 = no expiry)
@@ -590,6 +601,16 @@ mod tests {
             InviteToken::generate(&identity, "10.0.0.1:9735", None, past_ts).expect("generate");
         let err = InviteToken::parse(&token).unwrap_err();
         assert!(matches!(err, InviteError::Expired(1000)));
+    }
+
+    #[test]
+    fn trailing_bytes_rejected() {
+        let identity = test_identity();
+        let token = InviteToken::generate(&identity, "10.0.0.1:9735", None, 0).expect("generate");
+        let mut bytes = bs58::decode(&token).into_vec().unwrap();
+        bytes.push(0x00);
+        let err = InviteToken::parse(&bs58::encode(&bytes).into_string()).unwrap_err();
+        assert!(matches!(err, InviteError::TrailingBytes(1)));
     }
 
     #[test]

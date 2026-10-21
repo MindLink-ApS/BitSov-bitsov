@@ -16,7 +16,7 @@ One identity (one mnemonic), N devices (phone, laptop, desktop, tablet, friend's
 
 Identity is **mnemonic-derived Ed25519** (`konsensus-core/src/identity.rs`). Today the API has two endpoints (`konsensus-api/src/handlers/auth_routes.rs`):
 
-- `GET /api/v1/auth/challenge` then `POST /api/v1/auth/token` — sign the live challenge string `bitsov-auth-v1:<64-hex-nonce>:<unix-exp>` (exact bytes) with the node key, receive 24h JWT. Same-key only. **Does not support multi-device.** (`konsensus sign-challenge --challenge …`; encrypted seeds also take `--password`, `--password-file`, or `--password-fd`, forwarded by `docs/ops/owner-token.sh`.)
+- `GET /api/v1/auth/challenge` then `POST /api/v1/auth/token` — sign the live challenge string `bitsov-auth-v1:<64-hex-nonce>:<unix-exp>` (exact bytes) with the node key, receive 24h JWT. Same-key only. **Does not support multi-device.** (`konsensus sign-challenge --challenge …`; encrypted seeds also take `--password-file` or `--password-fd`, forwarded by `docs/ops/owner-token.sh`.)
 - `POST /api/v1/auth/local` — loopback-only freebie JWT for desktop UX.
 
 We extend, we do not replace. The Cell Test: cells signal identity via **surface receptors** derived from but not equal to nuclear DNA. Each device is a receptor.
