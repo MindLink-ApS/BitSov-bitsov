@@ -77,6 +77,7 @@ pub mod state;
 pub mod ws;
 // N2 membrane ring (declared last to stay clear of neighbouring module additions).
 mod local_read;
+mod local_request;
 pub mod membrane;
 
 pub use audit::AuditLog;
@@ -113,8 +114,20 @@ async fn metrics_handler() -> impl IntoResponse {
 
 /// Build the Axum router with all routes and middleware.
 pub fn build_router(state: Arc<AppState>) -> Router {
+    build_router_for_addr(state, SocketAddr::from(([127, 0, 0, 1], 3141)))
+}
+
+/// Build a local router whose trusted Host values use this listener's address.
+/// Pass the bound address (not port zero) when serving an ephemeral listener.
+pub fn build_router_for_addr(state: Arc<AppState>, addr: SocketAddr) -> Router {
+    let origins = if state.cors_enabled {
+        cors_allowed_origins()
+    } else {
+        Vec::new()
+    };
+    let policy = local_request::LocalRequestPolicy::new(addr, origins);
     let limiter = Arc::clone(&state.rate_limiter);
-    build_router_with_options(state, limiter, true, false)
+    build_router_with_options(state, limiter, true, false).layer(axum::Extension(policy))
 }
 
 /// Build the ordinary API behind the encrypted remote tunnel, without the
@@ -309,9 +322,9 @@ pub async fn serve(
             }
         }
     });
-    let app = build_router(state).into_make_service_with_connect_info::<SocketAddr>();
-
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let app = build_router_for_addr(state, listener.local_addr()?)
+        .into_make_service_with_connect_info::<SocketAddr>();
     info!(%addr, "API server listening");
 
     axum::serve(listener, app)

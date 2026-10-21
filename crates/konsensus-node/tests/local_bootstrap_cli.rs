@@ -38,9 +38,6 @@ fn start_source(config: &Path, log: &std::fs::File, local: bool, source: &str) -
         "descriptor" => {
             cmd.args(["--password-fd", "0"]);
         }
-        "flag" => {
-            cmd.args(["--password", PASSWORD]);
-        }
         "file" => {
             use std::os::unix::fs::PermissionsExt;
             let path = config.with_file_name("password-input");
@@ -334,7 +331,7 @@ async fn descriptor_bootstrap_restart_intent_and_no_secret_logs() {
 
 #[tokio::test]
 async fn legacy_create_restore_encrypt_with_password_and_keep_plaintext_without() {
-    for source in ["descriptor", "none", "flag", "file"] {
+    for source in ["descriptor", "none", "file"] {
         let password = source != "none";
         for restore in [false, true] {
             let dir = tempfile::tempdir().unwrap();
