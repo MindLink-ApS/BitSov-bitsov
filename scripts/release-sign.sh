@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # release-sign.sh: the operator's one command per release (RELEASE_POLICY.md).
 #
-#   scripts/release-sign.sh v0.3.0-rc10 <commit-on-main>
+#   scripts/release-sign.sh <tag> <reviewed-commit>
 #
 # 1. Creates and pushes a GPG-signed tag on the commit (skipped if the tag already
 #    exists and is signed by the release key).
@@ -90,17 +90,30 @@ while [ $# -gt 0 ]; do
     *) POSITIONAL+=("$1"); shift ;;
   esac
 done
-[ "${#POSITIONAL[@]}" -eq 2 ] || die "usage: $0 [--dry-run] [--accept-unverified-host <reason>] [--accept-unverified-target <triple>]... <tag> <commit-on-main>"
+[ "${#POSITIONAL[@]}" -eq 2 ] || die "usage: $0 [--dry-run] [--accept-unverified-host <reason>] [--accept-unverified-target <triple>]... <tag> <reviewed-commit>"
 set -- "${POSITIONAL[@]}"
 TAG=$1 COMMIT=$2
-[[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]] || die "tag must look like v0.3.0 or v0.3.0-rc9"
+[[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+(\.[0-9]+)?)?$ ]] || die "tag must look like v0.3.0, v0.3.0-rc9 or v0.3.0-rc19.1"
 for t in git gh gpg shasum rustup diff; do command -v "$t" >/dev/null || die "$t not found"; done
 
 SOURCE_REPO=$(git rev-parse --show-toplevel)
 cd "$SOURCE_REPO"
-git fetch -q origin main --tags
+RELEASE_REF=''
+if [[ $TAG =~ -rc[0-9]+\.[0-9]+$ ]]; then
+  RELEASE_REF="release/$TAG"
+  # Fetch the exact remote branch, never a same-named tag or cached tracking ref.
+  git fetch -q origin "refs/heads/$RELEASE_REF" --tags ||
+    die "cannot fetch approved release branch $RELEASE_REF from origin"
+else
+  git fetch -q origin main --tags
+fi
 FULL=$(git rev-parse --verify "$COMMIT^{commit}") || die "unknown commit $COMMIT"
-git merge-base --is-ancestor "$FULL" origin/main || die "$FULL is not on origin/main"
+if [ -n "$RELEASE_REF" ]; then
+  [ "$(git rev-parse --verify 'FETCH_HEAD^{commit}')" = "$FULL" ] ||
+    die "$FULL does not match the approved release branch $RELEASE_REF"
+else
+  git merge-base --is-ancestor "$FULL" origin/main || die "$FULL is not on origin/main"
+fi
 
 WORK=$(mktemp -d)
 KEEP_WORK=false

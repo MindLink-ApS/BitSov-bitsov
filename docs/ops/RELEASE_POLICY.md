@@ -36,7 +36,27 @@ The open-core release remains canonical.
 
 ## Operator signing (one command)
 
-`scripts/release-sign.sh <tag> <commit-on-main>` is the operator's single step per release. It creates and pushes the GPG-signed tag (or verifies an existing one), waits for the tag's CI run, downloads every binary from the draft and checks it against its `.sha256`, writes `SHA256SUMS`, independently rebuilds the host target and requires a matching hash or an explicit reasoned host break-glass (plus explicit waivers for other targets), signs it with the release key (`B299274C200301714DC6F51A7C2D6F8AC842EF6E`, the same key as `RELEASE_KEY.asc`), verifies the signature, and attaches `SHA256SUMS` and `SHA256SUMS.asc` to the draft. The key never leaves the operator's machine, and the script never publishes.
+`scripts/release-sign.sh <tag> <reviewed-commit>` is the operator's single step per release. It creates and pushes the GPG-signed tag (or verifies an existing one), waits for the tag's CI run, downloads every binary from the draft and checks it against its `.sha256`, writes `SHA256SUMS`, independently rebuilds the host target and requires a matching hash or an explicit reasoned host break-glass (plus explicit waivers for other targets), signs it with the release key (`B299274C200301714DC6F51A7C2D6F8AC842EF6E`, the same key as `RELEASE_KEY.asc`), verifies the signature, and attaches `SHA256SUMS` and `SHA256SUMS.asc` to the draft. The key never leaves the operator's machine, and the script never publishes.
+
+### Approved release refs
+
+Accepted tags are `vX.Y.Z`, `vX.Y.Z-rcN` and `vX.Y.Z-rcN.M`, with numeric
+components. The source gate runs before any signing or CI access:
+
+- A dotted RC point-release tag (`vX.Y.Z-rcN.M`) requires the exact branch
+  `refs/heads/release/<tag>` on `origin`. The signer fetches that branch fresh
+  with tags and requires the reviewed commit to equal `FETCH_HEAD^{commit}`,
+  not merely be an ancestor of the branch head. For `v0.3.0-rc19.1`, the approved
+  branch is `release/v0.3.0-rc19.1`; its isolated head need not be on main.
+  A missing/unfetchable branch or a different head refuses signing, even if
+  the commit is on main. Cached tracking refs and same-named tags do not qualify.
+- Every other accepted tag retains the existing ancestry gate: fetch `main`
+  and tags from `origin`, then require the reviewed commit to be an ancestor
+  of `origin/main`. A release branch cannot authorize a plain RC or stable tag.
+
+Existing signed tags must still resolve to the exact reviewed commit, and the
+CI run must build that same commit. No flag bypasses the approved-ref policy;
+`--dry-run` and host/non-host waivers retain these checks.
 
 ## Independent rebuild gate (H3)
 
@@ -211,7 +231,10 @@ draft. The signer requires both Darwin evidence files and includes their hashes
 in signed `SHA256SUMS` (17 source assets total). Archive these alongside the
 signing log, which includes the local preflight output. On a host hash mismatch,
 the retained evidence also includes the CI files and local toolchain record.
-These version records aid diagnosis; only the H3 binary hash comparison proves
+The signer requires nonempty CI toolchain records and hashes them; it does not
+parse or compare their contents against the pins. Local preflight and CI's own
+build preflight check their respective toolchains. These version records aid
+diagnosis; only the H3 binary hash comparison proves
 a matching host rebuild.
 
 ## Release-script tests
