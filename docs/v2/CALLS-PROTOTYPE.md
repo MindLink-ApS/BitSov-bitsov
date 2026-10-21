@@ -101,6 +101,36 @@ the price query at all, the call is refused before paying
 
 Calls are 1:1: a room compose of 400-403 is refused (`call_room`).
 
+## Compose API refusals
+
+For a new operation, `POST /api/v1/messages/compose` checks the call rules
+before creating an operation row, requesting a quote, or attempting payment.
+These refusals remain HTTP **400** and use the existing non-dispatch contract:
+
+```json
+{
+  "error": "call offer replayed: this call id was already used",
+  "code": "not_dispatched",
+  "reason": "call_id_used"
+}
+```
+
+| `reason` | Meaning |
+|---|---|
+| `call_id_used` | The offer's call id is already reserved or used. |
+| `call_busy` | The node cannot make room for another call. |
+| `call_signal_in_flight` | Another operation has a pending signal for this call. |
+| `call_signal_invalid` | The signal or meeting leg is invalid. |
+| `call_not_live` | The signal requires a live/ringing call or the correct caller/callee role. |
+
+Clients may use `code: "not_dispatched"` to release their local spend
+reservation and `reason` to explain the refusal. The guarantee applies to
+the refused operation, not another operation holding the call reservation.
+Retries with an existing operation row retain their previous error shape:
+the call rules alone cannot prove that an earlier attempt never dispatched.
+Incoming paid-signal rejections and later payment/dispatch failures do not
+gain this code from the call-rule check.
+
 ## Mesh meetings (up to 4)
 
 A meeting is a set of ordinary 1:1 calls ("legs") that share a meeting id and

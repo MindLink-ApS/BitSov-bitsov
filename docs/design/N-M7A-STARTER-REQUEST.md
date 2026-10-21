@@ -386,7 +386,11 @@ Metrics (hub, no peer-identifying labels): `konsensus_starter_requests_total{res
 
 Out of scope: idle reclaim (Option A H3; not needed on signet, **required before mainnet**), the invite issuance service (H5), mainnet sizes, app UI, the ONB5 fix (#349).
 
-## 12. Open questions for Rasmus
+## 12. Decision log
 
-1. **Signet hub and funder.** Which node is the dedicated non-lockable signet hub, and who funds its signet wallet (≥ 2,000,000 sats lifetime budget + 25,000 anchor reserve per channel + fees)?
-2. **Mainnet.** The funding vehicle, gift size and reclaim period are still open from T4a. `allow_mainnet` stays hard-refused until you say GO, and reclaim must exist first.
+| Date (CST) | Question | Decision | By |
+|---|---|---|---|
+| 21 Oct 2026, 10:38 | **Signet hub and funder** (was open question 1) | The dedicated, non-lockable signet hub is the GCP `beta` signet VM, which already hubs the beta/Maya/Josh mesh. If beta is gone or unfit, fall back to a new small GCP VM. **Never** the Pi (Rasmus's lockable owner node) and **never** the Umbrel. MindLink funds it from signet faucets plus its own signet wallets; Claude and Atlas may top it up on their own (signet coins have no value). Budget: the 2,000,000-sat lifetime cap + 25,000-sat anchor reserve per channel + fees. | Atlas, delegated by Rasmus (explicit GO 10:33) |
+| 21 Oct 2026, 10:38 | **Mainnet** (was open question 2) | `allow_mainnet` stays hard-refused; this lane changes nothing. Shape for later: (a) the funding vehicle is MindLink's own hub node wallet, never a user's and never Rasmus's father's; (b) the gift is 10,000 sats per new person, one channel per node, daily cap unchanged; (c) **cooperative-only** reclaim (as T4a defines it, so it stays non-custodial) after 90 days with no outbound activity, and reclaim must be built and tested on signet before any mainnet switch; (d) going live on mainnet is a separate Rasmus GO, because it sends sats to external nodes. | Atlas, delegated by Rasmus (explicit GO 10:33) |
+
+No open questions remain for signet. Mainnet stays behind (c) and (d), and the 20-per-day cap is re-checked at the mainnet GO.
