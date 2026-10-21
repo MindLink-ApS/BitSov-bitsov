@@ -5,6 +5,12 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Fix ONB5 channel opens on LDK hubs (#349): use the six-block funding priority
+  with a checked LDK quote and a hard total-fee cap from the existing fee buffer,
+  instead of an exact rate that LDK rejects. Non-LDK fee handling is unchanged;
+  channels remain private with no balance push, and automatic onboarding opens
+  remain disabled by default.
+
 ## [0.3.0-rc19] — 2026-10-21 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. rc19 is rc18 (`20c6449e`) plus

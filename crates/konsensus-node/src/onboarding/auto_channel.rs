@@ -12,7 +12,9 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use konsensus_core::traits::chain::ChainProvider;
-use konsensus_core::traits::lightning::{ChannelInfo, LightningError, LightningProvider};
+use konsensus_core::traits::lightning::{
+    ChannelInfo, FundingOptions, FundingPriority, LightningError, LightningProvider,
+};
 use konsensus_core::types::NodeId;
 use konsensus_storage::{InviteIssuedRecord, InviteState, Storage, StorageError};
 
@@ -43,6 +45,8 @@ pub struct AutoChannelDeps {
     pub shutdown_rx: watch::Receiver<bool>,
     /// R1-a onboarding subsidy policy. OFF by default → the worker is inert.
     pub subsidy: SubsidyConfig,
+    /// LDK uses estimator-selected funding; None preserves exact-rate backends.
+    pub funding_priority: Option<FundingPriority>,
 }
 
 #[derive(Debug, Error)]
@@ -72,6 +76,7 @@ pub async fn run(mut deps: AutoChannelDeps) {
                     Arc::clone(&deps.chain),
                     Arc::clone(&deps.notifier),
                     deps.subsidy.clone(),
+                    deps.funding_priority,
                 ).await {
                     warn!(error = %e, "auto-channel event failed");
                 }
@@ -91,6 +96,7 @@ pub async fn handle_event(
     chain: Arc<dyn ChainProvider>,
     notifier: Arc<dyn NotificationSink>,
     subsidy: SubsidyConfig,
+    funding_priority: Option<FundingPriority>,
 ) -> Result<(), AutoChannelError> {
     match event {
         AutoChannelEvent::PeerLightningInfo {
@@ -99,7 +105,15 @@ pub async fn handle_event(
             ln_addr,
         } => {
             handle_peer_lightning_info(
-                peer_id, ln_pubkey, ln_addr, storage, lightning, chain, notifier, subsidy,
+                peer_id,
+                ln_pubkey,
+                ln_addr,
+                storage,
+                lightning,
+                chain,
+                notifier,
+                subsidy,
+                funding_priority,
             )
             .await
         }
@@ -116,6 +130,7 @@ pub async fn handle_peer_lightning_info(
     chain: Arc<dyn ChainProvider>,
     notifier: Arc<dyn NotificationSink>,
     subsidy: SubsidyConfig,
+    funding_priority: Option<FundingPriority>,
 ) -> Result<(), AutoChannelError> {
     // R1-a LOAD-BEARING DRIFT-DEATH: the onboarding subsidy is OFF by default, so
     // on the live mesh an invite's `Pending` membership authorizes ZERO spend —
@@ -176,7 +191,17 @@ pub async fn handle_peer_lightning_info(
         .unwrap_or(DEFAULT_MAX_FEE_RATE_SAT_PER_VB)
         .min(subsidy.max_funding_fee_rate_sat_per_vb);
 
-    let current_fee_rate = estimate_fee_rate_sat_per_vb(chain.as_ref()).await?;
+    let funding_options = funding_priority.map(|priority| FundingOptions {
+        priority,
+        // Use the already-budgeted fee buffer as a hard transaction fee cap.
+        max_funding_fee_sats: Some(funding_fee_buffer_sats(max_fee_rate)),
+    });
+    let current_fee_rate = if let Some(options) = &funding_options {
+        let quote = lightning.funding_fee_quote(options.clone()).await?;
+        checked_fee_rate_sat_per_vb(quote.estimated_fee_rate_sat_per_vb)?
+    } else {
+        estimate_fee_rate_sat_per_vb(chain.as_ref()).await?
+    };
     if current_fee_rate > max_fee_rate {
         notify_abort(
             notifier.as_ref(),
@@ -368,16 +393,25 @@ pub async fn handle_peer_lightning_info(
         return Ok(());
     }
 
-    let channel_id = match lightning
-        .open_channel(
-            &ln_pubkey,
-            &ln_addr,
-            amount_sats,
-            false,
-            Some(current_fee_rate as f32),
-        )
-        .await
-    {
+    let open_result = if let Some(options) = funding_options {
+        // LDK refuses exact caller rates. Keep this private and zero-push, with
+        // a fresh estimator policy and a fee cap enforced during construction.
+        lightning
+            .open_channel_with_funding(&ln_pubkey, &ln_addr, amount_sats, false, options, None)
+            .await
+            .map(|result| result.user_channel_id.unwrap_or(result.channel_id))
+    } else {
+        lightning
+            .open_channel(
+                &ln_pubkey,
+                &ln_addr,
+                amount_sats,
+                false,
+                Some(current_fee_rate as f32),
+            )
+            .await
+    };
+    let channel_id = match open_result {
         Ok(channel_id) => channel_id,
         Err(e) => {
             let _ = storage.mark_invite_pending(&invite.id).await?;
@@ -415,15 +449,18 @@ pub async fn handle_peer_lightning_info(
 
 async fn estimate_fee_rate_sat_per_vb(chain: &dyn ChainProvider) -> Result<u32, AutoChannelError> {
     let estimate = chain.estimate_fee(FEE_ESTIMATE_TARGET_BLOCKS).await?;
-    let fee = estimate.sat_per_vbyte.ceil();
+    checked_fee_rate_sat_per_vb(estimate.sat_per_vbyte)
+}
+
+fn checked_fee_rate_sat_per_vb(estimate: f64) -> Result<u32, AutoChannelError> {
+    let fee = estimate.ceil();
     if !fee.is_finite()
         || fee < 1.0
         || fee > f64::from(konsensus_core::fee_rate::MAX_FEE_RATE_SAT_PER_VB)
     {
         return Err(AutoChannelError::Chain(
             konsensus_core::traits::chain::ChainError::FeeEstimationFailed(format!(
-                "invalid funding fee estimate: {}",
-                estimate.sat_per_vbyte
+                "invalid funding fee estimate: {estimate}"
             )),
         ));
     }
@@ -519,7 +556,8 @@ mod tests {
 
     use konsensus_core::traits::chain::{BlockHeader, ChainError, FeeEstimate, TrustLevel};
     use konsensus_core::traits::lightning::{
-        Invoice, PaymentDetails, PaymentDirection, PaymentStatus,
+        ChannelOpenResult, FundingFeeEstimate, Invoice, PaymentDetails, PaymentDirection,
+        PaymentStatus,
     };
     use konsensus_storage::{InviteState, SqliteStorage};
 
@@ -573,6 +611,7 @@ mod tests {
     #[derive(Default)]
     struct TestLightning {
         balance_msat: u64,
+        ldk: Option<konsensus_lightning::LdkProvider>,
         channels: Mutex<Vec<ChannelInfo>>,
         opens: Mutex<Vec<ChannelOpen>>,
         reject_fee_requests: bool,
@@ -631,6 +670,17 @@ mod tests {
             announce: bool,
             fee_rate_sat_per_vb: Option<f32>,
         ) -> Result<String, LightningError> {
+            if let Some(ldk) = &self.ldk {
+                return ldk
+                    .open_channel(
+                        peer_pubkey,
+                        peer_addr,
+                        amount_sats,
+                        announce,
+                        fee_rate_sat_per_vb,
+                    )
+                    .await;
+            }
             if self.reject_fee_requests && fee_rate_sat_per_vb.is_some() {
                 return Err(LightningError::PaymentNotDispatched(
                     "funding fee override unsupported".into(),
@@ -654,6 +704,47 @@ mod tests {
                 release_open.notified().await;
             }
             Ok("temp-channel-id".to_string())
+        }
+
+        async fn funding_fee_quote(
+            &self,
+            options: FundingOptions,
+        ) -> Result<FundingFeeEstimate, LightningError> {
+            self.ldk
+                .as_ref()
+                .expect("only LDK uses funding policy")
+                .funding_fee_quote(options)
+                .await
+        }
+
+        async fn open_channel_with_funding(
+            &self,
+            peer_pubkey: &str,
+            peer_addr: &str,
+            amount_sats: u64,
+            announce: bool,
+            options: FundingOptions,
+            push_msat: Option<u64>,
+        ) -> Result<ChannelOpenResult, LightningError> {
+            assert_eq!(
+                options.priority,
+                konsensus_core::traits::lightning::FundingPriority::Fast
+            );
+            assert_eq!(options.max_funding_fee_sats, Some(1500));
+            assert!(!announce);
+            assert_eq!(push_msat, None);
+            self.ldk
+                .as_ref()
+                .expect("only LDK uses funding policy")
+                .open_channel_with_funding(
+                    peer_pubkey,
+                    peer_addr,
+                    amount_sats,
+                    announce,
+                    options,
+                    push_msat,
+                )
+                .await
         }
     }
 
@@ -736,6 +827,178 @@ mod tests {
         }
     }
 
+    // Only the wallet balance is faked: both open APIs and fee quotes go through
+    // the real LdkProvider. NotRunning comes from LDK's opener, after the exact
+    // rate refusal, so it proves dispatch without dialing or spending funds.
+    async fn ldk_fixture(fees: &str) -> (tempfile::TempDir, Arc<TestLightning>, String) {
+        let mut server = mockito::Server::new_async().await;
+        let _fees = server
+            .mock("GET", "/fee-estimates")
+            .with_body(fees)
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = ldk_node::Builder::new();
+        builder.set_network(bitcoin::Network::Regtest);
+        builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+        builder.set_listening_addresses(vec![]).unwrap();
+        builder.set_gossip_source_p2p();
+        builder.set_chain_source_esplora(
+            server.url(),
+            Some(ldk_node::config::EsploraSyncConfig {
+                background_sync_config: None,
+            }),
+        );
+        let node = Arc::new(builder.build().unwrap());
+        node.start().unwrap();
+        node.stop().unwrap();
+        let ln_pubkey = node.node_id().to_string();
+        let lightning = Arc::new(TestLightning {
+            balance_msat: 100_000_000,
+            ldk: Some(konsensus_lightning::LdkProvider::from_node(node)),
+            ..Default::default()
+        });
+        (dir, lightning, ln_pubkey)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn onb5_ldk_open_reaches_dispatch() {
+        let (_dir, lightning, ln_pubkey) = ldk_fixture(r#"{"1":2.0,"6":2.0,"144":2.0}"#).await;
+        let peer = NodeId::from_bytes([1; 32]);
+        let storage = storage_with_invite(peer, 5, Some(10_000), now_unix() + 60).await;
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (s, l, c, n) = deps(storage.clone(), lightning, 100.0, notifier.clone());
+        let result = handle_event(
+            AutoChannelEvent::PeerLightningInfo {
+                peer_id: peer,
+                ln_pubkey,
+                ln_addr: Some("127.0.0.1:9735".into()),
+            },
+            s,
+            l,
+            c,
+            n,
+            test_subsidy(),
+            Some(FundingPriority::Fast),
+        )
+        .await;
+        assert!(
+            matches!(result,
+            Err(AutoChannelError::Lightning(LightningError::PaymentNotDispatched(ref reason)))
+                if reason.contains(&ldk_node::NodeError::NotRunning.to_string())),
+            "{result:?}"
+        );
+        assert_eq!(
+            storage.list_invites_issued().await.unwrap()[0].state,
+            InviteState::Pending
+        );
+        assert!(notifier.notices.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn onb5_ldk_quote_above_either_rate_cap_never_opens() {
+        let (_dir, lightning, ln_pubkey) = ldk_fixture(r#"{"1":2.0,"6":2.0,"144":2.0}"#).await;
+        for (operator_cap, invite_cap) in [(1, 5), (5, 1)] {
+            let peer = NodeId::from_bytes([1; 32]);
+            let storage =
+                storage_with_invite(peer, invite_cap, Some(10_000), now_unix() + 60).await;
+            let notifier = Arc::new(RecordingNotifier::default());
+            let mut subsidy = test_subsidy();
+            subsidy.max_funding_fee_rate_sat_per_vb = operator_cap;
+            let (s, l, c, n) = deps(storage.clone(), lightning.clone(), 1.0, notifier.clone());
+            handle_peer_lightning_info(
+                peer,
+                ln_pubkey.clone(),
+                Some("127.0.0.1:9735".into()),
+                s,
+                l,
+                c,
+                n,
+                subsidy,
+                Some(FundingPriority::Fast),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                storage.list_invites_issued().await.unwrap()[0].state,
+                InviteState::Pending
+            );
+            let notices = notifier.notices.lock().await;
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0].status, "aborted");
+            assert_eq!(notices[0].reason.as_deref(), Some("fee_too_high:2>1"));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn onb5_ldk_missing_quote_refuses_without_falling_back() {
+        let (_dir, lightning, ln_pubkey) = ldk_fixture("{}").await;
+        let peer = NodeId::from_bytes([1; 32]);
+        let storage = storage_with_invite(peer, 5, Some(10_000), now_unix() + 60).await;
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (s, l, c, n) = deps(storage.clone(), lightning, 1.0, notifier.clone());
+        let result = handle_peer_lightning_info(
+            peer,
+            ln_pubkey,
+            Some("127.0.0.1:9735".into()),
+            s,
+            l,
+            c,
+            n,
+            test_subsidy(),
+            Some(FundingPriority::Fast),
+        )
+        .await;
+        assert!(
+            matches!(result,
+            Err(AutoChannelError::Lightning(LightningError::PaymentNotDispatched(ref reason)))
+                if reason.contains("funding estimate unavailable or invalid")),
+            "{result:?}"
+        );
+        assert_eq!(
+            storage.list_invites_issued().await.unwrap()[0].state,
+            InviteState::Pending
+        );
+        assert!(notifier.notices.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn onb5_ldk_policy_does_not_enable_subsidy() {
+        let mut disabled = test_subsidy();
+        disabled.enabled = false;
+        for subsidy in [SubsidyConfig::default(), disabled] {
+            let peer = NodeId::from_bytes([1; 32]);
+            let storage = storage_with_invite(peer, 5, Some(10_000), now_unix() + 60).await;
+            // A funding quote or open would panic: no LDK is installed. Even a
+            // fully provisioned policy with only enabled=false must be inert.
+            let lightning = Arc::new(TestLightning {
+                balance_msat: 100_000_000,
+                ..Default::default()
+            });
+            let notifier = Arc::new(RecordingNotifier::default());
+            let (s, l, c, n) = deps(storage.clone(), lightning.clone(), 1.0, notifier.clone());
+            handle_peer_lightning_info(
+                peer,
+                LN_PUBKEY.into(),
+                Some("127.0.0.1:9735".into()),
+                s,
+                l,
+                c,
+                n,
+                subsidy,
+                Some(FundingPriority::Fast),
+            )
+            .await
+            .unwrap();
+            assert!(lightning.opens.lock().await.is_empty());
+            assert_eq!(
+                storage.list_invites_issued().await.unwrap()[0].state,
+                InviteState::Pending
+            );
+            assert!(notifier.notices.lock().await.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn channel_fee_operator_cap_and_rounded_quote_are_enforced() {
         for (quote, operator_cap, invite_cap, expected_rate) in [
@@ -768,6 +1031,7 @@ mod tests {
                 c,
                 n,
                 subsidy,
+                None,
             )
             .await
             .unwrap();
@@ -813,6 +1077,7 @@ mod tests {
             c,
             n,
             test_subsidy(),
+            None,
         )
         .await
         .unwrap_err();
@@ -870,6 +1135,7 @@ mod tests {
             chain_dyn,
             notifier_dyn,
             test_subsidy(),
+            None,
         )
         .await
         .unwrap();
@@ -877,13 +1143,11 @@ mod tests {
         assert!(lightning.opens.lock().await.is_empty());
         let notices = notifier.notices.lock().await;
         assert_eq!(notices[0].status, "aborted");
-        assert!(
-            notices[0]
-                .reason
-                .as_deref()
-                .unwrap()
-                .starts_with("fee_too_high")
-        );
+        assert!(notices[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("fee_too_high"));
     }
 
     #[tokio::test]
@@ -908,6 +1172,7 @@ mod tests {
             chain_dyn,
             notifier_dyn,
             test_subsidy(),
+            None,
         )
         .await
         .unwrap();
@@ -938,18 +1203,17 @@ mod tests {
             chain_dyn,
             notifier_dyn,
             test_subsidy(),
+            None,
         )
         .await
         .unwrap();
 
         assert!(lightning.opens.lock().await.is_empty());
-        assert!(
-            notifier.notices.lock().await[0]
-                .reason
-                .as_deref()
-                .unwrap()
-                .starts_with("insufficient_balance")
-        );
+        assert!(notifier.notices.lock().await[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("insufficient_balance"));
     }
 
     #[tokio::test]
@@ -973,6 +1237,7 @@ mod tests {
             chain_dyn,
             notifier_dyn,
             test_subsidy(),
+            None,
         )
         .await
         .unwrap();
@@ -1005,6 +1270,7 @@ mod tests {
             chain_dyn,
             notifier_dyn,
             test_subsidy(),
+            None,
         )
         .await
         .unwrap();
@@ -1041,6 +1307,7 @@ mod tests {
                 chain_dyn,
                 notifier_dyn,
                 test_subsidy(),
+                None,
             )
             .await
             .unwrap();
@@ -1074,6 +1341,7 @@ mod tests {
             chain_dyn,
             notifier_dyn,
             test_subsidy(),
+            None,
         ));
 
         open_started.notified().await;
@@ -1089,6 +1357,7 @@ mod tests {
             chain_dyn,
             notifier_dyn,
             test_subsidy(),
+            None,
         )
         .await
         .unwrap();
@@ -1127,6 +1396,7 @@ mod tests {
             chain_dyn,
             notifier_dyn,
             SubsidyConfig::default(),
+            None,
         )
         .await
         .unwrap();
@@ -1177,6 +1447,7 @@ mod tests {
                 per_peer_max_opens: 1,
                 allowlist: Vec::new(),
             },
+            None,
         )
         .await
         .unwrap();
@@ -1216,6 +1487,7 @@ mod tests {
                 per_peer_max_opens: 1,
                 allowlist: vec![hex::encode(peer.as_bytes())],
             },
+            None,
         )
         .await
         .unwrap();
@@ -1257,18 +1529,17 @@ mod tests {
                 per_peer_max_opens: 1,
                 allowlist: vec![hex::encode(peer.as_bytes())],
             },
+            None,
         )
         .await
         .unwrap();
 
         assert!(lightning.opens.lock().await.is_empty());
-        assert!(
-            notifier.notices.lock().await[0]
-                .reason
-                .as_deref()
-                .unwrap()
-                .starts_with("subsidy_budget_exhausted")
-        );
+        assert!(notifier.notices.lock().await[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("subsidy_budget_exhausted"));
     }
 
     #[tokio::test]
@@ -1336,6 +1607,7 @@ mod tests {
                 per_peer_max_opens: 1,
                 allowlist: vec![hex::encode(peer.as_bytes())],
             },
+            None,
         )
         .await
         .unwrap();
@@ -1344,18 +1616,11 @@ mod tests {
             lightning.opens.lock().await.is_empty(),
             "per-peer cap must block a second subsidised open"
         );
-        assert!(
-            notifier
-                .notices
-                .lock()
-                .await
-                .iter()
-                .any(|n| n
-                    .reason
-                    .as_deref()
-                    .map(|r| r.starts_with("subsidy_per_peer_cap"))
-                    .unwrap_or(false))
-        );
+        assert!(notifier.notices.lock().await.iter().any(|n| n
+            .reason
+            .as_deref()
+            .map(|r| r.starts_with("subsidy_per_peer_cap"))
+            .unwrap_or(false)));
     }
 
     #[tokio::test]
@@ -1400,6 +1665,7 @@ mod tests {
                 per_peer_max_opens: 1,
                 allowlist: vec![hex::encode(peer.as_bytes())],
             },
+            None,
         )
         .await
         .unwrap();

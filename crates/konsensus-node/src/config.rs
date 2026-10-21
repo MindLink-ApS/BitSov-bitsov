@@ -1144,8 +1144,9 @@ pub struct SubsidyConfig {
 
     /// Maximum funding fee rate (sat/vB). Zero (default) forbids new opens.
     /// The worker enforces the lower of this operator ceiling and the invite's
-    /// ceiling, and requests the checked rate from the Lightning backend.
-    /// Backends unable to enforce that request must refuse before dispatch.
+    /// ceiling. LDK checks its estimator quote and caps the total funding fee at
+    /// this ceiling times the worker's 300-vbyte budget; final sat/vB may differ.
+    /// Other backends receive the checked exact rate and must refuse if unsupported.
     #[serde(default)]
     pub max_funding_fee_rate_sat_per_vb: u32,
 
