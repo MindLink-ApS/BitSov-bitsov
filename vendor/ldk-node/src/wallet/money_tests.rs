@@ -964,20 +964,12 @@ fn funding_failure_reason_survives_restart() {
 	let id = crate::funding::new_policy_channel_id();
 	{
 		let node = node(dir.path());
-        assert!(node
-            .channel_funding_failure(crate::UserChannelId(id))
-            .unwrap()
-            .is_none());
-        node.wallet
-            .record_funding_failure(id, Error::FundingFeeCapExceeded)
-            .unwrap();
+		assert!(node.channel_funding_failure(crate::UserChannelId(id)).unwrap().is_none());
+		node.wallet.record_funding_failure(id, Error::FundingFeeCapExceeded).unwrap();
 	}
 	let node = node(dir.path());
-    let reason = node
-        .channel_funding_failure(crate::UserChannelId(id))
-        .unwrap()
-        .unwrap();
-    assert_eq!(reason, "funding_fee_cap_exceeded");
+	let reason = node.channel_funding_failure(crate::UserChannelId(id)).unwrap().unwrap();
+	assert_eq!(reason, "funding_fee_cap_exceeded");
 }
 
 #[test]

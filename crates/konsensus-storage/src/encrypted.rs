@@ -479,6 +479,15 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     async fn starter_grants(&self) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
         self.inner.starter_grants().await
     }
+    async fn starter_query(
+        &self,
+        query: crate::starter::StarterQuery,
+    ) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
+        self.inner.starter_query(query).await
+    }
+    async fn starter_has_served_invite(&self, peer: &[u8; 32]) -> Result<bool, StorageError> {
+        self.inner.starter_has_served_invite(peer).await
+    }
     async fn starter_counters(&self) -> Result<crate::starter::StarterCounters, StorageError> {
         self.inner.starter_counters().await
     }

@@ -8,7 +8,7 @@ use konsensus_core::{
     NodeId,
 };
 use konsensus_message::{wire::Frame, NoiseTransport};
-use konsensus_storage::{starter::*, ChannelOpenOperation, InviteState, Storage};
+use konsensus_storage::{starter::*, ChannelOpenOperation, Storage};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, watch};
@@ -172,19 +172,26 @@ impl StarterHub {
             return Ok(refusal(request_id, "ln_signature_invalid", None, None));
         }
         let key = ln_pubkey.to_ascii_lowercase();
-        let grants = self.storage.starter_grants().await?;
-        if let Some(g) = grants
-            .iter()
-            .find(|g| g.request_id == request_id.to_string())
+        if let Some(g) = self
+            .storage
+            .starter_query(StarterQuery::Request(request_id.to_string()))
+            .await?
+            .first()
         {
             if g.requester_node_id != peer.to_hex() || g.ln_pubkey != key || g.network != network {
                 return Ok(refusal(request_id, "operation_mismatch", None, None));
             }
             return Ok(status(g));
         }
-        if let Some(g) = grants.iter().find(|g| {
-            g.state != "refused" && (g.requester_node_id == peer.to_hex() || g.ln_pubkey == key)
-        }) {
+        if let Some(g) = self
+            .storage
+            .starter_query(StarterQuery::Identity {
+                requester: peer.to_hex(),
+                ln_pubkey: key.clone(),
+            })
+            .await?
+            .first()
+        {
             return Ok(refusal(
                 request_id,
                 "already_served",
@@ -210,10 +217,10 @@ impl StarterHub {
             now,
         );
         let channels = self.lightning.list_channels().await?;
-        let onb5 = self.storage.list_invites_issued().await?.iter().any(|i| {
-            i.invitee_pubkey == *peer.as_bytes()
-                && matches!(i.state, InviteState::Opening | InviteState::Accepted)
-        });
+        let onb5 = self
+            .storage
+            .starter_has_served_invite(peer.as_bytes())
+            .await?;
         let mut deny = if onb5
             || channels
                 .iter()
@@ -224,14 +231,20 @@ impl StarterHub {
             None
         };
         if deny.is_none() {
-            if let Some(last) = grants
-                .iter()
-                .filter(|g| g.requester_node_id == peer.to_hex())
+            if let Some(last) = self
+                .storage
+                .starter_query(StarterQuery::LatestRequester(peer.to_hex()))
+                .await?
+                .first()
                 .map(|g| g.created_at)
-                .max()
                 .filter(|t| now - *t < 600)
             {
-                deny = Some(("rate_limited", Some(last + 600)));
+                // Do not store rate-limit responses or slide the retry window.
+                metrics::counter!("konsensus_starter_requests_total", "result"=>"refused")
+                    .increment(1);
+                metrics::counter!("konsensus_starter_refusals_total", "reason"=>"rate_limited")
+                    .increment(1);
+                return Ok(refusal(request_id, "rate_limited", Some(last + 600), None));
             }
         }
         if deny.is_none()
@@ -305,27 +318,37 @@ impl StarterHub {
         self.storage
             .starter_update(StarterUpdate::Rebuild, time)
             .await?;
-        let grants = self.storage.starter_grants().await?;
-        for g in grants {
-            let result: anyhow::Result<()> = async {
-                if matches!(g.state.as_str(), "opening" | "resolved") {
-                    self.reconcile(&g, time).await?;
-                } else if g.state == "admitted" {
-                    self.dispatch(&g, time).await?;
-                }
-                // Repair invite bookkeeping if ready committed before a crash.
-                if g.state == "ready" {
-                    self.storage
-                        .mark_invite_accepted(&g.invite_id.parse()?, now as u64)
-                        .await?;
-                }
-                Ok(())
+        let mut after = String::new();
+        loop {
+            let grants = self
+                .storage
+                .starter_query(StarterQuery::Work { after })
+                .await?;
+            if grants.is_empty() {
+                break;
             }
-            .await;
-            if result.is_err() {
-                // An individual failure must not starve recovery of other grants.
-                // Backend errors may contain peer addresses: log fixed text only.
-                tracing::warn!(request_id=%g.request_id, "starter grant reconciliation unavailable; reservation retained");
+            after = grants.last().expect("nonempty page").request_id.clone();
+            for g in grants {
+                let result: anyhow::Result<()> = async {
+                    if matches!(g.state.as_str(), "opening" | "resolved") {
+                        self.reconcile(&g, time).await?;
+                    } else if g.state == "admitted" {
+                        self.dispatch(&g, time).await?;
+                    }
+                    // Repair invite bookkeeping if ready committed before a crash.
+                    if g.state == "ready" {
+                        self.storage
+                            .mark_invite_accepted(&g.invite_id.parse()?, now as u64)
+                            .await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                if result.is_err() {
+                    // An individual failure must not starve recovery of other grants.
+                    // Backend errors may contain peer addresses: log fixed text only.
+                    tracing::warn!(request_id=%g.request_id, "starter grant reconciliation unavailable; reservation retained");
+                }
             }
         }
         let c = self.storage.starter_counters().await?;
@@ -534,8 +557,11 @@ pub async fn run(
             _=interval.tick()=>{
                 let now=chrono::Utc::now().timestamp();
                 if hub.tick(None).await.is_err(){tracing::warn!("starter reconciliation unavailable; reservations retained");}
-                if let Ok(grants)=hub.storage.starter_grants().await {
-                    for g in grants.iter().filter(|g|g.updated_at>=now-15) {
+                let mut after=(i64::MIN,String::new());
+                while let Ok(grants)=hub.storage.starter_query(StarterQuery::Recent { since: now-15, after }).await {
+                    let Some(last)=grants.last() else {break;};
+                    after=(last.updated_at,last.request_id.clone());
+                    for g in &grants {
                         if let Ok(peer)=NodeId::from_hex(&g.requester_node_id) {let _=transport.enqueue_control_frame(&peer,&status(g)).await;}
                     }
                 }

@@ -335,7 +335,7 @@ impl Node {
 			return Err(Error::AlreadyRunning);
 		}
 
-        log_debug!(
+		log_info!(
 			self.logger,
 			"Starting up LDK Node with node ID {} on network: {}",
 			self.node_id(),
@@ -465,8 +465,7 @@ impl Node {
 							listeners.push(listener);
 						}
 						Err(e) => {
-                            log_error!(logger, "Lightning peer operation failed");
-                            log_debug!(
+							log_error!(
 								logger,
 								"Failed to bind to {}: {} - is something else already listening?",
 								addr,
@@ -780,11 +779,7 @@ impl Node {
 			return Err(Error::NotRunning);
 		}
 
-        log_debug!(
-            self.logger,
-            "Shutting down LDK Node with node ID {}...",
-            self.node_id()
-        );
+		log_info!(self.logger, "Shutting down LDK Node with node ID {}...", self.node_id());
 
 		// Stop background tasks.
 		self.stop_sender
@@ -1170,12 +1165,7 @@ impl Node {
 			con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
 		})?;
 
-        log_debug!(
-            self.logger,
-            "Connected to peer {}@{}. ",
-            peer_info.node_id,
-            peer_info.address
-        );
+		log_info!(self.peer_store.peer_logger(&peer_info.node_id), "Connected to peer {}@{}. ", peer_info.node_id, peer_info.address);
 
 		if persist {
 			self.peer_store.add_peer(peer_info)?;
@@ -1193,18 +1183,12 @@ impl Node {
 			return Err(Error::NotRunning);
 		}
 
-        log_debug!(self.logger, "Disconnecting peer {}..", counterparty_node_id);
+		log_info!(self.peer_store.peer_logger(&counterparty_node_id), "Disconnecting peer {}..", counterparty_node_id);
 
 		match self.peer_store.remove_peer(&counterparty_node_id) {
 			Ok(()) => {}
 			Err(e) => {
-                log_error!(self.logger, "Lightning peer operation failed");
-                log_debug!(
-                    self.logger,
-                    "Failed to remove peer {}: {}",
-                    counterparty_node_id,
-                    e
-                );
+				log_error!(self.peer_store.peer_logger(&counterparty_node_id), "Failed to remove peer {}: {}", counterparty_node_id, e)
 			}
 		}
 
@@ -1223,18 +1207,8 @@ impl Node {
 		announce_for_forwarding: bool,
 		funding_policy: Option<funding::FundingPolicy>,
 	) -> Result<UserChannelId, Error> {
-        if self
-            .config
-            .channel_peer_allowlist
-            .as_ref()
-            .is_some_and(|peers| !peers.contains(&node_id))
-        {
-            log_error!(self.logger, "Lightning peer operation failed");
-            log_debug!(
-                self.logger,
-                "HUB_ONLY_WHILE_LOCKABLE: refusing to open a channel to peer {}",
-                node_id
-            );
+		if self.config.channel_peer_allowlist.as_ref().is_some_and(|peers| !peers.contains(&node_id)) {
+			log_error!(self.peer_store.peer_logger(&node_id), "HUB_ONLY_WHILE_LOCKABLE: refusing to open a channel to peer {}", node_id);
 			return Err(Error::ChannelCreationFailed);
 		}
 		// Cheap early refusal before dialing; recheck atomically with creation below.
@@ -1312,8 +1286,8 @@ impl Node {
 			Some(user_config),
 		) {
 			Ok(_) => {
-                log_debug!(
-					self.logger,
+				log_info!(
+					self.peer_store.peer_logger(&peer_info.node_id),
 					"Initiated channel creation with peer {}. ",
 					peer_info.node_id
 				);
@@ -1349,10 +1323,10 @@ impl Node {
 		funding::failure(self.kv_store.as_ref(), id.0)
 	}
 
-    /// Starter peers reconnect to us; never retain their observed socket address.
-    pub fn suppress_peer_address(&self, node_id: PublicKey) -> Result<(), Error> {
-        self.peer_store.suppress_address(node_id)
-    }
+	/// Starter peers reconnect to us; never retain their observed socket address.
+	pub fn suppress_peer_address(&self, node_id: PublicKey) -> Result<(), Error> {
+		self.peer_store.suppress_address(node_id)
+	}
 
 	/// Open using an estimator-selected policy, durably pinned before negotiation.
 	pub fn open_channel_with_funding_policy(
@@ -1616,9 +1590,8 @@ impl Node {
 					}
 				})
 		} else {
-            log_error!(self.logger, "Lightning peer operation failed");
-            log_debug!(
-				self.logger,
+			log_error!(
+				self.peer_store.peer_logger(&counterparty_node_id),
 				"Channel not found for user_channel_id {} and counterparty {}",
 				user_channel_id,
 				counterparty_node_id
@@ -1694,9 +1667,8 @@ impl Node {
 					Error::ChannelSplicingFailed
 				})
 		} else {
-            log_error!(self.logger, "Lightning peer operation failed");
-            log_debug!(
-				self.logger,
+			log_error!(
+				self.peer_store.peer_logger(&counterparty_node_id),
 				"Channel not found for user_channel_id {} and counterparty {}",
 				user_channel_id,
 				counterparty_node_id

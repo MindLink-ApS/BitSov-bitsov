@@ -65,6 +65,26 @@ pub fn utc_day(now: i64) -> String {
         .format("%Y-%m-%d")
         .to_string()
 }
+/// Hot-path reads never materialize the grant history. Pages use a fixed bound
+/// and keyset cursors so a failed grant cannot starve later recovery work.
+#[derive(Debug)]
+pub enum StarterQuery {
+    Request(String),
+    Identity {
+        requester: String,
+        ln_pubkey: String,
+    },
+    LatestRequester(String),
+    Work {
+        after: String,
+    },
+    Recent {
+        since: i64,
+        after: (i64, String),
+    },
+}
+pub const STARTER_PAGE_SIZE: usize = 128;
+
 #[derive(Debug, Clone)]
 pub struct StarterLimits {
     pub max_opens_per_day: i64,
@@ -180,6 +200,37 @@ macro_rules! backend {
             pub async fn grants(pool: &sqlx::Pool<$db>) -> Result<Vec<StarterGrant>,StorageError> {
                 Ok(sqlx::query_as("SELECT * FROM starter_grants ORDER BY created_at, request_id").fetch_all(pool).await?)
             }
+            pub async fn query(pool: &sqlx::Pool<$db>, query: StarterQuery) -> Result<Vec<StarterGrant>,StorageError> {
+                Ok(match query {
+                    StarterQuery::Request(id) => sqlx::query_as(&sql("SELECT * FROM starter_grants WHERE request_id=?"))
+                        .bind(id).fetch_all(pool).await?,
+                    StarterQuery::Identity { requester, ln_pubkey } => sqlx::query_as(&sql("SELECT * FROM starter_grants WHERE state<>'refused' AND requester_node_id=? UNION ALL SELECT * FROM starter_grants WHERE state<>'refused' AND ln_pubkey=? LIMIT 1"))
+                        .bind(requester).bind(ln_pubkey).fetch_all(pool).await?,
+                    StarterQuery::LatestRequester(requester) => sqlx::query_as(&sql("SELECT * FROM starter_grants WHERE requester_node_id=? ORDER BY created_at DESC, request_id DESC LIMIT 1"))
+                        .bind(requester).fetch_all(pool).await?,
+                    StarterQuery::Work { after } => {
+                        // Drive ready-bookkeeping repair from unsettled invites, not
+                        // from the ever-growing completed grant history. Invite IDs
+                        // are binary in both backends; grant IDs are canonical UUIDs.
+                        let hex = if $postgres { "encode(i.id,'hex')" } else { "lower(hex(i.id))" };
+                        let id = format!("substr({hex},1,8)||'-'||substr({hex},9,4)||'-'||substr({hex},13,4)||'-'||substr({hex},17,4)||'-'||substr({hex},21,12)");
+                        sqlx::query_as(&sql(&format!("SELECT * FROM starter_grants WHERE state IN ('admitted','opening','resolved') AND request_id>? UNION ALL SELECT g.* FROM invites_issued i CROSS JOIN starter_grants g WHERE g.invite_id={id} AND i.state IN ('pending','opening') AND g.state='ready' AND g.request_id>? ORDER BY request_id LIMIT {STARTER_PAGE_SIZE}")))
+                            .bind(&after).bind(&after).fetch_all(pool).await?
+                    },
+                    StarterQuery::Recent { since, after } => sqlx::query_as(&sql(&format!("SELECT * FROM starter_grants WHERE updated_at>=? AND (updated_at,request_id)>(?,?) ORDER BY updated_at,request_id LIMIT {STARTER_PAGE_SIZE}")))
+                        .bind(since).bind(after.0).bind(after.1).fetch_all(pool).await?,
+                })
+            }
+            pub async fn has_served_invite(pool: &sqlx::Pool<$db>, peer: &[u8;32]) -> Result<bool,StorageError> {
+                let found:Option<i32> = sqlx::query_scalar(&sql("SELECT 1 FROM invites_issued WHERE invitee_pubkey=? AND state IN ('opening','accepted') LIMIT 1"))
+                    .bind(peer.as_slice()).fetch_optional(pool).await?;
+                Ok(found.is_some())
+            }
+            pub async fn pending_invite_id(pool: &sqlx::Pool<$db>, peer: &[u8;32]) -> Result<Option<uuid::Uuid>,StorageError> {
+                let id:Option<Vec<u8>> = sqlx::query_scalar(&sql("SELECT id FROM invites_issued WHERE invitee_pubkey=? AND state='pending' ORDER BY created_at DESC LIMIT 1"))
+                    .bind(peer.as_slice()).fetch_optional(pool).await?;
+                id.map(|id|uuid::Uuid::from_slice(&id).map_err(|_|StorageError::Conversion("invalid invite id".into()))).transpose()
+            }
             pub async fn counters(pool: &sqlx::Pool<$db>) -> Result<StarterCounters,StorageError> {
                 Ok(sqlx::query_as("SELECT * FROM starter_hub_counters WHERE id=1").fetch_one(pool).await?)
             }
@@ -217,6 +268,10 @@ macro_rules! backend {
                             else {None};
                             if let Some(reason)=reason {grant.state="refused".into();grant.reason=Some(reason.into());grant.retry_after_unix=match reason {"daily_cap_reached"=>Some((now/86400+1)*86400),"hub_busy"=>Some(now+600),_=>None};}
                         }
+                        // Only the newest refusal is useful for the requester throttle.
+                        // Never prune a reservation or dispatch evidence from a live grant.
+                        sqlx::query(&sql("DELETE FROM starter_grants WHERE requester_node_id=? AND state='refused'"))
+                            .bind(&grant.requester_node_id).execute(&mut *tx).await?;
                         grant.utc_day=day.clone();
                         // ON CONFLICT covers partial-index races as well as PKs;
                         // it does not abort a Postgres transaction with a 500.

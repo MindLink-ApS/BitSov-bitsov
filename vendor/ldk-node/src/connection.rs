@@ -14,8 +14,9 @@ use std::time::Duration;
 use bitcoin::secp256k1::PublicKey;
 use lightning::ln::msgs::SocketAddress;
 
-use crate::logger::{log_error, log_debug, LdkLogger};
+use crate::logger::{log_error, log_info, LdkLogger};
 use crate::types::PeerManager;
+use crate::peer_store::PeerStore;
 use crate::Error;
 
 pub(crate) struct ConnectionManager<L: Deref + Clone + Sync + Send>
@@ -25,6 +26,7 @@ where
 	pending_connections:
 		Mutex<HashMap<PublicKey, Vec<tokio::sync::oneshot::Sender<Result<(), Error>>>>>,
 	peer_manager: Arc<PeerManager>,
+	peer_store: Arc<PeerStore<L>>,
 	logger: L,
 }
 
@@ -32,9 +34,9 @@ impl<L: Deref + Clone + Sync + Send> ConnectionManager<L>
 where
 	L::Target: LdkLogger,
 {
-	pub(crate) fn new(peer_manager: Arc<PeerManager>, logger: L) -> Self {
+	pub(crate) fn new(peer_manager: Arc<PeerManager>, peer_store: Arc<PeerStore<L>>, logger: L) -> Self {
 		let pending_connections = Mutex::new(HashMap::new());
-		Self { pending_connections, peer_manager, logger }
+		Self { pending_connections, peer_manager, peer_store, logger }
 	}
 
 	pub(crate) async fn connect_peer_if_necessary(
@@ -62,20 +64,18 @@ where
 			})?;
 		}
 
-		log_debug!(self.logger, "Connecting to peer: {}@{}", node_id, addr);
+		log_info!(self.peer_store.peer_logger(&node_id), "Connecting to peer: {}@{}", node_id, addr);
 
 		let socket_addr = addr
 			.to_socket_addrs()
 			.map_err(|e| {
-				log_error!(self.logger, "Lightning peer operation failed");
-				log_debug!(self.logger, "Failed to resolve network address {}: {}", addr, e);
+				log_error!(self.peer_store.peer_logger(&node_id), "Failed to resolve network address {}: {}", addr, e);
 				self.propagate_result_to_subscribers(&node_id, Err(Error::InvalidSocketAddress));
 				Error::InvalidSocketAddress
 			})?
 			.next()
 			.ok_or_else(|| {
-				log_error!(self.logger, "Lightning peer operation failed");
-				log_debug!(self.logger, "Failed to resolve network address {}", addr);
+				log_error!(self.peer_store.peer_logger(&node_id), "Failed to resolve network address {}", addr);
 				self.propagate_result_to_subscribers(&node_id, Err(Error::InvalidSocketAddress));
 				Error::InvalidSocketAddress
 			})?;
@@ -92,7 +92,7 @@ where
 				loop {
 					tokio::select! {
 						_ = &mut connection_closed_future => {
-							log_debug!(self.logger, "Peer connection closed: {}@{}", node_id, addr);
+							log_info!(self.peer_store.peer_logger(&node_id), "Peer connection closed: {}@{}", node_id, addr);
 							break Err(Error::ConnectionFailed);
 						},
 						_ = tokio::time::sleep(Duration::from_millis(10)) => {},
@@ -105,8 +105,7 @@ where
 				}
 			},
 			None => {
-				log_error!(self.logger, "Lightning peer operation failed");
-				log_debug!(self.logger, "Failed to connect to peer: {}@{}", node_id, addr);
+				log_error!(self.peer_store.peer_logger(&node_id), "Failed to connect to peer: {}@{}", node_id, addr);
 				Err(Error::ConnectionFailed)
 			},
 		};
@@ -157,31 +156,53 @@ where
 
 #[cfg(test)]
 mod starter_log_tests {
-    use super::*;
-    #[derive(Default)]
-    struct Capture(Mutex<Vec<String>>);
-    impl lightning::util::logger::Logger for Capture {
-        fn log(&self, record: lightning::util::logger::Record) {
-            if record.level >= lightning::util::logger::Level::Info {
-                self.0.lock().unwrap().push(record.args.to_string());
-            }
-        }
-    }
-    #[test]
-    fn failed_peer_connection_does_not_log_identity_or_address_at_info() {
-        let dir=tempfile::tempdir().unwrap();
-        let mut builder=crate::Builder::new();
-        builder.set_network(bitcoin::Network::Regtest);
-        builder.set_entropy_seed_bytes([73;64]);
-        builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
-        let node=builder.build_with_fs_store().unwrap();
-        let logs=Arc::new(Capture::default());
-        let manager=ConnectionManager::new(node.peer_manager.clone(),logs.clone());
-        let key="0276607124ebe6a6c9338517b6f485825b27c2dcc0b9fc2aa6a4c0df91194e5993";
-        let runtime=tokio::runtime::Runtime::new().unwrap();
-        assert!(runtime.block_on(manager.do_connect_peer(key.parse().unwrap(),"127.0.0.1:0".parse().unwrap())).is_err());
-        let text=logs.0.lock().unwrap().join("\n");
-        assert!(!text.is_empty());
-        assert!(!text.contains(key));assert!(!text.contains("127.0.0.1"));
-    }
+	use super::*;
+	#[derive(Default)]
+	struct Capture(Mutex<Vec<String>>);
+	impl lightning::util::logger::Logger for Capture {
+		fn log(&self, record: lightning::util::logger::Record) {
+			if record.level >= lightning::util::logger::Level::Info {
+				self.0.lock().unwrap().push(record.args.to_string());
+			}
+		}
+	}
+	#[test]
+	fn failed_peer_connection_does_not_log_identity_or_address_at_info() {
+		let dir=tempfile::tempdir().unwrap();
+		let mut builder=crate::Builder::new();
+		builder.set_network(bitcoin::Network::Regtest);
+		builder.set_entropy_seed_bytes([73;64]);
+		builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+		let node=builder.build_with_fs_store().unwrap();
+		let logs=Arc::new(Capture::default());
+		let peers = Arc::new(PeerStore::new(node.kv_store.clone(), logs.clone()));
+		let manager=ConnectionManager::new(node.peer_manager.clone(),peers.clone(),logs.clone());
+		let key="0276607124ebe6a6c9338517b6f485825b27c2dcc0b9fc2aa6a4c0df91194e5993";
+		peers.suppress_address(key.parse().unwrap()).unwrap();
+		let runtime=tokio::runtime::Runtime::new().unwrap();
+		assert!(runtime.block_on(manager.do_connect_peer(key.parse().unwrap(),"127.0.0.1:0".parse().unwrap())).is_err());
+		let text=logs.0.lock().unwrap().join("\n");
+		assert!(!text.is_empty());
+		assert!(!text.contains(key));assert!(!text.contains("127.0.0.1"));
+	}
+	#[test]
+	fn ordinary_peer_connection_keeps_operator_diagnostics() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut builder = crate::Builder::new();
+		builder.set_network(bitcoin::Network::Regtest);
+		builder.set_entropy_seed_bytes([73; 64]);
+		builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+		let node = builder.build_with_fs_store().unwrap();
+		let logs = Arc::new(Capture::default());
+		let peers = Arc::new(PeerStore::new(node.kv_store.clone(), logs.clone()));
+		let manager = ConnectionManager::new(node.peer_manager.clone(), peers, logs.clone());
+		let key = "0276607124ebe6a6c9338517b6f485825b27c2dcc0b9fc2aa6a4c0df91194e5993";
+		let runtime = tokio::runtime::Runtime::new().unwrap();
+		assert!(runtime.block_on(manager.do_connect_peer(key.parse().unwrap(), "127.0.0.1:0".parse().unwrap())).is_err());
+		let text = logs.0.lock().unwrap().join("\n");
+		assert!(text.contains(key));
+		assert!(text.contains("Failed to connect to peer"));
+		assert!(text.contains("127.0.0.1:0"));
+	}
+
 }

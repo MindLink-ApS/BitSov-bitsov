@@ -194,6 +194,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (29, "operation abandon", include_str!("../migrations/029_operation_abandon.sql")),
     (30, "channel open operations", include_str!("../migrations/030_channel_open_operations.sql")),
     (31, "starter requests", include_str!("../migrations/031_starter_requests.sql")),
+    (32, "starter queries", include_str!("../migrations/032_starter_queries.sql")),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -676,6 +677,15 @@ impl Storage for SqliteStorage {
     }
     async fn starter_grants(&self) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
         crate::starter::sqlite::grants(&self.pool).await
+    }
+    async fn starter_query(
+        &self,
+        query: crate::starter::StarterQuery,
+    ) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
+        crate::starter::sqlite::query(&self.pool, query).await
+    }
+    async fn starter_has_served_invite(&self, peer: &[u8; 32]) -> Result<bool, StorageError> {
+        crate::starter::sqlite::has_served_invite(&self.pool, peer).await
     }
     async fn starter_counters(&self) -> Result<crate::starter::StarterCounters, StorageError> {
         crate::starter::sqlite::counters(&self.pool).await
@@ -2344,6 +2354,16 @@ impl Storage for SqliteStorage {
             })
         })
         .transpose()
+    }
+
+    async fn find_pending_invite_for_invitee(
+        &self,
+        peer: &[u8; 32],
+    ) -> Result<Option<InviteIssuedRecord>, StorageError> {
+        match crate::starter::sqlite::pending_invite_id(&self.pool, peer).await? {
+            Some(id) => self.find_invite_issued(&id).await,
+            None => Ok(None),
+        }
     }
 
     async fn list_invites_issued(&self) -> Result<Vec<InviteIssuedRecord>, StorageError> {

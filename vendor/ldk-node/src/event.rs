@@ -1225,21 +1225,16 @@ where
 				};
 			},
 
-            LdkEvent::PaymentPathSuccessful { .. } => {}
-            LdkEvent::PaymentPathFailed { .. } => {}
-            LdkEvent::ProbeSuccessful { .. } => {}
-            LdkEvent::ProbeFailed { .. } => {}
+			LdkEvent::PaymentPathSuccessful { .. } => {},
+			LdkEvent::PaymentPathFailed { .. } => {},
+			LdkEvent::ProbeSuccessful { .. } => {},
+			LdkEvent::ProbeFailed { .. } => {},
 			LdkEvent::HTLCHandlingFailed { failure_type, .. } => {
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-                    liquidity_source
-                        .handle_htlc_handling_failed(failure_type)
-                        .await;
+					liquidity_source.handle_htlc_handling_failed(failure_type).await;
 				}
-            }
-            LdkEvent::SpendableOutputs {
-                outputs,
-                channel_id,
-            } => {
+			},
+			LdkEvent::SpendableOutputs { outputs, channel_id } => {
 				match self
 					.output_sweeper
 					.track_spendable_outputs(outputs, channel_id, true, None)
@@ -1249,9 +1244,9 @@ where
 					Err(_) => {
 						log_error!(self.logger, "Failed to track spendable outputs");
 						return Err(ReplayEvent());
-                    }
+					},
 				};
-            }
+			},
 			LdkEvent::OpenChannelRequest {
 				temporary_channel_id,
 				counterparty_node_id,
@@ -1261,12 +1256,7 @@ where
 				is_announced,
 				params: _,
 			} => {
-                if self
-                    .config
-                    .work_admission
-                    .as_ref()
-                    .is_some_and(|check| !check.allowed())
-                {
+				if self.config.work_admission.as_ref().is_some_and(|check| !check.allowed()) {
 					log_info!(self.logger, "disk_low: refusing inbound channel");
 					// No funding transaction exists for this unaccepted request.
 					if let Err(error) = self.channel_manager.force_close_broadcasting_latest_txn(
@@ -1284,8 +1274,8 @@ where
 					.as_ref()
 					.is_some_and(|peers| !peers.contains(&counterparty_node_id))
 				{
-                    log_debug!(
-						self.logger,
+					log_info!(
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"HUB_ONLY_WHILE_LOCKABLE: refusing inbound channel from peer {}",
 						counterparty_node_id
 					);
@@ -1302,19 +1292,11 @@ where
 				// The lock covers snapshot + accept and is shared with outbound/JIT opens.
 				// Unaccepted inbound requests are not in list_channels; accepted unfunded
 				// channels are, so acceptance reserves capacity immediately.
-                let admission = self
-                    .config
-                    .channel_limits
-                    .as_ref()
-                    .map(|limits| limits.lock())
-                    .transpose();
+				let admission =
+					self.config.channel_limits.as_ref().map(|limits| limits.lock()).transpose();
 				let cap_result = match &admission {
 					Err(error) => Err(*error),
-                    Ok(_) => self
-                        .config
-                        .channel_limits
-                        .as_ref()
-                        .map_or(Ok(()), |limits| {
+					Ok(_) => self.config.channel_limits.as_ref().map_or(Ok(()), |limits| {
 						limits.check(
 							funding_satoshis,
 							self.channel_manager
@@ -1325,8 +1307,8 @@ where
 					}),
 				};
 				if let Err(error) = cap_result {
-                    log_debug!(
-						self.logger,
+					log_info!(
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"{}: refusing inbound channel from peer {}",
 						error,
 						counterparty_node_id
@@ -1349,8 +1331,7 @@ where
 				}
 				if is_announced {
 					if let Err(err) = may_announce_channel(&*self.config) {
-                        log_error!(self.logger, "Lightning peer operation failed");
-                        log_debug!(self.logger, "Rejecting inbound announced channel from peer {} due to missing configuration: {}", counterparty_node_id, err);
+						log_error!(self.peer_store.peer_logger(&counterparty_node_id), "Rejecting inbound announced channel from peer {} due to missing configuration: {}", counterparty_node_id, err);
 
 						self.channel_manager
 							.force_close_broadcasting_latest_txn(
@@ -1370,8 +1351,8 @@ where
 				// non-anchor retry can bypass a rejected anchor-reserve check.
 				// anchor_channels_config = None now refuses every inbound channel (konsensus always sets it).
 				if !anchor_channel {
-                    log_debug!(
-						self.logger,
+					log_info!(
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"Rejecting non-anchor inbound channel from peer {}",
 						counterparty_node_id
 					);
@@ -1411,9 +1392,8 @@ where
 						};
 
 						if spendable_amount_sats < required_amount_sats {
-                            log_error!(self.logger, "Lightning peer operation failed");
-                            log_debug!(
-								self.logger,
+							log_error!(
+								self.peer_store.peer_logger(&counterparty_node_id),
 								"Rejecting inbound Anchor channel from peer {} due to insufficient available on-chain reserves. Available: {}/{}sats",
 								counterparty_node_id,
 								spendable_amount_sats,
@@ -1431,9 +1411,8 @@ where
 							return Ok(());
 						}
 					} else {
-                        log_error!(self.logger, "Lightning peer operation failed");
-                        log_debug!(
-							self.logger,
+						log_error!(
+							self.peer_store.peer_logger(&counterparty_node_id),
 							"Rejecting inbound channel from peer {} due to Anchor channels being disabled.",
 							counterparty_node_id,
 						);
@@ -1495,8 +1474,8 @@ where
 
 				match res {
 					Ok(()) => {
-                        log_debug!(
-							self.logger,
+						log_info!(
+							self.peer_store.peer_logger(&counterparty_node_id),
 							"Accepting inbound{}{} channel of {}sats from{} peer {}",
 							if allow_0conf { " 0conf" } else { "" },
 							if anchor_channel { " Anchor" } else { "" },
@@ -1504,11 +1483,10 @@ where
 							if allow_0conf { " trusted" } else { "" },
 							counterparty_node_id,
 						);
-                    }
+					},
 					Err(e) => {
-                        log_error!(self.logger, "Lightning peer operation failed");
-                        log_debug!(
-							self.logger,
+						log_error!(
+							self.peer_store.peer_logger(&counterparty_node_id),
 							"Error while accepting inbound{}{} channel from{} peer {}: {:?}",
 							if allow_0conf { " 0conf" } else { "" },
 							if anchor_channel { " Anchor" } else { "" },
@@ -1516,9 +1494,9 @@ where
 							if allow_0conf { " trusted" } else { "" },
 							e,
 						);
+					},
 				}
-                }
-            }
+			},
 			LdkEvent::PaymentForwarded {
 				prev_channel_id,
 				next_channel_id,
@@ -1634,8 +1612,8 @@ where
 						.map_err(|_| ReplayEvent())?;
 				}
 
-                log_debug!(
-					self.logger,
+				log_info!(
+					self.peer_store.peer_logger(&counterparty_node_id),
 					"New channel {} with counterparty {} has been created and is pending confirmation on chain.",
 					channel_id,
 					counterparty_node_id,
@@ -1677,9 +1655,8 @@ where
 							};
 
 							self.peer_store.add_peer(peer).unwrap_or_else(|e| {
-                                log_error!(self.logger, "Lightning peer operation failed");
-                                log_debug!(
-									self.logger,
+								log_error!(
+									self.peer_store.peer_logger(&counterparty_node_id),
 									"Failed to add peer {} to peer store: {}",
 									counterparty_node_id,
 									e
@@ -1688,7 +1665,7 @@ where
 						}
 					}
 				}
-            }
+			},
 			LdkEvent::ChannelReady {
 				channel_id,
 				user_channel_id,
@@ -1704,16 +1681,16 @@ where
 				}
 
 				if let Some(funding_txo) = funding_txo {
-                    log_debug!(
-						self.logger,
+					log_info!(
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"Channel {} with counterparty {} ready to be used with funding_txo {}",
 						channel_id,
 						counterparty_node_id,
 						funding_txo,
 					);
 				} else {
-                    log_debug!(
-						self.logger,
+					log_info!(
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"Channel {} with counterparty {} ready to be used",
 						channel_id,
 						counterparty_node_id,
@@ -1764,18 +1741,16 @@ where
 				};
 
 				match self.event_queue.add_event(event).await {
-                    Ok(_) => {}
+					Ok(_) => {},
 					Err(e) => {
 						log_error!(self.logger, "Failed to push to event queue: {}", e);
 						return Err(ReplayEvent());
-                    }
+					},
 				};
-            }
+			},
 			LdkEvent::DiscardFunding { funding_info, .. } => {
-                self.wallet
-                    .discard_funding(funding_info)
-                    .map_err(|_| ReplayEvent())?;
-            }
+				self.wallet.discard_funding(funding_info).map_err(|_| ReplayEvent())?;
+			},
 			LdkEvent::HTLCIntercepted {
 				requested_next_hop_scid,
 				intercept_id,
@@ -1793,37 +1768,33 @@ where
 						)
 						.await;
 				}
-            }
+			},
 			LdkEvent::InvoiceReceived { .. } => {
 				debug_assert!(false, "We currently don't handle BOLT12 invoices manually, so this event should never be emitted.");
-            }
+			},
 			LdkEvent::ConnectionNeeded { node_id, addresses } => {
-				let spawn_logger = self.logger.clone();
+				let spawn_peer_store = Arc::clone(&self.peer_store);
 				let spawn_cm = Arc::clone(&self.connection_manager);
 				let future = async move {
 					for addr in &addresses {
-                        match spawn_cm
-                            .connect_peer_if_necessary(node_id, addr.clone())
-                            .await
-                        {
+						match spawn_cm.connect_peer_if_necessary(node_id, addr.clone()).await {
 							Ok(()) => {
 								return;
-                            }
+							},
 							Err(e) => {
-                                log_error!(spawn_logger, "Lightning peer operation failed");
-                                log_debug!(
-									spawn_logger,
+								log_error!(
+									spawn_peer_store.peer_logger(&node_id),
 									"Failed to establish connection to peer {}@{}: {}",
 									node_id,
 									addr,
 									e
 								);
-                            }
+							},
 						}
 					}
 				};
 				self.runtime.spawn_cancellable_background_task(future);
-            }
+			},
 			LdkEvent::BumpTransaction(bte) => {
 				match bte {
 					BumpTransactionEvent::ChannelClose {
@@ -1945,7 +1916,7 @@ where
 							) {
 								log_error!(self.logger, "Failed to send static invoice: {:?}", e);
 							}
-                        }
+						},
 						Ok(None) => {
 							log_trace!(
 								self.logger,
@@ -1953,14 +1924,14 @@ where
 								hex_utils::to_string(&recipient_id),
 								invoice_slot
 							);
-                        }
+						},
 						Err(e) => {
 							log_error!(self.logger, "Failed to retrieve static invoice: {}", e);
 							return Err(ReplayEvent());
+						},
 					}
 				}
-                }
-            }
+			},
 			// TODO(splicing): Revisit error handling once splicing API is settled in LDK 0.3
 			LdkEvent::FundingTransactionReadyForSigning {
 				channel_id,
@@ -1975,20 +1946,20 @@ where
 						partially_signed_tx,
 					) {
 						Ok(()) => {
-                            log_debug!(
-								self.logger,
+							log_info!(
+								self.peer_store.peer_logger(&counterparty_node_id),
 								"Signed funding transaction for channel {} with counterparty {}",
 								channel_id,
 								counterparty_node_id
 							);
-                        }
+						},
 						Err(e) => {
 							// TODO(splicing): Abort splice once supported in LDK 0.3
 							debug_assert!(false, "Failed signing funding transaction: {:?}", e);
 							log_error!(self.logger, "Failed signing funding transaction: {:?}", e);
+						},
 					}
-                    }
-                }
+				},
 				Err(()) => log_error!(self.logger, "Failed signing funding transaction"),
 			},
 			LdkEvent::SplicePending {
@@ -1998,8 +1969,8 @@ where
 				new_funding_txo,
 				..
 			} => {
-                log_debug!(
-					self.logger,
+				log_info!(
+					self.peer_store.peer_logger(&counterparty_node_id),
 					"Channel {} with counterparty {} pending splice with funding_txo {}",
 					channel_id,
 					counterparty_node_id,
@@ -2014,13 +1985,13 @@ where
 				};
 
 				match self.event_queue.add_event(event).await {
-                    Ok(_) => {}
+					Ok(_) => {},
 					Err(e) => {
 						log_error!(self.logger, "Failed to push to event queue: {}", e);
 						return Err(ReplayEvent());
-                    }
+					},
 				};
-            }
+			},
 			LdkEvent::SpliceFailed {
 				channel_id,
 				user_channel_id,
@@ -2030,16 +2001,16 @@ where
 				..
 			} => {
 				if let Some(funding_txo) = abandoned_funding_txo {
-                    log_debug!(
-						self.logger,
+					log_info!(
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"Channel {} with counterparty {} failed splice with funding_txo {}",
 						channel_id,
 						counterparty_node_id,
 						funding_txo,
 					);
 				} else {
-                    log_debug!(
-						self.logger,
+					log_info!(
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"Channel {} with counterparty {} failed splice",
 						channel_id,
 						counterparty_node_id,

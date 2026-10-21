@@ -443,6 +443,7 @@ impl PostgresStorage {
     (29, "operation abandon", include_str!("../migrations/postgres/029_operation_abandon.sql")),
     (30, "channel open operations", include_str!("../migrations/postgres/030_channel_open_operations.sql")),
     (31, "starter requests", include_str!("../migrations/postgres/031_starter_requests.sql")),
+    (32, "starter queries", include_str!("../migrations/postgres/032_starter_queries.sql")),
         ]
     }
 
@@ -788,6 +789,15 @@ impl Storage for PostgresStorage {
     }
     async fn starter_grants(&self) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
         crate::starter::postgres::grants(&self.pool).await
+    }
+    async fn starter_query(
+        &self,
+        query: crate::starter::StarterQuery,
+    ) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
+        crate::starter::postgres::query(&self.pool, query).await
+    }
+    async fn starter_has_served_invite(&self, peer: &[u8; 32]) -> Result<bool, StorageError> {
+        crate::starter::postgres::has_served_invite(&self.pool, peer).await
     }
     async fn starter_counters(&self) -> Result<crate::starter::StarterCounters, StorageError> {
         crate::starter::postgres::counters(&self.pool).await
@@ -2442,6 +2452,16 @@ impl Storage for PostgresStorage {
             })
         })
         .transpose()
+    }
+
+    async fn find_pending_invite_for_invitee(
+        &self,
+        peer: &[u8; 32],
+    ) -> Result<Option<InviteIssuedRecord>, StorageError> {
+        match crate::starter::postgres::pending_invite_id(&self.pool, peer).await? {
+            Some(id) => self.find_invite_issued(&id).await,
+            None => Ok(None),
+        }
     }
 
     async fn list_invites_issued(&self) -> Result<Vec<InviteIssuedRecord>, StorageError> {

@@ -32,6 +32,15 @@ pub trait Storage: Send + Sync {
     async fn starter_grants(&self) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
         Err(StorageError::Unsupported("starter hub".into()))
     }
+    async fn starter_query(
+        &self,
+        _query: crate::starter::StarterQuery,
+    ) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
+        Err(StorageError::Unsupported("starter queries".into()))
+    }
+    async fn starter_has_served_invite(&self, _peer: &[u8; 32]) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("starter invite lookup".into()))
+    }
     async fn starter_counters(&self) -> Result<crate::starter::StarterCounters, StorageError> {
         Err(StorageError::Unsupported("starter hub".into()))
     }

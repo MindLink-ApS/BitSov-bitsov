@@ -1,7 +1,7 @@
 use super::*;
 use async_trait::async_trait;
 use konsensus_core::traits::lightning::*;
-use konsensus_storage::{InviteIssuedRecord, SqliteStorage};
+use konsensus_storage::{InviteIssuedRecord, InviteState, SqliteStorage};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -388,4 +388,43 @@ async fn one_grants_recovery_error_does_not_starve_later_grants() {
         100_000
     );
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn refused_request_flood_keeps_only_one_row_and_does_not_extend_throttle() {
+    let (hub, backend, peer) = setup(0).await;
+    backend.connected.store(false, Ordering::SeqCst);
+    for now in 10..110 {
+        let id = Uuid::new_v4();
+        let frame = hub
+            .handle(peer, request(&hub, peer, id), Some(now))
+            .await
+            .unwrap();
+        assert!(matches!(
+            frame,
+            Frame::StarterStatus {
+                retry_after_unix: Some(610),
+                ..
+            }
+        ));
+        assert!(
+            matches!(frame, Frame::StarterStatus { reason: Some(ref reason), .. }
+            if reason == if now == 10 { "ln_peer_not_connected" } else { "rate_limited" })
+        );
+    }
+    assert_eq!(hub.storage.starter_grants().await.unwrap().len(), 1);
+    // A new refusal after the throttle replaces the old refusal, rather than
+    // growing history; reconnecting after that throttle still permits admission.
+    let id = Uuid::new_v4();
+    hub.handle(peer, request(&hub, peer, id), Some(610))
+        .await
+        .unwrap();
+    assert_eq!(hub.storage.starter_grants().await.unwrap().len(), 1);
+    backend.connected.store(true, Ordering::SeqCst);
+    let id = Uuid::new_v4();
+    assert!(
+        matches!(hub.handle(peer, request(&hub, peer, id), Some(1210)).await.unwrap(),
+        Frame::StarterStatus { state, .. } if state == "received")
+    );
+    assert_eq!(hub.storage.starter_grants().await.unwrap().len(), 1);
 }

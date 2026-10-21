@@ -353,6 +353,111 @@ async fn postgres_starter_migration_caps_and_identity_races() {
     .unwrap();
     assert_eq!(a.starter_counters().await.unwrap().day_count, 0);
     assert_eq!(a.starter_counters().await.unwrap().committed_sats, 950_000);
+    // Exercise the dialect-specific bounded queries in the PostgreSQL CI lane.
+    assert_eq!(
+        a.starter_query(StarterQuery::Work {
+            after: String::new()
+        })
+        .await
+        .unwrap()
+        .len(),
+        19
+    );
+    assert_eq!(
+        a.starter_query(StarterQuery::Request("request-1".into()))
+            .await
+            .unwrap()[0]
+            .state,
+        "refused"
+    );
+    assert_eq!(
+        a.starter_query(StarterQuery::LatestRequester("node-1".into()))
+            .await
+            .unwrap()[0]
+            .request_id,
+        "request-1"
+    );
+    assert_eq!(
+        a.starter_query(StarterQuery::Identity {
+            requester: "absent".into(),
+            ln_pubkey: "key-2".into()
+        })
+        .await
+        .unwrap()[0]
+            .request_id,
+        "request-2"
+    );
+    assert_eq!(
+        a.starter_query(StarterQuery::Recent {
+            since: 172800,
+            after: (i64::MIN, String::new())
+        })
+        .await
+        .unwrap()
+        .len(),
+        1
+    );
+    claim(&a, "request-2", 172800).await;
+    a.starter_update(
+        StarterUpdate::Observe {
+            id: "request-2".into(),
+            channel_id: "channel".into(),
+            user_channel_id: None,
+            funding_txid: None,
+            ready: true,
+        },
+        Some(172800),
+    )
+    .await
+    .unwrap();
+    assert!(a.starter_has_served_invite(&[1; 32]).await.unwrap());
+    assert!(a
+        .find_pending_invite_for_invitee(&[1; 32])
+        .await
+        .unwrap()
+        .is_some());
+    assert!(a
+        .starter_query(StarterQuery::Work {
+            after: String::new()
+        })
+        .await
+        .unwrap()
+        .iter()
+        .any(|g| g.request_id == "request-2"));
+    a.mark_invite_accepted(&uuid::Uuid::from_u128(3), 172800)
+        .await
+        .unwrap();
+    assert!(!a
+        .starter_query(StarterQuery::Work {
+            after: String::new()
+        })
+        .await
+        .unwrap()
+        .iter()
+        .any(|g| g.request_id == "request-2"));
+    for n in 100..110 {
+        let mut g = grant(n, 172800);
+        g.requester_node_id = "refusal-flood".into();
+        g.state = "refused".into();
+        a.starter_update(
+            StarterUpdate::Admit {
+                grant: g,
+                limits: limits(),
+            },
+            Some(172800),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        a.starter_grants()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|g| g.requester_node_id == "refusal-flood")
+            .count(),
+        1
+    );
     drop(a);
     drop(b);
     sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)"))
@@ -383,4 +488,181 @@ async fn invalid_invite_cancellation_never_refunds_an_existing_operation() {
     let c = db.starter_counters().await.unwrap();
     assert_eq!((c.inflight_count, c.committed_sats), (1, 50_000));
     assert_eq!(db.starter_grants().await.unwrap()[0].state, "admitted");
+}
+
+#[tokio::test]
+async fn capped_refusals_preserve_live_grants_and_accounting() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    for n in 0..100 {
+        let mut g = grant(n, i64::from(n) * 600);
+        g.requester_node_id = "same-node".into();
+        g.state = "refused".into();
+        g.reason = Some("ln_peer_not_connected".into());
+        db.starter_update(
+            StarterUpdate::Admit {
+                grant: g,
+                limits: limits(),
+            },
+            Some(i64::from(n) * 600),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(db.starter_grants().await.unwrap().len(), 1);
+    let c = db.starter_counters().await.unwrap();
+    assert_eq!((c.day_count, c.inflight_count, c.committed_sats), (0, 0, 0));
+    let mut g = grant(101, 60_000);
+    g.requester_node_id = "same-node".into();
+    db.starter_update(
+        StarterUpdate::Admit {
+            grant: g,
+            limits: limits(),
+        },
+        Some(60_000),
+    )
+    .await
+    .unwrap();
+    let rows = db.starter_grants().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, "admitted");
+    let c = db.starter_counters().await.unwrap();
+    assert_eq!(
+        (c.day_count, c.inflight_count, c.committed_sats),
+        (1, 1, 50_000)
+    );
+}
+
+#[tokio::test]
+async fn indexed_starter_pages_skip_terminal_history_without_losing_work() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    // More work than fits in one page, interspersed with terminal history.
+    for n in 0..300 {
+        let g = grant(n, 10);
+        db.starter_update(
+            StarterUpdate::Admit {
+                grant: g,
+                limits: StarterLimits {
+                    max_opens_per_day: 500,
+                    max_concurrent_opens: 500,
+                    lifetime_budget_sats: 50_000_000,
+                },
+            },
+            Some(10),
+        )
+        .await
+        .unwrap();
+    }
+    sqlx::query("UPDATE starter_grants SET state='refused' WHERE CAST(substr(request_id,9) AS INTEGER) >= 140").execute(db.pool()).await.unwrap();
+    // One ready grant needs crash-repair; another already has settled bookkeeping.
+    for n in [0, 1] {
+        seed_invite(&db, &format!("request-{n}")).await;
+        sqlx::query("UPDATE starter_grants SET state='ready' WHERE request_id=?")
+            .bind(format!("request-{n}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    db.mark_invite_accepted(&uuid::Uuid::from_u128(2), 10)
+        .await
+        .unwrap();
+    let mut ids = vec![];
+    let mut after = String::new();
+    loop {
+        let page = db
+            .starter_query(StarterQuery::Work { after })
+            .await
+            .unwrap();
+        assert!(page.len() <= 128);
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().unwrap().request_id.clone();
+        ids.extend(page.into_iter().map(|g| g.request_id));
+    }
+    assert_eq!(ids.len(), 139);
+    assert!(ids.contains(&"request-0".into()));
+    assert!(!ids.contains(&"request-1".into()));
+    assert!(!ids.contains(&"request-140".into()));
+    let mut recent = vec![];
+    let mut after = (i64::MIN, String::new());
+    loop {
+        let page = db
+            .starter_query(StarterQuery::Recent { since: 10, after })
+            .await
+            .unwrap();
+        assert!(page.len() <= 128);
+        if page.is_empty() {
+            break;
+        }
+        let last = page.last().unwrap();
+        after = (last.updated_at, last.request_id.clone());
+        recent.extend(page.into_iter().map(|g| g.request_id));
+    }
+    assert_eq!(recent.len(), 300);
+    recent.sort();
+    recent.dedup();
+    assert_eq!(recent.len(), 300);
+    assert!(db
+        .starter_query(StarterQuery::Recent {
+            since: 11,
+            after: (i64::MIN, String::new())
+        })
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.starter_query(StarterQuery::Request("request-299".into()))
+            .await
+            .unwrap()[0]
+            .request_id,
+        "request-299"
+    );
+    assert_eq!(
+        db.starter_query(StarterQuery::LatestRequester("node-299".into()))
+            .await
+            .unwrap()[0]
+            .request_id,
+        "request-299"
+    );
+    assert_eq!(
+        db.starter_query(StarterQuery::Identity {
+            requester: "absent".into(),
+            ln_pubkey: "key-2".into()
+        })
+        .await
+        .unwrap()[0]
+            .request_id,
+        "request-2"
+    );
+    assert!(db
+        .starter_query(StarterQuery::Identity {
+            requester: "node-299".into(),
+            ln_pubkey: "key-299".into()
+        })
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db.starter_has_served_invite(&[1; 32]).await.unwrap());
+    assert!(!db.starter_has_served_invite(&[2; 32]).await.unwrap());
+    assert_eq!(
+        db.find_pending_invite_for_invitee(&[1; 32])
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        uuid::Uuid::from_u128(1)
+    );
+
+    // These are the hot-path predicates: removing their indexes must be visible
+    // even when a small fixture would hide the latency regression.
+    for (sql, index) in [
+        ("SELECT * FROM starter_grants WHERE requester_node_id='node-299' ORDER BY created_at DESC,request_id DESC LIMIT 1", "starter_grants_requester_time"),
+        ("SELECT * FROM starter_grants WHERE state IN ('admitted','opening','resolved') AND request_id>'request-2' ORDER BY request_id LIMIT 128", "starter_grants_work"),
+        ("SELECT * FROM starter_grants WHERE updated_at>=10 AND (updated_at,request_id)>(10,'request-2') ORDER BY updated_at,request_id LIMIT 128", "starter_grants_recent"),
+        ("SELECT id FROM invites_issued WHERE invitee_pubkey=x'01' AND state='pending' ORDER BY created_at DESC LIMIT 1", "starter_invites_requester"),
+    ] {
+        let plan: Vec<(i64,i64,i64,String)> = sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}")).fetch_all(db.pool()).await.unwrap();
+        assert!(plan.iter().any(|r|r.3.contains(index)), "{plan:?}");
+        assert!(!plan.iter().any(|r|r.3.contains("USE TEMP B-TREE")), "{plan:?}");
+    }
 }
