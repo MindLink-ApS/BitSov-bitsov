@@ -275,6 +275,7 @@ fn report(resp: ControlResponse) -> Result<()> {
 pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
     match send(config_path, ControlRequest::Status).await? {
         ControlResponse::Status {
+            enrollment,
             second_device_alerts,
             clients,
             pending_elevations,
@@ -285,6 +286,15 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             pending_device_keys,
             pending_owner_approvals,
         } => {
+            if let Some(status) = &enrollment {
+                for provisional in &status.provisional {
+                    safe_println!(
+                        "PROVISIONAL client={} deadline={}",
+                        provisional.client_id,
+                        provisional.expires_at
+                    );
+                }
+            }
             for alert in second_device_alerts {
                 safe_println!("This QR was used again after you approved {:?}. Revoke it if it wasn't yours. (client={})",alert.name,alert.client_id);
             }
@@ -300,6 +310,9 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                 );
             }
             for p in pending_device_keys.iter().filter(|p| !p.lost) {
+                if let Some(words) = enrollment.as_ref().and_then(|e| e.words.get(&p.op_id)) {
+                    safe_println!("SAS v2 {}: {}  expires_at={}", p.op_id, words, p.expires_at);
+                }
                 safe_println!(
                     "PENDING DEVICE KEY {}  {:?}  client={}\n  approve with: konsensus device approve --op {}",
                     p.fingerprint, p.name, p.client_id, p.op_id
@@ -698,8 +711,117 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
                 .await?,
             )
         }
-        DeviceCommand::Revoke { key_id, config } => {
-            report(send(&config, ControlRequest::RevokeDeviceKey { key_id }).await?)
+        DeviceCommand::Reject { op_id, config } => cmd_pair_cancel(&config, &op_id).await,
+        DeviceCommand::Revoke {
+            key_id,
+            approved_by,
+            with_pairing,
+            cascade,
+            keep,
+            allow_zero_owner,
+            config,
+        } => {
+            let enabled = NodeConfig::load_before_identity_validation(&config)?
+                .pairing
+                .second_device_enrollment;
+            if !enabled
+                && approved_by.is_none()
+                && !with_pairing
+                && !cascade
+                && keep.is_empty()
+                && !allow_zero_owner
+            {
+                return report(
+                    send(
+                        &config,
+                        ControlRequest::RevokeDeviceKey {
+                            key_id: key_id.context("missing key")?,
+                        },
+                    )
+                    .await?,
+                );
+            }
+            let options = konsensus_api::pairing::console::RevokeOptions {
+                root: approved_by
+                    .clone()
+                    .or(key_id)
+                    .context("missing revocation root")?,
+                cascade: cascade || approved_by.is_some(),
+                with_pairing,
+                keep,
+                allow_zero_owner,
+            };
+            let response = send(
+                &config,
+                ControlRequest::RevokeDevices {
+                    options: options.clone(),
+                    confirmation: None,
+                },
+            )
+            .await?;
+            let ControlResponse::RevokePlan { plan } = response else {
+                return report(response);
+            };
+            for key in &plan.keys {
+                safe_println!(
+                    "REVOKE {} {:?} client={} enrolled_by={}",
+                    key.key_id,
+                    key.name,
+                    key.client_id,
+                    key.enrolled_by
+                );
+            }
+            for client in &plan.pairings {
+                safe_println!("REVOKE PAIRING {} (all tokens and keys)", client);
+            }
+            if !options.cascade && !plan.descendants.is_empty() {
+                for key in &plan.descendants {
+                    safe_println!(
+                        "DESCENDANT {} {:?} enrolled_by={}",
+                        key.key_id,
+                        key.name,
+                        key.enrolled_by
+                    );
+                }
+                safe_println!(
+                    "Remove descendants with: konsensus device revoke --approved-by {}",
+                    options.root
+                );
+            }
+            safe_println!(
+                "Resulting owner_device_count(): {}",
+                plan.owner_device_count
+            );
+            anyhow::ensure!(
+                plan.owner_device_count != 0 || options.allow_zero_owner,
+                "zero owner devices; use --allow-zero-owner for console-only recovery"
+            );
+            println!("Type revoke to confirm, or press Enter to cancel:");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            if line.trim() != "revoke" {
+                println!("not revoked");
+                return Ok(());
+            }
+            let response = send(
+                &config,
+                ControlRequest::RevokeDevices {
+                    options,
+                    confirmation: Some(plan.confirmation),
+                },
+            )
+            .await?;
+            match response {
+                ControlResponse::RevokePlan { plan } => {
+                    safe_println!(
+                        "Revoked {} device keys; owner_device_count()={}",
+                        plan.keys.len(),
+                        plan.owner_device_count
+                    );
+                    Ok(())
+                }
+                other => report(other),
+            }
         }
         DeviceCommand::List { config } => match send(&config, ControlRequest::Status).await? {
             ControlResponse::Status {
@@ -711,6 +833,13 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
                     safe_println!("no device keys");
                 }
                 for k in &device_keys {
+                    if let Some(provenance) = &k.enrolled_by {
+                        safe_println!(
+                            "  enrolled_by={} approver={:?}",
+                            provenance,
+                            k.approver_name
+                        );
+                    }
                     safe_println!(
                         "DEVICE KEY {}  {:?}  client={}  registered_at={}\n  revoke with: konsensus device revoke --key {}",
                         k.fingerprint, k.name, k.client_id, k.registered_at, k.key_id
@@ -2240,4 +2369,29 @@ pub async fn cmd_peer_add(
         )
         .await?,
     )
+}
+
+/// Verify the running node can accept a console second-device ticket.
+pub async fn check_second_device_ticket(config: &Path) -> Result<()> {
+    match send(config, ControlRequest::SecondDeviceTicketReady).await? {
+        ControlResponse::Ok { .. } => Ok(()),
+        ControlResponse::Error { message } => anyhow::bail!("{}", terminal_safe(&message)),
+        _ => anyhow::bail!("unexpected ticket readiness response"),
+    }
+}
+
+pub async fn cmd_pair_cancel(config: &Path, op_id: &str) -> Result<()> {
+    report(
+        send(
+            config,
+            ControlRequest::CancelSecondDevice {
+                op_id: op_id.into(),
+            },
+        )
+        .await?,
+    )
+}
+
+pub async fn cmd_pair_reset_sas(config: &Path) -> Result<()> {
+    report(send(config, ControlRequest::ResetSas).await?)
 }

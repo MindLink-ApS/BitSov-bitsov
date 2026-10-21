@@ -1050,3 +1050,292 @@ async fn t21_mixed_expiry_never_refunds_a_consumed_ticket() {
         "only the four unconsumed tickets refund slots, even with equal issue times"
     );
 }
+
+// T16: console revocation follows provenance, including missing roots and cycles.
+#[test]
+fn console_revocation_chain_keep_and_zero_owner_guard() {
+    use super::console::RevokeOptions;
+    let f = Fixture::new();
+    let (_, b_op) = f.confirmed(2);
+    let b = f
+        .approve(&b_op, &sign(&f.key, &f.message(&b_op, false)))
+        .unwrap();
+    let (_, c_op) = f.confirmed(3);
+    let c = f
+        .approve(&c_op, &sign(&f.key, &f.message(&c_op, false)))
+        .unwrap();
+    f.svc
+        .lock()
+        .file
+        .device_keys
+        .iter_mut()
+        .find(|k| k.key_id == c.key_id)
+        .unwrap()
+        .enrolled_by = format!("device:{}", b.key_id);
+    let mut options = RevokeOptions {
+        root: f.key_id.clone(),
+        cascade: true,
+        with_pairing: true,
+        keep: vec![],
+        allow_zero_owner: false,
+    };
+    let plan = f.svc.console_revoke_devices(&options, None).unwrap();
+    assert_eq!(plan.keys.len(), 3);
+    assert_eq!(plan.owner_device_count, 0);
+    assert!(f
+        .svc
+        .console_revoke_devices(&options, Some(&plan.confirmation))
+        .is_err());
+    assert_eq!(f.svc.owner_device_count(), 3);
+    options.keep.push(b.key_id.clone());
+    let plan = f.svc.console_revoke_devices(&options, None).unwrap();
+    assert_eq!(plan.owner_device_count, 1);
+    f.svc
+        .console_revoke_devices(&options, Some(&plan.confirmation))
+        .unwrap();
+    assert_eq!(f.svc.device_keys()[0].key_id, b.key_id);
+    assert_eq!(f.svc.snapshot().clients.len(), 1);
+    // The deleted root still reaches B through its provenance string.
+    options.keep.clear();
+    let plan = f.svc.console_revoke_devices(&options, None).unwrap();
+    assert_eq!(plan.keys.len(), 1);
+    options.allow_zero_owner = true;
+    let plan = f.svc.console_revoke_devices(&options, None).unwrap();
+    f.svc
+        .console_revoke_devices(&options, Some(&plan.confirmation))
+        .unwrap();
+    assert!(f.svc.snapshot().clients.is_empty());
+}
+
+#[test]
+fn console_revocation_cycle_and_stale_confirmation() {
+    use super::console::RevokeOptions;
+    let f = Fixture::new();
+    let (_, op) = f.confirmed(2);
+    let b = f
+        .approve(&op, &sign(&f.key, &f.message(&op, false)))
+        .unwrap();
+    f.svc.lock().file.device_keys[0].enrolled_by = format!("second_device:{}", b.key_id);
+    let options = RevokeOptions {
+        root: f.key_id.clone(),
+        cascade: true,
+        with_pairing: true,
+        keep: vec![],
+        allow_zero_owner: true,
+    };
+    let plan = f.svc.console_revoke_devices(&options, None).unwrap();
+    assert_eq!(plan.keys.len(), 2);
+    f.svc.lock().file.device_keys[1].name = "changed since preview".into();
+    assert!(f
+        .svc
+        .console_revoke_devices(&options, Some(&plan.confirmation))
+        .is_err());
+    assert_eq!(f.svc.owner_device_count(), 2);
+    let plan = f.svc.console_revoke_devices(&options, None).unwrap();
+    f.svc
+        .console_revoke_devices(&options, Some(&plan.confirmation))
+        .unwrap();
+    assert_eq!(f.svc.owner_device_count(), 0);
+}
+
+#[test]
+fn console_cancel_removes_pairing_and_status_hides_unconfirmed_words() {
+    let f = Fixture::new();
+    let c = f.provisional(2);
+    let op = f.request(&c, &key()).unwrap();
+    let status = f.svc.console_enrollment_status();
+    assert_eq!(status.provisional.len(), 1);
+    assert!(status.words.is_empty());
+    f.svc.console_cancel_second_device(&op.op_id).unwrap();
+    assert!(!f
+        .svc
+        .snapshot()
+        .clients
+        .iter()
+        .any(|p| p.client_id == c.client_id));
+    assert!(f.svc.pending_device_keys().is_empty());
+    assert!(f.svc.console_enrollment_status().provisional.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn t16_console_socket_approve_status_revoke_cancel_and_reset() {
+    use super::console::RevokeOptions;
+    use crate::control::{
+        self, ControlContext, ControlRequest as Q, ControlResponse as R, ControlServer,
+    };
+    let f = Fixture::new();
+    let (client, op) = f.confirmed(2);
+    let signer = konsensus_core::OwnerApprovalKey::from_seed(&[7; 64], &[9; 32]).unwrap();
+    let signature = hex::encode(
+        signer
+            .sign(
+                owner_approval_message(
+                    &f.svc.bound_fingerprint(),
+                    &op.client_pubkey,
+                    op.epoch,
+                    &op.public_key,
+                )
+                .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    let confirmation = f.console.owner_code(&op.op_id);
+    let pending = f.svc.console_enrollment_status();
+    assert_eq!(pending.words[&op.op_id].split_whitespace().count(), 4);
+    let service = std::sync::Arc::new(f.svc);
+    let ctx = std::sync::Arc::new(ControlContext {
+        service: service.clone(),
+        identity_fingerprint: service.bound_fingerprint(),
+        data_dir: f.dir.path().into(),
+        mnemonic_path: f.dir.path().join("mnemonic.enc"),
+        replacement_guard: control::ReplacementGuard {
+            layout: crate::bootstrap::DataDirLayout::new(f.dir.path()),
+            uses_identity_derived_keys: true,
+            has_identity_passphrase: false,
+        },
+    });
+    let server = ControlServer::bind(f.dir.path(), ctx).unwrap();
+    let path = server.path().to_path_buf();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(server.serve(rx));
+    assert!(matches!(
+        control::send(&path, &Q::SecondDeviceTicketReady)
+            .await
+            .unwrap(),
+        R::Ok { .. }
+    ));
+    let status = control::send(&path, &Q::Status).await.unwrap();
+    let json = serde_json::to_string(&status).unwrap();
+    for forbidden in [
+        "ticket_commitment",
+        "delegation_nonce",
+        "owner_approval",
+        "box_nonce",
+        "sas_digest",
+        "second_2",
+    ] {
+        // pending_owner_approvals is an existing public status field.
+        if forbidden == "owner_approval" {
+            assert!(!json.contains("\"owner_approval\":"));
+        } else {
+            assert!(!json.contains(forbidden), "{forbidden}");
+        }
+    }
+    assert!(!json.contains(&confirmation));
+    assert!(matches!(
+        control::send(
+            &path,
+            &Q::ApproveDeviceKey {
+                op_id: op.op_id.clone(),
+                confirmation,
+                owner_signature: signature
+            }
+        )
+        .await
+        .unwrap(),
+        R::Ok { .. }
+    ));
+    service.sweep_provisional_pairings().unwrap();
+    assert_eq!(
+        service.validate_remote_transport(&[2; 32]).unwrap().scopes,
+        vec![Scope::Read, Scope::Receive]
+    );
+    assert!(service.console_enrollment_status().provisional.is_empty());
+    // A late QR rescan must survive transport serialization without deleting the device.
+    assert!(service
+        .check_second_device_rescan("second_2", &pubkey(9), &[9; 32])
+        .is_err());
+    let status = control::send(&path, &Q::Status).await.unwrap();
+    assert!(
+        matches!(status, R::Status { second_device_alerts, .. } if second_device_alerts.len() == 1)
+    );
+    let options = RevokeOptions {
+        root: op.key_id,
+        cascade: false,
+        with_pairing: true,
+        keep: vec![],
+        allow_zero_owner: false,
+    };
+    let R::RevokePlan { plan } = control::send(
+        &path,
+        &Q::RevokeDevices {
+            options: options.clone(),
+            confirmation: None,
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("preview");
+    };
+    assert_eq!(plan.owner_device_count, 1);
+    assert!(matches!(
+        control::send(
+            &path,
+            &Q::RevokeDevices {
+                options,
+                confirmation: Some(plan.confirmation)
+            }
+        )
+        .await
+        .unwrap(),
+        R::RevokePlan { .. }
+    ));
+    assert!(service.validate_remote_transport(&[2; 32]).is_err());
+    assert!(service.device_keys_for(&client.client_id).is_empty());
+    service.lock().sas_failures = 3;
+    service.lock().second_device.mismatches = vec![std::time::Instant::now(); 10];
+    assert!(matches!(
+        control::send(&path, &Q::ResetSas).await.unwrap(),
+        R::Ok { .. }
+    ));
+    assert_eq!(service.lock().sas_failures, 0);
+    assert!(service.lock().second_device.mismatches.is_empty());
+    let c = service
+        .create_second_device_pairing("second_cancel", "new", &pubkey(4), &[4; 32], "console")
+        .unwrap();
+    let k = key();
+    let public = hex::encode(k.public_key().as_ref());
+    let op = service
+        .request_device_key_versioned(
+            &c.client_id,
+            &public,
+            "new",
+            &sign(
+                &k,
+                &registration_message(&service.bound_fingerprint(), &c.client_id, &public),
+            ),
+            Some(2),
+            Some(binding(&service, &c)),
+        )
+        .unwrap();
+    assert!(matches!(
+        control::send(&path, &Q::CancelSecondDevice { op_id: op.op_id })
+            .await
+            .unwrap(),
+        R::Ok { .. }
+    ));
+    assert!(service.validate_remote_transport(&[4; 32]).is_err());
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[test]
+fn console_flag_off_and_no_owner_ticket_refusal() {
+    let mut f = Fixture::new();
+    f.svc.lock().file.device_keys.clear();
+    assert!(f
+        .svc
+        .console_second_ticket_ready()
+        .unwrap_err()
+        .to_string()
+        .contains("no_owner_device"));
+    f.svc.second_device_enrollment = false;
+    assert!(f.svc.console_second_ticket_ready().is_err());
+    assert!(f.svc.console_cancel_second_device("missing").is_err());
+    assert!(f.svc.console_reset_sas().is_err());
+    assert_eq!(
+        f.svc.console_enrollment_status(),
+        super::console::EnrollmentStatus::default()
+    );
+}

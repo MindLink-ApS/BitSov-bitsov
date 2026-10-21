@@ -29,6 +29,9 @@ pub enum Command {
     },
     /// Print a one-use enrollment ticket (and optionally a terminal QR).
     PairTicket {
+        /// Claimless enrollment approved by an existing owner device (10m default, 30m max).
+        #[arg(long, conflicts_with = "legacy")]
+        second_device: bool,
         /// Emit the strict v1 schema using only the first endpoint for older apps.
         #[arg(long)]
         legacy: bool,
@@ -37,8 +40,20 @@ pub enum Command {
         #[arg(long)]
         qr: bool,
         /// Ticket lifetime: positive seconds, minutes, hours or days (s/m/h/d).
-        #[arg(long, default_value = "24h", value_parser = crate::ticket_cmd::parse_ttl)]
+        #[arg(long, default_value = "24h", default_value_if("second_device", "true", "10m"), value_parser = crate::ticket_cmd::parse_ttl)]
         ttl: std::time::Duration,
+    },
+    /// Reject a v2 enrollment and remove its provisional pairing.
+    PairCancel {
+        #[arg(long = "op")]
+        op_id: String,
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+    /// Clear v1 SAS failures and the v2 mismatch window (owner console).
+    PairResetSas {
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
     },
     /// Close channels and send funds to an owner-specified home address (local console only).
     MoveHome(crate::move_home_cmd::MoveHomeArgs),
@@ -115,7 +130,7 @@ pub enum Command {
 
         /// Enable existing owner-approved devices to sign recipient-bound spend envelopes.
         /// Requires a descriptor password or remote unlock and an encrypted seed; does not open a console.
-        #[arg(long, requires = "owner_password", conflicts_with_all = ["password", "password_file", "owner_control"])]
+        #[arg(long, requires = "owner_password", conflicts_with_all = ["password", "password_file"])]
         local_owner_device: bool,
 
         /// Override admission mode for this run: `whitelist` (default) or `price-open`.
@@ -701,6 +716,13 @@ pub enum DeviceCommand {
         #[arg(short, long, default_value = "konsensus.toml")]
         config: PathBuf,
     },
+    /// Reject a pending v2 enrollment and its provisional pairing.
+    Reject {
+        #[arg(long = "op")]
+        op_id: String,
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
     /// List registered and pending device keys.
     List {
         /// Path to the configuration file.
@@ -710,8 +732,27 @@ pub enum DeviceCommand {
     /// Retire a device key now; its spend envelopes end with it.
     Revoke {
         /// Key id (see `konsensus device list`).
-        #[arg(long = "key")]
-        key_id: String,
+        #[arg(
+            long = "key",
+            required_unless_present = "approved_by",
+            conflicts_with = "approved_by"
+        )]
+        key_id: Option<String>,
+        /// Revoke this approver and all descendants, including their pairings.
+        #[arg(long, conflicts_with = "cascade")]
+        approved_by: Option<String>,
+        /// Also revoke the pairing and all its tokens.
+        #[arg(long)]
+        with_pairing: bool,
+        /// Include all transitively approved keys and their pairings.
+        #[arg(long, requires = "key_id")]
+        cascade: bool,
+        /// Keep this key but still walk its children (repeatable).
+        #[arg(long, requires = "approved_by", conflicts_with = "key_id")]
+        keep: Vec<String>,
+        /// Permit console-only recovery with no remaining owner devices.
+        #[arg(long)]
+        allow_zero_owner: bool,
         /// Path to the configuration file.
         #[arg(short, long, default_value = "konsensus.toml")]
         config: PathBuf,
@@ -886,7 +927,7 @@ mod local_owner_tests {
     }
 
     #[test]
-    fn local_owner_requires_descriptor_and_excludes_console_and_other_password_sources() {
+    fn local_owner_requires_descriptor_and_excludes_other_password_sources() {
         assert!(Cli::try_parse_from([
             "konsensus",
             "start",
@@ -903,12 +944,6 @@ mod local_owner_tests {
                 "--local-owner-device",
                 "--password-fd",
                 "0",
-                "--owner-control",
-            ],
-            vec![
-                "--local-owner-device",
-                "--password-fd",
-                "0",
                 "--password",
                 "secret",
             ],
@@ -921,6 +956,84 @@ mod local_owner_tests {
             ],
         ] {
             assert!(Cli::try_parse_from([vec!["konsensus", "start"], args].concat()).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod second_device_console_tests {
+    use super::*;
+
+    #[test]
+    fn console_second_device_arguments() {
+        assert!(Cli::try_parse_from([
+            "konsensus",
+            "start",
+            "--local-owner-device",
+            "--password-fd",
+            "0",
+            "--owner-control"
+        ])
+        .is_ok());
+        for (args, seconds) in [
+            (vec!["konsensus", "pair-ticket"], 86400),
+            (vec!["konsensus", "pair-ticket", "--second-device"], 600),
+            (
+                vec![
+                    "konsensus",
+                    "pair-ticket",
+                    "--second-device",
+                    "--ttl",
+                    "30m",
+                ],
+                1800,
+            ),
+        ] {
+            let Command::PairTicket { ttl, .. } = Cli::try_parse_from(args).unwrap().command else {
+                panic!("ticket");
+            };
+            assert_eq!(ttl.as_secs(), seconds);
+        }
+        for args in [
+            vec!["pair-ticket", "--second-device"],
+            vec!["device", "reject", "--op", "pending"],
+            vec!["pair-cancel", "--op", "pending"],
+            vec!["pair-reset-sas"],
+            vec![
+                "device",
+                "revoke",
+                "--key",
+                "a",
+                "--with-pairing",
+                "--cascade",
+            ],
+            vec![
+                "device",
+                "revoke",
+                "--approved-by",
+                "a",
+                "--keep",
+                "b",
+                "--keep",
+                "c",
+                "--allow-zero-owner",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from([vec!["konsensus"], args.clone()].concat()).is_ok(),
+                "{args:?}"
+            );
+        }
+        for args in [
+            vec!["pair-ticket", "--second-device", "--legacy"],
+            vec!["device", "revoke"],
+            vec!["device", "revoke", "--key", "a", "--approved-by", "b"],
+            vec!["device", "revoke", "--key", "a", "--keep", "a"],
+        ] {
+            assert!(
+                Cli::try_parse_from([vec!["konsensus"], args.clone()].concat()).is_err(),
+                "{args:?}"
+            );
         }
     }
 }

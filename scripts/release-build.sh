@@ -1,13 +1,25 @@
 #!/usr/bin/env bash
 # Shared CI/signing-machine recipe. Run from a clean checkout of the release tag.
 set -euo pipefail
-[ $# -eq 1 ] || { echo "usage: $0 <target-triple>" >&2; exit 1; }
+CHECK_ONLY=false
+if [ "${1:-}" = --check-toolchain ]; then CHECK_ONLY=true; shift; fi
+[ $# -eq 1 ] || { echo "usage: $0 [--check-toolchain] <target-triple>" >&2; exit 1; }
 TARGET=$1
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
 TOOLCHAIN=$(cat scripts/release-toolchain)
 [[ $TOOLCHAIN =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'release toolchain must be an exact version' >&2; exit 1; }
 export LC_ALL=C TZ=UTC
+case "$TARGET" in
+  *-apple-darwin)
+    [ -f scripts/release-macos-toolchain.sh ] || { echo 'macOS toolchain preflight: missing pin; prepare a new release' >&2; exit 1; }
+    # shellcheck source=scripts/release-macos-toolchain.sh
+    source scripts/release-macos-toolchain.sh
+    macos_toolchain_prepare
+    macos_toolchain_evidence
+    ;;
+esac
+"$CHECK_ONLY" && exit 0
 SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
 export SOURCE_DATE_EPOCH
 export CARGO_TARGET_DIR="$ROOT/target" CARGO_INCREMENTAL=0
@@ -31,4 +43,10 @@ if [ "$TARGET" = aarch64-unknown-linux-gnu ]; then
 fi
 printf 'release build: toolchain=%s target=%s commit=%s SOURCE_DATE_EPOCH=%s\n' \
   "$TOOLCHAIN" "$TARGET" "$(git rev-parse HEAD)" "$SOURCE_DATE_EPOCH"
+case "$TARGET" in
+  *-apple-darwin)
+    mkdir -p "$CARGO_TARGET_DIR/$TARGET"
+    macos_toolchain_evidence > "$CARGO_TARGET_DIR/$TARGET/release-toolchain.txt"
+    ;;
+esac
 rustup run "$TOOLCHAIN" cargo build --locked --release -p konsensus-node --target "$TARGET"
