@@ -4,8 +4,15 @@ Pre-release; not for production use. Copy this template for each new RC.
 
 ## Prepare
 
-- [ ] Record the reviewed commit on `origin/main`, scope, migration and rollback
-      constraints. Update versions, lockfile, changelog and upgrade notes.
+- [ ] Record the reviewed commit, scope, migration and rollback constraints.
+      Update versions, lockfile, changelog and upgrade notes. Follow the
+      [approved release-ref policy](../ops/RELEASE_POLICY.md#approved-release-refs):
+      for `vX.Y.Z-rcN.M`, freshly fetch `refs/heads/release/<tag>` from `origin`
+      and require the reviewed commit to equal `FETCH_HEAD^{commit}` exactly.
+      For example, `v0.3.0-rc19.1` requires `release/v0.3.0-rc19.1` at that commit.
+      Missing branches and different heads fail, even for commits on main.
+      Plain RC and stable tags still require ancestry on freshly fetched
+      `origin/main`. No signing flag bypasses these checks.
 - [ ] Review the tag's `scripts/release-toolchain`, `scripts/release-build.sh`,
       `scripts/release-macos-toolchain.sh`, lockfile and CI release matrix together.
       Install the pinned Rust toolchain.
@@ -24,6 +31,9 @@ Pre-release; not for production use. Copy this template for each new RC.
 - [ ] Archive both Darwin `<asset>.toolchain.txt` release assets and the local
       preflight log: SDK version, Xcode build and full `clang --version` output.
       Verify both evidence assets are covered by `SHA256SUMS` (17 source assets).
+      The signer requires nonempty records and hashes them; it does not compare
+      their reported versions against the pins. Local and CI build preflights
+      enforce their respective toolchain pins.
 
 ## Rebuild and sign
 
@@ -59,7 +69,9 @@ Pre-release; not for production use. Copy this template for each new RC.
 ## Independently verify and publish
 
 - [ ] In a fresh download directory, verify the tag commit/signature, checksum
-      signature and all five downloaded binaries against `SHA256SUMS`.
+      signature and all 17 source assets against `SHA256SUMS`: five binaries,
+      their five `.sha256` files, five `.sbom.spdx.json` files, and
+      `bitsov-darwin-aarch64.toolchain.txt` and `bitsov-darwin-x86_64.toolchain.txt`.
 - [ ] Check SBOM, provenance and release notes. Record unverified targets as such;
       their signed checksums do not prove they were independently rebuilt.
 - [ ] Obtain operator publication sign-off. The signing script never publishes.

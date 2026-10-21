@@ -87,8 +87,10 @@ Existing forward-only fences still apply.
 
 - Validate the pinned primary fingerprint in field 10 of an anchored GnuPG
   `VALIDSIG` status record, rejecting bad/expired/revoked signatures. Sign a
-  15-entry `SHA256SUMS` covering five binaries, five checksum files and five
-  SBOMs; retries allow only existing `SHA256SUMS`/`SHA256SUMS.asc` extras (#342).
+  `SHA256SUMS` covering five binaries, five checksum files and five SBOMs;
+  the current signer requires 17 entries including the two Darwin
+  `.toolchain.txt` records added by #355. Retries allow only existing
+  `SHA256SUMS`/`SHA256SUMS.asc` extras (#342).
 - Rebuild the exact tag commit for the signing host with the pinned release
   recipe before signing artifacts. Retain mismatch evidence; proceeding after
   investigation requires a logged `--accept-unverified-host` reason. Other
