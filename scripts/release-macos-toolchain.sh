@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Sourced by release-build.sh, including its preflight-only mode. These pins
 # belong to the release commit, never the operator's current checkout.
-MACOS_XCODE_VERSION=27.0
-MACOS_XCODE_BUILD=27A266a
+MACOS_XCODE_VERSION=27.1
+MACOS_XCODE_BUILD=27A9275
 MACOS_SDK_VERSION=27.0
 MACOS_CLANG_VERSION='Apple clang version 21.0.0 (clang-2100.3.34.2)'
 

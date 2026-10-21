@@ -245,10 +245,10 @@ cat > "$WORK/bin/xcodebuild" <<'STUB'
 source "$TEST_ROOT/bin/common"
 expect_args -version "$@"
 case "$TEST_CASE" in
-  *xcode-drift) printf 'Xcode 27.1\nBuild version 27A9275\n' ;;
-  *build-drift) printf 'Xcode 27.0\nBuild version 27A999\n' ;;
+  *xcode-drift) printf 'Xcode 27.0\nBuild version 27A266a\n' ;;
+  *build-drift) printf 'Xcode 27.1\nBuild version 27A999\n' ;;
   *tools-missing) exit 1 ;;
-  *) printf 'Xcode 27.0\nBuild version 27A266a\n' ;;
+  *) printf 'Xcode 27.1\nBuild version 27A9275\n' ;;
 esac
 STUB
 cat > "$WORK/bin/xcrun" <<'STUB'
@@ -296,7 +296,7 @@ for asset in bitsov-darwin-aarch64 bitsov-darwin-x86_64 bitsov-linux-aarch64 bit
   (cd "$WORK/fixtures" && shasum -a 256 "$asset" "$asset.sha256" "$asset.sbom.spdx.json") >> "$WORK/expected-sums"
   case "$asset" in
     bitsov-darwin-*)
-      printf 'target=%s\nxcode_version=27.0\nxcode_build=27A266a\nsdk_version=27.0\nclang --version:\nApple clang version 21.0.0 (clang-2100.3.34.2)\n' "$asset" > "$WORK/fixtures/$asset.toolchain.txt"
+      printf 'target=%s\nxcode_version=27.1\nxcode_build=27A9275\nsdk_version=27.0\nclang --version:\nApple clang version 21.0.0 (clang-2100.3.34.2)\n' "$asset" > "$WORK/fixtures/$asset.toolchain.txt"
       (cd "$WORK/fixtures" && shasum -a 256 "$asset.toolchain.txt") >> "$WORK/expected-sums"
       ;;
   esac
@@ -348,14 +348,14 @@ run_case() (
     bash scripts/release-build.sh "$TEST_HOST" > "$CASE_DIR/output" 2>&1 || rc=$?
     if [[ "$TEST_CASE" == *-match ]]; then
       [ "$rc" -eq 0 ] && [ -s "$CASE_DIR/build.log" ] || fail 'matching build preflight did not proceed'
-      grep -q '^xcode_build=27A266a$' "target/$TEST_HOST/release-toolchain.txt" || fail 'missing Xcode evidence'
+      grep -q '^xcode_build=27A9275$' "target/$TEST_HOST/release-toolchain.txt" || fail 'missing Xcode evidence'
       grep -q '^sdk_version=27.0$' "target/$TEST_HOST/release-toolchain.txt" || fail 'missing SDK evidence'
       grep -q '^Apple clang version 21.0.0 (clang-2100.3.34.2)$' "target/$TEST_HOST/release-toolchain.txt" || fail 'missing clang evidence'
     else
       [ "$rc" -ne 0 ] || fail 'build accepted toolchain drift'
       [ ! -e "$CASE_DIR/build.log" ] || fail 'build ran before toolchain rejection'
       grep -q 'macOS toolchain preflight' "$CASE_DIR/output" || fail 'missing preflight diagnosis'
-      grep -q 'Xcode_27.0.app' "$CASE_DIR/output" || fail 'missing repair instructions'
+      grep -q 'Xcode_27.1.app' "$CASE_DIR/output" || fail 'missing repair instructions'
     fi
     [ ! -f "$CASE_DIR/unexpected" ] || fail 'unexpected stub call'
     exit 0
@@ -433,7 +433,7 @@ run_case() (
     [ ! -s "$CASE_DIR/gpg.log" ] || fail 'signer accessed GPG before toolchain rejection'
     [ ! -e "$CASE_DIR/upload.args" ] || fail 'signer uploaded after toolchain rejection'
     grep -q 'macOS toolchain preflight' "$CASE_DIR/output" || fail 'missing preflight diagnosis'
-    grep -q 'Xcode_27.0.app' "$CASE_DIR/output" || fail 'missing repair instructions'
+    grep -q 'Xcode_27.1.app' "$CASE_DIR/output" || fail 'missing repair instructions'
     exit 0
   fi
   reason=''
@@ -467,7 +467,7 @@ run_case() (
         cmp "$WORK/fixtures/$asset.toolchain.txt" "$evidence/$asset.toolchain.txt"
       done
       if [[ "$TEST_HOST" == *-apple-darwin ]]; then
-        grep -qx 'xcode_build=27A266a' "$evidence/host-toolchain.txt" || fail 'missing retained Xcode build'
+        grep -qx 'xcode_build=27A9275' "$evidence/host-toolchain.txt" || fail 'missing retained Xcode build'
         grep -qx 'sdk_version=27.0' "$evidence/host-toolchain.txt" || fail 'missing retained SDK'
         grep -qx 'Apple clang version 21.0.0 (clang-2100.3.34.2)' "$evidence/host-toolchain.txt" || fail 'missing retained clang'
       fi

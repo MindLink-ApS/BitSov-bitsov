@@ -145,7 +145,7 @@ check.
 ## Pinned macOS release toolchain (NOVA)
 
 Both Release CLI Darwin targets use GitHub's **`xcode-27` Apple Silicon runner**
-and explicitly select `/Applications/Xcode_27.0.app` with `sudo xcode-select -s`.
+and explicitly select `/Applications/Xcode_27.1.app` with `sudo xcode-select -s`.
 The x86_64 Darwin target is cross-compiled on that same runner. Linux and Windows
 runner/build settings are unchanged. Release CI has no Rust artifact cache or
 sccache; host verification uses a fresh detached worktree.
@@ -154,33 +154,38 @@ The exact pins live in `scripts/release-macos-toolchain.sh`:
 
 | Input | Required value |
 | --- | --- |
-| Xcode | 27.0 |
-| Xcode build | 27A266a |
+| Xcode | 27.1 |
+| Xcode build | 27A9275 |
 | macOS SDK | 27.0 |
 | Apple clang version line | `Apple clang version 21.0.0 (clang-2100.3.34.2)` |
 | Rust | `scripts/release-toolchain` (1.91.1) |
 
-Inventory checked 2026-10-21: [macOS 15](https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md)
-and [macOS 26](https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md)
-do not include full Xcode 27.0 (the Command Line Tools entry is not full Xcode).
-The [dedicated Xcode 27 image](https://github.com/actions/runner-images/blob/main/images/macos/xcode-27-arm64-Readme.md)
-lists Xcode 27.0 build 27A266a, SDK 27.0 and the `Xcode_27.0.app` alias
-(image 20261012.0260.1). The [runner label inventory](https://github.com/actions/runner-images#available-images)
-marks `xcode-27` as preview. This is a versioned runner family, **not an immutable
-VM snapshot**; GitHub still updates it. Exact compiler/SDK checks fail closed if
-the selected toolchain changes or disappears. The full Apple clang build pin
-comes from the NOVA rc19 investigation; CI must pass the same check before building.
+Inventory checked 2026-10-21: the macOS 14, 15 and 26 images listed in the
+[runner label inventory](https://github.com/actions/runner-images#available-images)
+do not include full Xcode 27.1 (the Command Line Tools entry is not full Xcode).
+The [dedicated Xcode 27 image](https://github.com/actions/runner-images/blob/main/images/macos/xcode-27-arm64-Readme.md#xcode)
+(image 20261012.0260.1) lists **Xcode 27.1 build 27A9275** at
+`/Applications/Xcode_27.1_Release_Candidate.app`, with symlinks
+`/Applications/Xcode_27.1.app` and `/Applications/Xcode_27.1.0.app`, and macOS SDK
+27.0 for Xcode 27.1. CI selects the documented `Xcode_27.1.app` symlink; the
+`Release_Candidate` directory name does not change the exact version/build check.
+The image README lists Clang/LLVM 21.0.0 but not its full build string. The full
+Apple clang pin above comes from NOVA's reported toolchain; CI must pass that
+same exact check before building. This is a versioned runner family, **not an
+immutable VM snapshot**; GitHub still updates it. Exact compiler/SDK checks fail
+closed if the selected toolchain changes or disappears.
 
-On NOVA, install **Xcode 27.0 build 27A266a**, not 27.1, a beta/RC, or Command
-Line Tools alone. If that exact build is already installed, no reinstall is
-needed. Download the matching Xcode `.xip` from
+NOVA already reports **Xcode 27.1 build 27A9275**, SDK **27.0**, and the Apple
+clang line pinned above; no reinstall is needed when those checks pass. Do not
+downgrade it to Xcode 27.0 or substitute a different build. If installation is
+needed, download the matching Xcode `.xip` from
 [Apple Developer Downloads](https://developer.apple.com/download/all/?q=Xcode),
-expand it and place the app at `/Applications/Xcode_27.0.app`. Keep other Xcode
+expand it and place the app at `/Applications/Xcode_27.1.app`. Keep other Xcode
 versions alongside it. Complete its first-launch setup and license acceptance:
 
 ```sh
 unset DEVELOPER_DIR SDKROOT TOOLCHAINS
-sudo xcode-select -s /Applications/Xcode_27.0.app
+sudo xcode-select -s /Applications/Xcode_27.1.app
 sudo xcodebuild -runFirstLaunch
 sudo xcodebuild -license accept
 xcodebuild -version

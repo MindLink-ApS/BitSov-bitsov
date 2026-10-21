@@ -9,14 +9,14 @@ Pre-release; not for production use. Copy this template for each new RC.
 - [ ] Review the tag's `scripts/release-toolchain`, `scripts/release-build.sh`,
       `scripts/release-macos-toolchain.sh`, lockfile and CI release matrix together.
       Install the pinned Rust toolchain.
-- [ ] On NOVA, install/select **Xcode 27.0 build 27A266a**, macOS SDK **27.0**,
+- [ ] On NOVA, install/select **Xcode 27.1 build 27A9275**, macOS SDK **27.0**,
       Apple clang **21.0.0 (clang-2100.3.34.2)** using the
       [installation steps](../ops/RELEASE_POLICY.md#pinned-macos-release-toolchain-nova).
       From the reviewed release commit, run
       `bash scripts/release-build.sh --check-toolchain aarch64-apple-darwin`.
       A mismatch must stop before rebuilding or signing; host break-glass cannot
       waive it. Confirm both Darwin CI jobs use `xcode-27` and explicitly select
-      `/Applications/Xcode_27.0.app`.
+      `/Applications/Xcode_27.1.app`.
 - [ ] Pass release CI and the isolated release-signing regression tests.
       Tests use only generated keys in a throwaway GnuPG home.
 - [ ] Record signing host triple, `rustc -vV`, native compiler/linker/SDK versions,
