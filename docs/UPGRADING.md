@@ -3,12 +3,12 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
-## rc18 → rc19.1
+## rc18 → rc19.2
 
-rc19 was never published. rc19.1 is the same code with a pinned macOS release
-toolchain (#355), so follow [rc18 → rc19](#rc18--rc19) below exactly; read
-"rc19" there as "rc19.1". Going from an rc19 test build to rc19.1 needs no
-migration.
+rc19 and rc19.1 were never published. rc19.2 is the same runtime code with
+release-tooling fixes only (#355, #358, #359), so follow
+[rc18 → rc19](#rc18--rc19) below exactly; read "rc19" there as "rc19.2". Going
+from an rc19 or rc19.1 test build to rc19.2 needs no migration.
 
 ## rc18 → rc19
 

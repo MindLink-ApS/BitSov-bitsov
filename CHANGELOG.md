@@ -5,7 +5,24 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
-## [0.3.0-rc19.1] — 2026-10-21 (prep; not tagged yet)
+## [0.3.0-rc19.2] — 2026-10-21 (prep; not tagged yet)
+
+**Pre-release.** Not for production use. rc19.2 is the unpublished rc19 tag
+(`e8ed5874`) plus the release-tooling fixes #355, #358 and #359 only. No runtime
+code changes from rc19. It replaces the unsigned rc19.1 draft, whose Darwin
+binaries could not be reproduced on the signing host. Tagged from
+`release/v0.3.0-rc19.2`. See the
+[rc19.2 signing checklist](docs/releases/v0.3.0-rc19.2.md); upgrade guidance is
+[rc18 → rc19](docs/UPGRADING.md#rc18--rc19).
+
+### Release
+
+- Link Darwin release binaries with `-Wl,-S` so ld64's `LC_UUID` no longer
+  encodes build paths and the signer's host rebuild can match CI; add
+  `scripts/release-repro-check.sh` (#359).
+- Bump all 14 workspace packages to `0.3.0-rc19.2`.
+
+## [0.3.0-rc19.1] — 2026-10-21 (unsigned draft; superseded by rc19.2)
 
 **Pre-release.** Not for production use. rc19.1 is the unpublished rc19 tag
 (`e8ed5874`) plus the release-tooling fixes #355 and #358 only: the macOS
