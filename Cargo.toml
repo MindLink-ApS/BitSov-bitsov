@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["vendor/lightning", "vendor/ldk-node", "vendor/x25519-dalek", "vendor/esplora-client"]
+exclude = ["vendor/lightning", "vendor/ldk-node", "vendor/x25519-dalek", "vendor/esplora-client", "vendor/electrum-client"]
 members = [
     "crates/konsensus-recovery",
     "crates/konsensus-core",
@@ -132,3 +132,4 @@ lightning = { path = "vendor/lightning" }
 ldk-node = { path = "vendor/ldk-node" }
 x25519-dalek = { path = "vendor/x25519-dalek" }
 esplora-client = { path = "vendor/esplora-client" }
+electrum-client = { path = "vendor/electrum-client" }

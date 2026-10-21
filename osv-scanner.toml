@@ -81,3 +81,15 @@ reason = "Alias of RUSTSEC-2026-0346; same legacy rustls 0.21 risk acceptance an
 [[IgnoredVulns]]
 id = "GHSA-w44r-93j7-qv28"
 reason = "Alias of RUSTSEC-2026-0349; same legacy rustls 0.21 risk acceptance and recheck triggers in .cargo/audit.toml and deny.toml."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0382"
+reason = "rustls-webpki 0.101.7 via sqlx-core 0.8.0 -> rustls 0.21.12, pinned by the sqlx/ldk-node SQLite conflict (#59), plus test-only minreq. Accepts distrusted emSign intermediates when trust anchors permit the path. Runtime use is SQLx Postgres TLS only; the default SQLite node opens no TLS through it. RESIDUAL RISK: a Postgres-over-TLS deployment could accept a chain through a distrusted intermediate, enabling server impersonation; test-only minreq shares this risk. The 0.103.x copy is already patched to 0.103.16 in this branch and is not waived. Recheck TLS/trust-store changes or runtime minreq use; remove on the sqlx/ldk-node island upgrade (#59). Full triage: .cargo/audit.toml; alias CVE-2026-111943."
+
+[[IgnoredVulns]]
+id = "CVE-2026-111943"
+reason = "Shared alias of RUSTSEC-2026-0382 and RUSTSEC-2026-0381; same legacy rustls-webpki 0.101.7 and webpki-roots 0.25.4 risk acceptance for SQLx Postgres TLS and test-only minreq, with recheck triggers and removal on the sqlx/ldk-node island upgrade (#59) in .cargo/audit.toml and deny.toml. Does not waive the remediated runtime Electrum copy or permit downgrading the patched rustls-webpki 0.103.x / webpki-roots 1.0.x lines."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0381"
+reason = "webpki-roots 0.25.4 via sqlx-core 0.8.0 / rustls 0.21 Postgres TLS, pinned by the sqlx/ldk-node SQLite conflict (#59), plus test-only minreq. The runtime Electrum copy is remediated via vendor/electrum-client (webpki-roots >=1.0.10), and the 1.0.x line is patched to 1.0.10. The default SQLite node opens no TLS through the legacy stack; Postgres TLS is already selectable. RESIDUAL RISK: the legacy root bundle can allow chains through distrusted emSign intermediates with publicly known private keys, enabling server impersonation in Postgres-over-TLS deployments and test-only minreq. This accepts only the remaining legacy copies, not a downgrade of 1.0.x or a new Electrum copy. Recheck TLS/trust-store changes, new 0.25.4 consumers or runtime minreq use; remove on the sqlx/ldk-node island upgrade (#59). Full triage: .cargo/audit.toml; alias CVE-2026-111943."
