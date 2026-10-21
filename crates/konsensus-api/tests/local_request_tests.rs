@@ -13,6 +13,130 @@ use konsensus_api::{auth, build_router_for_addr};
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn local_host_allows_port_omission_only_on_port_80() {
+    for port in [80, 4321, 443] {
+        for (bind_ip, extra_host) in [
+            ("192.0.2.10", Some("192.0.2.10")),
+            ("[2001:db8::10]", Some("[2001:db8::10]")),
+            ("0.0.0.0", None),
+            ("[::]", None),
+        ] {
+            let app =
+                build_router_for_addr(test_state(), format!("{bind_ip}:{port}").parse().unwrap());
+            for host in ["localhost", "LOCALHOST", "127.0.0.1", "[::1]"]
+                .into_iter()
+                .chain(extra_host)
+            {
+                assert_local_read_headers(&app, &format!("{host}:{port}"), None, None).await;
+                let rejection = (port != 80).then_some("local_host_forbidden");
+                assert_local_read_headers(&app, host, None, rejection).await;
+            }
+            for host in [
+                "attacker.example",
+                "localhost.attacker.example",
+                "user@localhost",
+                "::1",
+                "0.0.0.0",
+                "[::]",
+                "localhost:81",
+                "localhost:",
+                "localhost,127.0.0.1",
+            ] {
+                assert_local_read_headers(&app, host, None, Some("local_host_forbidden")).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_origin_allows_port_omission_only_on_port_80() {
+    for port in [80, 4321, 443] {
+        for bind_ip in ["192.0.2.10", "[2001:db8::10]"] {
+            let app =
+                build_router_for_addr(test_state(), format!("{bind_ip}:{port}").parse().unwrap());
+            // Keep Host explicit to test Origin admission independently.
+            let host = format!("localhost:{port}");
+            for origin_host in ["localhost", "LOCALHOST", "127.0.0.1", "[::1]", bind_ip] {
+                assert_local_read_headers(
+                    &app,
+                    &host,
+                    Some(&format!("http://{origin_host}:{port}")),
+                    None,
+                )
+                .await;
+                let rejection = (port != 80).then_some("local_origin_forbidden");
+                assert_local_read_headers(
+                    &app,
+                    &host,
+                    Some(&format!("http://{origin_host}")),
+                    rejection,
+                )
+                .await;
+            }
+            for origin in [
+                "https://localhost",
+                "https://localhost:80",
+                "http://localhost:81",
+                "http://attacker.example",
+                "http://localhost.attacker.example",
+                "http://user@localhost",
+                "http://::1",
+                "http://0.0.0.0",
+                "http://[::]",
+                "http://localhost/",
+                "http://localhost/path",
+                "http://localhost?x",
+                "http://localhost#x",
+                "null",
+            ] {
+                assert_local_read_headers(
+                    &app,
+                    &host,
+                    Some(origin),
+                    Some("local_origin_forbidden"),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+async fn assert_local_read_headers(
+    app: &axum::Router,
+    host: &str,
+    origin: Option<&str>,
+    rejection: Option<&str>,
+) {
+    let mut request = Request::builder()
+        .uri("/api/v1/energy")
+        .header("host", host)
+        .extension(ConnectInfo("127.0.0.1:1000".parse::<SocketAddr>().unwrap()));
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    // Accepted headers reach the JWT check without consuming the mint quota.
+    assert_eq!(
+        response.status(),
+        if rejection.is_some() {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::UNAUTHORIZED
+        },
+        "Host: {host}, Origin: {origin:?}"
+    );
+    if let Some(code) = rejection {
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], code, "Host: {host}, Origin: {origin:?}");
+    }
+}
+
+#[tokio::test]
 async fn local_auth_accepts_allowed_hosts_origins_and_native_clients() {
     let state = test_state();
     let app = build_router_for_addr(state.clone(), "192.0.2.10:4321".parse().unwrap());

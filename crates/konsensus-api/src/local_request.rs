@@ -28,6 +28,15 @@ impl LocalRequestPolicy {
         if !addr.ip().is_unspecified() {
             authorities.push(addr.to_string());
         }
+        // HTTP clients and browsers omit the default port from Host and Origin.
+        // Derive aliases only from the configured authorities, never the request.
+        if port == 80 {
+            let portless = authorities
+                .iter()
+                .filter_map(|authority| authority.strip_suffix(":80").map(str::to_owned))
+                .collect::<Vec<_>>();
+            authorities.extend(portless);
+        }
         Self {
             authorities,
             browser_origins,

@@ -8,7 +8,9 @@ request headers before granting local trust.
 
 The allowed `Host` values are `localhost`, `127.0.0.1`, and `[::1]`, each with the
 API listener's port, plus the concrete IP address configured by `api.listen_addr`
-with that port. Wildcard bind addresses (`0.0.0.0` and `[::]`) are not additional
+with that port. When the listener port is 80, these same authorities may also
+omit the port in `Host` and HTTP `Origin`; other listener ports require an
+explicit port. Wildcard bind addresses (`0.0.0.0` and `[::]`) are not additional
 trusted hosts. IPv6 addresses require brackets. Host names are case-insensitive;
 missing, duplicate, malformed, and unlisted hosts are refused. Forwarded headers
 never extend this allowlist.
