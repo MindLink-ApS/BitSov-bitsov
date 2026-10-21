@@ -5,6 +5,8 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Deflake locked-mode shutdown and unpaid-request flood tests with independent,
+  generous hang guards for slow CI runners. Fixes #325.
 - Update rustls-webpki 0.103.15 to 0.103.16 and webpki-roots 1.0.6 to 1.0.10
   for RUSTSEC-2026-0382 / RUSTSEC-2026-0381 (distrusted emSign certificates).
   Vendor electrum-client 0.24.1 to use webpki-roots >=1.0.10 and the current
