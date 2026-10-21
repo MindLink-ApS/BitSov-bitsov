@@ -797,10 +797,10 @@ async fn locked_mode_shutdown_mid_unlock_closes_listeners_without_starting_node(
     )
     .await
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let verification_deadline = Instant::now() + Duration::from_secs(60);
     while !logs(&log).contains("UNLOCK_VERIFYING") {
         assert!(
-            Instant::now() < deadline,
+            Instant::now() < verification_deadline,
             "verification never began: {}",
             logs(&log)
         );
@@ -811,11 +811,18 @@ async fn locked_mode_shutdown_mid_unlock_closes_listeners_without_starting_node(
         .status()
         .unwrap()
         .success());
+    // Shutdown waits for the in-flight Argon2 task; give it its own hang guard
+    // so verification on a slow runner cannot consume the shutdown budget.
+    let shutdown_deadline = Instant::now() + Duration::from_secs(120);
     let status = loop {
         if let Some(status) = node.0.try_wait().unwrap() {
             break status;
         }
-        assert!(Instant::now() < deadline, "shutdown timed out");
+        assert!(
+            Instant::now() < shutdown_deadline,
+            "shutdown timed out: {}",
+            logs(&log)
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert!(status.success(), "{}", logs(&log));
