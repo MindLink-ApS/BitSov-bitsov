@@ -81,9 +81,25 @@ pub fn set_locked(dir: &Path, locked: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_pair_ticket(config_path: &Path, qr: bool, ttl: Duration, legacy: bool) -> Result<()> {
+pub fn cmd_pair_ticket(
+    config_path: &Path,
+    qr: bool,
+    ttl: Duration,
+    legacy: bool,
+    second_device: bool,
+) -> Result<()> {
     let config = NodeConfig::load_before_identity_validation(config_path)?;
     config.node.validate()?;
+    if second_device {
+        anyhow::ensure!(
+            config.pairing.second_device_enrollment,
+            "second-device enrollment is disabled"
+        );
+        anyhow::ensure!(
+            !legacy && ttl.as_secs() <= 1800,
+            "second-device tickets require v2 and a TTL of at most 30 minutes"
+        );
+    }
     anyhow::ensure!(
         config.remote_access.listen_addr.is_some(),
         "remote access is disabled"
@@ -122,7 +138,11 @@ pub fn cmd_pair_ticket(config_path: &Path, qr: bool, ttl: Duration, legacy: bool
         transport_signature: String::new(),
         box_transport_pubkey: public,
         box_transport_signature: None,
-        code: new_code(),
+        code: if second_device {
+            format!("second_{}", new_code())
+        } else {
+            new_code()
+        },
         expires_at: chrono::Utc::now().timestamp() + ttl.as_secs() as i64,
         hosted_by: config.node.hosted_by.clone(),
     };
@@ -219,6 +239,10 @@ pub fn cmd_pair_ticket(config_path: &Path, qr: bool, ttl: Duration, legacy: bool
     if let Some(rendered) = rendered {
         println!("{rendered}");
     }
+    if second_device {
+        println!("Open Add a device on your other device now, so it can approve");
+        println!("Older apps cannot complete this second-device QR; update the app first.");
+    }
     Ok(())
 }
 
@@ -232,4 +256,38 @@ fn render_qr(uri: &str) -> Result<String> {
         .light_color(Dense1x2::Dark)
         .quiet_zone(true)
         .build())
+}
+
+#[cfg(test)]
+mod second_device_tests {
+    use super::*;
+
+    #[test]
+    fn second_device_ticket_refusals_do_not_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("konsensus.toml");
+        let mut config = NodeConfig::default_for_tier(
+            crate::config::NodeTier::Light,
+            dir.path().join("mnemonic.enc"),
+            dir.path(),
+        );
+        config.save(&path).unwrap();
+        assert!(
+            cmd_pair_ticket(&path, false, Duration::from_secs(600), false, true)
+                .unwrap_err()
+                .to_string()
+                .contains("disabled")
+        );
+        config.pairing.second_device_enrollment = true;
+        config.save(&path).unwrap();
+        for (ttl, legacy) in [(1801, false), (600, true)] {
+            assert!(
+                cmd_pair_ticket(&path, false, Duration::from_secs(ttl), legacy, true)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("30 minutes")
+            );
+        }
+        assert!(!dir.path().join("pairing/remote-access-link").exists());
+    }
 }

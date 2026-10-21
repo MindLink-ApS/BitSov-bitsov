@@ -889,3 +889,76 @@ Enter/`--yes` is a client courtesy, not a boundary against same-UID processes.
 Admissions appear in the audit log as `peer.added` with `source: owner_control`.
 See the [design note](../design/owner-console-peer-add.md) for the trust boundary
 and restart behavior.
+
+## Add and recover a second owner device (rc20)
+
+The claimless flow is opt-in: set `[pairing] second_device_enrollment = true`
+and restart unlocked in owner-device mode. The default remains `false`.
+First-device claiming is unchanged. For a console QR:
+
+```sh
+konsensus pair-ticket --config /path/to/konsensus.toml --second-device --qr
+```
+
+Open **Add a device** on an already enrolled owner device now, so it can poll
+and approve. Scan with the new device, compare its four words with the approving
+device, and approve with Touch ID / Face ID. The app must wait until
+`approval_message` is non-null before showing SAS words. Console tickets expire
+in 10 minutes (maximum `--ttl 30m`); each request lasts five minutes and the
+provisional pairing lasts at most fifteen minutes. Use a fresh QR after that.
+Older apps cannot finish a second-device QR; update the app first.
+
+The owner control socket is required for `pair-ticket --second-device`,
+`pair-status`, `device list`,
+`device approve/reject`, revocation, `pair-cancel` and `pair-reset-sas`. These are
+local operator commands; they are not HTTP approval routes. For these commands,
+start the unlocked operator-run process with `--password-fd <fd>
+--local-owner-device --owner-control` and the N-2DEV config flag enabled. This
+explicit combination retains the owner signer and opens the console socket.
+`--home` and `--remote-unlock` still exclude `--owner-control`; they expose no
+console socket. Stop the home service before starting this operator process;
+never run two processes against the same data directory. A console approval
+still needs the owner code and protected encrypted recovery phrase.
+
+```sh
+konsensus pair-status --config /path/to/konsensus.toml
+konsensus pair-cancel --op <id> --config /path/to/konsensus.toml
+konsensus pair-reset-sas --config /path/to/konsensus.toml
+konsensus device list --config /path/to/konsensus.toml
+konsensus device revoke --key <id> --with-pairing --config /path/to/konsensus.toml
+konsensus device revoke --approved-by <id> --keep <trusted_id> --config /path/to/konsensus.toml
+```
+
+Status shows provisional deadlines, confirmed v2 words and late QR-rescan alerts:
+“This QR was used again after you approved {name}. Revoke it if it wasn't yours.”
+A late rescan refuses the second attempt but preserves the enrolled device.
+Review and revoke it if unrecognized. Before enrollment, a contested QR kills
+the provisional pairing and both attempts must start over.
+
+Revocation prints the affected chain and remaining owner count, then asks for
+confirmation. `--keep` preserves the specified key but still visits its children.
+Walking from an already revoked approver is supported. Zero remaining owners
+requires `--allow-zero-owner` and leaves console-only recovery. See
+[device keys](../security/device-keys.md#claimless-second-devices-rc20-opt-in).
+
+### T18 signet acceptance record
+
+Use `bash scripts/regress/second-device-signet.sh NODE_BINARY CONFIG` as an
+interactive checklist, or follow the steps below. Run on an opt-in signet box with an enrolled Mac and an iPhone using Secure
+Enclave keys. Record the node commit, app commit, OS versions and timestamp;
+never save the QR URI, ticket code, tokens, mnemonic or signing keys.
+
+1. On the Mac open **Add a device**, display its QR, and scan it on the iPhone.
+2. Verify no claim code is requested, words appear only after finalization
+   (`approval_message != null`), and both devices display the same four words.
+3. Approve on the Mac with Touch ID (or Face ID on a supported approver).
+   Verify the iPhone reports registered and can read/receive. Record its public
+   key id and `second_device:<Mac key id>` provenance using `device list`.
+4. Open a per-contact envelope from the iPhone and verify it is usable.
+5. Run `device revoke --key <iPhone key id> --with-pairing`, review and confirm.
+   Verify the old iPhone token is refused and its next envelope request fails.
+6. Repeat with a console QR while **Add a device** is open on the Mac; check the
+   console reminder and identical approval flow.
+
+A passing automated suite does not substitute for this hardware acceptance run.
+Record PASS only after these checks have been observed on the stated commits.

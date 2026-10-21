@@ -616,7 +616,7 @@ commitment `66` × 32. Its digest is
 `960be0e8e070d1089b55da2113669f8530ee396eb36cd0fa04e82cb9ae346f35`;
 indices are `1200, 760, 465, 1543`: **noodle gallery demand science**.
 
-### N-2DEV SAS v2 frozen vector (PR A)
+### N-2DEV SAS v2 frozen vector
 
 Behind `[pairing] second_device_enrollment = true`, second-device enrollment
 uses `bitsov-sas-v2` and the ticket commitment from
@@ -641,7 +641,12 @@ A provisional contested kill records `pair.second_device_contested` without
 QR or SAS secrets. Approval of the killed op returns HTTP 403 with
 `kind: "contested"` until the original provisional deadline; after that it is
 an unknown op. A late rescan after enrollment preserves the device and records
-`pair.second_device_contested_after_enroll`.
+`pair.second_device_contested_after_enroll`. `pair-status` displays the alert
+without revoking the enrolled device. Console v2 tickets use
+`pair-ticket --second-device [--qr] [--ttl 10m]` (30 minutes maximum);
+the flag remains off by default in rc20. See the
+[operator commands](device-keys.md#claimless-second-devices-rc20-opt-in) for
+transitive revocation, cancellation and SAS reset.
 
 The claim-bound second-device v1 path retains its prior error ordering: an
 unknown finalize op is 404 (or 403 when the v1 failure gate is closed), and a

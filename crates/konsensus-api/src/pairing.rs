@@ -59,6 +59,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{self, Scope, TokenError};
 
 pub mod approval;
+pub mod console;
 pub mod device;
 pub mod second_device;
 #[cfg(test)]

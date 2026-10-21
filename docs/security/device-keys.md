@@ -87,7 +87,9 @@ keys on other pairings; revoke those keys explicitly when needed.
 Available while unlocked in `--local-owner-device` mode (including `--home`),
 with the owner signing key held in memory. Locked mode exposes none of these
 routes. Owner-local v1 delegation remains compatible for legacy non-SAS
-requests; **tunnel delegation always requires SAS v1 enrollment and v2 signing**.
+requests; **the legacy tunnel `/delegate` route requires SAS v1 enrollment and
+v2 signing**. Opt-in claimless SAS v2 uses the separate second-device approval
+route described below.
 
 All routes below require the approver's live paired token on its own authenticated
 Noise connection. The key must belong to that pairing and current epoch and
@@ -401,3 +403,52 @@ expiry and restrictions. Three device resets per grant per rolling day are
 persisted across restart and console reset; successful and refused approvals
 are audited. Pairing storage v7 prevents older binaries discarding this state.
 Console reset and root-of-trust operations retain their existing authority paths.
+
+### Claimless second devices (rc20, opt-in)
+
+`[pairing] second_device_enrollment = false` remains the default. With it enabled
+on an unlocked owner-device node, use the owner's **Add a device** screen or
+`konsensus pair-ticket --second-device --qr`. The console ticket lasts 10 minutes
+by default (`--ttl`, maximum 30 minutes) and requires an existing owner device.
+Open **Add a device** on that device so it polls for the request. The claim code
+is used only for the first device. Older apps cannot complete this v2 flow.
+
+The new device automatically finalizes SAS v2. **The app shows SAS words only
+once `approval_message` is non-null.** The approver compares the four words and
+approves with Touch ID / Face ID. It reconstructs the signed message, checks its
+pinned node, expiry and ticket id, and treats the device name as untrusted text.
+An owner-device QR must be approved on the device that issued it; a console QR
+can be approved on any enrolled owner device. The new device has no “They match”
+button. Its “They don't match” action cancels the attempt.
+
+On an owner control socket, `device approve --op <id>` can complete a confirmed
+v2 request using the existing console code and encrypted-phrase signature.
+`device reject --op <id>` (also `pair-cancel --op <id>`) removes the v2 request
+and its provisional pairing immediately. `pair-reset-sas` clears both the v1
+failure counter and the decaying v2 mismatch window.
+
+`device list` shows enrollment provenance and the approver's name when that key
+still exists. Revoking a key alone ends its envelopes; `--with-pairing` also
+invalidates its pairing and tokens. It lists descendants left behind. To remove
+a lost or malicious approver and everything it approved:
+
+```sh
+konsensus device revoke --approved-by <key_id>
+konsensus device revoke --approved-by <key_id> --keep <trusted_key_id>
+# Equivalent traversal starting with a live key:
+konsensus device revoke --key <key_id> --cascade
+```
+
+The walk includes the root and follows both `device:` and `second_device:`
+provenance transitively, even when the root was already revoked. It is cycle-safe.
+The walk uses the provenance still stored on live keys. If an intermediate
+approver was previously deleted without cascading, run `--approved-by` on that
+deleted key id too: its former parent can no longer discover the missing edge.
+The plain `--key` preview lists descendants and the follow-up command before
+deleting that edge. Repeat `--keep` to preserve keys; their children are still visited. Pairing
+revocation affects every key on that pairing, so a kept key sharing a pairing
+with a revoked key causes a refusal. Review the displayed chain, pairings and
+remaining owner count before typing `revoke`. A changed preview requires a new
+confirmation. Reaching zero owners is refused unless `--allow-zero-owner` is
+explicit: recovery then requires the owner console. Keep a trusted owner key
+when possible.
