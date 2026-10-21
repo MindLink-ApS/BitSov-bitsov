@@ -414,7 +414,21 @@ pub async fn handle_peer_lightning_info(
     let channel_id = match open_result {
         Ok(channel_id) => channel_id,
         Err(e) => {
-            let _ = storage.mark_invite_pending(&invite.id).await?;
+            // Only proven non-dispatch permits retry. An uncertain outcome stays
+            // Opening so later events cannot reopen and both subsidy caps count it.
+            if matches!(
+                e,
+                LightningError::PaymentNotDispatched(_) | LightningError::NotReady
+            ) {
+                let _ = storage.mark_invite_pending(&invite.id).await?;
+            } else {
+                warn!(
+                    invite_id = %invite.id,
+                    peer = %peer_id,
+                    error = %e,
+                    "auto-channel outcome uncertain; retaining Opening; inspect channel before retrying"
+                );
+            }
             return Err(e.into());
         }
     };
@@ -477,9 +491,10 @@ async fn existing_channel_to_peer(
     ln_pubkey: &str,
 ) -> Result<bool, LightningError> {
     let channels: Vec<ChannelInfo> = lightning.list_channels().await?;
+    // Pending funding and temporarily unusable channels still cover this peer.
     Ok(channels
         .iter()
-        .any(|channel| channel.peer_pubkey == ln_pubkey && channel.active))
+        .any(|channel| channel.peer_pubkey == ln_pubkey))
 }
 
 fn validate_host_port(addr: &str) -> Result<(), AutoChannelError> {
@@ -614,6 +629,7 @@ mod tests {
         ldk: Option<konsensus_lightning::LdkProvider>,
         channels: Mutex<Vec<ChannelInfo>>,
         opens: Mutex<Vec<ChannelOpen>>,
+        open_error: Mutex<Option<LightningError>>,
         reject_fee_requests: bool,
         open_started: Option<Arc<Notify>>,
         release_open: Option<Arc<Notify>>,
@@ -703,6 +719,9 @@ mod tests {
             if let Some(release_open) = &self.release_open {
                 release_open.notified().await;
             }
+            if let Some(error) = self.open_error.lock().await.take() {
+                return Err(error);
+            }
             Ok("temp-channel-id".to_string())
         }
 
@@ -733,6 +752,16 @@ mod tests {
             assert_eq!(options.max_funding_fee_sats, Some(1500));
             assert!(!announce);
             assert_eq!(push_msat, None);
+            self.opens.lock().await.push((
+                peer_pubkey.to_string(),
+                peer_addr.to_string(),
+                amount_sats,
+                None,
+                announce,
+            ));
+            if let Some(error) = self.open_error.lock().await.take() {
+                return Err(error);
+            }
             self.ldk
                 .as_ref()
                 .expect("only LDK uses funding policy")
@@ -827,9 +856,10 @@ mod tests {
         }
     }
 
-    // Only the wallet balance is faked: both open APIs and fee quotes go through
-    // the real LdkProvider. NotRunning comes from LDK's opener, after the exact
-    // rate refusal, so it proves dispatch without dialing or spending funds.
+    // Unless open_error is injected, only the wallet balance is faked: both open
+    // APIs and fee quotes use the real LdkProvider. NotRunning comes from LDK's
+    // opener, after the exact-rate refusal, so it proves dispatch without dialing
+    // or spending funds.
     async fn ldk_fixture(fees: &str) -> (tempfile::TempDir, Arc<TestLightning>, String) {
         let mut server = mockito::Server::new_async().await;
         let _fees = server
@@ -893,6 +923,201 @@ mod tests {
             InviteState::Pending
         );
         assert!(notifier.notices.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uncertain_open_blocks_duplicate_event_and_retains_subsidy_caps() {
+        for funding_priority in [None, Some(FundingPriority::Fast)] {
+            let (_dir, ldk, _) = ldk_fixture(r#"{"1":2.0,"6":2.0,"144":2.0}"#).await;
+            for reason in [
+                "funding transaction unavailable after 60s; outcome uncertain",
+                "open_channel worker failed",
+                "channel disappeared before funding was verified",
+            ] {
+                let peer = NodeId::from_bytes([1; 32]);
+                let storage = storage_with_invite(peer, 5, Some(10_000), now_unix() + 60).await;
+                let lightning = if funding_priority.is_some() {
+                    ldk.clone()
+                } else {
+                    Arc::new(TestLightning {
+                        balance_msat: 100_000_000,
+                        ..Default::default()
+                    })
+                };
+                lightning.opens.lock().await.clear();
+                *lightning.open_error.lock().await = Some(LightningError::Backend(reason.into()));
+                let notifier = Arc::new(RecordingNotifier::default());
+                let event = AutoChannelEvent::PeerLightningInfo {
+                    peer_id: peer,
+                    ln_pubkey: LN_PUBKEY.into(),
+                    ln_addr: Some("127.0.0.1:9735".into()),
+                };
+                let subsidy = SubsidyConfig {
+                    max_total_budget_sats: 10_000,
+                    ..test_subsidy()
+                };
+                let (s, l, c, n) = deps(storage.clone(), lightning.clone(), 2.0, notifier.clone());
+                let result =
+                    handle_event(event.clone(), s, l, c, n, subsidy.clone(), funding_priority)
+                        .await;
+                assert!(matches!(result,
+                    Err(AutoChannelError::Lightning(LightningError::Backend(ref message)))
+                        if message == reason));
+
+                // No channel is visible yet: the durable invite must prevent retry.
+                let (s, l, c, n) = deps(storage.clone(), lightning.clone(), 2.0, notifier.clone());
+                let retry =
+                    handle_event(event, s, l, c, n, subsidy.clone(), funding_priority).await;
+                assert_eq!(lightning.opens.lock().await.len(), 1, "{reason}");
+                retry.unwrap();
+                let uncertain = storage.list_invites_issued().await.unwrap().remove(0);
+                assert_eq!(uncertain.state, InviteState::Opening);
+                assert!(notifier.notices.lock().await.is_empty());
+
+                // A fresh invite cannot bypass either the peer cap or the budget.
+                for (next_peer, expected_reason) in [
+                    (peer, "subsidy_per_peer_cap"),
+                    (NodeId::from_bytes([2; 32]), "subsidy_budget_exhausted"),
+                ] {
+                    let mut fresh = uncertain.clone();
+                    fresh.id = uuid::Uuid::new_v4();
+                    fresh.nonce = *fresh.id.as_bytes();
+                    fresh.invitee_pubkey = *next_peer.as_bytes();
+                    fresh.state = InviteState::Pending;
+                    fresh.accepted_at = None;
+                    storage.add_invite_issued(&fresh).await.unwrap();
+                    let (s, l, c, n) =
+                        deps(storage.clone(), lightning.clone(), 2.0, notifier.clone());
+                    handle_event(
+                        AutoChannelEvent::PeerLightningInfo {
+                            peer_id: next_peer,
+                            ln_pubkey: LN_PUBKEY.into(),
+                            ln_addr: Some("127.0.0.1:9735".into()),
+                        },
+                        s,
+                        l,
+                        c,
+                        n,
+                        subsidy.clone(),
+                        funding_priority,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(lightning.opens.lock().await.len(), 1);
+                    let notices = notifier.notices.lock().await;
+                    assert!(notices
+                        .last()
+                        .unwrap()
+                        .reason
+                        .as_deref()
+                        .unwrap()
+                        .starts_with(expected_reason));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proven_non_dispatch_allows_retry() {
+        for error in [
+            LightningError::NotReady,
+            LightningError::PaymentNotDispatched("refused".into()),
+        ] {
+            let peer = NodeId::from_bytes([1; 32]);
+            let storage = storage_with_invite(peer, 5, Some(10_000), now_unix() + 60).await;
+            let lightning = Arc::new(TestLightning {
+                balance_msat: 100_000_000,
+                open_error: Mutex::new(Some(error)),
+                ..Default::default()
+            });
+            let notifier = Arc::new(RecordingNotifier::default());
+            for attempt in 0..2 {
+                let (s, l, c, n) = deps(storage.clone(), lightning.clone(), 2.0, notifier.clone());
+                let result = handle_event(
+                    AutoChannelEvent::PeerLightningInfo {
+                        peer_id: peer,
+                        ln_pubkey: LN_PUBKEY.into(),
+                        ln_addr: Some("127.0.0.1:9735".into()),
+                    },
+                    s,
+                    l,
+                    c,
+                    n,
+                    test_subsidy(),
+                    None,
+                )
+                .await;
+                let expected_state = if attempt == 0 {
+                    assert!(matches!(
+                        result,
+                        Err(AutoChannelError::Lightning(
+                            LightningError::NotReady | LightningError::PaymentNotDispatched(_)
+                        ))
+                    ));
+                    InviteState::Pending
+                } else {
+                    result.unwrap();
+                    InviteState::Accepted
+                };
+                assert_eq!(
+                    storage.list_invites_issued().await.unwrap()[0].state,
+                    expected_state
+                );
+            }
+            assert_eq!(lightning.opens.lock().await.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_channel_prevents_another_open() {
+        let peer = NodeId::from_bytes([1; 32]);
+        let storage = storage_with_invite(peer, 5, Some(10_000), now_unix() + 60).await;
+        let lightning = Arc::new(TestLightning {
+            balance_msat: 100_000_000,
+            channels: Mutex::new(vec![ChannelInfo {
+                channel_id: "pending-channel".into(),
+                user_channel_id: None,
+                funding_txo: None,
+                peer_pubkey: LN_PUBKEY.into(),
+                capacity_msat: 10_000_000,
+                local_balance_msat: 10_000_000,
+                remote_balance_msat: 0,
+                active: false,
+                short_channel_id: None,
+            }]),
+            ..Default::default()
+        });
+        assert!(
+            !existing_channel_to_peer(lightning.as_ref(), "another-peer")
+                .await
+                .unwrap()
+        );
+        let (s, l, c, n) = deps(
+            storage.clone(),
+            lightning.clone(),
+            2.0,
+            Arc::new(RecordingNotifier::default()),
+        );
+        handle_event(
+            AutoChannelEvent::PeerLightningInfo {
+                peer_id: peer,
+                ln_pubkey: LN_PUBKEY.into(),
+                ln_addr: Some("127.0.0.1:9735".into()),
+            },
+            s,
+            l,
+            c,
+            n,
+            test_subsidy(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(lightning.opens.lock().await.is_empty());
+        assert_eq!(
+            storage.list_invites_issued().await.unwrap()[0].state,
+            InviteState::Accepted
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
