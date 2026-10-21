@@ -653,9 +653,16 @@ fn reload_pairing_code(
             && link.box_transport_pubkey == hex::encode(pairing.box_transport_pubkey()),
         "remote pairing ticket belongs to another identity"
     );
+    let code_body = if pairing.second_device_enrollment_enabled() {
+        link.code
+            .strip_prefix(konsensus_api::pairing::second_device::SECOND_TICKET_PREFIX)
+            .unwrap_or(&link.code)
+    } else {
+        &link.code
+    };
     anyhow::ensure!(
         URL_SAFE_NO_PAD
-            .decode(&link.code)
+            .decode(code_body)
             .is_ok_and(|code| code.len() == 32),
         "invalid ticket code"
     );
@@ -880,7 +887,20 @@ async fn handle_connection(
         },
         Err(error) => AuthResponse::Error {
             v: VERSION,
-            code: "authentication_failed".into(),
+            code: match error.downcast_ref::<konsensus_api::pairing::PairingError>() {
+                Some(konsensus_api::pairing::PairingError::PairingInvalid(kind))
+                    if matches!(
+                        kind.as_str(),
+                        "already_paired" | "contested" | "no_owner_device"
+                    ) =>
+                {
+                    kind.clone()
+                }
+                Some(konsensus_api::pairing::PairingError::OwnerChannelUnavailable) => {
+                    "box_locked".into()
+                }
+                _ => "authentication_failed".into(),
+            },
             message: error.to_string(),
         },
     };
@@ -1046,6 +1066,33 @@ fn authenticate_ticket(
     verifying
         .verify(proof.as_bytes(), &signature)
         .context("remote pairing proof did not verify")?;
+
+    if code.starts_with(konsensus_api::pairing::second_device::SECOND_TICKET_PREFIX) {
+        let mut guard = pairing_code.lock().unwrap_or_else(|e| e.into_inner());
+        // Serialize rescan detection with consumption so a queued scanner sees
+        // the tombstone installed by the first scan before inspecting the code.
+        pairing.check_second_device_rescan(code, pubkey_hex, remote_static)?;
+        let active = guard
+            .as_ref()
+            .context("second-device ticket unavailable or already used")?;
+        if tokio::time::Instant::now() >= active.expires_at
+            || blake3::hash(code.as_bytes()) != blake3::hash(active.value.as_bytes())
+        {
+            anyhow::bail!("second-device ticket invalid or expired");
+        }
+        let client = pairing.create_second_device_pairing(
+            code,
+            name,
+            pubkey_hex,
+            remote_static,
+            "console",
+        )?;
+        *guard = None;
+        if remove_file {
+            pairing.remove_remote_access_link()?;
+        }
+        return Ok(client);
+    }
 
     // Owner-device tickets are strictly single use, including exact retries.
     // Dispatch before the legacy CLI idempotency path; consumed/restarted tickets
@@ -1849,8 +1896,153 @@ mod tests {
         assert_eq!(pairing.list_clients().len(), 1);
     }
 
+    #[test]
+    fn concurrent_console_second_scans_contest_the_provisional_pairing() {
+        use konsensus_api::pairing::device;
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+        #[derive(Clone, Default)]
+        struct Console(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Console {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let node = identity();
+        let fp = konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
+        let owner = konsensus_core::OwnerApprovalKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "", &[9;32]).unwrap();
+        let console = Console::default();
+        let pairing = PairingService::open(dir.path(), fp.clone(), true)
+            .unwrap()
+            .with_owner_approval_key(owner.verifying_key())
+            .with_owner_console(Box::new(console.clone()))
+            .without_stdout_code();
+        let client_key = SigningKey::from_bytes(&[81; 32]);
+        let client = pairing
+            .create_ticket_remote_pairing(
+                "owner",
+                &hex::encode(client_key.verifying_key().to_bytes()),
+                &[82; 32],
+            )
+            .unwrap();
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let device =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
+        let sign = |msg: &str| hex::encode(device.sign(&rng, msg.as_bytes()).unwrap().as_ref());
+        let public = hex::encode(device.public_key().as_ref());
+        let op = pairing
+            .request_device_key(
+                &client.client_id,
+                &public,
+                "owner",
+                &sign(&device::registration_message(
+                    &fp,
+                    &client.client_id,
+                    &public,
+                )),
+            )
+            .unwrap();
+        let text = String::from_utf8(console.0.lock().unwrap().clone()).unwrap();
+        let code = text
+            .lines()
+            .find_map(|l| l.split("type this code when it asks: ").nth(1))
+            .unwrap();
+        let _key = pairing
+            .approve_device_key(
+                &op.op_id,
+                code,
+                &hex::encode(
+                    owner
+                        .sign(
+                            device::owner_approval_message(
+                                &fp,
+                                &client.client_pubkey,
+                                client.epoch,
+                                &public,
+                            )
+                            .as_bytes(),
+                        )
+                        .to_bytes(),
+                ),
+            )
+            .unwrap();
+        drop(pairing);
+        let pairing = Arc::new(
+            PairingService::open(dir.path(), fp.clone(), false)
+                .unwrap()
+                .with_local_owner_device()
+                .with_second_device_enrollment(true)
+                .with_owner_signing_key(owner),
+        );
+        let code = format!("second_{}", URL_SAFE_NO_PAD.encode([93; 32]));
+        let pairing_code = Mutex::new(Some(ActivePairingCode {
+            value: code.clone(),
+            expires_at: tokio::time::Instant::now() + PAIRING_CODE_TTL,
+            content_digest: blake3::hash(code.as_bytes()),
+            content_len: code.len(),
+        }));
+        let requests =
+            [94, 95].map(|n| request(&node, &[n; 32], &code, &SigningKey::from_bytes(&[n; 32])));
+        let barrier = std::sync::Barrier::new(3);
+        let results = std::thread::scope(|scope| {
+            // Queue both scans behind consumption. Before the fix their rescan
+            // checks run here, before either scan has created a tombstone.
+            let guard = pairing_code.lock().unwrap();
+            let handles: Vec<_> = requests
+                .iter()
+                .zip([94, 95])
+                .map(|(req, n)| {
+                    let barrier = &barrier;
+                    let pairing = &pairing;
+                    let pairing_code = &pairing_code;
+                    let node = &node;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        authenticate_ticket(
+                            req,
+                            &[n; 32],
+                            &node.node_id().to_hex(),
+                            pairing,
+                            pairing_code,
+                            false,
+                        )
+                    })
+                })
+                .collect();
+            barrier.wait();
+            std::thread::sleep(Duration::from_millis(100));
+            drop(guard);
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        let error = results.into_iter().find_map(Result::err).unwrap();
+        assert!(error.to_string().contains("contested"), "{error}");
+        assert!(pairing.validate_remote_transport(&[94; 32]).is_err());
+        assert!(pairing.validate_remote_transport(&[95; 32]).is_err());
+        assert_eq!(pairing.list_clients().len(), 1);
+    }
+
     #[tokio::test]
     async fn owner_ticket_listener_verifies_proof_consumes_once_and_rejects_exact_replay() {
+        owner_ticket_listener_contract(false).await;
+    }
+
+    #[tokio::test]
+    async fn second_device_ticket_listener_verifies_proof_consumes_once_and_rejects_replay() {
+        owner_ticket_listener_contract(true).await;
+    }
+
+    async fn owner_ticket_listener_contract(second_device: bool) {
         use konsensus_api::pairing::device;
         use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
         #[derive(Clone, Default)]
@@ -1931,6 +2123,7 @@ mod tests {
             PairingService::open(dir.path(), fp.clone(), false)
                 .unwrap()
                 .with_local_owner_device()
+                .with_second_device_enrollment(second_device)
                 .with_owner_signing_key(owner),
         );
         let server = RemoteAccessServer::bind(
@@ -1950,22 +2143,27 @@ mod tests {
             .owner_ticket_challenge(&client.client_id, client.epoch, &key.key_id)
             .unwrap();
         let ticket = pairing
-            .mint_owner_ticket(
+            .mint_owner_ticket_with_purpose(
                 &client.client_id,
                 client.epoch,
                 &key.key_id,
                 &nonce,
-                &sign(&format!("bitsov-ticket-v1\nnode:{fp}\nnonce:{nonce}")),
+                &sign(&if second_device {
+                    format!("bitsov-ticket-v2\nnode:{fp}\nnonce:{nonce}\npurpose:second_device")
+                } else {
+                    format!("bitsov-ticket-v1\nnode:{fp}\nnonce:{nonce}")
+                }),
+                second_device.then_some("second_device"),
             )
             .unwrap();
         ticket.verify_endpoints(&node.node_id().to_hex()).unwrap();
-        let request = request(
+        let auth_request = request(
             &node,
             &[83; 32],
             &ticket.code,
             &SigningKey::from_bytes(&[84; 32]),
         );
-        let mut bad = request.clone();
+        let mut bad = auth_request.clone();
         bad.signature = Some(URL_SAFE_NO_PAD.encode([0; 64]));
         assert!(authenticate_from_file(
             &bad,
@@ -1982,7 +2180,7 @@ mod tests {
                     scope.spawn(|| {
                         barrier.wait();
                         authenticate_from_file(
-                            &request,
+                            &auth_request,
                             &[83; 32],
                             &node.node_id().to_hex(),
                             &pairing,
@@ -2002,13 +2200,179 @@ mod tests {
         assert_eq!(pairing.list_clients().len(), 2);
         assert!(!pairing.remote_access_link_path().exists());
         assert!(authenticate_from_file(
-            &request,
+            &auth_request,
             &[83; 32],
             &node.node_id().to_hex(),
             &pairing,
             &server.pairing_code
         )
         .is_err());
+        if second_device {
+            assert!(pairing
+                .validate_remote_transport(&[83; 32])
+                .unwrap()
+                .scopes
+                .is_empty());
+            // T13: verified second proof contests the provisional pairing.
+            let rescan = request(
+                &node,
+                &[85; 32],
+                &ticket.code,
+                &SigningKey::from_bytes(&[86; 32]),
+            );
+            assert!(authenticate_from_file(
+                &rescan,
+                &[85; 32],
+                &node.node_id().to_hex(),
+                &pairing,
+                &server.pairing_code
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("contested"));
+            assert!(pairing.validate_remote_transport(&[83; 32]).is_err());
+            // T19: second_ console codes dispatch before legacy idempotency, and
+            // an already paired scanner cannot spend the file ticket.
+            let mut console_ticket = ticket.clone();
+            console_ticket.code = format!("second_{}", URL_SAFE_NO_PAD.encode([89; 32]));
+            pairing
+                .write_remote_access_link(&console_ticket.to_uri().unwrap())
+                .unwrap();
+            let old = request(&node, &[82; 32], &console_ticket.code, &client_key);
+            assert!(authenticate_from_file(
+                &old,
+                &[82; 32],
+                &node.node_id().to_hex(),
+                &pairing,
+                &server.pairing_code
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("already_paired"));
+            assert!(pairing.remote_access_link_path().exists());
+            let new = request(
+                &node,
+                &[87; 32],
+                &console_ticket.code,
+                &SigningKey::from_bytes(&[88; 32]),
+            );
+            let provisional = authenticate_from_file(
+                &new,
+                &[87; 32],
+                &node.node_id().to_hex(),
+                &pairing,
+                &server.pairing_code,
+            )
+            .unwrap();
+            assert!(provisional.scopes.is_empty());
+            assert!(!pairing.remote_access_link_path().exists());
+            assert!(authenticate_from_file(
+                &new,
+                &[87; 32],
+                &node.node_id().to_hex(),
+                &pairing,
+                &server.pairing_code
+            )
+            .is_err());
+            // D1 / T13: a valid late rescan refuses the scanner and preserves enrollment.
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            let pkcs8 =
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+            let phone_key =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                    .unwrap();
+            let public = hex::encode(phone_key.public_key().as_ref());
+            let phone_sign =
+                |msg: &str| hex::encode(phone_key.sign(&rng, msg.as_bytes()).unwrap().as_ref());
+            let binding = konsensus_api::sas::NoiseBinding {
+                handshake_hash: [89; 32],
+                box_public_key: pairing.box_transport_pubkey(),
+                client_static: [87; 32],
+            };
+            let op = pairing
+                .request_device_key_versioned(
+                    &provisional.client_id,
+                    &public,
+                    "phone",
+                    &phone_sign(&device::registration_message(
+                        &fp,
+                        &provisional.client_id,
+                        &public,
+                    )),
+                    Some(2),
+                    Some(binding),
+                )
+                .unwrap();
+            let nonce: [u8; 16] = hex::decode(op.box_nonce().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let digest = konsensus_api::sas::digest_v2(
+                &binding,
+                &konsensus_api::sas::device_key(&public).unwrap(),
+                &nonce,
+                &konsensus_api::pairing::second_device::ticket_commitment(&console_ticket.code),
+            );
+            pairing
+                .confirm_device_sas(
+                    &provisional.client_id,
+                    &op.op_id,
+                    &binding,
+                    &digest.to_hex(),
+                    &phone_sign(&device::sas_registration_message(
+                        &fp,
+                        &provisional.client_id,
+                        &public,
+                        &digest,
+                    )),
+                )
+                .unwrap();
+            let message = pairing
+                .second_device_message(
+                    &client.client_id,
+                    client.epoch,
+                    &key.key_id,
+                    &op.op_id,
+                    false,
+                )
+                .unwrap();
+            pairing
+                .approve_second_device(
+                    &client.client_id,
+                    client.epoch,
+                    &op.op_id,
+                    &key.key_id,
+                    &sign(&message),
+                )
+                .unwrap();
+            let late = request(
+                &node,
+                &[90; 32],
+                &console_ticket.code,
+                &SigningKey::from_bytes(&[91; 32]),
+            );
+            assert!(authenticate_from_file(
+                &late,
+                &[90; 32],
+                &node.node_id().to_hex(),
+                &pairing,
+                &server.pairing_code
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("contested"));
+            assert_eq!(
+                pairing.validate_remote_transport(&[87; 32]).unwrap().scopes,
+                vec![
+                    konsensus_api::auth::Scope::Read,
+                    konsensus_api::auth::Scope::Receive
+                ]
+            );
+            assert_eq!(
+                pairing.second_device_alerts()[0].event,
+                "pair.second_device_contested_after_enroll"
+            );
+        }
     }
 
     #[tokio::test]

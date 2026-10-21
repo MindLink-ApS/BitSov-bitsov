@@ -9,6 +9,12 @@ use thiserror::Error;
 /// API errors — converted to appropriate HTTP status codes.
 #[derive(Debug, Error)]
 pub enum ApiError {
+    /// Unlocked process has no live owner signer.
+    #[error("box locked")]
+    BoxLocked,
+    /// Another scanner retired this provisional enrollment.
+    #[error("pairing invalid: contested")]
+    PairingContested,
     #[error("{source}")]
     Operation { source: Box<ApiError>, operation_id: String, state: String, payment_hash: Option<String>, retry_allowed: bool },
     #[error("{0}")]
@@ -207,8 +213,31 @@ impl ApiError {
                 "remaining_msat": remaining,
             }));
         }
+        if matches!(self, ApiError::BoxLocked) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({"error":"box locked","code":503,"kind":"box_locked"}),
+            );
+        }
+        if matches!(self, ApiError::PairingContested) {
+            return (
+                StatusCode::FORBIDDEN,
+                serde_json::json!({"error":self.to_string(),"code":403,"kind":"contested"}),
+            );
+        }
         let (status, message) = match &self {
-            ApiError::Operation { .. } | ApiError::OperationConflict(_) | ApiError::NotReady | ApiError::PeerNotReady { .. } | ApiError::RoutingFee { .. } | ApiError::Reasoned { .. } | ApiError::NotDispatched(_) | ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
+            ApiError::BoxLocked
+            | ApiError::PairingContested
+            | ApiError::Operation { .. }
+            | ApiError::OperationConflict(_)
+            | ApiError::NotReady
+            | ApiError::PeerNotReady { .. }
+            | ApiError::RoutingFee { .. }
+            | ApiError::Reasoned { .. }
+            | ApiError::NotDispatched(_)
+            | ApiError::PriceCapExceeded(_)
+            | ApiError::BudgetExceeded(_)
+            | ApiError::StatelessQuoteUnsupported => unreachable!(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),

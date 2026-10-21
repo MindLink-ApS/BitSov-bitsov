@@ -143,6 +143,9 @@ pub fn stun_url(endpoint: Option<&str>, stun_port: Option<u16>) -> Option<String
 /// deploy/keepalive probes read (status + counts + availability flags).
 #[derive(Serialize)]
 pub struct PublicHealthResponse {
+    /// Additive enrollment capability, omitted with rollout off.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub api_capabilities: Vec<&'static str>,
     /// Operator-supplied display label, not a custody claim.
     pub hosted_by: Option<String>,
     /// Always "ok" if the node is running.
@@ -177,7 +180,9 @@ pub struct PublicHealthResponse {
 ///
 /// `BitSov-Data-As-Of` is the time `block_height` was read from the chain
 /// backend (a live query per request); omitted when `block_height` is null.
-async fn health(State(state): State<Arc<AppState>>) -> (DataFreshness, Json<PublicHealthResponse>) {
+pub(crate) async fn health(
+    State(state): State<Arc<AppState>>,
+) -> (DataFreshness, Json<PublicHealthResponse>) {
     let readiness = state.lightning.readiness().await;
     let connected = state.transport.connected_peers().await;
     let ln_available = state.lightning.is_available().await;
@@ -208,6 +213,15 @@ async fn health(State(state): State<Arc<AppState>>) -> (DataFreshness, Json<Publ
     (
         freshness,
         Json(PublicHealthResponse {
+            api_capabilities: if state
+                .pairing
+                .as_ref()
+                .is_some_and(|p| p.second_device_enrollment_enabled())
+            {
+                vec![crate::pairing::second_device::CAPABILITY]
+            } else {
+                vec![]
+            },
             hosted_by: state
                 .pairing
                 .as_ref()
@@ -306,31 +320,41 @@ async fn status(
         disk_free_floor_bytes: disk.map(|s| s.disk_free_floor_bytes),
         money_ready: readiness.money_ready,
         readiness,
-        api_capabilities: vec![
-            crate::pairing::approval::CAPABILITY,
-            crate::pairing::approval::BREAKER_RESET_CAPABILITY,
-            "storage_list_diagnostics_v1",
-            "offline_readiness_v1",
-            "message_operations_v1",
-            "message_operation_abandon_v1",
-            "channel_open_operations_v1",
-            super::messages::caps::CAPABILITY,
-            super::messages::caps::QUOTED_READMISSION_CAPABILITY,
-            super::messages::caps::ROOM_CAPABILITY,
-            super::organism::ENERGY_CAPABILITY,
-            crate::membrane::CAPABILITY,
-            crate::spend_budget::CAPABILITY,
-            crate::spend_budget::RELATION_ENVELOPE_ID_CAPABILITY,
-            crate::spend_budget::FIRST_CONTACT_CAPABILITY,
-            super::introduction::CAPABILITY,
-            super::front_door::CAPABILITY,
-            super::browse::CAPABILITY,
-            konsensus_core::payloads::content::PORCH_QUOTE_CAPABILITY,
-            super::liquidity::CAPABILITY,
-            super::sponsor::CAPABILITY,
-            konsensus_core::payloads::call::MEETING_CAPABILITY,
-            konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY,
-        ],
+        api_capabilities: {
+            let mut capabilities = vec![
+                crate::pairing::approval::CAPABILITY,
+                crate::pairing::approval::BREAKER_RESET_CAPABILITY,
+                "storage_list_diagnostics_v1",
+                "offline_readiness_v1",
+                "message_operations_v1",
+                "message_operation_abandon_v1",
+                "channel_open_operations_v1",
+                super::messages::caps::CAPABILITY,
+                super::messages::caps::QUOTED_READMISSION_CAPABILITY,
+                super::messages::caps::ROOM_CAPABILITY,
+                super::organism::ENERGY_CAPABILITY,
+                crate::membrane::CAPABILITY,
+                crate::spend_budget::CAPABILITY,
+                crate::spend_budget::RELATION_ENVELOPE_ID_CAPABILITY,
+                crate::spend_budget::FIRST_CONTACT_CAPABILITY,
+                super::introduction::CAPABILITY,
+                super::front_door::CAPABILITY,
+                super::browse::CAPABILITY,
+                konsensus_core::payloads::content::PORCH_QUOTE_CAPABILITY,
+                super::liquidity::CAPABILITY,
+                super::sponsor::CAPABILITY,
+                konsensus_core::payloads::call::MEETING_CAPABILITY,
+                konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY,
+            ];
+            if state
+                .pairing
+                .as_ref()
+                .is_some_and(|p| p.second_device_enrollment_enabled())
+            {
+                capabilities.push(crate::pairing::second_device::CAPABILITY);
+            }
+            capabilities
+        },
         status: "ok",
         node_id: state.identity.node_id().to_hex(),
         connected_peers: connected.len(),

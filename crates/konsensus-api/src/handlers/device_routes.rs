@@ -13,7 +13,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::scoped::{Read, ScopedAuth};
-use crate::auth::PairingBinding;
+use crate::auth::{EnrollmentAuth, PairingBinding};
 use crate::error::ApiError;
 use crate::pairing::{PairingError, PairingService, RelationIntent};
 use crate::spend_budget::GrantView;
@@ -26,7 +26,7 @@ pub(super) fn service(state: &AppState) -> Result<&Arc<PairingService>, ApiError
         .ok_or_else(|| ApiError::Internal("pairing is not configured on this node".into()))
 }
 
-pub(super) fn binding(auth: &ScopedAuth<Read>) -> Result<&PairingBinding, ApiError> {
+pub(super) fn binding(auth: &crate::auth::AuthUser) -> Result<&PairingBinding, ApiError> {
     auth.pairing.as_ref().ok_or_else(|| {
         ApiError::Forbidden("device keys belong to a paired client — pair first".into())
     })
@@ -94,7 +94,7 @@ pub struct DeviceKeyResponse {
 }
 
 pub(crate) async fn request_device_key(
-    auth: ScopedAuth<Read>,
+    auth: EnrollmentAuth,
     State(state): State<Arc<AppState>>,
     noise: Option<axum::Extension<crate::rate_limit::AuthenticatedNoise>>,
     Json(body): Json<DeviceKeyRequest>,
@@ -103,7 +103,7 @@ pub(crate) async fn request_device_key(
     let svc = service(&state)?;
     let noise = match body.sas_version {
         None => None,
-        Some(1) => Some(
+        Some(1) | Some(2) => Some(
             noise
                 .filter(|n| n.client_id.as_ref() == binding.client_id)
                 .ok_or_else(|| ApiError::Forbidden("completed Noise transcript required".into()))?
@@ -112,11 +112,12 @@ pub(crate) async fn request_device_key(
         Some(_) => return Err(ApiError::BadRequest("unsupported SAS version".into())),
     };
     let op = svc
-        .request_device_key_with_sas(
+        .request_device_key_versioned(
             &binding.client_id,
             &body.public_key,
             &body.name,
             &body.proof,
+            body.sas_version,
             noise,
         )
         .map_err(map_err)?;
@@ -124,8 +125,10 @@ pub(crate) async fn request_device_key(
         sas_version: op.sas_version,
         box_nonce: op.box_nonce(),
         owner_action: svc.owner_device_command(&op.op_id),
-        delegation_message: (svc.local_owner_device() && op.sas_confirmed())
-            .then(|| crate::pairing::device::delegation_message(&svc.bound_fingerprint(), &op)),
+        delegation_message: (svc.local_owner_device()
+            && op.sas_confirmed()
+            && op.sas_version != Some(2))
+        .then(|| crate::pairing::device::delegation_message(&svc.bound_fingerprint(), &op)),
         fingerprint: crate::pairing::device::key_fingerprint(&op.key_id),
         op_id: op.op_id,
         key_id: op.key_id,
@@ -142,19 +145,27 @@ pub(crate) struct SasFinalizeRequest {
 }
 
 pub(crate) async fn finalize_device_sas(
-    auth: ScopedAuth<Read>,
+    auth: EnrollmentAuth,
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
     noise: Option<axum::Extension<crate::rate_limit::AuthenticatedNoise>>,
     Json(body): Json<SasFinalizeRequest>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let binding = binding(&auth)?;
-    if body.sas_version != 1 {
+    if !matches!(body.sas_version, 1 | 2) {
         return Err(ApiError::BadRequest("unsupported SAS version".into()));
     }
     let noise = noise
         .filter(|n| n.client_id.as_ref() == binding.client_id)
         .ok_or_else(|| ApiError::Forbidden("completed Noise transcript required".into()))?;
+    if service(&state)?
+        .pending_device_key(&op_id)
+        .map_or(body.sas_version == 2, |op| {
+            op.sas_version != Some(body.sas_version)
+        })
+    {
+        return Err(ApiError::Forbidden("SAS version mismatch".into()));
+    }
     service(&state)?
         .confirm_device_sas(
             &binding.client_id,
@@ -168,7 +179,7 @@ pub(crate) async fn finalize_device_sas(
 }
 
 pub(crate) async fn device_key_status(
-    auth: ScopedAuth<Read>,
+    auth: EnrollmentAuth,
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -179,14 +190,20 @@ pub(crate) async fn device_key_status(
         .pending_device_key(&op_id)
         .filter(|op| {
             svc.local_owner_device()
+                && op.sas_version != Some(2)
                 && op.sas_confirmed()
                 && op.client_id == binding.client_id
                 && status == crate::pairing::DeviceKeyStatus::Pending
         })
         .map(|op| crate::pairing::device::delegation_message(&svc.bound_fingerprint(), &op));
-    Ok(Json(
-        serde_json::json!({ "op_id": op_id, "status": status, "delegation_message": message }),
-    ))
+    let mut view = serde_json::json!({"op_id":op_id,"status":status,"delegation_message":message});
+    if svc
+        .pending_device_key(&op_id)
+        .is_some_and(|p| p.sas_version == Some(2))
+    {
+        view["approval"] = serde_json::json!("owner_device");
+    }
+    Ok(Json(view))
 }
 
 /// An enrolled owner's P-256 signature over the pending delegation tuple.
@@ -223,7 +240,7 @@ async fn delegate_device_key(
 /// `DELETE /api/v1/pair/device-key/{op_id}` and
 /// `DELETE /api/v1/pair/elevation/{op_id}`: withdraw your own pending request.
 pub(crate) async fn cancel_pending(
-    auth: ScopedAuth<Read>,
+    auth: EnrollmentAuth,
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -350,7 +367,7 @@ pub(crate) async fn cancel_elevation(
     state: State<Arc<AppState>>,
     op_id: Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    cancel_pending(auth, state, op_id).await
+    cancel_pending(EnrollmentAuth(auth.user), state, op_id).await
 }
 
 #[cfg(test)]
