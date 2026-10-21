@@ -5,6 +5,12 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Return HTTP 400 with `code: "not_dispatched"` and the specific `reason` for
+  call-rule refusals before an operation is created, quoted, or paid
+  (`call_id_used`, `call_busy`, `call_signal_in_flight`, `call_signal_invalid`,
+  `call_not_live`). Refusals on retries of existing operations do not claim
+  non-dispatch, since an earlier attempt may already have dispatched payment.
+
 ## [0.3.0-rc19] — 2026-10-21 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. rc19 is rc18 (`20c6449e`) plus
