@@ -125,6 +125,9 @@ pub struct PendingDeviceKey {
     pub name: String,
     /// Unix seconds after which it can no longer be approved.
     pub expires_at: i64,
+    /// Unix seconds at request creation; zero for legacy records.
+    #[serde(default)]
+    pub created_at: i64,
     /// Server-issued, single-use delegation challenge (16 random bytes, hex).
     /// Older pending console requests have no nonce and cannot be delegated.
     #[serde(default)]
@@ -150,6 +153,13 @@ impl std::fmt::Debug for DeviceSas {
     }
 }
 impl PendingDeviceKey {
+    pub(super) fn sas_ttl_secs(&self) -> i64 {
+        if self.sas_version == Some(2) {
+            super::second_device::SECOND_DEVICE_SAS_TTL_SECS
+        } else {
+            ELEVATION_TTL_SECS
+        }
+    }
     /// Public nonce only, never the computed words or digest.
     pub fn sas_confirmed(&self) -> bool {
         self.sas_version.is_none() || self.sas.as_ref().is_some_and(|s| s.confirmed)
@@ -158,12 +168,11 @@ impl PendingDeviceKey {
     pub fn box_nonce(&self) -> Option<String> {
         self.sas.as_ref().map(|s| hex::encode(s.nonce))
     }
-    fn require_sas_confirmed(&self) -> Result<(), PairingError> {
+    pub(super) fn require_sas_confirmed(&self) -> Result<(), PairingError> {
         if self.sas_version.is_some()
-            && !self
-                .sas
-                .as_ref()
-                .is_some_and(|s| s.confirmed && s.created_at.elapsed().as_secs() < 900)
+            && !self.sas.as_ref().is_some_and(|s| {
+                s.confirmed && s.created_at.elapsed().as_secs() < self.sas_ttl_secs() as u64
+            })
         {
             return Err(PairingError::NotGrantable(
                 "SAS confirmation required; restart requires a new ceremony".into(),
@@ -459,6 +468,36 @@ impl PairingService {
         proof_hex: &str,
         binding: Option<crate::sas::NoiseBinding>,
     ) -> Result<PendingDeviceKey, PairingError> {
+        self.request_device_key_versioned(
+            client_id,
+            public_key_hex,
+            name,
+            proof_hex,
+            binding.as_ref().map(|_| 1),
+            binding,
+        )
+    }
+
+    /// Explicit SAS negotiation. Provisional callers can only use v2; normal callers never can.
+    pub fn request_device_key_versioned(
+        &self,
+        client_id: &str,
+        public_key_hex: &str,
+        name: &str,
+        proof_hex: &str,
+        version: Option<u8>,
+        binding: Option<crate::sas::NoiseBinding>,
+    ) -> Result<PendingDeviceKey, PairingError> {
+        let v2 = version == Some(2);
+        if !matches!(version, None | Some(1) | Some(2)) || version.is_some() != binding.is_some() {
+            return Err(PairingError::BadProof);
+        }
+        if v2 {
+            self.second_device_available()?;
+        }
+        if version == Some(1) && !self.second_device_claim_v1 {
+            return Err(PairingError::BadProof);
+        }
         if !self.owner_control_enabled && !self.local_owner_device {
             return Err(PairingError::OwnerChannelUnavailable);
         }
@@ -496,16 +535,23 @@ impl PairingService {
             .cloned()
             .ok_or(PairingError::UnknownClient)?;
         let key_id = key_id_for(&raw);
-        if inner.sas_failures >= 3 {
-            return Err(PairingError::Closed);
+        if v2 {
+            self.provisional_locked(&inner, client_id)?;
+            Self::second_request_rate(&mut inner)?;
+        } else {
+            if client.scopes.is_empty() {
+                return Err(PairingError::BadProof);
+            }
+            if inner.sas_failures >= 3 {
+                return Err(PairingError::Closed);
+            }
         }
         let now = chrono::Utc::now().timestamp();
-        if inner
-            .file
-            .pending_device_keys
-            .iter()
-            .any(|p| p.expires_at > now && (binding.is_some() || p.sas_version.is_some()))
-        {
+        if inner.file.pending_device_keys.iter().any(|p| {
+            p.expires_at > now
+                && (binding.is_some() || p.sas_version.is_some())
+                && !(v2 && p.sas_version == Some(1) && p.sas.as_ref().is_none_or(|s| !s.confirmed))
+        }) {
             return Err(PairingError::TooManyPending);
         }
         // At most one new registration request per client every 30 s: each
@@ -514,7 +560,7 @@ impl PairingService {
             .file
             .pending_device_keys
             .iter()
-            .any(|p| p.client_id == client_id && p.expires_at - ELEVATION_TTL_SECS > now - 30)
+            .any(|p| p.client_id == client_id && p.created_at != 0 && now - p.created_at < 30)
         {
             return Err(PairingError::TooManyPending);
         }
@@ -564,18 +610,30 @@ impl PairingService {
             {
                 return Err(PairingError::BadProof);
             }
-            let claim = crate::sas::load(
-                self.dir
-                    .parent()
-                    .ok_or_else(|| PairingError::Io("claim code directory unavailable".into()))?,
-            )?;
+            let commitment =
+                if v2 {
+                    if binding.box_public_key != self.box_transport_pubkey() {
+                        return Err(PairingError::BadProof);
+                    }
+                    self.provisional_locked(&inner, client_id)?
+                        .ticket_commitment
+                } else {
+                    crate::sas::load(self.dir.parent().ok_or_else(|| {
+                        PairingError::Io("claim code directory unavailable".into())
+                    })?)?
+                    .commitment()
+                };
             let device = crate::sas::device_key(&public_key_hex)
                 .map_err(|e| PairingError::Malformed(e.into()))?;
             let mut nonce = [0; 16];
             rand::rngs::OsRng.fill_bytes(&mut nonce);
             Some(DeviceSas {
                 nonce,
-                digest: crate::sas::digest(&binding, &device, &nonce, &claim.commitment()),
+                digest: if v2 {
+                    crate::sas::digest_v2(&binding, &device, &nonce, &commitment)
+                } else {
+                    crate::sas::digest(&binding, &device, &nonce, &commitment)
+                },
                 binding,
                 confirmed: false,
                 created_at: std::time::Instant::now(),
@@ -594,9 +652,15 @@ impl PairingService {
             key_id,
             public_key: public_key_hex,
             name,
-            expires_at: now + ELEVATION_TTL_SECS,
+            expires_at: if v2 {
+                (now + super::second_device::SECOND_DEVICE_SAS_TTL_SECS)
+                    .min(self.provisional_locked(&inner, client_id)?.expires_at)
+            } else {
+                now + ELEVATION_TTL_SECS
+            },
+            created_at: now,
             delegation_nonce: hex::encode(nonce),
-            sas_version: sas.as_ref().map(|_| 1),
+            sas_version: version,
             sas,
         };
         if self.owner_control_enabled {
@@ -608,6 +672,21 @@ impl PairingService {
                 Some(self.owner_device_command(&op.op_id)),
             )?;
         }
+        let before = inner.file.clone();
+        let cancelled_before = inner.cancelled_ops.clone();
+        // Takeover is not a user cancellation: never charge v1 sas_failures.
+        if v2 {
+            let preempted: Vec<_> = inner
+                .file
+                .pending_device_keys
+                .iter()
+                .filter(|p| p.sas_version == Some(1) && p.sas.as_ref().is_none_or(|s| !s.confirmed))
+                .map(|p| p.op_id.clone())
+                .collect();
+            for id in preempted {
+                Self::drop_second_op(&mut inner, &id);
+            }
+        }
         // One registration in flight per client: a new request replaces it.
         let replaced: Vec<String> = inner
             .file
@@ -616,19 +695,27 @@ impl PairingService {
             .filter(|p| p.client_id == client_id || p.expires_at <= now)
             .map(|p| p.op_id.clone())
             .collect();
-        for id in &replaced {
-            inner.owner_confirmations.remove(id);
-        }
         inner
             .file
             .pending_device_keys
             .retain(|p| !replaced.contains(&p.op_id));
-        let before = inner.file.clone();
         inner.file.pending_device_keys.push(op.clone());
         if let Err(e) = self.persist(&mut inner.file) {
             inner.file = before;
+            inner.cancelled_ops = cancelled_before;
             inner.owner_confirmations.remove(&op.op_id);
             return Err(e);
+        }
+        for id in &replaced {
+            inner.owner_confirmations.remove(id);
+        }
+        Self::commit_enrollment_cleanup(&mut inner);
+        if v2 {
+            self.enrollment_event(
+                "pair.second_device_requested",
+                client_id,
+                serde_json::json!({"op_id":op.op_id,"epoch":op.epoch}),
+            );
         }
         Ok(op)
     }
@@ -643,19 +730,25 @@ impl PairingService {
         proof: &str,
     ) -> Result<(), PairingError> {
         let mut inner = self.lock();
-        if inner.sas_failures >= 3 {
-            return Err(PairingError::Closed);
-        }
         let op = inner
             .file
             .pending_device_keys
             .iter()
             .find(|p| p.op_id == op_id && p.client_id == client_id)
-            .cloned()
-            .ok_or(PairingError::UnknownOperation)?;
+            .cloned();
+        let v2 = op.as_ref().is_some_and(|op| op.sas_version == Some(2));
+        // Preserve v1's failure-gate precedence even for an unknown op. A live
+        // v2 operation never reads the v1 counter.
+        if !v2 && inner.sas_failures >= 3 {
+            return Err(PairingError::Closed);
+        }
+        let op = op.ok_or(PairingError::UnknownOperation)?;
+        if v2 {
+            self.provisional_locked(&inner, client_id)?;
+        }
         let sas = op.sas.as_ref().ok_or(PairingError::UnknownOperation)?;
         if op.expires_at <= chrono::Utc::now().timestamp()
-            || sas.created_at.elapsed().as_secs() >= 900
+            || sas.created_at.elapsed().as_secs() >= op.sas_ttl_secs() as u64
         {
             return Err(PairingError::Expired);
         }
@@ -664,6 +757,10 @@ impl PairingService {
         }
         let matches = blake3::Hash::from_hex(digest).ok() == Some(sas.digest);
         if !matches {
+            if v2 {
+                self.charge_second_failure(&mut inner, &op, true)?;
+                return Err(PairingError::BadProof);
+            }
             inner.sas_failures = inner.sas_failures.saturating_add(1);
             inner.file.pending_device_keys.retain(|p| p.op_id != op_id);
             inner.owner_confirmations.remove(op_id);
@@ -706,6 +803,9 @@ impl PairingService {
         {
             if p.expires_at <= now {
                 return DeviceKeyStatus::Expired;
+            }
+            if p.sas_version.is_some() && p.sas.is_none() {
+                return DeviceKeyStatus::Lost;
             }
             if !(Self::confirmable(&inner, op_id)
                 || self.local_owner_device && is_hex(&p.delegation_nonce, 32))
@@ -777,6 +877,9 @@ impl PairingService {
             ));
         }
         op.require_sas_confirmed()?;
+        if op.sas_version == Some(2) {
+            self.validate_second_op(&inner, &op)?;
+        }
         // The owner key signs first: a wrong signature spends no code attempt.
         let client_pubkey = inner
             .file
@@ -808,6 +911,20 @@ impl PairingService {
             return Err(PairingError::PairingInvalid(
                 "the pairing changed since this key was requested; ask again".into(),
             ));
+        }
+        if op.sas_version == Some(2) {
+            let key = self.complete_second_locked(
+                &mut inner,
+                &op,
+                owner_signature.to_ascii_lowercase(),
+                console_enrollment(),
+            )?;
+            self.enrollment_event(
+                "pair.second_device_enrolled",
+                "console",
+                serde_json::json!({"client_id":op.client_id,"epoch":op.epoch,"op_id":op.op_id}),
+            );
+            return Ok(key);
         }
         let key = DeviceKey {
             key_id: op.key_id.clone(),
@@ -903,6 +1020,9 @@ impl PairingService {
             .find(|p| p.op_id == op_id)
             .cloned()
             .ok_or(PairingError::UnknownOperation)?;
+        if !matches!(op.sas_version, None | Some(1)) {
+            return Err(PairingError::BadProof);
+        }
         if require_sas && (op.sas_version != Some(1) || op.sas.is_none()) {
             return Err(PairingError::BadProof);
         }
@@ -1078,6 +1198,15 @@ impl PairingService {
     /// working.
     pub fn cancel_pending(&self, client_id: &str, op_id: &str) -> Result<(), PairingError> {
         let mut inner = self.lock();
+        if let Some(op) = inner
+            .file
+            .pending_device_keys
+            .iter()
+            .find(|p| p.op_id == op_id && p.client_id == client_id && p.sas_version == Some(2))
+            .cloned()
+        {
+            return self.charge_second_failure(&mut inner, &op, false);
+        }
         if inner
             .file
             .pending_device_keys

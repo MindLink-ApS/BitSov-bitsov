@@ -79,7 +79,10 @@ impl Fixture {
                 name: "phone".into(),
                 client_pubkey: format!("pub{n}"),
                 remote_transport_pubkey: None,
-                scopes: vec![],
+                scopes: vec![
+                    konsensus_api::auth::Scope::Read,
+                    konsensus_api::auth::Scope::Receive,
+                ],
                 epoch: 1,
                 identity_fingerprint: fingerprint.clone(),
                 created_at: 1,

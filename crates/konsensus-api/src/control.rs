@@ -192,6 +192,9 @@ pub enum ControlRequest {
 pub enum ControlResponse {
     /// Current pairing state.
     Status {
+        /// Late rescans never revoke an enrolled device; ask the owner to check.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        second_device_alerts: Vec<crate::pairing::second_device::ContestedAlert>,
         /// Paired clients, as `(client_id, name, scopes, epoch)`.
         clients: Vec<ClientSummary>,
         /// Pending elevation requests awaiting the owner.
@@ -436,6 +439,7 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
         ControlRequest::Status => {
             let file = service.snapshot();
             ControlResponse::Status {
+                second_device_alerts: service.second_device_alerts(),
                 clients: file
                     .clients
                     .iter()
@@ -1005,6 +1009,9 @@ pub async fn sweep_expired_grants(
         if *shutdown_rx.borrow() {
             break;
         }
+        if let Err(e) = service.sweep_provisional_pairings() {
+            tracing::warn!(error=%e,"provisional pairing sweep failed");
+        }
         let delay = match service.prune_expired_grants() {
             Ok(n) => {
                 if n > 0 {
@@ -1020,7 +1027,7 @@ pub async fn sweep_expired_grants(
         tokio::select! {
             _ = shutdown_rx.changed() => break,
             _ = service.grant_changed() => {},
-            _ = tokio::time::sleep(delay) => {},
+            _ = tokio::time::sleep(delay.min(std::time::Duration::from_secs(60))) => {},
         }
     }
     // Shutdown is a cleanup opportunity even if signalled before our first
