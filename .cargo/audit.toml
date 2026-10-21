@@ -60,22 +60,26 @@
 # remaining island, and assess the SQL encoded-size argument. This file records
 # what is known; it does not stand in for those decisions.
 ignore = [
-  # Applicability triage 2026-10-17 — zip 0.6.6, build-dependency ONLY of
-  # corepc-node 0.10.1 and electrsd 0.36.1. The optional harnesses are enabled
-  # by konsensus-node/regtest-e2e and konsensus-lightning/ldk-integration-test.
-  # `cargo tree -i zip -e all --all-features --locked` confirms those two paths;
-  # `cargo tree -p konsensus-node -e normal,build --locked` contains no zip or
-  # harness. CI's release build enables neither feature: zip is never compiled
-  # into the shipped konsensus binary. cargo-audit still scans its lock entry.
+  # Applicability triage 2026-10-17, rechecked 2026-10-21 when konsensus-node
+  # moved its optional corepc-node pin from 0.10.1 to 0.12.0. zip 0.6.6 remains
+  # a build-dependency ONLY of corepc-node 0.10.1 and electrsd 0.36.1.
+  # konsensus-lightning/ldk-integration-test enables electrsd with
+  # corepc-node_28_2, which turns on corepc-node 0.10.1's download feature and
+  # electrsd's own zip build-dependency. konsensus-node/regtest-e2e now depends
+  # on corepc-node 0.12.0 with default features only (0_17_2). That copy's
+  # download feature is off, and its lock entry does not list zip.
+  # `cargo tree -p konsensus-node -e normal,build --locked` contains no zip.
+  # CI's release build enables neither harness: zip is never compiled into the
+  # shipped konsensus binary. cargo-audit still scans the lock entry.
   #
-  # UPGRADE CHECK: crates.io release metadata on 2026-10-17 shows corepc-node
-  # 0.12.0 (Dependabot #230) still needs zip ^0.6.6; electrsd 0.42.0 still needs
-  # zip ^0.6 and bitcoind ^0.42.0, which also needs zip ^0.6.6. No released
-  # upgrade removes the affected zip dependency; the fix is zip >=9.0.0.
+  # UPGRADE CHECK: corepc-node 0.12.0's download feature (not enabled on the
+  # regtest-e2e pin) still needs zip ^0.6.6. electrsd 0.42.0 still needs zip
+  # ^0.6 and bitcoind ^0.42.0, which also needs zip ^0.6.6. No released upgrade
+  # removes the affected zip dependency; the fix is zip >=9.0.0.
   #
   # INPUTS VERIFIED in the locked crates' build.rs and bundled hash files:
-  # corepc-node downloads Bitcoin Core 28.2 from
-  # https://bitcoincore.org/bin/bitcoin-core-28.2/<platform archive>;
+  # the electrsd-pinned corepc-node 0.10.1 download feature fetches Bitcoin Core
+  # 28.2 from https://bitcoincore.org/bin/bitcoin-core-28.2/<platform archive>;
   # electrsd downloads electrs_<platform>_esplora_
   # a33e97e1a1fc63fa9c20a116bb92579bbf43b254.zip from
   # https://github.com/RCasatta/electrsd/releases/download/electrs_releases.
