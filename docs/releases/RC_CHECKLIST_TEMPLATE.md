@@ -4,7 +4,8 @@ Pre-release; not for production use. Copy this template for each new RC.
 
 ## Prepare
 
-- [ ] Record the reviewed commit, scope, migration and rollback constraints.
+- [ ] Record the full 40-character lowercase hexadecimal reviewed commit SHA
+      in the review verdict, along with scope, migration and rollback constraints.
       Update versions, lockfile, changelog and upgrade notes. Follow the
       [approved release-ref policy](../ops/RELEASE_POLICY.md#approved-release-refs):
       for `vX.Y.Z-rcN.M`, freshly fetch `refs/heads/release/<tag>` from `origin`
@@ -13,6 +14,10 @@ Pre-release; not for production use. Copy this template for each new RC.
       Missing branches and different heads fail, even for commits on main.
       Plain RC and stable tags still require ancestry on freshly fetched
       `origin/main`. No signing flag bypasses these checks.
+- [ ] For a dotted RC, require the review verdict to name the full release
+      branch-head SHA. Protect `release/*` against force-push and deletion, and
+      keep the reviewed release branch unchanged until its tag is signed.
+      If its head changes, obtain a new review verdict for the new full SHA.
 - [ ] Review the tag's `scripts/release-toolchain`, `scripts/release-build.sh`,
       `scripts/release-macos-toolchain.sh`, lockfile and CI release matrix together.
       Install the pinned Rust toolchain.
@@ -44,7 +49,9 @@ Pre-release; not for production use. Copy this template for each new RC.
       cannot rebuild. Each accepted target needs its own
       `--accept-unverified-target <triple>`; this flag cannot waive the host.
 - [ ] Run `scripts/release-sign.sh <tag> <reviewed-commit>` with those explicit
-      per-target flags. Keep the command and full output in release evidence.
+      per-target flags and the exact full SHA from the review verdict. Branch
+      names, tags, `FETCH_HEAD` and abbreviated SHAs are refused for every tag
+      format. Keep the command and full output in release evidence.
       For an existing signed tag, first add `--dry-run` to exercise every gate
       without signing, secret-key access or upload.
 - [ ] Confirm `VERIFIED` identifies the exact tag commit, native target and matching
