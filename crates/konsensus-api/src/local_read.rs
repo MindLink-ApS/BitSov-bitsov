@@ -24,7 +24,18 @@ impl FromRequestParts<Arc<AppState>> for LocalConnection {
         _state: &Arc<AppState>,
     ) -> Result<Self, Response> {
         match parts.extensions.get::<ConnectInfo<SocketAddr>>() {
-            Some(ConnectInfo(addr)) if addr.ip().is_loopback() => Ok(Self),
+            Some(ConnectInfo(addr)) if addr.ip().is_loopback() => {
+                let policy = parts
+                    .extensions
+                    .get::<crate::local_request::LocalRequestPolicy>()
+                    .ok_or_else(|| {
+                        (StatusCode::FORBIDDEN, "local API policy required").into_response()
+                    })?;
+                policy
+                    .validate(&parts.headers)
+                    .map_err(IntoResponse::into_response)?;
+                Ok(Self)
+            }
             _ => Err((StatusCode::FORBIDDEN, "local paired read required").into_response()),
         }
     }

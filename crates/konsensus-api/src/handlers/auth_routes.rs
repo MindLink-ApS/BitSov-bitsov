@@ -169,7 +169,8 @@ fn auth_local_rate_limiter() -> &'static crate::rate_limit::RateLimiter {
 ///
 /// If the request originates from 127.0.0.1 or ::1, a JWT is issued
 /// without requiring signature proof. Physical/local access to the
-/// machine running the node is sufficient trust for the desktop UX.
+/// machine running the node is sufficient trust for the desktop UX, after
+/// Host and Origin admission prevents browsers from borrowing loopback trust.
 ///
 /// This follows standard practice for desktop apps (Spotify, Discord,
 /// VS Code) where the local API is the trust boundary.
@@ -226,7 +227,10 @@ pub fn routes(local_auth_enabled: bool) -> Router<Arc<AppState>> {
         .route("/api/v1/auth/token", post(issue_token));
 
     if local_auth_enabled {
-        router.route("/api/v1/auth/local", post(issue_local_token))
+        router.route(
+            "/api/v1/auth/local",
+            post(issue_local_token).layer(axum::middleware::from_fn(crate::local_request::guard)),
+        )
     } else {
         router
     }

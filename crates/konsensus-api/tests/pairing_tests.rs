@@ -893,6 +893,7 @@ async fn websocket_pairing_binding_blocks_upgrade_and_post_revocation_plaintext(
             pair_and_token(&app, &service, &SigningKey::from_bytes(&[62; 32])).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let app = konsensus_api::build_router_for_addr(state.clone(), addr);
         let server = tokio::spawn(async move {
             axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await
@@ -1021,6 +1022,14 @@ async fn membrane_ws_requires_local_pairing_and_rechecks_revocation() {
         } else {
             paired
         };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Preserve the test router's fallback for the rate-limit extractor;
+        // LocalConnection still requires actual ConnectInfo, not this mock.
+        let app = konsensus_api::build_router_for_addr(state.clone(), addr)
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                "127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap(),
+            ));
         let app = match mode {
             "remote" => app.layer(axum::Extension(axum::extract::ConnectInfo(
                 "203.0.113.1:1234".parse::<std::net::SocketAddr>().unwrap(),
@@ -1030,8 +1039,6 @@ async fn membrane_ws_requires_local_pairing_and_rechecks_revocation() {
                 "127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap(),
             ))),
         };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             axum::serve(listener, app.into_make_service())
                 .await
