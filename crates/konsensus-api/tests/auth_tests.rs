@@ -286,6 +286,7 @@ async fn local_auth_rejects_non_localhost() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/auth/local")
+        .header("host", "localhost:3141")
         .header("content-type", "application/json")
         .body(Body::from("{}"))
         .unwrap();
@@ -307,6 +308,7 @@ async fn remote_router_never_mounts_local_token_mint() {
     let request = Request::builder()
         .method("POST")
         .uri("/api/v1/auth/local")
+        .header("host", "localhost:3141")
         .header("content-type", "application/json")
         .body(Body::from("{}"))
         .unwrap();
@@ -1432,6 +1434,7 @@ async fn ws_rejects_missing_token() {
     // Axum's Query<WsParams> extractor rejects before the handler runs.
     let req = Request::builder()
         .uri("/api/v1/ws")
+        .header("host", "localhost:3141")
         .header("connection", "Upgrade")
         .header("upgrade", "websocket")
         .header("sec-websocket-version", "13")
@@ -1453,6 +1456,7 @@ async fn ws_rejects_invalid_token() {
     // a plain HTTP request even with a token — it must be a real WS upgrade.
     let req = Request::builder()
         .uri("/api/v1/ws?token=invalid-jwt-token")
+        .header("host", "localhost:3141")
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -1605,6 +1609,7 @@ async fn auth_local_without_connect_info_rejected() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/auth/local")
+        .header("host", "localhost:3141")
         .body(Body::empty())
         .unwrap();
 
@@ -1625,6 +1630,45 @@ async fn auth_local_without_connect_info_rejected() {
     );
 }
 
+// These requests reach the real loopback token route. Removing either header
+// check would mint a token instead of returning the stable refusal code.
+#[tokio::test]
+async fn auth_local_rebinding_host_is_rejected() {
+    assert_local_header_rejected("attacker.example:3141", None, "local_host_forbidden").await;
+}
+
+#[tokio::test]
+async fn auth_local_foreign_origin_is_rejected() {
+    assert_local_header_rejected(
+        "localhost:3141",
+        Some("https://attacker.example"),
+        "local_origin_forbidden",
+    )
+    .await;
+}
+
+async fn assert_local_header_rejected(host: &str, origin: Option<&str>, code: &str) {
+    let app = build_router(test_state());
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/local")
+        .header("host", host);
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+    let response = app
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], code);
+    assert!(json.get("token").is_none());
+}
+
 #[tokio::test]
 async fn auth_local_rate_limited_after_burst() {
     use axum::extract::ConnectInfo;
@@ -1638,12 +1682,13 @@ async fn auth_local_rate_limited_after_burst() {
         let mut req = Request::builder()
             .method("POST")
             .uri("/api/v1/auth/local")
+            .header("host", "localhost:3141")
             .body(Body::empty())
             .unwrap();
         // Inject loopback ConnectInfo so the handler treats this as a local request
-        // and reaches the SEC1 rate-limit check (the other /auth/local tests omit
-        // ConnectInfo and are rejected 401 before it — so this is the only test that
-        // drives the shared "auth_local" bucket, which therefore starts fresh here).
+        // and reaches the SEC1 rate-limit check. Other /auth/local tests in this
+        // binary fail admission before consuming this shared bucket, so it starts
+        // fresh here.
         req.extensions_mut().insert(ConnectInfo(loopback));
         req
     };
@@ -1678,6 +1723,7 @@ async fn auth_local_not_mounted_when_sensitive_identity_disabled() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/auth/local")
+        .header("host", "localhost:3141")
         .body(Body::empty())
         .unwrap();
 

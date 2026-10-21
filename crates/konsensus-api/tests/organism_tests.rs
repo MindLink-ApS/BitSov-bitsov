@@ -36,6 +36,7 @@ fn envelope(sender: NodeId, recipient: Recipient, amount_msat: u64, age_ms: u64)
 
 async fn get(state: &Arc<AppState>, path: &str, bearer: Option<String>) -> (StatusCode, Value) {
     let mut req = Request::builder()
+        .header("host", "localhost:3141")
         .uri(path)
         .extension(axum::extract::ConnectInfo(
             "127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap(),
@@ -302,7 +303,7 @@ async fn capped_send_refusal_is_an_outbound_membrane_event() {
 
     let response = test_router(state.clone())
         .oneshot(
-            Request::builder()
+            Request::builder().header("host", "localhost:3141")
                 .method("POST")
                 .uri("/api/v1/messages/compose")
                 .header("authorization", auth_header(&state))
@@ -334,6 +335,7 @@ async fn capped_send_refusal_is_an_outbound_membrane_event() {
     let response = test_router(state.clone())
         .oneshot(
             Request::builder()
+                .header("host", "localhost:3141")
                 .method("POST")
                 .uri("/api/v1/messages/compose")
                 .header("authorization", auth_header(&state))
@@ -415,6 +417,7 @@ async fn organism_requires_loopback_current_pairing_and_read() {
     for path in ["/api/v1/energy", "/api/v1/membrane"] {
         for peer in [None, Some("203.0.113.7:1234"), Some("[2001:db8::1]:1234")] {
             let mut req = Request::builder()
+                .header("host", "localhost:3141")
                 .uri(path)
                 .header("authorization", &paired)
                 .header("x-forwarded-for", "127.0.0.1");
@@ -438,6 +441,7 @@ async fn organism_requires_loopback_current_pairing_and_read() {
             let response = test_router(state.clone())
                 .oneshot(
                     Request::builder()
+                        .header("host", "localhost:3141")
                         .uri(path)
                         .extension(axum::extract::ConnectInfo(
                             addr.parse::<std::net::SocketAddr>().unwrap(),
@@ -470,7 +474,7 @@ async fn cap_refusal_never_retains_unvalidated_text() {
         "PRIVATE PLAINTEXT lnbc1invoice".to_string(),
         "X".repeat(100_000),
     ] {
-        let response = test_router(state.clone()).oneshot(Request::builder().method("POST").uri("/api/v1/messages")
+        let response = test_router(state.clone()).oneshot(Request::builder().header("host", "localhost:3141").method("POST").uri("/api/v1/messages")
             .header("authorization", auth_header(&state)).header("content-type", "application/json")
             .body(Body::from(json!({"recipient":recipient,"kind":100,"ciphertext":"","payment_hash":"","preimage":"","amount_msat":1000,"max_total_msat":0}).to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -500,6 +504,7 @@ async fn file_cap_refusal_emits_one_event_without_payment() {
     let response = test_router(state.clone())
         .oneshot(
             Request::builder()
+                .header("host", "localhost:3141")
                 .method("POST")
                 .uri("/api/v1/files/test-file/send")
                 .header("authorization", auth_header(&state))

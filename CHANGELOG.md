@@ -36,6 +36,7 @@ also live on the corresponding GitHub pre-release pages.
 
 ### Security
 
+- Validate Host and Origin before local token issuance and local-only reads/WebSocket admission to prevent browser DNS rebinding; preserve native clients without Origin.
 - **Breaking change (H2):** argv passwords and mnemonic phrases are deprecated,
   warn on stderr, and refuse execution unless `--insecure-argv` is explicit.
   This includes `--encrypt <password>` and nonempty BIP-39 `--passphrase` values.
