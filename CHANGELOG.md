@@ -5,6 +5,10 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Make Darwin release binaries independent of the build path: link with
+  `-Wl,-S` so ld64's `LC_UUID` no longer hashes absolute debug-map paths, which
+  made every H3 host rebuild mismatch CI. Add `scripts/release-repro-check.sh`
+  for a two-path reproducibility check.
 - Update shipped binary dependencies to bitcoin 0.32.102, zeroize 1.9.1, hyper 1.12.0, and tokio-rustls 0.26.6 (#338).
 - Return HTTP 400 with `code: "not_dispatched"` and the specific `reason` for
   call-rule refusals before an operation is created, quoted, or paid
