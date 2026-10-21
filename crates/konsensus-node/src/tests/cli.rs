@@ -320,6 +320,7 @@ fn parse_sign_challenge() {
             mnemonic,
             config,
             passphrase,
+            passphrase_fd,
             password,
             password_file,
             password_fd,
@@ -328,6 +329,7 @@ fn parse_sign_challenge() {
             assert_eq!(mnemonic, Some(PathBuf::from("/keys/m.txt")));
             assert!(config.is_none());
             assert_eq!(passphrase, "");
+            assert!(passphrase_fd.is_none());
             assert!(password.is_none());
             assert!(password_file.is_none());
             assert!(password_fd.is_none());
@@ -352,6 +354,7 @@ fn parse_sign_challenge_with_config() {
             mnemonic,
             config,
             passphrase,
+            passphrase_fd,
             password,
             password_file,
             password_fd,
@@ -360,6 +363,7 @@ fn parse_sign_challenge_with_config() {
             assert!(mnemonic.is_none());
             assert_eq!(config, Some(PathBuf::from("/data/konsensus.toml")));
             assert_eq!(passphrase, "");
+            assert!(passphrase_fd.is_none());
             assert!(password.is_none());
             assert!(password_file.is_none());
             assert!(password_fd.is_none());
@@ -386,6 +390,7 @@ fn parse_sign_challenge_with_passphrase() {
             mnemonic,
             config,
             passphrase,
+            passphrase_fd,
             password,
             password_file,
             password_fd,
@@ -394,6 +399,7 @@ fn parse_sign_challenge_with_passphrase() {
             assert_eq!(mnemonic, Some(PathBuf::from("/keys/m.txt")));
             assert!(config.is_none());
             assert_eq!(passphrase, "my-pass");
+            assert!(passphrase_fd.is_none());
             assert!(password.is_none());
             assert!(password_file.is_none());
             assert!(password_fd.is_none());

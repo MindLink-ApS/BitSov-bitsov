@@ -221,6 +221,10 @@ args_file="$WORK/sign-args"
 cat >"$WORK/konsensus" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" > "${OWNER_TOKEN_ARGS_FILE:?}"
+if [[ "$*" == *"--password-fd 0"* ]]; then
+  IFS= read -r password
+  [[ "$password" == "super-secret-pw" ]] || exit 1
+fi
 printf '%s\n' "$(printf 'ab%.0s' {1..64})"
 EOF
 chmod +x "$WORK/konsensus"
@@ -253,8 +257,8 @@ password_probe() {
   else
     bad "expected $label in sign-challenge args, got args=[$args] out=[$out]"
   fi
-  if echo "$stderr" | grep -q 'super-secret-pw'; then
-    bad "password echoed on stderr: $stderr"
+  if echo "$stderr $args" | grep -q 'super-secret-pw'; then
+    bad "password leaked in stderr or argv: $stderr $args"
   else
     ok "password not echoed for $label"
   fi
@@ -262,7 +266,7 @@ password_probe() {
 
 password_probe "--password-fd 3" KONSENSUS_PASSWORD_FD=3
 password_probe "--password-file $WORK/pw" KONSENSUS_PASSWORD_FILE="$WORK/pw"
-password_probe "--password super-secret-pw" KONSENSUS_PASSWORD=super-secret-pw
+password_probe "--password-fd 0" KONSENSUS_PASSWORD=super-secret-pw
 
 conflict="$(
   PATH="$WORK:$PATH" \

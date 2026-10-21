@@ -62,7 +62,8 @@ verification cannot complete and normal startup remains fenced. See
 ### Contacts and encrypted seeds
 
 `konsensus node-id` can now decrypt `mnemonic.enc` using the same terminal,
-`--password-fd`, `--password-file` or `--password` sources as `sign-challenge`.
+`--password-fd` or `--password-file` sources as `sign-challenge`.
+Argv secrets now require `--insecure-argv`; see [password input](operations/password-input.md).
 The funding-address API reports the configured network, including signet;
 `GET /api/v1/peers/export` now accepts Read scope.
 

@@ -117,8 +117,9 @@ impl konsensus_crypto::SessionStore for StorageSessionAdapter {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let file_logging = logging::init();
     let cli = Cli::parse();
+    cli.check_argv_secrets()?;
+    let file_logging = logging::init();
 
     match cli.command {
         Command::ClaimCode { config, show: _ } => claim_code::show(&config)?,
@@ -285,12 +286,20 @@ async fn main() -> Result<()> {
             mnemonic,
             config,
             passphrase,
+            passphrase_fd,
             password,
             password_file,
             password_fd,
         } => {
             // Wrap before resolve_mnemonic_path so a config error still zeroizes it.
             let password = password.map(Zeroizing::new);
+            let passphrase = Zeroizing::new(passphrase);
+            let passphrase = match passphrase_fd {
+                Some(fd) => {
+                    password::read_password_fd(fd).context("failed to read BIP-39 passphrase")?
+                }
+                None => passphrase,
+            };
             let mnemonic_path = resolve_mnemonic_path(mnemonic, config)?;
             let password = supplied_seed_password(password, password_file.as_deref(), password_fd)?;
             cmd_node_id(&mnemonic_path, &passphrase, password)?;
@@ -300,12 +309,20 @@ async fn main() -> Result<()> {
             mnemonic,
             config,
             passphrase,
+            passphrase_fd,
             password,
             password_file,
             password_fd,
         } => {
             // Wrap before resolve_mnemonic_path so a config error still zeroizes it.
             let password = password.map(Zeroizing::new);
+            let passphrase = Zeroizing::new(passphrase);
+            let passphrase = match passphrase_fd {
+                Some(fd) => {
+                    password::read_password_fd(fd).context("failed to read BIP-39 passphrase")?
+                }
+                None => passphrase,
+            };
             let mnemonic_path = resolve_mnemonic_path(mnemonic, config)?;
             let password = supplied_seed_password(password, password_file.as_deref(), password_fd)?;
             cmd_sign_challenge(&mnemonic_path, &passphrase, &challenge, password)?;
@@ -335,16 +352,39 @@ async fn main() -> Result<()> {
                 config,
                 out,
                 password,
+                password_file,
+                password_fd,
             } => {
-                whitelist_cmd::cmd_whitelist_backup(&config, password.as_deref(), out.as_deref())
-                    .await?;
+                let password = supplied_seed_password(
+                    password.map(Zeroizing::new),
+                    password_file.as_deref(),
+                    password_fd,
+                )?;
+                whitelist_cmd::cmd_whitelist_backup(
+                    &config,
+                    password.as_deref().map(String::as_str),
+                    out.as_deref(),
+                )
+                .await?;
             }
             WhitelistCommand::Restore {
                 from,
                 config,
                 password,
+                password_file,
+                password_fd,
             } => {
-                whitelist_cmd::cmd_whitelist_restore(&config, password.as_deref(), &from).await?;
+                let password = supplied_seed_password(
+                    password.map(Zeroizing::new),
+                    password_file.as_deref(),
+                    password_fd,
+                )?;
+                whitelist_cmd::cmd_whitelist_restore(
+                    &config,
+                    password.as_deref().map(String::as_str),
+                    &from,
+                )
+                .await?;
             }
         },
     }
