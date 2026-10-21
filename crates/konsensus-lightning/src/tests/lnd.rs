@@ -630,7 +630,7 @@ async fn start_mock_lnd_payment() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     }
     /// Payment with garbage + valid line (tests resilience).
     async fn pay_mixed() -> String {
-        let valid = serde_json::json!({"result": {"payment_hash": "good", "payment_preimage": "preimg", "status": "SUCCEEDED", "value_msat": "5000"}});
+        let valid = serde_json::json!({"result": {"payment_hash": "good", "payment_preimage": "preimg", "status": "SUCCEEDED", "value_msat": "10000"}});
         format!("{{broken json\n\n{}\n", valid)
     }
 
@@ -644,6 +644,12 @@ async fn start_mock_lnd_payment() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         .route("/pay_fail/v2/router/send", post(pay_failed))
         .route("/pay_empty/v2/router/send", post(pay_empty))
         .route("/pay_mixed/v2/router/send", post(pay_mixed))
+        .route("/pay_omit/v2/router/send", post(|| async {
+            format!("{}\n", serde_json::json!({"result": {"payment_hash": "abc", "status": "SUCCEEDED", "fee_msat": "0"}}))
+        }))
+        .route("/pay_mismatch/v2/router/send", post(|| async {
+            format!("{}\n", serde_json::json!({"result": {"payment_hash": "abc", "status": "SUCCEEDED", "value_msat": "1", "fee_msat": "0"}}))
+        }))
         .fallback(|| async { (axum::http::StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"code":5}))) });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -726,7 +732,35 @@ async fn pay_invoice_mixed_garbage_finds_valid_line() {
     let result = provider.pay_invoice_with_fee_limit(&crate::MockLightningProvider::new().create_invoice(10000, "test", 3600).await.unwrap().bolt11, 5000).await.unwrap();
     assert_eq!(result.status, PaymentStatus::Settled);
     assert_eq!(result.payment_hash, "good");
-    assert_eq!(result.amount_msat, 5_000);
+    assert_eq!(result.amount_msat, 10_000);
+}
+
+#[tokio::test]
+async fn settled_payment_without_matching_amount_is_not_zero() {
+    let (addr, _handle) = start_mock_lnd_payment().await;
+    for prefix in ["pay_omit", "pay_mismatch"] {
+        let config = LndConfig {
+            api_url: format!("http://{addr}/{prefix}"),
+            macaroon_hex: "abc".into(),
+            tls_cert_path: None,
+        };
+        let provider = LndProvider::with_client(config, Client::new());
+        let err = provider
+            .pay_invoice_with_fee_limit(
+                &crate::MockLightningProvider::new()
+                    .create_invoice(10_000, "test", 3600)
+                    .await
+                    .unwrap()
+                    .bolt11,
+                5_000,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, LightningError::Backend(ref msg) if msg.contains("grant not released")),
+            "{prefix}: {err:?}"
+        );
+    }
 }
 
 // ── Probe payment capability edge cases ────────────────────────────
@@ -863,6 +897,33 @@ fn keysend_invalid_dest_pubkey_hex() {
 }
 
 // ── parse_u64 additional edge cases ────────────────────────────────
+
+#[test]
+fn settled_amount_rejects_zero_and_satoshi_overflow() {
+    assert!(LndProvider::scale_sats(u64::MAX).is_err());
+    assert_eq!(LndProvider::scale_sats(25).unwrap(), 25_000);
+    assert!(LndProvider::reported_amount_msat(PaymentStatus::Settled, None, None).is_err());
+    assert!(LndProvider::reported_amount_msat(PaymentStatus::Settled, Some("0"), None).is_err());
+    assert!(LndProvider::reported_amount_msat(PaymentStatus::Settled, Some("nope"), None).is_err());
+    assert!(LndProvider::reported_amount_msat(
+        PaymentStatus::Settled,
+        None,
+        Some(&u64::MAX.to_string()),
+    )
+    .is_err());
+    assert_eq!(
+        LndProvider::reported_amount_msat(PaymentStatus::Settled, Some("25000"), None).unwrap(),
+        25_000
+    );
+    assert_eq!(
+        LndProvider::reported_amount_msat(PaymentStatus::Settled, None, Some("25")).unwrap(),
+        25_000
+    );
+    assert_eq!(
+        LndProvider::reported_amount_msat(PaymentStatus::Pending, None, None).unwrap(),
+        0
+    );
+}
 
 #[test]
 fn parse_u64_overflow_returns_zero() {

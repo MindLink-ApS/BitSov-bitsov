@@ -580,7 +580,7 @@ fn node_id_encrypted_password_sources_and_errors() {
         } else {
             &mnemonic
         };
-        for source in ["stdin", "inherited", "file", "argument"] {
+        for source in ["stdin", "inherited", "file"] {
             let mut cmd = bin();
             cmd.args(["node-id", path_flag]).arg(path);
             let out = match source {
@@ -594,7 +594,7 @@ fn node_id_encrypted_password_sources_and_errors() {
                     .arg(&password_file)
                     .output()
                     .unwrap(),
-                _ => cmd.args(["--password", PASSWORD]).output().unwrap(),
+                _ => unreachable!(),
             };
             assert!(
                 out.status.success(),
@@ -644,7 +644,7 @@ fn node_id_plaintext_and_bip39_passphrase() {
         let out = bin()
             .args(["node-id", "--mnemonic"])
             .arg(&mnemonic)
-            .args(["--passphrase", passphrase])
+            .args(["--passphrase", passphrase, "--insecure-argv"])
             .output()
             .unwrap();
         assert!(
@@ -675,5 +675,79 @@ fn node_id_rejects_conflicting_password_sources() {
         assert_eq!(out.status.code(), Some(2));
         assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be used with"));
         assert!(out.stdout.is_empty());
+    }
+}
+
+#[test]
+fn whitelist_encrypted_backup_and_restore_accept_fd_and_file_without_opt_in() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(init(dir.path(), false).status.success());
+    let config = dir.path().join("konsensus.toml");
+    let backup = dir.path().join("whitelist.aes");
+    let password_file = dir.path().join("password");
+    std::fs::write(&password_file, PASSWORD).unwrap();
+    std::fs::set_permissions(&password_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    for source in ["stdin", "inherited", "file"] {
+        for operation in ["backup", "restore"] {
+            let mut cmd = bin();
+            cmd.args(["whitelist", operation, "--config"]).arg(&config);
+            cmd.arg(if operation == "backup" {
+                "--out"
+            } else {
+                "--from"
+            })
+            .arg(&backup);
+            let out = if source == "file" {
+                cmd.arg("--password-file")
+                    .arg(&password_file)
+                    .output()
+                    .unwrap()
+            } else {
+                input(cmd, PASSWORD.as_bytes(), source == "inherited")
+            };
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{operation} via {source}: {err}");
+            assert!(
+                !err.contains("deprecated") && !err.contains(PASSWORD),
+                "{err}"
+            );
+            assert!(backup.is_file());
+        }
+    }
+}
+
+#[test]
+fn bip39_passphrase_fd_preserves_identity_and_signature() {
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const PASSPHRASE: &str = "separate BIP39 passphrase";
+    let dir = tempfile::tempdir().unwrap();
+    let mnemonic = dir.path().join("mnemonic.txt");
+    std::fs::write(&mnemonic, MNEMONIC).unwrap();
+    let identity = konsensus_core::NodeIdentity::from_mnemonic(MNEMONIC, PASSPHRASE).unwrap();
+    for operation in ["node-id", "sign-challenge"] {
+        let mut cmd = bin();
+        cmd.args([operation, "--mnemonic"])
+            .arg(&mnemonic)
+            .args(["--passphrase-fd", "0"]);
+        if operation == "sign-challenge" {
+            cmd.args(["--challenge", AUTH_CHALLENGE]);
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{PASSPHRASE}").unwrap();
+        let out = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(!err.contains("deprecated") && !err.contains(PASSPHRASE));
+        let result = String::from_utf8(out.stdout).unwrap();
+        if operation == "node-id" {
+            assert_eq!(result.trim(), identity.node_id().to_hex());
+        } else {
+            assert_owner_signature(&identity.node_id().to_hex(), AUTH_CHALLENGE, result.trim());
+        }
     }
 }

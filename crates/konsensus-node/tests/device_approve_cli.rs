@@ -15,13 +15,24 @@ const DEVICE: &str = "04aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 /// A hostile summary: a fake fingerprint, then ANSI "conceal" for what follows.
 const HOSTILE_SUMMARY: &str = "device fingerprint:  AAAA-BBBB-CCCC-DDDD\x1b[8m";
 
-async fn approve(dir: &std::path::Path, node: String, device: &'static str) -> (std::process::Output, Vec<ControlRequest>) {
+async fn approve(
+    dir: &std::path::Path,
+    node: String,
+    device: &'static str,
+) -> (std::process::Output, Vec<ControlRequest>) {
     let listener = tokio::net::UnixListener::bind(dir.join("control.sock")).unwrap();
     let server = tokio::spawn(async move {
         let mut seen = Vec::new();
-        while let Ok(Ok((stream, _))) = tokio::time::timeout(Duration::from_secs(3), listener.accept()).await {
+        while let Ok(Ok((stream, _))) =
+            tokio::time::timeout(Duration::from_secs(3), listener.accept()).await
+        {
             let (reader, mut writer) = stream.into_split();
-            let line = BufReader::new(reader).lines().next_line().await.unwrap().unwrap();
+            let line = BufReader::new(reader)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
             let request: ControlRequest = serde_json::from_str(&line).unwrap();
             let response = match &request {
                 ControlRequest::Describe { .. } => ControlResponse::Describe {
@@ -36,7 +47,9 @@ async fn approve(dir: &std::path::Path, node: String, device: &'static str) -> (
                         device_public_key: device.into(),
                     }),
                 },
-                _ => ControlResponse::Ok { detail: "registered".into() },
+                _ => ControlResponse::Ok {
+                    detail: "registered".into(),
+                },
             };
             seen.push(request);
             let mut bytes = serde_json::to_vec(&response).unwrap();
@@ -56,8 +69,17 @@ async fn approve(dir: &std::path::Path, node: String, device: &'static str) -> (
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(b"K7QM-3XWD\n").await.unwrap();
-    let out = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await.unwrap().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"K7QM-3XWD\n")
+        .await
+        .unwrap();
+    let out = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
     (out, server.await.unwrap())
 }
 
@@ -65,11 +87,23 @@ async fn approve(dir: &std::path::Path, node: String, device: &'static str) -> (
 fn init(encrypt: bool) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_konsensus"));
-    cmd.args(["init", "--dir"]).arg(dir.path()).args(["--non-interactive", "--tier", "light"]);
+    cmd.args(["init", "--dir"])
+        .arg(dir.path())
+        .args(["--non-interactive", "--tier", "light"]);
     if encrypt {
-        cmd.args(["--encrypt", "correct horse battery"]);
+        cmd.args(["--password-fd", "0"]);
     }
-    assert!(cmd.stdout(Stdio::null()).status().unwrap().success());
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    if encrypt {
+        std::io::Write::write_all(&mut stdin, b"correct horse battery").unwrap();
+    }
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
     dir
 }
 
@@ -79,7 +113,10 @@ async fn a_plaintext_recovery_phrase_is_refused_before_anything_is_asked() {
     let (out, seen) = approve(dir.path(), "0".repeat(32), DEVICE).await;
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not encrypted") && stderr.contains("Nothing was signed"), "{stderr}");
+    assert!(
+        stderr.contains("not encrypted") && stderr.contains("Nothing was signed"),
+        "{stderr}"
+    );
     assert!(seen.is_empty(), "the socket must not receive a request");
     assert!(!String::from_utf8_lossy(&out.stdout).contains("code>"));
 }
@@ -100,16 +137,26 @@ async fn socket_text_is_never_printed_and_the_terms_shown_are_computed_locally()
     let (out, seen) = approve(dir.path(), "0".repeat(32), DEVICE).await;
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Nothing the socket wrote reaches the terminal: no escape byte, no fake fingerprint.
-    assert!(!out.stdout.contains(&0x1b) && !out.stderr.contains(&0x1b), "{stdout:?}");
+    assert!(
+        !out.stdout.contains(&0x1b) && !out.stderr.contains(&0x1b),
+        "{stdout:?}"
+    );
     assert!(!stdout.contains("AAAA-BBBB-CCCC-DDDD"), "{stdout}");
     let expected = konsensus_api::pairing::device::key_fingerprint(
         &konsensus_api::pairing::device::key_id_for(&hex::decode(DEVICE).unwrap()),
     );
-    assert!(stdout.contains(&format!("device fingerprint:  {expected}")), "{stdout}");
+    assert!(
+        stdout.contains(&format!("device fingerprint:  {expected}")),
+        "{stdout}"
+    );
     assert!(stdout.contains("computed by this command"), "{stdout}");
     // With no terminal to type the password on, nothing is signed or sent.
     assert!(!out.status.success());
-    assert!(seen.iter().all(|r| !matches!(r, ControlRequest::ApproveDeviceKey { .. })), "the socket must not receive an approval");
+    assert!(
+        seen.iter()
+            .all(|r| !matches!(r, ControlRequest::ApproveDeviceKey { .. })),
+        "the socket must not receive an approval"
+    );
 }
 
 #[tokio::test]
@@ -118,7 +165,11 @@ async fn a_malformed_tuple_is_refused_before_signing() {
     let (out, seen) = approve(dir.path(), "0".repeat(32), "04zz").await;
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("malformed device key"));
-    assert!(seen.iter().all(|r| !matches!(r, ControlRequest::ApproveDeviceKey { .. })), "the socket must not receive an approval");
+    assert!(
+        seen.iter()
+            .all(|r| !matches!(r, ControlRequest::ApproveDeviceKey { .. })),
+        "the socket must not receive an approval"
+    );
 }
 
 /// Run the command in a new session with no controlling terminal, so a
