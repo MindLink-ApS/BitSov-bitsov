@@ -338,16 +338,25 @@ jobs:
             runner: ubuntu-latest
             artifact: bitsov-linux-aarch64
           - target: aarch64-apple-darwin
-            runner: macos-latest
+            runner: xcode-27
             artifact: bitsov-darwin-aarch64
           - target: x86_64-apple-darwin
-            runner: macos-latest
+            runner: xcode-27
             artifact: bitsov-darwin-x86_64
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             artifact: bitsov-windows-x86_64
     steps:
       - uses: actions/checkout@v4
+
+      # xcode-27 is the versioned Apple Silicon image (both Darwin targets).
+      # Fail closed if GitHub retires the exact Xcode build; never fall back.
+      - name: Select pinned Xcode
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.0.app
+          bash scripts/release-build.sh --check-toolchain ${{ matrix.target }}
 
       - name: Read release toolchain pin
         id: release-toolchain
@@ -389,6 +398,11 @@ jobs:
           else
             (cd artifacts && shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256)
           fi
+
+      - name: Prepare Darwin toolchain evidence
+        if: runner.os == 'macOS'
+        shell: bash
+        run: cp target/${{ matrix.target }}/release-toolchain.txt artifacts/${{ matrix.artifact }}.toolchain.txt
 
       # Windows: build output is `konsensus.exe`; there is no sha256sum/chmod. Emit the SAME GNU
       # "<hash>  <file>" line (lowercase hex, two spaces, LF, no BOM) so the checksum file is
@@ -448,3 +462,4 @@ jobs:
             artifacts/${{ matrix.artifact }}
             artifacts/${{ matrix.artifact }}.sha256
             artifacts/${{ matrix.artifact }}.sbom.spdx.json
+            ${{ runner.os == 'macOS' && format('artifacts/{0}.toolchain.txt', matrix.artifact) || '' }}

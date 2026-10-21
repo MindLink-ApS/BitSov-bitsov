@@ -21,6 +21,12 @@ mkdir -p "$WORK/bin" "$WORK/home" "$WORK/tmp" "$WORK/fixtures"
 export HOME="$WORK/home" GNUPGHOME="$WORK/home/gnupg" TMPDIR="$WORK/tmp"
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ALLOW_PROTOCOL=file
 export PATH="$WORK/bin:$PATH"
+# On macOS /usr/bin/git is an SDK-sensitive shim. Use the same real Git
+# directly so simulated SDKROOT paths do not invoke Xcode's tool installer.
+if [ "$(command -v git)" = /usr/bin/git ] && command -v xcrun >/dev/null; then
+  printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$(xcrun --find git)" > "$WORK/bin/git"
+  chmod +x "$WORK/bin/git"
+fi
 export TEST_ROOT="$WORK" TEST_TAG=v0.0.0-rc1
 export TEST_REPO=MindLink-ApS/BitSov-bitsov
 export REAL_GPG
@@ -77,6 +83,7 @@ case "${1:-} ${2:-}" in
       if [ -d "$CASE_DIR/upload" ]; then printf '%s\n' SHA256SUMS SHA256SUMS.asc; fi
       for name in bitsov-darwin-aarch64 bitsov-darwin-x86_64 bitsov-linux-aarch64 bitsov-linux-x86_64 bitsov-windows-x86_64; do
         printf '%s\n' "$name" "$name.sha256" "$name.sbom.spdx.json"
+        case "$name" in bitsov-darwin-*) printf '%s\n' "$name.toolchain.txt" ;; esac
       done
       exit 0
     fi
@@ -97,6 +104,11 @@ case "${1:-} ${2:-}" in
   'release download')
     asset=${7:-}
     case "$asset" in
+      bitsov-darwin-*.toolchain.txt)
+        expect_args "$(printf '%s\n' release download "$TEST_TAG" --repo "$TEST_REPO" --pattern "$asset" --clobber)" "$@"
+        cp "$TEST_ROOT/fixtures/$asset" .
+        exit 0
+        ;;
       bitsov-darwin-aarch64|bitsov-darwin-x86_64|bitsov-linux-aarch64|bitsov-linux-x86_64|bitsov-windows-x86_64) ;;
       *) bad_call "$@" ;;
     esac
@@ -209,6 +221,12 @@ case "$*" in
     [ "$CARGO_PROFILE_RELEASE_STRIP" = symbols ] || bad_call strip
     [ "$CARGO_INCREMENTAL" = 0 ] || bad_call incremental
     [[ "$CARGO_ENCODED_RUSTFLAGS" == *--remap-path-prefix* ]] || bad_call remap
+    if [[ "$TEST_HOST" == *-apple-darwin ]]; then
+      [ "$CC" = "$TEST_ROOT/bin/clang" ] || bad_call wrong-cc
+      [ "$CXX" = "$TEST_ROOT/bin/clang++" ] || bad_call wrong-cxx
+      [ "$AR" = "$TEST_ROOT/bin/ar" ] || bad_call wrong-ar
+      [ "$SDKROOT" = /mock/MacOSX27.0.sdk ] || bad_call wrong-sdk
+    fi
     printf '%s\n' "$PWD" >> "$CASE_DIR/build.log"
     case "$TEST_CASE" in *build-failure) exit 1 ;; esac
     mkdir -p "$CARGO_TARGET_DIR/$TEST_HOST/release"
@@ -221,6 +239,44 @@ case "$*" in
 esac
 STUB
 chmod +x "$WORK/bin/rustup"
+
+cat > "$WORK/bin/xcodebuild" <<'STUB'
+#!/usr/bin/env bash
+source "$TEST_ROOT/bin/common"
+expect_args -version "$@"
+case "$TEST_CASE" in
+  *xcode-drift) printf 'Xcode 27.1\nBuild version 27A9275\n' ;;
+  *build-drift) printf 'Xcode 27.0\nBuild version 27A999\n' ;;
+  *tools-missing) exit 1 ;;
+  *) printf 'Xcode 27.0\nBuild version 27A266a\n' ;;
+esac
+STUB
+cat > "$WORK/bin/xcrun" <<'STUB'
+#!/usr/bin/env bash
+source "$TEST_ROOT/bin/common"
+case "$*" in
+  '--sdk macosx --show-sdk-version')
+    if [[ "$TEST_CASE" == *sdk-drift ]]; then echo 26.5; else echo 27.0; fi ;;
+  '--sdk macosx --show-sdk-path') echo /mock/MacOSX27.0.sdk ;;
+  '--sdk macosx --find clang') echo "$TEST_ROOT/bin/clang" ;;
+  '--sdk macosx --find clang++') echo "$TEST_ROOT/bin/clang++" ;;
+  '--sdk macosx --find ar') echo "$TEST_ROOT/bin/ar" ;;
+  *) bad_call "$@" ;;
+esac
+STUB
+cat > "$WORK/bin/clang" <<'STUB'
+#!/usr/bin/env bash
+source "$TEST_ROOT/bin/common"
+expect_args --version "$@"
+if [[ "$TEST_CASE" == *clang-drift ]]; then
+  echo 'Apple clang version 20.0.0 (clang-2000.0.0)'
+else
+  echo 'Apple clang version 21.0.0 (clang-2100.3.34.2)'
+fi
+printf 'Target: arm64-apple-darwin27.0.0\nThread model: posix\nInstalledDir: /mock/Xcode/usr/bin\n'
+STUB
+chmod +x "$WORK/bin/xcodebuild" "$WORK/bin/xcrun" "$WORK/bin/clang"
+
 
 # A broken run-list stub must fail promptly rather than spend ten minutes
 # polling. Record it even if the production script ignores the exit status.
@@ -238,6 +294,12 @@ for asset in bitsov-darwin-aarch64 bitsov-darwin-x86_64 bitsov-linux-aarch64 bit
   (cd "$WORK/fixtures" && shasum -a 256 "$asset" > "$asset.sha256")
   printf '{"spdxVersion":"SPDX-2.3","name":"%s"}\n' "$asset" > "$WORK/fixtures/$asset.sbom.spdx.json"
   (cd "$WORK/fixtures" && shasum -a 256 "$asset" "$asset.sha256" "$asset.sbom.spdx.json") >> "$WORK/expected-sums"
+  case "$asset" in
+    bitsov-darwin-*)
+      printf 'target=%s\nxcode_version=27.0\nxcode_build=27A266a\nsdk_version=27.0\nclang --version:\nApple clang version 21.0.0 (clang-2100.3.34.2)\n' "$asset" > "$WORK/fixtures/$asset.toolchain.txt"
+      (cd "$WORK/fixtures" && shasum -a 256 "$asset.toolchain.txt") >> "$WORK/expected-sums"
+      ;;
+  esac
 done
 
 run_case() (
@@ -257,14 +319,20 @@ run_case() (
   mkdir scripts
   printf '1.91.1\n' > scripts/release-toolchain
   cp "$HERE/release-build.sh" scripts/release-build.sh
+  if [ -f "$HERE/release-macos-toolchain.sh" ]; then
+    cp "$HERE/release-macos-toolchain.sh" scripts/
+  fi
   printf 'tagged\n' > tagged-content
-  git add scripts/release-toolchain scripts/release-build.sh tagged-content
+  git add scripts tagged-content
   git commit -q -m release
   COMMIT=$(git rev-parse HEAD)
   export COMMIT OTHER_COMMIT
   export TEST_HOST=x86_64-unknown-linux-gnu TEST_HOST_ASSET=bitsov-linux-x86_64
-  if [ "$TEST_CASE" = accept-darwin-mismatch ]; then
+  if [[ "$TEST_CASE" == *darwin* ]]; then
     TEST_HOST=aarch64-apple-darwin TEST_HOST_ASSET=bitsov-darwin-aarch64
+  fi
+  if [[ "$TEST_CASE" == *darwin-intel* ]]; then
+    TEST_HOST=x86_64-apple-darwin TEST_HOST_ASSET=bitsov-darwin-x86_64
   fi
   git remote add origin "file://$CASE_DIR/origin.git"
   git push -q -u origin main
@@ -275,10 +343,31 @@ run_case() (
     git push -q origin "refs/tags/$TEST_TAG"
     old_tag=$(git rev-parse "refs/tags/$TEST_TAG")
   fi
+  if [[ "$TEST_CASE" == build-darwin-* ]]; then
+    rc=0
+    bash scripts/release-build.sh "$TEST_HOST" > "$CASE_DIR/output" 2>&1 || rc=$?
+    if [[ "$TEST_CASE" == *-match ]]; then
+      [ "$rc" -eq 0 ] && [ -s "$CASE_DIR/build.log" ] || fail 'matching build preflight did not proceed'
+      grep -q '^xcode_build=27A266a$' "target/$TEST_HOST/release-toolchain.txt" || fail 'missing Xcode evidence'
+      grep -q '^sdk_version=27.0$' "target/$TEST_HOST/release-toolchain.txt" || fail 'missing SDK evidence'
+      grep -q '^Apple clang version 21.0.0 (clang-2100.3.34.2)$' "target/$TEST_HOST/release-toolchain.txt" || fail 'missing clang evidence'
+    else
+      [ "$rc" -ne 0 ] || fail 'build accepted toolchain drift'
+      [ ! -e "$CASE_DIR/build.log" ] || fail 'build ran before toolchain rejection'
+      grep -q 'macOS toolchain preflight' "$CASE_DIR/output" || fail 'missing preflight diagnosis'
+      grep -q 'Xcode_27.0.app' "$CASE_DIR/output" || fail 'missing repair instructions'
+    fi
+    [ ! -f "$CASE_DIR/unexpected" ] || fail 'unexpected stub call'
+    exit 0
+  fi
   # Exclude fixture setup from side-effect assertions.
   rm -f "$CASE_DIR/signed-tag"
   : > "$CASE_DIR/gpg.log"
   : > "$CASE_DIR/gh.log"
+  case "$TEST_CASE" in
+    *sdk-override) export SDKROOT=/mock/other.sdk ;;
+    *compiler-override) export CC_aarch64_apple_darwin=/mock/other-clang ;;
+  esac
   # A dirty checkout and later commit must never become the build input.
   printf 'exit 89\n' > scripts/release-build.sh
   printf 'later\n' > tagged-content
@@ -337,9 +426,19 @@ run_case() (
     ! grep -q -- '--list-secret-keys' "$CASE_DIR/gpg.log" || fail 'evidence failure accessed private keys'
     exit 0
   fi
+  if [[ "$TEST_CASE" == *darwin-* ]] && [[ "$TEST_CASE" != *-match && "$TEST_CASE" != *-mismatch ]]; then
+    [ "$rc" -ne 0 ] || fail 'signer accepted toolchain drift'
+    [ ! -e "$CASE_DIR/build.log" ] || fail 'signer rebuilt before toolchain rejection'
+    [ ! -s "$CASE_DIR/gh.log" ] || fail 'signer contacted CI before toolchain rejection'
+    [ ! -s "$CASE_DIR/gpg.log" ] || fail 'signer accessed GPG before toolchain rejection'
+    [ ! -e "$CASE_DIR/upload.args" ] || fail 'signer uploaded after toolchain rejection'
+    grep -q 'macOS toolchain preflight' "$CASE_DIR/output" || fail 'missing preflight diagnosis'
+    grep -q 'Xcode_27.0.app' "$CASE_DIR/output" || fail 'missing repair instructions'
+    exit 0
+  fi
   reason=''
   case "$TEST_CASE" in
-    existing|fresh|subkey|stderr-noise|retry|retry-sums|retry-signature|dry-existing|accept-mismatch|dry-accept-mismatch|accept-darwin-mismatch|accept-match) ;;
+    darwin-match|darwin-intel-match|existing|fresh|subkey|stderr-noise|retry|retry-sums|retry-signature|dry-existing|accept-mismatch|dry-accept-mismatch|accept-darwin-mismatch|accept-match) ;;
     mismatch|dry-mismatch|compromised-ci) reason='reproducibility mismatch for x86_64-unknown-linux-gnu' ;;
     build-failure|accept-build-failure) reason='local rebuild failed' ;;
     no-waivers|missing-waiver|accept-missing-waiver) reason='unverified target' ;;
@@ -364,6 +463,14 @@ run_case() (
     *mismatch|compromised-ci)
       evidence=$(sed -n 's/^REBUILD EVIDENCE: //p' "$CASE_DIR/output")
       [ -d "$evidence" ] || fail 'mismatch evidence was not retained'
+      for asset in bitsov-darwin-aarch64 bitsov-darwin-x86_64; do
+        cmp "$WORK/fixtures/$asset.toolchain.txt" "$evidence/$asset.toolchain.txt"
+      done
+      if [[ "$TEST_HOST" == *-apple-darwin ]]; then
+        grep -qx 'xcode_build=27A266a' "$evidence/host-toolchain.txt" || fail 'missing retained Xcode build'
+        grep -qx 'sdk_version=27.0' "$evidence/host-toolchain.txt" || fail 'missing retained SDK'
+        grep -qx 'Apple clang version 21.0.0 (clang-2100.3.34.2)' "$evidence/host-toolchain.txt" || fail 'missing retained clang'
+      fi
       [ -f "$evidence/$TEST_HOST_ASSET.rebuilt" ] || fail 'rebuilt binary was deleted'
       cp "$WORK/fixtures/$TEST_HOST_ASSET" "$CASE_DIR/expected-rebuilt"
       [ "$TEST_CASE" = compromised-ci ] || echo different >> "$CASE_DIR/expected-rebuilt"
@@ -427,9 +534,9 @@ run_case() (
     cmp "$CASE_DIR/expected.args" "$CASE_DIR/upload.args"
     runs=1
     [ "$TEST_CASE" != retry ] || runs=2
-    [ "$(grep -c '^release download ' "$CASE_DIR/gh.log")" -eq $((5 * runs)) ]
+    [ "$(grep -c '^release download ' "$CASE_DIR/gh.log")" -eq $((7 * runs)) ]
     [ "$(grep -c '^release upload ' "$CASE_DIR/gh.log")" -eq "$runs" ]
-    [ "$(wc -l < "$CASE_DIR/upload/SHA256SUMS")" -eq 15 ]
+    [ "$(wc -l < "$CASE_DIR/upload/SHA256SUMS")" -eq 17 ]
     grep -qx "run watch 123 --repo $TEST_REPO --exit-status" "$CASE_DIR/gh.log"
     grep -qx -- '--status-fd 1 --verify SHA256SUMS.asc SHA256SUMS' "$CASE_DIR/gpg.log"
     grep -q '^Not published\.' "$CASE_DIR/output"
@@ -487,7 +594,9 @@ locales+=("$utf8")
 
 passed=0 failed=0
 for test_locale in "${locales[@]}"; do
-  for test_case in existing fresh wrong-tag ci-sha non-draft checksum filename expired-tag \
+  for test_case in darwin-xcode-drift darwin-build-drift darwin-sdk-drift darwin-clang-drift darwin-tools-missing darwin-sdk-override darwin-compiler-override \
+    accept-darwin-sdk-drift darwin-match darwin-intel-match build-darwin-xcode-drift build-darwin-build-drift \
+    build-darwin-sdk-drift build-darwin-clang-drift build-darwin-tools-missing build-darwin-match existing fresh wrong-tag ci-sha non-draft checksum filename expired-tag \
     expired-sums mismatch compromised-ci unsupported-host build-failure no-waivers missing-waiver waive-host \
     unknown-waiver dry-existing dry-mismatch dry-fresh accept-mismatch dry-accept-mismatch accept-darwin-mismatch accept-evidence-failure-mismatch \
     accept-match accept-build-failure accept-checksum accept-missing-waiver reason-empty reason-blank reason-option reason-missing \

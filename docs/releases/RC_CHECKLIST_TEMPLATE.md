@@ -7,11 +7,23 @@ Pre-release; not for production use. Copy this template for each new RC.
 - [ ] Record the reviewed commit on `origin/main`, scope, migration and rollback
       constraints. Update versions, lockfile, changelog and upgrade notes.
 - [ ] Review the tag's `scripts/release-toolchain`, `scripts/release-build.sh`,
-      lockfile and CI release matrix together. Install the pinned Rust toolchain.
+      `scripts/release-macos-toolchain.sh`, lockfile and CI release matrix together.
+      Install the pinned Rust toolchain.
+- [ ] On NOVA, install/select **Xcode 27.0 build 27A266a**, macOS SDK **27.0**,
+      Apple clang **21.0.0 (clang-2100.3.34.2)** using the
+      [installation steps](../ops/RELEASE_POLICY.md#pinned-macos-release-toolchain-nova).
+      From the reviewed release commit, run
+      `bash scripts/release-build.sh --check-toolchain aarch64-apple-darwin`.
+      A mismatch must stop before rebuilding or signing; host break-glass cannot
+      waive it. Confirm both Darwin CI jobs use `xcode-27` and explicitly select
+      `/Applications/Xcode_27.0.app`.
 - [ ] Pass release CI and the isolated release-signing regression tests.
       Tests use only generated keys in a throwaway GnuPG home.
 - [ ] Record signing host triple, `rustc -vV`, native compiler/linker/SDK versions,
       CI runner image and the tag commit's timestamp (`SOURCE_DATE_EPOCH`).
+- [ ] Archive both Darwin `<asset>.toolchain.txt` release assets and the local
+      preflight log: SDK version, Xcode build and full `clang --version` output.
+      Verify both evidence assets are covered by `SHA256SUMS` (17 source assets).
 
 ## Rebuild and sign
 
@@ -29,7 +41,8 @@ Pre-release; not for production use. Copy this template for each new RC.
       local/CI SHA-256, or explicitly record a host break-glass decision below.
       Retain every non-host `ACCEPT UNVERIFIED` entry and its rationale.
 - [ ] On any mismatch, inspect and archive the printed `REBUILD EVIDENCE` directory:
-      rebuilt binary, hash diff, `SHA256SUMS` and `manifest.txt`. It survives exit
+      rebuilt binary, hash diff, `SHA256SUMS`, `manifest.txt`, both CI Darwin
+      toolchain records and (on NOVA) `host-toolchain.txt`. It survives exit
       even on rejection or dry-run; later attempts create separate directories.
 - [ ] If proceeding despite an investigated host mismatch, supply
       `--accept-unverified-host "<incident-specific reason>"` explicitly. Confirm
