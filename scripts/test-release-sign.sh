@@ -13,6 +13,7 @@ WORK=$(mktemp -d /tmp/release-sign-test.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin" "$WORK/home" "$WORK/tmp" "$WORK/fixtures"
 export HOME="$WORK/home" GNUPGHOME="$WORK/home/gnupg" TMPDIR="$WORK/tmp"
+mkdir -m 700 "$GNUPGHOME"
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ALLOW_PROTOCOL=file
 export PATH="$WORK/bin:$PATH"
 export TEST_ROOT="$WORK" TEST_TAG=v0.0.0-rc1
@@ -48,8 +49,34 @@ case "${1:-} ${2:-}" in
     expect_args "$(printf '%s\n' run watch 123 --repo "$TEST_REPO" --exit-status)" "$@"
     ;;
   'release view')
+    if [ "${7:-}" = assets ]; then
+      expect_args "$(printf '%s\n' release view "$TEST_TAG" --repo "$TEST_REPO" --json assets -q '.assets[].name')" "$@"
+      case "$TEST_CASE" in
+        extra-asset|retry-extra) printf '%s\n' BitSov.dmg ;;
+        retry-lookalike) printf '%s\n' SHA256SUMS.asc.bak ;;
+      esac
+      case "$TEST_CASE" in
+        retry-sums) printf '%s\n' SHA256SUMS ;;
+        retry-signature) printf '%s\n' SHA256SUMS.asc ;;
+        retry-extra|retry-lookalike) printf '%s\n' SHA256SUMS SHA256SUMS.asc ;;
+      esac
+      # A second invocation sees exactly the output uploaded by the first.
+      if [ -d "$CASE_DIR/upload" ]; then printf '%s\n' SHA256SUMS SHA256SUMS.asc; fi
+      for name in bitsov-darwin-aarch64 bitsov-darwin-x86_64 bitsov-linux-aarch64 bitsov-linux-x86_64 bitsov-windows-x86_64; do
+        printf '%s\n' "$name" "$name.sha256" "$name.sbom.spdx.json"
+      done
+      exit 0
+    fi
     expect_args "$(printf '%s\n' release view "$TEST_TAG" --repo "$TEST_REPO" --json isDraft -q .isDraft)" "$@"
-    if [ "$TEST_CASE" = non-draft ]; then echo false; else echo true; fi
+    n=0
+    if [ -f "$CASE_DIR/draft-checks" ]; then n=$(cat "$CASE_DIR/draft-checks"); fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$CASE_DIR/draft-checks"
+    if [ "$TEST_CASE" = non-draft ] || { [ "$TEST_CASE" = published-late ] && [ "$n" -ge 2 ]; }; then
+      echo false
+    else
+      echo true
+    fi
     ;;
   'release download')
     asset=${7:-}
@@ -57,7 +84,12 @@ case "${1:-} ${2:-}" in
       bitsov-darwin-aarch64|bitsov-darwin-x86_64|bitsov-linux-aarch64|bitsov-linux-x86_64|bitsov-windows-x86_64) ;;
       *) bad_call "$@" ;;
     esac
-    expect_args "$(printf '%s\n' release download "$TEST_TAG" --repo "$TEST_REPO" --pattern "$asset" --pattern "$asset.sha256" --clobber)" "$@"
+    if [ "${10:-}" = --clobber ]; then
+      expect_args "$(printf '%s\n' release download "$TEST_TAG" --repo "$TEST_REPO" --pattern "$asset" --pattern "$asset.sha256" --clobber)" "$@"
+    else
+      expect_args "$(printf '%s\n' release download "$TEST_TAG" --repo "$TEST_REPO" --pattern "$asset" --pattern "$asset.sha256" --pattern "$asset.sbom.spdx.json" --clobber)" "$@"
+      cp "$TEST_ROOT/fixtures/$asset.sbom.spdx.json" .
+    fi
     cp "$TEST_ROOT/fixtures/$asset" "$TEST_ROOT/fixtures/$asset.sha256" .
     # Corrupt the LAST asset: the script must validate all five before signing.
     if [ "$asset" = bitsov-windows-x86_64 ]; then
@@ -70,7 +102,7 @@ case "${1:-} ${2:-}" in
   'release upload')
     printf '%s\n' "$@" > "$CASE_DIR/upload.args"
     expect_args "$(printf '%s\n' release upload "$TEST_TAG" SHA256SUMS SHA256SUMS.asc --repo "$TEST_REPO" --clobber)" "$@"
-    mkdir "$CASE_DIR/upload"
+    mkdir -p "$CASE_DIR/upload"
     cp SHA256SUMS SHA256SUMS.asc "$CASE_DIR/upload/"
     ;;
   *) bad_call "$@" ;; # Includes release edit/create: publishing always fails.
@@ -85,13 +117,41 @@ signature() {
   printf '%s\n' '-----BEGIN PGP SIGNATURE-----' '' 'offline-test-signature' '-----END PGP SIGNATURE-----'
 }
 status() {
-  local marker=GOODSIG
+  local marker=GOODSIG fpr=$TEST_KEY
   if [ "$TEST_CASE" = "expired-$1" ]; then marker=EXPKEYSIG; fi
+  if [ "$TEST_CASE" = subkey ]; then fpr=0123456789ABCDEF0123456789ABCDEF01234567; fi
   printf '[GNUPG:] NEWSIG\n'
-  printf '[GNUPG:] %s %s Test Release Key\n' "$marker" "${TEST_KEY:24}"
-  # GPG emits VALIDSIG even with EXPKEYSIG; exit zero deliberately tests the
-  # status filter rather than relying on GPG's process exit code.
-  printf '[GNUPG:] VALIDSIG %s 2026-01-01 1767225600 0 4 0 1 10 00 %s\n' "$TEST_KEY" "$TEST_KEY"
+  # Both verification paths must ignore human stderr, even status-like text.
+  if [ "$TEST_CASE" = "stderr-only-$1" ]; then
+    printf '[GNUPG:] GOODSIG %s Test Release Key\n' "${TEST_KEY:24}"
+    printf '[GNUPG:] VALIDSIG %s 2026-01-01 1767225600 0 4 0 1 10 00 %s\n' "$TEST_KEY" "$TEST_KEY" >&2
+    return
+  fi
+  if [ "$TEST_CASE" = stderr-noise ]; then
+    printf '[GNUPG:] BADSIG %s diagnostic, not status\n' "${TEST_KEY:24}" >&2
+  fi
+  if [ "$TEST_CASE" = notation ] && [ "$1" = tag ]; then
+    # A user id that contains the release fingerprint must not count as VALIDSIG.
+    printf '[GNUPG:] GOODSIG %s VALIDSIG %s\n' "${TEST_KEY:24}" "$TEST_KEY"
+    printf '[GNUPG:] VALIDSIG %s 2026-01-01 1767225600 0 4 0 1 10 00 %s\n' \
+      AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  else
+    printf '[GNUPG:] %s %s Test Release Key\n' "$marker" "${TEST_KEY:24}"
+    # GPG emits VALIDSIG even with EXPKEYSIG; exit zero deliberately tests the
+    # status filter rather than relying on GPG's process exit code.
+    # subkey: signing-key fingerprint differs; the primary field is the release key.
+    case "$TEST_CASE" in
+      "wrong-primary-$1")
+        printf '[GNUPG:] VALIDSIG %s 2026-01-01 1767225600 0 4 0 1 10 00 %s\n' "$TEST_KEY" AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ;;
+      "missing-primary-$1")
+        printf '[GNUPG:] VALIDSIG %s 2026-01-01 1767225600 0 4 0 1 10 00\n' "$TEST_KEY" ;;
+      "truncated-$1") printf '[GNUPG:] VALIDSIG %s\n' "$TEST_KEY" ;;
+      "trailing-key-$1")
+        printf '[GNUPG:] VALIDSIG %s 2026-01-01 1767225600 0 4 0 1 10 00 %s %s\n' \
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA "$TEST_KEY" ;;
+      *) printf '[GNUPG:] VALIDSIG %s 2026-01-01 1767225600 0 4 0 1 10 00 %s\n' "$fpr" "$TEST_KEY" ;;
+    esac
+  fi
   printf '[GNUPG:] TRUST_ULTIMATE 0 pgp\n'
 }
 case "${1:-}" in
@@ -141,7 +201,8 @@ chmod +x "$WORK/bin/gh" "$WORK/bin/gpg" "$WORK/bin/sleep"
 for asset in bitsov-darwin-aarch64 bitsov-darwin-x86_64 bitsov-linux-aarch64 bitsov-linux-x86_64 bitsov-windows-x86_64; do
   printf 'offline binary: %s\n' "$asset" > "$WORK/fixtures/$asset"
   (cd "$WORK/fixtures" && shasum -a 256 "$asset" > "$asset.sha256")
-  cat "$WORK/fixtures/$asset.sha256" >> "$WORK/expected-sums"
+  printf '{"spdxVersion":"SPDX-2.3","name":"%s"}\n' "$asset" > "$WORK/fixtures/$asset.sbom.spdx.json"
+  (cd "$WORK/fixtures" && shasum -a 256 "$asset" "$asset.sha256" "$asset.sbom.spdx.json") >> "$WORK/expected-sums"
 done
 
 run_case() (
@@ -176,18 +237,27 @@ run_case() (
   : > "$CASE_DIR/gh.log"
   rc=0
   bash "$HERE/release-sign.sh" "$TEST_TAG" "$COMMIT" > "$CASE_DIR/output" 2>&1 || rc=$?
+  if [ "$TEST_CASE" = retry ]; then
+    [ "$rc" -eq 0 ] || fail "initial signing failed: $rc"
+    cmp "$WORK/expected-sums" "$CASE_DIR/upload/SHA256SUMS"
+    # Stale uploaded output must be replaced, not downloaded into the new sums.
+    printf 'stale manifest\n' > "$CASE_DIR/upload/SHA256SUMS"
+    printf 'stale signature\n' > "$CASE_DIR/upload/SHA256SUMS.asc"
+    bash "$HERE/release-sign.sh" "$TEST_TAG" "$COMMIT" >> "$CASE_DIR/output" 2>&1 || rc=$?
+  fi
   [ ! -f "$CASE_DIR/unexpected" ] || { cat "$CASE_DIR/unexpected"; fail 'unexpected stub call'; }
 
   reason=''
   case "$TEST_CASE" in
-    existing|fresh) ;;
+    existing|fresh|subkey|stderr-noise|retry|retry-sums|retry-signature) ;;
     wrong-tag) reason="tag $TEST_TAG exists on a different commit" ;;
     ci-sha) reason="CI run 123 built $OTHER_COMMIT, not the tagged commit $COMMIT" ;;
-    non-draft) reason="release $TEST_TAG is not a draft; refusing to change it" ;;
+    non-draft|published-late) reason="release $TEST_TAG is not a draft; refusing to change it" ;;
+    extra-asset|retry-extra|retry-lookalike) reason="release $TEST_TAG assets are not exactly the five binaries" ;;
     checksum) reason='bitsov-windows-x86_64: expected' ;;
     filename) reason='bitsov-windows-x86_64.sha256 names a different file' ;;
-    expired-tag) reason="existing tag $TEST_TAG is not validly signed" ;;
-    expired-sums) reason='signature check failed' ;;
+    expired-tag|notation|wrong-primary-tag|missing-primary-tag|truncated-tag|trailing-key-tag|stderr-only-tag) reason="existing tag $TEST_TAG is not validly signed" ;;
+    expired-sums|wrong-primary-sums|missing-primary-sums|truncated-sums|trailing-key-sums|stderr-only-sums) reason='signature check failed' ;;
     *) fail "unknown case $TEST_CASE" ;;
   esac
   if [ -z "$reason" ]; then
@@ -196,8 +266,11 @@ run_case() (
     cmp "$CASE_DIR/signed-sums" "$CASE_DIR/upload/SHA256SUMS"
     printf '%s\n' release upload "$TEST_TAG" SHA256SUMS SHA256SUMS.asc --repo "$TEST_REPO" --clobber > "$CASE_DIR/expected.args"
     cmp "$CASE_DIR/expected.args" "$CASE_DIR/upload.args"
-    [ "$(grep -c '^release download ' "$CASE_DIR/gh.log")" -eq 5 ]
-    [ "$(grep -c '^release upload ' "$CASE_DIR/gh.log")" -eq 1 ]
+    runs=1
+    [ "$TEST_CASE" != retry ] || runs=2
+    [ "$(grep -c '^release download ' "$CASE_DIR/gh.log")" -eq $((5 * runs)) ]
+    [ "$(grep -c '^release upload ' "$CASE_DIR/gh.log")" -eq "$runs" ]
+    [ "$(wc -l < "$CASE_DIR/upload/SHA256SUMS")" -eq 15 ]
     grep -qx "run watch 123 --repo $TEST_REPO --exit-status" "$CASE_DIR/gh.log"
     grep -qx -- '--status-fd 1 --verify SHA256SUMS.asc SHA256SUMS' "$CASE_DIR/gpg.log"
     grep -q '^Not published\.' "$CASE_DIR/output"
@@ -206,7 +279,7 @@ run_case() (
     [ "$rc" -ne 0 ] || fail 'expected rejection, got success'
     grep -F "release-sign: $reason" "$CASE_DIR/output" >/dev/null || fail "missing rejection: $reason"
     [ ! -e "$CASE_DIR/upload.args" ] || fail 'uploaded after rejection'
-    if [ "$TEST_CASE" != expired-sums ]; then
+    if [ "$reason" != 'signature check failed' ]; then
       [ ! -e "$CASE_DIR/signed-sums" ] || fail 'signed before validation finished'
     fi
   fi
@@ -245,7 +318,10 @@ locales+=("$utf8")
 
 passed=0 failed=0
 for test_locale in "${locales[@]}"; do
-  for test_case in existing fresh wrong-tag ci-sha non-draft checksum filename expired-tag expired-sums; do
+  for test_case in existing fresh subkey wrong-tag ci-sha non-draft published-late extra-asset checksum filename expired-tag notation expired-sums \
+    wrong-primary-tag missing-primary-tag truncated-tag trailing-key-tag \
+    wrong-primary-sums missing-primary-sums truncated-sums trailing-key-sums \
+    stderr-only-tag stderr-only-sums stderr-noise retry retry-sums retry-signature retry-extra retry-lookalike; do
     # Launch a separate process so errexit remains active inside run_case.
     # Calling a function in an if condition would silently disable it.
     set +e
