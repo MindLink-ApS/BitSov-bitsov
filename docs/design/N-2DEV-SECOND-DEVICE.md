@@ -4,7 +4,7 @@ Design note, docs only. Source read at `origin/main` `7af21ae`. Paths are under 
 
 **Ruling (Atlas, 21 Oct).** A box is claimed **exactly once**, by its owner's first device, with the claim code that Rasmus types on the owner console. Every later device joins as a **second device**: QR → word match → an **already-enrolled owner device approves** with Touch ID / Face ID. Second devices never use a claim code.
 
-**Problem.** Today the only tunnel path for a later device is the claim-bound SAS v1. `request_device_key_with_sas` loads the claim code and mixes its commitment into the digest (`konsensus-api/src/pairing/device.rs:567`, `sas.rs:115`). Tunnel delegation refuses anything else (`device.rs:860`, `:906`). The new device therefore has to type the claim code to compute the words, which is why app onboarding PR 1 could not drop it. This note defines the node contract that removes the claim from the second-device path and leaves the first-device path unchanged.
+**Problem.** Today the only tunnel path for a later device is the claim-bound SAS v1. `request_device_key_with_sas` loads the claim code and mixes its commitment into the digest (`konsensus-api/src/pairing/device.rs:567`, `konsensus-api/src/sas.rs:116`). Tunnel delegation refuses anything else (`device.rs:860`, `:906`). The new device therefore has to type the claim code to compute the words, which is why app onboarding PR 1 could not drop it. This note defines the node contract that removes the claim from the second-device path and leaves the first-device path unchanged.
 
 **Constraints.**
 
@@ -12,7 +12,7 @@ Design note, docs only. Source read at `origin/main` `7af21ae`. Paths are under 
 |---|---|---|
 | C1 | Claim code is first-device only and is typed on the console | SAS v1, remote first run and console `device approve` are unchanged. SAS v2 never reads `claim-code` |
 | C2 | The approver sees the same word match: one step, one short line | The approver shows the 4 words and "Approve if these match your new device", then Face ID / Touch ID. The new device has no "They match" button |
-| C3 | Approval is revocable from the owner console | `konsensus device revoke --key … [--with-pairing]`, plus provenance in `device list` (§7) |
+| C3 | Approval is revocable from the owner console | `konsensus device revoke --key … [--with-pairing] [--cascade]` and a transitive `--approved-by`, plus provenance in `device list` (§7) |
 | C4 | Each person keeps their own seed | Nothing here touches seeds. The node's own seed-derived owner key signs the enrollment, exactly as delegation does today |
 | C5 | No new network exposure | No new listener, port, push service or relay. Every call uses the existing Noise tunnel routes, each device on its own session |
 
@@ -24,7 +24,7 @@ Design note, docs only. Source read at `origin/main` `7af21ae`. Paths are under 
 | Console ticket `konsensus pair-ticket [--qr]` | `konsensus-node/src/cli/ticket.rs:84` | The QR source on the box console (gains `--second-device`, §7) |
 | Ticket dispatch in the Noise listener | `konsensus-node/src/remote_access.rs:1053` | Routes `second_` / owner tickets of purpose `second_device` to a provisional pairing |
 | `NoiseBinding {handshake_hash, box_public_key, client_static}` attached by the server, never from HTTP | `remote_access.rs:899-907`, `rate_limit.rs:33-40` | Bound into the SAS v2 digest and the approval message |
-| `PendingDeviceKey` + memory-only `DeviceSas`, a single live SAS op node-wide, `sas_failures ≥ 3` closes SAS | `device.rs:108-176`, `:503-509`, `pairing.rs:661` | The pending second-device record (`sas_version: 2`) |
+| `PendingDeviceKey` + memory-only `DeviceSas`, a single live SAS op node-wide, `sas_failures ≥ 3` closes SAS | `device.rs:108-176`, `:503-509`, `pairing.rs:661` | The pending second-device record (`sas_version: 2`). v2 failures are charged to the provisional pairing, not to `sas_failures` (§5) |
 | Owner pending list and per-op view over the approver's tunnel | `ticket.rs:232-300`, routes `GET …/device-key/pending`, `GET …/{op}/delegation` | The channel that carries the approval request (§2) |
 | `delegate_device_key_inner`: re-verify the approver key, sign `owner_approval_message` with the in-memory seed-derived key, consume atomically | `device.rs:879-994` | The enrollment write, with a new message domain |
 | `verify_p256` (ring, ECDSA P-256/SHA-256, DER) and 65-byte SEC1 parsing | `device.rs:323-345` | Verifying the iPhone Secure Enclave key (app #284) |
@@ -38,16 +38,16 @@ The approval request reaches the owner device **by pull over the owner device's 
 | 1 | Owner device → node (owner tunnel) | `GET /pair/ticket` → nonce; `POST /pair/ticket {approver_key_id, nonce, purpose:"second_device", signature}` (`bitsov-ticket-v2`) | Ticket hash in memory, 5 min, `purpose=second_device`, issuer key + epoch |
 | 1′ | *or* Rasmus at the console | `konsensus pair-ticket --second-device --qr` | Ticket file with a `second_` code, 10 min default |
 | 2 | Owner device / console → new device (camera) | QR = PairLink v2 (signed endpoints, box key pin) | n/a |
-| 3 | New device → node (new Noise XX, pinned box key) | Pairing proof with the ticket code (`wire::pairing_proof_message`) | Ticket consumed. **Provisional pairing**: `scopes: []`, plus a memory record `{client_id, ticket_id, ticket_commitment, issuer, deadline = now+15 min}` |
+| 3 | New device → node (new Noise XX, pinned box key) | Pairing proof with the ticket code (`wire::pairing_proof_message`) | Ticket consumed and a **used-ticket tombstone** `{ticket_hash → client_id}` kept until the provisional deadline. **Provisional pairing**: `scopes: []`, plus a memory record `{client_id, ticket_id, ticket_commitment, issuer, deadline = now+15 min, failures = 0}`. If the client pubkey or Noise static already has a pairing → refuse `already_paired` (§5a). If the tombstone exists (QR already used) → **contested** kill (§6) |
 | 4 | New device → node (its tunnel) | `POST /pair/token` (existing challenge flow) | Token valid only on the 4 enrollment routes (§6) |
-| 5 | New device → node | `POST /pair/device-key {public_key, name, proof, sas_version:2}`, where `proof` is the Secure Enclave sig over `bitsov-device-register-v1` | `PendingDeviceKey{sas_version:2}` with `DeviceSas{binding, box_nonce, digest_v2}`. Response `{op_id, box_nonce, expires_at}` |
+| 5 | New device → node | `POST /pair/device-key {public_key, name, proof, sas_version:2}`, where `proof` is the Secure Enclave sig over `bitsov-device-register-v1` | `PendingDeviceKey{sas_version:2, created_at}` with `DeviceSas{binding, box_nonce, digest_v2}`, `expires_at = now + SECOND_DEVICE_SAS_TTL_SECS` (300). Response `{op_id, box_nonce, expires_at}` |
 | 6 | New device (local) | Computes `digest_v2` from its own handshake hash, box key, own static, own device key, `box_nonce` and the ticket code it scanned | n/a |
-| 7 | New device → node | `POST /pair/device-key/{op}/finalize {sas_version:2, sas_digest, proof}` with `proof` over `bitsov-device-register-v2 … sas_digest:` (automatic, no human tap) | Constant-time digest compare. Mismatch → op dropped, `sas_failures += 1`. Match → `confirmed = true` |
-| 8 | New device (UI) | Shows the 4 words and "Approve on your other device". Quiet "They don't match" → `DELETE /pair/device-key/{op}` | n/a |
+| 7 | New device → node | `POST /pair/device-key/{op}/finalize {sas_version:2, sas_digest, proof}` with `proof` over `bitsov-device-register-v2 … sas_digest:` (automatic, no human tap) | Constant-time digest compare. Mismatch → op dropped and the **provisional pairing revoked** (its first failure is its last); a node-wide `sas_v2_mismatches` counter rises (§5). Match → `confirmed = true` |
+| 8 | New device (UI) | Shows the 4 words and "Approve on your other device". Quiet "They don't match" → `DELETE /pair/device-key/{op}` | On a v2 op: op dropped and provisional pairing revoked. No node-wide count |
 | 9 | Owner device → node (owner tunnel, poll) | `GET /pair/device-key/pending` → `GET /pair/device-key/{op}/delegation` | Read only |
-| 10 | Owner device (UI) | Rebuilds the approval message from the fields and its pinned node fingerprint, recomputes the words from `sas_digest`, and shows the words + one line. Face ID / Touch ID signs | n/a |
+| 10 | Owner device (UI) | Rebuilds the approval message from the fields and its pinned node fingerprint, recomputes the words from `sas_digest`, and shows the words + one line (the unsigned-by-device name in small secondary text, §4). **Approve is enabled only when `ticket_id` equals the QR this app is showing right now**; any other v2 op is shown as console-origin (open question 1). Face ID / Touch ID signs | n/a |
 | 11 | Owner device → node | `POST /pair/device-key/{op}/second-device/approve {approver_key_id, signature}` | §5 checks. Enrolled `DeviceKey{enrolled_by:"second_device:<approver key_id>"}`, pairing scopes → `[read, receive]`, op + nonce consumed, provisional record removed, all in one lock and one persist |
-| 11′ | Owner device → node | `POST …/second-device/reject {approver_key_id, signature}` (domain `…-reject-v1`, same fields) | Op dropped, provisional pairing revoked, `sas_failures += 1` |
+| 11′ | Owner device → node | `POST …/second-device/reject {approver_key_id, signature}` (domain `…-reject-v1`, same fields) | Op dropped, provisional pairing revoked. No node-wide count (the reject is the owner's own decision) |
 | 12 | New device → node | `GET /pair/device-key/{op}` → `registered` | Normal paired device |
 
 ## 3. SAS v2 digest (claimless)
@@ -87,6 +87,7 @@ nonce:{32 hex, server delegation nonce, single use}
 client_pubkey:{new pairing Ed25519 pubkey hex}
 epoch:{new pairing epoch}
 device_key:{130 hex, SEC1 uncompressed}
+device_name:{name as shown, after clean_name; UTF-8}
 noise_handshake_hash:{64 hex}
 noise_client_static:{64 hex}
 box_transport_pubkey:{64 hex}
@@ -97,7 +98,7 @@ sas_words:{w1} {w2} {w3} {w4}
 expires_at:{unix seconds}
 ```
 
-The reject message is identical except for the domain `bitsov-second-device-reject-v1`. The domain differs from `bitsov-owner-delegation-v1/v2`, `bitsov-device-register-v1/v2`, `bitsov-ticket-v1/v2`, `bitsov-relation-intent-v1` and the app's `unlock-v1`, so a signature from one protocol cannot be used in another. Approver-side rules (normative for the app): rebuild the bytes locally and require them to be byte-equal to `approval_message`, recompute `sas_words` from `sas_digest`, require `node` to equal the pinned fingerprint, and refuse when `expires_at` is in the past.
+The reject message is identical except for the domain `bitsov-second-device-reject-v1`. The domain differs from `bitsov-owner-delegation-v1/v2`, `bitsov-device-register-v1/v2`, `bitsov-ticket-v1/v2`, `bitsov-relation-intent-v1` and the app's `unlock-v1`, so a signature from one protocol cannot be used in another. Approver-side rules (normative for the app): rebuild the bytes locally and require them to be byte-equal to `approval_message`, recompute `sas_words` from `sas_digest`, require `node` to equal the pinned fingerprint, and refuse when `expires_at` is in the past. `device_name` is chosen by the new device and proves nothing; it is signed only so that the signed bytes equal what was shown. The words are the primary element on screen and the name is secondary.
 
 ## 5. Node verification and state
 
@@ -105,12 +106,12 @@ The reject message is identical except for the domain `bitsov-second-device-reje
 
 | # | Check | Error |
 |---|---|---|
-| 1 | Flag on, `local_owner_device`, owner signing key in memory, not locked | `OwnerChannelUnavailable` (503) |
+| 1 | Flag on, `local_owner_device`, owner signing key in memory, not locked (a home box after a power cut is locked until remote unlock, §6) | `OwnerChannelUnavailable` (503, kind `box_locked`) |
 | 2 | Caller's tunnel `client_id` = token `client_id`; approver pairing is not provisional | 403 |
 | 3 | `intent_key(approver_client, epoch, key_id)`: the approver key is registered, at its current epoch, with a valid owner approval | `BadProof` (403) |
 | 4 | Approver `client_id` ≠ op `client_id` (no self-approval) and the approver key was registered before the op was created | 403 |
-| 5 | Op exists, `sas_version == 2`, `confirmed`, `now < expires_at`, created by this process (`DeviceSas` present) | `UnknownOperation` / `Expired` |
-| 6 | The op's pairing is still provisional, at the same epoch and `client_pubkey`, and its provisional deadline has not passed | `PairingInvalid` |
+| 5 | Op exists, `sas_version == 2`, `confirmed`, `now < expires_at`, `DeviceSas.created_at.elapsed() < SECOND_DEVICE_SAS_TTL_SECS`, created by this process (`DeviceSas` present) | `UnknownOperation` / `Expired` |
+| 6 | The op's pairing is still provisional, not `contested`, at the same epoch and `client_pubkey`, and its provisional deadline has not passed | `PairingInvalid` (kind `contested` when contested) |
 | 7 | `key_id_for(device_key)` matches; key not already enrolled; under `MAX_DEVICE_KEYS_PER_CLIENT` | `NotGrantable` |
 | 8 | `verify_p256(approver_pubkey, approval_message(node state), sig)` | `BadProof`; counts toward the approver rate limit; the op is **not** consumed |
 | 9 | Sign `owner_approval_message` with the seed-derived owner key → `DeviceKey`; set scopes; remove the op and the provisional record; record `registered_ops[op]`; persist (roll back on error) | `Io` |
@@ -120,51 +121,71 @@ The reject message is identical except for the domain `bitsov-second-device-reje
 | Record | Persisted? | Lifetime | Single use |
 |---|---|---|---|
 | Second-device ticket | Memory: owner tickets. File: console `second_` code, as today | 5 min (owner) / 10 min default, 30 min max (console) | Removed on consumption, including exact retries (`OWNER_TICKET_PREFIX` rule extended to `second_`) |
-| Provisional pairing | `PairedClient` with `scopes: []` (no file format change) plus a memory record `{ticket_id, ticket_commitment, issuer, deadline}` | 15 min. A sweep on start and every minute deletes provisional pairings past their deadline or with no memory record (for example after a restart) | One enrollment |
-| `PendingDeviceKey{sas_version:2}` | Yes (`sas_version` only); `DeviceSas` is memory-only | 300 s from step 5, and never past the provisional deadline. A restart makes it `lost` | Consumed with its `delegation_nonce` at approve or reject |
+| Used-ticket tombstone | Memory `{blake3(code) → client_id, client_static}` | Until the provisional deadline of the pairing it created (15 min). Lost on restart, together with that pairing, which the start-up sweep removes | A second valid pairing proof for the same code from a different static or pubkey marks the pairing `contested`: its op is dropped, the pairing revoked, the tombstone kept. The second device is refused |
+| Provisional pairing | `PairedClient` with `scopes: []` (no file format change) plus a memory record `{ticket_id, ticket_commitment, issuer, deadline}` | 15 min. A sweep on start and every minute deletes provisional pairings past their deadline or with no memory record (for example after a restart). The sweep is keyed by `client_id` | One enrollment. Any v2 failure (digest mismatch, new-device cancel, approver reject, contested) revokes it at once |
+| `PendingDeviceKey{sas_version:2}` | Yes (`sas_version` only); `DeviceSas` is memory-only | `SECOND_DEVICE_SAS_TTL_SECS = 300` from step 5, and never past the provisional deadline. A restart makes it `lost` | Consumed with its `delegation_nonce` at approve or reject |
+
+**TTL reconciliation.** v1 keeps `ELEVATION_TTL_SECS = 900` (`pairing.rs:112`) unchanged. v2 uses the new `SECOND_DEVICE_SAS_TTL_SECS = 300`, which matches the 5 min owner ticket, in all three places that today hard-code 900 s for SAS: `expires_at`, `require_sas_confirmed` and `pending_device_view`. The per-client 30 s limit (`device.rs:517`) today derives request time as `expires_at - ELEVATION_TTL_SECS`, which is wrong for a 300 s op. `PendingDeviceKey` gains `#[serde(default)] created_at: i64`, and the limit becomes `now - created_at < 30` for both versions. Records without the field (`0`) never block.
 
 **Rate limits.**
 
 | Limit | Value | Source |
 |---|---|---|
-| Second-device ticket issues | 5 / 15 min node-wide (shared with owner tickets); challenge reads 30 / min | `ticket.rs:12-14` |
+| Second-device ticket issues | 5 / 15 min node-wide (shared with owner tickets); challenge reads 30 / min. A ticket that expires **unconsumed** refunds its issue slot, so QR retries after a timeout or camera trouble do not run into 429 | `ticket.rs:12-14` + refund |
 | Provisional pairings alive | 2 node-wide | new |
 | Live SAS ops node-wide (v1 + v2) | 1 | `device.rs:503-509` |
 | Device-key requests per client | 1 / 30 s | `device.rs:512-519` |
-| SAS failures (digest mismatch, cancel, reject) | 3 per process → SAS closed until restart or `konsensus pair-reset-sas` | `pairing.rs:661` + new console reset |
+| v2 failures | Charged to the provisional pairing: the first one revokes it. Cancels, rejects and contested kills **never** count node-wide | new |
+| v2 finalize digest mismatches node-wide (`sas_v2_mismatches`) | 10 per rolling hour → v2 requests 429 for the rest of that hour. The counter decays, so no restart and no console is needed. `pair-reset-sas` clears it early | new |
+| v1 `sas_failures` | Unchanged: 3 per process (`pairing.rs:661`). v2 never increments it | `pairing.rs:661` |
 | Approver bad signatures | 10 / hour per approver key → 429 | `approval.rs` `rate()` helper |
+
+### 5a. SAS version matrix (normative)
+
+| Caller pairing | `sas_version` none | `1` (claim) | `2` (claimless) |
+|---|---|---|---|
+| Provisional (from a second-device ticket) | 403 | 403 | Allowed |
+| Normal pairing | As today | As today (behind `second_device_claim_v1`) | 403 |
+| Device that already holds a pairing and scans a second-device QR | n/a | n/a | Ticket consumption refuses `already_paired` (the client pubkey or Noise static matches an existing pairing, `create_remote_pairing_locked` would otherwise return the existing full pairing). **The ticket is not consumed.** The app generates fresh pairing keys and scans again |
+
+The approval routes accept only `sas_version: 2` ops. `delegate_device_key_inner` refuses any op whose `sas_version` is not `None` or `Some(1)` **inside the function**, so every caller (the tunnel `/delegate` and the loopback `device_routes::delegate_device_key`, which passes `require_sas = false`) refuses v2. A v2 op can be enrolled only by `…/second-device/approve` or by console `device approve`.
 
 ## 6. Failure modes
 
 | Case | What happens | New device shows | Approver shows |
 |---|---|---|---|
 | Owner device offline / asleep | Nothing polls. The op expires at 300 s; the new device may re-request (new nonce, new words) until the 15 min provisional deadline, then the pairing is swept | "Approve on your other device" → after expiry "Your other device didn't answer. Try again." | n/a |
-| Words mismatch (approver) | Reject → op dropped, pairing revoked, `sas_failures += 1` | "Stopped. Nothing was added." | "Stopped. Nothing was added." |
-| Words mismatch (new device) | `DELETE` op → `sas_failures += 1`; the pairing stays provisional until its deadline | Same | The op disappears from pending |
-| New device's view ≠ node's (MITM or wrong box) | Finalize digest mismatch → op dropped, failure counted; the approver never sees words | "Couldn't verify this box." | n/a |
+| Words mismatch (approver) | Reject → op dropped, pairing revoked. No node-wide count | "Stopped. Nothing was added." | "Stopped. Nothing was added." |
+| Words mismatch (new device) | `DELETE` op → op dropped, pairing revoked. No node-wide count. The father can start over at once with a fresh QR | Same | The op disappears from pending |
+| New device's view ≠ node's (MITM or wrong box) | Finalize digest mismatch → op dropped, pairing revoked, `sas_v2_mismatches += 1`; the approver never sees words | "Couldn't verify this box." | n/a |
 | Timeout mid-approval | The approve after `expires_at` → `Expired`; nothing written | Expired | "This request expired." |
 | Replay of the approve signature | Op and nonce already consumed → `UnknownOperation`. Another node → `node` differs. A changed approver epoch → check 3 | n/a | n/a |
-| Stolen QR | A thief who consumes the ticket first gets a **scopeless** provisional pairing that can only ask for enrollment. The real device fails with "used". The approver sees words that match no device in hand; if it approves anyway, the thief's device is enrolled → console revoke (§7). An owner-minted ticket also lets the owner app flag a `ticket_id` that it never minted | "This QR was already used." | Words with no device: do not approve |
-| Two devices racing one ticket | The single-use ticket picks one; the other fails at the Noise pairing step | "This QR was already used." | n/a |
+| Stolen QR, thief first | The thief gets a **scopeless** provisional pairing. When the real device then presents the same QR with a valid pairing proof, the tombstone marks the ticket **contested**: the thief's op is dropped and its pairing revoked. The real device is refused too. Nothing can be approved from that QR. `ticket_id` alone does not help here (the stolen QR *is* the owner's), so the contested kill is what defends | "Someone else scanned this QR. Don't approve on your other device. Make a new QR." | "Two devices used this QR. Nothing was added." (the op disappears with kind `contested`) |
+| Stolen QR, thief only (the real device never scans) | The thief's words appear on the owner app while it is still showing that QR. Nobody in the room has a device showing words, so the owner must not approve. If the owner does approve, the thief is enrolled → console revoke (§7, transitive) | n/a | Words, with the line "Approve only if your new device shows these words" |
+| Two devices racing one ticket | The first consumes it. The second's valid proof triggers the contested kill above, so neither enrolls | "Someone else scanned this QR…" | "Two devices used this QR…" |
+| Device already paired to this box scans a second-device QR | Refused `already_paired`, and the ticket is **not** consumed (§5a) | App makes fresh pairing keys and retries the same QR automatically | n/a |
+| Box locked after a power cut (home mode starts locked; the owner signing key exists only after remote unlock) | Only the locked router is mounted. `second_device_enrollment_v1` is not advertised, and ticket mint and approve return 503 kind `box_locked`. Nothing is consumed | "Your box is locked. Unlock it on your other device first." | "Unlock your box first." with the existing unlock action |
 | Box restart mid-flow | Memory tickets and `DeviceSas` are gone; the provisional pairing is swept; pending is `lost` | "Start over" | The op disappears |
 | Approver revoked mid-flow | Check 3 fails under the lock | n/a | 403 |
 | Box has **no** enrolled owner device (`owner_device_count() == 0`) | Ticket `purpose=second_device` and `pair-ticket --second-device` are refused with `no_owner_device`. **Recovery is console-only (re-claim with Rasmus at the box). Out of scope.** | "This box has no owner device yet." | n/a |
 
 ## 7. API and CLI changes
 
-**HTTP (tunnel router only; the loopback router is unchanged).**
+**HTTP.** New routes are on the tunnel router only. The one loopback change is that `delegate` refuses v2 (inside `delegate_device_key_inner`, §5a).
 
 | Route | Who | Change |
 |---|---|---|
 | `GET/POST /api/v1/pair/ticket` | enrolled owner device | `POST` accepts `purpose: "second_device"`, signed as `bitsov-ticket-v2\nnode:{fp}\nnonce:{n}\npurpose:second_device`. Without `purpose`, the v1 path is unchanged |
-| `POST /api/v1/pair/device-key` | provisional or normal pairing | Accepts `sas_version: 2` only from a provisional pairing over its own tunnel |
+| `POST /api/v1/pair/device-key` | provisional or normal pairing | Version matrix §5a: provisional → only `2`; normal → never `2` |
 | `POST /api/v1/pair/device-key/{op}/finalize` | own op | Accepts `sas_version: 2` |
 | `GET/DELETE /api/v1/pair/device-key/{op}` | own op | Status adds `approval: "owner_device"`. Rejected ops report `lost` |
 | `GET /api/v1/pair/device-key/pending` | enrolled owner device | Lists v2 ops (`sas_version: 2`) |
 | `GET /api/v1/pair/device-key/{op}/delegation` | enrolled owner device | For v2, adds `noise_handshake_hash`, `noise_client_static`, `box_transport_pubkey`, `ticket_id`, `sas_digest`, `approval_message` (null until finalized). Never the claim, never the ticket code |
 | `POST /api/v1/pair/device-key/{op}/second-device/approve` | enrolled owner device | **New** `{approver_key_id, signature}` → `{op_id, key_id, status:"registered"}` |
 | `POST /api/v1/pair/device-key/{op}/second-device/reject` | enrolled owner device | **New**, same body → `204` |
-| `POST /api/v1/pair/device-key/{op}/delegate` | n/a | Refuses `sas_version: 2` ops (so an old app cannot approve a v2 op with delegation-v2) |
+| `POST /api/v1/pair/device-key/{op}/delegate` (tunnel **and** loopback) | n/a | Refuses `sas_version: 2` ops via the check in `delegate_device_key_inner`, so neither an old app nor the loopback path can approve a v2 op with delegation-v2 |
+| `POST /api/v1/pair/rotate` (unauthenticated today) | n/a | Refuses a provisional pairing (`provisional`, 403). Rotation is allowed after enrollment |
+| Pairing proof on the Noise listener (`remote_access.rs:1053`) | new device | `second_` and `purpose=second_device` owner codes: tombstone check (contested), then the `already_paired` check, then provisional creation |
 | `GET /api/v1/health` `api_capabilities` | any | Adds `second_device_enrollment_v1` when the flag is on and owner-device mode is live |
 
 Provisional tokens are accepted **only** by `POST /pair/token`, `GET /pair/challenge`, and the 4 own-op device-key routes above. This needs a new `EnrollmentAuth` extractor and `issue_token_kind` must allow an empty scope set for provisional pairings. Every other route sees no scope and returns 403. All new responses use `Cache-Control: no-store`. Audit events: `pair.second_device_ticket_issued`, `pair.second_device_requested`, `pair.second_device_enrolled`, `pair.second_device_rejected`, `pair.provisional_swept`. They carry the approver client, epoch, key id and op id, and never the nonce, signature, ticket, digest or words.
@@ -173,13 +194,13 @@ Provisional tokens are accepted **only** by `POST /pair/token`, `GET /pair/chall
 
 | Command | Change |
 |---|---|
-| `konsensus pair-ticket --second-device [--qr] [--ttl 10m]` | New flag: `second_` code, 10 min default, 30 min max. Refused when no owner device is enrolled or the flag is off |
+| `konsensus pair-ticket --second-device [--qr] [--ttl 10m]` | New flag: `second_` code, 10 min default, 30 min max. Refused when no owner device is enrolled or the flag is off. Below the QR it prints "Open Add a device on your other device now, so it can approve", because a console QR has no poller unless the owner app is open |
 | `konsensus pair-status` | Lists provisional pairings (deadline) and pending v2 ops (device name, fingerprint, words), so the console can watch or cancel |
 | `konsensus device list` | Shows `enrolled_by` (`console`, `device:…`, `second_device:<key_id>`) and the approver's device name |
-| `konsensus device revoke --key <id> [--with-pairing]` | `--with-pairing` also revokes the device's pairing (all tokens die). **This is the C3 revoke** |
-| `konsensus device revoke --approved-by <key_id>` | Revokes every key that this approver enrolled, for a lost or stolen owner device |
+| `konsensus device revoke --key <id> [--with-pairing] [--cascade]` | `--with-pairing` also revokes the device's pairing (all tokens die). **This is the C3 revoke.** Without `--cascade` it prints the keys this key enrolled (from `enrolled_by`) and the command to remove them; with `--cascade` it removes them as in `--approved-by` |
+| `konsensus device revoke --approved-by <key_id>` | **Transitive**: walks `enrolled_by` (`second_device:<id>` and `device:<id>`) breadth-first from the given key, and revokes every reached key **and its pairing** (`--with-pairing` implied), cycle-safe. It prints the chain before acting and asks for confirmation. Used for a lost, stolen or malicious owner device |
 | `konsensus pair-cancel --op <id>` | Drops a pending v2 op and its provisional pairing |
-| `konsensus pair-reset-sas` | Clears `sas_failures` |
+| `konsensus pair-reset-sas` | Clears v1 `sas_failures` and the v2 `sas_v2_mismatches` window |
 | `konsensus device approve --op <id>` | Unchanged. It also accepts a confirmed v2 op where `--owner-control` is live (console fallback when no owner device is online) |
 
 ## 8. Migration and compatibility
@@ -206,26 +227,30 @@ Provisional tokens are accepted **only** by `POST /pair/token`, `GET /pair/chall
 | T3 | Approve happy path: iPhone-format key (65-byte, DER sig), owner Mac approves; `enrolled_by`, scopes `[read, receive]`, `registered` status | pairing unit + tunnel integration |
 | T4 | Each field of the approval message mutated → `BadProof`, op not consumed | unit, table-driven |
 | T5 | Replay after success; replay to a second node; after an approver epoch bump; after approver revoke; self-approval; approver enrolled after the op | unit |
-| T6 | `delegation-v2` signature on a v2 op is refused; a v2 approval signature on a v1 op is refused | unit |
-| T7 | Finalize digest mismatch → op dropped, failure counted; 3 failures → closed; `pair-reset-sas` reopens | unit |
+| T6 | `delegation-v2` signature on a v2 op is refused on the **tunnel and loopback** `/delegate` routes, and in `delegate_device_key_inner` directly with `require_sas = false`; a v2 approval signature on a v1 op is refused | unit + both routers |
+| T7 | Each v2 failure (mismatch, cancel, reject) revokes only that provisional pairing and leaves v1 `sas_failures` at 0; a fresh QR works at once; 10 mismatches/hour → 429, which decays; `pair-reset-sas` clears it | unit |
 | T8 | Reject path revokes the provisional pairing; the new device sees `lost` | unit |
 | T9 | Provisional token: 403 on every non-enrollment route (iterate the router table) | router test |
 | T10 | Provisional sweep: deadline passes; restart drops the memory record → swept at start; an older-format reader treats `scopes: []` as inert | unit + restart test |
-| T11 | Expiry by wall clock and by monotonic clock (`created_at` ≥ 300 s) | unit |
+| T11 | v2 expiry at `SECOND_DEVICE_SAS_TTL_SECS` by wall clock and monotonic clock in `expires_at`, `require_sas_confirmed` and `pending_device_view`; v1 still 900 s; the per-client 30 s limit uses `created_at` for both versions, and a legacy record with `created_at = 0` does not block | unit |
 | T12 | Concurrent approves on one op → exactly one `registered` | unit (`concurrent_approval_consumes_exactly_once` pattern) |
-| T13 | Stolen QR: a second consumer of the same ticket fails; a thief's provisional pairing cannot read status, balance or history | tunnel integration |
-| T14 | No owner device → ticket refused with `no_owner_device`; flag off → routes 404, capability absent | unit + router |
+| T13 | Stolen QR: a second valid proof for a used ticket → both refused, the first pairing revoked and its op gone from the owner's pending list (kind `contested`); the thief's provisional pairing cannot read status, balance or history | tunnel integration |
+| T14 | No owner device → ticket refused with `no_owner_device`; flag off → routes 404, capability absent; locked box → capability absent, mint/approve 503 `box_locked`, nothing consumed | unit + router |
 | T15 | Rate limits: 2 provisional, 1 live SAS op, 10 bad approver sigs / hour → 429 | unit |
-| T16 | Console: `device revoke --with-pairing`, `--approved-by`, `pair-cancel`, `pair-status` output carries no secrets | control-socket tests |
+| T16 | Console: `device revoke --with-pairing`; `--approved-by` on a chain of 3 (A approves B, B approves C) removes A, B, C and their pairings, cycle-safe; `--key` lists children and `--cascade` removes them; `pair-cancel`; `pair-status` output carries no secrets | control-socket tests |
 | T17 | First-device regression: remote first run with claim SAS v1 and existing v1 delegation pass unchanged | existing suites stay green |
+| T19 | Version matrix §5a: provisional with `None`/`1` → 403; normal with `2` → 403; an already-paired device on a second-device QR → `already_paired` with the ticket still usable by fresh keys | unit + tunnel |
+| T20 | `/pair/rotate` refuses a provisional pairing; the sweep removes a provisional pairing by `client_id` | unit |
+| T21 | An unconsumed expired ticket refunds its issue slot; a consumed one does not | unit |
+| T22 | The approval message includes `device_name`; changing it → `BadProof` | unit |
 | T18 | Signet E2E: iPhone scans the Mac QR, words match, Mac Face ID / Touch ID, iPhone registered; console revoke ends its envelopes | regtest/signet script |
 
 ## 11. PR plan
 
 | PR | Scope |
 |---|---|
-| **A: node core** | SAS v2 digest + vector; ticket `purpose` / `bitsov-ticket-v2`; `second_` console code; provisional pairing, sweep and `EnrollmentAuth`; v2 request/finalize; approve/reject routes and messages; flag + capability; audit; T1–T15, T17 |
-| **B: console + docs** | `pair-ticket --second-device`, `pair-status`, `device list`/`revoke` options, `pair-cancel`, `pair-reset-sas`; update `docs/security/device-keys.md`, `pairing.md` (v2 vector) and `operations/home-node.md`; T16, T18 |
+| **A: node core** | SAS v2 digest + vector; ticket `purpose` / `bitsov-ticket-v2`; `second_` console code; provisional pairing, used-ticket tombstone and contested kill, `already_paired`, sweep and `EnrollmentAuth`; version matrix and the v2 refusal in `delegate_device_key_inner`; `SECOND_DEVICE_SAS_TTL_SECS` + `created_at`; per-pairing failure charging and the decaying mismatch counter; rotate refusal; ticket slot refund; v2 request/finalize; approve/reject routes and messages; flag + capability + `box_locked`; audit; T1–T15, T17, T19–T22 |
+| **B: console + docs** | `pair-ticket --second-device` (with the "open Add a device" line), `pair-status`, `device list`, `device revoke --cascade` and transitive `--approved-by`, `pair-cancel`, `pair-reset-sas`; update `docs/security/device-keys.md`, `pairing.md` (v2 vector) and `operations/home-node.md`; T16, T18 |
 
 ## 12. Open questions
 
@@ -234,6 +259,7 @@ Provisional tokens are accepted **only** by `POST /pair/token`, `GET /pair/chall
 | 1 | Should an approver that did **not** mint the ticket (a console QR) see an extra caution line, or should console second-device QRs be disallowed entirely so that every QR comes from an owner device? | Allowed, with the same one line |
 | 2 | When is the claim-bound second-device path (`second_device_claim_v1`) turned off? Proposed: one rc after the app ships N-2DEV | On for one rc |
 | 3 | Is a 15-minute provisional deadline enough for the father pre-mortem's "leave the app to find Tailscale" case, or should re-requests extend it? | 15 min, no extension |
-| 4 | Should `sas_failures` stay process-wide (a thief with a stolen QR can block enrollment until restart) or be counted per provisional pairing? | Process-wide plus `pair-reset-sas` |
+| 4 | *Resolved (Fool F4):* v2 failures are charged to the provisional pairing; only digest mismatches count node-wide, in a decaying window | n/a |
 | 5 | Does the phone's "must never be the only owner device" rule (`device-keys.md` §Keep a second owner device) block a phone from being the **approver** for another phone? | No: the rule is about count, not approver type |
-| 6 | Optional WebSocket hint ("pending enrollment changed", no data) on the owner tunnel to replace the 2 s poll? | Poll only in v1 |
+| 6 | Optional, still one step: instead of a yes button, the approver picks the matching 4-word set from 3 candidates (the 2 decoys derived from the digest by the node). This makes careless approval of a thief's words harder. Is it worth the extra friction for the father? | Not in v1; revisit after signet E2E |
+| 7 | Optional WebSocket hint ("pending enrollment changed", no data) on the owner tunnel to replace the 2 s poll? | Poll only in v1 |
