@@ -74,6 +74,7 @@ sqlx.workspace = true
 lightning-invoice.workspace = true
 
 [dev-dependencies]
+mockito = "1"
 # Decode terminal output in the P1 regression; no image stack.
 quircs = "=0.10.3"
 ring = "0.17"

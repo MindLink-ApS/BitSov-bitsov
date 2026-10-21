@@ -2350,6 +2350,7 @@ dependencies = [
  "log",
  "mdns-sd",
  "metrics",
+ "mockito",
  "qrcode",
  "quircs",
  "rand 0.8.6",
