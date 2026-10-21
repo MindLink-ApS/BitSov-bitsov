@@ -870,6 +870,18 @@ async fn replay_channel_open(
     ))
 }
 
+/// Largest channel size whose millisatoshi form (`amount * 1000`) fits in `u64`.
+const MAX_CHANNEL_AMOUNT_SATS: u64 = u64::MAX / 1000;
+
+/// Reject a zero or overflowing channel size before any peer is dialed.
+pub(crate) fn validate_channel_amount_sats(amount_sats: u64) -> Result<(), &'static str> {
+    if amount_sats == 0 || amount_sats > MAX_CHANNEL_AMOUNT_SATS {
+        Err("amount_sats must be between 1 and 18446744073709551")
+    } else {
+        Ok(())
+    }
+}
+
 /// Close a Lightning channel by a listed channel ID.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -910,6 +922,8 @@ async fn open_channel(
         }
         None => None,
     };
+    validate_channel_amount_sats(req.amount_sats)
+        .map_err(|message| ApiError::NotDispatched(message.into()))?;
     crate::error::require_money_ready(&state).await?;
     // L0a: shared validator rejects NaN/Inf and enforces 1.0–10_000.0 sat/vB.
     // The naive `<= 0.0` check accepts NaN (NaN compares false everywhere) and
@@ -1260,5 +1274,13 @@ mod actual_fee_tests {
         details.status = PaymentStatus::Settled;
         details.direction = PaymentDirection::Incoming;
         assert_eq!(fee_paid_msat("ldk", &details), None);
+    }
+
+    #[test]
+    fn channel_amount_rejects_zero_and_msat_overflow_before_dial() {
+        assert!(validate_channel_amount_sats(0).is_err());
+        assert!(validate_channel_amount_sats(u64::MAX).is_err());
+        assert!(validate_channel_amount_sats(1).is_ok());
+        assert!(validate_channel_amount_sats(MAX_CHANNEL_AMOUNT_SATS).is_ok());
     }
 }

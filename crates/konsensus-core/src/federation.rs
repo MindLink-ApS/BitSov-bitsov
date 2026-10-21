@@ -69,7 +69,7 @@ impl SignedMessage {
         let ed_sig = self.signature.to_ed25519();
 
         verifying_key
-            .verify(&signable, &ed_sig)
+            .verify_strict(&signable, &ed_sig)
             .map_err(|e| CoreError::InvalidSignature(e.to_string()))
     }
 

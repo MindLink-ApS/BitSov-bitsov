@@ -908,9 +908,12 @@ impl ControlServer {
     ///
     /// A stale socket from a previous run is removed first — a socket file left
     /// by a crashed node must not make the owner channel permanently
-    /// unavailable. The mode is set immediately after bind and verified by
-    /// `tests/pairing_tests.rs::owner_control_socket_permissions`.
+    /// unavailable. The parent directory is forced to `0700` *before* bind so
+    /// another local user cannot traverse it while the new inode still has the
+    /// process umask. The socket mode is then set to `0600` and checked.
+    /// `tests/pairing_tests.rs::owner_control_socket_permissions` locks both.
     pub fn bind(data_dir: &Path, ctx: Arc<ControlContext>) -> std::io::Result<Self> {
+        crate::pairing::ensure_owner_private_dir(data_dir)?;
         let path = data_dir.join(SOCKET_FILE);
         if path.exists() {
             std::fs::remove_file(&path)?;
@@ -918,7 +921,26 @@ impl ControlServer {
         let listener = tokio::net::UnixListener::bind(&path)?;
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            if let Err(error) =
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            {
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.permissions().mode() & 0o077 == 0 => {}
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "owner control socket is group- or world-accessible",
+                    ));
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+            }
         }
         tracing::info!(
             socket = %path.display(),

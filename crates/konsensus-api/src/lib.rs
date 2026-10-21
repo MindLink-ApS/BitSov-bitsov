@@ -205,7 +205,12 @@ fn build_router_with_options(
             rate_limiter,
             rate_limit::rate_limit_middleware,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                let target = traced_http_request(request.method(), request.uri());
+                tracing::info_span!("http", request = %target)
+            }),
+        )
         .layer(cors)
         .with_state(state)
 }
@@ -224,11 +229,21 @@ fn cors_allowed_origins() -> Vec<HeaderValue> {
     )
 }
 
+/// Method and path for HTTP traces. The query string is omitted because
+/// WebSocket clients may still pass `?token=`.
+pub(crate) fn traced_http_request(method: &axum::http::Method, uri: &axum::http::Uri) -> String {
+    format!("{method} {}", uri.path())
+}
+
+fn cors_origin_token_ok(origin: &str) -> bool {
+    !origin.is_empty() && origin != "*" && !origin.eq_ignore_ascii_case("null")
+}
+
 fn parse_cors_allowed_origins(raw: &str) -> Vec<HeaderValue> {
     raw.split(',')
         .filter_map(|origin| {
             let origin = origin.trim();
-            if origin.is_empty() {
+            if !cors_origin_token_ok(origin) {
                 return None;
             }
             HeaderValue::from_str(origin).ok()
@@ -322,6 +337,21 @@ mod tests {
         assert!(!origins
             .iter()
             .any(|origin| origin == HeaderValue::from_static("*")));
+    }
+
+    #[test]
+    fn cors_rejects_wildcard_and_null_origin() {
+        let origins = parse_cors_allowed_origins("*, null, NULL, http://localhost:1420");
+        assert_eq!(origins, vec![HeaderValue::from_static("http://localhost:1420")]);
+    }
+
+    #[test]
+    fn http_trace_omits_query_token() {
+        let uri: axum::http::Uri = "/api/v1/ws?token=super-secret-jwt".parse().unwrap();
+        let line = traced_http_request(&axum::http::Method::GET, &uri);
+        assert_eq!(line, "GET /api/v1/ws");
+        assert!(!line.contains("super-secret-jwt"));
+        assert!(!line.contains('?'));
     }
 }
 

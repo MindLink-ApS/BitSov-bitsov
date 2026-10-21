@@ -633,7 +633,7 @@ impl PaymentGate {
         let ed_sig = envelope.signature.to_ed25519();
 
         verifying_key
-            .verify(&signable, &ed_sig)
+            .verify_strict(&signable, &ed_sig)
             .map_err(|e: ed25519_dalek::SignatureError| {
                 GateRejection::InvalidSignature(e.to_string())
             })
