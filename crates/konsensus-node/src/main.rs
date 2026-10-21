@@ -442,9 +442,10 @@ fn cmd_init(
     let password = mnemonic_encryption_password(encrypt, password, non_interactive)?;
     use crate::config::NodeTier;
 
-    // Create directory if needed
+    // Create directory if needed, then drop group/other traversal before any secret is written.
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create directory: {}", dir.display()))?;
+    restrict_data_dir(dir)?;
 
     let config_path = dir.join("konsensus.toml");
     let mnemonic_path = dir.join("mnemonic.txt");
@@ -570,6 +571,7 @@ fn cmd_restore(
 
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create directory: {}", dir.display()))?;
+    restrict_data_dir(dir)?;
 
     anyhow::ensure!(
         std::fs::read_dir(dir)?.next().is_none(),
@@ -688,6 +690,13 @@ fn cmd_restore(
     println!();
 
     Ok(())
+}
+
+/// Owner-only data directory (`0700`). Group or other traversal would expose
+/// the control socket during the bind/chmod window and the names of seed files.
+fn restrict_data_dir(dir: &Path) -> Result<()> {
+    konsensus_api::pairing::ensure_owner_private_dir(dir)
+        .with_context(|| format!("failed to restrict {} to mode 0700", dir.display()))
 }
 
 /// Write `NODE_INITIALIZED` last, after identity and config are on disk.
@@ -1146,6 +1155,9 @@ async fn cmd_start(
     // Balance is not consulted, here or in `classify`: an initialized node with
     // no funds is initialized.
     let data_dir = owner_cmd::data_dir_of(config_path);
+    if data_dir.is_dir() {
+        restrict_data_dir(&data_dir)?;
+    }
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
             // A new encrypted seed must reject blank input before even logging

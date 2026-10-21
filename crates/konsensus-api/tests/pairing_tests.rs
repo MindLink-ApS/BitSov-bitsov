@@ -687,11 +687,17 @@ async fn owner_control_socket_permissions() {
         },
     });
 
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let server = control::ControlServer::bind(tmp.path(), Arc::clone(&ctx)).unwrap();
     let path = server.path().to_path_buf();
     assert_eq!(path, tmp.path().join("control.sock"));
 
-    use std::os::unix::fs::PermissionsExt;
+    let dir_mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        dir_mode, 0o700,
+        "the data directory must be owner-only before the control socket is reachable"
+    );
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(
         mode, 0o600,
