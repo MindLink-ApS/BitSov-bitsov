@@ -157,5 +157,47 @@ ignore = [
   # Recheck shared-config/cache changes, key-exchange policy, or promotion of
   # minreq to runtime use. Remove on the sqlx/ldk-node island upgrade (#59).
   "RUSTSEC-2026-0349",
+  # Applicability triage 2026-10-20 — RUSTSEC-2026-0382 / CVE-2026-111943:
+  # rustls-webpki 0.101.7 may accept certificate chains through distrusted
+  # emSign intermediates whose private keys are publicly known, when the
+  # configured trust anchors permit the path. Runtime path: konsensus-storage
+  # -> sqlx-core 0.8.0 -> rustls 0.21.12 -> rustls-webpki 0.101.7.
+  # This is SQLx Postgres TLS only: the default SQLite node opens no TLS
+  # through this stack. Postgres is already selectable and TLS is reachable;
+  # neither the SQLite default nor query size caps mitigate that deployment.
+  # Test-feature-gated minreq also carries this legacy verifier (see above).
+  # The 0.103.x copy is already patched to 0.103.16 in this branch; this
+  # exception accepts only the 0.101.7 island held by the sqlx/ldk-node pin.
+  # cargo-audit ignores advisory IDs, not versions: do not downgrade 0.103.x.
+  #
+  # RESIDUAL RISK: a Postgres-over-TLS deployment could accept a certificate
+  # chain through a distrusted intermediate if its configured trust anchors
+  # allow it, enabling server impersonation with a known intermediate key.
+  # This is accepted residual certificate-validation risk, not a claim that
+  # the legacy verifier is patched. The same risk applies to test-only minreq.
+  # Recheck Postgres TLS/trust-store changes or promotion of minreq to runtime;
+  # remove on the sqlx/ldk-node island upgrade (#59).
+  "RUSTSEC-2026-0382",
+  # Applicability triage 2026-10-20 — RUSTSEC-2026-0381 / CVE-2026-111943:
+  # webpki-roots 0.25.4 includes emSign ECC Root CA - G3, which can allow
+  # certificate paths through distrusted emSign intermediates whose private
+  # keys are publicly known. The runtime Electrum copy is now remediated via
+  # vendor/electrum-client (webpki-roots >=1.0.10); the 1.0.x line is patched
+  # to 1.0.10. Remaining 0.25.4 copies are reachable only via sqlx-core 0.8.0
+  # / rustls 0.21 Postgres TLS and test-only minreq. The default SQLite node
+  # opens no TLS through this stack; Postgres TLS is already selectable.
+  # This exception accepts only that legacy sqlx/ldk-node dependency island
+  # and test-only minreq. cargo-audit ignores advisory IDs, not versions:
+  # do not downgrade the patched 1.0.x line or reintroduce an Electrum copy.
+  #
+  # RESIDUAL RISK: the legacy root bundle can permit a Postgres-over-TLS
+  # deployment to accept chains through distrusted emSign intermediates,
+  # enabling server impersonation with a known intermediate private key.
+  # Test-only minreq shares this risk. This is accepted certificate-trust
+  # risk, not a claim that 0.25.4 is patched; SQLite defaults and query size
+  # caps do not mitigate Postgres TLS. Recheck TLS/trust-store changes, new
+  # consumers of 0.25.4, or promotion of minreq to runtime;
+  # remove on the sqlx/ldk-node island upgrade (#59).
+  "RUSTSEC-2026-0381",
   "RUSTSEC-2025-0134", # rustls-pemfile 1.0.4 UNMAINTAINED via sqlx-core 0.8.0 island (same pin); no known vuln. Remove on sqlx bump (#59).
 ]

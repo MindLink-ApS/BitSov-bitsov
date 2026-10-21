@@ -1,0 +1,47 @@
+[package]
+name = "electrum-client"
+version = "0.24.1"
+authors = ["Alekos Filini <alekos.filini@gmail.com>"]
+license = "MIT"
+homepage = "https://github.com/bitcoindevkit/rust-electrum-client"
+repository = "https://github.com/bitcoindevkit/rust-electrum-client"
+documentation = "https://docs.rs/electrum-client/"
+description = "Bitcoin Electrum client library. Supports plaintext, TLS and Onion servers."
+keywords = ["bitcoin", "electrum"]
+readme = "README.md"
+rust-version = "1.75.0"
+edition = "2021"
+
+# loosely based on https://github.com/evgeniy-scherbina/rust-electrumx-client
+
+[lib]
+name = "electrum_client"
+path = "src/lib.rs"
+
+[dependencies]
+log = "^0.4"
+bitcoin = { version = "0.32", features = ["serde"] }
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = { version = "^1.0" }
+
+# Optional dependencies
+openssl = { version = "0.10", optional = true }
+rustls = { version = "0.23.21", optional = true, default-features = false }
+webpki-roots = { version = "1.0.10", optional = true }
+
+byteorder = { version = "1.0", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version="0.3.9", features=["winsock2"], optional = true }
+
+[features]
+default = ["proxy", "use-rustls"]
+minimal = []
+debug-calls = []
+proxy = ["byteorder", "winapi", "libc"]
+use-rustls = ["webpki-roots", "rustls/default"]
+use-rustls-ring = ["webpki-roots", "rustls/ring", "rustls/logging", "rustls/std", "rustls/tls12"]
+use-openssl = ["openssl"]

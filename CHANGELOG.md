@@ -7,6 +7,14 @@ also live on the corresponding GitHub pre-release pages.
 
 - Deflake locked-mode shutdown and unpaid-request flood tests with independent,
   generous hang guards for slow CI runners. Fixes #325.
+- Update rustls-webpki 0.103.15 to 0.103.16 and webpki-roots 1.0.6 to 1.0.10
+  for RUSTSEC-2026-0382 / RUSTSEC-2026-0381 (distrusted emSign certificates).
+  Vendor electrum-client 0.24.1 to use webpki-roots >=1.0.10 and the current
+  trust-anchor API. Document RUSTSEC-2026-0382 and RUSTSEC-2026-0381 exceptions
+  for the remaining SQLx Postgres TLS / test-only minreq verifier and root
+  bundle, including residual risk and removal on the sqlx/ldk-node island
+  upgrade (#59). Mirror both exceptions and their shared CVE alias across
+  the advisory scanner configurations; the patched modern lines stay required.
 - Make `POST /api/v1/payments/open-channel` idempotent with an optional UUIDv4
   `operation_id` (#331, capability `channel_open_operations_v1`): recorded
   before dispatch (migration 030), a retry with the same id returns the recorded
