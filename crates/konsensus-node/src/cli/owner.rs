@@ -1075,6 +1075,8 @@ pub async fn serve_bootstrap_mode(
     let layout = configured_layout(&data_dir, config);
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("failed to create {}", data_dir.display()))?;
+    konsensus_api::pairing::ensure_owner_private_dir(&data_dir)
+        .with_context(|| format!("failed to restrict {} to mode 0700", data_dir.display()))?;
 
     crate::claim_code::initialize(&data_dir)?;
 

@@ -36,12 +36,18 @@ also live on the corresponding GitHub pre-release pages.
 
 ### Security
 
+- Validate Host and Origin before local token issuance and local-only reads/WebSocket admission to prevent browser DNS rebinding; preserve native clients without Origin.
 - **Breaking change (H2):** argv passwords and mnemonic phrases are deprecated,
   warn on stderr, and refuse execution unless `--insecure-argv` is explicit.
   This includes `--encrypt <password>` and nonempty BIP-39 `--passphrase` values.
   Use `--password-fd`, `--password-file`, `--passphrase-fd` (BIP-39), or the
   interactive prompt instead.
   The owner-token helper now sends its legacy password variable through an fd.
+- **Behaviour change (#337):** the node forces its data directory (the folder
+  that holds `--config`) to 0700 and the control socket to 0600 before binding,
+  and refuses to start if it cannot. Keep the config inside a dedicated data dir
+  (not `$HOME` directly) and make sure the node's user owns that directory,
+  e.g. on container volumes.
 
 ## [0.3.0-rc18] — 2026-10-20 (prep; not tagged yet)
 

@@ -2022,6 +2022,7 @@ dependencies = [
 name = "konsensus-bsx"
 version = "0.3.0-rc18"
 dependencies = [
+ "proptest",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2203,6 +2204,7 @@ dependencies = [
  "konsensus-crypto",
  "konsensus-storage",
  "mockall",
+ "proptest",
  "rand 0.8.6",
  "reqwest",
  "serde",
