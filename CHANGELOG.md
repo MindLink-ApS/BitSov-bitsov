@@ -10,6 +10,11 @@ also live on the corresponding GitHub pre-release pages.
   (`call_id_used`, `call_busy`, `call_signal_in_flight`, `call_signal_invalid`,
   `call_not_live`). Refusals on retries of existing operations do not claim
   non-dispatch, since an earlier attempt may already have dispatched payment.
+- Fix ONB5 channel opens on LDK hubs (#349): use the six-block funding priority
+  with a checked LDK quote and a hard total-fee cap from the existing fee buffer,
+  instead of an exact rate that LDK rejects. Non-LDK fee handling is unchanged;
+  channels remain private with no balance push, and automatic onboarding opens
+  remain disabled by default.
 
 ## [0.3.0-rc19] — 2026-10-21 (prep; not tagged yet)
 
