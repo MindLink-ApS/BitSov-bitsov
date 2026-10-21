@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Offline end-to-end regression tests; bash 3.2+, git, shasum and core utilities.
-# Real Git uses a throwaway file:// origin. Only gh and GPG are faked: no
-# credentials, real keyring, network, or release publishing are involved.
+# Real Git and GPG use a throwaway origin and generated test key. gh and
+# Rust compilation are simulated; no real keyring, network or publishing.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Drop inherited Git configuration/environment (including signing and hooks).
@@ -10,14 +10,28 @@ if [ "${1:-}" != --isolated ]; then
 fi
 
 WORK=$(mktemp -d /tmp/release-sign-test.XXXXXX)
-trap 'rm -rf "$WORK"' EXIT
+cleanup() {
+  if command -v gpgconf >/dev/null && [ -d "$WORK/home/gnupg" ]; then
+    GNUPGHOME="$WORK/home/gnupg" gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+  fi
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
 mkdir -p "$WORK/bin" "$WORK/home" "$WORK/tmp" "$WORK/fixtures"
 export HOME="$WORK/home" GNUPGHOME="$WORK/home/gnupg" TMPDIR="$WORK/tmp"
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ALLOW_PROTOCOL=file
 export PATH="$WORK/bin:$PATH"
 export TEST_ROOT="$WORK" TEST_TAG=v0.0.0-rc1
 export TEST_REPO=MindLink-ApS/BitSov-bitsov
-export TEST_KEY=B299274C200301714DC6F51A7C2D6F8AC842EF6E
+export REAL_GPG
+REAL_GPG=$(command -v gpg)
+mkdir -m 700 "$GNUPGHOME"
+"$REAL_GPG" --batch --pinentry-mode loopback --passphrase '' --quick-generate-key \
+  'Release Test <release-test@example.invalid>' ed25519 sign 0 >"$WORK/keygen.log" 2>&1 || { cat "$WORK/keygen.log" >&2; exit 1; }
+TEST_KEY=$("$REAL_GPG" --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" {print $10; exit}')
+export TEST_KEY
+# Change only a private test copy, never the production key pin or a real keyring.
+sed "s/B299274C200301714DC6F51A7C2D6F8AC842EF6E/$TEST_KEY/g" "$HERE/release-sign.sh" > "$WORK/release-sign.sh"
 
 cat > "$WORK/bin/common" <<'STUB'
 set -euo pipefail
@@ -59,6 +73,11 @@ case "${1:-} ${2:-}" in
     esac
     expect_args "$(printf '%s\n' release download "$TEST_TAG" --repo "$TEST_REPO" --pattern "$asset" --pattern "$asset.sha256" --clobber)" "$@"
     cp "$TEST_ROOT/fixtures/$asset" "$TEST_ROOT/fixtures/$asset.sha256" .
+    # A compromised CI can replace BOTH the host binary and its checksum.
+    if [ "$asset" = bitsov-linux-x86_64 ] && [ "$TEST_CASE" = compromised-ci ]; then
+      echo injected >> "$asset"
+      shasum -a 256 "$asset" > "$asset.sha256"
+    fi
     # Corrupt the LAST asset: the script must validate all five before signing.
     if [ "$asset" = bitsov-windows-x86_64 ]; then
       case "$TEST_CASE" in
@@ -81,51 +100,51 @@ cat > "$WORK/bin/gpg" <<'STUB'
 #!/usr/bin/env bash
 source "$TEST_ROOT/bin/common"
 printf '%s\n' "$*" >> "$CASE_DIR/gpg.log"
-signature() {
-  printf '%s\n' '-----BEGIN PGP SIGNATURE-----' '' 'offline-test-signature' '-----END PGP SIGNATURE-----'
-}
-status() {
-  local marker=GOODSIG
-  if [ "$TEST_CASE" = "expired-$1" ]; then marker=EXPKEYSIG; fi
-  printf '[GNUPG:] NEWSIG\n'
-  printf '[GNUPG:] %s %s Test Release Key\n' "$marker" "${TEST_KEY:24}"
-  # GPG emits VALIDSIG even with EXPKEYSIG; exit zero deliberately tests the
-  # status filter rather than relying on GPG's process exit code.
-  printf '[GNUPG:] VALIDSIG %s 2026-01-01 1767225600 0 4 0 1 10 00 %s\n' "$TEST_KEY" "$TEST_KEY"
-  printf '[GNUPG:] TRUST_ULTIMATE 0 pgp\n'
-}
-case "${1:-}" in
-  --list-secret-keys)
-    expect_args "$(printf '%s\n' --list-secret-keys "$TEST_KEY")" "$@"
+case "$*" in
+  *--detach-sign*) cp SHA256SUMS "$CASE_DIR/signed-sums" ;;
+  *-bsau*) touch "$CASE_DIR/signed-tag" ;;
+  *--verify*) touch "$CASE_DIR/verified-tag" ;;
+esac
+# Use real cryptography; inject an expired status only for rejection coverage.
+if { [ "$TEST_CASE" = expired-tag ] && [ "${1:-}" = --keyid-format=long ]; } ||
+   { [ "$TEST_CASE" = expired-sums ] && [ "${1:-}" = --status-fd ]; }; then
+  output=$("$REAL_GPG" "$@" 2>&1)
+  printf '%s\n' "$output" | sed 's/\[GNUPG:\] GOODSIG /[GNUPG:] EXPKEYSIG /'
+else
+  exec "$REAL_GPG" "$@"
+fi
+STUB
+
+cat > "$WORK/bin/rustup" <<'STUB'
+#!/usr/bin/env bash
+source "$TEST_ROOT/bin/common"
+case "$*" in
+  'run 1.91.1 rustc -vV')
+    if [ "$TEST_CASE" = unsupported-host ]; then
+      printf 'rustc 1.91.1\nhost: riscv64gc-unknown-linux-gnu\n'
+    else
+      printf 'rustc 1.91.1\nhost: x86_64-unknown-linux-gnu\n'
+    fi
     ;;
-  --armor)
-    expect_args "$(printf '%s\n' --armor --detach-sign --local-user "$TEST_KEY" --output SHA256SUMS.asc SHA256SUMS)" "$@"
-    cp SHA256SUMS "$CASE_DIR/signed-sums"
-    signature > SHA256SUMS.asc
-    ;;
-  --status-fd)
-    expect_args "$(printf '%s\n' --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS)" "$@"
-    cmp SHA256SUMS "$CASE_DIR/signed-sums"
-    signature | cmp - SHA256SUMS.asc
-    status sums
-    ;;
-  --status-fd=2)
-    # Git's tag -s invokes gpg with this signing protocol.
-    expect_args "$(printf '%s\n' --status-fd=2 -bsau "$TEST_KEY")" "$@"
-    cat > "$CASE_DIR/signed-tag"
-    signature
-    printf '[GNUPG:] SIG_CREATED D 1 10 00 1767225600 %s\n' "$TEST_KEY" >&2
-    ;;
-  --keyid-format=long)
-    # Git passes the detached signature file and the tag payload on stdin.
-    expect_args "$(printf '%s\n' --keyid-format=long --status-fd=1 --verify "${4:-}" -)" "$@"
-    signature | cmp - "$4"
-    cat > "$CASE_DIR/verified-tag"
-    status tag
+  'run 1.91.1 cargo build --locked --release -p konsensus-node --target x86_64-unknown-linux-gnu')
+    [ "$(git rev-parse HEAD)" = "$COMMIT" ] || bad_call wrong-commit
+    [ "$(cat tagged-content)" = tagged ] || bad_call dirty-source
+    [ "$SOURCE_DATE_EPOCH" = "$(git show -s --format=%ct HEAD)" ] || bad_call epoch
+    [ "$CARGO_PROFILE_RELEASE_STRIP" = symbols ] || bad_call strip
+    [ "$CARGO_INCREMENTAL" = 0 ] || bad_call incremental
+    [[ "$CARGO_ENCODED_RUSTFLAGS" == *--remap-path-prefix* ]] || bad_call remap
+    printf '%s\n' "$PWD" >> "$CASE_DIR/build.log"
+    [ "$TEST_CASE" != build-failure ] || exit 1
+    mkdir -p "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"
+    cp "$TEST_ROOT/fixtures/bitsov-linux-x86_64" "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/konsensus"
+    if [ "$TEST_CASE" = mismatch ] || [ "$TEST_CASE" = dry-mismatch ]; then
+      echo different >> "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/konsensus"
+    fi
     ;;
   *) bad_call "$@" ;;
 esac
 STUB
+chmod +x "$WORK/bin/rustup"
 
 # A broken run-list stub must fail promptly rather than spend ten minutes
 # polling. Record it even if the production script ignores the exit status.
@@ -158,12 +177,17 @@ run_case() (
   git checkout -q -b main
   git commit -q --allow-empty -m base
   OTHER_COMMIT=$(git rev-parse HEAD)
-  git commit -q --allow-empty -m release
+  mkdir scripts
+  printf '1.91.1\n' > scripts/release-toolchain
+  cp "$HERE/release-build.sh" scripts/release-build.sh
+  printf 'tagged\n' > tagged-content
+  git add scripts/release-toolchain scripts/release-build.sh tagged-content
+  git commit -q -m release
   COMMIT=$(git rev-parse HEAD)
   export COMMIT OTHER_COMMIT
   git remote add origin "file://$CASE_DIR/origin.git"
   git push -q -u origin main
-  if [ "$TEST_CASE" != fresh ]; then
+  if [ "$TEST_CASE" != fresh ] && [ "$TEST_CASE" != dry-fresh ]; then
     target=$COMMIT
     [ "$TEST_CASE" != wrong-tag ] || target=$OTHER_COMMIT
     git tag -s -u "$TEST_KEY" "$TEST_TAG" "$target" -m "BitSov $TEST_TAG"
@@ -174,13 +198,39 @@ run_case() (
   rm -f "$CASE_DIR/signed-tag"
   : > "$CASE_DIR/gpg.log"
   : > "$CASE_DIR/gh.log"
+  # A dirty checkout and later commit must never become the build input.
+  printf 'exit 89\n' > scripts/release-build.sh
+  printf 'later\n' > tagged-content
+  git commit -qam later
+  printf 'exit 90\n' > scripts/release-build.sh
+  printf 'dirty\n' > tagged-content
+  args=()
+  if [ "$TEST_CASE" != no-waivers ]; then
+    for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+      if [ "$TEST_CASE" != missing-waiver ] || [ "$target" != x86_64-pc-windows-msvc ]; then
+        args+=(--accept-unverified-target "$target")
+      fi
+    done
+  fi
+  case "$TEST_CASE" in
+    dry-*) args+=(--dry-run) ;;
+    waive-host) args+=(--accept-unverified-target x86_64-unknown-linux-gnu) ;;
+    unknown-waiver) args+=(--accept-unverified-target imaginary-triple) ;;
+  esac
   rc=0
-  bash "$HERE/release-sign.sh" "$TEST_TAG" "$COMMIT" > "$CASE_DIR/output" 2>&1 || rc=$?
+  bash "$WORK/release-sign.sh" ${args[@]+"${args[@]}"} "$TEST_TAG" "$COMMIT" > "$CASE_DIR/output" 2>&1 || rc=$?
   [ ! -f "$CASE_DIR/unexpected" ] || { cat "$CASE_DIR/unexpected"; fail 'unexpected stub call'; }
 
   reason=''
   case "$TEST_CASE" in
-    existing|fresh) ;;
+    existing|fresh|dry-existing) ;;
+    mismatch|dry-mismatch|compromised-ci) reason='reproducibility mismatch for x86_64-unknown-linux-gnu' ;;
+    build-failure) reason='local rebuild failed' ;;
+    no-waivers|missing-waiver) reason='unverified target' ;;
+    waive-host) reason='host target cannot be waived' ;;
+    unknown-waiver) reason='unknown target' ;;
+    unsupported-host) reason='unsupported signing host' ;;
+    dry-fresh) reason='dry-run requires an existing tag' ;;
     wrong-tag) reason="tag $TEST_TAG exists on a different commit" ;;
     ci-sha) reason="CI run 123 built $OTHER_COMMIT, not the tagged commit $COMMIT" ;;
     non-draft) reason="release $TEST_TAG is not a draft; refusing to change it" ;;
@@ -192,6 +242,14 @@ run_case() (
   esac
   if [ -z "$reason" ]; then
     [ "$rc" -eq 0 ] || fail "expected success, got exit $rc"
+    [ -s "$CASE_DIR/build.log" ] || fail 'host was not rebuilt'
+    grep -q 'ACCEPT UNVERIFIED target=' "$CASE_DIR/output" || fail 'waivers not logged'
+    if [ "$TEST_CASE" = dry-existing ]; then
+      [ ! -e "$CASE_DIR/signed-sums" ] || fail 'dry-run signed'
+      [ ! -e "$CASE_DIR/upload.args" ] || fail 'dry-run uploaded'
+      ! grep -q -- '--list-secret-keys' "$CASE_DIR/gpg.log" || fail 'dry-run accessed private keys'
+      exit 0
+    fi
     cmp "$WORK/expected-sums" "$CASE_DIR/upload/SHA256SUMS"
     cmp "$CASE_DIR/signed-sums" "$CASE_DIR/upload/SHA256SUMS"
     printf '%s\n' release upload "$TEST_TAG" SHA256SUMS SHA256SUMS.asc --repo "$TEST_REPO" --clobber > "$CASE_DIR/expected.args"
@@ -201,7 +259,7 @@ run_case() (
     grep -qx "run watch 123 --repo $TEST_REPO --exit-status" "$CASE_DIR/gh.log"
     grep -qx -- '--status-fd 1 --verify SHA256SUMS.asc SHA256SUMS' "$CASE_DIR/gpg.log"
     grep -q '^Not published\.' "$CASE_DIR/output"
-    [ -s "$CASE_DIR/verified-tag" ]
+    [ -e "$CASE_DIR/verified-tag" ]
   else
     [ "$rc" -ne 0 ] || fail 'expected rejection, got success'
     grep -F "release-sign: $reason" "$CASE_DIR/output" >/dev/null || fail "missing rejection: $reason"
@@ -210,8 +268,14 @@ run_case() (
       [ ! -e "$CASE_DIR/signed-sums" ] || fail 'signed before validation finished'
     fi
   fi
-  if [ "$TEST_CASE" = fresh ]; then
-    [ -s "$CASE_DIR/signed-tag" ] || fail 'fresh tag was not signed'
+  if [ "$TEST_CASE" = mismatch ] || [ "$TEST_CASE" = dry-mismatch ]; then
+    grep -q '^--- CI/' "$CASE_DIR/output" || fail 'missing CI diff'
+    grep -q '^+++ local/' "$CASE_DIR/output" || fail 'missing local diff'
+  fi
+  if [ "$TEST_CASE" = dry-fresh ]; then
+    [ ! -e "$CASE_DIR/signed-tag" ] || fail 'dry-run signed a tag'
+  elif [ "$TEST_CASE" = fresh ]; then
+    [ -e "$CASE_DIR/signed-tag" ] || fail 'fresh tag was not signed'
     [ "$(git --git-dir="$CASE_DIR/origin.git" rev-parse "$TEST_TAG^{commit}")" = "$COMMIT" ] || fail 'fresh tag was not pushed'
   else
     [ ! -e "$CASE_DIR/signed-tag" ] || fail 'existing tag was signed again'
@@ -227,7 +291,7 @@ legacy=''
 utf8=''
 available=$(LC_ALL=C locale -a)
 for candidate in da_DK.ISO8859-1 en_US.UTF-8 $available; do
-  [ "$candidate" != C ] && [ "$candidate" != POSIX ] || continue
+  if [ "$candidate" = C ] || [ "$candidate" = POSIX ]; then continue; fi
   printf '%s\n' "$available" | grep -Fxi "$candidate" >/dev/null || continue
   encoding=$(LC_ALL="$candidate" locale charmap 2>/dev/null) || continue
   case "$encoding" in
@@ -245,7 +309,7 @@ locales+=("$utf8")
 
 passed=0 failed=0
 for test_locale in "${locales[@]}"; do
-  for test_case in existing fresh wrong-tag ci-sha non-draft checksum filename expired-tag expired-sums; do
+  for test_case in existing fresh wrong-tag ci-sha non-draft checksum filename expired-tag expired-sums mismatch compromised-ci unsupported-host build-failure no-waivers missing-waiver waive-host unknown-waiver dry-existing dry-mismatch dry-fresh; do
     # Launch a separate process so errexit remains active inside run_case.
     # Calling a function in an if condition would silently disable it.
     set +e
