@@ -48,8 +48,24 @@ case "${1:-} ${2:-}" in
     expect_args "$(printf '%s\n' run watch 123 --repo "$TEST_REPO" --exit-status)" "$@"
     ;;
   'release view')
+    if [ "${7:-}" = assets ]; then
+      expect_args "$(printf '%s\n' release view "$TEST_TAG" --repo "$TEST_REPO" --json assets -q '.assets[].name')" "$@"
+      if [ "$TEST_CASE" = extra-asset ]; then printf '%s\n' BitSov.dmg; fi
+      for name in bitsov-darwin-aarch64 bitsov-darwin-x86_64 bitsov-linux-aarch64 bitsov-linux-x86_64 bitsov-windows-x86_64; do
+        printf '%s\n' "$name" "$name.sha256" "$name.sbom.spdx.json"
+      done
+      exit 0
+    fi
     expect_args "$(printf '%s\n' release view "$TEST_TAG" --repo "$TEST_REPO" --json isDraft -q .isDraft)" "$@"
-    if [ "$TEST_CASE" = non-draft ]; then echo false; else echo true; fi
+    n=0
+    if [ -f "$CASE_DIR/draft-checks" ]; then n=$(cat "$CASE_DIR/draft-checks"); fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$CASE_DIR/draft-checks"
+    if [ "$TEST_CASE" = non-draft ] || { [ "$TEST_CASE" = published-late ] && [ "$n" -ge 2 ]; }; then
+      echo false
+    else
+      echo true
+    fi
     ;;
   'release download')
     asset=${7:-}
@@ -85,13 +101,22 @@ signature() {
   printf '%s\n' '-----BEGIN PGP SIGNATURE-----' '' 'offline-test-signature' '-----END PGP SIGNATURE-----'
 }
 status() {
-  local marker=GOODSIG
+  local marker=GOODSIG fpr=$TEST_KEY
   if [ "$TEST_CASE" = "expired-$1" ]; then marker=EXPKEYSIG; fi
+  if [ "$TEST_CASE" = subkey ]; then fpr=0123456789ABCDEF0123456789ABCDEF01234567; fi
   printf '[GNUPG:] NEWSIG\n'
-  printf '[GNUPG:] %s %s Test Release Key\n' "$marker" "${TEST_KEY:24}"
-  # GPG emits VALIDSIG even with EXPKEYSIG; exit zero deliberately tests the
-  # status filter rather than relying on GPG's process exit code.
-  printf '[GNUPG:] VALIDSIG %s 2026-01-01 1767225600 0 4 0 1 10 00 %s\n' "$TEST_KEY" "$TEST_KEY"
+  if [ "$TEST_CASE" = notation ] && [ "$1" = tag ]; then
+    # A user id that contains the release fingerprint must not count as VALIDSIG.
+    printf '[GNUPG:] GOODSIG %s VALIDSIG %s\n' "${TEST_KEY:24}" "$TEST_KEY"
+    printf '[GNUPG:] VALIDSIG %s 2026-01-01 1767225600 0 4 0 1 10 00 %s\n' \
+      AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  else
+    printf '[GNUPG:] %s %s Test Release Key\n' "$marker" "${TEST_KEY:24}"
+    # GPG emits VALIDSIG even with EXPKEYSIG; exit zero deliberately tests the
+    # status filter rather than relying on GPG's process exit code.
+    # subkey: signing-key fingerprint differs; the primary field is the release key.
+    printf '[GNUPG:] VALIDSIG %s 2026-01-01 1767225600 0 4 0 1 10 00 %s\n' "$fpr" "$TEST_KEY"
+  fi
   printf '[GNUPG:] TRUST_ULTIMATE 0 pgp\n'
 }
 case "${1:-}" in
@@ -180,13 +205,14 @@ run_case() (
 
   reason=''
   case "$TEST_CASE" in
-    existing|fresh) ;;
+    existing|fresh|subkey) ;;
     wrong-tag) reason="tag $TEST_TAG exists on a different commit" ;;
     ci-sha) reason="CI run 123 built $OTHER_COMMIT, not the tagged commit $COMMIT" ;;
-    non-draft) reason="release $TEST_TAG is not a draft; refusing to change it" ;;
+    non-draft|published-late) reason="release $TEST_TAG is not a draft; refusing to change it" ;;
+    extra-asset) reason="release $TEST_TAG assets are not exactly the five binaries" ;;
     checksum) reason='bitsov-windows-x86_64: expected' ;;
     filename) reason='bitsov-windows-x86_64.sha256 names a different file' ;;
-    expired-tag) reason="existing tag $TEST_TAG is not validly signed" ;;
+    expired-tag|notation) reason="existing tag $TEST_TAG is not validly signed" ;;
     expired-sums) reason='signature check failed' ;;
     *) fail "unknown case $TEST_CASE" ;;
   esac
@@ -245,7 +271,7 @@ locales+=("$utf8")
 
 passed=0 failed=0
 for test_locale in "${locales[@]}"; do
-  for test_case in existing fresh wrong-tag ci-sha non-draft checksum filename expired-tag expired-sums; do
+  for test_case in existing fresh subkey wrong-tag ci-sha non-draft published-late extra-asset checksum filename expired-tag notation expired-sums; do
     # Launch a separate process so errexit remains active inside run_case.
     # Calling a function in an if condition would silently disable it.
     set +e

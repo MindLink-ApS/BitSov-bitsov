@@ -18,12 +18,36 @@ KEY_FPR=B299274C200301714DC6F51A7C2D6F8AC842EF6E
 ASSETS=(bitsov-darwin-aarch64 bitsov-darwin-x86_64 bitsov-linux-aarch64 bitsov-linux-x86_64 bitsov-windows-x86_64)
 
 die() { echo "release-sign: $*" >&2; exit 1; }
-# A good signature from the pinned key: VALIDSIG for it, and none of the
-# expired/revoked/bad markers gpg would also print.
+# A good signature from the pinned key. The fingerprint has to be a VALIDSIG
+# field: a GOODSIG user id can contain the text "VALIDSIG <release key>"
+# without that key having signed anything. Expired/revoked/bad markers still fail.
 signed_by_key() {
-  local status; status=$(cat)
-  grep -q "VALIDSIG $KEY_FPR" <<<"$status" \
-    && ! grep -qE "^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG|EXPSIG|BADSIG|ERRSIG)" <<<"$status"
+  local status line rest fpr primary
+  status=$(cat)
+  if grep -qE '^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG|EXPSIG|BADSIG|ERRSIG) ' <<<"$status"; then
+    return 1
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      '[GNUPG:] VALIDSIG '*)
+        rest=${line#\[GNUPG:\] VALIDSIG }
+        fpr=${rest%% *}
+        primary=${line##* }
+        if [ "$fpr" = "$KEY_FPR" ] || [ "$primary" = "$KEY_FPR" ]; then
+          return 0
+        fi
+        ;;
+    esac
+  done <<<"$status"
+  return 1
+}
+require_release_assets() {
+  local expected present
+  # CI attaches each binary, its checksum, and its SBOM. Anything else
+  # (a DMG, a second binary, a renamed installer) is not covered by SHA256SUMS.
+  expected=$(for a in "${ASSETS[@]}"; do printf '%s\n' "$a" "$a.sha256" "$a.sbom.spdx.json"; done | LC_ALL=C sort)
+  present=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | LC_ALL=C sort)
+  [ "$present" = "$expected" ] || die "release $TAG assets are not exactly the five binaries, their .sha256 files, and their SBOMs"
 }
 [ $# -eq 2 ] || die "usage: $0 <tag> <commit-on-main>"
 TAG=$1 COMMIT=$2
@@ -64,6 +88,7 @@ gh run watch "$RUN" --repo "$REPO" --exit-status >/dev/null || die "CI run $RUN 
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
 gh release view "$TAG" --repo "$REPO" --json isDraft -q .isDraft | grep -qx true || die "release $TAG is not a draft; refusing to change it"
+require_release_assets
 for a in "${ASSETS[@]}"; do
   gh release download "$TAG" --repo "$REPO" --pattern "$a" --pattern "$a.sha256" --clobber
   expected=$(awk '{print $1; exit}' "$a.sha256")
@@ -74,7 +99,9 @@ for a in "${ASSETS[@]}"; do
   printf '%s  %s\n' "$actual" "$a" >> SHA256SUMS
 done
 
-# 4. Sign, verify, attach
+# 4. Sign, verify, attach. Re-check the draft after the download window so a
+# publish that landed while the binaries were hashing is not then modified.
+gh release view "$TAG" --repo "$REPO" --json isDraft -q .isDraft | grep -qx true || die "release $TAG is not a draft; refusing to change it"
 gpg --armor --detach-sign --local-user "$KEY_FPR" --output SHA256SUMS.asc SHA256SUMS
 gpg --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>&1 | signed_by_key || die "signature check failed"
 gh release upload "$TAG" SHA256SUMS SHA256SUMS.asc --repo "$REPO" --clobber
