@@ -275,6 +275,11 @@ impl PairingService {
             .get(&hash)
             .cloned()
             .ok_or(PairingError::BadProof)?;
+        // Legacy tickets burn on any consumption attempt, including expiry or
+        // stale issuer authority. V2 keeps its eligibility-before-consume order.
+        if !ticket.second_device {
+            inner.owner_tickets.tickets.remove(&hash);
+        }
         if ticket.deadline <= Instant::now() {
             return Err(PairingError::Expired);
         }
@@ -291,7 +296,6 @@ impl PairingService {
             inner.owner_tickets.tickets.remove(&hash);
             Ok(client)
         } else {
-            inner.owner_tickets.tickets.remove(&hash);
             self.create_remote_pairing_locked(&mut inner, name, public_key, transport, false)
         }
     }
@@ -391,6 +395,41 @@ fn pending_device_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v1_owner_ticket_is_burned_on_expiry_or_invalid_approver() {
+        for expired in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let svc = PairingService::open(dir.path(), "node".into(), false).unwrap();
+            let code = "owner_legacy";
+            let hash = blake3::hash(code.as_bytes()).to_hex().to_string();
+            svc.lock().owner_tickets.tickets.insert(
+                hash.clone(),
+                Ticket {
+                    client_id: "revoked".into(),
+                    key_id: "revoked".into(),
+                    epoch: 1,
+                    deadline: if expired {
+                        Instant::now() - TTL
+                    } else {
+                        Instant::now() + TTL
+                    },
+                    second_device: false,
+                },
+            );
+            let first = svc.consume_owner_ticket(code, "phone", "", &[2; 32]);
+            if expired {
+                assert!(matches!(first, Err(PairingError::Expired)));
+            } else {
+                assert!(first.is_err());
+            }
+            assert!(!svc.lock().owner_tickets.tickets.contains_key(&hash));
+            assert!(matches!(
+                svc.consume_owner_ticket(code, "phone", "", &[2; 32]),
+                Err(PairingError::BadProof)
+            ));
+        }
+    }
 
     // Discovery must stop exposing a ceremony when either lifetime expires or
     // the target pairing changes, even if the in-memory SAS survived.

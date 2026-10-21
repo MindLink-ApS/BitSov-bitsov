@@ -12,14 +12,11 @@ pub enum ApiError {
     /// Unlocked process has no live owner signer.
     #[error("box locked")]
     BoxLocked,
+    /// Another scanner retired this provisional enrollment.
+    #[error("pairing invalid: contested")]
+    PairingContested,
     #[error("{source}")]
-    Operation {
-        source: Box<ApiError>,
-        operation_id: String,
-        state: String,
-        payment_hash: Option<String>,
-        retry_allowed: bool,
-    },
+    Operation { source: Box<ApiError>, operation_id: String, state: String, payment_hash: Option<String>, retry_allowed: bool },
     #[error("{0}")]
     OperationConflict(&'static str),
     #[error("Lightning is offline or synchronizing; retry when money_ready is true")]
@@ -28,17 +25,11 @@ pub enum ApiError {
     PeerNotReady { reason: &'static str },
 
     #[error("{source}")]
-    RoutingFee {
-        source: Box<ApiError>,
-        max_routing_fee_msat: u64,
-    },
+    RoutingFee { source: Box<ApiError>, max_routing_fee_msat: u64 },
     /// `source`'s response plus a stable machine `reason`, for clients that
     /// must not parse the English message. Status and `code` are unchanged.
     #[error("{source}")]
-    Reasoned {
-        source: Box<ApiError>,
-        reason: &'static str,
-    },
+    Reasoned { source: Box<ApiError>, reason: &'static str },
     /// The backend positively refused the operation before any dispatch.
     #[error("not dispatched: {0}")]
     NotDispatched(String),
@@ -120,69 +111,38 @@ struct ErrorBody {
 
 impl ApiError {
     pub(crate) fn with_routing_fee(self, max_routing_fee_msat: u64) -> Self {
-        Self::RoutingFee {
-            source: Box::new(self),
-            max_routing_fee_msat,
-        }
+        Self::RoutingFee { source: Box::new(self), max_routing_fee_msat }
     }
     pub(crate) fn with_reason(self, reason: &'static str) -> Self {
-        Self::Reasoned {
-            source: Box::new(self),
-            reason,
-        }
+        Self::Reasoned { source: Box::new(self), reason }
     }
     /// The error a `reason` was added to.
     pub(crate) fn without_reason(&self) -> &Self {
-        match self {
-            Self::Reasoned { source, .. } => source.without_reason(),
-            other => other,
-        }
+        match self { Self::Reasoned { source, .. } => source.without_reason(), other => other }
     }
     fn response_parts(&self) -> (StatusCode, serde_json::Value) {
-        if let Self::Operation {
-            source,
-            operation_id,
-            state,
-            payment_hash,
-            retry_allowed,
-        } = self
-        {
+        if let Self::Operation { source, operation_id, state, payment_hash, retry_allowed } = self {
             let (status, mut body) = source.response_parts();
-            body["operation_id"] = operation_id.clone().into();
-            body["state"] = state.clone().into();
+            body["operation_id"] = operation_id.clone().into(); body["state"] = state.clone().into();
             body["payment_hash"] = serde_json::json!(payment_hash);
-            body["accepted"] = false.into();
-            body["retry_allowed"] = (*retry_allowed).into();
+            body["accepted"] = false.into(); body["retry_allowed"] = (*retry_allowed).into();
             return (status, body);
         }
         if let Self::OperationConflict(code) = self {
-            return (
-                StatusCode::CONFLICT,
-                serde_json::json!({"error": code, "code": code}),
-            );
+            return (StatusCode::CONFLICT, serde_json::json!({"error": code, "code": code}));
         }
         if let Self::PeerNotReady { reason } = self {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                serde_json::json!({
-                    "error": self.to_string(), "code": "peer_not_ready",
-                    "reason": reason, "retry_allowed": true
-                }),
-            );
+            return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+                "error": self.to_string(), "code": "peer_not_ready",
+                "reason": reason, "retry_allowed": true
+            }));
         }
         if matches!(self, Self::NotReady) {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                serde_json::json!({
-                    "error": self.to_string(), "code": "not_ready", "money_ready": false
-                }),
-            );
+            return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+                "error": self.to_string(), "code": "not_ready", "money_ready": false
+            }));
         }
-        if let Self::RoutingFee {
-            source,
-            max_routing_fee_msat,
-        } = self
-        {
+        if let Self::RoutingFee { source, max_routing_fee_msat } = self {
             let (status, mut body) = source.response_parts();
             body["max_routing_fee_msat"] = (*max_routing_fee_msat).into();
             return (status, body);
@@ -194,13 +154,10 @@ impl ApiError {
         }
         if let Self::NotDispatched(reason) = self {
             if reason == "disk_low" {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    serde_json::json!({
-                        "error": "Insufficient free disk space for new paid work or channel opens",
-                        "code": "disk_low", "retry_allowed": true
-                    }),
-                );
+                return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+                    "error": "Insufficient free disk space for new paid work or channel opens",
+                    "code": "disk_low", "retry_allowed": true
+                }));
             }
             if reason == konsensus_core::traits::lightning::CHANNEL_CAPACITY_EXCEEDED
                 || reason == konsensus_core::traits::lightning::TOTAL_CHANNEL_CAPACITY_EXCEEDED
@@ -222,40 +179,24 @@ impl ApiError {
                     }),
                 );
             }
-            return (
-                StatusCode::BAD_REQUEST,
-                serde_json::json!({
-                    "error": reason, "code": "not_dispatched"
-                }),
-            );
+            return (StatusCode::BAD_REQUEST, serde_json::json!({
+                "error": reason, "code": "not_dispatched"
+            }));
         }
         if matches!(self, ApiError::StatelessQuoteUnsupported) {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                serde_json::json!({
-                    "error": self.to_string(), "code": "stateless_quote_unsupported"
-                }),
-            );
+            return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+                "error": self.to_string(), "code": "stateless_quote_unsupported"
+            }));
         }
         if let ApiError::PriceCapExceeded(message) = &self {
-            return (
-                StatusCode::CONFLICT,
-                serde_json::json!({
-                    "error": message, "code": "price_cap_exceeded"
-                }),
-            );
+            return (StatusCode::CONFLICT, serde_json::json!({
+                "error": message, "code": "price_cap_exceeded"
+            }));
         }
-        if let ApiError::PaymentProofUnavailable {
-            amount_msat,
-            reason,
-        } = &self
-        {
-            return (
-                StatusCode::BAD_GATEWAY,
-                serde_json::json!({
-                    "error": reason, "code": "payment_settled_send_incomplete", "amount_msat": amount_msat
-                }),
-            );
+        if let ApiError::PaymentProofUnavailable { amount_msat, reason } = &self {
+            return (StatusCode::BAD_GATEWAY, serde_json::json!({
+                "error": reason, "code": "payment_settled_send_incomplete", "amount_msat": amount_msat
+            }));
         }
         if let ApiError::BudgetExceeded(refusal) = &self {
             let remaining = match refusal {
@@ -265,15 +206,12 @@ impl ApiError {
                 }
                 _ => None,
             };
-            return (
-                StatusCode::CONFLICT,
-                serde_json::json!({
-                    "error": refusal.to_string(),
-                    "code": "budget_exceeded",
-                    "reason": refusal.reason(),
-                    "remaining_msat": remaining,
-                }),
-            );
+            return (StatusCode::CONFLICT, serde_json::json!({
+                "error": refusal.to_string(),
+                "code": "budget_exceeded",
+                "reason": refusal.reason(),
+                "remaining_msat": remaining,
+            }));
         }
         if matches!(self, ApiError::BoxLocked) {
             return (
@@ -281,8 +219,15 @@ impl ApiError {
                 serde_json::json!({"error":"box locked","code":503,"kind":"box_locked"}),
             );
         }
+        if matches!(self, ApiError::PairingContested) {
+            return (
+                StatusCode::FORBIDDEN,
+                serde_json::json!({"error":self.to_string(),"code":403,"kind":"contested"}),
+            );
+        }
         let (status, message) = match &self {
             ApiError::BoxLocked
+            | ApiError::PairingContested
             | ApiError::Operation { .. }
             | ApiError::OperationConflict(_)
             | ApiError::NotReady
@@ -302,9 +247,7 @@ impl ApiError {
             ApiError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             ApiError::Transport(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
             ApiError::PaymentUnresolved(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
-            ApiError::PaymentProofUnavailable { reason, .. } => {
-                (StatusCode::BAD_GATEWAY, reason.clone())
-            }
+            ApiError::PaymentProofUnavailable { reason, .. } => (StatusCode::BAD_GATEWAY, reason.clone()),
             ApiError::Lightning(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             ApiError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
@@ -315,10 +258,7 @@ impl ApiError {
             code: status.as_u16(),
         };
 
-        (
-            status,
-            serde_json::to_value(body).expect("error body serializes"),
-        )
+        (status, serde_json::to_value(body).expect("error body serializes"))
     }
 }
 impl IntoResponse for ApiError {
@@ -330,11 +270,7 @@ impl IntoResponse for ApiError {
 
 /// Check before parsing payment details, consuming grants, or issuing invoices.
 pub(crate) async fn require_money_ready(state: &crate::state::AppState) -> Result<(), ApiError> {
-    if state.lightning.money_ready().await {
-        Ok(())
-    } else {
-        Err(ApiError::NotReady)
-    }
+    if state.lightning.money_ready().await { Ok(()) } else { Err(ApiError::NotReady) }
 }
 
 impl From<konsensus_core::traits::lightning::LightningError> for ApiError {
@@ -366,31 +302,20 @@ mod tests {
 
     #[tokio::test]
     async fn reasoned_price_cap_keeps_status_and_code_and_adds_only_reason() {
-        let (status, body) = error_body(
-            ApiError::PriceCapExceeded("capped".into()).with_reason("readmission_required"),
-        )
-        .await;
+        let (status, body) = error_body(ApiError::PriceCapExceeded("capped".into()).with_reason("readmission_required")).await;
         assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(
-            body,
-            serde_json::json!({"error": "capped", "code": "price_cap_exceeded", "reason": "readmission_required"})
-        );
+        assert_eq!(body, serde_json::json!({"error": "capped", "code": "price_cap_exceeded", "reason": "readmission_required"}));
         let (status, body) = error_body(ApiError::PriceCapExceeded("capped".into())).await;
         assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(
-            body,
-            serde_json::json!({"error": "capped", "code": "price_cap_exceeded"}),
-            "other producers unchanged"
-        );
+        assert_eq!(body, serde_json::json!({"error": "capped", "code": "price_cap_exceeded"}), "other producers unchanged");
     }
 
     #[tokio::test]
     async fn lightning_conversion_preserves_only_proven_non_dispatch() {
         use konsensus_core::traits::lightning::LightningError;
-        let (status, body) = error_body(ApiError::from(LightningError::PaymentNotDispatched(
-            "fee ceiling exceeded".into(),
-        )))
-        .await;
+        let (status, body) = error_body(ApiError::from(
+            LightningError::PaymentNotDispatched("fee ceiling exceeded".into()),
+        )).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "not_dispatched");
         assert_eq!(body["error"], "fee ceiling exceeded");
@@ -414,8 +339,7 @@ mod tests {
         for ceiling in [0, 5_000] {
             let (status, body) = error_body(
                 ApiError::NotDispatched("announce_unavailable".into()).with_routing_fee(ceiling),
-            )
-            .await;
+            ).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(body["code"], "not_dispatched");
             assert_eq!(body["error"], "announce_unavailable");
@@ -426,11 +350,8 @@ mod tests {
     #[tokio::test]
     async fn disk_refusal_is_retryable_and_preserves_non_dispatch() {
         let (status, body) = error_body(ApiError::from(
-            konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(
-                "disk_low".into(),
-            ),
-        ))
-        .await;
+            konsensus_core::traits::lightning::LightningError::PaymentNotDispatched("disk_low".into()),
+        )).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["code"], "disk_low");
         assert_eq!(body["retry_allowed"], true);
@@ -457,10 +378,9 @@ mod tests {
     #[tokio::test]
     async fn hub_only_refusal_is_forbidden_and_not_retryable() {
         use konsensus_core::traits::lightning::{LightningError, HUB_ONLY_WHILE_LOCKABLE};
-        let (status, body) = error_body(ApiError::from(LightningError::PaymentNotDispatched(
-            HUB_ONLY_WHILE_LOCKABLE.into(),
-        )))
-        .await;
+        let (status, body) = error_body(ApiError::from(
+            LightningError::PaymentNotDispatched(HUB_ONLY_WHILE_LOCKABLE.into()),
+        )).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["code"], HUB_ONLY_WHILE_LOCKABLE);
         assert_eq!(body["retry_allowed"], false);
@@ -535,12 +455,18 @@ mod tests {
 
     #[test]
     fn error_display_messages() {
-        assert_eq!(ApiError::NotFound("x".into()).to_string(), "not found: x");
+        assert_eq!(
+            ApiError::NotFound("x".into()).to_string(),
+            "not found: x"
+        );
         assert_eq!(
             ApiError::BadRequest("y".into()).to_string(),
             "bad request: y"
         );
-        assert_eq!(ApiError::Conflict("c".into()).to_string(), "conflict: c");
+        assert_eq!(
+            ApiError::Conflict("c".into()).to_string(),
+            "conflict: c"
+        );
         assert_eq!(
             ApiError::Unauthorized("z".into()).to_string(),
             "unauthorized: z"

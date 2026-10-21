@@ -2316,7 +2316,7 @@ async fn owner_ticket_and_nonce_expire_and_rate_window_recovers() {
             &[98; 32]
         )
         .is_err());
-    for _ in 0..5 {
+    for _ in 0..4 {
         let n = svc
             .owner_ticket_challenge(&client.client_id, client.epoch, &key_id)
             .unwrap();

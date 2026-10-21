@@ -294,6 +294,68 @@ fn t13_contested_before_and_after_enrollment() {
     }
 }
 #[test]
+fn contested_approval_retains_reason_and_audits_once() {
+    let mut f = Fixture::new();
+    let path = f.dir.path().join("audit.jsonl");
+    f.svc = f.svc.with_enrollment_audit(std::sync::Arc::new(
+        crate::audit::AuditLog::open(&path).unwrap(),
+    ));
+    let (client, op) = f.confirmed(2);
+    let signature = sign(&f.key, &f.message(&op, false));
+    // A failed durable kill must retain the op and produce no contest audit.
+    let blocker = f.svc.file_path.with_extension("json.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    assert!(matches!(
+        f.svc.check_second_device_rescan("second_2", &pubkey(3), &[3; 32]),
+        Err(PairingError::Io(_))
+    ));
+    assert!(f.svc.is_provisional(&client.client_id));
+    assert!(f.svc.pending_device_key(&op.op_id).is_some());
+    f.message(&op, false);
+    std::fs::remove_dir(&blocker).unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            f.svc.check_second_device_rescan("second_2", &pubkey(3), &[3; 32]),
+            Err(PairingError::PairingInvalid(reason)) if reason == "contested"
+        ));
+        assert!(matches!(
+            f.approve(&op, &signature),
+            Err(PairingError::PairingInvalid(reason)) if reason == "contested"
+        ));
+    }
+    assert!(f.svc.pending_device_key(&op.op_id).is_none());
+    assert!(f.svc.validate_remote_transport(&[2; 32]).is_err());
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &serde_json::Value| event["event"] == "pair.second_device_contested")
+        .collect();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].to_string().contains(&client.client_id));
+    assert!(!events[0].to_string().contains("second_2"));
+}
+
+#[test]
+fn v1_failure_gate_precedes_unknown_op_but_does_not_block_v2() {
+    let f = Fixture::new();
+    f.svc.lock().sas_failures = 3;
+    assert!(matches!(
+        f.svc.confirm_device_sas(
+            &f.owner.client_id,
+            "unknown",
+            &binding(&f.svc, &f.owner),
+            "",
+            ""
+        ),
+        Err(PairingError::Closed)
+    ));
+    // Both request and finalize for v2 ignore the v1 counter.
+    f.confirmed(2);
+    assert_eq!(f.svc.lock().sas_failures, 3);
+}
+
+#[test]
 fn t10_restart_sweeps_zero_scope_pairing() {
     let f = Fixture::new();
     f.provisional(2);

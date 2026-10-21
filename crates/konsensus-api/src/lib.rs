@@ -387,10 +387,7 @@ mod tests {
     #[test]
     fn cors_rejects_wildcard_and_null_origin() {
         let origins = parse_cors_allowed_origins("*, null, NULL, http://localhost:1420");
-        assert_eq!(
-            origins,
-            vec![HeaderValue::from_static("http://localhost:1420")]
-        );
+        assert_eq!(origins, vec![HeaderValue::from_static("http://localhost:1420")]);
     }
 
     #[test]

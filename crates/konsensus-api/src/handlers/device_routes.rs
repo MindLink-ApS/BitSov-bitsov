@@ -160,7 +160,9 @@ pub(crate) async fn finalize_device_sas(
         .ok_or_else(|| ApiError::Forbidden("completed Noise transcript required".into()))?;
     if service(&state)?
         .pending_device_key(&op_id)
-        .is_none_or(|op| op.sas_version != Some(body.sas_version))
+        .map_or(body.sas_version == 2, |op| {
+            op.sas_version != Some(body.sas_version)
+        })
     {
         return Err(ApiError::Forbidden("SAS version mismatch".into()));
     }

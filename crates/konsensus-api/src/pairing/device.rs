@@ -735,13 +735,16 @@ impl PairingService {
             .pending_device_keys
             .iter()
             .find(|p| p.op_id == op_id && p.client_id == client_id)
-            .cloned()
-            .ok_or(PairingError::UnknownOperation)?;
-        let v2 = op.sas_version == Some(2);
+            .cloned();
+        let v2 = op.as_ref().is_some_and(|op| op.sas_version == Some(2));
+        // Preserve v1's failure-gate precedence even for an unknown op. A live
+        // v2 operation never reads the v1 counter.
+        if !v2 && inner.sas_failures >= 3 {
+            return Err(PairingError::Closed);
+        }
+        let op = op.ok_or(PairingError::UnknownOperation)?;
         if v2 {
             self.provisional_locked(&inner, client_id)?;
-        } else if inner.sas_failures >= 3 {
-            return Err(PairingError::Closed);
         }
         let sas = op.sas.as_ref().ok_or(PairingError::UnknownOperation)?;
         if op.expires_at <= chrono::Utc::now().timestamp()

@@ -35,6 +35,8 @@ struct UsedTicket {
     transport: [u8; 32],
     deadline: Instant,
     contested: bool,
+    // Retain only the killed op's id, bounded by this ticket's original deadline.
+    contested_op: Option<String>,
 }
 /// Owner-visible late-rescan alert; contains no ticket or SAS material.
 #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -242,6 +244,7 @@ impl PairingService {
                 transport: *transport,
                 deadline,
                 contested: false,
+                contested_op: None,
             },
         );
         if let Err(e) = self.persist(&mut inner.file) {
@@ -294,8 +297,16 @@ impl PairingService {
             let before = inner.file.clone();
             let state = inner.second_device.clone();
             let cancelled = inner.cancelled_ops.clone();
+            let contested_op = inner
+                .file
+                .pending_device_keys
+                .iter()
+                .find(|op| op.client_id == used.client_id && op.sas_version == Some(2))
+                .map(|op| op.op_id.clone());
             Self::remove_provisional_locked(inner, &used.client_id);
-            inner.second_device.used.get_mut(&hash).unwrap().contested = true;
+            let tombstone = inner.second_device.used.get_mut(&hash).unwrap();
+            tombstone.contested = true;
+            tombstone.contested_op = contested_op;
             if let Err(e) = self.persist(&mut inner.file) {
                 inner.file = before;
                 inner.second_device = state;
@@ -304,6 +315,11 @@ impl PairingService {
             }
             Self::commit_enrollment_cleanup(inner);
             self.notify_authority_change();
+            self.enrollment_event(
+                "pair.second_device_contested",
+                &used.client_id,
+                serde_json::json!({"epoch": used.epoch}),
+            );
         } else if !used.contested {
             if let Some(key) = inner
                 .file
@@ -579,6 +595,11 @@ impl PairingService {
             return Err(PairingError::BadProof);
         }
         let approver = self.intent_key(&inner, client, epoch, key_id)?;
+        if inner.second_device.used.values().any(|ticket| {
+            ticket.contested_op.as_deref() == Some(op_id) && ticket.deadline > Instant::now()
+        }) {
+            return Err(PairingError::PairingInvalid("contested".into()));
+        }
         let op = inner
             .file
             .pending_device_keys

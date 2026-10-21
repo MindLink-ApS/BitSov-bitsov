@@ -1372,6 +1372,15 @@ async fn sas_enrollment_http_uses_server_noise_context_and_grants_no_authority()
             .0,
         StatusCode::FORBIDDEN
     );
+    let (status, unknown) = call_router(
+        router.clone(),
+        "POST",
+        "/api/v1/pair/device-key/000000000000000000000000/finalize",
+        Some(body.clone()),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
     assert_eq!(
         call_router(router, "POST", &path, Some(body), Some(&token))
             .await
@@ -2071,6 +2080,47 @@ async fn t3_t6_t9_t13_t14_second_device_tunnel_contract() {
     assert!(std::fs::read_to_string(dir.path().join("audit.jsonl"))
         .unwrap()
         .contains("pair.second_device_contested_after_enroll"));
+    let contested = svc
+        .create_second_device_pairing(
+            "second_contested",
+            "contested phone",
+            &hex::encode(SigningKey::from_bytes(&[79; 32]).verifying_key().to_bytes()),
+            &[80; 32],
+            "console",
+        )
+        .unwrap();
+    let contested_key = new_key();
+    let public = hex::encode(contested_key.public_key().as_ref());
+    let op = svc
+        .request_device_key_versioned(
+            &contested.client_id,
+            &public,
+            "contested phone",
+            &sign(
+                &contested_key,
+                &registration_message(&fp, &contested.client_id, &public),
+            ),
+            Some(2),
+            Some(konsensus_api::sas::NoiseBinding {
+                handshake_hash: [81; 32],
+                box_public_key: svc.box_transport_pubkey(),
+                client_static: [80; 32],
+            }),
+        )
+        .unwrap();
+    assert!(svc
+        .check_second_device_rescan("second_contested", &mac.client_pubkey, &[62; 32])
+        .is_err());
+    let (status, error) = call_router(
+        mac_router.clone(),
+        "POST",
+        &format!("/api/v1/pair/device-key/{}/second-device/approve", op.op_id),
+        Some(json!({"approver_key_id":mac_key_id,"signature":"00"})),
+        Some(&mac_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
+    assert_eq!(error["kind"], "contested", "{error}");
     let (_, pending) = call_router(
         mac_router,
         "GET",

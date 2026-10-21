@@ -107,11 +107,7 @@ pub fn validate_jwt_secret(secret: &str) -> Result<(), String> {
 const JWT_HEADER_JSON: &[u8] = br#"{"alg":"HS256","typ":"JWT"}"#;
 
 /// Compute the base64url (no padding) HMAC-SHA256 signature over `<h>.<p>`.
-fn hs256_signature(
-    header_b64: &str,
-    payload_b64: &str,
-    secret: &str,
-) -> Result<String, TokenError> {
+fn hs256_signature(header_b64: &str, payload_b64: &str, secret: &str) -> Result<String, TokenError> {
     // `Hmac::new_from_slice` accepts any key length; the 32-byte floor for
     // operator-configured secrets is enforced separately by `validate_jwt_secret`.
     let mut mac =
@@ -280,7 +276,11 @@ impl PairingBinding {
     /// partial binding, which is rejected outright rather than interpreted:
     /// half a binding is not a weaker grant, it is a malformed one.
     pub fn from_claims(claims: &Claims) -> Result<Option<Self>, TokenError> {
-        match (claims.cid.as_deref(), claims.epc, claims.idf.as_deref()) {
+        match (
+            claims.cid.as_deref(),
+            claims.epc,
+            claims.idf.as_deref(),
+        ) {
             (None, None, None) => Ok(None),
             (Some(cid), Some(epoch), Some(idf)) if !cid.is_empty() && !idf.is_empty() => {
                 Ok(Some(PairingBinding {
@@ -303,11 +303,7 @@ const TOKEN_VALIDITY_SECS: i64 = 86400;
 /// one no-argument `create_token`, so a change made for the loopback path would silently
 /// have altered the key-proof path too; requiring the set here makes that impossible to
 /// do by accident (#72).
-pub fn create_token(
-    node_id_hex: &str,
-    secret: &str,
-    scopes: Vec<Scope>,
-) -> Result<String, TokenError> {
+pub fn create_token(node_id_hex: &str, secret: &str, scopes: Vec<Scope>) -> Result<String, TokenError> {
     let now = Utc::now().timestamp();
     let claims = Claims {
         sub: node_id_hex.to_string(),
@@ -396,9 +392,7 @@ pub fn validate_token(token: &str, secret: &str) -> Result<Claims, TokenError> {
     let mut parts = token.split('.');
     let (header_b64, payload_b64, sig_b64) =
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(h), Some(p), Some(s), None)
-                if !h.is_empty() && !p.is_empty() && !s.is_empty() =>
-            {
+            (Some(h), Some(p), Some(s), None) if !h.is_empty() && !p.is_empty() && !s.is_empty() => {
                 (h, p, s)
             }
             _ => return Err(TokenError::Malformed),

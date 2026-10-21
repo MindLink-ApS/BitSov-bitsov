@@ -635,6 +635,20 @@ The v1 vector and first-device protocol are unchanged. The owner view exposes
 `issuer`, and both approval and rejection sign it after `ticket_id`. Matching
 the issuing device's current QR (or accepting `issuer:console`) is app UI policy;
 the node trusts any currently enrolled owner key that passes the approval checks.
+The owner app displays words only when `approval_message` is non-null, so a
+request that has not passed finalize never presents words to the approver.
+A provisional contested kill records `pair.second_device_contested` without
+QR or SAS secrets. Approval of the killed op returns HTTP 403 with
+`kind: "contested"` until the original provisional deadline; after that it is
+an unknown op. A late rescan after enrollment preserves the device and records
+`pair.second_device_contested_after_enroll`.
+
+The claim-bound second-device v1 path retains its prior error ordering: an
+unknown finalize op is 404 (or 403 when the v1 failure gate is closed), and a
+v1 owner ticket is spent before expiry and approver checks. V2 alone bypasses
+the v1 failure gate and preserves tickets on failed eligibility checks.
+The shared expired-ticket issue-slot refund and `created_at` request throttle
+remain as required by §5 of the N-2DEV design.
 
 
 ### Remote first run

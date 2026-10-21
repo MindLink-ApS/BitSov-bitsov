@@ -280,7 +280,9 @@ pub struct PairedClient {
     /// Optional X25519 static public key used by remote-access Noise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_transport_pubkey: Option<String>,
-    /// Scopes this pairing carries.
+    /// Scopes this pairing carries. Empty scopes are reserved for provisional
+    /// enrollment; startup and expiry sweeps remove such records without a live
+    /// in-memory provisional record, regardless of the rollout flag.
     pub scopes: Vec<Scope>,
     /// Revocation epoch. Bumping it invalidates every outstanding token for
     /// this client immediately, without waiting for expiry.

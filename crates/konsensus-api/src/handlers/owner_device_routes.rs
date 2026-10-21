@@ -241,7 +241,7 @@ fn second_error(e: crate::pairing::PairingError) -> ApiError {
     match e {
         crate::pairing::PairingError::OwnerChannelUnavailable => ApiError::BoxLocked,
         crate::pairing::PairingError::PairingInvalid(ref reason) if reason == "contested" => {
-            ApiError::Forbidden(e.to_string()).with_reason("contested")
+            ApiError::PairingContested
         }
         crate::pairing::PairingError::PairingInvalid(ref reason) if reason == "no_owner_device" => {
             ApiError::Forbidden(e.to_string()).with_reason("no_owner_device")
