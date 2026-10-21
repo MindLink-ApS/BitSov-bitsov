@@ -12,9 +12,6 @@ fn run(command: &str, dir: &std::path::Path, args: &[&str], input: &str) -> Outp
     cmd.args([command, "--dir"])
         .arg(dir)
         .args(["--tier", "full"]);
-    if command == "restore" {
-        cmd.args(["--mnemonic", PHRASE]);
-    }
     let mut child = cmd
         .args(args)
         .stdin(Stdio::piped())
@@ -22,6 +19,11 @@ fn run(command: &str, dir: &std::path::Path, args: &[&str], input: &str) -> Outp
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let input = if command == "restore" {
+        format!("{input}{PHRASE}\n")
+    } else {
+        input.to_owned()
+    };
     child
         .stdin
         .take()
@@ -32,7 +34,7 @@ fn run(command: &str, dir: &std::path::Path, args: &[&str], input: &str) -> Outp
 }
 
 #[test]
-fn blank_explicit_passwords_write_nothing() {
+fn legacy_blank_explicit_passwords_write_nothing_with_opt_in() {
     for command in ["init", "restore"] {
         for password in ["", "   ", "\t", "\u{2003}\u{a0}"] {
             for existing_dir in [false, true] {
@@ -41,7 +43,7 @@ fn blank_explicit_passwords_write_nothing() {
                 if existing_dir {
                     std::fs::create_dir(&dir).unwrap();
                 }
-                let mut args = vec!["--encrypt", password];
+                let mut args = vec!["--encrypt", password, "--insecure-argv"];
                 if command == "init" {
                     args.push("--non-interactive");
                 }
@@ -87,14 +89,15 @@ fn non_interactive_encrypt_requires_a_password() {
 }
 
 #[test]
-fn explicit_normal_password_creates_only_encrypted_mnemonic() {
+fn safe_normal_password_creates_only_encrypted_mnemonic() {
     for command in ["init", "restore"] {
         let temp = tempfile::tempdir().unwrap();
-        let mut args = vec!["--encrypt", "  normal password  "];
-        if command == "init" {
-            args.push("--non-interactive");
-        }
-        let out = run(command, temp.path(), &args, "");
+        let args: &[&str] = if command == "init" {
+            &["--non-interactive", "--password-fd", "0"]
+        } else {
+            &["--encrypt"]
+        };
+        let out = run(command, temp.path(), args, "  normal password  \n");
         assert!(
             out.status.success(),
             "{}",
@@ -132,17 +135,23 @@ fn blank_bootstrap_password_writes_nothing() {
     for password in ["", "          "] {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("node");
-        let out = Command::new(env!("CARGO_BIN_EXE_konsensus"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_konsensus"))
             .arg("start")
             .arg("--config")
             .arg(dir.join("konsensus.toml"))
-            .args(["--password", password])
-            .output()
+            .args(["--password-fd", "0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{password}").unwrap();
+        let out = child.wait_with_output().unwrap();
         assert!(!out.status.success());
         let error = String::from_utf8_lossy(&out.stderr);
         assert!(
-            error.contains("must not be empty or whitespace-only"),
+            error.contains("must not be empty or whitespace-only")
+                || error.contains("descriptor is empty"),
             "{error}"
         );
         assert!(

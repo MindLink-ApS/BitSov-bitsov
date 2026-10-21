@@ -210,11 +210,35 @@ at rest) **before** dispatch. A request carrying a recorded id never opens again
 | --- | --- |
 | `opened` | HTTP 200 with the original open response, plus `operation_id` and `replayed: true`. |
 | `uncertain` (the first attempt returned a timeout, connection or backend error) | HTTP 202 `status: "outcome_uncertain"`, `last_error`, and `peer_channels` (this peer's current channels, or null if Lightning cannot list them). Inspect them; to try again, use a **new** `operation_id`. |
-| `pending` (dispatch in flight, or the node stopped before recording the outcome) | HTTP 202 `status: "pending"` with the same fields. |
+| `pending` (dispatch in flight, or at most ten minutes old) | HTTP 202 `status: "pending"` with the same fields. |
+| `pending` older than ten minutes, with no in-process open running | Inspect the node's channels: exactly one channel to the requested peer with the requested capacity records `opened` and returns HTTP 200; zero or multiple matches, or an unavailable channel list, records `uncertain` and returns HTTP 202. Never dispatches again. |
+
+Dispatch and outcome recording for an operation run in a background task that
+survives an HTTP client disconnect. A node crash or failed outcome write can
+still leave a `pending` row. Retrying the same id after ten minutes reconciles
+that row using the existing timestamps and result columns; no new migration is
+required. An open still running in this process is never reconciled, regardless
+of age.
+
+A recovered success includes `recovered: true` and the observed channel IDs and
+funding outpoint. Its `pending_visibility` status does not claim transaction
+visibility or confirmation; its original fee quote is unavailable. Peer and
+capacity matching cannot prove that the observed channel was created by this
+operation, so inspect it before taking further action. An uncertain recovery
+includes an "inspect GET /payments/channels" hint (the full route is
+`GET /api/v1/payments/channels`). Neither an uncertain record nor an absent
+channel permits automatic re-dispatch. A settled record keeps its outcome on
+later retries even if the channel list changes.
 
 The same id with any different parameter returns `409 operation_mismatch`
 before dispatch. A proven non-dispatch (`400 not_dispatched`, or `503 not_ready`
-from the backend) removes the record, so the same id may be retried. A replay
+from the backend) removes the record, so the same id may be retried. For the
+pinned LDK open path, stopped-node, insufficient-funds, peer-connection,
+invalid-socket-address, channel-capacity-limit, and channel-creation validation
+refusals are proven to occur before LDK accepts the open. Persistence failures
+remain uncertain because peer persistence can fail after creation. These
+classifications apply at the open-call boundary; a later funding timeout or
+unknown backend error does not become retry-safe. A replay
 does not require `money_ready`. `operation_id` cannot be combined with
 `dry_run` (`400 not_dispatched`); an invalid id is HTTP 400. The first
 successful response also includes `operation_id`.

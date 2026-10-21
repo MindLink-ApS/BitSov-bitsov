@@ -5,6 +5,10 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Finish channel-open operation recording after HTTP disconnects; reconcile
+  crash-left `pending` operations older than ten minutes against the node's
+  channels on retry, without dispatching again. Proven LDK pre-dispatch refusals
+  release the operation ID. Uses the existing migration 030 schema.
 - Deflake locked-mode shutdown and unpaid-request flood tests with independent,
   generous hang guards for slow CI runners. Fixes #325.
 - Update rustls-webpki 0.103.15 to 0.103.16 and webpki-roots 1.0.6 to 1.0.10
@@ -15,6 +19,7 @@ also live on the corresponding GitHub pre-release pages.
   bundle, including residual risk and removal on the sqlx/ldk-node island
   upgrade (#59). Mirror both exceptions and their shared CVE alias across
   the advisory scanner configurations; the patched modern lines stay required.
+
 - Make `POST /api/v1/payments/open-channel` idempotent with an optional UUIDv4
   `operation_id` (#331, capability `channel_open_operations_v1`): recorded
   before dispatch (migration 030), a retry with the same id returns the recorded
@@ -28,6 +33,21 @@ also live on the corresponding GitHub pre-release pages.
   `UserChannelId(n)` values. Clients should use `user_channel_id` for a stable ID.
 - Report the configured Bitcoin `network` in owner `/api/v1/status`, including
   LDK signet, using the same configuration as funding-address (#321).
+
+### Security
+
+- Validate Host and Origin before local token issuance and local-only reads/WebSocket admission to prevent browser DNS rebinding; preserve native clients without Origin.
+- **Breaking change (H2):** argv passwords and mnemonic phrases are deprecated,
+  warn on stderr, and refuse execution unless `--insecure-argv` is explicit.
+  This includes `--encrypt <password>` and nonempty BIP-39 `--passphrase` values.
+  Use `--password-fd`, `--password-file`, `--passphrase-fd` (BIP-39), or the
+  interactive prompt instead.
+  The owner-token helper now sends its legacy password variable through an fd.
+- **Behaviour change (#337):** the node forces its data directory (the folder
+  that holds `--config`) to 0700 and the control socket to 0600 before binding,
+  and refuses to start if it cannot. Keep the config inside a dedicated data dir
+  (not `$HOME` directly) and make sure the node's user owns that directory,
+  e.g. on container volumes.
 
 ## [0.3.0-rc18] — 2026-10-20 (prep; not tagged yet)
 

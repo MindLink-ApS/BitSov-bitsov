@@ -4188,6 +4188,26 @@ pub fn restrict_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Make `path` owner-only (`0700`) and fail if group or other bits remain.
+///
+/// A seed directory that stays traversable lets another local user reach a
+/// socket inode during the window before its own mode is tightened.
+pub fn ensure_owner_private_dir(path: &Path) -> io::Result<()> {
+    restrict_dir(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory is group- or world-accessible after chmod 0700",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// fsync a directory so a rename into it is durable on Unix.
 /// On other platforms the directory sync is best-effort; a missing directory still fails.
 pub fn fsync_dir_strict(path: &Path) -> io::Result<()> {

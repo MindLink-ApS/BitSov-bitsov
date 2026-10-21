@@ -3089,17 +3089,42 @@ fn open_ldk_channel_with_policy(
         node.open_channel(node_pubkey, ldk_addr, amount_sats, push_msat, None)
     }
     .map_err(|e| match e {
-        // In vendored ldk-node 0.7 this means announcement preflight failed or
-        // lightning 0.2.2's create_channel returned Err, before queuing an open
-        // message. Other errors (e.g. peer persistence AFTER creation) may be
-        // post-dispatch and must retain the conservative Backend classification.
+        // vendor/ldk-node/src/lib.rs: Node::open_channel_inner checks is_running
+        // before connecting, checking funds, or calling create_channel.
+        ldk_node::NodeError::NotRunning => {
+            LightningError::PaymentNotDispatched(format!("open_channel failed: {e}"))
+        }
+        // vendor/ldk-node/src/lib.rs: open_channel_inner calls
+        // check_sufficient_funds_for_channel (both balance/anchor-reserve
+        // refusals) before ChannelManager::create_channel.
+        ldk_node::NodeError::InsufficientFunds => {
+            LightningError::PaymentNotDispatched(format!("open_channel failed: {e}"))
+        }
+        // vendor/ldk-node/src/lib.rs: open_channel_inner propagates connection
+        // errors and check_sufficient_funds_for_channel's missing-peer refusal
+        // before create_channel. vendor/ldk-node/src/connection.rs:
+        // ConnectionManager::do_connect_peer also returns InvalidSocketAddress
+        // during address resolution, before any channel can be created.
+        ldk_node::NodeError::ConnectionFailed | ldk_node::NodeError::InvalidSocketAddress => {
+            LightningError::PaymentNotDispatched(format!("open_channel failed: {e}"))
+        }
+        // vendor/ldk-node/src/lib.rs: both ChannelLimits::lock/check calls in
+        // open_channel_inner precede create_channel; the two capacity errors
+        // originate in vendor/ldk-node/src/channel_limits.rs.
         ldk_node::NodeError::ChannelCapacityExceeded
         | ldk_node::NodeError::TotalChannelCapacityExceeded => {
             LightningError::PaymentNotDispatched(e.to_string())
         }
+        // vendor/ldk-node/src/lib.rs: announcement/allowlist preflight, or Err
+        // from create_channel. vendor/lightning/src/ln/channelmanager.rs:
+        // ChannelManager::create_channel returns all validation/disconnected
+        // peer errors before inserting the channel or queuing SendOpenChannel.
         ldk_node::NodeError::ChannelCreationFailed => {
             LightningError::PaymentNotDispatched(format!("open_channel failed: {e}"))
         }
+        // PersistenceFailed is ambiguous: open_channel_inner saves the funding
+        // policy BEFORE creation, but peer_store.add_peer can fail AFTER it.
+        // Do not generalize this allowlist to arbitrary backend/validation errors.
         _ => LightningError::Backend(format!("open_channel failed: {e}")),
     })?;
 

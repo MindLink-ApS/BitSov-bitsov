@@ -349,8 +349,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read release toolchain pin
+        id: release-toolchain
+        shell: bash
+        run: echo "version=$(cat scripts/release-toolchain)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.release-toolchain.outputs.version }}
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools
@@ -362,25 +368,11 @@ jobs:
       # Tag-only matrix. It is not part of pull_request or main pushes: macOS
       # runners are billed at 10× and Windows at 2×, so running the full
       # matrix on every main push would spend more than it saves.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          cache-all-crates: "true"
-          cache-workspace-crates: "true"
-
-      - name: sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      - name: Enable sccache for Cargo
-        shell: bash
-        run: |
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-
+      # Do not reuse compiled artifacts for a release reproducibility check
+      # (#341): no rust-cache or sccache in this job.
       - name: Build release binary
-        run: cargo build --locked --release -p konsensus-node --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        shell: bash
+        run: bash scripts/release-build.sh ${{ matrix.target }}
 
       # Unix (Linux + macOS): build output is `konsensus`. Linux keeps sha256sum (identical to
       # before); macOS has no sha256sum, so fall back to `shasum -a 256`, which emits the SAME

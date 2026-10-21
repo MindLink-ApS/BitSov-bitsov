@@ -117,8 +117,9 @@ impl konsensus_crypto::SessionStore for StorageSessionAdapter {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let file_logging = logging::init();
     let cli = Cli::parse();
+    cli.check_argv_secrets()?;
+    let file_logging = logging::init();
 
     match cli.command {
         Command::ClaimCode { config, show: _ } => claim_code::show(&config)?,
@@ -285,12 +286,20 @@ async fn main() -> Result<()> {
             mnemonic,
             config,
             passphrase,
+            passphrase_fd,
             password,
             password_file,
             password_fd,
         } => {
             // Wrap before resolve_mnemonic_path so a config error still zeroizes it.
             let password = password.map(Zeroizing::new);
+            let passphrase = Zeroizing::new(passphrase);
+            let passphrase = match passphrase_fd {
+                Some(fd) => {
+                    password::read_password_fd(fd).context("failed to read BIP-39 passphrase")?
+                }
+                None => passphrase,
+            };
             let mnemonic_path = resolve_mnemonic_path(mnemonic, config)?;
             let password = supplied_seed_password(password, password_file.as_deref(), password_fd)?;
             cmd_node_id(&mnemonic_path, &passphrase, password)?;
@@ -300,12 +309,20 @@ async fn main() -> Result<()> {
             mnemonic,
             config,
             passphrase,
+            passphrase_fd,
             password,
             password_file,
             password_fd,
         } => {
             // Wrap before resolve_mnemonic_path so a config error still zeroizes it.
             let password = password.map(Zeroizing::new);
+            let passphrase = Zeroizing::new(passphrase);
+            let passphrase = match passphrase_fd {
+                Some(fd) => {
+                    password::read_password_fd(fd).context("failed to read BIP-39 passphrase")?
+                }
+                None => passphrase,
+            };
             let mnemonic_path = resolve_mnemonic_path(mnemonic, config)?;
             let password = supplied_seed_password(password, password_file.as_deref(), password_fd)?;
             cmd_sign_challenge(&mnemonic_path, &passphrase, &challenge, password)?;
@@ -335,16 +352,39 @@ async fn main() -> Result<()> {
                 config,
                 out,
                 password,
+                password_file,
+                password_fd,
             } => {
-                whitelist_cmd::cmd_whitelist_backup(&config, password.as_deref(), out.as_deref())
-                    .await?;
+                let password = supplied_seed_password(
+                    password.map(Zeroizing::new),
+                    password_file.as_deref(),
+                    password_fd,
+                )?;
+                whitelist_cmd::cmd_whitelist_backup(
+                    &config,
+                    password.as_deref().map(String::as_str),
+                    out.as_deref(),
+                )
+                .await?;
             }
             WhitelistCommand::Restore {
                 from,
                 config,
                 password,
+                password_file,
+                password_fd,
             } => {
-                whitelist_cmd::cmd_whitelist_restore(&config, password.as_deref(), &from).await?;
+                let password = supplied_seed_password(
+                    password.map(Zeroizing::new),
+                    password_file.as_deref(),
+                    password_fd,
+                )?;
+                whitelist_cmd::cmd_whitelist_restore(
+                    &config,
+                    password.as_deref().map(String::as_str),
+                    &from,
+                )
+                .await?;
             }
         },
     }
@@ -402,9 +442,10 @@ fn cmd_init(
     let password = mnemonic_encryption_password(encrypt, password, non_interactive)?;
     use crate::config::NodeTier;
 
-    // Create directory if needed
+    // Create directory if needed, then drop group/other traversal before any secret is written.
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create directory: {}", dir.display()))?;
+    restrict_data_dir(dir)?;
 
     let config_path = dir.join("konsensus.toml");
     let mnemonic_path = dir.join("mnemonic.txt");
@@ -530,6 +571,7 @@ fn cmd_restore(
 
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create directory: {}", dir.display()))?;
+    restrict_data_dir(dir)?;
 
     anyhow::ensure!(
         std::fs::read_dir(dir)?.next().is_none(),
@@ -648,6 +690,13 @@ fn cmd_restore(
     println!();
 
     Ok(())
+}
+
+/// Owner-only data directory (`0700`). Group or other traversal would expose
+/// the control socket during the bind/chmod window and the names of seed files.
+fn restrict_data_dir(dir: &Path) -> Result<()> {
+    konsensus_api::pairing::ensure_owner_private_dir(dir)
+        .with_context(|| format!("failed to restrict {} to mode 0700", dir.display()))
 }
 
 /// Write `NODE_INITIALIZED` last, after identity and config are on disk.
@@ -1106,6 +1155,9 @@ async fn cmd_start(
     // Balance is not consulted, here or in `classify`: an initialized node with
     // no funds is initialized.
     let data_dir = owner_cmd::data_dir_of(config_path);
+    if data_dir.is_dir() {
+        restrict_data_dir(&data_dir)?;
+    }
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
             // A new encrypted seed must reject blank input before even logging

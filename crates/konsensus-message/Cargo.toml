@@ -27,6 +27,7 @@ socket2 = "0.6"
 
 [dev-dependencies]
 mockall.workspace = true
+proptest.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 konsensus-storage = { path = "../konsensus-storage" }
 uuid.workspace = true
