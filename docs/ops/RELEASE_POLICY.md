@@ -146,6 +146,16 @@ checkout and Cargo home. Inherited Rust flags and compiler wrappers are removed.
 CI copies the resulting `konsensus` (Windows: `konsensus.exe`) without further
 binary transformation before hashing.
 
+On Darwin, ld64 derives the Mach-O `LC_UUID` from the link output, including the
+debug map whose `N_OSO` entries carry absolute object paths (the checkout and the
+rustup home); path remapping does not reach them. The recipe therefore links
+Darwin targets with `-Wl,-S`, which omits the debug map. Without it, two builds
+of the same commit differ only in `LC_UUID` and the linker code-signature hash
+that covers it, so the H3 host rebuild (which runs in a fresh temporary
+worktree) could never match CI (found on rc19.1). `scripts/release-repro-check.sh
+<triple> [commit]` builds a target twice from two different worktree paths and
+compares the hashes; run it on the signing host when changing the recipe.
+
 These settings are necessary, not a guarantee across arbitrary systems. Use a
 trusted build environment and dependency cache, matching native compiler,
 linker/binutils, OS libraries and SDK versions, target CPU/features and Cargo
