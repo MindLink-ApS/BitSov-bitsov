@@ -108,7 +108,7 @@ pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind:
     Ok(signal)
 }
 
-fn refused(e: CallRefusal) -> ApiError {
+fn refused(e: CallRefusal, new_operation: bool) -> ApiError {
     let reason = match e {
         CallRefusal::Replayed => "call_id_used",
         CallRefusal::Full => "call_busy",
@@ -116,7 +116,12 @@ fn refused(e: CallRefusal) -> ApiError {
         CallRefusal::Invalid(_) | CallRefusal::NotCallKind => "call_signal_invalid",
         _ => "call_not_live",
     };
-    ApiError::BadRequest(e.to_string()).with_reason(reason)
+    let error = if new_operation {
+        ApiError::NotDispatched(e.to_string())
+    } else {
+        ApiError::BadRequest(e.to_string())
+    };
+    error.with_reason(reason)
 }
 
 /// Reserve one of our signals under `operation_id` and the exact request
@@ -126,27 +131,58 @@ fn refused(e: CallRefusal) -> ApiError {
 /// same call with another payload (Codex delta2 #2) is refused without
 /// touching the existing reservation. A meeting leg we (`own`) place must go
 /// to a later participant of its roster.
-pub async fn reserve_outgoing(store: Store<'_>, own: &NodeId, peer: &NodeId, kind: u16, plaintext: &str, operation_id: &str, request_hash: &str) -> Result<(), ApiError> {
+pub async fn reserve_outgoing(
+    store: Store<'_>,
+    own: &NodeId,
+    peer: &NodeId,
+    kind: u16,
+    plaintext: &str,
+    operation_id: &str,
+    request_hash: &str,
+) -> Result<(), ApiError> {
+    let storage =
+        |e: konsensus_storage::StorageError| ApiError::Internal(format!("call state: {e}"));
+    // Compose holds the operation lock through reservation and journal insertion.
+    // Only a missing journal proves no earlier attempt dispatched: even an
+    // expired offer can be retried while its previous payment is unresolved.
+    let new_operation = store
+        .get_outbox_operation(operation_id)
+        .await
+        .map_err(storage)?
+        .is_none();
+    let refused = |e| refused(e, new_operation);
     let signal = CallSignal::parse(kind, plaintext).map_err(refused)?;
     signal.check_leg(own, peer).map_err(refused)?;
     let _g = lock().lock().await;
     let now = now_ms();
-    let storage = |e: konsensus_storage::StorageError| ApiError::Internal(format!("call state: {e}"));
-    let taken = store.call_pending().await.map_err(storage)?.into_iter().any(|(p, call_id, e)| {
-        e.pending.is_some_and(|x| {
-            x.operation_id == operation_id && (p != *peer || call_id != signal.call_id || !x.is(operation_id, request_hash))
-        })
-    });
+    let taken = store
+        .call_pending()
+        .await
+        .map_err(storage)?
+        .into_iter()
+        .any(|(p, call_id, e)| {
+            e.pending.is_some_and(|x| {
+                x.operation_id == operation_id
+                    && (p != *peer
+                        || call_id != signal.call_id
+                        || !x.is(operation_id, request_hash))
+            })
+        });
     if taken {
         return Err(ApiError::OperationConflict("operation_mismatch"));
     }
-    let entry = current(store, peer, &signal.call_id, now).await.map_err(storage)?;
+    let entry = current(store, peer, &signal.call_id, now)
+        .await
+        .map_err(storage)?;
     if entry.is_none() && kind == konsensus_core::kind::KIND_CALL_INVITE {
         room(store, peer, now).await.map_err(refused)?;
     }
-    let next = rules::reserve(entry.clone(), kind, operation_id, request_hash, now).map_err(refused)?;
+    let next =
+        rules::reserve(entry.clone(), kind, operation_id, request_hash, now).map_err(refused)?;
     if entry.as_ref() != Some(&next) {
-        write(store, peer, &signal.call_id, Some(&next)).await.map_err(storage)?;
+        write(store, peer, &signal.call_id, Some(&next))
+            .await
+            .map_err(storage)?;
     }
     Ok(())
 }

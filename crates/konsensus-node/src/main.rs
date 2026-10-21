@@ -1908,6 +1908,8 @@ async fn start_node_services<'a>(
             event_rx: auto_channel_rx,
             shutdown_rx: node.shutdown_rx(),
             subsidy: config.onboarding_subsidy.clone(),
+            funding_priority: matches!(config.lightning, config::LightningConfig::Ldk { .. })
+                .then_some(konsensus_core::traits::lightning::FundingPriority::Fast),
         },
     ));
     let advertised_lightning_addr = config.lightning.advertised_lightning_addr();
