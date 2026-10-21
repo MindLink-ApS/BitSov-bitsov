@@ -38,6 +38,15 @@ case "$TARGET" in
     export CXXFLAGS="$CFLAGS"
     ;;
 esac
+case "$TARGET" in
+  *-apple-darwin)
+    # ld64 derives LC_UUID from the link output, including the debug map whose
+    # N_OSO entries hold absolute checkout and rustup paths. Omit that map
+    # (-S; the shipped binary is symbol-stripped anyway) so the UUID, and with
+    # it the linker signature, no longer depends on where the build ran.
+    CARGO_ENCODED_RUSTFLAGS+=$'\x1f'"-Clink-arg=-Wl,-S"
+    ;;
+esac
 if [ "$TARGET" = aarch64-unknown-linux-gnu ]; then
   export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 fi

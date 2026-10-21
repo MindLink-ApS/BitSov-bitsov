@@ -226,6 +226,9 @@ case "$*" in
       [ "$CXX" = "$TEST_ROOT/bin/clang++" ] || bad_call wrong-cxx
       [ "$AR" = "$TEST_ROOT/bin/ar" ] || bad_call wrong-ar
       [ "$SDKROOT" = /mock/MacOSX27.0.sdk ] || bad_call wrong-sdk
+      [[ "$CARGO_ENCODED_RUSTFLAGS" == *$'\x1f'-Clink-arg=-Wl,-S ]] || bad_call darwin-debug-map
+    else
+      [[ "$CARGO_ENCODED_RUSTFLAGS" != *-Wl,-S* ]] || bad_call non-darwin-link-arg
     fi
     printf '%s\n' "$PWD" >> "$CASE_DIR/build.log"
     case "$TEST_CASE" in *build-failure) exit 1 ;; esac
