@@ -304,6 +304,10 @@ done
 
 run_case() (
   export LC_ALL=$1 TEST_CASE=$2 CASE_DIR="$WORK/$1-$2"
+  case "$TEST_CASE" in
+    dotted-*) TEST_TAG=v0.3.0-rc19.1 ;;
+    stable-off-main) TEST_TAG=v0.3.0 ;;
+  esac
   mkdir -p "$CASE_DIR"
   fail() { echo "$*" >&2; exit 1; }
   git init -q --bare "$CASE_DIR/origin.git"
@@ -335,10 +339,34 @@ run_case() (
     TEST_HOST=x86_64-apple-darwin TEST_HOST_ASSET=bitsov-darwin-x86_64
   fi
   git remote add origin "file://$CASE_DIR/origin.git"
-  git push -q -u origin main
-  if [ "$TEST_CASE" != fresh ] && [ "$TEST_CASE" != dry-fresh ]; then
+  case "$TEST_CASE" in
+    dotted-release|dotted-release-fresh|dotted-release-head-diff|dotted-wrong-tag|plain-rc-off-main|stable-off-main)
+      # The reviewed release is isolated from origin/main.
+      git push -q origin "$OTHER_COMMIT:refs/heads/main"
+      git push -q origin "$COMMIT:refs/heads/release/$TEST_TAG"
+      if [ "$TEST_CASE" = dotted-release-head-diff ]; then
+        # Leave a stale matching tracking ref; only a fresh fetch sees the advance.
+        branch_head=$(printf 'advance release\n' | git commit-tree "${COMMIT}^{tree}" -p "$COMMIT")
+        git push -q origin "$branch_head:refs/heads/release/$TEST_TAG"
+        git update-ref "refs/remotes/origin/release/$TEST_TAG" "$COMMIT"
+      elif [ "$TEST_CASE" = dotted-release ]; then
+        # A stale nonmatching tracking ref must not override fresh FETCH_HEAD.
+        git update-ref "refs/remotes/origin/release/$TEST_TAG" "$OTHER_COMMIT"
+      fi
+      ;;
+    *) git push -q -u origin main ;;
+  esac
+  if [ "$TEST_CASE" = dotted-release-missing ]; then
+    # Even main ancestry, a stale tracking ref, and a same-named tag cannot
+    # replace an absent release branch on origin.
+    git update-ref "refs/remotes/origin/release/$TEST_TAG" "$COMMIT"
+    git tag "release/$TEST_TAG" "$COMMIT"
+    git push -q origin "refs/tags/release/$TEST_TAG"
+    git fetch -q origin main
+  fi
+  if [ "$TEST_CASE" != fresh ] && [ "$TEST_CASE" != dry-fresh ] && [ "$TEST_CASE" != dotted-release-fresh ]; then
     target=$COMMIT
-    [ "$TEST_CASE" != wrong-tag ] || target=$OTHER_COMMIT
+    case "$TEST_CASE" in wrong-tag|dotted-wrong-tag) target=$OTHER_COMMIT ;; esac
     git tag -s -u "$TEST_KEY" "$TEST_TAG" "$target" -m "BitSov $TEST_TAG"
     git push -q origin "refs/tags/$TEST_TAG"
     old_tag=$(git rev-parse "refs/tags/$TEST_TAG")
@@ -438,7 +466,10 @@ run_case() (
   fi
   reason=''
   case "$TEST_CASE" in
-    darwin-match|darwin-intel-match|existing|fresh|subkey|stderr-noise|retry|retry-sums|retry-signature|dry-existing|accept-mismatch|dry-accept-mismatch|accept-darwin-mismatch|accept-match) ;;
+    darwin-match|darwin-intel-match|existing|fresh|dotted-release|dotted-release-fresh|subkey|stderr-noise|retry|retry-sums|retry-signature|dry-existing|accept-mismatch|dry-accept-mismatch|accept-darwin-mismatch|accept-match) ;;
+    dotted-release-head-diff) reason="$COMMIT does not match the approved release branch release/$TEST_TAG" ;;
+    dotted-release-missing) reason="cannot fetch approved release branch release/$TEST_TAG from origin" ;;
+    plain-rc-off-main|stable-off-main) reason="$COMMIT is not on origin/main" ;;
     mismatch|dry-mismatch|compromised-ci) reason='reproducibility mismatch for x86_64-unknown-linux-gnu' ;;
     build-failure|accept-build-failure) reason='local rebuild failed' ;;
     no-waivers|missing-waiver|accept-missing-waiver) reason='unverified target' ;;
@@ -446,7 +477,7 @@ run_case() (
     unknown-waiver) reason='unknown target' ;;
     unsupported-host) reason='unsupported signing host' ;;
     dry-fresh) reason='dry-run requires an existing tag' ;;
-    wrong-tag) reason="tag $TEST_TAG exists on a different commit" ;;
+    wrong-tag|dotted-wrong-tag) reason="tag $TEST_TAG exists on a different commit" ;;
     ci-sha) reason="CI run 123 built $OTHER_COMMIT, not the tagged commit $COMMIT" ;;
     non-draft|published-late) reason="release $TEST_TAG is not a draft; refusing to change it" ;;
     checksum|accept-checksum) reason='bitsov-windows-x86_64: expected' ;;
@@ -457,6 +488,13 @@ run_case() (
     reason-duplicate) reason='--accept-unverified-host may only be supplied once' ;;
     extra-asset|retry-extra|retry-lookalike) reason="release $TEST_TAG assets are not exactly the five binaries" ;;
     *) fail "unknown case $TEST_CASE" ;;
+  esac
+  case "$TEST_CASE" in
+    dotted-release-head-diff|dotted-release-missing|plain-rc-off-main|stable-off-main)
+      [ ! -s "$CASE_DIR/gpg.log" ] || fail 'ref rejection accessed GPG'
+      [ ! -s "$CASE_DIR/gh.log" ] || fail 'ref rejection contacted CI'
+      [ ! -e "$CASE_DIR/build.log" ] || fail 'ref rejection rebuilt'
+      ;;
   esac
   # Inspect evidence AFTER the signer has exited and its EXIT trap has run.
   case "$TEST_CASE" in
@@ -559,7 +597,7 @@ run_case() (
   fi
   if [ "$TEST_CASE" = dry-fresh ]; then
     [ ! -e "$CASE_DIR/signed-tag" ] || fail 'dry-run signed a tag'
-  elif [ "$TEST_CASE" = fresh ]; then
+  elif [ "$TEST_CASE" = fresh ] || [ "$TEST_CASE" = dotted-release-fresh ]; then
     [ -e "$CASE_DIR/signed-tag" ] || fail 'fresh tag was not signed'
     [ "$(git --git-dir="$CASE_DIR/origin.git" rev-parse "$TEST_TAG^{commit}")" = "$COMMIT" ] || fail 'fresh tag was not pushed'
   else
@@ -602,7 +640,8 @@ for test_locale in "${locales[@]}"; do
     accept-match accept-build-failure accept-checksum accept-missing-waiver reason-empty reason-blank reason-option reason-missing \
     reason-duplicate subkey published-late extra-asset notation wrong-primary-tag missing-primary-tag truncated-tag \
     trailing-key-tag wrong-primary-sums missing-primary-sums truncated-sums trailing-key-sums stderr-only-tag stderr-only-sums stderr-noise \
-    retry retry-sums retry-signature retry-extra retry-lookalike; do
+    retry retry-sums retry-signature retry-extra retry-lookalike \
+    dotted-release dotted-release-fresh dotted-release-head-diff dotted-release-missing dotted-wrong-tag plain-rc-off-main stable-off-main; do
     # Launch a separate process so errexit remains active inside run_case.
     # Calling a function in an if condition would silently disable it.
     set +e
