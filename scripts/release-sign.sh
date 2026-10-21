@@ -6,9 +6,9 @@
 # 1. Creates and pushes a GPG-signed tag on the commit (skipped if the tag already
 #    exists and is signed by the release key).
 # 2. Waits for the tag's CI run, which stages the DRAFT release with the binaries
-#    and per-file .sha256 and .sbom.spdx.json files.
-# 3. Downloads all fifteen assets, checks each binary against its .sha256,
-#    and writes SHA256SUMS covering the binaries, checksums, and SBOMs.
+#    and per-file checksums, SBOMs, and Darwin toolchain evidence.
+# 3. Downloads all seventeen assets, checks each binary against its .sha256,
+#    and writes SHA256SUMS covering all seventeen source assets.
 # 4. Rebuilds the host target from the tag and compares its hash with CI.
 #    A mismatch retains evidence and requires a reasoned break-glass to proceed.
 #    Every other target requires an explicit, logged waiver.
@@ -60,14 +60,17 @@ verify_tag() {
 }
 require_release_assets() {
   local expected present
-  # CI attaches each binary, its checksum, and its SBOM. Anything else
+  # CI attaches each binary, its checksum, SBOM, and Darwin toolchain record. Anything else
   # (a DMG, a second binary, a renamed installer) is not covered by SHA256SUMS.
-  expected=$(for a in "${ASSETS[@]}"; do printf '%s\n' "$a" "$a.sha256" "$a.sbom.spdx.json"; done | LC_ALL=C sort)
+  expected=$(for a in "${ASSETS[@]}"; do
+    printf '%s\n' "$a" "$a.sha256" "$a.sbom.spdx.json"
+    if [[ "$a" == bitsov-darwin-* ]]; then printf '%s\n' "$a.toolchain.txt"; fi
+  done | LC_ALL=C sort)
   # A full or partial previous upload is safe to regenerate. Only these exact
-  # generated names are exempt; all fifteen source assets remain mandatory.
+  # generated names are exempt; all seventeen source assets remain mandatory.
   present=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' |
     awk '$0 != "SHA256SUMS" && $0 != "SHA256SUMS.asc"' | LC_ALL=C sort)
-  [ "$present" = "$expected" ] || die "release $TAG assets are not exactly the five binaries, their .sha256 files, and their SBOMs"
+  [ "$present" = "$expected" ] || die "release $TAG assets are not exactly the five binaries, their .sha256 files, their SBOMs, and Darwin toolchain evidence"
 }
 POSITIONAL=()
 while [ $# -gt 0 ]; do
@@ -122,6 +125,15 @@ for i in "${!TARGETS[@]}"; do
   [ "${TARGETS[$i]}" != "$HOST" ] || HOST_ASSET=${ASSETS[$i]}
 done
 [ -n "$HOST_ASSET" ] || die "unsupported signing host $HOST"
+case "$HOST" in
+  *-apple-darwin)
+    [ -f "$WORK/source/scripts/release-macos-toolchain.sh" ] || die 'tag lacks macOS toolchain pin; prepare a new release'
+    # Fail before tag signing, CI waiting, downloads, or the expensive rebuild.
+    (cd "$WORK/source" && bash scripts/release-build.sh --check-toolchain "$HOST") > "$WORK/host-toolchain.txt" ||
+      die 'macOS toolchain preflight failed; nothing signed'
+    cat "$WORK/host-toolchain.txt"
+    ;;
+esac
 # Bash 3.2 treats an empty array as unset under nounset.
 for target in ${ACCEPTED[@]+"${ACCEPTED[@]}"}; do
   [ "$target" != "$HOST" ] || die "host target cannot be waived: $HOST"
@@ -173,6 +185,13 @@ for a in "${ASSETS[@]}"; do
   [ "$expected" = "$actual" ] || die "$a: expected $expected, got $actual"
   printf '%s  %s\n' "$actual" "$a" >> SHA256SUMS
   shasum -a 256 "$a.sha256" "$a.sbom.spdx.json" >> SHA256SUMS
+  case "$a" in
+    bitsov-darwin-*)
+      gh release download "$TAG" --repo "$REPO" --pattern "$a.toolchain.txt" --clobber
+      [ -s "$a.toolchain.txt" ] || die "$a.toolchain.txt is empty"
+      shasum -a 256 "$a.toolchain.txt" >> SHA256SUMS
+      ;;
+  esac
 done
 
 # 4. Rebuild independently: never execute or trust a downloaded CI binary.
@@ -193,6 +212,12 @@ if [ "$LOCAL_HASH" != "$CI_HASH" ]; then
   EVIDENCE=$(mktemp -d "$SOURCE_REPO/release-sign-evidence/$TAG.XXXXXX")
   cp "$BINARY" "$EVIDENCE/$HOST_ASSET.rebuilt"
   cp SHA256SUMS "$EVIDENCE/SHA256SUMS"
+  cp bitsov-darwin-*.toolchain.txt "$EVIDENCE/"
+  case "$HOST" in
+    *-apple-darwin)
+      cp "$WORK/source/target/$HOST/release-toolchain.txt" "$EVIDENCE/host-toolchain.txt"
+      ;;
+  esac
   diff_status=0
   diff -u --label "CI/$HOST" --label "local/$HOST" "$WORK/ci-hash" "$WORK/local-hash" > "$EVIDENCE/host-hash.diff" || diff_status=$?
   [ "$diff_status" -eq 1 ] || die 'could not record host hash diff; refusing to sign'
