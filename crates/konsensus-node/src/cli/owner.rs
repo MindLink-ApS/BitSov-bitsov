@@ -275,6 +275,7 @@ fn report(resp: ControlResponse) -> Result<()> {
 pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
     match send(config_path, ControlRequest::Status).await? {
         ControlResponse::Status {
+            second_device_alerts,
             clients,
             pending_elevations,
             pending_replacements,
@@ -284,6 +285,9 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             pending_device_keys,
             pending_owner_approvals,
         } => {
+            for alert in second_device_alerts {
+                safe_println!("This QR was used again after you approved {:?}. Revoke it if it wasn't yours. (client={})",alert.name,alert.client_id);
+            }
             for p in pending_owner_approvals {
                 safe_println!("PENDING OWNER APPROVAL {} kind={} client={} expires_at={} (approve on a different enrolled owner device)", p.op_id, p.kind, p.client_id, p.expires_at);
             }

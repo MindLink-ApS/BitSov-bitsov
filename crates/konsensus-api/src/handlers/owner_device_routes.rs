@@ -58,7 +58,11 @@ pub(crate) async fn ticket_challenge(
     let svc = service(&state)?;
     let nonce = svc
         .owner_ticket_challenge(&binding.client_id, binding.epoch, &query.approver_key_id)
-        .map_err(map_err)?;
+        .map_err(if svc.second_device_enrollment_enabled() {
+            second_error
+        } else {
+            map_err
+        })?;
     Ok((
         [(CACHE_CONTROL, "no-store")],
         Json(json!({
@@ -74,6 +78,7 @@ pub(crate) struct TicketRequest {
     approver_key_id: String,
     nonce: String,
     signature: String,
+    purpose: Option<String>,
 }
 
 pub(crate) async fn mint_ticket(
@@ -83,12 +88,18 @@ pub(crate) async fn mint_ticket(
     Json(body): Json<TicketRequest>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
     let binding = tunnel(&auth, &state, noise)?;
-    let result = service(&state)?.mint_owner_ticket(
+    if body.purpose.is_some() && !service(&state)?.second_device_enrollment_enabled() {
+        return Err(ApiError::NotFound(
+            "second-device enrollment disabled".into(),
+        ));
+    }
+    let result = service(&state)?.mint_owner_ticket_with_purpose(
         &binding.client_id,
         binding.epoch,
         &body.approver_key_id,
         &body.nonce,
         &body.signature,
+        body.purpose.as_deref(),
     );
     state.audit_log.record(
         if result.is_ok() {
@@ -99,7 +110,11 @@ pub(crate) async fn mint_ticket(
         &binding.client_id,
         Some(json!({"key_id": body.approver_key_id, "epoch": binding.epoch})),
     );
-    let link = result.map_err(map_err)?;
+    let link = result.map_err(if body.purpose.is_some() {
+        second_error
+    } else {
+        map_err
+    })?;
     let uri = link
         .to_uri()
         .map_err(|_| ApiError::Internal("ticket encoding failed".into()))?;
@@ -121,7 +136,11 @@ pub(crate) async fn pending_devices(
         .map_err(map_err)?;
     Ok((
         [(CACHE_CONTROL, "no-store")],
-        Json(json!({"pending":pending})),
+        Json(if service(&state)?.second_device_enrollment_enabled() {
+            json!({"pending":pending,"alerts":service(&state)?.second_device_alerts()})
+        } else {
+            json!({"pending":pending})
+        }),
     ))
 }
 
@@ -172,4 +191,61 @@ pub(crate) async fn delegate(
     Ok(Json(
         json!({"op_id":op,"key_id":key.key_id,"status":"registered"}),
     ))
+}
+
+pub(crate) async fn second_approve(
+    auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+    Path(op): Path<String>,
+    noise: Option<Extension<AuthenticatedNoise>>,
+    Json(body): Json<DelegationRequest>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    let binding = tunnel(&auth, &state, noise)?;
+    let key = service(&state)?
+        .approve_second_device(
+            &binding.client_id,
+            binding.epoch,
+            &op,
+            &body.approver_key_id,
+            &body.signature,
+        )
+        .map_err(second_error)?;
+    Ok((
+        [(CACHE_CONTROL, "no-store")],
+        Json(json!({"op_id":op,"key_id":key.key_id,"status":"registered"})),
+    ))
+}
+pub(crate) async fn second_reject(
+    auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+    Path(op): Path<String>,
+    noise: Option<Extension<AuthenticatedNoise>>,
+    Json(body): Json<DelegationRequest>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    let binding = tunnel(&auth, &state, noise)?;
+    service(&state)?
+        .reject_second_device(
+            &binding.client_id,
+            binding.epoch,
+            &op,
+            &body.approver_key_id,
+            &body.signature,
+        )
+        .map_err(second_error)?;
+    Ok((
+        [(CACHE_CONTROL, "no-store")],
+        axum::http::StatusCode::NO_CONTENT,
+    ))
+}
+fn second_error(e: crate::pairing::PairingError) -> ApiError {
+    match e {
+        crate::pairing::PairingError::OwnerChannelUnavailable => ApiError::BoxLocked,
+        crate::pairing::PairingError::PairingInvalid(ref reason) if reason == "contested" => {
+            ApiError::Forbidden(e.to_string()).with_reason("contested")
+        }
+        crate::pairing::PairingError::PairingInvalid(ref reason) if reason == "no_owner_device" => {
+            ApiError::Forbidden(e.to_string()).with_reason("no_owner_device")
+        }
+        _ => map_err(e),
+    }
 }

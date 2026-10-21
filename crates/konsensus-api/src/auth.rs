@@ -107,7 +107,11 @@ pub fn validate_jwt_secret(secret: &str) -> Result<(), String> {
 const JWT_HEADER_JSON: &[u8] = br#"{"alg":"HS256","typ":"JWT"}"#;
 
 /// Compute the base64url (no padding) HMAC-SHA256 signature over `<h>.<p>`.
-fn hs256_signature(header_b64: &str, payload_b64: &str, secret: &str) -> Result<String, TokenError> {
+fn hs256_signature(
+    header_b64: &str,
+    payload_b64: &str,
+    secret: &str,
+) -> Result<String, TokenError> {
     // `Hmac::new_from_slice` accepts any key length; the 32-byte floor for
     // operator-configured secrets is enforced separately by `validate_jwt_secret`.
     let mut mac =
@@ -276,11 +280,7 @@ impl PairingBinding {
     /// partial binding, which is rejected outright rather than interpreted:
     /// half a binding is not a weaker grant, it is a malformed one.
     pub fn from_claims(claims: &Claims) -> Result<Option<Self>, TokenError> {
-        match (
-            claims.cid.as_deref(),
-            claims.epc,
-            claims.idf.as_deref(),
-        ) {
+        match (claims.cid.as_deref(), claims.epc, claims.idf.as_deref()) {
             (None, None, None) => Ok(None),
             (Some(cid), Some(epoch), Some(idf)) if !cid.is_empty() && !idf.is_empty() => {
                 Ok(Some(PairingBinding {
@@ -303,7 +303,11 @@ const TOKEN_VALIDITY_SECS: i64 = 86400;
 /// one no-argument `create_token`, so a change made for the loopback path would silently
 /// have altered the key-proof path too; requiring the set here makes that impossible to
 /// do by accident (#72).
-pub fn create_token(node_id_hex: &str, secret: &str, scopes: Vec<Scope>) -> Result<String, TokenError> {
+pub fn create_token(
+    node_id_hex: &str,
+    secret: &str,
+    scopes: Vec<Scope>,
+) -> Result<String, TokenError> {
     let now = Utc::now().timestamp();
     let claims = Claims {
         sub: node_id_hex.to_string(),
@@ -392,7 +396,9 @@ pub fn validate_token(token: &str, secret: &str) -> Result<Claims, TokenError> {
     let mut parts = token.split('.');
     let (header_b64, payload_b64, sig_b64) =
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(h), Some(p), Some(s), None) if !h.is_empty() && !p.is_empty() && !s.is_empty() => {
+            (Some(h), Some(p), Some(s), None)
+                if !h.is_empty() && !p.is_empty() && !s.is_empty() =>
+            {
                 (h, p, s)
             }
             _ => return Err(TokenError::Malformed),
@@ -554,6 +560,51 @@ pub(crate) fn check_pairing_binding(
     Ok(Some(binding))
 }
 
+/// A read-capable pairing or a live provisional pairing on its own Noise session.
+/// Use only on the four own-operation enrollment routes.
+pub struct EnrollmentAuth(pub AuthUser);
+impl std::ops::Deref for EnrollmentAuth {
+    type Target = AuthUser;
+    fn deref(&self) -> &AuthUser {
+        &self.0
+    }
+}
+#[axum::async_trait]
+impl FromRequestParts<Arc<AppState>> for EnrollmentAuth {
+    type Rejection = Response;
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Response> {
+        let user = AuthUser::from_request_parts(parts, state).await?;
+        if user.has(Scope::Read) {
+            return Ok(Self(user));
+        }
+        let allowed = user.pairing.as_ref().is_some_and(|b| {
+            parts
+                .extensions
+                .get::<crate::rate_limit::AuthenticatedNoise>()
+                .is_some_and(|n| {
+                    n.client_id.as_ref() == b.client_id
+                        && state.pairing.as_ref().is_some_and(|s| {
+                            s.is_provisional(&b.client_id)
+                                || s.validate_remote_transport(&n.binding.client_static)
+                                    .is_ok_and(|c| {
+                                        c.client_id == b.client_id
+                                            && c.epoch == b.epoch
+                                            && c.scopes.contains(&Scope::Read)
+                                    })
+                        })
+                })
+        });
+        if allowed {
+            Ok(Self(user))
+        } else {
+            Err((StatusCode::FORBIDDEN, "enrollment authority required").into_response())
+        }
+    }
+}
+
 /// Scope-enforcing extractors (#72).
 ///
 /// A handler names the authority it needs in its own signature, so enforcement is a
@@ -669,6 +720,46 @@ pub mod scoped {
             })
         }
     }
+}
+
+/// Defense in depth for provisional Noise sessions, including otherwise public routes.
+pub(crate) async fn enrollment_routes_only(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(noise) = req
+        .extensions()
+        .get::<crate::rate_limit::AuthenticatedNoise>()
+    {
+        if state
+            .pairing
+            .as_ref()
+            .is_some_and(|p| p.is_provisional(&noise.client_id))
+        {
+            let path = req.uri().path();
+            let method = req.method().as_str();
+            let own = path.strip_prefix("/api/v1/pair/device-key/");
+            let allowed = matches!(
+                (method, path),
+                ("GET", "/api/v1/pair/challenge")
+                    | ("POST", "/api/v1/pair/token")
+                    | ("POST", "/api/v1/pair/device-key")
+            ) || own.is_some_and(|rest| {
+                let (op, tail) = rest.split_once('/').unwrap_or((rest, ""));
+                op.len() == 24
+                    && op.bytes().all(|b| b.is_ascii_hexdigit())
+                    && matches!(
+                        (method, tail),
+                        ("GET", "") | ("DELETE", "") | ("POST", "finalize")
+                    )
+            });
+            if !allowed {
+                return (StatusCode::FORBIDDEN, "provisional enrollment only").into_response();
+            }
+        }
+    }
+    next.run(req).await
 }
 
 #[cfg(test)]

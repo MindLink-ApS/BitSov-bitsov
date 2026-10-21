@@ -616,6 +616,27 @@ commitment `66` × 32. Its digest is
 `960be0e8e070d1089b55da2113669f8530ee396eb36cd0fa04e82cb9ae346f35`;
 indices are `1200, 760, 465, 1543`: **noodle gallery demand science**.
 
+### N-2DEV SAS v2 frozen vector (PR A)
+
+Behind `[pairing] second_device_enrollment = true`, second-device enrollment
+uses `bitsov-sas-v2` and the ticket commitment from
+[the N-2DEV contract](../design/N-2DEV-SECOND-DEVICE.md#3-sas-v2-digest-claimless).
+It never reads the first-device claim code. With handshake bytes `00` through
+`1f`, box key `22` × 32, client static `33` × 32, device key `04` followed by
+`44` × 64, nonce `55` × 16, and ticket commitment `77` × 32:
+
+```text
+digest: 93398e09883acf7401e66410f924dd8d726e625c816d260f963ca5f8a7250a5e
+words: nasty small list away
+```
+
+The synthetic device bytes are a transcript vector, not a registration proof.
+The v1 vector and first-device protocol are unchanged. The owner view exposes
+`issuer`, and both approval and rejection sign it after `ticket_id`. Matching
+the issuing device's current QR (or accepting `issuer:console`) is app UI policy;
+the node trusts any currently enrolled owner key that passes the approval checks.
+
+
 ### Remote first run
 
 `POST /api/v1/identity/create-pending` accepts:

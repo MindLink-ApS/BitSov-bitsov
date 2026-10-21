@@ -1532,7 +1532,10 @@ async fn start_node_services<'a>(
         .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?
         // The owner command the app and console show names this exact config.
         .with_owner_config(config_path.to_path_buf())
-        .with_hosted_by(config.node.hosted_by.clone());
+        .with_hosted_by(config.node.hosted_by.clone())
+        .with_second_device_enrollment(config.pairing.second_device_enrollment)
+        .with_second_device_claim_v1(config.pairing.second_device_claim_v1)
+        .with_enrollment_audit(Arc::clone(&audit_log));
         let service = if local_owner_device {
             service.with_local_owner_device()
         } else {
