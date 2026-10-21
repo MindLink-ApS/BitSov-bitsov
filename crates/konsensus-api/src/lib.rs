@@ -169,11 +169,40 @@ fn build_router_with_options(
     } else {
         handlers::health::routes(state.operator_probes_enabled)
     };
-    let pairing_routes = if remote {
+    let mut pairing_routes = if remote {
         handlers::pairing_routes::remote_routes(state.pairing.is_some())
     } else {
         handlers::pairing_routes::routes(state.pairing.is_some())
     };
+    if remote
+        && state
+            .pairing
+            .as_ref()
+            .is_some_and(|p| p.second_device_enrollment_enabled())
+    {
+        pairing_routes = pairing_routes
+            .route(
+                "/api/v1/health",
+                axum::routing::get(handlers::health::health),
+            )
+            .route(
+                "/api/v1/pair/device-key/:op_id/second-device/approve",
+                axum::routing::post(handlers::owner_device_routes::second_approve),
+            )
+            .route(
+                "/api/v1/pair/device-key/:op_id/second-device/reject",
+                axum::routing::post(handlers::owner_device_routes::second_reject),
+            );
+        pairing_routes = pairing_routes.layer(axum::middleware::map_response(
+            |mut response: axum::response::Response| async move {
+                response.headers_mut().insert(
+                    axum::http::header::CACHE_CONTROL,
+                    axum::http::HeaderValue::from_static("no-store"),
+                );
+                response
+            },
+        ));
+    }
 
     let router = Router::new()
         .merge(health_routes)
@@ -209,7 +238,10 @@ fn build_router_with_options(
         .merge(handlers::gossip::routes())
         .merge(ws::routes());
     let router = if remote {
-        router
+        router.layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::enrollment_routes_only,
+        ))
     } else {
         // Prometheus scrape endpoint — unauthenticated, restrict via network ACL.
         router.route("/metrics", get(metrics_handler))

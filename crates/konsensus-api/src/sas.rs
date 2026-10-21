@@ -133,6 +133,27 @@ pub fn digest(
     }
     h.finalize()
 }
+/// Claimless second-device transcript, bound to the scanned ticket commitment.
+pub fn digest_v2(
+    binding: &NoiseBinding,
+    device: &[u8; 65],
+    nonce: &[u8; 16],
+    ticket: &[u8; 32],
+) -> blake3::Hash {
+    let mut h = blake3::Hasher::new();
+    for bytes in [
+        b"bitsov-sas-v2".as_slice(),
+        &binding.handshake_hash,
+        &binding.box_public_key,
+        &binding.client_static,
+        device,
+        nonce,
+        ticket,
+    ] {
+        h.update(bytes);
+    }
+    h.finalize()
+}
 /// First 44 bits, most significant bit first, four BIP-39 English word indices.
 pub fn words(digest: &blake3::Hash) -> [&'static str; 4] {
     let mut first = [0; 8];
@@ -225,6 +246,40 @@ mod tests {
         bytes[5] = 15;
         bytes[6..].fill(255);
         assert_eq!(words(&blake3::Hash::from(bytes)), ["abandon"; 4]);
+    }
+    #[test]
+    fn t1_sas_v2_fields_and_domain() {
+        let binding = NoiseBinding {
+            handshake_hash: std::array::from_fn(|i| i as u8),
+            box_public_key: [0x22; 32],
+            client_static: [0x33; 32],
+        };
+        let mut device = [0x44; 65];
+        device[0] = 4;
+        let nonce = [0x55; 16];
+        let ticket = [0x77; 32];
+        let result = digest_v2(&binding, &device, &nonce, &ticket);
+        assert_ne!(result, digest(&binding, &device, &nonce, &ticket));
+        for i in 0..6 {
+            let mut b = binding;
+            let mut d = device;
+            let mut n = nonce;
+            let mut t = ticket;
+            match i {
+                0 => b.handshake_hash[0] ^= 1,
+                1 => b.box_public_key[0] ^= 1,
+                2 => b.client_static[0] ^= 1,
+                3 => d[1] ^= 1,
+                4 => n[0] ^= 1,
+                _ => t[0] ^= 1,
+            }
+            assert_ne!(result, digest_v2(&b, &d, &n, &t));
+        }
+        assert_eq!(
+            result.to_hex().as_str(),
+            "93398e09883acf7401e66410f924dd8d726e625c816d260f963ca5f8a7250a5e"
+        );
+        assert_eq!(words(&result), ["nasty", "small", "list", "away"]);
     }
     #[test]
     fn sas_vector_and_all_fields_bound() {

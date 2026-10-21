@@ -60,6 +60,9 @@ use crate::auth::{self, Scope, TokenError};
 
 pub mod approval;
 pub mod device;
+pub mod second_device;
+#[cfg(test)]
+mod second_device_tests;
 pub mod ticket;
 use crate::spend_budget::{
     BudgetRefusal, Charge, GrantBudget, GrantTerms, GrantView, Reservation,
@@ -277,7 +280,9 @@ pub struct PairedClient {
     /// Optional X25519 static public key used by remote-access Noise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_transport_pubkey: Option<String>,
-    /// Scopes this pairing carries.
+    /// Scopes this pairing carries. Empty scopes are reserved for provisional
+    /// enrollment; startup and expiry sweeps remove such records without a live
+    /// in-memory provisional record, regardless of the rollout flag.
     pub scopes: Vec<Scope>,
     /// Revocation epoch. Bumping it invalidates every outstanding token for
     /// this client immediately, without waiting for expiry.
@@ -630,6 +635,9 @@ pub struct PairingService {
     owner_control_enabled: bool,
     /// Explicit live-start authority for device envelopes and signed delegation.
     local_owner_device: bool,
+    second_device_enrollment: bool,
+    second_device_claim_v1: bool,
+    enrollment_audit: Option<std::sync::Arc<crate::audit::AuditLog>>,
     /// Whether a safe protected-file instruction is written to stdout. The
     /// code/challenge itself is never printed.
     print_pairing_instruction: bool,
@@ -659,6 +667,7 @@ struct Inner {
     // Wrong grant confirmations in this run (see `OWNER_CODE_FAILURES_PER_RUN`).
     owner_code_failures: u32,
     sas_failures: u8,
+    second_device: second_device::State,
     owner_tickets: ticket::OwnerTickets,
     owner_approvals: approval::OwnerApprovals,
     // Requests cancelled by wrong codes in this run, so their status reads
@@ -893,6 +902,7 @@ impl PairingService {
                 owner_confirmations: HashMap::new(),
                 owner_code_failures: 0,
                 sas_failures: 0,
+                second_device: second_device::State::default(),
                 owner_tickets: ticket::OwnerTickets::default(),
                 owner_approvals: approval::OwnerApprovals::default(),
                 cancelled_ops: std::collections::HashMap::new(),
@@ -902,6 +912,9 @@ impl PairingService {
             authority_changes,
             owner_control_enabled,
             local_owner_device: false,
+            second_device_enrollment: false,
+            second_device_claim_v1: true,
+            enrollment_audit: None,
             print_pairing_instruction: true,
             owner_console: Mutex::new(Box::new(OwnerTerminal)),
             owner_config: None,
@@ -912,6 +925,7 @@ impl PairingService {
         // A grant that expired while the node was down, or an unmetered
         // pre-G1 grant, must not survive the restart on disk either.
         service.prune_expired_grants()?;
+        service.sweep_provisional_pairings()?;
         Ok(service)
     }
 
@@ -1780,6 +1794,9 @@ impl PairingService {
             .find(|client| client.remote_transport_pubkey.as_deref() == Some(remote_hex.as_str()))
             .cloned()
             .ok_or(PairingError::UnknownClient)?;
+        if record.scopes.is_empty() {
+            self.provisional_locked(&inner, &record.client_id)?;
+        }
         if record.identity_fingerprint != inner.identity_fingerprint {
             return Err(PairingError::PairingInvalid(
                 "identity fingerprint changed".into(),
@@ -1806,6 +1823,9 @@ impl PairingService {
             .iter()
             .find(|client| client.client_id == client_id)
             .ok_or(PairingError::UnknownClient)?;
+        if record.scopes.is_empty() {
+            self.provisional_locked(&inner, &record.client_id)?;
+        }
         if record.epoch != epoch
             || record.remote_transport_pubkey.as_deref() != Some(remote_hex.as_str())
             || record.identity_fingerprint != identity_fingerprint
@@ -1915,6 +1935,9 @@ impl PairingService {
             .cloned()
             .ok_or(PairingError::UnknownClient)?;
 
+        if record.scopes.is_empty() {
+            self.provisional_locked(&inner, &record.client_id)?;
+        }
         if record.identity_fingerprint != fingerprint {
             return Err(PairingError::PairingInvalid(
                 "pairing was created against a different identity".into(),
@@ -1997,6 +2020,9 @@ impl PairingService {
             .iter()
             .find(|c| c.client_id == client_id)
             .ok_or(PairingError::UnknownClient)?;
+        if record.scopes.is_empty() {
+            self.provisional_locked(&inner, &record.client_id)?;
+        }
         if record.epoch != epoch {
             return Err(PairingError::PairingInvalid(
                 "pairing epoch has been bumped — the token is revoked".into(),
@@ -2054,6 +2080,9 @@ impl PairingService {
     /// honour recipient-only device budgets or verified owner-approval receipts.
     /// Grantable scopes embedded in a base pairing record never widen sidecar authority.
     fn effective_scopes(&self, inner: &Inner, record: &PairedClient, now_unix: i64) -> Vec<Scope> {
+        if record.scopes.is_empty() {
+            return vec![];
+        }
         let mut scopes = record.scopes.clone();
         if !self.owner_control_enabled {
             scopes.retain(|s| !grantable_scopes().contains(s));
@@ -2156,6 +2185,7 @@ impl PairingService {
             .collect();
         inner.file.registered_ops.retain(|_, k| keys.contains(k));
         self.persist(&mut inner.file)?;
+        inner.second_device.provisional.remove(client_id);
         self.notify_authority_change();
         Ok(())
     }
@@ -2182,6 +2212,9 @@ impl PairingService {
             .find(|c| c.client_id == client_id)
             .cloned()
             .ok_or(PairingError::UnknownClient)?;
+        if old.scopes.is_empty() {
+            return Err(PairingError::PairingInvalid("provisional".into()));
+        }
         let old_key = parse_pubkey(&old.client_pubkey)?;
         let msg = format!("bitsov-pair-rotate-v1:{client_id}:{new_pubkey_hex}");
         old_key

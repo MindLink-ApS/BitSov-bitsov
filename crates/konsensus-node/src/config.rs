@@ -164,12 +164,31 @@ impl Default for SetupPageConfig {
     }
 }
 
+/// Pairing rollout switches; first-device bootstrap is independent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PairingConfig {
+    pub second_device_enrollment: bool,
+    pub second_device_claim_v1: bool,
+}
+impl Default for PairingConfig {
+    fn default() -> Self {
+        Self {
+            second_device_enrollment: false,
+            second_device_claim_v1: true,
+        }
+    }
+}
+
 /// Top-level node configuration, matching `konsensus.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     #[serde(default)]
     pub starter_hub: crate::onboarding::starter_hub::StarterHubConfig,
+    /// Owner-approved second-device enrollment rollout.
+    #[serde(default)]
+    pub pairing: PairingConfig,
     /// Separate LAN box page port; activated only by --home.
     #[serde(default)]
     pub setup_page: SetupPageConfig,
@@ -2034,6 +2053,7 @@ impl NodeConfig {
         let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
 
         Self {
+            pairing: PairingConfig::default(),
             setup_page: Default::default(),
             tower: Default::default(),
             node: NodeDisplayConfig::default(),

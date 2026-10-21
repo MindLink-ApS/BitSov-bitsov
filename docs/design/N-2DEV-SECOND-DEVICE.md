@@ -50,6 +50,8 @@ The approval request reaches the owner device **by pull over the owner device's 
 | 11′ | Owner device → node | `POST …/second-device/reject {approver_key_id, signature}` (domain `…-reject-v1`, same fields) | Op dropped, provisional pairing revoked. No node-wide count (the reject is the owner's own decision) |
 | 12 | New device → node | `GET /pair/device-key/{op}` → `registered` | Normal paired device |
 
+The issuer/ticket-id approval gate in step 10 is **UI policy**, not a node authorization check. Owner devices are trusted: the node accepts a valid approval from any enrolled owner device regardless of ticket issuer. The signed `issuer` field covers the UI policy input.
+
 ## 3. SAS v2 digest (claimless)
 
 ```text
@@ -92,6 +94,7 @@ noise_handshake_hash:{64 hex}
 noise_client_static:{64 hex}
 box_transport_pubkey:{64 hex}
 ticket_id:{32 hex}
+issuer:{console or minting key_id}
 sas_version:2
 sas_digest:{64 hex}
 sas_words:{w1} {w2} {w3} {w4}
@@ -148,7 +151,7 @@ The reject message is identical except for the domain `bitsov-second-device-reje
 | Normal pairing | As today | As today (behind `second_device_claim_v1`) | 403 |
 | Device that already holds a pairing and scans a second-device QR | n/a | n/a | Ticket consumption refuses `already_paired` (the client pubkey or Noise static matches an existing pairing, `create_remote_pairing_locked` would otherwise return the existing full pairing). **The ticket is not consumed.** The app generates fresh pairing keys and scans again |
 
-**Single SAS slot vs v1.** Any Read pairing can hold the one live SAS slot with an unconfirmed v1 request (creating a v1 op needs no claim). A v2 request **pre-empts an unconfirmed v1 op**: it drops it (its client sees `lost`) and takes the slot. A confirmed v1 op is never pre-empted.
+**Single SAS slot vs v1.** Any Read pairing can hold the one live SAS slot with an unconfirmed v1 request (creating a v1 op needs no claim). A v2 request **pre-empts an unconfirmed v1 op**: it drops it (its client sees `lost`) and takes the slot. A confirmed v1 op is never pre-empted. Pre-emption does not raise v1 `sas_failures` and must not reuse `cancel_pending`.
 
 The approval routes accept only `sas_version: 2` ops. `delegate_device_key_inner` refuses any op whose `sas_version` is not `None` or `Some(1)` **inside the function**, so every caller (the tunnel `/delegate` and the loopback `device_routes::delegate_device_key`, which passes `require_sas = false`) refuses v2. A v2 op can be enrolled only by `…/second-device/approve` or by console `device approve`.
 
@@ -183,7 +186,7 @@ The approval routes accept only `sas_version: 2` ops. `delegate_device_key_inner
 | `POST /api/v1/pair/device-key/{op}/finalize` | own op | Accepts `sas_version: 2` |
 | `GET/DELETE /api/v1/pair/device-key/{op}` | own op | Status adds `approval: "owner_device"`. Rejected ops report `lost` |
 | `GET /api/v1/pair/device-key/pending` | enrolled owner device | Lists v2 ops (`sas_version: 2`) |
-| `GET /api/v1/pair/device-key/{op}/delegation` | enrolled owner device | For v2, adds `noise_handshake_hash`, `noise_client_static`, `box_transport_pubkey`, `ticket_id`, `sas_digest`, `approval_message` (null until finalized). Never the claim, never the ticket code |
+| `GET /api/v1/pair/device-key/{op}/delegation` | enrolled owner device | For v2, adds `noise_handshake_hash`, `noise_client_static`, `box_transport_pubkey`, `ticket_id`, `issuer` ("console" or minting key_id), `sas_digest`, `approval_message` (null until finalized). Never the claim, never the ticket code |
 | `POST /api/v1/pair/device-key/{op}/second-device/approve` | enrolled owner device | **New** `{approver_key_id, signature}` → `{op_id, key_id, status:"registered"}` |
 | `POST /api/v1/pair/device-key/{op}/second-device/reject` | enrolled owner device | **New**, same body → `204` |
 | `POST /api/v1/pair/device-key/{op}/delegate` (tunnel **and** loopback) | n/a | Refuses `sas_version: 2` ops via the check in `delegate_device_key_inner`, so neither an old app nor the loopback path can approve a v2 op with delegation-v2 |
@@ -231,7 +234,7 @@ Provisional tokens are accepted **only** by `POST /pair/token`, `GET /pair/chall
 | T4 | Each field of the approval message mutated → `BadProof`, op not consumed | unit, table-driven |
 | T5 | Replay after success; replay to a second node; after an approver epoch bump; after approver revoke; self-approval; approver enrolled after the op | unit |
 | T6 | `delegation-v2` signature on a v2 op is refused on the **tunnel and loopback** `/delegate` routes, and in `delegate_device_key_inner` directly with `require_sas = false`; a v2 approval signature on a v1 op is refused | unit + both routers |
-| T7 | 2 v2 mismatches/cancels keep the pairing and the 3rd revokes it; a reject revokes at once; v1 `sas_failures` stays 0; v1 `sas_failures = 3` does not block v2; a fresh QR works at once; 10 mismatches/hour → 429, which expires by itself; `pair-reset-sas` clears it; a v2 request pre-empts an unconfirmed v1 op but not a confirmed one | unit |
+| T7 | 2 v2 mismatches/cancels keep the pairing and the 3rd revokes it; a reject revokes at once; v1 `sas_failures` stays 0; v1 `sas_failures = 3` does not block v2; a fresh QR works at once; 10 mismatches/hour → 429, which expires by itself; `pair-reset-sas` clears it; a v2 request pre-empts an unconfirmed v1 op without raising v1 `sas_failures`, but not a confirmed one | unit |
 | T8 | Reject path revokes the provisional pairing; the new device sees `lost` | unit |
 | T9 | Provisional token: 403 on every non-enrollment route (iterate the router table) | router test |
 | T10 | Provisional sweep: deadline passes; restart drops the memory record → swept at start; an older-format reader treats `scopes: []` as inert | unit + restart test |
