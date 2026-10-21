@@ -381,6 +381,42 @@ impl LndProvider {
         s.parse::<u64>().unwrap_or(0)
     }
 
+    /// A payment amount. Failure is not zero: a settled zero releases a budget grant.
+    fn parse_amount_u64(raw: &str) -> Result<u64, LightningError> {
+        raw.parse::<u64>().map_err(|_| {
+            LightningError::Backend("unparseable integer amount; not treated as zero".into())
+        })
+    }
+
+    /// Satoshis to millisatoshis. A wrapping multiply would report a small settled amount.
+    fn scale_sats(sats: u64) -> Result<u64, LightningError> {
+        sats.checked_mul(1_000).ok_or_else(|| {
+            LightningError::Backend("satoshi amount overflows millisatoshis".into())
+        })
+    }
+
+    /// Amount from an LND payment or invoice. A settled record with no positive
+    /// amount is an error so callers cannot release a grant for funds that left.
+    fn reported_amount_msat(
+        status: PaymentStatus,
+        value_msat: Option<&str>,
+        value_sat: Option<&str>,
+    ) -> Result<u64, LightningError> {
+        let amount = if let Some(msat) = value_msat {
+            Some(Self::parse_amount_u64(msat)?)
+        } else if let Some(sat) = value_sat {
+            Some(Self::scale_sats(Self::parse_amount_u64(sat)?)?)
+        } else {
+            None
+        };
+        if status == PaymentStatus::Settled && amount.unwrap_or(0) == 0 {
+            return Err(LightningError::Backend(
+                "settled payment has no positive amount; not reporting zero".into(),
+            ));
+        }
+        Ok(amount.unwrap_or(0))
+    }
+
     /// Convert LND invoice state string to PaymentStatus.
     fn invoice_state_to_status(state: &str) -> PaymentStatus {
         match state {
@@ -578,15 +614,33 @@ impl LightningProvider for LndProvider {
             .payment_preimage
             .filter(|p| !p.is_empty() && p != "0000000000000000000000000000000000000000000000000000000000000000");
 
-        let amount_msat = result
-            .value_msat
-            .as_deref()
-            .map(Self::parse_u64)
-            .unwrap_or(0);
-        let fee_msat = result
-            .fee_msat
-            .as_deref()
-            .map(Self::parse_u64);
+        let invoice_msat = invoice.amount_milli_satoshis().ok_or_else(|| {
+            LightningError::PaymentNotDispatched("amountless invoice".into())
+        })?;
+        let reported = match result.value_msat.as_deref() {
+            Some(raw) => Some(Self::parse_amount_u64(raw)?),
+            None => None,
+        };
+        // The grant is settled from this amount. It must be the invoice amount,
+        // not a missing field read as zero and not a smaller figure that would
+        // return the difference to the caller.
+        let amount_msat = if status == PaymentStatus::Settled {
+            match reported {
+                Some(amount) if amount == invoice_msat => amount,
+                _ => {
+                    return Err(LightningError::Backend(
+                        "settled value_msat missing or does not match the invoice; grant not released"
+                            .into(),
+                    ));
+                }
+            }
+        } else {
+            reported.unwrap_or(invoice_msat)
+        };
+        let fee_msat = match result.fee_msat.as_deref() {
+            Some(raw) => Some(Self::parse_amount_u64(raw)?),
+            None => None,
+        };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -640,12 +694,11 @@ impl LightningProvider for LndProvider {
                 })
                 .filter(|p| !p.is_empty() && p != "0000000000000000000000000000000000000000000000000000000000000000");
 
-            let amount_msat = resp
-                .value_msat
-                .as_deref()
-                .map(Self::parse_u64)
-                .or_else(|| resp.value.as_deref().map(|v| Self::parse_u64(v) * 1000))
-                .unwrap_or(0);
+            let amount_msat = Self::reported_amount_msat(
+                status,
+                resp.value_msat.as_deref(),
+                resp.value.as_deref(),
+            )?;
 
             let timestamp = resp
                 .creation_date
@@ -700,12 +753,11 @@ impl LightningProvider for LndProvider {
                     .clone()
                     .filter(|pr| !pr.is_empty() && pr != "0000000000000000000000000000000000000000000000000000000000000000");
 
-                let amount_msat = p
-                    .value_msat
-                    .as_deref()
-                    .map(Self::parse_u64)
-                    .or_else(|| p.value_sat.as_deref().map(|v| Self::parse_u64(v) * 1000))
-                    .unwrap_or(0);
+                let amount_msat = Self::reported_amount_msat(
+                    status,
+                    p.value_msat.as_deref(),
+                    p.value_sat.as_deref(),
+                )?;
 
                 let timestamp = p
                     .creation_date
@@ -713,7 +765,10 @@ impl LightningProvider for LndProvider {
                     .map(Self::parse_u64)
                     .unwrap_or(0);
 
-                let fee_msat = p.fee_msat.as_deref().map(Self::parse_u64);
+                let fee_msat = match p.fee_msat.as_deref() {
+                    Some(raw) => Some(Self::parse_amount_u64(raw)?),
+                    None => None,
+                };
 
                 Ok(PaymentDetails {
                     payment_hash: payment_hash.to_string(),
@@ -749,17 +804,19 @@ impl LightningProvider for LndProvider {
             .await
             .map_err(|e| LightningError::Backend(format!("parse channel balance: {e}")))?;
 
-        // Prefer msat field, fall back to sat * 1000
-        let balance_msat = resp
-            .local_balance
-            .as_ref()
-            .and_then(|b| {
-                b.msat
-                    .as_deref()
-                    .map(Self::parse_u64)
-                    .or_else(|| b.sat.as_deref().map(|s| Self::parse_u64(s) * 1000))
-            })
-            .unwrap_or(0);
+        // Prefer msat. The sat fallback must not wrap: a wrapped balance is a
+        // small number, and a later check against it can authorize another spend.
+        let balance_msat = if let Some(balance) = &resp.local_balance {
+            if let Some(msat) = balance.msat.as_deref() {
+                Self::parse_u64(msat)
+            } else if let Some(sat) = balance.sat.as_deref() {
+                Self::scale_sats(Self::parse_u64(sat))?
+            } else {
+                0
+            }
+        } else {
+            0
+        };
 
         Ok(balance_msat)
     }
@@ -792,19 +849,18 @@ impl LightningProvider for LndProvider {
             .payments
             .unwrap_or_default()
             .into_iter()
-            .map(|p| {
+            .map(|p| -> Result<PaymentDetails, LightningError> {
                 let status_str = p.status.as_deref().unwrap_or("UNKNOWN");
                 let status = Self::payment_status_to_status(status_str);
                 let preimage = p
                     .payment_preimage
                     .filter(|pr| !pr.is_empty() && pr != "0000000000000000000000000000000000000000000000000000000000000000");
 
-                let amount_msat = p
-                    .value_msat
-                    .as_deref()
-                    .map(Self::parse_u64)
-                    .or_else(|| p.value_sat.as_deref().map(|v| Self::parse_u64(v) * 1000))
-                    .unwrap_or(0);
+                let amount_msat = Self::reported_amount_msat(
+                    status,
+                    p.value_msat.as_deref(),
+                    p.value_sat.as_deref(),
+                )?;
 
                 let timestamp = p
                     .creation_date
@@ -812,9 +868,12 @@ impl LightningProvider for LndProvider {
                     .map(Self::parse_u64)
                     .unwrap_or(0);
 
-                let fee_msat = p.fee_msat.as_deref().map(Self::parse_u64);
+                let fee_msat = match p.fee_msat.as_deref() {
+                    Some(raw) => Some(Self::parse_amount_u64(raw)?),
+                    None => None,
+                };
 
-                PaymentDetails {
+                Ok(PaymentDetails {
                     payment_hash: p.payment_hash.unwrap_or_default(),
                     preimage,
                     amount_msat,
@@ -823,9 +882,9 @@ impl LightningProvider for LndProvider {
                     timestamp,
                     memo: None,
                     fee_msat,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(payments)
     }
@@ -853,25 +912,25 @@ impl LightningProvider for LndProvider {
             .channels
             .unwrap_or_default()
             .into_iter()
-            .map(|ch| {
+            .map(|ch| -> Result<ChannelInfo, LightningError> {
                 let capacity_sat = ch.capacity.as_deref().map(Self::parse_u64).unwrap_or(0);
                 let local_sat = ch.local_balance.as_deref().map(Self::parse_u64).unwrap_or(0);
                 let remote_sat = ch.remote_balance.as_deref().map(Self::parse_u64).unwrap_or(0);
 
-                ChannelInfo {
+                Ok(ChannelInfo {
                     user_channel_id: None,
                     funding_txo: None,
                     // LND identifies channels by chan_id (also surfaced as the scid).
                     channel_id: ch.chan_id.clone().unwrap_or_default(),
                     peer_pubkey: ch.remote_pubkey.unwrap_or_default(),
-                    capacity_msat: capacity_sat * 1000,
-                    local_balance_msat: local_sat * 1000,
-                    remote_balance_msat: remote_sat * 1000,
+                    capacity_msat: Self::scale_sats(capacity_sat)?,
+                    local_balance_msat: Self::scale_sats(local_sat)?,
+                    remote_balance_msat: Self::scale_sats(remote_sat)?,
                     active: ch.active.unwrap_or(false),
                     short_channel_id: ch.chan_id,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(channels)
     }
@@ -1009,7 +1068,10 @@ impl LightningProvider for LndProvider {
             direction: PaymentDirection::Outgoing,
             timestamp: now,
             memo: memo.map(|m| m.to_string()),
-            fee_msat: result.fee_msat.as_deref().map(Self::parse_u64),
+            fee_msat: match result.fee_msat.as_deref() {
+                Some(raw) => Some(Self::parse_amount_u64(raw)?),
+                None => None,
+            },
         })
     }
 
