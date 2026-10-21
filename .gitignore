@@ -1,4 +1,5 @@
 /target/
+/release-sign-evidence/
 .slack-webhook
 .slack-signing-secret
 .xai-api-key

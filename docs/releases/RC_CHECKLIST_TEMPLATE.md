@@ -20,15 +20,27 @@ Pre-release; not for production use. Copy this template for each new RC.
       `--locked`, stripped symbols, disabled debug/incremental output, remapped paths.
 - [ ] Record a separate decision and reason for each target the host verifier
       cannot rebuild. Each accepted target needs its own
-      `--accept-unverified-target <triple>`; no host waiver is allowed.
+      `--accept-unverified-target <triple>`; this flag cannot waive the host.
 - [ ] Run `scripts/release-sign.sh <tag> <reviewed-commit>` with those explicit
       per-target flags. Keep the command and full output in release evidence.
       For an existing signed tag, first add `--dry-run` to exercise every gate
       without signing, secret-key access or upload.
 - [ ] Confirm `VERIFIED` identifies the exact tag commit, native target and matching
-      local/CI SHA-256. Retain every `ACCEPT UNVERIFIED` entry and its rationale.
-      A build failure or hash diff blocks signing: investigate, never bypass it.
-- [ ] Confirm the checksum signature and upload occurred only after verification.
+      local/CI SHA-256, or explicitly record a host break-glass decision below.
+      Retain every non-host `ACCEPT UNVERIFIED` entry and its rationale.
+- [ ] On any mismatch, inspect and archive the printed `REBUILD EVIDENCE` directory:
+      rebuilt binary, hash diff, `SHA256SUMS` and `manifest.txt`. It survives exit
+      even on rejection or dry-run; later attempts create separate directories.
+- [ ] If proceeding despite an investigated host mismatch, supply
+      `--accept-unverified-host "<incident-specific reason>"` explicitly. Confirm
+      `WARNING: BREAK-GLASS ACCEPT UNVERIFIED HOST` in the signing log and manifest
+      records the reason, exact tag/commit/target and **both** hashes. Archive them
+      with the command/output; they are not automatically uploaded or signed.
+      Record the host as unverified and dependent on CI integrity. This does not
+      skip the rebuild or waive build failures or any other validation gate.
+- [ ] Confirm the checksum signature and upload occurred only after a matching
+      rebuild or the explicit, recorded host break-glass decision. Signed checksums
+      describe the downloaded CI binaries, including when the local binary differs.
       The initial tag signature triggers CI; it does not approve CI binaries.
 
 ## Independently verify and publish

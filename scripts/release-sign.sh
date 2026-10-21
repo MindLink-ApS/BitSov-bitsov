@@ -9,6 +9,7 @@
 #    and per-file .sha256 files.
 # 3. Downloads every binary, checks it against its .sha256, and writes SHA256SUMS.
 # 4. Rebuilds the host target from the tag and compares its hash with CI.
+#    A mismatch retains evidence and requires a reasoned break-glass to proceed.
 #    Every other target requires an explicit, logged waiver.
 # 5. Signs SHA256SUMS with the release key, verifies the signature, and attaches
 #    SHA256SUMS + SHA256SUMS.asc to the draft.
@@ -18,6 +19,7 @@ set -euo pipefail
 REPO=MindLink-ApS/BitSov-bitsov
 KEY_FPR=B299274C200301714DC6F51A7C2D6F8AC842EF6E
 DRY_RUN=false
+HOST_REASON=''
 ACCEPTED=()
 TARGETS=(aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu x86_64-pc-windows-msvc)
 ASSETS=(bitsov-darwin-aarch64 bitsov-darwin-x86_64 bitsov-linux-aarch64 bitsov-linux-x86_64 bitsov-windows-x86_64)
@@ -34,6 +36,10 @@ POSITIONAL=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=true; shift ;;
+    --accept-unverified-host)
+      [ $# -ge 2 ] && [[ $2 != --* && $2 =~ [^[:space:]] ]] || die '--accept-unverified-host requires a nonblank reason'
+      [ -z "$HOST_REASON" ] || die '--accept-unverified-host may only be supplied once'
+      HOST_REASON=$2; shift 2 ;;
     --accept-unverified-target)
       [ $# -ge 2 ] || die '--accept-unverified-target requires a triple'
       found=false
@@ -44,7 +50,7 @@ while [ $# -gt 0 ]; do
     *) POSITIONAL+=("$1"); shift ;;
   esac
 done
-[ "${#POSITIONAL[@]}" -eq 2 ] || die "usage: $0 [--dry-run] [--accept-unverified-target <triple>]... <tag> <commit-on-main>"
+[ "${#POSITIONAL[@]}" -eq 2 ] || die "usage: $0 [--dry-run] [--accept-unverified-host <reason>] [--accept-unverified-target <triple>]... <tag> <commit-on-main>"
 set -- "${POSITIONAL[@]}"
 TAG=$1 COMMIT=$2
 [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]] || die "tag must look like v0.3.0 or v0.3.0-rc9"
@@ -57,7 +63,12 @@ FULL=$(git rev-parse --verify "$COMMIT^{commit}") || die "unknown commit $COMMIT
 git merge-base --is-ancestor "$FULL" origin/main || die "$FULL is not on origin/main"
 
 WORK=$(mktemp -d)
+KEEP_WORK=false
 cleanup() {
+  if "$KEEP_WORK"; then
+    echo "WARNING: evidence preservation incomplete; retaining rebuild workspace: $WORK" >&2
+    return
+  fi
   git -C "$SOURCE_REPO" worktree remove --force "$WORK/source" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
@@ -134,17 +145,35 @@ BINARY="$WORK/source/target/$HOST/release/konsensus"
 LOCAL_HASH=$(shasum -a 256 "$BINARY" | awk '{print $1}')
 CI_HASH=$(awk -v asset="$HOST_ASSET" '$2 == asset {print $1}' SHA256SUMS)
 if [ "$LOCAL_HASH" != "$CI_HASH" ]; then
+  # Keep the original workspace if saving evidence fails (e.g. disk full).
+  # The named evidence directory survives EXIT cleanup and repeated attempts.
+  KEEP_WORK=true
   printf '%s  %s\n' "$CI_HASH" "$HOST_ASSET" > "$WORK/ci-hash"
   printf '%s  %s\n' "$LOCAL_HASH" "$HOST_ASSET" > "$WORK/local-hash"
-  diff -u --label "CI/$HOST" --label "local/$HOST" "$WORK/ci-hash" "$WORK/local-hash" >&2 || true
-  die "reproducibility mismatch for $HOST at $FULL; refusing to sign"
+  mkdir -p "$SOURCE_REPO/release-sign-evidence"
+  EVIDENCE=$(mktemp -d "$SOURCE_REPO/release-sign-evidence/$TAG.XXXXXX")
+  cp "$BINARY" "$EVIDENCE/$HOST_ASSET.rebuilt"
+  cp SHA256SUMS "$EVIDENCE/SHA256SUMS"
+  diff_status=0
+  diff -u --label "CI/$HOST" --label "local/$HOST" "$WORK/ci-hash" "$WORK/local-hash" > "$EVIDENCE/host-hash.diff" || diff_status=$?
+  [ "$diff_status" -eq 1 ] || die 'could not record host hash diff; refusing to sign'
+  status='REJECTED HOST MISMATCH'
+  [ -z "$HOST_REASON" ] || status='WARNING: BREAK-GLASS ACCEPT UNVERIFIED HOST'
+  # %q keeps even multiline/control-character reasons on a single audit line.
+  printf '%s target=%s tag=%s commit=%s ci_sha256=%s local_sha256=%s reason=%q\n' \
+    "$status" "$HOST" "$TAG" "$FULL" "$CI_HASH" "$LOCAL_HASH" "$HOST_REASON" > "$EVIDENCE/manifest.txt"
+  KEEP_WORK=false
+  cat "$EVIDENCE/host-hash.diff" "$EVIDENCE/manifest.txt" >&2
+  printf 'REBUILD EVIDENCE: %s\n' "$EVIDENCE" >&2
+  [ -n "$HOST_REASON" ] || die "reproducibility mismatch for $HOST at $FULL; refusing to sign (investigate retained evidence; break-glass requires --accept-unverified-host <reason>)"
+else
+  printf 'VERIFIED target=%s tag=%s commit=%s sha256=%s\n' "$HOST" "$TAG" "$FULL" "$LOCAL_HASH"
 fi
-printf 'VERIFIED target=%s tag=%s commit=%s sha256=%s\n' "$HOST" "$TAG" "$FULL" "$LOCAL_HASH"
 for target in ${ACCEPTED[@]+"${ACCEPTED[@]}"}; do
   printf 'ACCEPT UNVERIFIED target=%s tag=%s commit=%s (explicit operator waiver)\n' "$target" "$TAG" "$FULL" >&2
 done
 if "$DRY_RUN"; then
-  echo 'Dry-run: verification passed; no signing or upload performed.'
+  echo 'Dry-run: gates completed (see verification/waiver status above); no signing or upload performed.'
   cat SHA256SUMS
   exit 0
 fi

@@ -81,7 +81,7 @@ case "${1:-} ${2:-}" in
     # Corrupt the LAST asset: the script must validate all five before signing.
     if [ "$asset" = bitsov-windows-x86_64 ]; then
       case "$TEST_CASE" in
-        checksum) printf 'corrupt\n' >> "$asset" ;;
+        checksum|accept-checksum) printf 'corrupt\n' >> "$asset" ;;
         filename) sed "s/$asset/another-file/" "$asset.sha256" > altered; mv altered "$asset.sha256" ;;
       esac
     fi
@@ -123,10 +123,10 @@ case "$*" in
     if [ "$TEST_CASE" = unsupported-host ]; then
       printf 'rustc 1.91.1\nhost: riscv64gc-unknown-linux-gnu\n'
     else
-      printf 'rustc 1.91.1\nhost: x86_64-unknown-linux-gnu\n'
+      printf 'rustc 1.91.1\nhost: %s\n' "$TEST_HOST"
     fi
     ;;
-  'run 1.91.1 cargo build --locked --release -p konsensus-node --target x86_64-unknown-linux-gnu')
+  "run 1.91.1 cargo build --locked --release -p konsensus-node --target $TEST_HOST")
     [ "$(git rev-parse HEAD)" = "$COMMIT" ] || bad_call wrong-commit
     [ "$(cat tagged-content)" = tagged ] || bad_call dirty-source
     [ "$SOURCE_DATE_EPOCH" = "$(git show -s --format=%ct HEAD)" ] || bad_call epoch
@@ -134,11 +134,11 @@ case "$*" in
     [ "$CARGO_INCREMENTAL" = 0 ] || bad_call incremental
     [[ "$CARGO_ENCODED_RUSTFLAGS" == *--remap-path-prefix* ]] || bad_call remap
     printf '%s\n' "$PWD" >> "$CASE_DIR/build.log"
-    [ "$TEST_CASE" != build-failure ] || exit 1
-    mkdir -p "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"
-    cp "$TEST_ROOT/fixtures/bitsov-linux-x86_64" "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/konsensus"
-    if [ "$TEST_CASE" = mismatch ] || [ "$TEST_CASE" = dry-mismatch ]; then
-      echo different >> "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/konsensus"
+    case "$TEST_CASE" in *build-failure) exit 1 ;; esac
+    mkdir -p "$CARGO_TARGET_DIR/$TEST_HOST/release"
+    cp "$TEST_ROOT/fixtures/$TEST_HOST_ASSET" "$CARGO_TARGET_DIR/$TEST_HOST/release/konsensus"
+    if [[ "$TEST_CASE" == *mismatch ]]; then
+      echo different >> "$CARGO_TARGET_DIR/$TEST_HOST/release/konsensus"
     fi
     ;;
   *) bad_call "$@" ;;
@@ -185,6 +185,10 @@ run_case() (
   git commit -q -m release
   COMMIT=$(git rev-parse HEAD)
   export COMMIT OTHER_COMMIT
+  export TEST_HOST=x86_64-unknown-linux-gnu TEST_HOST_ASSET=bitsov-linux-x86_64
+  if [ "$TEST_CASE" = accept-darwin-mismatch ]; then
+    TEST_HOST=aarch64-apple-darwin TEST_HOST_ASSET=bitsov-darwin-aarch64
+  fi
   git remote add origin "file://$CASE_DIR/origin.git"
   git push -q -u origin main
   if [ "$TEST_CASE" != fresh ] && [ "$TEST_CASE" != dry-fresh ]; then
@@ -206,8 +210,9 @@ run_case() (
   printf 'dirty\n' > tagged-content
   args=()
   if [ "$TEST_CASE" != no-waivers ]; then
-    for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-pc-windows-msvc; do
-      if [ "$TEST_CASE" != missing-waiver ] || [ "$target" != x86_64-pc-windows-msvc ]; then
+    for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+      [ "$target" != "$TEST_HOST" ] || continue
+      if [[ "$TEST_CASE" != *missing-waiver ]] || [ "$target" != x86_64-pc-windows-msvc ]; then
         args+=(--accept-unverified-target "$target")
       fi
     done
@@ -217,16 +222,42 @@ run_case() (
     waive-host) args+=(--accept-unverified-target x86_64-unknown-linux-gnu) ;;
     unknown-waiver) args+=(--accept-unverified-target imaginary-triple) ;;
   esac
+  host_reason=$'Investigated SDK drift; operator accepts risk "rc"\nVERIFIED forged'
+  case "$TEST_CASE" in
+    accept-*|dry-accept-*) args+=(--accept-unverified-host "$host_reason") ;;
+    reason-empty) args+=(--accept-unverified-host '') ;;
+    reason-blank) args+=(--accept-unverified-host $' \t\n') ;;
+    reason-option) args+=(--accept-unverified-host --dry-run) ;;
+    reason-duplicate) args+=(--accept-unverified-host first --accept-unverified-host second) ;;
+  esac
+  # Put the valueless option last so positionals cannot become its reason.
+  tail_args=()
+  [ "$TEST_CASE" != reason-missing ] || tail_args+=(--accept-unverified-host)
+  # Force a real filesystem failure without relying on permissions/root behavior.
+  [ "$TEST_CASE" != accept-evidence-failure-mismatch ] || touch release-sign-evidence
   rc=0
-  bash "$WORK/release-sign.sh" ${args[@]+"${args[@]}"} "$TEST_TAG" "$COMMIT" > "$CASE_DIR/output" 2>&1 || rc=$?
+  bash "$WORK/release-sign.sh" ${args[@]+"${args[@]}"} "$TEST_TAG" "$COMMIT" ${tail_args[@]+"${tail_args[@]}"} > "$CASE_DIR/output" 2>&1 || rc=$?
   [ ! -f "$CASE_DIR/unexpected" ] || { cat "$CASE_DIR/unexpected"; fail 'unexpected stub call'; }
 
+  if [ "$TEST_CASE" = accept-evidence-failure-mismatch ]; then
+    [ "$rc" -ne 0 ] || fail 'accepted mismatch despite failing to save evidence'
+    retained=$(sed -n 's/^WARNING: evidence preservation incomplete; retaining rebuild workspace: //p' "$CASE_DIR/output")
+    [ -d "$retained" ] || fail 'fallback workspace was deleted'
+    cp "$WORK/fixtures/$TEST_HOST_ASSET" "$CASE_DIR/expected-rebuilt"
+    echo different >> "$CASE_DIR/expected-rebuilt"
+    cmp "$CASE_DIR/expected-rebuilt" "$retained/source/target/$TEST_HOST/release/konsensus"
+    [ -s "$retained/ci-hash" ] && [ -s "$retained/local-hash" ] || fail 'fallback lost hashes'
+    [ ! -e "$CASE_DIR/signed-sums" ] || fail 'signed after evidence failure'
+    [ ! -e "$CASE_DIR/upload.args" ] || fail 'uploaded after evidence failure'
+    ! grep -q -- '--list-secret-keys' "$CASE_DIR/gpg.log" || fail 'evidence failure accessed private keys'
+    exit 0
+  fi
   reason=''
   case "$TEST_CASE" in
-    existing|fresh|dry-existing) ;;
+    existing|fresh|dry-existing|accept-mismatch|dry-accept-mismatch|accept-darwin-mismatch|accept-match) ;;
     mismatch|dry-mismatch|compromised-ci) reason='reproducibility mismatch for x86_64-unknown-linux-gnu' ;;
-    build-failure) reason='local rebuild failed' ;;
-    no-waivers|missing-waiver) reason='unverified target' ;;
+    build-failure|accept-build-failure) reason='local rebuild failed' ;;
+    no-waivers|missing-waiver|accept-missing-waiver) reason='unverified target' ;;
     waive-host) reason='host target cannot be waived' ;;
     unknown-waiver) reason='unknown target' ;;
     unsupported-host) reason='unsupported signing host' ;;
@@ -234,21 +265,75 @@ run_case() (
     wrong-tag) reason="tag $TEST_TAG exists on a different commit" ;;
     ci-sha) reason="CI run 123 built $OTHER_COMMIT, not the tagged commit $COMMIT" ;;
     non-draft) reason="release $TEST_TAG is not a draft; refusing to change it" ;;
-    checksum) reason='bitsov-windows-x86_64: expected' ;;
+    checksum|accept-checksum) reason='bitsov-windows-x86_64: expected' ;;
     filename) reason='bitsov-windows-x86_64.sha256 names a different file' ;;
     expired-tag) reason="existing tag $TEST_TAG is not validly signed" ;;
     expired-sums) reason='signature check failed' ;;
+    reason-empty|reason-blank|reason-option|reason-missing) reason='--accept-unverified-host requires a nonblank reason' ;;
+    reason-duplicate) reason='--accept-unverified-host may only be supplied once' ;;
     *) fail "unknown case $TEST_CASE" ;;
+  esac
+  # Inspect evidence AFTER the signer has exited and its EXIT trap has run.
+  case "$TEST_CASE" in
+    *mismatch|compromised-ci)
+      evidence=$(sed -n 's/^REBUILD EVIDENCE: //p' "$CASE_DIR/output")
+      [ -d "$evidence" ] || fail 'mismatch evidence was not retained'
+      [ -f "$evidence/$TEST_HOST_ASSET.rebuilt" ] || fail 'rebuilt binary was deleted'
+      cp "$WORK/fixtures/$TEST_HOST_ASSET" "$CASE_DIR/expected-rebuilt"
+      [ "$TEST_CASE" = compromised-ci ] || echo different >> "$CASE_DIR/expected-rebuilt"
+      cmp "$CASE_DIR/expected-rebuilt" "$evidence/$TEST_HOST_ASSET.rebuilt"
+      local_hash=$(shasum -a 256 "$CASE_DIR/expected-rebuilt" | awk '{print $1}')
+      cp "$WORK/fixtures/$TEST_HOST_ASSET" "$CASE_DIR/expected-ci"
+      [ "$TEST_CASE" != compromised-ci ] || echo injected >> "$CASE_DIR/expected-ci"
+      ci_hash=$(shasum -a 256 "$CASE_DIR/expected-ci" | awk '{print $1}')
+      grep -qx "$ci_hash  $TEST_HOST_ASSET" "$evidence/SHA256SUMS" || fail 'retained CI hash is wrong'
+      grep -F "$local_hash" "$evidence/host-hash.diff" >/dev/null || fail 'diff lost local hash'
+      grep -F "$ci_hash" "$evidence/host-hash.diff" >/dev/null || fail 'diff lost CI hash'
+      grep -q '^--- CI/' "$evidence/host-hash.diff" || fail 'missing retained CI diff'
+      grep -q '^+++ local/' "$evidence/host-hash.diff" || fail 'missing retained local diff'
+      for record in "target=$TEST_HOST" "tag=$TEST_TAG" "commit=$COMMIT" "ci_sha256=$ci_hash" "local_sha256=$local_hash"; do
+        grep -F "$record" "$evidence/manifest.txt" >/dev/null || fail "missing evidence: $record"
+        grep -F "$record" "$CASE_DIR/output" >/dev/null || fail "missing log: $record"
+      done
+      case "$TEST_CASE" in
+        *accept-*)
+          printf -v escaped_reason '%q' "$host_reason"
+          grep -F "reason=$escaped_reason" "$evidence/manifest.txt" >/dev/null || fail 'reason missing from manifest'
+          grep -F "reason=$escaped_reason" "$CASE_DIR/output" >/dev/null || fail 'reason missing from log'
+          grep -q '^WARNING: BREAK-GLASS ACCEPT UNVERIFIED HOST ' "$CASE_DIR/output" || fail 'host waiver not prominent'
+          ;;
+        *)
+          ! grep -q -- '--list-secret-keys' "$CASE_DIR/gpg.log" || fail 'rejected mismatch accessed private keys'
+          ;;
+      esac
+      ! grep -q '^VERIFIED ' "$CASE_DIR/output" || fail 'mismatch falsely marked verified'
+      ! grep -q 'verification passed' "$CASE_DIR/output" || fail 'mismatch falsely marked passed'
+      build_dir=$(cat "$CASE_DIR/build.log")
+      [ ! -d "$build_dir" ] || fail 'temporary worktree leaked after evidence saved'
+      if [ "$TEST_CASE" = mismatch ]; then
+        retry_rc=0
+        bash "$WORK/release-sign.sh" "${args[@]}" "$TEST_TAG" "$COMMIT" > "$CASE_DIR/retry-output" 2>&1 || retry_rc=$?
+        [ "$retry_rc" -ne 0 ] || fail 'retry unexpectedly accepted mismatch'
+        retry_evidence=$(sed -n 's/^REBUILD EVIDENCE: //p' "$CASE_DIR/retry-output")
+        [ -d "$retry_evidence" ] && [ "$retry_evidence" != "$evidence" ] || fail 'retry reused evidence directory'
+        cmp "$CASE_DIR/expected-rebuilt" "$evidence/$TEST_HOST_ASSET.rebuilt"
+        cmp "$CASE_DIR/expected-rebuilt" "$retry_evidence/$TEST_HOST_ASSET.rebuilt"
+      fi
+      ;;
   esac
   if [ -z "$reason" ]; then
     [ "$rc" -eq 0 ] || fail "expected success, got exit $rc"
     [ -s "$CASE_DIR/build.log" ] || fail 'host was not rebuilt'
     grep -q 'ACCEPT UNVERIFIED target=' "$CASE_DIR/output" || fail 'waivers not logged'
-    if [ "$TEST_CASE" = dry-existing ]; then
+    if [[ "$TEST_CASE" == dry-* ]]; then
       [ ! -e "$CASE_DIR/signed-sums" ] || fail 'dry-run signed'
       [ ! -e "$CASE_DIR/upload.args" ] || fail 'dry-run uploaded'
       ! grep -q -- '--list-secret-keys' "$CASE_DIR/gpg.log" || fail 'dry-run accessed private keys'
       exit 0
+    fi
+    if [ "$TEST_CASE" = accept-match ]; then
+      grep -q '^VERIFIED ' "$CASE_DIR/output" || fail 'matching rebuild not verified'
+      ! grep -q '^WARNING: BREAK-GLASS' "$CASE_DIR/output" || fail 'unused waiver reported as applied'
     fi
     cmp "$WORK/expected-sums" "$CASE_DIR/upload/SHA256SUMS"
     cmp "$CASE_DIR/signed-sums" "$CASE_DIR/upload/SHA256SUMS"
@@ -309,7 +394,7 @@ locales+=("$utf8")
 
 passed=0 failed=0
 for test_locale in "${locales[@]}"; do
-  for test_case in existing fresh wrong-tag ci-sha non-draft checksum filename expired-tag expired-sums mismatch compromised-ci unsupported-host build-failure no-waivers missing-waiver waive-host unknown-waiver dry-existing dry-mismatch dry-fresh; do
+  for test_case in existing fresh wrong-tag ci-sha non-draft checksum filename expired-tag expired-sums mismatch compromised-ci unsupported-host build-failure no-waivers missing-waiver waive-host unknown-waiver dry-existing dry-mismatch dry-fresh accept-mismatch dry-accept-mismatch accept-darwin-mismatch accept-evidence-failure-mismatch accept-match accept-build-failure accept-checksum accept-missing-waiver reason-empty reason-blank reason-option reason-missing reason-duplicate; do
     # Launch a separate process so errexit remains active inside run_case.
     # Calling a function in an if condition would silently disable it.
     set +e
