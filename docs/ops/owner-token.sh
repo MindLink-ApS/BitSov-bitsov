@@ -16,8 +16,8 @@
 #   Encrypted mnemonic (.enc) — same inputs as `konsensus start`. Set only one:
 #   KONSENSUS_PASSWORD_FD    descriptor (0 = stdin) → sign-challenge --password-fd
 #   KONSENSUS_PASSWORD_FILE  chmod-600 regular file → sign-challenge --password-file
-#   KONSENSUS_PASSWORD       → sign-challenge --password (visible in process
-#                            arguments; prefer a descriptor or file)
+#   KONSENSUS_PASSWORD       legacy shell variable → stdin descriptor (never argv)
+#                            Prefer KONSENSUS_PASSWORD_FD; do not export secrets.
 #   With none of these, an .enc seed prompts on the terminal. The password is
 #   never echoed, logged, or written to disk.
 #
@@ -100,8 +100,6 @@ _bitsov_owner_token_mint() {
     sign_args+=(--password-fd "$KONSENSUS_PASSWORD_FD")
   elif [[ -n "${KONSENSUS_PASSWORD_FILE:-}" ]]; then
     sign_args+=(--password-file "$KONSENSUS_PASSWORD_FILE")
-  elif [[ -n "${KONSENSUS_PASSWORD:-}" ]]; then
-    sign_args+=(--password "$KONSENSUS_PASSWORD")
   fi
 
   challenge_json="$(curl -fsS "$api_root/auth/challenge" 2>/dev/null)" || {
@@ -119,7 +117,18 @@ _bitsov_owner_token_mint() {
   bin="${KONSENSUS_BIN:-konsensus}"
   # Leave stderr attached so an encrypted seed can prompt without echoing
   # the password. The signature itself is stdout only.
-  signature="$("$bin" sign-challenge --challenge "$challenge" "${sign_args[@]}")" || {
+  signature="$(
+    if [[ -n "${KONSENSUS_PASSWORD:-}" ]]; then
+      # Bash's builtin printf keeps the compatibility input off argv. Remove
+      # an exported legacy variable from the signer's environment as well.
+      builtin printf '%s' "$KONSENSUS_PASSWORD" | (
+        unset KONSENSUS_PASSWORD
+        "$bin" sign-challenge --challenge "$challenge" "${sign_args[@]}" --password-fd 0
+      )
+    else
+      "$bin" sign-challenge --challenge "$challenge" "${sign_args[@]}"
+    fi
+  )" || {
     echo "owner-token: sign-challenge failed" >&2
     _bitsov_owner_token_restore_xtrace
     return 1

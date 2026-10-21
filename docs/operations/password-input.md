@@ -5,7 +5,7 @@ putting the password in argv, environment variables, or a plaintext file.
 `konsensus start --password-fd <n>` unlocks that encrypted seed.
 `konsensus sign-challenge --password-fd <n>` uses the same descriptor to
 decrypt `mnemonic.enc` before signing a live `/api/v1/auth/challenge` string.
-`--password` and `--password-file` follow the same rules as `start` (the file
+`--password-file` follows the same rules as `start` (the file
 must be a regular chmod-600 file). With none of those flags, an `.enc`
 mnemonic prompts on the terminal and the password is not echoed.
 `docs/ops/owner-token.sh` forwards `KONSENSUS_PASSWORD_FD`,
@@ -43,8 +43,34 @@ consume stdin.
 `start` rejects combinations of `--password-fd`, `--password`, and
 `--password-file`. `init --password-fd` implies encryption and conflicts with
 `--encrypt` (including its interactive form); omit `--encrypt` entirely.
-The legacy `init --encrypt <password>` and `start --password <password>` forms
-still work, but expose the secret in process arguments.
+**Breaking change (H2): argv secrets are deprecated and refused by default.**
+Every `--password <secret>` option, `init/restore --encrypt <password>`,
+`restore/approve-replacement --mnemonic <words>`, and nonempty
+`node-id/sign-challenge --passphrase <secret>` prints a warning to stderr and
+requires explicit `--insecure-argv`. The flag may appear before or after the
+subcommand. Even with this opt-in, the warning remains: other local users may
+read argv through `ps` or `/proc/<pid>/cmdline`, and shell history may retain it.
+The warning never includes the supplied secret. Refusal occurs before command I/O.
+
+For a nonempty BIP-39 passphrase, use `--passphrase-fd N` on `node-id` or
+`sign-challenge`. It uses the same UTF-8/EOF/4096-byte contract as password fds,
+including trailing CR/LF removal; use separate descriptors when supplying both
+secrets. Omitting the passphrase means the empty BIP-39 passphrase and derives a
+different identity. Password fds/files decrypt the seed; they do not replace the
+BIP-39 passphrase.
+
+Migrate automation to `--password-fd N` (preferred) or `--password-file PATH`
+where supported; otherwise omit the secret option and use the interactive prompt.
+`whitelist backup/restore` accept both fd and file inputs. `seed encrypt` already
+uses a terminal prompt and accepts no argv password. SCB restore remains disabled.
+For `restore`, omit `--mnemonic` and enter the phrase at the prompt; omit the
+value after `--encrypt` to prompt for its password. `--mnemonic PATH` on
+`node-id` and `sign-challenge` is a filename, not a phrase, and needs no opt-in.
+
+`docs/ops/owner-token.sh` prefers `KONSENSUS_PASSWORD_FD`, also supports
+`KONSENSUS_PASSWORD_FILE`, and prompts when neither is set. Its legacy
+`KONSENSUS_PASSWORD` shell variable is sent through stdin with `--password-fd 0`,
+never argv. Avoid exporting that variable; prefer a launcher-owned pipe.
 
 `init --encrypt` and `restore --encrypt` require a password with at least one
 non-whitespace character; a blank prompt answer is an error, never a request for

@@ -9,6 +9,11 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "konsensus", version, about = "Sovereign mesh network node")]
 pub struct Cli {
+    /// Allow deprecated secrets on argv despite exposure through ps and /proc.
+    /// Prefer --password-fd, --password-file, or an interactive prompt.
+    #[arg(long, global = true)]
+    pub insecure_argv: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -59,6 +64,7 @@ pub enum Command {
         #[arg(long)]
         tier: Option<String>,
 
+        /// A password value on argv is deprecated and requires --insecure-argv.
         /// Encrypt the mnemonic file; empty or whitespace-only passwords are rejected.
         /// If set without a value, prompts for the password interactively.
         #[arg(long)]
@@ -77,6 +83,7 @@ pub enum Command {
         #[arg(short, long, default_value = "konsensus.toml")]
         config: PathBuf,
 
+        /// Deprecated argv secret: requires --insecure-argv. Prefer --password-fd or --password-file.
         /// Password to decrypt an encrypted mnemonic file (`.enc`).
         /// If the mnemonic file has `.enc` extension and no password is
         /// provided, the node will prompt interactively.
@@ -145,10 +152,17 @@ pub enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
 
+        /// Nonempty argv secrets are deprecated and require --insecure-argv; prefer --passphrase-fd.
         /// BIP-39 passphrase (optional). Distinct from the encryption password.
         #[arg(short, long, default_value = "")]
         passphrase: String,
 
+        /// Read the BIP-39 passphrase once to EOF (0 = stdin), independently of
+        /// the encryption password. Use a separate descriptor for each secret.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..), conflicts_with = "passphrase")]
+        passphrase_fd: Option<i32>,
+
+        /// Deprecated argv secret: requires --insecure-argv. Prefer --password-fd or --password-file.
         /// Password to decrypt an encrypted mnemonic file (`.enc`).
         /// If the mnemonic file has `.enc` extension and no password is
         /// provided, prompts interactively (the password is not echoed).
@@ -183,6 +197,7 @@ pub enum Command {
         #[arg(short, long, default_value = ".")]
         dir: PathBuf,
 
+        /// Deprecated argv secret: requires --insecure-argv. Prefer the interactive prompt.
         /// The 24-word mnemonic phrase (space-separated, quoted).
         /// If omitted, prompts interactively.
         #[arg(short, long)]
@@ -192,6 +207,7 @@ pub enum Command {
         #[arg(long)]
         tier: Option<String>,
 
+        /// A password value on argv is deprecated and requires --insecure-argv.
         /// Encrypt the mnemonic file; empty or whitespace-only passwords are rejected.
         #[arg(long)]
         encrypt: Option<Option<String>>,
@@ -221,10 +237,17 @@ pub enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
 
+        /// Nonempty argv secrets are deprecated and require --insecure-argv; prefer --passphrase-fd.
         /// BIP-39 passphrase (optional). Distinct from the encryption password.
         #[arg(short, long, default_value = "")]
         passphrase: String,
 
+        /// Read the BIP-39 passphrase once to EOF (0 = stdin), independently of
+        /// the encryption password. Use a separate descriptor for each secret.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..), conflicts_with = "passphrase")]
+        passphrase_fd: Option<i32>,
+
+        /// Deprecated argv secret: requires --insecure-argv. Prefer --password-fd or --password-file.
         /// Password to decrypt an encrypted mnemonic file (`.enc`).
         /// If the mnemonic file has `.enc` extension and no password is
         /// provided, prompts interactively (the password is not echoed).
@@ -373,6 +396,7 @@ pub enum Command {
         #[arg(long = "op")]
         op_id: String,
 
+        /// Deprecated argv secret: requires --insecure-argv. Prefer the interactive prompt.
         /// The 24-word recovery phrase of the destination identity.
         /// Prompted for if omitted, so it need not appear in shell history.
         #[arg(long)]
@@ -510,6 +534,7 @@ pub enum ScbCommand {
         #[arg(long)]
         restore_dir: Option<PathBuf>,
 
+        /// Deprecated argv secret: requires --insecure-argv. SCB restore remains disabled.
         /// Password to decrypt an encrypted mnemonic file (`.enc`), if needed.
         #[arg(long)]
         password: Option<String>,
@@ -537,9 +562,18 @@ pub enum WhitelistCommand {
         #[arg(long)]
         out: Option<PathBuf>,
 
+        /// Deprecated argv secret: requires --insecure-argv. Prefer --password-fd or --password-file.
         /// Password to decrypt an encrypted mnemonic file (`.enc`), if needed.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["password_file", "password_fd"])]
         password: Option<String>,
+
+        /// Read the password from a regular owner-only file (chmod 600).
+        #[arg(long, conflicts_with = "password_fd")]
+        password_file: Option<PathBuf>,
+
+        /// Read the password once to EOF from an inherited descriptor (0 = stdin).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..))]
+        password_fd: Option<i32>,
     },
 
     /// Restore the gate-whitelist state from an encrypted sidecar into the
@@ -554,10 +588,88 @@ pub enum WhitelistCommand {
         #[arg(short, long, default_value = "konsensus.toml")]
         config: PathBuf,
 
+        /// Deprecated argv secret: requires --insecure-argv. Prefer --password-fd or --password-file.
         /// Password to decrypt an encrypted mnemonic file (`.enc`), if needed.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["password_file", "password_fd"])]
         password: Option<String>,
+
+        /// Read the password from a regular owner-only file (chmod 600).
+        #[arg(long, conflicts_with = "password_fd")]
+        password_file: Option<PathBuf>,
+
+        /// Read the password once to EOF from an inherited descriptor (0 = stdin).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..))]
+        password_fd: Option<i32>,
     },
+}
+
+impl Cli {
+    /// Reject secrets before dispatch, without including their values in diagnostics.
+    pub fn check_argv_secrets(&self) -> anyhow::Result<()> {
+        let mut options = Vec::new();
+        match &self.command {
+            Command::Start { password, .. }
+            | Command::Scb {
+                command: ScbCommand::Restore { password, .. },
+            }
+            | Command::Whitelist {
+                command: WhitelistCommand::Backup { password, .. },
+            }
+            | Command::Whitelist {
+                command: WhitelistCommand::Restore { password, .. },
+            } => {
+                if password.is_some() {
+                    options.push("--password");
+                }
+            }
+            Command::NodeId {
+                password,
+                passphrase,
+                ..
+            }
+            | Command::SignChallenge {
+                password,
+                passphrase,
+                ..
+            } => {
+                if password.is_some() {
+                    options.push("--password");
+                }
+                if !passphrase.is_empty() {
+                    options.push("--passphrase");
+                }
+            }
+            Command::Init { encrypt, .. } => {
+                if matches!(encrypt, Some(Some(_))) {
+                    options.push("--encrypt");
+                }
+            }
+            Command::Restore {
+                mnemonic, encrypt, ..
+            } => {
+                if mnemonic.is_some() {
+                    options.push("--mnemonic");
+                }
+                if matches!(encrypt, Some(Some(_))) {
+                    options.push("--encrypt");
+                }
+            }
+            Command::ApproveReplacement { mnemonic, .. } => {
+                if mnemonic.is_some() {
+                    options.push("--mnemonic");
+                }
+            }
+            _ => {}
+        }
+        if !options.is_empty() {
+            eprintln!("WARNING: secrets on argv ({}) are deprecated and visible to other local users through ps or /proc/<pid>/cmdline. Use --password-fd, --password-file, --passphrase-fd for BIP-39 passphrases, or the interactive prompt instead. Legacy use requires --insecure-argv.", options.join(", "));
+            anyhow::ensure!(
+                self.insecure_argv,
+                "refusing argv secrets without --insecure-argv"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

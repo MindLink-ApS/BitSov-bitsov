@@ -27,6 +27,15 @@ also live on the corresponding GitHub pre-release pages.
 - Report the configured Bitcoin `network` in owner `/api/v1/status`, including
   LDK signet, using the same configuration as funding-address (#321).
 
+### Security
+
+- **Breaking change (H2):** argv passwords and mnemonic phrases are deprecated,
+  warn on stderr, and refuse execution unless `--insecure-argv` is explicit.
+  This includes `--encrypt <password>` and nonempty BIP-39 `--passphrase` values.
+  Use `--password-fd`, `--password-file`, `--passphrase-fd` (BIP-39), or the
+  interactive prompt instead.
+  The owner-token helper now sends its legacy password variable through an fd.
+
 ## [0.3.0-rc18] — 2026-10-20 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. rc18 is rc17 (`ce7fb53`) plus
