@@ -184,7 +184,11 @@ pub(crate) fn record_failure(store: &DynStore, id: u128, error: Error) -> Result
 		"bitsov_funding_failure",
 		"",
 		&id.to_string(),
-		error.to_string().into_bytes(),
+        if matches!(error, Error::FundingFeeCapExceeded) {
+            b"funding_fee_cap_exceeded".to_vec()
+        } else {
+            error.to_string().into_bytes()
+        },
 	)
 	.map_err(|_| Error::PersistenceFailed)
 }

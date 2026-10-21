@@ -193,6 +193,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (28, "call request hold", include_str!("../migrations/028_call_request_hold.sql")),
     (29, "operation abandon", include_str!("../migrations/029_operation_abandon.sql")),
     (30, "channel open operations", include_str!("../migrations/030_channel_open_operations.sql")),
+    (31, "starter requests", include_str!("../migrations/031_starter_requests.sql")),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -669,6 +670,15 @@ impl Storage for SqliteStorage {
 
     async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = ?").bind(id).fetch_optional(&self.pool).await?)
+    }
+    async fn starter_update(&self, update: crate::starter::StarterUpdate, now: Option<i64>) -> Result<crate::starter::StarterOutcome, StorageError> {
+        crate::starter::sqlite::update(&self.pool, update, now).await
+    }
+    async fn starter_grants(&self) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
+        crate::starter::sqlite::grants(&self.pool).await
+    }
+    async fn starter_counters(&self) -> Result<crate::starter::StarterCounters, StorageError> {
+        crate::starter::sqlite::counters(&self.pool).await
     }
     async fn insert_channel_open_operation(&self, op: &crate::ChannelOpenOperation) -> Result<bool, StorageError> {
         Ok(sqlx::query("INSERT INTO channel_open_operations (operation_id, request_hash, state, request, result, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO NOTHING")

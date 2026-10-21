@@ -1607,3 +1607,70 @@ fn channel_open_pre_dispatch_refusals_release_the_operation() {
         }
     }
 }
+
+#[test]
+fn starter_open_and_ready_info_logs_exclude_lightning_identity_and_socket() {
+    // Other tests execute these callsites without a subscriber. Isolate their
+    // process-wide interest cache from this thread-local capture.
+    const CHILD: &str = "BITSOV_STARTER_LOG_CAPTURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "ldk::tests::starter_open_and_ready_info_logs_exclude_lightning_identity_and_socket", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    #[derive(Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = Capture(bytes.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let mut opener = MockChannelOpener::new();
+        opener
+            .expect_open_channel()
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(ldk_node::UserChannelId(42)));
+        open_ldk_channel_with_policy(
+            &opener,
+            CHANNEL_PEER,
+            "192.0.2.23:9735",
+            100_000,
+            false,
+            None,
+            Some(10_000_000),
+        )
+        .unwrap();
+        LdkProvider::log_event(&ldk_node::Event::ChannelReady {
+            channel_id: ldk_node::lightning::ln::types::ChannelId([1; 32]),
+            user_channel_id: ldk_node::UserChannelId(42),
+            counterparty_node_id: Some(CHANNEL_PEER.parse().unwrap()),
+            funding_txo: None,
+        });
+    });
+    let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    assert!(log.contains("opening initiated") && log.contains("channel ready"));
+    assert!(!log.contains(CHANNEL_PEER));
+    assert!(!log.contains("192.0.2.23"));
+}

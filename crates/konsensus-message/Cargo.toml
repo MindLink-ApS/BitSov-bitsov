@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+uuid = { workspace = true }
 konsensus-core = { path = "../konsensus-core" }
 konsensus-crypto = { path = "../konsensus-crypto" }
 tokio.workspace = true

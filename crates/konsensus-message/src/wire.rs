@@ -841,6 +841,25 @@ pub enum Frame {
     /// Contains the node's Lightning pubkey, enabling peers to send keysend
     /// (spontaneous) payments without the RequestInvoice/InvoiceResponse
     /// round-trip. This reduces message compose latency by ~100-200ms.
+    StarterRequest {
+        v: u8,
+        request_id: uuid::Uuid,
+        network: String,
+        ln_pubkey: String,
+        ln_sig: String,
+    },
+    StarterStatus {
+        request_id: uuid::Uuid,
+        state: String,
+        reason: Option<String>,
+        retry_after_unix: Option<u64>,
+        original_request_id: Option<uuid::Uuid>,
+        capacity_sats: Option<u64>,
+        push_sats: Option<u64>,
+        channel_id: Option<String>,
+        funding_txid: Option<String>,
+    },
+
     LightningInfo {
         /// Compressed Lightning node public key (hex, 66 characters).
         /// This is the pubkey of the LND/LDK/CLN node, not the Ed25519 identity key.

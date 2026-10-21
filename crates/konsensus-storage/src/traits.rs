@@ -22,6 +22,19 @@ pub enum PaidAcceptance { Accepted, AlreadyAccepted, NonceReused, PaymentReused 
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
+    async fn starter_update(
+        &self,
+        _update: crate::starter::StarterUpdate,
+        _now: Option<i64>,
+    ) -> Result<crate::starter::StarterOutcome, StorageError> {
+        Err(StorageError::Unsupported("starter hub".into()))
+    }
+    async fn starter_grants(&self) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
+        Err(StorageError::Unsupported("starter hub".into()))
+    }
+    async fn starter_counters(&self) -> Result<crate::starter::StarterCounters, StorageError> {
+        Err(StorageError::Unsupported("starter hub".into()))
+    }
     /// Local at-rest read diagnostics, never exposed by public health.
     fn storage_read_health(&self) -> crate::StorageReadHealth {
         crate::StorageReadHealth::default()

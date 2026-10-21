@@ -3,3 +3,5 @@
 pub mod auto_channel;
 pub mod funding_poll;
 pub mod notify;
+
+pub mod starter_hub;

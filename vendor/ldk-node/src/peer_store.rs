@@ -43,6 +43,19 @@ where
 	pub(crate) fn add_peer(&self, peer_info: PeerInfo) -> Result<(), Error> {
 		let mut locked_peers = self.peers.write().unwrap();
 
+        // Permanent address suppression is independent of the serialized peer
+        // list and survives restarts. Unknown storage errors fail closed.
+        match KVStoreSync::read(
+            &*self.kv_store,
+            "bitsov_starter_peers",
+            "",
+            &peer_info.node_id.to_string(),
+        ) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(Error::PersistenceFailed),
+        }
+
 		if locked_peers.contains_key(&peer_info.node_id) {
 			return Ok(());
 		}
@@ -50,6 +63,22 @@ where
 		locked_peers.insert(peer_info.node_id, peer_info);
 		self.persist_peers(&*locked_peers)
 	}
+
+    /// Forget an address before opening a starter channel, and prevent the
+    /// normal open/connect paths from re-persisting it, including after restart.
+    pub(crate) fn suppress_address(&self, node_id: PublicKey) -> Result<(), Error> {
+        let mut peers = self.peers.write().unwrap();
+        peers.remove(&node_id);
+        self.persist_peers(&*peers)?;
+        KVStoreSync::write(
+            &*self.kv_store,
+            "bitsov_starter_peers",
+            "",
+            &node_id.to_string(),
+            vec![1],
+        )
+        .map_err(|_| Error::PersistenceFailed)
+    }
 
 	pub(crate) fn remove_peer(&self, node_id: &PublicKey) -> Result<(), Error> {
 		let mut locked_peers = self.peers.write().unwrap();
@@ -194,4 +223,53 @@ mod tests {
 		assert_eq!(peers[0], expected_peer_info);
 		assert_eq!(deser_peer_store.get_peer(&node_id), Some(expected_peer_info));
 	}
+}
+
+#[cfg(test)]
+mod starter_privacy_tests {
+    use super::*;
+    use lightning::util::test_utils::TestLogger;
+    use lightning_persister::fs_store::FilesystemStore;
+    use std::str::FromStr;
+
+    #[test]
+    fn starter_peer_address_is_removed_and_cannot_be_repersisted_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<DynStore> = Arc::new(FilesystemStore::new(dir.path().to_path_buf()));
+        let logger = Arc::new(TestLogger::new());
+        let peers = PeerStore::new(store.clone(), logger.clone());
+        let node_id = PublicKey::from_str(
+            "0276607124ebe6a6c9338517b6f485825b27c2dcc0b9fc2aa6a4c0df91194e5993",
+        )
+        .unwrap();
+        let peer = PeerInfo {
+            node_id,
+            address: SocketAddress::from_str("192.0.2.17:9735").unwrap(),
+        };
+        peers.add_peer(peer.clone()).unwrap();
+        peers.suppress_address(node_id).unwrap();
+        peers.add_peer(peer.clone()).unwrap(); // channel creation's ordinary add
+        let bytes = KVStoreSync::read(
+            &*store,
+            PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+            PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+            PEER_INFO_PERSISTENCE_KEY,
+        )
+        .unwrap();
+        drop(peers);
+        drop(store);
+        let store: Arc<DynStore> = Arc::new(FilesystemStore::new(dir.path().to_path_buf()));
+        let restarted = PeerStore::read(&mut &bytes[..], (store.clone(), logger)).unwrap();
+        assert!(restarted.list_peers().is_empty());
+        restarted.add_peer(peer).unwrap();
+        assert!(restarted.list_peers().is_empty());
+        let bytes = KVStoreSync::read(
+            &*store,
+            PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+            PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+            PEER_INFO_PERSISTENCE_KEY,
+        )
+        .unwrap();
+        assert!(!bytes.windows(4).any(|b| b == [192, 0, 2, 17]));
+    }
 }

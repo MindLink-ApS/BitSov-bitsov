@@ -308,6 +308,17 @@ pub enum ControlEvent {
     /// `Capability::Keysend`. Enables the compose flow to use keysend
     /// (spontaneous payment) instead of the invoice-request round-trip,
     /// reducing message compose latency by ~100-200ms.
+    StarterRequestReceived {
+        peer_id: NodeId,
+        frame: Frame,
+        privileged: bool,
+    },
+    StarterStatusReceived {
+        peer_id: NodeId,
+        frame: Frame,
+        privileged: bool,
+    },
+
     LightningInfoReceived {
         /// The peer who shared their Lightning pubkey.
         peer_id: NodeId,

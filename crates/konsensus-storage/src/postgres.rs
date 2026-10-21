@@ -442,6 +442,7 @@ impl PostgresStorage {
     (28, "call request hold", include_str!("../migrations/028_call_request_hold.sql")),
     (29, "operation abandon", include_str!("../migrations/postgres/029_operation_abandon.sql")),
     (30, "channel open operations", include_str!("../migrations/postgres/030_channel_open_operations.sql")),
+    (31, "starter requests", include_str!("../migrations/postgres/031_starter_requests.sql")),
         ]
     }
 
@@ -781,6 +782,15 @@ impl Storage for PostgresStorage {
 
     async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = $1").bind(id).fetch_optional(&self.pool).await?)
+    }
+    async fn starter_update(&self, update: crate::starter::StarterUpdate, now: Option<i64>) -> Result<crate::starter::StarterOutcome, StorageError> {
+        crate::starter::postgres::update(&self.pool, update, now).await
+    }
+    async fn starter_grants(&self) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
+        crate::starter::postgres::grants(&self.pool).await
+    }
+    async fn starter_counters(&self) -> Result<crate::starter::StarterCounters, StorageError> {
+        crate::starter::postgres::counters(&self.pool).await
     }
     async fn insert_channel_open_operation(&self, op: &crate::ChannelOpenOperation) -> Result<bool, StorageError> {
         Ok(sqlx::query("INSERT INTO channel_open_operations (operation_id, request_hash, state, request, result, last_error, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT(operation_id) DO NOTHING")
