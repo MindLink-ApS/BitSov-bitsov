@@ -26,6 +26,14 @@ struct OpenBackend {
     /// Whether a failed open still created the channel (a lost response).
     open_despite_failure: bool,
     channels: Mutex<Vec<ChannelInfo>>,
+    gate: Option<Arc<OpenGate>>,
+    list_fails: bool,
+}
+
+#[derive(Default)]
+struct OpenGate {
+    started: tokio::sync::Notify,
+    finish: tokio::sync::Notify,
 }
 
 impl OpenBackend {
@@ -39,8 +47,12 @@ impl OpenBackend {
     fn opens(&self) -> usize {
         self.opens.load(Ordering::SeqCst)
     }
-    fn open(&self, peer: &str, amount: u64) -> Result<ChannelOpenResult, LightningError> {
+    async fn open(&self, peer: &str, amount: u64) -> Result<ChannelOpenResult, LightningError> {
         let n = self.opens.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(gate) = &self.gate {
+            gate.started.notify_one();
+            gate.finish.notified().await;
+        }
         let failure = {
             let mut f = self.failures.lock().unwrap();
             (!f.is_empty()).then(|| f.remove(0))
@@ -91,6 +103,9 @@ impl LightningProvider for OpenBackend {
         true
     }
     async fn list_channels(&self) -> Result<Vec<ChannelInfo>, LightningError> {
+        if self.list_fails {
+            return Err(LightningError::Backend("channel list unavailable".into()));
+        }
         Ok(self.channels.lock().unwrap().clone())
     }
     async fn open_channel_with_status(
@@ -101,7 +116,7 @@ impl LightningProvider for OpenBackend {
         _announce: bool,
         _rate: Option<f32>,
     ) -> Result<ChannelOpenResult, LightningError> {
-        self.open(peer, amount)
+        self.open(peer, amount).await
     }
     async fn open_channel_with_funding(
         &self,
@@ -112,7 +127,7 @@ impl LightningProvider for OpenBackend {
         _options: FundingOptions,
         _push_msat: Option<u64>,
     ) -> Result<ChannelOpenResult, LightningError> {
-        self.open(peer, amount)
+        self.open(peer, amount).await
     }
 }
 
@@ -364,4 +379,287 @@ async fn status_advertises_channel_open_operations() {
         .as_array()
         .unwrap()
         .contains(&serde_json::json!("channel_open_operations_v1")));
+}
+
+// Dropping the HTTP service future models client disconnect cancellation. The
+// backend is held mid-open, so success cannot race ahead of the disconnect.
+#[tokio::test]
+async fn dropped_request_still_records_open_outcome() {
+    for failure in [None, Some(timeout()), Some(LightningError::NotReady)] {
+        let expected = match &failure {
+            None => Some("opened"),
+            Some(LightningError::NotReady) => None,
+            _ => Some("uncertain"),
+        };
+        let gate = Arc::new(OpenGate::default());
+        let backend = Arc::new(OpenBackend {
+            gate: Some(gate.clone()),
+            failures: Mutex::new(failure.into_iter().collect()),
+            ..Default::default()
+        });
+        let storage = sqlite().await;
+        let request = tokio::spawn(open(
+            backend.clone(),
+            storage.clone(),
+            serde_json::json!({"operation_id": OP}),
+        ));
+        gate.started.notified().await;
+        assert_eq!(
+            storage
+                .get_channel_open_operation(OP)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "pending"
+        );
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        gate.finish.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let row = storage.get_channel_open_operation(OP).await.unwrap();
+                if row.as_ref().map(|op| op.state.as_str()) == expected {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("disconnect must not cancel outcome recording");
+        assert_eq!(backend.opens(), 1);
+        if expected.is_some() {
+            let (status, body) = open(
+                backend.clone(),
+                storage,
+                serde_json::json!({"operation_id": OP}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                if expected == Some("opened") {
+                    StatusCode::OK
+                } else {
+                    StatusCode::ACCEPTED
+                },
+                "{body}"
+            );
+            assert_eq!(backend.opens(), 1);
+        }
+    }
+}
+
+async fn seed_pending(storage: &dyn Storage, age_ms: i64) {
+    use sha2::{Digest, Sha256};
+    let request = serde_json::to_vec(&serde_json::json!({
+        "peer_pubkey": PEER, "peer_addr": "127.0.0.1:9735", "amount_sats": 50000,
+        "push_sats": null, "announce": false, "funding_priority": null,
+        "max_funding_fee_sats": null, "fee_rate_sat_per_vb_bits": null,
+    }))
+    .unwrap();
+    let mut row = konsensus_storage::ChannelOpenOperation::pending(
+        OP.into(),
+        hex::encode(Sha256::digest(&request)),
+        request,
+    );
+    row.created_at -= age_ms;
+    row.updated_at = row.created_at;
+    assert!(storage.insert_channel_open_operation(&row).await.unwrap());
+}
+
+fn listed_channel(id: u8, peer: &str, capacity_msat: u64) -> ChannelInfo {
+    ChannelInfo {
+        channel_id: format!("{id:064x}"),
+        user_channel_id: Some(id.to_string()),
+        funding_txo: Some(format!("{}:1", "ab".repeat(32))),
+        peer_pubkey: peer.into(),
+        capacity_msat,
+        local_balance_msat: 0,
+        remote_balance_msat: 0,
+        active: false,
+        short_channel_id: None,
+    }
+}
+
+#[tokio::test]
+async fn crash_pending_recovers_only_one_matching_peer_and_capacity() {
+    for matches in 0..=2 {
+        let storage = sqlite().await;
+        seed_pending(storage.as_ref(), 600_001).await;
+        let mut channels = vec![
+            listed_channel(9, PEER, 49_999_000),
+            listed_channel(8, "other-peer", 50_000_000),
+        ];
+        channels
+            .extend((1..=matches).map(|id| listed_channel(id, &PEER.to_uppercase(), 50_000_000)));
+        let backend = Arc::new(OpenBackend {
+            channels: Mutex::new(channels),
+            ..Default::default()
+        });
+        let (status, body) = open(
+            backend.clone(),
+            storage.clone(),
+            serde_json::json!({"operation_id": OP}),
+        )
+        .await;
+        let row = storage
+            .get_channel_open_operation(OP)
+            .await
+            .unwrap()
+            .unwrap();
+        if matches == 1 {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(row.state, "opened");
+            assert_eq!(body["channel_id"], format!("{:064x}", 1));
+            assert_eq!(body["user_channel_id"], "1");
+            assert_eq!(body["funding_txo"], format!("{}:1", "ab".repeat(32)));
+            assert_eq!(body["funding_txid"], "ab".repeat(32));
+            assert_eq!(body["amount_sats"], 50000);
+            assert_eq!(body["replayed"], true);
+            assert!(row.result.is_some());
+        } else {
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            assert_eq!(row.state, "uncertain");
+            assert_eq!(body["status"], "outcome_uncertain");
+            assert!(row
+                .last_error
+                .unwrap()
+                .contains("inspect GET /payments/channels"));
+        }
+        // The settled outcome is durable even if the channel list changes.
+        backend.channels.lock().unwrap().clear();
+        let (again_status, again) = open(
+            backend.clone(),
+            storage,
+            serde_json::json!({"operation_id": OP}),
+        )
+        .await;
+        assert_eq!(again_status, status, "{again}");
+        assert_eq!(again["status"], body["status"]);
+        assert_eq!(backend.opens(), 0, "recovery must never dispatch");
+    }
+}
+
+#[tokio::test]
+async fn crash_pending_with_unavailable_channel_list_is_uncertain() {
+    let storage = sqlite().await;
+    seed_pending(storage.as_ref(), 600_001).await;
+    let backend = Arc::new(OpenBackend {
+        list_fails: true,
+        ..Default::default()
+    });
+    let (status, body) = open(
+        backend.clone(),
+        storage.clone(),
+        serde_json::json!({"operation_id": OP}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["status"], "outcome_uncertain");
+    assert!(body["last_error"]
+        .as_str()
+        .unwrap()
+        .contains("inspect GET /payments/channels"));
+    assert!(body["peer_channels"].is_null());
+    assert_eq!(
+        storage
+            .get_channel_open_operation(OP)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "uncertain"
+    );
+    assert_eq!(backend.opens(), 0);
+}
+
+#[tokio::test]
+async fn fresh_pending_and_mismatched_stale_retry_do_not_settle() {
+    for (age, extra, expected) in [
+        (
+            0,
+            serde_json::json!({"operation_id": OP}),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            600_001,
+            serde_json::json!({"operation_id": OP, "amount_sats": 50001}),
+            StatusCode::CONFLICT,
+        ),
+    ] {
+        let storage = sqlite().await;
+        seed_pending(storage.as_ref(), age).await;
+        let backend = Arc::new(OpenBackend {
+            channels: Mutex::new(vec![listed_channel(1, PEER, 50_000_000)]),
+            ..Default::default()
+        });
+        let (status, body) = open(backend.clone(), storage.clone(), extra).await;
+        assert_eq!(status, expected, "{body}");
+        assert_eq!(
+            storage
+                .get_channel_open_operation(OP)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "pending"
+        );
+        assert_eq!(backend.opens(), 0);
+    }
+}
+
+#[tokio::test]
+async fn old_pending_is_not_settled_while_detached_open_is_running() {
+    let storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let gate = Arc::new(OpenGate::default());
+    let backend = Arc::new(OpenBackend {
+        gate: Some(gate.clone()),
+        ..Default::default()
+    });
+    let request = tokio::spawn(open(
+        backend.clone(),
+        storage.clone(),
+        serde_json::json!({"operation_id": OP}),
+    ));
+    gate.started.notified().await;
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    sqlx::query("UPDATE channel_open_operations SET created_at = created_at - 600001, updated_at = updated_at - 600001")
+        .execute(storage.pool()).await.unwrap();
+    let (status, body) = open(
+        backend.clone(),
+        storage.clone(),
+        serde_json::json!({"operation_id": OP}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["status"], "pending");
+    assert_eq!(
+        storage
+            .get_channel_open_operation(OP)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "pending"
+    );
+    gate.finish.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if storage
+                .get_channel_open_operation(OP)
+                .await
+                .unwrap()
+                .unwrap()
+                .state
+                == "opened"
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(backend.opens(), 1);
 }

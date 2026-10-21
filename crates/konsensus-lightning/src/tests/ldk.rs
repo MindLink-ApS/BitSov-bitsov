@@ -1357,7 +1357,9 @@ fn owner_funding_priorities_reach_the_expected_ldk_targets() {
 }
 
 // A stopped real node lets us observe dispatch without opening sockets. Missing
-// estimates must not replace the legacy backend result with a quote refusal.
+// estimates must not replace LDK's specific NotRunning refusal with a quote
+// refusal. Checking the reason (not just PaymentNotDispatched) proves dispatch
+// reached the real open call even after pre-dispatch error reclassification.
 #[tokio::test]
 async fn default_open_reaches_ldk_without_fee_estimates() {
     for network in [
@@ -1380,7 +1382,7 @@ async fn default_open_reaches_ldk_without_fee_estimates() {
             .open_channel_with_status(&peer, "127.0.0.1:9735", 100_000, false, None)
             .await;
         assert!(
-            matches!(result, Err(LightningError::Backend(ref reason))
+            matches!(result, Err(LightningError::PaymentNotDispatched(ref reason))
             if reason.contains(&ldk_node::NodeError::NotRunning.to_string())),
             "{result:?}"
         );
@@ -1563,4 +1565,45 @@ async fn successful_ldk_dispatch_reconciles_real_ids_without_502_parse_error() {
         result.status,
         konsensus_core::traits::lightning::ChannelOpenStatus::Opening
     );
+}
+
+#[test]
+fn channel_open_pre_dispatch_refusals_release_the_operation() {
+    use ldk_node::NodeError as E;
+    for error in [
+        E::InsufficientFunds,
+        E::ConnectionFailed,
+        E::InvalidSocketAddress,
+        E::NotRunning,
+        E::ChannelCreationFailed,
+        E::ChannelCapacityExceeded,
+        E::TotalChannelCapacityExceeded,
+    ] {
+        for announce in [false, true] {
+            let mut node = MockChannelOpener::new();
+            node.expect_has_node_alias().return_const(true);
+            node.expect_has_listening_addresses().return_const(true);
+            if announce {
+                node.expect_open_announced_channel()
+                    .times(1)
+                    .return_once(move |_, _, _, _, _| Err(error));
+            } else {
+                node.expect_open_channel()
+                    .times(1)
+                    .return_once(move |_, _, _, _, _| Err(error));
+            }
+            let result = open_ldk_channel(
+                &node,
+                CHANNEL_PEER,
+                "127.0.0.1:9735",
+                50_000,
+                announce,
+                None,
+            );
+            assert!(
+                matches!(&result, Err(LightningError::PaymentNotDispatched(reason)) if reason.contains(&error.to_string())),
+                "{error:?}: {result:?}"
+            );
+        }
+    }
 }
