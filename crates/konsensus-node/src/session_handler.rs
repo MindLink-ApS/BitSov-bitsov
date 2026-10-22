@@ -444,7 +444,20 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::StarterRequestReceived {peer_id,frame,privileged} => {
                         if privileged {
-                            if let Some(tx)=&starter_hub_tx {let _=tx.try_send((peer_id,frame));}
+                            if let Some(tx) = &starter_hub_tx {
+                                if let Err(error) = tx.try_send((peer_id, frame)) {
+                                    let reason = match error {
+                                        mpsc::error::TrySendError::Full(_) => "queue_full",
+                                        mpsc::error::TrySendError::Closed(_) => "worker_unavailable",
+                                    };
+                                    metrics::counter!("konsensus_starter_requests_total", "result"=>"refused").increment(1);
+                                    metrics::counter!("konsensus_starter_refusals_total", "reason"=>reason).increment(1);
+                                    // Do not silently drop or await space behind a
+                                    // potentially slow Lightning operation. A lost
+                                    // reply remains safe to replay after reconnect.
+                                    let _ = transport.disconnect(&peer_id).await;
+                                }
+                            }
                             else if let Frame::StarterRequest{request_id,..}=frame {
                                 let reply=Frame::StarterStatus{request_id,state:"refused".into(),reason:Some("starter_disabled".into()),retry_after_unix:None,original_request_id:None,capacity_sats:None,push_sats:None,channel_id:None,funding_txid:None};
                                 let _=transport.enqueue_control_frame(&peer_id,&reply).await;

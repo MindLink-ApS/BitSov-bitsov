@@ -10,8 +10,8 @@ use konsensus_core::{
 use konsensus_message::{wire::Frame, NoiseTransport};
 use konsensus_storage::{starter::*, ChannelOpenOperation, Storage};
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
-use tokio::sync::{mpsc, watch};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio::sync::{mpsc, watch, Mutex};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +92,9 @@ pub struct StarterHub {
     pub lightning: Arc<dyn LightningProvider>,
     pub hub_id: NodeId,
     pub network: String,
+    /// Attempt windows survive reconnects and cover failures without a grant row.
+    /// Only authenticated Noise peer IDs may be used as keys.
+    pub request_windows: Mutex<HashMap<NodeId, i64>>,
 }
 fn refusal(id: Uuid, reason: &str, retry: Option<i64>, original: Option<String>) -> Frame {
     Frame::StarterStatus {
@@ -131,6 +134,31 @@ impl StarterHub {
             && matches!(self.network.as_str(), "signet" | "regtest")
             && self.lightning.starter_network().as_deref() == Some(self.network.as_str())
     }
+    /// Reserve before any signature or Lightning work. The lock also prevents
+    /// concurrent requests from passing before the first grant is persisted.
+    async fn throttle(&self, peer: NodeId, now: i64) -> anyhow::Result<Option<i64>> {
+        let mut windows = self.request_windows.lock().await;
+        if let Some(last) = windows
+            .get(&peer)
+            .filter(|last| now < last.saturating_add(600))
+        {
+            return Ok(Some(last.saturating_add(600)));
+        }
+        windows.retain(|_, last| now < last.saturating_add(600));
+        // Preserve the existing durable window across hub restarts without a
+        // migration. Failed signatures have only the process-local window.
+        let last = self
+            .storage
+            .starter_query(StarterQuery::LatestRequester(peer.to_hex()))
+            .await?
+            .first()
+            .map(|g| g.created_at)
+            .filter(|last| now < last.saturating_add(600));
+        windows.insert(peer, last.unwrap_or(now));
+        Ok(last.map(|last| last.saturating_add(600)))
+    }
+    /// `peer` comes from the privileged, authenticated Noise control event,
+    /// never from a request field or the claimed Lightning key.
     pub async fn handle(
         &self,
         peer: NodeId,
@@ -157,20 +185,10 @@ impl StarterHub {
         if v != 1 || request_id.get_version_num() != 4 {
             return Ok(refusal(request_id, "invalid_request", None, None));
         }
-        if ln_pubkey.len() != 66
-            || ln_sig.len() > 1024
-            || !self
-                .lightning
-                .verify_message(
-                    canonical(&network, &self.hub_id, &peer, request_id, &ln_pubkey).as_bytes(),
-                    &ln_sig,
-                    &ln_pubkey,
-                )
-                .await
-                .unwrap_or(false)
-        {
+        if ln_pubkey.len() != 66 || ln_sig.len() > 1024 {
             return Ok(refusal(request_id, "ln_signature_invalid", None, None));
         }
+        let retry = self.throttle(peer, now).await?;
         let key = ln_pubkey.to_ascii_lowercase();
         if let Some(g) = self
             .storage
@@ -181,7 +199,52 @@ impl StarterHub {
             if g.requester_node_id != peer.to_hex() || g.ln_pubkey != key || g.network != network {
                 return Ok(refusal(request_id, "operation_mismatch", None, None));
             }
+            // A replay is a read of an already authenticated grant, bound to
+            // this Noise identity and its stored LN key. Returning it without
+            // re-verification preserves lost-reply/adoption recovery during the
+            // window and cannot dispatch another open.
             return Ok(status(g));
+        }
+        if let Some(retry) = retry {
+            // A delayed ancestor may have been admitted just before the final
+            // newcomer retry. Permit read-only adoption without spending another
+            // successor or repeating crypto/Lightning work. Identity queries
+            // match peer OR key, so require BOTH plus the network before reply.
+            let original = self
+                .storage
+                .starter_query(StarterQuery::Identity {
+                    requester: peer.to_hex(),
+                    ln_pubkey: key.clone(),
+                })
+                .await?
+                .first()
+                .filter(|g| {
+                    g.requester_node_id == peer.to_hex()
+                        && g.ln_pubkey == key
+                        && g.network == network
+                })
+                .map(|g| g.request_id.clone());
+            let (reason, retry) = if original.is_some() {
+                ("already_served", None)
+            } else {
+                ("rate_limited", Some(retry))
+            };
+            // Never persist these replies or slide the attempt window.
+            metrics::counter!("konsensus_starter_requests_total", "result"=>"refused").increment(1);
+            metrics::counter!("konsensus_starter_refusals_total", "reason"=>reason).increment(1);
+            return Ok(refusal(request_id, reason, retry, original));
+        }
+        if !self
+            .lightning
+            .verify_message(
+                canonical(&network, &self.hub_id, &peer, request_id, &ln_pubkey).as_bytes(),
+                &ln_sig,
+                &ln_pubkey,
+            )
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(refusal(request_id, "ln_signature_invalid", None, None));
         }
         if let Some(g) = self
             .storage
@@ -230,23 +293,6 @@ impl StarterHub {
         } else {
             None
         };
-        if deny.is_none() {
-            if let Some(last) = self
-                .storage
-                .starter_query(StarterQuery::LatestRequester(peer.to_hex()))
-                .await?
-                .first()
-                .map(|g| g.created_at)
-                .filter(|t| now - *t < 600)
-            {
-                // Do not store rate-limit responses or slide the retry window.
-                metrics::counter!("konsensus_starter_requests_total", "result"=>"refused")
-                    .increment(1);
-                metrics::counter!("konsensus_starter_refusals_total", "reason"=>"rate_limited")
-                    .increment(1);
-                return Ok(refusal(request_id, "rate_limited", Some(last + 600), None));
-            }
-        }
         if deny.is_none()
             && !self
                 .lightning
