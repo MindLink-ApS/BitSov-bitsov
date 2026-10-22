@@ -3491,15 +3491,32 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_control_fields_count_toward_invalid_frame_ban() {
-        let (transport_a, transport_b, _id_a, _id_b, node_a_id, node_b_id) =
-            setup_connected_pair().await;
         let oversized = Frame::InvoiceError {
             request_id: "cap-ban".into(),
             reason: "x".repeat(crate::wire::MAX_CONTROL_REASON_BYTES + 1),
         }.to_bytes().unwrap();
+        assert_invalid_frames_ban_peer(&oversized).await;
+    }
+
+    #[tokio::test]
+    async fn global_string_tokens_count_toward_invalid_frame_ban() {
+        let value = "x".repeat(crate::wire::MAX_BOLT11_BYTES * 6);
+        // The ignored escaped key used to be accepted, so it never charged
+        // the invalid-frame budget. Keep the connection open with a Ping.
+        for json in [
+            format!(r#"{{"Ping":{{"nonce":1,"\n{value}":1}}}}"#),
+            format!(r#"{{"Ping":{{"nonce":"\n{value}"}}}}"#),
+        ] {
+            assert_invalid_frames_ban_peer(json.as_bytes()).await;
+        }
+    }
+
+    async fn assert_invalid_frames_ban_peer(oversized: &[u8]) {
+        let (transport_a, transport_b, _id_a, _id_b, node_a_id, node_b_id) =
+            setup_connected_pair().await;
         // Valid JSON and a known variant must still consume the invalid budget.
         for _ in 0..20 {
-            if transport_a.send_raw_bytes(&node_b_id, &oversized).await.is_err() {
+            if transport_a.send_raw_bytes(&node_b_id, oversized).await.is_err() {
                 break;
             }
         }

@@ -530,7 +530,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         warn!(
                             peer = %peer_id,
                             %session_id,
-                            %reason,
+                            reason = %konsensus_message::wire::sanitized_peer_reason(&reason),
                             "rejected legacy unpaid call end; use paid UKM realtime kind"
                         );
                     }
@@ -1168,7 +1168,7 @@ async fn handle_message_rejected(
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
     update_weights: bool,
 ) {
-    warn!(peer = %peer_id, msg_id = %message_id, %reason, "message rejected by peer");
+    warn!(peer = %peer_id, msg_id = %message_id, reason = %konsensus_message::wire::sanitized_peer_reason(reason), "message rejected by peer");
     if update_weights { routing.record_failure(peer_id).await; }
 
     if let Err(e) = ws_delivery_tx.send(Arc::new(
@@ -1600,7 +1600,7 @@ async fn handle_invoice_error_received(
         return true;
     }
     warn!(
-        peer = %peer_id, %request_id, %reason,
+        peer = %peer_id, %request_id, reason = %konsensus_message::wire::sanitized_peer_reason(reason),
         "peer reported invoice creation error — failing compose"
     );
     let mut requests = invoice_requests.lock().await;

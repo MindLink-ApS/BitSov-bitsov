@@ -8,7 +8,7 @@ use tracing::{debug, info, warn};
 use konsensus_core::traits::transport::TransportError;
 use konsensus_core::types::NodeId;
 
-use crate::wire::{Frame, WireError};
+use crate::wire::{sanitized_peer_reason, Frame, WireError};
 
 use super::{
     write_noise_message, read_noise_message,
@@ -469,7 +469,7 @@ pub(super) fn spawn_reader_task(
                     if state.pending_ping == Some(nonce) { state.pending_ping = None; }
                 }
                 Frame::Disconnect { reason } => {
-                    info!(peer = %peer_id, %reason, "peer disconnected gracefully");
+                    info!(peer = %peer_id, reason = %sanitized_peer_reason(&reason), "peer disconnected gracefully");
                     break;
                 }
                 Frame::MessageAck { id, duplicate } => {
@@ -487,7 +487,7 @@ pub(super) fn spawn_reader_task(
                     }
                 }
                 Frame::MessageReject { id, reason } => {
-                    warn!(peer = %peer_id, msg_id = %id, %reason, "message rejected by peer");
+                    warn!(peer = %peer_id, msg_id = %id, reason = %sanitized_peer_reason(&reason), "message rejected by peer");
                     if let Err(e) = control_tx
                         .send(ControlEvent::MessageRejected {
                             peer_id,
@@ -592,7 +592,7 @@ pub(super) fn spawn_reader_task(
                     debug!(
                         peer = %peer_id,
                         %request_id,
-                        %reason,
+                        reason = %sanitized_peer_reason(&reason),
                         "received invoice error"
                     );
                     if let Err(e) = control_tx
@@ -824,6 +824,15 @@ mod warning_tests {
             }
             event.record(&mut Fields(&mut self.0.lock().unwrap()));
         }
+    }
+
+    #[test]
+    fn peer_log_reasons_strip_controls_and_truncate_on_utf8_boundaries() {
+        assert_eq!(sanitized_peer_reason("bye\n\r\t\0\x1b[31m\u{85}\u{2028}\u{2029}ok"), "bye[31mok");
+        assert_eq!(sanitized_peer_reason("normal reason"), "normal reason");
+        let safe = sanitized_peer_reason(&format!("x{}", "💥".repeat(1024)));
+        assert_eq!(safe.len(), 1021);
+        assert!(!safe.chars().any(char::is_control));
     }
 
     #[test]

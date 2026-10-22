@@ -37,7 +37,7 @@ static ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
 fn oversized_plain_and_escaped_strings_do_not_allocate_payload_sized_buffers() {
     let mut failures = Vec::new();
     for prefix in ["", r"\n", r"\u0061", r"\ud83d\ude00"] {
-        let value = format!("{prefix}{}", "x".repeat(4 * 1024 * 1024));
+        let value = format!("{prefix}{}", "x".repeat(128 * 1024));
         // Escaped field names also select the bounded helpers.
         let cases = [
             format!(
@@ -93,7 +93,7 @@ fn assert_bounded_rejection(json: &str, label: &str) {
 fn l4_escaped_strings_reject_before_parser_scratch_allocation() {
     // Build inputs before enabling the thread-local counting allocator.
     for prefix in ["", r"\n", r"\u00e9", r"\ud83d\ude00"] {
-        let value = format!("{prefix}{}", "x".repeat(1024 * 1024));
+        let value = format!("{prefix}{}", "x".repeat(128 * 1024));
         let cases = [
             format!(r#"{{"Disconnect":{{"reason":"{value}"}}}}"#),
             format!(
@@ -120,7 +120,7 @@ fn l4_escaped_strings_reject_before_parser_scratch_allocation() {
 #[test]
 fn unknown_variant_tags_reject_before_copying_or_formatting() {
     for prefix in ["", r"\n", r"\u00e9", r"\ud83d\ude00"] {
-        let value = format!("{prefix}{}", "x".repeat(4 * 1024 * 1024));
+        let value = format!("{prefix}{}", "x".repeat(128 * 1024));
         for json in [
             format!(r#"{{"{value}":{{}}}}"#),
             format!(r#""{value}""#),
@@ -225,7 +225,7 @@ fn every_l4_string_field_rejects_escaped_over_cap_without_large_allocations() {
         ),
     ];
     for prefix in ["", r"\n", r"\u00e9", r"\ud83d\ude00"] {
-        let value = format!("{prefix}{}", "x".repeat(1024 * 1024));
+        let value = format!("{prefix}{}", "x".repeat(128 * 1024));
         for (mut frame, pointer) in cases.clone() {
             *frame.pointer_mut(pointer).unwrap() = json!("ALLOCATION_MARKER");
             let json = serde_json::to_string(&frame)
@@ -238,7 +238,7 @@ fn every_l4_string_field_rejects_escaped_over_cap_without_large_allocations() {
 
 #[test]
 fn typed_text_fields_reject_escaped_over_cap_without_large_allocations() {
-    let value = format!(r"\n{}", "x".repeat(1024 * 1024));
+    let value = format!(r"\n{}", "x".repeat(128 * 1024));
     for json in [
         format!(r#"{{"Message":{{"recipient":{{"Room":"{value}"}}}}}}"#),
         format!(r#"{{"StarterRequest":{{"request_id":"{value}"}}}}"#),
@@ -266,7 +266,7 @@ fn escaped_known_tags_and_typed_fields_remain_compatible() {
 
 #[test]
 fn wrong_type_byte_arrays_and_elements_do_not_copy_hostile_strings() {
-    let value = format!(r"\n{}", "x".repeat(1024 * 1024));
+    let value = format!(r"\n{}", "x".repeat(128 * 1024));
     for json in [
         format!(r#"{{"Hello":{{"x25519_sig":"{value}"}}}}"#),
         format!(r#"{{"Hello":{{"x25519_public":["{value}"]}}}}"#),
@@ -285,7 +285,7 @@ fn wrong_type_byte_arrays_and_elements_do_not_copy_hostile_strings() {
 #[test]
 fn starter_lightning_porch_and_quote_hooks_reject_without_large_allocations() {
     for prefix in ["", r"\n", r"\u00e9", r"\ud83d\ude00"] {
-        let value = format!("{prefix}{}", "x".repeat(1024 * 1024));
+        let value = format!("{prefix}{}", "x".repeat(128 * 1024));
         for (variant, field) in [
             ("StarterRequest", "network"),
             ("StarterRequest", "ln_pubkey"),
@@ -306,5 +306,97 @@ fn starter_lightning_porch_and_quote_hooks_reject_without_large_allocations() {
         }
         let json = format!(r#"{{"PeerExchangeQuote":{{"quote":{{"bolt11":"{value}"}}}}}}"#);
         assert_bounded_rejection(&json, "quote.bolt11");
+    }
+}
+
+
+#[test]
+fn global_string_ceiling_rejects_every_schema_position_before_allocation() {
+    use konsensus_message::wire::{MAX_BOLT11_BYTES, MAX_FRAME_BYTES};
+    let patterns = [
+        ("u64", r#"{"Ping":{"nonce":"PAYLOAD"}}"#),
+        ("u16", r#"{"PriceQuery":{"kind":"PAYLOAD"}}"#),
+        ("u8", r#"{"StarterRequest":{"v":"PAYLOAD"}}"#),
+        ("u32", r#"{"PriceTable":{"valid_blocks":"PAYLOAD"}}"#),
+        ("bool", r#"{"PorchQuoteResponse":{"admission_required":"PAYLOAD"}}"#),
+        ("f64", r#"{"PriceTable":{"trust_discount":"PAYLOAD"}}"#),
+        ("optional u64", r#"{"StarterStatus":{"capacity_sats":"PAYLOAD"}}"#),
+        ("hello version", r#"{"Hello":{"version":"PAYLOAD"}}"#),
+        ("price value", r#"{"PriceTable":{"prices":{"chat":"PAYLOAD"}}}"#),
+        ("quote expiry", r#"{"PeerExchangeQuote":{"quote":{"expires_at":"PAYLOAD"}}}"#),
+        ("timestamp", r#"{"Message":{"timestamp":"PAYLOAD"}}"#),
+        ("kind", r#"{"Message":{"kind":"PAYLOAD"}}"#),
+        ("amount", r#"{"Message":{"payment_proof":{"amount_msat":"PAYLOAD"}}}"#),
+        ("unit content", r#"{"SessionAck":"PAYLOAD"}"#),
+        ("recipient unit", r#"{"Message":{"recipient":{"Broadcast":"PAYLOAD"}}}"#),
+        ("tier content", r#"{"Hello":{"tier":{"T1":"PAYLOAD"}}}"#),
+        ("struct body", r#"{"Ping":"PAYLOAD"}"#),
+        ("envelope body", r#"{"Message":"PAYLOAD"}"#),
+        ("nested struct body", r#"{"PeerExchangeQuote":{"quote":"PAYLOAD"}}"#),
+        ("unknown key", r#"{"Disconnect":{"reason":"bye","PAYLOAD":1}}"#),
+        ("ignored value", r#"{"Disconnect":{"reason":"bye","future":"PAYLOAD"}}"#),
+    ];
+    let mut failures = Vec::new();
+    for size in [6 * MAX_BOLT11_BYTES + 1, MAX_FRAME_BYTES - 1024] {
+        for prefix in ["", r"\n", r"\u0061", r"\ud83d\ude00", r#"\"\\{}[]"#, "é", "💥"] {
+            let value = format!("{prefix}{}", "x".repeat(size - prefix.len()));
+            for (label, pattern) in patterns {
+                let json = pattern.replace("PAYLOAD", &value);
+                assert!(json.len() <= MAX_FRAME_BYTES);
+                TOTAL.set(0);
+                LARGEST.set(Some(0));
+                let result = Frame::from_bytes(json.as_bytes());
+                let largest = LARGEST.replace(None).unwrap();
+                let total = TOTAL.get();
+                let correct_error = result.as_ref().err().is_some_and(|e| {
+                    e.to_string() == "serialization error: JSON string exceeds frame token cap"
+                });
+                if !correct_error || largest > 4096 || total > 16384 {
+                    failures.push((label, size, prefix, correct_error, largest, total));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "global string ceiling failures: {failures:?}");
+}
+
+#[test]
+fn global_string_ceiling_preserves_exact_raw_boundary_and_maximum_escaped_fields() {
+    use konsensus_message::wire::{MAX_BOLT11_BYTES, MAX_SDP_BYTES};
+    let cap = 6 * MAX_BOLT11_BYTES;
+    // Both keys and ignored values are allowed exactly at the raw ceiling.
+    for token in ["x".repeat(cap), r"\u0078".repeat(cap / 6)] {
+        for json in [
+            format!(r#"{{"Disconnect":{{"reason":"bye","{token}":1}}}}"#),
+            format!(r#"{{"Disconnect":{{"reason":"bye","future":"{token}"}}}}"#),
+        ] {
+            Frame::from_bytes(json.as_bytes()).unwrap();
+        }
+    }
+    for (variant, field, limit, other) in [
+        ("InvoiceResponse", "bolt11", MAX_BOLT11_BYTES, r#""request_id":"id","payment_hash":"00""#),
+        ("CallOffer", "sdp", MAX_SDP_BYTES, r#""session_id":"id""#),
+    ] {
+        let json = format!(r#"{{"{variant}":{{{other},"{field}":"{}"}}}}"#, r"\u0078".repeat(limit));
+        Frame::from_bytes(json.as_bytes()).unwrap();
+    }
+    // Reset between tokens; escaped quotes/backslashes cannot hide a boundary.
+    let json = format!(r#"{{"Disconnect":{{"reason":"bye","a":"{}","b":"{}"}}}}"#,
+        r#"\"\\{}[]"#.repeat(32 * 1024), "x".repeat(cap));
+    Frame::from_bytes(json.as_bytes()).unwrap();
+}
+
+#[test]
+fn malformed_frame_errors_never_include_peer_text() {
+    for json in [
+        r#"{"Ping":{"nonce":"PEER_SECRET\n\u001b"}}"#,
+        r#"{"PEER_SECRET":{}}"#,
+        r#"{"Hello":{"tier":{"PEER_SECRET":null}}}"#,
+        r#"{"SessionAck":"PEER_SECRET"}"#,
+        r#"{"Message":"PEER_SECRET"}"#,
+    ] {
+        let error = Frame::from_bytes(json.as_bytes()).unwrap_err().to_string();
+        assert!(!error.contains("PEER_SECRET"), "peer bytes in decode error");
+        assert!(error.len() <= 128 && !error.chars().any(char::is_control));
     }
 }

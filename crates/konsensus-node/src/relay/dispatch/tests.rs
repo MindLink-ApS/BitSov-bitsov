@@ -651,3 +651,35 @@ async fn drain_scoped_to_sender_t_auth() {
     let replies = dispatch(&eng, &ctrl(kind::KIND_RELAY_DRAIN, r2, drain_body(10))).await;
     assert!(is_ack(&replies, r2), "r2 has no holds → empty ack, never r1's mail");
 }
+
+
+#[tokio::test]
+async fn malformed_relay_bodies_return_fixed_wire_compatible_reasons() {
+    let (eng, _) = setup();
+    let hostile = serde_json::to_vec(&"PEER_SECRET\n\x1b".repeat(1024)).unwrap();
+    let mut cases = Vec::new();
+    for (kind, code) in [
+        (kind::KIND_RELAY_REGISTER, "relay_register_invalid_body"),
+        (kind::KIND_RELAY_ACK, "relay_ack_invalid_body"),
+        (kind::KIND_RELAY_DEPOSIT, "relay_deposit_invalid_body"),
+        (kind::KIND_RELAY_DRAIN, "relay_drain_invalid_body"),
+    ] {
+        cases.push((kind, hostile.clone(), code));
+    }
+    let inner = serde_json::to_vec(&serde_json::json!({
+        "binding_recipient": vec![0u8; 32],
+        "inner_envelope_bytes": hostile,
+        "inner_kind": 0, "ttl_secs": 60
+    })).unwrap();
+    cases.push((kind::KIND_RELAY_DEPOSIT, inner, "relay_deposit_invalid_envelope"));
+    for (kind, body, code) in cases {
+        let replies = dispatch(&eng, &ctrl(kind, node(1), body)).await;
+        let [(peer, frame @ Frame::MessageReject { reason, .. })] = replies.as_slice() else {
+            panic!("expected one rejection");
+        };
+        assert_eq!(*peer, node(1));
+        assert_eq!(reason, code);
+        assert!(reason.len() <= konsensus_message::wire::MAX_CONTROL_REASON_BYTES);
+        Frame::from_bytes(&frame.to_bytes().unwrap()).unwrap();
+    }
+}

@@ -208,6 +208,21 @@ pub const MAX_LN_ADDR_BYTES: usize = 262;
 pub const MAX_CONTROL_ID_BYTES: usize = 256;
 /// Human-readable rejection/disconnect/invoice/call reasons.
 pub const MAX_CONTROL_REASON_BYTES: usize = 1024;
+/// Keep peer reasons on one log line and within the wire reason byte budget.
+pub fn sanitized_peer_reason(reason: &str) -> String {
+    let mut safe = String::with_capacity(reason.len().min(MAX_CONTROL_REASON_BYTES));
+    for ch in reason.chars() {
+        if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+            continue;
+        }
+        if safe.len() + ch.len_utf8() > MAX_CONTROL_REASON_BYTES {
+            break;
+        }
+        safe.push(ch);
+    }
+    safe
+}
+
 /// Invoice descriptions; allows UTF-8 text and hashed-description backends.
 pub const MAX_INVOICE_PURPOSE_BYTES: usize = 1024;
 /// Hex payment hashes are normally 64 characters; leave representation headroom.
@@ -220,6 +235,14 @@ pub const MAX_PAYMENT_HASH_BYTES: usize = 128;
 pub const MAX_BOLT11_BYTES: usize = 64 * 1024;
 /// Generous SDP budget for multi-track sessions, codecs and ICE attributes.
 pub const MAX_SDP_BYTES: usize = 64 * 1024;
+/// Raw bytes inside any JSON string token, including keys and ignored fields.
+/// Six bytes per decoded UTF-8 byte permits even a full 64 KiB BOLT11/SDP
+/// expressed as `\uXXXX` escapes (surrogate pairs have a smaller ratio).
+/// Larger payloads are byte arrays. This lexical ceiling bounds serde scratch
+/// and wrong-type error formatting before any schema-specific visitor runs;
+/// narrower decoded per-field limits still apply.
+pub const MAX_RAW_STRING_TOKEN_BYTES: usize = 6 * MAX_BOLT11_BYTES;
+
 /// One trickled ICE candidate, including a JSON wrapper and extension fields.
 pub const MAX_ICE_CANDIDATE_BYTES: usize = 4096;
 /// Application-defined capability name.
@@ -288,23 +311,38 @@ mod bounded {
     /// RawValue's ignored-value parser uses a heap stack without serde_json's
     /// normal recursion guard. Bound it before parsing, including wrong-type
     /// arrays/objects in string fields and ignored fields. This is a lexical
-    /// depth check only; serde_json remains responsible for JSON validity.
+    /// depth/string-token check only; serde_json handles JSON validity. Count
+    /// raw token bytes so neither unescaping nor type-error formatting can
+    /// allocate in proportion to an arbitrary peer string, including ignored
+    /// keys and values. Error text is fixed and never contains peer bytes.
     pub fn check_frame_depth(data: &[u8]) -> Result<(), WireError> {
         let mut depth: usize = 0;
         let mut in_string = false;
         let mut escaped = false;
+        let mut string_bytes = 0;
         for &byte in data {
             if in_string {
+                if !escaped && byte == b'"' {
+                    in_string = false;
+                    continue;
+                }
+                string_bytes += 1;
+                if string_bytes > MAX_RAW_STRING_TOKEN_BYTES {
+                    return Err(WireError::Serialization(
+                        "JSON string exceeds frame token cap".into(),
+                    ));
+                }
                 if escaped {
                     escaped = false;
                 } else if byte == b'\\' {
                     escaped = true;
-                } else if byte == b'"' {
-                    in_string = false;
                 }
             } else {
                 match byte {
-                    b'"' => in_string = true,
+                    b'"' => {
+                        in_string = true;
+                        string_bytes = 0;
+                    }
                     b'[' | b'{' => {
                         depth += 1;
                         if depth > 128 {
@@ -1274,7 +1312,8 @@ impl Frame {
         bounded_json::check_enum_tag(raw)
             .map_err(|error| WireError::Serialization(error.into()))?;
         let frame: Self =
-            serde_json::from_slice(data).map_err(|e| WireError::Serialization(e.to_string()))?;
+            serde_json::from_slice(data)
+                .map_err(|_| WireError::Serialization("invalid frame JSON".into()))?;
         frame.validate()?;
         Ok(frame)
     }
@@ -2818,10 +2857,7 @@ mod tests {
         let err = Frame::from_bytes(json.as_bytes()).unwrap_err();
         match err {
             WireError::Serialization(msg) => {
-                assert!(
-                    msg.contains("byte array exceeds maximum"),
-                    "expected cap-exceeded message, got: {msg}"
-                );
+                assert_eq!(msg, "invalid frame JSON");
             }
             other => panic!("expected Serialization cap error, got: {other:?}"),
         }
@@ -2978,10 +3014,7 @@ mod tests {
         let err = Frame::from_bytes(json.as_bytes()).unwrap_err();
         match err {
             WireError::Serialization(msg) => {
-                assert!(
-                    msg.contains("maximum depth"),
-                    "expected depth-cap message, got: {msg}"
-                );
+                assert_eq!(msg, "invalid frame JSON");
             }
             other => panic!("expected Serialization depth error, got: {other:?}"),
         }
@@ -3008,10 +3041,7 @@ mod tests {
         let err = Frame::from_bytes(json.as_bytes()).unwrap_err();
         match err {
             WireError::Serialization(msg) => {
-                assert!(
-                    msg.contains("maximum of") && msg.contains("nodes"),
-                    "expected node-count-cap message, got: {msg}"
-                );
+                assert_eq!(msg, "invalid frame JSON");
             }
             other => panic!("expected Serialization node-count error, got: {other:?}"),
         }

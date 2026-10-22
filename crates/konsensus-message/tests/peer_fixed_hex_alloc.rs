@@ -64,7 +64,9 @@ fn fixed_hex_fields_reject_before_owned_allocation() {
             .unwrap()
             .replace("HEX_MARKER", &r"\u0030".repeat(cap));
         Frame::from_bytes(honest.as_bytes()).unwrap();
-        for len in [cap + 1, 128 * 1024] {
+        // The escaped 48 KiB sample remains below the global raw-token
+        // ceiling, so removing this field's pre-copy guard cannot be masked.
+        for len in [cap + 1, 48 * 1024, 128 * 1024] {
             let mut frame: Value = base.clone();
             *frame.pointer_mut(pointer).unwrap() = json!("HEX_MARKER");
             let json = serde_json::to_string(&frame).unwrap();

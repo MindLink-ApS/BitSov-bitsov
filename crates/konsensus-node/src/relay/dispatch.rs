@@ -204,7 +204,7 @@ pub(crate) async fn handle_relay_control(
         kind::KIND_RELAY_REGISTER => {
             let body: RegisterBody = match serde_json::from_slice(&envelope.ciphertext) {
                 Ok(b) => b,
-                Err(e) => return reply(sender, reject(id, format!("relay register body: {e}"))),
+                Err(_) => return reply(sender, reject(id, "relay_register_invalid_body".into())),
             };
             let binding_id: [u8; 16] = match body.binding_id.as_slice().try_into() {
                 Ok(a) => a,
@@ -250,7 +250,7 @@ pub(crate) async fn handle_relay_control(
             // attacker-sized Vec is ever materialized.
             let body: AckBody = match serde_json::from_slice(&envelope.ciphertext) {
                 Ok(b) => b,
-                Err(e) => return reply(sender, reject(id, format!("relay ack body: {e}"))),
+                Err(_) => return reply(sender, reject(id, "relay_ack_invalid_body".into())),
             };
             match engine.handle_ack(sender, &body.message_ids).await {
                 Ok(_count) => reply(sender, Frame::MessageAck { id, duplicate: false }),
@@ -260,7 +260,7 @@ pub(crate) async fn handle_relay_control(
         kind::KIND_RELAY_DEPOSIT => {
             let body: DepositBody = match serde_json::from_slice(&envelope.ciphertext) {
                 Ok(b) => b,
-                Err(e) => return reply(sender, reject(id, format!("relay deposit body: {e}"))),
+                Err(_) => return reply(sender, reject(id, "relay_deposit_invalid_body".into())),
             };
             let recipient = match to_32(&body.binding_recipient) {
                 Some(a) => NodeId::from_bytes(a),
@@ -277,12 +277,12 @@ pub(crate) async fn handle_relay_control(
             let inner_envelope: UkmEnvelope =
                 match serde_json::from_slice(&body.inner_envelope_bytes) {
                     Ok(env) => env,
-                    Err(e) => {
+                    Err(_) => {
                         return reply(
                             sender,
                             reject(
                                 id,
-                                format!("relay deposit: inner envelope parse failed: {e}"),
+                                "relay_deposit_invalid_envelope".into(),
                             ),
                         )
                     }
@@ -395,7 +395,7 @@ pub(crate) async fn handle_relay_control(
         kind::KIND_RELAY_DRAIN => {
             let body: DrainBody = match serde_json::from_slice(&envelope.ciphertext) {
                 Ok(b) => b,
-                Err(e) => return reply(sender, reject(id, format!("relay drain body: {e}"))),
+                Err(_) => return reply(sender, reject(id, "relay_drain_invalid_body".into())),
             };
             // FINDING-2 (DOCTRINE-CRITICAL): the relay RETURNS held ciphertext; it
             // never admits. Each held envelope is re-injected to the drainer as a

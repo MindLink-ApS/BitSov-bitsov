@@ -5,7 +5,7 @@ A mutant only counts as killed on a test assertion failure, never a build error.
 Sources are restored in finally; do not run concurrently with edits/builds.
 """
 from pathlib import Path
-import os, re, subprocess, sys
+import argparse, os, re, subprocess, sys
 wire = Path('crates/konsensus-message/src/wire.rs')
 envelope = Path('crates/konsensus-message/src/wire/bounded_envelope.rs')
 helper = Path('crates/konsensus-message/src/wire/bounded_json.rs')
@@ -102,6 +102,15 @@ change('bytes.wrong_element_type', helper,
 change('enum.exact_limit', helper,
        'check_string_bytes(&tag[..=i], MAX_ENUM_TAG_BYTES)',
        'check_string_bytes(&tag[..=i], MAX_ENUM_TAG_BYTES - 1)', ['--lib','enum_tag_bound_counts_decoded_bytes'])
+change('frame.raw_string_ceiling', wire,
+       'if string_bytes > MAX_RAW_STRING_TOKEN_BYTES {',
+       'if false {', alloc+['global_string_ceiling_rejects'])
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--only', help='Run mutations whose names contain this text')
+selected = parser.parse_args().only
+if selected:
+ mutations = [m for m in mutations if selected in m[0]]
+ assert mutations, f'No mutations match {selected!r}'
 env=os.environ.copy();env.update(CARGO_PROFILE_DEV_DEBUG='0',CARGO_PROFILE_TEST_DEBUG='0')
 logs=Path('/private/tmp/peer-caps-mutations-round2');logs.mkdir(exist_ok=True)
 try:
