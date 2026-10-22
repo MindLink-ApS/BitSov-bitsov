@@ -452,3 +452,12 @@ remaining owner count before typing `revoke`. A changed preview requires a new
 confirmation. Reaching zero owners is refused unless `--allow-zero-owner` is
 explicit: recovery then requires the owner console. Keep a trusted owner key
 when possible.
+
+For incident response, revocation fails closed without `--owner-control` if the
+pairing holds the last owner key or a stored owner-signed device key whose
+signature the running process cannot verify. Restart with `--owner-control`
+before revoking it through the console's preview and confirmation flow; removing
+the last owner additionally needs `--allow-zero-owner`. Stop any home service
+before starting the unlocked operator process against the same data directory;
+see the [home-node runbook](../operations/home-node.md#add-and-recover-a-second-owner-device-rc20).
+Disabling enrollment or re-pairing the same public key cannot bypass the guard.
