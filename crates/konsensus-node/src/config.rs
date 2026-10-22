@@ -853,6 +853,32 @@ impl LightningConfig {
         }
     }
 
+    /// Both addresses can be advertised to peers, so reject values they cannot decode.
+    fn validate_address_lengths(&self) -> anyhow::Result<()> {
+        if let Self::Ldk {
+            advertised_address,
+            listening_address,
+            ..
+        } = self
+        {
+            for (field, address) in [
+                ("advertised_address", advertised_address),
+                ("listening_address", listening_address),
+            ] {
+                if address
+                    .as_ref()
+                    .is_some_and(|address| address.len() > konsensus_message::wire::MAX_LN_ADDR_BYTES)
+                {
+                    anyhow::bail!(
+                        "Lightning address lightning.{field} exceeds the wire limit of {} UTF-8 bytes",
+                        konsensus_message::wire::MAX_LN_ADDR_BYTES
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Dialable Lightning address to announce in `Frame::LightningInfo`.
     ///
     /// Prefer the explicit public address. Falling back to `listening_address`
@@ -1571,6 +1597,7 @@ impl NodeConfig {
                 "invalid node configuration; check field names, types and file-based credentials"
             )
         })?;
+        config.lightning.validate_address_lengths()?;
         config.anchor_relative_backup_dir(path);
         Ok(config)
     }
@@ -1620,6 +1647,7 @@ impl NodeConfig {
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.lightning.validate_address_lengths()?;
         self.validate_starter_hub(false)?;
         self.tower.validate()?;
         if !self.tower.clients.is_empty() && !matches!(self.lightning, LightningConfig::Ldk { .. })
