@@ -15,6 +15,8 @@ BitSov is a sovereign mesh network where users hold their own cryptographic iden
 
 We do not backport security patches. Users should always run the latest build.
 
+The Daily Security Scan scopes OSV to the root `Cargo.lock`, which resolves all release dependencies (no frontend ships here); vendored crates' standalone lockfiles are not release build inputs, and any future release-input lockfiles must be added explicitly.
+
 ---
 
 ## Reporting a Vulnerability
