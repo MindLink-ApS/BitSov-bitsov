@@ -76,7 +76,7 @@ impl PairLink {
             .decode(encoded)
             .map_err(|e| format!("invalid pairing link base64: {e}"))?;
         let link: Self =
-            serde_json::from_slice(&json).map_err(|_| "invalid pairing link JSON".to_string())?;
+            konsensus_core::wire_json::from_slice(&json).map_err(|_| "invalid pairing link JSON".to_string())?;
         if link.v != VERSION && link.v != PAIR_LINK_VERSION {
             return Err(format!("unsupported pairing link version {}", link.v));
         }

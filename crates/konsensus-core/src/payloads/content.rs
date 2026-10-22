@@ -139,6 +139,14 @@ pub struct PageResponse {
     pub total_chunks: u32,
 }
 
+impl PageResponse {
+    /// Decode a peer reply with the porch body budget, including fully escaped
+    /// Unicode, while retaining ordinary bounds on metadata and wrong types.
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, crate::wire_json::DecodeError> {
+        crate::wire_json::from_slice_with_large_strings(bytes, &[("body", MAX_PORCH_BODY_BYTES)])
+    }
+}
+
 fn default_true() -> bool {
     true
 }

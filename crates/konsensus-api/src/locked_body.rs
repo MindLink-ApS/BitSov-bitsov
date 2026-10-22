@@ -58,7 +58,7 @@ struct BorrowedBody<'a> {
 
 pub(super) fn parse(raw: &[u8]) -> Result<UnlockBody, UnlockError> {
     // RawValue borrows the JSON spelling and skips, rather than decodes, escapes.
-    let body: BorrowedBody<'_> = serde_json::from_slice(raw).map_err(|_| UnlockError::Failed)?;
+    let body: BorrowedBody<'_> = konsensus_core::wire_json::from_slice(raw).map_err(|_| UnlockError::Failed)?;
     Ok(UnlockBody {
         challenge: body.challenge,
         key_id: body.key_id,

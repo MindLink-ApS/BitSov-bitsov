@@ -209,7 +209,7 @@ async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &s
 /// send (money already moved): a store error is logged and `resolve` or
 /// `recover` commits later from the operation journal.
 pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) {
-    let Ok(signal) = serde_json::from_str::<CallSignal>(plaintext) else { return };
+    let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else { return };
     if let Err(e) = settle(store, peer, &signal.call_id, operation_id, request_hash, Settlement::Paid).await {
         tracing::warn!(peer = %peer, error = %e, "call commit after settlement failed; recovery will retry");
     }
@@ -229,7 +229,7 @@ fn journal_settlement(op: Option<&konsensus_storage::OutboxOperation>, peer: &No
 /// After compose returned (either way): read the operation journal and commit,
 /// release (definite nonpayment) or keep (ambiguous) this request's reservation.
 pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) {
-    let Ok(signal) = serde_json::from_str::<CallSignal>(plaintext) else { return };
+    let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else { return };
     // The reservation's own kind (an ICE reserves nothing; then this is moot).
     let kind = match store.call_get(peer, &signal.call_id).await {
         Ok(Some(CallEntry { pending: Some(p), .. })) => p.kind,
