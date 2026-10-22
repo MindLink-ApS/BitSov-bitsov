@@ -1,6 +1,9 @@
 //! Durable `open-channel` idempotency records (#331). One row per caller
 //! `operation_id`; a retry with the same id never dispatches a second open.
 //! `request` and `result` are opaque bytes, encrypted by EncryptedStorage.
+//! The send-onchain API also uses this ledger with `send-onchain:<UUID>` keys.
+//! For those isolated records, `opened` holds a returned txid and `uncertain`
+//! may hold a saved non-dispatch refusal; only that API interprets their blobs.
 
 /// Dispatch is in flight, or the process stopped before the outcome was recorded.
 pub const CHANNEL_OPEN_PENDING: &str = "pending";
