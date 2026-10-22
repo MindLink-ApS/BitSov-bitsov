@@ -69,9 +69,80 @@ require_release_assets() {
   done | LC_ALL=C sort)
   # A full or partial previous upload is safe to regenerate. Only these exact
   # generated names are exempt; all seventeen source assets remain mandatory.
-  present=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' |
+  present=$(cut -f1 "$WORK/assets.pinned" |
     awk '$0 != "SHA256SUMS" && $0 != "SHA256SUMS.asc"' | LC_ALL=C sort)
   [ "$present" = "$expected" ] || die "release $TAG assets are not exactly the five binaries, their .sha256 files, their SBOMs, and Darwin toolchain evidence"
+}
+# REST exposes asset IDs and SHA-256 digests, including assets not downloaded
+# on a retry (the prior manifest/signature). Pin the entire set, not just names.
+snapshot_release_assets() {
+  local snapshot
+  # The tag endpoint returns 404 for drafts. Count matches across every page;
+  # a separate marker also counts drafts with no assets. TAG is validated below.
+  snapshot=$(gh api "repos/$REPO/releases" --paginate --jq \
+    ".[] | select(.draft == true and .tag_name == \"$TAG\") |
+      \"draft\", (.assets[] | [.name, (.id | tostring), (.digest // \"\")] | @tsv)") ||
+    die 'cannot snapshot release assets'
+  [ "$(printf '%s\n' "$snapshot" | grep -cx draft)" = 1 ] ||
+    die "expected exactly one draft release for $TAG"
+  printf '%s\n' "$snapshot" | sed '/^draft$/d' |
+    LC_ALL=C sort > "$1" || die 'cannot snapshot release assets'
+}
+require_unchanged_release() {
+  gh release view "$TAG" --repo "$REPO" --json isDraft -q .isDraft | grep -qx true ||
+    die "release $TAG is not a draft; refusing to change it"
+  snapshot_release_assets "$WORK/assets.current"
+  cmp -s "$WORK/assets.pinned" "$WORK/assets.current" ||
+    die "release $TAG assets changed since download (ID, digest, name, addition or removal); refusing to upload"
+}
+# Numeric fields are normalized and compared as decimal strings: Bash integer
+# arithmetic and sort -V are either overflow-prone or not portable to macOS.
+version_fields() {
+  local field stable=0 dotted=0
+  local -a fields
+  [[ $1 =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-rc([0-9]+)(\.([0-9]+))?)?$ ]] || return 1
+  [ -n "${BASH_REMATCH[4]:-}" ] || stable=1
+  [ -z "${BASH_REMATCH[6]:-}" ] || dotted=1
+  fields=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    "$stable" "${BASH_REMATCH[5]:-0}" "$dotted" "${BASH_REMATCH[7]:-0}")
+  for field in "${fields[@]}"; do
+    while [[ $field == 0* && ${#field} -gt 1 ]]; do field=${field#0}; done
+    printf '%s ' "$field"
+  done
+  printf '\n'
+}
+version_greater() {
+  local i LC_ALL=C
+  local -a left right
+  read -r -a left <<<"$(version_fields "$1")"
+  read -r -a right <<<"$(version_fields "$2")"
+  for i in "${!left[@]}"; do
+    [ "${left[$i]}" != "${right[$i]}" ] || continue
+    if [ "${#left[$i]}" -ne "${#right[$i]}" ]; then
+      [ "${#left[$i]}" -gt "${#right[$i]}" ]; return
+    fi
+    [[ ${left[$i]} > ${right[$i]} ]]; return
+  done
+  return 1 # Equal versions are not newer.
+}
+require_newer_release() {
+  local published newest='' major minor rest candidate_major candidate_minor
+  read -r major minor rest <<<"$(version_fields "$TAG")"
+  # Paginate all releases; neither creation order nor GitHub's latest flag is
+  # SemVer order. Published prereleases count too; drafts never do.
+  gh api "repos/$REPO/releases" --paginate --jq \
+    '.[] | select(.draft == false) | .tag_name' > "$WORK/published-tags" ||
+    die 'cannot list published releases; refusing to sign'
+  while IFS= read -r published; do
+    rest=$(version_fields "$published") || continue
+    read -r candidate_major candidate_minor rest <<<"$rest"
+    [ "$major" = "$candidate_major" ] && [ "$minor" = "$candidate_minor" ] || continue
+    if [ -z "$newest" ] || version_greater "$published" "$newest"; then newest=$published; fi
+  done < "$WORK/published-tags"
+  if [ -n "$newest" ]; then
+    version_greater "$TAG" "$newest" ||
+      die "tag $TAG must be newer than newest published release $newest in the same major/minor line; refusing to sign"
+  fi
 }
 POSITIONAL=()
 while [ $# -gt 0 ]; do
@@ -165,6 +236,10 @@ for target in "${TARGETS[@]}"; do
   "$accepted" || die "unverified target $target; requires --accept-unverified-target $target"
 done
 
+# Refuse downgrades/re-signing published versions before any private-key access
+# or tag creation/push. There is deliberately no override for this gate.
+require_newer_release
+
 # 1. Signed tag (this triggers CI; artifact signing is gated below).
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   [ "$(git rev-parse "$TAG^{commit}")" = "$FULL" ] || die "tag $TAG exists on a different commit"
@@ -195,7 +270,13 @@ gh run watch "$RUN" --repo "$REPO" --exit-status >/dev/null || die "CI run $RUN 
 mkdir "$WORK/artifacts"
 cd "$WORK/artifacts"
 gh release view "$TAG" --repo "$REPO" --json isDraft -q .isDraft | grep -qx true || die "release $TAG is not a draft; refusing to change it"
+snapshot_release_assets "$WORK/assets.pinned"
 require_release_assets
+while IFS=$'\t' read -r name id digest; do
+  case "$name" in SHA256SUMS|SHA256SUMS.asc) continue ;; esac
+  [[ $id =~ ^[0-9]+$ && $digest =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    die "missing or invalid SHA-256 digest for release asset $name (ID $id)"
+done < "$WORK/assets.pinned"
 for a in "${ASSETS[@]}"; do
   gh release download "$TAG" --repo "$REPO" --pattern "$a" --pattern "$a.sha256" --pattern "$a.sbom.spdx.json" --clobber
   expected=$(awk '{print $1; exit}' "$a.sha256")
@@ -213,6 +294,15 @@ for a in "${ASSETS[@]}"; do
       ;;
   esac
 done
+
+# Bind every downloaded byte to the pre-download ID/digest snapshot. Checking
+# the per-binary .sha256 alone would miss a replaced binary+checksum or SBOM.
+while IFS=$'\t' read -r name id digest; do
+  case "$name" in SHA256SUMS|SHA256SUMS.asc) continue ;; esac
+  actual=$(awk -v asset="$name" '$2 == asset {print $1}' SHA256SUMS)
+  [ "sha256:$actual" = "$digest" ] ||
+    die "downloaded asset digest differs from pinned draft: $name (ID $id)"
+done < "$WORK/assets.pinned"
 
 # 4. Rebuild independently: never execute or trust a downloaded CI binary.
 echo "rebuilding $TAG ($FULL) for host $HOST"
@@ -256,6 +346,8 @@ fi
 for target in ${ACCEPTED[@]+"${ACCEPTED[@]}"}; do
   printf 'ACCEPT UNVERIFIED target=%s tag=%s commit=%s (explicit operator waiver)\n' "$target" "$TAG" "$FULL" >&2
 done
+# Recheck even in dry-run, after the potentially long rebuild.
+require_unchanged_release
 if "$DRY_RUN"; then
   echo 'Dry-run: gates completed (see verification/waiver status above); no signing or upload performed.'
   cat SHA256SUMS
@@ -264,10 +356,11 @@ fi
 
 # 5. Sign, verify, attach only after the reproducibility gate.
 gpg --list-secret-keys "$KEY_FPR" >/dev/null 2>&1 || die "release key $KEY_FPR is not on this machine"
-# Re-check the draft after downloads and the rebuild, immediately before signing.
-gh release view "$TAG" --repo "$REPO" --json isDraft -q .isDraft | grep -qx true || die "release $TAG is not a draft; refusing to change it"
 gpg --armor --detach-sign --local-user "$KEY_FPR" --output SHA256SUMS.asc SHA256SUMS
 gpg --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>/dev/null | signed_by_key || die "signature check failed"
+# Signing may involve an interactive pinentry. Re-fetch immediately before
+# upload as well, so changes during signing cannot receive this stale manifest.
+require_unchanged_release
 gh release upload "$TAG" SHA256SUMS SHA256SUMS.asc --repo "$REPO" --clobber
 
 echo
