@@ -52,6 +52,16 @@ pub struct FilePayload {
     pub data_b64: String,
 }
 
+impl FilePayload {
+    /// Peer payload: only the actual base64 data field gets the file-size budget.
+    /// Wrong-type numeric fields and unknown keys keep the shared token ceiling.
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, konsensus_core::wire_json::DecodeError> {
+        konsensus_core::wire_json::from_slice_with_large_strings(
+            bytes, &[("data_b64", MAX_FILE_SIZE.div_ceil(3) * 4)],
+        )
+    }
+}
+
 /// Request to upload a file to the local node.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -182,7 +182,7 @@ impl CallSignal {
         if plaintext.len() > MAX_SDP_BYTES + 1024 {
             return Err(CallRefusal::Invalid("payload too large"));
         }
-        let s: CallSignal = serde_json::from_str(plaintext).map_err(|_| CallRefusal::Invalid("not a call signal"))?;
+        let s: CallSignal = crate::wire_json::from_str(plaintext).map_err(|_| CallRefusal::Invalid("not a call signal"))?;
         if s.v != CALL_SIGNAL_VERSION {
             return Err(CallRefusal::Invalid("unsupported version"));
         }

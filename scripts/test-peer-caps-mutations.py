@@ -8,9 +8,10 @@ from pathlib import Path
 import argparse, os, re, subprocess, sys
 wire = Path('crates/konsensus-message/src/wire.rs')
 envelope = Path('crates/konsensus-message/src/wire/bounded_envelope.rs')
-helper = Path('crates/konsensus-message/src/wire/bounded_json.rs')
+helper = Path('crates/konsensus-core/src/wire_json/strings.rs')
 logging = Path('crates/konsensus-message/src/transport/messaging.rs')
-originals = {p:p.read_text() for p in [wire, envelope, helper, logging]}
+scanner = Path('crates/konsensus-core/src/wire_json.rs')
+originals = {p:p.read_text() for p in [wire, envelope, helper, logging, scanner]}
 regression_dir = Path('crates/konsensus-message/tests')
 regressions = {p: p.read_bytes() for p in regression_dir.glob('*.proptest-regressions')}
 mutations=[]
@@ -102,8 +103,8 @@ change('bytes.wrong_element_type', helper,
 change('enum.exact_limit', helper,
        'check_string_bytes(&tag[..=i], MAX_ENUM_TAG_BYTES)',
        'check_string_bytes(&tag[..=i], MAX_ENUM_TAG_BYTES - 1)', ['--lib','enum_tag_bound_counts_decoded_bytes'])
-change('frame.raw_string_ceiling', wire,
-       'if string_bytes > MAX_RAW_STRING_TOKEN_BYTES {',
+change('frame.raw_string_ceiling', scanner,
+       'if i - begin > limit.map_or(MAX_RAW_STRING_TOKEN_BYTES, |n: usize| n.saturating_mul(6))\n            {',
        'if false {', alloc+['global_string_ceiling_rejects'])
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--only', help='Run mutations whose names contain this text')

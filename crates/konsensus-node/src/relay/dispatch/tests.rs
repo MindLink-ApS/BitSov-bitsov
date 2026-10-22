@@ -683,3 +683,206 @@ async fn malformed_relay_bodies_return_fixed_wire_compatible_reasons() {
         Frame::from_bytes(&frame.to_bytes().unwrap()).unwrap();
     }
 }
+
+// Track only the current test thread; payload construction is outside the window.
+mod decode_allocations {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    struct MeasuredAllocator;
+    thread_local! {
+        static LARGEST: Cell<Option<usize>> = const { Cell::new(None) };
+        static TOTAL: Cell<usize> = const { Cell::new(0) };
+    }
+    fn record(size: usize) {
+        let _ = LARGEST.try_with(|largest| {
+            if let Some(previous) = largest.get() {
+                largest.set(Some(previous.max(size)));
+                TOTAL.with(|total| total.set(total.get() + size));
+            }
+        });
+    }
+    // SAFETY: all operations forward the original pointer/layout to System.
+    unsafe impl GlobalAlloc for MeasuredAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record(layout.size());
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            record(size);
+            unsafe { System.realloc(ptr, layout, size) }
+        }
+    }
+    #[global_allocator]
+    static ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
+
+    #[tokio::test]
+    async fn relay_body_decodes_reject_before_large_allocations() {
+        let (engine, _) = setup();
+        for size in [393_217, 2 * 1024 * 1024] {
+            let token = format!(r"\n{}", "x".repeat(size));
+            for (kind, field) in [
+                (kind::KIND_RELAY_REGISTER, "quota_bytes"),
+                (kind::KIND_RELAY_ACK, "message_ids"),
+                (kind::KIND_RELAY_DEPOSIT, "inner_kind"),
+                (kind::KIND_RELAY_DRAIN, "max"),
+            ] {
+                for json in [
+                    format!(r#"{{"{field}":"{token}"}}"#),
+                    format!(r#"{{"{token}":0}}"#),
+                ] {
+                    let env = ctrl(kind, node(1), json.into_bytes());
+                    TOTAL.set(0);
+                    LARGEST.set(Some(0));
+                    let replies = dispatch(&engine, &env).await;
+                    let largest = LARGEST.replace(None).unwrap();
+                    let total = TOTAL.get();
+                    assert!(is_reject(&replies, node(1)));
+                    assert!(
+                        largest <= 4096 && total <= 16384,
+                        "kind={kind}: largest={largest}, total={total}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn relay_deposit_and_held_mail_use_standalone_envelope_admission() {
+    use tracing_subscriber::layer::SubscriberExt;
+    struct Errors(Arc<std::sync::Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Errors {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields<'a>(&'a mut Vec<String>);
+            impl tracing::field::Visit for Fields<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "error" {
+                        self.0.push(format!("{value:?}"));
+                    }
+                }
+            }
+            event.record(&mut Fields(&mut self.0.lock().unwrap()));
+        }
+    }
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(Errors(captured.clone())),
+    );
+    let (engine, store) = setup();
+    let recipient = node(2);
+    let registration = serde_json::to_vec(&RegisterBody {
+        binding_id: vec![0; 16],
+        quota_bytes: 10_000_000,
+        ttl_max_secs: 3600,
+        depositor_whitelist_root: vec![0; 32],
+        created_at: 1,
+    })
+    .unwrap();
+    assert!(is_ack(
+        &dispatch(
+            &engine,
+            &ctrl(kind::KIND_RELAY_REGISTER, recipient, registration)
+        )
+        .await,
+        recipient
+    ));
+    let inner = inner_envelope(node(1), recipient);
+    let honest = serde_json::to_string(&inner).unwrap();
+    // Core serde would accept and ignore this escaped key; the wire preflight
+    // must reject it at BOTH the deposit boundary and the mailbox read boundary.
+    let token = format!(r"\n{}", "x".repeat(393_217));
+    let hostile = format!("{{\"{token}\":0,{}", &honest[1..]);
+    let deposit = ctrl(
+        kind::KIND_RELAY_DEPOSIT,
+        node(1),
+        deposit_body(recipient, hostile.clone().into_bytes(), 0, 1),
+    );
+    let replies = dispatch(&engine, &deposit).await;
+    assert!(
+        matches!(replies.as_slice(), [(_, Frame::MessageReject { reason, .. })]
+        if reason == "relay_deposit_invalid_envelope")
+    );
+    assert!(store
+        .list_held(&recipient, 10, unix_secs())
+        .await
+        .is_empty());
+    // Seed a pre-upgrade/externally stored mailbox item, bypassing deposit.
+    for (index, bytes) in [
+        hostile.into_bytes(),
+        br#"{"timestamp":"PEER_SECRET\n\u001b"}"#.to_vec(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store
+            .hold_envelope(
+                &recipient,
+                MessageId::from_bytes([index as u8; 32]),
+                node(1),
+                bytes,
+                10_000_000,
+                unix_secs(),
+                unix_secs() + 3600,
+            )
+            .await
+            .unwrap();
+    }
+    let replies = dispatch(
+        &engine,
+        &ctrl(kind::KIND_RELAY_DRAIN, recipient, drain_body(10)),
+    )
+    .await;
+    assert!(
+        is_ack(&replies, recipient),
+        "invalid held mail must never be forwarded"
+    );
+    let logged = captured.lock().unwrap();
+    assert_eq!(logged.len(), 2);
+    assert!(logged.iter().all(|error| error == "invalid wire JSON"));
+}
+
+#[test]
+fn relay_payload_field_bounds_reject_before_materializing_large_arrays() {
+    let body = DepositBody {
+        binding_recipient: vec![0; 32],
+        inner_envelope_bytes: vec![],
+        inner_kind: 0,
+        ttl_secs: 60,
+        whitelist: Some(WhitelistAuth {
+            merkle_path: vec![],
+            whitelist_root: vec![0; 32],
+        }),
+    };
+    let honest = serde_json::to_value(&body).unwrap();
+    assert!(wire_json::from_slice::<DepositBody>(&serde_json::to_vec(&honest).unwrap()).is_ok());
+    for pointer in [
+        "/binding_recipient",
+        "/whitelist/whitelist_root",
+        "/whitelist/merkle_path",
+    ] {
+        let mut hostile = honest.clone();
+        *hostile.pointer_mut(pointer).unwrap() = if pointer.ends_with("merkle_path") {
+            serde_json::json!(vec![vec![0u8; 32]; 65])
+        } else {
+            serde_json::json!(vec![0u8; 33])
+        };
+        assert!(
+            wire_json::from_slice::<DepositBody>(&serde_json::to_vec(&hostile).unwrap()).is_err(),
+            "{pointer}"
+        );
+    }
+    assert!(wire_json::from_str::<DrainBody>(r#"{"max":64}"#).is_ok());
+}

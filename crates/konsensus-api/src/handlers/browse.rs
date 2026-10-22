@@ -258,7 +258,7 @@ async fn fetch(
         ApiError::Transport(format!("porch_reply_invalid: paid {paid} msat, {what}"))
             .with_reason("porch_reply_invalid")
     };
-    let page: PageResponse = serde_json::from_str(&text)
+    let page: PageResponse = PageResponse::from_wire_bytes(text.as_bytes())
         .map_err(|e| bad_reply(format!("reply is not a page response: {e}")))?;
     if page.request_id != request_id {
         return Err(bad_reply("reply names another request".into()));
