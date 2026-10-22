@@ -2066,7 +2066,12 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
                 .send_frame(
                     &recipient,
                     &Frame::RequestInvoice {
-                        request_id: format!("{i:04}{}", "x".repeat(1000)),
+                        // Stay at the wire cap so this exercises handler/reply
+                        // backpressure, rather than the invalid-frame ban.
+                        request_id: format!(
+                            "{i:04}{}",
+                            "x".repeat(konsensus_message::wire::MAX_CONTROL_ID_BYTES - 4)
+                        ),
                         amount_msat: 1000,
                         purpose: "konsensus message".into(),
                     },
@@ -3736,4 +3741,43 @@ fn starter_control_requires_privileged_session_and_counts_refusal() {
         },
         &membrane
     ));
+}
+
+#[tokio::test]
+async fn peer_rejection_logs_strip_controls_at_downstream_handlers() {
+    use tracing_subscriber::layer::SubscriberExt;
+    struct Reasons(Arc<std::sync::Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Reasons {
+        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            struct Fields<'a>(&'a mut Vec<String>);
+            impl tracing::field::Visit for Fields<'_> {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "reason" {
+                        self.0.push(format!("{value:?}"));
+                    }
+                }
+            }
+            event.record(&mut Fields(&mut self.0.lock().unwrap()));
+        }
+    }
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(Reasons(captured.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let routing = konsensus_routing::RoutingTable::new(Default::default());
+    let (ws_tx, mut ws_rx) = broadcast::channel(4);
+    let reason = "peer\n\r\x1b\u{85}\u{2028}\u{2029}reason";
+    handle_message_rejected(
+        &test_peer_id(), &konsensus_core::MessageId::from_bytes([0; 32]),
+        reason, &routing, &ws_tx, false,
+    ).await;
+    handle_invoice_error_received(
+        &test_peer_id(), "log-test", reason, true,
+        &tokio::sync::Mutex::new(std::collections::HashMap::new()),
+    ).await;
+    assert_eq!(ws_rx.recv().await.unwrap().reason.as_deref(), Some(reason));
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    for logged in captured.iter() {
+        assert_eq!(logged, "peerreason");
+    }
 }

@@ -58,6 +58,34 @@ where
     deserializer.deserialize_seq(RefVisitor)
 }
 
+/// Maximum ciphertext per envelope: 6 MiB. Allows the API's 4 MiB files
+/// after base64/JSON encoding and encryption overhead while bounding allocation before payment validation.
+/// Shared by Message, Gossip and PeerExchangePaidRequest decoding.
+pub const MAX_CIPHERTEXT_BYTES: usize = 6 * 1024 * 1024;
+
+fn bounded_ciphertext<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<u8>, D::Error> {
+    struct CiphertextVisitor;
+    impl<'de> Visitor<'de> for CiphertextVisitor {
+        type Value = Vec<u8>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "ciphertext of at most {MAX_CIPHERTEXT_BYTES} bytes")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            let mut bytes = Vec::new();
+            while let Some(byte) = seq.next_element::<u8>()? {
+                if bytes.len() >= MAX_CIPHERTEXT_BYTES {
+                    return Err(de::Error::custom("ciphertext exceeds byte cap"));
+                }
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+    deserializer.deserialize_seq(CiphertextVisitor)
+}
+
 /// The Unified BitSov Message envelope.
 ///
 /// Every piece of communication in the BitSov network is wrapped in this
@@ -76,6 +104,7 @@ pub struct UkmEnvelope {
     /// Unix timestamp in milliseconds.
     pub timestamp: u64,
     /// E2EE encrypted payload (PQXDH for 1:1, MLS for groups).
+    #[serde(deserialize_with = "bounded_ciphertext")]
     pub ciphertext: Vec<u8>,
     /// Lightning payment proof — MANDATORY. Principle 2: no payment = rejected.
     pub payment_proof: PaymentProof,
