@@ -252,7 +252,7 @@ jobs:
       - name: Test vendored ldk-node library
         run: cargo test --locked --manifest-path vendor/ldk-node/Cargo.toml --lib
       - name: Test fork-private Lightning TLV pins (65537/65539/65541)
-        run: cargo test --manifest-path vendor/lightning/Cargo.toml --lib starter_initial_push_
+        run: cargo test --locked --manifest-path vendor/lightning/Cargo.toml --lib starter_initial_push_
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
