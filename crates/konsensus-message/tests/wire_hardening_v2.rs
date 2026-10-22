@@ -441,19 +441,11 @@ fn decode_consumed_bytes_correct() {
 }
 
 #[test]
-fn decode_frame_exact_max_size() {
-    // Create a frame that's just under MAX_FRAME_SIZE
-    // A Disconnect with a very long reason string
-    let reason = "x".repeat(1024 * 1024); // 1 MiB reason string
-    let frame = Frame::Disconnect { reason: reason.clone() };
+fn decode_frame_rejects_oversize_control_field_under_frame_limit() {
+    let frame = Frame::Disconnect { reason: "x".repeat(1024 * 1024) };
     let encoded = encode_frame(&frame).unwrap();
-
-    // Should decode successfully
-    let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
-    match decoded {
-        Frame::Disconnect { reason: r } => assert_eq!(r.len(), 1024 * 1024),
-        _ => panic!("expected Disconnect"),
-    }
+    assert!(encoded.len() < MAX_FRAME_BYTES);
+    assert!(matches!(decode_frame(&encoded), Err(WireError::Serialization(_))));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

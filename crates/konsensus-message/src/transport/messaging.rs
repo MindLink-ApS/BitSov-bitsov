@@ -8,7 +8,7 @@ use tracing::{debug, info, warn};
 use konsensus_core::traits::transport::TransportError;
 use konsensus_core::types::NodeId;
 
-use crate::wire::Frame;
+use crate::wire::{sanitized_peer_reason, Frame, WireError};
 
 use super::{
     write_noise_message, read_noise_message,
@@ -398,24 +398,9 @@ pub(super) fn spawn_reader_task(
                         conn.invalid_frame_level += 1.0;
                         let level = conn.invalid_frame_level;
 
-                        if level > INVALID_FRAME_BUDGET as f64 {
-                            warn!(
-                                peer = %peer_id,
-                                invalid_level = level,
-                                error = %e,
-                                "frame validation budget exceeded — disconnecting and banning peer"
-                            );
-                            true
-                        } else {
-                            warn!(
-                                peer = %peer_id,
-                                invalid_level = level,
-                                budget = INVALID_FRAME_BUDGET,
-                                error = %e,
-                                "invalid frame (budget warning)"
-                            );
-                            false
-                        }
+                        let should_ban = level > INVALID_FRAME_BUDGET as f64;
+                        warn_invalid_frame(&peer_id, level, should_ban, &e);
+                        should_ban
                     };
 
                     if should_ban {
@@ -484,7 +469,7 @@ pub(super) fn spawn_reader_task(
                     if state.pending_ping == Some(nonce) { state.pending_ping = None; }
                 }
                 Frame::Disconnect { reason } => {
-                    info!(peer = %peer_id, %reason, "peer disconnected gracefully");
+                    info!(peer = %peer_id, reason = %sanitized_peer_reason(&reason), "peer disconnected gracefully");
                     break;
                 }
                 Frame::MessageAck { id, duplicate } => {
@@ -502,7 +487,7 @@ pub(super) fn spawn_reader_task(
                     }
                 }
                 Frame::MessageReject { id, reason } => {
-                    warn!(peer = %peer_id, msg_id = %id, %reason, "message rejected by peer");
+                    warn!(peer = %peer_id, msg_id = %id, reason = %sanitized_peer_reason(&reason), "message rejected by peer");
                     if let Err(e) = control_tx
                         .send(ControlEvent::MessageRejected {
                             peer_id,
@@ -607,7 +592,7 @@ pub(super) fn spawn_reader_task(
                     debug!(
                         peer = %peer_id,
                         %request_id,
-                        %reason,
+                        reason = %sanitized_peer_reason(&reason),
                         "received invoice error"
                     );
                     if let Err(e) = control_tx
@@ -802,5 +787,78 @@ async fn connection_keepalive(conn: &Connection) {
             write_noise_message(&mut state.writer, &encrypted).await.ok()
         }).await;
         if !matches!(sent, Ok(Some(()))) { return; }
+    }
+}
+
+// Keep both warning paths together so neither can accidentally log raw peer data.
+fn warn_invalid_frame(peer_id: &NodeId, level: f64, should_ban: bool, error: &WireError) {
+    if should_ban {
+        warn!(peer = %peer_id, invalid_level = level, error = error.log_category(),
+            "frame validation budget exceeded — disconnecting and banning peer");
+    } else {
+        warn!(peer = %peer_id, invalid_level = level, budget = INVALID_FRAME_BUDGET,
+            error = error.log_category(), "invalid frame (budget warning)");
+    }
+}
+
+#[cfg(test)]
+mod warning_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tracing::{span, Event, Metadata, Subscriber};
+
+    struct Capture(Arc<Mutex<Vec<String>>>);
+    impl Subscriber for Capture {
+        fn enabled(&self, _: &Metadata<'_>) -> bool { true }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id { span::Id::from_u64(1) }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            struct Fields<'a>(&'a mut Vec<String>);
+            impl tracing::field::Visit for Fields<'_> {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "error" { self.0.push(format!("{value:?}")); }
+                }
+            }
+            event.record(&mut Fields(&mut self.0.lock().unwrap()));
+        }
+    }
+
+    #[test]
+    fn peer_log_reasons_strip_controls_and_truncate_on_utf8_boundaries() {
+        assert_eq!(sanitized_peer_reason("bye\n\r\t\0\x1b[31m\u{85}\u{2028}\u{2029}ok"), "bye[31mok");
+        assert_eq!(sanitized_peer_reason("normal reason"), "normal reason");
+        let safe = sanitized_peer_reason(&format!("x{}", "💥".repeat(1024)));
+        assert_eq!(safe.len(), 1021);
+        assert!(!safe.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn invalid_frame_warnings_never_echo_peer_bytes() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let hostile = "PEER_SECRET\n\r\x1b[31m💥".repeat(1024 * 1024);
+        let errors = [
+            WireError::Serialization(hostile.clone()),
+            WireError::InvalidFrame(hostile.clone()),
+            WireError::Io(std::io::Error::other(hostile)),
+            WireError::FrameTooLarge { size: usize::MAX, max: 0 },
+            WireError::IncompleteFrame { expected: usize::MAX, got: 0 },
+        ];
+        tracing::subscriber::with_default(Capture(captured.clone()), || {
+            for error in &errors {
+                for should_ban in [false, true] {
+                    warn_invalid_frame(&NodeId::from_bytes([0; 32]), 11.0, should_ban, error);
+                }
+            }
+        });
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 10, "both warning paths must be captured");
+        for error in captured.iter() {
+            assert!(error.len() <= 256, "logged {} error bytes", error.len());
+            assert!(!error.contains("PEER_SECRET"));
+            assert!(error.is_ascii() && !error.chars().any(char::is_control));
+        }
     }
 }
