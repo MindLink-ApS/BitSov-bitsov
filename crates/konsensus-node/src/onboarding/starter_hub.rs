@@ -570,10 +570,6 @@ pub async fn run(
     }
 }
 
-// TODO(PR-2, Codex C3): persist initial push evidence or prevent spending before
-// newcomer verification; current balance after spending is not initial-push proof.
-// TODO(PR-2, Fool F4): automatically mint a new UUID after a retryable refusal,
-// respecting retry_after_unix and the hub's ten-minute admission throttle.
 #[cfg(test)]
 #[path = "starter_hub_tests.rs"]
 mod tests;

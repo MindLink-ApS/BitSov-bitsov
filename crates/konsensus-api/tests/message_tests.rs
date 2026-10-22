@@ -1890,6 +1890,7 @@ async fn compose_happy_path_keysend() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(StubLightning),
@@ -2043,6 +2044,7 @@ async fn compose_happy_path_invoice_flow() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(StubLightning),
@@ -2167,6 +2169,7 @@ async fn compose_rejects_invoice_amount_mismatch() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(StubLightning),
@@ -2354,6 +2357,7 @@ async fn compose_keysend_fallback_to_invoice() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(KeysendFailingLightning),
@@ -2488,6 +2492,7 @@ async fn compose_queues_when_transport_send_fails() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(StubLightning),
@@ -2600,6 +2605,7 @@ async fn compose_room_delivers_to_all_connected_members() {
     let storage = Arc::new(MemStorage::new());
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::clone(&storage) as Arc<dyn Storage>,
         lightning: Arc::new(StubLightning),
@@ -2743,6 +2749,7 @@ async fn compose_broadcasts_to_websocket() {
     let mut ws_subscriber = ws_tx.subscribe();
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(StubLightning),
@@ -2847,6 +2854,7 @@ async fn compose_records_send_timestamp_for_stdp() {
     let send_timestamps = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(StubLightning),
@@ -2950,6 +2958,7 @@ async fn compose_room_all_members_fail_returns_explicit_refusals() {
     let storage = Arc::new(MemStorage::new());
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::clone(&storage) as Arc<dyn Storage>,
         lightning: Arc::new(StubLightning),
@@ -3116,6 +3125,7 @@ async fn compose_room_rejects_oversized_member_count() {
     );
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::clone(&storage) as Arc<dyn Storage>,
         lightning: Arc::new(StubLightning),

@@ -2874,6 +2874,8 @@ pub(super) struct ChannelContext<SP: Deref>
 where
 	SP::Target: SignerProvider,
 {
+	/// Negotiated initial push, independent of subsequent HTLC balance changes.
+	pub(super) initial_push_msat: Option<u64>,
 	config: LegacyChannelConfig,
 
 	// Track the previous `ChannelConfig` so that we can continue forwarding HTLCs that were
@@ -3627,6 +3629,7 @@ where
 			minimum_depth_override: None,
 		};
 		let channel_context = ChannelContext {
+			initial_push_msat: Some(msg_push_msat),
 			user_id,
 
 			config: LegacyChannelConfig {
@@ -3867,6 +3870,7 @@ where
 			minimum_depth_override: None,
 		};
 		let channel_context = Self {
+			initial_push_msat: Some(push_msat),
 			user_id,
 
 			config: LegacyChannelConfig {
@@ -14910,6 +14914,7 @@ where
 			(65, self.quiescent_action, option), // Added in 0.2
 			(67, pending_outbound_held_htlc_flags, optional_vec), // Added in 0.2
 			(69, holding_cell_held_htlc_flags, optional_vec), // Added in 0.2
+			(65_537, self.context.initial_push_msat, option), // Fork-private; see BITSOV-PATCH.md
 		});
 
 		Ok(())
@@ -15277,6 +15282,7 @@ where
 
 		let mut pending_outbound_held_htlc_flags_opt: Option<Vec<Option<()>>> = None;
 		let mut holding_cell_held_htlc_flags_opt: Option<Vec<Option<()>>> = None;
+		let mut initial_push_msat = None;
 
 		read_tlv_fields!(reader, {
 			(0, announcement_sigs, option),
@@ -15324,6 +15330,7 @@ where
 			(65, quiescent_action, upgradable_option), // Added in 0.2
 			(67, pending_outbound_held_htlc_flags_opt, optional_vec), // Added in 0.2
 			(69, holding_cell_held_htlc_flags_opt, optional_vec), // Added in 0.2
+			(65_537, initial_push_msat, option), // Fork-private; see BITSOV-PATCH.md
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -15604,6 +15611,7 @@ where
 				minimum_depth_override,
 			},
 			context: ChannelContext {
+				initial_push_msat,
 				user_id,
 
 				config,

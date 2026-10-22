@@ -394,3 +394,22 @@ Out of scope: idle reclaim (Option A H3; not needed on signet, **required before
 | 21 Oct 2026, 10:38 | **Mainnet** (was open question 2) | `allow_mainnet` stays hard-refused; this lane changes nothing. Shape for later: (a) the funding vehicle is MindLink's own hub node wallet, never a user's and never Rasmus's father's; (b) the gift is 10,000 sats per new person, one channel per node, daily cap unchanged; (c) **cooperative-only** reclaim (as T4a defines it, so it stays non-custodial) after 90 days with no outbound activity, and reclaim must be built and tested on signet before any mainnet switch; (d) going live on mainnet is a separate Rasmus GO, because it sends sats to external nodes. | Atlas, delegated by Rasmus (explicit GO 10:33) |
 
 No open questions remain for signet. Mainnet stays behind (c) and (d), and the 20-per-day cap is re-checked at the mainnet GO.
+
+### PR-2 implementation follow-ups: C3 and F4
+
+C3 replaces the §7 current-balance heuristic with durable negotiated
+`initial_push_msat` in LDK channel persistence. The newcomer verifies that value
+and local channel readiness; ordinary spending cannot erase the proof. Old
+channel records with no evidence fail closed. This is an optional LDK TLV
+extension, not a SQL migration.
+
+F4 keeps timeout retransmissions on the same UUID. To bound delivery work, there
+are eight sends per mesh connection with §3's capped backoff; reconnect or an
+explicit POST replay rearms the same operation. Local reconciliation never stops
+on timeout. Retryable terminal hub refusals can create at most three successor
+UUIDs, transactionally linked through `original_request_id` in the existing
+031 table. Successor backoff is 10/20/40 minutes, or the hub's later retry time.
+The original API request resolves to its current `operation_id`. An authenticated
+`already_served` may revive the named original solely for reconciliation, including
+a locally refused record that the hub subsequently admitted after refusal pruning.
+See [operational details](../ops/starter-newcomer.md).

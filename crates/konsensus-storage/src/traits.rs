@@ -22,6 +22,40 @@ pub enum PaidAcceptance { Accepted, AlreadyAccepted, NonceReused, PaymentReused 
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
+    async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
+        let _ = id;
+        Err(StorageError::Unsupported("starter newcomer".into()))
+    }
+
+    async fn starter_request_current(&self) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
+
+        Err(StorageError::Unsupported("starter newcomer".into()))
+    }
+
+    async fn starter_request_create(&self, r: &crate::starter_request::StarterRequest) -> Result<(crate::starter_request::StarterRequest, bool), StorageError> {
+        let _ = r;
+        Err(StorageError::Unsupported("starter newcomer".into()))
+    }
+
+    async fn starter_request_adopt(&self, r: &crate::starter_request::StarterRequest) -> Result<crate::starter_request::StarterRequest, StorageError> {
+        let _ = r;
+        Err(StorageError::Unsupported("starter newcomer".into()))
+    }
+
+    async fn starter_request_rearm(&self, id: &str) -> Result<(), StorageError> {
+        let _=id; Err(StorageError::Unsupported("starter newcomer".into()))
+    }
+
+    async fn starter_request_save(&self, r: &crate::starter_request::StarterRequest) -> Result<(), StorageError> {
+        let _ = r;
+        Err(StorageError::Unsupported("starter newcomer".into()))
+    }
+
+    async fn starter_request_retry(&self, id: &str, now: i64) -> Result<crate::starter_request::StarterRequest, StorageError> {
+        let _ = id; let _ = now;
+        Err(StorageError::Unsupported("starter newcomer".into()))
+    }
+
     async fn starter_update(
         &self,
         _update: crate::starter::StarterUpdate,

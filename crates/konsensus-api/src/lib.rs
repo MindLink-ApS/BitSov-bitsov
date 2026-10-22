@@ -234,6 +234,7 @@ fn build_router_with_options(
         .merge(handlers::sponsor::routes())
         .merge(handlers::onboarding::routes())
         .merge(handlers::starter_hub::routes())
+        .merge(handlers::starter_channel::routes())
         .merge(handlers::organism::routes())
         .merge(handlers::gossip::routes())
         .merge(ws::routes());

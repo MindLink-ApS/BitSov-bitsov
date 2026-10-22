@@ -733,6 +733,34 @@ const PEERS_SELECT: &str =
 
 #[async_trait]
 impl Storage for PostgresStorage {
+    async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
+        crate::starter_request::postgres::get(&self.pool, id).await
+    }
+
+    async fn starter_request_current(&self) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
+        crate::starter_request::postgres::current(&self.pool).await
+    }
+
+    async fn starter_request_create(&self, r: &crate::starter_request::StarterRequest) -> Result<(crate::starter_request::StarterRequest, bool), StorageError> {
+        crate::starter_request::postgres::create(&self.pool, r).await
+    }
+
+    async fn starter_request_adopt(&self, r: &crate::starter_request::StarterRequest) -> Result<crate::starter_request::StarterRequest, StorageError> {
+        crate::starter_request::postgres::adopt(&self.pool, r).await
+    }
+
+    async fn starter_request_rearm(&self, id: &str) -> Result<(), StorageError> {
+        crate::starter_request::postgres::rearm(&self.pool,id).await
+    }
+
+    async fn starter_request_save(&self, r: &crate::starter_request::StarterRequest) -> Result<(), StorageError> {
+        crate::starter_request::postgres::save(&self.pool, r).await
+    }
+
+    async fn starter_request_retry(&self, id: &str, now: i64) -> Result<crate::starter_request::StarterRequest, StorageError> {
+        crate::starter_request::postgres::retry(&self.pool, id, now).await
+    }
+
     async fn record_outbox_sent(&self, id: &MessageId, peer: &NodeId) -> Result<(), StorageError> {
         sqlx::query("UPDATE outbox_operations SET state = 'sent', last_sent_at = CAST(EXTRACT(EPOCH FROM NOW()) * 1000 AS BIGINT), updated_at = CAST(EXTRACT(EPOCH FROM NOW()) * 1000 AS BIGINT), version = version + 1 WHERE message_id = $1 AND recipient = $2 AND state IN ('paid', 'sent')")
             .bind(id.to_hex()).bind(peer.to_hex()).execute(&self.pool).await?;

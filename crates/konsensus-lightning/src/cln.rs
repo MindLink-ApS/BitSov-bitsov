@@ -691,6 +691,11 @@ impl LightningProvider for ClnProvider {
                 let capacity = required(ch.total_msat)?.0;
                 let local = required(ch.to_us_msat)?.0;
                 Ok(ChannelInfo {
+                    is_outbound: None,
+                    is_announced: None,
+                    is_channel_ready: None,
+                    local_reserve_msat: None,
+                    initial_push_msat: None,
                     user_channel_id: None,
                     funding_txo: None,
                     channel_id: hex32(&required(ch.channel_id)?)?,
