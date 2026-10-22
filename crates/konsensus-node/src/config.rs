@@ -1639,6 +1639,13 @@ impl NodeConfig {
             lsps2_service.to_ldk(liquidity.enabled)?;
             konsensus_lightning::ldk::validate_our_to_self_delay(*our_to_self_delay_blocks)?;
         }
+        if let Some(addr) = self.lightning.advertised_lightning_addr() {
+            let max = konsensus_message::wire::MAX_LN_ADDR_BYTES;
+            anyhow::ensure!(
+                addr.len() <= max,
+                "advertised Lightning address exceeds {max} bytes; shorten [lightning].advertised_address or its listening_address fallback"
+            );
+        }
         self.lightning.esplora_sync_intervals().to_sync_config()?;
         self.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?;
         self.network

@@ -2065,7 +2065,12 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
                 .send_frame(
                     &recipient,
                     &Frame::RequestInvoice {
-                        request_id: format!("{i:04}{}", "x".repeat(1000)),
+                        // Stay at the wire cap so this exercises handler/reply
+                        // backpressure, rather than the invalid-frame ban.
+                        request_id: format!(
+                            "{i:04}{}",
+                            "x".repeat(konsensus_message::wire::MAX_CONTROL_ID_BYTES - 4)
+                        ),
                         amount_msat: 1000,
                         purpose: "konsensus message".into(),
                     },

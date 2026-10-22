@@ -3600,3 +3600,27 @@ fn provider_reserve_trust_is_opt_in_and_round_trips_toml() {
         );
     }
 }
+
+
+#[test]
+fn load_rejects_oversize_advertised_lightning_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    for fallback in [false, true] {
+        for len in [256, 257] {
+            let mut config = NodeConfig::default_for_tier(NodeTier::Full, PathBuf::from("/dev/null"), dir.path());
+            if let LightningConfig::Ldk { advertised_address, listening_address, .. } = &mut config.lightning {
+                let address = "a".repeat(len - 5) + ":9735";
+                if fallback { *listening_address = Some(address); }
+                else { *advertised_address = Some(address); }
+            } else { panic!("expected LDK"); }
+            config.save(&path).unwrap();
+            let result = NodeConfig::load(&path);
+            if len == 256 { result.unwrap(); }
+            else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("Lightning") && error.contains("256") && error.contains("bytes"), "{error}");
+            }
+        }
+    }
+}

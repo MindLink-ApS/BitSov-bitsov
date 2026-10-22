@@ -187,6 +187,34 @@ pub const MAX_LN_PUBKEY_BYTES: usize = 130;
 /// auto-channel path dials this string after a privileged announcement.
 pub const MAX_LN_ADDR_BYTES: usize = 256;
 
+/// Correlation/session identifiers. Admission quote IDs bind two 64-character
+/// identities, a timestamp and a nonce (up to 190 bytes); UUIDs are shorter.
+pub const MAX_CONTROL_ID_BYTES: usize = 256;
+/// Human-readable rejection/disconnect/invoice/call reasons.
+pub const MAX_CONTROL_REASON_BYTES: usize = 1024;
+/// Invoice descriptions; allows UTF-8 text and hashed-description backends.
+pub const MAX_INVOICE_PURPOSE_BYTES: usize = 1024;
+/// Hex payment hashes are normally 64 characters; leave representation headroom.
+pub const MAX_PAYMENT_HASH_BYTES: usize = 128;
+/// BOLT11 has no overall length limit and permits repeated route-hint fields.
+/// 64 KiB accommodates hundreds of route-hint hops (51 bytes / ~82 bech32
+/// characters per hop), plus descriptions and other tags. This is a resource
+/// policy, not a BOLT11 validity limit. PEX quotes retain their separate 8 KiB
+/// limit to fit the bounded, single-Noise-record quote reply channel.
+pub const MAX_BOLT11_BYTES: usize = 64 * 1024;
+/// Generous SDP budget for multi-track sessions, codecs and ICE attributes.
+pub const MAX_SDP_BYTES: usize = 64 * 1024;
+/// One trickled ICE candidate, including a JSON wrapper and extension fields.
+pub const MAX_ICE_CANDIDATE_BYTES: usize = 4096;
+/// Application-defined capability name.
+pub const MAX_CUSTOM_CAPABILITY_BYTES: usize = 128;
+/// Price category name (the normal taxonomy uses short ASCII tokens).
+pub const MAX_PRICE_KEY_BYTES: usize = 128;
+/// Object keys in prekey/session JSON are short field names.
+pub const MAX_JSON_KEY_BYTES: usize = 256;
+/// Prekey/session strings, including hex-encoded post-quantum key material.
+pub const MAX_JSON_STRING_BYTES: usize = 4096;
+
 /// Max number of JSON value nodes (scalars + container slots) permitted in a
 /// `serde_json::Value` field (`PrekeyOffer.bundle`, `SessionInit.init_data`).
 ///
@@ -255,6 +283,14 @@ mod bounded {
             }
         }
         deserializer.deserialize_str(StringVisitor::<MAX>)
+    }
+
+    struct LimitedString<const MAX: usize>(String);
+
+    impl<'de, const MAX: usize> Deserialize<'de> for LimitedString<MAX> {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            limited_string::<D, MAX>(deserializer).map(Self)
+        }
     }
 
     /// `Option<String>` form of [`limited_string`]. `null` and unit are `None`.
@@ -505,13 +541,13 @@ mod bounded {
             {
                 let mut out: std::collections::HashMap<String, u64> =
                     std::collections::HashMap::new();
-                while let Some((key, value)) = map.next_entry::<String, u64>()? {
+                while let Some((key, value)) = map.next_entry::<LimitedString<MAX_PRICE_KEY_BYTES>, u64>()? {
                     if out.len() >= MAX_PRICE_ENTRIES {
                         return Err(de::Error::custom(format!(
                             "price table exceeds maximum of {MAX_PRICE_ENTRIES} entries"
                         )));
                     }
-                    out.insert(key, value);
+                    out.insert(key.0, value);
                 }
                 Ok(out)
             }
@@ -612,12 +648,10 @@ mod bounded {
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<serde_json::Value, E> {
                 self.counter.charge::<E>()?;
+                if v.len() > MAX_JSON_STRING_BYTES {
+                    return Err(E::custom("JSON string exceeds byte cap"));
+                }
                 Ok(serde_json::Value::String(v.to_owned()))
-            }
-
-            fn visit_string<E: de::Error>(self, v: String) -> Result<serde_json::Value, E> {
-                self.counter.charge::<E>()?;
-                Ok(serde_json::Value::String(v))
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<serde_json::Value, A::Error>
@@ -653,12 +687,12 @@ mod bounded {
                     )));
                 }
                 let mut obj = serde_json::Map::new();
-                while let Some(key) = map.next_key::<String>()? {
+                while let Some(key) = map.next_key::<LimitedString<MAX_JSON_KEY_BYTES>>()? {
                     let val = map.next_value_seed(ValueSeed {
                         counter: self.counter,
                         depth_remaining: self.depth_remaining - 1,
                     })?;
-                    obj.insert(key, val);
+                    obj.insert(key.0, val);
                 }
                 Ok(serde_json::Value::Object(obj))
             }
@@ -741,7 +775,7 @@ pub enum Capability {
     /// capability's encoding.
     Relay,
     /// Application-defined capability.
-    Custom(String),
+    Custom(#[serde(deserialize_with = "bounded::limited_string::<_, MAX_CUSTOM_CAPABILITY_BYTES>")] String),
 }
 
 /// The sovereignty tier of a node.
@@ -820,6 +854,7 @@ pub enum Frame {
         /// The ID of the rejected message.
         id: MessageId,
         /// Human-readable rejection reason.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_CONTROL_REASON_BYTES>")]
         reason: String,
     },
 
@@ -838,6 +873,7 @@ pub enum Frame {
     /// Graceful disconnect notification.
     Disconnect {
         /// Why the peer is disconnecting.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_CONTROL_REASON_BYTES>")]
         reason: String,
     },
 
@@ -887,10 +923,12 @@ pub enum Frame {
     RequestInvoice {
         /// Correlation ID — the sender generates a unique ID so the response
         /// can be matched to the pending request.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_CONTROL_ID_BYTES>")]
         request_id: String,
         /// Amount in millisatoshis.
         amount_msat: u64,
         /// Purpose description.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_INVOICE_PURPOSE_BYTES>")]
         purpose: String,
     },
 
@@ -898,10 +936,13 @@ pub enum Frame {
     /// on the recipient's Lightning wallet.
     InvoiceResponse {
         /// Correlation ID — matches the `request_id` from the request.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_CONTROL_ID_BYTES>")]
         request_id: String,
         /// BOLT11 payment request string.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_BOLT11_BYTES>")]
         bolt11: String,
         /// Payment hash (hex, 32 bytes).
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_PAYMENT_HASH_BYTES>")]
         payment_hash: String,
     },
 
@@ -910,8 +951,10 @@ pub enum Frame {
     /// instead of waiting for the 30-second timeout.
     InvoiceError {
         /// Correlation ID — matches the `request_id` from the request.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_CONTROL_ID_BYTES>")]
         request_id: String,
         /// Human-readable error reason.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_CONTROL_REASON_BYTES>")]
         reason: String,
     },
 
@@ -932,17 +975,18 @@ pub enum Frame {
         request_id: uuid::Uuid,
         #[serde(deserialize_with = "bounded::limited_string::<_, MAX_STARTER_STATE_BYTES>")]
         state: String,
-        #[serde(deserialize_with = "bounded::limited_opt_string::<_, MAX_STARTER_REASON_BYTES>")]
+        #[serde(default, deserialize_with = "bounded::limited_opt_string::<_, MAX_STARTER_REASON_BYTES>")]
         reason: Option<String>,
         retry_after_unix: Option<u64>,
         original_request_id: Option<uuid::Uuid>,
         capacity_sats: Option<u64>,
         push_sats: Option<u64>,
         #[serde(
+            default,
             deserialize_with = "bounded::limited_opt_string::<_, MAX_STARTER_CHANNEL_ID_BYTES>"
         )]
         channel_id: Option<String>,
-        #[serde(deserialize_with = "bounded::limited_opt_string::<_, MAX_STARTER_TXID_BYTES>")]
+        #[serde(default, deserialize_with = "bounded::limited_opt_string::<_, MAX_STARTER_TXID_BYTES>")]
         funding_txid: Option<String>,
     },
 
@@ -1074,16 +1118,20 @@ pub enum Frame {
     /// The peer responds with `CallAnswer` to complete the negotiation.
     CallOffer {
         /// Unique session identifier (random hex, 16+ bytes).
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_CONTROL_ID_BYTES>")]
         session_id: String,
         /// SDP offer string from the local WebRTC stack.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_SDP_BYTES>")]
         sdp: String,
     },
 
     /// VoIP call answer — accepts a `CallOffer` with an SDP answer.
     CallAnswer {
         /// Session ID matching the corresponding `CallOffer`.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_CONTROL_ID_BYTES>")]
         session_id: String,
         /// SDP answer string from the local WebRTC stack.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_SDP_BYTES>")]
         sdp: String,
     },
 
@@ -1093,16 +1141,20 @@ pub enum Frame {
     /// Multiple candidates are typically exchanged per session.
     IceCandidate {
         /// Session ID of the in-progress call.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_CONTROL_ID_BYTES>")]
         session_id: String,
         /// Serialized ICE candidate (SDP candidate line or JSON).
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_ICE_CANDIDATE_BYTES>")]
         candidate: String,
     },
 
     /// Call end — terminates an active or pending call session.
     CallEnd {
         /// Session ID of the call to terminate.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_CONTROL_ID_BYTES>")]
         session_id: String,
         /// Human-readable reason (e.g., "user_hangup", "declined", "timeout").
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_CONTROL_REASON_BYTES>")]
         reason: String,
     },
 
@@ -2252,7 +2304,7 @@ mod tests {
     #[test]
     fn frame_message_reject_long_reason() {
         let id = MessageId::compute(b"data", &Nonce::from_bytes([2u8; 24]));
-        let long_reason = "x".repeat(10_000);
+        let long_reason = "x".repeat(MAX_CONTROL_REASON_BYTES);
         let frame = Frame::MessageReject {
             id,
             reason: long_reason.clone(),
@@ -2260,7 +2312,7 @@ mod tests {
         let bytes = frame.to_bytes().unwrap();
         let decoded = Frame::from_bytes(&bytes).unwrap();
         match decoded {
-            Frame::MessageReject { reason, .. } => assert_eq!(reason.len(), 10_000),
+            Frame::MessageReject { reason, .. } => assert_eq!(reason.len(), MAX_CONTROL_REASON_BYTES),
             _ => panic!("expected MessageReject frame"),
         }
     }
@@ -2284,21 +2336,13 @@ mod tests {
 
     #[test]
     fn encode_frame_size_boundary() {
-        // Create a frame that's close to but under MAX_FRAME_SIZE
-        // Use a large message reject with a very long reason
-        let id = MessageId::compute(b"data", &Nonce::from_bytes([2u8; 24]));
-        let frame = Frame::MessageReject {
-            id,
-            reason: "x".repeat(1_000_000), // 1 MB reason string
-        };
+        // Large legitimate payloads still round-trip below the outer frame cap.
+        let frame = Frame::RatchetInit { payload: vec![0; MAX_RATCHET_PAYLOAD_BYTES] };
         let encoded = encode_frame(&frame).unwrap();
-        assert!(encoded.len() < MAX_FRAME_SIZE + 4); // length prefix + payload under limit
+        assert!(encoded.len() < MAX_FRAME_SIZE + 4);
         let (decoded, consumed) = decode_frame(&encoded).unwrap().unwrap();
         assert_eq!(consumed, encoded.len());
-        match decoded {
-            Frame::MessageReject { reason, .. } => assert_eq!(reason.len(), 1_000_000),
-            _ => panic!("expected MessageReject frame"),
-        }
+        assert!(matches!(decoded, Frame::RatchetInit { payload } if payload.len() == MAX_RATCHET_PAYLOAD_BYTES));
     }
 
     #[test]
