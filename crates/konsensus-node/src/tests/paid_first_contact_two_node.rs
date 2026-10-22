@@ -467,6 +467,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
     }));
 
     let state = Arc::new(konsensus_api::AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::clone(&storage),
         lightning: Arc::clone(&lightning),
@@ -567,6 +568,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         ws_delivery_tx,
         pending_tx,
         starter_hub_tx: None,
+        starter_newcomer_tx: None,
         auto_channel_tx,
         shutdown_rx,
     }));

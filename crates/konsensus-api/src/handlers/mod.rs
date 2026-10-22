@@ -36,3 +36,5 @@ pub mod liquidity;
 pub(crate) mod list_diagnostics;
 
 pub mod starter_hub;
+
+pub mod starter_channel;

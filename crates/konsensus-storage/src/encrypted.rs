@@ -441,6 +441,35 @@ impl<S: Storage> EncryptedStorage<S> {
 
 #[async_trait]
 impl<S: Storage> Storage for EncryptedStorage<S> {
+    async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
+        self.inner.starter_request_get(id).await
+    }
+
+    async fn starter_request_current(&self) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
+        self.inner.starter_request_current().await
+    }
+
+    async fn starter_request_create(&self, r: &crate::starter_request::StarterRequest) -> Result<(crate::starter_request::StarterRequest, bool), StorageError> {
+        self.inner.starter_request_create(r).await
+    }
+
+    async fn starter_request_adopt(&self, r: &crate::starter_request::StarterRequest) -> Result<crate::starter_request::StarterRequest, StorageError> {
+        self.inner.starter_request_adopt(r).await
+    }
+
+    async fn starter_request_rearm(&self, id: &str) -> Result<(), StorageError> {
+        self.inner.starter_request_rearm(id).await
+    }
+
+    async fn starter_request_save(&self, r: &crate::starter_request::StarterRequest) -> Result<(), StorageError> {
+        self.inner.starter_request_save(r).await
+    }
+
+    async fn starter_request_retry(&self, id: &str, now: i64) -> Result<crate::starter_request::StarterRequest, StorageError> {
+        self.inner.starter_request_retry(id, now).await
+    }
+
+
     fn storage_read_health(&self) -> crate::StorageReadHealth {
         *self.read_health.lock().unwrap_or_else(|e| e.into_inner())
     }

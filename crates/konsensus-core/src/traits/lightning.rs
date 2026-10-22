@@ -200,6 +200,17 @@ pub struct LocalSpendReservation {
 /// Information about a Lightning channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInfo {
+    #[serde(default)]
+    pub is_outbound: Option<bool>,
+    #[serde(default)]
+    pub is_announced: Option<bool>,
+    #[serde(default)]
+    pub is_channel_ready: Option<bool>,
+    #[serde(default)]
+    pub local_reserve_msat: Option<u64>,
+    /// Durable negotiated push, never inferred from the current balance.
+    #[serde(default)]
+    pub initial_push_msat: Option<u64>,
     /// LDK/CLN: 32-byte Lightning channel ID in hex. LND: native `chan_id`.
     /// LDK close accepts this or `user_channel_id`; distinct from the routing scid.
     pub channel_id: String,
@@ -221,6 +232,25 @@ pub struct ChannelInfo {
     pub active: bool,
     /// Short channel ID (if assigned).
     pub short_channel_id: Option<String>,
+}
+
+impl ChannelInfo {
+    /// Verify locally negotiated starter terms. The durable initial push is
+    /// commitment evidence, unlike today's balance (which may already be spent).
+    /// LDK cannot spend this balance until the channel's commitment is ready.
+    pub fn verifies_starter(&self, hub: &str, capacity_sats: u64, push_sats: u64,
+        channel_id: Option<&str>, funding_txid: Option<&str>) -> bool {
+        capacity_sats > 0 && capacity_sats <= 200_000
+            && push_sats > 0 && push_sats <= capacity_sats / 2
+            && self.peer_pubkey.eq_ignore_ascii_case(hub)
+            && self.is_outbound == Some(false) && self.is_announced == Some(false)
+            && self.is_channel_ready == Some(true) && self.active
+            && self.capacity_msat == capacity_sats * 1000
+            && self.initial_push_msat.is_some_and(|push| push >= push_sats * 1000)
+            && channel_id.is_none_or(|id| id == self.channel_id)
+            && funding_txid.is_none_or(|txid| self.funding_txo.as_deref()
+                .and_then(|outpoint| outpoint.split_once(':')).is_some_and(|(id,_)| id == txid))
+    }
 }
 
 /// Details of a completed or in-progress payment.

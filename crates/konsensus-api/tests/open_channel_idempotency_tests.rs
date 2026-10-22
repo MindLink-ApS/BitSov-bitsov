@@ -60,6 +60,11 @@ impl OpenBackend {
         let channel_id = format!("{n:064x}");
         if failure.is_none() || self.open_despite_failure {
             self.channels.lock().unwrap().push(ChannelInfo {
+                is_outbound: None,
+                is_announced: None,
+                is_channel_ready: None,
+                local_reserve_msat: None,
+                initial_push_msat: None,
                 channel_id: channel_id.clone(),
                 user_channel_id: Some(n.to_string()),
                 funding_txo: None,
@@ -469,6 +474,11 @@ async fn seed_pending(storage: &dyn Storage, age_ms: i64) {
 
 fn listed_channel(id: u8, peer: &str, capacity_msat: u64) -> ChannelInfo {
     ChannelInfo {
+        is_outbound: None,
+        is_announced: None,
+        is_channel_ready: None,
+        local_reserve_msat: None,
+        initial_push_msat: None,
         channel_id: format!("{id:064x}"),
         user_channel_id: Some(id.to_string()),
         funding_txo: Some(format!("{}:1", "ab".repeat(32))),

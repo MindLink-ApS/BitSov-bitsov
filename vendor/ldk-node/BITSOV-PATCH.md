@@ -677,8 +677,9 @@ lost tower data. Fable + Grok PASS on the same SHA remains the money-path merge 
   `holder_selected_contest_delay` (`our_to_self_delay`), the delay protecting us
   on the counterparty's commitment, rather than our `force_close_spend_delay`.
   Lightning serializes this optional diagnostic as backward-compatible odd
-  TLV 49: older readers skip it and older records yield `None`. This local TLV
-  allocation must be checked for upstream collisions on upgrades/rebases.
+  TLV 65,541 (moved from 49 in PR #364 round 1): older readers skip it and
+  records without it yield `None`. See the private allocation ledger in
+  `../lightning/BITSOV-PATCH.md`; recheck upstream on upgrades/rebases.
 - `lib.rs`: `NodeMetrics::record_lightning_sync` captures height and timestamp
   together in `latest_lightning_wallet_sync`, exposed through `NodeStatus`.
   The checkpoint is deliberately non-persisted and resets to `None` on load;

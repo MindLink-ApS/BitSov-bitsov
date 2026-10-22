@@ -231,6 +231,8 @@ impl fmt::Display for UserChannelId {
 /// [`Node::list_channels`]: crate::Node::list_channels
 #[derive(Debug, Clone)]
 pub struct ChannelDetails {
+	/// Initial negotiated push; unknown for older channel records.
+	pub initial_push_msat: Option<u64>,
 	/// The channel ID (prior to funding transaction generation, this is a random 32-byte
 	/// identifier, afterwards this is the transaction ID of the funding transaction XOR the
 	/// funding transaction output).
@@ -387,6 +389,7 @@ pub struct ChannelDetails {
 impl From<LdkChannelDetails> for ChannelDetails {
 	fn from(value: LdkChannelDetails) -> Self {
 		ChannelDetails {
+			initial_push_msat: value.initial_push_msat,
 			channel_id: value.channel_id,
 			counterparty_node_id: value.counterparty.node_id,
 			funding_txo: value.funding_txo.map(|o| o.into_bitcoin_outpoint()),
