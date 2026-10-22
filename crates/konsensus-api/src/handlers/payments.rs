@@ -19,6 +19,8 @@ use crate::error::ApiError;
 use crate::freshness::DataFreshness;
 use crate::state::AppState;
 
+mod onchain;
+
 /// Reporting only: LDK's converted PaymentDetails carry the actual routing fee.
 /// Never infer settlement from a fee, a preimage, or the authorized ceiling.
 pub(crate) fn fee_paid_msat(
@@ -1258,6 +1260,10 @@ async fn close_channel(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendOnchainRequest {
+    /// Optional client UUIDv4. Reuse it only with the same address, amount and fee rate.
+    /// Missing IDs remain supported for legacy clients, without retry protection.
+    #[serde(default)]
+    pub request_id: Option<String>,
     pub address: String,
     pub amount_sats: u64,
     /// Optional fee rate override in sat/vB.
@@ -1272,45 +1278,7 @@ async fn send_onchain(
     _user: ScopedAuth<Spend>,
     Json(req): Json<SendOnchainRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    crate::error::require_money_ready(&state).await?;
-    // L0a: see open_channel above for the same validation rationale.
-    if let Some(rate) = req.fee_rate_sat_per_vb {
-        validate_fee_rate_sat_per_vb(rate).map_err(|e| ApiError::NotDispatched(e.to_string()))?;
-    }
-    // L0f: distinguish between "broadcast confirmed visible" (HTTP 200) and
-    // "broadcast initiated, but the chain provider couldn't confirm
-    // visibility within the verification timeout" (HTTP 202 Accepted with
-    // the txid). The 202 path lets the client poll for confirmation
-    // rather than treating the silent-fail as success — covers the
-    // documented 2026-04-23 ba91a6ac…45ef incident class.
-    match state
-        .lightning
-        .send_onchain(&req.address, req.amount_sats, req.fee_rate_sat_per_vb)
-        .await
-    {
-        Ok(txid) => Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "txid": txid,
-                "address": req.address,
-                "amount_sats": req.amount_sats,
-                "broadcast_status": "confirmed_visible",
-            })),
-        )),
-        Err(konsensus_core::traits::lightning::LightningError::BroadcastUnconfirmed { txid }) => {
-            Ok((
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "txid": txid,
-                    "address": req.address,
-                    "amount_sats": req.amount_sats,
-                    "broadcast_status": "unconfirmed",
-                    "message": "Backend returned a txid but the chain provider could not verify mempool visibility within 10s. Poll mempool.space or call /tx/<txid> to confirm; the tx may still propagate.",
-                })),
-            ))
-        }
-        Err(e) => Err(ApiError::from(e)),
-    }
+    onchain::send(state, req).await
 }
 
 /// Get an on-chain Bitcoin funding address for this node's LDK wallet.
