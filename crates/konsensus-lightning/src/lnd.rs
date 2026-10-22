@@ -918,6 +918,11 @@ impl LightningProvider for LndProvider {
                 let remote_sat = ch.remote_balance.as_deref().map(Self::parse_u64).unwrap_or(0);
 
                 Ok(ChannelInfo {
+                    is_outbound: None,
+                    is_announced: None,
+                    is_channel_ready: None,
+                    local_reserve_msat: None,
+                    initial_push_msat: None,
                     user_channel_id: None,
                     funding_txo: None,
                     // LND identifies channels by chan_id (also surfaced as the scid).

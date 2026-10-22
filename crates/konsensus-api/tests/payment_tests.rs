@@ -296,6 +296,7 @@ async fn pricing_own_chain_aware_reports_mode() {
     );
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(StubLightning),
@@ -1319,6 +1320,7 @@ async fn health_lightning_unavailable_shows_null_balance() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(UnavailableLightning),
@@ -1824,6 +1826,7 @@ async fn chain_status_with_failing_provider() {
     let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(StubLightning),
@@ -1942,6 +1945,7 @@ async fn chain_status_partial_failure() {
     let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(StubLightning),
@@ -2279,6 +2283,7 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
     // `test_state()` then patch the `lightning` field via a fresh Arc.
     let base = test_state();
     let state = Arc::new(konsensus_api::AppState {
+        starter: Default::default(),
         identity: Arc::clone(&base.identity),
         storage: Arc::clone(&base.storage),
         lightning: Arc::new(UnconfirmedLightning),

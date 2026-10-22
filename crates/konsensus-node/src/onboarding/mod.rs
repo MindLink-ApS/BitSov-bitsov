@@ -5,3 +5,5 @@ pub mod funding_poll;
 pub mod notify;
 
 pub mod starter_hub;
+
+pub mod starter_newcomer;

@@ -57,6 +57,7 @@ async fn pair(policy: SponsorPolicy) -> Pair {
     let storage = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
     let nbase = test_state_with_lightning(newcomer_ln.clone());
     let newcomer = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::new(identity),
         storage,
         introduction: intro(9002),

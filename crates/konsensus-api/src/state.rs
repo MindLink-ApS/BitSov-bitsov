@@ -67,6 +67,7 @@ pub struct WsDeliveryStatus {
 /// All fields are `Arc`-wrapped so cloning is cheap (required by Axum).
 #[derive(Clone)]
 pub struct AppState {
+    pub starter: crate::handlers::starter_channel::StarterSettings,
     /// The node's cryptographic identity.
     pub identity: Arc<NodeIdentity>,
 

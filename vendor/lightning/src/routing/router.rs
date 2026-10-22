@@ -4017,6 +4017,7 @@ mod tests {
 			features: InitFeatures, outbound_capacity_msat: u64) -> ChannelDetails {
 		#[allow(deprecated)] // TODO: Remove once balance_msat is removed.
 		ChannelDetails {
+			initial_push_msat: None,
 			channel_id: ChannelId::new_zero(),
 			counterparty: ChannelCounterparty {
 				features,
@@ -9477,6 +9478,7 @@ pub(crate) mod bench_utils {
 	pub(crate) fn first_hop(node_id: PublicKey) -> ChannelDetails {
 		#[allow(deprecated)] // TODO: Remove once balance_msat is removed.
 		ChannelDetails {
+			initial_push_msat: None,
 			channel_id: ChannelId::new_zero(),
 			counterparty: ChannelCounterparty {
 				features: channelmanager::provided_init_features(&UserConfig::default()),

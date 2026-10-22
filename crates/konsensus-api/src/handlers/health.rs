@@ -346,6 +346,7 @@ async fn status(
                 konsensus_core::payloads::call::MEETING_CAPABILITY,
                 konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY,
             ];
+            if state.starter.config.enabled { capabilities.push("starter_channel_request_v1"); }
             if state
                 .pairing
                 .as_ref()

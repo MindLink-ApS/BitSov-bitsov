@@ -911,6 +911,7 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
     let storage = Arc::new(MemStorage::new());
 
     let state = Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: storage.clone() as Arc<dyn Storage>,
         lightning: Arc::new(StubLightning),

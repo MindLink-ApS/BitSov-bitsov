@@ -266,6 +266,7 @@ impl App {
         }
         let invoice_requests: InvoiceRequests = Default::default();
         let state = Arc::new(konsensus_api::AppState {
+            starter: Default::default(),
             identity: Arc::clone(identity),
             storage,
             lightning: wallet.clone(),
@@ -380,6 +381,7 @@ impl App {
                 ws_delivery_tx: state.ws_delivery_broadcast.clone(),
                 pending_tx,
                 starter_hub_tx: None,
+        starter_newcomer_tx: None,
                 auto_channel_tx,
                 shutdown_rx: shutdown_rx.clone(),
             },
