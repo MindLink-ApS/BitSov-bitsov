@@ -41,18 +41,29 @@ The open-core release remains canonical.
 ### Approved release refs
 
 Accepted tags are `vX.Y.Z`, `vX.Y.Z-rcN` and `vX.Y.Z-rcN.M`, with numeric
-components. The source gate runs before any signing or CI access:
+components. For every tag format, `<reviewed-commit>` must be the full
+40-character lowercase hexadecimal SHA named in the review verdict. Branch
+names, tags, `FETCH_HEAD`, abbreviated SHAs and revision expressions are refused
+before fetching. The source gate runs before any signing or CI access:
 
 - A dotted RC point-release tag (`vX.Y.Z-rcN.M`) requires the exact branch
   `refs/heads/release/<tag>` on `origin`. The signer fetches that branch fresh
-  with tags and requires the reviewed commit to equal `FETCH_HEAD^{commit}`,
+  without tags and requires the reviewed commit to equal `FETCH_HEAD^{commit}`,
   not merely be an ancestor of the branch head. For `v0.3.0-rc19.1`, the approved
   branch is `release/v0.3.0-rc19.1`; its isolated head need not be on main.
   A missing/unfetchable branch or a different head refuses signing, even if
   the commit is on main. Cached tracking refs and same-named tags do not qualify.
 - Every other accepted tag retains the existing ancestry gate: fetch `main`
-  and tags from `origin`, then require the reviewed commit to be an ancestor
+  from `origin`, then require the reviewed commit to be an ancestor
   of `origin/main`. A release branch cannot authorize a plain RC or stable tag.
+
+The review verdict for a dotted RC must name the full release branch-head SHA;
+pass that exact SHA to the signer. Keep `release/*` protected against force-push
+and deletion, and leave the reviewed release branch unchanged until its tag is
+signed. Any head change requires a new review verdict naming the new full SHA.
+After the source gate, tags are fetched separately; a tag-fetch failure (such as
+a conflicting local tag) also refuses signing and is reported separately from
+a branch-fetch failure.
 
 Existing signed tags must still resolve to the exact reviewed commit, and the
 CI run must build that same commit. No flag bypasses the approved-ref policy;

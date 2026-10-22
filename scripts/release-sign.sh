@@ -2,6 +2,7 @@
 # release-sign.sh: the operator's one command per release (RELEASE_POLICY.md).
 #
 #   scripts/release-sign.sh <tag> <reviewed-commit>
+#   reviewed-commit must be the full 40-character lowercase hex SHA from review.
 #
 # 1. Creates and pushes a GPG-signed tag on the commit (skipped if the tag already
 #    exists and is signed by the release key).
@@ -94,6 +95,9 @@ done
 set -- "${POSITIONAL[@]}"
 TAG=$1 COMMIT=$2
 [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+(\.[0-9]+)?)?$ ]] || die "tag must look like v0.3.0, v0.3.0-rc9 or v0.3.0-rc19.1"
+# Reject movable refs before fetching can change their meaning. List ASCII
+# characters explicitly: locale-sensitive ranges can include uppercase letters.
+[[ $COMMIT =~ ^[0123456789abcdef]{40}$ ]] || die 'reviewed commit must be a full 40-character lowercase hex SHA'
 for t in git gh gpg shasum rustup diff; do command -v "$t" >/dev/null || die "$t not found"; done
 
 SOURCE_REPO=$(git rev-parse --show-toplevel)
@@ -102,10 +106,10 @@ RELEASE_REF=''
 if [[ $TAG =~ -rc[0-9]+\.[0-9]+$ ]]; then
   RELEASE_REF="release/$TAG"
   # Fetch the exact remote branch, never a same-named tag or cached tracking ref.
-  git fetch -q origin "refs/heads/$RELEASE_REF" --tags ||
+  git fetch -q origin "refs/heads/$RELEASE_REF" --no-tags ||
     die "cannot fetch approved release branch $RELEASE_REF from origin"
 else
-  git fetch -q origin main --tags
+  git fetch -q origin main --no-tags || die 'cannot fetch main from origin'
 fi
 FULL=$(git rev-parse --verify "$COMMIT^{commit}") || die "unknown commit $COMMIT"
 if [ -n "$RELEASE_REF" ]; then
@@ -114,6 +118,9 @@ if [ -n "$RELEASE_REF" ]; then
 else
   git merge-base --is-ancestor "$FULL" origin/main || die "$FULL is not on origin/main"
 fi
+# Consume the branch FETCH_HEAD above before a separate tag fetch replaces it.
+# A local tag conflict must not be diagnosed as an unavailable release branch.
+git fetch -q origin --tags || die 'cannot fetch tags from origin (check fetch diagnostics for conflicting local tags)'
 
 WORK=$(mktemp -d)
 KEEP_WORK=false

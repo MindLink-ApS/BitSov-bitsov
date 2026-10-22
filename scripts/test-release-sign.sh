@@ -309,7 +309,7 @@ run_case() (
   export LC_ALL=$1 TEST_CASE=$2 CASE_DIR="$WORK/$1-$2"
   case "$TEST_CASE" in
     dotted-*) TEST_TAG=v0.3.0-rc19.1 ;;
-    stable-off-main) TEST_TAG=v0.3.0 ;;
+    stable-*) TEST_TAG=v0.3.0 ;;
   esac
   mkdir -p "$CASE_DIR"
   fail() { echo "$*" >&2; exit 1; }
@@ -343,21 +343,31 @@ run_case() (
   fi
   git remote add origin "file://$CASE_DIR/origin.git"
   case "$TEST_CASE" in
-    dotted-release|dotted-release-fresh|dotted-release-head-diff|dotted-wrong-tag|plain-rc-off-main|stable-off-main)
+    dotted-release|dotted-release-fresh|dotted-release-head-diff|dotted-stale-fetch-head|dotted-wrong-tag|dotted-commit-*|plain-rc-off-main|stable-off-main)
       # The reviewed release is isolated from origin/main.
       git push -q origin "$OTHER_COMMIT:refs/heads/main"
       git push -q origin "$COMMIT:refs/heads/release/$TEST_TAG"
-      if [ "$TEST_CASE" = dotted-release-head-diff ]; then
+      if [ "$TEST_CASE" = dotted-release-head-diff ] || [ "$TEST_CASE" = dotted-stale-fetch-head ]; then
         # Leave a stale matching tracking ref; only a fresh fetch sees the advance.
         branch_head=$(printf 'advance release\n' | git commit-tree "${COMMIT}^{tree}" -p "$COMMIT")
         git push -q origin "$branch_head:refs/heads/release/$TEST_TAG"
         git update-ref "refs/remotes/origin/release/$TEST_TAG" "$COMMIT"
       elif [ "$TEST_CASE" = dotted-release ]; then
-        # A stale nonmatching tracking ref must not override fresh FETCH_HEAD.
+        # Disable opportunistic release tracking updates so this stale ref
+        # remains distinguishable from the freshly fetched branch head.
+        git config remote.origin.fetch '+refs/heads/main:refs/remotes/origin/main'
         git update-ref "refs/remotes/origin/release/$TEST_TAG" "$OTHER_COMMIT"
+        git fetch -q origin main
       fi
       ;;
     *) git push -q -u origin main ;;
+  esac
+  if [ "$TEST_CASE" = dotted-on-main-head-diff ]; then
+    git push -q origin "$OTHER_COMMIT:refs/heads/release/$TEST_TAG"
+    git merge-base --is-ancestor "$COMMIT" origin/main || fail 'fixture commit is not on main'
+  fi
+  case "$TEST_CASE" in
+    dotted-tag-fetch-conflict) git push -q origin "$COMMIT:refs/heads/release/$TEST_TAG" ;;
   esac
   if [ "$TEST_CASE" = dotted-release-missing ]; then
     # Even main ancestry, a stale tracking ref, and a same-named tag cannot
@@ -374,6 +384,13 @@ run_case() (
     git push -q origin "refs/tags/$TEST_TAG"
     old_tag=$(git rev-parse "refs/tags/$TEST_TAG")
   fi
+  case "$TEST_CASE" in
+    *tag-fetch-conflict)
+      git tag conflict "$OTHER_COMMIT"
+      git push -q origin refs/tags/conflict
+      git tag -f conflict "$COMMIT" >/dev/null
+      ;;
+  esac
   if [[ "$TEST_CASE" == build-darwin-* ]]; then
     rc=0
     bash scripts/release-build.sh "$TEST_HOST" > "$CASE_DIR/output" 2>&1 || rc=$?
@@ -432,8 +449,44 @@ run_case() (
   [ "$TEST_CASE" != reason-missing ] || tail_args+=(--accept-unverified-host)
   # Force a real filesystem failure without relying on permissions/root behavior.
   [ "$TEST_CASE" != accept-evidence-failure-mismatch ] || touch release-sign-evidence
+  commit_arg=$COMMIT
+  case "$TEST_CASE" in
+    *-commit-fetch-head) git fetch -q origin main; commit_arg=FETCH_HEAD ;;
+    *-commit-branch) commit_arg=origin/main ;;
+    *-commit-local-branch) git branch reviewed "$COMMIT"; commit_arg=reviewed ;;
+    *-commit-short) commit_arg=${COMMIT:0:12} ;;
+    *-commit-upper) commit_arg=000000000000000000000000000000000000000A ;;
+    *-commit-long) commit_arg="${COMMIT}0" ;;
+    *-commit-nonhex) commit_arg="${COMMIT:0:39}g" ;;
+    *-commit-empty) commit_arg='' ;;
+    *-commit-space) commit_arg="$COMMIT " ;;
+    *-commit-newline) commit_arg="$COMMIT"$'\n' ;;
+    *-commit-expression) commit_arg="$COMMIT^{commit}" ;;
+    *-commit-tag) commit_arg=$TEST_TAG ;;
+  esac
+  # Keep a valid fixture tag, varying only the signer's input for format tests.
+  tag_arg=$TEST_TAG
+  case "$TEST_CASE" in
+    malformed-tag-extra-rc) tag_arg=v0.3.0-rc19.1.2 ;;
+    malformed-tag-extra-version) tag_arg=v0.3.0.1 ;;
+    malformed-tag-empty-suffix) tag_arg=v0.3.0-rc19. ;;
+    malformed-tag-prefix) tag_arg=xv0.3.0 ;;
+    malformed-tag-case) tag_arg=v0.3.0-RC19.1 ;;
+    malformed-tag-space) tag_arg='v0.3.0-rc19.1 ' ;;
+    malformed-tag-newline) tag_arg=$'v0.3.0-rc19.1\n' ;;
+    malformed-tag-path) tag_arg=v0.3.0-rc19.1/x ;;
+  esac
+  # Input rejection must happen before even a fetch changes repository state.
+  git fetch -q origin main
+  cp .git/FETCH_HEAD "$CASE_DIR/fetch-head-before"
+  if [ "$TEST_CASE" = dotted-stale-fetch-head ]; then
+    # A cached FETCH_HEAD matches the requested SHA, but the remote does not.
+    git fetch -q origin "$COMMIT"
+    [ "$(git rev-parse FETCH_HEAD)" = "$COMMIT" ] || fail 'stale FETCH_HEAD fixture is wrong'
+    cp .git/FETCH_HEAD "$CASE_DIR/fetch-head-before"
+  fi
   rc=0
-  bash "$WORK/release-sign.sh" ${args[@]+"${args[@]}"} "$TEST_TAG" "$COMMIT" ${tail_args[@]+"${tail_args[@]}"} > "$CASE_DIR/output" 2>&1 || rc=$?
+  bash "$WORK/release-sign.sh" ${args[@]+"${args[@]}"} "$tag_arg" "$commit_arg" ${tail_args[@]+"${tail_args[@]}"} > "$CASE_DIR/output" 2>&1 || rc=$?
   if [ "$TEST_CASE" = retry ]; then
     [ "$rc" -eq 0 ] || fail "initial signing failed: $rc"
     cmp "$WORK/expected-sums" "$CASE_DIR/upload/SHA256SUMS"
@@ -470,8 +523,11 @@ run_case() (
   reason=''
   case "$TEST_CASE" in
     darwin-match|darwin-intel-match|existing|fresh|dotted-release|dotted-release-fresh|subkey|stderr-noise|retry|retry-sums|retry-signature|dry-existing|accept-mismatch|dry-accept-mismatch|accept-darwin-mismatch|accept-match) ;;
-    dotted-release-head-diff) reason="$COMMIT does not match the approved release branch release/$TEST_TAG" ;;
+    dotted-release-head-diff|dotted-on-main-head-diff|dotted-stale-fetch-head) reason="$COMMIT does not match the approved release branch release/$TEST_TAG" ;;
     dotted-release-missing) reason="cannot fetch approved release branch release/$TEST_TAG from origin" ;;
+    *tag-fetch-conflict) reason='cannot fetch tags from origin' ;;
+    *-commit-*) reason='reviewed commit must be a full 40-character lowercase hex SHA' ;;
+    malformed-tag-*) reason='tag must look like' ;;
     plain-rc-off-main|stable-off-main) reason="$COMMIT is not on origin/main" ;;
     mismatch|dry-mismatch|compromised-ci) reason='reproducibility mismatch for x86_64-unknown-linux-gnu' ;;
     build-failure|accept-build-failure) reason='local rebuild failed' ;;
@@ -493,11 +549,14 @@ run_case() (
     *) fail "unknown case $TEST_CASE" ;;
   esac
   case "$TEST_CASE" in
-    dotted-release-head-diff|dotted-release-missing|plain-rc-off-main|stable-off-main)
+    dotted-release-head-diff|dotted-release-missing|dotted-on-main-head-diff|dotted-stale-fetch-head|plain-rc-off-main|stable-off-main|*tag-fetch-conflict|*-commit-*|malformed-tag-*)
       [ ! -s "$CASE_DIR/gpg.log" ] || fail 'ref rejection accessed GPG'
       [ ! -s "$CASE_DIR/gh.log" ] || fail 'ref rejection contacted CI'
       [ ! -e "$CASE_DIR/build.log" ] || fail 'ref rejection rebuilt'
       ;;
+  esac
+  case "$TEST_CASE" in
+    *-commit-*|malformed-tag-*) cmp "$CASE_DIR/fetch-head-before" .git/FETCH_HEAD || fail 'invalid input changed FETCH_HEAD' ;;
   esac
   # Inspect evidence AFTER the signer has exited and its EXIT trap has run.
   case "$TEST_CASE" in
@@ -644,7 +703,15 @@ for test_locale in "${locales[@]}"; do
     reason-duplicate subkey published-late extra-asset notation wrong-primary-tag missing-primary-tag truncated-tag \
     trailing-key-tag wrong-primary-sums missing-primary-sums truncated-sums trailing-key-sums stderr-only-tag stderr-only-sums stderr-noise \
     retry retry-sums retry-signature retry-extra retry-lookalike \
-    dotted-release dotted-release-fresh dotted-release-head-diff dotted-release-missing dotted-wrong-tag plain-rc-off-main stable-off-main; do
+    dotted-release dotted-release-fresh dotted-release-head-diff dotted-release-missing dotted-wrong-tag plain-rc-off-main stable-off-main \
+    dotted-on-main-head-diff dotted-stale-fetch-head dotted-tag-fetch-conflict plain-tag-fetch-conflict \
+    dotted-commit-fetch-head dotted-commit-branch dotted-commit-local-branch dotted-commit-short dotted-commit-upper \
+    dotted-commit-long dotted-commit-nonhex dotted-commit-empty dotted-commit-space dotted-commit-newline dotted-commit-expression dotted-commit-tag \
+    plain-commit-fetch-head plain-commit-branch plain-commit-local-branch plain-commit-short plain-commit-upper \
+    plain-commit-long plain-commit-nonhex plain-commit-empty plain-commit-space plain-commit-newline plain-commit-expression plain-commit-tag \
+    stable-commit-fetch-head stable-commit-branch stable-commit-short \
+    malformed-tag-extra-rc malformed-tag-extra-version malformed-tag-empty-suffix malformed-tag-prefix \
+    malformed-tag-case malformed-tag-space malformed-tag-newline malformed-tag-path; do
     # Launch a separate process so errexit remains active inside run_case.
     # Calling a function in an if condition would silently disable it.
     set +e
