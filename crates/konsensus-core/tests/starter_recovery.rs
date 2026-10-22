@@ -1,6 +1,11 @@
 use konsensus_core::traits::lightning::{unique_channel_match, ChannelInfo};
 fn channel(peer: &str, capacity: u64) -> ChannelInfo {
     ChannelInfo {
+        is_outbound: None,
+        is_announced: None,
+        is_channel_ready: None,
+        local_reserve_msat: None,
+        initial_push_msat: None,
         channel_id: "channel".into(),
         user_channel_id: Some("7".into()),
         funding_txo: None,

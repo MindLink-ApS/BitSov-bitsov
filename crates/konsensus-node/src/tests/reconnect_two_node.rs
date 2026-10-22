@@ -245,6 +245,7 @@ async fn start_sender(
 ) -> Sender {
     let invoice_requests: InvoiceRequests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let state = Arc::new(konsensus_api::AppState {
+        starter: Default::default(),
         file_staging: Default::default(),
         identity: Arc::clone(identity),
         storage: storage().await,

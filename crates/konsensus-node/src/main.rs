@@ -1633,6 +1633,7 @@ async fn start_node_services<'a>(
     };
 
     let api_state = Arc::new(konsensus_api::AppState {
+        starter: config.starter_settings(),
         identity: Arc::clone(node.identity()),
         pairing: Some(Arc::clone(&pairing_service)),
         storage: Arc::clone(node.storage()),
@@ -1909,6 +1910,21 @@ async fn start_node_services<'a>(
         shutdown_rx: node.shutdown_rx(),
     }));
 
+    let (starter_newcomer_tx, starter_newcomer_handle) = if config.starter.enabled {
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let client = onboarding::starter_newcomer::StarterNewcomer {
+            settings: config.starter_settings(),
+            storage: Arc::clone(node.storage()),
+            lightning: Arc::clone(node.lightning()),
+            node_id: *node.node_id(),
+        };
+        let handle = tokio::spawn(onboarding::starter_newcomer::run(
+            client, Arc::clone(node.transport()), rx, node.shutdown_rx(),
+        ));
+        (Some(tx), Some(handle))
+    } else {
+        (None, None)
+    };
     let (starter_hub_tx, starter_hub_handle) = if config.starter_hub.enabled {
         let (tx,rx)=tokio::sync::mpsc::channel(64);
         let hub=onboarding::starter_hub::StarterHub {
@@ -1970,6 +1986,7 @@ async fn start_node_services<'a>(
         pending_tx,
         auto_channel_tx,
         starter_hub_tx,
+        starter_newcomer_tx,
         shutdown_rx: node.shutdown_rx(),
     }));
 
@@ -2172,6 +2189,9 @@ async fn start_node_services<'a>(
         }
         if let Err(e) = pending_handle.await {
             warn!(error = %e, "pending delivery task panicked");
+        }
+        if let Some(handle) = starter_newcomer_handle {
+            let _ = handle.await;
         }
         if let Some(handle)=starter_hub_handle {let _=handle.await;}
         if let Err(e) = auto_channel_handle.await {

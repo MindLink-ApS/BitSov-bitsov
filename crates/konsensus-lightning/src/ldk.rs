@@ -2972,6 +2972,12 @@ impl ChannelOpener for LdkNode {
 /// Convert LDK identifiers at the provider boundary, never through Display parsing.
 fn channel_info(ch: ldk_node::ChannelDetails) -> ChannelInfo {
     ChannelInfo {
+        is_outbound: Some(ch.is_outbound),
+        is_announced: Some(ch.is_announced),
+        is_channel_ready: Some(ch.is_channel_ready),
+        local_reserve_msat: ch.unspendable_punishment_reserve.map(|s| s * 1000),
+        initial_push_msat: ch.initial_push_msat,
+
         channel_id: ch.channel_id.to_string(),
         user_channel_id: Some(ch.user_channel_id.0.to_string()),
         funding_txo: ch.funding_txo.map(|outpoint| outpoint.to_string()),

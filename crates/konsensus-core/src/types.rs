@@ -8,40 +8,51 @@ use crate::error::CoreError;
 
 /// Serde helper for hex-encoding fixed-size byte arrays.
 mod hex_serde {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&hex::encode(bytes))
     }
 
+    /// Decode directly into a fixed stack buffer. In particular, do not build
+    /// a peer-controlled String or hex Vec before checking its wire length.
+    fn fixed_hex<'de, D: Deserializer<'de>, const N: usize>(
+        deserializer: D,
+    ) -> Result<[u8; N], D::Error> {
+        struct HexVisitor<const N: usize>;
+        impl<const N: usize> serde::de::Visitor<'_> for HexVisitor<N> {
+            type Value = [u8; N];
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "exactly {} hex characters", N * 2)
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value.len() != N * 2 {
+                    return Err(E::custom(format!("expected {} hex characters", N * 2)));
+                }
+                let mut bytes = [0; N];
+                hex::decode_to_slice(value, &mut bytes).map_err(E::custom)?;
+                Ok(bytes)
+            }
+        }
+        deserializer.deserialize_str(HexVisitor::<N>)
+    }
+
     pub fn deserialize_32<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<[u8; 32], D::Error> {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected 32 bytes"))
+        fixed_hex(deserializer)
     }
 
     pub fn deserialize_64<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<[u8; 64], D::Error> {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected 64 bytes"))
+        fixed_hex(deserializer)
     }
 
     pub fn deserialize_24<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<[u8; 24], D::Error> {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected 24 bytes"))
+        fixed_hex(deserializer)
     }
 }
 
@@ -61,8 +72,7 @@ impl Serialize for MessageId {
 
 impl<'de> Deserialize<'de> for MessageId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Self::from_hex(&s).map_err(serde::de::Error::custom)
+        hex_serde::deserialize_32(deserializer).map(Self)
     }
 }
 
@@ -136,8 +146,7 @@ impl Serialize for NodeId {
 
 impl<'de> Deserialize<'de> for NodeId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Self::from_hex(&s).map_err(serde::de::Error::custom)
+        hex_serde::deserialize_32(deserializer).map(Self)
     }
 }
 

@@ -1,6 +1,6 @@
 # Starter hub (N-M7a PR-1, rc20)
 
-This opt-in hub service requires embedded LDK on **signet** or **regtest**. Regtest is for tests. Mainnet, testnet, non-LDK backends, `allow_mainnet = true`, and `--home` / `--remote-unlock` are refused at startup. Existing configurations remain disabled. PR-2 supplies the newcomer app API and worker.
+This opt-in hub service requires embedded LDK on **signet** or **regtest**. Regtest is for tests. Mainnet, testnet, non-LDK backends, `allow_mainnet = true`, and `--home` / `--remote-unlock` are refused at startup. Existing configurations remain disabled. The [newcomer API and worker](starter-newcomer.md) are separately enabled on the newcomer.
 
 ```toml
 [starter_hub]
@@ -78,4 +78,16 @@ Starter tables retain the LN key for uniqueness and recovery, but no IP/socket a
 
 Set `enabled = false` and restart to stop the worker and capability advertisement. Existing channels remain intact. The Admin charged-resolution endpoint remains available for previously created uncertain grants.
 
-PR-2 TODOs: Codex C3 requires durable initial-push evidence or spending exclusion before newcomer verification; Fool F4 requires automatic retries with fresh UUIDs after retryable refusals. Neither is implemented by this hub PR. Mainnet still requires an explicit policy decision and idle reclaim.
+PR-2 implements C3 with durable negotiated initial-push evidence and F4 with bounded, persisted retry successors. Timeouts reuse the same UUID; only an explicit retryable refusal permits a successor UUID. See [newcomer operations](starter-newcomer.md) for bounds, backoff and status. Mainnet still requires an explicit policy decision and idle reclaim.
+
+## Confirmation policy and before-mainnet checklist
+
+Starter channels are not configured as zero-confirmation channels.
+`trust_no_reserve` affects the anchor-reserve policy only; the newcomer still
+requires LDK's inbound funding confirmation depth and channel-ready checks.
+
+The newcomer's `ready` request state is terminal. Once verified, it is not
+re-checked for confirmation depth, a later deep reorg, or channel closure.
+Before mainnet GO, decide and implement ongoing readiness/reorg/closure handling
+and idle reclaim; a historical `ready` request must not be treated as proof of
+current spendable channel liquidity. Mainnet remains disabled.

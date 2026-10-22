@@ -242,7 +242,7 @@ pub(super) async fn recv_encrypted_frame(
     let decrypted = noise
         .decrypt(&encrypted)
         .map_err(|e| TransportError::NoiseError(e.to_string()))?;
-    Frame::from_bytes(&decrypted).map_err(|e| TransportError::WireProtocol(e.to_string()))
+    Frame::from_bytes(&decrypted).map_err(|e| TransportError::WireProtocol(e.log_category().into()))
 }
 
 // ─── Federation handshake ───────────────────────────────────────────────────
@@ -318,7 +318,7 @@ pub(super) async fn perform_federation_handshake_initiator(
             Ok((node_id, tier, capabilities, reader, writer, noise))
         }
         Frame::Disconnect { reason } => {
-            Err(TransportError::Rejected(format!("peer disconnected: {reason}")))
+            Err(TransportError::Rejected(format!("peer disconnected: {}", crate::wire::sanitized_peer_reason(&reason))))
         }
         other => Err(TransportError::WireProtocol(format!(
             "expected HelloAck, got {:?}",
@@ -422,7 +422,7 @@ pub(super) async fn perform_federation_handshake_responder(
             Ok((node_id, tier, capabilities, reader, writer, noise, privileged))
         }
         Frame::Disconnect { reason } => {
-            Err(TransportError::Rejected(format!("peer disconnected: {reason}")))
+            Err(TransportError::Rejected(format!("peer disconnected: {}", crate::wire::sanitized_peer_reason(&reason))))
         }
         other => Err(TransportError::WireProtocol(format!(
             "expected Hello, got {:?}",
@@ -575,4 +575,30 @@ pub(super) async fn connect_to_peer(
 
     info!(peer = %peer_node_id, "peer connected and authenticated");
     Ok(())
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn handshake_decode_errors_use_fixed_categories() {
+        let mut sender = NoiseSession::initiator(&[11; 32]).unwrap();
+        let mut receiver = NoiseSession::responder(&[22; 32]).unwrap();
+        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
+        sender.read_handshake(&receiver.write_handshake(&[]).unwrap()).unwrap();
+        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
+        assert!(sender.try_finish_handshake().unwrap());
+        assert!(receiver.try_finish_handshake().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, accepted) = tokio::join!(
+            tokio::net::TcpStream::connect(listener.local_addr().unwrap()), listener.accept()
+        );
+        let (_reader, mut writer) = client.unwrap().into_split();
+        let (mut reader, _writer) = accepted.unwrap().0.into_split();
+        let encrypted = sender.encrypt(br#"{"Ping":{"nonce":"PEER_SECRET\n\u001b"}}"#).unwrap();
+        write_noise_message(&mut writer, &encrypted).await.unwrap();
+        let error = recv_encrypted_frame(&mut reader, &mut receiver).await.unwrap_err();
+        assert!(matches!(error, TransportError::WireProtocol(ref text) if text == "serialization error"));
+    }
 }

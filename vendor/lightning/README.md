@@ -1,3 +1,6 @@
+BitSov fork changes and private serialization allocations are recorded in
+[BITSOV-PATCH.md](BITSOV-PATCH.md).
+
 Rust-Lightning
 ==============
 

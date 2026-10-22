@@ -66,6 +66,7 @@ pub(crate) struct SessionHandlerDeps {
     pub ws_broadcast: broadcast::Sender<Arc<konsensus_api::state::WsMessage>>,
     pub ws_delivery_tx: broadcast::Sender<Arc<WsDeliveryStatus>>,
     pub pending_tx: tokio::sync::mpsc::Sender<NodeId>,
+    pub starter_newcomer_tx: Option<mpsc::Sender<(NodeId, Frame)>>,
     pub starter_hub_tx: Option<mpsc::Sender<(NodeId,Frame)>>,
     pub auto_channel_tx: mpsc::Sender<AutoChannelEvent>,
     pub shutdown_rx: watch::Receiver<bool>,
@@ -166,6 +167,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         pending_tx,
         auto_channel_tx,
         starter_hub_tx,
+        starter_newcomer_tx,
         mut shutdown_rx,
     } = deps;
 
@@ -449,9 +451,12 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             }
                         }
                     }
-                    ControlEvent::StarterStatusReceived {..} => {
-                        // TODO(PR-2): verify status from the configured hub and
-                        // reconcile the newcomer's durable initial-push evidence.
+                    ControlEvent::StarterStatusReceived { peer_id, frame, privileged } => {
+                        if privileged {
+                            if let Some(tx) = &starter_newcomer_tx {
+                                let _ = tx.try_send((peer_id, frame));
+                            }
+                        }
                     }
                     ControlEvent::LightningInfoReceived { peer_id, ln_pubkey, ln_addr, privileged } => {
                         if !privileged {
@@ -530,7 +535,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         warn!(
                             peer = %peer_id,
                             %session_id,
-                            %reason,
+                            reason = %konsensus_message::wire::sanitized_peer_reason(&reason),
                             "rejected legacy unpaid call end; use paid UKM realtime kind"
                         );
                     }
@@ -1168,7 +1173,7 @@ async fn handle_message_rejected(
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
     update_weights: bool,
 ) {
-    warn!(peer = %peer_id, msg_id = %message_id, %reason, "message rejected by peer");
+    warn!(peer = %peer_id, msg_id = %message_id, reason = %konsensus_message::wire::sanitized_peer_reason(reason), "message rejected by peer");
     if update_weights { routing.record_failure(peer_id).await; }
 
     if let Err(e) = ws_delivery_tx.send(Arc::new(
@@ -1600,7 +1605,7 @@ async fn handle_invoice_error_received(
         return true;
     }
     warn!(
-        peer = %peer_id, %request_id, %reason,
+        peer = %peer_id, %request_id, reason = %konsensus_message::wire::sanitized_peer_reason(reason),
         "peer reported invoice creation error — failing compose"
     );
     let mut requests = invoice_requests.lock().await;

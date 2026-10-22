@@ -86,8 +86,12 @@ jobs:
       - name: Run osv-scanner
         id: osv_scan
         continue-on-error: true
+        # Release builds resolve workspace dependencies from the root Cargo.lock.
+        # Vendored crates' standalone lockfiles are not release build inputs:
+        # Cargo uses the workspace lockfile for these patched path dependencies.
+        # No frontend ships here; add explicit lockfiles if release inputs expand.
         run: |
-          osv-scanner --recursive --config osv-scanner.toml --format json . \
+          osv-scanner --lockfile Cargo.lock --config osv-scanner.toml --format json \
             > /tmp/osv-scan.json 2>/dev/null || true
 
       # gitleaks --exit-code 0 means it always exits cleanly; findings appear
