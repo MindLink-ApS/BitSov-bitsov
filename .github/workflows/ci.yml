@@ -231,13 +231,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      # Both standalone vendor manifests reuse this job's cached target tree.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/vendor/ldk-node/target
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: vendor/ldk-node
-          shared-key: ldk-node-security-${{ hashFiles('vendor/ldk-node/Cargo.lock') }}
+          shared-key: ldk-node-security-${{ hashFiles('vendor/ldk-node/Cargo.lock', 'vendor/lightning/Cargo.lock') }}
           cache-all-crates: "true"
       - name: sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -249,6 +251,8 @@ jobs:
       # Run its private-handler regressions plus all existing local patch tests.
       - name: Test vendored ldk-node library
         run: cargo test --locked --manifest-path vendor/ldk-node/Cargo.toml --lib
+      - name: Test fork-private Lightning TLV pins (65537/65539/65541)
+        run: cargo test --manifest-path vendor/lightning/Cargo.toml --lib starter_initial_push_
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
