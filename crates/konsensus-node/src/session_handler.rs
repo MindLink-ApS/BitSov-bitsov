@@ -66,6 +66,7 @@ pub(crate) struct SessionHandlerDeps {
     pub ws_broadcast: broadcast::Sender<Arc<konsensus_api::state::WsMessage>>,
     pub ws_delivery_tx: broadcast::Sender<Arc<WsDeliveryStatus>>,
     pub pending_tx: tokio::sync::mpsc::Sender<NodeId>,
+    pub starter_hub_tx: Option<mpsc::Sender<(NodeId,Frame)>>,
     pub auto_channel_tx: mpsc::Sender<AutoChannelEvent>,
     pub shutdown_rx: watch::Receiver<bool>,
 }
@@ -119,6 +120,7 @@ fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
         PeerExchangeReceived { privileged, .. } => {
             (privileged, PrePaymentReason::PeerExchangeBeforePayment)
         }
+        StarterRequestReceived { privileged, .. } | StarterStatusReceived { privileged, .. } => (privileged, PrePaymentReason::StarterBeforeInvite),
         LightningInfoReceived { privileged, .. } => {
             (privileged, PrePaymentReason::LightningInfoBeforePayment)
         }
@@ -163,6 +165,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         ws_delivery_tx,
         pending_tx,
         auto_channel_tx,
+        starter_hub_tx,
         mut shutdown_rx,
     } = deps;
 
@@ -211,6 +214,9 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                 // Unprivileged frames refused here never reach the per-arm
                 // `!privileged` guards below; those stay as defense in depth.
                 if refuse_unpaid_control(&event, audit_log.membrane()) {
+                    if let ControlEvent::StarterRequestReceived { peer_id, .. } = &event {
+                        let _ = transport.disconnect(peer_id).await;
+                    }
                     continue;
                 }
 
@@ -434,6 +440,19 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                     }
 
+                    ControlEvent::StarterRequestReceived {peer_id,frame,privileged} => {
+                        if privileged {
+                            if let Some(tx)=&starter_hub_tx {let _=tx.try_send((peer_id,frame));}
+                            else if let Frame::StarterRequest{request_id,..}=frame {
+                                let reply=Frame::StarterStatus{request_id,state:"refused".into(),reason:Some("starter_disabled".into()),retry_after_unix:None,original_request_id:None,capacity_sats:None,push_sats:None,channel_id:None,funding_txid:None};
+                                let _=transport.enqueue_control_frame(&peer_id,&reply).await;
+                            }
+                        }
+                    }
+                    ControlEvent::StarterStatusReceived {..} => {
+                        // TODO(PR-2): verify status from the configured hub and
+                        // reconcile the newcomer's durable initial-push evidence.
+                    }
                     ControlEvent::LightningInfoReceived { peer_id, ln_pubkey, ln_addr, privileged } => {
                         if !privileged {
                             continue;
@@ -1758,11 +1777,7 @@ async fn handle_lightning_info_received(
     }
 
     peer_ln_pubkeys.lock().await.insert(*peer_id, ln_pubkey.to_string());
-    info!(
-        peer = %peer_id,
-        ln_pubkey_prefix = &ln_pubkey[..16],
-        "stored peer Lightning pubkey — keysend payments enabled"
-    );
+    debug!(peer = %peer_id, "stored peer Lightning info for keysend");
     true
 }
 

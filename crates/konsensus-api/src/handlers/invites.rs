@@ -439,6 +439,11 @@ async fn issue_invite(
             ))
         })?;
 
+    state
+        .transport
+        .add_to_whitelist(&NodeId::from_bytes(invitee_pubkey))
+        .await;
+
     Ok(Json(IssueInviteResponse {
         invite_id: invite_id.to_string(),
         invite_link: format!("bitsov://invite/{token}"),

@@ -361,6 +361,7 @@ async fn worker(
             ws_broadcast: ws,
             ws_delivery_tx: delivery,
             pending_tx: pending,
+            starter_hub_tx: None,
             auto_channel_tx: auto,
             shutdown_rx,
         },

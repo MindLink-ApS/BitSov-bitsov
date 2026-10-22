@@ -879,3 +879,62 @@ async fn sqlite_invites_round_trip_preserves_numeric_and_state_fields() {
 
     assert_eq!(loaded, record);
 }
+
+#[tokio::test]
+async fn issued_invite_promotes_live_handshake_whitelist_without_restart() {
+    use konsensus_core::{identity::NodeIdentity, traits::transport::MessageTransport};
+    use konsensus_message::transport::ControlEvent;
+    use konsensus_message::wire::Frame;
+    use konsensus_message::{NoiseTransport, ReachabilityMode, TransportConfig};
+    let mut state = (*test_state()).clone();
+    let config = TransportConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        admission_mode: ReachabilityMode::PriceOpen,
+        ..Default::default()
+    };
+    let hub = Arc::new(NoiseTransport::new(state.identity.clone(), config.clone()));
+    hub.start_listener().await.unwrap();
+    let (_, identity) = NodeIdentity::generate().unwrap();
+    let newcomer_id = *identity.node_id();
+    let newcomer = NoiseTransport::new(Arc::new(identity), config);
+    newcomer
+        .connect(
+            state.identity.node_id(),
+            &hub.listen_addr().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+    async fn privileged(hub: &NoiseTransport, newcomer: &NoiseTransport, id: &NodeId) -> bool {
+        newcomer
+            .send_frame(
+                id,
+                &Frame::LightningInfo {
+                    ln_pubkey: "02".repeat(33),
+                    ln_addr: None,
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(ControlEvent::LightningInfoReceived { privileged, .. }) =
+                    hub.recv_control().await
+                {
+                    return privileged;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+    assert!(!privileged(&hub, &newcomer, state.identity.node_id()).await);
+    state.transport = hub.clone();
+    let state = Arc::new(state);
+    let auth = auth_header(&state);
+    let response=build_router(state.clone()).oneshot(Request::builder().method("POST").uri("/api/v1/invites")
+        .header("authorization",auth).header("content-type","application/json")
+        .body(Body::from(serde_json::json!({"invitee_pubkey":newcomer_id.to_hex(),"expiry_unix":now_unix()+3600,"addr":TEST_INVITER_ADDR}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(privileged(&hub, &newcomer, state.identity.node_id()).await);
+    newcomer.disconnect(state.identity.node_id()).await.unwrap();
+}

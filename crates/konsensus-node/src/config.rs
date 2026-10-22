@@ -184,6 +184,8 @@ impl Default for PairingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
+    #[serde(default)]
+    pub starter_hub: crate::onboarding::starter_hub::StarterHubConfig,
     /// Owner-approved second-device enrollment rollout.
     #[serde(default)]
     pub pairing: PairingConfig,
@@ -1612,7 +1614,13 @@ impl NodeConfig {
         Ok(())
     }
 
+    pub(crate) fn validate_starter_hub(&self, lockable: bool) -> anyhow::Result<()> {
+        let network = self.lightning.bitcoin_network();
+        self.starter_hub.validate(network.as_deref(), self.lightning.channel_capacity_limits().map(|l| l.max_channel_capacity_sats), lockable)
+    }
+
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.validate_starter_hub(false)?;
         self.tower.validate()?;
         if !self.tower.clients.is_empty() && !matches!(self.lightning, LightningConfig::Ldk { .. })
         {
@@ -2097,6 +2105,7 @@ impl NodeConfig {
             dos_edge: Default::default(),
             // R1-a: onboarding channel-open subsidy OFF by default — generated
             // configs never auto-spend operator sats on invite membership.
+            starter_hub: Default::default(),
             onboarding_subsidy: SubsidyConfig::default(),
             sponsor: SponsorConfig::default(),
             // T2R8: relay advertisement OFF by default — generated configs do

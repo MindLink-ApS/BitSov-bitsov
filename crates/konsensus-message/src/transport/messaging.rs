@@ -622,13 +622,14 @@ pub(super) fn spawn_reader_task(
                         warn!(peer = %peer_id, error = %e, "failed to send InvoiceErrorReceived control event");
                     }
                 }
+                frame @ Frame::StarterRequest { .. } => {
+                    let _ = control_tx.send(ControlEvent::StarterRequestReceived { peer_id, frame, privileged }).await;
+                }
+                frame @ Frame::StarterStatus { .. } => {
+                    let _ = control_tx.send(ControlEvent::StarterStatusReceived { peer_id, frame, privileged }).await;
+                }
                 Frame::LightningInfo { ln_pubkey, ln_addr } => {
-                    info!(
-                        peer = %peer_id,
-                        ln_pubkey_prefix = &ln_pubkey[..std::cmp::min(16, ln_pubkey.len())],
-                        ln_addr = ln_addr.as_deref().unwrap_or("none"),
-                        "received Lightning pubkey for keysend"
-                    );
+                    debug!(peer = %peer_id, "received Lightning info for keysend");
                     if let Err(e) = control_tx
                         .send(ControlEvent::LightningInfoReceived {
                             peer_id,

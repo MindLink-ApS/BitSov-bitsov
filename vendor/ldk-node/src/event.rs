@@ -1275,7 +1275,7 @@ where
 					.is_some_and(|peers| !peers.contains(&counterparty_node_id))
 				{
 					log_info!(
-						self.logger,
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"HUB_ONLY_WHILE_LOCKABLE: refusing inbound channel from peer {}",
 						counterparty_node_id
 					);
@@ -1308,7 +1308,7 @@ where
 				};
 				if let Err(error) = cap_result {
 					log_info!(
-						self.logger,
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"{}: refusing inbound channel from peer {}",
 						error,
 						counterparty_node_id
@@ -1331,7 +1331,7 @@ where
 				}
 				if is_announced {
 					if let Err(err) = may_announce_channel(&*self.config) {
-						log_error!(self.logger, "Rejecting inbound announced channel from peer {} due to missing configuration: {}", counterparty_node_id, err);
+						log_error!(self.peer_store.peer_logger(&counterparty_node_id), "Rejecting inbound announced channel from peer {} due to missing configuration: {}", counterparty_node_id, err);
 
 						self.channel_manager
 							.force_close_broadcasting_latest_txn(
@@ -1352,7 +1352,7 @@ where
 				// anchor_channels_config = None now refuses every inbound channel (konsensus always sets it).
 				if !anchor_channel {
 					log_info!(
-						self.logger,
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"Rejecting non-anchor inbound channel from peer {}",
 						counterparty_node_id
 					);
@@ -1393,7 +1393,7 @@ where
 
 						if spendable_amount_sats < required_amount_sats {
 							log_error!(
-								self.logger,
+								self.peer_store.peer_logger(&counterparty_node_id),
 								"Rejecting inbound Anchor channel from peer {} due to insufficient available on-chain reserves. Available: {}/{}sats",
 								counterparty_node_id,
 								spendable_amount_sats,
@@ -1412,7 +1412,7 @@ where
 						}
 					} else {
 						log_error!(
-							self.logger,
+							self.peer_store.peer_logger(&counterparty_node_id),
 							"Rejecting inbound channel from peer {} due to Anchor channels being disabled.",
 							counterparty_node_id,
 						);
@@ -1475,7 +1475,7 @@ where
 				match res {
 					Ok(()) => {
 						log_info!(
-							self.logger,
+							self.peer_store.peer_logger(&counterparty_node_id),
 							"Accepting inbound{}{} channel of {}sats from{} peer {}",
 							if allow_0conf { " 0conf" } else { "" },
 							if anchor_channel { " Anchor" } else { "" },
@@ -1486,7 +1486,7 @@ where
 					},
 					Err(e) => {
 						log_error!(
-							self.logger,
+							self.peer_store.peer_logger(&counterparty_node_id),
 							"Error while accepting inbound{}{} channel from{} peer {}: {:?}",
 							if allow_0conf { " 0conf" } else { "" },
 							if anchor_channel { " Anchor" } else { "" },
@@ -1613,7 +1613,7 @@ where
 				}
 
 				log_info!(
-					self.logger,
+					self.peer_store.peer_logger(&counterparty_node_id),
 					"New channel {} with counterparty {} has been created and is pending confirmation on chain.",
 					channel_id,
 					counterparty_node_id,
@@ -1656,7 +1656,7 @@ where
 
 							self.peer_store.add_peer(peer).unwrap_or_else(|e| {
 								log_error!(
-									self.logger,
+									self.peer_store.peer_logger(&counterparty_node_id),
 									"Failed to add peer {} to peer store: {}",
 									counterparty_node_id,
 									e
@@ -1682,7 +1682,7 @@ where
 
 				if let Some(funding_txo) = funding_txo {
 					log_info!(
-						self.logger,
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"Channel {} with counterparty {} ready to be used with funding_txo {}",
 						channel_id,
 						counterparty_node_id,
@@ -1690,7 +1690,7 @@ where
 					);
 				} else {
 					log_info!(
-						self.logger,
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"Channel {} with counterparty {} ready to be used",
 						channel_id,
 						counterparty_node_id,
@@ -1773,7 +1773,7 @@ where
 				debug_assert!(false, "We currently don't handle BOLT12 invoices manually, so this event should never be emitted.");
 			},
 			LdkEvent::ConnectionNeeded { node_id, addresses } => {
-				let spawn_logger = self.logger.clone();
+				let spawn_peer_store = Arc::clone(&self.peer_store);
 				let spawn_cm = Arc::clone(&self.connection_manager);
 				let future = async move {
 					for addr in &addresses {
@@ -1783,7 +1783,7 @@ where
 							},
 							Err(e) => {
 								log_error!(
-									spawn_logger,
+									spawn_peer_store.peer_logger(&node_id),
 									"Failed to establish connection to peer {}@{}: {}",
 									node_id,
 									addr,
@@ -1947,7 +1947,7 @@ where
 					) {
 						Ok(()) => {
 							log_info!(
-								self.logger,
+								self.peer_store.peer_logger(&counterparty_node_id),
 								"Signed funding transaction for channel {} with counterparty {}",
 								channel_id,
 								counterparty_node_id
@@ -1970,7 +1970,7 @@ where
 				..
 			} => {
 				log_info!(
-					self.logger,
+					self.peer_store.peer_logger(&counterparty_node_id),
 					"Channel {} with counterparty {} pending splice with funding_txo {}",
 					channel_id,
 					counterparty_node_id,
@@ -2002,7 +2002,7 @@ where
 			} => {
 				if let Some(funding_txo) = abandoned_funding_txo {
 					log_info!(
-						self.logger,
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"Channel {} with counterparty {} failed splice with funding_txo {}",
 						channel_id,
 						counterparty_node_id,
@@ -2010,7 +2010,7 @@ where
 					);
 				} else {
 					log_info!(
-						self.logger,
+						self.peer_store.peer_logger(&counterparty_node_id),
 						"Channel {} with counterparty {} failed splice",
 						channel_id,
 						counterparty_node_id,

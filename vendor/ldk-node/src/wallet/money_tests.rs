@@ -969,7 +969,7 @@ fn funding_failure_reason_survives_restart() {
 	}
 	let node = node(dir.path());
 	let reason = node.channel_funding_failure(crate::UserChannelId(id)).unwrap().unwrap();
-	assert!(reason.contains("max_funding_fee_sats"));
+	assert_eq!(reason, "funding_fee_cap_exceeded");
 }
 
 #[test]
