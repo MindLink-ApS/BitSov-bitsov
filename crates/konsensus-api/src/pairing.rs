@@ -767,7 +767,17 @@ fn normalize_owner_code(typed: &str) -> String {
 /// reads (bidi controls, zero-width characters, soft hyphen and the like).
 fn invisible_format(c: char) -> bool {
     matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
-        | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+        | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}'
+        // Remaining Unicode format controls (Cf), including supplementary planes.
+        | '\u{0600}'..='\u{0605}' | '\u{06DD}' | '\u{070F}'
+        | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{1343F}'
+        | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
+        | '\u{E0001}' | '\u{E0020}'..='\u{E007F}'
+        // Invisible fillers, grapheme joiner and variation selectors are not Cf.
+        | '\u{034F}' | '\u{115F}'..='\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}'
+        | '\u{180B}'..='\u{180D}' | '\u{180F}' | '\u{FE00}'..='\u{FE0F}'
+        | '\u{E0100}'..='\u{E01EF}')
 }
 
 /// `s` single-quoted for a shell only when it needs it. `None` when it holds a
@@ -2125,6 +2135,7 @@ impl PairingService {
     /// Bump a pairing's epoch, invalidating every outstanding token for it.
     pub fn bump_epoch(&self, client_id: &str) -> Result<u64, PairingError> {
         let mut inner = self.lock();
+        self.guard_device_removal(&inner, |key| key.client_id == client_id)?;
         let record = inner
             .file
             .clients
@@ -2146,6 +2157,7 @@ impl PairingService {
     /// Remove a pairing entirely (and any grant bound to it).
     pub fn revoke(&self, client_id: &str) -> Result<(), PairingError> {
         let mut inner = self.lock();
+        self.guard_device_removal(&inner, |key| key.client_id == client_id)?;
         let Some(existing) = inner
             .file
             .clients
@@ -2223,6 +2235,9 @@ impl PairingService {
             .map_err(|_| PairingError::BadProof)?;
 
         let new_id = client_id_from_pubkey(&new_pubkey_hex.to_ascii_lowercase());
+        self.guard_device_removal(&inner, |key| {
+            key.client_id == client_id || key.client_id == new_id
+        })?;
         // Allocate above the source epoch *and* any destination history or
         // live record. `old.epoch + 1` alone can recreate a revoked destination
         // binding, or overwrite a higher last_epoch when rotating away later.

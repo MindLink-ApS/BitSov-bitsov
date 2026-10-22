@@ -288,8 +288,9 @@ pub struct RevokeBody {
 
 /// `POST /api/v1/pair/revoke` — revoke from an `admin`-holding paired client.
 ///
-/// Also reachable offline from the CLI, because the client being revoked may be
-/// the compromised one.
+/// The service refuses unreviewed device-authority removal with 403. Such
+/// removals require the owner console's preview/confirmation flow, including
+/// after second-device enrollment is disabled.
 async fn revoke_pairing(
     _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,

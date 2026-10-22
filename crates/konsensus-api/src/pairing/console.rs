@@ -76,6 +76,58 @@ fn audit_device_name(name: &str) -> String {
 }
 
 impl PairingService {
+    /// Route owner CLI revocation through preview even after a flag-off restart.
+    /// This is a routing hint; mutation methods also check under the pairing lock.
+    pub fn device_revocation_review_required(&self) -> bool {
+        self.second_device_enrollment_enabled() || !self.lock().file.device_keys.is_empty()
+    }
+
+    /// Unguarded callers cannot orphan approvals or retire the last owner.
+    /// Apply this before any mutation, under the same lock as the write, including
+    /// every key whose pairing epoch will change (rotation's destination too).
+    pub(super) fn guard_device_removal(
+        &self,
+        inner: &Inner,
+        affected: impl Fn(&super::DeviceKey) -> bool,
+    ) -> Result<(), PairingError> {
+        let removed: HashSet<_> = inner
+            .file
+            .device_keys
+            .iter()
+            .filter(|key| affected(key))
+            .map(|key| key.key_id.clone())
+            .collect();
+        if removed.is_empty() {
+            return Ok(());
+        }
+        let has_approvals = inner.file.device_keys.iter().any(|key| {
+            provenance_parent(&key.enrolled_by).is_some_and(|parent| removed.contains(parent))
+        });
+        let clients = BTreeSet::new();
+        let owners_before = self.console_owner_count(inner, &HashSet::new(), &clients);
+        let loses_last_owner =
+            owners_before > 0 && self.console_owner_count(inner, &removed, &clients) == 0;
+        // Disabling authority must not make signed records safe to delete. If
+        // startup cannot verify them, require console review conservatively.
+        let unverifiable_owner = (self.owner_approval_key.is_none()
+            || self.device_authority_off().is_some())
+            && inner
+                .file
+                .device_keys
+                .iter()
+                .any(|key| removed.contains(&key.key_id) && !key.owner_approval.is_empty());
+        if self.second_device_enrollment_enabled()
+            || has_approvals
+            || loses_last_owner
+            || unverifiable_owner
+        {
+            return Err(PairingError::NotGrantable(
+                "revocation requires owner review; use device revoke on the owner console (preview and confirmation required)".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn require_console_enrollment(&self) -> Result<(), PairingError> {
         if !self.owner_control_enabled || !self.second_device_enrollment {
             return Err(PairingError::OwnerChannelUnavailable);
@@ -199,7 +251,11 @@ impl PairingService {
         options: &RevokeOptions,
         confirmation: Option<&str>,
     ) -> Result<RevokePlan, PairingError> {
-        self.require_console_enrollment()?;
+        // Removing durable authority remains available after rollout is disabled.
+        // Enrollment itself still requires the rollout flag.
+        if !self.owner_control_enabled {
+            return Err(PairingError::OwnerChannelUnavailable);
+        }
         if options.root.is_empty() || (!options.cascade && !options.keep.is_empty()) {
             return Err(PairingError::NotGrantable(
                 "invalid revocation options".into(),
@@ -216,7 +272,9 @@ impl PairingService {
             if let Some(key) = inner.file.device_keys.iter().find(|k| k.key_id == id) {
                 // Removing this pairing also removes independently enrolled sibling
                 // keys. Walk their approvals too, to a fixpoint, before previewing.
-                if options.cascade && !options.keep.contains(&id) {
+                if (options.cascade || (options.with_pairing && id == options.root))
+                    && !options.keep.contains(&id)
+                {
                     queue.extend(
                         inner
                             .file
@@ -356,10 +414,20 @@ impl PairingService {
             let mut audit_keys = plan.keys.clone();
             for key in &mut audit_keys {
                 key.name = audit_device_name(&key.name);
+                key.key_id = audit_device_name(&key.key_id);
+                key.client_id = audit_device_name(&key.client_id);
+                // A missing root can also appear inside its children's provenance.
+                // Keep the provenance prefix and the full normal 64-character id.
+                key.enrolled_by = if let Some(parent) = provenance_parent(&key.enrolled_by) {
+                    let prefix = &key.enrolled_by[..key.enrolled_by.len() - parent.len()];
+                    format!("{prefix}{}", audit_device_name(parent))
+                } else {
+                    audit_device_name(&key.enrolled_by)
+                };
             }
             self.enrollment_event(
                 "pair.device_revoked",
-                &options.root,
+                &audit_device_name(&options.root),
                 serde_json::json!({"keys":audit_keys,"owner_device_count":plan.owner_device_count}),
             );
         }

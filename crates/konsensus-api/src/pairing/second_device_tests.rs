@@ -306,7 +306,8 @@ fn contested_approval_retains_reason_and_audits_once() {
     let blocker = f.svc.file_path.with_extension("json.tmp");
     std::fs::create_dir(&blocker).unwrap();
     assert!(matches!(
-        f.svc.check_second_device_rescan("second_2", &pubkey(3), &[3; 32]),
+        f.svc
+            .check_second_device_rescan("second_2", &pubkey(3), &[3; 32]),
         Err(PairingError::Io(_))
     ));
     assert!(f.svc.is_provisional(&client.client_id));
@@ -725,7 +726,19 @@ fn t5_approver_epoch_revocation_chronology_and_node_binding() {
                     .unwrap()
                     .epoch += 1
             }
-            "revoke" => f.svc.revoke_device_key(&f.key_id, None).unwrap(),
+            "revoke" => {
+                let options = super::console::RevokeOptions {
+                    root: f.key_id.clone(),
+                    cascade: false,
+                    with_pairing: false,
+                    keep: vec![],
+                    allow_zero_owner: true,
+                };
+                let plan = f.svc.console_revoke_devices(&options, None).unwrap();
+                f.svc
+                    .console_revoke_devices(&options, Some(&plan.confirmation))
+                    .unwrap();
+            }
             "after" => f.svc.lock().file.device_keys[0].registered_at = op.created_at,
             "node" => f.svc.lock().identity_fingerprint = "e".repeat(32),
             "self" => {
@@ -1396,6 +1409,21 @@ fn console_revocation_walks_approvals_by_pairing_siblings() {
         keep: vec![],
         allow_zero_owner: true,
     };
+    options.cascade = false;
+    options.with_pairing = true;
+    let preview = f.svc.console_revoke_devices(&options, None).unwrap();
+    assert_eq!(preview.keys.len(), 2);
+    assert_eq!(preview.pairings.len(), 1);
+    assert_eq!(preview.owner_device_count, 2);
+    for id in [&child.key_id, &grandchild.key_id] {
+        assert!(
+            preview.descendants.iter().any(|k| &k.key_id == id),
+            "sibling approvals must be visible without cascade"
+        );
+        assert!(!preview.keys.iter().any(|k| &k.key_id == id));
+    }
+    options.cascade = true;
+    options.with_pairing = false;
     let plan = f.svc.console_revoke_devices(&options, None).unwrap();
     assert_eq!(
         plan.keys.len(),
@@ -1428,6 +1456,7 @@ fn console_revocation_audit_sanitizes_device_names() {
     for (hostile, expected) in [
         (format!(" \n\u{001b}\u{200b}\u{202e}\u{feff}\u{206a}\u{206f}\u{fff9}\u{fffb}\u{e0020}\u{e007f}{} ", "é".repeat(80)), "é".repeat(64)),
         (" \u{206b}\u{fffa}\u{e0061} ".into(), "unnamed device".into()),
+        ("\u{0600}\u{0605}\u{06dd}\u{070f}\u{0890}\u{0891}\u{08e2}\u{110bd}\u{110cd}\u{13430}\u{1343f}\u{1bca0}\u{1bca3}\u{1d173}\u{1d17a}\u{e0001}\u{034f}\u{061c}\u{115f}\u{1160}\u{3164}\u{ffa0}\u{2800}\u{180b}\u{180d}\u{180f}\u{fe00}\u{fe0f}\u{e0100}\u{e01ef}".into(), "unnamed device".into()),
         ("  Alice’s 日本語 phone  ".into(), "Alice’s 日本語 phone".into()),
     ] {
         let mut f = Fixture::new();
@@ -1465,7 +1494,7 @@ fn console_revocation_audit_sanitizes_device_names() {
 }
 
 #[test]
-fn console_legacy_revocations_refused_only_when_running_flag_is_on() {
+fn console_legacy_revocations_refused_with_last_owner_even_when_flag_is_off() {
     use crate::control::{self, ControlContext, ControlRequest as Q, ControlResponse as R};
     for enabled in [true, false] {
         for operation in 0..3 {
@@ -1493,17 +1522,238 @@ fn console_legacy_revocations_refused_only_when_running_flag_is_on() {
                 }
             };
             let response = control::handle(&ctx, request);
-            if enabled {
-                assert!(
-                    matches!(response, R::Error { ref message } if message.contains("device revoke")),
-                    "{response:?}"
+            assert!(
+                matches!(
+                    control::handle(&ctx, Q::Status),
+                    R::Status {
+                        enrollment: Some(_),
+                        ..
+                    }
+                ),
+                "stored device keys must route the CLI through preview after restart"
+            );
+            assert!(
+                matches!(response, R::Error { ref message } if message.contains("device revoke")),
+                "{response:?}"
+            );
+            assert_eq!(serde_json::to_value(service.snapshot()).unwrap(), before);
+            assert_eq!(service.owner_device_count(), 1);
+        }
+    }
+}
+
+// Each case must fail if its service entry point loses the locked guard.
+#[test]
+fn unreviewed_removal_refuses_stored_approvals_and_zero_owners() {
+    use ed25519_dalek::Signer;
+    for enabled in [true, false] {
+        for provenance in [None, Some("device:"), Some("second_device:")] {
+            for operation in [
+                "key",
+                "pairing",
+                "epoch",
+                "rotation",
+                "rotation_destination",
+            ] {
+                let mut f = Fixture::new();
+                if let Some(prefix) = provenance {
+                    let (_, op) = f.confirmed(2);
+                    let child = f
+                        .approve(&op, &sign(&f.key, &f.message(&op, false)))
+                        .unwrap();
+                    f.svc
+                        .lock()
+                        .file
+                        .device_keys
+                        .iter_mut()
+                        .find(|k| k.key_id == child.key_id)
+                        .unwrap()
+                        .enrolled_by = format!("{prefix}{}", f.key_id);
+                }
+                let source = if operation == "rotation_destination" {
+                    f.svc
+                        .create_ticket_remote_pairing("source", &pubkey(4), &[4; 32])
+                        .unwrap()
+                } else {
+                    f.owner.clone()
+                };
+                // Persist and reopen: a rollout flag is not durable authority.
+                {
+                    let mut inner = f.svc.lock();
+                    f.svc.persist(&mut inner.file).unwrap();
+                }
+                let signer =
+                    konsensus_core::OwnerApprovalKey::from_seed(&[7; 64], &[9; 32]).unwrap();
+                f.svc = PairingService::open(f.dir.path(), f.svc.bound_fingerprint(), true)
+                    .unwrap()
+                    .with_local_owner_device()
+                    .with_owner_signing_key(signer)
+                    .with_second_device_enrollment(enabled);
+                let before = serde_json::to_value(f.svc.snapshot()).unwrap();
+                let disk = std::fs::read(f.svc.dir().join("clients.json")).unwrap();
+                let result = match operation {
+                    "key" => f.svc.revoke_device_key(&f.key_id, Some(&f.owner.client_id)),
+                    "pairing" => f.svc.revoke(&f.owner.client_id),
+                    "epoch" => f.svc.bump_epoch(&f.owner.client_id).map(|_| ()),
+                    _ => {
+                        let (seed, dest) = if operation == "rotation_destination" {
+                            (4, pubkey(1))
+                        } else {
+                            (1, pubkey(4))
+                        };
+                        let msg = format!("bitsov-pair-rotate-v1:{}:{dest}", source.client_id);
+                        let sig =
+                            ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).sign(msg.as_bytes());
+                        f.svc
+                            .rotate_client_key(
+                                &source.client_id,
+                                &dest,
+                                &hex::encode(sig.to_bytes()),
+                            )
+                            .map(|_| ())
+                    }
+                };
+                assert!(matches!(result, Err(PairingError::NotGrantable(ref reason)) if reason.contains("device revoke")),
+                    "enabled={enabled}, provenance={provenance:?}, operation={operation}: {result:?}");
+                assert_eq!(serde_json::to_value(f.svc.snapshot()).unwrap(), before);
+                assert_eq!(
+                    std::fs::read(f.svc.dir().join("clients.json")).unwrap(),
+                    disk
                 );
-                assert_eq!(serde_json::to_value(service.snapshot()).unwrap(), before);
-                assert_eq!(service.owner_device_count(), 1);
-            } else {
-                assert!(matches!(response, R::Ok { .. }), "{response:?}");
-                assert_ne!(serde_json::to_value(service.snapshot()).unwrap(), before);
             }
         }
+    }
+}
+
+#[test]
+fn console_revocation_after_flag_off_restart_preserves_review_and_cascade() {
+    let mut f = Fixture::new();
+    let (_, op) = f.confirmed(2);
+    f.approve(&op, &sign(&f.key, &f.message(&op, false)))
+        .unwrap();
+    let signer = konsensus_core::OwnerApprovalKey::from_seed(&[7; 64], &[9; 32]).unwrap();
+    f.svc = PairingService::open(f.dir.path(), f.svc.bound_fingerprint(), true)
+        .unwrap()
+        .with_local_owner_device()
+        .with_owner_signing_key(signer);
+    assert!(!f.svc.second_device_enrollment_enabled());
+    let mut options = super::console::RevokeOptions {
+        root: f.key_id,
+        cascade: true,
+        with_pairing: true,
+        keep: vec![],
+        allow_zero_owner: false,
+    };
+    let plan = f.svc.console_revoke_devices(&options, None).unwrap();
+    assert_eq!(plan.keys.len(), 2);
+    assert_eq!(plan.owner_device_count, 0);
+    assert!(f
+        .svc
+        .console_revoke_devices(&options, Some(&plan.confirmation))
+        .is_err());
+    options.allow_zero_owner = true;
+    assert!(f
+        .svc
+        .console_revoke_devices(&options, Some(&plan.confirmation))
+        .is_err());
+    let reviewed = f.svc.console_revoke_devices(&options, None).unwrap();
+    f.svc
+        .console_revoke_devices(&options, Some(&reviewed.confirmation))
+        .unwrap();
+    assert!(f.svc.snapshot().device_keys.is_empty());
+    assert!(f.svc.snapshot().clients.is_empty());
+}
+
+#[test]
+fn console_revocation_audit_sanitizes_missing_root() {
+    let mut f = Fixture::new();
+    let path = f.dir.path().join("root-audit.jsonl");
+    f.svc = f.svc.with_enrollment_audit(std::sync::Arc::new(
+        crate::audit::AuditLog::open(&path).unwrap(),
+    ));
+    let root = format!(" \n\u{202e}\u{e0001}{} ", "r".repeat(80));
+    f.svc.lock().file.device_keys[0].enrolled_by = format!("device:{root}");
+    let options = super::console::RevokeOptions {
+        root,
+        cascade: true,
+        with_pairing: true,
+        keep: vec![],
+        allow_zero_owner: true,
+    };
+    let plan = f.svc.console_revoke_devices(&options, None).unwrap();
+    f.svc
+        .console_revoke_devices(&options, Some(&plan.confirmation))
+        .unwrap();
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let event = events
+        .iter()
+        .find(|e| e["event"] == "pair.device_revoked")
+        .unwrap();
+    assert_eq!(event["actor"], "r".repeat(64));
+    assert_eq!(
+        event["detail"]["keys"][0]["enrolled_by"],
+        format!("device:{}", "r".repeat(64))
+    );
+    assert_eq!(plan.keys[0].enrolled_by, format!("device:{}", options.root));
+}
+
+#[test]
+fn flag_off_leaf_retirement_preserves_an_independent_owner() {
+    let mut f = Fixture::new();
+    let (_, op) = f.confirmed(2);
+    let child = f
+        .approve(&op, &sign(&f.key, &f.message(&op, false)))
+        .unwrap();
+    f.svc.second_device_enrollment = false;
+    // Refusing the approver must not turn into a blanket ban on safe leaf retirement.
+    assert!(f
+        .svc
+        .revoke_device_key(&f.key_id, Some(&f.owner.client_id))
+        .is_err());
+    assert!(f
+        .svc
+        .revoke_device_key(&child.key_id, Some(&f.owner.client_id))
+        .is_err());
+    f.svc
+        .revoke_device_key(&child.key_id, Some(&child.client_id))
+        .unwrap();
+    assert_eq!(f.svc.owner_device_count(), 1);
+    assert_eq!(f.svc.device_keys()[0].key_id, f.key_id);
+}
+
+#[test]
+fn restart_without_owner_verifier_still_protects_stored_signed_keys() {
+    for operation in ["key", "pairing", "epoch", "rotation"] {
+        let mut f = Fixture::new();
+        {
+            let mut inner = f.svc.lock();
+            f.svc.persist(&mut inner.file).unwrap();
+        }
+        f.svc = PairingService::open(f.dir.path(), f.svc.bound_fingerprint(), true).unwrap();
+        assert_eq!(f.svc.owner_device_count(), 0, "no verifier loaded");
+        let before = serde_json::to_value(f.svc.snapshot()).unwrap();
+        let result = match operation {
+            "key" => f.svc.revoke_device_key(&f.key_id, Some(&f.owner.client_id)),
+            "pairing" => f.svc.revoke(&f.owner.client_id),
+            "epoch" => f.svc.bump_epoch(&f.owner.client_id).map(|_| ()),
+            _ => {
+                use ed25519_dalek::Signer;
+                let dest = pubkey(4);
+                let msg = format!("bitsov-pair-rotate-v1:{}:{dest}", f.owner.client_id);
+                let sig = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).sign(msg.as_bytes());
+                f.svc
+                    .rotate_client_key(&f.owner.client_id, &dest, &hex::encode(sig.to_bytes()))
+                    .map(|_| ())
+            }
+        };
+        assert!(
+            matches!(result, Err(PairingError::NotGrantable(_))),
+            "{operation}: {result:?}"
+        );
+        assert_eq!(serde_json::to_value(f.svc.snapshot()).unwrap(), before);
     }
 }

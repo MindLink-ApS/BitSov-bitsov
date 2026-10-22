@@ -1461,7 +1461,7 @@ async fn owner_tunnel_ticket_and_sas_delegation_happy_path_and_refusals() {
         .unwrap();
     drop(svc);
     let svc = Arc::new(
-        PairingService::open(dir.path(), fp.clone(), false)
+        PairingService::open(dir.path(), fp.clone(), true)
             .unwrap()
             .with_local_owner_device()
             .with_owner_signing_key(owner)
@@ -1719,7 +1719,18 @@ async fn owner_tunnel_ticket_and_sas_delegation_happy_path_and_refusals() {
     assert!(audit.contains("pair.device_delegated"));
     assert!(!audit.contains(&link.code));
     assert!(!audit.contains(&digest.to_hex().to_string()));
-    svc.revoke_device_key(&approved.key_id, Some(&client.client_id))
+    assert!(svc
+        .revoke_device_key(&approved.key_id, Some(&client.client_id))
+        .is_err());
+    let options = pairing::console::RevokeOptions {
+        root: approved.key_id.clone(),
+        cascade: false,
+        with_pairing: false,
+        keep: vec![],
+        allow_zero_owner: false,
+    };
+    let plan = svc.console_revoke_devices(&options, None).unwrap();
+    svc.console_revoke_devices(&options, Some(&plan.confirmation))
         .unwrap();
     assert_eq!(
         call_router(router, "GET", &challenge_path, None, Some(&token))
@@ -2269,4 +2280,124 @@ async fn t14_locked_router_never_mounts_enrollment_or_health() {
     let (status, body) = call_router(router, "GET", "/api/v1/node/lock", None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["state"], "locked");
+}
+
+// The real router must surface the service refusal, with no durable mutation.
+#[tokio::test]
+async fn http_unreviewed_device_removals_are_refused() {
+    use konsensus_api::auth::{create_paired_token, create_token, Scope};
+    use konsensus_api::pairing::device::{key_id_for, owner_approval_message};
+    for enabled in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let base = test_state();
+        let fp = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
+        let signer = konsensus_core::OwnerApprovalKey::from_seed(&[7; 64], &[9; 32]).unwrap();
+        let svc = PairingService::open(dir.path(), fp.clone(), true).unwrap();
+        let client_key = SigningKey::from_bytes(&[1; 32]);
+        let public = hex::encode(client_key.verifying_key().to_bytes());
+        let client = svc
+            .create_ticket_remote_pairing("owner", &public, &[1; 32])
+            .unwrap();
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let device =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
+        let public = hex::encode(device.public_key().as_ref());
+        let key_id = key_id_for(device.public_key().as_ref());
+        let mut file = svc.snapshot();
+        file.device_keys.push(pairing::DeviceKey {
+            key_id: key_id.clone(),
+            client_id: client.client_id.clone(),
+            public_key: public.clone(),
+            name: "owner".into(),
+            registered_at: 1,
+            epoch: client.epoch,
+            client_pubkey: client.client_pubkey.clone(),
+            enrolled_by: "console".into(),
+            owner_approval: hex::encode(
+                signer
+                    .sign(
+                        owner_approval_message(&fp, &client.client_pubkey, client.epoch, &public)
+                            .as_bytes(),
+                    )
+                    .to_bytes(),
+            ),
+        });
+        std::fs::write(
+            svc.dir().join("clients.json"),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        let svc = Arc::new(
+            PairingService::open(dir.path(), fp.clone(), true)
+                .unwrap()
+                .with_owner_signing_key(signer)
+                .with_local_owner_device()
+                .with_second_device_enrollment(enabled),
+        );
+        let state = Arc::new(AppState {
+            pairing: Some(svc.clone()),
+            ..(*base).clone()
+        });
+        let admin = create_token(
+            &state.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            vec![Scope::Admin],
+        )
+        .unwrap();
+        let read = create_paired_token(
+            &state.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            vec![Scope::Read],
+            &client.client_id,
+            client.epoch,
+            &fp,
+        )
+        .unwrap();
+        let new_public = hex::encode(SigningKey::from_bytes(&[4; 32]).verifying_key().to_bytes());
+        let signature = hex::encode(
+            client_key
+                .sign(format!("bitsov-pair-rotate-v1:{}:{new_public}", client.client_id).as_bytes())
+                .to_bytes(),
+        );
+        let before = serde_json::to_value(svc.snapshot()).unwrap();
+        for (method, path, body, token) in [
+            (
+                "POST",
+                "/api/v1/pair/revoke".to_string(),
+                Some(json!({"client_id":client.client_id})),
+                &admin,
+            ),
+            (
+                "POST",
+                "/api/v1/pair/revoke".to_string(),
+                Some(json!({"client_id":client.client_id,"keep_pairing":true})),
+                &admin,
+            ),
+            (
+                "DELETE",
+                format!("/api/v1/pair/device-keys/{key_id}"),
+                None,
+                &read,
+            ),
+            (
+                "POST",
+                "/api/v1/pair/rotate".to_string(),
+                Some(
+                    json!({"client_id":client.client_id,"new_pubkey":new_public,"signature":signature}),
+                ),
+                &read,
+            ),
+        ] {
+            let (status, body) = call(&state, method, &path, body, Some(token)).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "enabled={enabled}, {path}: {body}"
+            );
+            assert!(body.to_string().contains("device revoke"), "{body}");
+            assert_eq!(serde_json::to_value(svc.snapshot()).unwrap(), before);
+        }
+    }
 }
