@@ -134,6 +134,59 @@ pub const MAX_PEER_EXCHANGE_ENTRIES: usize = 64;
 /// an unbounded `String` (validate-before-allocate gap).
 pub const MAX_PEER_LABEL_BYTES: usize = 256;
 
+/// Max UTF-8 bytes of `StarterRequest.network`.
+///
+/// Honest values are `signet` and `regtest`. 32 bytes still lets a wrong
+/// network through to the hub's mismatch refusal, and rejects a frame that
+/// would otherwise copy a multi-megabyte string into the signature preimage.
+pub const MAX_STARTER_NETWORK_BYTES: usize = 32;
+
+/// Max UTF-8 bytes of `StarterRequest.ln_pubkey`.
+///
+/// A compressed Lightning key is 66 hex characters. The hub refuses any other
+/// length. 128 leaves room for that refusal instead of treating a short typo
+/// as an invalid frame.
+pub const MAX_STARTER_LN_PUBKEY_BYTES: usize = 128;
+
+/// Max UTF-8 bytes of `StarterRequest.ln_sig`.
+///
+/// LDK message signatures are 104 zbase32 characters. The hub already refuses
+/// anything longer than 1024 before it verifies; this cap applies that bound
+/// while the JSON string is still borrowed.
+pub const MAX_STARTER_LN_SIG_BYTES: usize = 1024;
+
+/// Max UTF-8 bytes of `StarterStatus.state`.
+///
+/// Wire states are short tokens (`received`, `opening`, `refused`, `ready`).
+pub const MAX_STARTER_STATE_BYTES: usize = 32;
+
+/// Max UTF-8 bytes of `StarterStatus.reason`.
+///
+/// Refusal reasons are fixed tokens such as `hub_insufficient_funds`.
+pub const MAX_STARTER_REASON_BYTES: usize = 64;
+
+/// Max UTF-8 bytes of `StarterStatus.channel_id`.
+///
+/// LDK's channel id is 64 hex characters. 128 covers that and a short native id.
+pub const MAX_STARTER_CHANNEL_ID_BYTES: usize = 128;
+
+/// Max UTF-8 bytes of `StarterStatus.funding_txid`.
+///
+/// A transaction id is 64 hex characters.
+pub const MAX_STARTER_TXID_BYTES: usize = 128;
+
+/// Max UTF-8 bytes of `LightningInfo.ln_pubkey`.
+///
+/// Compressed keys are 66 hex characters; uncompressed hex is 130. The session
+/// handler still requires the compressed form.
+pub const MAX_LN_PUBKEY_BYTES: usize = 130;
+
+/// Max UTF-8 bytes of `LightningInfo.ln_addr`.
+///
+/// A dialable `host:port` (DNS name, IPv6, or onion) fits in 256 bytes. The
+/// auto-channel path dials this string after a privileged announcement.
+pub const MAX_LN_ADDR_BYTES: usize = 256;
+
 /// Max number of JSON value nodes (scalars + container slots) permitted in a
 /// `serde_json::Value` field (`PrekeyOffer.bundle`, `SessionInit.init_data`).
 ///
@@ -202,6 +255,33 @@ mod bounded {
             }
         }
         deserializer.deserialize_str(StringVisitor::<MAX>)
+    }
+
+    /// `Option<String>` form of [`limited_string`]. `null` and unit are `None`.
+    /// A present string is rejected before it is copied when it exceeds `MAX`.
+    pub fn limited_opt_string<'de, D: Deserializer<'de>, const MAX: usize>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        struct OptVisitor<const MAX: usize>;
+        impl<'de, const MAX: usize> Visitor<'de> for OptVisitor<MAX> {
+            type Value = Option<String>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "optional string of at most {MAX} bytes")
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Option<String>, E> {
+                Ok(None)
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Option<String>, E> {
+                Ok(None)
+            }
+            fn visit_some<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Option<String>, D::Error> {
+                limited_string::<D, MAX>(deserializer).map(Some)
+            }
+        }
+        deserializer.deserialize_option(OptVisitor::<MAX>)
     }
 
     /// Deserialize a `Vec<u8>` whose element count must not exceed `MAX`.
@@ -835,40 +915,56 @@ pub enum Frame {
         reason: String,
     },
 
+    /// Invite-gated starter-channel request. String fields are capped; see
+    /// [`MAX_STARTER_NETWORK_BYTES`].
+    StarterRequest {
+        v: u8,
+        request_id: uuid::Uuid,
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_STARTER_NETWORK_BYTES>")]
+        network: String,
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_STARTER_LN_PUBKEY_BYTES>")]
+        ln_pubkey: String,
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_STARTER_LN_SIG_BYTES>")]
+        ln_sig: String,
+    },
+    /// Hub reply to a starter request. String fields are capped at decode.
+    StarterStatus {
+        request_id: uuid::Uuid,
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_STARTER_STATE_BYTES>")]
+        state: String,
+        #[serde(deserialize_with = "bounded::limited_opt_string::<_, MAX_STARTER_REASON_BYTES>")]
+        reason: Option<String>,
+        retry_after_unix: Option<u64>,
+        original_request_id: Option<uuid::Uuid>,
+        capacity_sats: Option<u64>,
+        push_sats: Option<u64>,
+        #[serde(
+            deserialize_with = "bounded::limited_opt_string::<_, MAX_STARTER_CHANNEL_ID_BYTES>"
+        )]
+        channel_id: Option<String>,
+        #[serde(deserialize_with = "bounded::limited_opt_string::<_, MAX_STARTER_TXID_BYTES>")]
+        funding_txid: Option<String>,
+    },
+
     /// Lightning node information — exchanged after federation handshake when
     /// a node advertises `Capability::Keysend`.
     ///
     /// Contains the node's Lightning pubkey, enabling peers to send keysend
     /// (spontaneous) payments without the RequestInvoice/InvoiceResponse
     /// round-trip. This reduces message compose latency by ~100-200ms.
-    StarterRequest {
-        v: u8,
-        request_id: uuid::Uuid,
-        network: String,
-        ln_pubkey: String,
-        ln_sig: String,
-    },
-    StarterStatus {
-        request_id: uuid::Uuid,
-        state: String,
-        reason: Option<String>,
-        retry_after_unix: Option<u64>,
-        original_request_id: Option<uuid::Uuid>,
-        capacity_sats: Option<u64>,
-        push_sats: Option<u64>,
-        channel_id: Option<String>,
-        funding_txid: Option<String>,
-    },
-
     LightningInfo {
         /// Compressed Lightning node public key (hex, 66 characters).
         /// This is the pubkey of the LND/LDK/CLN node, not the Ed25519 identity key.
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_LN_PUBKEY_BYTES>")]
         ln_pubkey: String,
         /// Dialable Lightning P2P address (`host:port`) for channel opens.
         ///
         /// Optional for backward compatibility with pre-ONB5 nodes that only
         /// exchanged the pubkey for keysend payments.
-        #[serde(default)]
+        #[serde(
+            default,
+            deserialize_with = "bounded::limited_opt_string::<_, MAX_LN_ADDR_BYTES>"
+        )]
         ln_addr: Option<String>,
     },
 
