@@ -947,11 +947,22 @@ self-retirement (`DELETE /api/v1/pair/device-keys/{id}`), and pairing-key rotati
 refuse with 403 when they would retire device keys while enrollment is enabled,
 or orphan stored `device:` / `second_device:` approvals, or remove the last
 owner device. These checks run under the pairing lock, including after a flag-off
-restart; rotation also checks the destination pairing's keys. The refusal points
+restart; rotation also checks the destination pairing's keys. Re-pairing an
+already-paired public key runs the same guard before advancing its epoch and
+making its device keys stale. The refusal points
 to `device revoke --key <id>` on the owner console. Add `--with-pairing` to remove
 its pairing, or `--cascade` to remove its approval chain. Console revocation
 remains available with enrollment disabled and requires a fresh preview digest
 at commit; changed options or authority invalidate the confirmation.
+
+For incident response, a node running without `--owner-control` fails closed:
+a pairing holding the last owner key, or a stored owner-signed device key whose
+signature the running process cannot verify, cannot be revoked until the node
+is restarted with `--owner-control`. Stop the home service and use the unlocked
+operator process described above, then review and confirm `device revoke` on
+the owner console. Removing the last owner also requires `--allow-zero-owner`.
+Disabling enrollment or re-pairing the same public key does not bypass this
+review.
 
 A cascade visits approvals by every key on each pairing it removes, including
 independently enrolled sibling keys. `--keep` preserves the specified key but

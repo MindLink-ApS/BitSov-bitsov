@@ -1586,6 +1586,9 @@ impl PairingService {
         if scopes.contains(&Scope::Identity) && !inner.identity_fingerprint.is_empty() {
             return Err(PairingError::Closed);
         }
+        // Re-pairing advances the epoch and stales every device key on this
+        // pairing. Review that loss of authority before changing durable state.
+        self.guard_device_removal(&inner, |key| key.client_id == client_id)?;
         let fingerprint = inner.identity_fingerprint.clone();
         let epoch = {
             let prior = inner

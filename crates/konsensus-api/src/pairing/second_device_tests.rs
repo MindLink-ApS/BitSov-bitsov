@@ -1542,6 +1542,32 @@ fn console_legacy_revocations_refused_with_last_owner_even_when_flag_is_off() {
     }
 }
 
+// Exercise the real local ceremony, including consumption of a refused attempt.
+fn re_pair(svc: &PairingService, seed: u8) -> Result<PairedClient, PairingError> {
+    use ed25519_dalek::Signer;
+    svc.open_pairing_window(Duration::from_secs(60));
+    let public = pubkey(seed);
+    let pending = svc.request_pairing("re-paired device", &public).unwrap();
+    let path = svc.challenge_path(&pending.pair_id);
+    let challenge = std::fs::read(&path).unwrap();
+    let signature = hex::encode(
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+            .sign(&PairingService::proof_message(
+                &pending.pair_id,
+                &public,
+                &challenge,
+            ))
+            .to_bytes(),
+    );
+    let result = svc.confirm_pairing(&pending.pair_id, &signature, default_pairing_scopes());
+    assert!(!path.exists());
+    assert!(matches!(
+        svc.confirm_pairing(&pending.pair_id, &signature, default_pairing_scopes()),
+        Err(PairingError::UnknownPending)
+    ));
+    result
+}
+
 // Each case must fail if its service entry point loses the locked guard.
 #[test]
 fn unreviewed_removal_refuses_stored_approvals_and_zero_owners() {
@@ -1554,6 +1580,7 @@ fn unreviewed_removal_refuses_stored_approvals_and_zero_owners() {
                 "epoch",
                 "rotation",
                 "rotation_destination",
+                "re_pairing",
             ] {
                 let mut f = Fixture::new();
                 if let Some(prefix) = provenance {
@@ -1595,6 +1622,7 @@ fn unreviewed_removal_refuses_stored_approvals_and_zero_owners() {
                     "key" => f.svc.revoke_device_key(&f.key_id, Some(&f.owner.client_id)),
                     "pairing" => f.svc.revoke(&f.owner.client_id),
                     "epoch" => f.svc.bump_epoch(&f.owner.client_id).map(|_| ()),
+                    "re_pairing" => re_pair(&f.svc, 1).map(|_| ()),
                     _ => {
                         let (seed, dest) = if operation == "rotation_destination" {
                             (4, pubkey(1))
@@ -1702,12 +1730,27 @@ fn console_revocation_audit_sanitizes_missing_root() {
 }
 
 #[test]
-fn flag_off_leaf_retirement_preserves_an_independent_owner() {
+fn leaf_retirement_requires_review_only_while_enrollment_is_on() {
     let mut f = Fixture::new();
     let (_, op) = f.confirmed(2);
     let child = f
         .approve(&op, &sign(&f.key, &f.message(&op, false)))
         .unwrap();
+    assert_eq!(f.svc.owner_device_count(), 2);
+    let before = serde_json::to_value(f.svc.snapshot()).unwrap();
+    let disk = std::fs::read(f.svc.dir().join("clients.json")).unwrap();
+    // This leaf approved nobody, has a verifiable signature, and leaves an owner.
+    // Only the enrollment-on term can refuse its retirement.
+    assert!(matches!(
+        f.svc
+            .revoke_device_key(&child.key_id, Some(&child.client_id)),
+        Err(PairingError::NotGrantable(_))
+    ));
+    assert_eq!(serde_json::to_value(f.svc.snapshot()).unwrap(), before);
+    assert_eq!(
+        std::fs::read(f.svc.dir().join("clients.json")).unwrap(),
+        disk
+    );
     f.svc.second_device_enrollment = false;
     // Refusing the approver must not turn into a blanket ban on safe leaf retirement.
     assert!(f
@@ -1727,7 +1770,7 @@ fn flag_off_leaf_retirement_preserves_an_independent_owner() {
 
 #[test]
 fn restart_without_owner_verifier_still_protects_stored_signed_keys() {
-    for operation in ["key", "pairing", "epoch", "rotation"] {
+    for operation in ["key", "pairing", "epoch", "rotation", "re_pairing"] {
         let mut f = Fixture::new();
         {
             let mut inner = f.svc.lock();
@@ -1740,6 +1783,7 @@ fn restart_without_owner_verifier_still_protects_stored_signed_keys() {
             "key" => f.svc.revoke_device_key(&f.key_id, Some(&f.owner.client_id)),
             "pairing" => f.svc.revoke(&f.owner.client_id),
             "epoch" => f.svc.bump_epoch(&f.owner.client_id).map(|_| ()),
+            "re_pairing" => re_pair(&f.svc, 1).map(|_| ()),
             _ => {
                 use ed25519_dalek::Signer;
                 let dest = pubkey(4);
@@ -1756,4 +1800,46 @@ fn restart_without_owner_verifier_still_protects_stored_signed_keys() {
         );
         assert_eq!(serde_json::to_value(f.svc.snapshot()).unwrap(), before);
     }
+}
+
+#[test]
+fn re_pairing_without_device_keys_is_allowed_with_enrollment_on_or_off() {
+    for enabled in [true, false] {
+        let mut f = Fixture::new();
+        let client = f
+            .svc
+            .create_ticket_remote_pairing("leaf", &pubkey(4), &[4; 32])
+            .unwrap();
+        f.svc.second_device_enrollment = enabled;
+        let paired = re_pair(&f.svc, 4).unwrap();
+        assert_eq!(paired.client_id, client.client_id);
+        assert_eq!(paired.epoch, client.epoch + 1);
+        assert_eq!(f.svc.owner_device_count(), 1);
+    }
+}
+
+#[test]
+fn re_pairing_a_leaf_requires_review_only_while_enrollment_is_on() {
+    let mut f = Fixture::new();
+    let (client, op) = f.confirmed(2);
+    f.approve(&op, &sign(&f.key, &f.message(&op, false)))
+        .unwrap();
+    assert_eq!(f.svc.owner_device_count(), 2);
+    let before = serde_json::to_value(f.svc.snapshot()).unwrap();
+    let disk = std::fs::read(f.svc.dir().join("clients.json")).unwrap();
+    assert!(matches!(
+        re_pair(&f.svc, 2),
+        Err(PairingError::NotGrantable(_))
+    ));
+    assert_eq!(serde_json::to_value(f.svc.snapshot()).unwrap(), before);
+    assert_eq!(
+        std::fs::read(f.svc.dir().join("clients.json")).unwrap(),
+        disk
+    );
+    f.svc.second_device_enrollment = false;
+    let paired = re_pair(&f.svc, 2).unwrap();
+    assert_eq!(paired.client_id, client.client_id);
+    assert_eq!(paired.epoch, client.epoch + 1);
+    assert_eq!(f.svc.owner_device_count(), 1);
+    assert!(f.svc.device_keys().iter().any(|key| key.key_id == f.key_id));
 }
