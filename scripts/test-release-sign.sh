@@ -56,6 +56,55 @@ cat > "$WORK/bin/gh" <<'STUB'
 source "$TEST_ROOT/bin/common"
 printf '%s\n' "$*" >> "$CASE_DIR/gh.log"
 case "${1:-} ${2:-}" in
+  "api repos/$TEST_REPO/releases")
+    expect_args "$(printf '%s\n' api "repos/$TEST_REPO/releases" --paginate --jq '.[] | select(.draft == false) | .tag_name')" "$@"
+    [ "$TEST_CASE" != version-api-failure ] || exit 1
+    if [[ "$TEST_CASE" == version:* ]]; then
+      # Deliberately unordered: the highest version is not necessarily first.
+      printf '%s\n' v8.9.99 v0.2.99 "$PUBLISHED_TAG" v0.3.0-rc1 unrelated
+    fi
+    ;;
+  "api repos/$TEST_REPO/releases/tags/$TEST_TAG")
+    expect_args "$(printf '%s\n' api "repos/$TEST_REPO/releases/tags/$TEST_TAG" --jq '.assets[] | [.name, (.id | tostring), (.digest // "")] | @tsv')" "$@"
+    [ "$TEST_CASE" != asset-api-failure ] || exit 1
+    n=0
+    [ ! -f "$CASE_DIR/asset-checks" ] || n=$(cat "$CASE_DIR/asset-checks")
+    n=$((n + 1))
+    echo "$n" > "$CASE_DIR/asset-checks"
+    names=$("$0" release view "$TEST_TAG" --repo "$TEST_REPO" --json assets -q '.assets[].name')
+    id=0
+    while IFS= read -r name; do
+      id=$((id + 1))
+      digest=''
+      if [ -f "$TEST_ROOT/fixtures/$name" ]; then
+        digest="sha256:$(awk -v name="$name" '$2 == name {print $1}' "$TEST_ROOT/expected-sums")"
+      fi
+      if [ "$TEST_CASE" = compromised-ci ]; then
+        # This case models compromised CI bytes already in the pinned draft.
+        cp "$TEST_ROOT/fixtures/bitsov-linux-x86_64" "$CASE_DIR/injected"
+        echo injected >> "$CASE_DIR/injected"
+        hash=$(shasum -a 256 "$CASE_DIR/injected" | awk '{print $1}')
+        case "$name" in
+          bitsov-linux-x86_64) digest="sha256:$hash" ;;
+          bitsov-linux-x86_64.sha256)
+            digest="sha256:$(printf '%s  bitsov-linux-x86_64\n' "$hash" | shasum -a 256 | awk '{print $1}')" ;;
+        esac
+      fi
+      if [ "$name" = bitsov-windows-x86_64.sbom.spdx.json ]; then
+        case "$TEST_CASE" in
+          asset-missing-digest) digest='' ;;
+          asset-changed-after-download) [ "$n" -lt 2 ] || digest="sha256:$(printf '%064d' 0)" ;;
+          asset-replaced-after-download) [ "$n" -lt 2 ] || id=999 ;;
+          asset-removed-after-download) [ "$n" -lt 2 ] || continue ;;
+          asset-changed-after-sign) [ ! -e "$CASE_DIR/signed-sums" ] || digest="sha256:$(printf '%064d' 0)" ;;
+        esac
+      fi
+      printf '%s\t%s\t%s\n' "$name" "$id" "$digest"
+    done <<<"$names"
+    if [ "$TEST_CASE" = asset-added-after-download ] && [ "$n" -ge 2 ]; then
+      printf 'extra.txt\t999\tsha256:%064d\n' 0
+    fi
+    ;;
   'run list')
     expect_args "$(printf '%s\n' run list --repo "$TEST_REPO" --workflow ci.yml --branch "$TEST_TAG" --event push --limit 1 --json databaseId -q '.[0].databaseId')" "$@"
     echo 123
@@ -123,6 +172,9 @@ case "${1:-} ${2:-}" in
     if [ "$asset" = bitsov-linux-x86_64 ] && [ "$TEST_CASE" = compromised-ci ]; then
       echo injected >> "$asset"
       shasum -a 256 "$asset" > "$asset.sha256"
+    fi
+    if [ "$TEST_CASE" = asset-download-digest-drift ]; then
+      echo changed >> "$asset.sbom.spdx.json"
     fi
     # Corrupt the LAST asset: the script must validate all five before signing.
     if [ "$asset" = bitsov-windows-x86_64 ]; then
@@ -311,6 +363,10 @@ run_case() (
     dotted-*) TEST_TAG=v0.3.0-rc19.1 ;;
     stable-*) TEST_TAG=v0.3.0 ;;
   esac
+  if [[ "$TEST_CASE" == version:* ]]; then
+    IFS=: read -r _ TEST_TAG PUBLISHED_TAG VERSION_RESULT <<<"$TEST_CASE"
+    export TEST_TAG PUBLISHED_TAG
+  fi
   mkdir -p "$CASE_DIR"
   fail() { echo "$*" >&2; exit 1; }
   git init -q --bare "$CASE_DIR/origin.git"
@@ -362,6 +418,9 @@ run_case() (
       ;;
     *) git push -q -u origin main ;;
   esac
+  if [[ "$TEST_CASE" == version:* && "$TEST_TAG" =~ -rc[0-9]+\.[0-9]+$ ]]; then
+    git push -q origin "$COMMIT:refs/heads/release/$TEST_TAG"
+  fi
   if [ "$TEST_CASE" = dotted-on-main-head-diff ]; then
     git push -q origin "$OTHER_COMMIT:refs/heads/release/$TEST_TAG"
     git merge-base --is-ancestor "$COMMIT" origin/main || fail 'fixture commit is not on main'
@@ -523,6 +582,13 @@ run_case() (
   reason=''
   case "$TEST_CASE" in
     darwin-match|darwin-intel-match|existing|fresh|dotted-release|dotted-release-fresh|subkey|stderr-noise|retry|retry-sums|retry-signature|dry-existing|accept-mismatch|dry-accept-mismatch|accept-darwin-mismatch|accept-match) ;;
+    version:*)
+      [ "$VERSION_RESULT" = reject ] && reason="tag $TEST_TAG must be newer than newest published release $PUBLISHED_TAG" || true ;;
+    version-api-failure) reason='cannot list published releases; refusing to sign' ;;
+    asset-api-failure) reason='cannot snapshot release assets' ;;
+    asset-missing-digest) reason='missing or invalid SHA-256 digest for release asset' ;;
+    asset-download-digest-drift) reason='downloaded asset digest differs from pinned draft' ;;
+    asset-*-after-*) reason="release $TEST_TAG assets changed since download" ;;
     dotted-release-head-diff|dotted-on-main-head-diff|dotted-stale-fetch-head) reason="$COMMIT does not match the approved release branch release/$TEST_TAG" ;;
     dotted-release-missing) reason="cannot fetch approved release branch release/$TEST_TAG from origin" ;;
     *tag-fetch-conflict) reason='cannot fetch tags from origin' ;;
@@ -645,8 +711,18 @@ run_case() (
     [ "$rc" -ne 0 ] || fail 'expected rejection, got success'
     grep -F "release-sign: $reason" "$CASE_DIR/output" >/dev/null || fail "missing rejection: $reason"
     [ ! -e "$CASE_DIR/upload.args" ] || fail 'uploaded after rejection'
-    if [ "$reason" != 'signature check failed' ]; then
+    if [ "$reason" != 'signature check failed' ] && [ "$TEST_CASE" != asset-changed-after-sign ]; then
       [ ! -e "$CASE_DIR/signed-sums" ] || fail 'signed before validation finished'
+    fi
+  fi
+  if [[ "$TEST_CASE" == version:* ]] && [ "$VERSION_RESULT" = reject ]; then
+    [ ! -s "$CASE_DIR/gpg.log" ] || fail 'version rejection accessed GPG'
+    [ ! -e "$CASE_DIR/build.log" ] || fail 'version rejection rebuilt'
+  fi
+  if [[ "$TEST_CASE" == asset-*-after-* ]]; then
+    [ -s "$CASE_DIR/build.log" ] || fail 'asset mutation rejected before rebuild'
+    if [ "$TEST_CASE" = asset-changed-after-sign ]; then
+      [ -e "$CASE_DIR/signed-sums" ] || fail 'mutation did not occur during signing'
     fi
   fi
   if [ "$TEST_CASE" = published-late ]; then
@@ -692,9 +768,26 @@ if [ -n "$legacy" ]; then locales+=("$legacy"); else echo 'SKIP: no non-UTF-8 lo
 [ -n "$utf8" ] || { echo 'ERROR: en_US.UTF-8 is required (install/generate it first)' >&2; exit 1; }
 locales+=("$utf8")
 
+# All pairwise relations in the required RC chain, plus stable/patch boundaries.
+version_cases=()
+versions=(v0.3.0-rc18 v0.3.0-rc19 v0.3.0-rc19.1 v0.3.0-rc19.2)
+for i in "${!versions[@]}"; do
+  for j in "${!versions[@]}"; do
+    result=reject
+    [ "$i" -le "$j" ] || result=accept
+    version_cases+=("version:${versions[$i]}:${versions[$j]}:$result")
+  done
+done
+version_cases+=(version:v0.3.0:v0.3.0-rc19.2:accept version:v0.3.0-rc20:v0.3.0:reject
+  version:v0.3.0:v0.3.0:reject version:v0.3.1-rc1:v0.3.0:accept
+  version:v0.3.0:v0.3.1-rc1:reject version:v0.3.0-rc10:v0.3.0-rc9:accept
+  version:v0.3.0-rc19.10:v0.3.0-rc19.2:accept)
+
 passed=0 failed=0
 for test_locale in "${locales[@]}"; do
-  for test_case in darwin-xcode-drift darwin-build-drift darwin-sdk-drift darwin-clang-drift darwin-tools-missing darwin-sdk-override darwin-compiler-override \
+  for test_case in "${version_cases[@]}" version-api-failure asset-api-failure asset-missing-digest \
+    asset-changed-after-download asset-replaced-after-download asset-added-after-download asset-removed-after-download \
+    asset-changed-after-sign asset-download-digest-drift darwin-xcode-drift darwin-build-drift darwin-sdk-drift darwin-clang-drift darwin-tools-missing darwin-sdk-override darwin-compiler-override \
     accept-darwin-sdk-drift darwin-match darwin-intel-match build-darwin-xcode-drift build-darwin-build-drift \
     build-darwin-sdk-drift build-darwin-clang-drift build-darwin-tools-missing build-darwin-match existing fresh wrong-tag ci-sha non-draft checksum filename expired-tag \
     expired-sums mismatch compromised-ci unsupported-host build-failure no-waivers missing-waiver waive-host \
