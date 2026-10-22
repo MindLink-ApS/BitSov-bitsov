@@ -3781,3 +3781,194 @@ async fn peer_rejection_logs_strip_controls_at_downstream_handlers() {
         assert_eq!(logged, "peerreason");
     }
 }
+
+// A local recorder keeps this assertion isolated from concurrently running tests.
+#[derive(Default)]
+struct StarterQueueRecorder(
+    std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicU64>>>,
+);
+impl metrics::Recorder for StarterQueueRecorder {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        if key.name() == "konsensus_starter_refusals_total" {
+            if let Some(reason) = key.labels().find(|l| l.key() == "reason") {
+                return metrics::Counter::from_arc(
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .entry(reason.value().into())
+                        .or_default()
+                        .clone(),
+                );
+            }
+        }
+        metrics::Counter::noop()
+    }
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+#[tokio::test]
+async fn starter_full_or_closed_queue_disconnects_noise_peer_with_counted_reason() {
+    for closed in [false, true] {
+        let recorder = StarterQueueRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        use konsensus_message::{ReachabilityMode, TransportConfig};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let (_, a) = NodeIdentity::generate().unwrap();
+        let (_, b) = NodeIdentity::generate().unwrap();
+        let a = Arc::new(a);
+        let b = Arc::new(b);
+        let peer = *a.node_id();
+        let recipient = *b.node_id();
+        let transport = |id: Arc<NodeIdentity>| {
+            Arc::new(NoiseTransport::new(
+                id,
+                TransportConfig {
+                    listen_addr: "127.0.0.1:0".parse().unwrap(),
+                    admission_mode: ReachabilityMode::PriceOpen,
+                    whitelist: vec![peer, recipient],
+                    ..Default::default()
+                },
+            ))
+        };
+        let source = transport(a);
+        let target = transport(b.clone());
+        target.start_listener().await.unwrap();
+        let storage = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+        let sessions = Arc::new(SessionManager::new(b.clone()));
+        let registry = Arc::new(tokio::sync::RwLock::new(PeerRegistry::new()));
+        let prices = Arc::new(PeerPriceCache::new());
+        let provider = Arc::new(
+            konsensus_lightning::shared_mock::SharedMockProvider::new(
+                &dir.path().join("mock.sqlite"),
+                "b",
+                0,
+            )
+            .unwrap(),
+        );
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (ws, _ws_rx) = broadcast::channel(8);
+        let (delivery, _delivery_rx) = broadcast::channel(8);
+        let (pending, _pending_rx) = mpsc::channel(8);
+        let (auto, _auto_rx) = mpsc::channel(8);
+        let (starter_tx, mut starter_rx) = mpsc::channel(1);
+        let queued = Frame::StarterRequest {
+            v: 1,
+            request_id: uuid::Uuid::new_v4(),
+            network: "regtest".into(),
+            ln_pubkey: "02".repeat(33),
+            ln_sig: "signature".into(),
+        };
+        starter_tx.try_send((peer, queued.clone())).unwrap();
+        if closed {
+            starter_rx.close();
+        }
+        let worker = tokio::spawn(run(SessionHandlerDeps {
+            content_server: None,
+            front_door: Default::default(),
+            min_admission_cost_msat: 0,
+            privacy: Default::default(),
+            peer_exchange_floor: 0,
+            transport: target.clone(),
+            session_manager: sessions.clone(),
+            storage: storage.clone(),
+            our_node_id: recipient,
+            identity: b,
+            audit_log: Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap()),
+            pricing: Arc::new(konsensus_pricing::StaticPricingEngine::new(
+                konsensus_pricing::StaticPricingConfig {
+                    chat_msat: 2000,
+                    ..Default::default()
+                },
+            )),
+            chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+            peer_prices: prices.clone(),
+            peer_registry: registry.clone(),
+            routing: Arc::new(konsensus_routing::RoutingTable::new(Default::default())),
+            gossip_validator: Arc::new(konsensus_gossip::GossipValidator::new(Default::default())),
+            send_timestamps: Default::default(),
+            lightning: provider.clone(),
+            lightning_addr: None,
+            mock_lightning: true,
+            invoice_requests: Default::default(),
+            peer_ln_pubkeys: Default::default(),
+            ws_broadcast: ws,
+            ws_delivery_tx: delivery,
+            pending_tx: pending,
+            starter_hub_tx: Some(starter_tx),
+            starter_newcomer_tx: None,
+            auto_channel_tx: auto,
+            shutdown_rx,
+        }));
+        source
+            .connect(&recipient, &target.listen_addr().unwrap().to_string())
+            .await
+            .unwrap();
+
+        assert!(target.connected_session_peers().await.contains(&peer));
+        source.send_frame(&recipient, &queued).await.unwrap();
+        let disconnected = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !target.connected_session_peers().await.contains(&peer) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        shutdown.send(true).unwrap();
+        worker.await.unwrap();
+        source.shutdown();
+        target.shutdown();
+        assert!(
+            disconnected.is_ok(),
+            "overloaded starter queue silently dropped request"
+        );
+        let reason = if closed {
+            "worker_unavailable"
+        } else {
+            "queue_full"
+        };
+        assert_eq!(
+            recorder
+                .0
+                .lock()
+                .unwrap()
+                .get(reason)
+                .map(|c| c.load(std::sync::atomic::Ordering::SeqCst)),
+            Some(1)
+        );
+        assert!(matches!(starter_rx.try_recv(), Ok((id, _)) if id == peer));
+        assert!(starter_rx.try_recv().is_err());
+    }
+}
