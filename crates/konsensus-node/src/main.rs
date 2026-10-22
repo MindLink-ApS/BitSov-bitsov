@@ -1468,10 +1468,12 @@ async fn start_node_services<'a>(
     let rate_limiter = Arc::new(konsensus_api::RateLimiter::new(config.api.rate_limit_rps));
 
     // Audit log
-    let audit_log = Arc::new(
-        konsensus_api::AuditLog::open(&config.api.audit_log_path)
-            .context("failed to open audit log")?,
-    );
+    let audit_log = konsensus_api::AuditLog::open_with_starter_storage(
+        &config.api.audit_log_path,
+        node.storage().clone(),
+    )
+    .await
+    .context("failed to open audit log")?;
     audit_log.record(
         konsensus_api::audit::events::NODE_STARTED,
         &node.node_id().to_hex(),

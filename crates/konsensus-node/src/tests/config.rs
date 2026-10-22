@@ -3658,3 +3658,26 @@ fn privacy_node_ids_still_deserialize_from_toml() {
     assert_eq!(config.shareable_peers[0].to_hex(), id);
     assert_eq!(config.share_peer_labels[0].to_hex(), id);
 }
+
+#[test]
+fn load_rejects_oversized_starter_hub_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let mnemonic_path = dir.path().join("mnemonic.txt");
+    std::fs::write(&mnemonic_path, "abandon ".repeat(24).trim()).unwrap();
+    let mut config = NodeConfig::default_for_tier(NodeTier::Light, mnemonic_path, dir.path());
+    let path = dir.path().join("konsensus.toml");
+    for alias in ["a".repeat(128), "é".repeat(64)] {
+        config.starter.hub_alias = Some(alias);
+        config.save(&path).unwrap();
+        assert!(NodeConfig::load(&path).is_ok());
+    }
+    for alias in ["a".repeat(129), "é".repeat(65)] {
+        config.starter.hub_alias = Some(alias);
+        config.save(&path).unwrap();
+        let error = NodeConfig::load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("starter.hub_alias must be at most 128 bytes"),
+            "{error}"
+        );
+    }
+}
