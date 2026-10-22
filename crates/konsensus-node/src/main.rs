@@ -1929,6 +1929,7 @@ async fn start_node_services<'a>(
     let (starter_hub_tx, starter_hub_handle) = if config.starter_hub.enabled {
         let (tx,rx)=tokio::sync::mpsc::channel(64);
         let hub=onboarding::starter_hub::StarterHub {
+            request_windows: Default::default(),
             config:config.starter_hub.clone(),storage:Arc::clone(node.storage()),lightning:Arc::clone(node.lightning()),
             hub_id:*node.node_id(),network:config.lightning.bitcoin_network().expect("validated starter network"),
         };

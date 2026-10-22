@@ -8,6 +8,10 @@ use std::sync::Mutex;
 struct Backend {
     db: Arc<dyn Storage>,
     calls: AtomicUsize,
+    verifications: AtomicUsize,
+    channel_reads: AtomicUsize,
+    peer_reads: AtomicUsize,
+    balance_reads: AtomicUsize,
     channels: Mutex<Vec<ChannelInfo>>,
     outcome: u8,
     connected: std::sync::atomic::AtomicBool,
@@ -49,9 +53,11 @@ impl LightningProvider for Backend {
         sig: &str,
         _: &str,
     ) -> Result<bool, LightningError> {
+        self.verifications.fetch_add(1, Ordering::SeqCst);
         Ok(sig == String::from_utf8_lossy(message))
     }
     async fn list_peers(&self) -> Result<Vec<LightningPeer>, LightningError> {
+        self.peer_reads.fetch_add(1, Ordering::SeqCst);
         Ok(vec![LightningPeer {
             pubkey: "02".repeat(33),
             address: "192.0.2.4:9735".into(),
@@ -62,12 +68,14 @@ impl LightningProvider for Backend {
         Ok(())
     }
     async fn get_balance_breakdown(&self) -> Result<WalletBalanceBreakdown, LightningError> {
+        self.balance_reads.fetch_add(1, Ordering::SeqCst);
         Ok(WalletBalanceBreakdown {
             onchain_spendable_sats: Some(1_000_000),
             ..Default::default()
         })
     }
     async fn list_channels(&self) -> Result<Vec<ChannelInfo>, LightningError> {
+        self.channel_reads.fetch_add(1, Ordering::SeqCst);
         if self.fail_channel_read.swap(false, Ordering::SeqCst) {
             return Err(LightningError::Backend("channel read failed".into()));
         }
@@ -140,12 +148,17 @@ async fn setup(outcome: u8) -> (StarterHub, Arc<Backend>, NodeId) {
     let backend = Arc::new(Backend {
         db: db.clone(),
         calls: AtomicUsize::new(0),
+        verifications: AtomicUsize::new(0),
+        channel_reads: AtomicUsize::new(0),
+        peer_reads: AtomicUsize::new(0),
+        balance_reads: AtomicUsize::new(0),
         channels: Mutex::new(vec![]),
         outcome,
         connected: std::sync::atomic::AtomicBool::new(true),
         fail_channel_read: std::sync::atomic::AtomicBool::new(false),
     });
     let hub = StarterHub {
+        request_windows: Default::default(),
         config: StarterHubConfig {
             enabled: true,
             ..Default::default()
@@ -435,6 +448,10 @@ async fn refused_request_flood_keeps_only_one_row_and_does_not_extend_throttle()
             if reason == if now == 10 { "ln_peer_not_connected" } else { "rate_limited" })
         );
     }
+    assert_eq!(backend.verifications.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.channel_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.peer_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.balance_reads.load(Ordering::SeqCst), 0);
     assert_eq!(hub.storage.starter_grants().await.unwrap().len(), 1);
     // A new refusal after the throttle replaces the old refusal, rather than
     // growing history; reconnecting after that throttle still permits admission.
@@ -462,6 +479,10 @@ async fn newcomer_replays_timeout_without_duplicate_hub_open_and_waits_for_push(
     let client_backend = Arc::new(Backend {
         db: db.clone(),
         calls: AtomicUsize::new(0),
+        verifications: AtomicUsize::new(0),
+        channel_reads: AtomicUsize::new(0),
+        peer_reads: AtomicUsize::new(0),
+        balance_reads: AtomicUsize::new(0),
         channels: Mutex::new(vec![]),
         outcome: 0,
         connected: std::sync::atomic::AtomicBool::new(true),
@@ -510,6 +531,7 @@ async fn newcomer_replays_timeout_without_duplicate_hub_open_and_waits_for_push(
     let replay = newcomer.poll(115, true).await.unwrap().unwrap();
     assert!(matches!(replay,Frame::StarterRequest{request_id,..} if request_id==id));
     let status = hub.handle(peer, replay, Some(115)).await.unwrap();
+    assert_eq!(backend.verifications.load(Ordering::SeqCst), 1);
     hub.tick(Some(115)).await.unwrap();
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     newcomer.handle(hub.hub_id, status, 115).await.unwrap();
@@ -603,6 +625,10 @@ async fn newcomer_fixture(
     let backend = Arc::new(Backend {
         db: db.clone(),
         calls: AtomicUsize::new(0),
+        verifications: AtomicUsize::new(0),
+        channel_reads: AtomicUsize::new(0),
+        peer_reads: AtomicUsize::new(0),
+        balance_reads: AtomicUsize::new(0),
         channels: Mutex::new(vec![]),
         outcome: 0,
         connected: std::sync::atomic::AtomicBool::new(true),
@@ -1226,4 +1252,312 @@ async fn newcomer_journals_revival_before_queued_terminal_status_after_restart()
     assert_eq!(entries[3]["event"], "starter.refused");
     assert_eq!(entries[3]["detail"]["reason"], "invite_expired");
     assert_eq!(entries[3]["detail"]["paired_device_id"], "paired-device");
+}
+
+#[tokio::test]
+async fn invalid_signature_flood_is_bound_to_session_peer_not_claimed_ln_key() {
+    let (hub, backend, peer) = setup(0).await;
+    for now in 10..110 {
+        let mut frame = request(&hub, peer, Uuid::new_v4());
+        if let Frame::StarterRequest {
+            ln_pubkey, ln_sig, ..
+        } = &mut frame
+        {
+            *ln_pubkey = format!("02{now:064x}");
+            *ln_sig = "invalid".into();
+        }
+        let reply = hub.handle(peer, frame, Some(now)).await.unwrap();
+        assert!(
+            matches!(reply, Frame::StarterStatus { reason: Some(reason), .. }
+            if reason == if now == 10 { "ln_signature_invalid" } else { "rate_limited" })
+        );
+    }
+    assert_eq!(backend.verifications.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.channel_reads.load(Ordering::SeqCst), 0);
+    // The same claimed LN key cannot consume a different authenticated peer's window.
+    let other = NodeId::from_bytes([9; 32]);
+    let mut invite = hub.storage.list_invites_issued().await.unwrap().remove(0);
+    invite.id = Uuid::new_v4();
+    invite.invitee_pubkey = *other.as_bytes();
+    invite.nonce = [2; 16];
+    hub.storage.add_invite_issued(&invite).await.unwrap();
+    let reply = hub
+        .handle(other, request(&hub, other, Uuid::new_v4()), Some(110))
+        .await
+        .unwrap();
+    assert!(matches!(reply, Frame::StarterStatus { state, .. } if state == "received"));
+    assert_eq!(backend.verifications.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.channel_reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn already_served_flood_gets_only_one_expensive_pass_per_window() {
+    for existing_channel in [false, true] {
+        let (hub, backend, peer) = setup(0).await;
+        if existing_channel {
+            backend.channels.lock().unwrap().push(ChannelInfo {
+                is_outbound: None,
+                is_announced: None,
+                is_channel_ready: None,
+                local_reserve_msat: None,
+                initial_push_msat: None,
+                channel_id: "funded".into(),
+                user_channel_id: Some("42".into()),
+                funding_txo: Some("tx:0".into()),
+                peer_pubkey: "02".repeat(33),
+                capacity_msat: 100_000_000,
+                local_balance_msat: 90_000_000,
+                remote_balance_msat: 10_000_000,
+                active: false,
+                short_channel_id: None,
+            });
+        } else {
+            let invite = hub.storage.list_invites_issued().await.unwrap().remove(0);
+            hub.storage
+                .mark_invite_accepted(&invite.id, 5)
+                .await
+                .unwrap();
+            // A pending invite still exists, but a prior invite was already served.
+            let mut pending = invite;
+            pending.id = Uuid::new_v4();
+            pending.state = InviteState::Pending;
+            pending.nonce = [2; 16];
+            hub.storage.add_invite_issued(&pending).await.unwrap();
+        }
+        for now in 10..110 {
+            let reply = hub
+                .handle(peer, request(&hub, peer, Uuid::new_v4()), Some(now))
+                .await
+                .unwrap();
+            assert!(
+                matches!(reply, Frame::StarterStatus { reason: Some(reason), .. }
+            if reason == if now == 10 { "already_served" } else { "rate_limited" })
+            );
+        }
+        assert_eq!(backend.verifications.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.channel_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.peer_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.balance_reads.load(Ordering::SeqCst), 0);
+        let reply = hub
+            .handle(peer, request(&hub, peer, Uuid::new_v4()), Some(610))
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply, Frame::StarterStatus { reason: Some(reason), .. } if reason == "already_served")
+        );
+        assert_eq!(backend.verifications.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.channel_reads.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn newcomer_ten_twenty_forty_minute_successors_survive_hub_throttle() {
+    let (hub, backend, peer) = setup(3).await;
+    let (client, db, _) = newcomer_fixture(&hub, peer).await;
+    let root = newcomer_create(&client).await;
+    backend.connected.store(false, Ordering::SeqCst);
+    for (now, due) in [(100, 700), (700, 1900), (1900, 4300)] {
+        let request = client.poll(now, true).await.unwrap().unwrap();
+        let reply = hub.handle(peer, request, Some(now)).await.unwrap();
+        assert!(
+            matches!(&reply, Frame::StarterStatus { reason: Some(reason), .. } if reason == "ln_peer_not_connected")
+        );
+        client.handle(hub.hub_id, reply, now).await.unwrap();
+        assert!(client.poll(due - 1, true).await.unwrap().is_none());
+    }
+    backend.connected.store(true, Ordering::SeqCst);
+    let request = client.poll(4300, true).await.unwrap().unwrap();
+    let reply = hub.handle(peer, request, Some(4300)).await.unwrap();
+    assert!(matches!(&reply, Frame::StarterStatus { state, .. } if state == "received"));
+    client.handle(hub.hub_id, reply, 4300).await.unwrap();
+    hub.tick(Some(4300)).await.unwrap();
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.verifications.load(Ordering::SeqCst), 4);
+    let current = db.starter_request_current().await.unwrap().unwrap();
+    assert_ne!(current.request_id, root.to_string());
+    assert_eq!(current.root_id(), root.to_string());
+    assert_eq!(current.detail.as_deref(), Some("channel_pending"));
+}
+
+#[tokio::test]
+async fn stored_status_replay_is_bound_to_noise_identity_and_ln_key() {
+    let (hub, backend, peer) = setup(0).await;
+    let id = Uuid::new_v4();
+    let first = request(&hub, peer, id);
+    hub.handle(peer, first.clone(), Some(10)).await.unwrap();
+    let other = NodeId::from_bytes([9; 32]);
+    let stolen = hub.handle(other, first.clone(), Some(11)).await.unwrap();
+    assert!(
+        matches!(stolen, Frame::StarterStatus { reason: Some(reason), .. } if reason == "operation_mismatch")
+    );
+    let mut changed_key = first.clone();
+    if let Frame::StarterRequest { ln_pubkey, .. } = &mut changed_key {
+        *ln_pubkey = "03".repeat(33);
+    }
+    let changed = hub.handle(peer, changed_key, Some(12)).await.unwrap();
+    assert!(
+        matches!(changed, Frame::StarterStatus { reason: Some(reason), .. } if reason == "operation_mismatch")
+    );
+    let replay = hub.handle(peer, first, Some(13)).await.unwrap();
+    assert!(matches!(replay, Frame::StarterStatus { state, .. } if state == "received"));
+    assert_eq!(backend.verifications.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.channel_reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn concurrent_requests_from_one_noise_peer_share_one_expensive_pass() {
+    let (hub, backend, peer) = setup(0).await;
+    backend.connected.store(false, Ordering::SeqCst);
+    let requests = (0..20).map(|_| hub.handle(peer, request(&hub, peer, Uuid::new_v4()), Some(10)));
+    let replies = futures::future::join_all(requests).await;
+    assert_eq!(replies.into_iter().filter(|reply| matches!(reply, Ok(Frame::StarterStatus { reason: Some(reason), .. }) if reason == "rate_limited")).count(), 19);
+    assert_eq!(backend.verifications.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.channel_reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn persisted_window_survives_hub_restart_without_sliding_retry() {
+    let (hub, backend, peer) = setup(0).await;
+    backend.connected.store(false, Ordering::SeqCst);
+    hub.handle(peer, request(&hub, peer, Uuid::new_v4()), Some(10))
+        .await
+        .unwrap();
+    // Drop only volatile attempt state, as when rebuilding the hub after restart.
+    hub.request_windows.lock().await.clear();
+    for now in [100, 609] {
+        let reply = hub
+            .handle(peer, request(&hub, peer, Uuid::new_v4()), Some(now))
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply, Frame::StarterStatus { reason: Some(reason), retry_after_unix: Some(610), .. } if reason == "rate_limited")
+        );
+    }
+    backend.connected.store(true, Ordering::SeqCst);
+    let reply = hub
+        .handle(peer, request(&hub, peer, Uuid::new_v4()), Some(610))
+        .await
+        .unwrap();
+    assert!(matches!(reply, Frame::StarterStatus { state, .. } if state == "received"));
+    assert_eq!(backend.verifications.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.channel_reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn invalid_signature_window_expires_and_cheap_rejections_do_not_consume_it() {
+    let (hub, backend, peer) = setup(0).await;
+    for invalid_version in [false, true] {
+        let mut malformed = request(&hub, peer, Uuid::new_v4());
+        if let Frame::StarterRequest { v, ln_sig, .. } = &mut malformed {
+            if invalid_version {
+                *v = 2;
+            } else {
+                *ln_sig = "x".repeat(1025);
+            }
+        }
+        hub.handle(peer, malformed, Some(9)).await.unwrap();
+    }
+    let mut invalid = request(&hub, peer, Uuid::new_v4());
+    if let Frame::StarterRequest { ln_sig, .. } = &mut invalid {
+        *ln_sig = "invalid".into();
+    }
+    let reply = hub.handle(peer, invalid, Some(10)).await.unwrap();
+    assert!(
+        matches!(reply, Frame::StarterStatus { reason: Some(reason), .. } if reason == "ln_signature_invalid")
+    );
+    let reply = hub
+        .handle(peer, request(&hub, peer, Uuid::new_v4()), Some(609))
+        .await
+        .unwrap();
+    assert!(matches!(
+        reply,
+        Frame::StarterStatus {
+            retry_after_unix: Some(610),
+            ..
+        }
+    ));
+    let reply = hub
+        .handle(peer, request(&hub, peer, Uuid::new_v4()), Some(610))
+        .await
+        .unwrap();
+    assert!(matches!(reply, Frame::StarterStatus { state, .. } if state == "received"));
+    assert_eq!(backend.verifications.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.channel_reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn final_newcomer_successor_can_adopt_a_recently_admitted_ancestor() {
+    let (hub, backend, peer) = setup(3).await;
+    let (client, db, _) = newcomer_fixture(&hub, peer).await;
+    let root = newcomer_create(&client).await;
+    backend.connected.store(false, Ordering::SeqCst);
+    for now in [100, 700, 1900] {
+        let request = client.poll(now, true).await.unwrap().unwrap();
+        let reply = hub.handle(peer, request, Some(now)).await.unwrap();
+        client.handle(hub.hub_id, reply, now).await.unwrap();
+    }
+    // A delayed duplicate of the pruned, locally refused root is admitted just
+    // before the newcomer's final automatic successor (forty-minute backoff).
+    backend.connected.store(true, Ordering::SeqCst);
+    hub.handle(peer, request(&hub, peer, root), Some(4200))
+        .await
+        .unwrap();
+    hub.tick(Some(4200)).await.unwrap();
+    assert!(client.poll(4299, true).await.unwrap().is_none());
+    let final_retry = client.poll(4300, true).await.unwrap().unwrap();
+    let reply = hub.handle(peer, final_retry, Some(4300)).await.unwrap();
+    assert!(
+        matches!(&reply, Frame::StarterStatus { reason: Some(reason), original_request_id: Some(id), .. } if reason == "already_served" && *id == root)
+    );
+    client.handle(hub.hub_id, reply, 4300).await.unwrap();
+    let adopted = db.starter_request_current().await.unwrap().unwrap();
+    assert_eq!(adopted.request_id, root.to_string());
+    assert_eq!(adopted.state, "requested");
+    let replay = client.poll(4301, true).await.unwrap().unwrap();
+    let status = hub.handle(peer, replay, Some(4301)).await.unwrap();
+    client.handle(hub.hub_id, status, 4301).await.unwrap();
+    let current = db.starter_request_current().await.unwrap().unwrap();
+    assert_eq!(current.state, "opening");
+    assert_eq!(current.detail.as_deref(), Some("channel_pending"));
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.verifications.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn throttled_adoption_is_read_only_and_bound_to_both_noise_peer_and_ln_key() {
+    let (hub, backend, peer) = setup(0).await;
+    let original = Uuid::new_v4();
+    hub.handle(peer, request(&hub, peer, original), Some(10))
+        .await
+        .unwrap();
+    for now in 11..111 {
+        let reply = hub
+            .handle(peer, request(&hub, peer, Uuid::new_v4()), Some(now))
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply, Frame::StarterStatus { reason: Some(reason), original_request_id: Some(id), .. } if reason == "already_served" && id == original)
+        );
+    }
+    let mut changed_key = request(&hub, peer, Uuid::new_v4());
+    if let Frame::StarterRequest { ln_pubkey, .. } = &mut changed_key {
+        *ln_pubkey = "03".repeat(33);
+    }
+    let reply = hub.handle(peer, changed_key, Some(111)).await.unwrap();
+    assert!(
+        matches!(reply, Frame::StarterStatus { reason: Some(reason), original_request_id: None, .. } if reason == "rate_limited")
+    );
+    let other = NodeId::from_bytes([9; 32]);
+    let mut forged = request(&hub, peer, Uuid::new_v4());
+    if let Frame::StarterRequest { ln_sig, .. } = &mut forged {
+        *ln_sig = "invalid".into();
+    }
+    hub.handle(other, forged.clone(), Some(111)).await.unwrap();
+    let reply = hub.handle(other, forged, Some(112)).await.unwrap();
+    assert!(
+        matches!(reply, Frame::StarterStatus { reason: Some(reason), original_request_id: None, .. } if reason == "rate_limited")
+    );
+    assert_eq!(backend.verifications.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.channel_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(hub.storage.starter_grants().await.unwrap().len(), 1);
 }
