@@ -121,7 +121,11 @@ impl RoomChat {
         if !plaintext.trim_start().starts_with('{') {
             return Ok(None);
         }
-        let Ok(object) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(plaintext) else {
+        // Admission failures are not ordinary non-room chat. Otherwise an
+        // oversized field could hide a top-level room binding from validation.
+        crate::wire_json::check_payload(plaintext.as_bytes(), &[])
+            .map_err(|_| RoomRefusal::Invalid("room payload exceeds JSON limits"))?;
+        let Ok(object) = crate::wire_json::from_str::<serde_json::Map<String, serde_json::Value>>(plaintext) else {
             return Ok(None);
         };
         if !object.contains_key("room") {

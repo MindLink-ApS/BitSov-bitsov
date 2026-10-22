@@ -35,7 +35,8 @@ use tracing::warn;
 use konsensus_core::kind;
 use konsensus_core::types::{NodeId, Recipient};
 use konsensus_core::{MessageId, UkmEnvelope};
-use konsensus_message::wire::Frame;
+use konsensus_message::wire::{self as bounded, envelope_from_bytes, Frame};
+use konsensus_core::wire_json;
 
 use super::engine::{DepositAuth, RelayEngine};
 
@@ -74,7 +75,9 @@ where
             A: SeqAccess<'de>,
         {
             let mut out: Vec<MessageId> = Vec::new();
-            while let Some(item) = seq.next_element::<MessageId>()? {
+            #[derive(Deserialize)]
+            struct Id(#[serde(deserialize_with = "bounded::hex_32")] MessageId);
+            while let Some(Id(item)) = seq.next_element::<Id>()? {
                 if out.len() >= MAX_RELAY_ACK_IDS {
                     return Err(de::Error::custom(format!(
                         "ack message_ids exceeds maximum of {MAX_RELAY_ACK_IDS} entries"
@@ -86,7 +89,28 @@ where
         }
     }
 
-    deserializer.deserialize_seq(AckIdVisitor)
+    konsensus_core::wire_json::strings::sequence(deserializer, AckIdVisitor)
+}
+
+fn bounded_merkle_path<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error> {
+    struct Path;
+    impl<'de> Visitor<'de> for Path {
+        type Value = Vec<Vec<u8>>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("bounded merkle path") }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            #[derive(Deserialize)]
+            struct Hash(#[serde(deserialize_with = "bounded::vec_u8::<_, 32>")] Vec<u8>);
+            let mut out = Vec::new();
+            while let Some(Hash(hash)) = seq.next_element::<Hash>()? {
+                if out.len() >= MAX_RELAY_WHITELIST_PROOF_DEPTH {
+                    return Err(de::Error::custom("merkle path exceeds element cap"));
+                }
+                out.push(hash);
+            }
+            Ok(out)
+        }
+    }
+    wire_json::strings::sequence(deserializer, Path)
 }
 
 /// kind-600 REGISTER body. `binding_id`/`depositor_whitelist_root` are carried as
@@ -97,9 +121,11 @@ where
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegisterBody {
+    #[serde(deserialize_with = "bounded::vec_u8::<_, 16>")]
     binding_id: Vec<u8>,
     quota_bytes: u64,
     ttl_max_secs: u32,
+    #[serde(deserialize_with = "bounded::vec_u8::<_, 32>")]
     depositor_whitelist_root: Vec<u8>,
     created_at: u64,
 }
@@ -130,7 +156,9 @@ struct AckBody {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DepositBody {
+    #[serde(deserialize_with = "bounded::vec_u8::<_, 32>")]
     binding_recipient: Vec<u8>,
+    #[serde(deserialize_with = "bounded::vec_u8::<_, { konsensus_core::envelope::MAX_CIPHERTEXT_BYTES }>")]
     inner_envelope_bytes: Vec<u8>,
     inner_kind: u16,
     ttl_secs: u32,
@@ -143,7 +171,9 @@ struct DepositBody {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WhitelistAuth {
+    #[serde(deserialize_with = "bounded_merkle_path")]
     merkle_path: Vec<Vec<u8>>,
+    #[serde(deserialize_with = "bounded::vec_u8::<_, 32>")]
     whitelist_root: Vec<u8>,
 }
 
@@ -202,7 +232,7 @@ pub(crate) async fn handle_relay_control(
 
     match envelope.kind {
         kind::KIND_RELAY_REGISTER => {
-            let body: RegisterBody = match serde_json::from_slice(&envelope.ciphertext) {
+            let body: RegisterBody = match wire_json::from_slice(&envelope.ciphertext) {
                 Ok(b) => b,
                 Err(_) => return reply(sender, reject(id, "relay_register_invalid_body".into())),
             };
@@ -248,7 +278,7 @@ pub(crate) async fn handle_relay_control(
             // `bounded_ack_ids` caps `message_ids` DURING parse (aborts at
             // cap + 1), so an oversized ack fails here as a parse error — no
             // attacker-sized Vec is ever materialized.
-            let body: AckBody = match serde_json::from_slice(&envelope.ciphertext) {
+            let body: AckBody = match wire_json::from_slice(&envelope.ciphertext) {
                 Ok(b) => b,
                 Err(_) => return reply(sender, reject(id, "relay_ack_invalid_body".into())),
             };
@@ -258,7 +288,7 @@ pub(crate) async fn handle_relay_control(
             }
         }
         kind::KIND_RELAY_DEPOSIT => {
-            let body: DepositBody = match serde_json::from_slice(&envelope.ciphertext) {
+            let body: DepositBody = match wire_json::from_slice(&envelope.ciphertext) {
                 Ok(b) => b,
                 Err(_) => return reply(sender, reject(id, "relay_deposit_invalid_body".into())),
             };
@@ -275,7 +305,7 @@ pub(crate) async fn handle_relay_control(
                 }
             };
             let inner_envelope: UkmEnvelope =
-                match serde_json::from_slice(&body.inner_envelope_bytes) {
+                match envelope_from_bytes(&body.inner_envelope_bytes) {
                     Ok(env) => env,
                     Err(_) => {
                         return reply(
@@ -393,7 +423,7 @@ pub(crate) async fn handle_relay_control(
             }
         }
         kind::KIND_RELAY_DRAIN => {
-            let body: DrainBody = match serde_json::from_slice(&envelope.ciphertext) {
+            let body: DrainBody = match wire_json::from_slice(&envelope.ciphertext) {
                 Ok(b) => b,
                 Err(_) => return reply(sender, reject(id, "relay_drain_invalid_body".into())),
             };
@@ -410,7 +440,7 @@ pub(crate) async fn handle_relay_control(
                 .await;
             let mut out: Vec<(NodeId, Frame)> = Vec::with_capacity(items.len());
             for item in items {
-                match serde_json::from_slice::<UkmEnvelope>(&item.envelope_bytes) {
+                match envelope_from_bytes(&item.envelope_bytes) {
                     Ok(env) => out.push((sender, Frame::Message(Box::new(env)))),
                     Err(e) => {
                         // A held item that doesn't deserialize to a UkmEnvelope

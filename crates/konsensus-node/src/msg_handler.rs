@@ -855,7 +855,7 @@ async fn process_file_message(
     storage: &Arc<dyn konsensus_storage::Storage>,
     audit: &Arc<AuditLog>,
 ) -> Option<String> {
-    let payload: konsensus_api::handlers::files::FilePayload = match serde_json::from_slice(bytes) {
+    let payload = match konsensus_api::handlers::files::FilePayload::from_wire_bytes(bytes) {
         Ok(p) => p,
         Err(e) => {
             debug!(sender = %sender, error = %e, "KIND_FILE_REF payload not valid JSON");
@@ -941,7 +941,7 @@ async fn process_calendar_event(
     storage: &Arc<dyn konsensus_storage::Storage>,
 ) -> Option<String> {
     let payload: konsensus_core::payloads::calendar::CalendarEventPayload =
-        match serde_json::from_slice(bytes) {
+        match konsensus_core::wire_json::from_slice(bytes) {
             Ok(p) => p,
             Err(e) => {
                 debug!(sender = %sender, error = %e, "calendar event payload not valid JSON");
@@ -999,7 +999,7 @@ async fn process_rsvp(
     storage: &Arc<dyn konsensus_storage::Storage>,
 ) -> Option<String> {
     let payload: konsensus_core::payloads::calendar::RsvpPayload =
-        match serde_json::from_slice(bytes) {
+        match konsensus_core::wire_json::from_slice(bytes) {
             Ok(p) => p,
             Err(e) => {
                 debug!(sender = %sender, error = %e, "RSVP payload not valid JSON");
@@ -1086,7 +1086,7 @@ async fn process_page_request(
     gate: &PaymentGate,
 ) -> Option<String> {
     let page_req: konsensus_core::payloads::content::PageRequest =
-        match serde_json::from_slice(bytes) {
+        match konsensus_core::wire_json::from_slice(bytes) {
             Ok(r) => r,
             Err(e) => {
                 debug!(sender = %sender, error = %e, "KIND_PAGE_REQUEST payload not valid JSON");

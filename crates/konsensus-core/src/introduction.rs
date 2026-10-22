@@ -320,7 +320,7 @@ impl Introduction {
         }
         let text = text.trim();
         if text.starts_with('{') {
-            return serde_json::from_str(text).map_err(|e| IntroductionError::Malformed(e.to_string()));
+            return crate::wire_json::from_str(text).map_err(|e| IntroductionError::Malformed(e.to_string()));
         }
         let payload = match text.split_once('#') {
             Some((prefix, frag)) if format!("{prefix}#") == LINK_PREFIX => frag,

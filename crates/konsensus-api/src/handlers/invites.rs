@@ -472,7 +472,7 @@ async fn accept_invite(
     let invite_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&req.token)
         .map_err(|e| ApiError::BadRequest(format!("invalid token base64: {e}")))?;
-    let invite: BitSovInvite = serde_json::from_slice(&invite_json)
+    let invite: BitSovInvite = konsensus_core::wire_json::from_slice(&invite_json)
         .map_err(|e| ApiError::BadRequest(format!("invalid token json: {e}")))?;
 
     let now_unix = std::time::SystemTime::now()

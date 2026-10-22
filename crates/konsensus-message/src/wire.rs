@@ -82,7 +82,7 @@ impl WireError {
 /// stack). The per-field caps below close that pre-auth amplification window by
 /// rejecting hostile collections/values *at deserialize time*, before the
 /// oversized allocation happens.
-pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_FRAME_BYTES: usize = konsensus_core::wire_json::MAX_JSON_BYTES;
 
 /// Backwards-compatible alias for [`MAX_FRAME_BYTES`].
 ///
@@ -241,7 +241,7 @@ pub const MAX_SDP_BYTES: usize = 64 * 1024;
 /// Larger payloads are byte arrays. This lexical ceiling bounds serde scratch
 /// and wrong-type error formatting before any schema-specific visitor runs;
 /// narrower decoded per-field limits still apply.
-pub const MAX_RAW_STRING_TOKEN_BYTES: usize = 6 * MAX_BOLT11_BYTES;
+pub const MAX_RAW_STRING_TOKEN_BYTES: usize = konsensus_core::wire_json::MAX_RAW_STRING_TOKEN_BYTES;
 
 /// One trickled ICE candidate, including a JSON wrapper and extension fields.
 pub const MAX_ICE_CANDIDATE_BYTES: usize = 4096;
@@ -305,6 +305,9 @@ mod bounded_envelope;
 #[path = "wire/bounded_json.rs"]
 mod bounded_json;
 
+/// Borrowing field adapters for standalone wire payloads.
+pub use bounded::{hex_32, vec_u8};
+
 mod bounded {
     use super::*;
 
@@ -316,47 +319,8 @@ mod bounded {
     /// allocate in proportion to an arbitrary peer string, including ignored
     /// keys and values. Error text is fixed and never contains peer bytes.
     pub fn check_frame_depth(data: &[u8]) -> Result<(), WireError> {
-        let mut depth: usize = 0;
-        let mut in_string = false;
-        let mut escaped = false;
-        let mut string_bytes = 0;
-        for &byte in data {
-            if in_string {
-                if !escaped && byte == b'"' {
-                    in_string = false;
-                    continue;
-                }
-                string_bytes += 1;
-                if string_bytes > MAX_RAW_STRING_TOKEN_BYTES {
-                    return Err(WireError::Serialization(
-                        "JSON string exceeds frame token cap".into(),
-                    ));
-                }
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                }
-            } else {
-                match byte {
-                    b'"' => {
-                        in_string = true;
-                        string_bytes = 0;
-                    }
-                    b'[' | b'{' => {
-                        depth += 1;
-                        if depth > 128 {
-                            return Err(WireError::Serialization(
-                                "JSON nesting exceeds frame depth cap".into(),
-                            ));
-                        }
-                    }
-                    b']' | b'}' => depth = depth.saturating_sub(1),
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
+        konsensus_core::wire_json::check_tokens(data, &[])
+            .map_err(|error| WireError::Serialization(error.into()))
     }
 
     pub fn snapshot_serialize<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
@@ -1292,6 +1256,14 @@ pub struct PeerExchangeEntry {
     /// The peer's sovereignty tier.
     #[serde(deserialize_with = "bounded::enum_value")]
     pub tier: SovereigntyTier,
+}
+
+/// Decode a standalone peer or relay-mailbox envelope through the same field
+/// adapters as Frame::Message. Errors never retain serde's peer-controlled text.
+pub fn envelope_from_bytes(data: &[u8]) -> Result<UkmEnvelope, konsensus_core::wire_json::DecodeError> {
+    #[derive(Deserialize)]
+    struct Envelope(#[serde(deserialize_with = "bounded_envelope::deserialize")] Box<UkmEnvelope>);
+    konsensus_core::wire_json::from_slice::<Envelope>(data).map(|envelope| *envelope.0)
 }
 
 impl Frame {

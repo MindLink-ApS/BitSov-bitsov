@@ -56,3 +56,6 @@ pub use traits::{
 };
 
 pub mod admission_quote;
+
+/// Bounded entry points for untrusted JSON, separate from generic serde.
+pub mod wire_json;

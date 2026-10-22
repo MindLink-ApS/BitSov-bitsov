@@ -217,7 +217,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
                     }
                     Some(Ok(Message::Text(text))) => {
                         // Handle application-level ping from frontend
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Ok(val) = konsensus_core::wire_json::from_str::<serde_json::Value>(&text) {
                             if val.get("type").and_then(|t| t.as_str()) == Some("ping") {
                                 let pong = r#"{"type":"pong"}"#.to_string();
                                 if socket.send(Message::Text(pong)).await.is_err() {

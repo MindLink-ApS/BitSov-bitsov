@@ -192,7 +192,7 @@ pub(crate) async fn redeem(
         .decrypt(aes_gcm::Nonce::from_slice(nonce), encrypted)
         .map_err(|_| "invalid_snapshot")?;
     let Frame::PeerExchangeResponse { peers } =
-        serde_json::from_slice(&plain).map_err(|_| "invalid_snapshot")?
+        Frame::from_bytes(&plain).map_err(|_| "invalid_snapshot")?
     else {
         return Err("invalid_snapshot".into());
     };

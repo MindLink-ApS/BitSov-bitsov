@@ -466,7 +466,7 @@ impl FrontDoorCard {
         let payload = if let Some(rest) = text.strip_prefix(LINK_PREFIX) {
             rest
         } else if text.starts_with('{') {
-            let card: Self = serde_json::from_str(text)
+            let card: Self = crate::wire_json::from_str(text)
                 .map_err(|e| FrontDoorError::Malformed(e.to_string()))?;
             card.check_shape()?;
             card.ensure_size()?;
@@ -481,7 +481,7 @@ impl FrontDoorCard {
         if bytes.len() > MAX_CARD_BYTES {
             return Err(FrontDoorError::TooLarge(bytes.len()));
         }
-        let card: Self = serde_json::from_slice(&bytes)
+        let card: Self = crate::wire_json::from_slice(&bytes)
             .map_err(|e| FrontDoorError::Malformed(e.to_string()))?;
         card.check_shape()?;
         card.ensure_size()?;
