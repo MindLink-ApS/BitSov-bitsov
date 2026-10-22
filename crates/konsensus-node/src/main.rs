@@ -1153,6 +1153,7 @@ async fn cmd_start(
     )
     .with_context(|| format!("failed to prepare startup from {}", config_path.display()))?;
 
+    config.validate_starter_hub(home || password_source == PasswordSource::RemoteUnlock)?;
     anyhow::ensure!(
         !(owner_control && local_owner_device) || config.pairing.second_device_enrollment,
         "combining --owner-control and --local-owner-device requires [pairing] second_device_enrollment = true"
@@ -1908,6 +1909,15 @@ async fn start_node_services<'a>(
         shutdown_rx: node.shutdown_rx(),
     }));
 
+    let (starter_hub_tx, starter_hub_handle) = if config.starter_hub.enabled {
+        let (tx,rx)=tokio::sync::mpsc::channel(64);
+        let hub=onboarding::starter_hub::StarterHub {
+            config:config.starter_hub.clone(),storage:Arc::clone(node.storage()),lightning:Arc::clone(node.lightning()),
+            hub_id:*node.node_id(),network:config.lightning.bitcoin_network().expect("validated starter network"),
+        };
+        (Some(tx),Some(tokio::spawn(onboarding::starter_hub::run(hub,Arc::clone(node.transport()),rx,node.shutdown_rx()))))
+    } else {(None,None)};
+
     let (auto_channel_tx, auto_channel_rx) =
         tokio::sync::mpsc::channel::<onboarding::auto_channel::AutoChannelEvent>(64);
     let auto_channel_notifier = Arc::new(onboarding::notify::LocalUiNotifier::new(
@@ -1959,6 +1969,7 @@ async fn start_node_services<'a>(
         ws_delivery_tx,
         pending_tx,
         auto_channel_tx,
+        starter_hub_tx,
         shutdown_rx: node.shutdown_rx(),
     }));
 
@@ -2162,6 +2173,7 @@ async fn start_node_services<'a>(
         if let Err(e) = pending_handle.await {
             warn!(error = %e, "pending delivery task panicked");
         }
+        if let Some(handle)=starter_hub_handle {let _=handle.await;}
         if let Err(e) = auto_channel_handle.await {
             warn!(error = %e, "auto-channel task panicked");
         }

@@ -1800,9 +1800,6 @@ fn build_with_store_internal(
 		Arc::clone(&runtime),
 	);
 
-	let connection_manager =
-		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), Arc::clone(&logger)));
-
 	let output_sweeper = match io::utils::read_output_sweeper(
 		Arc::clone(&tx_broadcaster),
 		Arc::clone(&fee_estimator),
@@ -1855,6 +1852,9 @@ fn build_with_store_internal(
 			}
 		},
 	};
+
+	let connection_manager =
+		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), Arc::clone(&peer_store), Arc::clone(&logger)));
 
 	let om_mailbox = if let Some(AsyncPaymentsRole::Server) = async_payments_role {
 		Some(Arc::new(OnionMessageMailbox::new()))

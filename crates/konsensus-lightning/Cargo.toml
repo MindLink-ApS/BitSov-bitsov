@@ -52,3 +52,4 @@ tempfile = "3"
 konsensus-storage = { path = "../konsensus-storage" }
 sqlx.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tracing-subscriber.workspace = true

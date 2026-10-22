@@ -879,14 +879,9 @@ async fn replay_channel_open(
             .saturating_sub(op.created_at)
             > 10 * 60 * 1000
     {
-        let matches = channels.as_ref().map(|channels| {
-            channels
-                .iter()
-                .filter(|c| req.amount_sats.checked_mul(1000) == Some(c.capacity_msat))
-                .collect::<Vec<_>>()
-        });
-        let recovered = match matches.as_deref() {
-            Some([channel]) => Some(serde_json::json!({
+        let matched = channels.as_deref().and_then(|channels|
+            konsensus_core::traits::lightning::unique_channel_match(channels, &req.peer_pubkey, req.amount_sats));
+        let recovered = matched.map(|channel| serde_json::json!({
                 "channel_id": channel.channel_id,
                 "user_channel_id": channel.user_channel_id,
                 "funding_txo": channel.funding_txo,
@@ -897,9 +892,7 @@ async fn replay_channel_open(
                 "status": "pending_visibility",
                 "recovered": true,
                 "warning": "Recovered from the node's channel list by peer and capacity; original funding fee and transaction visibility are unknown. Inspect GET /payments/channels.",
-            })),
-            _ => None,
-        };
+            }));
         let result = recovered
             .as_ref()
             .map(serde_json::to_vec)

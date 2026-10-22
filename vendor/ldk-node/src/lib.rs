@@ -1165,7 +1165,7 @@ impl Node {
 			con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
 		})?;
 
-		log_info!(self.logger, "Connected to peer {}@{}. ", peer_info.node_id, peer_info.address);
+		log_info!(self.peer_store.peer_logger(&peer_info.node_id), "Connected to peer {}@{}. ", peer_info.node_id, peer_info.address);
 
 		if persist {
 			self.peer_store.add_peer(peer_info)?;
@@ -1183,12 +1183,12 @@ impl Node {
 			return Err(Error::NotRunning);
 		}
 
-		log_info!(self.logger, "Disconnecting peer {}..", counterparty_node_id);
+		log_info!(self.peer_store.peer_logger(&counterparty_node_id), "Disconnecting peer {}..", counterparty_node_id);
 
 		match self.peer_store.remove_peer(&counterparty_node_id) {
 			Ok(()) => {}
 			Err(e) => {
-				log_error!(self.logger, "Failed to remove peer {}: {}", counterparty_node_id, e)
+				log_error!(self.peer_store.peer_logger(&counterparty_node_id), "Failed to remove peer {}: {}", counterparty_node_id, e)
 			}
 		}
 
@@ -1208,7 +1208,7 @@ impl Node {
 		funding_policy: Option<funding::FundingPolicy>,
 	) -> Result<UserChannelId, Error> {
 		if self.config.channel_peer_allowlist.as_ref().is_some_and(|peers| !peers.contains(&node_id)) {
-			log_error!(self.logger, "HUB_ONLY_WHILE_LOCKABLE: refusing to open a channel to peer {}", node_id);
+			log_error!(self.peer_store.peer_logger(&node_id), "HUB_ONLY_WHILE_LOCKABLE: refusing to open a channel to peer {}", node_id);
 			return Err(Error::ChannelCreationFailed);
 		}
 		// Cheap early refusal before dialing; recheck atomically with creation below.
@@ -1287,7 +1287,7 @@ impl Node {
 		) {
 			Ok(_) => {
 				log_info!(
-					self.logger,
+					self.peer_store.peer_logger(&peer_info.node_id),
 					"Initiated channel creation with peer {}. ",
 					peer_info.node_id
 				);
@@ -1321,6 +1321,11 @@ impl Node {
 	/// Construction failure for a policy-bearing channel; no funding tx was dispatched.
 	pub fn channel_funding_failure(&self, id: UserChannelId) -> Result<Option<String>, Error> {
 		funding::failure(self.kv_store.as_ref(), id.0)
+	}
+
+	/// Starter peers reconnect to us; never retain their observed socket address.
+	pub fn suppress_peer_address(&self, node_id: PublicKey) -> Result<(), Error> {
+		self.peer_store.suppress_address(node_id)
 	}
 
 	/// Open using an estimator-selected policy, durably pinned before negotiation.
@@ -1586,7 +1591,7 @@ impl Node {
 				})
 		} else {
 			log_error!(
-				self.logger,
+				self.peer_store.peer_logger(&counterparty_node_id),
 				"Channel not found for user_channel_id {} and counterparty {}",
 				user_channel_id,
 				counterparty_node_id
@@ -1663,7 +1668,7 @@ impl Node {
 				})
 		} else {
 			log_error!(
-				self.logger,
+				self.peer_store.peer_logger(&counterparty_node_id),
 				"Channel not found for user_channel_id {} and counterparty {}",
 				user_channel_id,
 				counterparty_node_id

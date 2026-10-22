@@ -566,6 +566,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         ws_broadcast,
         ws_delivery_tx,
         pending_tx,
+        starter_hub_tx: None,
         auto_channel_tx,
         shutdown_rx,
     }));
