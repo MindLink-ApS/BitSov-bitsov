@@ -764,6 +764,19 @@ mod tests {
                 key_id,
             }
         }
+        fn revoke_owner(&self, with_pairing: bool) {
+            let options = crate::pairing::console::RevokeOptions {
+                root: self.key_id.clone(),
+                cascade: false,
+                with_pairing,
+                keep: vec![],
+                allow_zero_owner: true,
+            };
+            let plan = self.svc.console_revoke_devices(&options, None).unwrap();
+            self.svc
+                .console_revoke_devices(&options, Some(&plan.confirmation))
+                .unwrap();
+        }
         fn request(&self) -> ApprovalView {
             self.svc
                 .request_owner_approval(
@@ -1016,7 +1029,7 @@ mod tests {
             if mode {
                 f.svc.owner_control_enabled = false;
             } else {
-                f.svc.revoke(&f.owner.client_id).unwrap();
+                f.revoke_owner(true);
             }
             assert!(f.approve(&op).is_err());
             f.inert();
@@ -1191,15 +1204,20 @@ mod tests {
                         .replace("remaining_msat:100000", "remaining_msat:99999");
                 }
                 2 => {
-                    f.svc
-                        .revoke_device_key(&f.key_id, Some(&f.owner.client_id))
-                        .unwrap();
+                    f.revoke_owner(false);
                 }
                 3 => {
-                    f.svc.bump_epoch(&f.owner.client_id).unwrap();
+                    f.svc
+                        .lock()
+                        .file
+                        .clients
+                        .iter_mut()
+                        .find(|c| c.client_id == f.owner.client_id)
+                        .unwrap()
+                        .epoch += 1;
                 }
                 4 => {
-                    f.svc.revoke(&f.owner.client_id).unwrap();
+                    f.revoke_owner(true);
                 }
                 5 => {
                     f.svc

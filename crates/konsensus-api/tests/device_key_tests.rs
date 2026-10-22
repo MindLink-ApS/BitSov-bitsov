@@ -165,6 +165,38 @@ fn registered(
     (service, console, client, device, key.key_id)
 }
 
+// Retain a separate console-enrolled owner when testing legacy epoch/rotation
+// invalidation. These cases must not depend on unreviewed zero-owner removal.
+fn add_recovery_owner(service: &PairingService, console: &OwnerConsole) {
+    let (client, _) = pair(service, 201);
+    let device = Device::new();
+    let op = service
+        .request_device_key(
+            &client.client_id,
+            &device.public_hex(),
+            "recovery",
+            &device.proof(&client.client_id),
+        )
+        .unwrap();
+    service
+        .approve_device_key(&op.op_id, &console.owner_code(&op.op_id), &owner_sig(&op))
+        .unwrap();
+}
+
+fn reviewed_remove(service: &PairingService, key_id: &str, with_pairing: bool) {
+    let options = pairing::console::RevokeOptions {
+        root: key_id.into(),
+        cascade: false,
+        with_pairing,
+        keep: vec![],
+        allow_zero_owner: true,
+    };
+    let plan = service.console_revoke_devices(&options, None).unwrap();
+    service
+        .console_revoke_devices(&options, Some(&plan.confirmation))
+        .unwrap();
+}
+
 fn charge(recipient: &str, msat: u64) -> Vec<Charge> {
     vec![Charge {
         recipient: recipient.to_string(),
@@ -779,9 +811,7 @@ fn revoking_the_key_or_the_pairing_ends_the_envelopes() {
     service
         .revoke_device_key(&key_id, Some("someone-else"))
         .unwrap_err();
-    service
-        .revoke_device_key(&key_id, Some(&client.client_id))
-        .unwrap();
+    reviewed_remove(&service, &key_id, false);
     assert!(matches!(
         service
             .reserve_spend(&client.client_id, client.epoch, charge(PEER, 1))
@@ -795,7 +825,8 @@ fn revoking_the_key_or_the_pairing_ends_the_envelopes() {
 
     // An epoch bump retires every key of the pairing.
     let tmp = tempfile::tempdir().unwrap();
-    let (service, _, client, device, key_id) = registered(tmp.path());
+    let (service, console, client, device, key_id) = registered(tmp.path());
+    add_recovery_owner(&service, &console);
     service.bump_epoch(&client.client_id).unwrap();
     let i = intent(&key_id, PEER, 10_000, 10_000);
     let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
@@ -1025,6 +1056,7 @@ fn a_client_cannot_cancel_another_clients_pending_device_key() {
 fn a_rotated_pairing_can_register_the_same_device_again() {
     let tmp = tempfile::tempdir().unwrap();
     let (service, console, client, device, _) = registered(tmp.path());
+    add_recovery_owner(&service, &console);
     let old_key = SigningKey::from_bytes(&[1; 32]);
     let new_key = SigningKey::from_bytes(&[7; 32]);
     let new_pub = hex::encode(new_key.verifying_key().to_bytes());
@@ -1034,7 +1066,10 @@ fn a_rotated_pairing_can_register_the_same_device_again() {
         .rotate_client_key(&client.client_id, &new_pub, &sig)
         .unwrap();
     assert!(
-        service.device_keys().is_empty(),
+        service
+            .device_keys()
+            .iter()
+            .all(|key| key.client_id != client.client_id),
         "keys of the old pairing id are retired"
     );
     let op = service
@@ -1708,7 +1743,8 @@ fn delegation_rechecks_approver_approval_revocation_and_both_epochs() {
         "legacy_nonce",
     ] {
         let tmp = tempfile::tempdir().unwrap();
-        let (svc, _, approver, device, key_id) = registered(tmp.path());
+        let (svc, console, approver, device, key_id) = registered(tmp.path());
+        add_recovery_owner(&svc, &console);
         let (target, _) = pair(&svc, 2);
         drop(svc);
         let svc = delegation_run(tmp.path());
@@ -1776,7 +1812,11 @@ fn delegation_rechecks_approver_approval_revocation_and_both_epochs() {
         ]
         .contains(&mutation)
         {
-            assert_eq!(svc.owner_device_count(), 0, "{mutation}");
+            assert_eq!(
+                svc.owner_device_count(),
+                1,
+                "recovery owner remains: {mutation}"
+            );
         }
     }
 }
@@ -2047,7 +2087,8 @@ fn sas_device_cancels_and_mismatches_share_budget_and_restart_cannot_approve_old
 fn owner_ticket_signature_single_use_and_revocation() {
     for revoke in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
-        let (svc, _, client, device, key_id) = registered(tmp.path());
+        let (svc, console, client, device, key_id) = registered(tmp.path());
+        add_recovery_owner(&svc, &console);
         drop(svc);
         let svc = delegation_run(tmp.path());
         let identity = konsensus_core::NodeIdentity::from_mnemonic(MNEMONIC, "").unwrap();
@@ -2337,7 +2378,8 @@ async fn owner_ticket_and_nonce_expire_and_rate_window_recovers() {
 fn owner_ticket_rechecks_mode_signer_approval_pairing_epoch_and_restart() {
     for refusal in ["mode", "signer", "approval", "pairing", "epoch", "restart"] {
         let tmp = tempfile::tempdir().unwrap();
-        let (svc, _, client, device, key_id) = registered(tmp.path());
+        let (svc, console, client, device, key_id) = registered(tmp.path());
+        add_recovery_owner(&svc, &console);
         drop(svc);
         let mut svc = delegation_run(tmp.path());
         let identity = konsensus_core::NodeIdentity::from_mnemonic(MNEMONIC, "").unwrap();
