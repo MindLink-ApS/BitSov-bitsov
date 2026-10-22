@@ -625,6 +625,10 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                 Err(e) => error(e),
             }
         }
+        ControlRequest::RevokeDeviceKey { .. } | ControlRequest::Revoke { .. }
+            if service.second_device_enrollment_enabled() => ControlResponse::Error {
+                message: "legacy revocation is disabled while second_device_enrollment is on; use device revoke --key <key-id> (with --with-pairing to remove its pairing) to review and confirm the plan".into(),
+            },
         ControlRequest::RevokeDeviceKey { key_id } => match service.revoke_device_key(&key_id, None) {
             Ok(()) => ControlResponse::Ok {
                 detail: format!(
