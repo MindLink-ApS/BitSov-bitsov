@@ -194,6 +194,17 @@ async fn wrong_length_binding_id_is_rejected() {
     assert!(is_reject(&replies, a));
 }
 
+#[test]
+fn register_binding_id_rejects_seventeen_bytes_during_decode() {
+    let valid = register_body(vec![0; 16], vec![0; 32]);
+    assert!(wire_json::from_slice::<RegisterBody>(&valid).is_ok());
+    let oversized = register_body(vec![0; 17], vec![0; 32]);
+    assert_eq!(
+        wire_json::from_slice::<RegisterBody>(&oversized).unwrap_err(),
+        wire_json::DecodeError,
+    );
+}
+
 /// T-REVOKE (seam-6) — a recipient revokes its OWN binding (kind-604). After the
 /// revoke the binding is gone: a deposit addressed to it now rejects (no binding),
 /// so registration is no longer a trap. Revoking nothing is a reject, never a
@@ -719,6 +730,31 @@ mod decode_allocations {
     }
     #[global_allocator]
     static ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
+
+    #[tokio::test]
+    async fn ack_under_cap_strings_reject_before_large_allocations() {
+        let (engine, _) = setup();
+        // An escape forces serde scratch allocation if either the sequence or
+        // element guard is removed. Keep the raw token below the outer cap.
+        let token = format!(r"\n{}", "x".repeat(390_000));
+        assert!(token.len() < wire_json::MAX_RAW_STRING_TOKEN_BYTES);
+        for json in [
+            format!(r#"{{"message_ids":"{token}"}}"#),
+            format!(r#"{{"message_ids":["{token}"]}}"#),
+        ] {
+            let env = ctrl(kind::KIND_RELAY_ACK, node(1), json.into_bytes());
+            TOTAL.set(0);
+            LARGEST.set(Some(0));
+            let replies = dispatch(&engine, &env).await;
+            let largest = LARGEST.replace(None).unwrap();
+            let total = TOTAL.get();
+            assert!(is_reject(&replies, node(1)));
+            assert!(
+                largest <= 4096 && total <= 16384,
+                "largest={largest}, total={total}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn relay_body_decodes_reject_before_large_allocations() {

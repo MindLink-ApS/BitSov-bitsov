@@ -68,3 +68,24 @@ fn file_exception_does_not_admit_oversize_wrong_types_or_unknown_keys() {
         );
     }
 }
+
+#[test]
+fn file_exception_rejects_nested_unknown_key_lookalike() {
+    // All required fields are valid, so removing the depth-one restriction
+    // would let serde ignore the nested data_b64 and accept the whole payload.
+    let json = format!(
+        r#"{{"x":{{"data_b64":"{}"}},"filename":"photo.bin","mime_type":"application/octet-stream","size_bytes":0,"blake3_hash":"{}","data_b64":""}}"#,
+        "A".repeat(5_000_000),
+        "00".repeat(32),
+    );
+    TOTAL.set(0);
+    LARGEST.set(Some(0));
+    let result = FilePayload::from_wire_bytes(json.as_bytes());
+    let largest = LARGEST.replace(None).unwrap();
+    let total = TOTAL.get();
+    assert_eq!(result.unwrap_err().to_string(), "invalid wire JSON");
+    assert!(
+        largest <= 4096 && total <= 16384,
+        "largest={largest}, total={total}"
+    );
+}

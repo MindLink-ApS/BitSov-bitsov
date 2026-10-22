@@ -3972,3 +3972,60 @@ async fn starter_full_or_closed_queue_disconnects_noise_peer_with_counted_reason
         assert!(starter_rx.try_recv().is_err());
     }
 }
+
+#[tokio::test]
+async fn session_decode_logs_do_not_echo_peer_json() {
+    use tracing_subscriber::layer::SubscriberExt;
+    struct Errors(Arc<std::sync::Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Errors {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields<'a>(&'a mut Vec<String>);
+            impl tracing::field::Visit for Fields<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "error" {
+                        self.0.push(format!("{value:?}"));
+                    }
+                }
+            }
+            event.record(&mut Fields(&mut self.0.lock().unwrap()));
+        }
+    }
+    let identity = identity_from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    );
+    let manager = SessionManager::new(Arc::clone(&identity));
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+    let mut negotiations = std::collections::HashMap::new();
+    let peer = NodeId::from_bytes([255; 32]);
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(Errors(captured.clone())),
+    );
+    // Valid, bounded Frame values with the wrong typed shape. Raw serde errors
+    // include this string, while the peer-facing adapter must discard it.
+    let hostile = serde_json::json!("peer-controlled-secret");
+    handle_prekey_offer(
+        &peer, hostile.clone(), *identity.node_id(), &manager, &storage,
+        &transport, &audit, &mut negotiations,
+    ).await;
+    handle_session_init(
+        &peer, hostile, &manager, &storage, &transport, &audit, &mut negotiations,
+    ).await;
+    assert!(!manager.has_session(&peer).await);
+    assert!(negotiations.is_empty());
+    assert_eq!(
+        *captured.lock().unwrap(),
+        vec!["invalid wire JSON", "invalid wire JSON"],
+    );
+}
