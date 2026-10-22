@@ -23,6 +23,8 @@ use uuid::Uuid;
 pub struct StarterConfig {
     pub enabled: bool,
     pub hub_node_id: String,
+    /// Operator-configured display name only; never used for routing.
+    pub hub_alias: Option<String>,
     pub allow_mainnet: bool,
 }
 impl StarterConfig {
@@ -46,6 +48,28 @@ pub struct StarterSettings {
     pub trust_no_reserve: bool,
 }
 impl StarterSettings {
+    /// Local configuration only: no network, wallet or readiness query.
+    pub fn hub_configured(&self) -> bool {
+        self.config.enabled
+            && NodeId::from_hex(&self.config.hub_node_id).is_ok()
+            && self.hub_whitelisted
+            && self.hub_ln_pubkey.len() == 66
+            && hex::decode(&self.hub_ln_pubkey).is_ok()
+            && !self.hub_ln_address.is_empty()
+    }
+    fn discovery(&self, value: &mut serde_json::Value) {
+        let configured = self.hub_configured();
+        value["hub_configured"] = serde_json::json!(configured);
+        if let Some(alias) = self
+            .config
+            .hub_alias
+            .as_deref()
+            .filter(|a| configured && !a.is_empty())
+        {
+            value["hub_alias"] = serde_json::json!(alias);
+        }
+    }
+
     pub fn precondition(&self, provider_network: Option<&str>) -> Option<&'static str> {
         if !self.config.enabled {
             return Some("starter_disabled");
@@ -74,6 +98,8 @@ impl StarterSettings {
             && self.network == r.network
     }
 }
+// Receive-only allowlist: adding cost, fee, amount or push inputs here would
+// permit a spend without spend authorization. Reject them, including on replay.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -89,8 +115,9 @@ fn error(status: StatusCode, code: &str) -> Response {
 fn not_dispatched(reason: &str) -> Response {
     (StatusCode::BAD_REQUEST,Json(serde_json::json!({"error":"not dispatched","code":"not_dispatched","reason":reason,"retry_allowed":true}))).into_response()
 }
-fn render(r: StarterRequest, id: &str, status: StatusCode) -> Response {
+fn render(settings: &StarterSettings, r: StarterRequest, id: &str, status: StatusCode) -> Response {
     let mut value = serde_json::to_value(&r).expect("serializable request");
+    settings.discovery(&mut value);
     value["operation_id"] = serde_json::json!(r.request_id);
     value["request_id"] = serde_json::json!(id);
     value["verified"] = serde_json::json!(r.state == "ready" && r.verified_at.is_some());
@@ -146,7 +173,7 @@ async fn create(
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
             .expect("existing request");
-        return Ok(render(current, &id, StatusCode::OK));
+        return Ok(render(&state.starter, current, &id, StatusCode::OK));
     }
     if let Some(reason) = state
         .starter
@@ -168,6 +195,13 @@ async fn create(
     if state.lightning.disk_status().is_some_and(|d| d.disk_low) {
         return Err(ApiError::NotDispatched("disk_low".into()));
     }
+    state
+        .audit_log
+        .starter_requested(
+            &id,
+            &auth.pairing.as_ref().expect("checked pairing").client_id,
+        )
+        .map_err(|e| ApiError::Storage(format!("starter audit: {e}")))?;
     let row = StarterRequest::new(
         id.clone(),
         state.starter.config.hub_node_id.clone(),
@@ -181,9 +215,12 @@ async fn create(
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
     if stored.request_id != id {
+        state.audit_log.record("starter.request_conflict", &auth.pairing.as_ref().expect("checked pairing").client_id,
+            Some(serde_json::json!({"request_id":id,"paired_device_id":auth.pairing.as_ref().expect("checked pairing").client_id,"reason":"starter_already_requested"})));
         return Ok((StatusCode::CONFLICT,Json(serde_json::json!({"error":"starter_already_requested","code":"starter_already_requested","request_id":stored.root_id(),"state":stored.state,"retry_allowed":false}))).into_response());
     }
     Ok(render(
+        &state.starter,
         stored,
         &id,
         if created {
@@ -205,7 +242,12 @@ async fn status(
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound("starter request".into()))?;
-    Ok(render(follow(&state, row).await?, &id, StatusCode::OK))
+    Ok(render(
+        &state.starter,
+        follow(&state, row).await?,
+        &id,
+        StatusCode::OK,
+    ))
 }
 async fn current(
     _auth: ScopedAuth<Read>,
@@ -215,10 +257,14 @@ async fn current(
         .storage
         .starter_request_current()
         .await
-        .map_err(|e| ApiError::Storage(e.to_string()))?
-        .ok_or_else(|| ApiError::NotFound("starter request".into()))?;
+        .map_err(|e| ApiError::Storage(e.to_string()))?;
+    let Some(row) = row else {
+        let mut value = serde_json::json!({"state":"not_requested"});
+        state.starter.discovery(&mut value);
+        return Ok((StatusCode::OK, Json(value)).into_response());
+    };
     let id = row.root_id().to_owned();
-    Ok(render(row, &id, StatusCode::OK))
+    Ok(render(&state.starter, row, &id, StatusCode::OK))
 }
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()

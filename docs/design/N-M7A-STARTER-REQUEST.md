@@ -1,6 +1,6 @@
 # N-M7a — Newcomer starter-channel request + status API (Option A, signet)
 
-Design note, docs only. Source read at `origin/main` `e8ed587` (v0.3.0-rc19 prep). Paths are under `crates/` unless stated. No code changed.
+Original design baseline. Source read at `origin/main` `e8ed587` (v0.3.0-rc19 prep). Paths are under `crates/` unless stated. The implementation amendments below supersede the original proposal where noted.
 
 **Goal (M7).** A brand-new user gets a hub-funded starter channel from inside the app, with no command line, so two users on their own nodes can message, call and pay each other from iPhone and Mac.
 
@@ -103,7 +103,7 @@ Capability: `starter_channel_request_v1` in `/api/v1/status` `api_capabilities` 
 |---|---|---|---|
 | `POST` | `/api/v1/onboarding/starter-channel` | `receive` **and** a verified `PairingBinding`. No other token is accepted, Admin included | Create or replay the request |
 | `GET` | `/api/v1/onboarding/starter-channel/{request_id}` | `read` | Status of one request |
-| `GET` | `/api/v1/onboarding/starter-channel` | `read` | The node's current request (latest non-refused, else latest), or 404 |
+| `GET` | `/api/v1/onboarding/starter-channel` | `read` | The node's current request (latest non-refused, else latest), or 200 `not_requested` with hub discovery |
 
 **Why `receive`, not `spend` or `admin`.** The newcomer moves no value out, opens nothing and changes no config; it asks to be paid into a channel, which is "create the means to be paid" (`docs/security/AUTH_SCOPES.md` §receive). Loopback `/auth/local` tokens also hold `receive`, so the handler additionally requires `auth.pairing.is_some()`. `AuthUser::from_request_parts` populates `pairing` only after `check_pairing_binding` has verified the client id and epoch against the durable pairing record (`konsensus-api/src/auth.rs:497-506`). A token without a binding, including a key-proof Admin token, gets `403 paired_session_required`. Tests use paired credentials.
 
@@ -413,3 +413,51 @@ The original API request resolves to its current `operation_id`. An authenticate
 `already_served` may revive the named original solely for reconciliation, including
 a locally refused record that the hub subsequently admitted after refusal pruning.
 See [operational details](../ops/starter-newcomer.md).
+
+
+## Hub discovery and no-approval ruling (22 Oct)
+
+The authenticated starter GETs expose read-only `hub_configured` and optional
+`hub_alias`. Before any request, GET `/api/v1/onboarding/starter-channel` returns
+200 with `{"state":"not_requested","hub_configured":false}` (or `true`, with an
+optional alias). GET of an unknown explicit UUID still returns 404. Read scope
+is required, including the existing verified pairing checks for paired tokens.
+Unauthenticated callers receive no hub identity, endpoint, alias or balance.
+The existing `starter_channel_request_v1` capability advertisement is unchanged.
+
+`hub_configured` means starter is enabled and its mesh identity, whitelisted
+peer, LN identity and LN address are configured. It does not assert reachability,
+wallet readiness, an available invite or available hub funds. `hub_alias` is
+optional `[starter] hub_alias` on the newcomer: an operator-supplied display name,
+never a peer-discovered LN alias or an identifier used for routing. It is omitted
+when no hub is configured. Discovery does not mutate config or request state.
+
+Atlas's no-approval ruling retains `receive` plus a verified paired session for
+POST, without adding an approval kind. The body is an explicit allowlist of
+`request_id` only (`deny_unknown_fields`): caller-supplied cost, fee, amount or
+push fields are refused before persistence, replay, or dispatch, even if zero.
+All funding and push remain hub-to-newcomer. Any future newcomer-to-hub value
+transfer must use the spend authorization path and cannot extend this request.
+
+Idempotency remains scoped to this node's durable request UUID. Same-ID replays,
+including concurrent replays, share one operation; terminal refusals alone permit
+the bounded successor behavior documented in [newcomer operations](../ops/starter-newcomer.md).
+
+The existing owner audit JSONL log records `starter.requested`, `starter.ready`
+and `starter.refused` with the paired device ID in both `actor` and
+`detail.paired_device_id`, request UUID, lineage root, state and refusal reason.
+The request intent is flushed and synced before a new durable request can be
+created; terminal outcomes are recorded from persisted state and retried on
+reconciliation if logging fails. Replay does not replace the original device.
+Automatic retries/adoption inherit the root's device identity. The log rebuilds
+this attribution and event deduplication on restart; pre-upgrade requests with
+no recorded origin are explicitly attributed to `unknown`, never guessed.
+No SQL migration or new approval kind is introduced.
+
+Conflicts before operation creation are separate `starter.request_conflict`
+events, not terminal hub refusals; that UUID can be accepted later. Attribution
+binds to the first device that requested the UUID. If authenticated adoption
+revives a refused UUID, a new `starter.requested` transition allows its next
+terminal outcome to be logged. Reconciliation repairs missing terminal events
+for earlier operations even after a newer request becomes current. Startup
+separates a crash-truncated journal tail before appending new records.

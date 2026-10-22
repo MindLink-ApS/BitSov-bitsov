@@ -14,6 +14,7 @@ address as the selected `[lightning.liquidity]` provider with
 [starter]
 enabled = true
 hub_node_id = "<64-hex hub mesh identity>"
+hub_alias = "Signet starter" # optional operator display name
 allow_mainnet = false
 ```
 
@@ -29,7 +30,8 @@ Authorization: Bearer <paired-receive-token>
 ```
 
 An unpaired token, including Admin or loopback authority, is refused. GET on the
-same path returns the current request; GET with `/{request_id}` follows that
+same path returns the current request, or 200 `not_requested` before the first
+request with `hub_configured` and optional `hub_alias`; GET with `/{request_id}` follows that
 owner request through automatic retries. Both GETs require `read` scope. POST
 returns 202 on creation and 200 on replay. A different live owner request gets
 409, including its ID. Changing the configured hub/key/network causes a replay

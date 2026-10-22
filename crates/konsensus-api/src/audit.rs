@@ -14,10 +14,12 @@
 //! See `docs/operations/LOGGING.md` for audit retention and sharing guidance.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+
+mod starter;
 
 use chrono::Utc;
 use serde::Serialize;
@@ -37,6 +39,7 @@ pub struct AuditLog {
     path: PathBuf,
     /// Bounded in-memory membrane log (N2). Never written to this file.
     membrane: crate::membrane::Membrane,
+    starter_activity: Mutex<starter::StarterActivity>,
 }
 
 /// A single audit log entry.
@@ -133,14 +136,16 @@ impl AuditLog {
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
 
+        let mut starter_activity = starter::StarterActivity::default();
         // Read the last sequence number from the existing file (if any)
         let last_seq = if path.exists() {
             let file = File::open(&path)?;
             let reader = BufReader::new(file);
             let mut max_seq = 0u64;
 
-            for line in reader.lines().map_while(Result::ok) {
-                if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
+            for line in reader.split(b'\n') {
+                if let Ok(entry) = serde_json::from_slice::<serde_json::Value>(&line?) {
+                    starter_activity.recover(&entry);
                     if let Some(seq) = entry.get("seq").and_then(|s| s.as_u64()) {
                         max_seq = max_seq.max(seq);
                     }
@@ -151,7 +156,22 @@ impl AuditLog {
             0
         };
 
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
+        // A crash can leave a partial final record. Preserve that evidence, but
+        // separate subsequent entries so durable starter attribution stays parseable.
+        if file.metadata()?.len() > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+                file.sync_data()?;
+            }
+        }
 
         let writer = BufWriter::new(file);
 
@@ -160,6 +180,7 @@ impl AuditLog {
             seq: AtomicU64::new(last_seq + 1),
             path,
             membrane: crate::membrane::Membrane::default(),
+            starter_activity: Mutex::new(starter_activity),
         })
     }
 

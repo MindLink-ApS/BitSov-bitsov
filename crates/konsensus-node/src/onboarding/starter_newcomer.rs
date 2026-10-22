@@ -16,6 +16,7 @@ pub struct StarterNewcomer {
     pub storage: Arc<dyn Storage>,
     pub lightning: Arc<dyn LightningProvider>,
     pub node_id: NodeId,
+    pub audit_log: Arc<konsensus_api::AuditLog>,
 }
 fn retryable(reason: &str) -> bool {
     matches!(
@@ -39,6 +40,15 @@ fn backoff(attempts: i64) -> i64 {
     }
 }
 impl StarterNewcomer {
+    async fn save_progress(&self, r: &StarterRequest) -> anyhow::Result<()> {
+        self.storage.starter_request_save(r).await?;
+        // Terminal storage updates are monotonic; audit the persisted winner.
+        if let Some(stored) = self.storage.starter_request_get(&r.request_id).await? {
+            self.audit_log.starter_progress(&stored)?;
+        }
+        Ok(())
+    }
+
     fn enabled(&self) -> bool {
         self.settings
             .precondition(self.lightning.starter_network().as_deref())
@@ -73,6 +83,9 @@ impl StarterNewcomer {
         if !self.settings.matches(&r) || r.terminal() {
             return Ok(());
         }
+        // Adoption may have revived this UUID just before a crash. Journal its
+        // nonterminal lifecycle before a queued status can make it terminal again.
+        self.audit_log.starter_progress(&r)?;
         if !matches!(state.as_str(), "received" | "opening" | "ready" | "refused") {
             return Ok(());
         }
@@ -99,7 +112,7 @@ impl StarterNewcomer {
                     .map(|id| format!("adopt:{id}"));
             }
             r.updated_at = now;
-            self.storage.starter_request_save(&r).await?;
+            self.save_progress(&r).await?;
             // Adopt only an explicit authenticated original grant; never dispatch
             // a replacement for already_served. A crash is repaired on poll below.
             if r.reason.as_deref() == Some("already_served") {
@@ -143,7 +156,7 @@ impl StarterNewcomer {
         }
         r.detail = Some("channel_pending".into());
         r.updated_at = now;
-        self.storage.starter_request_save(&r).await?;
+        self.save_progress(&r).await?;
         self.reconcile(r, now).await?;
         Ok(())
     }
@@ -157,7 +170,8 @@ impl StarterNewcomer {
         );
         adopted.detail = Some("adopted".into());
         adopted.original_request_id = (original != r.root_id()).then(|| r.root_id().to_owned());
-        self.storage.starter_request_adopt(&adopted).await?;
+        let stored = self.storage.starter_request_adopt(&adopted).await?;
+        self.audit_log.starter_progress(&stored)?;
         Ok(())
     }
     async fn reconcile(&self, mut r: StarterRequest, now: i64) -> anyhow::Result<StarterRequest> {
@@ -209,12 +223,19 @@ impl StarterNewcomer {
             r.detail = Some("hub_silent_24h".into());
         }
         r.updated_at = now;
-        self.storage.starter_request_save(&r).await?;
+        self.save_progress(&r).await?;
         Ok(r)
     }
     /// Called every 15s and on status arrival. A send attempt is persisted BEFORE
     /// connecting/signing/transmitting; cancellation and restart retain its UUID.
     pub async fn poll(&self, now: i64, connected: bool) -> anyhow::Result<Option<Frame>> {
+        // A later owner request may have replaced the current row after a crash.
+        // Repair all pending audit intents, not only the current operation.
+        for id in self.audit_log.starter_pending() {
+            if let Some(row) = self.storage.starter_request_get(&id).await? {
+                self.audit_log.starter_progress(&row)?;
+            }
+        }
         if !self.enabled() {
             return Ok(None);
         }
@@ -224,6 +245,8 @@ impl StarterNewcomer {
         if !self.settings.matches(&r) {
             return Ok(None);
         }
+        // Repair an outcome saved just before a crash/audit failure, before retry.
+        self.audit_log.starter_progress(&r)?;
         if r.state == "refused" && r.reason.as_deref() == Some("already_served") {
             if let Some(original) = r.detail.as_deref().and_then(|v| v.strip_prefix("adopt:")) {
                 if let Ok(id) = original.parse::<uuid::Uuid>() {
@@ -239,6 +262,7 @@ impl StarterNewcomer {
                 .storage
                 .starter_request_retry(&r.request_id, now)
                 .await?;
+            self.audit_log.starter_progress(&r)?;
         }
         if r.terminal() {
             return Ok(None);
@@ -253,7 +277,7 @@ impl StarterNewcomer {
         if r.send_attempts >= 8 {
             if r.detail.as_deref() != Some("hub_silent_24h") {
                 r.detail = Some("delivery_retry_exhausted".into());
-                self.storage.starter_request_save(&r).await?;
+                self.save_progress(&r).await?;
             }
             return Ok(None);
         }
@@ -268,7 +292,7 @@ impl StarterNewcomer {
         r.send_attempts += 1;
         r.last_sent_at = Some(now);
         r.updated_at = now;
-        self.storage.starter_request_save(&r).await?;
+        self.save_progress(&r).await?;
         let prepare = async {
             self.lightning
                 .connect_peer(&r.hub_ln_pubkey, &self.settings.hub_ln_address, true)
@@ -296,7 +320,7 @@ impl StarterNewcomer {
             Ok(Ok(frame)) => Ok(Some(frame)),
             _ => {
                 r.detail = Some("hub_unreachable".into());
-                self.storage.starter_request_save(&r).await?;
+                self.save_progress(&r).await?;
                 Ok(None)
             }
         }
