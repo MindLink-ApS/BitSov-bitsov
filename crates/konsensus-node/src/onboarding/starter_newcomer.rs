@@ -92,9 +92,11 @@ impl StarterNewcomer {
                 None
             };
             if r.reason.as_deref() == Some("already_served") {
-                r.original_request_id = original_request_id
+                // The hub's target is not our local lineage root. Keep both
+                // durable so a crash before adoption cannot reset the budget.
+                r.detail = original_request_id
                     .filter(|id| id.get_version_num() == 4 && *id != request_id)
-                    .map(|id| id.to_string());
+                    .map(|id| format!("adopt:{id}"));
             }
             r.updated_at = now;
             self.storage.starter_request_save(&r).await?;
@@ -154,6 +156,7 @@ impl StarterNewcomer {
             now.max(r.created_at + 1),
         );
         adopted.detail = Some("adopted".into());
+        adopted.original_request_id = (original != r.root_id()).then(|| r.root_id().to_owned());
         self.storage.starter_request_adopt(&adopted).await?;
         Ok(())
     }
@@ -222,8 +225,12 @@ impl StarterNewcomer {
             return Ok(None);
         }
         if r.state == "refused" && r.reason.as_deref() == Some("already_served") {
-            if let Some(original) = r.original_request_id.as_deref() {
-                self.adopt(&r, original, now).await?;
+            if let Some(original) = r.detail.as_deref().and_then(|v| v.strip_prefix("adopt:")) {
+                if let Ok(id) = original.parse::<uuid::Uuid>() {
+                    if id.get_version_num() == 4 && original != r.request_id {
+                        self.adopt(&r, original, now).await?;
+                    }
+                }
             }
             return Ok(None);
         }

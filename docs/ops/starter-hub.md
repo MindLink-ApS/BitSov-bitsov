@@ -79,3 +79,15 @@ Starter tables retain the LN key for uniqueness and recovery, but no IP/socket a
 Set `enabled = false` and restart to stop the worker and capability advertisement. Existing channels remain intact. The Admin charged-resolution endpoint remains available for previously created uncertain grants.
 
 PR-2 implements C3 with durable negotiated initial-push evidence and F4 with bounded, persisted retry successors. Timeouts reuse the same UUID; only an explicit retryable refusal permits a successor UUID. See [newcomer operations](starter-newcomer.md) for bounds, backoff and status. Mainnet still requires an explicit policy decision and idle reclaim.
+
+## Confirmation policy and before-mainnet checklist
+
+Starter channels are not configured as zero-confirmation channels.
+`trust_no_reserve` affects the anchor-reserve policy only; the newcomer still
+requires LDK's inbound funding confirmation depth and channel-ready checks.
+
+The newcomer's `ready` request state is terminal. Once verified, it is not
+re-checked for confirmation depth, a later deep reorg, or channel closure.
+Before mainnet GO, decide and implement ongoing readiness/reorg/closure handling
+and idle reclaim; a historical `ready` request must not be treated as proof of
+current spendable channel liquidity. Mainnet remains disabled.

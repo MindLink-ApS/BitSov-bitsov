@@ -160,12 +160,25 @@ macro_rules! backend {
     let mut adopted=r.clone();
     adopted.state="requested".into();adopted.detail=Some("adopted".into());
     adopted.reason=None;adopted.retry_allowed=false;adopted.retry_after_unix=None;
-    adopted.original_request_id=None;adopted.send_attempts=0;adopted.last_sent_at=None;
+    adopted.send_attempts=0;adopted.last_sent_at=None;
+    let root=r.root_id();
     if let Some(existing)=sqlx::query_as::<_,StarterRequest>(&sql("SELECT * FROM starter_requests WHERE request_id=?")).bind(&r.request_id).fetch_optional(&mut *tx).await? {
-        if existing.hub_node_id!=r.hub_node_id || existing.hub_ln_pubkey!=r.hub_ln_pubkey || existing.network!=r.network {tx.commit().await?;return Ok(existing);}
+        if existing.hub_node_id!=r.hub_node_id || existing.hub_ln_pubkey!=r.hub_ln_pubkey || existing.network!=r.network || existing.root_id()!=root {tx.commit().await?;return Ok(existing);}
+        // Reusing a known UUID never detaches it from its local root.
+        adopted.original_request_id=existing.original_request_id;
         // Authenticated adoption is the sole exception to refusal terminality:
         // the hub proves this exact UUID now identifies a live grant.
         sqlx::query(&sql("DELETE FROM starter_requests WHERE request_id=? AND state='refused'")).bind(&r.request_id).execute(&mut *tx).await?;
+    } else if adopted.original_request_id.is_some() {
+        // A hub-nominated UUID consumes the same bounded budget as a retry.
+        // Count under the same lock as retry(), including previously adopted IDs.
+        let count:i64=sqlx::query_scalar(&sql("SELECT COUNT(*) FROM starter_requests WHERE original_request_id=?")).bind(root).fetch_one(&mut *tx).await?;
+        if count>=3 {
+            let mut latest:StarterRequest=sqlx::query_as(&sql("SELECT * FROM starter_requests WHERE request_id=? OR original_request_id=? ORDER BY created_at DESC,request_id DESC LIMIT 1")).bind(root).bind(root).fetch_one(&mut *tx).await?;
+            latest.detail=Some("auto_retry_exhausted".into());
+            sqlx::query(&sql("UPDATE starter_requests SET detail='auto_retry_exhausted' WHERE request_id=?")).bind(&latest.request_id).execute(&mut *tx).await?;
+            tx.commit().await?;return Ok(latest);
+        }
     }
     insert(&mut tx,&adopted).await?;
     tx.commit().await?;Ok(adopted)

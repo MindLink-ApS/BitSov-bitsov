@@ -100,7 +100,7 @@ async fn paired_receive_is_required_before_any_persistence() {
 }
 
 use konsensus_core::traits::lightning::*;
-struct ReadyLn;
+struct ReadyLn(&'static str);
 #[async_trait::async_trait]
 impl LightningProvider for ReadyLn {
     async fn create_invoice(&self, _: u64, _: &str, _: u32) -> Result<Invoice, LightningError> {
@@ -119,7 +119,7 @@ impl LightningProvider for ReadyLn {
         true
     }
     fn starter_network(&self) -> Option<String> {
-        Some("regtest".into())
+        Some(self.0.into())
     }
 }
 #[tokio::test]
@@ -128,7 +128,7 @@ async fn paired_create_replay_conflict_and_changed_hub_are_durable() {
     let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
     let mut state = (*test_state()).clone();
     state.storage = db.clone();
-    state.lightning = Arc::new(ReadyLn);
+    state.lightning = Arc::new(ReadyLn("regtest"));
     state.starter = StarterSettings {
         config: StarterConfig {
             enabled: true,
@@ -234,7 +234,7 @@ async fn error_metadata_no_persistence_and_revoked_pairing() {
     let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
     let mut state = (*test_state()).clone();
     state.storage = db.clone();
-    state.lightning = Arc::new(ReadyLn);
+    state.lightning = Arc::new(ReadyLn("regtest"));
     let dir = tempfile::tempdir().unwrap();
     let token = paired(&mut state, dir.path(), pairing::default_pairing_scopes());
     for reason in [
@@ -357,4 +357,40 @@ async fn post_replay_rearms_current_child_but_get_does_not() {
     assert_eq!(rearmed.request_id, child.request_id);
     assert_eq!(rearmed.send_attempts, 0);
     assert_eq!(rearmed.original_request_id, Some(id.to_string()));
+}
+
+#[tokio::test]
+async fn provider_mainnet_with_signet_config_is_rejected_before_persistence() {
+    use konsensus_api::handlers::starter_channel::{StarterConfig, StarterSettings};
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let mut state = (*test_state()).clone();
+    state.storage = db.clone();
+    state.lightning = Arc::new(ReadyLn("bitcoin"));
+    state.starter = StarterSettings {
+        config: StarterConfig {
+            enabled: true,
+            hub_node_id: "08".repeat(32),
+            allow_mainnet: false,
+        },
+        network: "signet".into(),
+        hub_ln_pubkey: "03".repeat(33),
+        hub_ln_address: "127.0.0.1:9735".into(),
+        hub_whitelisted: true,
+        trust_no_reserve: true,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let token = paired(&mut state, dir.path(), pairing::default_pairing_scopes());
+    let response = test_router(Arc::new(state))
+        .oneshot(post(&token, uuid::Uuid::new_v4()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 10000)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["reason"], "network_not_allowed");
+    assert!(db.starter_request_current().await.unwrap().is_none());
 }

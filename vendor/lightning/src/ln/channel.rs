@@ -14914,7 +14914,7 @@ where
 			(65, self.quiescent_action, option), // Added in 0.2
 			(67, pending_outbound_held_htlc_flags, optional_vec), // Added in 0.2
 			(69, holding_cell_held_htlc_flags, optional_vec), // Added in 0.2
-			(71, self.context.initial_push_msat, option), // BitSov starter evidence
+			(65_537, self.context.initial_push_msat, option), // Fork-private; see BITSOV-PATCH.md
 		});
 
 		Ok(())
@@ -15330,7 +15330,7 @@ where
 			(65, quiescent_action, upgradable_option), // Added in 0.2
 			(67, pending_outbound_held_htlc_flags_opt, optional_vec), // Added in 0.2
 			(69, holding_cell_held_htlc_flags_opt, optional_vec), // Added in 0.2
-			(71, initial_push_msat, option), // BitSov starter evidence
+			(65_537, initial_push_msat, option), // Fork-private; see BITSOV-PATCH.md
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);

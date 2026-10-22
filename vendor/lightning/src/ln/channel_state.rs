@@ -644,8 +644,9 @@ impl_writeable_tlv_based!(ChannelDetails, {
 	(43, pending_inbound_htlcs, optional_vec),
 	(45, pending_outbound_htlcs, optional_vec),
 	(47, funding_redeem_script, option),
-	(49, counterparty_force_close_spend_delay, option),
-	(51, initial_push_msat, option),
+	// Fork-private odd types; upstream uses 49/51. See BITSOV-PATCH.md.
+	(65_539, initial_push_msat, option),
+	(65_541, counterparty_force_close_spend_delay, option),
 	(_unused, user_channel_id, (static_value,
 		_user_channel_id_low.unwrap_or(0) as u128 | ((_user_channel_id_high.unwrap_or(0) as u128) << 64)
 	)),

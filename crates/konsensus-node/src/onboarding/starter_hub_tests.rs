@@ -770,3 +770,302 @@ async fn newcomer_adopts_an_original_that_was_previously_refused() {
     );
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
 }
+
+fn newcomer_refusal(
+    id: Uuid,
+    reason: &str,
+    retry_after: Option<u64>,
+    original: Option<Uuid>,
+) -> Frame {
+    Frame::StarterStatus {
+        request_id: id,
+        state: "refused".into(),
+        reason: Some(reason.into()),
+        retry_after_unix: retry_after,
+        original_request_id: original,
+        capacity_sats: None,
+        push_sats: None,
+        channel_id: None,
+        funding_txid: None,
+    }
+}
+
+async fn newcomer_create(client: &super::super::starter_newcomer::StarterNewcomer) -> Uuid {
+    use konsensus_storage::starter_request::StarterRequest;
+    let id = Uuid::new_v4();
+    client
+        .storage
+        .starter_request_create(&StarterRequest::new(
+            id.to_string(),
+            client.settings.config.hub_node_id.clone(),
+            client.settings.hub_ln_pubkey.clone(),
+            client.settings.network.clone(),
+            100,
+        ))
+        .await
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn newcomer_non_retryable_refusals_never_create_a_successor() {
+    let (hub, _, peer) = setup(3).await;
+    for reason in ["not_invited", "operation_mismatch", "unknown_reason"] {
+        let (client, db, _) = newcomer_fixture(&hub, peer).await;
+        let id = newcomer_create(&client).await;
+        client
+            .handle(hub.hub_id, newcomer_refusal(id, reason, Some(0), None), 100)
+            .await
+            .unwrap();
+        let refused = db.starter_request_current().await.unwrap().unwrap();
+        assert!(!refused.retry_allowed, "{reason}");
+        assert_eq!(refused.retry_after_unix, None);
+        for now in [700, 10_000, 100_000] {
+            assert!(client.poll(now, true).await.unwrap().is_none());
+            let current = db.starter_request_current().await.unwrap().unwrap();
+            assert_eq!(current.request_id, id.to_string());
+            assert_eq!(current.state, "refused");
+        }
+    }
+}
+
+#[tokio::test]
+async fn newcomer_refusal_persists_local_minimum_delay_even_if_hub_says_now() {
+    let (hub, _, peer) = setup(3).await;
+    for advertised in [Some(0), Some(500), Some(501), None, Some(2000)] {
+        let (client, db, _) = newcomer_fixture(&hub, peer).await;
+        let id = newcomer_create(&client).await;
+        client
+            .handle(
+                hub.hub_id,
+                newcomer_refusal(id, "hub_busy", advertised, None),
+                500,
+            )
+            .await
+            .unwrap();
+        let due = advertised.unwrap_or(1100).max(1100) as i64;
+        // Check durable status directly: storage's additional backoff must not mask
+        // removal of the worker's now+600 floor.
+        assert_eq!(
+            db.starter_request_get(&id.to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .retry_after_unix,
+            Some(due)
+        );
+        assert!(client.poll(due - 1, true).await.unwrap().is_none());
+        assert_eq!(
+            db.starter_request_current()
+                .await
+                .unwrap()
+                .unwrap()
+                .request_id,
+            id.to_string()
+        );
+        assert!(
+            matches!(client.poll(due, true).await.unwrap(), Some(Frame::StarterRequest { request_id, .. }) if request_id != id)
+        );
+    }
+}
+
+#[tokio::test]
+async fn newcomer_lying_hub_adoption_preserves_root_and_three_successor_budget() {
+    let (hub, _, peer) = setup(3).await;
+    let (client, db, _) = newcomer_fixture(&hub, peer).await;
+    let root = newcomer_create(&client).await;
+    client
+        .handle(
+            hub.hub_id,
+            newcomer_refusal(root, "hub_busy", Some(0), None),
+            100,
+        )
+        .await
+        .unwrap();
+    client.poll(700, true).await.unwrap().unwrap();
+    let child = db.starter_request_current().await.unwrap().unwrap();
+    let child_id = child.request_id.parse().unwrap();
+    let adopted_id = Uuid::new_v4();
+    client
+        .handle(
+            hub.hub_id,
+            newcomer_refusal(child_id, "already_served", None, Some(adopted_id)),
+            701,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.starter_request_get(&child.request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .root_id(),
+        root.to_string()
+    );
+    let adopted = db.starter_request_current().await.unwrap().unwrap();
+    assert_eq!(adopted.request_id, adopted_id.to_string());
+    assert_eq!(adopted.root_id(), root.to_string());
+    // A lying hub can bounce between known IDs but cannot erase either row's lineage.
+    client
+        .handle(
+            hub.hub_id,
+            newcomer_refusal(adopted_id, "already_served", None, Some(child_id)),
+            702,
+        )
+        .await
+        .unwrap();
+    client
+        .handle(
+            hub.hub_id,
+            newcomer_refusal(child_id, "already_served", None, Some(root)),
+            703,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.starter_request_current()
+            .await
+            .unwrap()
+            .unwrap()
+            .request_id,
+        root.to_string()
+    );
+    client
+        .handle(
+            hub.hub_id,
+            newcomer_refusal(root, "hub_busy", Some(0), None),
+            704,
+        )
+        .await
+        .unwrap();
+    assert!(client.poll(3103, true).await.unwrap().is_none()); // third successor: 40 minutes
+    client.poll(3104, true).await.unwrap().unwrap();
+    let third = db.starter_request_current().await.unwrap().unwrap();
+    assert_eq!(third.root_id(), root.to_string());
+    let fourth = Uuid::new_v4();
+    client
+        .handle(
+            hub.hub_id,
+            newcomer_refusal(
+                third.request_id.parse().unwrap(),
+                "already_served",
+                None,
+                Some(fourth),
+            ),
+            3105,
+        )
+        .await
+        .unwrap();
+    assert!(db
+        .starter_request_get(&fourth.to_string())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(client.poll(100_000, true).await.unwrap().is_none());
+    assert_eq!(
+        db.starter_request_current()
+            .await
+            .unwrap()
+            .unwrap()
+            .detail
+            .as_deref(),
+        Some("auto_retry_exhausted")
+    );
+    assert_eq!(
+        db.starter_request_get(&child.request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .root_id(),
+        root.to_string()
+    );
+    assert_eq!(
+        db.starter_request_get(&adopted_id.to_string())
+            .await
+            .unwrap()
+            .unwrap()
+            .root_id(),
+        root.to_string()
+    );
+}
+
+#[tokio::test]
+async fn newcomer_pending_adoption_recovers_after_restart_without_new_budget() {
+    let (hub, _, peer) = setup(3).await;
+    let (mut client, _, _) = newcomer_fixture(&hub, peer).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("newcomer.sqlite");
+    client.storage = Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap());
+    let root = newcomer_create(&client).await;
+    client
+        .handle(
+            hub.hub_id,
+            newcomer_refusal(root, "hub_busy", Some(0), None),
+            100,
+        )
+        .await
+        .unwrap();
+    client.poll(700, true).await.unwrap().unwrap();
+    let mut child = client
+        .storage
+        .starter_request_current()
+        .await
+        .unwrap()
+        .unwrap();
+    let target = Uuid::new_v4();
+    // Simulate a crash after the refusal is durable but before adopt() runs.
+    child.state = "refused".into();
+    child.reason = Some("already_served".into());
+    child.detail = Some(format!("adopt:{target}"));
+    child.updated_at = 701;
+    client.storage.starter_request_save(&child).await.unwrap();
+    client.storage = Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap());
+    assert!(client.poll(702, true).await.unwrap().is_none());
+    let adopted = client
+        .storage
+        .starter_request_current()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(adopted.request_id, target.to_string());
+    assert_eq!(adopted.root_id(), root.to_string());
+    client
+        .handle(
+            hub.hub_id,
+            newcomer_refusal(target, "hub_busy", Some(0), None),
+            703,
+        )
+        .await
+        .unwrap();
+    client.storage = Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap());
+    assert!(client.poll(3102, true).await.unwrap().is_none());
+    client.poll(3103, true).await.unwrap().unwrap();
+    let last = client
+        .storage
+        .starter_request_current()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(last.root_id(), root.to_string());
+    client
+        .handle(
+            hub.hub_id,
+            newcomer_refusal(last.request_id.parse().unwrap(), "hub_busy", Some(0), None),
+            3104,
+        )
+        .await
+        .unwrap();
+    client.storage = Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap());
+    assert!(client.poll(100_000, true).await.unwrap().is_none());
+    assert_eq!(
+        client
+            .storage
+            .starter_request_current()
+            .await
+            .unwrap()
+            .unwrap()
+            .detail
+            .as_deref(),
+        Some("auto_retry_exhausted")
+    );
+}

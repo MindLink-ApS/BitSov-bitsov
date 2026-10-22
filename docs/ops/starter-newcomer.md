@@ -39,7 +39,9 @@ Responses expose `requested`, `opening`, `ready` or `refused`, `detail`, refusal
 `reason`, retry timing, hub identities, amounts, channel identifiers and
 `verified`. `operation_id` identifies the current hub attempt; `request_id`
 remains the owner's polled ID. `original_request_id` links automatic successors
-to their original owner request, or identifies a hub grant being adopted.
+to their original owner request, including adopted hub grants. A pending
+adoption target is persisted separately in `detail` as `adopt:<UUID>` so crash
+recovery cannot replace the local lineage root.
 
 ## Delivery and recovery
 
@@ -59,7 +61,10 @@ minutes, also respecting a later hub `retry_after_unix`. The limit and lineage
 survive restart. Exhaustion is surfaced as `auto_retry_exhausted`; the owner may
 explicitly start a fresh request after a proven refusal. Non-retryable refusals
 never automatically create successors. `already_served` adopts the identified
-original grant instead, including when its old local record was refused.
+original grant instead, including when its old local record was refused. A new
+adopted UUID consumes one of the same three successor slots; revisiting a known
+UUID preserves its lineage and cannot replenish the budget. A target belonging
+to another local lineage is not adopted.
 
 ## Push evidence
 
@@ -68,9 +73,10 @@ with the configured counterparty, matching capacity and any stated channel or
 funding identifiers. Capacity is capped at 200,000 sats. LDK's negotiated initial
 push is persisted with the channel before it can be used, and must cover the
 hub's promised push. Spending later does not erase this evidence. A hub `ready`
-frame alone is insufficient. Trusted signet zero-confirmation channels still
-use LDK's commitment/channel-ready checks; advertised balance alone is not
-spendable liquidity.
+frame alone is insufficient. `trust_no_reserve` relaxes the anchor-reserve
+policy only; it does not configure zero-confirmation trust. Inbound funding
+must reach LDK's required confirmation depth and channel-ready checks.
+Advertised balance alone is not spendable liquidity.
 
 Channels written by older versions have unknown initial-push evidence and fail
 closed (`verify_mismatch`). This patch adds optional, backward-readable LDK TLV
@@ -79,3 +85,12 @@ newcomer requests, attempts, retry lineage and verification timestamps.
 
 Set `[starter] enabled = false` and restart to stop delivery. Existing channel
 balances remain available, and persisted request status remains readable.
+
+## Before mainnet
+
+`ready` is terminal: the newcomer worker stops reconciling that request and does
+not re-check confirmation depth, a later deep reorg, or channel closure. The
+record reports successful starter verification at `verified_at`, not continuing
+channel availability. Before any mainnet GO, decide and implement ongoing
+readiness/reorg/closure handling together with the idle-reclaim policy. Mainnet
+remains disabled pending those decisions and validation.

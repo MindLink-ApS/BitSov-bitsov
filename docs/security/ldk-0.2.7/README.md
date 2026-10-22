@@ -26,7 +26,7 @@ The ldk-node v0.7.1 annotated tag is dated October 12 2026 and resolves to `edc8
 
 `local-history.txt` is the complete ordered list of 24 commits touching either vendor tree through the base commit, not just #265/#270/#275. `local-before.json` records every file differing from the original archives, including additions, deletions, packaging and formatting, with SHA-256 values. Existing `vendor/{lightning,ldk-node}/BITSOV-PATCH.md` describe the behaviors.
 
-Lightning local behaviors: explicit cooperative-close consent, pending-monitor-event visibility, their regressions, offline breach-window diagnostic/odd TLV 49, local lint/test configuration and formatting. Node local behaviors: stateless receipts and duplicate/skim protection; fixed JIT net minimum; wallet reservations/bump isolation; source evidence; sync health/retry/deadline handling; Esplora auth/rate limits/rebroadcast policy; owner funding fees; private forwarding; bounded LSPS2 opens and metrics; move-home; configured contest delay; hub peer admission; watchtower durable candidates/quarantine/bounded outbox; offline sync checkpoint and breach diagnostics; channel-capacity limits. The complete per-file/hash inventory is authoritative for less visible changes.
+Lightning local behaviors: explicit cooperative-close consent, pending-monitor-event visibility, their regressions, offline breach-window diagnostic (originally odd TLV 49; now fork-private 65,541), local lint/test configuration and formatting. Node local behaviors: stateless receipts and duplicate/skim protection; fixed JIT net minimum; wallet reservations/bump isolation; source evidence; sync health/retry/deadline handling; Esplora auth/rate limits/rebroadcast policy; owner funding fees; private forwarding; bounded LSPS2 opens and metrics; move-home; configured contest delay; hub peer admission; watchtower durable candidates/quarantine/bounded outbox; offline sync checkpoint and breach diagnostics; channel-capacity limits. The complete per-file/hash inventory is authoritative for less visible changes.
 
 ## Package provenance
 
@@ -60,7 +60,9 @@ local deltas (whitespace/commas excluded for the formatting comparison); an
 independent reviewer confirmed this separately. The sole three-way conflict was
 an old brace-format change overlapping upstream's new
 `BackgroundEvent::AttemptUnblockMonitorUpdates` handler; the upstream handler is
-retained. Local TLV 49 remains unused by upstream (its schema ends at 47).
+retained. At this rebase, upstream 0.2.7 ended at TLV 47. PR #364 round 1
+subsequently found that upstream main uses 49 and moved the diagnostic to
+fork-private 65,541; see [the current allocation ledger](../../../vendor/lightning/BITSOV-PATCH.md).
 The old reload whitespace-only delta is absorbed by upstream; the monitor
 whitespace cleanup remains inventoried.
 Node production **and test source** files are byte-identical to `9fdb1480`.

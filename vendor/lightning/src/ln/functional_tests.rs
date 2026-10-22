@@ -10158,3 +10158,77 @@ fn starter_initial_push_survives_spend_and_restart() {
     reload_node!(nodes[1], test_default_channel_config(), &node_encoded, &chanmon_encoded.iter().map(|v| &v[..]).collect::<Vec<_>>(), persister, new_chain_monitor, new_node);
     assert_eq!(nodes[1].node.list_channels()[0].initial_push_msat, Some(10_000_000));
 }
+
+// Pin the on-disk fork allocations, not just same-version round trips.
+#[test]
+fn starter_initial_push_uses_private_tlvs_and_reads_upstream_shape() {
+    use crate::ln::channel::FundedChannel;
+    use crate::ln::channel_state::ChannelDetails;
+    use crate::util::ser::{BigSize, Readable};
+
+    let chanmon_cfgs = create_chanmon_cfgs(2);
+    let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+    let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+    let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+    let (_, _, channel_id, _) = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 10_000_000);
+    let details = nodes[1].node.list_channels().remove(0);
+    let per_peer_state_lock;
+    let mut peer_state_lock;
+    let channel = get_channel_ref!(nodes[1], nodes[0], per_peer_state_lock, peer_state_lock, channel_id);
+    let channel = channel.as_funded_mut().unwrap();
+    // Channel's TLV suffix ends with the highest type: BigSize(65537), len=8, u64.
+    let mut expected = BigSize(65_537).encode();
+    expected.push(8);
+    expected.extend_from_slice(&10_000_000u64.to_be_bytes());
+    assert!(channel.encode().ends_with(&expected));
+
+    let encoded = details.encode();
+    let mut reader = &encoded[..];
+    let length = BigSize::read(&mut reader).unwrap().0 as usize;
+    assert_eq!(reader.len(), length);
+    let mut upstream_fields = Vec::new();
+    let mut push_seen = false;
+    let mut delay_seen = false;
+    while !reader.is_empty() {
+        let typ = BigSize::read(&mut reader).unwrap().0;
+        let len = BigSize::read(&mut reader).unwrap().0 as usize;
+        let (value, rest) = reader.split_at(len);
+        reader = rest;
+        match typ {
+            65_539 => {
+                assert_eq!(value, &10_000_000u64.to_be_bytes());
+                push_seen = true;
+            },
+            65_541 => {
+                assert_eq!(value, &details.counterparty_force_close_spend_delay.unwrap().to_be_bytes());
+                delay_seen = true;
+            },
+            49 | 51 => panic!("fork field collides with upstream"),
+            _ => {
+                BigSize(typ).write(&mut upstream_fields).unwrap();
+                BigSize(len as u64).write(&mut upstream_fields).unwrap();
+                upstream_fields.extend_from_slice(value);
+            },
+        }
+    }
+    assert!(push_seen && delay_seen);
+    let decoded = ChannelDetails::read(&mut &encoded[..]).unwrap();
+    assert_eq!(decoded.initial_push_msat, Some(10_000_000));
+    // Upstream-shaped details: no fork fields, with upstream 49 (u64 dust exposure)
+    // and 51 (an empty SpliceDetails TLV stream). Both must be skipped as unknown.
+    upstream_fields.extend_from_slice(&[49, 8, 0, 0, 0, 0, 0, 0, 0, 42, 51, 3, 2, 1, 0]);
+    let mut upstream = BigSize(upstream_fields.len() as u64).encode();
+    upstream.extend_from_slice(&upstream_fields);
+    let decoded = ChannelDetails::read(&mut &upstream[..]).unwrap();
+    assert_eq!(decoded.initial_push_msat, None);
+    assert_eq!(decoded.counterparty_force_close_spend_delay, None);
+    assert_eq!(decoded.channel_id, details.channel_id);
+
+    // Omit the optional field to reproduce a pre-fork Channel, then read it.
+    channel.context.initial_push_msat = None;
+    let legacy = channel.encode();
+    let features = crate::ln::channelmanager::provided_channel_type_features(&test_default_channel_config());
+    let decoded = FundedChannel::read(&mut &legacy[..], (&nodes[1].keys_manager, &nodes[1].keys_manager, &features)).unwrap();
+    assert_eq!(decoded.context.initial_push_msat, None);
+    channel.context.initial_push_msat = Some(10_000_000);
+}

@@ -137,3 +137,65 @@ async fn authenticated_adoption_can_recover_a_previously_refused_id() {
         original.request_id
     );
 }
+
+#[tokio::test]
+async fn storage_retry_rejects_non_retryable_refusal_even_after_deadline() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let mut row = StarterRequest::new(
+        uuid::Uuid::new_v4().to_string(),
+        "hub".into(),
+        "ln".into(),
+        "regtest".into(),
+        100,
+    );
+    db.starter_request_create(&row).await.unwrap();
+    row.state = "refused".into();
+    row.reason = Some("not_invited".into());
+    row.retry_after_unix = Some(700);
+    row.retry_allowed = false;
+    db.starter_request_save(&row).await.unwrap();
+    let result = db
+        .starter_request_retry(&row.request_id, 100_000)
+        .await
+        .unwrap();
+    assert_eq!(result.request_id, row.request_id);
+    assert_eq!(result.state, "refused");
+}
+
+#[tokio::test]
+async fn adoption_cannot_steal_an_existing_uuid_from_another_lineage() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let mut original = StarterRequest::new(
+        uuid::Uuid::new_v4().to_string(),
+        "hub".into(),
+        "ln".into(),
+        "regtest".into(),
+        100,
+    );
+    db.starter_request_create(&original).await.unwrap();
+    original.state = "refused".into();
+    db.starter_request_save(&original).await.unwrap();
+    let mut other = StarterRequest::new(
+        uuid::Uuid::new_v4().to_string(),
+        "hub".into(),
+        "ln".into(),
+        "regtest".into(),
+        200,
+    );
+    db.starter_request_create(&other).await.unwrap();
+    other.state = "refused".into();
+    db.starter_request_save(&other).await.unwrap();
+    let mut target = original.clone();
+    target.original_request_id = Some(other.request_id.clone());
+    let result = db.starter_request_adopt(&target).await.unwrap();
+    assert_eq!(result.state, "refused");
+    assert_eq!(result.root_id(), original.request_id);
+    assert_eq!(
+        db.starter_request_get(&other.request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .root_id(),
+        other.request_id
+    );
+}
