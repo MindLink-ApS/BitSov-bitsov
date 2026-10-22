@@ -3489,6 +3489,34 @@ mod tests {
         transport_b.shutdown();
     }
 
+    #[tokio::test]
+    async fn oversized_control_fields_count_toward_invalid_frame_ban() {
+        let (transport_a, transport_b, _id_a, _id_b, node_a_id, node_b_id) =
+            setup_connected_pair().await;
+        let oversized = Frame::InvoiceError {
+            request_id: "cap-ban".into(),
+            reason: "x".repeat(crate::wire::MAX_CONTROL_REASON_BYTES + 1),
+        }.to_bytes().unwrap();
+        // Valid JSON and a known variant must still consume the invalid budget.
+        for _ in 0..20 {
+            if transport_a.send_raw_bytes(&node_b_id, &oversized).await.is_err() {
+                break;
+            }
+        }
+        let banned = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if transport_b.banned_peers.read().await.contains_key(&node_a_id) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await;
+        transport_a.shutdown();
+        transport_b.shutdown();
+        assert!(banned.is_ok(), "oversized fields must exhaust the invalid-frame budget");
+        assert!(!transport_b.is_connected(&node_a_id).await);
+    }
+
     /// A few garbage frames well under budget, even with a valid frame mixed in,
     /// leave the peer connected. This is the legitimate-but-noisy peer case: the
     /// leaky bucket tolerates occasional bad frames.
