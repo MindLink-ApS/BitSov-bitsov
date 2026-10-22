@@ -451,24 +451,44 @@ async fn proven_refusal_releases_id_for_retry_after_restart() {
 
 #[tokio::test]
 async fn refusal_release_failure_keeps_pending_row_and_never_resends() {
-    for outcome in [Outcome::Refused, Outcome::NotReady] {
+    for (outcome, expected, code) in [
+        (Outcome::Refused, StatusCode::BAD_REQUEST, "not_dispatched"),
+        (Outcome::NotReady, StatusCode::SERVICE_UNAVAILABLE, "not_ready"),
+    ] {
         let wallet = Wallet::new(outcome, false);
-        let (dir, app, auth) = setup(wallet.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("operations.db");
+        let db = Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap());
+        let state = common::test_state_with_lightning_and_storage(wallet.clone(), db.clone());
+        let auth = common::auth_header(&state);
+        let app = common::test_router(state);
         let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
             .await
             .unwrap();
         sqlx::query("CREATE TRIGGER fail_release BEFORE DELETE ON channel_open_operations BEGIN SELECT RAISE(FAIL, 'simulated disk failure'); END")
             .execute(&pool).await.unwrap();
-        let (status, _) = post(app.clone(), &auth, body()).await;
-        assert!(status == StatusCode::BAD_REQUEST || status == StatusCode::SERVICE_UNAVAILABLE);
+        let (status, response) = post(app.clone(), &auth, body()).await;
+        assert_eq!(status, expected, "{response}");
+        assert_eq!(response["code"], code);
+        assert_eq!(wallet.calls.load(Ordering::SeqCst), 1);
+
+        // SQLx can deliver the DELETE error before its worker finishes stepping
+        // and resetting the failed statement. Keep the trigger installed until
+        // every app connection has passed SQLx's return-to-pool ping; otherwise
+        // a late step can delete the pending row after DROP TRIGGER.
+        let mut connections = Vec::new();
+        for _ in 0..db.pool().options().get_max_connections() {
+            connections.push(db.pool().acquire().await.unwrap());
+        }
         sqlx::query("DROP TRIGGER fail_release")
             .execute(&pool)
             .await
             .unwrap();
+        pool.close().await;
+        drop(connections);
         for _ in 0..2 {
             let (status, response) = post(app.clone(), &auth, body()).await;
-            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(status, StatusCode::ACCEPTED, "{response}");
             assert_eq!(response["status"], "pending");
         }
         assert_eq!(wallet.calls.load(Ordering::SeqCst), 1);
