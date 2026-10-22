@@ -133,6 +133,7 @@ async fn paired_create_replay_conflict_and_changed_hub_are_durable() {
         config: StarterConfig {
             enabled: true,
             hub_node_id: "08".repeat(32),
+            hub_alias: None,
             allow_mainnet: false,
         },
         network: "regtest".into(),
@@ -150,13 +151,73 @@ async fn paired_create_replay_conflict_and_changed_hub_are_durable() {
     transport.advertise(hub, &["Custom(\"starter_hub_v1\")"]);
     state.transport = transport.clone();
     let dir = tempfile::tempdir().unwrap();
+    state.audit_log =
+        Arc::new(konsensus_api::AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
     let token = paired(&mut state, dir.path(), pairing::default_pairing_scopes());
     let id = uuid::Uuid::new_v4();
     let app = test_router(Arc::new(state.clone()));
-    let first = app.clone().oneshot(post(&token, id)).await.unwrap();
+    let (first, second) = tokio::join!(
+        app.clone().oneshot(post(&token, id)),
+        app.clone().oneshot(post(&token, id))
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    let (first, concurrent_replay) = if first.status() == StatusCode::ACCEPTED {
+        (first, second)
+    } else {
+        (second, first)
+    };
     assert_eq!(first.status(), StatusCode::ACCEPTED);
+    assert_eq!(concurrent_replay.status(), StatusCode::OK);
     let replay = app.clone().oneshot(post(&token, id)).await.unwrap();
+    let entries: Vec<serde_json::Value> = std::fs::read_to_string(state.audit_log.path())
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|e: &serde_json::Value| e["event"] == "starter.requested")
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let claims =
+        auth::validate_token(token.strip_prefix("Bearer ").unwrap(), &state.jwt_secret).unwrap();
+    assert_eq!(entries[0]["actor"], claims.cid.unwrap());
+    assert_eq!(entries[0]["detail"]["request_id"], id.to_string());
     assert_eq!(replay.status(), StatusCode::OK);
+    let concurrent_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(concurrent_replay.into_body(), 10000)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(concurrent_body["hub_configured"], true);
+    assert!(concurrent_body.get("hub_alias").is_none());
+    let spend_replay = Request::builder()
+        .method("POST")
+        .uri("/api/v1/onboarding/starter-channel")
+        .header("authorization", &token)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"request_id":id,"push_sats":1}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(spend_replay).await.unwrap().status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    for path in [
+        "/api/v1/onboarding/starter-channel".to_string(),
+        format!("/api/v1/onboarding/starter-channel/{id}"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), 10000)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains(&state.starter.config.hub_node_id));
+    }
     assert_eq!(
         axum::body::to_bytes(first.into_body(), 10000)
             .await
@@ -165,9 +226,10 @@ async fn paired_create_replay_conflict_and_changed_hub_are_durable() {
             .await
             .unwrap()
     );
+    let conflicting_id = uuid::Uuid::new_v4();
     assert_eq!(
         app.clone()
-            .oneshot(post(&token, uuid::Uuid::new_v4()))
+            .oneshot(post(&token, conflicting_id))
             .await
             .unwrap()
             .status(),
@@ -186,7 +248,46 @@ async fn paired_create_replay_conflict_and_changed_hub_are_durable() {
         .header("authorization", &token)
         .body(Body::empty())
         .unwrap();
-    assert_eq!(app.oneshot(get).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.clone().oneshot(get).await.unwrap().status(),
+        StatusCode::OK
+    );
+    // A conflict is not a persisted terminal refusal. Its UUID can later be
+    // accepted and must still log its actual hub outcome.
+    let mut old = db
+        .starter_request_get(&id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    old.state = "refused".into();
+    db.starter_request_save(&old).await.unwrap();
+    assert_eq!(
+        app.oneshot(post(&token, conflicting_id))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    let mut later = db
+        .starter_request_get(&conflicting_id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    later.state = "refused".into();
+    later.reason = Some("invite_expired".into());
+    db.starter_request_save(&later).await.unwrap();
+    state.audit_log.starter_progress(&later).unwrap();
+    let entries: Vec<serde_json::Value> = std::fs::read_to_string(state.audit_log.path())
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|e: &serde_json::Value| {
+            e["event"] == "starter.refused"
+                && e["detail"]["request_id"] == conflicting_id.to_string()
+        })
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["detail"]["reason"], "invite_expired");
     state.starter.config.hub_node_id = "09".repeat(32);
     assert_eq!(
         test_router(Arc::new(state))
@@ -370,6 +471,7 @@ async fn provider_mainnet_with_signet_config_is_rejected_before_persistence() {
         config: StarterConfig {
             enabled: true,
             hub_node_id: "08".repeat(32),
+            hub_alias: None,
             allow_mainnet: false,
         },
         network: "signet".into(),
@@ -393,4 +495,208 @@ async fn provider_mainnet_with_signet_config_is_rejected_before_persistence() {
     .unwrap();
     assert_eq!(body["reason"], "network_not_allowed");
     assert!(db.starter_request_current().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn discovery_before_request_is_authenticated_and_contains_only_display_metadata() {
+    let mut state = (*test_state()).clone();
+    state.storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let token = paired(&mut state, dir.path(), pairing::default_pairing_scopes());
+    for configured in [false, true] {
+        // Deserialize so this regression test compiles before hub_alias exists.
+        state.starter.config = serde_json::from_value(serde_json::json!({
+            "enabled": configured, "hub_node_id": "08".repeat(32),
+            "hub_alias": "Signet starter"
+        }))
+        .unwrap();
+        state.starter.hub_ln_pubkey = "03".repeat(33);
+        state.starter.hub_ln_address = "private.example:9735".into();
+        state.starter.hub_whitelisted = true;
+        let app = test_router(Arc::new(state.clone()));
+        for auth in [Some(token.clone()), Some(auth_header(&state)), None] {
+            let mut req = Request::builder().uri("/api/v1/onboarding/starter-channel");
+            if let Some(token) = &auth {
+                req = req.header("authorization", token);
+            }
+            let response = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            if auth.is_none() {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+                let body: serde_json::Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 10000)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                let expected = if configured {
+                    serde_json::json!({"state":"not_requested", "hub_configured":true, "hub_alias":"Signet starter"})
+                } else {
+                    serde_json::json!({"state":"not_requested", "hub_configured":false})
+                };
+                assert_eq!(body, expected);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn starter_refuses_all_caller_supplied_cost_and_push_fields_before_persistence() {
+    let mut state = (*test_state()).clone();
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    state.storage = db.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let token = paired(&mut state, dir.path(), pairing::default_pairing_scopes());
+    let app = test_router(Arc::new(state));
+    for field in [
+        "cost_sats",
+        "cost_msat",
+        "push_sats",
+        "push_msat",
+        "amount_sats",
+        "fee_sats",
+    ] {
+        for amount in [
+            serde_json::json!(1),
+            serde_json::json!(0),
+            serde_json::Value::Null,
+        ] {
+            let mut body = serde_json::json!({"request_id": uuid::Uuid::new_v4()});
+            body[field] = amount;
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/onboarding/starter-channel")
+                        .header("authorization", &token)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{field}"
+            );
+            assert!(db.starter_request_current().await.unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+fn starter_activity_retains_origin_and_deduplicates_terminal_outcomes_across_restart() {
+    use konsensus_api::AuditLog;
+    use konsensus_storage::starter_request::StarterRequest;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let mut row = StarterRequest::new(
+        uuid::Uuid::new_v4().to_string(),
+        "08".repeat(32),
+        "03".repeat(33),
+        "regtest".into(),
+        100,
+    );
+    {
+        let audit = AuditLog::open(&path).unwrap();
+        audit
+            .starter_requested(&row.request_id, "paired-device-a")
+            .unwrap();
+        audit
+            .starter_requested(&row.request_id, "paired-device-b")
+            .unwrap();
+    }
+    row.state = "refused".into();
+    row.reason = Some("hub_busy".into());
+    {
+        let audit = AuditLog::open(&path).unwrap();
+        audit.starter_progress(&row).unwrap();
+        audit.starter_progress(&row).unwrap();
+    }
+    let audit = AuditLog::open(&path).unwrap();
+    audit.starter_progress(&row).unwrap();
+    let mut child = StarterRequest::new(
+        uuid::Uuid::new_v4().to_string(),
+        row.hub_node_id.clone(),
+        row.hub_ln_pubkey.clone(),
+        "regtest".into(),
+        700,
+    );
+    child.original_request_id = Some(row.request_id.clone());
+    audit.starter_progress(&child).unwrap();
+    child.state = "ready".into();
+    child.verified_at = Some(800);
+    audit.starter_progress(&child).unwrap();
+    let entries: Vec<serde_json::Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(entries.len(), 4);
+    assert!(entries
+        .iter()
+        .all(|e| e["actor"] == "paired-device-a"
+            && e["detail"]["paired_device_id"] == "paired-device-a"));
+    assert_eq!(entries[1]["event"], "starter.refused");
+    assert_eq!(entries[1]["detail"]["reason"], "hub_busy");
+    assert_eq!(entries[3]["event"], "starter.ready");
+    assert_eq!(entries[3]["detail"]["request_id"], child.request_id);
+    assert_eq!(entries[3]["detail"]["root_request_id"], row.request_id);
+}
+
+#[test]
+fn starter_activity_survives_truncated_tail_and_a_revived_refusal() {
+    use konsensus_api::AuditLog;
+    use konsensus_storage::starter_request::StarterRequest;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    // Simulate a process dying during an unrelated audit append.
+    std::fs::write(&path, [b'{', b'"', 0xf0, 0x9f]).unwrap();
+    let mut row = StarterRequest::new(
+        uuid::Uuid::new_v4().to_string(),
+        "08".repeat(32),
+        "03".repeat(33),
+        "regtest".into(),
+        100,
+    );
+    {
+        let audit = AuditLog::open(&path).unwrap();
+        audit
+            .starter_requested(&row.request_id, "paired-device")
+            .unwrap();
+    }
+    {
+        let audit = AuditLog::open(&path).unwrap();
+        row.state = "refused".into();
+        row.reason = Some("hub_busy".into());
+        audit.starter_progress(&row).unwrap();
+        row.state = "requested".into(); // authenticated adoption revives this UUID
+        row.reason = None;
+        audit.starter_progress(&row).unwrap();
+        assert_eq!(audit.starter_pending(), vec![row.request_id.clone()]);
+    }
+    let audit = AuditLog::open(&path).unwrap();
+    assert_eq!(audit.starter_pending(), vec![row.request_id.clone()]);
+    row.state = "refused".into();
+    row.reason = Some("invite_expired".into());
+    audit.starter_progress(&row).unwrap();
+    audit.starter_progress(&row).unwrap();
+    assert!(audit.starter_pending().is_empty());
+    let entries: Vec<serde_json::Value> = std::fs::read(path)
+        .unwrap()
+        .split(|b| *b == b'\n')
+        .filter_map(|l| serde_json::from_slice(l).ok())
+        .collect();
+    assert_eq!(entries.len(), 4);
+    assert!(entries
+        .iter()
+        .all(|e| e["detail"]["paired_device_id"] == "paired-device"));
+    assert_eq!(entries[3]["detail"]["reason"], "invite_expired");
 }
