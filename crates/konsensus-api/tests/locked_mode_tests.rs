@@ -34,6 +34,13 @@ impl Fixture {
         Self::with_hook(forged, || {})
     }
     fn with_hook(forged: bool, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        Self::with_setup(forged, hook, false)
+    }
+    fn with_setup(
+        forged: bool,
+        hook: impl Fn() + Send + Sync + 'static,
+        owner_verifier: bool,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
@@ -95,11 +102,13 @@ impl Fixture {
             serde_json::to_vec(&file).unwrap(),
         )
         .unwrap();
-        let pairing = Arc::new(
-            PairingService::open(dir.path(), fingerprint, false)
-                .unwrap()
-                .with_pairing_closed(),
-        );
+        let mut pairing = PairingService::open(dir.path(), fingerprint, false)
+            .unwrap()
+            .with_pairing_closed();
+        if owner_verifier {
+            pairing = pairing.with_owner_approval_key(owner.verifying_key());
+        }
+        let pairing = Arc::new(pairing);
         let clients = Arc::new(RemoteTunnelClients::default());
         let (tx, rx) = tokio::sync::oneshot::channel();
         let state = Arc::new(LockedState::new(
@@ -261,7 +270,10 @@ async fn locked_router_allowlist_and_tunnel_only_unlock() {
 
 #[tokio::test(start_paused = true)]
 async fn challenges_are_single_use_expire_and_bind_client_and_epoch() {
-    let f = Fixture::new(false);
+    // Load a verifier for this synthetic epoch-mutation test. Without one,
+    // retiring signed records is correctly refused by the removal guard.
+    // The fixture's keyN identifiers do not constitute live owner-device IDs.
+    let f = Fixture::with_setup(false, || {}, true);
     let c = f.challenge(0).await;
     assert_eq!(
         f.unlock(1, f.body(0, &c, "unlock-test-secret")).await,

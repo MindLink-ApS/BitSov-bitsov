@@ -207,7 +207,8 @@ pub enum ControlResponse {
     },
     /// Current pairing state.
     Status {
-        /// V2 console observations, omitted when the rollout flag is off.
+        /// Console observations and guarded-revocation capability. Present while
+        /// enrollment is enabled or stored device keys still require review.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         enrollment: Option<crate::pairing::console::EnrollmentStatus>,
         /// Late rescans never revoke an enrolled device; ask the owner to check.
@@ -463,7 +464,7 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
         ControlRequest::Status => {
             let file = service.snapshot();
             ControlResponse::Status {
-                enrollment: service.second_device_enrollment_enabled().then(|| service.console_enrollment_status()),
+                enrollment: service.device_revocation_review_required().then(|| service.console_enrollment_status()),
                 second_device_alerts: service.second_device_alerts(),
                 clients: file
                     .clients

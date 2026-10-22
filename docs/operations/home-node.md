@@ -936,16 +936,29 @@ Review and revoke it if unrecognized. Before enrollment, a contested QR kills
 the provisional pairing and both attempts must start over.
 
 Revocation prints the affected chain and remaining owner count, then requires
-the typed word `revoke`. The CLI checks the running process's rollout flag over
-the control socket; editing the config without restarting cannot bypass this
-review. While that flag is on, legacy `pair-revoke` (including `--keep-pairing`)
-and raw single-key revoke requests are refused. Use `device revoke --key <id>`
-for a key, adding `--with-pairing` to remove its pairing.
+the typed word `revoke`. The CLI checks the running process and stored device
+keys over the control socket. Disabling enrollment or restarting with the flag
+off does not bypass review of existing authority. While enrollment is enabled,
+legacy console `pair-revoke` (including `--keep-pairing`) and raw single-key
+revoke requests are refused.
+
+The HTTP `POST /api/v1/pair/revoke` route (including `keep_pairing`), device
+self-retirement (`DELETE /api/v1/pair/device-keys/{id}`), and pairing-key rotation
+refuse with 403 when they would retire device keys while enrollment is enabled,
+or orphan stored `device:` / `second_device:` approvals, or remove the last
+owner device. These checks run under the pairing lock, including after a flag-off
+restart; rotation also checks the destination pairing's keys. The refusal points
+to `device revoke --key <id>` on the owner console. Add `--with-pairing` to remove
+its pairing, or `--cascade` to remove its approval chain. Console revocation
+remains available with enrollment disabled and requires a fresh preview digest
+at commit; changed options or authority invalidate the confirmation.
 
 A cascade visits approvals by every key on each pairing it removes, including
 independently enrolled sibling keys. `--keep` preserves the specified key but
 still visits its children; keeping a key on a pairing being removed is refused.
-Walking from an already revoked approver is supported. Zero remaining owners
+With `--with-pairing` but no `--cascade`, the preview also lists sibling-approved
+devices that will remain enrolled. Walking from an already revoked approver is
+supported. Zero remaining owners
 requires `--allow-zero-owner` and leaves console-only recovery. See
 [device keys](../security/device-keys.md#claimless-second-devices-rc20-opt-in).
 
