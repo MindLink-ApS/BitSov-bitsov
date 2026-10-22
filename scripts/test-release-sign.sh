@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline end-to-end regression tests; bash 3.2+, git, shasum and core utilities.
+# Offline end-to-end regression tests; bash 3.2+, git, jq, shasum and core utilities.
 # Real Git and GPG use a throwaway origin and generated test key. gh and
 # Rust compilation are simulated; no real keyring, network or publishing.
 set -euo pipefail
@@ -56,20 +56,25 @@ cat > "$WORK/bin/gh" <<'STUB'
 source "$TEST_ROOT/bin/common"
 printf '%s\n' "$*" >> "$CASE_DIR/gh.log"
 case "${1:-} ${2:-}" in
-  "api repos/$TEST_REPO/releases")
-    expect_args "$(printf '%s\n' api "repos/$TEST_REPO/releases" --paginate --jq '.[] | select(.draft == false) | .tag_name')" "$@"
-    [ "$TEST_CASE" != version-api-failure ] || exit 1
-    if [[ "$TEST_CASE" == version:* ]]; then
-      # Deliberately unordered: the highest version is not necessarily first.
-      printf '%s\n' v8.9.99 v0.2.99 "$PUBLISHED_TAG" v0.3.0-rc1 unrelated
-    fi
-    ;;
   "api repos/$TEST_REPO/releases/tags/$TEST_TAG")
-    expect_args "$(printf '%s\n' api "repos/$TEST_REPO/releases/tags/$TEST_TAG" --jq '.assets[] | [.name, (.id | tostring), (.digest // "")] | @tsv')" "$@"
-    [ "$TEST_CASE" != asset-api-failure ] || exit 1
+    # GitHub's tag endpoint does not expose drafts, even with authentication.
+    echo 'gh: Not Found (HTTP 404)' >&2
+    exit 1
+    ;;
+  "api repos/$TEST_REPO/releases")
+    [ "$#" -eq 5 ] && [ "$3" = --paginate ] && [ "$4" = --jq ] || bad_call "$@"
+    query=$5
+    [ "$TEST_CASE" != version-api-failure ] || exit 1
+    # The first list call is the published-version gate; later calls snapshot
+    # assets. Apply the real jq expression to JSON pages, not canned results.
+    calls=0
+    [ ! -f "$CASE_DIR/list-calls" ] || calls=$(cat "$CASE_DIR/list-calls")
+    calls=$((calls + 1))
+    echo "$calls" > "$CASE_DIR/list-calls"
+    [ "$TEST_CASE" != asset-api-failure ] || [ "$calls" -eq 1 ] || exit 1
     n=0
     [ ! -f "$CASE_DIR/asset-checks" ] || n=$(cat "$CASE_DIR/asset-checks")
-    n=$((n + 1))
+    if [ "$calls" -gt 1 ]; then n=$((n + 1)); fi
     echo "$n" > "$CASE_DIR/asset-checks"
     names=$("$0" release view "$TEST_TAG" --repo "$TEST_REPO" --json assets -q '.assets[].name')
     id=0
@@ -100,10 +105,32 @@ case "${1:-} ${2:-}" in
         esac
       fi
       printf '%s\t%s\t%s\n' "$name" "$id" "$digest"
-    done <<<"$names"
+    done <<<"$names" > "$CASE_DIR/assets.tsv"
     if [ "$TEST_CASE" = asset-added-after-download ] && [ "$n" -ge 2 ]; then
-      printf 'extra.txt\t999\tsha256:%064d\n' 0
+      printf 'extra.txt\t999\tsha256:%064d\n' 0 >> "$CASE_DIR/assets.tsv"
     fi
+    # Page one has an unrelated draft; the matching draft is on page two.
+    # A duplicate is on page three, so uniqueness must span every page.
+    {
+      printf '[{"id":100,"draft":true,"tag_name":"v99.0.0-rc1","assets":[]}'
+      if [[ "$TEST_CASE" == version:* ]]; then
+        for tag in v8.9.99 v0.2.99 "$PUBLISHED_TAG" v0.3.0-rc1 unrelated; do
+          printf ',{"draft":false,"tag_name":"%s","assets":[]}' "$tag"
+        done
+      fi
+      printf ']\n'
+      jq -Rn --arg tag "$TEST_TAG" --arg test_case "$TEST_CASE" '
+        [inputs | split("\t") | {name: .[0], id: (.[1] | tonumber), digest: .[2]}] |
+        if $test_case == "no-draft" then []
+        else [{id: 101, draft: true, tag_name: $tag, assets: .}] end
+      ' < "$CASE_DIR/assets.tsv"
+      if [ "$TEST_CASE" = duplicate-drafts ]; then
+        jq -Rn --arg tag "$TEST_TAG" '
+          [inputs | split("\t") | {name: .[0], id: (.[1] | tonumber), digest: .[2]}] |
+          [{id: 102, draft: true, tag_name: $tag, assets: .}]
+        ' < "$CASE_DIR/assets.tsv"
+      fi
+    } | jq -r "$query"
     ;;
   'run list')
     expect_args "$(printf '%s\n' run list --repo "$TEST_REPO" --workflow ci.yml --branch "$TEST_TAG" --event push --limit 1 --json databaseId -q '.[0].databaseId')" "$@"
@@ -581,11 +608,12 @@ run_case() (
   fi
   reason=''
   case "$TEST_CASE" in
-    darwin-match|darwin-intel-match|existing|fresh|dotted-release|dotted-release-fresh|subkey|stderr-noise|retry|retry-sums|retry-signature|dry-existing|accept-mismatch|dry-accept-mismatch|accept-darwin-mismatch|accept-match) ;;
+    draft-found-via-list|darwin-match|darwin-intel-match|existing|fresh|dotted-release|dotted-release-fresh|subkey|stderr-noise|retry|retry-sums|retry-signature|dry-existing|accept-mismatch|dry-accept-mismatch|accept-darwin-mismatch|accept-match) ;;
     version:*)
       [ "$VERSION_RESULT" = reject ] && reason="tag $TEST_TAG must be newer than newest published release $PUBLISHED_TAG" || true ;;
     version-api-failure) reason='cannot list published releases; refusing to sign' ;;
     asset-api-failure) reason='cannot snapshot release assets' ;;
+    no-draft|duplicate-drafts) reason="expected exactly one draft release for $TEST_TAG" ;;
     asset-missing-digest) reason='missing or invalid SHA-256 digest for release asset' ;;
     asset-download-digest-drift) reason='downloaded asset digest differs from pinned draft' ;;
     asset-*-after-*) reason="release $TEST_TAG assets changed since download" ;;
@@ -719,6 +747,11 @@ run_case() (
     [ ! -s "$CASE_DIR/gpg.log" ] || fail 'version rejection accessed GPG'
     [ ! -e "$CASE_DIR/build.log" ] || fail 'version rejection rebuilt'
   fi
+  if [ "$TEST_CASE" = no-draft ] || [ "$TEST_CASE" = duplicate-drafts ]; then
+    [ ! -e "$CASE_DIR/build.log" ] || fail 'draft lookup rejection rebuilt'
+    ! grep -q '^release download ' "$CASE_DIR/gh.log" || fail 'ambiguous/missing draft downloaded assets'
+    ! grep -q -- '--list-secret-keys' "$CASE_DIR/gpg.log" || fail 'draft lookup rejection accessed private keys'
+  fi
   if [[ "$TEST_CASE" == asset-*-after-* ]]; then
     [ -s "$CASE_DIR/build.log" ] || fail 'asset mutation rejected before rebuild'
     if [ "$TEST_CASE" = asset-changed-after-sign ]; then
@@ -781,11 +814,12 @@ done
 version_cases+=(version:v0.3.0:v0.3.0-rc19.2:accept version:v0.3.0-rc20:v0.3.0:reject
   version:v0.3.0:v0.3.0:reject version:v0.3.1-rc1:v0.3.0:accept
   version:v0.3.0:v0.3.1-rc1:reject version:v0.3.0-rc10:v0.3.0-rc9:accept
-  version:v0.3.0-rc19.10:v0.3.0-rc19.2:accept)
+  version:v0.3.0-rc19.10:v0.3.0-rc19.2:accept
+  version:v0.3.0-rc19.0:v0.3.0-rc19:accept)
 
 passed=0 failed=0
 for test_locale in "${locales[@]}"; do
-  for test_case in "${version_cases[@]}" version-api-failure asset-api-failure asset-missing-digest \
+  for test_case in "${version_cases[@]}" draft-found-via-list no-draft duplicate-drafts version-api-failure asset-api-failure asset-missing-digest \
     asset-changed-after-download asset-replaced-after-download asset-added-after-download asset-removed-after-download \
     asset-changed-after-sign asset-download-digest-drift darwin-xcode-drift darwin-build-drift darwin-sdk-drift darwin-clang-drift darwin-tools-missing darwin-sdk-override darwin-compiler-override \
     accept-darwin-sdk-drift darwin-match darwin-intel-match build-darwin-xcode-drift build-darwin-build-drift \

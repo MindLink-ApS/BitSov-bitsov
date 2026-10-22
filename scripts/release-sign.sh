@@ -76,8 +76,16 @@ require_release_assets() {
 # REST exposes asset IDs and SHA-256 digests, including assets not downloaded
 # on a retry (the prior manifest/signature). Pin the entire set, not just names.
 snapshot_release_assets() {
-  gh api "repos/$REPO/releases/tags/$TAG" --jq \
-    '.assets[] | [.name, (.id | tostring), (.digest // "")] | @tsv' |
+  local snapshot
+  # The tag endpoint returns 404 for drafts. Count matches across every page;
+  # a separate marker also counts drafts with no assets. TAG is validated below.
+  snapshot=$(gh api "repos/$REPO/releases" --paginate --jq \
+    ".[] | select(.draft == true and .tag_name == \"$TAG\") |
+      \"draft\", (.assets[] | [.name, (.id | tostring), (.digest // \"\")] | @tsv)") ||
+    die 'cannot snapshot release assets'
+  [ "$(printf '%s\n' "$snapshot" | grep -cx draft)" = 1 ] ||
+    die "expected exactly one draft release for $TAG"
+  printf '%s\n' "$snapshot" | sed '/^draft$/d' |
     LC_ALL=C sort > "$1" || die 'cannot snapshot release assets'
 }
 require_unchanged_release() {
