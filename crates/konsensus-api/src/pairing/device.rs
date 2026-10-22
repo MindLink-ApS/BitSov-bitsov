@@ -1176,6 +1176,7 @@ impl PairingService {
         else {
             return Err(PairingError::UnknownOperation);
         };
+        self.guard_device_removal(&inner, |k| k.key_id == key_id)?;
         inner.file.device_keys.retain(|k| k.key_id != key_id);
         inner.file.registered_ops.retain(|_, k| k != key_id);
         Self::end_relation_grants(&mut inner, &key.client_id);

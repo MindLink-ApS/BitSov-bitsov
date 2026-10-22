@@ -34,6 +34,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(home: bool) -> Self {
+        Self::with_recovery_owner(home, false)
+    }
+    fn with_recovery_owner(home: bool, recovery: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let base = test_state();
         let fp = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
@@ -89,6 +92,48 @@ impl Fixture {
                 ),
             )
             .unwrap();
+        if recovery {
+            let recovery_client = svc
+                .create_ticket_remote_pairing(
+                    "recovery",
+                    &hex::encode(
+                        SigningKey::from_bytes(&[201; 32])
+                            .verifying_key()
+                            .to_bytes(),
+                    ),
+                    &[202; 32],
+                )
+                .unwrap();
+            let pkcs8 =
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+            let recovery_key =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                    .unwrap();
+            let public = hex::encode(recovery_key.public_key().as_ref());
+            let message =
+                pairing::device::registration_message(&fp, &recovery_client.client_id, &public);
+            let proof = hex::encode(
+                recovery_key
+                    .sign(&rng, message.as_bytes())
+                    .unwrap()
+                    .as_ref(),
+            );
+            let op = svc
+                .request_device_key(&recovery_client.client_id, &public, "recovery", &proof)
+                .unwrap();
+            let approval = pairing::device::owner_approval_message(
+                &fp,
+                &recovery_client.client_pubkey,
+                recovery_client.epoch,
+                &public,
+            );
+            svc.approve_device_key(
+                &op.op_id,
+                &console.owner_code(&op.op_id),
+                &hex::encode(root.sign(approval.as_bytes()).to_bytes()),
+            )
+            .unwrap();
+        }
         drop(svc);
         let mut svc = PairingService::open(dir.path(), fp, !home)
             .unwrap()
@@ -275,7 +320,7 @@ async fn self_approval_and_borrowed_key_and_missing_noise_grant_nothing() {
 }
 #[tokio::test]
 async fn wrong_node_tampered_terms_revoked_key_and_stale_epoch_are_refused() {
-    let f = Fixture::new(true);
+    let f = Fixture::with_recovery_owner(true, true);
     let op = f.request(false).await;
     let message = op["approval_message"].as_str().unwrap();
     for tampered in [
@@ -296,7 +341,7 @@ async fn wrong_node_tampered_terms_revoked_key_and_stale_epoch_are_refused() {
         f.approve(&op, f.sign(message), true, true).await.0,
         StatusCode::FORBIDDEN
     );
-    let f = Fixture::new(true);
+    let f = Fixture::with_recovery_owner(true, true);
     let op = f.request(false).await;
     f.svc.bump_epoch(&f.owner.client_id).unwrap();
     assert_ne!(
