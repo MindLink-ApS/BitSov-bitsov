@@ -721,9 +721,12 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
             allow_zero_owner,
             config,
         } => {
-            let enabled = NodeConfig::load_before_identity_validation(&config)?
-                .pairing
-                .second_device_enrollment;
+            // Disk config may have changed since startup. Only the running
+            // process can select the guarded revocation protocol.
+            let enabled = match send(&config, ControlRequest::Status).await? {
+                ControlResponse::Status { enrollment, .. } => enrollment.is_some(),
+                other => return report(other),
+            };
             if !enabled
                 && approved_by.is_none()
                 && !with_pairing

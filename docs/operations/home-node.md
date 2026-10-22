@@ -935,8 +935,16 @@ A late rescan refuses the second attempt but preserves the enrolled device.
 Review and revoke it if unrecognized. Before enrollment, a contested QR kills
 the provisional pairing and both attempts must start over.
 
-Revocation prints the affected chain and remaining owner count, then asks for
-confirmation. `--keep` preserves the specified key but still visits its children.
+Revocation prints the affected chain and remaining owner count, then requires
+the typed word `revoke`. The CLI checks the running process's rollout flag over
+the control socket; editing the config without restarting cannot bypass this
+review. While that flag is on, legacy `pair-revoke` (including `--keep-pairing`)
+and raw single-key revoke requests are refused. Use `device revoke --key <id>`
+for a key, adding `--with-pairing` to remove its pairing.
+
+A cascade visits approvals by every key on each pairing it removes, including
+independently enrolled sibling keys. `--keep` preserves the specified key but
+still visits its children; keeping a key on a pairing being removed is refused.
 Walking from an already revoked approver is supported. Zero remaining owners
 requires `--allow-zero-owner` and leaves console-only recovery. See
 [device keys](../security/device-keys.md#claimless-second-devices-rc20-opt-in).
