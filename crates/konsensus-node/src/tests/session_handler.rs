@@ -1774,6 +1774,7 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
         ws_broadcast: ws,
         ws_delivery_tx: delivery,
         pending_tx: pending,
+        starter_hub_tx: None,
         auto_channel_tx: auto,
         shutdown_rx,
     }));
@@ -3705,4 +3706,33 @@ async fn issue204_zero_height_refuses_admission_with_typed_not_ready() {
         .unwrap_err(),
         konsensus_api::invoice_refusal::CHAIN_UNAVAILABLE
     );
+}
+
+#[test]
+fn starter_control_requires_privileged_session_and_counts_refusal() {
+    let membrane = konsensus_api::membrane::Membrane::default();
+    let frame = Frame::StarterRequest {
+        v: 1,
+        request_id: uuid::Uuid::new_v4(),
+        network: "regtest".into(),
+        ln_pubkey: "02".repeat(33),
+        ln_sig: "signature".into(),
+    };
+    let peer_id = NodeId::from_bytes([5; 32]);
+    assert!(refuse_unpaid_control(
+        &ControlEvent::StarterRequestReceived {
+            peer_id,
+            frame: frame.clone(),
+            privileged: false
+        },
+        &membrane
+    ));
+    assert!(!refuse_unpaid_control(
+        &ControlEvent::StarterRequestReceived {
+            peer_id,
+            frame,
+            privileged: true
+        },
+        &membrane
+    ));
 }

@@ -464,6 +464,33 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         encrypted.recovery = self.encrypt(&op.recovery)?;
         self.inner.update_outbox_operation(&encrypted).await
     }
+    async fn starter_update(
+        &self,
+        mut update: crate::starter::StarterUpdate,
+        now: Option<i64>,
+    ) -> Result<crate::starter::StarterOutcome, StorageError> {
+        // Indexed grant identifiers follow the peer/invite metadata policy. Operation
+        // payloads retain the same at-rest encryption as ordinary channel opens.
+        if let crate::starter::StarterUpdate::Claim { operation, .. } = &mut update {
+            operation.request = self.encrypt(&operation.request)?;
+        }
+        self.inner.starter_update(update, now).await
+    }
+    async fn starter_grants(&self) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
+        self.inner.starter_grants().await
+    }
+    async fn starter_query(
+        &self,
+        query: crate::starter::StarterQuery,
+    ) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
+        self.inner.starter_query(query).await
+    }
+    async fn starter_has_served_invite(&self, peer: &[u8; 32]) -> Result<bool, StorageError> {
+        self.inner.starter_has_served_invite(peer).await
+    }
+    async fn starter_counters(&self) -> Result<crate::starter::StarterCounters, StorageError> {
+        self.inner.starter_counters().await
+    }
     async fn insert_channel_open_operation(&self, op: &crate::ChannelOpenOperation) -> Result<bool, StorageError> {
         let mut encrypted = op.clone();
         encrypted.request = self.encrypt(&op.request)?;

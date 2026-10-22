@@ -379,6 +379,7 @@ impl App {
                 ws_broadcast: state.ws_broadcast.clone(),
                 ws_delivery_tx: state.ws_delivery_broadcast.clone(),
                 pending_tx,
+                starter_hub_tx: None,
                 auto_channel_tx,
                 shutdown_rx: shutdown_rx.clone(),
             },

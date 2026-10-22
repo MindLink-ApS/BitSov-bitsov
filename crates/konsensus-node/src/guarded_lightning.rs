@@ -103,6 +103,40 @@ pub struct GuardedLightning {
 
 #[async_trait]
 impl LightningProvider for GuardedLightning {
+    fn starter_network(&self) -> Option<String> {
+        self.inner.starter_network()
+    }
+    async fn sign_message(&self, message: &[u8]) -> Result<String, LightningError> {
+        self.inner.sign_message(message).await
+    }
+    async fn verify_message(
+        &self,
+        message: &[u8],
+        signature: &str,
+        pubkey: &str,
+    ) -> Result<bool, LightningError> {
+        self.inner.verify_message(message, signature, pubkey).await
+    }
+    async fn connect_peer(
+        &self,
+        pubkey: &str,
+        address: &str,
+        persist: bool,
+    ) -> Result<(), LightningError> {
+        self.inner.connect_peer(pubkey, address, persist).await
+    }
+    async fn list_peers(
+        &self,
+    ) -> Result<Vec<konsensus_core::traits::lightning::LightningPeer>, LightningError> {
+        self.inner.list_peers().await
+    }
+    async fn suppress_peer_address(&self, pubkey: &str) -> Result<(), LightningError> {
+        self.inner.suppress_peer_address(pubkey).await
+    }
+    async fn channel_is_ready(&self, id: &str) -> Result<bool, LightningError> {
+        self.inner.channel_is_ready(id).await
+    }
+
     fn channel_safety(&self) -> Option<ChannelSafetyStatus> {
         self.inner.channel_safety()
     }

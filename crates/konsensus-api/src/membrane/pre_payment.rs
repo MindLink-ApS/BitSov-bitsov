@@ -7,7 +7,7 @@ use serde::Serialize;
 
 const BUCKET_MS: u64 = 3_600_000;
 const CAPACITY: usize = 24;
-const REASONS: [PrePaymentReason; 8] = [
+const REASONS: [PrePaymentReason; 9] = [
     PrePaymentReason::SessionBeforePayment,
     PrePaymentReason::DeliveryBeforePayment,
     PrePaymentReason::PriceBeforePayment,
@@ -16,6 +16,7 @@ const REASONS: [PrePaymentReason; 8] = [
     PrePaymentReason::GossipBeforePayment,
     PrePaymentReason::InvoiceErrorBeforePayment,
     PrePaymentReason::AdmissionRequired,
+    PrePaymentReason::StarterBeforeInvite,
 ];
 
 /// Fixed vocabulary: no peer, address, request identifier or attacker text.
@@ -38,6 +39,8 @@ pub enum PrePaymentReason {
     InvoiceErrorBeforePayment,
     /// A non-admission invoice request requires admission first.
     AdmissionRequired,
+    /// Starter control traffic requires an invite-privileged session.
+    StarterBeforeInvite,
 }
 
 #[derive(Clone, Copy, Default)]

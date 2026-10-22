@@ -32,6 +32,7 @@ pub struct ChannelSafetyStatus {
     pub hub_only: bool,
 }
 
+pub const FUNDING_FEE_CAP_EXCEEDED: &str = "funding_fee_cap_exceeded";
 pub const CHANNEL_CAPACITY_EXCEEDED: &str = "CHANNEL_CAPACITY_EXCEEDED";
 pub const TOTAL_CHANNEL_CAPACITY_EXCEEDED: &str = "TOTAL_CHANNEL_CAPACITY_EXCEEDED";
 
@@ -418,6 +419,53 @@ pub struct LightningReadiness {
 /// Every message must have its payment verified through this interface.
 #[async_trait]
 pub trait LightningProvider: Send + Sync {
+    /// Only embedded LDK exposes this opt-in starter capability.
+    fn starter_network(&self) -> Option<String> {
+        None
+    }
+    async fn sign_message(&self, _message: &[u8]) -> Result<String, LightningError> {
+        Err(LightningError::PaymentNotDispatched(
+            "message signing unsupported".into(),
+        ))
+    }
+    async fn verify_message(
+        &self,
+        _message: &[u8],
+        _signature: &str,
+        _pubkey: &str,
+    ) -> Result<bool, LightningError> {
+        Err(LightningError::PaymentNotDispatched(
+            "message verification unsupported".into(),
+        ))
+    }
+    async fn connect_peer(
+        &self,
+        _pubkey: &str,
+        _address: &str,
+        _persist: bool,
+    ) -> Result<(), LightningError> {
+        Err(LightningError::PaymentNotDispatched(
+            "peer connection unsupported".into(),
+        ))
+    }
+    /// Addresses are transient; callers must never serialize this list.
+    async fn list_peers(&self) -> Result<Vec<LightningPeer>, LightningError> {
+        Err(LightningError::PaymentNotDispatched(
+            "peer listing unsupported".into(),
+        ))
+    }
+    /// Must succeed before a starter open. Implementations remove any existing
+    /// durable address and prevent open_channel from adding it again.
+    async fn suppress_peer_address(&self, _pubkey: &str) -> Result<(), LightningError> {
+        Err(LightningError::PaymentNotDispatched(
+            "ephemeral peers unsupported".into(),
+        ))
+    }
+    /// Durable readiness, independent of a consumed ChannelReady event.
+    async fn channel_is_ready(&self, _id: &str) -> Result<bool, LightningError> {
+        Ok(false)
+    }
+
     /// Active embedded-LDK admission policy, without network work.
     fn channel_safety(&self) -> Option<ChannelSafetyStatus> {
         None
@@ -1040,5 +1088,31 @@ mod chain_rate_limit_tests {
         assert_eq!(serde_json::to_value(status).unwrap(), serde_json::json!({
             "state": "stalled", "since": 123, "last_error_kind": "rate_limited"
         }));
+    }
+}
+
+/// In-memory peer observation; deliberately not serializable.
+pub struct LightningPeer {
+    pub pubkey: String,
+    pub address: String,
+    pub connected: bool,
+}
+
+/// Shared #331 recovery rule. No match or ambiguous matches NEVER prove that
+/// dispatch failed. Callers retain the operation and its monetary reservation.
+pub fn unique_channel_match<'a>(
+    channels: &'a [ChannelInfo],
+    peer: &str,
+    capacity_sats: u64,
+) -> Option<&'a ChannelInfo> {
+    let capacity = capacity_sats.checked_mul(1000)?;
+    let mut matches = channels
+        .iter()
+        .filter(|c| c.peer_pubkey.eq_ignore_ascii_case(peer) && c.capacity_msat == capacity);
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        None
+    } else {
+        Some(first)
     }
 }

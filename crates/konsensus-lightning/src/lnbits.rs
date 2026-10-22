@@ -514,14 +514,17 @@ impl LightningProvider for LnbitsProvider {
             .await
             .map_err(|e| LightningError::Backend(format!("parse response: {e}")))?;
 
-        // LNbits returns balance in msat
-        let balance = resp
-            .balance_msat
-            .or(resp.balance.map(|b| b * 1000))
-            .unwrap_or_else(|| {
+        // Prefer explicit msat; only convert the sat fallback when needed.
+        let balance = match (resp.balance_msat, resp.balance) {
+            (Some(msat), _) => msat,
+            (None, Some(sats)) => sats.checked_mul(1000).ok_or_else(|| {
+                LightningError::Backend("LNbits balance sat-to-msat conversion overflow".into())
+            })?,
+            (None, None) => {
                 warn!("LNbits wallet response missing both balance_msat and balance fields, defaulting to 0");
                 0
-            });
+            }
+        };
 
         // Negative balance (debt state) should not silently become a huge positive number
         if balance < 0 {
