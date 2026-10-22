@@ -5,6 +5,10 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Raise the source-build MSRV to Rust 1.89 to match locked `uuid` 1.28.0.
+- Discard serde diagnostics from peer session-value decodes; add relay and
+  file-payload guard regressions and use unique temporary mutation-log directories.
+
 - Pin release asset IDs and SHA-256 digests, verify downloaded bytes, and
   refuse signing/upload if draft assets change during verification or signing
   (security sweep #2, M3).

@@ -1060,7 +1060,7 @@ handling. No storage migration or configuration change is required.
    backup/recovery procedure. Do not re-run `init`, copy/export the seed, or
    delete state to resolve an upgrade refusal. Upgrade one host at a time.
 2. Verify the replacement artifact's signed checksums and provenance under
-   [release policy](ops/RELEASE_POLICY.md). Source builds require Rust 1.88+
+   [release policy](ops/RELEASE_POLICY.md). Source builds require Rust 1.89+
    and the release lockfile. These preparation notes do not publish a release.
 3. Remove stale `KONSENSUS_SQLITE_MIGRATIONS_DIR`, or ensure it contains every
    embedded SQLite migration **001–028**. rc7 ends at **019**; rc9 applies
@@ -1185,7 +1185,7 @@ must not reopen or show the phrase again. See the
    **before the first LDK start on rc8**; it must never replace newer live state.
 2. Verify the replacement artifact's signed checksums and release provenance as
    required by [release policy](ops/RELEASE_POLICY.md). These notes alone are not
-   a release artifact or permission to publish. For source builds use Rust 1.88+
+   a release artifact or permission to publish. For source builds use Rust 1.89+
    and the release lockfile.
 3. Review the config inventory below. **Esplora remains the default unless the
    owner explicitly configures `[chain] backend = "bitcoind"` or `"electrum"`.**
@@ -1210,13 +1210,17 @@ must not reopen or show the phrase again. See the
    below, then verify ordinary reads and intended paid flows. Once LDK has
    started on rc8, preserve current state and roll forward only.
 
-## MSRV (Rust 1.88+)
+## MSRV (Rust 1.89+)
 
-Workspace `rust-version` is **1.88** (raised from 1.75). The tree uses
-`Option::is_none_or` (stabilized in 1.82), and the locked dependency set
-requires Rust 1.88 (`home` 0.5.12 and related crates). Build with Rust 1.88 or
-newer; CI continues to use stable. rc9 preparation uses Rust 1.91.1 for the
-locked offline build, Clippy and workspace tests; this is not a fresh MSRV test.
+Workspace `rust-version` is **1.89** (raised from 1.88 to match the
+lockfile). The locked `uuid` 1.28.0 declares `rust-version = "1.89.0"`, the
+highest requirement in the resolved dependency metadata. Dependencies are not
+downgraded to support an older compiler. Build with Rust 1.89 or newer; CI
+continues to use stable, and release builds use `scripts/release-toolchain`.
+
+Verified on 2026-10-22 with the rustup-installed Rust 1.89.0 toolchain on
+`aarch64-apple-darwin`: `cargo +1.89.0 check --workspace --locked` passed
+without changing `Cargo.lock`.
 
 ## Missing `NODE_INITIALIZED` after upgrade (pre-#76/#77 nodes)
 
