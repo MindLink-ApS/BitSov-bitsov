@@ -1913,6 +1913,7 @@ async fn start_node_services<'a>(
     let (starter_newcomer_tx, starter_newcomer_handle) = if config.starter.enabled {
         let (tx, rx) = tokio::sync::mpsc::channel(128);
         let client = onboarding::starter_newcomer::StarterNewcomer {
+            audit_log: Arc::clone(&audit_log),
             settings: config.starter_settings(),
             storage: Arc::clone(node.storage()),
             lightning: Arc::clone(node.lightning()),

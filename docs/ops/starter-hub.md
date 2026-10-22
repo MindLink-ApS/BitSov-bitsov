@@ -91,3 +91,54 @@ re-checked for confirmation depth, a later deep reorg, or channel closure.
 Before mainnet GO, decide and implement ongoing readiness/reorg/closure handling
 and idle reclaim; a historical `ready` request must not be treated as proof of
 current spendable channel liquidity. Mainnet remains disabled.
+
+
+## App discovery and owner activity
+
+On the **newcomer**, optionally configure an operator display name:
+
+```toml
+[starter]
+enabled = true
+hub_node_id = "<64-hex hub mesh identity>"
+hub_alias = "MindLink signet hub"
+```
+
+This alias is display-only, not the hub's LN alias, address or identity. The
+owner/paired `read` GET `/api/v1/onboarding/starter-channel` returns 200 before
+any request, with `state: "not_requested"`, `hub_configured`, and `hub_alias`
+when configured. Existing request responses include these discovery fields too.
+`hub_configured` checks local enabled hub configuration, not reachability,
+funds, invites or readiness. The capability advertisement is unchanged. These
+fields are not published on unauthenticated health or discovery surfaces.
+
+A paired `receive` POST accepts only `request_id`. Cost, fee, amount and push
+fields are rejected before dispatch: the newcomer cannot spend through this
+flow. Retrying the same UUID is idempotent; it does not create a second grant
+or change the requesting device attribution. No additional owner approval kind
+is needed for this receive-only request.
+
+The newcomer's configured `api.audit_log_path` contains owner activity events
+`starter.requested`, `starter.ready` and `starter.refused`. Each carries the
+requesting `paired_device_id`, operation UUID, root request UUID, state and
+terminal refusal reason. Retries and adopted operations retain the original
+paired device after restart; historical requests predating attribution use
+`unknown`. A requested entry is an intent recorded before persistence and may
+remain if the process stops before creating the request. Audit write failure
+blocks new dispatch until logging succeeds. Keep the audit file across restarts.
+For a local console listing (using the configured path):
+
+```sh
+jq -c 'select(.event | startswith("starter.")) | {timestamp,event,actor,detail}' /path/to/audit.jsonl
+```
+
+These are private owner activity records; do not publish the log. No database
+migration is required.
+
+Conflicts before operation creation are separate `starter.request_conflict`
+events, not terminal hub refusals; that UUID can be accepted later. Attribution
+binds to the first device that requested the UUID. If authenticated adoption
+revives a refused UUID, a new `starter.requested` transition allows its next
+terminal outcome to be logged. Reconciliation repairs missing terminal events
+for earlier operations even after a newer request becomes current. Startup
+separates a crash-truncated journal tail before appending new records.

@@ -488,7 +488,11 @@ async fn newcomer_replays_timeout_without_duplicate_hub_open_and_waits_for_push(
         connected: std::sync::atomic::AtomicBool::new(true),
         fail_channel_read: std::sync::atomic::AtomicBool::new(false),
     });
+    let audit_dir = tempfile::tempdir().unwrap();
     let newcomer = StarterNewcomer {
+        audit_log: Arc::new(
+            konsensus_api::AuditLog::open(audit_dir.path().join("audit.jsonl")).unwrap(),
+        ),
         storage: db.clone(),
         lightning: client_backend.clone(),
         node_id: peer,
@@ -496,6 +500,7 @@ async fn newcomer_replays_timeout_without_duplicate_hub_open_and_waits_for_push(
             config: StarterConfig {
                 enabled: true,
                 hub_node_id: hub.hub_id.to_hex(),
+                hub_alias: None,
                 allow_mainnet: false,
             },
             network: "regtest".into(),
@@ -506,6 +511,10 @@ async fn newcomer_replays_timeout_without_duplicate_hub_open_and_waits_for_push(
         },
     };
     let id = Uuid::new_v4();
+    newcomer
+        .audit_log
+        .starter_requested(&id.to_string(), "paired-ready-device")
+        .unwrap();
     db.starter_request_create(&StarterRequest::new(
         id.to_string(),
         hub.hub_id.to_hex(),
@@ -587,6 +596,19 @@ async fn newcomer_replays_timeout_without_duplicate_hub_open_and_waits_for_push(
         .unwrap();
     assert_eq!(ready.state, "ready");
     assert!(ready.verified_at.is_some());
+    newcomer.poll(119, true).await.unwrap();
+    let entries: Vec<serde_json::Value> = std::fs::read_to_string(newcomer.audit_log.path())
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[1]["event"], "starter.ready");
+    assert_eq!(
+        entries[1]["detail"]["paired_device_id"],
+        "paired-ready-device"
+    );
+    assert_eq!(entries[1]["detail"]["request_id"], id.to_string());
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
 }
 
@@ -613,6 +635,9 @@ async fn newcomer_fixture(
         fail_channel_read: std::sync::atomic::AtomicBool::new(false),
     });
     let client = super::super::starter_newcomer::StarterNewcomer {
+        audit_log: Arc::new(
+            konsensus_api::AuditLog::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap(),
+        ),
         storage: db.clone(),
         lightning: backend.clone(),
         node_id: peer,
@@ -620,6 +645,7 @@ async fn newcomer_fixture(
             config: StarterConfig {
                 enabled: true,
                 hub_node_id: hub.hub_id.to_hex(),
+                hub_alias: None,
                 allow_mainnet: false,
             },
             network: "regtest".into(),
@@ -635,8 +661,15 @@ async fn newcomer_fixture(
 async fn newcomer_refusal_retries_once_after_backoff_and_late_status_cannot_regress_it() {
     use konsensus_storage::starter_request::StarterRequest;
     let (hub, backend, peer) = setup(3).await;
-    let (client, db, _) = newcomer_fixture(&hub, peer).await;
+    let (mut client, db, _) = newcomer_fixture(&hub, peer).await;
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    client.audit_log = Arc::new(konsensus_api::AuditLog::open(&audit_path).unwrap());
     let id = Uuid::new_v4();
+    client
+        .audit_log
+        .starter_requested(&id.to_string(), "paired-retry-device")
+        .unwrap();
     db.starter_request_create(&StarterRequest::new(
         id.to_string(),
         hub.hub_id.to_hex(),
@@ -665,6 +698,7 @@ async fn newcomer_refusal_retries_once_after_backoff_and_late_status_cannot_regr
         db.starter_request_current().await.unwrap().unwrap().state,
         "refused"
     );
+    client.audit_log = Arc::new(konsensus_api::AuditLog::open(&audit_path).unwrap());
     assert!(client.poll(699, true).await.unwrap().is_none());
     backend.connected.store(true, Ordering::SeqCst);
     let retry = client.poll(700, true).await.unwrap().unwrap();
@@ -675,6 +709,19 @@ async fn newcomer_refusal_retries_once_after_backoff_and_late_status_cannot_regr
         panic!("request")
     };
     assert_ne!(child, id);
+    let entries: Vec<serde_json::Value> = std::fs::read_to_string(&audit_path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[1]["event"], "starter.refused");
+    assert_eq!(entries[1]["detail"]["reason"], "ln_peer_not_connected");
+    assert_eq!(entries[2]["event"], "starter.requested");
+    assert_eq!(entries[2]["detail"]["request_id"], child.to_string());
+    assert!(entries
+        .iter()
+        .all(|e| e["detail"]["paired_device_id"] == "paired-retry-device"));
     let accepted = hub.handle(peer, retry.clone(), Some(700)).await.unwrap();
     client.handle(hub.hub_id, accepted, 700).await.unwrap();
     client.handle(hub.hub_id, refused, 701).await.unwrap();
@@ -1094,6 +1141,117 @@ async fn newcomer_pending_adoption_recovers_after_restart_without_new_budget() {
             .as_deref(),
         Some("auto_retry_exhausted")
     );
+}
+
+#[tokio::test]
+async fn newcomer_recovers_terminal_activity_when_a_newer_request_is_current() {
+    use konsensus_storage::starter_request::StarterRequest;
+    let (hub, _, peer) = setup(3).await;
+    let (mut client, db, _) = newcomer_fixture(&hub, peer).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    client.audit_log = Arc::new(konsensus_api::AuditLog::open(&path).unwrap());
+    let mut old = StarterRequest::new(
+        Uuid::new_v4().to_string(),
+        hub.hub_id.to_hex(),
+        "03".repeat(33),
+        "regtest".into(),
+        100,
+    );
+    client
+        .audit_log
+        .starter_requested(&old.request_id, "paired-old-device")
+        .unwrap();
+    db.starter_request_create(&old).await.unwrap();
+    old.state = "refused".into();
+    old.reason = Some("invite_expired".into());
+    db.starter_request_save(&old).await.unwrap(); // crash before audit outcome
+    let next = StarterRequest::new(
+        Uuid::new_v4().to_string(),
+        hub.hub_id.to_hex(),
+        "03".repeat(33),
+        "regtest".into(),
+        200,
+    );
+    client
+        .audit_log
+        .starter_requested(&next.request_id, "paired-new-device")
+        .unwrap();
+    db.starter_request_create(&next).await.unwrap();
+    client.audit_log = Arc::new(konsensus_api::AuditLog::open(&path).unwrap());
+    client.poll(201, false).await.unwrap();
+    client.poll(202, false).await.unwrap();
+    let entries: Vec<serde_json::Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[2]["event"], "starter.refused");
+    assert_eq!(
+        entries[2]["detail"]["paired_device_id"],
+        "paired-old-device"
+    );
+    assert_eq!(entries[2]["detail"]["request_id"], old.request_id);
+    assert_eq!(entries[2]["detail"]["reason"], "invite_expired");
+}
+
+#[tokio::test]
+async fn newcomer_journals_revival_before_queued_terminal_status_after_restart() {
+    use konsensus_storage::starter_request::StarterRequest;
+    let (hub, _, peer) = setup(3).await;
+    let (mut client, db, _) = newcomer_fixture(&hub, peer).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    client.audit_log = Arc::new(konsensus_api::AuditLog::open(&path).unwrap());
+    let id = Uuid::new_v4();
+    let mut row = StarterRequest::new(
+        id.to_string(),
+        hub.hub_id.to_hex(),
+        "03".repeat(33),
+        "regtest".into(),
+        100,
+    );
+    client
+        .audit_log
+        .starter_requested(&row.request_id, "paired-device")
+        .unwrap();
+    db.starter_request_create(&row).await.unwrap();
+    row.state = "refused".into();
+    row.reason = Some("hub_busy".into());
+    db.starter_request_save(&row).await.unwrap();
+    client.audit_log.starter_progress(&row).unwrap();
+    db.starter_request_adopt(&row).await.unwrap(); // crash before revival audit
+    client.audit_log = Arc::new(konsensus_api::AuditLog::open(&path).unwrap());
+    client
+        .handle(
+            hub.hub_id,
+            Frame::StarterStatus {
+                request_id: id,
+                state: "refused".into(),
+                reason: Some("invite_expired".into()),
+                retry_after_unix: None,
+                original_request_id: None,
+                capacity_sats: None,
+                push_sats: None,
+                channel_id: None,
+                funding_txid: None,
+            },
+            200,
+        )
+        .await
+        .unwrap();
+    client.poll(201, false).await.unwrap();
+    let entries: Vec<serde_json::Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(entries.len(), 4);
+    assert_eq!(entries[2]["event"], "starter.requested");
+    assert_eq!(entries[3]["event"], "starter.refused");
+    assert_eq!(entries[3]["detail"]["reason"], "invite_expired");
+    assert_eq!(entries[3]["detail"]["paired_device_id"], "paired-device");
 }
 
 #[tokio::test]
