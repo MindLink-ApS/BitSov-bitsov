@@ -3,7 +3,7 @@
 //! Reuse the existing encrypted channel-open operation store. Its pending-only
 //! CAS and opaque request/result blobs fit sends without a migration. Prefixes
 //! isolate these rows from channel-open UUIDs and their channel reconciliation.
-//! `opened` means a returned txid here; `uncertain` also holds terminal refusals.
+//! `opened` means a returned txid here; `uncertain` holds ambiguous outcomes.
 use super::SendOnchainRequest;
 use crate::{error::ApiError, state::AppState};
 use axum::{http::StatusCode, Json};
@@ -39,7 +39,8 @@ impl Receipt {
 }
 
 fn storage(error: impl std::fmt::Display) -> ApiError {
-    ApiError::Storage(format!("on-chain operation: {error}"))
+    tracing::warn!(%error, "on-chain operation storage failure");
+    ApiError::Storage("on-chain operation unavailable".into())
 }
 
 fn unresolved(id: &str, uncertain: bool) -> Response {
@@ -48,7 +49,7 @@ fn unresolved(id: &str, uncertain: bool) -> Response {
         Json(json!({
             "request_id": id,
             "status": if uncertain { "outcome_uncertain" } else { "pending" },
-            "message": "The send is in flight or its outcome was not recorded. This request_id will never send again. Inspect the wallet and chain before considering a new request_id; a missing receipt does not prove non-dispatch.",
+            "message": "The send is in flight or its outcome was not recorded. Retries will not dispatch while this operation remains pending or uncertain. Inspect the wallet and chain before considering a new request_id; a missing receipt does not prove non-dispatch.",
         })),
     ))
 }
@@ -76,15 +77,19 @@ pub(super) async fn send(state: Arc<AppState>, req: SendOnchainRequest) -> Respo
     }
     // A dropped HTTP future detaches this task. The insert, backend call and
     // receipt write must survive together, including blocking wallet work.
-    tokio::spawn(run(state, req))
-        .await
-        .map_err(|e| ApiError::Internal(format!("on-chain send task failed: {e}")))?
+    tokio::spawn(run(state, req)).await.map_err(|error| {
+        tracing::error!(%error, "on-chain send task failed");
+        ApiError::Internal("on-chain send task failed".into())
+    })?
 }
 
 async fn run(state: Arc<AppState>, req: SendOnchainRequest) -> Response {
     let id = uuid::Uuid::parse_str(req.request_id.as_deref().unwrap_or_default())
-        .map_err(|_| ApiError::BadRequest("request_id must be a UUID".into()))?
-        .to_string();
+        .map_err(|_| ApiError::BadRequest("request_id must be a UUIDv4".into()))?;
+    if id.get_version_num() != 4 || id.get_variant() != uuid::Variant::RFC4122 {
+        return Err(ApiError::BadRequest("request_id must be a UUIDv4".into()));
+    }
+    let id = id.to_string();
     let key = format!("send-onchain:{id}");
     let request = serde_json::to_vec(&json!({
         "address": req.address,
@@ -118,8 +123,9 @@ async fn run(state: Arc<AppState>, req: SendOnchainRequest) -> Response {
             .ok_or_else(|| storage("missing operation after duplicate insert"))?;
         return replay(op, &id, &hash);
     }
-    // Only the durable insert winner reaches the money-moving call. Neither
-    // replay nor recovery deletes the binding, even for a proven refusal.
+    // Only the durable insert winner reaches the money-moving call. Only its
+    // proven pre-dispatch refusal can release the binding.
+    let mut last_error = None;
     let (outcome, receipt) = match dispatch(&state, &req).await {
         Ok((status, Json(mut body))) => {
             body["request_id"] = id.clone().into();
@@ -131,12 +137,23 @@ async fn run(state: Arc<AppState>, req: SendOnchainRequest) -> Response {
                 }),
             )
         }
-        Err(ApiError::NotDispatched(reason)) => {
-            (CHANNEL_OPEN_UNCERTAIN, Some(Receipt::NotDispatched(reason)))
+        Err(error @ (ApiError::NotDispatched(_) | ApiError::NotReady)) => {
+            // Do not retry deletion: after an ambiguous DB acknowledgement,
+            // another request could already own a new pending row under this id.
+            if let Err(storage) = state
+                .storage
+                .delete_pending_channel_open_operation(&key)
+                .await
+            {
+                tracing::warn!(request_id = %id, %storage, "on-chain refusal not released");
+            }
+            return Err(error);
         }
-        Err(ApiError::NotReady) => (CHANNEL_OPEN_UNCERTAIN, Some(Receipt::NotReady)),
         Err(error) => {
             tracing::warn!(request_id = %id, %error, "on-chain send outcome uncertain; retry will not dispatch");
+            // Preserve diagnostic evidence, including any txid carried in a
+            // Backend error, without interpreting free text as dispatch proof.
+            last_error = Some(error.to_string());
             (CHANNEL_OPEN_UNCERTAIN, None)
         }
     };
@@ -145,19 +162,64 @@ async fn run(state: Arc<AppState>, req: SendOnchainRequest) -> Response {
         .map(serde_json::to_vec)
         .transpose()
         .map_err(storage)?;
-    if !state
-        .storage
-        .resolve_channel_open_operation(&key, outcome, bytes.as_deref(), None)
-        .await
-        .map_err(storage)?
+    if !record_outcome(
+        &state,
+        &key,
+        outcome,
+        bytes.as_deref(),
+        last_error.as_deref(),
+    )
+    .await
     {
-        return Err(storage(
-            "pending operation changed before outcome recording",
-        ));
+        // Keep the known wallet response even if its receipt cannot be saved.
+        // Retry persistence independently of the HTTP lifetime; never dispatch.
+        tokio::spawn(async move {
+            for delay_ms in [100, 500, 1_000, 5_000, 30_000] {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                if record_outcome(
+                    &state,
+                    &key,
+                    outcome,
+                    bytes.as_deref(),
+                    last_error.as_deref(),
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            tracing::error!(operation_id = %key, "on-chain outcome persistence retries exhausted; inspect wallet before any new send");
+        });
     }
     match receipt {
         Some(receipt) => receipt.response(),
         None => unresolved(&id, true),
+    }
+}
+
+// True means no further write is needed. A lost CAS must never overwrite a
+// terminal receipt. Only storage errors warrant retrying this pending-only CAS.
+async fn record_outcome(
+    state: &AppState,
+    key: &str,
+    outcome: &str,
+    bytes: Option<&[u8]>,
+    last_error: Option<&str>,
+) -> bool {
+    match state
+        .storage
+        .resolve_channel_open_operation(key, outcome, bytes, last_error)
+        .await
+    {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(operation_id = %key, "on-chain pending operation changed before outcome recording");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(operation_id = %key, %error, "on-chain outcome not recorded; retrying persistence");
+            false
+        }
     }
 }
 

@@ -29,6 +29,7 @@ enum Outcome {
     Refused,
     NotReady,
     Unknown,
+    UnknownWithTxid,
 }
 
 struct Wallet {
@@ -108,6 +109,9 @@ impl LightningProvider for Wallet {
             )),
             Outcome::NotReady => Err(LightningError::NotReady),
             Outcome::Unknown => Err(LightningError::Backend("connection lost".into())),
+            Outcome::UnknownWithTxid => Err(LightningError::Backend(format!(
+                "transaction {TXID} accepted but wallet reservation update failed: disk failure"
+            ))),
         }
     }
 }
@@ -214,7 +218,7 @@ async fn different_body_is_refused_without_dispatch() {
 
 // A durable record with no receipt is not proof that dispatch never happened.
 #[tokio::test]
-async fn crash_between_record_and_dispatch_reconciles_without_sending() {
+async fn crash_left_pending_row_is_retained_without_resending() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("operations.db");
     let db = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
@@ -247,9 +251,8 @@ async fn terminal_and_uncertain_outcomes_survive_restart_without_redispatch() {
     for (outcome, expected) in [
         (Outcome::Sent, StatusCode::OK),
         (Outcome::Unconfirmed, StatusCode::ACCEPTED),
-        (Outcome::Refused, StatusCode::BAD_REQUEST),
-        (Outcome::NotReady, StatusCode::SERVICE_UNAVAILABLE),
         (Outcome::Unknown, StatusCode::ACCEPTED),
+        (Outcome::UnknownWithTxid, StatusCode::ACCEPTED),
     ] {
         let wallet = Wallet::new(outcome, false);
         let (dir, app, auth) = setup(wallet.clone()).await;
@@ -307,12 +310,20 @@ async fn disconnected_client_does_not_cancel_outcome_recording() {
 async fn invalid_id_and_invalid_fee_never_dispatch_but_legacy_requests_still_work() {
     let wallet = Wallet::new(Outcome::Sent, false);
     let (_dir, app, auth) = setup(wallet.clone()).await;
-    let mut invalid = body();
-    invalid["request_id"] = json!("not-a-uuid");
-    assert_eq!(
-        post(app.clone(), &auth, invalid).await.0,
-        StatusCode::BAD_REQUEST
-    );
+    for id in [
+        "not-a-uuid",
+        "00000000-0000-0000-0000-000000000000",
+        "2abe1acf-5844-1824-ae48-575db0ec7561",
+        "2abe1acf-5844-7824-ae48-575db0ec7561",
+        "2abe1acf-5844-4824-0e48-575db0ec7561",
+    ] {
+        let mut invalid = body();
+        invalid["request_id"] = json!(id);
+        assert_eq!(
+            post(app.clone(), &auth, invalid).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
     for rate in [0.0, -1.0, 0.5, 10_001.0] {
         let mut invalid = body();
         invalid["fee_rate_sat_per_vb"] = json!(rate);
@@ -332,48 +343,180 @@ async fn invalid_id_and_invalid_fee_never_dispatch_but_legacy_requests_still_wor
     assert_eq!(wallet.calls.load(Ordering::SeqCst), 2);
 }
 
-// Storage errors must fail closed on either side of the dispatch boundary.
+// Losing the pre-dispatch record must prevent any wallet call and hide DB details.
 #[tokio::test]
-async fn durable_record_failure_never_dispatches_and_receipt_failure_never_resends() {
-    for failing_write in ["INSERT", "UPDATE"] {
-        let wallet = Wallet::new(Outcome::Sent, false);
+async fn durable_record_failure_never_dispatches_or_leaks_db_details() {
+    let wallet = Wallet::new(Outcome::Sent, false);
+    let (dir, app, auth) = setup(wallet.clone()).await;
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite:{}",
+        dir.path().join("operations.db").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query("CREATE TRIGGER fail_operation_write BEFORE INSERT ON channel_open_operations BEGIN SELECT RAISE(FAIL, 'private database details'); END")
+        .execute(&pool).await.unwrap();
+    let (status, response) = post(app, &auth, body()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!response.to_string().contains("private database details"));
+    assert_eq!(wallet.calls.load(Ordering::SeqCst), 0);
+}
+
+// Returning 500 after broadcast hides the txid and encourages a second send.
+#[tokio::test]
+async fn receipt_failure_returns_txid_and_retries_persistence_without_resending() {
+    for (outcome, expected) in [
+        (Outcome::Sent, StatusCode::OK),
+        (Outcome::Unconfirmed, StatusCode::ACCEPTED),
+    ] {
+        let wallet = Wallet::new(outcome, false);
         let (dir, app, auth) = setup(wallet.clone()).await;
-        let pool = sqlx::SqlitePool::connect(&format!(
-            "sqlite:{}",
-            dir.path().join("operations.db").display()
-        ))
-        .await
-        .unwrap();
-        sqlx::query(&format!("CREATE TRIGGER fail_operation_write BEFORE {failing_write} ON channel_open_operations BEGIN SELECT RAISE(FAIL, 'simulated disk failure'); END"))
+        let path = dir.path().join("operations.db");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER fail_operation_write BEFORE UPDATE ON channel_open_operations BEGIN SELECT RAISE(FAIL, 'simulated disk failure'); END")
             .execute(&pool).await.unwrap();
-        assert_eq!(
-            post(app, &auth, body()).await.0,
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        let expected_calls = usize::from(failing_write == "UPDATE");
-        assert_eq!(wallet.calls.load(Ordering::SeqCst), expected_calls);
+        let original = post(app.clone(), &auth, body()).await;
+        assert_eq!(original.0, expected);
+        assert_eq!(original.1["txid"], TXID);
+        assert_eq!(original.1["request_id"], ID);
+        let pending = post(app.clone(), &auth, body()).await;
+        assert_eq!(pending.0, StatusCode::ACCEPTED);
+        assert_eq!(pending.1["status"], "pending");
+        assert_eq!(wallet.calls.load(Ordering::SeqCst), 1);
         sqlx::query("DROP TRIGGER fail_operation_write")
             .execute(&pool)
             .await
             .unwrap();
-        pool.close().await;
+        let db = Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if db
+                    .get_channel_open_operation(&format!("send-onchain:{ID}"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .result
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(app);
+        let state = common::test_state_with_lightning_and_storage(wallet.clone(), db);
+        let auth = common::auth_header(&state);
+        assert_eq!(
+            post(common::test_router(state), &auth, body()).await,
+            original
+        );
+        assert_eq!(wallet.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn proven_refusal_releases_id_for_retry_after_restart() {
+    for (outcome, expected) in [
+        (Outcome::Refused, StatusCode::BAD_REQUEST),
+        (Outcome::NotReady, StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let wallet = Wallet::new(outcome, false);
+        let (dir, app, auth) = setup(wallet.clone()).await;
+        assert_eq!(post(app, &auth, body()).await.0, expected);
+        assert_eq!(wallet.calls.load(Ordering::SeqCst), 1);
         let db = Arc::new(
             SqliteStorage::open(dir.path().join("operations.db").to_str().unwrap())
                 .await
                 .unwrap(),
         );
-        let state = common::test_state_with_lightning_and_storage(wallet.clone(), db);
+        assert!(db
+            .get_channel_open_operation(&format!("send-onchain:{ID}"))
+            .await
+            .unwrap()
+            .is_none());
+        let ready_wallet = Wallet::new(Outcome::Sent, false);
+        let state = common::test_state_with_lightning_and_storage(ready_wallet.clone(), db);
         let auth = common::auth_header(&state);
-        let (status, receipt) = post(common::test_router(state), &auth, body()).await;
-        if failing_write == "UPDATE" {
+        let app = common::test_router(state);
+        let original = post(app.clone(), &auth, body()).await;
+        assert_eq!(original.0, StatusCode::OK);
+        assert_eq!(post(app, &auth, body()).await, original);
+        assert_eq!(ready_wallet.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn refusal_release_failure_keeps_pending_row_and_never_resends() {
+    for outcome in [Outcome::Refused, Outcome::NotReady] {
+        let wallet = Wallet::new(outcome, false);
+        let (dir, app, auth) = setup(wallet.clone()).await;
+        let path = dir.path().join("operations.db");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER fail_release BEFORE DELETE ON channel_open_operations BEGIN SELECT RAISE(FAIL, 'simulated disk failure'); END")
+            .execute(&pool).await.unwrap();
+        let (status, _) = post(app.clone(), &auth, body()).await;
+        assert!(status == StatusCode::BAD_REQUEST || status == StatusCode::SERVICE_UNAVAILABLE);
+        sqlx::query("DROP TRIGGER fail_release")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let (status, response) = post(app.clone(), &auth, body()).await;
             assert_eq!(status, StatusCode::ACCEPTED);
-            assert_eq!(receipt["status"], "pending");
-        } else {
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(receipt["txid"], TXID);
+            assert_eq!(response["status"], "pending");
         }
         assert_eq!(wallet.calls.load(Ordering::SeqCst), 1);
     }
+}
+
+#[tokio::test]
+async fn ambiguous_error_keeps_txid_in_durable_row() {
+    let wallet = Wallet::new(Outcome::UnknownWithTxid, false);
+    let (dir, app, auth) = setup(wallet.clone()).await;
+    assert_eq!(post(app, &auth, body()).await.0, StatusCode::ACCEPTED);
+    let db = SqliteStorage::open(dir.path().join("operations.db").to_str().unwrap())
+        .await
+        .unwrap();
+    let op = db
+        .get_channel_open_operation(&format!("send-onchain:{ID}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(op.state, "uncertain");
+    assert!(op.last_error.unwrap().contains(TXID));
+    assert_eq!(wallet.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn null_request_id_uses_legacy_path_without_retry_protection() {
+    let wallet = Wallet::new(Outcome::Sent, false);
+    let (dir, app, auth) = setup(wallet.clone()).await;
+    let mut request = body();
+    request["request_id"] = Value::Null;
+    for _ in 0..2 {
+        let (status, response) = post(app.clone(), &auth, request.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["txid"], TXID);
+        assert!(response.get("request_id").is_none());
+    }
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite:{}",
+        dir.path().join("operations.db").display()
+    ))
+    .await
+    .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM channel_open_operations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(wallet.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

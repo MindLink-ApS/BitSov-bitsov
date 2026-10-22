@@ -1260,7 +1260,7 @@ async fn close_channel(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendOnchainRequest {
-    /// Optional client UUID. Reuse it only with the same address, amount and fee rate.
+    /// Optional client UUIDv4. Reuse it only with the same address, amount and fee rate.
     /// Missing IDs remain supported for legacy clients, without retry protection.
     #[serde(default)]
     pub request_id: Option<String>,
