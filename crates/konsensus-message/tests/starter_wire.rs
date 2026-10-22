@@ -184,3 +184,111 @@ fn starter_status_null_strings_and_lightning_info_without_addr_still_decode() {
         Frame::LightningInfo { ln_addr: None, .. }
     ));
 }
+
+#[test]
+fn starter_status_omitted_optional_strings_decode_as_none() {
+    for omitted in [
+        vec!["reason"],
+        vec!["channel_id"],
+        vec!["funding_txid"],
+        vec!["reason", "channel_id", "funding_txid"],
+    ] {
+        let mut value = serde_json::to_value(starter_status("received", None, None, None)).unwrap();
+        for field in omitted {
+            value["StarterStatus"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        let decoded = Frame::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            Frame::StarterStatus {
+                reason: None,
+                channel_id: None,
+                funding_txid: None,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn lightning_address_accepts_maximum_dns_hostname_and_five_digit_port() {
+    let host = [
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61),
+    ]
+    .join(".");
+    assert_eq!(host.len(), 253);
+    let addr = format!("{host}:65535");
+    assert_eq!(addr.len(), 259);
+    assert!(decodes(&Frame::LightningInfo {
+        ln_pubkey: "02".repeat(33),
+        ln_addr: Some(addr)
+    }));
+}
+
+#[test]
+fn bounded_strings_count_decoded_utf8_bytes_and_preserve_escapes() {
+    for (encoded, decoded) in [
+        (r"\u0061".repeat(32), "a".repeat(32)),
+        (r"\u00e9".repeat(16), "é".repeat(16)),
+        (r"\u20ac".repeat(10) + "ab", "€".repeat(10) + "ab"),
+        (r"\ud83d\ude00".repeat(8), "😀".repeat(8)),
+        (r#"\"\\\/\b\f\n\r\t"#.into(), "\"\\/\u{8}\u{c}\n\r\t".into()),
+        ("é".repeat(16), "é".repeat(16)),
+    ] {
+        let json = format!(
+            r#"{{"StarterRequest":{{"v":1,"request_id":"00000000-0000-0000-0000-000000000000","network":"{encoded}","ln_pubkey":"02","ln_sig":"sig"}}}}"#
+        );
+        let frame = Frame::from_bytes(json.as_bytes()).unwrap();
+        assert!(matches!(frame, Frame::StarterRequest { network, .. } if network == decoded));
+        if decoded.len() == 32 {
+            assert!(Frame::from_bytes(
+                json.replace(&format!("\"{encoded}\""), &format!("\"{encoded}x\""))
+                    .as_bytes()
+            )
+            .is_err());
+        }
+    }
+    for malformed in [r"\ud800", r"\udc00", r"\ud800\u0061", r"\uZZZZ", r"\x"] {
+        let json = format!(r#"{{"LightningInfo":{{"ln_pubkey":"{malformed}"}}}}"#);
+        assert!(Frame::from_bytes(json.as_bytes()).is_err());
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn bounded_string_unicode_encodings_match_decoded_byte_limit(
+        chars in proptest::collection::vec(proptest::char::any(), 0..40)
+    ) {
+        let value: String = chars.into_iter().collect();
+        let escaped: String = value.encode_utf16().map(|unit| format!(r"\u{unit:04x}")).collect();
+        for token in [serde_json::to_string(&value).unwrap(), format!("\"{escaped}\"")] {
+            let json = format!(r#"{{"StarterRequest":{{"v":1,"request_id":"00000000-0000-0000-0000-000000000000","network":{token},"ln_pubkey":"02","ln_sig":"sig"}}}}"#);
+            let result = Frame::from_bytes(json.as_bytes());
+            if value.len() <= MAX_STARTER_NETWORK_BYTES {
+                let Frame::StarterRequest { network, .. } = result.unwrap() else { unreachable!() };
+                proptest::prop_assert_eq!(network, value.as_str());
+            } else {
+                proptest::prop_assert!(result.is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn frame_depth_guard_counts_containers_but_not_escaped_string_contents() {
+    // Two outer objects plus 126 arrays reaches the frame depth cap.
+    for (arrays, accepted) in [(126, true), (127, false)] {
+        let nested = format!("{}0{}", "[".repeat(arrays), "]".repeat(arrays));
+        let json = format!(r#"{{"LightningInfo":{{"ln_pubkey":"02","ignored":{nested}}}}}"#);
+        assert_eq!(Frame::from_bytes(json.as_bytes()).is_ok(), accepted);
+    }
+    let value = "\"\\[{]}".repeat(256);
+    let json = serde_json::json!({"LightningInfo": {"ln_pubkey": "02", "ignored": value}});
+    assert!(Frame::from_bytes(&serde_json::to_vec(&json).unwrap()).is_ok());
+}

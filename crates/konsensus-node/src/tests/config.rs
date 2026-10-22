@@ -3600,3 +3600,51 @@ fn provider_reserve_trust_is_opt_in_and_round_trips_toml() {
         );
     }
 }
+
+#[test]
+fn config_load_bounds_advertised_lightning_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let mnemonic = dir.path().join("mnemonic.txt");
+    std::fs::write(&mnemonic, "abandon ".repeat(24).trim()).unwrap();
+    let mut config = NodeConfig::default_for_tier(NodeTier::Light, mnemonic, dir.path());
+    config.payment_gate.verify_lightning_settlement = Some(true);
+    let host = [
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61),
+    ]
+    .join(".");
+    let path = dir.path().join("konsensus.toml");
+    for field in ["advertised_address", "listening_address"] {
+        for (address, accepted) in [
+            (format!("{host}:65535"), true),
+            ("a".repeat(konsensus_message::wire::MAX_LN_ADDR_BYTES), true),
+            (
+                "a".repeat(konsensus_message::wire::MAX_LN_ADDR_BYTES + 1),
+                false,
+            ),
+        ] {
+            config.lightning =
+                toml::from_str(&format!("backend = \"ldk\"\n{field} = \"{address}\"\n")).unwrap();
+            config.save(&path).unwrap();
+            let result = NodeConfig::load(&path);
+            if accepted {
+                let loaded = result.unwrap();
+                assert_eq!(
+                    loaded.lightning.advertised_lightning_addr().as_deref(),
+                    Some(address.as_str())
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("Lightning")
+                        && error.contains("byte")
+                        && error.contains(&konsensus_message::wire::MAX_LN_ADDR_BYTES.to_string()),
+                    "{error}"
+                );
+                assert!(NodeConfig::load_before_identity_validation(&path).is_err());
+            }
+        }
+    }
+}
