@@ -129,7 +129,8 @@ pub enum Command {
         remote_unlock: bool,
 
         /// Enable existing owner-approved devices to sign recipient-bound spend envelopes.
-        /// Requires a descriptor password or remote unlock and an encrypted seed; does not open a console.
+        /// Requires a descriptor password or remote unlock and an encrypted seed.
+        /// Add --owner-control to open a console when second_device_enrollment is enabled.
         #[arg(long, requires = "owner_password", conflicts_with_all = ["password", "password_file"])]
         local_owner_device: bool,
 

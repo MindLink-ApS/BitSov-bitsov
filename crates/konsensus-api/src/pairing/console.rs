@@ -53,6 +53,28 @@ fn provenance_parent(value: &str) -> Option<&str> {
         .or_else(|| value.strip_prefix("device:"))
 }
 
+/// Audit legacy/untrusted records with the device and node display-name
+/// exclusions and their 64-character limit. Keep raw names in the plan so
+/// confirmation still detects any change to the stored record.
+fn audit_device_name(name: &str) -> String {
+    let visible: String = name
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !super::invisible_format(*c)
+                // NodeDisplayConfig also excludes deprecated formatting,
+                // interlinear annotation controls, and invisible Unicode tags.
+                && !matches!(c, '\u{206A}'..='\u{206F}' | '\u{FFF9}'..='\u{FFFB}' | '\u{E0020}'..='\u{E007F}')
+        })
+        .collect();
+    let name: String = visible.trim().chars().take(64).collect();
+    if name.is_empty() {
+        "unnamed device".into()
+    } else {
+        name
+    }
+}
+
 impl PairingService {
     fn require_console_enrollment(&self) -> Result<(), PairingError> {
         if !self.owner_control_enabled || !self.second_device_enrollment {
@@ -192,6 +214,18 @@ impl PairingService {
                 continue;
             }
             if let Some(key) = inner.file.device_keys.iter().find(|k| k.key_id == id) {
+                // Removing this pairing also removes independently enrolled sibling
+                // keys. Walk their approvals too, to a fixpoint, before previewing.
+                if options.cascade && !options.keep.contains(&id) {
+                    queue.extend(
+                        inner
+                            .file
+                            .device_keys
+                            .iter()
+                            .filter(|sibling| sibling.client_id == key.client_id)
+                            .map(|sibling| sibling.key_id.clone()),
+                    );
+                }
                 chain.push(RevokeKey {
                     key_id: id.clone(),
                     client_id: key.client_id.clone(),
@@ -319,10 +353,14 @@ impl PairingService {
                 .token_challenges
                 .retain(|_, (client, _)| !pairings.contains(client));
             self.notify_authority_change();
+            let mut audit_keys = plan.keys.clone();
+            for key in &mut audit_keys {
+                key.name = audit_device_name(&key.name);
+            }
             self.enrollment_event(
                 "pair.device_revoked",
                 &options.root,
-                serde_json::json!({"keys":plan.keys,"owner_device_count":plan.owner_device_count}),
+                serde_json::json!({"keys":audit_keys,"owner_device_count":plan.owner_device_count}),
             );
         }
         Ok(plan)
