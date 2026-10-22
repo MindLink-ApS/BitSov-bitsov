@@ -43,6 +43,10 @@ fn fixed_hex_fields_reject_before_owned_allocation() {
         "signature": "00".repeat(64), "nonce": "00".repeat(24), "references": ["00".repeat(32)]
     }});
     Frame::from_bytes(&serde_json::to_vec(&base).unwrap()).unwrap();
+    let envelope: konsensus_core::UkmEnvelope =
+        serde_json::from_value(base["Message"].clone()).unwrap();
+    let reader = serde_json::to_vec(&envelope).unwrap();
+    let _: konsensus_core::UkmEnvelope = serde_json::from_reader(reader.as_slice()).unwrap();
     for (pointer, cap) in [
         ("/Message/id", 64),
         ("/Message/sender", 64),
@@ -53,20 +57,30 @@ fn fixed_hex_fields_reject_before_owned_allocation() {
         ("/Message/nonce", 48),
         ("/Message/references/0", 64),
     ] {
+        // A valid escaped target must decode, proving later fields are reached.
+        let mut honest = base.clone();
+        *honest.pointer_mut(pointer).unwrap() = json!("HEX_MARKER");
+        let honest = serde_json::to_string(&honest)
+            .unwrap()
+            .replace("HEX_MARKER", &r"\u0030".repeat(cap));
+        Frame::from_bytes(honest.as_bytes()).unwrap();
         for len in [cap + 1, 128 * 1024] {
             let mut frame: Value = base.clone();
-            *frame.pointer_mut(pointer).unwrap() = json!("0".repeat(len));
-            let bytes = serde_json::to_vec(&frame).unwrap();
-            LARGEST.set(0);
-            TRACK.set(true);
-            let result = Frame::from_bytes(&bytes);
-            TRACK.set(false);
-            assert!(result.is_err(), "{pointer}");
-            assert!(
-                LARGEST.get() < 4096,
-                "{pointer} allocated {} bytes",
-                LARGEST.get()
-            );
+            *frame.pointer_mut(pointer).unwrap() = json!("HEX_MARKER");
+            let json = serde_json::to_string(&frame).unwrap();
+            for token in ["0".repeat(len), r"\u0030".repeat(len)] {
+                let bytes = json.replace("HEX_MARKER", &token).into_bytes();
+                LARGEST.set(0);
+                TRACK.set(true);
+                let result = Frame::from_bytes(&bytes);
+                TRACK.set(false);
+                assert!(result.is_err(), "{pointer}");
+                assert!(
+                    LARGEST.get() < 4096,
+                    "{pointer} allocated {} bytes",
+                    LARGEST.get()
+                );
+            }
         }
     }
 }
