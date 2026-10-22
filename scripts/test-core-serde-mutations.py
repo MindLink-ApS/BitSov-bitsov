@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Mutation check for peer payload boundaries; restores sources even on failure.
-Run alone (no concurrent build/editor). Logs: /tmp/core-serde-mutations.
+Run alone (no concurrent build/editor). Logs are retained in a unique temporary
+directory printed at startup.
 Only an assertion/test failure kills a mutant; compilation failures do not.
 """
 from pathlib import Path
 import argparse
 import subprocess
+import tempfile
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--only')
@@ -60,11 +62,29 @@ add('room-admission-fail-closed', room,
     'Ok::<(), &str>(())',
     'konsensus-core', '--test', 'wire_json_allocations', 'oversized_room_chat')
 
-logs = Path('/tmp/core-serde-mutations')
-logs.mkdir(exist_ok=True)
+# Regressions for the #370 review's surviving defence-in-depth mutants.
+add('ack-sequence-guard', relay,
+    'konsensus_core::wire_json::strings::sequence(deserializer, AckIdVisitor)',
+    'deserializer.deserialize_seq(AckIdVisitor)',
+    'konsensus-node', '--bin', 'konsensus', 'ack_under_cap_strings')
+add('ack-element-guard', relay,
+    'struct Id(#[serde(deserialize_with = "bounded::hex_32")] MessageId);',
+    'struct Id(MessageId);',
+    'konsensus-node', '--bin', 'konsensus', 'ack_under_cap_strings')
+add('register-binding-id-bound', relay,
+    '#[serde(deserialize_with = "bounded::vec_u8::<_, 16>")]\n    binding_id:',
+    'binding_id:',
+    'konsensus-node', '--bin', 'konsensus', 'register_binding_id_rejects_seventeen_bytes')
+add('large-field-top-level-only', core,
+    'if depth == 1\n                    && data[i + 1..]',
+    'if data[i + 1..]',
+    'konsensus-api', '--test', 'file_wire_decode', 'file_exception_rejects_nested_unknown_key')
+
 if selected:
     mutants = [m for m in mutants if selected in m[0]]
     assert mutants, selected
+logs = Path(tempfile.mkdtemp(prefix='core-serde-mutations-'))
+print(f'Logs: {logs}', flush=True)
 try:
     for name, path, mutant, package, args in mutants:
         path.write_text(mutant)

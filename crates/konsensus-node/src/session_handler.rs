@@ -780,7 +780,7 @@ async fn handle_prekey_offer(
     }
 
     let peer_bundle: konsensus_crypto::SerializablePrekeyBundle =
-        match serde_json::from_value(bundle) {
+        match serde_json::from_value(bundle).map_err(|_| konsensus_core::wire_json::DecodeError) {
             Ok(b) => b,
             Err(e) => {
                 warn!(peer = %peer_id, error = %e, "invalid prekey bundle");
@@ -841,7 +841,7 @@ async fn handle_session_init(
     }
 
     let init: konsensus_crypto::SerializableSessionInit =
-        match serde_json::from_value(init_data) {
+        match serde_json::from_value(init_data).map_err(|_| konsensus_core::wire_json::DecodeError) {
             Ok(d) => d,
             Err(e) => {
                 warn!(peer = %peer_id, error = %e, "invalid session init data");
