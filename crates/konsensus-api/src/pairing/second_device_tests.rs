@@ -1339,3 +1339,171 @@ fn console_flag_off_and_no_owner_ticket_refusal() {
         super::console::EnrollmentStatus::default()
     );
 }
+
+#[test]
+fn console_revocation_walks_approvals_by_pairing_siblings() {
+    use super::console::RevokeOptions;
+    let f = Fixture::new();
+    // K1 and K2 share a pairing, but K2 was independently console-enrolled.
+    let sibling = key();
+    let sibling_id = key_id_for(sibling.public_key().as_ref());
+    let mut k2 = f.svc.device_keys()[0].clone();
+    k2.key_id = sibling_id.clone();
+    k2.public_key = hex::encode(sibling.public_key().as_ref());
+    let signer = konsensus_core::OwnerApprovalKey::from_seed(&[7; 64], &[9; 32]).unwrap();
+    k2.owner_approval = hex::encode(
+        signer
+            .sign(
+                owner_approval_message(
+                    &f.svc.bound_fingerprint(),
+                    &k2.client_pubkey,
+                    k2.epoch,
+                    &k2.public_key,
+                )
+                .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    f.svc.lock().file.device_keys.push(k2);
+    let (_, op) = f.confirmed(2);
+    let child = f
+        .approve(&op, &sign(&f.key, &f.message(&op, false)))
+        .unwrap();
+    f.svc
+        .lock()
+        .file
+        .device_keys
+        .iter_mut()
+        .find(|k| k.key_id == child.key_id)
+        .unwrap()
+        .enrolled_by = format!("device:{sibling_id}");
+    let (_, op) = f.confirmed(3);
+    let grandchild = f
+        .approve(&op, &sign(&f.key, &f.message(&op, false)))
+        .unwrap();
+    f.svc
+        .lock()
+        .file
+        .device_keys
+        .iter_mut()
+        .find(|k| k.key_id == grandchild.key_id)
+        .unwrap()
+        .enrolled_by = format!("second_device:{}", child.key_id);
+    let mut options = RevokeOptions {
+        root: f.key_id.clone(),
+        cascade: true,
+        with_pairing: false,
+        keep: vec![],
+        allow_zero_owner: true,
+    };
+    let plan = f.svc.console_revoke_devices(&options, None).unwrap();
+    assert_eq!(
+        plan.keys.len(),
+        4,
+        "pairing siblings' approvals must join the cascade"
+    );
+    assert_eq!(plan.pairings.len(), 3);
+    assert_eq!(plan.owner_device_count, 0);
+    for id in [&sibling_id, &child.key_id, &grandchild.key_id] {
+        assert!(plan.descendants.iter().any(|k| &k.key_id == id));
+    }
+    options.keep = vec![sibling_id.clone()];
+    assert!(f.svc.console_revoke_devices(&options, None).is_err());
+    // Keeping the whole parent pairing must not revoke independent siblings
+    // or start walking their approvals.
+    options.keep.push(f.key_id.clone());
+    let kept = f.svc.console_revoke_devices(&options, None);
+    // K2 isn't provenance-linked to K1; preserving P must not start a K2 cascade.
+    assert!(matches!(kept, Err(PairingError::UnknownOperation)));
+    options.keep.clear();
+    f.svc
+        .console_revoke_devices(&options, Some(&plan.confirmation))
+        .unwrap();
+    assert!(f.svc.device_keys().is_empty());
+    assert!(f.svc.snapshot().clients.is_empty());
+}
+
+#[test]
+fn console_revocation_audit_sanitizes_device_names() {
+    for (hostile, expected) in [
+        (format!(" \n\u{001b}\u{200b}\u{202e}\u{feff}\u{206a}\u{206f}\u{fff9}\u{fffb}\u{e0020}\u{e007f}{} ", "é".repeat(80)), "é".repeat(64)),
+        (" \u{206b}\u{fffa}\u{e0061} ".into(), "unnamed device".into()),
+        ("  Alice’s 日本語 phone  ".into(), "Alice’s 日本語 phone".into()),
+    ] {
+        let mut f = Fixture::new();
+        let path = f.dir.path().join("revoke-audit.jsonl");
+        f.svc = f.svc.with_enrollment_audit(std::sync::Arc::new(
+            crate::audit::AuditLog::open(&path).unwrap(),
+        ));
+        f.svc.lock().file.device_keys[0].name = hostile.clone();
+        let options = super::console::RevokeOptions {
+            root: f.key_id.clone(),
+            cascade: false,
+            with_pairing: false,
+            keep: vec![],
+            allow_zero_owner: true,
+        };
+        let plan = f.svc.console_revoke_devices(&options, None).unwrap();
+        f.svc
+            .console_revoke_devices(&options, Some(&plan.confirmation))
+            .unwrap();
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let event = events
+            .iter()
+            .find(|e| e["event"] == "pair.device_revoked")
+            .unwrap();
+        assert_eq!(event["detail"]["keys"][0]["name"], expected);
+        assert_eq!(
+            plan.keys[0].name, hostile,
+            "confirmation binds the original record"
+        );
+    }
+}
+
+#[test]
+fn console_legacy_revocations_refused_only_when_running_flag_is_on() {
+    use crate::control::{self, ControlContext, ControlRequest as Q, ControlResponse as R};
+    for enabled in [true, false] {
+        for operation in 0..3 {
+            let mut f = Fixture::new();
+            f.svc = f.svc.with_second_device_enrollment(enabled);
+            let service = std::sync::Arc::new(f.svc);
+            let ctx = ControlContext {
+                service: service.clone(),
+                identity_fingerprint: service.bound_fingerprint(),
+                data_dir: f.dir.path().into(),
+                mnemonic_path: f.dir.path().join("mnemonic.enc"),
+                replacement_guard: control::ReplacementGuard {
+                    layout: crate::bootstrap::DataDirLayout::new(f.dir.path()),
+                    uses_identity_derived_keys: true,
+                    has_identity_passphrase: false,
+                },
+            };
+            let before = serde_json::to_value(service.snapshot()).unwrap();
+            let request = if operation == 0 {
+                Q::RevokeDeviceKey { key_id: f.key_id }
+            } else {
+                Q::Revoke {
+                    client_id: f.owner.client_id,
+                    keep_pairing: operation == 2,
+                }
+            };
+            let response = control::handle(&ctx, request);
+            if enabled {
+                assert!(
+                    matches!(response, R::Error { ref message } if message.contains("device revoke")),
+                    "{response:?}"
+                );
+                assert_eq!(serde_json::to_value(service.snapshot()).unwrap(), before);
+                assert_eq!(service.owner_device_count(), 1);
+            } else {
+                assert!(matches!(response, R::Ok { .. }), "{response:?}");
+                assert_ne!(serde_json::to_value(service.snapshot()).unwrap(), before);
+            }
+        }
+    }
+}
