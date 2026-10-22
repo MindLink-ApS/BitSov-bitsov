@@ -1008,6 +1008,7 @@ pub fn test_state() -> Arc<AppState> {
     )));
 
     Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(StubLightning),
@@ -1073,6 +1074,7 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
     )));
 
     Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage,
         lightning: Arc::new(StubLightning),
@@ -1126,6 +1128,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
     )));
 
     Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage,
         lightning: Arc::new(StubLightning),
@@ -1189,6 +1192,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
     )));
 
     Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(StubLightning),
@@ -1242,6 +1246,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
     )));
 
     Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(StubLightning),
@@ -1502,6 +1507,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
     )));
 
     Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(MemStorage::new()),
         lightning: Arc::new(StubLightning),
@@ -1745,6 +1751,7 @@ pub fn test_state_with_lightning_and_storage(
     )));
 
     Arc::new(AppState {
+        starter: Default::default(),
         identity: Arc::clone(&identity),
         storage,
         lightning,

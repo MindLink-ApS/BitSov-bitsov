@@ -1630,3 +1630,15 @@ failures. The safe default remains **1,000 msat = 1 sat**; explicit operator
 prices at or above that floor are preserved. Lower retained values must be
 raised or removed before startup. See [BROWSE.md](protocol/BROWSE.md) and
 [NOTES-PORCH.md](../NOTES-PORCH.md) for compatibility and availability limits.
+
+## N-M7a newcomer starter requests (PR-2)
+
+The optional `[starter]` section exposes the paired `receive` starter-channel API
+on embedded LDK signet nodes (regtest for tests). It defaults off; mainnet and
+`allow_mainnet = true` remain refused. See [newcomer setup and recovery](ops/starter-newcomer.md).
+No SQL migrations are added beyond PR-1's 031/032. New LDK channel records retain
+initial-push evidence in optional TLV fields; older channels without that evidence
+cannot be automatically verified as starter gifts. Ordinary channels and balances
+remain usable. Automatic retries preserve an uncertain operation's UUID, and only
+a proven hub refusal allows a bounded successor. No automatic onboarding opens
+are enabled: each starter still requires an explicit owner request and hub invite.

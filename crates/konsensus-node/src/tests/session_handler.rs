@@ -1775,6 +1775,7 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
         ws_delivery_tx: delivery,
         pending_tx: pending,
         starter_hub_tx: None,
+        starter_newcomer_tx: None,
         auto_channel_tx: auto,
         shutdown_rx,
     }));

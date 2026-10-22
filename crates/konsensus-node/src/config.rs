@@ -185,6 +185,8 @@ impl Default for PairingConfig {
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     #[serde(default)]
+    pub starter: konsensus_api::handlers::starter_channel::StarterConfig,
+    #[serde(default)]
     pub starter_hub: crate::onboarding::starter_hub::StarterHubConfig,
     /// Owner-approved second-device enrollment rollout.
     #[serde(default)]
@@ -1614,8 +1616,28 @@ impl NodeConfig {
         Ok(())
     }
 
+    pub(crate) fn starter_settings(&self) -> konsensus_api::handlers::starter_channel::StarterSettings {
+        let mut settings = konsensus_api::handlers::starter_channel::StarterSettings {
+            config: self.starter.clone(),
+            network: self.lightning.bitcoin_network().unwrap_or_default(),
+            hub_whitelisted: self.peers.iter().any(|p| p.node_id == self.starter.hub_node_id),
+            ..Default::default()
+        };
+        if let LightningConfig::Ldk { liquidity, .. } = &self.lightning {
+            if let Ok(Some(provider)) = liquidity.selected() {
+                settings.hub_ln_pubkey = provider.node_id.clone();
+                settings.hub_ln_address = provider.address.clone();
+                settings.trust_no_reserve = provider.trust_no_reserve;
+            }
+        }
+        settings
+    }
+
     pub(crate) fn validate_starter_hub(&self, lockable: bool) -> anyhow::Result<()> {
         let network = self.lightning.bitcoin_network();
+        self.starter
+            .validate(network.as_deref(), matches!(self.lightning, LightningConfig::Ldk { .. }))
+            .map_err(anyhow::Error::msg)?;
         self.starter_hub.validate(network.as_deref(), self.lightning.channel_capacity_limits().map(|l| l.max_channel_capacity_sats), lockable)
     }
 
@@ -2105,6 +2127,7 @@ impl NodeConfig {
             dos_edge: Default::default(),
             // R1-a: onboarding channel-open subsidy OFF by default — generated
             // configs never auto-spend operator sats on invite membership.
+            starter: Default::default(),
             starter_hub: Default::default(),
             onboarding_subsidy: SubsidyConfig::default(),
             sponsor: SponsorConfig::default(),

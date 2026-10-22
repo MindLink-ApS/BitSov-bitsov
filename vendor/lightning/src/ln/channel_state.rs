@@ -285,6 +285,8 @@ impl_writeable_tlv_based!(ChannelCounterparty, {
 /// [`ChannelMonitor::get_claimable_balances`]: crate::chain::channelmonitor::ChannelMonitor::get_claimable_balances
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChannelDetails {
+	/// Initial negotiated push; unknown for channels persisted by older versions.
+	pub initial_push_msat: Option<u64>,
 	/// The channel's ID (prior to initial channel setup this is a random 32 bytes, thereafter it is
 	/// derived from channel funding or key material).
 	///
@@ -543,6 +545,7 @@ impl ChannelDetails {
 			funding.get_holder_counterparty_selected_channel_reserve_satoshis();
 		#[allow(deprecated)] // TODO: Remove once balance_msat is removed.
 		ChannelDetails {
+			initial_push_msat: context.initial_push_msat,
 			channel_id: context.channel_id(),
 			counterparty: ChannelCounterparty {
 				node_id: context.get_counterparty_node_id(),
@@ -642,6 +645,7 @@ impl_writeable_tlv_based!(ChannelDetails, {
 	(45, pending_outbound_htlcs, optional_vec),
 	(47, funding_redeem_script, option),
 	(49, counterparty_force_close_spend_delay, option),
+	(51, initial_push_msat, option),
 	(_unused, user_channel_id, (static_value,
 		_user_channel_id_low.unwrap_or(0) as u128 | ((_user_channel_id_high.unwrap_or(0) as u128) << 64)
 	)),
@@ -705,6 +709,7 @@ mod tests {
 	fn test_channel_details_serialization() {
 		#[allow(deprecated)]
 		let channel_details = ChannelDetails {
+			initial_push_msat: None,
 			channel_id: ChannelId::new_zero(),
 			counterparty: ChannelCounterparty {
 				features: Features::empty(),

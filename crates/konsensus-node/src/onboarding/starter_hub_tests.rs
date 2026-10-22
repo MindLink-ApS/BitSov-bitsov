@@ -15,6 +15,16 @@ struct Backend {
 }
 #[async_trait]
 impl LightningProvider for Backend {
+    async fn sign_message(&self, message: &[u8]) -> Result<String, LightningError> {
+        Ok(String::from_utf8_lossy(message).into())
+    }
+    async fn get_node_pubkey(&self) -> Option<String> {
+        Some("02".repeat(33))
+    }
+    async fn connect_peer(&self, _: &str, _: &str, _: bool) -> Result<(), LightningError> {
+        Ok(())
+    }
+
     async fn create_invoice(&self, _: u64, _: &str, _: u32) -> Result<Invoice, LightningError> {
         unimplemented!()
     }
@@ -96,6 +106,14 @@ impl LightningProvider for Backend {
                 FUNDING_FEE_CAP_EXCEEDED.into(),
             )),
             2 => Err(LightningError::PaymentNotDispatched("preflight".into())),
+            3 => Ok(ChannelOpenResult {
+                channel_id: "ab".repeat(32),
+                user_channel_id: Some("1".into()),
+                funding_txo: Some(format!("{}:0", "cd".repeat(32))),
+                funding_txid: Some("cd".repeat(32)),
+                funding_fee: None,
+                status: ChannelOpenStatus::Opening,
+            }),
             _ => Err(LightningError::Backend("ambiguous".into())),
         }
     }
@@ -220,6 +238,11 @@ async fn consumed_channel_ready_is_recovered_even_when_operation_already_opened(
                 .unwrap();
         }
         backend.channels.lock().unwrap().push(ChannelInfo {
+            is_outbound: None,
+            is_announced: None,
+            is_channel_ready: None,
+            local_reserve_msat: None,
+            initial_push_msat: None,
             channel_id: "funded".into(),
             user_channel_id: Some("42".into()),
             funding_txo: Some("tx:0".into()),
@@ -427,4 +450,323 @@ async fn refused_request_flood_keeps_only_one_row_and_does_not_extend_throttle()
         Frame::StarterStatus { state, .. } if state == "received")
     );
     assert_eq!(hub.storage.starter_grants().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn newcomer_replays_timeout_without_duplicate_hub_open_and_waits_for_push() {
+    use crate::onboarding::starter_newcomer::StarterNewcomer;
+    use konsensus_api::handlers::starter_channel::{StarterConfig, StarterSettings};
+    use konsensus_storage::starter_request::StarterRequest;
+    let (hub, backend, peer) = setup(3).await;
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let client_backend = Arc::new(Backend {
+        db: db.clone(),
+        calls: AtomicUsize::new(0),
+        channels: Mutex::new(vec![]),
+        outcome: 0,
+        connected: std::sync::atomic::AtomicBool::new(true),
+        fail_channel_read: std::sync::atomic::AtomicBool::new(false),
+    });
+    let newcomer = StarterNewcomer {
+        storage: db.clone(),
+        lightning: client_backend.clone(),
+        node_id: peer,
+        settings: StarterSettings {
+            config: StarterConfig {
+                enabled: true,
+                hub_node_id: hub.hub_id.to_hex(),
+                allow_mainnet: false,
+            },
+            network: "regtest".into(),
+            hub_ln_pubkey: "03".repeat(33),
+            hub_ln_address: "127.0.0.1:9735".into(),
+            hub_whitelisted: true,
+            trust_no_reserve: true,
+        },
+    };
+    let id = Uuid::new_v4();
+    db.starter_request_create(&StarterRequest::new(
+        id.to_string(),
+        hub.hub_id.to_hex(),
+        "03".repeat(33),
+        "regtest".into(),
+        100,
+    ))
+    .await
+    .unwrap();
+    let first = newcomer.poll(100, true).await.unwrap().unwrap();
+    let _lost_reply = hub.handle(peer, first, Some(100)).await.unwrap();
+    hub.tick(Some(100)).await.unwrap();
+    assert!(newcomer.poll(114, true).await.unwrap().is_none());
+    let replay = newcomer.poll(115, true).await.unwrap().unwrap();
+    assert!(matches!(replay,Frame::StarterRequest{request_id,..} if request_id==id));
+    let status = hub.handle(peer, replay, Some(115)).await.unwrap();
+    hub.tick(Some(115)).await.unwrap();
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    newcomer.handle(hub.hub_id, status, 115).await.unwrap();
+    let mut channel = ChannelInfo {
+        channel_id: "ab".repeat(32),
+        user_channel_id: Some("1".into()),
+        funding_txo: None,
+        peer_pubkey: "03".repeat(33),
+        capacity_msat: 100_000_000,
+        local_balance_msat: 0,
+        remote_balance_msat: 100_000_000,
+        active: true,
+        short_channel_id: None,
+        is_outbound: Some(false),
+        is_announced: Some(false),
+        is_channel_ready: Some(true),
+        local_reserve_msat: Some(0),
+        initial_push_msat: None,
+    };
+    // Use the actual hub operation identifiers, never a channel for another grant.
+    let grant = hub
+        .storage
+        .starter_query(StarterQuery::Request(id.to_string()))
+        .await
+        .unwrap()
+        .remove(0);
+    channel.channel_id = grant.channel_id.unwrap();
+    channel.funding_txo = grant.funding_txid.map(|t| format!("{t}:0"));
+    client_backend
+        .channels
+        .lock()
+        .unwrap()
+        .push(channel.clone());
+    newcomer.poll(116, true).await.unwrap();
+    assert_eq!(
+        db.starter_request_get(&id.to_string())
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "opening"
+    );
+    channel.initial_push_msat = Some(10_000_000);
+    channel.is_channel_ready = Some(false);
+    *client_backend.channels.lock().unwrap() = vec![channel.clone()];
+    newcomer.poll(117, true).await.unwrap();
+    assert_ne!(
+        db.starter_request_get(&id.to_string())
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "ready"
+    );
+    channel.is_channel_ready = Some(true); // Balance can already be spent: durable evidence remains.
+    *client_backend.channels.lock().unwrap() = vec![channel];
+    newcomer.poll(118, true).await.unwrap();
+    let ready = db
+        .starter_request_get(&id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ready.state, "ready");
+    assert!(ready.verified_at.is_some());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+}
+
+async fn newcomer_fixture(
+    hub: &StarterHub,
+    peer: NodeId,
+) -> (
+    super::super::starter_newcomer::StarterNewcomer,
+    Arc<SqliteStorage>,
+    Arc<Backend>,
+) {
+    use konsensus_api::handlers::starter_channel::{StarterConfig, StarterSettings};
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let backend = Arc::new(Backend {
+        db: db.clone(),
+        calls: AtomicUsize::new(0),
+        channels: Mutex::new(vec![]),
+        outcome: 0,
+        connected: std::sync::atomic::AtomicBool::new(true),
+        fail_channel_read: std::sync::atomic::AtomicBool::new(false),
+    });
+    let client = super::super::starter_newcomer::StarterNewcomer {
+        storage: db.clone(),
+        lightning: backend.clone(),
+        node_id: peer,
+        settings: StarterSettings {
+            config: StarterConfig {
+                enabled: true,
+                hub_node_id: hub.hub_id.to_hex(),
+                allow_mainnet: false,
+            },
+            network: "regtest".into(),
+            hub_ln_pubkey: "03".repeat(33),
+            hub_ln_address: "127.0.0.1:9735".into(),
+            hub_whitelisted: true,
+            trust_no_reserve: true,
+        },
+    };
+    (client, db, backend)
+}
+#[tokio::test]
+async fn newcomer_refusal_retries_once_after_backoff_and_late_status_cannot_regress_it() {
+    use konsensus_storage::starter_request::StarterRequest;
+    let (hub, backend, peer) = setup(3).await;
+    let (client, db, _) = newcomer_fixture(&hub, peer).await;
+    let id = Uuid::new_v4();
+    db.starter_request_create(&StarterRequest::new(
+        id.to_string(),
+        hub.hub_id.to_hex(),
+        "03".repeat(33),
+        "regtest".into(),
+        100,
+    ))
+    .await
+    .unwrap();
+    backend.connected.store(false, Ordering::SeqCst);
+    let frame = client.poll(100, true).await.unwrap().unwrap();
+    let refused = hub.handle(peer, frame, Some(100)).await.unwrap();
+    client
+        .handle(NodeId::from_bytes([99; 32]), refused.clone(), 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.starter_request_current().await.unwrap().unwrap().state,
+        "requested"
+    );
+    client
+        .handle(hub.hub_id, refused.clone(), 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.starter_request_current().await.unwrap().unwrap().state,
+        "refused"
+    );
+    assert!(client.poll(699, true).await.unwrap().is_none());
+    backend.connected.store(true, Ordering::SeqCst);
+    let retry = client.poll(700, true).await.unwrap().unwrap();
+    let Frame::StarterRequest {
+        request_id: child, ..
+    } = retry
+    else {
+        panic!("request")
+    };
+    assert_ne!(child, id);
+    let accepted = hub.handle(peer, retry.clone(), Some(700)).await.unwrap();
+    client.handle(hub.hub_id, accepted, 700).await.unwrap();
+    client.handle(hub.hub_id, refused, 701).await.unwrap();
+    assert_eq!(
+        db.starter_request_current()
+            .await
+            .unwrap()
+            .unwrap()
+            .request_id,
+        child.to_string()
+    );
+    hub.tick(Some(700)).await.unwrap();
+    hub.handle(peer, retry, Some(715)).await.unwrap();
+    hub.tick(Some(715)).await.unwrap();
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        hub.storage
+            .get_channel_open_operation(&child.to_string())
+            .await
+            .unwrap()
+            .unwrap()
+            .operation_id,
+        child.to_string()
+    );
+}
+#[tokio::test]
+async fn newcomer_delivery_is_bounded_and_reconnect_reuses_operation_after_24h() {
+    use konsensus_storage::starter_request::StarterRequest;
+    let (hub, _, peer) = setup(3).await;
+    let (client, db, _) = newcomer_fixture(&hub, peer).await;
+    let id = Uuid::new_v4();
+    db.starter_request_create(&StarterRequest::new(
+        id.to_string(),
+        hub.hub_id.to_hex(),
+        "03".repeat(33),
+        "regtest".into(),
+        100,
+    ))
+    .await
+    .unwrap();
+    for now in [100, 115, 145, 205, 325, 625, 925, 1225] {
+        assert!(
+            matches!(client.poll(now,true).await.unwrap(),Some(Frame::StarterRequest{request_id,..}) if request_id==id)
+        );
+    }
+    assert!(client.poll(100_000, true).await.unwrap().is_none());
+    assert!(client.poll(100_001, false).await.unwrap().is_none());
+    let row = db.starter_request_current().await.unwrap().unwrap();
+    assert_eq!(row.state, "requested");
+    assert_eq!(row.detail.as_deref(), Some("hub_silent_24h"));
+    db.starter_request_rearm(&row.request_id).await.unwrap();
+    assert!(
+        matches!(client.poll(100_002,true).await.unwrap(),Some(Frame::StarterRequest{request_id,..}) if request_id==id)
+    );
+    assert_eq!(
+        db.starter_request_current()
+            .await
+            .unwrap()
+            .unwrap()
+            .original_request_id,
+        None
+    );
+}
+#[tokio::test]
+async fn newcomer_adopts_an_original_that_was_previously_refused() {
+    use konsensus_storage::starter_request::StarterRequest;
+    let (hub, backend, peer) = setup(3).await;
+    let (client, db, client_backend) = newcomer_fixture(&hub, peer).await;
+    let id = Uuid::new_v4();
+    db.starter_request_create(&StarterRequest::new(
+        id.to_string(),
+        hub.hub_id.to_hex(),
+        "03".repeat(33),
+        "regtest".into(),
+        100,
+    ))
+    .await
+    .unwrap();
+    backend.connected.store(false, Ordering::SeqCst);
+    let first = client.poll(100, true).await.unwrap().unwrap();
+    let refused = hub.handle(peer, first.clone(), Some(100)).await.unwrap();
+    client.handle(hub.hub_id, refused, 100).await.unwrap();
+    let child = client.poll(700, true).await.unwrap().unwrap();
+    // Hub prunes A's refusal when B is evaluated. B's refusal response is lost.
+    let _lost = hub.handle(peer, child.clone(), Some(700)).await.unwrap();
+    backend.connected.store(true, Ordering::SeqCst);
+    // A delayed duplicate A can now be admitted, since PR-1 pruned its refusal.
+    hub.handle(peer, first, Some(1300)).await.unwrap();
+    hub.tick(Some(1300)).await.unwrap();
+    let served = hub.handle(peer, child, Some(1301)).await.unwrap();
+    client.handle(hub.hub_id, served, 1301).await.unwrap();
+    let adopted = db.starter_request_current().await.unwrap().unwrap();
+    assert_eq!(adopted.request_id, id.to_string());
+    assert_eq!(adopted.state, "requested");
+    let replay = client.poll(1302, true).await.unwrap().unwrap();
+    assert!(matches!(replay,Frame::StarterRequest{request_id,..} if request_id==id));
+    let status = hub.handle(peer, replay, Some(1302)).await.unwrap();
+    client.handle(hub.hub_id, status, 1302).await.unwrap();
+    client_backend.channels.lock().unwrap().push(ChannelInfo {
+        channel_id: "ab".repeat(32),
+        user_channel_id: Some("1".into()),
+        funding_txo: Some(format!("{}:0", "cd".repeat(32))),
+        peer_pubkey: "03".repeat(33),
+        capacity_msat: 100_000_000,
+        local_balance_msat: 10_000_000,
+        remote_balance_msat: 90_000_000,
+        active: true,
+        short_channel_id: None,
+        is_outbound: Some(false),
+        is_announced: Some(false),
+        is_channel_ready: Some(true),
+        local_reserve_msat: Some(0),
+        initial_push_msat: Some(10_000_000),
+    });
+    client.poll(1303, true).await.unwrap();
+    assert_eq!(
+        db.starter_request_current().await.unwrap().unwrap().state,
+        "ready"
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
 }

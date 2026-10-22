@@ -1075,6 +1075,11 @@ mod tests {
         let lightning = Arc::new(TestLightning {
             balance_msat: 100_000_000,
             channels: Mutex::new(vec![ChannelInfo {
+                is_outbound: None,
+                is_announced: None,
+                is_channel_ready: None,
+                local_reserve_msat: None,
+                initial_push_msat: None,
                 channel_id: "pending-channel".into(),
                 user_channel_id: None,
                 funding_txo: None,
@@ -1860,6 +1865,11 @@ mod tests {
             ..Default::default()
         });
         *lightning.channels.lock().await = vec![ChannelInfo {
+            is_outbound: None,
+            is_announced: None,
+            is_channel_ready: None,
+            local_reserve_msat: None,
+            initial_push_msat: None,
             user_channel_id: None,
             funding_txo: None,
             channel_id: "1".to_string(),

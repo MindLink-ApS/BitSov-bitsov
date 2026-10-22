@@ -31,6 +31,7 @@ async fn owner_router(identity: Arc<NodeIdentity>) -> axum::Router {
     let sessions = Arc::new(SessionManager::new(Arc::clone(&identity)));
     let audit = tempfile::NamedTempFile::new().unwrap();
     let state = Arc::new(konsensus_api::AppState {
+        starter: Default::default(),
         file_staging: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap()),

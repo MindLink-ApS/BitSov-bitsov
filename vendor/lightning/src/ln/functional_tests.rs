@@ -10130,3 +10130,31 @@ fn test_dup_htlc_claim_onchain_and_offchain() {
 	// which calls claim_funds_internal a second time.
 	connect_blocks(&nodes[1], ANTI_REORG_DELAY);
 }
+
+// Initial push evidence must survive spending and a channel-manager restart.
+#[test]
+fn starter_initial_push_survives_spend_and_restart() {
+    let chanmon_cfgs = create_chanmon_cfgs(2);
+    let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+    let persister;
+    let new_chain_monitor;
+    let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+    let new_node;
+    let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+    let tx = create_chan_between_nodes_with_value_init(&nodes[0], &nodes[1], 100_000, 10_000_000);
+    // Negotiated push alone does not make unconfirmed funding spendable.
+    assert_eq!(nodes[1].node.list_channels()[0].initial_push_msat, Some(10_000_000));
+    assert!(!nodes[1].node.list_channels()[0].is_channel_ready);
+    assert!(nodes[1].node.list_usable_channels().is_empty());
+    let (ready, _) = create_chan_between_nodes_with_value_confirm(&nodes[0], &nodes[1], &tx);
+    create_chan_between_nodes_with_value_b(&nodes[0], &nodes[1], &ready);
+    assert_eq!(nodes[1].node.list_channels()[0].initial_push_msat, Some(10_000_000));
+    send_payment(&nodes[1], &[&nodes[0]], 2_000_000);
+    assert_eq!(nodes[1].node.list_channels()[0].initial_push_msat, Some(10_000_000));
+    let node_encoded = nodes[1].node.encode();
+    let chanmon_encoded = nodes[1].chain_monitor.chain_monitor.list_monitors().iter().map(|channel_id| {
+        nodes[1].chain_monitor.chain_monitor.get_monitor(*channel_id).unwrap().encode()
+    }).collect::<Vec<_>>();
+    reload_node!(nodes[1], test_default_channel_config(), &node_encoded, &chanmon_encoded.iter().map(|v| &v[..]).collect::<Vec<_>>(), persister, new_chain_monitor, new_node);
+    assert_eq!(nodes[1].node.list_channels()[0].initial_push_msat, Some(10_000_000));
+}
