@@ -5,6 +5,17 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Pin release asset IDs and SHA-256 digests, verify downloaded bytes, and
+  refuse signing/upload if draft assets change during verification or signing
+  (security sweep #2, M3).
+- Refuse signing release versions at or below the newest published release in
+  the same major/minor line, including ordered `-rcN` and `-rcN.M` prereleases;
+  no downgrade override (security sweep #2, M4).
+- Return an error when LNbits sat-to-msat balance conversion overflows
+  (security sweep #2, L2).
+- Require the reviewed commit argument to be a full 40-character lowercase
+  hexadecimal SHA before any release-sign fetch; movable refs and abbreviated
+  SHAs are rejected (#360).
 - Make Darwin release binaries independent of the build path: link with
   `-Wl,-S` so ld64's `LC_UUID` no longer hashes absolute debug-map paths, which
   made every H3 host rebuild mismatch CI. Add `scripts/release-repro-check.sh`
