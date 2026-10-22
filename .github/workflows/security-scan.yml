@@ -80,8 +80,12 @@ jobs:
         id: cargo_audit
         continue-on-error: true
         run: |
-          cargo audit --json 2>/dev/null > /tmp/cargo-audit.json || true
-          cargo audit 2>&1 > /tmp/cargo-audit.txt || true
+          status=0
+          cargo audit --json > /tmp/cargo-audit.json 2>/tmp/cargo-audit.log || status=$?
+          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
+
+      - name: Require release lockfile
+        run: test -s Cargo.lock
 
       - name: Run osv-scanner
         id: osv_scan
@@ -91,21 +95,26 @@ jobs:
         # Cargo uses the workspace lockfile for these patched path dependencies.
         # No frontend ships here; add explicit lockfiles if release inputs expand.
         run: |
-          osv-scanner --lockfile Cargo.lock --config osv-scanner.toml --format json \
-            > /tmp/osv-scan.json 2>/dev/null || true
+          status=0
+          # Include clean packages so the report can verify nonzero scan coverage.
+          osv-scanner --lockfile Cargo.lock --config osv-scanner.toml --format json --experimental-all-packages \
+            > /tmp/osv-scan.json 2>/tmp/osv-scan.log || status=$?
+          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
 
-      # gitleaks --exit-code 0 means it always exits cleanly; findings appear
-      # only in the JSON report which we parse below.
+      # --exit-code 0 suppresses the findings exit code, but tool errors still
+      # fail validation below. Keep raw diagnostics out of published reports.
       - name: Run gitleaks
         id: gitleaks
         continue-on-error: true
         run: |
+          status=0
           gitleaks detect \
             --source . \
             --no-banner \
             --report-format json \
             --report-path /tmp/gitleaks.json \
-            --exit-code 0
+            --exit-code 0 > /tmp/gitleaks.log 2>&1 || status=$?
+          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
 
       # ── Ensure label exists in repository ─────────────────────────────────
 
@@ -122,6 +131,10 @@ jobs:
 
       - name: Generate security report
         id: report
+        env:
+          CARGO_EXIT_CODE: ${{ steps.cargo_audit.outputs.exit_code }}
+          OSV_EXIT_CODE: ${{ steps.osv_scan.outputs.exit_code }}
+          GITLEAKS_EXIT_CODE: ${{ steps.gitleaks.outputs.exit_code }}
         run: |
           SCAN_DATE=$(date -u +"%Y-%m-%d")
           SCAN_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -129,30 +142,67 @@ jobs:
           REPORT_FILE="${REPORT_DIR}/${SCAN_DATE}.md"
           mkdir -p "$REPORT_DIR"
 
+          # Require exactly one JSON value of the expected shape. Empty files,
+          # malformed JSON and concatenated documents must never mean "clean".
+          valid_json() {
+            [ -s "$1" ] && jq -e -s "length == 1 and (.[0] | $2)" "$1" >/dev/null 2>&1
+          }
+          SCAN_ERROR=false
+          CARGO_ERROR=false
+          OSV_ERROR=false
+          LEAK_ERROR=false
+
           # ── Parse cargo-audit ──
           CARGO_VULN_COUNT=0
           CARGO_WARN_COUNT=0
-          if [ -f /tmp/cargo-audit.json ] && [ -s /tmp/cargo-audit.json ]; then
-            CARGO_VULN_COUNT=$(jq '.vulnerabilities.count // 0' /tmp/cargo-audit.json 2>/dev/null || echo 0)
-            CARGO_WARN_COUNT=$(jq '
-              .warnings
-              | if type == "object" then to_entries | map(.value | length) | add // 0
-                else 0 end
-            ' /tmp/cargo-audit.json 2>/dev/null || echo 0)
+          if [[ "$CARGO_EXIT_CODE" =~ ^[01]$ ]] && valid_json /tmp/cargo-audit.json '
+            type == "object" and
+            (.vulnerabilities | type == "object") and
+            (.vulnerabilities.count | type == "number" and . >= 0 and . == floor) and
+            (.vulnerabilities.list | type == "array") and
+            (.vulnerabilities.count == (.vulnerabilities.list | length)) and
+            all(.vulnerabilities.list[]; type == "object" and
+              (.advisory.id | type == "string") and (.package.name | type == "string")) and
+            (.warnings | type == "object" and all(.[]; type == "array" and
+              all(.[]; type == "object" and (.package.name | type == "string"))))'; then
+            CARGO_VULN_COUNT=$(jq '.vulnerabilities.count' /tmp/cargo-audit.json)
+            CARGO_WARN_COUNT=$(jq '[.warnings[] | length] | add // 0' /tmp/cargo-audit.json)
+            # Exit 1 with no findings is an operational failure, not a clean scan.
+            if [ "$CARGO_EXIT_CODE" = 1 ] && [ "$CARGO_VULN_COUNT" -eq 0 ]; then
+              CARGO_ERROR=true
+            fi
+          else
+            CARGO_ERROR=true
           fi
 
           # ── Parse osv-scanner ──
           OSV_COUNT=0
-          if [ -f /tmp/osv-scan.json ] && [ -s /tmp/osv-scan.json ]; then
+          OSV_PACKAGE_COUNT=0
+          if [[ "$OSV_EXIT_CODE" =~ ^[01]$ ]] && valid_json /tmp/osv-scan.json '
+            type == "object" and (.results | type == "array") and
+            all(.results[]; type == "object" and (.packages | type == "array") and
+              all(.packages[]; type == "object" and (.package | type == "object") and
+                (.package.name | type == "string") and (.package.version | type == "string") and
+                ((has("vulnerabilities") | not) or
+                  (.vulnerabilities | type == "array" and all(.[]; type == "object" and (.id | type == "string"))))))'; then
+            OSV_PACKAGE_COUNT=$(jq '[.results[].packages[]] | length' /tmp/osv-scan.json)
             OSV_COUNT=$(jq '[.results[]?.packages[]?.vulnerabilities[]?] | length' \
-              /tmp/osv-scan.json 2>/dev/null || echo 0)
+              /tmp/osv-scan.json)
+            if [ "$OSV_PACKAGE_COUNT" -eq 0 ] || { [ "$OSV_EXIT_CODE" = 1 ] && [ "$OSV_COUNT" -eq 0 ]; }; then
+              OSV_ERROR=true
+            fi
+          else
+            OSV_ERROR=true
           fi
 
           # ── Parse gitleaks ──
           LEAK_COUNT=0
-          if [ -f /tmp/gitleaks.json ] && [ -s /tmp/gitleaks.json ]; then
-            LEAK_COUNT=$(jq 'if type == "array" then length else 0 end' \
-              /tmp/gitleaks.json 2>/dev/null || echo 0)
+          if [ "$GITLEAKS_EXIT_CODE" = 0 ] && valid_json /tmp/gitleaks.json '
+            type == "array" and all(.[]; type == "object" and
+              (.RuleID | type == "string") and (.File | type == "string") and (.Secret | type == "string"))'; then
+            LEAK_COUNT=$(jq 'length' /tmp/gitleaks.json)
+          else
+            LEAK_ERROR=true
           fi
 
           # ── Overall status ──
@@ -165,6 +215,13 @@ jobs:
           osv_status=$([ "${OSV_COUNT}"           -gt 0 ] && echo "FINDINGS (${OSV_COUNT})"        || echo "clean")
           leak_status=$([ "${LEAK_COUNT}"         -gt 0 ] && echo "FINDINGS (${LEAK_COUNT})"       || echo "clean")
           overall=$([ "${HAS_FINDINGS}" = "true" ]         && echo "REQUIRES REVIEW"               || echo "ALL CLEAR")
+          if [ "$CARGO_ERROR" = true ] || [ "$OSV_ERROR" = true ] || [ "$LEAK_ERROR" = true ]; then
+            SCAN_ERROR=true
+            overall="SCAN ERROR — triage privately"
+          fi
+          [ "$CARGO_ERROR" = true ] && cargo_status="SCAN ERROR"
+          [ "$OSV_ERROR" = true ] && osv_status="SCAN ERROR"
+          [ "$LEAK_ERROR" = true ] && leak_status="SCAN ERROR"
 
           # ── Build cargo-audit detail section ──
           CARGO_DETAIL="No vulnerabilities found."
@@ -200,6 +257,10 @@ jobs:
           if [ "${LEAK_COUNT}" -gt 0 ] && [ -f /tmp/gitleaks.json ] && [ -s /tmp/gitleaks.json ]; then
             LEAK_DETAIL="Potential secrets found. Details are intentionally withheld from generated reports; triage the restricted runner output and rotate before publishing any public summary."
           fi
+          ERROR_DETAIL="Scan could not be verified (tool failure, missing/invalid output, or zero OSV packages). Triage privately; do not treat this as clean."
+          [ "$CARGO_ERROR" = true ] && CARGO_DETAIL="$ERROR_DETAIL"
+          [ "$OSV_ERROR" = true ] && OSV_DETAIL="$ERROR_DETAIL"
+          [ "$LEAK_ERROR" = true ] && LEAK_DETAIL="$ERROR_DETAIL"
 
           # ── Write report ──
           {
@@ -228,6 +289,7 @@ jobs:
           } > "${REPORT_FILE}"
 
           echo "has_findings=${HAS_FINDINGS}"          >> "$GITHUB_OUTPUT"
+          echo "scan_error=${SCAN_ERROR}"              >> "$GITHUB_OUTPUT"
           echo "report_file=${REPORT_FILE}"            >> "$GITHUB_OUTPUT"
           echo "scan_date=${SCAN_DATE}"                >> "$GITHUB_OUTPUT"
           echo "cargo_vuln_count=${CARGO_VULN_COUNT}"  >> "$GITHUB_OUTPUT"
@@ -243,11 +305,11 @@ jobs:
           path: ${{ steps.report.outputs.report_file }}
           retention-days: 90
 
-      # ── Fail when findings exist ───────────────────────────────────────────
+      # ── Fail when findings exist or a scan could not be verified ────────────
       # Do not commit leak metadata or open public PRs with confirmed file paths.
 
-      - name: Fail on security findings
-        if: steps.report.outputs.has_findings == 'true'
+      - name: Fail on security findings or scan errors
+        if: steps.report.outputs.has_findings == 'true' || steps.report.outputs.scan_error == 'true'
         run: |
-          echo "Security scan found issues. Triage privately; do not publish leak metadata in a PR."
+          echo "Security scan found issues or could not be verified. Triage privately; do not publish leak metadata in a PR."
           exit 1
