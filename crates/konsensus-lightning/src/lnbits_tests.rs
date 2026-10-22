@@ -914,6 +914,59 @@ mod tests {
         assert_eq!(balance, 500_000); // 500 sats * 1000 = 500_000 msat
     }
 
+    async fn balance_from_wallet_response(
+        body: Value,
+    ) -> Result<u64, konsensus_core::traits::lightning::LightningError> {
+        let router = Router::new().route("/api/v1/wallet", get(move || async move { Json(body) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let result = make_provider(addr).get_balance_msat().await;
+        server.abort();
+        result
+    }
+
+    #[tokio::test]
+    async fn get_balance_sats_overflow_returns_error() {
+        for sats in [i64::MAX / 1000 + 1, i64::MIN / 1000 - 1, i64::MAX, i64::MIN] {
+            let err = balance_from_wallet_response(json!({ "balance": sats }))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                konsensus_core::traits::lightning::LightningError::Backend(_)
+            ));
+            assert!(err.to_string().contains("overflow"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_balance_sats_conversion_boundaries() {
+        for (sats, expected) in [
+            (i64::MAX / 1000, 9_223_372_036_854_775_000),
+            (i64::MIN / 1000, 0),
+            (0, 0),
+            (500, 500_000),
+        ] {
+            assert_eq!(
+                balance_from_wallet_response(json!({ "balance": sats }))
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_balance_msat_takes_precedence_over_overflowing_sats() {
+        assert_eq!(
+            balance_from_wallet_response(json!({ "balance_msat": 1234, "balance": i64::MAX }))
+                .await
+                .unwrap(),
+            1234
+        );
+    }
+
     // ── Invoice amount edge cases ─────────────────────────────────────
 
     #[tokio::test]

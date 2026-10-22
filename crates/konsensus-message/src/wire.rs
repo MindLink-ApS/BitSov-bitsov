@@ -183,9 +183,10 @@ pub const MAX_LN_PUBKEY_BYTES: usize = 130;
 
 /// Max UTF-8 bytes of `LightningInfo.ln_addr`.
 ///
-/// A dialable `host:port` (DNS name, IPv6, or onion) fits in 256 bytes. The
-/// auto-channel path dials this string after a privileged announcement.
-pub const MAX_LN_ADDR_BYTES: usize = 256;
+/// A 253-byte DNS hostname plus ':' and a five-digit port needs 259 bytes.
+/// Allow a trailing root dot and modest headroom; IPv6 and onion addresses also
+/// fit. Config loading enforces this same cap before a node advertises it.
+pub const MAX_LN_ADDR_BYTES: usize = 262;
 
 /// Correlation/session identifiers. Admission quote IDs bind two 64-character
 /// identities, a timestamp and a nonce (up to 190 bytes); UUIDs are shorter.
@@ -258,10 +259,47 @@ pub fn is_realtime_signal(kind: u16) -> bool {
 /// enforced while the JSON parser streams elements out, before the oversized
 /// collection/value is materialised.** None of them pre-allocate from an
 /// attacker-declared length, so a hostile length-prefix or an over-long array
-/// is rejected after parsing only `cap + 1` elements — never after allocating
-/// the full (potentially multi-megabyte) structure.
+/// is rejected after parsing only `cap + 1` elements. Strings first scan a
+/// borrowed raw token and count decoded bytes without copying; only admitted
+/// strings enter serde_json's unescaping scratch buffer.
 mod bounded {
     use super::*;
+
+    /// RawValue's ignored-value parser uses a heap stack without serde_json's
+    /// normal recursion guard. Bound it before parsing, including wrong-type
+    /// arrays/objects in string fields and ignored fields. This is a lexical
+    /// depth check only; serde_json remains responsible for JSON validity.
+    pub fn check_frame_depth(data: &[u8]) -> Result<(), WireError> {
+        let mut depth: usize = 0;
+        let mut in_string = false;
+        let mut escaped = false;
+        for &byte in data {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match byte {
+                    b'"' => in_string = true,
+                    b'[' | b'{' => {
+                        depth += 1;
+                        if depth > 128 {
+                            return Err(WireError::Serialization(
+                                "JSON nesting exceeds frame depth cap".into(),
+                            ));
+                        }
+                    }
+                    b']' | b'}' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
 
     pub fn snapshot_serialize<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&hex::encode(bytes))
@@ -272,17 +310,71 @@ mod bounded {
         hex::decode(encoded).map_err(de::Error::custom)
     }
 
-    pub fn limited_string<'de, D: Deserializer<'de>, const MAX: usize>(deserializer: D) -> Result<String, D::Error> {
-        struct StringVisitor<const MAX: usize>;
-        impl<const MAX: usize> Visitor<'_> for StringVisitor<MAX> {
-            type Value = String;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "string of at most {MAX} bytes") }
-            fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
-                if value.len() > MAX { return Err(E::custom("string exceeds byte cap")); }
-                Ok(value.to_owned())
+    /// Borrow the raw token before serde_json can unescape it into scratch space.
+    /// This wire decoder requires a borrowing JSON source (`from_slice`/`from_str`),
+    /// as used by `Frame::from_bytes`; a reader or prebuilt Value cannot supply it.
+    /// RawValue scans the token without copying it. Count decoded UTF-8 bytes
+    /// without materialising them, then let serde_json decode only an admitted
+    /// string. CPU for the raw scan is still bounded by the outer frame limit.
+    pub fn limited_string<'de, D: Deserializer<'de>, const MAX: usize>(
+        deserializer: D,
+    ) -> Result<String, D::Error> {
+        let raw = <&serde_json::value::RawValue>::deserialize(deserializer)?;
+        check_string_bytes::<MAX>(raw.get()).map_err(de::Error::custom)?;
+        serde_json::from_str(raw.get()).map_err(de::Error::custom)
+    }
+
+    fn check_string_bytes<const MAX: usize>(raw: &str) -> Result<(), &'static str> {
+        let contents = raw
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .ok_or("expected a JSON string")?;
+        let mut chars = contents.chars();
+        let mut bytes = 0;
+        while let Some(ch) = chars.next() {
+            bytes += if ch != '\\' {
+                ch.len_utf8()
+            } else {
+                match chars.next() {
+                    Some('u') => {
+                        let first = hex_quad(&mut chars)?;
+                        match first {
+                            0xD800..=0xDBFF => {
+                                if chars.next() != Some('\\') || chars.next() != Some('u') {
+                                    return Err("invalid Unicode surrogate pair");
+                                }
+                                if !(0xDC00..=0xDFFF).contains(&hex_quad(&mut chars)?) {
+                                    return Err("invalid Unicode surrogate pair");
+                                }
+                                4
+                            }
+                            0xDC00..=0xDFFF => return Err("unpaired Unicode surrogate"),
+                            0..=0x7F => 1,
+                            0x80..=0x7FF => 2,
+                            _ => 3,
+                        }
+                    }
+                    Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => 1,
+                    _ => return Err("invalid JSON string escape"),
+                }
+            };
+            if bytes > MAX {
+                return Err("string exceeds byte cap");
             }
         }
-        deserializer.deserialize_str(StringVisitor::<MAX>)
+        Ok(())
+    }
+
+    fn hex_quad(chars: &mut std::str::Chars<'_>) -> Result<u32, &'static str> {
+        let mut value = 0;
+        for _ in 0..4 {
+            let digit = chars
+                .next()
+                .and_then(|ch| ch.to_digit(16))
+                .ok_or("invalid Unicode escape")?;
+            value = value * 16 + digit;
+        }
+        Ok(value)
     }
 
     struct LimitedString<const MAX: usize>(String);
@@ -454,63 +546,7 @@ mod bounded {
     where
         D: Deserializer<'de>,
     {
-        struct LabelVisitor;
-
-        impl<'de> Visitor<'de> for LabelVisitor {
-            type Value = String;
-
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                write!(f, "a peer label of at most {MAX_PEER_LABEL_BYTES} bytes")
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<String, E>
-            where
-                E: de::Error,
-            {
-                if v.len() > MAX_PEER_LABEL_BYTES {
-                    return Err(de::Error::custom(format!(
-                        "peer label exceeds maximum of {MAX_PEER_LABEL_BYTES} bytes"
-                    )));
-                }
-                Ok(v.to_owned())
-            }
-        }
-
-        struct OptLabelVisitor;
-
-        impl<'de> Visitor<'de> for OptLabelVisitor {
-            type Value = Option<String>;
-
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                write!(
-                    f,
-                    "an optional peer label of at most {MAX_PEER_LABEL_BYTES} bytes"
-                )
-            }
-
-            fn visit_none<E>(self) -> Result<Option<String>, E>
-            where
-                E: de::Error,
-            {
-                Ok(None)
-            }
-
-            fn visit_unit<E>(self) -> Result<Option<String>, E>
-            where
-                E: de::Error,
-            {
-                Ok(None)
-            }
-
-            fn visit_some<D>(self, deserializer: D) -> Result<Option<String>, D::Error>
-            where
-                D: Deserializer<'de>,
-            {
-                deserializer.deserialize_str(LabelVisitor).map(Some)
-            }
-        }
-
-        deserializer.deserialize_option(OptLabelVisitor)
+        limited_opt_string::<D, MAX_PEER_LABEL_BYTES>(deserializer)
     }
 
     /// Deserialize a `HashMap<String, u64>` price table capped at
@@ -1242,6 +1278,7 @@ impl Frame {
     /// (NaN, Infinity) in fields like `trust_discount` to prevent malicious peers
     /// from injecting poison values that propagate through pricing calculations.
     pub fn from_bytes(data: &[u8]) -> Result<Self, WireError> {
+        bounded::check_frame_depth(data)?;
         let frame: Self =
             serde_json::from_slice(data).map_err(|e| WireError::Serialization(e.to_string()))?;
         frame.validate()?;
