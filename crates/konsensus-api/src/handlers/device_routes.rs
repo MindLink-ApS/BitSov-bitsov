@@ -355,7 +355,9 @@ pub(crate) async fn log_relation_intent_refusal(
                 403 => "forbidden",
                 404 => "not_found",
                 405 => "method_not_allowed",
-                429 => "rate_limited",
+                // Per-client caps set their own reason; a bare 429 is the
+                // router's global limiter.
+                429 => "rate_limited_global",
                 _ => "internal_error",
             });
         log_relation_intent_status(PATH, response.status(), reason);

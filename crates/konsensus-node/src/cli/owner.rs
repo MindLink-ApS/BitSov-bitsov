@@ -289,7 +289,7 @@ fn report(resp: ControlResponse) -> Result<()> {
 pub async fn cmd_lock_status(config_path: &Path) -> Result<()> {
     match send(config_path, ControlRequest::LockStatus {}).await? {
         ControlResponse::LockStatus { status } => {
-            println!("{}", serde_json::to_string(&status)?);
+            println!("{}", terminal_safe(&serde_json::to_string(&status)?));
             Ok(())
         }
         error @ ControlResponse::Error { .. } => report(error),

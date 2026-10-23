@@ -2008,6 +2008,8 @@ async fn start_node_services<'a>(
     // A failure to bind is fatal rather than a silent downgrade: an owner who
     // asked for the channel must not end up running without it and discover
     // later that nothing can be approved.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut control_handle: Option<tokio::task::JoinHandle<()>> = None;
     if owner_control || lock_status_socket {
         #[cfg(unix)]
         {
@@ -2043,7 +2045,7 @@ async fn start_node_services<'a>(
                 konsensus_api::control::ControlServer::bind_status_only(&data_dir, status)
                     .context("failed to bind owner status socket")?
             };
-            tokio::spawn(server.serve(node.shutdown_rx()));
+            control_handle = Some(tokio::spawn(server.serve(node.shutdown_rx())));
         }
         #[cfg(not(unix))]
         if owner_control {
@@ -2279,6 +2281,12 @@ async fn start_node_services<'a>(
         if let Some(h) = remote_internal_handle {
             if let Err(e) = h.await {
                 warn!(error = %e, "internal remote API task panicked");
+            }
+        }
+        // Lets an in-flight owner-control operation finish or answer cleanly.
+        if let Some(h) = control_handle {
+            if let Err(e) = h.await {
+                warn!(error = %e, "owner control socket task panicked");
             }
         }
         Ok(())

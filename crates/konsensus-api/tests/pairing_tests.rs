@@ -1265,6 +1265,131 @@ async fn malformed_control_requests_never_echo_input() {
     task.await.unwrap();
 }
 
+/// An owner-control socket with an operation that blocks until released,
+/// signalling when it has started.
+#[cfg(unix)]
+fn blocking_owner_control(
+    dir: &std::path::Path,
+) -> (
+    control::ControlServer,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (_, service, _) = state_with_pairing(dir, true);
+    let ctx = Arc::new(control::ControlContext {
+        identity_fingerprint: service.bound_fingerprint(),
+        service,
+        data_dir: dir.to_path_buf(),
+        mnemonic_path: dir.join("unused-mnemonic"),
+        replacement_guard: control::ReplacementGuard {
+            layout: konsensus_api::bootstrap::DataDirLayout::new(dir),
+            uses_identity_derived_keys: false,
+            has_identity_passphrase: false,
+        },
+    });
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new((started_tx, release_rx));
+    let server = control::ControlServer::bind(dir, ctx)
+        .unwrap()
+        .with_lock_status(move || {
+            let gate = gate.lock().unwrap();
+            gate.0.send(()).unwrap();
+            gate.1.recv().unwrap();
+            serde_json::json!({"state": "unlocked"})
+        });
+    (server, started_rx, release_tx)
+}
+
+/// The socket closes without a further line.
+#[cfg(unix)]
+async fn assert_closes<R: tokio::io::AsyncBufRead + Unpin>(lines: &mut tokio::io::Lines<R>) {
+    assert!(lines.next_line().await.unwrap().is_none());
+}
+
+#[cfg(unix)]
+async fn wait_started(started: std::sync::mpsc::Receiver<()>) {
+    tokio::task::spawn_blocking(move || started.recv().unwrap())
+        .await
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_shutdown_finishes_in_flight_operation_and_closes_idle_connections() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (server, started, release) = blocking_owner_control(tmp.path());
+    let path = server.path().to_path_buf();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(server.serve(rx));
+    let idle = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let busy = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let (read, mut write) = busy.into_split();
+    write
+        .write_all(b"{\"op\":\"lock-status\"}\n")
+        .await
+        .unwrap();
+    wait_started(started).await;
+
+    stop.send(true).unwrap();
+    // The idle connection closes; nothing ran for it.
+    let mut idle_lines = BufReader::new(idle).lines();
+    assert_closes(&mut idle_lines).await;
+    // The in-flight operation keeps the server alive until it completes.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!task.is_finished(), "shutdown cut an in-flight operation");
+    release.send(()).unwrap();
+    let mut lines = BufReader::new(read).lines();
+    let response = lines.next_line().await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&response).unwrap(),
+        serde_json::json!({"result": "lock-status", "status": {"state": "unlocked"}})
+    );
+    assert_closes(&mut lines).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_shutdown_past_grace_fails_in_flight_operation_with_fixed_text() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (server, started, release) = blocking_owner_control(tmp.path());
+    let server = server.with_shutdown_grace(std::time::Duration::from_millis(50));
+    let path = server.path().to_path_buf();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(server.serve(rx));
+    let (read, mut write) = tokio::net::UnixStream::connect(&path)
+        .await
+        .unwrap()
+        .into_split();
+    write
+        .write_all(b"{\"op\":\"lock-status\"}\n")
+        .await
+        .unwrap();
+    wait_started(started).await;
+
+    stop.send(true).unwrap();
+    let mut lines = BufReader::new(read).lines();
+    let response = lines.next_line().await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&response).unwrap(),
+        serde_json::json!({"result": "error", "message": control::CONTROL_OPERATION_INTERRUPTED})
+    );
+    assert_closes(&mut lines).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    release.send(()).unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn same_uid_socket_client_cannot_self_grant_from_public_information() {

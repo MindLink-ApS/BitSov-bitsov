@@ -276,6 +276,15 @@ pub enum ControlResponse {
 /// Stable error code for a control request that could not be decoded.
 pub const MALFORMED_CONTROL_REQUEST: &str = "malformed_control_request";
 
+/// Sent when an operation outlives the shutdown grace. It keeps running, so
+/// its outcome is not known to the socket.
+pub const CONTROL_OPERATION_INTERRUPTED: &str = "node_stopping: the node stopped before this operation finished; its outcome is unknown, check status after restart";
+
+/// How long an in-flight operation may keep its connection after shutdown.
+/// The node lifecycle gives task joins 10s.
+#[cfg(unix)]
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A paired client as rendered to the owner.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientSummary {
@@ -971,6 +980,7 @@ pub struct ControlServer {
     ctx: Option<Arc<ControlContext>>,
     approval_state: Option<Arc<crate::state::AppState>>,
     lock_status: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>>,
+    shutdown_grace: std::time::Duration,
 }
 
 #[cfg(unix)]
@@ -1045,6 +1055,7 @@ impl ControlServer {
             ctx,
             approval_state: None,
             lock_status: None,
+            shutdown_grace: SHUTDOWN_GRACE,
         })
     }
 
@@ -1060,9 +1071,22 @@ impl ControlServer {
         &self.path
     }
 
+    /// Override how long in-flight operations may finish after shutdown.
+    #[doc(hidden)]
+    pub fn with_shutdown_grace(mut self, grace: std::time::Duration) -> Self {
+        self.shutdown_grace = grace;
+        self
+    }
+
     /// Serve until `shutdown_rx` fires.
+    ///
+    /// Idle connections are then closed. A request already read runs to
+    /// completion and gets its response before its connection closes; if it
+    /// outlives the shutdown grace, the client gets
+    /// [`CONTROL_OPERATION_INTERRUPTED`] instead of a torn reply.
     pub async fn serve(self, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
         let mut connections = tokio::task::JoinSet::new();
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         loop {
             if *shutdown_rx.borrow() {
                 break;
@@ -1076,8 +1100,10 @@ impl ControlServer {
                             let ctx = self.ctx.clone();
                             let approval_state = self.approval_state.clone();
                             let lock_status = self.lock_status.clone();
+                            let stop = stop_rx.clone();
+                            let grace = self.shutdown_grace;
                             connections.spawn(async move {
-                                if let Err(e) = serve_connection(stream, ctx, approval_state, lock_status).await {
+                                if let Err(e) = serve_connection(stream, ctx, approval_state, lock_status, stop, grace).await {
                                     tracing::warn!(error = %e, "control socket connection failed");
                                 }
                             });
@@ -1090,8 +1116,14 @@ impl ControlServer {
                 }
             }
         }
-        // No connection may retain a stale locked snapshot after transition.
-        connections.shutdown().await;
+        // No connection may retain a stale locked snapshot after transition:
+        // each one closes, after finishing a request it already read.
+        let _ = stop_tx.send(true);
+        let drain = async { while connections.join_next().await.is_some() {} };
+        let bound = self.shutdown_grace + std::time::Duration::from_secs(1);
+        if tokio::time::timeout(bound, drain).await.is_err() {
+            connections.shutdown().await;
+        }
     }
 }
 
@@ -1148,40 +1180,82 @@ async fn serve_connection(
     ctx: Option<Arc<ControlContext>>,
     approval_state: Option<Arc<crate::state::AppState>>,
     lock_status: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    grace: std::time::Duration,
 ) -> std::io::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        // `next_line` is cancel safe: an unread request was never run.
+        let line = tokio::select! {
+            biased;
+            _ = stopped(&mut stop) => return Ok(()),
+            line = lines.next_line() => match line? {
+                Some(line) => line,
+                None => return Ok(()),
+            },
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<ControlRequest>(&line) {
-            Ok(ControlRequest::LockStatus {}) if lock_status.is_some() => {
-                ControlResponse::LockStatus {
-                    status: lock_status.as_ref().unwrap()(),
+        let ctx = ctx.clone();
+        let approval_state = approval_state.clone();
+        let lock_status = lock_status.clone();
+        // Shutdown never cancels an operation part-way: it runs in its own
+        // task, and only the wait for its reply is bounded.
+        let mut operation = tokio::spawn(async move {
+            match serde_json::from_str::<ControlRequest>(&line) {
+                Ok(ControlRequest::LockStatus {}) if lock_status.is_some() => {
+                    ControlResponse::LockStatus {
+                        status: lock_status.as_ref().unwrap()(),
+                    }
                 }
-            }
-            Ok(req) => match ctx.as_ref() {
-                Some(ctx) => handle_local(ctx, approval_state.as_ref(), req).await,
-                None => ControlResponse::Error {
-                    message: "owner_approval_unavailable: status-only control socket".into(),
+                Ok(req) => match ctx.as_ref() {
+                    Some(ctx) => handle_local(ctx, approval_state.as_ref(), req).await,
+                    None => ControlResponse::Error {
+                        message: "owner_approval_unavailable: status-only control socket".into(),
+                    },
                 },
-            },
-            // Serde diagnostics may quote secret-bearing input. Never echo them.
-            Err(_) => ControlResponse::Error {
-                message: format!("{MALFORMED_CONTROL_REQUEST}: invalid control request"),
-            },
-        };
-        let mut bytes = serde_json::to_vec(&response).unwrap_or_else(|_| {
-            br#"{"result":"error","message":"failed to encode response"}"#.to_vec()
+                // Serde diagnostics may quote secret-bearing input. Never echo them.
+                Err(_) => ControlResponse::Error {
+                    message: format!("{MALFORMED_CONTROL_REQUEST}: invalid control request"),
+                },
+            }
         });
-        bytes.push(b'\n');
-        write_half.write_all(&bytes).await?;
-        write_half.flush().await?;
+        let response = tokio::select! {
+            joined = &mut operation => joined.unwrap_or_else(|_| ControlResponse::Error {
+                message: "internal_error: the control operation failed".into(),
+            }),
+            _ = async {
+                stopped(&mut stop).await;
+                tokio::time::sleep(grace).await;
+            } => ControlResponse::Error { message: CONTROL_OPERATION_INTERRUPTED.into() },
+        };
+        write_response(&mut write_half, &response).await?;
     }
-    Ok(())
+}
+
+/// Resolves once the server stops; the watch guard is not held across awaits.
+#[cfg(unix)]
+async fn stopped(stop: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stopped| *stopped).await;
+}
+
+#[cfg(unix)]
+async fn write_response(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    response: &ControlResponse,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut bytes = serde_json::to_vec(response).unwrap_or_else(|_| {
+        br#"{"result":"error","message":"failed to encode response"}"#.to_vec()
+    });
+    bytes.push(b'\n');
+    write_half.write_all(&bytes).await?;
+    write_half.flush().await
 }
 
 // Keep wire encoding at the transport boundary: the secret-bearing request

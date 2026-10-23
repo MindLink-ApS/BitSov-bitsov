@@ -361,3 +361,28 @@ async fn expired_unpaid_reservations_still_block_admission_after_listing() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn open_calls_storage_failure_returns_fixed_text() {
+    let (state, store) = fixture().await;
+    // A missing table makes the read fail with a SQL diagnostic naming it.
+    sqlx::query("DROP TABLE call_state")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let (status, body) = get(
+        &state,
+        &format!("?peer={}", NodeId::from_bytes([11; 32])),
+        Some(common::auth_header(&state)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"],
+        "call state unavailable"
+    );
+    assert!(
+        !body.contains("call_state"),
+        "storage detail leaked: {body}"
+    );
+}

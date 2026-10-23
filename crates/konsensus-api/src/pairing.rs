@@ -307,9 +307,20 @@ impl From<PairingError> for PairingRefusal {
             PairingError::OwnerChannelUnavailable => "owner_channel_off",
             PairingError::DeviceApprovalsDisabled(_) => "device_approvals_disabled",
             PairingError::Malformed(_) => "malformed",
-            PairingError::TooManyPending => "rate_limited",
+            // Always a per-client cap; the HTTP limiter never builds this error.
+            PairingError::TooManyPending => "rate_limited_client",
             PairingError::Io(_) => "storage_error",
-            _ => "pairing_refused",
+            // The rest carry the variant name only, never its payload.
+            PairingError::Closed => "pairing_refused:Closed",
+            PairingError::UnknownPending => "pairing_refused:UnknownPending",
+            PairingError::UnknownOperation => "pairing_refused:UnknownOperation",
+            PairingError::ConfirmationMismatch => "pairing_refused:ConfirmationMismatch",
+            PairingError::WrongOwnerCode(_) => "pairing_refused:WrongOwnerCode",
+            PairingError::ConfirmationLost => "pairing_refused:ConfirmationLost",
+            PairingError::ShortCodesOff => "pairing_refused:ShortCodesOff",
+            PairingError::NotApproved => "pairing_refused:NotApproved",
+            PairingError::BindingMismatch => "pairing_refused:BindingMismatch",
+            PairingError::OwnerApprovalUnavailable => "pairing_refused:OwnerApprovalUnavailable",
         };
         Self::new(error, reason)
     }
@@ -4498,3 +4509,20 @@ mod headless_tests;
 #[cfg(test)]
 #[path = "pairing/token_challenge_tests.rs"]
 mod token_challenge_tests;
+
+#[cfg(test)]
+mod refusal_reason_tests {
+    use super::{PairingError, PairingRefusal};
+
+    #[test]
+    fn rate_limit_and_catch_all_reasons_are_fixed_names() {
+        let reason = |error| PairingRefusal::from(error).reason;
+        assert_eq!(reason(PairingError::TooManyPending), "rate_limited_client");
+        assert_eq!(reason(PairingError::Closed), "pairing_refused:Closed");
+        // Payload-bearing variants log only their name.
+        assert_eq!(
+            reason(PairingError::WrongOwnerCode(3)),
+            "pairing_refused:WrongOwnerCode"
+        );
+    }
+}
