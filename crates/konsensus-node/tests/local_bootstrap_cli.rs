@@ -151,9 +151,16 @@ async fn post(http: &reqwest::Client, base: &str, route: &str, token: &str, body
     serde_json::from_str(&text).unwrap()
 }
 async fn token(http: &reqwest::Client, base: &str, client: &str, key: &SigningKey) -> String {
+    let timestamp = chrono::Utc::now().timestamp();
+    let proof = format!("bitsov-pair-challenge-v1:{}:{timestamp}", client);
+    let proof_signature = hex::encode(key.sign(proof.as_bytes()).to_bytes());
     let challenge: Value = http
         .get(format!("{base}/api/v1/pair/challenge"))
         .query(&[("client_id", client)])
+        .header(
+            "authorization",
+            format!("PairChallenge {timestamp}:{proof_signature}"),
+        )
         .send()
         .await
         .unwrap()

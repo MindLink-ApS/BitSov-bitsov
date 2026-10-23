@@ -47,6 +47,409 @@ fn state_with_pairing(
     (state, service, console)
 }
 
+fn token_challenge_client(service: &PairingService, seed: u8) -> (String, SigningKey) {
+    let key = SigningKey::from_bytes(&[seed; 32]);
+    service.open_pairing_window(std::time::Duration::from_secs(60));
+    let paired = service
+        .create_verified_remote_pairing(
+            &format!("client-{seed}"),
+            &hex::encode(key.verifying_key().to_bytes()),
+            &[seed; 32],
+        )
+        .unwrap();
+    (paired.client_id, key)
+}
+
+fn fill_token_challenges(service: &PairingService, client_id: &str) -> Vec<String> {
+    (0..8)
+        .map(|_| service.issue_token_challenge(client_id).unwrap())
+        .collect()
+}
+
+#[test]
+fn token_challenges_client_cap_leaves_room_for_another_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, service, _) = state_with_pairing(dir.path(), false);
+    let (a, _) = token_challenge_client(&service, 1);
+    let (b, _) = token_challenge_client(&service, 2);
+    fill_token_challenges(&service, &a);
+    assert!(matches!(
+        service.issue_token_challenge(&a),
+        Err(pairing::PairingError::TooManyPending)
+    ));
+    fill_token_challenges(&service, &b);
+}
+
+#[test]
+fn token_challenges_global_cap_and_revocation_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, service, _) = state_with_pairing(dir.path(), false);
+    let clients: Vec<_> = (1..=17)
+        .map(|seed| token_challenge_client(&service, seed))
+        .collect();
+    let challenges: Vec<_> = clients[..16]
+        .iter()
+        .map(|(client, _)| fill_token_challenges(&service, client))
+        .collect();
+    let b = &clients[16].0;
+    assert!(matches!(
+        service.issue_token_challenge(b),
+        Err(pairing::PairingError::TooManyPending)
+    ));
+
+    let (a, a_key) = &clients[0];
+    service.revoke(a).unwrap();
+    assert!(matches!(
+        service.issue_token_challenge(a),
+        Err(pairing::PairingError::UnknownClient)
+    ));
+    // All eight revoked slots are available immediately, but the global cap holds.
+    fill_token_challenges(&service, b);
+    let (repaired_a, _) = token_challenge_client(&service, 1);
+    assert_eq!(&repaired_a, a);
+    assert!(matches!(
+        service.issue_token_challenge(a),
+        Err(pairing::PairingError::TooManyPending)
+    ));
+    // Re-pairing the same key must not resurrect a pre-revocation challenge.
+    assert!(matches!(
+        service.issue_token(
+            &state.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            a,
+            &challenges[0][0],
+            &hex::encode(a_key.sign(challenges[0][0].as_bytes()).to_bytes()),
+        ),
+        Err(pairing::PairingError::UnknownPending)
+    ));
+    // Revoking A leaves another client's existing challenges usable at capacity.
+    let (other, other_key) = &clients[1];
+    service
+        .issue_token(
+            &state.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            other,
+            &challenges[1][0],
+            &hex::encode(other_key.sign(challenges[1][0].as_bytes()).to_bytes()),
+        )
+        .unwrap();
+    service.issue_token_challenge(a).unwrap();
+}
+
+#[test]
+fn token_challenges_consumption_releases_client_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, service, _) = state_with_pairing(dir.path(), false);
+    let (a, key) = token_challenge_client(&service, 1);
+    let challenges = fill_token_challenges(&service, &a);
+    assert!(matches!(
+        service.issue_token_challenge(&a),
+        Err(pairing::PairingError::TooManyPending)
+    ));
+    service
+        .issue_token(
+            &state.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            &a,
+            &challenges[0],
+            &hex::encode(key.sign(challenges[0].as_bytes()).to_bytes()),
+        )
+        .unwrap();
+    service.issue_token_challenge(&a).unwrap();
+    assert!(matches!(
+        service.issue_token_challenge(&a),
+        Err(pairing::PairingError::TooManyPending)
+    ));
+}
+
+fn local_challenge_request(client_id: &str, key: &SigningKey, timestamp: i64) -> Request<Body> {
+    let message = format!("bitsov-pair-challenge-v1:{client_id}:{timestamp}");
+    Request::builder()
+        .uri(format!("/api/v1/pair/challenge?client_id={client_id}"))
+        .header(
+            "authorization",
+            format!(
+                "PairChallenge {timestamp}:{}",
+                hex::encode(key.sign(message.as_bytes()).to_bytes())
+            ),
+        )
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn challenge_response(
+    app: &axum::Router,
+    request: Request<Body>,
+) -> (StatusCode, serde_json::Value) {
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+async fn get_token_challenge(
+    app: &axum::Router,
+    client_id: &str,
+) -> (StatusCode, serde_json::Value) {
+    challenge_response(
+        app,
+        Request::builder()
+            .uri(format!("/api/v1/pair/challenge?client_id={client_id}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+async fn own_token_challenge(
+    app: &axum::Router,
+    client_id: &str,
+    key: &SigningKey,
+) -> (StatusCode, serde_json::Value) {
+    challenge_response(
+        app,
+        local_challenge_request(client_id, key, chrono::Utc::now().timestamp()),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn token_challenges_local_proof_uses_cors_allowed_authorization_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, service, _) = state_with_pairing(dir.path(), false);
+    let (client, key) = token_challenge_client(&service, 1);
+    let app = test_router(Arc::new(AppState {
+        cors_enabled: true,
+        ..(*state).clone()
+    }));
+    let preflight = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri(format!("/api/v1/pair/challenge?client_id={client}"))
+                .header("origin", "http://localhost:1420")
+                .header("access-control-request-method", "GET")
+                .header("access-control-request-headers", "authorization")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(preflight.status().is_success());
+    assert_eq!(
+        preflight.headers()["access-control-allow-origin"],
+        "http://localhost:1420"
+    );
+    assert!(preflight.headers()["access-control-allow-headers"]
+        .to_str()
+        .unwrap()
+        .contains("authorization"));
+    let mut request = local_challenge_request(&client, &key, chrono::Utc::now().timestamp());
+    request
+        .headers_mut()
+        .insert("origin", "http://localhost:1420".parse().unwrap());
+    assert_eq!(challenge_response(&app, request).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn token_challenges_local_live_and_bootstrap_require_client_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, service, _) = state_with_pairing(dir.path(), false);
+    let (a, key_a) = token_challenge_client(&service, 1);
+    let (_, key_b) = token_challenge_client(&service, 2);
+    let bootstrap = konsensus_api::bootstrap::build_bootstrap_router(Arc::new(
+        konsensus_api::bootstrap::BootstrapState::new(
+            konsensus_api::bootstrap::DataDirLayout::new(dir.path()),
+            service.clone(),
+        ),
+    ));
+    for app in [test_router(state.clone()), bootstrap] {
+        for _ in 0..8 {
+            assert_eq!(
+                get_token_challenge(&app, &a).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                own_token_challenge(&app, &a, &key_b).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        for timestamp in [0, chrono::Utc::now().timestamp() + 3600] {
+            assert_eq!(
+                challenge_response(&app, local_challenge_request(&a, &key_a, timestamp))
+                    .await
+                    .0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let (status, body) = own_token_challenge(&app, &a, &key_a).await;
+        assert_eq!(status, StatusCode::OK);
+        let challenge = body["challenge"].as_str().unwrap();
+        service
+            .issue_token(
+                &state.identity.node_id().to_hex(),
+                &state.jwt_secret,
+                &a,
+                challenge,
+                &hex::encode(key_a.sign(challenge.as_bytes()).to_bytes()),
+            )
+            .unwrap();
+    }
+    fill_token_challenges(&service, &a);
+}
+
+// The extension is server-owned; wire headers cannot create it.
+fn noise_app(app: axum::Router, client_id: &str) -> axum::Router {
+    app.layer(axum::Extension(
+        konsensus_api::rate_limit::AuthenticatedNoise {
+            client_id: client_id.to_string().into(),
+            binding: konsensus_api::sas::NoiseBinding {
+                handshake_hash: [1; 32],
+                client_static: [2; 32],
+                box_public_key: [3; 32],
+            },
+        },
+    ))
+}
+
+#[tokio::test]
+async fn token_challenges_caller_b_cannot_spend_a_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, service, _) = state_with_pairing(dir.path(), false);
+    let (a, a_key) = token_challenge_client(&service, 1);
+    let (b, _) = token_challenge_client(&service, 2);
+    let remote = remote_app(state.clone());
+    let b_app = noise_app(remote.clone(), &b);
+    for app in [&b_app, &remote, &test_router(state.clone())] {
+        for _ in 0..8 {
+            assert_eq!(
+                get_token_challenge(app, &a).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+    }
+    let a_app = noise_app(remote, &a);
+    let (status, body) = get_token_challenge(&a_app, &a).await;
+    assert_eq!(status, StatusCode::OK);
+    let challenge = body["challenge"].as_str().unwrap();
+    service
+        .issue_token(
+            &state.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            &a,
+            challenge,
+            &hex::encode(a_key.sign(challenge.as_bytes()).to_bytes()),
+        )
+        .unwrap();
+    fill_token_challenges(&service, &a);
+}
+
+#[tokio::test]
+async fn token_challenges_remote_bootstrap_uses_registered_noise_peer() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use konsensus_api::bootstrap::{
+        build_bootstrap_router, BootstrapState, DataDirLayout, RemoteOwner,
+    };
+    use konsensus_api::rate_limit::RemoteTunnelClients;
+    let dir = tempfile::tempdir().unwrap();
+    let (_, service, _) = state_with_pairing(dir.path(), false);
+    let (a, key_a) = token_challenge_client(&service, 1);
+    let (b, _) = token_challenge_client(&service, 2);
+    let tunnel = Arc::new(RemoteTunnelClients::default());
+    let peer_a: std::net::SocketAddr = "127.0.0.1:50001".parse().unwrap();
+    let peer_b: std::net::SocketAddr = "127.0.0.1:50002".parse().unwrap();
+    let binding = konsensus_api::sas::NoiseBinding {
+        handshake_hash: [1; 32],
+        client_static: [2; 32],
+        box_public_key: [3; 32],
+    };
+    let _a = tunnel.register_noise(peer_a, a.clone(), binding);
+    let _b = tunnel.register_noise(peer_b, b, binding);
+    let state = Arc::new(
+        BootstrapState::new(DataDirLayout::new(dir.path()), service.clone()).with_remote_owner(
+            RemoteOwner {
+                hooks: Box::new(|_| panic!("challenge route must not call owner hooks")),
+                tunnel,
+            },
+        ),
+    );
+    let app = build_bootstrap_router(state.clone());
+    let b_app = app.clone().layer(MockConnectInfo(peer_b));
+    for attacker in [&app, &b_app] {
+        for _ in 0..8 {
+            assert_eq!(
+                get_token_challenge(attacker, &a).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        // Even a local proof cannot bypass the remote-only transport binding.
+        assert_eq!(
+            own_token_challenge(attacker, &a, &key_a).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let a_app = app.layer(MockConnectInfo(peer_a));
+    let (status, body) = get_token_challenge(&a_app, &a).await;
+    assert_eq!(status, StatusCode::OK);
+    let challenge = body["challenge"].as_str().unwrap();
+    service
+        .issue_bootstrap_token(
+            &state.jwt_secret,
+            &a,
+            challenge,
+            &hex::encode(key_a.sign(challenge.as_bytes()).to_bytes()),
+        )
+        .unwrap();
+    fill_token_challenges(&service, &a);
+}
+
+#[tokio::test]
+async fn token_challenges_http_isolation_and_private_429_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, service, _) = state_with_pairing(dir.path(), false);
+    let local = test_router(state.clone());
+    let bootstrap = konsensus_api::bootstrap::build_bootstrap_router(Arc::new(
+        konsensus_api::bootstrap::BootstrapState::new(
+            konsensus_api::bootstrap::DataDirLayout::new(dir.path()),
+            service.clone(),
+        ),
+    ));
+    let remote = remote_app(state);
+    let (a, key_a) = token_challenge_client(&service, 1);
+    let (b, key_b) = token_challenge_client(&service, 2);
+    let a_remote = noise_app(remote.clone(), &a);
+    for _ in 0..8 {
+        assert_eq!(get_token_challenge(&a_remote, &a).await.0, StatusCode::OK);
+    }
+    let expected = serde_json::json!({"code": 429, "error": "too many pending pairing requests"});
+    for app in [&local, &bootstrap, &a_remote] {
+        let (status, body) = own_token_challenge(app, &a, &key_a).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, expected);
+    }
+    for app in [&local, &bootstrap, &noise_app(remote.clone(), &b)] {
+        assert_eq!(own_token_challenge(app, &b, &key_b).await.0, StatusCode::OK);
+    }
+    for _ in 0..5 {
+        service.issue_token_challenge(&b).unwrap();
+    }
+    for seed in 3..=16 {
+        let (client, _) = token_challenge_client(&service, seed);
+        fill_token_challenges(&service, &client);
+    }
+    let (c, key_c) = token_challenge_client(&service, 17);
+    for (client, key) in [(&a, &key_a), (&c, &key_c)] {
+        for app in [&local, &bootstrap, &noise_app(remote.clone(), client)] {
+            let (status, body) = own_token_challenge(app, client, key).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(body, expected);
+        }
+    }
+}
+
 #[test]
 fn rotating_client_key_clears_remote_transport_binding() {
     let dir = tempfile::tempdir().unwrap();

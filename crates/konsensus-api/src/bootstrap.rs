@@ -1418,12 +1418,29 @@ struct ChallengeQuery {
 
 async fn pair_challenge(
     State(state): State<Arc<BootstrapState>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     axum::extract::Query(q): axum::extract::Query<ChallengeQuery>,
-) -> Result<Json<serde_json::Value>, BootstrapError> {
-    let challenge = state
-        .pairing
-        .issue_token_challenge(&q.client_id)
-        .map_err(pairing_error_response)?;
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, crate::error::ApiError> {
+    use crate::handlers::pairing_routes::{local_token_challenge, map_err};
+    let challenge = if let Some(remote) = &state.remote {
+        // Bootstrap resolves its own server-owned bridge registry. Neither an
+        // HTTP header nor a local proof may substitute for a Noise session.
+        let noise = peer
+            .and_then(|peer| remote.tunnel.noise(peer.0))
+            .ok_or_else(|| map_err(PairingError::BadProof))?;
+        if q.client_id != noise.client_id.as_ref() {
+            return Err(map_err(PairingError::BadProof));
+        }
+        state
+            .pairing
+            .issue_token_challenge(&noise.client_id)
+            .map_err(map_err)?
+    } else {
+        // Local bootstrap has no transport identity: authenticate the paired key,
+        // just as the live loopback router does, before charging its quota.
+        local_token_challenge(&state.pairing, &q.client_id, &headers)?
+    };
     Ok(Json(serde_json::json!({ "challenge": challenge })))
 }
 

@@ -457,9 +457,19 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
             TcpStream::connect(f.peer).await.is_ok(),
             "normal startup binds peers"
         );
+        let timestamp = chrono::Utc::now().timestamp();
+        let proof = format!(
+            "bitsov-pair-challenge-v1:{}:{timestamp}",
+            &f.record.client_id
+        );
+        let proof_signature = hex::encode(f.client.sign(proof.as_bytes()).to_bytes());
         let challenge: Value = http
             .get(format!("http://{}/api/v1/pair/challenge", f.api))
             .query(&[("client_id", &f.record.client_id)])
+            .header(
+                "authorization",
+                format!("PairChallenge {timestamp}:{proof_signature}"),
+            )
             .send()
             .await
             .unwrap()
