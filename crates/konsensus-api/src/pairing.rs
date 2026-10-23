@@ -47,7 +47,7 @@
 //! per-request binding verification both compute the effective scopes from the
 //! deployment mode, so `spend` never reaches a sidecar token.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -113,7 +113,18 @@ pub const MAX_LIVE_TOKEN_CHALLENGES: usize = 128;
 /// Live token-issuance challenges allowed for one registered client id.
 ///
 /// Bound each client's share so requests for one id cannot fill the global cap.
+/// At capacity, a fresh request replaces only that client's oldest challenge.
 pub const MAX_LIVE_TOKEN_CHALLENGES_PER_CLIENT: usize = 8;
+
+/// Never discard an unexpired proof to make room: that would enable replay.
+/// This bounds the memory used even by authenticated callers that keep
+/// replacing/redeeming challenges or revoking and re-pairing their keys.
+const MAX_LOCAL_CHALLENGE_PROOFS: usize = 4096;
+// A signer can choose different Ed25519 nonces for the same timestamp. Keep
+// that holder from filling the shared memo, while leaving ample room for the
+// 61 timestamps a deterministic signer can use in the acceptance window.
+const MAX_LOCAL_CHALLENGE_PROOFS_PER_CLIENT: usize = 128;
+const LOCAL_CHALLENGE_PROOF_WINDOW_SECS: i64 = 30;
 
 /// Inactivity horizon for a pairing: 180 days.
 ///
@@ -671,6 +682,9 @@ struct Inner {
     file: PairingFile,
     pending: HashMap<String, PendingPairing>,
     token_challenges: HashMap<String, (String, Instant)>,
+    // Canonical decoded signatures; never serialized or logged. Retain across
+    // revocation/re-pairing until the signed timestamp's acceptance window ends.
+    local_challenge_proofs: HashSet<(String, i64, [u8; 64])>,
     window_until: Option<Instant>,
     pairing_closed: bool,
     identity_fingerprint: String,
@@ -919,6 +933,7 @@ impl PairingService {
                 file,
                 pending: HashMap::new(),
                 token_challenges: HashMap::new(),
+                local_challenge_proofs: HashSet::new(),
                 window_until: None,
                 pairing_closed: false,
                 identity_fingerprint,
@@ -1874,32 +1889,85 @@ impl PairingService {
     /// No JWT is required: this also works before the first token or after expiry.
     /// The signature is an authentication credential, valid within 30 seconds of
     /// the supplied Unix timestamp, and must not be logged. Its domain is distinct
-    /// from token redemption. Verification and allocation share the pairing lock.
+    /// from token redemption. A proof is one-shot within this node run.
+    /// Verification runs outside the lock; admission rechecks its authority and
+    /// atomically records the proof and allocates the challenge under the lock.
     pub fn issue_local_token_challenge(
         &self,
         client_id: &str,
         timestamp: i64,
         signature_hex: &str,
     ) -> Result<String, PairingError> {
-        if chrono::Utc::now().timestamp().abs_diff(timestamp) > 30 {
+        if chrono::Utc::now().timestamp().abs_diff(timestamp)
+            > LOCAL_CHALLENGE_PROOF_WINDOW_SECS as u64
+        {
             return Err(PairingError::BadProof);
         }
-        let signature = hex::decode(signature_hex)
-            .ok()
-            .and_then(|bytes| ed25519_dalek::Signature::from_slice(&bytes).ok())
-            .ok_or(PairingError::BadProof)?;
-        let mut inner = self.lock();
-        let client = inner
+        let mut signature_bytes = [0u8; 64];
+        hex::decode_to_slice(signature_hex, &mut signature_bytes)
+            .map_err(|_| PairingError::BadProof)?;
+        let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
+        let client = self
+            .lock()
             .file
             .clients
             .iter()
             .find(|client| client.client_id == client_id)
+            .cloned()
             .ok_or(PairingError::BadProof)?;
         let message = format!("bitsov-pair-challenge-v1:{client_id}:{timestamp}");
         parse_pubkey(&client.client_pubkey)?
             .verify_strict(message.as_bytes(), &signature)
             .map_err(|_| PairingError::BadProof)?;
-        Self::issue_token_challenge_locked(&mut inner, client_id)
+        self.issue_verified_local_token_challenge(&client, timestamp, signature_bytes)
+    }
+
+    fn issue_verified_local_token_challenge(
+        &self,
+        verified_client: &PairedClient,
+        timestamp: i64,
+        signature: [u8; 64],
+    ) -> Result<String, PairingError> {
+        let mut inner = self.lock();
+        let now = chrono::Utc::now().timestamp();
+        // Verification may have raced a revoke, re-pair, rotation or identity
+        // transition. last_epoch survives deletion, so re-pairing the same key
+        // cannot recreate this snapshot. None of these failures consumes a slot.
+        if now.abs_diff(timestamp) > LOCAL_CHALLENGE_PROOF_WINDOW_SECS as u64
+            || inner.identity_fingerprint != verified_client.identity_fingerprint
+            || !inner.file.clients.iter().any(|current| {
+                current.client_id == verified_client.client_id
+                    && current.client_pubkey == verified_client.client_pubkey
+                    && current.epoch == verified_client.epoch
+                    && current.identity_fingerprint == verified_client.identity_fingerprint
+            })
+        {
+            return Err(PairingError::BadProof);
+        }
+        // Prune by signed timestamp, not arrival time: future-dated proofs may
+        // be accepted for up to 60 seconds. The final second is inclusive.
+        inner.local_challenge_proofs.retain(|(_, timestamp, _)| {
+            timestamp.saturating_add(LOCAL_CHALLENGE_PROOF_WINDOW_SECS) >= now
+        });
+        let proof = (verified_client.client_id.clone(), timestamp, signature);
+        if inner.local_challenge_proofs.contains(&proof) {
+            return Err(PairingError::BadProof);
+        }
+        if inner.local_challenge_proofs.len() >= MAX_LOCAL_CHALLENGE_PROOFS
+            || inner
+                .local_challenge_proofs
+                .iter()
+                .filter(|(client_id, _, _)| client_id == &verified_client.client_id)
+                .count()
+                >= MAX_LOCAL_CHALLENGE_PROOFS_PER_CLIENT
+        {
+            return Err(PairingError::TooManyPending);
+        }
+        let challenge = Self::issue_token_challenge_locked(&mut inner, &verified_client.client_id)?;
+        // Only successful allocation spends the proof; a capacity refusal can
+        // be retried. The shared lock makes concurrent copies allocate once.
+        inner.local_challenge_proofs.insert(proof);
+        Ok(challenge)
     }
 
     fn issue_token_challenge_locked(
@@ -1918,9 +1986,20 @@ impl PairingService {
             .values()
             .filter(|(owner, _)| owner == client_id)
             .count();
-        if client_challenges >= MAX_LIVE_TOKEN_CHALLENGES_PER_CLIENT
-            || inner.token_challenges.len() >= MAX_LIVE_TOKEN_CHALLENGES
-        {
+        if client_challenges >= MAX_LIVE_TOKEN_CHALLENGES_PER_CLIENT {
+            // Every challenge has the same TTL, so the earliest expiry is the
+            // oldest issuance. Never evict another client's slot. Replacement
+            // also works at the global cap without growing the map.
+            let oldest = inner
+                .token_challenges
+                .iter()
+                .filter(|(_, (owner, _))| owner == client_id)
+                .min_by_key(|(_, (_, expires))| *expires)
+                .map(|(challenge, _)| challenge.clone());
+            if let Some(oldest) = oldest {
+                inner.token_challenges.remove(&oldest);
+            }
+        } else if inner.token_challenges.len() >= MAX_LIVE_TOKEN_CHALLENGES {
             return Err(PairingError::TooManyPending);
         }
         let challenge = format!("bitsov-pair-token-v1:{}", hex::encode(nonce));

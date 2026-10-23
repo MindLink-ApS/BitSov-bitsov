@@ -73,10 +73,7 @@ fn token_challenges_client_cap_leaves_room_for_another_client() {
     let (a, _) = token_challenge_client(&service, 1);
     let (b, _) = token_challenge_client(&service, 2);
     fill_token_challenges(&service, &a);
-    assert!(matches!(
-        service.issue_token_challenge(&a),
-        Err(pairing::PairingError::TooManyPending)
-    ));
+    service.issue_token_challenge(&a).unwrap();
     fill_token_challenges(&service, &b);
 }
 
@@ -142,10 +139,6 @@ fn token_challenges_consumption_releases_client_slot() {
     let (state, service, _) = state_with_pairing(dir.path(), false);
     let (a, key) = token_challenge_client(&service, 1);
     let challenges = fill_token_challenges(&service, &a);
-    assert!(matches!(
-        service.issue_token_challenge(&a),
-        Err(pairing::PairingError::TooManyPending)
-    ));
     service
         .issue_token(
             &state.identity.node_id().to_hex(),
@@ -156,10 +149,16 @@ fn token_challenges_consumption_releases_client_slot() {
         )
         .unwrap();
     service.issue_token_challenge(&a).unwrap();
-    assert!(matches!(
-        service.issue_token_challenge(&a),
-        Err(pairing::PairingError::TooManyPending)
-    ));
+    // Consuming a slot means the refill need not evict the next oldest.
+    service
+        .issue_token(
+            &state.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            &a,
+            &challenges[1],
+            &hex::encode(key.sign(challenges[1].as_bytes()).to_bytes()),
+        )
+        .unwrap();
 }
 
 fn local_challenge_request(client_id: &str, key: &SigningKey, timestamp: i64) -> Request<Body> {
@@ -216,6 +215,47 @@ async fn own_token_challenge(
 }
 
 #[tokio::test]
+async fn token_challenges_local_replay_is_401_but_fresh_proof_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, service, _) = state_with_pairing(dir.path(), false);
+    let (client, key) = token_challenge_client(&service, 1);
+    let local = test_router(state);
+    let bootstrap = konsensus_api::bootstrap::build_bootstrap_router(Arc::new(
+        konsensus_api::bootstrap::BootstrapState::new(
+            konsensus_api::bootstrap::DataDirLayout::new(dir.path()),
+            service,
+        ),
+    ));
+    let timestamp = chrono::Utc::now().timestamp();
+    for (offset, app) in [&local, &bootstrap].into_iter().enumerate() {
+        let timestamp = timestamp + offset as i64;
+        assert_eq!(
+            challenge_response(app, local_challenge_request(&client, &key, timestamp))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // Both routers share the memo. Hex casing cannot make a fresh proof.
+        for replay_app in [&local, &bootstrap] {
+            let mut request = local_challenge_request(&client, &key, timestamp);
+            let header = request.headers()["authorization"].to_str().unwrap();
+            let signature = header
+                .strip_prefix("PairChallenge ")
+                .unwrap()
+                .to_uppercase();
+            request.headers_mut().insert(
+                "authorization",
+                format!("PairChallenge {signature}").parse().unwrap(),
+            );
+            assert_eq!(
+                challenge_response(replay_app, request).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn token_challenges_local_proof_uses_cors_allowed_authorization_header() {
     let dir = tempfile::tempdir().unwrap();
     let (state, service, _) = state_with_pairing(dir.path(), false);
@@ -266,7 +306,11 @@ async fn token_challenges_local_live_and_bootstrap_require_client_proof() {
             service.clone(),
         ),
     ));
-    for app in [test_router(state.clone()), bootstrap] {
+    let now = chrono::Utc::now().timestamp();
+    for (offset, app) in [test_router(state.clone()), bootstrap]
+        .into_iter()
+        .enumerate()
+    {
         for _ in 0..8 {
             assert_eq!(
                 get_token_challenge(&app, &a).await.0,
@@ -285,7 +329,11 @@ async fn token_challenges_local_live_and_bootstrap_require_client_proof() {
                 StatusCode::UNAUTHORIZED
             );
         }
-        let (status, body) = own_token_challenge(&app, &a, &key_a).await;
+        let (status, body) = challenge_response(
+            &app,
+            local_challenge_request(&a, &key_a, now + offset as i64),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let challenge = body["challenge"].as_str().unwrap();
         service
@@ -424,14 +472,31 @@ async fn token_challenges_http_isolation_and_private_429_body() {
     for _ in 0..8 {
         assert_eq!(get_token_challenge(&a_remote, &a).await.0, StatusCode::OK);
     }
-    let expected = serde_json::json!({"code": 429, "error": "too many pending pairing requests"});
-    for app in [&local, &bootstrap, &a_remote] {
-        let (status, body) = own_token_challenge(app, &a, &key_a).await;
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(body, expected);
+    let now = chrono::Utc::now().timestamp();
+    for (offset, app) in [&local, &bootstrap, &a_remote].into_iter().enumerate() {
+        assert_eq!(
+            challenge_response(
+                app,
+                local_challenge_request(&a, &key_a, now + offset as i64)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
     }
-    for app in [&local, &bootstrap, &noise_app(remote.clone(), &b)] {
-        assert_eq!(own_token_challenge(app, &b, &key_b).await.0, StatusCode::OK);
+    for (offset, app) in [&local, &bootstrap, &noise_app(remote.clone(), &b)]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            challenge_response(
+                app,
+                local_challenge_request(&b, &key_b, now + offset as i64)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
     }
     for _ in 0..5 {
         service.issue_token_challenge(&b).unwrap();
@@ -440,13 +505,25 @@ async fn token_challenges_http_isolation_and_private_429_body() {
         let (client, _) = token_challenge_client(&service, seed);
         fill_token_challenges(&service, &client);
     }
+    // At the global cap A can still replace its own oldest slot; C cannot
+    // displace anyone else's challenges. All routers keep the static 429 body.
     let (c, key_c) = token_challenge_client(&service, 17);
-    for (client, key) in [(&a, &key_a), (&c, &key_c)] {
-        for app in [&local, &bootstrap, &noise_app(remote.clone(), client)] {
-            let (status, body) = own_token_challenge(app, client, key).await;
-            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-            assert_eq!(body, expected);
-        }
+    let expected = serde_json::json!({"code": 429, "error": "too many pending pairing requests"});
+    for (offset, app) in [&local, &bootstrap, &a_remote].into_iter().enumerate() {
+        assert_eq!(
+            challenge_response(
+                app,
+                local_challenge_request(&a, &key_a, now + 3 + offset as i64)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    for app in [&local, &bootstrap, &noise_app(remote, &c)] {
+        let (status, body) = own_token_challenge(app, &c, &key_c).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, expected);
     }
 }
 
