@@ -299,18 +299,29 @@ impl PairingRefusal {
 
 impl From<PairingError> for PairingRefusal {
     fn from(error: PairingError) -> Self {
+        // Exhaustive on purpose: a new variant must name its own log reason
+        // instead of collapsing into `pairing_refused`.
         let reason = match &error {
-            PairingError::BadProof => "bad_signature",
-            PairingError::Expired => "stale_or_future",
-            PairingError::NotGrantable(_) => "unknown_or_revoked_key",
-            PairingError::PairingInvalid(_) => "invalid_pairing",
-            PairingError::UnknownClient => "unknown_client",
-            PairingError::OwnerChannelUnavailable => "owner_channel_off",
-            PairingError::DeviceApprovalsDisabled(_) => "device_approvals_disabled",
-            PairingError::Malformed(_) => "malformed",
+            PairingError::Closed => "pairing_closed",
             PairingError::TooManyPending => "rate_limited",
+            PairingError::UnknownPending => "unknown_pending",
+            PairingError::BadProof => "bad_signature",
+            PairingError::Malformed(_) => "malformed",
+            PairingError::UnknownClient => "unknown_client",
+            PairingError::PairingInvalid(_) => "invalid_pairing",
+            PairingError::NotGrantable(_) => "unknown_or_revoked_key",
+            PairingError::UnknownOperation => "unknown_operation",
+            PairingError::ConfirmationMismatch => "confirmation_mismatch",
+            PairingError::WrongOwnerCode(_) => "wrong_owner_code",
+            PairingError::ConfirmationLost => "confirmation_lost",
+            PairingError::DeviceApprovalsDisabled(_) => "device_approvals_disabled",
+            PairingError::ShortCodesOff => "short_codes_off",
+            PairingError::Expired => "stale_or_future",
+            PairingError::NotApproved => "not_approved",
+            PairingError::BindingMismatch => "binding_mismatch",
+            PairingError::OwnerChannelUnavailable => "owner_channel_off",
+            PairingError::OwnerApprovalUnavailable => "owner_approval_unavailable",
             PairingError::Io(_) => "storage_error",
-            _ => "pairing_refused",
         };
         Self::new(error, reason)
     }

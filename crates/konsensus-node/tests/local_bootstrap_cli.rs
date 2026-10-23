@@ -316,7 +316,8 @@ async fn descriptor_bootstrap_restart_intent_and_no_secret_logs() {
             device_key
                 .sign(
                     &rng,
-                    device::intent_message(&fp, &client, &intent).as_bytes(),
+                    device::intent_message(&fp, &client, keys["epoch"].as_u64().unwrap(), &intent)
+                        .as_bytes(),
                 )
                 .unwrap()
                 .as_ref(),

@@ -441,7 +441,7 @@ async fn enrollment_requires_device_and_bound_possession_before_writing() {
         issued_at: chrono::Utc::now().timestamp(),
         nonce: "ab".repeat(16),
     };
-    let msg = pairing::device::intent_message(&fingerprint, &client, &intent);
+    let msg = pairing::device::intent_message(&fingerprint, &client, keys[0].epoch, &intent);
     let sig = hex::encode(
         key.sign(&ring::rand::SystemRandom::new(), msg.as_bytes())
             .unwrap()

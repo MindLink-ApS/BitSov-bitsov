@@ -101,7 +101,7 @@ sas_words:{w1} {w2} {w3} {w4}
 expires_at:{unix seconds}
 ```
 
-The reject message is identical except for the domain `bitsov-second-device-reject-v1`. The domain differs from `bitsov-owner-delegation-v1/v2`, `bitsov-device-register-v1/v2`, `bitsov-ticket-v1/v2`, `bitsov-relation-intent-v1` and the app's `unlock-v1`, so a signature from one protocol cannot be used in another. Approver-side rules (normative for the app): rebuild the bytes locally and require them to be byte-equal to `approval_message`, recompute `sas_words` from `sas_digest`, require `node` to equal the pinned fingerprint, and refuse when `expires_at` is in the past. `device_name` is chosen by the new device and proves nothing; it is signed only so that the signed bytes equal what was shown. The words are the primary element on screen and the name is secondary.
+The reject message is identical except for the domain `bitsov-second-device-reject-v1`. The domain differs from `bitsov-owner-delegation-v1/v2`, `bitsov-device-register-v1/v2`, `bitsov-ticket-v1/v2`, `bitsov-relation-intent-v2` and the app's `unlock-v1`, so a signature from one protocol cannot be used in another. Approver-side rules (normative for the app): rebuild the bytes locally and require them to be byte-equal to `approval_message`, recompute `sas_words` from `sas_digest`, require `node` to equal the pinned fingerprint, and refuse when `expires_at` is in the past. `device_name` is chosen by the new device and proves nothing; it is signed only so that the signed bytes equal what was shown. The words are the primary element on screen and the name is secondary.
 
 ## 5. Node verification and state
 
