@@ -18,7 +18,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use argon2::Argon2;
 use rand::RngCore;
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Current format version.
 const FORMAT_VERSION: u8 = 0x01;
@@ -131,11 +131,11 @@ pub fn encrypt_mnemonic(mnemonic: &str, password: &str) -> Result<Vec<u8>, Mnemo
 
 /// Decrypt a mnemonic phrase from encrypted bytes.
 ///
-/// Returns the plaintext mnemonic string if the password is correct.
+/// Returns the plaintext mnemonic in a buffer that is wiped on drop.
 pub fn decrypt_mnemonic(
     encrypted: &[u8],
     password: &str,
-) -> Result<String, MnemonicCryptoError> {
+) -> Result<Zeroizing<String>, MnemonicCryptoError> {
     if encrypted.len() < HEADER_LEN + 16 {
         // Minimum: header + 16-byte GCM tag (even empty plaintext has a tag)
         return Err(MnemonicCryptoError::InvalidFormat(
@@ -163,9 +163,14 @@ pub fn decrypt_mnemonic(
         .decrypt(nonce, ciphertext)
         .map_err(|_| MnemonicCryptoError::Decryption)?;
 
-    String::from_utf8(plaintext).map_err(|_| {
-        MnemonicCryptoError::InvalidFormat("decrypted data is not valid UTF-8".into())
-    })
+    String::from_utf8(plaintext)
+        .map(Zeroizing::new)
+        .map_err(|error| {
+            // FromUtf8Error owns the original plaintext allocation. Wipe it
+            // before returning an error that contains no decrypted bytes.
+            error.into_bytes().zeroize();
+            MnemonicCryptoError::InvalidFormat("decrypted data is not valid UTF-8".into())
+        })
 }
 
 /// Check if a file path looks like an encrypted mnemonic (`.enc` extension).
@@ -189,7 +194,7 @@ pub fn read_mnemonic(
     if is_encrypted_path(path) {
         let encrypted = std::fs::read(path)?;
         let password = password.unwrap_or("");
-        decrypt_mnemonic(&encrypted, password).map(Zeroizing::new)
+        decrypt_mnemonic(&encrypted, password)
     } else {
         // `read_to_string` allocates the full file (incl. the seed) on the
         // heap. Wrap that buffer in `Zeroizing` immediately so the untrimmed

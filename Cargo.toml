@@ -73,6 +73,10 @@ x25519-dalek = { version = "2.0", features = ["serde", "static_secrets", "zeroiz
 aes-gcm = { version = "0.10", features = ["zeroize"] }
 # aes-gcm 0.10's zeroize feature does not forward to the AES key schedule.
 aes = { version = "0.8", features = ["zeroize"] }
+# Enable GHASH temporaries and POLYVAL state wiping separately: neither
+# aes-gcm nor ghash forwards zeroize to its authentication backend.
+ghash = { version = "0.5", features = ["zeroize"] }
+polyval = { version = "0.6", features = ["zeroize"] }
 argon2 = { version = "0.5", features = ["zeroize"] }
 snow = "0.9"
 rand = "0.8"
