@@ -1228,7 +1228,7 @@ fn remote_pairing_route_declarations_are_an_explicit_allowlist() {
             r#""/api/v1/pair/device-key/pending",get(super::owner_device_routes::pending_devices)"#,
             r#""/api/v1/pair/device-key/:op_id/delegation",get(super::owner_device_routes::pending_device)"#,
             r#""/api/v1/pair/device-key/:op_id/delegate",post(super::owner_device_routes::delegate)"#,
-            r#""/api/v1/pair/challenge",get(pair_challenge)"#,
+            r#""/api/v1/pair/challenge",get(remote_pair_challenge)"#,
             r#""/api/v1/pair/token",post(pair_token)"#,
             r#""/api/v1/pair/rotate",post(rotate_pairing)"#,
             r#""/api/v1/pair/elevation-request",post(elevation_request)"#,

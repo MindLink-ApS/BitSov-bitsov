@@ -28,8 +28,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use zeroize::Zeroizing;
 
 use serde::{Deserialize, Serialize};
@@ -46,7 +47,7 @@ use crate::state::AppState;
 ///
 /// Every mapping is a refusal. None of them degrade a caller to a weaker
 /// success — a failure here means the operation did not happen.
-fn map_err(e: PairingError) -> ApiError {
+pub(crate) fn map_err(e: PairingError) -> ApiError {
     match e {
         PairingError::Closed | PairingError::OwnerApprovalUnavailable => {
             ApiError::Conflict(e.to_string())
@@ -170,12 +171,49 @@ struct ChallengeQuery {
     client_id: String,
 }
 
+/// Local callers are keyed on the paired key whose signature is verified here.
+/// Loopback reachability and the query's client_id are not authentication.
 async fn pair_challenge(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ChallengeQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let challenge = local_token_challenge(service(&state)?, &q.client_id, &headers)?;
+    Ok(Json(serde_json::json!({ "challenge": challenge })))
+}
+
+pub(crate) fn local_token_challenge(
+    service: &PairingService,
+    client_id: &str,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
+    let (timestamp, signature) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("PairChallenge "))
+        .and_then(|value| value.split_once(':'))
+        .ok_or_else(|| map_err(PairingError::BadProof))?;
+    let timestamp = timestamp
+        .parse::<i64>()
+        .map_err(|_| map_err(PairingError::BadProof))?;
+    service
+        .issue_local_token_challenge(client_id, timestamp, signature)
+        .map_err(map_err)
+}
+
+/// The query id is only a consistency check; allocation uses the Noise session.
+/// Missing transport authentication never falls back to the local proof path.
+async fn remote_pair_challenge(
+    State(state): State<Arc<AppState>>,
+    noise: Option<Extension<crate::rate_limit::AuthenticatedNoise>>,
+    Query(q): Query<ChallengeQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Extension(noise) = noise.ok_or_else(|| map_err(PairingError::BadProof))?;
+    if q.client_id != noise.client_id.as_ref() {
+        return Err(map_err(PairingError::BadProof));
+    }
     let challenge = service(&state)?
-        .issue_token_challenge(&q.client_id)
+        .issue_token_challenge(&noise.client_id)
         .map_err(map_err)?;
     Ok(Json(serde_json::json!({ "challenge": challenge })))
 }
@@ -758,7 +796,7 @@ pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
             "/api/v1/pair/device-key/:op_id/delegate",
             post(super::owner_device_routes::delegate),
         )
-        .route("/api/v1/pair/challenge", get(pair_challenge))
+        .route("/api/v1/pair/challenge", get(remote_pair_challenge))
         .route("/api/v1/pair/token", post(pair_token))
         .route("/api/v1/pair/rotate", post(rotate_pairing))
         .route("/api/v1/pair/elevation-request", post(elevation_request))

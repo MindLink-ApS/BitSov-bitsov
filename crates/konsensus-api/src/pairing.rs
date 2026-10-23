@@ -1864,11 +1864,50 @@ impl PairingService {
         Ok(())
     }
 
-    /// Issue a token-issuance challenge for a paired client.
+    /// Issue a challenge after the HTTP boundary has authenticated this client.
+    /// Remote callers must use the server-owned Noise identity, never a query id.
     pub fn issue_token_challenge(&self, client_id: &str) -> Result<String, PairingError> {
+        Self::issue_token_challenge_locked(&mut self.lock(), client_id)
+    }
+
+    /// Local live/bootstrap callers prove possession of the paired Ed25519 key.
+    /// No JWT is required: this also works before the first token or after expiry.
+    /// The signature is an authentication credential, valid within 30 seconds of
+    /// the supplied Unix timestamp, and must not be logged. Its domain is distinct
+    /// from token redemption. Verification and allocation share the pairing lock.
+    pub fn issue_local_token_challenge(
+        &self,
+        client_id: &str,
+        timestamp: i64,
+        signature_hex: &str,
+    ) -> Result<String, PairingError> {
+        if chrono::Utc::now().timestamp().abs_diff(timestamp) > 30 {
+            return Err(PairingError::BadProof);
+        }
+        let signature = hex::decode(signature_hex)
+            .ok()
+            .and_then(|bytes| ed25519_dalek::Signature::from_slice(&bytes).ok())
+            .ok_or(PairingError::BadProof)?;
+        let mut inner = self.lock();
+        let client = inner
+            .file
+            .clients
+            .iter()
+            .find(|client| client.client_id == client_id)
+            .ok_or(PairingError::BadProof)?;
+        let message = format!("bitsov-pair-challenge-v1:{client_id}:{timestamp}");
+        parse_pubkey(&client.client_pubkey)?
+            .verify_strict(message.as_bytes(), &signature)
+            .map_err(|_| PairingError::BadProof)?;
+        Self::issue_token_challenge_locked(&mut inner, client_id)
+    }
+
+    fn issue_token_challenge_locked(
+        inner: &mut Inner,
+        client_id: &str,
+    ) -> Result<String, PairingError> {
         let mut nonce = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let mut inner = self.lock();
         if !inner.file.clients.iter().any(|c| c.client_id == client_id) {
             return Err(PairingError::UnknownClient);
         }

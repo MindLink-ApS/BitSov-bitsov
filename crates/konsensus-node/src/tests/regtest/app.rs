@@ -418,12 +418,21 @@ impl App {
             axum::extract::connect_info::MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50000))),
         );
         let remote_router = options.as_ref().map(|_| {
-            konsensus_api::build_remote_router(state.clone()).layer(
-                axum::extract::connect_info::MockConnectInfo(SocketAddr::from((
-                    [127, 0, 0, 1],
-                    50001,
-                ))),
-            )
+            konsensus_api::build_remote_router(state.clone())
+                .layer(axum::extract::connect_info::MockConnectInfo(
+                    SocketAddr::from(([127, 0, 0, 1], 50001)),
+                ))
+                // In-memory remote fixture: production installs this only after Noise.
+                .layer(axum::Extension(
+                    konsensus_api::rate_limit::AuthenticatedNoise {
+                        client_id: pairing.1.clone().into(),
+                        binding: konsensus_api::sas::NoiseBinding {
+                            handshake_hash: [1; 32],
+                            box_public_key: [2; 32],
+                            client_static: [3; 32],
+                        },
+                    },
+                ))
         });
         let mut tasks = vec![session, messages];
         #[cfg(unix)]

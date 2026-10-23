@@ -704,9 +704,16 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
         TcpStream::connect(f.peer).await.is_ok(),
         "live node binds peers"
     );
+    let timestamp = chrono::Utc::now().timestamp();
+    let proof = format!("bitsov-pair-challenge-v1:{}:{timestamp}", &client_id);
+    let proof_signature = hex::encode(client.sign(proof.as_bytes()).to_bytes());
     let challenge: Value = http
         .get(format!("http://{}/api/v1/pair/challenge", f.api))
         .query(&[("client_id", &client_id)])
+        .header(
+            "authorization",
+            format!("PairChallenge {timestamp}:{proof_signature}"),
+        )
         .send()
         .await
         .unwrap()
