@@ -311,6 +311,9 @@ pub struct RelationIntentRequest {
     pub signature: String,
 }
 
+// The error is the finished HTTP response, refusal extension included.
+// Other handlers return `ApiError`; this one cannot, and axum moves it once.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn relation_intent(
     auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
