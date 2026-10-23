@@ -1596,6 +1596,20 @@ impl Storage for SqliteStorage {
         row.map(call_entry_from_row).transpose()
     }
 
+    async fn call_open_by_peer(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
+        let rows: Vec<(String, String, String, i64, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash FROM call_state \
+             WHERE peer = ? AND (pending_operation_id IS NOT NULL OR (phase <> 'ended' AND deadline_ms > ?)) \
+             ORDER BY CASE WHEN pending_operation_id IS NOT NULL THEN 0 ELSE 1 END, call_id LIMIT ?")
+            .bind(peer.to_hex()).bind(now)
+            .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS_PER_PEER as i64)
+            .fetch_all(&self.pool).await?;
+        rows.into_iter().map(|(id, side, phase, deadline, op, kind, hash)| {
+            Ok((id, call_entry_from_row((side, phase, deadline, op, kind, hash))?))
+        }).collect()
+    }
+
     async fn call_put(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
         let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
         sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \

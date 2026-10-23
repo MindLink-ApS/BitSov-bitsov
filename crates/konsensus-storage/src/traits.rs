@@ -1097,6 +1097,13 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("call state".into()))
     }
 
+    /// Read at most `MAX_OPEN_CALLS_PER_PEER` open calls for exactly this peer.
+    /// Pending reservations survive expiry and sort first, then by call id.
+    /// Returns stored (not aged) state; never sweeps or reconciles it.
+    async fn call_open_by_peer(&self, _peer: &konsensus_core::NodeId, _now_ms: u64) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
     /// Insert or replace `(peer, call_id)`.
     async fn call_put(&self, _peer: &konsensus_core::NodeId, _call_id: &str, _entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
         Err(StorageError::Unsupported("call state".into()))

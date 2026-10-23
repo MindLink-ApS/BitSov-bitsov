@@ -3,6 +3,7 @@
 pub mod auth_routes;
 pub mod browse;
 pub mod calendar;
+pub mod calls;
 pub mod chain;
 pub mod content;
 pub mod device_routes;
