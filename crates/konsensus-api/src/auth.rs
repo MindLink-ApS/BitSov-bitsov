@@ -494,11 +494,12 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
             (StatusCode::UNAUTHORIZED, "invalid token").into_response()
         })?;
 
-        let pairing = check_pairing_binding(state, &claims).map_err(|reason| {
-            metrics::counter!(crate::metrics::AUTH_FAILURES).increment(1);
-            tracing::warn!(reason = %reason, "paired token rejected");
-            (StatusCode::UNAUTHORIZED, "invalid token").into_response()
-        })?;
+        let pairing =
+            check_pairing_binding_with_reason(state, &claims).map_err(|(reason, code)| {
+                metrics::counter!(crate::metrics::AUTH_FAILURES).increment(1);
+                tracing::warn!(reason = %reason, "paired token rejected");
+                crate::error::refusal_response((StatusCode::UNAUTHORIZED, "invalid token"), code)
+            })?;
 
         Ok(AuthUser {
             node_id: claims.sub,
@@ -521,15 +522,29 @@ pub(crate) fn check_pairing_binding(
     state: &Arc<AppState>,
     claims: &Claims,
 ) -> Result<Option<PairingBinding>, String> {
+    check_pairing_binding_with_reason(state, claims).map_err(|(error, _)| error)
+}
+
+fn check_pairing_binding_with_reason(
+    state: &Arc<AppState>,
+    claims: &Claims,
+) -> Result<Option<PairingBinding>, (String, &'static str)> {
     // A bootstrap token has no business on the live router. Bootstrap uses an
     // ephemeral secret so these normally die at the signature check; this is
     // the independent second gate.
     if claims.bst == Some(true) {
-        return Err("token was minted during identity-free bootstrap".into());
+        return Err((
+            "token was minted during identity-free bootstrap".into(),
+            "invalid_pairing",
+        ));
     }
 
-    let binding = PairingBinding::from_claims(claims)
-        .map_err(|_| "token carries a partial pairing binding".to_string())?;
+    let binding = PairingBinding::from_claims(claims).map_err(|_| {
+        (
+            "token carries a partial pairing binding".to_string(),
+            "invalid_pairing",
+        )
+    })?;
 
     let Some(binding) = binding else {
         return Ok(None);
@@ -537,19 +552,21 @@ pub(crate) fn check_pairing_binding(
 
     // A paired token on a node with no pairing service cannot be checked, so it
     // is refused. Failing open here would make the binding advisory.
-    let service = state
-        .pairing
-        .as_ref()
-        .ok_or_else(|| "pairing is not configured on this node".to_string())?;
+    let service = state.pairing.as_ref().ok_or_else(|| {
+        (
+            "pairing is not configured on this node".to_string(),
+            "pairing_unavailable",
+        )
+    })?;
 
     service
-        .verify_token_binding(
+        .verify_token_binding_with_reason(
             &binding.client_id,
             binding.epoch,
             &binding.fingerprint,
             &claims.scp,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|refusal| (refusal.error.to_string(), refusal.reason))?;
 
     Ok(Some(binding))
 }
@@ -749,7 +766,10 @@ pub(crate) async fn enrollment_routes_only(
                     )
             });
             if !allowed {
-                return (StatusCode::FORBIDDEN, "provisional enrollment only").into_response();
+                return crate::error::refusal_response(
+                    (StatusCode::FORBIDDEN, "provisional enrollment only"),
+                    "provisional_session",
+                );
             }
         }
     }
