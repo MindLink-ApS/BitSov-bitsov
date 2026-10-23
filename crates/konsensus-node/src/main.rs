@@ -185,6 +185,9 @@ async fn main() -> Result<()> {
         Command::Device { command } => {
             owner_cmd::cmd_device(command).await?;
         }
+        Command::LockStatus { config } => {
+            owner_cmd::cmd_lock_status(&config).await?;
+        }
         Command::PairStatus { config } => {
             owner_cmd::cmd_pair_status(&config).await?;
         }
@@ -1053,6 +1056,7 @@ struct StartAuthority {
     device_authority: std::result::Result<OwnerDeviceAuthority, &'static str>,
     owner_control: bool,
     local_owner_device: bool,
+    lock_status_socket: bool,
 }
 
 /// Private signing material is retained only for explicit local delegation.
@@ -1354,6 +1358,7 @@ async fn cmd_start(
             device_authority,
             owner_control,
             local_owner_device,
+            lock_status_socket: password_source == PasswordSource::RemoteUnlock,
         },
     );
     run_node_lifecycle(
@@ -1384,6 +1389,7 @@ async fn start_node_services<'a>(
         device_authority,
         owner_control,
         local_owner_device,
+        lock_status_socket,
     } = authority;
     // ── Lightning health check ─────────────────────────────────────
     // Verify Lightning connectivity at startup so users get a clear
@@ -1994,7 +2000,7 @@ async fn start_node_services<'a>(
     }));
 
     // ── Owner control socket (#76) ──────────────────────────────────
-    // Started ONLY under `--owner-control`. This is the single channel that can
+    // Console authority is enabled ONLY under `--owner-control`. This channel can
     // write a console spend grant or execute a live-identity replacement, and it is a
     // Unix socket at mode 0600 rather than an HTTP route precisely because the
     // requesting app could call an HTTP route.
@@ -2002,35 +2008,45 @@ async fn start_node_services<'a>(
     // A failure to bind is fatal rather than a silent downgrade: an owner who
     // asked for the channel must not end up running without it and discover
     // later that nothing can be approved.
-    if owner_control {
+    if owner_control || lock_status_socket {
         #[cfg(unix)]
         {
-            let ctx = Arc::new(konsensus_api::control::ControlContext {
-                service: Arc::clone(&pairing_service),
-                identity_fingerprint: identity_fingerprint.clone(),
-                data_dir: data_dir.clone(),
-                mnemonic_path: config.identity.mnemonic_file.clone(),
-                replacement_guard: owner_cmd::replacement_guard(&data_dir, config),
-            });
-            let server =
-                konsensus_api::control::ControlServer::bind(&data_dir, ctx).with_context(|| {
-                    format!(
-                        "failed to bind the owner control socket at {}",
-                        data_dir.join(konsensus_api::control::SOCKET_FILE).display()
-                    )
-                })?;
-            info!(
-                socket = %server.path().display(),
-                "owner-run mode: elevation can be granted at this socket"
-            );
-            tokio::spawn(
+            let status_node_id = node.node_id().to_hex();
+            let status_pairing = Arc::clone(&pairing_service);
+            let status = move || {
+                serde_json::json!({
+                    "state": "unlocked", "node_id": status_node_id,
+                    "fingerprint": status_pairing.bound_fingerprint(),
+                    "locked_since": null, "attempts_left": null,
+                    "hosted_by": status_pairing.hosted_by()
+                })
+            };
+            let server = if owner_control {
+                let ctx = Arc::new(konsensus_api::control::ControlContext {
+                    service: Arc::clone(&pairing_service),
+                    identity_fingerprint: identity_fingerprint.clone(),
+                    data_dir: data_dir.clone(),
+                    mnemonic_path: config.identity.mnemonic_file.clone(),
+                    replacement_guard: owner_cmd::replacement_guard(&data_dir, config),
+                });
+                let server = konsensus_api::control::ControlServer::bind(&data_dir, ctx)
+                    .with_context(|| {
+                        format!(
+                            "failed to bind the owner control socket at {}",
+                            data_dir.join(konsensus_api::control::SOCKET_FILE).display()
+                        )
+                    })?;
                 server
+                    .with_lock_status(status)
                     .with_approval_state(Arc::clone(&api_state))
-                    .serve(node.shutdown_rx()),
-            );
+            } else {
+                konsensus_api::control::ControlServer::bind_status_only(&data_dir, status)
+                    .context("failed to bind owner status socket")?
+            };
+            tokio::spawn(server.serve(node.shutdown_rx()));
         }
         #[cfg(not(unix))]
-        {
+        if owner_control {
             anyhow::bail!(
                 "--owner-control requires Unix domain sockets, which this platform does not \
                  provide. Elevation is unavailable here rather than served over a weaker channel."

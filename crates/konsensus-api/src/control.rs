@@ -34,6 +34,9 @@
 //! endpoint. First-contact and gift approvals also have owner-key HTTP paths;
 //! paired credentials cannot use them, and this socket never exports a key.
 //!
+//! Home/remote-unlock starts use this same socket in status-only mode: only
+//! `lock-status` is accepted, without a console context or grant authority.
+//!
 //! # Consent is the typed phrase, not the connection
 //!
 //! The node never treats "a message arrived on the socket" as consent. Each
@@ -65,6 +68,8 @@ pub const SOCKET_FILE: &str = "control.sock";
 #[derive(Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControlRequest {
+    /// Read lock state without granting console authority.
+    LockStatus {},
     /// Admit an owner-typed contact. The complete tuple is consent.
     AddPeer {
         /// Peer node id, 64 hex characters.
@@ -201,6 +206,8 @@ pub enum ControlRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "result", rename_all = "kebab-case")]
 pub enum ControlResponse {
+    /// Lock status; the CLI prints this payload without the control envelope.
+    LockStatus { status: serde_json::Value },
     /// Exact preview of a device revocation.
     RevokePlan {
         plan: crate::pairing::console::RevokePlan,
@@ -464,6 +471,9 @@ impl ReplacementGuard {
 pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
     let service: &PairingService = &ctx.service;
     match req {
+        ControlRequest::LockStatus {} => ControlResponse::Error {
+            message: "lock_status_unavailable: no running status provider".into(),
+        },
         ControlRequest::Status => {
             let file = service.snapshot();
             ControlResponse::Status {
@@ -958,8 +968,9 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
 pub struct ControlServer {
     path: PathBuf,
     listener: tokio::net::UnixListener,
-    ctx: Arc<ControlContext>,
+    ctx: Option<Arc<ControlContext>>,
     approval_state: Option<Arc<crate::state::AppState>>,
+    lock_status: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>>,
 }
 
 #[cfg(unix)]
@@ -973,6 +984,27 @@ impl ControlServer {
     /// process umask. The socket mode is then set to `0600` and checked.
     /// `tests/pairing_tests.rs::owner_control_socket_permissions` locks both.
     pub fn bind(data_dir: &Path, ctx: Arc<ControlContext>) -> std::io::Result<Self> {
+        Self::bind_inner(data_dir, Some(ctx))
+    }
+
+    /// Bind the same owner-only socket without any console context or authority.
+    pub fn bind_status_only(
+        data_dir: &Path,
+        status: impl Fn() -> serde_json::Value + Send + Sync + 'static,
+    ) -> std::io::Result<Self> {
+        Ok(Self::bind_inner(data_dir, None)?.with_lock_status(status))
+    }
+
+    /// Supply the current lock status without changing console authorization.
+    pub fn with_lock_status(
+        mut self,
+        status: impl Fn() -> serde_json::Value + Send + Sync + 'static,
+    ) -> Self {
+        self.lock_status = Some(Arc::new(status));
+        self
+    }
+
+    fn bind_inner(data_dir: &Path, ctx: Option<Arc<ControlContext>>) -> std::io::Result<Self> {
         crate::pairing::ensure_owner_private_dir(data_dir)?;
         let path = data_dir.join(SOCKET_FILE);
         if path.exists() {
@@ -1004,13 +1036,15 @@ impl ControlServer {
         }
         tracing::info!(
             socket = %path.display(),
-            "owner control socket listening (mode 0600) — the only channel that can write a grant"
+            console_authority = ctx.is_some(),
+            "owner control socket listening (mode 0600)"
         );
         Ok(Self {
             path,
             listener,
             ctx,
             approval_state: None,
+            lock_status: None,
         })
     }
 
@@ -1028,16 +1062,22 @@ impl ControlServer {
 
     /// Serve until `shutdown_rx` fires.
     pub async fn serve(self, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+        let mut connections = tokio::task::JoinSet::new();
         loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
+                _ = connections.join_next(), if !connections.is_empty() => {},
                 accepted = self.listener.accept() => {
                     match accepted {
                         Ok((stream, _addr)) => {
-                            let ctx = Arc::clone(&self.ctx);
+                            let ctx = self.ctx.clone();
                             let approval_state = self.approval_state.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = serve_connection(stream, ctx, approval_state).await {
+                            let lock_status = self.lock_status.clone();
+                            connections.spawn(async move {
+                                if let Err(e) = serve_connection(stream, ctx, approval_state, lock_status).await {
                                     tracing::warn!(error = %e, "control socket connection failed");
                                 }
                             });
@@ -1050,6 +1090,14 @@ impl ControlServer {
                 }
             }
         }
+        // No connection may retain a stale locked snapshot after transition.
+        connections.shutdown().await;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ControlServer {
+    fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -1097,8 +1145,9 @@ pub async fn sweep_expired_grants(
 #[cfg(unix)]
 async fn serve_connection(
     stream: tokio::net::UnixStream,
-    ctx: Arc<ControlContext>,
+    ctx: Option<Arc<ControlContext>>,
     approval_state: Option<Arc<crate::state::AppState>>,
+    lock_status: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -1109,7 +1158,17 @@ async fn serve_connection(
             continue;
         }
         let response = match serde_json::from_str::<ControlRequest>(&line) {
-            Ok(req) => handle_local(&ctx, approval_state.as_ref(), req).await,
+            Ok(ControlRequest::LockStatus {}) if lock_status.is_some() => {
+                ControlResponse::LockStatus {
+                    status: lock_status.as_ref().unwrap()(),
+                }
+            }
+            Ok(req) => match ctx.as_ref() {
+                Some(ctx) => handle_local(ctx, approval_state.as_ref(), req).await,
+                None => ControlResponse::Error {
+                    message: "owner_approval_unavailable: status-only control socket".into(),
+                },
+            },
             // Serde diagnostics may quote secret-bearing input. Never echo them.
             Err(_) => ControlResponse::Error {
                 message: format!("{MALFORMED_CONTROL_REQUEST}: invalid control request"),
@@ -1146,6 +1205,7 @@ fn encode_request(req: &ControlRequest) -> Result<Zeroizing<Vec<u8>>, serde_json
             addr,
             label,
         } => fields!("add-peer", node_id, addr, label),
+        ControlRequest::LockStatus {} => fields!("lock-status"),
         ControlRequest::Status => fields!("status"),
         ControlRequest::Describe { op_id } => fields!("describe", op_id),
         ControlRequest::Grant {

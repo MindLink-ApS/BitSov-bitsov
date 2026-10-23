@@ -170,6 +170,20 @@ pub async fn serve_locked_mode(
         shutdown: shutdown_tx,
         tasks: JoinSet::new(),
     };
+    #[cfg(unix)]
+    {
+        let status_state = Arc::clone(&state);
+        let control =
+            konsensus_api::control::ControlServer::bind_status_only(&data_dir, move || {
+                status_state.status()
+            })
+            .context("could not bind locked owner status socket")?;
+        let stop = shutdown_rx.clone();
+        servers.tasks.spawn(async move {
+            control.serve(stop).await;
+            Ok(())
+        });
+    }
     for listener in [local, internal] {
         let router =
             locked_router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
