@@ -17,7 +17,7 @@ Scope: compares BitChat (permissionlesstech) with the BitSov node in this reposi
 - Android repo: `https://github.com/permissionlesstech/bitchat-android`. Files are cited as `Android:/<path>`, meaning `https://github.com/permissionlesstech/bitchat-android/blob/main/<path>`.
 - WP: the BitChat whitepaper, v2.0, dated July 6, 2026 (`iOS:/WHITEPAPER.md`).
 
-**Honesty rule.** BitSov today is a signet closed beta. The node's current line is `0.3.0-rc19`, which is in prep and not tagged ([CHANGELOG.md](../../CHANGELOG.md)). Signed binaries are not yet published ([README.md](../../README.md), "Developer Preview"). Where this note says BitSov "ships" something, it means "in the node today, on signet or regtest as stated". Everything else is labelled **target** or **not built**.
+**Honesty rule.** BitSov today is a signet closed beta. The node's current line is `0.3.0-rc19`. Git tags `v0.3.0-rc19` to `v0.3.0-rc19.2` exist, although the [CHANGELOG.md](../../CHANGELOG.md) heading still reads "prep; not tagged yet"; these are pre-release candidates, not a public release. Signed binaries are not yet published ([README.md](../../README.md), "Developer Preview"). Where this note says BitSov "ships" something, it means "in the node today, on signet or regtest as stated". Everything else is labelled **target** or **not built**.
 
 ---
 
