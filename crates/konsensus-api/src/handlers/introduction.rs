@@ -91,11 +91,40 @@ impl PeerEndpointView {
     }
 }
 
+/// Unix time source for introduction cards and sponsor authorization deadlines.
+/// Defaults to the real system clock; callers may inject a per-instance clock.
+#[derive(Clone)]
+pub struct UnixClock(Arc<dyn Fn() -> Result<u64, ApiError> + Send + Sync>);
+
+impl UnixClock {
+    pub fn new(clock: impl Fn() -> Result<u64, ApiError> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(clock))
+    }
+
+    pub(crate) fn now(&self) -> Result<u64, ApiError> {
+        (self.0)()
+    }
+}
+
+impl Default for UnixClock {
+    fn default() -> Self {
+        Self::new(now_unix)
+    }
+}
+
+impl std::fmt::Debug for UnixClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UnixClock")
+    }
+}
+
 /// What this node may sign into an introduction. Everything comes from the
 /// node's own configuration or its own STUN discovery; the caller supplies
 /// nothing.
 #[derive(Debug, Clone, Default)]
 pub struct IntroductionSettings {
+    /// Shared time source for card and sponsor expiry checks.
+    pub clock: UnixClock,
     /// Bitcoin network the node's prices are payable on. `None` (a backend
     /// that does not state its network) means no introduction is offered.
     pub network: Option<String>,
@@ -116,6 +145,7 @@ impl IntroductionSettings {
             configured_endpoint: endpoint.map(Into::into),
             configured_source: endpoint.map(|_| source::ADVERTISED),
             discovered: Arc::default(),
+            clock: UnixClock::default(),
         }
     }
 
@@ -262,7 +292,7 @@ pub(crate) async fn issue_card(state: &AppState) -> Result<Introduction, ApiErro
             admission_msat,
             message_msat,
             price_epoch: height / 2016,
-            issued_at: now_unix()?,
+            issued_at: state.introduction.clock.now()?,
             intro_id,
         },
     )
@@ -281,7 +311,7 @@ pub(crate) fn verified_card(state: &AppState, text: &str) -> Result<Introduction
             "introduction_unavailable: this node's Lightning backend does not state a Bitcoin network".into(),
         )
     })?;
-    card.verify(now_unix()?, network).map_err(invalid)?;
+    card.verify(state.introduction.clock.now()?, network).map_err(invalid)?;
     Ok(card)
 }
 

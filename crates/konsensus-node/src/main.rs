@@ -1612,6 +1612,7 @@ async fn start_node_services<'a>(
         configured_endpoint,
         configured_source,
         discovered: Default::default(),
+        clock: Default::default(),
     };
     let stun_discovery = match (
         &introduction.configured_endpoint,
