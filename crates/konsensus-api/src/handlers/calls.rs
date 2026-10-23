@@ -43,8 +43,11 @@ async fn open_calls(
     let peer = NodeId::from_hex(&query.peer).map_err(|_| invalid_peer())?;
     let now = u64::try_from(chrono::Utc::now().timestamp_millis())
         .map_err(|_| ApiError::Internal("call time unavailable".into()))?;
-    let storage_error =
-        |e: konsensus_storage::StorageError| ApiError::Internal(format!("call state: {e}"));
+    // Storage diagnostics stay in the node log, never in the response body.
+    let storage_error = |e: konsensus_storage::StorageError| {
+        tracing::warn!(error = %e, "open calls: storage read failed");
+        ApiError::Internal("call state unavailable".into())
+    };
     let entries = state
         .storage
         .call_open_by_peer(&peer, now)

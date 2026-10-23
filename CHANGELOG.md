@@ -5,6 +5,11 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Security review P3 follow-ups: `konsensus lock-status` prints its JSON through
+  the terminal-safe filter; owner control socket shutdown lets an in-flight
+  operation finish (or answer with a fixed `node_stopping` error after a 5s
+  grace) instead of cutting the connection; `GET /api/v1/calls?peer=` returns a
+  fixed 500 body and logs the storage error at warn (#385, #386).
 - Raise the source-build MSRV to Rust 1.89 to match locked `uuid` 1.28.0.
 - Discard serde diagnostics from peer session-value decodes; add relay and
   file-payload guard regressions and use unique temporary mutation-log directories.
