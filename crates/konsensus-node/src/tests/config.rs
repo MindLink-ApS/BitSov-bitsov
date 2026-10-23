@@ -3681,3 +3681,73 @@ fn load_rejects_oversized_starter_hub_alias() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn validate_tightens_mnemonic_permissions_and_continues() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty-test-mnemonic");
+    std::fs::File::create(&path).unwrap();
+    let config = NodeConfig::default_for_tier(NodeTier::Light, path.clone(), dir.path());
+    for mode in [0o644, 0o640, 0o604, 0o622, 0o700, 0o400, 0o600] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mnemonic_chmod_failure_refuses_only_group_or_world_readable_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("PRIVATE_PATH_MARKER");
+    std::fs::File::create(&path).unwrap();
+    for (mode, refuses) in [
+        (0o644, true),
+        (0o640, true),
+        (0o604, true),
+        (0o622, false),
+        (0o611, false),
+        (0o400, false),
+    ] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let result = super::tighten_mnemonic_permissions(&path, |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "PRIVATE_OS_ERROR",
+            ))
+        });
+        if refuses {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("refusing to start"));
+            assert!(error.contains("group- or world-readable"));
+            assert!(error.contains("chmod to 0600 failed"));
+            assert!(error.contains("Fix ownership or filesystem permissions"));
+            assert!(!error.contains("PRIVATE_"));
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            mode
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mnemonic_secure_and_special_files_do_not_attempt_chmod() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty-test-mnemonic");
+    std::fs::File::create(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    for path in [path.as_path(), Path::new("/dev/null")] {
+        super::tighten_mnemonic_permissions(path, |_, _| panic!("must not chmod")).unwrap();
+    }
+}
