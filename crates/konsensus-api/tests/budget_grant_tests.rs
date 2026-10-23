@@ -60,6 +60,7 @@ struct Wallet {
     mode: AtomicU8,
     pause_dispatch: AtomicBool,
     waiting: AtomicUsize,
+    entered: tokio::sync::Notify,
     resume: tokio::sync::Notify,
     money: AtomicUsize,
     invoices: AtomicUsize,
@@ -80,6 +81,7 @@ impl Wallet {
     async fn outcome(&self, amount_msat: u64) -> Result<PaymentDetails, LightningError> {
         if self.pause_dispatch.load(Ordering::SeqCst) {
             self.waiting.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
             self.resume.notified().await;
         }
         self.money.fetch_add(1, Ordering::SeqCst);

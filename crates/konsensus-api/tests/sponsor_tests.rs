@@ -5,7 +5,7 @@
 mod common;
 use common::*;
 
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -27,6 +27,7 @@ const FEE: u64 = 1_000;
 
 struct Pair {
     _dir: tempfile::TempDir,
+    clock: Arc<AtomicU64>,
     sponsor: Arc<AppState>,
     newcomer: Arc<AppState>,
     sponsor_ln: Arc<SharedMockProvider>,
@@ -42,7 +43,15 @@ async fn pair(policy: SponsorPolicy) -> Pair {
     let ledger = dir.path().join("ledger.db");
     let sponsor_ln = Arc::new(SharedMockProvider::new(&ledger, "sponsor", 1_000_000).unwrap());
     let newcomer_ln = Arc::new(SharedMockProvider::new(&ledger, "newcomer", 0).unwrap());
-    let intro = |port: u16| IntroductionSettings::fixed(Some("regtest"), Some(&format!("127.0.0.1:{port}")));
+    let clock = Arc::new(AtomicU64::new(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()));
+    let intro = |port: u16| {
+        let clock = clock.clone();
+        IntroductionSettings {
+            clock: konsensus_api::handlers::introduction::UnixClock::new(move || Ok(clock.load(Ordering::SeqCst))),
+            ..IntroductionSettings::fixed(Some("regtest"), Some(&format!("127.0.0.1:{port}")))
+        }
+    };
     let base = test_state_with_lightning(sponsor_ln.clone());
     let sponsor_dir = dir.path().join("sponsor-node");
     let sponsor = Arc::new(AppState {
@@ -65,7 +74,7 @@ async fn pair(policy: SponsorPolicy) -> Pair {
         data_dir: Some(dir.path().join("newcomer-node")),
         ..(*nbase).clone()
     });
-    Pair { _dir: dir, sponsor, newcomer, sponsor_ln, newcomer_ln }
+    Pair { _dir: dir, clock, sponsor, newcomer, sponsor_ln, newcomer_ln }
 }
 
 async fn call(state: &Arc<AppState>, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -279,7 +288,7 @@ async fn regression_old_unknown_reservation_and_late_settlement_remain_in_purse(
     let (ask, cand) = up_to_candidate(&p).await;
     let path = p.sponsor.data_dir.as_ref().unwrap().join("sponsor/kits.json");
     let mut ledger: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now = p.clock.load(Ordering::SeqCst);
     // Persist an honest old unresolved reservation as if the process resumed
     // after a >24h outage, with payment settlement only becoming known now.
     ledger["kits"][0]["approved_at"] = json!(now - 86_401);
@@ -331,13 +340,20 @@ async fn regression_signed_request_expiry_is_enforced_at_approval() {
     let (_, ask) = call(&p.newcomer, "POST", "/api/v1/sponsor/request", Some(json!({"link":offer["link"]}))).await;
     let original = FundingRequest::parse(ask["request"].as_str().unwrap()).unwrap();
     let offer_rec = konsensus_core::sponsor::SponsorOffer::decode(offer["link"].as_str().unwrap().rsplit_once('.').unwrap().1).unwrap();
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now = p.clock.load(Ordering::SeqCst);
     let short = FundingRequest::sign(p.newcomer.identity.ed25519_signing_key(), &offer_rec, original.newcomer_ln, original.amount_msat, original.payment_hash, now + 2, original.bolt11).unwrap();
     let (s, cand) = call(&p.sponsor,"POST","/api/v1/sponsor/candidate",Some(json!({"request":short.to_link()}))).await;
     assert_eq!(s,StatusCode::OK,"{cand}");
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // Expire exactly at the signed boundary, independent of scheduler or host sleep.
+    p.clock.store(now + 2, Ordering::SeqCst);
     let (s, paid) = call(&p.sponsor,"POST","/api/v1/sponsor/approve",Some(approval(&cand))).await;
-    assert_ne!(s,StatusCode::OK,"expired signed request still pays: {paid}");
+    assert_eq!(s, StatusCode::CONFLICT, "expired signed request still pays: {paid}");
+    assert_eq!(p.newcomer_ln.get_balance_msat().await.unwrap(), 0);
+    // Rolling time backwards must not resurrect the observed terminal expiry.
+    p.clock.store(now, Ordering::SeqCst);
+    let (s, _) = call(&p.sponsor,"POST","/api/v1/sponsor/approve",Some(approval(&cand))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(p.newcomer_ln.get_balance_msat().await.unwrap(), 0);
 }
 
 /// A zero-fee mock route whose fee report can be temporarily unavailable.
@@ -348,6 +364,7 @@ struct ReportedFeeProvider {
     pause: std::sync::atomic::AtomicBool,
     waiting: std::sync::atomic::AtomicBool,
     resume: tokio::sync::Notify,
+    entered: tokio::sync::Notify,
     pause_lookup: bool,
 }
 #[async_trait::async_trait]
@@ -358,6 +375,7 @@ impl LightningProvider for ReportedFeeProvider {
         self.cap.store(cap, std::sync::atomic::Ordering::SeqCst);
         if self.pause.load(std::sync::atomic::Ordering::SeqCst) {
             self.waiting.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.entered.notify_one();
             self.resume.notified().await;
         }
         let mut paid = self.inner.pay_invoice(b).await?;
@@ -368,6 +386,7 @@ impl LightningProvider for ReportedFeeProvider {
     async fn get_payment_status(&self,h:&str)->Result<konsensus_core::traits::lightning::PaymentDetails,konsensus_core::traits::lightning::LightningError>{
         if self.pause_lookup {
             self.waiting.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.entered.notify_one();
             self.resume.notified().await;
         }
         if self.pause.load(std::sync::atomic::Ordering::SeqCst)
@@ -396,7 +415,7 @@ async fn missing_fee_keeps_maximum_reserved_across_restart_and_window_rollover()
     use std::sync::atomic::Ordering;
     let p = pair(policy(GIFT + FEE, 2)).await;
     let (_, candidate) = up_to_candidate(&p).await;
-    let wallet = Arc::new(ReportedFeeProvider { inner: p.sponsor_ln.clone(), fee: u64::MAX.into(), cap: u64::MAX.into(), pause: false.into(), waiting: false.into(), resume: tokio::sync::Notify::new(), pause_lookup: false });
+    let wallet = Arc::new(ReportedFeeProvider { inner: p.sponsor_ln.clone(), fee: u64::MAX.into(), cap: u64::MAX.into(), pause: false.into(), waiting: false.into(), resume: tokio::sync::Notify::new(), entered: tokio::sync::Notify::new(), pause_lookup: false });
     let state = Arc::new(AppState { lightning: wallet.clone(), ..(*p.sponsor).clone() });
     let (s, paid) = call(&state, "POST", "/api/v1/sponsor/approve", Some(approval(&candidate))).await;
     assert_eq!(s, StatusCode::OK, "{paid}");
@@ -437,15 +456,16 @@ async fn reconciliation_cannot_release_a_live_dispatch_from_an_older_failed_reco
     let (_, candidate) = up_to_candidate(&p).await;
     let wallet = Arc::new(ReportedFeeProvider {
         inner: p.sponsor_ln.clone(), fee: 0.into(), cap: u64::MAX.into(),
-        pause: true.into(), waiting: false.into(), resume: tokio::sync::Notify::new(), pause_lookup: false,
+        pause: true.into(), waiting: false.into(), resume: tokio::sync::Notify::new(), entered: tokio::sync::Notify::new(), pause_lookup: false,
     });
     let state = Arc::new(AppState { lightning: wallet.clone(), ..(*p.sponsor).clone() });
     let sending = state.clone();
     let body = approval(&candidate);
-    let task = tokio::spawn(async move { call(&sending,"POST","/api/v1/sponsor/approve",Some(body)).await });
-    tokio::time::timeout(std::time::Duration::from_secs(5),async {
-        while !wallet.waiting.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
-    }).await.unwrap();
+    let mut task = tokio::spawn(async move { call(&sending,"POST","/api/v1/sponsor/approve",Some(body)).await });
+    tokio::select! {
+        _ = wallet.entered.notified() => {},
+        result = &mut task => panic!("approval ended before dispatch barrier: {result:?}"),
+    }
     let reconcile = format!("/api/v1/sponsor/kits/{}/reconcile", candidate["intro_id"].as_str().unwrap());
     let (_, current) = call(&state,"POST",&reconcile,None).await;
     let (offer_status, _) = call(&state,"POST","/api/v1/sponsor/offer",None).await;
@@ -494,7 +514,7 @@ async fn legacy_ambiguous_failure_cannot_release_the_purse_after_restart() {
     std::fs::write(path, serde_json::to_vec(&ledger).unwrap()).unwrap();
     let wallet = Arc::new(ReportedFeeProvider {
         inner: p.sponsor_ln.clone(), fee: 0.into(), cap: u64::MAX.into(),
-        pause: true.into(), waiting: true.into(), resume: tokio::sync::Notify::new(), pause_lookup: false,
+        pause: true.into(), waiting: true.into(), resume: tokio::sync::Notify::new(), entered: tokio::sync::Notify::new(), pause_lookup: false,
     });
     let restarted = Arc::new(AppState { lightning: wallet.clone(), ..(*p.sponsor).clone() });
     let reconcile = format!("/api/v1/sponsor/kits/{}/reconcile", candidate["intro_id"].as_str().unwrap());
@@ -676,13 +696,14 @@ async fn expired_candidate_resubmission_persists_terminal_expiry_even_on_refusal
     let (_, ask) = call(&p.newcomer, "POST", "/api/v1/sponsor/request", Some(json!({"link":offer["link"]}))).await;
     let original = FundingRequest::parse(ask["request"].as_str().unwrap()).unwrap();
     let offer = konsensus_core::sponsor::SponsorOffer::decode(offer["link"].as_str().unwrap().rsplit_once('.').unwrap().1).unwrap();
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now = p.clock.load(Ordering::SeqCst);
     let short = FundingRequest::sign(p.newcomer.identity.ed25519_signing_key(), &offer,
         original.newcomer_ln, GIFT, original.payment_hash, now + 2, original.bolt11).unwrap();
     let body = json!({"request":short.to_link()});
     let (s, candidate) = call(&p.sponsor, "POST", "/api/v1/sponsor/candidate", Some(body.clone())).await;
     assert_eq!(s, StatusCode::OK, "{candidate}");
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // Expire exactly at the signed boundary, independent of scheduler or host sleep.
+    p.clock.store(now + 2, Ordering::SeqCst);
     let (s, error) = call(&p.sponsor, "POST", "/api/v1/sponsor/candidate", Some(body)).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{error}");
     let path = p.sponsor.data_dir.as_ref().unwrap().join("sponsor/kits.json");
@@ -698,15 +719,16 @@ async fn time_floor_advanced_during_preflight_prevents_dispatch() {
     let (_, candidate) = up_to_candidate(&p).await;
     let wallet = Arc::new(ReportedFeeProvider {
         inner: p.sponsor_ln.clone(), fee: 0.into(), cap: u64::MAX.into(),
-        pause: false.into(), waiting: false.into(), resume: tokio::sync::Notify::new(), pause_lookup: true,
+        pause: false.into(), waiting: false.into(), resume: tokio::sync::Notify::new(), entered: tokio::sync::Notify::new(), pause_lookup: true,
     });
     let state = Arc::new(AppState { lightning: wallet.clone(), ..(*p.sponsor).clone() });
     let sending = state.clone();
     let body = approval(&candidate);
-    let pending = tokio::spawn(async move { call(&sending, "POST", "/api/v1/sponsor/approve", Some(body)).await });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !wallet.waiting.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
-    }).await.unwrap();
+    let mut pending = tokio::spawn(async move { call(&sending, "POST", "/api/v1/sponsor/approve", Some(body)).await });
+    tokio::select! {
+        _ = wallet.entered.notified() => {},
+        result = &mut pending => panic!("approval ended before preflight barrier: {result:?}"),
+    }
     let path = state.data_dir.as_ref().unwrap().join("sponsor/kits.json");
     let mut ledger: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(ledger["kits"][0]["state"], "paying");

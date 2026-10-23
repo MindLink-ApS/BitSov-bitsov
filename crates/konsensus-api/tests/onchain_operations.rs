@@ -33,9 +33,10 @@ enum Outcome {
 }
 
 struct Wallet {
-    calls: AtomicUsize,
-    started: Semaphore,
-    proceed: Semaphore,
+    calls: Arc<AtomicUsize>,
+    started: Arc<Semaphore>,
+    proceed: Arc<Semaphore>,
+    dropped: Arc<tokio::sync::Notify>,
     outcome: Outcome,
     ready_barrier: Option<tokio::sync::Barrier>,
 }
@@ -43,12 +44,19 @@ struct Wallet {
 impl Wallet {
     fn new(outcome: Outcome, blocked: bool) -> Arc<Self> {
         Arc::new(Self {
-            calls: AtomicUsize::new(0),
-            started: Semaphore::new(0),
-            proceed: Semaphore::new(if blocked { 0 } else { 32 }),
+            calls: Arc::new(AtomicUsize::new(0)),
+            started: Arc::new(Semaphore::new(0)),
+            proceed: Arc::new(Semaphore::new(if blocked { 0 } else { 32 })),
+            dropped: Arc::new(tokio::sync::Notify::new()),
             outcome,
             ready_barrier: None,
         })
+    }
+}
+
+impl Drop for Wallet {
+    fn drop(&mut self) {
+        self.dropped.notify_one();
     }
 }
 
@@ -276,34 +284,44 @@ async fn terminal_and_uncertain_outcomes_survive_restart_without_redispatch() {
 #[tokio::test]
 async fn disconnected_client_does_not_cancel_outcome_recording() {
     let wallet = Wallet::new(Outcome::Sent, true);
-    let (_dir, app, auth) = setup(wallet.clone()).await;
-    let request = tokio::spawn({
+    let (started, proceed, calls, dropped) = (
+        wallet.started.clone(), wallet.proceed.clone(), wallet.calls.clone(), wallet.dropped.clone(),
+    );
+    // The router and detached task are the only owners of this provider.
+    let (dir, app, auth) = setup(wallet).await;
+    let mut request = tokio::spawn({
         let app = app.clone();
         let auth = auth.clone();
         async move { post(app, &auth, body()).await }
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), wallet.started.acquire())
-        .await
-        .unwrap()
-        .unwrap()
-        .forget();
+    tokio::select! {
+        permit = started.acquire() => permit.unwrap().forget(),
+        result = &mut request => panic!("request ended before wallet dispatch: {result:?}"),
+    }
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
-    wallet.proceed.add_permits(1);
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let (status, receipt) = post(app.clone(), &auth, body()).await;
-            if status == StatusCode::OK {
-                assert_eq!(receipt["txid"], TXID);
-                break;
-            }
-            assert_eq!(status, StatusCode::ACCEPTED);
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(wallet.calls.load(Ordering::SeqCst), 1);
+    drop(app);
+    proceed.add_permits(1);
+    // Dropping the last provider is a task-lifecycle barrier: all AppState
+    // owners, including the detached writer, have finished. This also fires
+    // if cancellation wrongly kills the writer, so that regression fails the
+    // durable-row assertion below instead of polling forever.
+    dropped.notified().await;
+    let db = Arc::new(SqliteStorage::open(dir.path().join("operations.db").to_str().unwrap())
+        .await.unwrap());
+    let operation = db.get_channel_open_operation(&format!("send-onchain:{ID}"))
+        .await.unwrap().expect("dispatch inserted its durable operation");
+    assert!(operation.result.is_some(), "disconnect cancelled outcome recording");
+    // Reconstruct the API from durable state; replay must not touch a wallet.
+    let replay_wallet = Wallet::new(Outcome::Sent, false);
+    let state = common::test_state_with_lightning_and_storage(replay_wallet.clone(), db);
+    let auth = common::auth_header(&state);
+    let app = common::test_router(state);
+    let (status, receipt) = post(app, &auth, body()).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["txid"], TXID);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(replay_wallet.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
