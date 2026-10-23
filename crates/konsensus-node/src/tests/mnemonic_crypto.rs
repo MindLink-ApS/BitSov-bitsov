@@ -9,8 +9,33 @@ fn encrypt_decrypt_roundtrip() {
     assert!(encrypted.len() > HEADER_LEN);
     assert_eq!(encrypted[0], FORMAT_VERSION);
 
-    let decrypted = decrypt_mnemonic(&encrypted, password).unwrap();
-    assert_eq!(decrypted, mnemonic);
+    let decrypted: Zeroizing<String> = decrypt_mnemonic(&encrypted, password).unwrap();
+    assert_eq!(decrypted.as_str(), mnemonic);
+}
+
+#[test]
+fn non_utf8_plaintext_is_not_retained_in_error() {
+    // Authenticated legacy ciphertext containing synthetic, non-UTF-8 data.
+    let plaintext = b"synthetic-secret-marker\xff";
+    let password = "legacy-test-password";
+    let salt = [7; SALT_LEN];
+    let nonce = [9; NONCE_LEN];
+    let key = derive_key(password.as_bytes(), &salt).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(key.as_slice()).unwrap();
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
+        .unwrap();
+    let mut encrypted = vec![FORMAT_VERSION];
+    encrypted.extend_from_slice(&salt);
+    encrypted.extend_from_slice(&nonce);
+    encrypted.extend_from_slice(&ciphertext);
+
+    let error = decrypt_mnemonic(&encrypted, password).unwrap_err();
+    assert!(matches!(&error, MnemonicCryptoError::InvalidFormat(message)
+        if message == "decrypted data is not valid UTF-8"));
+    assert!(!error.to_string().contains("synthetic-secret-marker"));
+    assert!(!format!("{error:?}").contains("synthetic-secret-marker"));
+    assert!(std::error::Error::source(&error).is_none());
 }
 
 #[test]
@@ -106,8 +131,8 @@ fn different_encryptions_produce_different_output() {
     // Different salt/nonce means different output
     assert_ne!(enc1, enc2);
     // But both decrypt to the same mnemonic
-    assert_eq!(decrypt_mnemonic(&enc1, "password").unwrap(), mnemonic);
-    assert_eq!(decrypt_mnemonic(&enc2, "password").unwrap(), mnemonic);
+    assert_eq!(decrypt_mnemonic(&enc1, "password").unwrap().as_str(), mnemonic);
+    assert_eq!(decrypt_mnemonic(&enc2, "password").unwrap().as_str(), mnemonic);
 }
 
 #[test]
