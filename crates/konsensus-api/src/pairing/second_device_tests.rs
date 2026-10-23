@@ -1843,3 +1843,55 @@ fn re_pairing_a_leaf_requires_review_only_while_enrollment_is_on() {
     assert_eq!(f.svc.owner_device_count(), 1);
     assert!(f.svc.device_keys().iter().any(|key| key.key_id == f.key_id));
 }
+
+#[test]
+fn sas_digest_confirmation_checks_every_byte_and_rejects_invalid_hex() {
+    // Separate operations keep mismatch accounting from closing later cases.
+    for case in 0..36 {
+        let f = Fixture::new();
+        let c = f.provisional(2);
+        let k = key();
+        let op = f.request(&c, &k).unwrap();
+        let digest = op.sas.as_ref().unwrap().digest;
+        let proof = sign(
+            &k,
+            &sas_registration_message(
+                &f.svc.bound_fingerprint(),
+                &c.client_id,
+                &op.public_key,
+                &digest,
+            ),
+        );
+        let submitted = match case {
+            0..=31 => {
+                let mut bytes = *digest.as_bytes();
+                bytes[case] ^= 1;
+                hex::encode(bytes)
+            }
+            32 => "not-hex".into(),
+            33 => digest.to_hex()[..62].to_string(),
+            34 => digest.to_hex().to_string(),
+            _ => digest.to_hex().to_uppercase(),
+        };
+        let result = f.svc.confirm_device_sas(
+            &c.client_id,
+            &op.op_id,
+            &binding(&f.svc, &c),
+            &submitted,
+            &proof,
+        );
+        if case < 34 {
+            assert!(matches!(result, Err(PairingError::BadProof)), "case {case}");
+            assert!(f.svc.pending_device_key(&op.op_id).is_none());
+            assert_eq!(f.svc.lock().second_device.mismatches.len(), 1);
+        } else {
+            result.unwrap();
+            assert!(f
+                .svc
+                .pending_device_key(&op.op_id)
+                .unwrap()
+                .require_sas_confirmed()
+                .is_ok());
+        }
+    }
+}

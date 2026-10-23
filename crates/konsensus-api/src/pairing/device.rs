@@ -17,6 +17,7 @@
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use super::{Inner, PairingError, PairingService, SpendGrant, ELEVATION_TTL_SECS};
 use crate::auth::Scope;
@@ -755,7 +756,9 @@ impl PairingService {
         if &sas.binding != binding {
             return Err(PairingError::BadProof);
         }
-        let matches = blake3::Hash::from_hex(digest).ok() == Some(sas.digest);
+        let matches = blake3::Hash::from_hex(digest)
+            .ok()
+            .is_some_and(|digest| bool::from(digest.as_bytes().ct_eq(sas.digest.as_bytes())));
         if !matches {
             if v2 {
                 self.charge_second_failure(&mut inner, &op, true)?;
