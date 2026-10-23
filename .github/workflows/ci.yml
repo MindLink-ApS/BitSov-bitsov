@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: read # paths-filter reads the changed-file list for pull requests.
     outputs:
       # Pushes, tags, and merge-queue runs always take the Rust path. A PR
       # takes it when any changed file is outside the docs/`pm/` set, when the
@@ -46,7 +46,7 @@ jobs:
       - name: Detect Rust-impacting changes
         id: filter
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v4
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           # paths-filter defaults to 'some': a file matches a filter if it
           # matches ANY pattern, so the '**' entry would make every PR rust=true.
@@ -77,7 +77,7 @@ jobs:
       - name: Detect Cargo Audit inputs
         id: audit_paths
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
         with:
           filters: |
             audit:
@@ -97,7 +97,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Generate regression-test locales
         run: |
           sudo localedef -i da_DK -f ISO-8859-1 da_DK.ISO8859-1
@@ -114,7 +114,7 @@ jobs:
     # used on pull_request, because that would skip this job too.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Protocol repo has no frontend
         run: |
@@ -145,10 +145,11 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (upstream has no semver tags)
         with:
+          toolchain: stable
           components: clippy
 
       - name: Free runner disk space
@@ -171,7 +172,7 @@ jobs:
       # Cache registry crates and path/workspace crates (vendor/lightning,
       # vendor/ldk-node). The default rust-cache mode skips those, so every
       # test run recompiled them (~22 min) even after a "cache hit".
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: workspace-${{ hashFiles('Cargo.lock') }}
           cache-all-crates: "true"
@@ -234,9 +235,11 @@ jobs:
       # Both standalone vendor manifests reuse this job's cached target tree.
       CARGO_TARGET_DIR: ${{ github.workspace }}/vendor/ldk-node/target
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (upstream has no semver tags)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: vendor/ldk-node
           shared-key: ldk-node-security-${{ hashFiles('vendor/ldk-node/Cargo.lock', 'vendor/lightning/Cargo.lock') }}
@@ -268,14 +271,16 @@ jobs:
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.audit == 'true') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Security key ↔ policy consistency
         run: bash scripts/test-security-key.sh && bash scripts/check-security-key.sh
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (upstream has no semver tags)
+        with:
+          toolchain: stable
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/bin/
@@ -299,7 +304,7 @@ jobs:
     name: Semgrep Security Rules
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install semgrep
         run: pip install "semgrep==1.179.0"  # 1.180.0 ships without semgrep-core (sdist build); bump deliberately
@@ -328,9 +333,9 @@ jobs:
     needs: [check, ldk-node-security, audit, semgrep]
     runs-on: ${{ matrix.runner }}
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: write # Upload binaries, checksums and SBOMs to the draft release.
+      id-token: write # Obtain an OIDC token to sign build provenance.
+      attestations: write # Publish the binary build-provenance attestations.
     strategy:
       fail-fast: false
       matrix:
@@ -351,7 +356,7 @@ jobs:
             runner: windows-latest
             artifact: bitsov-windows-x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # xcode-27 is the versioned Apple Silicon image (both Darwin targets).
       # Fail closed if GitHub retires the exact Xcode build; never fall back.
@@ -367,7 +372,7 @@ jobs:
         shell: bash
         run: echo "version=$(cat scripts/release-toolchain)" >> "$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (upstream has no semver tags)
         with:
           toolchain: ${{ steps.release-toolchain.outputs.version }}
           targets: ${{ matrix.target }}
@@ -423,7 +428,7 @@ jobs:
           [System.IO.File]::WriteAllText("artifacts/${{ matrix.artifact }}.sha256", $line, (New-Object System.Text.UTF8Encoding($false)))
 
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           # The artifact is a single binary FILE, not a directory. `path:` makes
           # sbom-action invoke `syft scan dir:<path>`, which fails on a file
@@ -448,12 +453,12 @@ jobs:
         # backstop so this step can never fail the release build.
         if: ${{ !github.event.repository.private }}
         continue-on-error: true
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: artifacts/${{ matrix.artifact }}
 
       - name: Upload to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           # Stage a DRAFT release. Tag CI builds the CLI binaries + checksums + SBOM,
           # but the release is not published until the operator attaches the GPG-signed

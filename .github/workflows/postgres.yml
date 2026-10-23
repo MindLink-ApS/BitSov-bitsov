@@ -83,13 +83,15 @@ jobs:
       BITSOV_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (upstream has no semver tags)
+        with:
+          toolchain: stable
 
       # Cache compiled dependencies as well as downloads. rust-cache includes
       # Cargo.lock, the compiler, and the runner platform in its cache key.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: postgres-${{ hashFiles('Cargo.lock') }}
           cache-all-crates: "true"
