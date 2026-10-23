@@ -47,22 +47,179 @@ fn state_with_pairing(
     (state, service, console)
 }
 
+fn token_challenge_client(service: &PairingService, seed: u8) -> (String, SigningKey) {
+    let key = SigningKey::from_bytes(&[seed; 32]);
+    service.open_pairing_window(std::time::Duration::from_secs(60));
+    let paired = service
+        .create_verified_remote_pairing(
+            &format!("client-{seed}"),
+            &hex::encode(key.verifying_key().to_bytes()),
+            &[seed; 32],
+        )
+        .unwrap();
+    (paired.client_id, key)
+}
+
+fn fill_token_challenges(service: &PairingService, client_id: &str) -> Vec<String> {
+    (0..8)
+        .map(|_| service.issue_token_challenge(client_id).unwrap())
+        .collect()
+}
+
 #[test]
-fn token_challenges_stop_at_the_live_cap() {
+fn token_challenges_client_cap_leaves_room_for_another_client() {
     let dir = tempfile::tempdir().unwrap();
     let (_, service, _) = state_with_pairing(dir.path(), false);
-    let key = SigningKey::from_bytes(&[0x61; 32]);
-    let pubkey = hex::encode(key.verifying_key().to_bytes());
-    let paired = service
-        .create_verified_remote_pairing("remote", &pubkey, &[0x62; 32])
-        .unwrap();
-    for _ in 0..pairing::MAX_LIVE_TOKEN_CHALLENGES {
-        service.issue_token_challenge(&paired.client_id).unwrap();
-    }
+    let (a, _) = token_challenge_client(&service, 1);
+    let (b, _) = token_challenge_client(&service, 2);
+    fill_token_challenges(&service, &a);
     assert!(matches!(
-        service.issue_token_challenge(&paired.client_id),
+        service.issue_token_challenge(&a),
         Err(pairing::PairingError::TooManyPending)
     ));
+    fill_token_challenges(&service, &b);
+}
+
+#[test]
+fn token_challenges_global_cap_and_revocation_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, service, _) = state_with_pairing(dir.path(), false);
+    let clients: Vec<_> = (1..=17)
+        .map(|seed| token_challenge_client(&service, seed))
+        .collect();
+    let challenges: Vec<_> = clients[..16]
+        .iter()
+        .map(|(client, _)| fill_token_challenges(&service, client))
+        .collect();
+    let b = &clients[16].0;
+    assert!(matches!(
+        service.issue_token_challenge(b),
+        Err(pairing::PairingError::TooManyPending)
+    ));
+
+    let (a, a_key) = &clients[0];
+    service.revoke(a).unwrap();
+    assert!(matches!(
+        service.issue_token_challenge(a),
+        Err(pairing::PairingError::UnknownClient)
+    ));
+    // All eight revoked slots are available immediately, but the global cap holds.
+    fill_token_challenges(&service, b);
+    let (repaired_a, _) = token_challenge_client(&service, 1);
+    assert_eq!(&repaired_a, a);
+    assert!(matches!(
+        service.issue_token_challenge(a),
+        Err(pairing::PairingError::TooManyPending)
+    ));
+    // Re-pairing the same key must not resurrect a pre-revocation challenge.
+    assert!(matches!(
+        service.issue_token(
+            &state.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            a,
+            &challenges[0][0],
+            &hex::encode(a_key.sign(challenges[0][0].as_bytes()).to_bytes()),
+        ),
+        Err(pairing::PairingError::UnknownPending)
+    ));
+    // Revoking A leaves another client's existing challenges usable at capacity.
+    let (other, other_key) = &clients[1];
+    service
+        .issue_token(
+            &state.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            other,
+            &challenges[1][0],
+            &hex::encode(other_key.sign(challenges[1][0].as_bytes()).to_bytes()),
+        )
+        .unwrap();
+    service.issue_token_challenge(a).unwrap();
+}
+
+#[test]
+fn token_challenges_consumption_releases_client_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, service, _) = state_with_pairing(dir.path(), false);
+    let (a, key) = token_challenge_client(&service, 1);
+    let challenges = fill_token_challenges(&service, &a);
+    assert!(matches!(
+        service.issue_token_challenge(&a),
+        Err(pairing::PairingError::TooManyPending)
+    ));
+    service
+        .issue_token(
+            &state.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            &a,
+            &challenges[0],
+            &hex::encode(key.sign(challenges[0].as_bytes()).to_bytes()),
+        )
+        .unwrap();
+    service.issue_token_challenge(&a).unwrap();
+    assert!(matches!(
+        service.issue_token_challenge(&a),
+        Err(pairing::PairingError::TooManyPending)
+    ));
+}
+
+async fn get_token_challenge(
+    app: &axum::Router,
+    client_id: &str,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/pair/challenge?client_id={client_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn token_challenges_http_isolation_and_private_429_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, service, _) = state_with_pairing(dir.path(), false);
+    let local = test_router(state.clone());
+    let remote = remote_app(state);
+    let (a, _) = token_challenge_client(&service, 1);
+    let (b, _) = token_challenge_client(&service, 2);
+    for _ in 0..8 {
+        assert_eq!(get_token_challenge(&remote, &a).await.0, StatusCode::OK);
+    }
+    let expected = serde_json::json!({
+        "code": 429,
+        "error": "too many pending pairing requests"
+    });
+    for app in [&local, &remote] {
+        let (status, body) = get_token_challenge(app, &a).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, expected);
+        assert_eq!(get_token_challenge(app, &b).await.0, StatusCode::OK);
+    }
+    // Changing other clients' occupancy must not change A's error body.
+    for _ in 0..6 {
+        service.issue_token_challenge(&b).unwrap();
+    }
+    for seed in 3..=16 {
+        let (client, _) = token_challenge_client(&service, seed);
+        fill_token_challenges(&service, &client);
+    }
+    let (c, _) = token_challenge_client(&service, 17);
+    for app in [&local, &remote] {
+        for client in [&a, &c] {
+            let (status, body) = get_token_challenge(app, client).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(body, expected);
+        }
+    }
 }
 
 #[test]

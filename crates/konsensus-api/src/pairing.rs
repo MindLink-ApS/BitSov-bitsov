@@ -110,6 +110,11 @@ pub const TOKEN_CHALLENGE_TTL: Duration = Duration::from_secs(120);
 /// map from growing with the request rate for the whole TTL.
 pub const MAX_LIVE_TOKEN_CHALLENGES: usize = 128;
 
+/// Live token-issuance challenges allowed for one registered client id.
+///
+/// Bound each client's share so requests for one id cannot fill the global cap.
+pub const MAX_LIVE_TOKEN_CHALLENGES_PER_CLIENT: usize = 8;
+
 /// Inactivity horizon for a pairing: 180 days.
 ///
 /// An abandoned laptop must stop being a standing grant. A pairing unused for
@@ -1869,7 +1874,14 @@ impl PairingService {
         }
         let now = Instant::now();
         inner.token_challenges.retain(|_, (_, exp)| *exp > now);
-        if inner.token_challenges.len() >= MAX_LIVE_TOKEN_CHALLENGES {
+        let client_challenges = inner
+            .token_challenges
+            .values()
+            .filter(|(owner, _)| owner == client_id)
+            .count();
+        if client_challenges >= MAX_LIVE_TOKEN_CHALLENGES_PER_CLIENT
+            || inner.token_challenges.len() >= MAX_LIVE_TOKEN_CHALLENGES
+        {
             return Err(PairingError::TooManyPending);
         }
         let challenge = format!("bitsov-pair-token-v1:{}", hex::encode(nonce));
@@ -2167,7 +2179,7 @@ impl PairingService {
         Ok(epoch)
     }
 
-    /// Remove a pairing entirely (and any grant bound to it).
+    /// Remove a pairing entirely, including its grants and token challenges.
     pub fn revoke(&self, client_id: &str) -> Result<(), PairingError> {
         let mut inner = self.lock();
         self.guard_device_removal(&inner, |key| key.client_id == client_id)?;
@@ -2189,6 +2201,9 @@ impl PairingService {
             .or_insert(0);
         *tracked = (*tracked).max(existing.epoch);
         inner.file.clients.retain(|c| c.client_id != client_id);
+        inner
+            .token_challenges
+            .retain(|_, (owner, _)| owner != client_id);
         inner.file.revoke_grants(Some(client_id));
         inner
             .file
@@ -4310,3 +4325,7 @@ mod budget_transaction_tests;
 #[cfg(all(test, unix))]
 #[path = "pairing/headless_tests.rs"]
 mod headless_tests;
+
+#[cfg(test)]
+#[path = "pairing/token_challenge_tests.rs"]
+mod token_challenge_tests;
