@@ -101,6 +101,34 @@ the price query at all, the call is refused before paying
 
 Calls are 1:1: a room compose of 400-403 is refused (`call_room`).
 
+## Open calls by peer
+
+`GET /api/v1/calls?peer=<node-id>` returns the owner's open calls for exactly
+that peer, with `read` scope required and at most 4 entries. A valid unknown
+peer returns `[]`; a missing, duplicate, or malformed peer returns 400 with
+fixed error text `invalid peer id`.
+
+Each entry has `id`, `state` (`reserved`, `ringing`, `live`, or `ended`),
+`direction` (`incoming` or `outgoing`), and boolean
+`unresolved_paid_admission`. A pending signal keeps a call in this view even
+after its deadline and replay tombstone expire; its aged state is `ended`.
+Unresolved reservations sort first, followed by call id order.
+
+`created` and `op_id` are explicitly nullable. `created` is the stored pending
+offer operation's creation time (Unix milliseconds) when the journal binding
+matches; otherwise `null`, because call state stores no creation timestamp.
+`op_id` is the stored pending signal operation id or `null` when that binding
+is no longer retained. Neither field uses placeholder strings or inferred
+timestamps. This view requires no migration.
+
+**The client must fail closed per peer when `unresolved_paid_admission` is
+true:** keep blocking re-admission/new paid admission to that peer even for
+`ended` calls or null metadata. The flag conservatively reflects any retained
+pending signal; expiry alone is not proof of nonpayment. Other peers are
+unaffected. The GET is read-only: no recovery, sweeping, quote, payment,
+dispatch, or call event. See the [API contract](API_CALLS.md) for response
+fields, ordering, authentication, and error details.
+
 ## Compose API refusals
 
 For a new operation, `POST /api/v1/messages/compose` checks the call rules

@@ -328,10 +328,17 @@ pub enum Command {
         command: WhitelistCommand,
     },
 
+    /// Print owner-only lock status JSON (Unix; home, remote-unlock or owner-control).
+    LockStatus {
+        /// Config location selects the adjacent owner control socket.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+
     /// Show paired clients and anything awaiting the owner's decision (#76).
     ///
-    /// Talks to `<data-dir>/control.sock`, which exists only when the node was
-    /// started with `--owner-control`.
+    /// Requires `<data-dir>/control.sock` with console authority from
+    /// `--owner-control`; a home/remote-unlock status-only socket cannot serve it.
     PairStatus {
         /// Path to the configuration file (its directory is the data directory).
         #[arg(short, long, default_value = "konsensus.toml")]

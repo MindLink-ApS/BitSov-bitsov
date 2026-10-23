@@ -212,6 +212,12 @@ fn socket_path(config_path: &Path) -> PathBuf {
 async fn send(config_path: &Path, req: ControlRequest) -> Result<ControlResponse> {
     let socket = socket_path(config_path);
     control::send(&socket, &req).await.with_context(|| {
+        if matches!(req, ControlRequest::LockStatus {}) {
+            return format!(
+                "could not reach the owner status socket at {:?}; start the node with --home, --remote-unlock or --owner-control (not available during SETUP); retry during unlock startup",
+                socket
+            );
+        }
         format!(
             "could not reach the owner control socket at {:?}.\n\
              The node must be running and must have been started with `--owner-control`.\n\
@@ -276,6 +282,18 @@ fn report(resp: ControlResponse) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&other)?);
             Ok(())
         }
+    }
+}
+
+/// `konsensus lock-status` — JSON for local monitors, without a control envelope.
+pub async fn cmd_lock_status(config_path: &Path) -> Result<()> {
+    match send(config_path, ControlRequest::LockStatus {}).await? {
+        ControlResponse::LockStatus { status } => {
+            println!("{}", serde_json::to_string(&status)?);
+            Ok(())
+        }
+        error @ ControlResponse::Error { .. } => report(error),
+        _ => anyhow::bail!("invalid lock-status response; check CLI/node versions"),
     }
 }
 

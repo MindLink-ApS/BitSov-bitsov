@@ -846,6 +846,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_get(peer, call_id).await
     }
 
+    async fn call_open_by_peer(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        self.inner.call_open_by_peer(peer, now_ms).await
+    }
+
     async fn call_put(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
         self.inner.call_put(peer, call_id, entry).await
     }

@@ -215,6 +215,74 @@ impl Fixture {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
+    fn lock_status(&self) -> Value {
+        let output = Command::new(env!("CARGO_BIN_EXE_konsensus"))
+            .args(["lock-status", "--config"])
+            .arg(&self.config)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("stdout must contain only status JSON")
+    }
+
+    async fn check_status_socket(&self, expected: &Value) {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let socket = self.dir.path().join("control.sock");
+        assert_eq!(
+            std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        for input in [
+            r#"{"op":"lock-status","PRIVATE_FIELD":"PRIVATE_VALUE"}"#,
+            r#"{"op":"lock-status","extra": "PRIVATE_TRUNCATED"#,
+            r#"{"op":"PRIVATE_UNKNOWN"}"#,
+            r#"{"op":{"PRIVATE_TYPE":1}}"#,
+        ] {
+            write
+                .write_all(format!("{input}\n").as_bytes())
+                .await
+                .unwrap();
+            let reply: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(
+                reply,
+                json!({"result":"error", "message":"malformed_control_request: invalid control request"})
+            );
+        }
+        // Monitoring must not enable the console or any of its mutations.
+        for input in [
+            r#"{"op":"status"}"#,
+            r#"{"op":"open-window","seconds":60}"#,
+            r#"{"op":"reset-sas"}"#,
+        ] {
+            write
+                .write_all(format!("{input}\n").as_bytes())
+                .await
+                .unwrap();
+            let reply: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(
+                reply,
+                json!({"result":"error", "message":"owner_approval_unavailable: status-only control socket"})
+            );
+        }
+        write
+            .write_all(b"{\"op\":\"lock-status\"}\n")
+            .await
+            .unwrap();
+        let reply: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(reply, json!({"result":"lock-status", "status": expected}));
+    }
+
     fn unlock_body(&self, challenge: &str, password: &str) -> Value {
         let r = &self.record;
         let msg = unlock_message(
@@ -372,7 +440,12 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
             TcpStream::connect(f.peer).await.is_err(),
             "peer port must remain unbound"
         );
-        assert!(!f.dir.path().join("control.sock").exists());
+        assert_eq!(f.lock_status(), lock);
+        assert_eq!(lock.as_object().unwrap().len(), 6);
+        assert_eq!(lock["state"], "locked");
+        assert_eq!(lock["attempts_left"], 20);
+        assert!(lock["locked_since"].as_i64().is_some());
+        f.check_status_socket(&lock).await;
         for field in ["code", "client_name", "client_pubkey", "signature"] {
             let (_, response) = Tunnel::connect(&f, json!({"v":1,field:""})).await;
             assert_eq!(response["code"], "authentication_failed");
@@ -417,6 +490,20 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
                 .0,
             401
         );
+        let after_failure: Value = http
+            .get(format!("http://{}/api/v1/node/lock", f.api))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(after_failure["attempts_left"], 19);
+        assert_eq!(f.lock_status(), after_failure);
+        let mut old_status_connection =
+            tokio::net::UnixStream::connect(f.dir.path().join("control.sock"))
+                .await
+                .unwrap();
         let c = tunnel.challenge().await;
         assert_eq!(
             tunnel
@@ -435,6 +522,38 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
         );
         let health = f.ready(&mut node, "/api/v1/health", &log).await;
         assert_eq!(health["hosted_by"], "Rasmus's Pi");
+        use tokio::io::AsyncReadExt;
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                old_status_connection.read(&mut byte)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            0,
+            "old status connections must close on unlock, never serve stale locked state"
+        );
+        let unlocked = f.lock_status();
+        assert_eq!(
+            unlocked,
+            json!({
+                "state":"unlocked", "node_id":f.identity.node_id().to_hex(),
+                "fingerprint":lock["fingerprint"], "locked_since":null,
+                "attempts_left":null, "hosted_by":"Rasmus's Pi"
+            })
+        );
+        f.check_status_socket(&unlocked).await;
+        // The live HTTP router still does not expose the locked-only route.
+        assert_eq!(
+            http.get(format!("http://{}/api/v1/node/lock", f.api))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
         let issued = Command::new(env!("CARGO_BIN_EXE_konsensus"))
             .args(["pair-ticket", "--config"])
             .arg(&f.config)

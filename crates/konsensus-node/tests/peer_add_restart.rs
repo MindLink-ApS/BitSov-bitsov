@@ -270,3 +270,48 @@ async fn owner_added_peer_survives_restart_and_config_still_wins() {
     assert_eq!(peers[0]["label"], "Config contact");
     a.stop(pa).await;
 }
+
+#[tokio::test]
+async fn owner_console_lock_status_prints_unlocked_json() {
+    let node = Node::new();
+    let mut process = node.start(true);
+    let http = reqwest::Client::new();
+    node.ready(&mut process, &http, true).await;
+    let output = Command::new(env!("CARGO_BIN_EXE_konsensus"))
+        .args(["lock-status", "--config"])
+        .arg(&node.config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        status,
+        json!({
+            "state":"unlocked", "node_id":node.identity.node_id().to_hex(),
+            "fingerprint":konsensus_api::pairing::identity_fingerprint(&node.identity.node_id().to_hex()),
+            "locked_since":null, "attempts_left":null, "hosted_by":null
+        })
+    );
+    assert_eq!(
+        http.get(format!("http://{}/api/v1/node/lock", node.api))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    // The additive operation must leave existing console requests available.
+    assert!(matches!(
+        konsensus_api::control::send(
+            &node.dir.path().join("control.sock"),
+            &konsensus_api::control::ControlRequest::Status
+        )
+        .await
+        .unwrap(),
+        konsensus_api::control::ControlResponse::Status { .. }
+    ));
+}
