@@ -157,6 +157,11 @@ impl LockedState {
         self
     }
 
+    /// The locked status shared by HTTP and the owner-only control socket.
+    pub fn status(&self) -> serde_json::Value {
+        json!({"state": "locked", "node_id": self.node_id, "fingerprint": self.pairing.bound_fingerprint(), "locked_since": self.locked_since, "attempts_left": 20u32.saturating_sub(self.attempts.lock().unwrap_or_else(|e| e.into_inner()).total), "hosted_by": self.pairing.hosted_by()})
+    }
+
     fn client(&self, peer: Option<ConnectInfo<SocketAddr>>) -> Result<PairedClient, UnlockError> {
         let id = self
             .clients
@@ -211,9 +216,7 @@ async fn admit_local_or_tunnel(
     Ok(next.run(request).await)
 }
 async fn lock_status(State(state): State<Arc<LockedState>>) -> Json<serde_json::Value> {
-    Json(
-        json!({"state": "locked", "node_id": state.node_id, "fingerprint": state.pairing.bound_fingerprint(), "locked_since": state.locked_since, "attempts_left": 20u32.saturating_sub(state.attempts.lock().unwrap_or_else(|e| e.into_inner()).total), "hosted_by": state.pairing.hosted_by()}),
-    )
+    Json(state.status())
 }
 async fn challenge(
     State(state): State<Arc<LockedState>>,
