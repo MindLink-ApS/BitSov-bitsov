@@ -311,7 +311,7 @@ pub struct RelationIntentRequest {
     pub signature: String,
 }
 
-async fn relation_intent(
+pub(crate) async fn relation_intent(
     auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<RelationIntentRequest>,
@@ -329,6 +329,33 @@ async fn relation_intent(
         envelope_id: accepted.envelope_id,
         grant: accepted.grant,
     }))
+}
+
+/// Wrap the router's filters too, so extractor and provisional-session refusals
+/// are visible at info level. Never inspect or log either body or the query.
+pub(crate) async fn log_relation_intent_refusal(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    const PATH: &str = "/api/v1/pair/relation-intent";
+    let relation_intent = req.uri().path() == PATH;
+    let response = next.run(req).await;
+    if relation_intent {
+        log_relation_intent_status(PATH, response.status());
+    }
+    response
+}
+
+/// Also used by the outer tunnel-identity filter, which can reject before the
+/// router runs. The fixed path and status are the only inputs to the log.
+pub(crate) fn log_relation_intent_status(path: &str, status: axum::http::StatusCode) {
+    const PATH: &str = "/api/v1/pair/relation-intent";
+    if path == PATH && !status.is_success() {
+        // This endpoint's ApiError code is the numeric HTTP status; use the
+        // same code for middleware/extractor responses that have no JSON code.
+        let code = status.as_u16();
+        tracing::info!(path = PATH, status = code, code, "relation intent refused");
+    }
 }
 
 /// `POST /api/v1/pair/relation-intent` response: the client's relation grant.

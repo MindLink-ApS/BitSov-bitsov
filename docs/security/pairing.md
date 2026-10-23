@@ -236,8 +236,14 @@ the matching live Noise pairing and local-owner mode; issuance and delegation
 also require that device's P-256 signature. Tunnel delegation accepts only the
 claim-bound SAS v2 message. See the [owner-device contract](device-keys.md#adding-a-device-over-the-noise-tunnel).
 
+The tunnel also accepts `POST /pair/relation-intent` from a live paired client.
+It writes a contact budget only with a registered device key's signature bound
+to the node, client and key epoch, plus a fresh nonce. Provisional sessions remain
+blocked. Non-2xx responses log only the path, HTTP status and numeric code at info
+level; request/response bodies and signatures are never included in that log.
+
 Self-revocation (`DELETE /pair/device-keys/{key_id}`), pairing list/revoke/window/
-request/confirm, relation intents, first-contact-grant POST and identity replacement
+request/confirm, first-contact-grant POST and identity replacement
 requests remain absent on the tunnel. Console approval itself remains available
 only at `konsensus device approve`. Console enrollment requires
 `--owner-control` with a **typed** seed password; `--password-fd` disables owner device authority in that

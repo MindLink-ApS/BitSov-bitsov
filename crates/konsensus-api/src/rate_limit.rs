@@ -143,6 +143,10 @@ pub async fn remote_tunnel_identity(
             .cloned()
     });
     let Some(client) = client else {
+        crate::handlers::device_routes::log_relation_intent_status(
+            req.uri().path(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             "tunnel identity unavailable",

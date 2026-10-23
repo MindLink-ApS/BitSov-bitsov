@@ -219,7 +219,7 @@ use the bridge's loopback source address to mint an unbound local JWT. Apps
 obtain and present ordinary paired JWTs through `GET /api/v1/pair/challenge`
 and `POST /api/v1/pair/token`; `POST /api/v1/pair/rotate` remains available.
 
-It also exposes exactly these spend-request/read routes, using the same
+It also exposes these spend-request/read and signed-intent routes, using the same
 handlers and authorization as loopback:
 
 | Method | Path | Effect |
@@ -228,11 +228,14 @@ handlers and authorization as loopback:
 | GET | `/api/v1/pair/elevation/{op_id}` | Read only the caller's operation status; other clients' IDs return the same 404 as unknown IDs |
 | DELETE | `/api/v1/pair/elevation/{op_id}` | Cancel the caller's own pending request |
 | GET | `/api/v1/pair/grant` | Read the caller's own live grant, or `null` |
+| POST | `/api/v1/pair/relation-intent` | Write a contact budget with a registered device key's signature bound to the node, client and key epoch, plus a fresh nonce |
 
-All require `read`; asking, cancelling and reading a grant also require a live
-paired-client binding. No remote grant/approve handler is mounted, including
-first-contact grants, device-key management or relation intents. The owner
-still grants spend through `<data_dir>/control.sock`.
+All require `read`; asking, cancelling, reading a grant and submitting an intent
+also require a live paired-client binding. Provisional sessions cannot submit
+relation intents. `/pair/approve` and `POST /pair/first-contact-grant` remain
+absent remotely, as does device-key self-revocation. Console spend grants still
+require `<data_dir>/control.sock`. Non-2xx relation-intent responses log only the
+path, HTTP status and numeric code at info level, never bodies or signatures.
 
 A read-only pairing may obtain a first-contact price via
 `POST /api/v1/messages/first-contact/quote` before requesting spend. This remains

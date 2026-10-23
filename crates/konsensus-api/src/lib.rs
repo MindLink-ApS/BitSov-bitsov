@@ -259,6 +259,9 @@ fn build_router_with_options(
             }),
         )
         .layer(cors)
+        .layer(middleware::from_fn(
+            handlers::device_routes::log_relation_intent_refusal,
+        ))
         .with_state(state)
 }
 
