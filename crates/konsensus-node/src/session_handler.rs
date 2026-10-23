@@ -179,6 +179,10 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
     let mut last_negotiation: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
+    // Resends of an already-accepted SessionInit/SessionAck. Kept separate from
+    // `last_negotiation` so a replay cannot keep postponing a real rekey.
+    let mut last_control_replay: std::collections::HashMap<NodeId, tokio::time::Instant> =
+        std::collections::HashMap::new();
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
@@ -266,6 +270,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         handle_session_init(
                             &peer_id, init_data, &session_manager, &storage,
                             &transport, &audit_log, &mut last_negotiation,
+                            &mut last_control_replay,
                         ).await;
                     }
 
@@ -275,6 +280,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         }
                         handle_session_ack(
                             &peer_id, &session_manager, &transport, &audit_log,
+                            &mut last_control_replay,
                         ).await;
                     }
 
@@ -559,6 +565,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                 let now = tokio::time::Instant::now();
                 let before_neg = last_negotiation.len();
                 last_negotiation.retain(|_, ts| now.duration_since(*ts) < SESSION_NEGOTIATION_COOLDOWN * 6);
+                last_control_replay.retain(|_, ts| now.duration_since(*ts) < SESSION_NEGOTIATION_COOLDOWN * 6);
                 let before_pex = last_peer_exchange.len();
                 last_peer_exchange.retain(|_, ts| now.duration_since(*ts) < PEER_EXCHANGE_COOLDOWN * 6);
                 // Defense-in-depth: if maps still exceed cap after TTL eviction,
@@ -566,6 +573,10 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                 if last_negotiation.len() > MAX_COOLDOWN_ENTRIES {
                     warn!(len = last_negotiation.len(), cap = MAX_COOLDOWN_ENTRIES, "negotiation cooldown map exceeded cap, clearing");
                     last_negotiation.clear();
+                }
+                if last_control_replay.len() > MAX_COOLDOWN_ENTRIES {
+                    warn!(len = last_control_replay.len(), cap = MAX_COOLDOWN_ENTRIES, "control replay cooldown map exceeded cap, clearing");
+                    last_control_replay.clear();
                 }
                 if last_peer_exchange.len() > MAX_COOLDOWN_ENTRIES {
                     warn!(len = last_peer_exchange.len(), cap = MAX_COOLDOWN_ENTRIES, "peer exchange cooldown map exceeded cap, clearing");
@@ -812,6 +823,20 @@ async fn handle_prekey_offer(
     let _ = audit;
 }
 
+fn control_replay_ready(
+    peer_id: &NodeId,
+    last_control_replay: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
+) -> bool {
+    if let Some(last) = last_control_replay.get(peer_id) {
+        if last.elapsed() < SESSION_NEGOTIATION_COOLDOWN {
+            return false;
+        }
+    }
+    last_control_replay.insert(*peer_id, tokio::time::Instant::now());
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_init(
     peer_id: &NodeId,
     init_data: serde_json::Value,
@@ -820,8 +845,35 @@ async fn handle_session_init(
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
     last_negotiation: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
+    last_control_replay: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
 ) {
-    // Rate-limit session re-negotiation per peer.
+    let init: konsensus_crypto::SerializableSessionInit =
+        match serde_json::from_value(init_data).map_err(|_| konsensus_core::wire_json::DecodeError) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(peer = %peer_id, error = %e, "invalid session init data");
+                return;
+            }
+        };
+
+    // A retransmission of an init we already accepted must not refresh the
+    // negotiation cooldown, or a steady replay would postpone a real rekey.
+    if session_manager.is_repeat_session_init(peer_id, &init).await {
+        debug!(
+            peer = %peer_id,
+            "repeated SessionInit matches the accepted session; leaving it in place"
+        );
+        if control_replay_ready(peer_id, last_control_replay) {
+            let frame = Frame::SessionAck;
+            if let Err(e) = transport.send_frame(peer_id, &frame).await {
+                warn!(peer = %peer_id, error = %e, "failed to resend SessionAck");
+            }
+        }
+        return;
+    }
+
+    // Rate-limit a new session negotiation per peer. This returns before any
+    // session is removed, so a repeat inside the window cannot drop a live one.
     if let Some(last) = last_negotiation.get(peer_id) {
         if last.elapsed() < SESSION_NEGOTIATION_COOLDOWN {
             warn!(
@@ -833,21 +885,23 @@ async fn handle_session_init(
         }
     }
 
-    // If a session already exists, replace the stale one.
+    // A different init that names an already-consumed one-time prekey cannot
+    // derive the same secret. Keep the live session instead of replacing it.
     if session_manager.has_session(peer_id).await {
+        if let Some(opk_id) = init.one_time_prekey_id {
+            if !session_manager.one_time_prekey_available(opk_id).await {
+                debug!(
+                    peer = %peer_id,
+                    opk_id,
+                    "SessionInit names a consumed one-time prekey; keeping the existing session"
+                );
+                return;
+            }
+        }
         warn!(peer = %peer_id, "peer sent SessionInit but session exists — replacing stale session");
         session_manager.remove_session(peer_id).await;
         // Paid ciphertext remains queued until its recipient ACKs, even after a session reset.
     }
-
-    let init: konsensus_crypto::SerializableSessionInit =
-        match serde_json::from_value(init_data).map_err(|_| konsensus_core::wire_json::DecodeError) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(peer = %peer_id, error = %e, "invalid session init data");
-                return;
-            }
-        };
 
     match session_manager.accept_session(peer_id, &init).await {
         Ok(()) => {
@@ -874,7 +928,24 @@ async fn handle_session_ack(
     session_manager: &SessionManager,
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
+    last_control_replay: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
 ) {
+    if session_manager.session_ack_already_handled(peer_id).await {
+        debug!(
+            peer = %peer_id,
+            "repeated SessionAck; sending chain unchanged"
+        );
+        if control_replay_ready(peer_id, last_control_replay) {
+            if let Some(payload) = session_manager.cached_ratchet_init(peer_id).await {
+                let frame = Frame::RatchetInit { payload };
+                if let Err(e) = transport.send_frame(peer_id, &frame).await {
+                    warn!(peer = %peer_id, error = %e, "failed to resend RatchetInit");
+                }
+            }
+        }
+        return;
+    }
+
     info!(peer = %peer_id, "E2EE session established (initiator), sending ratchet init");
     audit.record(
         "e2ee_session_established",
@@ -886,6 +957,9 @@ async fn handle_session_ack(
     match session_manager.encrypt(peer_id, b"ratchet-init").await {
         Ok(ratchet_msg) => {
             let payload = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
+            session_manager
+                .note_sent_ratchet_init(peer_id, &payload)
+                .await;
             let frame = Frame::RatchetInit { payload };
             if let Err(e) = transport.send_frame(peer_id, &frame).await {
                 warn!(peer = %peer_id, error = %e, "failed to send RatchetInit");
@@ -908,22 +982,46 @@ async fn handle_ratchet_init(
     _storage: &Arc<dyn konsensus_storage::Storage>,
     transport: &Arc<NoiseTransport>,
 ) {
+    if session_manager
+        .is_repeat_ratchet_init(peer_id, payload)
+        .await
+    {
+        debug!(peer = %peer_id, "repeated RatchetInit; session unchanged");
+        return;
+    }
+
     match konsensus_crypto::ratchet_message_from_bytes(payload) {
         Ok(ratchet_msg) => {
             match session_manager.decrypt(peer_id, &ratchet_msg).await {
                 Ok(_) => {
+                    session_manager.note_ratchet_init(peer_id, payload).await;
                     info!(peer = %peer_id, "ratchet init received, bidirectional E2EE ready");
                 }
-                Err(e) => {
-                    warn!(
-                        peer = %peer_id, error = %e,
-                        "failed to decrypt ratchet init — removing broken session and re-negotiating"
+                Err(e) if !e.counts_toward_decrypt_budget() => {
+                    debug!(
+                        peer = %peer_id,
+                        error = %e,
+                        "repeated ratchet message ignored; session unchanged"
                     );
-                    session_manager.remove_session(peer_id).await;
-                    // Preserve paid envelopes across ratchet recovery; acceptance ACKs do not require decryption.
-                    // Send fresh PrekeyOffer to trigger re-negotiation
-                    if let Err(send_err) = send_prekey_offer(session_manager, transport, peer_id).await {
-                        warn!(peer = %peer_id, error = %send_err, "failed to send PrekeyOffer after ratchet init failure");
+                }
+                Err(e) => {
+                    if session_manager.record_decrypt_failure(peer_id).await {
+                        warn!(
+                            peer = %peer_id, error = %e,
+                            "ratchet init decryption failures exceeded the per-peer budget; removing session and re-offering prekeys"
+                        );
+                        session_manager.remove_session(peer_id).await;
+                        // Preserve paid envelopes across ratchet recovery; acceptance ACKs do not require decryption.
+                        if let Err(send_err) =
+                            send_prekey_offer(session_manager, transport, peer_id).await
+                        {
+                            warn!(peer = %peer_id, error = %send_err, "failed to send PrekeyOffer after ratchet init failure");
+                        }
+                    } else {
+                        warn!(
+                            peer = %peer_id, error = %e,
+                            "failed to decrypt ratchet init; keeping the existing session"
+                        );
                     }
                 }
             }
