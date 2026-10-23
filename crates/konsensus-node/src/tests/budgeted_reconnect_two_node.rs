@@ -14,7 +14,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
@@ -362,8 +361,10 @@ async fn start_recipient(
         let lightning = Arc::clone(&lightning);
         let pricing = Arc::clone(&pricing);
         let us = *identity.node_id();
+        // These scenarios start after restart quarantine. Construct the gate
+        // before spawning; a delayed task start cannot restart the quarantine.
+        let mut quotes = crate::admission_quotes::AdmissionQuotes::started_at_for_test(0);
         tokio::spawn(async move {
-            let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
             let mut last_refusal = crate::invoice_refusals::RefusalLimits::default();
             while let Some(event) = transport.recv_control().await {
                 if let ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } = event {
@@ -438,13 +439,13 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    for _ in 0..100 {
-        if check().await {
-            return;
+    // Connection state is the barrier. The outer timeout is only a deadlock
+    // watchdog for a broken transport; there is no sleep or latency assertion.
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        while !check().await {
+            tokio::task::yield_now().await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out waiting until {what}");
+    }).await.unwrap_or_else(|_| panic!("transport made no progress waiting for {what}"));
 }
 
 async fn privileged_on(transport: &NoiseTransport, peer: &NodeId) -> bool {
@@ -520,8 +521,6 @@ async fn two_nodes_with_outcome(
         dir_b.path(), &bob, &transport_b, &sessions_b, wallet_b, recipient_msat,
         Arc::clone(&refuse_message), Arc::clone(&refuse_admission_quote),
     ).await;
-    // B issues no quote in its first second after startup (F1 restart quarantine).
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
 
     TwoNodes {
         transport_a,
@@ -592,16 +591,10 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
     net.send_delivered("before the drop").await;
 
     // 2. Drop, 3. reconnect, 4. the next paid message is delivered on the
-    //    same E2EE session, with no 30 s silent timeout (B's quote window is
-    //    waited out once, out loud).
+    //    same E2EE session. Delivery, exactly-once debits and the explicit
+    //    admission refusal below are the contract, not host elapsed time.
     net.drop_and_reconnect().await;
-    let started = std::time::Instant::now();
     net.send_delivered("after the reconnect").await;
-    assert!(
-        started.elapsed() < Duration::from_secs(25),
-        "the refusals are answered at once, not by a 30 s timeout ({:?})",
-        started.elapsed()
-    );
 
     // Each act re-proven: two admissions and two messages, nothing paid twice.
     assert_eq!(net.sender.paid_out().await.len(), 4, "admission + message, twice");

@@ -491,10 +491,22 @@ async fn from_config_lnbits_lightning_provider() {
 async fn offline_fee_barrier_preserves_local_identity_and_storage() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
-    let expected = *KonsensusNode::from_config(config.clone(), None)
-        .await
-        .unwrap()
-        .node_id();
+    // Deriving the expected identity does not open a second node on the same
+    // STATE_GENERATION.lock. Only the node under test owns the state lease.
+    let mnemonic = std::fs::read_to_string(&config.identity.mnemonic_file).unwrap();
+    let expected = *NodeIdentity::from_mnemonic(mnemonic.trim(), &config.identity.passphrase)
+        .unwrap().node_id();
+    config.backup.scb_dir = dir.path().join("backups").to_string_lossy().into_owned();
+    // A private unavailable Esplora endpoint, rather than assuming port 1 is
+    // closed on every host. Binding before spawn makes readiness deterministic.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let unavailable = tokio::spawn(async move {
+        let app = axum::Router::new().fallback(|| async {
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        });
+        axum::serve(listener, app).await.unwrap();
+    });
     config.lightning = LightningConfig::Ldk {
         max_channel_capacity_sats: 1_000_000,
         max_total_channel_capacity_sats: 2_000_000,
@@ -506,8 +518,8 @@ async fn offline_fee_barrier_preserves_local_identity_and_storage() {
         lightning_wallet_sync_interval_secs: None,
         fee_rate_cache_update_interval_secs: None,
         liquidity: Default::default(),
-        network: "bitcoin".into(),
-        esplora_url: "http://127.0.0.1:1".into(),
+        network: "regtest".into(),
+        esplora_url: format!("http://{endpoint}"),
         esplora_url_fallback: None,
         credentials_file: None,
         rgs_url: None,
@@ -530,6 +542,8 @@ async fn offline_fee_barrier_preserves_local_identity_and_storage() {
         .unwrap_err();
     assert!(error.to_string().contains("not_ready"), "{error}");
     node.lightning().shutdown().await.unwrap();
+    unavailable.abort();
+    assert!(unavailable.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]

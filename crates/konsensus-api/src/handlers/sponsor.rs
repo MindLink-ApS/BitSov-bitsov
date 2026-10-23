@@ -355,18 +355,11 @@ fn load_observed(dir: &Path, wall_now: u64) -> Result<Ledger, ApiError> {
 async fn with_ledger<T>(state: &AppState, edit: impl FnOnce(&mut Ledger, u64) -> Result<T, ApiError>) -> Result<T, ApiError> {
     let _guard = LEDGER_LOCK.lock().await;
     let dir = ledger_dir(state)?;
-    let mut ledger = load_observed(&dir, now_unix()?)?;
+    let mut ledger = load_observed(&dir, state.introduction.clock.now()?)?;
     let now = ledger.last_observed_time;
     let out = edit(&mut ledger, now)?;
     save(&dir, &ledger)?;
     Ok(out)
-}
-
-fn now_unix() -> Result<u64, ApiError> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .map_err(|e| ApiError::Internal(format!("system clock before UNIX_EPOCH: {e}")))
 }
 
 fn network(state: &AppState) -> Result<String, ApiError> {
@@ -615,7 +608,7 @@ pub(crate) async fn approve_owner(
         // with its purse reservation. No await separates approval and claim.
         let _guard = LEDGER_LOCK.lock().await;
         let dir = ledger_dir(&state)?;
-        let mut ledger = load_observed(&dir, now_unix()?)?;
+        let mut ledger = load_observed(&dir, state.introduction.clock.now()?)?;
         let now = ledger.last_observed_time;
         let policy = &state.sponsor;
         if !policy.enabled {
@@ -858,7 +851,7 @@ pub struct StatusResponse {
 /// (newest first). Bolt11 strings are left out of this read.
 async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> Result<Json<StatusResponse>, ApiError> {
     let p = state.sponsor.clone();
-    let now = now_unix()?;
+    let now = state.introduction.clock.now()?;
     let _guard = LEDGER_LOCK.lock().await;
     let ledger = match ledger_dir(&state) {
         Ok(dir) => load_observed(&dir, now)?,
@@ -914,7 +907,7 @@ async fn request_funding(
     Json(body): Json<FundingAsk>,
 ) -> Result<Json<FundingAskResponse>, ApiError> {
     crate::error::require_money_ready(&state).await?;
-    let now = now_unix()?;
+    let now = state.introduction.clock.now()?;
     let net = network(&state)?;
     let (_, offer_text) = core::split_introduction_link(&body.link);
     let offer_text = offer_text.ok_or_else(|| invalid("this introduction offers no starter bitcoin"))?;

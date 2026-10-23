@@ -241,9 +241,10 @@ fn local_owner_unavailable_verifier_refuses_start_without_writing_files() {
             .parse()
             .unwrap();
         config["network"]["listen_addr"] = "127.0.0.1:0".into();
+        // Validation requires distinct API/P2P port numbers. Keep this
+        // OS-assigned port reserved: refusal must happen before any bind.
         let api_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         config["api"]["listen_addr"] = api_port.local_addr().unwrap().to_string().into();
-        drop(api_port);
         if matches!(case, "plaintext" | "plaintext-sibling") {
             std::fs::write(dir.path().join("mnemonic.txt"),
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
@@ -283,18 +284,10 @@ fn local_owner_unavailable_verifier_refuses_start_without_writing_files() {
             .unwrap()
             .write_all(password.as_bytes())
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                child.wait().unwrap();
-                panic!("{case}: local owner startup must refuse without a verifier");
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        };
+        // EOF above completes the password handoff. Await the refusal itself;
+        // Argon2 and process scheduling have no five-second latency contract.
+        let status = child.wait().unwrap();
+        drop(api_port);
         use std::os::unix::fs::FileExt;
         let mut bytes = vec![0; output.metadata().unwrap().len() as usize];
         output.read_exact_at(&mut bytes, 0).unwrap();

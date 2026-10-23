@@ -1,15 +1,18 @@
 //! K1 × G1: delegation cannot approve gifts. Owner-approved gifts use the
 //! sponsor purse; legacy grant-backed operations still reconcile after restart.
 use super::*;
-use konsensus_api::handlers::introduction::IntroductionSettings;
+use konsensus_api::handlers::introduction::{IntroductionSettings, UnixClock};
 use konsensus_api::handlers::sponsor::SponsorPolicy;
 use konsensus_lightning::shared_mock::SharedMockProvider;
 
 const GIFT: u64 = 20_000;
 const FEE: u64 = 1_000;
 
-fn intro(port: u16) -> IntroductionSettings {
-    IntroductionSettings::fixed(Some("regtest"), Some(&format!("127.0.0.1:{port}")))
+fn intro(port: u16, clock: UnixClock) -> IntroductionSettings {
+    IntroductionSettings {
+        clock,
+        ..IntroductionSettings::fixed(Some("regtest"), Some(&format!("127.0.0.1:{port}")))
+    }
 }
 
 /// The owner's node (sponsoring on) with a paired app holding `budget`, and a
@@ -17,9 +20,11 @@ fn intro(port: u16) -> IntroductionSettings {
 /// kit's candidate, frozen and ready for approval.
 async fn kit(budget: u64) -> (Fx, String, Value) {
     let mut fx = fixture().await;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let clock = UnixClock::new(move || Ok(now));
     fx.state = Arc::new(AppState {
         sponsor: SponsorPolicy::new(true, GIFT, FEE, 1_000_000, 2).unwrap(),
-        introduction: intro(9001),
+        introduction: intro(9001, clock.clone()),
         front_door: Default::default(),
         ..(*fx.state).clone()
     });
@@ -27,7 +32,7 @@ async fn kit(budget: u64) -> (Fx, String, Value) {
     let path = fx.tmp.path().join("newcomer-ln.db");
     let (_, identity) = konsensus_core::identity::NodeIdentity::generate().unwrap();
     let base = test_state_with_lightning(Arc::new(SharedMockProvider::new(&path, "newcomer", 0).unwrap()));
-    let newcomer = Arc::new(AppState { identity: Arc::new(identity), introduction: intro(9002),
+    let newcomer = Arc::new(AppState { identity: Arc::new(identity), introduction: intro(9002, clock),
         front_door: Default::default(), ..(*base).clone() });
     let newcomer_token = konsensus_api::auth::create_token(
         &newcomer.identity.node_id().to_hex(), &newcomer.jwt_secret, Scope::all()).unwrap();
@@ -167,14 +172,13 @@ async fn cancelled_owner_dispatch_retains_its_purse_reservation_for_restart() {
     let state = fx.state.clone();
     let request = approval(&cand);
     let token = auth_header(&fx.state).trim_start_matches("Bearer ").to_owned();
-    let pending = tokio::spawn(async move {
+    let mut pending = tokio::spawn(async move {
         call(&state, "POST", "/api/v1/sponsor/approve", Some(request), Some(&token)).await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while fx.wallet.waiting.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-    }).await.unwrap();
+    tokio::select! {
+        _ = fx.wallet.entered.notified() => {},
+        result = &mut pending => panic!("approval ended before dispatch barrier: {result:?}"),
+    }
     let ledger: Value = serde_json::from_slice(&std::fs::read(fx.state.data_dir.as_ref().unwrap().join("sponsor/kits.json")).unwrap()).unwrap();
     assert!(ledger["kits"][0]["grant_reservation"].is_null());
     assert_eq!(ledger["kits"][0]["reserved_msat"], GIFT + FEE);
