@@ -195,6 +195,11 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (30, "channel open operations", include_str!("../migrations/030_channel_open_operations.sql")),
     (31, "starter requests", include_str!("../migrations/031_starter_requests.sql")),
     (32, "starter queries", include_str!("../migrations/032_starter_queries.sql")),
+    (
+        33,
+        "calendar and schema parity",
+        include_str!("../migrations/033_calendar_and_schema_parity.sql"),
+    ),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -3444,6 +3449,10 @@ impl konsensus_core::gate::NonceStore for SqliteStorage {
 #[cfg(test)]
 #[path = "tests/sqlite.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/schema_parity.rs"]
+mod schema_parity_tests;
 
 #[cfg(test)]
 mod dbh2_guard {

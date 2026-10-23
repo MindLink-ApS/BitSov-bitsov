@@ -11,6 +11,8 @@ pub mod models;
 pub mod postgres;
 pub mod reactions;
 pub mod recovery;
+#[cfg(test)]
+mod schema_catalog;
 pub mod sqlite;
 pub mod traits;
 pub mod whitelist_backup;
