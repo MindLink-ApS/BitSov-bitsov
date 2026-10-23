@@ -92,12 +92,12 @@ impl PeerEndpointView {
 }
 
 /// Unix time source for introduction cards and sponsor authorization deadlines.
-/// Defaults to the real system clock; callers may inject a per-instance clock.
+/// Defaults to the real system clock; injection is restricted to test support.
 #[derive(Clone)]
-pub struct UnixClock(Arc<dyn Fn() -> Result<u64, ApiError> + Send + Sync>);
+pub(crate) struct UnixClock(Arc<dyn Fn() -> Result<u64, ApiError> + Send + Sync>);
 
 impl UnixClock {
-    pub fn new(clock: impl Fn() -> Result<u64, ApiError> + Send + Sync + 'static) -> Self {
+    fn new(clock: impl Fn() -> Result<u64, ApiError> + Send + Sync + 'static) -> Self {
         Self(Arc::new(clock))
     }
 
@@ -124,7 +124,7 @@ impl std::fmt::Debug for UnixClock {
 #[derive(Debug, Clone, Default)]
 pub struct IntroductionSettings {
     /// Shared time source for card and sponsor expiry checks.
-    pub clock: UnixClock,
+    pub(crate) clock: UnixClock,
     /// Bitcoin network the node's prices are payable on. `None` (a backend
     /// that does not state its network) means no introduction is offered.
     pub network: Option<String>,
@@ -138,6 +138,13 @@ pub struct IntroductionSettings {
 }
 
 impl IntroductionSettings {
+    /// Override time for deterministic integration tests. Never enabled by default.
+    #[cfg(feature = "test-support")]
+    pub fn with_test_clock(mut self, clock: impl Fn() -> Result<u64, ApiError> + Send + Sync + 'static) -> Self {
+        self.clock = UnixClock::new(clock);
+        self
+    }
+
     /// Settings with a fixed, explicit endpoint and no discovery.
     pub fn fixed(network: Option<&str>, endpoint: Option<&str>) -> Self {
         Self {

@@ -109,30 +109,34 @@ fn logs(file: &std::fs::File) -> String {
     file.read_exact_at(&mut bytes, 0).unwrap();
     String::from_utf8_lossy(&bytes).into_owned()
 }
-async fn ready(node: &mut Node, http: &reqwest::Client, base: &str, log: &std::fs::File) {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let mut listening = false;
-        for route in ["/livez", "/api/v1/health"] {
-            if let Ok(r) = http.get(format!("{base}{route}")).send().await {
-                if r.status().is_success() {
-                    listening = true;
-                    break;
+// The ceremony performs multiple 64 MiB Argon2 derivations in a debug build.
+// Allow CPU contention, but keep every request and readiness wait bounded.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+async fn ready(node: &mut Node, http: &reqwest::Client, base: &str, log: &std::fs::File, bootstrap: bool) {
+    let (route, field, expected) = if bootstrap {
+        ("/api/v1/bootstrap/state", "state", "bootstrap")
+    } else {
+        ("/api/v1/health", "status", "ok")
+    };
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            assert!(node.0.try_wait().unwrap().is_none(), "node exited: {}", logs(log));
+            if let Ok(response) = http.get(format!("{base}{route}"))
+                .timeout(Duration::from_secs(5)).send().await
+            {
+                if response.status().is_success() {
+                    if let Ok(body) = response.json::<Value>().await {
+                        if body[field] == expected {
+                            return;
+                        }
+                    }
                 }
             }
+            tokio::time::sleep(Duration::from_millis(40)).await;
         }
-        if listening {
-            break;
-        }
-        assert!(
-            node.0.try_wait().unwrap().is_none(),
-            "node exited: {}",
-            logs(log)
-        );
-        assert!(Instant::now() < deadline, "timeout: {}", logs(log));
-        tokio::time::sleep(Duration::from_millis(40)).await;
-    }
+    }).await.unwrap_or_else(|_| panic!("node did not become ready at {route}: {}", logs(log)));
 }
+
 async fn post(http: &reqwest::Client, base: &str, route: &str, token: &str, body: Value) -> Value {
     let response = http
         .post(format!("{base}/api/v1/{route}"))
@@ -140,7 +144,7 @@ async fn post(http: &reqwest::Client, base: &str, route: &str, token: &str, body
         .json(&body)
         .send()
         .await
-        .unwrap();
+        .unwrap_or_else(|error| panic!("POST {route} failed: {error}"));
     let status = response.status();
     let text = response.text().await.unwrap();
     assert!(status.is_success(), "{route}: {status} {text}");
@@ -223,11 +227,11 @@ async fn descriptor_bootstrap_restart_intent_and_no_secret_logs() {
     let (config, base) = configure(dir.path());
     let log = tempfile::tempfile().unwrap();
     let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(REQUEST_TIMEOUT)
         .build()
         .unwrap();
     let mut node = start(&config, &log, true, true);
-    ready(&mut node, &http, &base, &log).await;
+    ready(&mut node, &http, &base, &log, true).await;
     let (client, client_key, bst) = pair(&http, &base).await;
     let p = post(&http, &base, "identity/create-pending", &bst, json!({})).await;
     assert!(!dir.path().join("identity").exists());
@@ -277,7 +281,7 @@ async fn descriptor_bootstrap_restart_intent_and_no_secret_logs() {
     };
     for local in [true, false] {
         let mut node = start(&config, &log, local, true);
-        ready(&mut node, &http, &base, &log).await;
+        ready(&mut node, &http, &base, &log, false).await;
         let live_token = token(&http, &base, &client, &client_key).await;
         let dead = http
             .get(format!("{base}/api/v1/pair/device-keys"))
@@ -338,11 +342,11 @@ async fn legacy_create_restore_encrypt_with_password_and_keep_plaintext_without(
             let (config, base) = configure(dir.path());
             let log = tempfile::tempfile().unwrap();
             let http = reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
+                .timeout(REQUEST_TIMEOUT)
                 .build()
                 .unwrap();
             let mut node = start_source(&config, &log, false, source);
-            ready(&mut node, &http, &base, &log).await;
+            ready(&mut node, &http, &base, &log, true).await;
             let (_, _, token) = pair(&http, &base).await;
             let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
             let body = if restore {

@@ -60,7 +60,7 @@ fn legacy_blank_password_encrypted_files_remain_readable() {
         let salt = [7; SALT_LEN];
         let nonce = [9; NONCE_LEN];
         let key = derive_key(password.as_bytes(), &salt).unwrap();
-        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(key.as_slice()).unwrap();
         let ciphertext = cipher
             .encrypt(Nonce::from_slice(&nonce), mnemonic.as_bytes())
             .unwrap();
@@ -148,4 +148,17 @@ fn write_and_read_encrypted() {
     // Wrong password should fail
     let result = read_mnemonic(&final_path, Some("wrong"));
     assert!(result.is_err());
+}
+
+#[test]
+fn pre_zeroize_v1_fixture_still_decrypts() {
+    // Fixed bytes produced by the old dependencies, not encrypt_mnemonic.
+    // Pins KDF parameters, password whitespace, header layout and GCM tag.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mnemonic.enc");
+    std::fs::write(&path, include_bytes!("fixtures/mnemonic-v1.enc")).unwrap();
+    assert_eq!(
+        read_mnemonic(&path, Some("  legacy-fixture-password  ")).unwrap().as_str(),
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    );
 }

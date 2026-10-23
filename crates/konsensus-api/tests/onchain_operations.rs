@@ -306,7 +306,9 @@ async fn disconnected_client_does_not_cancel_outcome_recording() {
     // owners, including the detached writer, have finished. This also fires
     // if cancellation wrongly kills the writer, so that regression fails the
     // durable-row assertion below instead of polling forever.
-    dropped.notified().await;
+    tokio::time::timeout(std::time::Duration::from_secs(30), dropped.notified())
+        .await
+        .expect("wallet still retained 30s after disconnect; detached outcome writer or AppState owner did not finish");
     let db = Arc::new(SqliteStorage::open(dir.path().join("operations.db").to_str().unwrap())
         .await.unwrap());
     let operation = db.get_channel_open_operation(&format!("send-onchain:{ID}"))
