@@ -215,12 +215,12 @@ pub fn write_mnemonic(
         Some(pw) => {
             let enc_path = path.with_extension("enc");
             let encrypted = encrypt_mnemonic(mnemonic, pw)?;
-            (enc_path, encrypted)
+            (enc_path, Zeroizing::new(encrypted))
         }
-        None => (path.to_path_buf(), mnemonic.as_bytes().to_vec()),
+        None => (path.to_path_buf(), Zeroizing::new(mnemonic.as_bytes().to_vec())),
     };
 
-    std::fs::write(&final_path, &data)?;
+    std::fs::write(&final_path, data.as_slice())?;
 
     // Set file permissions to owner-only on Unix
     #[cfg(unix)]
