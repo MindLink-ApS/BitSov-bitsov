@@ -14,7 +14,7 @@ address as the selected `[lightning.liquidity]` provider with
 [starter]
 enabled = true
 hub_node_id = "<64-hex hub mesh identity>"
-hub_alias = "Signet starter" # optional operator display name
+hub_alias = "Signet starter" # optional operator display name, at most 128 UTF-8 bytes
 allow_mainnet = false
 ```
 
