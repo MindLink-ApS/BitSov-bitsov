@@ -14,7 +14,7 @@
 //! See `docs/operations/LOGGING.md` for audit retention and sharing guidance.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -27,12 +27,12 @@ use tracing::{debug, error, warn};
 
 /// The audit log — append-only, structured, tamper-evident.
 ///
-/// Thread-safe via `Mutex<BufWriter<File>>`. The file is opened in
+/// Thread-safe via `Mutex<File>`. The file is opened in
 /// append mode and flushed after every write to minimize data loss
 /// on crash.
 pub struct AuditLog {
     /// The underlying file writer.
-    writer: Mutex<BufWriter<File>>,
+    writer: Mutex<File>,
     /// Monotonic sequence number.
     seq: AtomicU64,
     /// Path for diagnostic messages.
@@ -40,6 +40,7 @@ pub struct AuditLog {
     /// Bounded in-memory membrane log (N2). Never written to this file.
     membrane: crate::membrane::Membrane,
     starter_activity: Mutex<starter::StarterActivity>,
+    starter_admission: tokio::sync::Mutex<()>,
 }
 
 /// A single audit log entry.
@@ -173,14 +174,13 @@ impl AuditLog {
             }
         }
 
-        let writer = BufWriter::new(file);
-
         Ok(Self {
-            writer: Mutex::new(writer),
+            writer: Mutex::new(file),
             seq: AtomicU64::new(last_seq + 1),
             path,
             membrane: crate::membrane::Membrane::default(),
             starter_activity: Mutex::new(starter_activity),
+            starter_admission: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -190,6 +190,10 @@ impl AuditLog {
     /// If the write fails, the error is logged via tracing but does not
     /// propagate (audit failures must not break the application).
     pub fn record(&self, event: &str, actor: &str, detail: Option<serde_json::Value>) {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| {
+            warn!("audit log mutex was poisoned, recovering");
+            e.into_inner()
+        });
         let entry = AuditEntry {
             seq: self.seq.fetch_add(1, Ordering::Relaxed),
             timestamp: Utc::now().to_rfc3339(),
@@ -200,10 +204,6 @@ impl AuditLog {
 
         match serde_json::to_string(&entry) {
             Ok(json) => {
-                let mut writer = self.writer.lock().unwrap_or_else(|e| {
-                    warn!("audit log mutex was poisoned, recovering");
-                    e.into_inner()
-                });
                 if let Err(e) = writeln!(writer, "{json}") {
                     error!(
                         error = %e,
@@ -340,5 +340,131 @@ mod tests {
             let entry: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(entry["seq"], i as u64 + 1);
         }
+    }
+
+    #[test]
+    fn concurrent_general_and_starter_sequences_follow_file_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let log = &log;
+                scope.spawn(move || {
+                    for n in 0..50 {
+                        if worker % 2 == 0 {
+                            log.record("test", "system", None);
+                        } else {
+                            log.starter_requested(&format!("{worker}-{n}"), "paired")
+                                .unwrap();
+                        }
+                    }
+                });
+            }
+        });
+        let contents = std::fs::read_to_string(log.path()).unwrap();
+        assert_eq!(contents.lines().count(), 400);
+        for (index, line) in contents.lines().enumerate() {
+            let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(entry["seq"], index + 1);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn durable_starter_write_does_not_block_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_log = log.clone();
+        let holder = std::thread::spawn(move || {
+            let _writer = blocked_log.writer.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        });
+        locked_rx.await.unwrap();
+        let writer = tokio::spawn(async move {
+            log.starter_requested_async("request", "paired")
+                .await
+                .unwrap();
+        });
+        // The write waits for the OS mutex, while this single runtime worker
+        // must remain available to release it. The timeout only breaks deadlock.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = release_tx.send(());
+        writer.await.unwrap();
+        assert!(
+            holder.join().unwrap(),
+            "audit write blocked the Tokio worker"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_admission_keeps_gate_until_blocking_conflict_finishes() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_log = log.clone();
+        let holder = std::thread::spawn(move || {
+            let _writer = blocked_log.writer.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        locked_rx.await.unwrap();
+        let first_log = log.clone();
+        let first = tokio::spawn(async move {
+            first_log
+                .starter_admitted(|log| async move {
+                    log.starter_conflict("reused-id", "old-device").await
+                })
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        // Confirm the blocking job is inside the activity lock, waiting on I/O.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while log.starter_activity.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+        let next_log = log.clone();
+        let next = tokio::spawn(async move {
+            next_log
+                .starter_admitted(|log| async move {
+                    entered_tx.send(()).unwrap();
+                    log.starter_requested_async("reused-id", "new-device").await
+                })
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        let overtook = tokio::time::timeout(Duration::from_millis(30), &mut entered_rx)
+            .await
+            .is_ok();
+        release_tx.send(()).unwrap();
+        next.await.unwrap();
+        holder.join().unwrap();
+        assert!(
+            !overtook,
+            "cancellation released admission before the blocking write finished"
+        );
+        assert_eq!(log.starter_pending(), vec!["reused-id"]);
+        let entries: Vec<serde_json::Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(entries[0]["event"], "starter.request_conflict");
+        assert_eq!(entries[1]["event"], "starter.requested");
+        assert_eq!(entries[1]["actor"], "new-device");
     }
 }
