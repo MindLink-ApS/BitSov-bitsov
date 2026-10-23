@@ -26,6 +26,13 @@ pub const ADMISSION_REQUIRED: &str = "konsensus:admission_required";
 /// too recently (the unpaid admission path has source and global limits).
 pub const ADMISSION_RATE_LIMITED: &str = "konsensus:admission_rate_limited";
 
+/// A paid peer asked for more service invoices than this node will issue or
+/// hold unpaid.
+pub const INVOICE_LIMITED: &str = "konsensus:invoice_limited";
+
+/// The node will not issue an invoice for this request.
+pub const INVOICE_UNAVAILABLE: &str = "konsensus:invoice_unavailable";
+
 /// Readiness refusals use the existing authenticated InvoiceError frame.
 pub const CHAIN_UNAVAILABLE: &str = "konsensus:not_ready:chain_unavailable";
 pub const NOT_SYNCED: &str = "konsensus:not_ready:not_synced";

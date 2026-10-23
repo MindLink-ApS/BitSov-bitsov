@@ -1304,10 +1304,12 @@ async fn invoice_requested_creates_invoice_on_local_wallet() {
         "req-inv-1",
         25_000,
         "konsensus message",
+        &admission_pricing(),
         &lightning,
         &transport,
         "127.0.0.1".parse().unwrap(),
         &mut crate::invoice_refusals::RefusalLimits::default(),
+        &mut crate::peer_invoices::PeerInvoiceBook::default(),
     )
     .await;
 
@@ -1357,10 +1359,12 @@ async fn invoice_requested_sends_error_on_lightning_failure() {
         "req-inv-fail",
         25_000,
         "konsensus message",
+        &admission_pricing(),
         &lightning,
         &transport,
         "127.0.0.1".parse().unwrap(),
         &mut crate::invoice_refusals::RefusalLimits::default(),
+        &mut crate::peer_invoices::PeerInvoiceBook::default(),
     )
     .await;
     // No panic = success
@@ -1375,19 +1379,19 @@ fn admission_pricing() -> Arc<dyn konsensus_core::traits::pricing::PricingEngine
 }
 
 #[tokio::test]
-async fn privileged_invoice_request_honours_caller_amount_unchanged() {
-    // Whitelist/promoted peers keep the exact pre-M1b behaviour: the caller's
-    // amount is honoured verbatim. Byte-identical to the legacy path.
+async fn privileged_invoice_amount_is_clamped_to_configured_price() {
     let peer_id = test_peer_id();
     let transport = make_gossip_test_transport();
     let lightning: Arc<dyn LightningProvider> =
         Arc::new(konsensus_lightning::MockLightningProvider::new());
     let pricing = admission_pricing();
+    let ceiling = configured_price_ceiling(pricing.as_ref()).await.unwrap();
+    let mut invoices = crate::peer_invoices::PeerInvoiceBook::default();
 
     handle_invoice_requested_gated(
         &peer_id,
-        "req-priv",
-        25_000,
+        "req-under",
+        ceiling - 1,
         "konsensus message",
         true,
         &pricing,
@@ -1400,18 +1404,250 @@ async fn privileged_invoice_request_honours_caller_amount_unchanged() {
         &konsensus_api::membrane::Membrane::with_capacity(8),
         &mut crate::invoice_refusals::RefusalLimits::default(),
         0,
+        &mut invoices,
+    )
+    .await;
+    handle_invoice_requested_gated(
+        &peer_id,
+        "req-over",
+        ceiling.saturating_mul(50),
+        "konsensus message",
+        true,
+        &pricing,
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &lightning,
+        &transport,
+        &test_peer_id(),
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &konsensus_api::membrane::Membrane::with_capacity(8),
+        &mut crate::invoice_refusals::RefusalLimits::default(),
+        0,
+        &mut invoices,
     )
     .await;
 
-    let payments = lightning.list_payments(10).await.unwrap();
-    assert_eq!(
-        payments.len(),
-        1,
-        "privileged request must create exactly one invoice"
+    let mut amounts: Vec<u64> = lightning
+        .list_payments(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|payment| payment.amount_msat)
+        .collect();
+    amounts.sort_unstable();
+    assert_eq!(amounts, vec![ceiling - 1, ceiling]);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn issue_privileged_invoice(
+    peer: &NodeId,
+    request_id: &str,
+    amount_msat: u64,
+    purpose: &str,
+    lightning: &Arc<dyn LightningProvider>,
+    transport: &Arc<NoiseTransport>,
+    pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
+    invoices: &mut crate::peer_invoices::PeerInvoiceBook,
+) {
+    handle_invoice_requested_gated(
+        peer,
+        request_id,
+        amount_msat,
+        purpose,
+        true,
+        pricing,
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        lightning,
+        transport,
+        &test_peer_id(),
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &konsensus_api::membrane::Membrane::with_capacity(8),
+        &mut crate::invoice_refusals::RefusalLimits::default(),
+        0,
+        invoices,
+    )
+    .await;
+}
+
+async fn pending_incoming_count(lightning: &Arc<dyn LightningProvider>) -> usize {
+    use konsensus_core::traits::lightning::{PaymentDirection, PaymentStatus};
+    lightning
+        .list_payments(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|payment| {
+            payment.status == PaymentStatus::Pending
+                && payment.direction == PaymentDirection::Incoming
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn privileged_invoice_flood_holds_peer_and_global_caps() {
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+    let mut invoices = crate::peer_invoices::PeerInvoiceBook::default();
+    let peer_cap = crate::peer_invoices::PEER_OUTSTANDING_CAP;
+    let global_cap = crate::peer_invoices::GLOBAL_OUTSTANDING_CAP;
+
+    for peer_byte in 1..=global_cap / peer_cap {
+        let peer_id = NodeId::from_bytes([u8::try_from(peer_byte).unwrap(); 32]);
+        for n in 0..(peer_cap + 2) {
+            issue_privileged_invoice(
+                &peer_id,
+                &format!("flood-{peer_byte}-{n}"),
+                1_000,
+                "konsensus message",
+                &lightning,
+                &transport,
+                &pricing,
+                &mut invoices,
+            )
+            .await;
+        }
+    }
+    assert_eq!(pending_incoming_count(&lightning).await, global_cap);
+
+    issue_privileged_invoice(
+        &NodeId::from_bytes([255u8; 32]),
+        "flood-extra",
+        1_000,
+        "konsensus message",
+        &lightning,
+        &transport,
+        &pricing,
+        &mut invoices,
+    )
+    .await;
+    assert_eq!(pending_incoming_count(&lightning).await, global_cap);
+}
+
+#[tokio::test]
+async fn expired_unpaid_peer_invoice_is_removed() {
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+    let mut invoices = crate::peer_invoices::PeerInvoiceBook::default();
+    issue_privileged_invoice(
+        &test_peer_id(),
+        "cleanup",
+        1_000,
+        "konsensus message",
+        &lightning,
+        &transport,
+        &pricing,
+        &mut invoices,
+    )
+    .await;
+    let created = lightning.list_payments(10).await.unwrap()[0].timestamp;
+    crate::peer_invoices::purge_expired_peer_invoices(
+        &mut invoices,
+        lightning.as_ref(),
+        created.saturating_add(30),
+    )
+    .await;
+    assert_eq!(pending_incoming_count(&lightning).await, 1);
+    crate::peer_invoices::purge_expired_peer_invoices(
+        &mut invoices,
+        lightning.as_ref(),
+        created.saturating_add(u64::from(crate::peer_invoices::INVOICE_EXPIRY_SECS)),
+    )
+    .await;
+    assert_eq!(pending_incoming_count(&lightning).await, 0);
+}
+
+#[tokio::test]
+async fn settled_peer_invoice_frees_its_slot_and_remains_in_the_wallet() {
+    use konsensus_core::traits::lightning::{PaymentDirection, PaymentStatus};
+    let transport = make_gossip_test_transport();
+    let mock = konsensus_lightning::MockLightningProvider::new();
+    let paid = mock
+        .create_invoice(
+            1_000,
+            "konsensus:paid",
+            crate::peer_invoices::INVOICE_EXPIRY_SECS,
+        )
+        .await
+        .unwrap();
+    let lightning: Arc<dyn LightningProvider> = Arc::new(mock);
+    let pricing = admission_pricing();
+    let mut invoices = crate::peer_invoices::PeerInvoiceBook::default();
+    let peer_id = test_peer_id();
+    invoices.commit(
+        peer_id,
+        paid.payment_hash.clone(),
+        paid.created_at
+            .saturating_add(u64::from(crate::peer_invoices::INVOICE_EXPIRY_SECS)),
     );
+    for n in 0..crate::peer_invoices::PEER_OUTSTANDING_CAP {
+        issue_privileged_invoice(
+            &peer_id,
+            &format!("slot-{n}"),
+            1_000,
+            "konsensus message",
+            &lightning,
+            &transport,
+            &pricing,
+            &mut invoices,
+        )
+        .await;
+    }
     assert_eq!(
-        payments[0].amount_msat, 25_000,
-        "caller amount honoured for privileged peer"
+        pending_incoming_count(&lightning).await,
+        crate::peer_invoices::PEER_OUTSTANDING_CAP
+    );
+    lightning.pay_invoice(&paid.bolt11).await.unwrap();
+    issue_privileged_invoice(
+        &peer_id,
+        "after-payment",
+        1_000,
+        "konsensus message",
+        &lightning,
+        &transport,
+        &pricing,
+        &mut invoices,
+    )
+    .await;
+    assert_eq!(
+        pending_incoming_count(&lightning).await,
+        crate::peer_invoices::PEER_OUTSTANDING_CAP
+    );
+    let settled = lightning
+        .get_payment_status(&paid.payment_hash)
+        .await
+        .unwrap();
+    assert_eq!(settled.status, PaymentStatus::Settled);
+    assert_eq!(settled.direction, PaymentDirection::Incoming);
+}
+
+#[tokio::test]
+async fn privileged_legacy_admission_requests_create_no_invoice() {
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+    let mut invoices = crate::peer_invoices::PeerInvoiceBook::default();
+    for purpose in ["konsensus:admission", "konsensus:admission:200"] {
+        issue_privileged_invoice(
+            &test_peer_id(),
+            "legacy",
+            50_000,
+            purpose,
+            &lightning,
+            &transport,
+            &pricing,
+            &mut invoices,
+        )
+        .await;
+    }
+    assert!(
+        lightning.list_payments(10).await.unwrap().is_empty(),
+        "legacy admission purposes must not mint a stored invoice"
     );
 }
 
@@ -1426,6 +1662,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
     let pricing = admission_pricing();
     let membrane = konsensus_api::membrane::Membrane::with_capacity(8);
     let mut last_refusal = crate::invoice_refusals::RefusalLimits::default();
+    let mut invoices = crate::peer_invoices::PeerInvoiceBook::default();
 
     handle_invoice_requested_gated(
         &peer_id,
@@ -1443,6 +1680,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
         &membrane,
         &mut last_refusal,
         0,
+        &mut invoices,
     )
     .await;
 
@@ -1482,6 +1720,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
             &membrane,
             &mut last_refusal,
             0,
+            &mut invoices,
         )
         .await;
     }
@@ -1689,6 +1928,7 @@ async fn stranger_cannot_quote_file_or_other_service_kinds() {
             &konsensus_api::membrane::Membrane::with_capacity(8),
             &mut crate::invoice_refusals::RefusalLimits::default(),
             0,
+            &mut crate::peer_invoices::PeerInvoiceBook::default(),
         )
         .await;
     }
@@ -1954,6 +2194,7 @@ async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
         &konsensus_api::membrane::Membrane::with_capacity(8),
         &mut crate::invoice_refusals::RefusalLimits::default(),
         0,
+        &mut crate::peer_invoices::PeerInvoiceBook::default(),
     )
     .await;
     let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control())
@@ -2013,6 +2254,7 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
         tokio::spawn(async move {
             let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
             let mut limits = crate::invoice_refusals::RefusalLimits::default();
+            let mut peer_invoices = crate::peer_invoices::PeerInvoiceBook::default();
             let mut max_handling_time = Duration::ZERO;
             while let Some(event) = target.recv_control().await {
                 if let ControlEvent::InvoiceRequested {
@@ -2043,6 +2285,7 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
                         &membrane,
                         &mut limits,
                         0,
+                        &mut peer_invoices,
                     )
                     .await;
                     max_handling_time = max_handling_time.max(started.elapsed());

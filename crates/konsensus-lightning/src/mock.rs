@@ -69,6 +69,8 @@ pub struct MockLightningProvider {
     balance_msat: Arc<Mutex<u64>>,
     /// Stored invoices/payments by payment hash.
     payments: Arc<Mutex<HashMap<String, PaymentDetails>>>,
+    /// Unix expiry of invoices created here, keyed by payment hash.
+    invoice_expiry: Arc<Mutex<HashMap<String, u64>>>,
     /// Broadcast sender for settled INBOUND payments surfaced by
     /// `watch_inbound_keysend`. Test code drives it via `inject_inbound_keysend`.
     inbound_tx: broadcast::Sender<InboundPayment>,
@@ -117,6 +119,7 @@ impl MockLightningProvider {
             routing_fee_msat: 0,
             balance_msat: Arc::new(Mutex::new(config.initial_balance_msat)),
             payments: Arc::new(Mutex::new(HashMap::new())),
+            invoice_expiry: Arc::new(Mutex::new(HashMap::new())),
             inbound_tx,
             sent_bindings: Arc::new(Mutex::new(Vec::new())),
             keysend_defer_polls: Arc::new(Mutex::new(None)),
@@ -302,6 +305,10 @@ impl LightningProvider for MockLightningProvider {
             .lock()
             .await
             .insert(payment_hash.clone(), details);
+        self.invoice_expiry.lock().await.insert(
+            payment_hash.clone(),
+            now.saturating_add(u64::from(expiry_secs)),
+        );
 
         // Balance is NOT credited yet — only credited when settled.
 
@@ -318,6 +325,50 @@ impl LightningProvider for MockLightningProvider {
             expiry_secs,
             created_at: now,
         })
+    }
+
+    async fn forget_pending_invoice(&self, payment_hash: &str) -> Result<bool, LightningError> {
+        let removed = {
+            let mut payments = self.payments.lock().await;
+            match payments.get(payment_hash) {
+                Some(details)
+                    if details.status == PaymentStatus::Pending
+                        && details.direction == PaymentDirection::Incoming =>
+                {
+                    payments.remove(payment_hash);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if removed {
+            self.invoice_expiry.lock().await.remove(payment_hash);
+        }
+        Ok(removed)
+    }
+
+    async fn purge_expired_pending_invoices(&self, now_unix: u64) -> Result<u32, LightningError> {
+        let expired: Vec<String> = self
+            .invoice_expiry
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, expires_at)| **expires_at <= now_unix)
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        let mut removed = 0u32;
+        for hash in expired {
+            if self.forget_pending_invoice(&hash).await? {
+                removed += 1;
+            } else {
+                self.invoice_expiry.lock().await.remove(&hash);
+            }
+        }
+        Ok(removed)
+    }
+
+    async fn pending_invoice_expiries(&self) -> Vec<(String, u64)> {
+        self.invoice_expiry.lock().await.iter().map(|(hash, expires_at)| (hash.clone(), *expires_at)).collect()
     }
 
     #[instrument(skip(self, bolt11))]

@@ -571,6 +571,33 @@ pub trait LightningProvider: Send + Sync {
         expiry_secs: u32,
     ) -> Result<Invoice, LightningError>;
 
+    /// Remove one invoice this node created, if it is still pending.
+    ///
+    /// Settled and unknown payments stay in the wallet. Backends that cannot
+    /// delete a pending invoice return `Ok(false)` rather than failing the
+    /// caller. Returns `Ok(true)` when a pending record was removed.
+    async fn forget_pending_invoice(&self, payment_hash: &str) -> Result<bool, LightningError> {
+        let _ = payment_hash;
+        Ok(false)
+    }
+
+    /// Remove pending invoices whose recorded expiry is at or before `now_unix`.
+    ///
+    /// Settled payments are left in place. The default is a no-op for backends
+    /// that do not track expiry locally.
+    async fn purge_expired_pending_invoices(&self, now_unix: u64) -> Result<u32, LightningError> {
+        let _ = now_unix;
+        Ok(0)
+    }
+
+    /// Pending invoices this backend can still expire, as `(payment_hash, expires_at_unix)`.
+    ///
+    /// The default is empty. Callers use it to keep counting invoices that
+    /// outlived a process restart. Settled payments are not included.
+    async fn pending_invoice_expiries(&self) -> Vec<(String, u64)> {
+        Vec::new()
+    }
+
     /// Issue a signed quote without retaining any pending invoice/payment record.
     /// Unsupported backends MUST NOT fall back to create_invoice.
     async fn create_stateless_invoice(

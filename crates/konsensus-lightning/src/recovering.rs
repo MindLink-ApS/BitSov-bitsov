@@ -325,6 +325,23 @@ impl LightningProvider for RecoveringLightning {
         p.create_invoice(amount_msat, description, expiry_secs)
             .await
     }
+    async fn forget_pending_invoice(&self, payment_hash: &str) -> Result<bool, LightningError> {
+        let p = self.backend()?;
+        p.forget_pending_invoice(payment_hash).await
+    }
+    async fn purge_expired_pending_invoices(&self, now_unix: u64) -> Result<u32, LightningError> {
+        let p = self.backend()?;
+        p.purge_expired_pending_invoices(now_unix).await
+    }
+    async fn pending_invoice_expiries(&self) -> Vec<(String, u64)> {
+        // Listing recorded expiries does not spend. Do it even while the
+        // backend is still synchronizing, so a restart still counts them.
+        let backend = self.state.read().unwrap().backend.clone();
+        match backend {
+            Some(backend) => backend.pending_invoice_expiries().await,
+            None => Vec::new(),
+        }
+    }
     async fn create_stateless_invoice(
         &self,
         amount_msat: u64,

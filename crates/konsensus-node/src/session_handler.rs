@@ -17,9 +17,12 @@ use ed25519_dalek::Verifier;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, info, warn};
 
+use konsensus_core::admission_quote;
 use konsensus_core::identity::NodeIdentity;
+use konsensus_core::kind::KindCategory;
 use konsensus_core::traits::chain::ChainProvider;
 use konsensus_core::traits::lightning::LightningProvider;
+use konsensus_core::traits::pricing::PricingEngine;
 use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::types::NodeId;
 use konsensus_crypto::SessionManager;
@@ -188,6 +191,17 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let mut exchange_quotes = std::collections::HashMap::<NodeId, tokio::time::Instant>::new();
     let exchange_nonces = konsensus_storage::StorageNonceAdapter::new(storage.clone());
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
+    let mut peer_invoices = crate::peer_invoices::PeerInvoiceBook::default();
+    let restarted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for (hash, expires_at) in lightning.pending_invoice_expiries().await {
+        let remaining = expires_at.saturating_sub(restarted_at);
+        if remaining > 0 && remaining <= u64::from(crate::peer_invoices::INVOICE_EXPIRY_SECS) {
+            peer_invoices.note_unattributed(hash, expires_at);
+        }
+    }
     let readiness_height = ReadinessHeightCache::new(chain.clone());
     // PSI-SPEED: bounds our prekey replies to a paid payee's offer. Separate
     // from the other two eager limiters on purpose; see `eager_offers` in the
@@ -204,6 +218,8 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let mut lightning_was_ready = lightning.money_ready().await;
     let mut session_self_heal_interval = tokio::time::interval(SESSION_SELF_HEAL_INTERVAL);
     session_self_heal_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut invoice_cleanup_interval = tokio::time::interval(crate::peer_invoices::CLEANUP_INTERVAL);
+    invoice_cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -378,6 +394,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             &peer_id, &request_id, amount_msat, &purpose, privileged,
                             &pricing, &readiness_height, &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
                             audit_log.membrane(), &mut last_admission_refusal, min_admission_cost_msat,
+                            &mut peer_invoices,
                         ).await;
                     }
 
@@ -580,6 +597,18 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         "pruned stale cooldown map entries"
                     );
                 }
+            }
+            _ = invoice_cleanup_interval.tick() => {
+                let now_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                crate::peer_invoices::purge_expired_peer_invoices(
+                    &mut peer_invoices,
+                    lightning.as_ref(),
+                    now_unix,
+                )
+                .await;
             }
             _ = session_self_heal_interval.tick() => {
                 refresh_recovered_lightning(
@@ -1277,7 +1306,9 @@ async fn handle_price_response_received(
 /// recipient-bound first-contact chat quote. Its amount comes from our pricing
 /// engine; the requester cannot choose a price or a different kind. All other
 /// invoice services require an already privileged connection. Legacy admission
-/// requests fail closed even on privileged connections.
+/// requests are refused even on a paid connection. Service invoices are capped
+/// per peer and for the node, cannot exceed this node's highest configured
+/// price, and expire quickly.
 #[allow(clippy::too_many_arguments)]
 async fn handle_invoice_requested_gated(
     peer_id: &NodeId,
@@ -1285,7 +1316,7 @@ async fn handle_invoice_requested_gated(
     amount_msat: u64,
     purpose: &str,
     privileged: bool,
-    pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
+    pricing: &Arc<dyn PricingEngine>,
     readiness_height: &ReadinessHeightCache,
     lightning: &Arc<dyn LightningProvider>,
     transport: &Arc<NoiseTransport>,
@@ -1295,8 +1326,8 @@ async fn handle_invoice_requested_gated(
     membrane: &konsensus_api::membrane::Membrane,
     last_admission_refusal: &mut crate::invoice_refusals::RefusalLimits,
     min_admission_cost_msat: u64,
+    invoices: &mut crate::peer_invoices::PeerInvoiceBook,
 ) {
-    use konsensus_core::admission_quote;
     if lightning.disk_status().is_some_and(|s| s.disk_low) {
         if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
             send_invoice_refusal(transport, peer_id, request_id, "disk_low").await;
@@ -1373,20 +1404,33 @@ async fn handle_invoice_requested_gated(
         }
         return;
     }
-    // Old arbitrary-kind/legacy admission requests fail closed, even if paid.
-    if privileged && !purpose.starts_with(ADMISSION_INVOICE_PURPOSE) {
-        handle_invoice_requested(
-            peer_id,
-            request_id,
-            amount_msat,
-            purpose,
-            lightning,
-            transport,
-            source_ip,
-            last_admission_refusal,
-        )
-        .await;
+    // Legacy admission purposes never mint a stored invoice, including after
+    // the peer has paid. The first-contact quote returned above.
+    if purpose.starts_with(ADMISSION_INVOICE_PURPOSE) {
+        if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
+            send_invoice_refusal(
+                transport,
+                peer_id,
+                request_id,
+                konsensus_api::invoice_refusal::INVOICE_UNAVAILABLE,
+            )
+            .await;
+        }
+        return;
     }
+    handle_invoice_requested(
+        peer_id,
+        request_id,
+        amount_msat,
+        purpose,
+        pricing,
+        lightning,
+        transport,
+        source_ip,
+        last_admission_refusal,
+        invoices,
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1395,18 +1439,66 @@ async fn handle_invoice_requested(
     request_id: &str,
     amount_msat: u64,
     purpose: &str,
+    pricing: &Arc<dyn PricingEngine>,
     lightning: &Arc<dyn LightningProvider>,
     transport: &Arc<NoiseTransport>,
     source_ip: std::net::IpAddr,
     refusals: &mut crate::invoice_refusals::RefusalLimits,
+    invoices: &mut crate::peer_invoices::PeerInvoiceBook,
 ) {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    crate::peer_invoices::purge_expired_peer_invoices(invoices, lightning.as_ref(), now_unix).await;
+    if let Err(limit) = invoices.try_issue(peer_id, std::time::Instant::now(), now_unix) {
+        debug!(peer = %peer_id, %request_id, ?limit, "refusing peer invoice request");
+        if refusals.permit(source_ip, tokio::time::Instant::now()) {
+            send_invoice_refusal(transport, peer_id, request_id, limit.reason()).await;
+        }
+        return;
+    }
+    let ceiling = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        configured_price_ceiling(pricing.as_ref()),
+    )
+    .await
+    {
+        Ok(Ok(ceiling)) => ceiling,
+        _ => {
+            if refusals.permit(source_ip, tokio::time::Instant::now()) {
+                send_invoice_refusal(transport, peer_id, request_id, "konsensus:price_unavailable").await;
+            }
+            return;
+        }
+    };
+    if amount_msat == 0 || ceiling == 0 {
+        if refusals.permit(source_ip, tokio::time::Instant::now()) {
+            send_invoice_refusal(
+                transport,
+                peer_id,
+                request_id,
+                konsensus_api::invoice_refusal::INVOICE_UNAVAILABLE,
+            )
+            .await;
+        }
+        return;
+    }
+    let amount_msat = amount_msat.min(ceiling);
     info!(
         peer = %peer_id, %request_id, amount_msat, %purpose,
         "peer requested invoice — creating on our wallet"
     );
     let description = format!("konsensus:{request_id}");
-    match lightning.create_invoice(amount_msat, &description, 3600).await {
+    match lightning
+        .create_invoice(amount_msat, &description, crate::peer_invoices::INVOICE_EXPIRY_SECS)
+        .await
+    {
         Ok(invoice) => {
+            let expires_at = invoice
+                .created_at
+                .saturating_add(u64::from(crate::peer_invoices::INVOICE_EXPIRY_SECS));
+            invoices.commit(*peer_id, invoice.payment_hash.clone(), expires_at);
             let response = Frame::InvoiceResponse {
                 request_id: request_id.to_string(),
                 bolt11: invoice.bolt11,
@@ -1432,6 +1524,43 @@ async fn handle_invoice_requested(
     }
 }
 
+/// Highest price this node will currently quote. A peer invoice cannot exceed it.
+async fn configured_price_ceiling(pricing: &dyn PricingEngine) -> Result<u64, &'static str> {
+    const CATEGORIES: [KindCategory; 9] = [
+        KindCategory::Communication,
+        KindCategory::StructuredData,
+        KindCategory::FilesMedia,
+        KindCategory::Collaboration,
+        KindCategory::RealTimeSignaling,
+        KindCategory::WebContent,
+        KindCategory::Storage,
+        KindCategory::Control,
+        KindCategory::AppExtension,
+    ];
+    const OVERRIDES: [u16; 2] = [
+        konsensus_core::kind::KIND_LONGFORM,
+        konsensus_core::kind::KIND_CALL_INVITE,
+    ];
+    let mut ceiling = 0u64;
+    let mut priced = false;
+    for category in CATEGORIES {
+        if let Ok(price) = pricing.get_category_price_msat(category).await {
+            priced = true;
+            ceiling = ceiling.max(price);
+        }
+    }
+    for kind in OVERRIDES {
+        if let Ok(price) = pricing.get_price_msat(kind).await {
+            priced = true;
+            ceiling = ceiling.max(price);
+        }
+    }
+    if !priced || ceiling == 0 {
+        return Err("konsensus:price_unavailable");
+    }
+    Ok(ceiling)
+}
+
 fn invoice_error_frame(
     request_id: &str,
     error: konsensus_core::traits::lightning::LightningError,
@@ -1451,7 +1580,7 @@ fn invoice_refusal_reason(error: konsensus_core::traits::lightning::LightningErr
         LightningError::StatelessQuoteUnsupported => "stateless_quote_unsupported",
         LightningError::PaymentNotDispatched(reason) if reason == "disk_low" => "disk_low",
         LightningError::ChainSourceUnavailable { .. } => CHAIN_UNAVAILABLE,
-        _ => "konsensus:invoice_unavailable",
+        _ => konsensus_api::invoice_refusal::INVOICE_UNAVAILABLE,
     }
 }
 

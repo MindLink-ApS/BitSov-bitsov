@@ -373,12 +373,14 @@ async fn start_recipient(
         tokio::spawn(async move {
             let mut last_refusal = crate::invoice_refusals::RefusalLimits::default();
             let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
+            let mut peer_invoices = crate::peer_invoices::PeerInvoiceBook::default();
             while let Some(event) = transport.recv_control().await {
                 if let ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose, privileged, source_ip } = event {
                     let privileged = privileged && !refuse_once.swap(false, std::sync::atomic::Ordering::AcqRel);
                     handle_invoice_requested_gated(
                         &peer_id, &request_id, amount_msat, &purpose, privileged,
                         &pricing, &super::ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &lightning, &transport, &recipient, source_ip, &mut quotes, audit.membrane(), &mut last_refusal, 0,
+                        &mut peer_invoices,
                     )
                     .await;
                 }
