@@ -70,8 +70,10 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 # Cryptography
 ed25519-dalek = { version = "2.1", features = ["serde", "rand_core", "zeroize"] }
 x25519-dalek = { version = "2.0", features = ["serde", "static_secrets", "zeroize"] }
-aes-gcm = "0.10"
-argon2 = "0.5"
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+# aes-gcm 0.10's zeroize feature does not forward to the AES key schedule.
+aes = { version = "0.8", features = ["zeroize"] }
+argon2 = { version = "0.5", features = ["zeroize"] }
 snow = "0.9"
 rand = "0.8"
 sha2 = "0.10"

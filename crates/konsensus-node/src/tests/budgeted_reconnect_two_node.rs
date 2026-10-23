@@ -591,10 +591,15 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
     net.send_delivered("before the drop").await;
 
     // 2. Drop, 3. reconnect, 4. the next paid message is delivered on the
-    //    same E2EE session. Delivery, exactly-once debits and the explicit
-    //    admission refusal below are the contract, not host elapsed time.
+    //    same E2EE session. Start the latency guard only after reconnect is
+    //    observed on both sides: setup and reconnect scheduling are excluded.
     net.drop_and_reconnect().await;
-    net.send_delivered("after the reconnect").await;
+    // The old silent invoice timeout was 30s. Give a loopback/mock send 28s
+    // under CPU load, while still rejecting a silent timeout followed by retry.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(28),
+        net.send_delivered("after the reconnect"),
+    ).await.expect("reconnected send exceeded 28s; possible silent 30s invoice timeout");
 
     // Each act re-proven: two admissions and two messages, nothing paid twice.
     assert_eq!(net.sender.paid_out().await.len(), 4, "admission + message, twice");

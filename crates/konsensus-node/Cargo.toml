@@ -56,6 +56,8 @@ blake3.workspace = true
 ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
 aes-gcm.workspace = true
+# Unify aes-gcm's AES backend with round-key wiping enabled.
+aes.workspace = true
 argon2.workspace = true
 uuid.workspace = true
 thiserror.workspace = true

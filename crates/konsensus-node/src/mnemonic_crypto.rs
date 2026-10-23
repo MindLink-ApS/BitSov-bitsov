@@ -66,14 +66,18 @@ pub enum MnemonicCryptoError {
 /// - Memory: 64 MiB (runs on a $5/month VPS)
 /// - Iterations: 3
 /// - Parallelism: 1
-fn derive_key(password: &[u8], salt: &[u8]) -> Result<[u8; 32], MnemonicCryptoError> {
+fn derive_key(password: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, MnemonicCryptoError> {
     let params = argon2::Params::new(64 * 1024, 3, 1, Some(32))
         .map_err(|e| MnemonicCryptoError::KeyDerivation(e.to_string()))?;
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
+    // Argon2 0.5's zeroize feature wipes internal temporaries and implements
+    // Zeroize for Block, but its allocating helper does not wipe the working
+    // buffer. Own it here so all 64 MiB are wiped on success and error paths.
+    let mut memory = Zeroizing::new(vec![argon2::Block::default(); argon2.params().block_count()]);
     argon2
-        .hash_password_into(password, salt, &mut key)
+        .hash_password_into_with_memory(password, salt, key.as_mut(), memory.as_mut_slice())
         .map_err(|e| MnemonicCryptoError::KeyDerivation(e.to_string()))?;
     Ok(key)
 }
@@ -86,7 +90,7 @@ pub fn owner_secret(password: &str, node_id_hex: &str) -> Result<zeroize::Zeroiz
         blake3::hash(b"bitsov-owner-approval-salt-v1").as_bytes(),
         node_id_hex.as_bytes(),
     );
-    Ok(zeroize::Zeroizing::new(derive_key(password.as_bytes(), &salt.as_bytes()[..16])?))
+    derive_key(password.as_bytes(), &salt.as_bytes()[..16])
 }
 
 /// Validate only new encryption passwords; legacy decryption stays permissive.
@@ -109,7 +113,7 @@ pub fn encrypt_mnemonic(mnemonic: &str, password: &str) -> Result<Vec<u8>, Mnemo
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
 
     let key = derive_key(password.as_bytes(), &salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&key)
+    let cipher = Aes256Gcm::new_from_slice(key.as_slice())
         .map_err(|e| MnemonicCryptoError::Encryption(e.to_string()))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
@@ -151,7 +155,7 @@ pub fn decrypt_mnemonic(
     let ciphertext = &encrypted[HEADER_LEN..];
 
     let key = derive_key(password.as_bytes(), salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&key)
+    let cipher = Aes256Gcm::new_from_slice(key.as_slice())
         .map_err(|e| MnemonicCryptoError::Encryption(e.to_string()))?;
     let nonce = Nonce::from_slice(nonce_bytes);
 
