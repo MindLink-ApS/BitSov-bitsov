@@ -4,6 +4,7 @@ use super::{AuditEntry, AuditLog};
 use konsensus_storage::starter_request::StarterRequest;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::sync::Arc;
 
 #[derive(Default)]
 pub(super) struct StarterActivity {
@@ -22,7 +23,13 @@ impl StarterActivity {
         match event {
             "starter.requested" => {
                 self.outcomes.retain(|(request_id, _)| request_id != id);
-                self.actors.entry(id.into()).or_insert_with(|| actor.into());
+                // Replays emit no new intent. A new requested event may reuse
+                // an orphan UUID after pruning, with a new initiating device.
+                self.actors.insert(id.into(), actor.into());
+            }
+            "starter.request_conflict" => {
+                self.actors.remove(id);
+                self.outcomes.retain(|(request_id, _)| request_id != id);
             }
             "starter.ready" | "starter.refused" => {
                 self.outcomes.insert((id.into(), event.into()));
@@ -32,6 +39,127 @@ impl StarterActivity {
     }
 }
 impl AuditLog {
+    /// Load attribution off the runtime and discard orphan intents before use.
+    pub async fn open_with_starter_storage(
+        path: impl AsRef<std::path::Path>,
+        storage: Arc<dyn konsensus_storage::Storage>,
+    ) -> std::io::Result<Arc<Self>> {
+        let path = path.as_ref().to_owned();
+        let log = Arc::new(
+            tokio::task::spawn_blocking(move || Self::open(path))
+                .await
+                .map_err(std::io::Error::other)??,
+        );
+        log.starter_reconcile(storage).await?;
+        Ok(log)
+    }
+
+    /// Serialize the complete intent/row transition and orphan pruning.
+    pub async fn starter_admitted<T, F, Fut>(self: &Arc<Self>, operation: F) -> std::io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+    {
+        let log = Arc::clone(self);
+        // Dropping an HTTP/worker future must not release admission while its
+        // blocking audit job or database commit can still complete later.
+        tokio::spawn(async move {
+            let _admission = log.starter_admission.lock().await;
+            operation(Arc::clone(&log)).await
+        })
+        .await
+        .map_err(std::io::Error::other)
+    }
+
+    // All std mutexes are acquired inside the blocking job, never carried
+    // across spawn_blocking or its await. Completion includes flush + fsync.
+    async fn starter_blocking<T: Send + 'static>(
+        self: &Arc<Self>,
+        write: impl FnOnce(&Self) -> std::io::Result<T> + Send + 'static,
+    ) -> std::io::Result<T> {
+        let log = Arc::clone(self);
+        tokio::task::spawn_blocking(move || write(&log))
+            .await
+            .map_err(std::io::Error::other)?
+    }
+
+    pub async fn starter_requested_async(
+        self: &Arc<Self>,
+        id: &str,
+        client_id: &str,
+    ) -> std::io::Result<()> {
+        let (id, client_id) = (id.to_owned(), client_id.to_owned());
+        self.starter_blocking(move |log| log.starter_requested(&id, &client_id))
+            .await
+    }
+
+    pub async fn starter_progress_async(
+        self: &Arc<Self>,
+        row: &StarterRequest,
+    ) -> std::io::Result<()> {
+        let row = row.clone();
+        self.starter_blocking(move |log| log.starter_progress(&row))
+            .await
+    }
+
+    /// Conflicts are durable events, but never pending request intents.
+    pub async fn starter_conflict(
+        self: &Arc<Self>,
+        id: &str,
+        client_id: &str,
+    ) -> std::io::Result<()> {
+        let (id, client_id) = (id.to_owned(), client_id.to_owned());
+        self.starter_blocking(move |log| {
+            let mut activity = log.starter_activity.lock().unwrap_or_else(|e| e.into_inner());
+            let result = log.starter_record("starter.request_conflict", &client_id, serde_json::json!({
+                "request_id": id, "paired_device_id": client_id, "reason": "starter_already_requested"
+            }));
+            // Also discard an intent if storage's final transaction lost a race
+            // with another process after the local admission check.
+            activity.actors.remove(&id);
+            activity.outcomes.retain(|(request_id, _)| request_id != &id);
+            result
+        }).await
+    }
+
+    /// Repair committed outcomes and forget old intents with no durable row.
+    /// Run at startup before serving requests, and on every worker sweep.
+    pub async fn starter_reconcile(
+        self: &Arc<Self>,
+        storage: Arc<dyn konsensus_storage::Storage>,
+    ) -> std::io::Result<()> {
+        self.starter_admitted(move |log| async move {
+            for id in log
+                .starter_blocking(|log| Ok(log.starter_pending()))
+                .await?
+            {
+                if let Some(row) = storage
+                    .starter_request_get(&id)
+                    .await
+                    .map_err(std::io::Error::other)?
+                {
+                    log.starter_progress_async(&row).await?;
+                } else {
+                    log.starter_blocking(move |log| {
+                        let mut activity = log
+                            .starter_activity
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        activity.actors.remove(&id);
+                        activity
+                            .outcomes
+                            .retain(|(request_id, _)| request_id != &id);
+                        Ok(())
+                    })
+                    .await?;
+                }
+            }
+            Ok(())
+        })
+        .await?
+    }
+
     // Unlike best-effort general audit events, starter attribution must be
     // durable before dispatch. The caller holds starter_activity across this
     // write, so concurrent replays cannot replace the initiating device.
@@ -41,6 +169,8 @@ impl AuditLog {
         actor: &str,
         detail: serde_json::Value,
     ) -> std::io::Result<()> {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let sync_file = writer.try_clone()?;
         let entry = AuditEntry {
             seq: self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -49,10 +179,13 @@ impl AuditLog {
             detail: Some(detail),
         };
         let json = serde_json::to_string(&entry)?;
-        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         writeln!(writer, "{json}")?;
         writer.flush()?;
-        writer.get_ref().sync_data()
+        // General audit events can be emitted from a Tokio worker. Release
+        // their writer lock before the slow sync, but still await durability
+        // before allowing the request row to be committed.
+        drop(writer);
+        sync_file.sync_data()
     }
 
     /// Record the first paired request intent before creating its operation.

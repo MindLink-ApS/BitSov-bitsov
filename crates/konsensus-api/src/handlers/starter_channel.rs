@@ -23,12 +23,19 @@ use uuid::Uuid;
 pub struct StarterConfig {
     pub enabled: bool,
     pub hub_node_id: String,
-    /// Operator-configured display name only; never used for routing.
+    /// Operator-configured display name only, at most 128 UTF-8 bytes; never used for routing.
     pub hub_alias: Option<String>,
     pub allow_mainnet: bool,
 }
 impl StarterConfig {
     pub fn validate(&self, network: Option<&str>, ldk: bool) -> Result<(), String> {
+        if self
+            .hub_alias
+            .as_ref()
+            .is_some_and(|alias| alias.len() > 128)
+        {
+            return Err("starter.hub_alias must be at most 128 bytes".into());
+        }
         if self.allow_mainnet {
             return Err("starter_mainnet_not_approved".into());
         }
@@ -150,6 +157,25 @@ async fn create(
         Ok(id) if id.get_version_num() == 4 => id.to_string(),
         _ => return Ok(error(StatusCode::BAD_REQUEST, "invalid_request_id")),
     };
+    let client_id = auth
+        .pairing
+        .as_ref()
+        .expect("checked pairing")
+        .client_id
+        .clone();
+    state
+        .audit_log
+        .clone()
+        .starter_admitted(move |_| create_admitted(state, id, client_id))
+        .await
+        .map_err(|e| ApiError::Storage(format!("starter admission: {e}")))?
+}
+
+async fn create_admitted(
+    state: Arc<AppState>,
+    id: String,
+    client_id: String,
+) -> Result<Response, ApiError> {
     // A persisted request is never described as not dispatched, including when
     // disabled/offline after a restart. The immutable config binding still holds.
     if let Some(r) = state
@@ -195,12 +221,19 @@ async fn create(
     if state.lightning.disk_status().is_some_and(|d| d.disk_low) {
         return Err(ApiError::NotDispatched("disk_low".into()));
     }
+    if let Some(current) = state
+        .storage
+        .starter_request_current()
+        .await
+        .map_err(|e| ApiError::Storage(e.to_string()))?
+        .filter(|row| row.state != "refused")
+    {
+        return conflict(&state, &id, &client_id, &current).await;
+    }
     state
         .audit_log
-        .starter_requested(
-            &id,
-            &auth.pairing.as_ref().expect("checked pairing").client_id,
-        )
+        .starter_requested_async(&id, &client_id)
+        .await
         .map_err(|e| ApiError::Storage(format!("starter audit: {e}")))?;
     let row = StarterRequest::new(
         id.clone(),
@@ -215,9 +248,7 @@ async fn create(
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
     if stored.request_id != id {
-        state.audit_log.record("starter.request_conflict", &auth.pairing.as_ref().expect("checked pairing").client_id,
-            Some(serde_json::json!({"request_id":id,"paired_device_id":auth.pairing.as_ref().expect("checked pairing").client_id,"reason":"starter_already_requested"})));
-        return Ok((StatusCode::CONFLICT,Json(serde_json::json!({"error":"starter_already_requested","code":"starter_already_requested","request_id":stored.root_id(),"state":stored.state,"retry_allowed":false}))).into_response());
+        return conflict(&state, &id, &client_id, &stored).await;
     }
     Ok(render(
         &state.starter,
@@ -229,6 +260,19 @@ async fn create(
             StatusCode::OK
         },
     ))
+}
+async fn conflict(
+    state: &AppState,
+    id: &str,
+    client_id: &str,
+    stored: &StarterRequest,
+) -> Result<Response, ApiError> {
+    state
+        .audit_log
+        .starter_conflict(id, client_id)
+        .await
+        .map_err(|e| ApiError::Storage(format!("starter audit: {e}")))?;
+    Ok((StatusCode::CONFLICT, Json(serde_json::json!({"error":"starter_already_requested","code":"starter_already_requested","request_id":stored.root_id(),"state":stored.state,"retry_allowed":false}))).into_response())
 }
 async fn status(
     _auth: ScopedAuth<Read>,

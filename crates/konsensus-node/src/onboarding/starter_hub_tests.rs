@@ -1561,3 +1561,17 @@ async fn throttled_adoption_is_read_only_and_bound_to_both_noise_peer_and_ln_key
     assert_eq!(backend.channel_reads.load(Ordering::SeqCst), 1);
     assert_eq!(hub.storage.starter_grants().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn newcomer_prunes_missing_audit_requests_on_reconcile() {
+    let (hub, _, peer) = setup(3).await;
+    let (client, _, _) = newcomer_fixture(&hub, peer).await;
+    let id = Uuid::new_v4().to_string();
+    client
+        .audit_log
+        .starter_requested(&id, "orphan-device")
+        .unwrap();
+    assert_eq!(client.audit_log.starter_pending(), vec![id]);
+    client.poll(100, false).await.unwrap();
+    assert!(client.audit_log.starter_pending().is_empty());
+}

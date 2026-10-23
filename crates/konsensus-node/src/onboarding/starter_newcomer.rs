@@ -44,7 +44,7 @@ impl StarterNewcomer {
         self.storage.starter_request_save(r).await?;
         // Terminal storage updates are monotonic; audit the persisted winner.
         if let Some(stored) = self.storage.starter_request_get(&r.request_id).await? {
-            self.audit_log.starter_progress(&stored)?;
+            self.audit_log.starter_progress_async(&stored).await?;
         }
         Ok(())
     }
@@ -85,7 +85,7 @@ impl StarterNewcomer {
         }
         // Adoption may have revived this UUID just before a crash. Journal its
         // nonterminal lifecycle before a queued status can make it terminal again.
-        self.audit_log.starter_progress(&r)?;
+        self.audit_log.starter_progress_async(&r).await?;
         if !matches!(state.as_str(), "received" | "opening" | "ready" | "refused") {
             return Ok(());
         }
@@ -170,8 +170,14 @@ impl StarterNewcomer {
         );
         adopted.detail = Some("adopted".into());
         adopted.original_request_id = (original != r.root_id()).then(|| r.root_id().to_owned());
-        let stored = self.storage.starter_request_adopt(&adopted).await?;
-        self.audit_log.starter_progress(&stored)?;
+        let storage = self.storage.clone();
+        self.audit_log
+            .starter_admitted(move |log| async move {
+                let stored = storage.starter_request_adopt(&adopted).await?;
+                log.starter_progress_async(&stored).await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
         Ok(())
     }
     async fn reconcile(&self, mut r: StarterRequest, now: i64) -> anyhow::Result<StarterRequest> {
@@ -231,11 +237,9 @@ impl StarterNewcomer {
     pub async fn poll(&self, now: i64, connected: bool) -> anyhow::Result<Option<Frame>> {
         // A later owner request may have replaced the current row after a crash.
         // Repair all pending audit intents, not only the current operation.
-        for id in self.audit_log.starter_pending() {
-            if let Some(row) = self.storage.starter_request_get(&id).await? {
-                self.audit_log.starter_progress(&row)?;
-            }
-        }
+        self.audit_log
+            .starter_reconcile(self.storage.clone())
+            .await?;
         if !self.enabled() {
             return Ok(None);
         }
@@ -246,7 +250,7 @@ impl StarterNewcomer {
             return Ok(None);
         }
         // Repair an outcome saved just before a crash/audit failure, before retry.
-        self.audit_log.starter_progress(&r)?;
+        self.audit_log.starter_progress_async(&r).await?;
         if r.state == "refused" && r.reason.as_deref() == Some("already_served") {
             if let Some(original) = r.detail.as_deref().and_then(|v| v.strip_prefix("adopt:")) {
                 if let Ok(id) = original.parse::<uuid::Uuid>() {
@@ -258,11 +262,16 @@ impl StarterNewcomer {
             return Ok(None);
         }
         if r.state == "refused" && r.retry_allowed {
+            let storage = self.storage.clone();
+            let id = r.request_id.clone();
             r = self
-                .storage
-                .starter_request_retry(&r.request_id, now)
-                .await?;
-            self.audit_log.starter_progress(&r)?;
+                .audit_log
+                .starter_admitted(move |log| async move {
+                    let row = storage.starter_request_retry(&id, now).await?;
+                    log.starter_progress_async(&row).await?;
+                    Ok::<_, anyhow::Error>(row)
+                })
+                .await??;
         }
         if r.terminal() {
             return Ok(None);

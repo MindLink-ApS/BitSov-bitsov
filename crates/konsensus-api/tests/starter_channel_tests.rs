@@ -235,6 +235,22 @@ async fn paired_create_replay_conflict_and_changed_hub_are_durable() {
             .status(),
         StatusCode::CONFLICT
     );
+    assert!(!state
+        .audit_log
+        .starter_pending()
+        .contains(&conflicting_id.to_string()));
+    let conflict_entries: Vec<serde_json::Value> = std::fs::read_to_string(state.audit_log.path())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|e: &serde_json::Value| e["detail"]["request_id"] == conflicting_id.to_string())
+        .collect();
+    assert_eq!(conflict_entries.len(), 1);
+    assert_eq!(conflict_entries[0]["event"], "starter.request_conflict");
+    let reopened = konsensus_api::AuditLog::open(state.audit_log.path()).unwrap();
+    assert!(!reopened
+        .starter_pending()
+        .contains(&conflicting_id.to_string()));
     assert_eq!(
         app.clone()
             .oneshot(post(&token, uuid::Uuid::nil()))
@@ -699,4 +715,173 @@ fn starter_activity_survives_truncated_tail_and_a_revived_refusal() {
         .iter()
         .all(|e| e["detail"]["paired_device_id"] == "paired-device"));
     assert_eq!(entries[3]["detail"]["reason"], "invite_expired");
+}
+
+#[tokio::test]
+async fn unpaired_receive_token_writes_no_starter_audit() {
+    let mut state = (*test_state()).clone();
+    state.storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    state.audit_log =
+        Arc::new(konsensus_api::AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let token = auth::create_token(
+        &state.identity.node_id().to_hex(),
+        &state.jwt_secret,
+        vec![auth::Scope::Receive],
+    )
+    .unwrap();
+    let response = test_router(Arc::new(state.clone()))
+        .oneshot(post(&format!("Bearer {token}"), uuid::Uuid::new_v4()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(std::fs::read(state.audit_log.path()).unwrap().is_empty());
+    assert!(state
+        .storage
+        .starter_request_current()
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn concurrent_fresh_requests_only_journal_the_winner() {
+    use konsensus_api::handlers::starter_channel::{StarterConfig, StarterSettings};
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let mut state = (*test_state()).clone();
+    state.storage = db.clone();
+    state.lightning = Arc::new(ReadyLn("regtest"));
+    state.starter = StarterSettings {
+        config: StarterConfig {
+            enabled: true,
+            hub_node_id: "08".repeat(32),
+            hub_alias: None,
+            allow_mainnet: false,
+        },
+        network: "regtest".into(),
+        hub_ln_pubkey: "03".repeat(33),
+        hub_ln_address: "127.0.0.1:9735".into(),
+        hub_whitelisted: true,
+        trust_no_reserve: true,
+    };
+    let hub = konsensus_core::NodeId::from_bytes([8; 32]);
+    let transport = Arc::new(ConnectedStubTransport::new(
+        vec![hub],
+        Arc::clone(&state.invoice_requests),
+    ));
+    // NoiseTransport::peer_info exposes Capability via its Debug representation.
+    transport.advertise(hub, &["Custom(\"starter_hub_v1\")"]);
+    state.transport = transport.clone();
+    let dir = tempfile::tempdir().unwrap();
+    state.audit_log =
+        Arc::new(konsensus_api::AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let token = paired(&mut state, dir.path(), pairing::default_pairing_scopes());
+
+    let ids = [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()];
+    let app = test_router(Arc::new(state.clone()));
+    let (a, b) = tokio::join!(
+        app.clone().oneshot(post(&token, ids[0])),
+        app.oneshot(post(&token, ids[1]))
+    );
+    let statuses = [a.unwrap().status(), b.unwrap().status()];
+    assert!(statuses.contains(&StatusCode::ACCEPTED));
+    assert!(statuses.contains(&StatusCode::CONFLICT));
+    let winner = db.starter_request_current().await.unwrap().unwrap();
+    assert_eq!(
+        state.audit_log.starter_pending(),
+        vec![winner.request_id.clone()]
+    );
+    let entries: Vec<serde_json::Value> = std::fs::read_to_string(state.audit_log.path())
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["event"], "starter.requested");
+    assert_eq!(entries[0]["detail"]["request_id"], winner.request_id);
+    assert_eq!(entries[1]["event"], "starter.request_conflict");
+}
+
+#[tokio::test]
+async fn starter_load_prunes_orphans_but_retains_durable_attribution() {
+    use konsensus_api::AuditLog;
+    use konsensus_storage::starter_request::StarterRequest;
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let orphan = uuid::Uuid::new_v4().to_string();
+    let row = StarterRequest::new(
+        uuid::Uuid::new_v4().to_string(),
+        "08".repeat(32),
+        "03".repeat(33),
+        "regtest".into(),
+        100,
+    );
+    {
+        let log = AuditLog::open(&path).unwrap();
+        log.starter_requested(&orphan, "orphan-device").unwrap();
+        log.starter_requested(&row.request_id, "real-device")
+            .unwrap();
+    }
+    db.starter_request_create(&row).await.unwrap();
+    let log = AuditLog::open_with_starter_storage(&path, db.clone())
+        .await
+        .unwrap();
+    assert_eq!(log.starter_pending(), vec![row.request_id.clone()]);
+    let mut terminal = row;
+    terminal.state = "refused".into();
+    db.starter_request_save(&terminal).await.unwrap();
+    log.starter_progress_async(&terminal).await.unwrap();
+    let entries: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(entries.last().unwrap()["actor"], "real-device");
+    // Historical evidence remains append-only, but never re-enters pending on load.
+    let log = AuditLog::open_with_starter_storage(&path, db.clone())
+        .await
+        .unwrap();
+    assert!(!log.starter_pending().contains(&orphan));
+}
+
+#[tokio::test]
+async fn starter_reused_orphan_keeps_new_device_after_restart() {
+    use konsensus_api::AuditLog;
+    use konsensus_storage::starter_request::StarterRequest;
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let mut row = StarterRequest::new(
+        uuid::Uuid::new_v4().to_string(),
+        "08".repeat(32),
+        "03".repeat(33),
+        "regtest".into(),
+        100,
+    );
+    AuditLog::open(&path)
+        .unwrap()
+        .starter_requested(&row.request_id, "orphan-device")
+        .unwrap();
+    let log = AuditLog::open_with_starter_storage(&path, db.clone())
+        .await
+        .unwrap();
+    assert!(log.starter_pending().is_empty());
+    log.starter_requested_async(&row.request_id, "new-device")
+        .await
+        .unwrap();
+    db.starter_request_create(&row).await.unwrap();
+    drop(log);
+    let log = AuditLog::open_with_starter_storage(&path, db.clone())
+        .await
+        .unwrap();
+    row.state = "refused".into();
+    db.starter_request_save(&row).await.unwrap();
+    log.starter_progress_async(&row).await.unwrap();
+    let entries: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(entries.last().unwrap()["actor"], "new-device");
 }
