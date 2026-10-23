@@ -50,8 +50,31 @@ are public on the loopback API. The unlock routes require an existing paired
 client authenticated by the Noise tunnel, even on loopback. The tunnel uses the
 box static and cannot create pairings. There is no `/api/v1/health`, `/auth/local`,
 pairing API, WebSocket, peer TCP listener (normally 9736), Lightning, chain source,
-or gossip. Monitor `/api/v1/node/lock`: it reports `state`, `node_id`, `fingerprint`,
-`locked_since`, process-wide `attempts_left` and the optional `hosted_by` label.
+or gossip.
+
+Run monitors as the node's OS user and poll the owner-only control socket:
+
+```sh
+konsensus lock-status --config /path/to/konsensus.toml
+# For the system service:
+sudo -u bitsov konsensus lock-status --config /var/lib/bitsov/konsensus.toml
+```
+
+The command prints JSON with `state`, `node_id`, `fingerprint`, `locked_since`,
+process-wide `attempts_left` and `hosted_by` (null when unset). While locked, it
+returns the same JSON as the HTTP route. After unlock, `state` is `unlocked` and
+`locked_since` and `attempts_left` are null. The socket is `<data-dir>/control.sock`
+(mode `0600`, parent directory `0700`) on Unix. `--home` and `--remote-unlock`
+provide it in status-only mode while locked and after unlock; `--owner-control`
+also supports the command on an unlocked node. Status-only mode cannot approve,
+list pairings, open pairing windows, or grant console authority. Retry a failed
+poll during the locked-to-unlocked startup transition; a connection failure is
+not evidence that the node is unlocked. It is not available during first-run SETUP.
+
+`GET /api/v1/node/lock` is **deprecated for monitoring**. Its current access rules
+and JSON fields remain unchanged in this step; it will be restricted in a later
+step. Move local monitors to `konsensus lock-status` now. The live HTTP router
+still does not expose this locked-only route.
 
 Unlock uses a fresh 32-byte hex challenge, valid for 120 seconds and consumed on
 its first use. The P-256 signature binds the fingerprint, client, pairing epoch,
@@ -882,8 +905,9 @@ If that node ID also appears in `[[peers]]`, the CLI warns: **the config entry
 wins at the next restart**. Remove that entry from the config if you want the
 console-saved address to stick. This command does not edit the config.
 
-The socket is local and owner-only (`control.sock`, mode `0600`); it exists only
-with `--owner-control`, and packaged sidecars do not provide it. The complete
+The socket is local and owner-only (`control.sock`, mode `0600`). Console
+authority requires `--owner-control`; home/remote-unlock sockets are status-only,
+and packaged sidecars do not provide it. The complete
 owner-typed tuple is consent, as with other tuple-based console commands;
 Enter/`--yes` is a client courtesy, not a boundary against same-UID processes.
 Admissions appear in the audit log as `peer.added` with `source: owner_control`.
@@ -916,8 +940,8 @@ start the unlocked operator-run process with `--password-fd <fd>
 --local-owner-device --owner-control` and the N-2DEV config flag enabled. This
 explicit combination retains the owner signer and opens the console socket.
 `--home` and `--remote-unlock` still exclude `--owner-control`; they expose no
-console socket. Stop the home service before starting this operator process;
-never run two processes against the same data directory. A console approval
+console authority (their control socket accepts only `lock-status`). Stop the
+home service before starting this operator process; never run two processes against the same data directory. A console approval
 still needs the owner code and protected encrypted recovery phrase.
 
 ```sh

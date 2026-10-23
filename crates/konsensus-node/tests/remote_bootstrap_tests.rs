@@ -646,7 +646,19 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
         assert!(!status_html.contains(secret));
     }
     assert_eq!(lock["state"], "locked");
-    assert!(!f.dir.path().join("control.sock").exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_konsensus"))
+        .args(["lock-status", "--config"])
+        .arg(&f.config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let owner_status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(owner_status["state"], "locked");
+    assert_eq!(owner_status, lock);
     let locked_pid = node.0.id();
     assert_eq!(lock["node_id"], node_id);
     assert_eq!(lock["fingerprint"], fingerprint);
@@ -699,7 +711,18 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
     assert_eq!(live_auth["client_id"], client_id);
     assert_eq!(node.0.id(), locked_pid);
     assert!(node.0.try_wait().unwrap().is_none());
-    assert!(!f.dir.path().join("control.sock").exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_konsensus"))
+        .args(["lock-status", "--config"])
+        .arg(&f.config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let owner_status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(owner_status["state"], "unlocked");
     assert!(
         TcpStream::connect(f.peer).await.is_ok(),
         "live node binds peers"
