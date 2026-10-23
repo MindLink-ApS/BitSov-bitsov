@@ -1,8 +1,8 @@
-# BitChat alignment and guide-trail milestones
+# BitChat alignment
 
 Status: Research note. Not a spec and not a commitment.
 Date: 2026-10-23
-Scope: compares BitChat (permissionlesstech) with the BitSov node in this repository, and proposes milestones that use BitChat's shipped features as a benchmark.
+Scope: compares BitChat (permissionlesstech) with the BitSov node in this repository, and records integration options with their trade-offs.
 
 ## How to read this
 
@@ -41,7 +41,7 @@ Scope: compares BitChat (permissionlesstech) with the BitSov node in this reposi
 | **Calls / voice** | Push-to-talk since iOS v1.7.0 ([releases](https://github.com/permissionlesstech/bitchat/releases)). Voice streaming in Android v2.0.1 ([releases](https://github.com/permissionlesstech/bitchat-android/releases)). | A 1:1 WebRTC call **prototype, proven on regtest only**. Paid signalling kinds 400 to 403, STUN only ([CALLS-PROTOTYPE.md](../v2/CALLS-PROTOTYPE.md)). |
 | **Metadata** | "Metadata is the weakest part of this design" (WP §8). Packet padding only, and "no cover traffic" ([BitchatProtocol.swift](https://github.com/permissionlesstech/bitchat/blob/main/bitchat/Protocols/BitchatProtocol.swift)). | Leak surfaces are documented in [THREAT_MODEL_TIER2_RELAY.md](../v2/THREAT_MODEL_TIER2_RELAY.md). Padding and cover traffic are mitigations, not shipped. |
 | **Supply chain** | Android v2.0.1 was the "first reproducible full-app release" ([releases](https://github.com/permissionlesstech/bitchat-android/releases)). | Pinned-asset, no-downgrade release signing and a Darwin reproducibility check ([CHANGELOG.md](../../CHANGELOG.md)). Signed binaries are not yet published. |
-| **License** | iOS/macOS: the Unlicense ([LICENSE](https://github.com/permissionlesstech/bitchat/blob/main/LICENSE)). Android: GPL-3.0, changed from MIT in 1.7.2 ([LICENSE.md](https://github.com/permissionlesstech/bitchat-android/blob/main/LICENSE.md); [releases](https://github.com/permissionlesstech/bitchat-android/releases)). | MIT ([LICENSE](../../LICENSE)). |
+| **License** | iOS/macOS: Unlicense. [`LICENSE`](https://github.com/permissionlesstech/bitchat/blob/main/LICENSE) is the Unlicense text and links to `https://unlicense.org`. The iOS [`README.md`](https://github.com/permissionlesstech/bitchat/blob/main/README.md) License section says the project is released into the public domain, which matches that dedication. Android: [`LICENSE.md`](https://github.com/permissionlesstech/bitchat-android/blob/main/LICENSE.md) is the GNU GPL version 3. It has been GPL-3.0 since commit [`fb2bb64`](https://github.com/permissionlesstech/bitchat-android/commit/fb2bb64d65a2d9a3d3ebd6183f0e9b6d46936b19) (2026-02-28, "change license from MIT to GPLv3"), included in release [1.7.2](https://github.com/permissionlesstech/bitchat-android/releases/tag/1.7.2). The Android [`README.md`](https://github.com/permissionlesstech/bitchat-android/blob/main/README.md) License section still says the project is released into the public domain and points at `LICENSE.md`, which does not match the license file. | MIT ([LICENSE](../../LICENSE)). |
 | **Release cadence** | About 20 iOS releases from v1.1 (2025-07) to **v1.7.1 (2026-07-31)** ([releases.atom](https://github.com/permissionlesstech/bitchat/releases.atom)). Android latest is **v2.0.3 (22 Oct 2026)** ([releases](https://github.com/permissionlesstech/bitchat-android/releases)). | Release candidates rc8 to rc19 ([docs/releases/](../releases/)). Pre-release only. |
 | **Adoption signals** | iOS repo: 36,718 stars and 5,844 forks. Android repo: 7,853 stars and 1,940 forks. Counts read from GitHub repo metadata on 2026-10-23 ([iOS](https://github.com/permissionlesstech/bitchat), [Android](https://github.com/permissionlesstech/bitchat-android)). | Closed signet beta. No public adoption figures. |
 
@@ -79,40 +79,40 @@ Scope: compares BitChat (permissionlesstech) with the BitSov node in this reposi
 5. **Multi-device under one identity.** BitSov has an owner-approved device enrolment design ([device-keys.md](../security/device-keys.md)). BitChat's identity is per device (WP §3).
 6. **A documented, dated security review cadence** ([docs/security/](../security/)). BitChat publishes no GitHub security advisories ([security page](https://github.com/permissionlesstech/bitchat/security)). Its Android repo carries a self-review listing Critical and High findings, with fix status unstated ([security-review-jul-27.md](https://github.com/permissionlesstech/bitchat-android/blob/main/docs/security-review-jul-27.md)).
 
-> **Doctrine drift found while reading.** Line 3 of [README.md](../../README.md) says "Bitcoin-anchored identity". The doctrine is that Bitcoin anchors energy and admission, never identity. The code derives identity from user-held keys. This note does not edit the README, which is out of scope; see open question 1.
+> **Documentation inconsistency.** Line 3 of [README.md](../../README.md) says "Bitcoin-anchored identity". Elsewhere in this repository, Bitcoin anchors energy and admission, and identity is derived from user-held keys. This note does not edit the README.
 
 ---
 
 ## (c) Interop options
 
-The options are ranked by doctrine fit first, then by effort.
+Four independent ways a BitSov node could relate to BitChat. The labels are for reference. Each option is described with its mechanism and its trade-offs.
 
-**Doctrine guardrails applied to every option.**
+**Constraints applied to every option.**
 - **G1:** identity is never anchored in Bitcoin.
 - **G2:** there is no free first message.
 - **G3:** everything runs on signet first.
 - **G4:** the charter holds: no operator-held keys.
 
-### 1. Compatible identity export (best fit, low effort)
+### 1. Compatible identity export
 
 - **What it is:**
   - Let a BitSov user show a verifiable link between their BitSov node key and a BitChat or Nostr pubkey.
   - The proof is a signed statement in each direction, displayed or scanned as a QR code.
   - The keys stay separate; this is cross-signing, not shared keys.
-- **Why:** it lets BitChat contacts verify "this is the same person" before paying to reach them on BitSov.
+- **Effect:** a contact can check that a BitChat or Nostr key and a BitSov node key are held by the same person. The check is a signature on a statement, not an on-chain record.
 - **Effort:** low. It is a signed-statement format plus a QR flow. BitChat's QR verification ([releases](https://github.com/permissionlesstech/bitchat/releases)) is the UX benchmark.
 - **Doctrine risks:**
   - **G1:** keep it key-to-key. Never put the link on-chain or in an invoice.
   - Don't reuse BitSov's Ed25519 key as a secp256k1 Nostr key, because that cross-protocol key reuse is unsafe. Derive a separate key or sign a link.
   - **Privacy:** a public link welds two social graphs together, so it must be opt-in, per contact, and revocable.
 
-### 2. Paid-admission gateway for BitChat users (strong fit, medium effort)
+### 2. Paid-admission gateway for BitChat users
 
 - **What it is:**
   - A BitSov node publishes a "reach me" card.
   - A BitChat user pays a recipient-bound invoice through their external wallet, which BitChat already hands `lightning:` links to.
   - The BitChat user then gets an admission they can use from a BitSov client, or from a thin web flow.
-- **Why:** it turns BitChat's audience into paid first contacts without weakening the gate.
+- **Effect:** BitChat already hands `lightning:` URIs to an external wallet. That wallet can pay a recipient-bound invoice. The admission returned is the same capped first contact any other payer presents, and the recipient's node checks it before delivering a message.
 - **Effort:** medium. It reuses F1 capped first contact. The new work is a payer path that is not a BitSov node.
 - **Doctrine risks:**
   - **G2:** the gateway must never deliver an unpaid teaser. Preparing the invoice must stay within F1's bounded payment-preparation floor ([F1-CAPPED-FIRST-CONTACT.md](../v2/F1-CAPPED-FIRST-CONTACT.md)).
@@ -120,7 +120,7 @@ The options are ranked by doctrine fit first, then by effort.
   - **G4:** the gateway must not hold keys for the payer or the recipient.
   - **Cashu:** do not accept Cashu bearer tokens as admission. A token is not recipient-bound or settled until it is redeemed at a mint. The repo already has a "No Cashu default" stance ([N-M7A-STARTER-REQUEST.md](../design/N-M7A-STARTER-REQUEST.md)).
 
-### 3. Bridge BitSov to BitChat's Nostr layer (medium fit, medium-high effort)
+### 3. Bridge BitSov to BitChat's Nostr layer
 
 - **What it is:** a bridge that relays between BitSov UKM envelopes and BitChat's Nostr DMs and geohash events.
 - **Hard facts:**
@@ -134,12 +134,12 @@ The options are ranked by doctrine fit first, then by effort.
   - **E2EE:** a bridge that re-encrypts sees plaintext. That is acceptable only if the bridge is the user's own node, never an operator (**G4**).
   - **Metadata:** Nostr relays see the recipient `p` tag (WP §5.3).
 
-### 4. Adopt BitChat's BLE mesh for offline delivery (high value, highest effort)
+### 4. Local BLE transport for offline ciphertext
 
 - **What it is:**
   - Add a local radio transport to the app, not the node, for when BitSov devices can't reach their nodes.
   - Ciphertext UKMs would be carried device to device and delivered when a node becomes reachable.
-- **Licence:** the iOS code is under the Unlicense, so it is reusable. The Android code is now GPL-3.0, which is incompatible with MIT distribution if copied. Reimplement from the whitepaper and do not copy Android code.
+- **Licence:** iOS `LICENSE` is the Unlicense. Android `LICENSE.md` is GPL-3.0 since commit `fb2bb64` (2026-02-28, release 1.7.2); the Android `README.md` License section still says public domain. Copying Android source into an MIT distribution is a GPL-3.0 obligation. An independent implementation can follow the whitepaper (`iOS:/WHITEPAPER.md`).
 - **Effort:**
   - High: radio stacks on iOS and Android, battery cost, and background limits.
   - Payment is the hard part. Lightning needs connectivity, so offline acts can't settle.
@@ -148,39 +148,16 @@ The options are ranked by doctrine fit first, then by effort.
   - **Metadata:** BitChat's own threat model calls metadata its weakest part (WP §8). BLE presence leaks location.
   - **G3:** this is not a signet concern by itself, but the drain-time payment path must be proven on signet first.
 
-**Recommendation.** Do 1 then 2 soon. Treat 3 as a research spike only. Defer 4 until the paid relay (store-and-forward) ships, because 4 depends on the same "admit on drain" machinery.
+**Trade-offs.** The options are independent.
+
+| Option | Cost | What stays the same |
+|---|---|---|
+| 1. Identity export | A signed statement format and a QR flow. A published link joins the two keys, and therefore the sets of people who can see each key, until the link is revoked. | Keys stay separate. The link is not written on-chain or into an invoice. Admission rules do not change. |
+| 2. Paid-admission gateway | A payer path that is not a BitSov node. A signet pilot needs wallets that can pay signet invoices. | Admission is still a settled, recipient-bound payment under F1. No message is delivered before it settles. Cashu bearer tokens are not admission. The gateway holds no keys. |
+| 3. Nostr bridge | Ongoing tracking of a BitChat-only envelope (not NIP-17, NIP-44, or NIP-59) that has no forward secrecy. Unpaid inbound events are held until payment settles, or dropped. Re-encryption sees plaintext, so the bridge is the user's own node. | After settlement, the BitSov side stays inside existing UKM and admission rules. |
+| 4. BLE carriage | Radio stacks on iOS and Android, including battery and background limits, plus a settlement step once a node is reachable again. Android `LICENSE.md` is GPL-3.0, so an implementation follows the whitepaper rather than copying Android source. iOS `LICENSE` is the Unlicense. | The radio carries ciphertext only. The recipient node admits it on drain, as in [RELAY_PROTOCOL.md](../v2/RELAY_PROTOCOL.md) commitment 2, and shows nothing before then. |
 
 ---
-
-## (d) Guide-trail milestones
-
-North star: *"Rasmus and his father message, call and pay from iPhone and Mac, each on their own node."*
-
-Each milestone names the BitChat feature that serves as its benchmark. Being "at parity" means matching the user-visible outcome, not copying the design. Every milestone is signet first.
-
-| # | Milestone | BitSov exit criterion (signet) | BitChat benchmark | Today |
-|---|---|---|---|---|
-| **M1** | **Two nodes, two people, paid chat** | Rasmus and his father each run a home node. Each pairs a Mac and an iPhone, and they exchange paid 1:1 messages with F1 first contact and the durable outbox. | BitChat 1:1 private messages with QR verification (iOS 1.3.2) | Node pieces exist (pairing, F1, paid outbox). The T18 Mac and iPhone checklist exists ([home-node.md](../operations/home-node.md)). The end-to-end two-person run is not recorded in this repo. |
-| **M2** | **Delivered while offline** | A message sent while the father's node is down is delivered once it is back. The paid relay holds ciphertext, and the recipient gates on drain. | BitChat couriers plus Nostr mailbox, with 24 h retention (WP §6) | The relay spec is "Proposed" and the engine code is inert ([RELAY_PROTOCOL.md](../v2/RELAY_PROTOCOL.md)). **Not shipped.** |
-| **M3** | **Paid call, iPhone to Mac** | A 1:1 call between their own nodes on signet, with paid offer and signalling. | BitChat push-to-talk and voice (iOS 1.7.0; Android 2.0.1) | Prototype, **proven on regtest only** ([CALLS-PROTOTYPE.md](../v2/CALLS-PROTOTYPE.md)). |
-| **M4** | **Pay each other in-thread** | A plain payment in the conversation, separate from admission, with fee caps and exactly-once semantics. | BitChat `/pay` Cashu and `lightning:` chips, both external-wallet handoff | The node has payments and spend grants. An in-thread payment UX is not covered in node docs. |
-| **M5** | **Hard to watch, easy to wipe** | Tor or equivalent reachability off the tailnet, a panic-wipe flow with a documented fund-recovery path, and padding on stored ciphertext. | BitChat Tor-by-default (Arti), triple-tap wipe, Noise padding buckets | Tor is **not shipped** ([reachability.md](../operations/reachability.md)). Wipe is **not built**. Padding is a mitigation only. |
-| **M6** | **Reach from the BitChat world** | Identity export (option 1) and the paid gateway (option 2) live on signet. A BitChat user can pay to reach Rasmus. | BitChat's own reach: about 20 iOS releases and a three-surface footprint | **Not built.** |
-
-Suggested order: M1, M3, M2, M4, M5, M6. M1 and M3 are the north star itself. M2 is the biggest gap against BitChat.
-
----
-
-## (e) Open questions for the owner
-
-1. **README wording.** Should line 3, "Bitcoin-anchored identity", be corrected to match the doctrine that keys are identity, with Bitcoin anchoring energy and admission? It is a one-line follow-up PR.
-2. **Offline doctrine.** Is "carry now, admit on drain" the accepted reading of "no free first message" for offline and BLE delivery? Or is any offline carriage out of doctrine?
-3. **Public lanes.** Does BitSov want any public or location channel analogue, which would be paid per post, or stay strictly 1:1 and rooms? BitChat's geohash channels are a large part of its pull.
-4. **Cashu.** Should a Cashu token ever count toward admission, for example redeemed by the recipient's node before admitting? Or is Cashu permanently out? The current stance is "No Cashu default".
-5. **Licence hygiene.** Confirm the "no copying from the GPL-3.0 Android repo" rule. Reading the Unlicense iOS code and the whitepaper is fine.
-6. **Gateway operator.** If option 2 ships, who runs the gateway: each user's own node only, or a MindLink-run signet gateway under the charter?
-7. **Panic wipe vs funds.** What should a wipe do to Lightning channel state and the encrypted SCB backups ([RECOVERY.md](../v2/RECOVERY.md))?
-8. **Benchmark refresh.** Should this note be re-checked on BitChat's next releases? The current latest are iOS v1.7.1 and Android v2.0.3.
 
 ## Unverified or conflicting items
 
