@@ -579,7 +579,7 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
         let timestamp = chrono::Utc::now().timestamp();
         let proof = format!(
             "bitsov-pair-challenge-v1:{}:{timestamp}",
-            &f.record.client_id
+            f.record.client_id
         );
         let proof_signature = hex::encode(f.client.sign(proof.as_bytes()).to_bytes());
         let challenge: Value = http

@@ -5,6 +5,12 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Count a home-setup cancel only when a pairing is in progress, cap pending
+  pairing requests per client key, and let that key replace its own pending
+  request.
+- Limit local sign-in challenges per source, rate-limit issuance, and apply
+  the local token route's Host and Origin admission to challenge issuance.
+
 - Raise the source-build MSRV to Rust 1.89 to match locked `uuid` 1.28.0.
 - Discard serde diagnostics from peer session-value decodes; add relay and
   file-payload guard regressions and use unique temporary mutation-log directories.

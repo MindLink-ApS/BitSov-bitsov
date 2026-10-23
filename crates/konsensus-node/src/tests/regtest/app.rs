@@ -23,8 +23,7 @@ impl OwnerConsole {
     fn confirmation(&self, label: &str) -> String {
         let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
         text.lines()
-            .filter(|line| line.starts_with(&format!("{label} CODE ")))
-            .next_back()
+            .rfind(|line| line.starts_with(&format!("{label} CODE ")))
             .unwrap_or_else(|| panic!("owner console has no confirmation for {label}"))
             .to_owned()
     }
@@ -291,7 +290,7 @@ impl App {
             transport: Arc::clone(transport) as Arc<dyn MessageTransport>,
             session_manager: Arc::clone(sessions),
             jwt_secret: JWT_SECRET.into(),
-            auth_challenges: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            auth_challenges: konsensus_api::AuthChallenges::new(),
             pairing: Some(pairing.0.clone()),
             cors_enabled: false,
             operator_probes_enabled: true,
@@ -381,7 +380,7 @@ impl App {
                 ws_delivery_tx: state.ws_delivery_broadcast.clone(),
                 pending_tx,
                 starter_hub_tx: None,
-        starter_newcomer_tx: None,
+                starter_newcomer_tx: None,
                 auto_channel_tx,
                 shutdown_rx: shutdown_rx.clone(),
             },

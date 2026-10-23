@@ -1,5 +1,8 @@
 mod common;
+use std::net::SocketAddr;
+
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use base64::Engine;
@@ -17,6 +20,7 @@ use tower::ServiceExt;
 async fn fetch_auth_challenge(app: Router) -> String {
     let req = Request::builder()
         .uri("/api/v1/auth/challenge")
+        .header("host", "localhost:3141")
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -2051,4 +2055,194 @@ async fn status_reports_custody_mode_to_the_owner_only() {
         assert_eq!(get(&state, "/api/v1/status", true).await["custody_mode"], wire);
         assert!(get(&state, "/api/v1/health", false).await.get("custody_mode").is_none());
     }
+}
+
+fn local_challenge_request(host: Option<&str>, origin: Option<&str>, peer: &str) -> Request<Body> {
+    let mut builder = Request::builder().uri("/api/v1/auth/challenge");
+    if let Some(host) = host {
+        builder = builder.header("host", host);
+    }
+    if let Some(origin) = origin {
+        builder = builder.header("origin", origin);
+    }
+    let mut request = builder.body(Body::empty()).unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+    request
+}
+
+async fn issue_local_challenge(
+    app: &Router,
+    host: Option<&str>,
+    origin: Option<&str>,
+    peer: &str,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(local_challenge_request(host, origin, peer))
+        .await
+        .unwrap()
+}
+
+async fn challenge_string(response: axum::response::Response) -> String {
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    json["challenge"].as_str().unwrap().to_owned()
+}
+
+async fn redeem(app: &Router, state: &AppState, challenge: &str) -> StatusCode {
+    let signature = hex::encode(state.identity.sign(challenge.as_bytes()).to_bytes());
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/token")
+        .header("content-type", "application/json")
+        .header("host", "localhost:3141")
+        .body(Body::from(
+            serde_json::json!({"challenge": challenge, "signature": signature}).to_string(),
+        ))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo("127.0.0.1:9".parse::<SocketAddr>().unwrap()));
+    let response = app.clone().oneshot(request).await.unwrap();
+    response.status()
+}
+
+#[tokio::test]
+async fn auth_challenge_rejects_foreign_host_and_origin_without_spending_budget() {
+    let state = test_state();
+    let app = konsensus_api::build_router(Arc::clone(&state));
+    for _ in 0..=konsensus_api::auth_challenge::AUTH_CHALLENGE_RATE_PER_MINUTE {
+        let response =
+            issue_local_challenge(&app, Some("attacker.example:3141"), None, "127.0.0.1:9").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "local_host_forbidden");
+    }
+    let missing = issue_local_challenge(&app, None, None, "127.0.0.1:9").await;
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    let origin = issue_local_challenge(
+        &app,
+        Some("127.0.0.1:3141"),
+        Some("https://attacker.example"),
+        "127.0.0.1:9",
+    )
+    .await;
+    assert_eq!(origin.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(origin.into_body(), 4096)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "local_origin_forbidden");
+
+    let allowed = issue_local_challenge(
+        &app,
+        Some("127.0.0.1:3141"),
+        Some("http://127.0.0.1:3141"),
+        "127.0.0.1:9",
+    )
+    .await;
+    let challenge = challenge_string(allowed).await;
+    assert_eq!(redeem(&app, &state, &challenge).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_challenge_per_source_cap_evicts_only_that_source() {
+    let state = test_state();
+    let app = konsensus_api::build_router(Arc::clone(&state));
+    let mut oldest = String::new();
+    for n in 0..konsensus_api::auth_challenge::AUTH_CHALLENGE_MAX_PER_SOURCE {
+        let challenge = challenge_string(
+            issue_local_challenge(&app, Some("localhost:3141"), None, "10.0.0.1:1").await,
+        )
+        .await;
+        if n == 0 {
+            oldest = challenge;
+        }
+    }
+    let mapped = challenge_string(
+        issue_local_challenge(&app, Some("localhost:3141"), None, "[::ffff:10.0.0.1]:2").await,
+    )
+    .await;
+    assert_eq!(
+        redeem(&app, &state, &oldest).await,
+        StatusCode::UNAUTHORIZED,
+        "the source's oldest challenge is replaced, including from an IPv4-mapped address"
+    );
+    let other = challenge_string(
+        issue_local_challenge(&app, Some("localhost:3141"), None, "10.0.0.2:1").await,
+    )
+    .await;
+    assert_eq!(redeem(&app, &state, &other).await, StatusCode::OK);
+    assert_eq!(redeem(&app, &state, &mapped).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_challenge_global_cap_does_not_evict_another_source() {
+    let state = test_state();
+    let app = konsensus_api::build_router(Arc::clone(&state));
+    let per_source = konsensus_api::auth_challenge::AUTH_CHALLENGE_MAX_PER_SOURCE;
+    let sources = konsensus_api::auth_challenge::AUTH_CHALLENGE_MAX_LIVE / per_source;
+    let mut first_of_second = String::new();
+    for source in 1..=sources {
+        for slot in 0..per_source {
+            let challenge = challenge_string(
+                issue_local_challenge(
+                    &app,
+                    Some("localhost:3141"),
+                    None,
+                    &format!("10.2.0.{source}:1"),
+                )
+                .await,
+            )
+            .await;
+            if source == 2 && slot == 0 {
+                first_of_second = challenge;
+            }
+        }
+    }
+    let refused = issue_local_challenge(&app, Some("localhost:3141"), None, "10.9.0.1:1").await;
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = axum::body::to_bytes(refused.into_body(), 4096)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("too many outstanding auth challenges"));
+    let refreshed = challenge_string(
+        issue_local_challenge(&app, Some("localhost:3141"), None, "10.2.0.1:9").await,
+    )
+    .await;
+    assert_eq!(redeem(&app, &state, &first_of_second).await, StatusCode::OK);
+    assert_eq!(redeem(&app, &state, &refreshed).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_challenge_rate_limit_is_per_source() {
+    let state = test_state();
+    let app = konsensus_api::build_router(Arc::clone(&state));
+    let limit = konsensus_api::auth_challenge::AUTH_CHALLENGE_RATE_PER_MINUTE;
+    let mut latest = String::new();
+    for _ in 0..limit {
+        latest = challenge_string(
+            issue_local_challenge(&app, Some("localhost:3141"), None, "10.4.0.1:1").await,
+        )
+        .await;
+    }
+    let limited = issue_local_challenge(&app, Some("localhost:3141"), None, "10.4.0.1:2").await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = axum::body::to_bytes(limited.into_body(), 4096)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("auth challenge rate limit exceeded"));
+    assert_eq!(redeem(&app, &state, &latest).await, StatusCode::OK);
+    let other = challenge_string(
+        issue_local_challenge(&app, Some("localhost:3141"), None, "10.4.0.2:1").await,
+    )
+    .await;
+    assert_eq!(redeem(&app, &state, &other).await, StatusCode::OK);
 }

@@ -94,6 +94,13 @@ pub const PENDING_PAIRING_TTL: Duration = Duration::from_secs(120);
 /// rest rather than letting the directory grow without limit.
 pub const MAX_PENDING_PAIRINGS: usize = 32;
 
+/// Pending pairing requests one client key may hold at once.
+///
+/// A further request from that key replaces its oldest pending request.
+/// Replacement does not take another slot, so the same key can refresh while
+/// this shared pool is already full. A different key is not evicted.
+pub const MAX_PENDING_PAIRINGS_PER_SOURCE: usize = 4;
+
 /// Paired-token lifetime: 10 minutes.
 ///
 /// Minutes, not the 24 hours a loopback token gets. The durable secret is the
@@ -538,6 +545,8 @@ struct PendingPairing {
     name: String,
     challenge: [u8; CHALLENGE_LEN],
     expires_at: Instant,
+    /// Issuance order among live requests. Expiry timestamps can tie.
+    issued_seq: u64,
 }
 
 /// What `request_pairing` returns to its caller.
@@ -1522,21 +1531,50 @@ impl PairingService {
                 inner.pending.remove(&id);
                 let _ = std::fs::remove_file(self.challenge_path(&id));
             }
-            if inner.pending.len() >= MAX_PENDING_PAIRINGS {
+            let source = client_pubkey_hex.to_ascii_lowercase();
+            let own: Vec<(String, u64)> = inner
+                .pending
+                .iter()
+                .filter(|(_, pending)| pending.client_pubkey == source)
+                .map(|(id, pending)| (id.clone(), pending.issued_seq))
+                .collect();
+            let pool_full = inner.pending.len() >= MAX_PENDING_PAIRINGS;
+            let source_full = own.len() >= MAX_PENDING_PAIRINGS_PER_SOURCE;
+            if source_full || (pool_full && !own.is_empty()) {
+                if let Some((oldest, _)) = own.iter().min_by_key(|(_, issued_seq)| *issued_seq) {
+                    let oldest = oldest.clone();
+                    inner.pending.remove(&oldest);
+                    let _ = std::fs::remove_file(self.challenge_path(&oldest));
+                }
+            } else if pool_full {
                 return Err(PairingError::TooManyPending);
             }
+            let issued_seq = inner
+                .pending
+                .values()
+                .map(|pending| pending.issued_seq)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
             inner.pending.insert(
                 pair_id.clone(),
                 PendingPairing {
-                    client_pubkey: client_pubkey_hex.to_ascii_lowercase(),
+                    client_pubkey: source,
                     name,
                     challenge,
                     expires_at: now + PENDING_PAIRING_TTL,
+                    issued_seq,
                 },
             );
         }
 
-        write_protected(&self.challenge_path(&pair_id), &challenge)?;
+        if let Err(error) = write_protected(&self.challenge_path(&pair_id), &challenge) {
+            // The slot was reserved before the file existed. Drop it on failure
+            // so a write error cannot occupy the per-source quota until TTL.
+            let mut inner = self.lock();
+            inner.pending.remove(&pair_id);
+            return Err(error.into());
+        }
 
         let code = short_code(&challenge);
         if self.print_pairing_instruction {

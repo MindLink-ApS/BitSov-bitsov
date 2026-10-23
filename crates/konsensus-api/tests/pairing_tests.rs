@@ -66,6 +66,102 @@ fn fill_token_challenges(service: &PairingService, client_id: &str) -> Vec<Strin
         .collect()
 }
 
+fn fresh_pairing_service() -> (tempfile::TempDir, PairingService) {
+    let dir = tempfile::tempdir().unwrap();
+    let service = PairingService::open(dir.path(), String::new(), false).unwrap();
+    (dir, service)
+}
+
+fn client_pubkey(seed: u8) -> String {
+    hex::encode(
+        SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes(),
+    )
+}
+
+fn challenge_file(service: &PairingService, pair_id: &str) -> std::path::PathBuf {
+    service.dir().join(format!("challenge-{pair_id}"))
+}
+
+#[test]
+fn pending_pairing_per_source_quota_replaces_own_oldest() {
+    let (_dir, service) = fresh_pairing_service();
+    let first = client_pubkey(1);
+    let second = client_pubkey(2);
+    let mut first_ids = Vec::new();
+    for _ in 0..pairing::MAX_PENDING_PAIRINGS_PER_SOURCE {
+        first_ids.push(service.request_pairing("a", &first).unwrap().pair_id);
+    }
+    let replaced = service
+        .request_pairing("a", &first.to_ascii_uppercase())
+        .unwrap();
+    assert_ne!(replaced.pair_id, first_ids[0]);
+    assert!(
+        !challenge_file(&service, &first_ids[0]).exists(),
+        "the oldest request from this key is replaced"
+    );
+    for id in &first_ids[1..] {
+        assert!(challenge_file(&service, id).exists(), "{id} must stay");
+    }
+    // Signature parsing runs before the pending lookup, so the probe must be a
+    // well-formed signature. A short hex string never reaches UnknownPending.
+    let error = service
+        .confirm_pairing(
+            &first_ids[0],
+            &"00".repeat(64),
+            pairing::default_pairing_scopes(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, pairing::PairingError::UnknownPending),
+        "replaced request must be gone, got {error:?}"
+    );
+    let other = service.request_pairing("b", &second).unwrap();
+    assert!(challenge_file(&service, &other.pair_id).exists());
+    assert!(challenge_file(&service, &replaced.pair_id).exists());
+    let kept = std::fs::read(challenge_file(&service, &replaced.pair_id)).unwrap();
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let message = PairingService::proof_message(&replaced.pair_id, &first, &kept);
+    service
+        .confirm_pairing(
+            &replaced.pair_id,
+            &hex::encode(key.sign(&message).to_bytes()),
+            pairing::default_pairing_scopes(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn pending_pairing_global_cap_rejects_a_new_key_and_lets_an_existing_key_replace() {
+    let (_dir, service) = fresh_pairing_service();
+    let mut ids = Vec::new();
+    for seed in 1..=pairing::MAX_PENDING_PAIRINGS as u8 {
+        ids.push(
+            service
+                .request_pairing("n", &client_pubkey(seed))
+                .unwrap()
+                .pair_id,
+        );
+    }
+    assert!(matches!(
+        service.request_pairing("overflow", &client_pubkey(33)),
+        Err(pairing::PairingError::TooManyPending)
+    ));
+    let refreshed = service
+        .request_pairing("n", &client_pubkey(1))
+        .unwrap()
+        .pair_id;
+    assert_ne!(refreshed, ids[0]);
+    assert!(!challenge_file(&service, &ids[0]).exists());
+    assert!(challenge_file(&service, &ids[1]).exists());
+    assert!(challenge_file(&service, &refreshed).exists());
+    assert!(matches!(
+        service.request_pairing("overflow", &client_pubkey(34)),
+        Err(pairing::PairingError::TooManyPending)
+    ));
+}
+
 #[test]
 fn token_challenges_client_cap_leaves_room_for_another_client() {
     let dir = tempfile::tempdir().unwrap();
