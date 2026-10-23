@@ -1,0 +1,68 @@
+name: Bug report
+description: Report a defect in the protocol, node, or docs that is not a vulnerability
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Read [SECURITY.md](https://github.com/MindLink-ApS/BitSov-bitsov/blob/main/SECURITY.md) first. Suspected vulnerabilities go to the **Security** tab, then **Report a vulnerability**. Do not describe them here.
+
+        Do not include mnemonics, keys, passwords, live node IDs, channel balances, transaction IDs, customer names, or internal addresses.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before filing
+      options:
+        - label: This is not a security vulnerability. I did not put secrets or private plans in this report.
+          required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed, and what did you expect?
+      placeholder: The node rejects a valid peer after paid admission.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Commands, config (with secrets removed), and what you observed.
+      placeholder: |
+        1. cargo build --release -p konsensus-node
+        2. ./target/release/konsensus ...
+        3. Observed error
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Commit, tag, or `konsensus --version`. Only the current pre-release line is supported.
+      placeholder: "0.3.0-rc20 or a main commit"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Where the defect shows up.
+      options:
+        - konsensus-node CLI
+        - API or WebSocket
+        - Crypto or identity
+        - Lightning or payment gate
+        - Storage
+        - Mesh, routing, or gossip
+        - Protocol docs
+        - Build or tests
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Logs with secrets removed, or a link to a public commit.
+      placeholder: Optional.

@@ -1,0 +1,41 @@
+name: Feature request
+description: Suggest a change to the protocol, node, or docs
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposals must keep the commitments in [CHARTER.md](https://github.com/MindLink-ApS/BitSov-bitsov/blob/main/CHARTER.md) and [CONTRIBUTING.md](https://github.com/MindLink-ApS/BitSov-bitsov/blob/main/CONTRIBUTING.md). Do not include secrets or private plans.
+
+        A suspected vulnerability is not a feature request. Use the **Security** tab, then **Report a vulnerability**, as described in [SECURITY.md](https://github.com/MindLink-ApS/BitSov-bitsov/blob/main/SECURITY.md).
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before filing
+      options:
+        - label: This request does not ask for operator-held mnemonics, key escrow, custodial recovery, or operator-decryptable message plaintext.
+          required: true
+        - label: This request contains no secrets or private plans.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is hard or missing for a node operator or protocol user?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: The behavior you want, and which crate or document it would touch.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Other approaches you considered.
+    validations:
+      required: false
