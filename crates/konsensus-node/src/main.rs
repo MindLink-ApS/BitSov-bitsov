@@ -1607,13 +1607,11 @@ async fn start_node_services<'a>(
         Some((endpoint, source)) => (Some(endpoint), Some(source)),
         None => (None, None),
     };
-    let introduction = konsensus_api::handlers::introduction::IntroductionSettings {
-        network: config.lightning.bitcoin_network(),
-        configured_endpoint,
-        configured_source,
-        discovered: Default::default(),
-        clock: Default::default(),
-    };
+    let mut introduction = konsensus_api::handlers::introduction::IntroductionSettings::fixed(
+        config.lightning.bitcoin_network().as_deref(),
+        configured_endpoint.as_deref(),
+    );
+    introduction.configured_source = configured_source;
     let stun_discovery = match (
         &introduction.configured_endpoint,
         config.network.stun_server_addr(),

@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::{net::UnixStream, process::CommandExt};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::Verifier;
@@ -206,6 +206,29 @@ fn init_encrypts_and_start_decrypts_from_a_single_handoff_without_logging_it() {
     }
 }
 
+/// A timeout owns cleanup: no long-lived node is left behind after a failure.
+fn wait_or_kill(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll child exit") {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill timed-out child");
+            child.wait().expect("reap killed child");
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn refusal_deadline_kills_and_reaps_a_child_that_keeps_running() {
+    let mut child = Command::new("/bin/sleep").arg("120").spawn().unwrap();
+    assert!(wait_or_kill(&mut child, Duration::ZERO).is_none());
+    assert!(child.try_wait().unwrap().is_some(), "timed-out child was not reaped");
+}
+
 fn directory_snapshot(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
     let mut snapshot = std::collections::BTreeMap::new();
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -284,9 +307,10 @@ fn local_owner_unavailable_verifier_refuses_start_without_writing_files() {
             .unwrap()
             .write_all(password.as_bytes())
             .unwrap();
-        // EOF above completes the password handoff. Await the refusal itself;
-        // Argon2 and process scheduling have no five-second latency contract.
-        let status = child.wait().unwrap();
+        // EOF above completes the password handoff. Allow slow debug Argon2
+        // under load, but a regression that starts the node must not hang CI.
+        let status = wait_or_kill(&mut child, Duration::from_secs(120))
+            .unwrap_or_else(|| panic!("{case}: node did not refuse startup within 120s; child killed and reaped"));
         drop(api_port);
         use std::os::unix::fs::FileExt;
         let mut bytes = vec![0; output.metadata().unwrap().len() as usize];

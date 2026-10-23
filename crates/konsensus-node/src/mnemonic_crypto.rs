@@ -72,8 +72,12 @@ fn derive_key(password: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, Mnemo
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
     let mut key = Zeroizing::new([0u8; 32]);
+    // Argon2 0.5's zeroize feature wipes internal temporaries and implements
+    // Zeroize for Block, but its allocating helper does not wipe the working
+    // buffer. Own it here so all 64 MiB are wiped on success and error paths.
+    let mut memory = Zeroizing::new(vec![argon2::Block::default(); argon2.params().block_count()]);
     argon2
-        .hash_password_into(password, salt, key.as_mut())
+        .hash_password_into_with_memory(password, salt, key.as_mut(), memory.as_mut_slice())
         .map_err(|e| MnemonicCryptoError::KeyDerivation(e.to_string()))?;
     Ok(key)
 }

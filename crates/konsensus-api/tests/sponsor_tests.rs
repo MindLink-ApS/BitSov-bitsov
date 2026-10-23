@@ -47,10 +47,8 @@ async fn pair(policy: SponsorPolicy) -> Pair {
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()));
     let intro = |port: u16| {
         let clock = clock.clone();
-        IntroductionSettings {
-            clock: konsensus_api::handlers::introduction::UnixClock::new(move || Ok(clock.load(Ordering::SeqCst))),
-            ..IntroductionSettings::fixed(Some("regtest"), Some(&format!("127.0.0.1:{port}")))
-        }
+        IntroductionSettings::fixed(Some("regtest"), Some(&format!("127.0.0.1:{port}")))
+            .with_test_clock(move || Ok(clock.load(Ordering::SeqCst)))
     };
     let base = test_state_with_lightning(sponsor_ln.clone());
     let sponsor_dir = dir.path().join("sponsor-node");

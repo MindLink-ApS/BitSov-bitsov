@@ -149,3 +149,16 @@ fn write_and_read_encrypted() {
     let result = read_mnemonic(&final_path, Some("wrong"));
     assert!(result.is_err());
 }
+
+#[test]
+fn pre_zeroize_v1_fixture_still_decrypts() {
+    // Fixed bytes produced by the old dependencies, not encrypt_mnemonic.
+    // Pins KDF parameters, password whitespace, header layout and GCM tag.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mnemonic.enc");
+    std::fs::write(&path, include_bytes!("fixtures/mnemonic-v1.enc")).unwrap();
+    assert_eq!(
+        read_mnemonic(&path, Some("  legacy-fixture-password  ")).unwrap().as_str(),
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    );
+}

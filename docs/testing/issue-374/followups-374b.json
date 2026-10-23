@@ -1,0 +1,106 @@
+{
+  "base": "eb53792ea58fc058e3612a6bc6139256c6db989b",
+  "rustc": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+  "msrv_rustc": "rustc 1.89.0 (29483883e 2025-08-04)",
+  "fixture_sha256": "1ed29c83c1717db6b0115076dfc6a20d10f965106fa9f3dcd16e27a2604bb963",
+  "runs": [
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--no-fail-fast"
+      ],
+      "mode": "plain",
+      "start": 1792731896.680494,
+      "worker_pids": [],
+      "exit_code": 0,
+      "workers_alive_at_completion": 0,
+      "worker_exit_codes": [],
+      "end": 1792732790.001366,
+      "duration_seconds": 893.321,
+      "log_sha256": "672a9223e687e3fc617a53ce577a64caafbbfe1915e2af912f86c2f31c476ad7",
+      "targets": 194,
+      "passed": 4949,
+      "failed": 0,
+      "ignored": 8
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--no-fail-fast"
+      ],
+      "mode": "loaded",
+      "start": 1792732830.773142,
+      "worker_pids": [
+        17957,
+        17958,
+        17960,
+        17961,
+        17962,
+        17963,
+        17965,
+        17966
+      ],
+      "exit_code": 0,
+      "workers_alive_at_completion": 8,
+      "worker_exit_codes": [
+        -15,
+        -15,
+        -15,
+        -15,
+        -15,
+        -15,
+        -15,
+        -15
+      ],
+      "end": 1792733402.953792,
+      "duration_seconds": 572.181,
+      "log_sha256": "58d4ac720440405493ad9293b832cf3480e14442512ffe964367f20e43f2cb56",
+      "targets": 194,
+      "passed": 4949,
+      "failed": 0,
+      "ignored": 8
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "mode": "clippy",
+      "start": 1792733468.680959,
+      "worker_pids": [],
+      "exit_code": 0,
+      "workers_alive_at_completion": 0,
+      "worker_exit_codes": [],
+      "end": 1792733520.821589,
+      "duration_seconds": 52.141,
+      "log_sha256": "4cff327eea67843c1ee322e3b9972e74ebbc076d8866851f8634fa00b40ee3a4"
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.89.0",
+        "check",
+        "--workspace",
+        "--locked"
+      ],
+      "mode": "msrv",
+      "start": 1792733552.505462,
+      "worker_pids": [],
+      "exit_code": 0,
+      "workers_alive_at_completion": 0,
+      "worker_exit_codes": [],
+      "end": 1792733599.9245281,
+      "duration_seconds": 47.419,
+      "log_sha256": "2cfab5f0bf06d2edfdf792d9767df595097a1eb4632e0f34afe50dd05ec0cb7d"
+    }
+  ]
+}

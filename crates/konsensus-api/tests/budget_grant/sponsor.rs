@@ -1,18 +1,16 @@
 //! K1 × G1: delegation cannot approve gifts. Owner-approved gifts use the
 //! sponsor purse; legacy grant-backed operations still reconcile after restart.
 use super::*;
-use konsensus_api::handlers::introduction::{IntroductionSettings, UnixClock};
+use konsensus_api::handlers::introduction::IntroductionSettings;
 use konsensus_api::handlers::sponsor::SponsorPolicy;
 use konsensus_lightning::shared_mock::SharedMockProvider;
 
 const GIFT: u64 = 20_000;
 const FEE: u64 = 1_000;
 
-fn intro(port: u16, clock: UnixClock) -> IntroductionSettings {
-    IntroductionSettings {
-        clock,
-        ..IntroductionSettings::fixed(Some("regtest"), Some(&format!("127.0.0.1:{port}")))
-    }
+fn intro(port: u16, now: u64) -> IntroductionSettings {
+    IntroductionSettings::fixed(Some("regtest"), Some(&format!("127.0.0.1:{port}")))
+        .with_test_clock(move || Ok(now))
 }
 
 /// The owner's node (sponsoring on) with a paired app holding `budget`, and a
@@ -21,10 +19,9 @@ fn intro(port: u16, clock: UnixClock) -> IntroductionSettings {
 async fn kit(budget: u64) -> (Fx, String, Value) {
     let mut fx = fixture().await;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let clock = UnixClock::new(move || Ok(now));
     fx.state = Arc::new(AppState {
         sponsor: SponsorPolicy::new(true, GIFT, FEE, 1_000_000, 2).unwrap(),
-        introduction: intro(9001, clock.clone()),
+        introduction: intro(9001, now),
         front_door: Default::default(),
         ..(*fx.state).clone()
     });
@@ -32,7 +29,7 @@ async fn kit(budget: u64) -> (Fx, String, Value) {
     let path = fx.tmp.path().join("newcomer-ln.db");
     let (_, identity) = konsensus_core::identity::NodeIdentity::generate().unwrap();
     let base = test_state_with_lightning(Arc::new(SharedMockProvider::new(&path, "newcomer", 0).unwrap()));
-    let newcomer = Arc::new(AppState { identity: Arc::new(identity), introduction: intro(9002, clock),
+    let newcomer = Arc::new(AppState { identity: Arc::new(identity), introduction: intro(9002, now),
         front_door: Default::default(), ..(*base).clone() });
     let newcomer_token = konsensus_api::auth::create_token(
         &newcomer.identity.node_id().to_hex(), &newcomer.jwt_secret, Scope::all()).unwrap();

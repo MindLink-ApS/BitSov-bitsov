@@ -384,7 +384,7 @@ async fn card_endpoint_or_error(state: &Arc<AppState>) -> Result<String, String>
 
 #[tokio::test]
 async fn discovered_endpoint_is_used_and_failures_carry_a_reason_code() {
-    let intro = IntroductionSettings { network: Some("regtest".into()), ..Default::default() };
+    let intro = IntroductionSettings::fixed(Some("regtest"), None);
     let state = state_with(Arc::default(), intro.clone());
     let err = card_endpoint_or_error(&state).await.unwrap_err();
     assert!(err.contains("introduction_unavailable: no_dialable_endpoint"), "{err}");

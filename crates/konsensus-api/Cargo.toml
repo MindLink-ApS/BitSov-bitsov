@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Integration-test clock injection; production builds use the system clock.
+test-support = []
+
 [dependencies]
 konsensus-core = { path = "../konsensus-core" }
 konsensus-message = { path = "../konsensus-message" }
@@ -47,6 +51,7 @@ zeroize = { workspace = true, features = ["serde"] }
 qrcode = { version = "=0.14.1", default-features = false }
 
 [dev-dependencies]
+konsensus-api = { path = ".", features = ["test-support"] }
 sqlx.workspace = true
 mockall.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
