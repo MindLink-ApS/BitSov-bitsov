@@ -33,6 +33,7 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use x25519_dalek::PublicKey as X25519Public;
+use zeroize::Zeroize;
 
 use konsensus_core::identity::NodeIdentity;
 use konsensus_core::types::NodeId;
@@ -58,6 +59,11 @@ pub enum SessionError {
     /// Double Ratchet error.
     #[error("ratchet error: {0}")]
     Ratchet(#[from] RatchetError),
+
+    /// The advanced session could not be saved. The in-memory ratchet is
+    /// unchanged, and the caller must not transmit a ciphertext from this call.
+    #[error("failed to persist session state: {0}")]
+    Persist(String),
 
     /// Invalid peer data.
     #[error("invalid peer data: {0}")]
@@ -214,8 +220,9 @@ impl SessionManager {
 
     /// Create a session manager with persistent storage.
     ///
-    /// Sessions are persisted after every ratchet operation (encrypt/decrypt)
-    /// and loaded from storage on startup via `restore_sessions()`.
+    /// Encrypt saves the advanced ratchet before it returns ciphertext, and
+    /// decrypt commits a copy of the ratchet only after authentication.
+    /// Sessions are loaded from storage on startup via `restore_sessions()`.
     /// Session state is encrypted at rest using AES-256-GCM with a key
     /// derived from the node identity (Principle 4: no plaintext at any layer).
     pub fn with_store(identity: Arc<NodeIdentity>, store: Arc<dyn SessionStore>) -> Self {
@@ -332,7 +339,9 @@ impl SessionManager {
                                 && self.decrypt_session_blob(&blob).is_err()
                             {
                                 debug!(peer = %peer_id, "re-encrypting legacy plaintext session");
-                                self.persist_session(peer_id).await;
+                                if let Err(e) = self.persist_session(peer_id).await {
+                                    warn!(peer = %peer_id, error = %e, "failed to persist session state");
+                                }
                             }
                         }
                         Err(e) => {
@@ -441,24 +450,6 @@ impl SessionManager {
         }
     }
 
-    /// Encrypt a session state blob with AES-256-GCM.
-    /// Returns nonce (12 bytes) || ciphertext.
-    fn encrypt_session_blob(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-        let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = AesNonce::from_slice(&nonce_bytes);
-
-        let encrypted = self
-            .session_cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|e| format!("session encrypt: {e}"))?;
-
-        let mut result = Vec::with_capacity(12 + encrypted.len());
-        result.extend_from_slice(&nonce_bytes);
-        result.extend_from_slice(&encrypted);
-        Ok(result)
-    }
-
     /// Decrypt a session state blob. Expects nonce (12 bytes) || ciphertext.
     fn decrypt_session_blob(&self, data: &[u8]) -> Result<Vec<u8>, String> {
         if data.len() < 12 {
@@ -475,39 +466,19 @@ impl SessionManager {
     ///
     /// Session state is serialized to JSON and then encrypted with AES-256-GCM
     /// before being written to the store (Principle 4: no plaintext at rest).
-    /// Errors are logged but don't fail the operation (session state is still
-    /// in memory).
-    async fn persist_session(&self, peer_id: &NodeId) {
-        let store = match &self.store {
-            Some(s) => s,
-            None => return,
-        };
-
-        let sessions = self.sessions.read().await;
-        let session = match sessions.get(peer_id) {
-            Some(s) => s,
-            None => return,
-        };
-
-        let state = session.ratchet.export_state();
-        match serde_json::to_vec(&state) {
-            Ok(json_blob) => {
-                // Encrypt the JSON before persisting (Principle 4)
-                match self.encrypt_session_blob(&json_blob) {
-                    Ok(encrypted_blob) => {
-                        if let Err(e) = store.save_session(peer_id, &encrypted_blob).await {
-                            warn!(peer = %peer_id, error = %e, "failed to persist session state");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(peer = %peer_id, error = %e, "failed to encrypt session state for storage");
-                    }
-                }
+    ///
+    /// Encrypt and decrypt do not use this helper: they save a prepared snapshot
+    /// while holding the session write lock. Establishment still logs a failure
+    /// and continues, because that path has not produced a message ciphertext.
+    async fn persist_session(&self, peer_id: &NodeId) -> Result<(), SessionError> {
+        let state = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(peer_id) {
+                Some(session) => session.ratchet.export_state(),
+                None => return Ok(()),
             }
-            Err(e) => {
-                warn!(peer = %peer_id, error = %e, "failed to serialize session state");
-            }
-        }
+        };
+        write_session_state(self.store.as_ref(), &self.session_cipher, peer_id, &state).await
     }
 
     /// Get our prekey bundle for distribution to peers.
@@ -578,8 +549,11 @@ impl SessionManager {
             .await
             .insert(*peer_id, PeerSession { ratchet });
 
-        // Persist to storage
-        self.persist_session(peer_id).await;
+        // Persist to storage. No message ciphertext exists yet; a later send
+        // saves the advanced ratchet before returning ciphertext.
+        if let Err(e) = self.persist_session(peer_id).await {
+            warn!(peer = %peer_id, error = %e, "failed to persist session state");
+        }
 
         Ok(SerializableSessionInit {
             identity_key: hex::encode(initiation.identity_key.as_bytes()),
@@ -646,8 +620,11 @@ impl SessionManager {
             .await
             .insert(*peer_id, PeerSession { ratchet });
 
-        // Persist to storage
-        self.persist_session(peer_id).await;
+        // Persist to storage. No message ciphertext exists yet; a later send
+        // saves the advanced ratchet before returning ciphertext.
+        if let Err(e) = self.persist_session(peer_id).await {
+            warn!(peer = %peer_id, error = %e, "failed to persist session state");
+        }
 
         // Replenish one-time pre-keys if running low
         self.replenish_prekeys().await;
@@ -660,21 +637,33 @@ impl SessionManager {
     /// Uses the Double Ratchet to derive a per-message key and encrypt.
     /// Returns the ratchet message (header + ciphertext) which should be
     /// placed in the UKM envelope's `ciphertext` field.
+    ///
+    /// The advanced ratchet is saved before this returns. If saving fails the
+    /// in-memory session stays where it was and the ciphertext is not returned,
+    /// so the caller cannot transmit it.
     pub async fn encrypt(
         &self,
         peer_id: &NodeId,
         plaintext: &[u8],
     ) -> Result<RatchetMessage, SessionError> {
-        let msg = {
-            let mut sessions = self.sessions.write().await;
+        let store = self.store.clone();
+        let cipher = &self.session_cipher;
+        let mut sessions = self.sessions.write().await;
+        let (msg, trial, state) = {
             let session = sessions
                 .get_mut(peer_id)
                 .ok_or(SessionError::NoSession(*peer_id))?;
-            session.ratchet.encrypt(plaintext)?
+            let mut trial = session.ratchet.clone();
+            let msg = trial.encrypt(plaintext)?;
+            let state = trial.export_state();
+            (msg, trial, state)
         };
 
-        // Persist updated ratchet state after chain advancement
-        self.persist_session(peer_id).await;
+        write_session_state(store.as_ref(), cipher, peer_id, &state).await?;
+        match sessions.get_mut(peer_id) {
+            Some(session) => session.ratchet = trial,
+            None => return Err(SessionError::NoSession(*peer_id)),
+        }
         Ok(msg)
     }
 
@@ -682,21 +671,33 @@ impl SessionManager {
     ///
     /// Uses the Double Ratchet to derive the message key and decrypt.
     /// Handles out-of-order delivery transparently.
+    ///
+    /// The ratchet is authenticated on a copy. The copy is saved and then
+    /// installed only after the AEAD tag succeeds. A failed tag or a failed
+    /// save leaves the stored session unchanged.
     pub async fn decrypt(
         &self,
         peer_id: &NodeId,
         message: &RatchetMessage,
     ) -> Result<Vec<u8>, SessionError> {
-        let plaintext = {
-            let mut sessions = self.sessions.write().await;
+        let store = self.store.clone();
+        let cipher = &self.session_cipher;
+        let mut sessions = self.sessions.write().await;
+        let (plaintext, trial, state) = {
             let session = sessions
                 .get_mut(peer_id)
                 .ok_or(SessionError::NoSession(*peer_id))?;
-            session.ratchet.decrypt(message)?
+            let mut trial = session.ratchet.clone();
+            let plaintext = trial.decrypt(message)?;
+            let state = trial.export_state();
+            (plaintext, trial, state)
         };
 
-        // Persist updated ratchet state after chain advancement
-        self.persist_session(peer_id).await;
+        write_session_state(store.as_ref(), cipher, peer_id, &state).await?;
+        match sessions.get_mut(peer_id) {
+            Some(session) => session.ratchet = trial,
+            None => return Err(SessionError::NoSession(*peer_id)),
+        }
         Ok(plaintext)
     }
 
@@ -825,6 +826,48 @@ fn deserialize_prekey_bundle(
         one_time_prekey,
         one_time_prekey_id: bundle.one_time_prekey_id,
     })
+}
+
+/// Seal session JSON as nonce (12 bytes) || AES-256-GCM ciphertext.
+fn seal_session_blob(cipher: &Aes256Gcm, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = AesNonce::from_slice(&nonce_bytes);
+
+    let encrypted = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| format!("session encrypt: {e}"))?;
+
+    let mut result = Vec::with_capacity(12 + encrypted.len());
+    result.extend_from_slice(&nonce_bytes);
+    result.extend_from_slice(&encrypted);
+    Ok(result)
+}
+
+/// Save `state` for `peer_id`. With no store this is a no-op success.
+///
+/// The JSON buffer is wiped after sealing. A store error is returned to the
+/// caller; this function does not log and continue.
+async fn write_session_state(
+    store: Option<&Arc<dyn SessionStore>>,
+    cipher: &Aes256Gcm,
+    peer_id: &NodeId,
+    state: &RatchetState,
+) -> Result<(), SessionError> {
+    let Some(store) = store else {
+        return Ok(());
+    };
+
+    let mut json_blob = serde_json::to_vec(state)
+        .map_err(|e| SessionError::Persist(format!("serialize session state: {e}")))?;
+    let encrypted = seal_session_blob(cipher, &json_blob);
+    json_blob.zeroize();
+    let encrypted_blob = encrypted.map_err(SessionError::Persist)?;
+    store
+        .save_session(peer_id, &encrypted_blob)
+        .await
+        .map_err(|e| SessionError::Persist(e.to_string()))?;
+    Ok(())
 }
 
 /// Whether the legacy plaintext-session migration path is active for this boot.

@@ -143,6 +143,11 @@ impl ChainKey {
 ///
 /// Initialized from an X3DH shared secret. Provides encrypt/decrypt with
 /// forward secrecy and post-compromise security.
+///
+/// `Clone` exists so decrypt can authenticate against a copy and commit the
+/// copy only after the AEAD tag checks out. Both copies zeroize their key
+/// material on drop.
+#[derive(Clone)]
 pub struct DoubleRatchet {
     /// Our current DH ratchet key pair.
     dh_secret: StaticSecret,
@@ -270,7 +275,7 @@ impl DoubleRatchet {
             .ok_or(RatchetError::NotInitialized)?;
 
         // Derive message key from sending chain
-        let (next_chain, message_key) = chain.ratchet()?;
+        let (next_chain, mut message_key) = chain.ratchet()?;
         self.sending_chain = Some(next_chain);
 
         let header = MessageHeader {
@@ -281,8 +286,12 @@ impl DoubleRatchet {
 
         self.send_count += 1;
 
-        // AEAD encrypt: key = message_key, nonce = header bytes, AD = associated_data + header
-        let ciphertext = aead_encrypt(&message_key, plaintext, &self.aead_ad(&header))?;
+        // AEAD encrypt: key = message_key, nonce derived from the key and header.
+        // The header layout is unchanged: 32-byte DH key, 4-byte previous chain
+        // length, 4-byte message number, then the ciphertext.
+        let ciphertext = aead_encrypt(&message_key, plaintext, &self.aead_ad(&header));
+        message_key.zeroize();
+        let ciphertext = ciphertext?;
 
         Ok(RatchetMessage { header, ciphertext })
     }
@@ -291,11 +300,32 @@ impl DoubleRatchet {
     ///
     /// Handles out-of-order delivery by checking skipped keys and performing
     /// DH ratchet steps as needed.
+    ///
+    /// Authentication runs on a copy of the session. Skipped keys, chain
+    /// counters, and DH ratchet keys are written back only after the AEAD tag
+    /// succeeds, so a tampered ciphertext leaves this session unchanged.
     pub fn decrypt(&mut self, message: &RatchetMessage) -> Result<Vec<u8>, RatchetError> {
+        let mut trial = self.clone();
+        let plaintext = trial.decrypt_in_place(message)?;
+        *self = trial;
+        Ok(plaintext)
+    }
+
+    /// Advance chains and decrypt `message` directly on `self`.
+    ///
+    /// Callers that must keep the prior state on failure use [`Self::decrypt`],
+    /// which commits this function's result only after authentication.
+    fn decrypt_in_place(&mut self, message: &RatchetMessage) -> Result<Vec<u8>, RatchetError> {
         // Check if we have a skipped key for this message
         let skip_key = (message.header.dh_public, message.header.message_number);
-        if let Some((message_key, _seq)) = self.skipped_keys.remove(&skip_key) {
-            return aead_decrypt(&message_key, &message.ciphertext, &self.aead_ad(&message.header));
+        if let Some((mut message_key, _seq)) = self.skipped_keys.remove(&skip_key) {
+            let result = aead_decrypt(
+                &message_key,
+                &message.ciphertext,
+                &self.aead_ad(&message.header),
+            );
+            message_key.zeroize();
+            return result;
         }
 
         let remote_pub = PublicKey::from(message.header.dh_public);
@@ -324,11 +354,37 @@ impl DoubleRatchet {
             .receiving_chain
             .as_ref()
             .ok_or(RatchetError::NotInitialized)?;
-        let (next_chain, message_key) = chain.ratchet()?;
+        let (next_chain, mut message_key) = chain.ratchet()?;
         self.receiving_chain = Some(next_chain);
         self.recv_count += 1;
 
-        aead_decrypt(&message_key, &message.ciphertext, &self.aead_ad(&message.header))
+        let result = aead_decrypt(
+            &message_key,
+            &message.ciphertext,
+            &self.aead_ad(&message.header),
+        );
+        message_key.zeroize();
+        result
+    }
+
+    /// Message key and AEAD nonce the next [`Self::encrypt`] would use.
+    ///
+    /// Does not advance the sending chain. Test-only, so production builds do
+    /// not expose upcoming key material.
+    #[cfg(test)]
+    pub(crate) fn next_send_key_and_nonce(&self) -> Result<([u8; 32], [u8; 12]), RatchetError> {
+        let chain = self
+            .sending_chain
+            .as_ref()
+            .ok_or(RatchetError::NotInitialized)?;
+        let (_next_chain, message_key) = chain.ratchet()?;
+        let header = MessageHeader {
+            dh_public: *self.dh_public.as_bytes(),
+            previous_chain_length: self.previous_chain_length,
+            message_number: self.send_count,
+        };
+        let nonce = derive_nonce(&message_key, &self.aead_ad(&header))?;
+        Ok((message_key, nonce))
     }
 
     /// Get our current DH ratchet public key.

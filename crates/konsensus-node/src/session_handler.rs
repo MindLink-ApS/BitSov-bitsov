@@ -882,7 +882,9 @@ async fn handle_session_ack(
         Some(serde_json::json!({ "role": "initiator" })),
     );
 
-    // Send a ratchet init message so the acceptor can initialize their sending chain.
+    // Encrypt saves the advanced ratchet before returning. On error the frame
+    // is not built and nothing is sent. A save failure leaves the session in
+    // place so a later attempt can send; other failures still drop it.
     match session_manager.encrypt(peer_id, b"ratchet-init").await {
         Ok(ratchet_msg) => {
             let payload = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
@@ -890,6 +892,13 @@ async fn handle_session_ack(
             if let Err(e) = transport.send_frame(peer_id, &frame).await {
                 warn!(peer = %peer_id, error = %e, "failed to send RatchetInit");
             }
+        }
+        Err(konsensus_crypto::SessionError::Persist(error)) => {
+            warn!(
+                peer = %peer_id,
+                error = %error,
+                "ratchet state was not saved; ratchet init was not sent"
+            );
         }
         Err(e) => {
             warn!(
@@ -913,6 +922,13 @@ async fn handle_ratchet_init(
             match session_manager.decrypt(peer_id, &ratchet_msg).await {
                 Ok(_) => {
                     info!(peer = %peer_id, "ratchet init received, bidirectional E2EE ready");
+                }
+                Err(konsensus_crypto::SessionError::Persist(error)) => {
+                    warn!(
+                        peer = %peer_id,
+                        error = %error,
+                        "ratchet state was not saved; ratchet init was not accepted"
+                    );
                 }
                 Err(e) => {
                     warn!(

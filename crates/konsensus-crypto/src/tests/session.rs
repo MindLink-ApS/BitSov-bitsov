@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use super::*;
 
 const TEST_MNEMONIC_A: &str =
@@ -746,4 +749,312 @@ async fn decrypt_without_session_fails() {
 
     let result = mgr_a.decrypt(&node_b, &fake_msg).await;
     assert!(matches!(result, Err(SessionError::NoSession(_))));
+}
+
+/// Store that can refuse saves after a session has already been written.
+struct FlakySessionStore {
+    data: tokio::sync::Mutex<HashMap<NodeId, Vec<u8>>>,
+    fail_saves: AtomicBool,
+    failed_saves: AtomicUsize,
+}
+
+impl FlakySessionStore {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            data: tokio::sync::Mutex::new(HashMap::new()),
+            fail_saves: AtomicBool::new(false),
+            failed_saves: AtomicUsize::new(0),
+        })
+    }
+
+    async fn blob(&self, peer_id: &NodeId) -> Option<Vec<u8>> {
+        self.data.lock().await.get(peer_id).cloned()
+    }
+}
+
+#[async_trait]
+impl super::SessionStore for FlakySessionStore {
+    async fn save_session(
+        &self,
+        peer_id: &NodeId,
+        state_json: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.fail_saves.load(Ordering::SeqCst) {
+            self.failed_saves.fetch_add(1, Ordering::SeqCst);
+            return Err("simulated session store failure".into());
+        }
+        self.data.lock().await.insert(*peer_id, state_json.to_vec());
+        Ok(())
+    }
+
+    async fn load_session(
+        &self,
+        peer_id: &NodeId,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.data.lock().await.get(peer_id).cloned())
+    }
+
+    async fn delete_session(
+        &self,
+        peer_id: &NodeId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.data.lock().await.remove(peer_id);
+        Ok(())
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.data.lock().await.keys().copied().collect())
+    }
+}
+
+struct Forwarded {
+    bytes: Vec<u8>,
+    key: [u8; 32],
+    nonce: [u8; 12],
+}
+
+async fn peek_send(mgr: &SessionManager, peer: &NodeId) -> ([u8; 32], [u8; 12]) {
+    let sessions = mgr.sessions.read().await;
+    sessions
+        .get(peer)
+        .expect("session")
+        .ratchet
+        .next_send_key_and_nonce()
+        .expect("sending chain")
+}
+
+async fn ratchet_state_json(mgr: &SessionManager, peer: &NodeId) -> Vec<u8> {
+    let sessions = mgr.sessions.read().await;
+    let state = sessions.get(peer).expect("session").ratchet.export_state();
+    serde_json::to_vec(&state).expect("state json")
+}
+
+/// Forward a ciphertext only after `encrypt` returns. That is the same gate
+/// the node send paths use: a persist error never reaches the transport.
+async fn forward_if_saved(
+    mgr: &SessionManager,
+    peer: &NodeId,
+    plaintext: &[u8],
+    sent: &mut Vec<Forwarded>,
+) -> Result<(), SessionError> {
+    let (key, nonce) = peek_send(mgr, peer).await;
+    let msg = mgr.encrypt(peer, plaintext).await?;
+    let bytes = ratchet_message_to_bytes(&msg);
+    assert_eq!(bytes.len(), 40 + msg.ciphertext.len());
+    assert_eq!(&bytes[..40], msg.header.to_bytes().as_slice());
+    assert_eq!(&bytes[40..], msg.ciphertext.as_slice());
+    sent.push(Forwarded { bytes, key, nonce });
+    Ok(())
+}
+
+fn assert_unique_keys(sent: &[Forwarded]) {
+    let mut keys = HashSet::new();
+    let mut nonces = HashSet::new();
+    let mut pairs = HashSet::new();
+    for item in sent {
+        assert!(keys.insert(item.key), "message key was used more than once");
+        assert!(nonces.insert(item.nonce), "nonce was used more than once");
+        assert!(
+            pairs.insert((item.key, item.nonce)),
+            "key/nonce pair was used more than once"
+        );
+    }
+}
+
+#[tokio::test]
+async fn persist_failure_sends_nothing_and_restart_does_not_reuse_keys() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_a = *id_a.node_id();
+    let node_b = *id_b.node_id();
+
+    let store = FlakySessionStore::new();
+    let mgr_a = SessionManager::with_store(Arc::clone(&id_a), store.clone());
+    let mgr_b = SessionManager::new(Arc::clone(&id_b));
+
+    let bundle_b = mgr_b.prekey_bundle().await;
+    let init_data = mgr_a.initiate_session(&node_b, &bundle_b).await.unwrap();
+    mgr_b.accept_session(&node_a, &init_data).await.unwrap();
+
+    let mut sent = Vec::new();
+    forward_if_saved(&mgr_a, &node_b, b"warmup", &mut sent)
+        .await
+        .unwrap();
+
+    let blocked = b"after restart";
+    let preview = {
+        let sessions = mgr_a.sessions.read().await;
+        let mut trial = sessions.get(&node_b).expect("session").ratchet.clone();
+        trial.encrypt(blocked).unwrap()
+    };
+    let preview_bytes = ratchet_message_to_bytes(&preview);
+    let key_before = peek_send(&mgr_a, &node_b).await;
+    let state_before = ratchet_state_json(&mgr_a, &node_b).await;
+    let blob_before = store.blob(&node_b).await.expect("persisted warmup");
+    let failed_before = store.failed_saves.load(Ordering::SeqCst);
+    let sent_before = sent.len();
+
+    store.fail_saves.store(true, Ordering::SeqCst);
+    let err = forward_if_saved(&mgr_a, &node_b, blocked, &mut sent)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SessionError::Persist(_)));
+    assert!(store.failed_saves.load(Ordering::SeqCst) > failed_before);
+    assert_eq!(
+        sent.len(),
+        sent_before,
+        "persist failure must not forward ciphertext"
+    );
+    assert!(!sent.iter().any(|item| item.bytes == preview_bytes));
+    assert_eq!(peek_send(&mgr_a, &node_b).await, key_before);
+    assert_eq!(ratchet_state_json(&mgr_a, &node_b).await, state_before);
+    assert_eq!(
+        store.blob(&node_b).await.as_deref(),
+        Some(blob_before.as_slice())
+    );
+
+    // Restart from the last successful save. The refused send is not on disk.
+    store.fail_saves.store(false, Ordering::SeqCst);
+    let mgr_a2 = SessionManager::with_store(Arc::clone(&id_a), store.clone());
+    assert_eq!(mgr_a2.restore_sessions().await, 1);
+    assert_eq!(peek_send(&mgr_a2, &node_b).await, key_before);
+
+    forward_if_saved(&mgr_a2, &node_b, blocked, &mut sent)
+        .await
+        .unwrap();
+    assert_eq!(sent.last().unwrap().bytes, preview_bytes);
+    assert_eq!(
+        (sent.last().unwrap().key, sent.last().unwrap().nonce),
+        key_before
+    );
+    assert_eq!(
+        sent.iter()
+            .filter(|item| item.bytes == preview_bytes)
+            .count(),
+        1,
+        "the withheld ciphertext may be sent once, after it has been saved"
+    );
+
+    // A second restart must advance past that key.
+    let mgr_a3 = SessionManager::with_store(Arc::clone(&id_a), store.clone());
+    assert_eq!(mgr_a3.restore_sessions().await, 1);
+    let key_after = peek_send(&mgr_a3, &node_b).await;
+    assert_ne!(key_after, key_before);
+    forward_if_saved(&mgr_a3, &node_b, b"second restart", &mut sent)
+        .await
+        .unwrap();
+
+    assert_unique_keys(&sent);
+    assert_eq!(sent.len(), 3);
+
+    let plaintexts: [&[u8]; 3] = [b"warmup", blocked, b"second restart"];
+    for (item, plaintext) in sent.iter().zip(plaintexts) {
+        let message = ratchet_message_from_bytes(&item.bytes).unwrap();
+        assert_eq!(mgr_b.decrypt(&node_a, &message).await.unwrap(), plaintext);
+    }
+}
+
+#[tokio::test]
+async fn tampered_ciphertext_does_not_commit_session() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_a = *id_a.node_id();
+    let node_b = *id_b.node_id();
+
+    let store_b = MemorySessionStore::new();
+    let mgr_a = SessionManager::new(Arc::clone(&id_a));
+    let mgr_b = SessionManager::with_store(Arc::clone(&id_b), store_b.clone());
+
+    let bundle_b = mgr_b.prekey_bundle().await;
+    let init_data = mgr_a.initiate_session(&node_b, &bundle_b).await.unwrap();
+    mgr_b.accept_session(&node_a, &init_data).await.unwrap();
+
+    let msg = mgr_a.encrypt(&node_b, b"authentic").await.unwrap();
+    let mut bad = msg.clone();
+    bad.ciphertext[0] ^= 0xff;
+
+    let state_before = ratchet_state_json(&mgr_b, &node_a).await;
+    let blob_before = store_b.data.read().await.get(&node_a).cloned();
+
+    let err = mgr_b.decrypt(&node_a, &bad).await.unwrap_err();
+    assert!(matches!(err, SessionError::Ratchet(_)));
+    assert_eq!(ratchet_state_json(&mgr_b, &node_a).await, state_before);
+    assert_eq!(store_b.data.read().await.get(&node_a).cloned(), blob_before);
+
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"authentic");
+    assert_ne!(ratchet_state_json(&mgr_b, &node_a).await, state_before);
+}
+
+/// A save that succeeds, followed by a crash before the ciphertext is handed
+/// to the transport, must not leave that key and nonce for the next boot.
+#[tokio::test]
+async fn saved_ciphertext_not_forwarded_is_not_reused_after_restart() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_b = *id_b.node_id();
+
+    let node_a = *id_a.node_id();
+    let store = FlakySessionStore::new();
+    let mgr_a = SessionManager::with_store(Arc::clone(&id_a), store.clone());
+    let mgr_b = SessionManager::new(Arc::clone(&id_b));
+    let bundle_b = mgr_b.prekey_bundle().await;
+    let init_data = mgr_a.initiate_session(&node_b, &bundle_b).await.unwrap();
+    mgr_b.accept_session(&node_a, &init_data).await.unwrap();
+
+    let mut sent = Vec::new();
+    forward_if_saved(&mgr_a, &node_b, b"warmup", &mut sent)
+        .await
+        .unwrap();
+
+    let withheld_key = peek_send(&mgr_a, &node_b).await;
+    let withheld = mgr_a.encrypt(&node_b, b"withheld").await.unwrap();
+    let withheld_bytes = ratchet_message_to_bytes(&withheld);
+    // Process ends before `withheld_bytes` reaches the transport.
+    drop(mgr_a);
+
+    let mgr_a2 = SessionManager::with_store(Arc::clone(&id_a), store.clone());
+    assert_eq!(mgr_a2.restore_sessions().await, 1);
+    let next = peek_send(&mgr_a2, &node_b).await;
+    assert_ne!(next, withheld_key);
+    forward_if_saved(&mgr_a2, &node_b, b"after crash", &mut sent)
+        .await
+        .unwrap();
+    assert_ne!(sent.last().unwrap().bytes, withheld_bytes);
+    assert_ne!(
+        (sent.last().unwrap().key, sent.last().unwrap().nonce),
+        withheld_key
+    );
+    assert_unique_keys(&sent);
+}
+
+/// A failed session save on decrypt must not consume the message key.
+#[tokio::test]
+async fn decrypt_persist_failure_leaves_session_able_to_retry() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_a = *id_a.node_id();
+    let node_b = *id_b.node_id();
+
+    let store_b = FlakySessionStore::new();
+    let mgr_a = SessionManager::new(Arc::clone(&id_a));
+    let mgr_b = SessionManager::with_store(Arc::clone(&id_b), store_b.clone());
+    let bundle_b = mgr_b.prekey_bundle().await;
+    let init_data = mgr_a.initiate_session(&node_b, &bundle_b).await.unwrap();
+    mgr_b.accept_session(&node_a, &init_data).await.unwrap();
+
+    let msg = mgr_a.encrypt(&node_b, b"once").await.unwrap();
+    let state_before = ratchet_state_json(&mgr_b, &node_a).await;
+    let blob_before = store_b.blob(&node_a).await;
+
+    store_b.fail_saves.store(true, Ordering::SeqCst);
+    let err = mgr_b.decrypt(&node_a, &msg).await.unwrap_err();
+    assert!(matches!(err, SessionError::Persist(_)));
+    assert_eq!(ratchet_state_json(&mgr_b, &node_a).await, state_before);
+    assert_eq!(store_b.blob(&node_a).await, blob_before);
+
+    store_b.fail_saves.store(false, Ordering::SeqCst);
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"once");
+    let err = mgr_b.decrypt(&node_a, &msg).await.unwrap_err();
+    assert!(matches!(err, SessionError::Ratchet(_)));
+    assert_ne!(ratchet_state_json(&mgr_b, &node_a).await, state_before);
 }

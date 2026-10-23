@@ -474,7 +474,10 @@ async fn decrypt_no_session_returns_none() {
     )
     .await;
 
-    assert!(result.is_none(), "no session should return None");
+    assert!(
+        result.into_option().is_none(),
+        "no session should return None"
+    );
 }
 
 #[tokio::test]
@@ -521,7 +524,7 @@ async fn decrypt_invalid_ratchet_message_returns_none() {
     .await;
 
     assert!(
-        result.is_none(),
+        result.into_option().is_none(),
         "invalid ratchet message should return None"
     );
 }
@@ -575,7 +578,7 @@ async fn decrypt_valid_message_returns_plaintext_and_caches() {
     )
     .await;
 
-    assert_eq!(result, Some("Hello from Alice!".to_string()));
+    assert_eq!(result.into_option(), Some("Hello from Alice!".to_string()));
     // Verify plaintext was cached in storage
     assert!(storage.has_plaintext(&envelope.id));
 }
@@ -641,7 +644,7 @@ async fn decrypt_file_ref_stores_and_returns_label() {
     )
     .await;
 
-    assert_eq!(result, Some("[file: report.pdf]".to_string()));
+    assert_eq!(result.into_option(), Some("[file: report.pdf]".to_string()));
     assert_eq!(storage.file_count(), 1);
 }
 
@@ -1024,7 +1027,7 @@ async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
     .await;
 
     // Decryption failed → returns None
-    assert!(result.is_none());
+    assert!(result.into_option().is_none());
     // Session should be removed for re-negotiation
     assert!(!bob_mgr.has_session(alice.node_id()).await);
 }
@@ -1081,7 +1084,7 @@ async fn decrypt_non_utf8_returns_none() {
     .await;
 
     // Non-UTF8 for a chat message returns None
-    assert!(result.is_none());
+    assert!(result.into_option().is_none());
 }
 
 // ── HARD-11: registry read guard released before the gate await ──────
