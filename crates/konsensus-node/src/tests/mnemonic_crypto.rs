@@ -158,6 +158,20 @@ fn write_and_read_plaintext() {
 }
 
 #[test]
+fn plaintext_write_preserves_exact_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mnemonic.txt");
+
+    // Synthetic input only. The legacy plaintext format is the input bytes
+    // verbatim, with no trimming, header, or added newline.
+    for mnemonic in ["test phrase", " \ttest  phrase\r\n", ""] {
+        let final_path = write_mnemonic(&path, mnemonic, None).unwrap();
+        assert_eq!(final_path, path);
+        assert_eq!(std::fs::read(&final_path).unwrap(), mnemonic.as_bytes());
+    }
+}
+
+#[test]
 fn write_and_read_encrypted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mnemonic.txt");

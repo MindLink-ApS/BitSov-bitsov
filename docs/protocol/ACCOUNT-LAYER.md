@@ -212,15 +212,32 @@ that pairing's holder. The query is not an identity credential.
   `Authorization: PairChallenge <timestamp>:<signature>`, where the timestamp is
   decimal Unix seconds and the signature is hex Ed25519 over the UTF-8 string
   `bitsov-pair-challenge-v1:<client_id>:<timestamp>`. The server
-  accepts a timestamp within 30 seconds of its clock. No JWT is needed, so first
-  issuance and renewal after token expiry both work. This proof is a
+  accepts a timestamp within 30 seconds of its clock, once per decoded
+  `(client_id, timestamp, signature)` tuple in this node run. A replay returns
+  401, including across the live/bootstrap routers or with different hex casing.
+  Each new request needs a fresh proof: deterministic Ed25519 signatures over
+  the same timestamp are identical, so serialize retries and use a new timestamp
+  within the window (wait for the next second if needed). No JWT is needed, so
+  first issuance and renewal after token expiry both work. This proof is a
   short-lived authentication credential: do not log or share it. The proof
   domain differs from the returned challenge that must be signed for redemption.
   Existing local clients must send this header; unsigned requests return 401.
 
-The existing eight outstanding challenges per authenticated client and global
-128-challenge backstop remain. A holder at its own cap receives the same 429 as
-at the global cap (`{"code":429,"error":"too many pending pairing requests"}`),
-without occupancy or identity details. It can redeem an existing challenge to
-free a slot; consumption, 120-second expiry and revocation release capacity.
+The replay memo holds at most 4096 accepted proofs, with at most 128 per client
+so one signer choosing many different signing nonces cannot fill it. Entries
+remain through `timestamp + 30` inclusive (a future-dated proof can remain valid for 60 seconds
+after arrival), and expired entries are pruned on local proof admission.
+Revocation/re-pairing does not forget live proofs. A full memo refuses new proofs
+with the static 429 below rather than evicting a live entry and enabling replay;
+replays still return 401. Invalid signatures never reserve memo space. Signature
+verification runs outside the pairing mutex; the current key, pairing epoch,
+identity and timestamp window are rechecked under it before the atomic memo and
+challenge insertion.
+
+The eight outstanding challenges per authenticated client and global
+128-challenge backstop remain. A holder at eight replaces only its own oldest
+challenge, even at the global cap; other clients' slots are never evicted.
+A holder below eight cannot allocate into a full global pool and receives
+`{"code":429,"error":"too many pending pairing requests"}`, without occupancy
+or identity details. Consumption, 120-second expiry and revocation release capacity.
 A caller knowing another client's public id cannot allocate in its quota.
