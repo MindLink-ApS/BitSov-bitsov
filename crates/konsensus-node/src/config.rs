@@ -27,6 +27,45 @@ pub(crate) fn fail_next_config_dir_sync() {
     FAIL_CONFIG_DIR_SYNC.set(true);
 }
 
+/// Best-effort permission repair, failing closed only when other users can read.
+/// The chmod boundary is injectable so failures can be tested without real seeds,
+/// changing process privileges, or relying on filesystem-specific immutable flags.
+#[cfg(unix)]
+fn tighten_mnemonic_permissions(
+    path: &Path,
+    chmod: impl FnOnce(&Path, std::fs::Permissions) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        // Existence is checked by validation; preserve its other I/O handling.
+        return Ok(());
+    };
+    // Development configs use /dev/null; never change a shared special file.
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode == 0o600 {
+        return Ok(());
+    }
+    match chmod(path, std::fs::Permissions::from_mode(0o600)) {
+        Ok(()) => tracing::info!("mnemonic file permissions tightened to 0600"),
+        Err(error) if mode & 0o044 != 0 => {
+            anyhow::bail!(
+                "refusing to start: mnemonic file is group- or world-readable and chmod to 0600 failed ({:?}). \
+                 Fix ownership or filesystem permissions, set the configured mnemonic file to mode 0600, then retry.",
+                error.kind()
+            );
+        }
+        Err(error) => tracing::warn!(
+            error_kind = ?error.kind(),
+            "could not set mnemonic file permissions to 0600; no group or world read access, continuing"
+        ),
+    }
+    Ok(())
+}
+
 /// User-facing onboarding tier.
 ///
 /// This determines the default configuration and UI presentation.
@@ -1702,24 +1741,11 @@ impl NodeConfig {
             );
         }
 
-        // Warn if mnemonic file has overly permissive permissions (Unix only)
+        // Repair permissions using metadata only; never open/read the seed here.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(metadata) = std::fs::metadata(&self.identity.mnemonic_file) {
-                let mode = metadata.permissions().mode();
-                // Check if group or other has read/write/execute access
-                if mode & 0o077 != 0 {
-                    tracing::warn!(
-                        path = %self.identity.mnemonic_file.display(),
-                        mode = format!("{mode:04o}"),
-                        "mnemonic file has overly permissive permissions — should be 0600. \
-                         Fix with: chmod 600 {}",
-                        self.identity.mnemonic_file.display()
-                    );
-                }
-            }
-        }
+        tighten_mnemonic_permissions(&self.identity.mnemonic_file, |path, permissions| {
+            std::fs::set_permissions(path, permissions)
+        })?;
 
         // Check P2P and API ports don't collide
         if tcp_addrs_collide(self.network.listen_addr, self.api.listen_addr) {

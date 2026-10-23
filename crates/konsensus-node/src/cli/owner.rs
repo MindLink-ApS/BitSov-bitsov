@@ -262,6 +262,14 @@ fn report(resp: ControlResponse) -> Result<()> {
             Ok(())
         }
         ControlResponse::Error { message } => {
+            if message
+                .split_once(':')
+                .is_some_and(|(code, _)| code == control::MALFORMED_CONTROL_REQUEST)
+            {
+                anyhow::bail!(
+                    "refused: malformed_control_request: invalid control request; check that the owner CLI and node versions match"
+                );
+            }
             anyhow::bail!("refused: {}", terminal_safe(&message))
         }
         other => {
@@ -2080,6 +2088,31 @@ mod startup_tests {
             (t.budget_msat, t.per_call_max_msat, t.ttl_secs),
             (50_000, 50_000, 1800)
         );
+    }
+
+    #[test]
+    fn report_recognizes_malformed_control_request_code() {
+        let response = serde_json::from_str::<ControlResponse>(
+            r#"{"result":"error","message":"malformed_control_request: invalid control request"}"#,
+        )
+        .unwrap();
+        let error = report(response).unwrap_err().to_string();
+        assert!(error.contains("malformed_control_request"));
+        assert!(error.contains("check that the owner CLI and node versions match"));
+
+        // Recognition is by code, independent of the fixed human-readable text.
+        let error = report(ControlResponse::Error {
+            message: "malformed_control_request: request rejected".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("check that the owner CLI and node versions match"));
+        let error = report(ControlResponse::Error {
+            message: "some_other_error: refused".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("versions match"));
     }
 
     #[test]

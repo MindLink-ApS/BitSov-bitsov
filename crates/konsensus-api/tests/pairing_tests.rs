@@ -1206,6 +1206,67 @@ async fn owner_control_socket_permissions() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn malformed_control_requests_never_echo_input() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, service, _) = state_with_pairing(tmp.path(), true);
+    let ctx = Arc::new(control::ControlContext {
+        identity_fingerprint: service.bound_fingerprint(),
+        service,
+        data_dir: tmp.path().to_path_buf(),
+        mnemonic_path: tmp.path().join("unused-mnemonic"),
+        replacement_guard: control::ReplacementGuard {
+            layout: konsensus_api::bootstrap::DataDirLayout::new(tmp.path()),
+            uses_identity_derived_keys: false,
+            has_identity_passphrase: false,
+        },
+    });
+    let server = control::ControlServer::bind(tmp.path(), ctx).unwrap();
+    let stream = tokio::net::UnixStream::connect(server.path())
+        .await
+        .unwrap();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(server.serve(rx));
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    for input in [
+        r#"{"op":"PRIVATE_UNKNOWN_OPERATION"}"#,
+        r#"{"op":"add-peer","node_id":"ab","addr":"127.0.0.1:9735","PRIVATE_UNKNOWN_FIELD":"PRIVATE_VALUE"}"#,
+        r#"{"op":"open-window","seconds":"PRIVATE_BAD_TYPE"}"#,
+        r#"{"op":"approve-replacement","mnemonic":"PRIVATE_TRUNCATED"#,
+    ] {
+        write
+            .write_all(format!("{input}\n").as_bytes())
+            .await
+            .unwrap();
+        let response = lines.next_line().await.unwrap().unwrap();
+        assert!(!response.contains("PRIVATE_"), "input leaked: {response}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap(),
+            serde_json::json!({
+                "result": "error",
+                "message": "malformed_control_request: invalid control request"
+            })
+        );
+    }
+    // A malformed line must not prevent the owner from using the connection.
+    write.write_all(b"{\"op\":\"status\"}\n").await.unwrap();
+    assert!(matches!(
+        serde_json::from_str::<control::ControlResponse>(
+            &lines.next_line().await.unwrap().unwrap()
+        )
+        .unwrap(),
+        control::ControlResponse::Status { .. }
+    ));
+    drop(write);
+    drop(lines);
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn same_uid_socket_client_cannot_self_grant_from_public_information() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, service, console) = state_with_pairing(tmp.path(), true);

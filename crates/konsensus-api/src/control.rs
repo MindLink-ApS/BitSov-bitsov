@@ -266,6 +266,9 @@ pub enum ControlResponse {
     },
 }
 
+/// Stable error code for a control request that could not be decoded.
+pub const MALFORMED_CONTROL_REQUEST: &str = "malformed_control_request";
+
 /// A paired client as rendered to the owner.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientSummary {
@@ -1107,8 +1110,9 @@ async fn serve_connection(
         }
         let response = match serde_json::from_str::<ControlRequest>(&line) {
             Ok(req) => handle_local(&ctx, approval_state.as_ref(), req).await,
-            Err(e) => ControlResponse::Error {
-                message: format!("malformed control request: {e}"),
+            // Serde diagnostics may quote secret-bearing input. Never echo them.
+            Err(_) => ControlResponse::Error {
+                message: format!("{MALFORMED_CONTROL_REQUEST}: invalid control request"),
             },
         };
         let mut bytes = serde_json::to_vec(&response).unwrap_or_else(|_| {
