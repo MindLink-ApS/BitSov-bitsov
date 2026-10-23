@@ -1,7 +1,12 @@
-# M2 — Offline delivery: carry now, admit on drain
+# M2 — Offline delivery: sender outbox; relay carriage blocked
 
 **Status:** Design proposal. **Nothing in this document is shipped.** It is not a
-spec and it is not a commitment.
+spec and it is not a commitment. **S3 (sender-side `held` outbox) is the only
+ready slice. Relay `E0` carriage and the "contact has mail" dial hint are
+BLOCKED pending owner rulings on Q1 and Q7, with no proposed default.**
+S1/S2/S4/S5 remain blocked; their relay details below are conditional design
+material, not authorization to build or enable them.
+
 **Date:** 2026-10-23
 **Scope:** How a message reaches a recipient whose node is offline when the
 sender sends, on signet, in the closed beta. This covers the sender's own node
@@ -47,8 +52,9 @@ behaviour; until then, the text should not promise queuing.
 
 ### Comparison with BitChat
 
-The comparison is taken from [BITCHAT-ALIGNMENT.md](https://github.com/mindlink-aps/bitsov-bitsov/blob/research/bitchat-alignment/docs/research/BITCHAT-ALIGNMENT.md)
-(branch `research/bitchat-alignment`). It cites BitChat WHITEPAPER v2.0 §6.
+The comparison is taken from [BITCHAT-ALIGNMENT.md](../research/BITCHAT-ALIGNMENT.md).
+That relative reference depends on companion #389; the file is not present
+at this branch's base. It cites BitChat WHITEPAPER v2.0 §6.
 
 - **Sender outbox.** 100 messages per peer, kept for 24 h, resent up to 8 times.
 - **Couriers.** Up to 3 couriers per envelope. Each envelope is capped at 16 KiB and 24 h, with quotas by favourite or verified tier.
@@ -72,9 +78,10 @@ moment too. So:
 > settle. Admission (D-2) can therefore only happen when the recipient comes
 > back.**
 
-That is the whole reason for "carry now, admit on drain". The ciphertext can
-move early. The **act** (settled payment plus admission) can only happen when
-the recipient is present.
+S3 keeps unpaid ciphertext on the sender's node until R is reachable and the
+sender can pay. Early relay carriage of `E0` is **BLOCKED on Q1 and Q7**: a
+paid relay deposit does not settle the act at R. The **act** (settled payment
+plus admission) can only happen when the recipient is present.
 
 There are only two ways to settle at drain time:
 
@@ -91,7 +98,7 @@ Mode B or an always-on node covers that, and this document says so plainly.
 
 ---
 
-## 2. Model: carry now, admit on drain
+## 2. Model: sender-held delivery and blocked relay extension
 
 ### Objects
 
@@ -100,7 +107,9 @@ Mode B or an always-on node covers that, and this document says so plainly.
 - **`E0` (carried form)** is the sealed `UkmEnvelope` for `M`. Its
   `payment_proof` is a fixed **deferred sentinel**: zero hash, zero preimage,
   `amount_msat = 0`. The recipient's gate already floors every paid kind at
-  1,000 msat, so `E0` **cannot be admitted** by any existing or future gate path.
+  1,000 msat, so the current ordinary receive gate rejects `E0`. S5 must
+  assert this for every relayable kind, including a zero advertised price;
+  this is not a guarantee about future gate paths.
   It is signed by the sender, so the relay cannot forge one.
 - **`E1` (admissible form)** has the same `id`, `nonce`, `ciphertext`, `kind` and
   `references` as `E0`. It carries the **real** settled payment proof and a
@@ -111,12 +120,21 @@ Mode B or an always-on node covers that, and this document says so plainly.
 
 1. **The sender's own outbox (always).** It is the source of truth. The sealed
    `E0`, the encrypted draft and the `operation_id` live there durably.
-2. **A paid relay chosen by the recipient (optional, contacts only in the MVP).**
+2. **A paid relay chosen by the recipient (BLOCKED on Q1 and Q7).**
    It holds a copy of `E0` (later `E1`) under the recipient's binding. It is
    best-effort: losing the relay copy never loses the message, because the
    outbox still has it.
 
-### Flow (Mode A)
+### Ready flow (S3, Mode A)
+
+S seals and holds `E0` locally → its own backoff reconnects to R → re-check
+price, reservation and consent (§3) → pay R → deliver `E1` directly → ACK.
+No unpaid envelope leaves S; no relay, STATUS poll or dial hint is used.
+
+### Conditional relay flow (BLOCKED on Q1 and Q7; no proposed default)
+
+Every `E0` deposit, drain and dial hint below is blocked, including when X is
+on R's own box. The diagram describes the unresolved proposal only.
 
 ```
  Sender node S                     Relay X (R's binding)          Recipient node R
@@ -138,7 +156,7 @@ Mode B or an always-on node covers that, and this document says so plainly.
   • R dials S (dial hint), or
   • S's outbox backoff connects, or
   • S polls X: kind-605 STATUS(R) → last_drain_at
- held → paying: pay R (existing keysend/invoice path, recipient-bound)
+ held → paying: re-check price + consent caps (§3), then pay R
  paying → paid: build E1 (same M, real proof)
  deliver E1:
   • direct, if connected ───────────────────────────────────────► gate: settled,
@@ -162,6 +180,9 @@ the only thing that admits. The relay never admits (FINDING 2 in
 
 ### Who pays whom, and when
 
+Only the S → R message payment is in S3. All relay acts in this table are
+conditional on the blocked relay slices and do not authorize `E0` carriage.
+
 | Act | Payer → payee | When | How it is verified | Notes |
 |---|---|---|---|---|
 | Register binding (kind 600) | R → X | When R first goes online with M2 enabled, and on renewal | X's gate: settled, bound to X, single-use | Already Route B. Price is the Storage category. |
@@ -178,14 +199,18 @@ and a held `E0` proves nothing about payment.
 **First contact (strangers) is out of the MVP.** F1 requires the stranger's
 quote to be requested over a live Noise connection to the target, with a
 quote that expires in 60 s or less. M2 does not change that: the outbox may
-only hold `E0` for **existing contacts**, meaning peers with a session and a
-known Lightning pubkey. A stranger still needs both nodes online (Q3).
+only hold `E0` for **existing contacts**: peers with a **prior settled,
+recipient-bound admission at R from S**. A session, address-book entry or
+known Lightning pubkey alone does not establish that history. The sender
+must also have the session and known Lightning pubkey needed for delivery.
+Without evidence of prior settled admission, S3 refuses held delivery; a
+stranger still needs both nodes online (Q3).
 
 ### Replay and duplicates
 
 | Threat | Prevented by | New work? |
 |---|---|---|
-| X replays a held `E0` | `E0` can never pass the gate (zero proof) | No |
+| X replays a held `E0` | The current gate rejects the deferred sentinel proof | S5 regression test (blocked slice) |
 | X replays `E1` after R admitted it | R's permanent `payment_receipts` binding → `AlreadyAccepted` → duplicate `MessageAck`, with no second message, promotion or event | No (slice 1) |
 | `E1` arrives both directly and via X | Same receipt path. The first one admits, the second gets a duplicate ACK. R then sends kind-602 ACK(M) so X deletes its copy. | S5: ack relay copies of already-accepted ids |
 | S's kind-601 deposit response is lost and S retries | S persists the **exact** kind-601 envelope (same nonce and proof) before paying the rent, and resends it byte for byte. X's gate sees an accepted receipt and returns a duplicate ACK **without** re-dispatching to the relay engine, so there is no second hold and no second rent. | S2: prove the dispatch is skipped on a duplicate |
@@ -200,12 +225,13 @@ of `M`. This design adds **one** new non-terminal state and **one** new
 terminal state to `outbox_operations`.
 
 ```
-prepared ──seal E0──► held ──R reachable──► paying ─► paid ─► sent ─► acked
-   │                   │                        │
-   │                   ├─ abandon ─► abandoned  └─ (existing payment_unknown,
-   │                   └─ TTL ─► expired_unpaid       released, failed_paid
-   │                                                  semantics unchanged)
-   └─ (existing)
+prepared ──seal E0──► held
+                       ├─ R reachable + caps valid ─► paying ─► paid ─► sent ─► acked
+                       ├─ abandon / consent or cap failure ─► abandoned
+                       └─ TTL ─► expired_unpaid
+
+Existing prepared exits and payment_unknown / released / failed_paid semantics
+remain unchanged.
 ```
 
 The rules:
@@ -215,13 +241,32 @@ The rules:
   from `held` with the existing unpaid-evidence check.
 - **`held → paying` is the only way out to money.** It happens under the
   per-operation lock with version CAS, exactly like `prepared → paying` today.
-  Concurrent triggers (a dial hint, a backoff tick, a STATUS answer and a client
-  POST retry) therefore produce **at most one** dispatch.
+  S3 triggers (a backoff tick, `PeerConnected` and a client POST retry)
+  therefore produce **at most one** dispatch. Relay STATUS and dial-hint
+  triggers are blocked on Q1 and Q7.
+- **Re-quote before delayed spending.** Compose persists the consented
+  recipient amount ceiling, routing-fee ceiling and all-in spending ceiling,
+  and reserves that budget. Up to 72 h later, under the same operation lock
+  and CAS at `held → paying`, re-read R's current authenticated price for the
+  kind (including the admission floor), revalidate the grant/consent and
+  reservation, and enforce the compose-time caps. Pay only if the current
+  price is within the consented recipient amount ceiling and the price plus
+  the enforced maximum routing fee fits **both** the still-valid reservation
+  and the consented all-in ceiling. Never silently raise a cap or reservation.
+  An increased price may proceed only within all these original limits.
+- **Failed consent/cap check is terminal and unpaid.** A price or fee over a
+  cap, insufficient reservation, or expired/revoked consent moves `held` to
+  `abandoned` with a reason visible to the sender, releases the reservation
+  through the accounting queue and makes **zero payment calls**. Sending again
+  requires fresh explicit consent and a new operation; a retry of the old id
+  cannot revive it. If a fresh authenticated price cannot be obtained, stay
+  `held` without payment and retry within the original deadline; never use the
+  stale compose price.
 - **The ratchet advances once, at seal.** `E0` is persisted with its ciphertext.
   Retries, re-deposits and `E1` reuse it. Re-sealing is forbidden, because it
   would burn a ratchet step and change `M`.
-- **Each relay deposit is a child record** keyed `(operation_id, relay_id,
-  form ∈ {E0, E1})`. The exact kind-601 envelope is persisted before its rent
+- **Each relay deposit (blocked on Q1 and Q7) is a child record** keyed
+  `(operation_id, relay_id, form ∈ {E0, E1})`. The exact kind-601 envelope is persisted before its rent
   is dispatched, which mirrors the admission journal. A deposit with an unknown
   outcome is resent byte for byte and never re-paid.
 - **`expired_unpaid` is terminal and unpaid.** It releases the budget
@@ -265,7 +310,7 @@ plaintext.
 
 | X learns | Source | Severity | MVP mitigation |
 |---|---|---|---|
-| R's NodeId, R's IP and **when R is online** (drain cadence) | The binding and drain connections | High | R picks X. "Personal relay": R can run X on their own always-on box, so the metadata stays with R. Tor on the R→X leg is not shipped. |
+| R's NodeId, R's IP and **when R is online** (drain cadence) | The binding and drain connections | High | R chooses X only after Q1/Q7 are resolved. A personal relay keeps metadata with R but makes unpaid `E0` storage target-side; it is not a proposed default. Tor on the R→X leg is not shipped. |
 | **Who writes to R** (depositor NodeIds = R's contacts) | Authenticated kind-601 sender | **Highest** (the social graph, THREAT_MODEL §2.2) | Contacts-only bindings keep the graph to people R already knows. Fanout is 1, so only one operator sees it. |
 | Inner envelope `kind` | **The `UkmEnvelope.kind` field is plaintext**, and dispatch reads it to enforce `allowed_kinds`. | Medium | See the inconsistency in §10. Relay policy needs the kind, so it cannot be hidden from X without a policy change. |
 | Sizes and timing of every message | Envelope length, deposit time | Medium | Pad `E0` ciphertext to buckets (1, 4 and 16 KiB) before sealing (S3). |
@@ -287,9 +332,11 @@ That is a deployment constraint, not new.
 
 ---
 
-## 6. F1 conformance on the recipient
+## 6. F1 constraints on the recipient (relay extension BLOCKED)
 
-R's node, when it drains:
+S3 retains unpaid ciphertext only at S. The following drain rules are
+conditional requirements for S5, **blocked on Q1 and Q7**, not a claim that
+the relay extension conforms to F1. R's node, if drain is authorized:
 
 1. It receives up to 64 opaque envelopes **in memory**.
 2. For each one, it runs the normal gate. An `E0` fails on the zero-amount
@@ -298,17 +345,21 @@ R's node, when it drains:
    peer record. Nonces and receipts are committed only inside the acceptance
    transaction (slice 1), so the existing code already satisfies this. S5 adds a
    regression test that proves it with a storage row count before and after.
-4. For an `E0` from an **existing contact**, it may keep a **volatile, bounded**
-   dial hint ("connect to S soon"), at most 64 entries, dropped on restart. That
-   is not a pre-settlement record about a stranger. The contact already exists.
-   An `E0` from a non-contact cannot be in R's binding under contacts-only, and is
-   dropped without a hint if it somehow is.
+4. The **"contact S has mail" dial hint is BLOCKED on Q1 and Q7**, with no
+   proposed default. Even a volatile hint from a prior admitted contact is an
+   unpaid trigger for action at R. Until the owner resolves this, `E0` must
+   not trigger a dial, app UI event, notification or other recipient action;
+   no hint table is built or enabled. Non-contact `E0`s are also dropped.
 5. It does **not** ack an `E0` at X. The item stays until S replaces it with
    `E1` or the TTL expires. R may ack, which deletes, junk it chooses to discard
    (Q6).
 
-The relay itself is **not** the target. Holding `E0` at X is not a target-side
-record, but it is unpaid-to-recipient ciphertext. See the doctrine tension in Q1.
+A relay on **R's own box is target-side infrastructure**: its `E0` rows are a
+pre-settlement inbound queue, which F1 forbids. Running the same store in a
+separate relay process does not remove that conflict. Third-party carriage
+also makes R pay to drain acts unpaid to R. Neither contacts-only filtering
+nor zero writes in R's receive gate resolves these issues. Q1 and Q7 must be
+settled before any relay `E0` carriage or dial hint can proceed.
 
 ---
 
@@ -323,6 +374,7 @@ record, but it is unpaid-to-recipient ciphertext. See the doctrine tension in Q1
 | R comes back briefly, then leaves again | S may pay while R is up and then fail to deliver | Payment settled → `paid`. `E1` is delivered on the next drain or connection. That is the existing paid-but-undelivered path. |
 | S's node is down when R comes back | No payment, so no delivery | Mode A limit. When S comes back, its outbox retries. If the two are never up together, only Mode B helps. |
 | Both nodes up but unable to dial each other (NAT, no tailnet) | No direct session | S keysends using R's known LN pubkey (Lightning connectivity is independent), then deposits `E1` at X. R admits on its next drain. |
+| Price, fee or consent drifts before `held → paying` | Delayed spending may exceed compose consent | Re-quote and revalidate under the operation lock (§3). Cap/reservation/consent failure → terminal unpaid `abandoned`, release reservation, zero payment calls. Unavailable fresh price → remain `held` until retry or expiry. |
 | `held` TTL passes | The message is never paid | `expired_unpaid`, the reservation is released, and the client sees a terminal state. The relay copy expires on its own TTL. |
 | Ratchet skip | R receives `M_k+5` before `M_k` | The Double Ratchet stores skipped keys up to `MAX_SKIP = 1000`. The 100-per-peer `held` cap keeps us well under it. |
 | R's clock or S's clock skews | Freshness checks on `E1` | `E1` is re-signed at payment time, so its timestamp is fresh. `E0` freshness never matters because it is never admitted. |
@@ -340,10 +392,10 @@ record, but it is unpaid-to-recipient ciphertext. See the doctrine tension in Q1
 | Malicious relay | Forge or alter mail | It cannot. Ed25519 covers the envelope. `M` is bound to the ciphertext. |
 | Malicious relay | Replay mail | It is harmless. `E0` is never admitted. `E1` gets a duplicate ACK through permanent receipts. |
 | Malicious relay | Make S pay without delivery | Funds reach R anyway (recipient-bound). Delivery falls back to direct. |
-| Malicious relay | Map R's social graph and online pattern | **It succeeds.** This is the main residual risk (§5). Mitigations are personal relays, contacts-only and fanout 1. Padding and Tor are not shipped. |
+| Malicious relay | Map R's social graph and online pattern | **It succeeds.** This is the main residual risk (§5). Conditional mitigations are contacts-only and fanout 1. Personal relays introduce the target-side queue conflict (Q1/Q7) and are not a default. Padding and Tor are not shipped. |
 | Subpoenaed relay | Recover past mail | Ciphertext only, kept up to 24 h, zero-on-ack. Metadata is recoverable. |
 | Compromised R device | Read held mail | The same as reading live mail. M2 adds nothing. |
-| Compromised S node | Spend S's budget on `held` mail | Spending stays inside the existing G1 grants and per-operation reservations. `held` reserves budget and only spends at `held → paying`. |
+| Compromised S node | Spend S's budget on `held` mail | Spending stays inside the existing G1 grants and per-operation reservations. `held` reserves budget and only spends at `held → paying` after revalidating price, reservation and consent caps (§3). |
 | Resource exhaustion on S | Fill S's disk with `held` | 100 per peer and 1,000 per node. Only S's own paired clients can create them. |
 | Resource exhaustion on X | Fill the relay | Paid rent (byte × day), binding and global caps, and the per-peer register cooldown, all already in code. |
 
@@ -410,11 +462,16 @@ These are listed as Q4. Nothing in S1–S5 depends on Mode B.
 
 ## 11. Milestone slices
 
+**Only S3 is ready to build. S1/S2/S4/S5 are BLOCKED pending owner rulings
+on Q1 and Q7 (and resolution of Q2 for contacts-only enforcement). No relay
+`E0` carriage or dial hint has a proposed default.** The relay tests and
+acceptance criteria below are conditional, not permission to implement them.
+
 Each slice is one small PR, signet only, behind configuration that is off by
 default. Every slice must pass `cargo test --workspace --locked` and
 `cargo clippy --workspace --locked -- -D warnings`.
 
-### S1 — Relay policy for M2 (relay side, config only)
+### S1 — Relay policy for M2 (relay side, config only) — BLOCKED on Q1 and Q7
 
 - **Files:**
   - `crates/konsensus-node/src/relay.rs` (`RelayPolicy`: add `max_envelope_bytes` and `max_items_per_binding`; tighten the M2 profile)
@@ -430,7 +487,7 @@ default. Every slice must pass `cargo test --workspace --locked` and
 - **Accept when:** the relay with the M2 profile enforces every value in §4, and
   existing relay tests are unchanged.
 
-### S2 — Relay idempotency: duplicate deposits and replace by `M`
+### S2 — Relay idempotency: duplicate deposits and replace by `M` — BLOCKED on Q1 and Q7
 
 - **Files:**
   - `relay/engine.rs`, `relay/store.rs` (`hold_envelope` → upsert scoped to `(binding, depositor, M)`)
@@ -446,13 +503,19 @@ default. Every slice must pass `cargo test --workspace --locked` and
 
 ### S3 — Sender outbox: the `held` state (no relay yet)
 
-This slice alone closes most of the M2 gap for two nodes that can dial each other.
+**READY, independently of the relay slices.** This slice alone closes most of
+the M2 gap for two nodes that can dial each other. It is signet-only: on
+mainnet, do not advertise `message_held_delivery_v1` and refuse
+`deliver_when_reachable: true` before creating a held operation, reserving
+budget or making any payment call. Recovery must also refuse delayed spending
+on mainnet, including a held row carried over from another network.
 
 - **Files:**
   - `crates/konsensus-storage/migrations/{,postgres/}033_outbox_held.sql` (state constraint: `held`, `expired_unpaid`; a `held_until` column; an index)
   - `konsensus-storage/src/{sqlite,postgres}.rs`
   - `konsensus-api/src/handlers/messages/compose.rs` (opt-in request field `deliver_when_reachable: true`; capability `message_held_delivery_v1`; padding buckets; fix the §0 error text)
-  - The recovery loop (`held → paying` when the peer is connected)
+  - Persist compose-time recipient amount, fee and all-in consent caps with the reservation.
+  - The recovery loop (`held → paying` only when connected and fresh price, reservation and consent checks pass; §3)
   - Abandon handling
 - **Tests:**
   - With R offline, compose → `held`. **Zero Lightning calls** and zero relay calls, and the budget is reserved.
@@ -461,18 +524,25 @@ This slice alone closes most of the M2 gap for two nodes that can dial each othe
   - Abandon from `held` → `abandoned`, and the reservation is released.
   - Expiry → `expired_unpaid`, and the reservation is released.
   - The 101st held message for a peer → `409 held_queue_full` before debit.
-  - Strangers (no session or no LN pubkey) → refused with the existing F1 message.
+  - No prior settled, recipient-bound admission at R → refused with the existing F1 message, even with a session, contact entry and LN pubkey. Missing session or LN pubkey also refuses held delivery.
+  - After a delay of up to 72 h, a fresh price within all compose-time caps → exactly one payment at that price; increased price beyond the recipient cap or price plus routing-fee ceiling beyond the all-in cap → terminal unpaid `abandoned`, zero payment calls, reservation released.
+  - Insufficient/released reservation, expired/revoked consent, or an excessive routing-fee ceiling at reconnect → the same unpaid terminal result, including concurrent retries and restart.
+  - No fresh authenticated price → still `held`, zero payment calls; original TTL still expires normally.
+  - Mainnet: capability absent and `deliver_when_reachable: true` refused before any held row, reservation or payment; recovery of an existing `held` row makes zero payment calls.
   - The ratchet advances once (the same `M` across restart and retry).
   - Migration upgrade from 032 keeps every existing row and checksum.
 - **Accept when:** on signet, between two nodes A and B, with B stopped, a message
   sent from A is admitted by B within one backoff interval of B restarting, with
-  exactly one settled payment. The evidence goes in a `docs/testing/` file.
+  exactly one settled payment within the revalidated caps, and all refusal
+  cases above remain unpaid. The evidence goes in a `docs/testing/` file.
 
-### S4 — Sender deposit client and relay discovery (contacts only)
+### S4 — Sender deposit client and relay discovery (contacts only) — BLOCKED on Q1 and Q7
 
 - **Files:**
-  - A new kind (proposed `KIND_RELAY_ENDPOINT = 605`, avoiding 960) for R → contacts: a paid UKM `{relay_node_id, addr, binding_id}`.
-  - The relay STATUS kind (606) in `kind.rs` and `relay/dispatch.rs`.
+  - A new kind (proposed `KIND_RELAY_ENDPOINT = 904`, Control category) for R → contacts: a paid UKM `{relay_node_id, addr, binding_id}`.
+  - The relay STATUS kind (`KIND_RELAY_STATUS = 605`, Storage category) in `kind.rs` and `relay/dispatch.rs`.
+  - Registry check at `0095a6b4`: `crates/konsensus-core/src/kind.rs` and the taxonomy in `docs/v2/UNIFIED_PROTOCOL.md` assign neither 904 nor 605; repository search found no other kind assignment for either number. 903 is already `KIND_PEER_EXCHANGE`, and 960 is `KIND_MLS_WELCOME`. These are proposed allocations only; re-check and register them when S4 is unblocked.
+  - Keep endpoint announcements outside 600–699: `msg_handler.rs:542-563` intercepts the entire Storage range when relay is enabled, so an endpoint kind in that range would be swallowed by relay dispatch.
   - A sender deposit worker in `konsensus-node` (child records `(operation_id, relay_id, form)`).
   - A storage migration `034_outbox_relay_deposits.sql`.
 - **Tests:**
@@ -481,16 +551,17 @@ This slice alone closes most of the M2 gap for two nodes that can dial each othe
   - After payment, `E1` is re-deposited (replace).
   - STATUS answers only for live depositors.
   - Without a published endpoint → outbox only (S3 behaviour).
-  - The endpoint UKM is paid and accepted only from an existing contact.
+  - The kind-904 endpoint UKM is paid and accepted only from a contact with prior settled admission; with the receiver's relay enabled, it reaches endpoint handling rather than relay-control dispatch.
+  - Registry uniqueness and category tests: STATUS is 605/Storage; endpoint is 904/Control, outside 600–699.
 - **Accept when:** a three-node test (A, X, B), with B offline at send time, shows
   `E0` held at X and the rent paid exactly once. B is not online in this slice.
 
-### S5 — Recipient drain client and admit on drain
+### S5 — Recipient drain client and admit on drain — BLOCKED on Q1 and Q7
 
 - **Files:**
   - A new `crates/konsensus-node/src/relay/drain_client.rs` (register on startup when `[m2] relay = <node_id>`, drain in batches, ack admitted and duplicate ids)
   - `msg_handler.rs` (drained envelopes keep relay provenance: replies route to the drain client, and the relay connection is never promoted; see the note below)
-  - The volatile dial-hint table
+  - Dial-hint handling remains blocked; any implementation requires explicit owner rulings on Q1 and Q7.
   - `docs/three-node-paid-e2e.md`-style signet runbook
 - **Tests:**
   - **F1 regression**: draining 64 `E0`s writes **zero** rows to any table, measured by row counts before and after.
@@ -499,7 +570,7 @@ This slice alone closes most of the M2 gap for two nodes that can dial each othe
     asserted here, not assumed.
   - `E1` → admitted once. The same `E1` again (direct and relayed) → duplicate ACK, and the relay copy is acked.
   - An `E1` with someone else's proof or an unsettled proof → rejected with no record.
-  - The dial hint is bounded to 64 and gone after restart.
+  - While Q1/Q7 are unresolved, `E0` creates no dial hint, connection attempt, app UI event or notification. Any owner-authorized hint design must define and test its permitted effects before implementation.
   - The relay connection is never marked `privileged` by a drained envelope.
 - **Accept when** a three-node signet run (A, X, B) passes:
   1. B is stopped.
@@ -529,17 +600,22 @@ Tauri repo. None of these is claimed.
 
 Doctrine tensions are marked **⚠ DOCTRINE**.
 
-1. **⚠ DOCTRINE: may a relay hold ciphertext that is unpaid to the recipient?**
-   `E0` is paid to the relay (storage rent) but not to R. F1's ban covers the
-   **target**, not a third party. This design reads "no free first message" as
-   "nothing is admitted or shown without a settled, recipient-bound payment", so
-   holding at X is allowed. **However**, R pays X to drain `E0`s it cannot
-   admit, so a contact can make R spend sats on unpaid bytes. Options:
-   - **(a)** Accept it, with the per-depositor caps in §4 (proposed).
-   - **(b)** Only `E1`s may be deposited. That makes the relay useless in Mode A,
-     except when the two nodes cannot dial each other.
-   - **(c)** A headers-only drain first (`M`, sender, size), then a fetch only of
-     items that have proofs. This adds a kind and a round trip.
+1. **⚠ DOCTRINE — Q1, BLOCKED: may a relay hold ciphertext unpaid to R, or
+   may an unpaid envelope trigger a dial at R?** Storage rent pays X, not R.
+   R pays to drain `E0`s it cannot admit. If X runs on R's own always-on box,
+   its `E0` rows are a target-side pre-settlement queue forbidden by F1; the
+   claim that a relay is always a third party does not hold. The dial hint is
+   also an unpaid actionable signal, even for a prior admitted contact.
+   **No proposed default. Relay `E0` carriage and the dial hint remain BLOCKED
+   until the owner resolves both Q1 and Q7.** Options for an owner ruling:
+   - **(a)** Permit some `E0` carriage with caps, explicitly resolving who pays
+     to drain and the target-side F1 conflict; caps alone do not resolve it.
+   - **(b)** Deposit only settled `E1`s; keep all unpaid ciphertext at S.
+     The relay can then help already-paid delivery when direct delivery fails.
+   - **(c)** Consider headers-only drain before fetching paid items. This still
+     exposes an unpaid signal and leaves any target-side `E0` store unresolved;
+     it is not an approved workaround or a default.
+   The ruling must separately address whether any unpaid dial trigger is allowed.
 2. **⚠ DOCTRINE: contacts-only bindings.** How does X enforce "contacts only"
    without learning R's whole contact list? The current code uses a Merkle root
    of depositor NodeIds, and each depositor proves inclusion, so X learns members
@@ -558,11 +634,16 @@ Doctrine tensions are marked **⚠ DOCTRINE**.
    holding the default and deletion a cost. It is small, but it is the wrong
    incentive. A free ack would need a non-gate authentication path (a signed ack
    over Noise), which Route B avoided on purpose.
-7. **Personal relay as the default.** Should the beta recommend that each user's
-   relay be their own always-on box (minimal metadata exposure), and treat a
-   third-party relay as an opt-in with a warning?
+7. **⚠ DOCTRINE — Q7, BLOCKED: relay placement and target-side storage.** A
+   personal relay reduces third-party metadata exposure but places `E0` on R's
+   own infrastructure before settlement, contrary to F1. What placement and
+   paid-only storage rules are permitted, and how do they resolve Q1's drain
+   cost and unpaid dial trigger? **No personal-relay or third-party default is
+   proposed. Relay `E0` carriage and the dial hint remain BLOCKED on Q1 and Q7.**
 8. **Spec hygiene.** Approve amending RELAY_PROTOCOL.md to "Route B" kinds,
    fixing the kind-960 clash and correcting THREAT_MODEL's "kind is encrypted"
    claim (§10). This should be a separate docs PR.
-9. **Ordering.** S3 delivers most of the value with no relay. Should S3 ship
-   first and alone, with S1/S2/S4/S5 gated on the answers to Q1 and Q2?
+9. **Ordering.** S3 is the only ready slice and proceeds alone. S1/S2/S4/S5
+   remain blocked on owner rulings on Q1 and Q7, with Q2 also required for
+   contacts-only enforcement. A future ruling requires a revised relay design
+   and acceptance criteria before those slices become ready.
