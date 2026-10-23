@@ -282,6 +282,39 @@ pub enum PairingError {
     Io(String),
 }
 
+/// Internal refusal classification. Keep the original error for existing callers
+/// and HTTP mappings; only the fixed reason is suitable for refusal logs.
+#[derive(Debug)]
+pub(crate) struct PairingRefusal {
+    pub error: PairingError,
+    pub reason: &'static str,
+}
+
+impl PairingRefusal {
+    pub(crate) fn new(error: PairingError, reason: &'static str) -> Self {
+        Self { error, reason }
+    }
+}
+
+impl From<PairingError> for PairingRefusal {
+    fn from(error: PairingError) -> Self {
+        let reason = match &error {
+            PairingError::BadProof => "bad_signature",
+            PairingError::Expired => "stale_or_future",
+            PairingError::NotGrantable(_) => "unknown_or_revoked_key",
+            PairingError::PairingInvalid(_) => "invalid_pairing",
+            PairingError::UnknownClient => "unknown_client",
+            PairingError::OwnerChannelUnavailable => "owner_channel_off",
+            PairingError::DeviceApprovalsDisabled(_) => "device_approvals_disabled",
+            PairingError::Malformed(_) => "malformed",
+            PairingError::TooManyPending => "rate_limited",
+            PairingError::Io(_) => "storage_error",
+            _ => "pairing_refused",
+        };
+        Self::new(error, reason)
+    }
+}
+
 impl From<io::Error> for PairingError {
     fn from(e: io::Error) -> Self {
         PairingError::Io(e.to_string())
@@ -2161,12 +2194,24 @@ impl PairingService {
         fingerprint: &str,
         scopes: &[Scope],
     ) -> Result<(), PairingError> {
+        self.verify_token_binding_with_reason(client_id, epoch, fingerprint, scopes)
+            .map_err(|refusal| refusal.error)
+    }
+
+    pub(crate) fn verify_token_binding_with_reason(
+        &self,
+        client_id: &str,
+        epoch: u64,
+        fingerprint: &str,
+        scopes: &[Scope],
+    ) -> Result<(), PairingRefusal> {
         let inner = self.lock();
         let now_unix = chrono::Utc::now().timestamp();
         if inner.identity_fingerprint != fingerprint {
             return Err(PairingError::PairingInvalid(
                 "token was issued against a different identity".into(),
-            ));
+            )
+            .into());
         }
         let record = inner
             .file
@@ -2175,24 +2220,30 @@ impl PairingService {
             .find(|c| c.client_id == client_id)
             .ok_or(PairingError::UnknownClient)?;
         if record.scopes.is_empty() {
-            self.provisional_locked(&inner, &record.client_id)?;
+            self.provisional_locked(&inner, &record.client_id)
+                .map_err(|error| PairingRefusal::new(error, "provisional_session"))?;
         }
         if record.epoch != epoch {
-            return Err(PairingError::PairingInvalid(
-                "pairing epoch has been bumped — the token is revoked".into(),
+            return Err(PairingRefusal::new(
+                PairingError::PairingInvalid(
+                    "pairing epoch has been bumped — the token is revoked".into(),
+                ),
+                "wrong_epoch",
             ));
         }
         if record.identity_fingerprint != fingerprint {
             return Err(PairingError::PairingInvalid(
                 "pairing is bound to a different identity".into(),
-            ));
+            )
+            .into());
         }
         let permitted = self.effective_scopes(&inner, record, now_unix);
         if let Some(extra) = scopes.iter().find(|s| !permitted.contains(s)) {
             return Err(PairingError::PairingInvalid(format!(
                 "token claims scope `{}` the pairing does not hold in this deployment",
                 extra.as_str()
-            )));
+            ))
+            .into());
         }
         Ok(())
     }
