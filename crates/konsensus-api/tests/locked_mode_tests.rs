@@ -20,6 +20,8 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tower::ServiceExt;
 use zeroize::Zeroizing;
 
+const LOCKED_API: &str = "127.0.0.1:3141";
+
 struct Fixture {
     _dir: tempfile::TempDir,
     pairing: Arc<PairingService>,
@@ -111,20 +113,23 @@ impl Fixture {
         let pairing = Arc::new(pairing);
         let clients = Arc::new(RemoteTunnelClients::default());
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let state = Arc::new(LockedState::new(
-            "node".into(),
-            pairing.clone(),
-            clients.clone(),
-            move |password| {
-                hook();
-                if password == "unlock-test-secret" {
-                    Ok(("node".into(), owner.verifying_key()))
-                } else {
-                    Err(UnlockError::Failed)
-                }
-            },
-            tx,
-        ));
+        let state = Arc::new(
+            LockedState::new(
+                "node".into(),
+                pairing.clone(),
+                clients.clone(),
+                move |password| {
+                    hook();
+                    if password == "unlock-test-secret" {
+                        Ok(("node".into(), owner.verifying_key()))
+                    } else {
+                        Err(UnlockError::Failed)
+                    }
+                },
+                tx,
+            )
+            .with_local_admission(LOCKED_API.parse().unwrap()),
+        );
         let router = locked_router(state);
         Self {
             _dir: dir,
@@ -143,20 +148,36 @@ impl Fixture {
         path: &str,
         body: Value,
     ) -> (StatusCode, String) {
+        let host = client.is_none().then_some(LOCKED_API);
+        self.request_with_headers(client, method, path, body, host, None)
+            .await
+    }
+    async fn request_with_headers(
+        &self,
+        client: Option<usize>,
+        method: &str,
+        path: &str,
+        body: Value,
+        host: Option<&str>,
+        origin: Option<&str>,
+    ) -> (StatusCode, String) {
         let peer: SocketAddr = "127.0.0.1:40001".parse().unwrap();
         let _guard = client.map(|n| self.clients.register(peer, format!("client{n}")));
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .extension(ConnectInfo(peer))
+            .header("content-type", "application/json");
+        if let Some(host) = host {
+            builder = builder.header("host", host);
+        }
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
         let response = self
             .router
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(path)
-                    .extension(ConnectInfo(peer))
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -256,6 +277,43 @@ async fn locked_router_allowlist_and_tunnel_only_unlock() {
             StatusCode::UNAUTHORIZED
         );
     }
+    let (status, body) = f
+        .request_with_headers(
+            None,
+            "GET",
+            "/api/v1/node/lock",
+            json!({}),
+            Some("evil.example:3141"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("local_host_forbidden"));
+    assert!(!body.contains("\"node_id\""));
+    let (status, body) = f
+        .request_with_headers(
+            None,
+            "GET",
+            "/livez",
+            json!({}),
+            Some(LOCKED_API),
+            Some("http://evil.example:3141"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("local_origin_forbidden"));
+    let (status, body) = f
+        .request_with_headers(
+            Some(0),
+            "GET",
+            "/api/v1/node/lock",
+            json!({}),
+            Some("localhost"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"node_id\""));
     assert!(!f.pairing.pairing_open());
     f.pairing.open_pairing_window(Duration::from_secs(60));
     assert!(!f.pairing.pairing_open());

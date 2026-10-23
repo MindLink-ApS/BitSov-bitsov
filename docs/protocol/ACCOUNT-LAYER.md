@@ -195,3 +195,32 @@ Why the gate lives in the node, and why the key needs the password:
 - A copy of the seed without the recovery-phrase password does not yield the owner key (`owner_key_startup_tests::an_old_plaintext_copy_of_the_seed_does_not_yield_the_owner_key`).
 - A device-key record without a valid owner signature for the current pairing key and epoch is refused on every use (`device_key_tests::a_device_key_written_into_data_dir_authorizes_nothing`).
 - Every key is domain-separated from the seed (`identity::tests::owner_approval_key_is_domain_separated_and_public_only_on_the_node`).
+
+### Token challenge identity and capacity
+
+`GET /api/v1/pair/challenge?client_id=<id>` allocates only after authenticating
+that pairing's holder. The query is not an identity credential.
+
+- On the live remote router, the allocation key is the server-owned
+  `AuthenticatedNoise.client_id`. A different query id or missing Noise identity
+  returns 401 before allocating. Local proof headers cannot override it.
+- During remote bootstrap, the identity comes from the completed Noise session
+  registered for the internal TCP bridge. A direct loopback request has no such
+  identity and returns 401, even with local proof headers.
+- On local live and local bootstrap routers, the allocation key is the paired
+  client whose Ed25519 key verifies the request. Send
+  `Authorization: PairChallenge <timestamp>:<signature>`, where the timestamp is
+  decimal Unix seconds and the signature is hex Ed25519 over the UTF-8 string
+  `bitsov-pair-challenge-v1:<client_id>:<timestamp>`. The server
+  accepts a timestamp within 30 seconds of its clock. No JWT is needed, so first
+  issuance and renewal after token expiry both work. This proof is a
+  short-lived authentication credential: do not log or share it. The proof
+  domain differs from the returned challenge that must be signed for redemption.
+  Existing local clients must send this header; unsigned requests return 401.
+
+The existing eight outstanding challenges per authenticated client and global
+128-challenge backstop remain. A holder at its own cap receives the same 429 as
+at the global cap (`{"code":429,"error":"too many pending pairing requests"}`),
+without occupancy or identity details. It can redeem an existing challenge to
+free a slot; consumption, 120-second expiry and revocation release capacity.
+A caller knowing another client's public id cannot allocate in its quota.

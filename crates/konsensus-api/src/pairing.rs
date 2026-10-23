@@ -103,6 +103,18 @@ pub const PAIRED_TOKEN_VALIDITY_SECS: i64 = 600;
 /// How long a token-issuance challenge stays usable.
 pub const TOKEN_CHALLENGE_TTL: Duration = Duration::from_secs(120);
 
+/// Live token-issuance challenges kept after expired rows are dropped.
+///
+/// Same order of magnitude as the node-identity auth challenge cap. A paired
+/// client may hold more than one outstanding challenge; this only stops the
+/// map from growing with the request rate for the whole TTL.
+pub const MAX_LIVE_TOKEN_CHALLENGES: usize = 128;
+
+/// Live token-issuance challenges allowed for one registered client id.
+///
+/// Bound each client's share so requests for one id cannot fill the global cap.
+pub const MAX_LIVE_TOKEN_CHALLENGES_PER_CLIENT: usize = 8;
+
 /// Inactivity horizon for a pairing: 180 days.
 ///
 /// An abandoned laptop must stop being a standing grant. A pairing unused for
@@ -1852,16 +1864,65 @@ impl PairingService {
         Ok(())
     }
 
-    /// Issue a token-issuance challenge for a paired client.
+    /// Issue a challenge after the HTTP boundary has authenticated this client.
+    /// Remote callers must use the server-owned Noise identity, never a query id.
     pub fn issue_token_challenge(&self, client_id: &str) -> Result<String, PairingError> {
+        Self::issue_token_challenge_locked(&mut self.lock(), client_id)
+    }
+
+    /// Local live/bootstrap callers prove possession of the paired Ed25519 key.
+    /// No JWT is required: this also works before the first token or after expiry.
+    /// The signature is an authentication credential, valid within 30 seconds of
+    /// the supplied Unix timestamp, and must not be logged. Its domain is distinct
+    /// from token redemption. Verification and allocation share the pairing lock.
+    pub fn issue_local_token_challenge(
+        &self,
+        client_id: &str,
+        timestamp: i64,
+        signature_hex: &str,
+    ) -> Result<String, PairingError> {
+        if chrono::Utc::now().timestamp().abs_diff(timestamp) > 30 {
+            return Err(PairingError::BadProof);
+        }
+        let signature = hex::decode(signature_hex)
+            .ok()
+            .and_then(|bytes| ed25519_dalek::Signature::from_slice(&bytes).ok())
+            .ok_or(PairingError::BadProof)?;
+        let mut inner = self.lock();
+        let client = inner
+            .file
+            .clients
+            .iter()
+            .find(|client| client.client_id == client_id)
+            .ok_or(PairingError::BadProof)?;
+        let message = format!("bitsov-pair-challenge-v1:{client_id}:{timestamp}");
+        parse_pubkey(&client.client_pubkey)?
+            .verify_strict(message.as_bytes(), &signature)
+            .map_err(|_| PairingError::BadProof)?;
+        Self::issue_token_challenge_locked(&mut inner, client_id)
+    }
+
+    fn issue_token_challenge_locked(
+        inner: &mut Inner,
+        client_id: &str,
+    ) -> Result<String, PairingError> {
         let mut nonce = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let mut inner = self.lock();
         if !inner.file.clients.iter().any(|c| c.client_id == client_id) {
             return Err(PairingError::UnknownClient);
         }
         let now = Instant::now();
         inner.token_challenges.retain(|_, (_, exp)| *exp > now);
+        let client_challenges = inner
+            .token_challenges
+            .values()
+            .filter(|(owner, _)| owner == client_id)
+            .count();
+        if client_challenges >= MAX_LIVE_TOKEN_CHALLENGES_PER_CLIENT
+            || inner.token_challenges.len() >= MAX_LIVE_TOKEN_CHALLENGES
+        {
+            return Err(PairingError::TooManyPending);
+        }
         let challenge = format!("bitsov-pair-token-v1:{}", hex::encode(nonce));
         inner.token_challenges.insert(
             challenge.clone(),
@@ -2157,7 +2218,7 @@ impl PairingService {
         Ok(epoch)
     }
 
-    /// Remove a pairing entirely (and any grant bound to it).
+    /// Remove a pairing entirely, including its grants and token challenges.
     pub fn revoke(&self, client_id: &str) -> Result<(), PairingError> {
         let mut inner = self.lock();
         self.guard_device_removal(&inner, |key| key.client_id == client_id)?;
@@ -2179,6 +2240,9 @@ impl PairingService {
             .or_insert(0);
         *tracked = (*tracked).max(existing.epoch);
         inner.file.clients.retain(|c| c.client_id != client_id);
+        inner
+            .token_challenges
+            .retain(|_, (owner, _)| owner != client_id);
         inner.file.revoke_grants(Some(client_id));
         inner
             .file
@@ -4300,3 +4364,7 @@ mod budget_transaction_tests;
 #[cfg(all(test, unix))]
 #[path = "pairing/headless_tests.rs"]
 mod headless_tests;
+
+#[cfg(test)]
+#[path = "pairing/token_challenge_tests.rs"]
+mod token_challenge_tests;

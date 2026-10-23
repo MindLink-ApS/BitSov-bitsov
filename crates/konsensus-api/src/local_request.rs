@@ -116,6 +116,15 @@ fn forbidden(code: &'static str, error: &'static str) -> LocalRequestRejection {
     LocalRequestRejection { code, error }
 }
 
+/// Same rejection as a bad Host. A locked listener with no bound address must
+/// not answer a non-tunnel caller, and must not say why.
+pub(crate) fn admission_required() -> LocalRequestRejection {
+    forbidden(
+        "local_host_forbidden",
+        "Host is not an allowed local API authority",
+    )
+}
+
 pub(crate) async fn guard(
     Extension(policy): Extension<LocalRequestPolicy>,
     request: Request,
