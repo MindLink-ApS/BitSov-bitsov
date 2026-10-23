@@ -340,7 +340,12 @@ fn relation_envelope_identity_replaces_only_its_recipient_and_survives_restart()
     let (service, _, client, device, key_id) = registered(tmp.path());
     let apply = |peer| {
         let i = intent(&key_id, peer, 80_000, 20_000);
-        let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+        let sig = device.sign(&intent_message(
+            &fingerprint(),
+            &client.client_id,
+            client.epoch,
+            &i,
+        ));
         service
             .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
             .unwrap()
@@ -378,7 +383,12 @@ fn relation_envelope_identity_legacy_migration_keeps_unknown_ids_null() {
     let (service, _, client, device, key_id) = registered(tmp.path());
     for peer in [PEER, OTHER] {
         let i = intent(&key_id, peer, 80_000, 20_000);
-        let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+        let sig = device.sign(&intent_message(
+            &fingerprint(),
+            &client.client_id,
+            client.epoch,
+            &i,
+        ));
         service
             .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
             .unwrap();
@@ -401,7 +411,12 @@ fn relation_envelope_identity_legacy_migration_keeps_unknown_ids_null() {
     );
     // A new approval gives only this recipient an identity; write upgrades to v8.
     let i = intent(&key_id, PEER, 80_000, 20_000);
-    let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let sig = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &i,
+    ));
     let accepted = serde_json::to_value(
         service
             .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
@@ -429,7 +444,12 @@ fn relation_envelope_identity_failed_write_and_replay_preserve_current_approval(
     let tmp = tempfile::tempdir().unwrap();
     let (service, _, client, device, key_id) = registered(tmp.path());
     let a = intent(&key_id, PEER, 80_000, 20_000);
-    let a_sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &a));
+    let a_sig = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &a,
+    ));
     let accepted = serde_json::to_value(
         service
             .apply_relation_intent(&client.client_id, client.epoch, &a, &a_sig)
@@ -439,7 +459,12 @@ fn relation_envelope_identity_failed_write_and_replay_preserve_current_approval(
     assert!(accepted["envelope_id"].is_string());
     let before = std::fs::read(service.dir().join("clients.json")).unwrap();
     let b = intent(&key_id, PEER, 80_000, 20_000);
-    let b_sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &b));
+    let b_sig = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &b,
+    ));
     // A directory at the temp-file path forces persistence to fail before rename.
     let blocked = service.dir().join("clients.json.tmp");
     std::fs::create_dir(&blocked).unwrap();
@@ -506,7 +531,12 @@ fn a_signed_intent_opens_a_recipient_bound_envelope() {
     let tmp = tempfile::tempdir().unwrap();
     let (service, _, client, device, key_id) = registered(tmp.path());
     let i = intent(&key_id, PEER, 80_000, 20_000);
-    let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let sig = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &i,
+    ));
     let view = service
         .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
         .unwrap()
@@ -573,7 +603,12 @@ fn a_signed_intent_opens_a_recipient_bound_envelope() {
 
     // A new tap renews the envelope on top of what was used.
     let again = intent(&key_id, PEER, 50_000, 20_000);
-    let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &again));
+    let sig = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &again,
+    ));
     service
         .apply_relation_intent(&client.client_id, client.epoch, &again, &sig)
         .unwrap();
@@ -588,7 +623,12 @@ fn a_second_peer_gets_its_own_envelope_without_touching_the_first() {
     let (service, _, client, device, key_id) = registered(tmp.path());
     for (peer, budget) in [(PEER, 100_000), (OTHER, 30_000)] {
         let i = intent(&key_id, peer, budget, 10_000);
-        let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+        let sig = device.sign(&intent_message(
+            &fingerprint(),
+            &client.client_id,
+            client.epoch,
+            &i,
+        ));
         service
             .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
             .unwrap();
@@ -626,7 +666,12 @@ fn a_tampered_replayed_stale_or_misbound_intent_writes_nothing() {
 
     // Tampered terms: signed 1,000, sent 100,000.
     let signed = intent(&key_id, PEER, 1_000, 1_000);
-    let sig = device.sign(&intent_message(&fp, &client.client_id, &signed));
+    let sig = device.sign(&intent_message(
+        &fp,
+        &client.client_id,
+        client.epoch,
+        &signed,
+    ));
     let tampered = RelationIntent {
         budget_msat: 100_000,
         per_act_max_msat: 100_000,
@@ -652,7 +697,7 @@ fn a_tampered_replayed_stale_or_misbound_intent_writes_nothing() {
         ("0".repeat(64), client.client_id.clone()),
         (fp.clone(), "other-client".into()),
     ] {
-        let s = device.sign(&intent_message(&node, &cid, &signed));
+        let s = device.sign(&intent_message(&node, &cid, client.epoch, &signed));
         assert!(matches!(
             service
                 .apply_relation_intent(&client.client_id, client.epoch, &signed, &s)
@@ -666,7 +711,12 @@ fn a_tampered_replayed_stale_or_misbound_intent_writes_nothing() {
         device_key_id: device::key_id_for(&hex::decode(stranger.public_hex()).unwrap()),
         ..signed.clone()
     };
-    let s = stranger.sign(&intent_message(&fp, &client.client_id, &foreign));
+    let s = stranger.sign(&intent_message(
+        &fp,
+        &client.client_id,
+        client.epoch,
+        &foreign,
+    ));
     assert!(matches!(
         service
             .apply_relation_intent(&client.client_id, client.epoch, &foreign, &s)
@@ -683,7 +733,12 @@ fn a_tampered_replayed_stale_or_misbound_intent_writes_nothing() {
             nonce: nonce(),
             ..signed.clone()
         };
-        let s = device.sign(&intent_message(&fp, &client.client_id, &stale));
+        let s = device.sign(&intent_message(
+            &fp,
+            &client.client_id,
+            client.epoch,
+            &stale,
+        ));
         assert!(matches!(
             service
                 .apply_relation_intent(&client.client_id, client.epoch, &stale, &s)
@@ -730,7 +785,7 @@ fn a_tampered_replayed_stale_or_misbound_intent_writes_nothing() {
             ..signed.clone()
         },
     ] {
-        let s = device.sign(&intent_message(&fp, &client.client_id, &bad));
+        let s = device.sign(&intent_message(&fp, &client.client_id, client.epoch, &bad));
         let err = service
             .apply_relation_intent(&client.client_id, client.epoch, &bad, &s)
             .unwrap_err();
@@ -780,18 +835,125 @@ fn a_tampered_replayed_stale_or_misbound_intent_writes_nothing() {
 }
 
 #[test]
+fn a_v1_signature_or_a_previous_epoch_does_not_open_a_grant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, console, client, device, key_id) = registered(tmp.path());
+    let fp = fingerprint();
+    let no_grant =
+        |service: &PairingService| assert!(service.grant_view_for(&client.client_id).is_none());
+    let signed = intent(&key_id, PEER, 1_000, 1_000);
+
+    // The historical v1 domain, signed by the live key. Verification rebuilds
+    // v2 only, so this signature is not a grant.
+    let v1 = format!(
+        "bitsov-relation-intent-v1\nnode:{fp}\nclient:{}\ndevice:{}\npeer:{}\nlevel:{}\n\
+         budget_msat:{}\nper_act_max_msat:{}\nwindow_secs:{}\nissued_at:{}\nnonce:{}",
+        client.client_id,
+        signed.device_key_id,
+        signed.peer,
+        signed.level,
+        signed.budget_msat,
+        signed.per_act_max_msat,
+        signed.window_secs,
+        signed.issued_at,
+        signed.nonce
+    );
+    let err = service
+        .apply_relation_intent(&client.client_id, client.epoch, &signed, &device.sign(&v1))
+        .unwrap_err();
+    assert!(matches!(err, PairingError::BadProof), "{err}");
+    no_grant(&service);
+
+    // Epoch is inside the verified bytes. Applying at the live epoch with a
+    // signature over the next epoch fails the signature, not the key lookup.
+    let err = service
+        .apply_relation_intent(
+            &client.client_id,
+            client.epoch,
+            &signed,
+            &device.sign(&intent_message(
+                &fp,
+                &client.client_id,
+                client.epoch + 1,
+                &signed,
+            )),
+        )
+        .unwrap_err();
+    assert!(matches!(err, PairingError::BadProof), "{err}");
+    no_grant(&service);
+
+    // Captured before the bump. Re-approving the same public key at the new
+    // epoch must not make this signature verify.
+    let captured = device.sign(&intent_message(
+        &fp,
+        &client.client_id,
+        client.epoch,
+        &signed,
+    ));
+    add_recovery_owner(&service, &console);
+    let new_epoch = service.bump_epoch(&client.client_id).unwrap();
+    assert_eq!(new_epoch, client.epoch + 1);
+    let op = service
+        .request_device_key(
+            &client.client_id,
+            &device.public_hex(),
+            "Rasmus's MacBook",
+            &device.proof(&client.client_id),
+        )
+        .unwrap();
+    assert_eq!(op.epoch, new_epoch);
+    let key = service
+        .approve_device_key(&op.op_id, &console.owner_code(&op.op_id), &owner_sig(&op))
+        .unwrap();
+    assert_eq!(key.key_id, key_id);
+    assert_eq!(key.epoch, new_epoch);
+    let err = service
+        .apply_relation_intent(&client.client_id, new_epoch, &signed, &captured)
+        .unwrap_err();
+    assert!(matches!(err, PairingError::BadProof), "{err}");
+    no_grant(&service);
+
+    let fresh = intent(&key_id, PEER, 1_000, 1_000);
+    service
+        .apply_relation_intent(
+            &client.client_id,
+            new_epoch,
+            &fresh,
+            &device.sign(&intent_message(&fp, &client.client_id, new_epoch, &fresh)),
+        )
+        .unwrap();
+    assert_eq!(
+        service
+            .grant_view_for(&client.client_id)
+            .unwrap()
+            .budget_msat,
+        1_000
+    );
+}
+
+#[test]
 fn intents_are_rate_limited_per_client() {
     let tmp = tempfile::tempdir().unwrap();
     let (service, _, client, device, key_id) = registered(tmp.path());
     for _ in 0..device::RELATION_INTENTS_PER_HOUR {
         let i = intent(&key_id, PEER, 1_000, 1_000);
-        let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+        let s = device.sign(&intent_message(
+            &fingerprint(),
+            &client.client_id,
+            client.epoch,
+            &i,
+        ));
         service
             .apply_relation_intent(&client.client_id, client.epoch, &i, &s)
             .unwrap();
     }
     let i = intent(&key_id, PEER, 1_000, 1_000);
-    let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let s = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &i,
+    ));
     let err = service
         .apply_relation_intent(&client.client_id, client.epoch, &i, &s)
         .unwrap_err();
@@ -804,7 +966,12 @@ fn revoking_the_key_or_the_pairing_ends_the_envelopes() {
     let (service, _, client, device, key_id) = registered(tmp.path());
     let open = |service: &PairingService| {
         let i = intent(&key_id, PEER, 10_000, 10_000);
-        let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+        let s = device.sign(&intent_message(
+            &fingerprint(),
+            &client.client_id,
+            client.epoch,
+            &i,
+        ));
         service.apply_relation_intent(&client.client_id, client.epoch, &i, &s)
     };
     open(&service).unwrap();
@@ -829,7 +996,12 @@ fn revoking_the_key_or_the_pairing_ends_the_envelopes() {
     add_recovery_owner(&service, &console);
     service.bump_epoch(&client.client_id).unwrap();
     let i = intent(&key_id, PEER, 10_000, 10_000);
-    let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let s = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &i,
+    ));
     let err = service
         .apply_relation_intent(&client.client_id, client.epoch + 1, &i, &s)
         .unwrap_err();
@@ -858,7 +1030,12 @@ fn a_relation_grant_requires_console_revocation_before_replacing_its_budget() {
     // A device intent must not erase the console grant's breaker history,
     // limits or unresolved outcomes. Only an owner console revocation permits it.
     let i = intent(&key_id, PEER, 10_000, 10_000);
-    let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let s = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &i,
+    ));
     let before = service.grant_views();
     assert!(service
         .apply_relation_intent(&client.client_id, client.epoch, &i, &s)
@@ -1118,7 +1295,12 @@ fn an_absurd_issued_at_is_refused_not_a_panic() {
         issued_at: i64::MIN,
         ..intent(&key_id, PEER, 1_000, 1_000)
     };
-    let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let s = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &i,
+    ));
     assert!(matches!(
         service.apply_relation_intent(&client.client_id, client.epoch, &i, &s),
         Err(PairingError::Expired)
@@ -1222,7 +1404,12 @@ fn a_device_key_written_into_data_dir_authorizes_nothing() {
     std::fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
     let (service, _) = owner_run(tmp.path());
     let i = intent(&attacker_id, PEER, 10_000, 10_000);
-    let s = attacker.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let s = attacker.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &i,
+    ));
     let err = service
         .apply_relation_intent(&client.client_id, client.epoch, &i, &s)
         .unwrap_err();
@@ -1231,7 +1418,12 @@ fn a_device_key_written_into_data_dir_authorizes_nothing() {
 
     // POSITIVE CONTROL: the owner-approved key still works after the reload.
     let i = intent(&key_id, PEER, 10_000, 10_000);
-    let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let s = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &i,
+    ));
     service
         .apply_relation_intent(&client.client_id, client.epoch, &i, &s)
         .unwrap();
@@ -1246,7 +1438,12 @@ fn a_node_started_without_an_owner_key_honours_no_device_key() {
         .unwrap()
         .without_stdout_code();
     let i = intent(&key_id, PEER, 10_000, 10_000);
-    let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let s = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &i,
+    ));
     assert!(matches!(
         service
             .apply_relation_intent(&client.client_id, client.epoch, &i, &s)
@@ -1272,7 +1469,12 @@ fn a_node_running_from_a_plaintext_seed_disables_device_authority_node_wide() {
         Some(device::SEED_NOT_ENCRYPTED)
     );
     let i = intent(&key_id, PEER, 10_000, 10_000);
-    let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let s = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &i,
+    ));
     let err = service
         .apply_relation_intent(&client.client_id, client.epoch, &i, &s)
         .unwrap_err();
@@ -1347,7 +1549,12 @@ fn local_owner_without_verifier_cannot_spend_stored_device_grants() {
     drop(console);
     let local = local_run(tmp.path());
     let i = intent(&key_id, PEER, 10_000, 1_000);
-    let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let sig = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &i,
+    ));
     local
         .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
         .unwrap();
@@ -1385,7 +1592,12 @@ fn local_owner_accepts_console_enrolled_key_but_restart_without_flag_refuses() {
     let local = local_run(tmp.path());
     assert!(!local.owner_control_enabled());
     let i = intent(&key_id, PEER, 10_000, 1_000);
-    let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let sig = device.sign(&intent_message(
+        &fingerprint(),
+        &client.client_id,
+        client.epoch,
+        &i,
+    ));
     local
         .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
         .unwrap();
@@ -1456,7 +1668,12 @@ fn local_owner_reverifies_approval_client_epoch_and_revocation() {
         std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
         let local = local_run(tmp.path());
         let i = intent(&key_id, PEER, 10_000, 1_000);
-        let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+        let sig = device.sign(&intent_message(
+            &fingerprint(),
+            &client.client_id,
+            client.epoch,
+            &i,
+        ));
         let result = local.apply_relation_intent(&client.client_id, client.epoch, &i, &sig);
         if mutation == "legacy" {
             result.unwrap();
@@ -1490,7 +1707,12 @@ fn local_owner_honours_only_recipient_bound_device_grants_from_disk() {
                 &client.client_id,
                 client.epoch,
                 &i,
-                &device.sign(&intent_message(&fingerprint(), &client.client_id, &i)),
+                &device.sign(&intent_message(
+                    &fingerprint(),
+                    &client.client_id,
+                    client.epoch,
+                    &i,
+                )),
             )
             .unwrap();
         drop(service);
@@ -1676,7 +1898,12 @@ fn delegation_binds_every_tuple_field_and_is_single_use_across_restart() {
         &target.client_id,
         target.epoch,
         &i,
-        &new.sign(&intent_message(&fingerprint(), &target.client_id, &i)),
+        &new.sign(&intent_message(
+            &fingerprint(),
+            &target.client_id,
+            target.epoch,
+            &i,
+        )),
     )
     .unwrap();
     drop(svc);
@@ -1852,7 +2079,12 @@ fn console_revoke_and_epoch_bump_retire_delegated_keys_and_envelopes() {
             &target.client_id,
             target.epoch,
             &i,
-            &new.sign(&intent_message(&fingerprint(), &target.client_id, &i)),
+            &new.sign(&intent_message(
+                &fingerprint(),
+                &target.client_id,
+                target.epoch,
+                &i,
+            )),
         )
         .unwrap();
         drop(svc);
@@ -1875,7 +2107,12 @@ fn console_revoke_and_epoch_bump_retire_delegated_keys_and_envelopes() {
                 &target.client_id,
                 target.epoch,
                 &fresh,
-                &new.sign(&intent_message(&fingerprint(), &target.client_id, &fresh))
+                &new.sign(&intent_message(
+                    &fingerprint(),
+                    &target.client_id,
+                    target.epoch,
+                    &fresh
+                ))
             )
             .is_err());
         assert!(svc

@@ -2590,8 +2590,14 @@ async fn local_owner_http_intent_spends_and_restart_without_flag_stops_it() {
         issued_at: chrono::Utc::now().timestamp(),
         nonce: "ac".repeat(16),
     };
-    let body =
-        json!({"intent": intent, "signature": sign(&intent_message(&fp, &fx.client_id, &intent))});
+    let epoch = fx
+        .service
+        .list_clients()
+        .iter()
+        .find(|c| c.client_id == fx.client_id)
+        .unwrap()
+        .epoch;
+    let body = json!({"intent": intent, "signature": sign(&intent_message(&fp, &fx.client_id, epoch, &intent))});
     let (status, response) = fx
         .call(
             "POST",
@@ -2612,8 +2618,7 @@ async fn local_owner_http_intent_spends_and_restart_without_flag_stops_it() {
         nonce: "ad".repeat(16),
         ..intent
     };
-    let body =
-        json!({"intent": fresh, "signature": sign(&intent_message(&fp, &fx.client_id, &fresh))});
+    let body = json!({"intent": fresh, "signature": sign(&intent_message(&fp, &fx.client_id, epoch, &fresh))});
 
     // Restart retains grants and device records but loses both local opt-in and
     // the descriptor-derived owner verifier. Neither a fresh nor old token pays.
