@@ -138,16 +138,24 @@ pub async fn serve_locked_mode(
     let clients = Arc::new(RemoteTunnelClients::default());
     let (tx, rx) = oneshot::channel();
     let verify_config = config.clone();
-    let state = Arc::new(LockedState::new(
-        identity.node_id.clone(),
-        pairing.clone(),
-        clients.clone(),
-        move |password| verify_password(&verify_config, password),
-        tx,
-    ));
     let local = TcpListener::bind(config.api.listen_addr)
         .await
         .context("could not bind locked loopback API")?;
+    // The bound address, not the pre-bind config: a port of 0 must not become
+    // an allowlist entry of `:0`.
+    let api_addr = local
+        .local_addr()
+        .context("locked loopback API has no local address")?;
+    let state = Arc::new(
+        LockedState::new(
+            identity.node_id.clone(),
+            pairing.clone(),
+            clients.clone(),
+            move |password| verify_password(&verify_config, password),
+            tx,
+        )
+        .with_local_admission(api_addr),
+    );
     let internal = TcpListener::bind("127.0.0.1:0").await?;
     let server = RemoteAccessServer::bind_locked(
         &config.remote_access,

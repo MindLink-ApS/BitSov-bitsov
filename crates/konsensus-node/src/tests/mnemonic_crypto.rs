@@ -60,7 +60,7 @@ fn legacy_blank_password_encrypted_files_remain_readable() {
         let salt = [7; SALT_LEN];
         let nonce = [9; NONCE_LEN];
         let key = derive_key(password.as_bytes(), &salt).unwrap();
-        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(key.as_slice()).unwrap();
         let ciphertext = cipher
             .encrypt(Nonce::from_slice(&nonce), mnemonic.as_bytes())
             .unwrap();

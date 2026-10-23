@@ -9,6 +9,7 @@ use std::{
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -115,6 +116,10 @@ pub struct LockedState {
     // HTTP request cannot admit a second Argon2 job or a second transition.
     transition: Arc<tokio::sync::Mutex<Option<oneshot::Sender<Zeroizing<String>>>>>,
     verify_password: Arc<PasswordVerifier>,
+    /// Host and Origin allowlist for the public loopback listener. Tunnel
+    /// peers skip it: the phone bridge sends `Host: localhost` with no port.
+    /// Absent means every non-tunnel request fails closed.
+    local_admission: Option<crate::local_request::LocalRequestPolicy>,
 }
 impl LockedState {
     /// The verifier returns the seed-derived node id and owner verifying key.
@@ -138,8 +143,20 @@ impl LockedState {
             attempts: Mutex::new(Attempts::default()),
             transition: Arc::new(tokio::sync::Mutex::new(Some(handoff))),
             verify_password: Arc::new(verify_password),
+            local_admission: None,
         }
     }
+
+    /// Trust `Host` / `Origin` only when they name this listener. Pass the
+    /// address returned by `local_addr()` after bind, never a pre-bind port 0.
+    pub fn with_local_admission(mut self, addr: SocketAddr) -> Self {
+        self.local_admission = Some(crate::local_request::LocalRequestPolicy::new(
+            addr,
+            Vec::new(),
+        ));
+        self
+    }
+
     fn client(&self, peer: Option<ConnectInfo<SocketAddr>>) -> Result<PairedClient, UnlockError> {
         let id = self
             .clients
@@ -157,13 +174,41 @@ impl LockedState {
 }
 
 /// Exactly four paths. No auth/local, pairing, health, peers or wallet handlers.
+///
+/// A registered Noise-bridge peer skips the Host check. Every other caller,
+/// including `/livez` and `/api/v1/node/lock`, must present a Host (and Origin,
+/// when sent) for the public loopback address.
 pub fn locked_router(state: Arc<LockedState>) -> Router {
     Router::new()
         .route("/livez", get(|| async { StatusCode::OK }))
         .route("/api/v1/node/lock", get(lock_status))
         .route("/api/v1/node/unlock/challenge", post(challenge))
         .route("/api/v1/node/unlock", post(unlock))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            admit_local_or_tunnel,
+        ))
         .with_state(state)
+}
+
+async fn admit_local_or_tunnel(
+    State(state): State<Arc<LockedState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, crate::local_request::LocalRequestRejection> {
+    // Read the extension; do not extract `ConnectInfo`, or the unlock
+    // handlers lose the peer the tunnel registered.
+    let tunneled = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_some_and(|ConnectInfo(peer)| state.clients.client_id(*peer).is_some());
+    if !tunneled {
+        match state.local_admission.as_ref() {
+            Some(policy) => policy.validate(request.headers())?,
+            None => return Err(crate::local_request::admission_required()),
+        }
+    }
+    Ok(next.run(request).await)
 }
 async fn lock_status(State(state): State<Arc<LockedState>>) -> Json<serde_json::Value> {
     Json(

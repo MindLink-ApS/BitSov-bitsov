@@ -103,6 +103,13 @@ pub const PAIRED_TOKEN_VALIDITY_SECS: i64 = 600;
 /// How long a token-issuance challenge stays usable.
 pub const TOKEN_CHALLENGE_TTL: Duration = Duration::from_secs(120);
 
+/// Live token-issuance challenges kept after expired rows are dropped.
+///
+/// Same order of magnitude as the node-identity auth challenge cap. A paired
+/// client may hold more than one outstanding challenge; this only stops the
+/// map from growing with the request rate for the whole TTL.
+pub const MAX_LIVE_TOKEN_CHALLENGES: usize = 128;
+
 /// Inactivity horizon for a pairing: 180 days.
 ///
 /// An abandoned laptop must stop being a standing grant. A pairing unused for
@@ -1862,6 +1869,9 @@ impl PairingService {
         }
         let now = Instant::now();
         inner.token_challenges.retain(|_, (_, exp)| *exp > now);
+        if inner.token_challenges.len() >= MAX_LIVE_TOKEN_CHALLENGES {
+            return Err(PairingError::TooManyPending);
+        }
         let challenge = format!("bitsov-pair-token-v1:{}", hex::encode(nonce));
         inner.token_challenges.insert(
             challenge.clone(),

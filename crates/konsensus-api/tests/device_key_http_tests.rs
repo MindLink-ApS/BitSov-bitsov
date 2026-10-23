@@ -2254,13 +2254,16 @@ async fn t14_locked_router_never_mounts_enrollment_or_health() {
             .with_pairing_closed(),
     );
     let (tx, _rx) = tokio::sync::oneshot::channel();
-    let router = locked_router(Arc::new(LockedState::new(
-        node,
-        svc,
-        Arc::new(konsensus_api::rate_limit::RemoteTunnelClients::default()),
-        |_| Err(UnlockError::Failed),
-        tx,
-    )));
+    let router = locked_router(Arc::new(
+        LockedState::new(
+            node,
+            svc,
+            Arc::new(konsensus_api::rate_limit::RemoteTunnelClients::default()),
+            |_| Err(UnlockError::Failed),
+            tx,
+        )
+        .with_local_admission("127.0.0.1:3141".parse().unwrap()),
+    ));
     for (method, path) in [
         ("GET", "/api/v1/pair/ticket"),
         ("POST", "/api/v1/pair/ticket"),
@@ -2270,14 +2273,50 @@ async fn t14_locked_router_never_mounts_enrollment_or_health() {
         ),
         ("GET", "/api/v1/health"),
     ] {
-        assert_eq!(
-            call_router(router.clone(), method, path, Some(json!({})), None)
-                .await
-                .0,
-            StatusCode::NOT_FOUND
-        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("host", "127.0.0.1:3141")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
     }
-    let (status, body) = call_router(router, "GET", "/api/v1/node/lock", None, None).await;
+    let denied = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/node/lock")
+                .header("host", "evil.example:3141")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/node/lock")
+                .header("host", "127.0.0.1:3141")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["state"], "locked");
 }

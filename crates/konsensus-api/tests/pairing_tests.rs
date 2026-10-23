@@ -48,6 +48,24 @@ fn state_with_pairing(
 }
 
 #[test]
+fn token_challenges_stop_at_the_live_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, service, _) = state_with_pairing(dir.path(), false);
+    let key = SigningKey::from_bytes(&[0x61; 32]);
+    let pubkey = hex::encode(key.verifying_key().to_bytes());
+    let paired = service
+        .create_verified_remote_pairing("remote", &pubkey, &[0x62; 32])
+        .unwrap();
+    for _ in 0..pairing::MAX_LIVE_TOKEN_CHALLENGES {
+        service.issue_token_challenge(&paired.client_id).unwrap();
+    }
+    assert!(matches!(
+        service.issue_token_challenge(&paired.client_id),
+        Err(pairing::PairingError::TooManyPending)
+    ));
+}
+
+#[test]
 fn rotating_client_key_clears_remote_transport_binding() {
     let dir = tempfile::tempdir().unwrap();
     let (_, service, _) = state_with_pairing(dir.path(), false);
