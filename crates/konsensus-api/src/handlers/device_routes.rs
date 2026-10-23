@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::scoped::{Read, ScopedAuth};
 use crate::auth::{EnrollmentAuth, PairingBinding};
-use crate::error::ApiError;
+use crate::error::{refusal_response, ApiError, RefusalReason};
 use crate::pairing::{PairingError, PairingService, RelationIntent};
 use crate::spend_budget::GrantView;
 use crate::state::AppState;
@@ -315,16 +315,17 @@ pub(crate) async fn relation_intent(
     auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<RelationIntentRequest>,
-) -> Result<Json<RelationIntentResponse>, ApiError> {
-    let binding = binding(&auth)?;
-    let accepted = service(&state)?
-        .apply_relation_intent(
+) -> Result<Json<RelationIntentResponse>, axum::response::Response> {
+    let binding = binding(&auth).map_err(|e| refusal_response(e, "no_pairing"))?;
+    let accepted = service(&state)
+        .map_err(|e| refusal_response(e, "pairing_unavailable"))?
+        .apply_relation_intent_with_reason(
             &binding.client_id,
             binding.epoch,
             &body.intent,
             &body.signature,
         )
-        .map_err(map_err)?;
+        .map_err(|refusal| refusal_response(map_err(refusal.error), refusal.reason))?;
     Ok(Json(RelationIntentResponse {
         envelope_id: accepted.envelope_id,
         grant: accepted.grant,
@@ -341,20 +342,43 @@ pub(crate) async fn log_relation_intent_refusal(
     let relation_intent = req.uri().path() == PATH;
     let response = next.run(req).await;
     if relation_intent {
-        log_relation_intent_status(PATH, response.status());
+        let reason = response
+            .extensions()
+            .get::<RefusalReason>()
+            .map(|r| r.0)
+            .unwrap_or_else(|| match response.status().as_u16() {
+                400 | 413 | 415 | 422 => "malformed",
+                401 => "unauthorized",
+                403 => "forbidden",
+                404 => "not_found",
+                405 => "method_not_allowed",
+                429 => "rate_limited",
+                _ => "internal_error",
+            });
+        log_relation_intent_status(PATH, response.status(), reason);
     }
     response
 }
 
 /// Also used by the outer tunnel-identity filter, which can reject before the
-/// router runs. The fixed path and status are the only inputs to the log.
-pub(crate) fn log_relation_intent_status(path: &str, status: axum::http::StatusCode) {
+/// router runs. Callers must supply only fixed, non-secret reason codes.
+pub(crate) fn log_relation_intent_status(
+    path: &str,
+    status: axum::http::StatusCode,
+    reason: &'static str,
+) {
     const PATH: &str = "/api/v1/pair/relation-intent";
     if path == PATH && !status.is_success() {
         // This endpoint's ApiError code is the numeric HTTP status; use the
         // same code for middleware/extractor responses that have no JSON code.
         let code = status.as_u16();
-        tracing::info!(path = PATH, status = code, code, "relation intent refused");
+        tracing::info!(
+            path = PATH,
+            status = code,
+            code,
+            reason,
+            "relation intent refused"
+        );
     }
 }
 

@@ -238,9 +238,15 @@ claim-bound SAS v2 message. See the [owner-device contract](device-keys.md#addin
 
 The tunnel also accepts `POST /pair/relation-intent` from a live paired client.
 It writes a contact budget only with a registered device key's signature bound
-to the node, client and key epoch, plus a fresh nonce. Provisional sessions remain
-blocked. Non-2xx responses log only the path, HTTP status and numeric code at info
-level; request/response bodies and signatures are never included in that log.
+to the node, client and device key ID, plus a fresh nonce. The server binds the
+key record's epoch to the token epoch; v1 does not sign an epoch field. An epoch
+bump invalidates registered keys, but re-approving the same public key within
+the clock window can allow an unused captured v1 intent to verify. The ±300-second
+clock window can span 10 minutes of node time for a fast device clock.
+Provisional sessions remain blocked. Non-2xx responses log only the path, HTTP
+status, numeric code and a fixed refusal reason at info level; bodies, keys,
+signatures and nonces are never included in that log. Reasons remain internal
+metadata and do not change HTTP responses.
 
 Self-revocation (`DELETE /pair/device-keys/{key_id}`), pairing list/revoke/window/
 request/confirm, first-contact-grant POST and identity replacement

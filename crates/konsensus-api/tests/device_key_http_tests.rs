@@ -88,6 +88,12 @@ async fn call_router(
         .unwrap_or_else(Body::empty);
     let response = router.oneshot(req.body(body).unwrap()).await.unwrap();
     let status = response.status();
+    if uri.starts_with("/api/v1/pair/relation-intent") {
+        assert!(!response
+            .headers()
+            .keys()
+            .any(|name| name.as_str().contains("reason")));
+    }
     let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
         .await
         .unwrap();
@@ -231,8 +237,9 @@ async fn tunnel_registration_console_approval_then_locked_restart_unlocks() {
         .finish();
     async {
         register_device_over_http(false, true).await;
-        let router = konsensus_api::build_remote_router(test_state())
-            .layer(axum::middleware::from_fn_with_state(
+        second_device_tunnel_contract().await;
+        let router = konsensus_api::build_remote_router(test_state()).layer(
+            axum::middleware::from_fn_with_state(
                 Arc::new(konsensus_api::rate_limit::RemoteTunnelClients::default()),
                 konsensus_api::rate_limit::remote_tunnel_identity,
             ));
@@ -242,20 +249,45 @@ async fn tunnel_registration_console_approval_then_locked_restart_unlocks() {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }.with_subscriber(subscriber).await;
     let captured = std::fs::read_to_string(log.path()).unwrap();
-    for code in [401, 403, 422, 500] {
-        assert!(captured.lines().any(|line| {
-            line.contains("INFO")
-                && line.contains("path=\"/api/v1/pair/relation-intent\"")
-                && line.contains(&format!("status={code}"))
-                && line.contains(&format!("code={code}"))
-        }), "missing refusal {code}: {captured}");
+    for (code, reason) in [
+        (401, "unauthorized"),
+        (403, "bad_signature"),
+        (403, "replayed_nonce"),
+        (409, "stale_or_future"),
+        (403, "unknown_or_revoked_key"),
+        (401, "wrong_epoch"),
+        (403, "provisional_session"),
+        (403, "owner_channel_off"),
+        (400, "cap_exceeded"),
+        (403, "cap_exceeded"),
+        (403, "no_pairing"),
+        (403, "device_approvals_disabled"),
+        (400, "console_grant_live"),
+        (429, "rate_limited"),
+        (422, "malformed"),
+        (500, "tunnel_identity_unavailable"),
+    ] {
+        assert!(
+            captured.lines().any(|line| {
+                line.contains("INFO")
+                    && line.contains("path=\"/api/v1/pair/relation-intent\"")
+                    && line.contains(&format!("status={code}"))
+                    && line.contains(&format!("code={code}"))
+                    && line.contains(&format!("reason=\"{reason}\""))
+            }),
+            "missing refusal {code}/{reason}: {captured}"
+        );
     }
     assert!(!captured.contains("PRIVATE_SIGNATURE"));
     assert!(!captured.contains("PRIVATE_QUERY"));
+    assert!(!captured.contains("PRIVATE_UNKNOWN_KEY"));
     assert!(!captured.contains(&"0f".repeat(16)));
     for line in captured.lines().filter(|line| line.contains("relation intent refused")) {
         assert!(!line.contains(PEER));
         assert!(!line.contains("status=200"));
+        for field in ["nonce", "signature", "device_key", "public_key", "body"] {
+            assert!(!line.contains(&format!("{field}=")), "{line}");
+        }
     }
 }
 
@@ -339,6 +371,25 @@ async fn register_device_over_http(headless: bool, remote: bool) {
         EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
     let public = hex::encode(device.public_key().as_ref());
     let sign = |msg: &str| hex::encode(device.sign(&rng, msg.as_bytes()).unwrap().as_ref());
+
+    if remote {
+        let intent = RelationIntent {
+            device_key_id: "PRIVATE_UNKNOWN_KEY".into(),
+            peer: PEER.into(),
+            level: 1,
+            budget_msat: 200_000,
+            per_act_max_msat: 20_000,
+            window_secs: 86_400,
+            issued_at: chrono::Utc::now().timestamp(),
+            nonce: "ab".repeat(16),
+        };
+        let (status, _) = remote_call(&state, "POST", "/api/v1/pair/relation-intent",
+            Some(json!({"intent": intent, "signature": sign(&intent_message(&fp, &client.client_id, &intent))})),
+            Some(&read_token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(service.device_keys_for(&client.client_id).is_empty());
+        assert!(service.grant_view_for(&client.client_id).is_none());
+    }
 
     let (status, reg) = enroll_call(remote, &state, "POST", "/api/v1/pair/device-key", Some(json!({
         "public_key": public, "name": "MacBook", "proof": sign(&registration_message(&fp, &client.client_id, &public)),
@@ -471,6 +522,123 @@ async fn register_device_over_http(headless: bool, remote: bool) {
         issued_at: chrono::Utc::now().timestamp(),
         nonce: "0f".repeat(16),
     };
+    if remote {
+        for (field, value, expected) in [
+            (
+                "issued_at",
+                json!(intent.issued_at - 600),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "issued_at",
+                json!(intent.issued_at + 600),
+                StatusCode::CONFLICT,
+            ),
+            ("budget_msat", json!(100_000_001), StatusCode::BAD_REQUEST),
+            ("window_secs", json!(86_401), StatusCode::BAD_REQUEST),
+            ("level", json!(2), StatusCode::FORBIDDEN),
+        ] {
+            let mut changed = serde_json::to_value(&intent).unwrap();
+            changed[field] = value;
+            let changed: RelationIntent = serde_json::from_value(changed).unwrap();
+            let (status, body) = remote_call(&state, "POST", "/api/v1/pair/relation-intent",
+                Some(json!({"intent": changed, "signature": sign(&intent_message(&fp, &client.client_id, &changed))})),
+                Some(&read_token)).await;
+            assert_eq!(status, expected, "{body}");
+            assert!(
+                body.get("reason").is_none(),
+                "internal reason leaked: {body}"
+            );
+            assert!(service.grant_view_for(&client.client_id).is_none());
+        }
+        let wrong_epoch_token = konsensus_api::auth::create_paired_token(
+            &base.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            client.scopes.clone(),
+            &client.client_id,
+            client.epoch + 1,
+            &fp,
+        )
+        .unwrap();
+        let payload = json!({"intent": intent, "signature": sign(&intent_message(&fp, &client.client_id, &intent))});
+        let (status, body) = remote_call(
+            &state,
+            "POST",
+            "/api/v1/pair/relation-intent",
+            Some(payload.clone()),
+            Some(&wrong_epoch_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, json!({"raw": "invalid token"}));
+        let off = Arc::new(AppState {
+            pairing: Some(Arc::new(
+                PairingService::open(tmp.path(), fp.clone(), false)
+                    .unwrap()
+                    .with_owner_approval_key(owner.verifying_key()),
+            )),
+            ..(*state).clone()
+        });
+        let (status, _) = remote_call(
+            &off,
+            "POST",
+            "/api/v1/pair/relation-intent",
+            Some(payload.clone()),
+            Some(&read_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let unpaired = konsensus_api::auth::create_token(
+            &base.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            client.scopes.clone(),
+        )
+        .unwrap();
+        let (status, _) = remote_call(
+            &state,
+            "POST",
+            "/api/v1/pair/relation-intent",
+            Some(payload.clone()),
+            Some(&unpaired),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let disabled = Arc::new(AppState {
+            pairing: Some(Arc::new(
+                PairingService::open(tmp.path(), fp.clone(), true)
+                    .unwrap()
+                    .with_device_authority_disabled(pairing::device::SEED_NOT_ENCRYPTED),
+            )),
+            ..(*state).clone()
+        });
+        let (status, body) = remote_call(
+            &disabled,
+            "POST",
+            "/api/v1/pair/relation-intent",
+            Some(payload.clone()),
+            Some(&read_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // This reason was already public before log-only reasons were added.
+        assert_eq!(body["reason"], "seed_not_encrypted");
+        let limited = konsensus_api::build_remote_router_with_limiter(
+            state.clone(),
+            Arc::new(konsensus_api::rate_limit::RateLimiter::new(0)),
+        )
+        .layer(axum::extract::connect_info::MockConnectInfo(
+            "127.0.0.1:40001".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let (status, _) = call_router(
+            limited,
+            "POST",
+            "/api/v1/pair/relation-intent",
+            Some(payload),
+            Some(&read_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
     let message = intent_message(&fp, &client.client_id, &intent);
     let valid_signature = sign(&message);
     let wrong_pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
@@ -515,6 +683,15 @@ async fn register_device_over_http(headless: bool, remote: bool) {
         )
         .await;
         assert_eq!(status, expected, "{body}");
+        if expected == StatusCode::FORBIDDEN {
+            assert_eq!(
+                body,
+                json!({
+                    "code": 403,
+                    "error": "the device signature did not verify, or that intent was already used",
+                })
+            );
+        }
         assert!(service.grant_view_for(&client.client_id).is_none());
     }
     let (status, body) = enroll_call(
@@ -568,6 +745,13 @@ async fn register_device_over_http(headless: bool, remote: bool) {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{replay}");
+    assert_eq!(
+        replay,
+        json!({
+            "code": 403,
+            "error": "the device signature did not verify, or that intent was already used",
+        })
+    );
     assert_eq!(
         serde_json::to_value(service.grant_view_for(&client.client_id)).unwrap(),
         before
@@ -808,6 +992,96 @@ async fn register_device_over_http(headless: bool, remote: bool) {
     .await;
     let (status, _) = call(&local_state, "POST", &uri, Some(body), Some(&read_token)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    if remote {
+        // Two nonces succeeded above; the service limit is 30 per client/hour.
+        for n in 2..=30 {
+            let mut fresh = intent.clone();
+            fresh.nonce = format!("{n:032x}");
+            let before = serde_json::to_value(local.grant_view_for(&client.client_id)).unwrap();
+            let (status, body) = remote_call(&local_state, "POST", "/api/v1/pair/relation-intent",
+                Some(json!({"intent": fresh, "signature": sign(&intent_message(&fp, &client.client_id, &fresh))})),
+                Some(&read_token)).await;
+            assert_eq!(
+                status,
+                if n < 30 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                },
+                "{body}"
+            );
+            if n == 30 {
+                assert_eq!(
+                    serde_json::to_value(local.grant_view_for(&client.client_id)).unwrap(),
+                    before
+                );
+            }
+        }
+        // Reopen in console mode to exercise a live console grant conflict.
+        let console_service = Arc::new(
+            PairingService::open(tmp.path(), fp.clone(), true)
+                .unwrap()
+                .with_owner_console(Box::new(console.clone()))
+                .without_stdout_code()
+                .with_owner_approval_key(owner_verifier),
+        );
+        let op = console_service
+            .create_elevation_request(&client.client_id, vec![konsensus_api::auth::Scope::Spend])
+            .unwrap();
+        console_service
+            .grant_elevation(
+                &op.op_id,
+                &console.owner_code(&op.op_id),
+                konsensus_api::spend_budget::GrantTerms::new(1_000_000),
+            )
+            .unwrap();
+        let console_state = Arc::new(AppState {
+            pairing: Some(console_service.clone()),
+            ..(*state).clone()
+        });
+        let before =
+            serde_json::to_value(console_service.grant_view_for(&client.client_id)).unwrap();
+        let (status, body) = remote_call(
+            &console_state,
+            "POST",
+            "/api/v1/pair/relation-intent",
+            Some(json!({"intent": intent, "signature": valid_signature})),
+            Some(&read_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.get("reason").is_none());
+        assert_eq!(
+            serde_json::to_value(console_service.grant_view_for(&client.client_id)).unwrap(),
+            before
+        );
+        let options = pairing::console::RevokeOptions {
+            root: intent.device_key_id.clone(),
+            cascade: false,
+            with_pairing: false,
+            keep: vec![],
+            allow_zero_owner: false,
+        };
+        let plan = console_service
+            .console_revoke_devices(&options, None)
+            .unwrap();
+        console_service
+            .console_revoke_devices(&options, Some(&plan.confirmation))
+            .unwrap();
+        let (status, body) = remote_call(
+            &console_state,
+            "POST",
+            "/api/v1/pair/relation-intent",
+            Some(json!({"intent": intent, "signature": valid_signature})),
+            Some(&read_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            body,
+            json!({"code": 403, "error": "scope is not grantable to a pairing: unknown or revoked device key"})
+        );
+    }
 }
 
 #[tokio::test]
@@ -1861,6 +2135,10 @@ async fn owner_tunnel_ticket_and_sas_delegation_happy_path_and_refusals() {
 
 #[tokio::test]
 async fn t3_t6_t9_t13_t14_second_device_tunnel_contract() {
+    second_device_tunnel_contract().await;
+}
+
+async fn second_device_tunnel_contract() {
     use konsensus_api::pairing::device::{self, owner_approval_message};
     use konsensus_api::rate_limit::{remote_tunnel_identity, RemoteTunnelClients};
     let dir = tempfile::tempdir().unwrap();
