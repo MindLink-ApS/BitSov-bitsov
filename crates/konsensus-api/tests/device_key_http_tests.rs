@@ -263,7 +263,8 @@ async fn tunnel_registration_console_approval_then_locked_restart_unlocks() {
         (403, "no_pairing"),
         (403, "device_approvals_disabled"),
         (400, "console_grant_live"),
-        (429, "rate_limited"),
+        (429, "rate_limited_client"),
+        (429, "rate_limited_global"),
         (422, "malformed"),
         (500, "tunnel_identity_unavailable"),
     ] {
