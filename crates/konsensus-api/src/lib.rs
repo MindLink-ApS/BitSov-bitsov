@@ -207,6 +207,7 @@ fn build_router_with_options(
     let router = Router::new()
         .merge(health_routes)
         .merge(handlers::messages::routes())
+        .merge(handlers::calls::routes())
         .merge(handlers::rooms::routes())
         .merge(handlers::peers::routes())
         .merge(handlers::payments::routes())
