@@ -5,6 +5,10 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Add a production-path smoke test and CI job: real nodes on shared mock
+  Lightning pair over the Noise tunnel, enroll a device key, submit a
+  device-signed relation intent and deliver a paid message, all through the
+  remote router; a 404/405 on any of those routes fails it (#393).
 - Raise the source-build MSRV to Rust 1.89 to match locked `uuid` 1.28.0.
 - Discard serde diagnostics from peer session-value decodes; add relay and
   file-payload guard regressions and use unique temporary mutation-log directories.
