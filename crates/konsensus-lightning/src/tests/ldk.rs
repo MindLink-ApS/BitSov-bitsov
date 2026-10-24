@@ -758,6 +758,38 @@ fn seam3b_inflight_fallback_preserves_payment_hash() {
     assert!(details.preimage.is_none());
 }
 
+#[test]
+fn keysend_inflight_hash_matches_settled_payment() {
+    use ldk_node::lightning::ln::channelmanager::PaymentId;
+    use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
+
+    let preimage = PaymentPreimage([42; 32]);
+    let hash = PaymentHash::from(preimage);
+    // Spontaneous sends use the hash as their PaymentId, even before a
+    // payment-store record is available to the provider.
+    let payment_id = PaymentId(hash.0);
+    let inflight = in_flight_spontaneous_payment_details(payment_id.0, 21_000, 42);
+    assert_eq!(inflight.status, PaymentStatus::InFlight);
+    assert_eq!(inflight.payment_hash.len(), 64);
+    assert!(inflight.preimage.is_none());
+
+    let settled = convert_payment_details(&ldk_node::payment::PaymentDetails {
+        id: payment_id,
+        kind: LdkPaymentKind::Spontaneous {
+            hash,
+            preimage: Some(preimage),
+        },
+        amount_msat: Some(21_000),
+        fee_paid_msat: Some(0),
+        direction: ldk_node::payment::PaymentDirection::Outbound,
+        status: LdkPaymentStatus::Succeeded,
+        latest_update_timestamp: 43,
+    });
+    assert_eq!(settled.status, PaymentStatus::Settled);
+    assert_eq!(inflight.payment_hash, settled.payment_hash);
+    assert_eq!(settled.preimage, Some(hex::encode(preimage.0)));
+}
+
 fn inbound_payment_details(
     status: PaymentStatus,
     direction: PaymentDirection,
