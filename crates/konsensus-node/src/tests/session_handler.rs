@@ -2285,7 +2285,7 @@ async fn delivery_receipts_only_advance_matching_sent_rows_and_never_unpaid_weig
     let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
     let (ws, mut updates) = broadcast::channel(16);
     let dir = tempfile::tempdir().unwrap();
-    let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
     let env = UkmEnvelopeBuilder::new(
         100,
         own,
@@ -2445,7 +2445,7 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
         let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
         let (ws, mut updates) = broadcast::channel(16);
         let dir = tempfile::tempdir().unwrap();
-        let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
         let env = UkmEnvelopeBuilder::new(
             0,
             own,
@@ -2580,7 +2580,7 @@ async fn unpaid_confirmation_flood_is_bounded_before_storage_even_across_peer_ch
     let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
     let (ws, mut updates) = broadcast::channel(16);
     let dir = tempfile::tempdir().unwrap();
-    let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
     // Both unknown ACKs and rejects consume the shared per-peer allowance.
     for n in 0..32 {
         handle_delivery_confirmation(
@@ -2925,7 +2925,7 @@ async fn accepted_chain_price_rise_and_delayed_ack_never_fail_paid() {
     let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
     let (ws, mut updates) = broadcast::channel(16);
     let dir = tempfile::tempdir().unwrap();
-    let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
     let mut budget = DeliveryConfirmationBudget::default();
     // Model an authenticated, whitelisted/privileged counterparty: the
     // PriceOpen unpaid-stranger suppression does not apply to this case.
@@ -3748,10 +3748,18 @@ async fn peer_rejection_logs_strip_controls_at_downstream_handlers() {
     use tracing_subscriber::layer::SubscriberExt;
     struct Reasons(Arc<std::sync::Mutex<Vec<String>>>);
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Reasons {
-        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
             struct Fields<'a>(&'a mut Vec<String>);
             impl tracing::field::Visit for Fields<'_> {
-                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
                     if field.name() == "reason" {
                         self.0.push(format!("{value:?}"));
                     }
@@ -3767,13 +3775,22 @@ async fn peer_rejection_logs_strip_controls_at_downstream_handlers() {
     let (ws_tx, mut ws_rx) = broadcast::channel(4);
     let reason = "peer\n\r\x1b\u{85}\u{2028}\u{2029}reason";
     handle_message_rejected(
-        &test_peer_id(), &konsensus_core::MessageId::from_bytes([0; 32]),
-        reason, &routing, &ws_tx, false,
-    ).await;
+        &test_peer_id(),
+        &konsensus_core::MessageId::from_bytes([0; 32]),
+        reason,
+        &routing,
+        &ws_tx,
+        false,
+    )
+    .await;
     handle_invoice_error_received(
-        &test_peer_id(), "log-test", reason, true,
+        &test_peer_id(),
+        "log-test",
+        reason,
+        true,
         &tokio::sync::Mutex::new(std::collections::HashMap::new()),
-    ).await;
+    )
+    .await;
     assert_eq!(ws_rx.recv().await.unwrap().reason.as_deref(), Some(reason));
     let captured = captured.lock().unwrap();
     assert_eq!(captured.len(), 2);
@@ -4016,16 +4033,183 @@ async fn session_decode_logs_do_not_echo_peer_json() {
     // include this string, while the peer-facing adapter must discard it.
     let hostile = serde_json::json!("peer-controlled-secret");
     handle_prekey_offer(
-        &peer, hostile.clone(), *identity.node_id(), &manager, &storage,
-        &transport, &audit, &mut negotiations,
-    ).await;
+        &peer,
+        hostile.clone(),
+        *identity.node_id(),
+        &manager,
+        &storage,
+        &transport,
+        &audit,
+        &mut negotiations,
+        &mut PendingRatchetInits::new(),
+    )
+    .await;
     handle_session_init(
-        &peer, hostile, &manager, &storage, &transport, &audit, &mut negotiations,
-    ).await;
+        &peer,
+        hostile,
+        &manager,
+        &storage,
+        &transport,
+        &audit,
+        &mut negotiations,
+        &mut PendingRatchetInits::new(),
+    )
+    .await;
     assert!(!manager.has_session(&peer).await);
     assert!(negotiations.is_empty());
     assert_eq!(
         *captured.lock().unwrap(),
         vec!["invalid wire JSON", "invalid wire JSON"],
     );
+}
+
+#[tokio::test]
+async fn failed_ratchet_init_send_retries_without_advancing_session() {
+    ratchet_init_retry_case(false, false).await;
+}
+
+#[tokio::test]
+async fn pending_ratchet_init_is_discarded_after_session_replacement() {
+    ratchet_init_retry_case(true, false).await;
+}
+
+#[tokio::test]
+async fn replacement_session_ack_builds_a_new_ratchet_init() {
+    ratchet_init_retry_case(true, true).await;
+}
+
+async fn ratchet_init_retry_case(replace_session: bool, replacement_ack: bool) {
+    use std::time::Duration;
+    let alice = identity_from_mnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+    let bob = identity_from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let sessions = SessionManager::with_store(
+        alice.clone(),
+        Arc::new(crate::StorageSessionAdapter {
+            storage: db.clone(),
+        }),
+    );
+    let receiver = SessionManager::new(bob.clone());
+    let init = sessions
+        .initiate_session(bob.node_id(), &receiver.prekey_bundle().await)
+        .await
+        .unwrap();
+    receiver
+        .accept_session(alice.node_id(), &init)
+        .await
+        .unwrap();
+    let transport = |identity| {
+        Arc::new(NoiseTransport::new(
+            identity,
+            konsensus_message::TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let mut pending = PendingRatchetInits::new();
+    handle_session_ack(bob.node_id(), &sessions, &source, &audit, &mut pending).await;
+    let mut retained = pending
+        .get(bob.node_id())
+        .unwrap()
+        .frame
+        .to_bytes()
+        .unwrap();
+    // Repeated SessionAck while offline must retry the retained frame as well.
+    handle_session_ack(bob.node_id(), &sessions, &source, &audit, &mut pending).await;
+    assert_eq!(
+        pending
+            .get(bob.node_id())
+            .unwrap()
+            .frame
+            .to_bytes()
+            .unwrap(),
+        retained
+    );
+    if replace_session {
+        // API session replacement bypasses the wire negotiation handlers.
+        sessions.remove_session(bob.node_id()).await;
+        let init = sessions
+            .initiate_session(bob.node_id(), &receiver.prekey_bundle().await)
+            .await
+            .unwrap();
+        receiver.remove_session(alice.node_id()).await;
+        receiver
+            .accept_session(alice.node_id(), &init)
+            .await
+            .unwrap();
+        if replacement_ack {
+            handle_session_ack(bob.node_id(), &sessions, &source, &audit, &mut pending).await;
+            let replacement = pending
+                .get(bob.node_id())
+                .expect("replacement ACK did not build a RatchetInit")
+                .frame
+                .to_bytes()
+                .unwrap();
+            assert_ne!(replacement, retained);
+            retained = replacement;
+        }
+    }
+    let saved = db.load_session(bob.node_id()).await.unwrap();
+    assert!(saved.is_some());
+    assert!(!receiver.can_send(alice.node_id()).await);
+    source.add_to_whitelist(bob.node_id()).await;
+    target.add_to_whitelist(alice.node_id()).await;
+    target.start_listener().await.unwrap();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    while !matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ) {}
+    heal_connected_e2ee_sessions(&sessions, &source, &mut pending).await;
+    let payload = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let ControlEvent::RatchetInit { payload, .. } = target.recv_control().await.unwrap()
+            {
+                break payload;
+            }
+        }
+    })
+    .await;
+    if replace_session && !replacement_ack {
+        assert!(
+            payload.is_err(),
+            "self-heal sent a frame from the replaced session"
+        );
+        assert!(pending.is_empty());
+        assert_eq!(db.load_session(bob.node_id()).await.unwrap(), saved);
+        source.shutdown();
+        target.shutdown();
+        return;
+    }
+    let payload = payload.expect("self-heal must retry the saved RatchetInit after a failed send");
+    assert_eq!(
+        db.load_session(bob.node_id()).await.unwrap(),
+        saved,
+        "retry must not encrypt again"
+    );
+    assert!(pending.is_empty());
+    assert_eq!(
+        (Frame::RatchetInit {
+            payload: payload.clone()
+        })
+        .to_bytes()
+        .unwrap(),
+        retained
+    );
+    let message = konsensus_crypto::ratchet_message_from_bytes(&payload).unwrap();
+    assert_eq!(
+        receiver.decrypt(alice.node_id(), &message).await.unwrap(),
+        b"ratchet-init"
+    );
+    assert!(receiver.can_send(alice.node_id()).await);
+    source.shutdown();
+    target.shutdown();
 }

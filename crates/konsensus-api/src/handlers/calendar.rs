@@ -4,7 +4,7 @@
 //! RSVPs use KIND_RSVP (101) and updates use KIND_CALENDAR_UPDATE (104).
 //! All messages pass through the payment gate (Principle 2).
 
-use crate::auth::scoped::{ScopedAuth, Admin, Read, Spend};
+use crate::auth::scoped::{Admin, Read, ScopedAuth, Spend};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -15,10 +15,12 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use konsensus_core::calendar::{CalendarEvent, Freq, RRule};
 use konsensus_core::calendar::expand_occurrences as core_expand_occurrences;
+use konsensus_core::calendar::{CalendarEvent, Freq, RRule};
 use konsensus_core::kind::{KIND_CALENDAR_EVENT, KIND_CALENDAR_UPDATE, KIND_RSVP};
-use konsensus_core::payloads::calendar::{CalendarEventPayload, RsvpPayload, RsvpResponse, WireRRule};
+use konsensus_core::payloads::calendar::{
+    CalendarEventPayload, RsvpPayload, RsvpResponse, WireRRule,
+};
 use konsensus_core::types::{NodeId, Recipient};
 use konsensus_crypto::ratchet_message_to_bytes;
 use konsensus_storage::{CalendarEventRecord, RsvpRecord};
@@ -55,21 +57,17 @@ fn default_limit() -> u32 {
 }
 
 fn recurring_master_budget(limit: usize) -> usize {
-    limit
-        .saturating_mul(8)
-        .clamp(
-            MIN_CALENDAR_LIST_RECURRING_MASTER_BUDGET,
-            MAX_CALENDAR_LIST_RECURRING_MASTERS,
-        )
+    limit.saturating_mul(8).clamp(
+        MIN_CALENDAR_LIST_RECURRING_MASTER_BUDGET,
+        MAX_CALENDAR_LIST_RECURRING_MASTERS,
+    )
 }
 
 fn expanded_occurrence_budget(limit: usize) -> usize {
-    limit
-        .saturating_mul(64)
-        .clamp(
-            MIN_CALENDAR_LIST_EXPANDED_OCCURRENCE_BUDGET,
-            MAX_CALENDAR_LIST_EXPANDED_OCCURRENCES,
-        )
+    limit.saturating_mul(64).clamp(
+        MIN_CALENDAR_LIST_EXPANDED_OCCURRENCE_BUDGET,
+        MAX_CALENDAR_LIST_EXPANDED_OCCURRENCES,
+    )
 }
 
 fn reject_if_recurring_master_budget_exceeded(
@@ -297,8 +295,7 @@ fn expand_occurrences(event: &CalendarEventRecord, from: i64, to: i64) -> Vec<i6
         bymonthday: Vec::new(), // WireRRule does not carry BYMONTHDAY
     };
 
-    let attendees: Vec<String> =
-        serde_json::from_str(&event.attendees_json).unwrap_or_default();
+    let attendees: Vec<String> = serde_json::from_str(&event.attendees_json).unwrap_or_default();
 
     let domain = CalendarEvent {
         id: event.id.clone(),
@@ -386,7 +383,10 @@ async fn list_events(
     let mut exc_by_parent: HashMap<String, HashSet<u64>> = HashMap::new();
     for exc in &exceptions {
         if let Some(pid) = &exc.parent_id {
-            exc_by_parent.entry(pid.clone()).or_default().insert(exc.start_ms);
+            exc_by_parent
+                .entry(pid.clone())
+                .or_default()
+                .insert(exc.start_ms);
         }
     }
 
@@ -476,7 +476,9 @@ async fn create_event(
         return Err(ApiError::BadRequest("start must be before end".into()));
     }
     if req.attendees.is_empty() {
-        return Err(ApiError::BadRequest("at least one attendee required".into()));
+        return Err(ApiError::BadRequest(
+            "at least one attendee required".into(),
+        ));
     }
     if req.attendees.len() > 100 {
         return Err(ApiError::BadRequest("too many attendees (max 100)".into()));
@@ -560,18 +562,11 @@ async fn create_event(
         let payload_bytes = serde_json::to_vec(&payload)
             .map_err(|e| ApiError::Internal(format!("payload serialization: {e}")))?;
 
-        let ratchet_msg = match state.session_manager.encrypt(peer_id, &payload_bytes).await {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::warn!(
-                    peer = %peer_id,
-                    error = %e,
-                    "no E2EE session for attendee, skipping"
-                );
-                queued_for.push(peer_id.to_hex());
-                continue;
-            }
-        };
+        let ratchet_msg = state.session_manager.encrypt(peer_id, &payload_bytes).await
+            .map_err(|e| match e {
+                konsensus_crypto::SessionError::Persist(error) => ApiError::Storage(error),
+                error => ApiError::Internal(format!("E2EE encryption failed for attendee: {error}")),
+            })?;
         let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
         let price_msat = state
@@ -676,7 +671,9 @@ async fn update_event(
         .ok_or_else(|| ApiError::NotFound(format!("event {event_id} not found")))?;
 
     if existing.organizer != auth.node_id {
-        return Err(ApiError::Unauthorized("only the organizer can update an event".into()));
+        return Err(ApiError::Unauthorized(
+            "only the organizer can update an event".into(),
+        ));
     }
 
     // Apply updates
@@ -760,13 +757,11 @@ async fn update_event(
         let payload_bytes = serde_json::to_vec(&payload)
             .map_err(|e| ApiError::Internal(format!("payload serialization: {e}")))?;
 
-        let ratchet_msg = match state.session_manager.encrypt(peer_id, &payload_bytes).await {
-            Ok(msg) => msg,
-            Err(_) => {
-                queued_for.push(peer_id.to_hex());
-                continue;
-            }
-        };
+        let ratchet_msg = state.session_manager.encrypt(peer_id, &payload_bytes).await
+            .map_err(|e| match e {
+                konsensus_crypto::SessionError::Persist(error) => ApiError::Storage(error),
+                error => ApiError::Internal(format!("E2EE encryption failed for attendee: {error}")),
+            })?;
         let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
         let price_msat = state
@@ -850,7 +845,9 @@ async fn delete_event(
         .ok_or_else(|| ApiError::NotFound(format!("event {event_id} not found")))?;
 
     if existing.organizer != auth.node_id {
-        return Err(ApiError::Unauthorized("only the organizer can delete an event".into()));
+        return Err(ApiError::Unauthorized(
+            "only the organizer can delete an event".into(),
+        ));
     }
 
     let deleted = state
@@ -1160,8 +1157,7 @@ mod tests {
     fn calendar_list_rejects_timestamps_that_would_wrap_i64() {
         assert!(reject_if_calendar_time_bounds_exceeded(0, i64::MAX as u64).is_ok());
 
-        let err =
-            reject_if_calendar_time_bounds_exceeded(0, i64::MAX as u64 + 1).unwrap_err();
+        let err = reject_if_calendar_time_bounds_exceeded(0, i64::MAX as u64 + 1).unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
