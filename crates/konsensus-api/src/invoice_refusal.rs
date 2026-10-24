@@ -33,6 +33,10 @@ pub const INVOICE_LIMITED: &str = "konsensus:invoice_limited";
 /// The node will not issue an invoice for this request.
 pub const INVOICE_UNAVAILABLE: &str = "konsensus:invoice_unavailable";
 
+/// A paid peer asked for a service invoice below this node's admission floor.
+/// The request is refused; the amount is not raised to the floor.
+pub const BELOW_ADMISSION_FLOOR: &str = "konsensus:below_admission_floor";
+
 /// Readiness refusals use the existing authenticated InvoiceError frame.
 pub const CHAIN_UNAVAILABLE: &str = "konsensus:not_ready:chain_unavailable";
 pub const NOT_SYNCED: &str = "konsensus:not_ready:not_synced";

@@ -1859,6 +1859,23 @@ fn legacy_orphan_expiry_guess_is_clamped_for_service_caps() {
     );
 }
 
+#[test]
+fn missing_invoice_expiry_is_backfilled_from_creation_and_not_due() {
+    let created = 1_700_000_000u64;
+    let expires = super::migrate_service_invoice_expiry(None, created);
+    // Purge deletes when `expires_at <= now`. The short orphan window is
+    // already due at creation+120; the pre-upgrade hour must still be open.
+    let short_window = created.saturating_add(super::SERVICE_INVOICE_ORPHAN_SECS);
+    assert!(
+        short_window < expires,
+        "cleanup at the short orphan window must not delete a pre-upgrade invoice"
+    );
+    assert_eq!(
+        expires,
+        created.saturating_add(super::LEGACY_SERVICE_INVOICE_EXPIRY_SECS)
+    );
+}
+
 #[tokio::test]
 async fn invoice_restart_does_not_trust_truncated_numeric_expiry() {
     let dir = tempfile::tempdir().unwrap();

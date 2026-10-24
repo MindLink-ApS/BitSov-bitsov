@@ -1444,7 +1444,7 @@ async fn handle_price_response_received(
 /// invoice services require an already privileged connection. Legacy admission
 /// requests are refused even on a paid connection. Service invoices are capped
 /// per peer and for the node, cannot exceed this node's highest configured
-/// price, and expire quickly.
+/// price, must meet the admission floor, and expire quickly.
 #[allow(clippy::too_many_arguments)]
 async fn handle_invoice_requested_gated(
     peer_id: &NodeId,
@@ -1587,6 +1587,7 @@ async fn handle_invoice_requested_gated(
         transport,
         source_ip,
         last_admission_refusal,
+        min_admission_cost_msat,
         invoices,
     )
     .await;
@@ -1604,6 +1605,7 @@ async fn handle_invoice_requested(
     transport: &Arc<NoiseTransport>,
     source_ip: std::net::IpAddr,
     refusals: &mut crate::invoice_refusals::RefusalLimits,
+    min_admission_cost_msat: u64,
     invoices: &mut crate::peer_invoices::PeerInvoiceBook,
 ) {
     let now_unix = std::time::SystemTime::now()
@@ -1626,6 +1628,22 @@ async fn handle_invoice_requested(
                 peer_id,
                 request_id,
                 konsensus_api::invoice_refusal::INVOICE_UNAVAILABLE,
+            )
+            .await;
+        }
+        return;
+    }
+    // Refuse before the price lookup. A request that only falls under the floor
+    // after the ceiling clamp is checked again once the ceiling is known.
+    let floor = konsensus_core::gate::price_with_floor_msat(0, min_admission_cost_msat);
+    if amount_msat < floor {
+        rollback_rate();
+        if refusals.permit(source_ip, tokio::time::Instant::now()) {
+            send_invoice_refusal(
+                transport,
+                peer_id,
+                request_id,
+                konsensus_api::invoice_refusal::BELOW_ADMISSION_FLOOR,
             )
             .await;
         }
@@ -1666,6 +1684,19 @@ async fn handle_invoice_requested(
         return;
     }
     let amount_msat = amount_msat.min(ceiling);
+    if amount_msat < floor {
+        rollback_rate();
+        if refusals.permit(source_ip, tokio::time::Instant::now()) {
+            send_invoice_refusal(
+                transport,
+                peer_id,
+                request_id,
+                konsensus_api::invoice_refusal::BELOW_ADMISSION_FLOOR,
+            )
+            .await;
+        }
+        return;
+    }
     info!(
         peer = %peer_id, %request_id, amount_msat, %purpose,
         "peer requested invoice — creating on our wallet"
@@ -1751,12 +1782,29 @@ async fn configured_price_ceiling(pricing: &dyn PricingEngine) -> Result<u64, &'
 
 const MAX_CONCURRENT_PRICE_CEILING_LOOKUPS: usize = 8;
 
-type PriceCeilingLookup =
-    futures::future::Shared<futures::future::BoxFuture<'static, Result<u64, &'static str>>>;
+/// A successful ceiling is reused only this long, then the next request reads
+/// pricing again. Matches the readiness-height cache so a changed tariff
+/// cannot stick for the process lifetime.
+const PRICE_CEILING_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+type PriceCeilingLookup = futures::future::Shared<
+    futures::future::BoxFuture<'static, Result<(u64, tokio::time::Instant), &'static str>>,
+>;
+
+/// Releases one in-flight price-ceiling lookup, including when the lookup
+/// fails or the future is dropped before it finishes.
+struct PriceCeilingPermit(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for PriceCeilingPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Coalesces configured price-ceiling reads so slow pricing cannot stall the
 /// control loop. At most [`MAX_CONCURRENT_PRICE_CEILING_LOOKUPS`] lookups run at
 /// once; additional callers fail fast with `konsensus:price_unavailable`.
+/// A successful ceiling expires after [`PRICE_CEILING_TTL`].
 pub(crate) struct ConfiguredPriceCeilingCache {
     lookup: tokio::sync::Mutex<Option<PriceCeilingLookup>>,
     active: Arc<std::sync::atomic::AtomicUsize>,
@@ -1780,7 +1828,7 @@ impl ConfiguredPriceCeilingCache {
             let refresh = match slot.as_ref() {
                 None => true,
                 Some(lookup) => match lookup.peek() {
-                    Some(Ok(_)) => false,
+                    Some(Ok((_, fetched_at))) => fetched_at.elapsed() >= PRICE_CEILING_TTL,
                     Some(Err(_)) => true,
                     None => lookup.strong_count() == Some(1),
                 },
@@ -1792,17 +1840,17 @@ impl ConfiguredPriceCeilingCache {
                     self.active.fetch_sub(1, Ordering::SeqCst);
                     return Err("konsensus:price_unavailable");
                 }
-                let active = self.active.clone();
+                let permit = PriceCeilingPermit(Arc::clone(&self.active));
                 *slot = Some(
                     async move {
+                        let _permit = permit;
                         let ceiling = tokio::time::timeout(
                             Duration::from_secs(5),
                             configured_price_ceiling(pricing.as_ref()),
                         )
                         .await
                         .map_err(|_| "konsensus:price_unavailable")??;
-                        active.fetch_sub(1, Ordering::SeqCst);
-                        Ok(ceiling)
+                        Ok((ceiling, tokio::time::Instant::now()))
                     }
                     .boxed()
                     .shared(),
@@ -1812,7 +1860,7 @@ impl ConfiguredPriceCeilingCache {
                 .expect("price ceiling lookup initialized")
                 .clone()
         };
-        lookup.await
+        lookup.await.map(|(ceiling, _)| ceiling)
     }
 }
 

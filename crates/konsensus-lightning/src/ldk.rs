@@ -2689,10 +2689,23 @@ fn load_invoice_expiries(
 /// and never occupy the service-invoice sidecar.
 const SERVICE_INVOICE_ORPHAN_SECS: u64 = 120;
 
+/// Peer invoices issued before expiry metadata existed used a one-hour BOLT11
+/// lifetime (`create_invoice(..., 3600)`). A missing sidecar row is backfilled
+/// from the payment's creation timestamp with that same lifetime so an upgrade
+/// does not purge an invoice that is still payable.
+const LEGACY_SERVICE_INVOICE_EXPIRY_SECS: u64 = 3600;
+
 fn legacy_orphan_expiry_guess(timestamp: u64) -> u64 {
     timestamp.saturating_add(u64::from(u32::MAX))
 }
 
+/// Expiry to store for a pending service invoice when the sidecar is repaired.
+///
+/// A real recorded expiry is kept (and is at least the short service window).
+/// The old `u32::MAX` orphan guess is clamped to that short window so it cannot
+/// occupy a cap slot for the whole `u32` range. No recorded expiry at all — the
+/// pre-upgrade case — is backfilled from the payment timestamp instead of being
+/// treated as already due.
 pub(crate) fn migrate_service_invoice_expiry(
     recorded: Option<u64>,
     latest_update_timestamp: u64,
@@ -2703,14 +2716,15 @@ pub(crate) fn migrate_service_invoice_expiry(
             min_payable
         }
         Some(expires_at) => expires_at.max(min_payable),
-        None => min_payable,
+        None => latest_update_timestamp.saturating_add(LEGACY_SERVICE_INVOICE_EXPIRY_SECS),
     }
 }
 
 /// Repair the existing sidecar against durable wallet state, without a schema
 /// migration. LDK does not retain BOLT11 expiry in PaymentDetails. Missing
-/// metadata uses a short orphan window for cap accounting; legacy rows that
-/// used the u32::MAX orphan guess are clamped on load.
+/// metadata is backfilled from the payment timestamp; see
+/// [`migrate_service_invoice_expiry`]. Legacy rows that used the `u32::MAX`
+/// orphan guess are clamped on load.
 fn reconcile_invoice_expiries(
     node: &ldk_node::Node,
     mut recorded: std::collections::HashMap<String, u64>,
