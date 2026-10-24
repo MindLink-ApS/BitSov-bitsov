@@ -6,7 +6,7 @@
 
 ## 1. Overview — The Exit-ability Principle
 
-BitSov ships four sovereignty tiers:
+BitSov defines four sovereignty tiers. T0 and T1 are the closed-beta path on signet test nodes; T2 Relay is proposed and not shipped:
 
 | Tier | Description | Node hardware | Lightning custody |
 |------|-------------|---------------|-------------------|

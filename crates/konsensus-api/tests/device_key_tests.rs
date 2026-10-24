@@ -505,14 +505,15 @@ fn relation_envelope_identity_console_recipient_has_no_approval_identity() {
 fn a_signed_intent_opens_a_recipient_bound_envelope() {
     let tmp = tempfile::tempdir().unwrap();
     let (service, _, client, device, key_id) = registered(tmp.path());
-    let i = intent(&key_id, PEER, 80_000, 20_000);
+    let i = intent(&key_id, PEER, 24_000, 20_000);
     let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
     let view = service
         .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
         .unwrap()
         .grant;
     assert!(view.recipients_only);
-    assert_eq!(view.per_recipient_msat.get(PEER), Some(&80_000));
+    assert_eq!(view.per_call_max_msat, 6_000);
+    assert_eq!(view.per_recipient_msat.get(PEER), Some(&24_000));
     assert_eq!(view.per_act_max_by_recipient.get(PEER), Some(&20_000));
 
     // The pairing's token now carries spend.
@@ -530,16 +531,16 @@ fn a_signed_intent_opens_a_recipient_bound_envelope() {
         .unwrap();
     assert!(issued.scopes.contains(&Scope::Spend));
 
-    // Within the envelope: paid. Above the per-act max, another peer, or
+    // Within the envelope: paid. Above the per-call max, another peer, or
     // past the budget: refused before anything is debited.
     service
-        .reserve_spend(&client.client_id, client.epoch, charge(PEER, 20_000))
+        .reserve_spend(&client.client_id, client.epoch, charge(PEER, 6_000))
         .unwrap();
     let per_act = service
-        .reserve_spend(&client.client_id, client.epoch, charge(PEER, 20_001))
+        .reserve_spend(&client.client_id, client.epoch, charge(PEER, 7_000))
         .unwrap_err();
     assert!(
-        matches!(per_act, BudgetRefusal::PerCall { max_msat: 20_000 }),
+        matches!(per_act, BudgetRefusal::PerCall { max_msat: 6_000 }),
         "{per_act:?}"
     );
     let other = service
@@ -552,7 +553,7 @@ fn a_signed_intent_opens_a_recipient_bound_envelope() {
     // Stay below breaker limits so this test isolates recipient exhaustion.
     for _ in 0..3 {
         service
-            .reserve_spend(&client.client_id, client.epoch, charge(PEER, 20_000))
+            .reserve_spend(&client.client_id, client.epoch, charge(PEER, 6_000))
             .unwrap();
     }
     let spent = service
@@ -569,7 +570,7 @@ fn a_signed_intent_opens_a_recipient_bound_envelope() {
         .grant_view_for(&client.client_id)
         .unwrap()
         .used_by_recipient[PEER];
-    assert_eq!(used, 80_000, "exactly the envelope, never more");
+    assert_eq!(used, 24_000, "exactly the envelope, never more");
 
     // A new tap renews the envelope on top of what was used.
     let again = intent(&key_id, PEER, 50_000, 20_000);
@@ -578,7 +579,7 @@ fn a_signed_intent_opens_a_recipient_bound_envelope() {
         .apply_relation_intent(&client.client_id, client.epoch, &again, &sig)
         .unwrap();
     service
-        .reserve_spend(&client.client_id, client.epoch, charge(PEER, 20_000))
+        .reserve_spend(&client.client_id, client.epoch, charge(PEER, 6_000))
         .unwrap();
 }
 
@@ -595,6 +596,7 @@ fn a_second_peer_gets_its_own_envelope_without_touching_the_first() {
     }
     let view = service.grant_view_for(&client.client_id).unwrap();
     assert_eq!(view.budget_msat, 130_000);
+    assert_eq!(view.per_call_max_msat, 6_000);
     assert_eq!(view.per_recipient_msat[PEER], 100_000);
     assert_eq!(view.per_recipient_msat[OTHER], 30_000);
     // A room act paying both, each within its own per-act max, is one call.
@@ -605,11 +607,11 @@ fn a_second_peer_gets_its_own_envelope_without_touching_the_first() {
             vec![
                 Charge {
                     recipient: PEER.into(),
-                    amount_msat: 10_000,
+                    amount_msat: 3_000,
                 },
                 Charge {
                     recipient: OTHER.into(),
-                    amount_msat: 10_000,
+                    amount_msat: 3_000,
                 },
             ],
         )

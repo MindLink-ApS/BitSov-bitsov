@@ -512,7 +512,7 @@ async fn replay_across_requests_and_replaced_grant_are_refused_and_audited_witho
 async fn approval_message_binds_every_displayed_field_and_rejects_unknown_terms() {
     let f = Fixture::new(true);
     let op = f.request(false).await;
-    let expected=format!("bitsov-owner-approval-v1\nnode:{}\nkind:spend_grant\nclient:{}\nclient_pubkey:{}\nepoch:{}\ngrant_op:-\nrecipient:-\nmax_total_msat:100000\nbudget_msat:100000\nper_call_max_msat:10000\nwindow_secs:600\nop_id:{}\nnonce:{}\nexpires_at:{}", f.svc.bound_fingerprint(),f.requester.client_id,f.requester.client_pubkey,f.requester.epoch,op["op_id"].as_str().unwrap(),op["nonce"].as_str().unwrap(),op["expires_at"]);
+    let expected=format!("bitsov-owner-approval-v1\nnode:{}\nkind:spend_grant\nclient:{}\nclient_pubkey:{}\nepoch:{}\ngrant_op:-\nrecipient:-\nmax_total_msat:100000\nbudget_msat:100000\nper_call_max_msat:6000\nwindow_secs:600\nop_id:{}\nnonce:{}\nexpires_at:{}", f.svc.bound_fingerprint(),f.requester.client_id,f.requester.client_pubkey,f.requester.epoch,op["op_id"].as_str().unwrap(),op["nonce"].as_str().unwrap(),op["expires_at"]);
     assert_eq!(op["approval_message"], expected);
     assert_eq!(op["nonce"].as_str().unwrap().len(), 32);
     let now = chrono::Utc::now().timestamp();
