@@ -579,7 +579,7 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
         let timestamp = chrono::Utc::now().timestamp();
         let proof = format!(
             "bitsov-pair-challenge-v1:{}:{timestamp}",
-            &f.record.client_id
+            f.record.client_id
         );
         let proof_signature = hex::encode(f.client.sign(proof.as_bytes()).to_bytes());
         let challenge: Value = http
@@ -604,7 +604,7 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
                 .await;
         assert_eq!(auth["status"], "ok");
         for path in [
-            "/api/v1/pair/relation-intent",
+            "/api/v1/pair/approve",
             "/api/v1/pair/first-contact-grant",
             "/api/v1/identity/replacement-request",
         ] {
@@ -722,7 +722,6 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
                 "authority stays disabled without local-owner mode"
             );
         }
-        drop(unlocked_tunnel);
         let keys: Value = http
             .get(format!("http://{}/api/v1/pair/device-keys", f.api))
             .bearer_auth(token)
@@ -757,17 +756,37 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
                 .unwrap()
                 .as_ref(),
         );
-        let response = http
-            .post(format!("http://{}/api/v1/pair/relation-intent", f.api))
-            .bearer_auth(token)
-            .json(&json!({"intent":intent,"signature":sig}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status().is_success(), local);
+        let (status, body) = unlocked_tunnel
+            .post_with_token(
+                "/api/v1/pair/relation-intent",
+                json!({"intent": intent, "signature": sig}),
+                Some(token),
+            )
+            .await;
+        assert_eq!(status, if local { 200 } else { 403 }, "{body}");
+        if local {
+            assert_eq!(
+                body["grant"]["per_recipient_msat"]["aa".repeat(32)],
+                100_000
+            );
+        }
+        drop(unlocked_tunnel);
         drop(node);
         let file_log = std::fs::read_to_string(f.dir.path().join("node.log")).unwrap();
+        if !local {
+            assert!(
+                file_log.lines().any(|line| {
+                    line.contains("relation intent refused")
+                        && line.contains("/api/v1/pair/relation-intent")
+                        && line.contains("status=403")
+                        && line.contains("code=403")
+                }),
+                "refusal must reach node.log"
+            );
+        }
         for captured in [logs(&log), file_log] {
+            assert!(!captured.contains(&sig));
+            assert!(!captured.contains(&intent.nonce));
             assert!(!captured.contains("bitsov://pair/"));
             assert!(!captured.contains(&ticket.code));
         }

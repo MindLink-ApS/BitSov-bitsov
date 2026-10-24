@@ -1,8 +1,10 @@
 # BitSov
 
-A sovereign mesh network where every user is a node with Bitcoin-anchored identity, payment-gated communication, and user-held keys.
+A sovereign mesh network where every user is a node whose identity comes from its own user-held keys, and Bitcoin/Lightning pays for communication admission.
 
 BitSov is a decentralized, privacy-respecting, Bitcoin-backed substrate where the node, not a platform account, owns the relationship. Today it carries messaging, scheduling, and collaboration; calls and file-sharing are on the roadmap.
+
+**Status:** BitSov is in closed beta with signet test nodes. Paid admission was proven on mainnet on 1 July 2026.
 
 Node IDs and public keys are the protocol identity layer. IP addresses and DNS names are reachability hints, not identity or admission authority. Nodes may learn those hints through invites, QR codes, manual entry, relays, or other out-of-band discovery, but communication remains governed by the node identity, encryption state, and payment/admission policy.
 
@@ -60,7 +62,7 @@ See the [CLN configuration reference](docs/CLN.md).
 
 All tiers use node identity as the canonical endpoint identifier. Reachability hints are secondary.
 
-> **Availability:** the **Light** and **Full** (self-host) tiers are the current shippable path. The **Relay** tier (operator-run ciphertext relay) is on the roadmap; relay/reachability remains the next major production-readiness milestone.
+> **Availability:** the **Light** and **Full** (self-host) tiers are the current closed-beta path on signet test nodes. The **Relay** tier (operator-run ciphertext relay) is on the roadmap; relay/reachability remains the next major production-readiness milestone.
 
 ## Architecture
 
