@@ -11,7 +11,11 @@ use konsensus_core::{NodeIdentity, UkmEnvelope};
 use konsensus_lightning::shared_mock::SharedMockProvider;
 use std::time::Instant;
 
-type Requests = Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>>;
+type Requests = Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
+    >,
+>;
 
 /// A contact with a live E2EE session. Its connection starts unpaid; it prices
 /// admission at 2000 and, in its signed quote, the message at 2000 while the
@@ -24,6 +28,7 @@ struct Contact {
     generation: std::sync::Mutex<Instant>,
     paid: AtomicBool,
     flap_on_proof: AtomicBool,
+    message_msat: AtomicU64,
 }
 
 impl Contact {
@@ -41,13 +46,22 @@ impl MessageTransport for Contact {
         }
         Ok(())
     }
-    async fn send_on_connection(&self, peer: &NodeId, since: Option<Instant>, envelope: &UkmEnvelope) -> Result<(), TransportError> {
+    async fn send_on_connection(
+        &self,
+        peer: &NodeId,
+        since: Option<Instant>,
+        envelope: &UkmEnvelope,
+    ) -> Result<(), TransportError> {
         if since != Some(*self.generation.lock().unwrap()) {
             return Err(TransportError::NotConnected("generation changed".into()));
         }
-        if envelope.ciphertext == b"konsensus:admission:v1" && self.flap_on_proof.swap(false, Ordering::SeqCst) {
+        if envelope.ciphertext == b"konsensus:admission:v1"
+            && self.flap_on_proof.swap(false, Ordering::SeqCst)
+        {
             self.reconnect();
-            return Err(TransportError::NotConnected("reconnected while the proof was sent".into()));
+            return Err(TransportError::NotConnected(
+                "reconnected while the proof was sent".into(),
+            ));
         }
         self.send(peer, envelope).await
     }
@@ -78,21 +92,52 @@ impl MessageTransport for Contact {
         }
     }
     async fn send_raw_frame(&self, _: &NodeId, bytes: &[u8]) -> Result<(), TransportError> {
-        let konsensus_message::wire::Frame::RequestInvoice { request_id, purpose, amount_msat } =
-            konsensus_message::wire::Frame::from_bytes(bytes).unwrap()
+        let konsensus_message::wire::Frame::RequestInvoice {
+            request_id,
+            purpose,
+            amount_msat,
+        } = konsensus_message::wire::Frame::from_bytes(bytes).unwrap()
         else {
             return Ok(());
         };
         let admission = purpose.starts_with("konsensus:admission");
         let outcome = if !admission && !self.paid.load(Ordering::SeqCst) {
-            assert!(invoice_refusal::record(&request_id, &self.peer, invoice_refusal::ADMISSION_REQUIRED));
-            Err(InvoiceResponseError { recipient: self.peer, reason: invoice_refusal::ADMISSION_REQUIRED.into() })
+            assert!(invoice_refusal::record(
+                &request_id,
+                &self.peer,
+                invoice_refusal::ADMISSION_REQUIRED
+            ));
+            Err(InvoiceResponseError {
+                recipient: self.peer,
+                reason: invoice_refusal::ADMISSION_REQUIRED.into(),
+            })
         } else {
-            let description = if admission { format!("konsensus:{request_id}:message=2000") } else { "konsensus message".into() };
-            let invoice = self.payee.create_invoice(if admission { 2000 } else { amount_msat }, &description, 55).await.unwrap();
-            Ok(InvoiceResponseData { recipient: self.peer, bolt11: invoice.bolt11, payment_hash: invoice.payment_hash })
+            let description = if admission {
+                format!(
+                    "konsensus:{request_id}:message={}",
+                    self.message_msat.load(Ordering::SeqCst)
+                )
+            } else {
+                "konsensus message".into()
+            };
+            let invoice = self
+                .payee
+                .create_invoice(if admission { 2000 } else { amount_msat }, &description, 55)
+                .await
+                .unwrap();
+            Ok(InvoiceResponseData {
+                recipient: self.peer,
+                bolt11: invoice.bolt11,
+                payment_hash: invoice.payment_hash,
+            })
         };
-        self.requests.lock().await.remove(&request_id).unwrap().send(outcome).unwrap();
+        self.requests
+            .lock()
+            .await
+            .remove(&request_id)
+            .unwrap()
+            .send(outcome)
+            .unwrap();
         Ok(())
     }
 }
@@ -106,14 +151,22 @@ struct LosingWallet {
 
 #[async_trait]
 impl LightningProvider for LosingWallet {
-    async fn create_invoice(&self, amount: u64, description: &str, expiry: u32)
-        -> Result<konsensus_core::traits::lightning::Invoice, LightningError> {
+    async fn create_invoice(
+        &self,
+        amount: u64,
+        description: &str,
+        expiry: u32,
+    ) -> Result<konsensus_core::traits::lightning::Invoice, LightningError> {
         self.inner.create_invoice(amount, description, expiry).await
     }
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
         self.inner.pay_invoice(bolt11).await
     }
-    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, cap: u64) -> Result<PaymentDetails, LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        bolt11: &str,
+        cap: u64,
+    ) -> Result<PaymentDetails, LightningError> {
         let paid = self.inner.pay_invoice_with_fee_limit(bolt11, cap).await;
         if self.lose_next.swap(false, Ordering::SeqCst) {
             return Err(LightningError::Connection("response lost".into()));
@@ -160,8 +213,16 @@ impl Probe {
         let peer = *identity.node_id();
         // An existing contact: the E2EE session survives every reconnect.
         let theirs = konsensus_crypto::SessionManager::new(Arc::new(identity));
-        let init = fx.state.session_manager.initiate_session(&peer, &theirs.prekey_bundle().await).await.unwrap();
-        theirs.accept_session(fx.state.identity.node_id(), &init).await.unwrap();
+        let init = fx
+            .state
+            .session_manager
+            .initiate_session(&peer, &theirs.prekey_bundle().await)
+            .await
+            .unwrap();
+        theirs
+            .accept_session(fx.state.identity.node_id(), &init)
+            .await
+            .unwrap();
         let contact = Arc::new(Contact {
             peer,
             requests: fx.state.invoice_requests.clone(),
@@ -169,9 +230,17 @@ impl Probe {
             generation: std::sync::Mutex::new(Instant::now()),
             paid: AtomicBool::new(false),
             flap_on_proof: AtomicBool::new(false),
+            message_msat: AtomicU64::new(2_000),
         });
-        let wallet = Arc::new(LosingWallet { inner: payer.clone(), lose_next: AtomicBool::new(false) });
-        fx.state = Arc::new(AppState { transport: contact.clone(), lightning: wallet.clone(), ..(*fx.state).clone() });
+        let wallet = Arc::new(LosingWallet {
+            inner: payer.clone(),
+            lose_next: AtomicBool::new(false),
+        });
+        fx.state = Arc::new(AppState {
+            transport: contact.clone(),
+            lightning: wallet.clone(),
+            ..(*fx.state).clone()
+        });
         fx.peer = peer;
         let token = if let Some(terms) = grant {
             let terms = if terms.per_recipient_msat.is_empty() {
@@ -181,16 +250,32 @@ impl Probe {
             };
             fx.grant(None, terms).await
         } else {
-            konsensus_api::auth::create_token(&fx.state.identity.node_id().to_hex(), &fx.state.jwt_secret, Scope::all()).unwrap()
+            konsensus_api::auth::create_token(
+                &fx.state.identity.node_id().to_hex(),
+                &fx.state.jwt_secret,
+                Scope::all(),
+            )
+            .unwrap()
         };
-        Probe { fx, contact, payer, wallet, token }
+        Probe {
+            fx,
+            contact,
+            payer,
+            wallet,
+            token,
+        }
     }
 
     async fn compose(&self, text: &str, cap: u64) -> (StatusCode, Value) {
         self.compose_with_fee(text, cap, None).await
     }
 
-    async fn compose_with_fee(&self, text: &str, cap: u64, fee: Option<u64>) -> (StatusCode, Value) {
+    async fn compose_with_fee(
+        &self,
+        text: &str,
+        cap: u64,
+        fee: Option<u64>,
+    ) -> (StatusCode, Value) {
         let mut body = json!({
             "recipient": self.contact.peer.to_hex(), "kind": 0, "plaintext": text,
             "max_total_msat": cap, "operation_id": uuid::Uuid::new_v4().to_string(),
@@ -198,11 +283,55 @@ impl Probe {
         if let Some(fee) = fee {
             body["max_routing_fee_msat"] = json!(fee);
         }
-        self.fx.call("POST", "/api/v1/messages/compose", Some(body), Some(&self.token)).await
+        self.fx
+            .call(
+                "POST",
+                "/api/v1/messages/compose",
+                Some(body),
+                Some(&self.token),
+            )
+            .await
     }
 
     async fn spent(&self) -> u64 {
         START_MSAT - self.payer.get_balance_msat().await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn signed_relation_readmission_respects_the_recipient_per_act_cap() {
+    for (cap, fee, message, allowed) in [
+        (1_999, 0, 1_000, false),
+        (1_999, 0, 1_500, false),
+        (2_000, 1, 1_000, false),
+        (2_000, 0, 1_000, true),
+        (2_001, 1, 1_000, true),
+    ] {
+        let mut p = Probe::new(false).await;
+        p.contact.message_msat.store(message, Ordering::SeqCst);
+        let (fx, token) = super::messaging_cap::messaging_fixture_for(p.fx, true, cap).await;
+        p.fx = fx;
+        p.token = token;
+        let (status, body) = p
+            .compose_with_fee("signed admission limit", 4_000, Some(fee))
+            .await;
+        if allowed {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(p.spent().await, 3_000);
+            assert_eq!(p.fx.used(), 3_000);
+        } else {
+            assert_budget_exceeded(status, &body, "per_call");
+            assert_eq!(
+                p.spent().await,
+                0,
+                "an admission quote above the signed cap pays nothing"
+            );
+            assert_eq!(
+                p.fx.used(),
+                0,
+                "the refused call releases its message reservation"
+            );
+        }
     }
 }
 
@@ -221,13 +350,21 @@ async fn recovered_admission_never_pays_the_quoted_message_above_the_owner_cap()
     // The announced price (1000) fits 1500; the contact's quote (2000) does not.
     let (status, body) = p.compose("recovered admission", 1_500).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!((body["code"].as_str(), body["reason"].as_str()), (Some("price_cap_exceeded"), Some("readmission_required")), "{body}");
+    assert_eq!(
+        (body["code"].as_str(), body["reason"].as_str()),
+        (Some("price_cap_exceeded"), Some("readmission_required")),
+        "{body}"
+    );
     assert_eq!(p.spent().await, 2_000, "nothing more paid under a 1500 cap");
     // The refused call still re-delivered the paid proof: the connection is
     // admitted, and the next message pays its price only, never admission again.
     let (status, body) = p.compose("after the recovered admission", 2_000).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(p.spent().await, 3_000, "the message once, no second admission");
+    assert_eq!(
+        p.spent().await,
+        3_000,
+        "the message once, no second admission"
+    );
 }
 
 #[tokio::test]
@@ -238,8 +375,16 @@ async fn recovered_admission_never_pays_the_quoted_message_above_a_paired_reserv
     // The call reserved the announced 1000; the recovery reserved no increase.
     let (status, body) = p.compose("recovered admission", 4_000).await;
     assert_budget_exceeded(status, &body, "unpriced");
-    assert_eq!(p.spent().await, 2_000, "nothing more paid beyond the reservation");
-    assert_eq!(p.fx.used(), used, "the grant is not charged for the refusal");
+    assert_eq!(
+        p.spent().await,
+        2_000,
+        "nothing more paid beyond the reservation"
+    );
+    assert_eq!(
+        p.fx.used(),
+        used,
+        "the grant is not charged for the refusal"
+    );
 }
 
 #[tokio::test]
@@ -252,17 +397,22 @@ async fn resumed_in_flight_admission_never_pays_the_quoted_message_above_the_cap
     assert!(status.is_server_error(), "{status} {body}");
     assert_eq!(p.spent().await, 2_000);
     let (status, body) = p.compose("resumed admission", 1_500).await;
-    assert!(status.is_client_error(), "refused before the message: {status} {body}");
+    assert!(
+        status.is_client_error(),
+        "refused before the message: {status} {body}"
+    );
     assert_eq!(p.spent().await, 2_000, "nothing more paid under a 1500 cap");
 }
 
 #[tokio::test]
 async fn grant_reservation_refusal_reports_no_admission_fee_ceiling() {
-    // Cap fits (admission+message+fees), but the grant's per-call max does not.
+    // Aggregate cap fits, but the fresh message price exceeds its own act cap.
     // Nothing is dispatched, so the error must not include the admission ceiling.
     const FEE: u64 = 100;
-    let p = Probe::with_terms(Some(GrantTerms::new(100_000).per_call(3_000))).await;
-    let (status, body) = p.compose_with_fee("grant cannot reserve", 10_000, Some(FEE)).await;
+    let p = Probe::with_terms(Some(GrantTerms::new(100_000).per_call(1_999))).await;
+    let (status, body) = p
+        .compose_with_fee("grant cannot reserve", 10_000, Some(FEE))
+        .await;
     assert_budget_exceeded(status, &body, "per_call");
     assert_eq!(p.spent().await, 0, "grant refusal pays nothing: {body}");
     assert_eq!(
@@ -270,4 +420,18 @@ async fn grant_reservation_refusal_reports_no_admission_fee_ceiling() {
         Some(FEE),
         "admission ceiling was never given to the wallet: {body}"
     );
+}
+
+#[tokio::test]
+async fn quoted_readmission_has_separate_fee_line_above_six_sats() {
+    let p = Probe::with_terms(Some(GrantTerms::new(100_000).per_call(6_000))).await;
+    let (status, body) = p
+        .compose_with_fee("separate admission", 13_000, Some(10_000))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["readmission_msat"], 2_000);
+    assert_eq!(body["amount_msat"], 2_000);
+    assert_eq!(body["max_routing_fee_msat"], 9_000);
+    assert_eq!(p.spent().await, 4_000);
+    assert_eq!(p.fx.used(), 4_000);
 }

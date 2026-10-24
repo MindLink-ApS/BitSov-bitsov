@@ -144,6 +144,8 @@ async fn pair_status_shows_six_sat_messaging_cap_with_original_budget() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(stdout.matches("per-call<=6 sats").count(), 2, "{stdout}");
+    assert_eq!(stdout.matches("message-all-in<=6 sats").count(), 2, "{stdout}");
+    assert!(stdout.contains("payment-all-in<=20 sats"), "{stdout}");
+    assert!(stdout.contains("payment-all-in<=6 sats"), "{stdout}");
     assert!(stdout.contains("200 of 200 sats left"), "{stdout}");
 }

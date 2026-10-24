@@ -251,6 +251,9 @@ pub struct ApprovalView {
     pub operation: ApprovalOperation,
     /// Exact bytes the owner displays and signs.
     pub approval_message: String,
+    /// Derived per-act display terms, available before the owner signs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub act_caps: Option<crate::spend_budget::ActCaps>,
     /// pending, consumed, or expired.
     pub status: &'static str,
     /// User action; never contains a console code or signature.
@@ -270,6 +273,10 @@ impl Pending {
         ApprovalView {
             operation: self.operation.clone(),
             approval_message: self.operation.message(),
+            act_caps: match &self.operation.request {
+                ApprovalRequest::SpendGrant { per_call_max_msat, .. } => Some(crate::spend_budget::ActCaps::new(*per_call_max_msat)),
+                _ => None,
+            },
             status: if self.consumed {
                 "consumed"
             } else if self.live(chrono::Utc::now().timestamp()) {

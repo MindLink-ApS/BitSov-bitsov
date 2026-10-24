@@ -358,12 +358,13 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             }
             for g in &grants {
                 safe_println!(
-                    "SPEND GRANT client={}  {} of {} sats left  per-call<={} sats  \
-                     expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
+                    "SPEND GRANT client={}  {} of {} sats left  message-all-in<={} sats  payment-all-in<={} sats  \
+                     expires_at={}\n  room: N paid members x their message all-in cap, one total\n  admission: quoted price + maximum fee, separate act\n  revoke with: konsensus grant-revoke --client-id {}",
                     g.client_id,
                     spend_budget::sats(g.remaining_msat),
                     spend_budget::sats(g.budget_msat),
                     spend_budget::sats(g.per_call_max_msat),
+                    spend_budget::sats(g.payment_per_call_max_msat),
                     g.expires_at,
                     g.client_id
                 );
