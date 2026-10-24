@@ -2036,6 +2036,13 @@ async fn status_reports_configured_stun_server_when_own_has_no_url() {
     assert_eq!(status["stun_url"], "stun:hub.example.org:3478");
     assert_eq!(status["stun_source"], "configured");
     assert!(status.get("peer_endpoint").is_none());
+    let health = get(&configured, "/api/v1/health", false).await;
+    assert!(
+        health.get("stun_url").is_none()
+            && health.get("stun_source").is_none()
+            && health.get("stun_port").is_none(),
+        "public /health must not expose configured STUN"
+    );
 
     let own_wins = Arc::new(AppState {
         stun_port: Some(3478),
@@ -2057,6 +2064,8 @@ async fn status_reports_configured_stun_server_when_own_has_no_url() {
     let status = get(&neither, "/api/v1/status", true).await;
     assert!(status.get("stun_url").is_none());
     assert!(status.get("stun_source").is_none());
+    let health = get(&neither, "/api/v1/health", false).await;
+    assert!(health.get("stun_url").is_none() && health.get("stun_source").is_none());
 }
 
 /// `custody_mode` (REMOTE-SIGNER.md §2) is owner-only: the owner's `/status`
