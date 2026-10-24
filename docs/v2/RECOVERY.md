@@ -138,7 +138,9 @@ non-anchor). Esplora can require at least one HTTP request per script per scan,
 reveals those scripts to the configured service, and is subject to its rate
 limits. Once a pass has found hub close outputs, the 30-second passes that
 follow poll only those outputs' scripts until the sweep confirms; one full
-rescan then checks for late closes before the self-test. Finding nothing does
+rescan then checks for late closes before the self-test. A focused sweep that
+cannot cover fees or would produce dust retries a full scan in the same pass
+to include funds on other scripts. Finding nothing does
 **not** mean recovery is complete. Seed-only
 recovery cannot prove that all old channels have closed; retain the seed for
 late closes even after a completed run.

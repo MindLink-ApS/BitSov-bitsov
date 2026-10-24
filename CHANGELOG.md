@@ -8,8 +8,10 @@ also live on the corresponding GitHub pre-release pages.
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second passes that follow poll only those outputs' scripts
   instead of all 2000 derived scripts, until the sweep confirms and one full
-  rescan checks for late closes. A backup index still scans its active
-  channels every pass. The Esplora request warning states the new bound (#414).
+  rescan checks for late closes. A focused sweep that cannot cover fees or
+  would produce dust retries a full scan in the same pass. A backup index still
+  scans its active channels every pass. The Esplora request warning states the
+  new bound (#414).
 - Pin the development and CI Rust toolchain to 1.99.1 in `rust-toolchain.toml`;
   every workflow installs the version from that file instead of floating
   `stable`, and a guard script fails CI if a workflow or the pin drifts (#394).

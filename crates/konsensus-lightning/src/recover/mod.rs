@@ -7,7 +7,7 @@ pub use journal::{
     JournalState, Report, Status, Verification,
 };
 use konsensus_chain::recovery::RecoveryChain;
-use konsensus_recovery::{BackupIndex, FoundOutput, RecoveryKeys, RecoveryScript};
+use konsensus_recovery::{BackupIndex, FoundOutput, RecoveryError, RecoveryKeys, RecoveryScript};
 use std::borrow::Cow;
 
 #[derive(Debug)]
@@ -83,24 +83,39 @@ impl Job {
         if let Some(progress) = self.resume_sweeps(chain).await? {
             return Ok(progress);
         }
-        let targets = self.scan_targets(scripts);
-        let mut outputs = chain.scan(&targets).await?;
-        if outputs.is_empty() && matches!(targets, Cow::Owned(_)) {
-            // The focused outputs are gone (spent, replaced or reorged): decide
-            // on a full scan in this same pass, never on a stale focus.
-            outputs = chain.scan(scripts).await?;
-        }
-        self.refocus(&outputs);
-        if outputs.iter().any(|o| o.confirmations == 0) {
-            return Ok(Progress::WaitingForHub);
-        }
-        if !outputs.is_empty() {
+        let mut targets = self.scan_targets(scripts);
+        loop {
+            let outputs = chain.scan(&targets).await?;
+            if outputs.is_empty() && matches!(targets, Cow::Owned(_)) {
+                // The focused outputs are gone (spent, replaced or reorged): decide
+                // on a full scan in this same pass, never on a stale focus.
+                targets = Cow::Borrowed(scripts);
+                continue;
+            }
+            self.refocus(&outputs);
+            if outputs.iter().any(|o| o.confirmations == 0) {
+                return Ok(Progress::WaitingForHub);
+            }
+            if outputs.is_empty() {
+                break;
+            }
             self.authenticate_closes(chain, &outputs).await?;
-            let signed = keys.build_sweep(
+            let signed = match keys.build_sweep(
                 &outputs,
                 self.plan().address()?.script_pubkey(),
                 FeeRate::from_sat_per_vb(self.plan().fee_rate_sat_vb).ok_or("invalid fee rate")?,
-            )?;
+            ) {
+                Ok(signed) => signed,
+                Err(RecoveryError::DustOutput | RecoveryError::InsufficientFunds)
+                    if matches!(targets, Cow::Owned(_)) =>
+                {
+                    // Other scripts may hold enough funds to make the sweep viable.
+                    // Retry once in full, including confirmation/authentication checks.
+                    targets = Cow::Borrowed(scripts);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let sweep = Sweep {
                 transaction: bitcoin::consensus::encode::serialize_hex(&signed.transaction),
                 fee_sats: signed.fee.to_sat(),
