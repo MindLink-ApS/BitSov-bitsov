@@ -5,6 +5,10 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Run the real-LDK 1:1 call regtest (`regtest_e2e::real_ldk_regtest_calls`)
+  every night as its own job in the scheduled three-node lane, via
+  `scripts/regress/calls_e2e.sh`; a skipped or filtered-out test or a missing
+  offer/answer/ICE/hangup marker fails the job. PR CI is unchanged (#411).
 - Pin the development and CI Rust toolchain to 1.99.1 in `rust-toolchain.toml`;
   every workflow installs the version from that file instead of floating
   `stable`, and a guard script fails CI if a workflow or the pin drifts (#394).
