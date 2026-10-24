@@ -694,10 +694,17 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // sender or this node is refused like a call signal:
                         // withdrawn (the payment hash and nonce stay burned) and
                         // never shown; if the withdrawal fails it stays held until
-                        // the sweep. Anything else is released before the app sees
-                        // it; if that write fails it stays held: fail closed.
+                        // the sweep. A retry after an unsaved decrypt does not
+                        // place a new hold (`hold_incoming` finds the message row
+                        // already stored) but the first hold is still there
+                        // (`held_duplicate`). Release either hold before the app
+                        // sees the chat; if that write fails it stays held: fail
+                        // closed.
                         let room = konsensus_api::room_binding::admit_incoming(identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref());
-                        if room.is_ok() && call_hold && konsensus_api::room_binding::is_candidate(envelope.kind) {
+                        if room.is_ok()
+                            && (call_hold || held_duplicate)
+                            && konsensus_api::room_binding::is_candidate(envelope.kind)
+                        {
                             if let Err(e) = storage_for_recv.call_admission_release(&msg_id).await {
                                 error!(msg_id = %msg_id, error = %e, "admitted chat could not be released; withheld");
                                 let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };

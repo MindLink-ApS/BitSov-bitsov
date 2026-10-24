@@ -648,6 +648,11 @@ impl SessionManager {
     ) -> Result<RatchetMessage, SessionError> {
         let store = self.store.clone();
         let cipher = &self.session_cipher;
+        // The sessions write lock is held across the store await below on
+        // purpose. Two sends then cannot clone one ratchet and derive the same
+        // message key: the next key stays invisible until this send has saved
+        // and installed it. The cost is that every other session operation on
+        // this manager waits out that write.
         let mut sessions = self.sessions.write().await;
         let (msg, trial, state) = {
             let session = sessions
@@ -682,6 +687,9 @@ impl SessionManager {
     ) -> Result<Vec<u8>, SessionError> {
         let store = self.store.clone();
         let cipher = &self.session_cipher;
+        // Same lock as `encrypt`: held across the store await so a concurrent
+        // send cannot derive a key from the ratchet this decrypt is replacing.
+        // Other session operations wait for the write.
         let mut sessions = self.sessions.write().await;
         let (plaintext, trial, state) = {
             let session = sessions
