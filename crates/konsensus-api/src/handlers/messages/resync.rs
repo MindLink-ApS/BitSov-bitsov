@@ -171,6 +171,11 @@ async fn fulfill(
             }
         } else { None };
 
+        if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE {
+            if let Some(text) = plaintext.as_deref() {
+                crate::calls::deliver_invite_to_device(state, &envelope.sender.to_hex(), &envelope.id.to_hex(), text).await;
+            }
+        }
         let ws_msg = Arc::new(crate::state::WsMessage { envelope: envelope.clone(), plaintext });
         if let Err(e) = state.ws_broadcast.send(ws_msg) {
             tracing::debug!(msg_id = %id.to_hex(), error = %e, "resync: no WS clients connected");

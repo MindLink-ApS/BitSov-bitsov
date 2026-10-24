@@ -1600,7 +1600,7 @@ impl Storage for SqliteStorage {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
         let rows: Vec<(String, String, String, i64, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
             "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash FROM call_state \
-             WHERE peer = ? AND (pending_operation_id IS NOT NULL OR (phase <> 'ended' AND deadline_ms > ?)) \
+             WHERE peer = ? AND (pending_operation_id IS NOT NULL OR (phase <> 'ended' AND phase <> 'unreachable' AND deadline_ms > ?)) \
              ORDER BY CASE WHEN pending_operation_id IS NOT NULL THEN 0 ELSE 1 END, call_id LIMIT ?")
             .bind(peer.to_hex()).bind(now)
             .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS_PER_PEER as i64)
@@ -1632,14 +1632,15 @@ impl Storage for SqliteStorage {
 
     async fn call_counts(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
-        // Open: ours pending, or not ended and before its deadline. Burned: the rest, while protected.
+        // Open: ours pending, or awaiting-device/reserved/ringing/live before its deadline.
+        // Not reachable is burned, like ended. Burned: the rest, while protected.
         let (open_peer, open_total, burned_peer, burned_total): (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT \
                 COALESCE(SUM(CASE WHEN open = 1 AND peer = ? THEN 1 ELSE 0 END), 0), \
                 COALESCE(SUM(CASE WHEN open = 1 THEN 1 ELSE 0 END), 0), \
                 COALESCE(SUM(CASE WHEN open = 0 AND peer = ? THEN 1 ELSE 0 END), 0), \
                 COALESCE(SUM(CASE WHEN open = 0 THEN 1 ELSE 0 END), 0) \
-             FROM (SELECT peer, CASE WHEN pending_operation_id IS NOT NULL OR (phase <> 'ended' AND deadline_ms > ?) THEN 1 ELSE 0 END AS open \
+             FROM (SELECT peer, CASE WHEN pending_operation_id IS NOT NULL OR (phase <> 'ended' AND phase <> 'unreachable' AND deadline_ms > ?) THEN 1 ELSE 0 END AS open \
                    FROM call_state WHERE replay_until_ms > ? OR pending_operation_id IS NOT NULL) AS rows")
             .bind(peer.to_hex()).bind(peer.to_hex()).bind(now).bind(now).fetch_one(&self.pool).await?;
         let n = |v: i64| u64::try_from(v).unwrap_or(0);
@@ -1650,7 +1651,7 @@ impl Storage for SqliteStorage {
         let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call time overflow".into()));
         let done = sqlx::query(
             "DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state \
-             WHERE (? IS NULL OR peer = ?) AND pending_operation_id IS NULL AND (phase = 'ended' OR deadline_ms <= ?) \
+             WHERE (? IS NULL OR peer = ?) AND pending_operation_id IS NULL AND (phase = 'ended' OR phase = 'unreachable' OR deadline_ms <= ?) \
              AND replay_until_ms <= ? ORDER BY replay_until_ms LIMIT ?)")
             .bind(peer.map(|p| p.to_hex())).bind(peer.map(|p| p.to_hex()))
             .bind(ms(now_ms)?).bind(ms(replay_until_at_most)?).bind(ms(max)?)

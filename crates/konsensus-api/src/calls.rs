@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use konsensus_core::payloads::call::{self as rules, CallEntry, CallRefusal, CallSignal, Settlement};
+use konsensus_core::payloads::call::{self as rules, CallEntry, CallRefusal, CallSignal, DeviceFetch, Phase, Settlement};
+use konsensus_core::traits::transport::MessageTransport;
+use konsensus_core::types::MessageId;
 use konsensus_core::types::NodeId;
 use konsensus_storage::Storage;
 
@@ -37,7 +39,7 @@ fn lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -106,6 +108,135 @@ pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind:
     let next = rules::receive(entry, kind, now)?;
     write(store, peer, &signal.call_id, Some(&next)).await.map_err(unavailable)?;
     Ok(signal)
+}
+
+/// What a paired device's fetch of an incoming invite did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceTook {
+    /// This fetch started the 60 s ring clock. Send the caller the ringing ack.
+    Started { deadline_ms: u64 },
+    /// A device already started the clock. Do not restart it or ack again.
+    Already { deadline_ms: u64 },
+    /// The grace elapsed with no device, or this fetch was too late.
+    NotReachable,
+    /// Not an incoming invite waiting on a device.
+    Ignored,
+}
+
+/// One of the callee's paired devices fetched or received this invite at `now_ms`.
+///
+/// The first call starts the ring clock at `now_ms` and is the signal to send
+/// the ringing acknowledgement. A second device does not move the deadline.
+pub async fn note_device_has_invite(store: Store<'_>, peer: &NodeId, call_id: &str, now_ms: u64) -> Result<DeviceTook, konsensus_storage::StorageError> {
+    let _g = lock().lock().await;
+    let Some(raw) = store.call_get(peer, call_id).await? else {
+        return Ok(DeviceTook::Ignored);
+    };
+    if raw.phase == Phase::AwaitingDevice && raw.deadline_ms <= now_ms {
+        if let Some(missed) = raw.at(now_ms) {
+            write(store, peer, call_id, Some(&missed)).await?;
+        }
+        return Ok(DeviceTook::NotReachable);
+    }
+    let Some(entry) = raw.at(now_ms) else {
+        return Ok(DeviceTook::Ignored);
+    };
+    match rules::note_device_fetch(entry, now_ms) {
+        DeviceFetch::Started(next) => {
+            let deadline_ms = next.deadline_ms;
+            write(store, peer, call_id, Some(&next)).await?;
+            Ok(DeviceTook::Started { deadline_ms })
+        }
+        DeviceFetch::Unchanged(entry) => Ok(DeviceTook::Already { deadline_ms: entry.deadline_ms }),
+        DeviceFetch::NotWaiting(entry) if entry.phase == Phase::Unreachable => Ok(DeviceTook::NotReachable),
+        DeviceFetch::NotWaiting(_) => Ok(DeviceTook::Ignored),
+    }
+}
+
+/// Grace-period result for an invite no device has fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unfetched {
+    /// Still inside the grace window. The ring clock has not started.
+    Waiting { until_ms: u64 },
+    /// A device already started the 60 s clock.
+    Ringing { deadline_ms: u64 },
+    /// This call just became not reachable. Tell the caller once.
+    BecameNotReachable,
+    /// Already told (or already stored) as not reachable.
+    AlreadyNotReachable,
+    /// No such invite, or it ended some other way.
+    Other,
+}
+
+/// If `call_id` is still waiting for a device at `now_ms` and the grace has
+/// elapsed, burn it as not reachable. The ring clock is not started.
+pub async fn conclude_unfetched(store: Store<'_>, peer: &NodeId, call_id: &str, now_ms: u64) -> Result<Unfetched, konsensus_storage::StorageError> {
+    let _g = lock().lock().await;
+    let Some(raw) = store.call_get(peer, call_id).await? else {
+        return Ok(Unfetched::Other);
+    };
+    match raw.phase {
+        Phase::Ringing | Phase::Live => Ok(Unfetched::Ringing { deadline_ms: raw.deadline_ms }),
+        Phase::Unreachable => Ok(Unfetched::AlreadyNotReachable),
+        Phase::AwaitingDevice if now_ms < raw.deadline_ms => Ok(Unfetched::Waiting { until_ms: raw.deadline_ms }),
+        Phase::AwaitingDevice => {
+            let Some(missed) = raw.at(now_ms) else {
+                return Ok(Unfetched::Other);
+            };
+            if missed.phase != Phase::Unreachable {
+                return Ok(Unfetched::Other);
+            }
+            write(store, peer, call_id, Some(&missed)).await?;
+            Ok(Unfetched::BecameNotReachable)
+        }
+        Phase::Reserved | Phase::Ended => Ok(Unfetched::Other),
+    }
+}
+
+/// Tell the caller the invite is ringing, or that no device can be reached.
+/// `duplicate` is set only when repeating an acknowledgement of an invite
+/// that already rang.
+pub async fn notify_caller(transport: &dyn MessageTransport, peer: &NodeId, id: MessageId, notice: CallerNotice) {
+    let frame = match notice {
+        CallerNotice::Ringing { duplicate } => konsensus_message::Frame::MessageAck { id, duplicate },
+        CallerNotice::NotReachable => konsensus_message::Frame::MessageReject { id, reason: rules::NOT_REACHABLE.into() },
+    };
+    let bytes = match frame.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(peer = %peer, error = %e, "call notice not encoded");
+            return;
+        }
+    };
+    if let Err(e) = transport.send_raw_frame(peer, &bytes).await {
+        tracing::warn!(peer = %peer, error = %e, "call notice not sent");
+    }
+}
+
+/// The caller-facing result of an invite's device grace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerNotice {
+    /// The ringing acknowledgement. Sent once, when a device first has the invite.
+    Ringing { duplicate: bool },
+    /// No paired device fetched the invite within the grace period.
+    NotReachable,
+}
+
+/// A paired device read this invite (message fetch or resync). Starts the
+/// ring clock on the first read and sends the ringing ack. Later reads do not.
+pub async fn deliver_invite_to_device(state: &AppState, sender_hex: &str, message_id_hex: &str, plaintext: &str) {
+    if sender_hex == state.identity.node_id().to_hex() {
+        return;
+    }
+    let Ok(peer) = NodeId::from_hex(sender_hex) else { return };
+    let Ok(id) = MessageId::from_hex(message_id_hex) else { return };
+    let Ok(signal) = CallSignal::parse(konsensus_core::kind::KIND_CALL_INVITE, plaintext) else { return };
+    match note_device_has_invite(state.storage.as_ref(), &peer, &signal.call_id, now_ms()).await {
+        Ok(DeviceTook::Started { .. }) => notify_caller(state.transport.as_ref(), &peer, id, CallerNotice::Ringing { duplicate: false }).await,
+        Ok(DeviceTook::NotReachable) => notify_caller(state.transport.as_ref(), &peer, id, CallerNotice::NotReachable).await,
+        Ok(DeviceTook::Already { .. } | DeviceTook::Ignored) => {}
+        Err(e) => tracing::warn!(peer = %peer, error = %e, "device invite fetch not recorded"),
+    }
 }
 
 fn refused(e: CallRefusal, new_operation: bool) -> ApiError {

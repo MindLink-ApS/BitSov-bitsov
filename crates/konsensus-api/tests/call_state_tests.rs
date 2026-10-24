@@ -111,6 +111,9 @@ async fn a_meeting_leg_out_of_roster_order_is_refused_before_reservation_or_paym
     assert!(calls::admit_incoming(store, &me, &stranger, 400, Some(&meeting_offer(&id(0x9105), &[&host, &me]))).await.is_err());
     let right = id(0x9106);
     calls::admit_incoming(store, &me, &host, 400, Some(&meeting_offer(&right, &[&host, &me, &later]))).await.unwrap();
+    // Admitted, not ringing, until a paired device fetches the invite.
+    assert_eq!(store.call_get(&host, &right).await.unwrap().unwrap().phase, Phase::AwaitingDevice);
+    calls::note_device_has_invite(store, &host, &right, now_ms()).await.unwrap();
     // From here it is an ordinary call: answer, then hangup.
     assert_eq!(store.call_get(&host, &right).await.unwrap().unwrap().phase, Phase::Ringing);
     calls::admit_incoming(store, &me, &host, 403, Some(&body(403, &right))).await.unwrap();
@@ -126,6 +129,8 @@ async fn an_unpaid_answer_leaves_the_call_ringing_and_retryable() {
     let peer = NodeId::from_bytes([84; 32]);
     let call = id(0x8400);
     calls::admit_incoming(state.storage.as_ref(), &own(), &peer, 400, Some(&body(400, &call))).await.unwrap();
+    // The callee's device has the invite, so the call is ringing and an answer can be reserved.
+    calls::note_device_has_invite(state.storage.as_ref(), &peer, &call, now_ms()).await.unwrap();
     let op = uuid::Uuid::new_v4().to_string();
     let first = compose(&state, &op, &peer, 401, &body(401, &call)).await;
     println!("answer: {first}");

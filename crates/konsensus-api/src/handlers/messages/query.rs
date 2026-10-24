@@ -185,7 +185,19 @@ pub(super) async fn get_message(
         .unwrap_or(None);
 
     let cipher = state.plaintext_cipher.as_deref();
-    Ok(Json(MessageResponse::from_envelope(&envelope).with_cached_plaintext(cached, cipher)))
+    let response = MessageResponse::from_envelope(&envelope).with_cached_plaintext(cached, cipher);
+    note_fetched_call_invite(&state, &response).await;
+    Ok(Json(response))
+}
+
+/// A paired device reading an incoming call invite is what starts its ring.
+async fn note_fetched_call_invite(state: &AppState, message: &MessageResponse) {
+    if message.kind != konsensus_core::kind::KIND_CALL_INVITE {
+        return;
+    }
+    if let Some(text) = message.plaintext.as_deref() {
+        crate::calls::deliver_invite_to_device(state, &message.sender, &message.id, text).await;
+    }
 }
 
 /// `GET /api/v1/messages/:id/plaintext` — get decrypted plaintext for a message.
@@ -220,11 +232,18 @@ pub(super) async fn get_message_plaintext(
 
     // Try to parse as UTF-8 text; fall back to base64 for binary content
     let content = match String::from_utf8(decrypted.clone()) {
-        Ok(text) => serde_json::json!({
-            "message_id": id_hex,
-            "plaintext": text,
-            "encoding": "utf8",
-        }),
+        Ok(text) => {
+            if let Ok(Some(envelope)) = state.storage.get_message(&id).await {
+                if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE {
+                    crate::calls::deliver_invite_to_device(&state, &envelope.sender.to_hex(), &id_hex, &text).await;
+                }
+            }
+            serde_json::json!({
+                "message_id": id_hex,
+                "plaintext": text,
+                "encoding": "utf8",
+            })
+        }
         Err(_) => {
             use base64::Engine;
             serde_json::json!({
@@ -319,6 +338,9 @@ pub(super) async fn list_messages(
             resp = resp.with_cached_plaintext(cached, cipher);
         }
         responses.push(resp);
+    }
+    for message in &responses {
+        note_fetched_call_invite(&state, message).await;
     }
 
     Ok((store_read, diagnostics, Json(responses)))

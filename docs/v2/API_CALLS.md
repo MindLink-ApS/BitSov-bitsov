@@ -29,7 +29,12 @@ The bound also applies if the stored data exceeds the admission bound.
 ```
 
 - `id`: the call id, scoped to the requested peer.
-- `state`: `reserved`, `ringing`, `live`, or `ended`, aged at read time.
+- `state`: `reserved`, `awaiting_device`, `ringing`, `live`, or `ended`, aged at read time.
+  `awaiting_device` is an admitted incoming invite whose 60 s ring clock has
+  not started: no paired device has fetched it yet. If none does within 15 s
+  the caller is answered `not reachable` (not a no-answer timeout) and the
+  call is omitted here, the same way an ended call with no pending signal is.
+  See [call state](CALLS-PROTOTYPE.md#shape).
 - `direction`: `outgoing` (this node offered) or `incoming` (the peer offered).
 - `unresolved_paid_admission`: boolean; conservatively true whenever the call
   retains a pending signal reservation. The read does not reconcile payment
@@ -42,7 +47,7 @@ The bound also applies if the stored data exceeds the admission bound.
   once no operation binding remains in call state. It can refer to an answer
   or hangup rather than an offer. No placeholder strings are returned.
 
-Open means an unexpired reserved/ringing/live call **or any call with a pending
+Open means an unexpired reserved/awaiting-device/ringing/live call **or any call with a pending
 signal**, including calls whose ringing/live deadline and replay tombstone
 have expired. Ended/expired calls without a pending signal are omitted.
 

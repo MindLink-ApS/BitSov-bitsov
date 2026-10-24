@@ -207,6 +207,69 @@ async fn offer_prekey_after_promotion(
     }
 }
 
+/// A resend of an accepted call invite must not look like ringing unless a
+/// device already has it. Returns whether the usual duplicate acknowledgement
+/// should go out. A not-reachable notice is sent from here.
+async fn duplicate_call_invite_should_ack(
+    envelope: &konsensus_core::UkmEnvelope,
+    storage: &dyn konsensus_storage::Storage,
+    cipher: &PlaintextCacheCipher,
+    transport: &Arc<NoiseTransport>,
+    sender: &konsensus_core::types::NodeId,
+    msg_id: konsensus_core::types::MessageId,
+) -> bool {
+    if envelope.kind != konsensus_core::kind::KIND_CALL_INVITE {
+        return true;
+    }
+    let Some(call_id) = cached_call_id(storage, cipher, &msg_id).await else {
+        return true;
+    };
+    match konsensus_api::calls::conclude_unfetched(storage, sender, &call_id, konsensus_api::calls::now_ms()).await {
+        Ok(konsensus_api::calls::Unfetched::Waiting { .. }) => false,
+        Ok(konsensus_api::calls::Unfetched::BecameNotReachable | konsensus_api::calls::Unfetched::AlreadyNotReachable) => {
+            konsensus_api::calls::notify_caller(transport.as_ref(), sender, msg_id, konsensus_api::calls::CallerNotice::NotReachable).await;
+            false
+        }
+        Ok(konsensus_api::calls::Unfetched::Ringing { .. } | konsensus_api::calls::Unfetched::Other) => true,
+        Err(e) => {
+            warn!(peer = %sender, error = %e, "call invite resend not classified; acknowledging");
+            true
+        }
+    }
+}
+
+async fn cached_call_id(
+    storage: &dyn konsensus_storage::Storage,
+    cipher: &PlaintextCacheCipher,
+    id: &konsensus_core::types::MessageId,
+) -> Option<String> {
+    let encrypted = storage.get_message_plaintext(id).await.ok().flatten()?;
+    let text = String::from_utf8(cipher.decrypt(&encrypted).ok()?).ok()?;
+    konsensus_core::payloads::call::CallSignal::parse(konsensus_core::kind::KIND_CALL_INVITE, &text).ok().map(|signal| signal.call_id)
+}
+
+/// No paired device was connected when the invite arrived. After the grace
+/// period, if one still has not fetched it, tell the caller — and do not
+/// start the ring clock.
+fn arm_device_grace(
+    storage: Arc<dyn konsensus_storage::Storage>,
+    transport: Arc<NoiseTransport>,
+    peer: konsensus_core::types::NodeId,
+    message_id: konsensus_core::types::MessageId,
+    call_id: String,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(konsensus_core::payloads::call::DEVICE_RING_GRACE_MS)).await;
+        match konsensus_api::calls::conclude_unfetched(storage.as_ref(), &peer, &call_id, konsensus_api::calls::now_ms()).await {
+            Ok(konsensus_api::calls::Unfetched::BecameNotReachable) => {
+                konsensus_api::calls::notify_caller(transport.as_ref(), &peer, message_id, konsensus_api::calls::CallerNotice::NotReachable).await;
+            }
+            Ok(_) => {}
+            Err(e) => warn!(peer = %peer, error = %e, "call device grace not concluded"),
+        }
+    });
+}
+
 /// Runs the incoming message handler loop.
 ///
 /// Receives envelopes from the transport, validates them through the payment gate,
@@ -305,6 +368,9 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         .await;
 
                         if matches!(gate_result, Ok((_, true))) {
+                            if !duplicate_call_invite_should_ack(&envelope, storage_for_recv.as_ref(), &plaintext_cipher, &transport_for_ack, &sender, msg_id).await {
+                                continue;
+                            }
                             let ack = Frame::MessageAck { id: msg_id, duplicate: true };
                             if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
                                 warn!(error = %e, "failed to send duplicate ACK");
@@ -355,6 +421,11 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                         continue;
                                     }
                                     // No second promotion, decrypt, application side effect or write.
+                                    // A call invite still waiting on a device must not be
+                                    // acknowledged as ringing by this duplicate.
+                                    if !duplicate_call_invite_should_ack(&envelope, storage_for_recv.as_ref(), &plaintext_cipher, &transport_for_ack, &sender, msg_id).await {
+                                        continue;
+                                    }
                                     let ack = Frame::MessageAck { id: msg_id, duplicate: true };
                                     if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
                                         warn!(error = %e, "failed to send duplicate ACK");
@@ -582,13 +653,20 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // the call registry makes the offer single-use per call id and
                         // accepts answer/ICE/hangup only for a live call with this
                         // sender. A refused signal never reaches the app.
+                        // An invite is admitted without ringing: the ring clock and the
+                        // caller's ringing ack wait until a paired device has it.
+                        let mut device_ring: Option<String> = None;
                         if konsensus_api::calls::is_call_kind(envelope.kind) {
                             let admitted = konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref()).await;
                             // Admitted: lift the hold before the app sees it. If that
                             // write fails the signal stays held and is withdrawn by the
                             // sweep: fail closed, the peer gets a reject, not an ACK.
                             let admitted = match admitted {
-                                Ok(signal) => match storage_for_recv.call_admission_release(&msg_id).await {
+                                Ok(signal) => {
+                                    if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE {
+                                        device_ring = Some(signal.call_id.clone());
+                                    }
+                                    match storage_for_recv.call_admission_release(&msg_id).await {
                                     Ok(()) => Ok(signal),
                                     Err(e) => {
                                         error!(msg_id = %msg_id, error = %e, "admitted call signal could not be released; withheld");
@@ -596,7 +674,8 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                         let _ = transport_for_ack.send_frame(&sender, &reject).await;
                                         continue;
                                     }
-                                },
+                                }
+                                }
                                 Err(refusal) => Err(refusal),
                             };
                             if let Err(refusal) = admitted {
@@ -656,20 +735,44 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             continue;
                         }
 
-                        // Broadcast to WebSocket clients (with plaintext if decrypted)
-                        if let Err(e) = ws_tx_for_recv.send(Arc::new(
+                        // Broadcast to WebSocket clients (with plaintext if decrypted).
+                        // A connected subscriber is the device-facing stream for this invite.
+                        let streamed = match ws_tx_for_recv.send(Arc::new(
                             WsMessage {
                                 envelope,
                                 plaintext,
                             },
                         )) {
-                            debug!(error = %e, "no WebSocket clients connected for incoming message broadcast");
-                        }
+                            Ok(_) => true,
+                            Err(e) => {
+                                debug!(error = %e, "no WebSocket clients connected for incoming message broadcast");
+                                false
+                            }
+                        };
 
-                        // Send MessageAck back to sender
-                        let ack = Frame::MessageAck { id: msg_id, duplicate: false };
-                        if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
-                            warn!(peer = %sender, error = %e, "failed to send MessageAck");
+                        if let Some(call_id) = device_ring {
+                            // Ringing ack only once a device has the invite. With nobody
+                            // listening, wait out the grace period, then say not reachable.
+                            if streamed {
+                                match konsensus_api::calls::note_device_has_invite(storage_for_recv.as_ref(), &sender, &call_id, konsensus_api::calls::now_ms()).await {
+                                    Ok(konsensus_api::calls::DeviceTook::Started { .. }) => {
+                                        konsensus_api::calls::notify_caller(transport_for_ack.as_ref(), &sender, msg_id, konsensus_api::calls::CallerNotice::Ringing { duplicate: false }).await;
+                                    }
+                                    Ok(konsensus_api::calls::DeviceTook::NotReachable) => {
+                                        konsensus_api::calls::notify_caller(transport_for_ack.as_ref(), &sender, msg_id, konsensus_api::calls::CallerNotice::NotReachable).await;
+                                    }
+                                    Ok(konsensus_api::calls::DeviceTook::Already { .. } | konsensus_api::calls::DeviceTook::Ignored) => {}
+                                    Err(e) => warn!(peer = %sender, error = %e, "call ring not started"),
+                                }
+                            } else {
+                                arm_device_grace(Arc::clone(&storage_for_recv), Arc::clone(&transport_for_ack), sender, msg_id, call_id);
+                            }
+                        } else {
+                            // Send MessageAck back to sender
+                            let ack = Frame::MessageAck { id: msg_id, duplicate: false };
+                            if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
+                                warn!(peer = %sender, error = %e, "failed to send MessageAck");
+                            }
                         }
                     }
                     Err(e) => {

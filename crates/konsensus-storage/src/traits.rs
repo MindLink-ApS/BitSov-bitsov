@@ -1115,7 +1115,7 @@ pub trait Storage: Send + Sync {
     }
 
     /// Open calls and burned ids as of `now_ms`, for this peer and in total.
-    /// Open: a pending signal of ours, or reserved/ringing/live before its
+    /// Open: a pending signal of ours, or reserved/awaiting-device/ringing/live before its
     /// deadline. Burned: otherwise, while replay protection runs past `now_ms`.
     async fn call_counts(&self, _peer: &konsensus_core::NodeId, _now_ms: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
         Err(StorageError::Unsupported("call state".into()))
