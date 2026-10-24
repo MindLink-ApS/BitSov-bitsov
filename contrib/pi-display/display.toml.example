@@ -1,0 +1,54 @@
+# /etc/bitsov-display/display.toml
+# Every key is optional. Unknown keys are refused so typos are not silently ignored.
+
+# The panel. The default profile is the Bitcoin Machines case: ST7735 1.8" 160x128
+# on SPI0 CE0, DC GPIO24, RST GPIO25, backlight GPIO18 active high, SPI at 8 MHz.
+# Any key below still overrides a single profile value (for example rotate).
+profile = "bitcoin-machines"
+
+# Another panel: remove `profile` and set `driver` instead (the two are exclusive).
+# auto | ssd1306 | sh1106 | st7735 | st7789 | ili9341 | fbdev
+# auto tries: a non-HDMI framebuffer, then an I2C OLED at 0x3C/0x3D, then
+# guesses st7789 if /dev/spidev0.0 exists. Pin the driver once --probe shows the panel.
+# driver = "auto"
+
+# Panel size as you look at it. Defaults: OLED 128x64, st7735 160x128,
+# st7789 240x240, ili9341 320x240. A portrait panel is fine: width = 128, height = 160.
+# width = 160
+# height = 128
+
+# Quarter turns clockwise, 0..3.
+# rotate = 0
+
+# I2C OLED
+# i2c_port = 1
+# i2c_address = 0x3C
+
+# SPI TFT (BCM pin numbers; -1 means not wired). Without a profile the speed
+# defaults to 32 MHz; long ribbon cables are happier at 8000000.
+# spi_port = 0
+# spi_device = 0
+# spi_speed_hz = 8000000
+# gpio_dc = 24
+# gpio_rst = 25
+# gpio_backlight = 18
+# backlight_active_low = false
+
+# Framebuffer (3.5" fbtft / DRM panels); auto picks the first non-HDMI one.
+# fb_device = "/dev/fb1"
+
+# The node's konsensus.toml. Read-only; only prices, [api].listen_addr and
+# [node].hosted_by are ever parsed. install.sh fills this in.
+# node_config = "/home/<user>/.local/share/konsensus/konsensus.toml"
+
+# Override the API port taken from [api].listen_addr (always dialled on 127.0.0.1).
+# api_port = 3141
+
+# The node starts with --remote-unlock: show "hub-only while lockable" on the
+# Lightning face from the start, not only after the display has seen it locked.
+# install.sh sets this when the node's systemd unit uses the switch.
+# remote_unlock = false
+
+interval_secs = 8
+# Faces in rotation order. A face whose data is unavailable is skipped that round.
+faces = ["bitsov", "price", "paid", "bitcoin", "lightning", "machine"]
