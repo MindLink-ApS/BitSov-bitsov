@@ -73,7 +73,12 @@ impl TestWallet {
     }
 }
 
-fn bolt11(amount_msat: u64, preimage: &[u8; 32], description: &str, expiry_secs: u32) -> (String, String) {
+fn bolt11(
+    amount_msat: u64,
+    preimage: &[u8; 32],
+    description: &str,
+    expiry_secs: u32,
+) -> (String, String) {
     use bitcoin::hashes::{sha256, Hash};
     use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
 
@@ -97,11 +102,27 @@ fn bolt11(amount_msat: u64, preimage: &[u8; 32], description: &str, expiry_secs:
 
 #[async_trait]
 impl LightningProvider for TestWallet {
-    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        invoice: &str,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.pay_invoice(invoice).await
     }
 
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn keysend_with_fee_limit(
+        &self,
+        dest: &str,
+        amount: u64,
+        memo: Option<&str>,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.keysend(dest, amount, memo).await
     }
 
@@ -111,8 +132,12 @@ impl LightningProvider for TestWallet {
         description: &str,
         expiry_secs: u32,
     ) -> Result<Invoice, LightningError> {
-        if !description.starts_with("konsensus:v1:") && self.fail_message.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(LightningError::Backend("test message invoice failure".into()));
+        if !description.starts_with("konsensus:v1:")
+            && self.fail_message.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(LightningError::Backend(
+                "test message invoice failure".into(),
+            ));
         }
         let preimage: [u8; 32] = rand::random();
         let (bolt11, payment_hash) = bolt11(amount_msat, &preimage, description, expiry_secs);
@@ -132,8 +157,14 @@ impl LightningProvider for TestWallet {
         })
     }
 
-    async fn create_stateless_invoice(&self, amount_msat: u64, description: &str, expiry_secs: u32) -> Result<Invoice, LightningError> {
-        self.create_invoice(amount_msat, description, expiry_secs).await
+    async fn create_stateless_invoice(
+        &self,
+        amount_msat: u64,
+        description: &str,
+        expiry_secs: u32,
+    ) -> Result<Invoice, LightningError> {
+        self.create_invoice(amount_msat, description, expiry_secs)
+            .await
     }
 
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
@@ -150,7 +181,10 @@ impl LightningProvider for TestWallet {
             entry.2 = true;
             (entry.0, entry.1)
         };
-        self.paid.lock().unwrap().push((payment_hash.clone(), amount_msat));
+        self.paid
+            .lock()
+            .unwrap()
+            .push((payment_hash.clone(), amount_msat));
         Ok(PaymentDetails {
             payment_hash,
             preimage: Some(hex::encode(preimage)),
@@ -163,7 +197,10 @@ impl LightningProvider for TestWallet {
         })
     }
 
-    async fn get_payment_status(&self, payment_hash: &str) -> Result<PaymentDetails, LightningError> {
+    async fn get_payment_status(
+        &self,
+        payment_hash: &str,
+    ) -> Result<PaymentDetails, LightningError> {
         let (preimage, amount_msat, settled) = *self
             .ledger
             .lock()
@@ -180,7 +217,11 @@ impl LightningProvider for TestWallet {
             payment_hash: payment_hash.to_string(),
             preimage: settled.then(|| hex::encode(preimage)),
             amount_msat,
-            status: if settled { PaymentStatus::Settled } else { PaymentStatus::Pending },
+            status: if settled {
+                PaymentStatus::Settled
+            } else {
+                PaymentStatus::Pending
+            },
             direction,
             timestamp: 0,
             memo: None,
@@ -194,6 +235,10 @@ impl LightningProvider for TestWallet {
 
     async fn is_available(&self) -> bool {
         true
+    }
+
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        Ok(Vec::new())
     }
 }
 
@@ -219,7 +264,11 @@ fn pricing() -> Arc<dyn konsensus_core::traits::pricing::PricingEngine> {
 }
 
 async fn storage() -> Arc<dyn konsensus_storage::Storage> {
-    Arc::new(konsensus_storage::sqlite::SqliteStorage::in_memory().await.unwrap())
+    Arc::new(
+        konsensus_storage::sqlite::SqliteStorage::in_memory()
+            .await
+            .unwrap(),
+    )
 }
 
 fn audit_log() -> Arc<konsensus_api::audit::AuditLog> {
@@ -253,7 +302,9 @@ async fn start_sender(
         chain: Arc::new(konsensus_chain::mock::MockChainProvider::new()),
         pricing: pricing(),
         gate: Arc::new(konsensus_core::PaymentGate::new()),
-        peer_registry: Arc::new(tokio::sync::RwLock::new(konsensus_message::PeerRegistry::new())),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(
+            konsensus_message::PeerRegistry::new(),
+        )),
         transport: Arc::clone(transport) as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(sessions),
         jwt_secret: "reconnect-regression-jwt-secret".into(),
@@ -297,13 +348,35 @@ async fn start_sender(
     tokio::spawn(async move {
         while let Some(event) = control.recv_control().await {
             match event {
-                ControlEvent::InvoiceResponseReceived { peer_id, request_id, bolt11, payment_hash } => {
-                    handle_invoice_response(&peer_id, &request_id, bolt11, payment_hash, &invoice_requests)
-                        .await;
+                ControlEvent::InvoiceResponseReceived {
+                    peer_id,
+                    request_id,
+                    bolt11,
+                    payment_hash,
+                } => {
+                    handle_invoice_response(
+                        &peer_id,
+                        &request_id,
+                        bolt11,
+                        payment_hash,
+                        &invoice_requests,
+                    )
+                    .await;
                 }
-                ControlEvent::InvoiceErrorReceived { peer_id, request_id, reason, privileged } => {
-                    handle_invoice_error_received(&peer_id, &request_id, &reason, privileged, &invoice_requests)
-                        .await;
+                ControlEvent::InvoiceErrorReceived {
+                    peer_id,
+                    request_id,
+                    reason,
+                    privileged,
+                } => {
+                    handle_invoice_error_received(
+                        &peer_id,
+                        &request_id,
+                        &reason,
+                        privileged,
+                        &invoice_requests,
+                    )
+                    .await;
                 }
                 _ => {}
             }
@@ -318,7 +391,11 @@ async fn start_sender(
     .unwrap();
     let router = konsensus_api::build_router(state)
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50_000))));
-    Sender { router, auth: format!("Bearer {token}"), wallet }
+    Sender {
+        router,
+        auth: format!("Bearer {token}"),
+        wallet,
+    }
 }
 
 impl Sender {
@@ -342,8 +419,13 @@ impl Sender {
             .unwrap();
         let response = self.router.clone().oneshot(request).await.unwrap();
         let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
     }
 }
 
@@ -355,13 +437,19 @@ async fn start_recipient(
     sessions: &Arc<SessionManager>,
     wallet: Arc<TestWallet>,
     refuse_once: Arc<std::sync::atomic::AtomicBool>,
-) -> (Arc<konsensus_api::audit::AuditLog>, mpsc::UnboundedReceiver<String>) {
+) -> (
+    Arc<konsensus_api::audit::AuditLog>,
+    mpsc::UnboundedReceiver<String>,
+) {
     let audit = audit_log();
     let lightning: Arc<dyn LightningProvider> = wallet;
     // Deliberately different from A's stale/default message estimate.
-    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(konsensus_pricing::StaticPricingEngine::new(
-        konsensus_pricing::StaticPricingConfig { chat_msat: 7000, ..Default::default() }
-    ));
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
+        konsensus_pricing::StaticPricingEngine::new(konsensus_pricing::StaticPricingConfig {
+            chat_msat: 7000,
+            ..Default::default()
+        }),
+    );
 
     // B's control plane: invoice requests, through the real privilege gate.
     {
@@ -376,15 +464,44 @@ async fn start_recipient(
             let mut peer_invoices = crate::peer_invoices::PeerInvoiceBook::default();
             // This focused control-plane harness bypasses run(), so perform
             // the same initial inventory import before accepting invoices.
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-            let restored = crate::peer_invoices::reconcile(peer_invoices.clone(), lightning.clone(), now).await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let restored =
+                crate::peer_invoices::reconcile(peer_invoices.clone(), lightning.clone(), now)
+                    .await;
             peer_invoices.apply_reconciliation(restored);
             while let Some(event) = transport.recv_control().await {
-                if let ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose, privileged, source_ip } = event {
-                    let privileged = privileged && !refuse_once.swap(false, std::sync::atomic::Ordering::AcqRel);
+                if let ControlEvent::InvoiceRequested {
+                    peer_id,
+                    request_id,
+                    amount_msat,
+                    purpose,
+                    privileged,
+                    source_ip,
+                } = event
+                {
+                    let privileged =
+                        privileged && !refuse_once.swap(false, std::sync::atomic::Ordering::AcqRel);
                     handle_invoice_requested_gated(
-                        &peer_id, &request_id, amount_msat, &purpose, privileged,
-                        &pricing, &super::ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &lightning, &transport, &recipient, source_ip, &mut quotes, audit.membrane(), &mut last_refusal, 0,
+                        &peer_id,
+                        &request_id,
+                        amount_msat,
+                        &purpose,
+                        privileged,
+                        &pricing,
+                        &super::ReadinessHeightCache::new(Arc::new(
+                            konsensus_chain::MockChainProvider::new(),
+                        )),
+                        &lightning,
+                        &transport,
+                        &recipient,
+                        source_ip,
+                        &mut quotes,
+                        audit.membrane(),
+                        &mut last_refusal,
+                        0,
                         &mut peer_invoices,
                     )
                     .await;
@@ -427,7 +544,8 @@ async fn start_recipient(
                 if envelope.ciphertext == ADMISSION_MARKER {
                     continue;
                 }
-                let message = konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext).unwrap();
+                let message =
+                    konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext).unwrap();
                 let plaintext = sessions.decrypt(&envelope.sender, &message).await.unwrap();
                 let _ = delivered_tx.send(String::from_utf8(plaintext).unwrap());
             }
@@ -480,81 +598,170 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
     sessions_b.accept_session(&alice_id, &init).await.unwrap();
 
     let ledger = Arc::new(std::sync::Mutex::new(Ledger::default()));
-    let sender = start_sender(&alice, &transport_a, &sessions_a, Arc::new(TestWallet::new(&ledger))).await;
+    let sender = start_sender(
+        &alice,
+        &transport_a,
+        &sessions_a,
+        Arc::new(TestWallet::new(&ledger)),
+    )
+    .await;
     let refuse_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let recipient_wallet = Arc::new(TestWallet::new(&ledger));
-    let (audit_b, mut delivered) =
-        start_recipient(&bob, &transport_b, &sessions_b, Arc::clone(&recipient_wallet), Arc::clone(&refuse_once)).await;
+    let (audit_b, mut delivered) = start_recipient(
+        &bob,
+        &transport_b,
+        &sessions_b,
+        Arc::clone(&recipient_wallet),
+        Arc::clone(&refuse_once),
+    )
+    .await;
 
     // 1. Admit: A connects as a stranger; its first paid message pays admission.
     transport_a.connect(&bob_id, &addr_b).await.unwrap();
     wait_until("B sees A", || transport_b.is_connected(&alice_id)).await;
-    assert!(!privileged_on(&transport_b, &alice_id).await, "a new connection starts unpaid");
+    assert!(
+        !privileged_on(&transport_b, &alice_id).await,
+        "a new connection starts unpaid"
+    );
 
     let (status, body) = sender.compose(&bob_id, "before the drop").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["delivered"], true, "{body}");
-    assert_eq!(body["amount_msat"].as_u64().unwrap() + body["readmission_msat"].as_u64().unwrap_or(0), 14_000, "admission plus message must both be reported: {body}");
+    assert_eq!(
+        body["amount_msat"].as_u64().unwrap() + body["readmission_msat"].as_u64().unwrap_or(0),
+        14_000,
+        "admission plus message must both be reported: {body}"
+    );
     assert_eq!(delivered.recv().await.as_deref(), Some("before the drop"));
-    assert!(privileged_on(&transport_b, &alice_id).await, "admission promoted A's connection");
+    assert!(
+        privileged_on(&transport_b, &alice_id).await,
+        "admission promoted A's connection"
+    );
 
     // 2. Drop the connection, 3. reconnect: B holds A as unpaid again (doctrine:
     //    no durable admission object).
     transport_b.disconnect(&alice_id).await.unwrap();
-    wait_until("A sees the drop", || async { !transport_a.is_connected(&bob_id).await }).await;
+    wait_until("A sees the drop", || async {
+        !transport_a.is_connected(&bob_id).await
+    })
+    .await;
     transport_a.connect(&bob_id, &addr_b).await.unwrap();
     wait_until("B sees A again", || transport_b.is_connected(&alice_id)).await;
-    assert!(!privileged_on(&transport_b, &alice_id).await, "a reconnect starts unpaid");
+    assert!(
+        !privileged_on(&transport_b, &alice_id).await,
+        "a reconnect starts unpaid"
+    );
 
     // 4. The next paid message is delivered, promptly, on the same E2EE session.
     let started = std::time::Instant::now();
     let (status, body) = sender.compose(&bob_id, "after the reconnect").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["delivered"], true, "{body}");
-    assert_eq!(body["amount_msat"].as_u64().unwrap() + body["readmission_msat"].as_u64().unwrap_or(0), 14_000, "admission plus message must both be reported: {body}");
+    assert_eq!(
+        body["amount_msat"].as_u64().unwrap() + body["readmission_msat"].as_u64().unwrap_or(0),
+        14_000,
+        "admission plus message must both be reported: {body}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(15),
         "no silent drop: the refusal is answered at once, not by a 30 s timeout ({:?})",
         started.elapsed()
     );
-    assert_eq!(delivered.recv().await.as_deref(), Some("after the reconnect"));
-    assert!(privileged_on(&transport_b, &alice_id).await, "re-admission promoted the new connection");
+    assert_eq!(
+        delivered.recv().await.as_deref(),
+        Some("after the reconnect")
+    );
+    assert!(
+        privileged_on(&transport_b, &alice_id).await,
+        "re-admission promoted the new connection"
+    );
 
-    assert!(started.elapsed() >= Duration::from_secs(9), "rapid reconnect must exercise the production quote cooldown");
+    assert!(
+        started.elapsed() >= Duration::from_secs(9),
+        "rapid reconnect must exercise the production quote cooldown"
+    );
 
     // Each act re-proven: two admissions and two messages, nothing paid twice.
     let payments = sender.wallet.payments_made();
-    assert!(payments.iter().all(|(_, amount)| *amount == 7000), "fresh recipient price must replace stale sender pricing: {payments:?}");
-    assert_eq!(payments.len(), 4, "admission + message, twice: {payments:?}");
+    assert!(
+        payments.iter().all(|(_, amount)| *amount == 7000),
+        "fresh recipient price must replace stale sender pricing: {payments:?}"
+    );
+    assert_eq!(
+        payments.len(),
+        4,
+        "admission + message, twice: {payments:?}"
+    );
     let unique: HashSet<_> = payments.iter().map(|(hash, _)| hash).collect();
     assert_eq!(unique.len(), 4, "no invoice paid twice");
 
     // B refused out loud (N2) and never saw a replayed admission proof.
     let (events, totals) = audit_b.membrane().read(None, 50);
     let codes: Vec<Code> = events.iter().map(|e| e.code).collect();
-    assert!(!codes.contains(&Code::AdmissionRequired), "unpaid refusals are aggregate only");
-    assert!(audit_b.membrane().pre_payment_refusals().buckets.iter().any(|b| b.counts.get(&konsensus_api::membrane::PrePaymentReason::AdmissionRequired).copied().unwrap_or(0) > 0));
-    assert!(!codes.contains(&Code::ProofReused), "stale admission proof re-sent: {codes:?}");
-    assert_eq!(totals.admitted, 4, "two admissions and two messages admitted: {codes:?}");
+    assert!(
+        !codes.contains(&Code::AdmissionRequired),
+        "unpaid refusals are aggregate only"
+    );
+    assert!(audit_b
+        .membrane()
+        .pre_payment_refusals()
+        .buckets
+        .iter()
+        .any(|b| b
+            .counts
+            .get(&konsensus_api::membrane::PrePaymentReason::AdmissionRequired)
+            .copied()
+            .unwrap_or(0)
+            > 0));
+    assert!(
+        !codes.contains(&Code::ProofReused),
+        "stale admission proof re-sent: {codes:?}"
+    );
+    assert_eq!(
+        totals.admitted, 4,
+        "two admissions and two messages admitted: {codes:?}"
+    );
 
     // A stale refusal on the same connection must never buy admission again.
     refuse_once.store(true, std::sync::atomic::Ordering::Release);
     let (status, body) = sender.compose(&bob_id, "same connection").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(delivered.recv().await.as_deref(), Some("same connection"));
-    assert_eq!(sender.wallet.payments_made().len(), 5, "only the new message is paid");
-    assert_eq!(body["amount_msat"], 7000, "same-connection retry pays only the message");
+    assert_eq!(
+        sender.wallet.payments_made().len(),
+        5,
+        "only the new message is paid"
+    );
+    assert_eq!(
+        body["amount_msat"], 7000,
+        "same-connection retry pays only the message"
+    );
 
     // A failure after re-admission must report the admission that really settled.
     transport_b.disconnect(&alice_id).await.unwrap();
-    wait_until("A sees second drop", || async { !transport_a.is_connected(&bob_id).await }).await;
+    wait_until("A sees second drop", || async {
+        !transport_a.is_connected(&bob_id).await
+    })
+    .await;
     transport_a.connect(&bob_id, &addr_b).await.unwrap();
-    wait_until("B sees third connection", || transport_b.is_connected(&alice_id)).await;
-    recipient_wallet.fail_message.store(true, std::sync::atomic::Ordering::Release);
+    wait_until("B sees third connection", || {
+        transport_b.is_connected(&alice_id)
+    })
+    .await;
+    recipient_wallet
+        .fail_message
+        .store(true, std::sync::atomic::Ordering::Release);
     let (status, body) = sender.compose(&bob_id, "message invoice fails").await;
     assert!(!status.is_success(), "{body}");
-    assert!(body.to_string().contains("7000"), "must disclose settled admission despite message failure: {body}");
-    assert_eq!(sender.wallet.payments_made().len(), 6, "only re-admission settled during failed send");
+    assert!(
+        body.to_string().contains("7000"),
+        "must disclose settled admission despite message failure: {body}"
+    );
+    assert_eq!(
+        sender.wallet.payments_made().len(),
+        6,
+        "only re-admission settled during failed send"
+    );
 
     transport_a.shutdown();
     transport_b.shutdown();

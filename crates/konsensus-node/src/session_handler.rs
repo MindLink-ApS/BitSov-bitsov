@@ -33,8 +33,8 @@ use konsensus_pricing::PeerPriceCache;
 use konsensus_api::audit::AuditLog;
 use konsensus_api::membrane::{Membrane, PrePaymentReason};
 use konsensus_api::state::WsDeliveryStatus;
-use konsensus_api::InvoiceResponseData;
 use konsensus_api::state::{InvoiceRequestOutcome, InvoiceResponseError};
+use konsensus_api::InvoiceResponseData;
 
 use crate::onboarding::auto_channel::AutoChannelEvent;
 use crate::onboarding::funding_poll;
@@ -58,19 +58,27 @@ pub(crate) struct SessionHandlerDeps {
     pub peer_registry: Arc<tokio::sync::RwLock<PeerRegistry>>,
     pub routing: Arc<konsensus_routing::RoutingTable>,
     pub gossip_validator: Arc<konsensus_gossip::GossipValidator>,
-    pub send_timestamps: Arc<tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>>>,
+    pub send_timestamps: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>,
+        >,
+    >,
     pub lightning: Arc<dyn LightningProvider>,
     pub lightning_addr: Option<String>,
     /// True only for Mock/SharedMock Lightning. Gates the connect-time
     /// profile envelope, which carries a mock payment proof.
     pub mock_lightning: bool,
-    pub invoice_requests: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>>,
+    pub invoice_requests: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
+        >,
+    >,
     pub peer_ln_pubkeys: Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, String>>>,
     pub ws_broadcast: broadcast::Sender<Arc<konsensus_api::state::WsMessage>>,
     pub ws_delivery_tx: broadcast::Sender<Arc<WsDeliveryStatus>>,
     pub pending_tx: tokio::sync::mpsc::Sender<NodeId>,
     pub starter_newcomer_tx: Option<mpsc::Sender<(NodeId, Frame)>>,
-    pub starter_hub_tx: Option<mpsc::Sender<(NodeId,Frame)>>,
+    pub starter_hub_tx: Option<mpsc::Sender<(NodeId, Frame)>>,
     pub auto_channel_tx: mpsc::Sender<AutoChannelEvent>,
     pub shutdown_rx: watch::Receiver<bool>,
 }
@@ -124,7 +132,9 @@ fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
         PeerExchangeReceived { privileged, .. } => {
             (privileged, PrePaymentReason::PeerExchangeBeforePayment)
         }
-        StarterRequestReceived { privileged, .. } | StarterStatusReceived { privileged, .. } => (privileged, PrePaymentReason::StarterBeforeInvite),
+        StarterRequestReceived { privileged, .. } | StarterStatusReceived { privileged, .. } => {
+            (privileged, PrePaymentReason::StarterBeforeInvite)
+        }
         LightningInfoReceived { privileged, .. } => {
             (privileged, PrePaymentReason::LightningInfoBeforePayment)
         }
@@ -143,7 +153,8 @@ fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
 /// Runs the session/control event handler loop.
 pub(crate) async fn run(deps: SessionHandlerDeps) {
     let SessionHandlerDeps {
-        content_server, front_door,
+        content_server,
+        front_door,
         privacy,
         peer_exchange_floor,
         transport,
@@ -209,7 +220,8 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let mut lightning_was_ready = lightning.money_ready().await;
     let mut session_self_heal_interval = tokio::time::interval(SESSION_SELF_HEAL_INTERVAL);
     session_self_heal_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut invoice_cleanup_interval = tokio::time::interval(crate::peer_invoices::CLEANUP_INTERVAL);
+    let mut invoice_cleanup_interval =
+        tokio::time::interval(crate::peer_invoices::CLEANUP_INTERVAL);
     invoice_cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -628,7 +640,16 @@ async fn refresh_recovered_lightning(
     let ready = lightning.money_ready().await;
     if ready && !*was_ready {
         for peer in transport.connected_privileged_peers().await {
-            send_lightning_info(&peer, transport, lightning, lightning_addr, storage, ws_delivery_tx, our_node_id).await;
+            send_lightning_info(
+                &peer,
+                transport,
+                lightning,
+                lightning_addr,
+                storage,
+                ws_delivery_tx,
+                our_node_id,
+            )
+            .await;
         }
     }
     *was_ready = ready;
@@ -672,7 +693,6 @@ async fn send_lightning_info(
             .await;
         }
     }
-
 }
 
 // ── Individual event handlers ─────────────────────────────────────────────
@@ -698,10 +718,7 @@ async fn handle_peer_connected(
     info!(peer = %peer_id, "peer connected, sending prekey offer + price table");
 
     // Notify pending delivery flusher about reconnected peer.
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        pending_tx.send(*peer_id),
-    ).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), pending_tx.send(*peer_id)).await {
         Ok(Err(e)) => warn!(error = %e, "pending delivery channel closed"),
         Err(_) => warn!(peer = %peer_id, "pending delivery notification timed out (5s)"),
         Ok(Ok(())) => {}
@@ -725,10 +742,9 @@ async fn handle_peer_connected(
     // Send our price table so the peer knows what we charge.
     // Compute the trust discount we offer this peer based on their synaptic weight
     // in our routing table — stronger relationships get lower prices.
-    let meta = konsensus_pricing::peer_prices::build_full_price_table(
-        pricing.as_ref(),
-        chain.as_ref(),
-    ).await;
+    let meta =
+        konsensus_pricing::peer_prices::build_full_price_table(pricing.as_ref(), chain.as_ref())
+            .await;
     match meta {
         Ok(meta) => {
             let peer_discount = routing
@@ -742,7 +758,16 @@ async fn handle_peer_connected(
                 valid_blocks: meta.valid_blocks,
                 trust_discount: peer_discount,
             };
-            if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage.as_ref(), peer_id, &price_frame, pricing.as_ref(), min_admission_cost_msat).await {
+            if let Err(e) = crate::delivery_prices::send_price_frame(
+                transport,
+                storage.as_ref(),
+                peer_id,
+                &price_frame,
+                pricing.as_ref(),
+                min_admission_cost_msat,
+            )
+            .await
+            {
                 warn!(peer = %peer_id, error = %e, "failed to send price table");
             }
         }
@@ -751,7 +776,16 @@ async fn handle_peer_connected(
         }
     }
 
-    send_lightning_info(peer_id, transport, lightning, lightning_addr, storage, ws_delivery_tx, our_node_id).await;
+    send_lightning_info(
+        peer_id,
+        transport,
+        lightning,
+        lightning_addr,
+        storage,
+        ws_delivery_tx,
+        our_node_id,
+    )
+    .await;
 
     // Send our KIND_PROFILE (103) so the peer can display our identity.
     // Mock backends only: a real backend never sends a mock payment proof.
@@ -806,7 +840,10 @@ async fn handle_prekey_offer(
             }
         };
 
-    match session_manager.initiate_session(peer_id, &peer_bundle).await {
+    match session_manager
+        .initiate_session(peer_id, &peer_bundle)
+        .await
+    {
         Ok(init_data) => {
             last_negotiation.insert(*peer_id, tokio::time::Instant::now());
             info!(peer = %peer_id, "X3DH initiated, sending SessionInit");
@@ -817,7 +854,9 @@ async fn handle_prekey_offer(
                     return;
                 }
             };
-            let frame = Frame::SessionInit { init_data: init_json };
+            let frame = Frame::SessionInit {
+                init_data: init_json,
+            };
             if let Err(e) = transport.send_frame(peer_id, &frame).await {
                 warn!(peer = %peer_id, error = %e, "failed to send SessionInit");
             }
@@ -858,14 +897,15 @@ async fn handle_session_init(
         // Paid ciphertext remains queued until its recipient ACKs, even after a session reset.
     }
 
-    let init: konsensus_crypto::SerializableSessionInit =
-        match serde_json::from_value(init_data).map_err(|_| konsensus_core::wire_json::DecodeError) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(peer = %peer_id, error = %e, "invalid session init data");
-                return;
-            }
-        };
+    let init: konsensus_crypto::SerializableSessionInit = match serde_json::from_value(init_data)
+        .map_err(|_| konsensus_core::wire_json::DecodeError)
+    {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(peer = %peer_id, error = %e, "invalid session init data");
+            return;
+        }
+    };
 
     match session_manager.accept_session(peer_id, &init).await {
         Ok(()) => {
@@ -940,7 +980,9 @@ async fn handle_ratchet_init(
                     session_manager.remove_session(peer_id).await;
                     // Preserve paid envelopes across ratchet recovery; acceptance ACKs do not require decryption.
                     // Send fresh PrekeyOffer to trigger re-negotiation
-                    if let Err(send_err) = send_prekey_offer(session_manager, transport, peer_id).await {
+                    if let Err(send_err) =
+                        send_prekey_offer(session_manager, transport, peer_id).await
+                    {
                         warn!(peer = %peer_id, error = %send_err, "failed to send PrekeyOffer after ratchet init failure");
                     }
                 }
@@ -1011,7 +1053,9 @@ async fn reply_prekey_offer_to_paid_payee(
     // The generation is captured once; the reply goes on that connection only,
     // and only if it is still the one we paid on (checked under its lock by
     // `send_raw_frame_on`), never on an unpaid replacement.
-    let Some(since) = transport.connected_since(peer_id).await else { return };
+    let Some(since) = transport.connected_since(peer_id).await else {
+        return;
+    };
     if our_node_id.as_bytes() < peer_id.as_bytes()
         || !transport.admission_paid_on_connection(peer_id).await
         || !e2ee_needs_self_heal(session_manager, peer_id).await
@@ -1024,17 +1068,29 @@ async fn reply_prekey_offer_to_paid_payee(
     }
     let sent = match serde_json::to_value(session_manager.prekey_bundle().await)
         .map_err(|e| format!("serialize prekey bundle: {e}"))
-        .and_then(|bundle| Frame::PrekeyOffer { bundle }.to_bytes().map_err(|e| e.to_string()))
-    {
+        .and_then(|bundle| {
+            Frame::PrekeyOffer { bundle }
+                .to_bytes()
+                .map_err(|e| e.to_string())
+        }) {
         Ok(frame) => transport
-            .send_raw_frame_on(peer_id, since, konsensus_message::Standing::AdmissionPaid, &frame)
+            .send_raw_frame_on(
+                peer_id,
+                since,
+                konsensus_message::Standing::AdmissionPaid,
+                &frame,
+            )
             .await
             .map_err(|e| e.to_string()),
         Err(e) => Err(e),
     };
     match sent {
-        Ok(()) => info!(peer = %peer_id, "answered the paid payee's PrekeyOffer with ours (PSI-SPEED)"),
-        Err(e) => warn!(peer = %peer_id, error = %e, "failed to answer the paid payee's PrekeyOffer"),
+        Ok(()) => {
+            info!(peer = %peer_id, "answered the paid payee's PrekeyOffer with ours (PSI-SPEED)")
+        }
+        Err(e) => {
+            warn!(peer = %peer_id, error = %e, "failed to answer the paid payee's PrekeyOffer")
+        }
     }
 }
 
@@ -1048,9 +1104,11 @@ async fn send_prekey_offer(
     peer_id: &NodeId,
 ) -> Result<(), String> {
     let bundle = session_manager.prekey_bundle().await;
-    let bundle_json = serde_json::to_value(&bundle)
-        .map_err(|e| format!("serialize prekey bundle: {e}"))?;
-    let frame = Frame::PrekeyOffer { bundle: bundle_json };
+    let bundle_json =
+        serde_json::to_value(&bundle).map_err(|e| format!("serialize prekey bundle: {e}"))?;
+    let frame = Frame::PrekeyOffer {
+        bundle: bundle_json,
+    };
     transport
         .send_frame(peer_id, &frame)
         .await
@@ -1061,10 +1119,16 @@ async fn send_prekey_offer(
 /// retryable so older peers and temporary gate failures cannot burn delivery.
 fn terminal_paid_rejection(reason: &str) -> bool {
     [
-        "payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:",
-        "room_binding_invalid:", "room_sender_not_member:", "room_recipient_not_member:",
+        "payment proof already used:",
+        "insufficient payment:",
+        "recipient mismatch:",
+        "invalid signature:",
+        "room_binding_invalid:",
+        "room_sender_not_member:",
+        "room_recipient_not_member:",
     ]
-    .iter().any(|prefix| reason.starts_with(prefix))
+    .iter()
+    .any(|prefix| reason.starts_with(prefix))
 }
 
 /// Bound storage work before looking up an unprivileged confirmation. A
@@ -1079,15 +1143,24 @@ struct DeliveryConfirmationBudget {
 
 impl DeliveryConfirmationBudget {
     fn allow(&mut self, peer: &NodeId, privileged: bool, now: tokio::time::Instant) -> bool {
-        if privileged { return true; }
-        if self.window.is_none_or(|start| now.duration_since(start) >= std::time::Duration::from_secs(1)) {
+        if privileged {
+            return true;
+        }
+        if self
+            .window
+            .is_none_or(|start| now.duration_since(start) >= std::time::Duration::from_secs(1))
+        {
             self.window = Some(now);
             self.used = 0;
             self.peers.clear();
         }
-        if self.used >= 128 { return false; }
+        if self.used >= 128 {
+            return false;
+        }
         let used = self.peers.entry(*peer).or_default();
-        if *used >= 32 { return false; }
+        if *used >= 32 {
+            return false;
+        }
         *used += 1;
         self.used += 1;
         true
@@ -1097,45 +1170,91 @@ impl DeliveryConfirmationBudget {
 /// Delivery confirmations cannot grant admission or mutate unrelated deliveries.
 #[allow(clippy::too_many_arguments)]
 async fn handle_delivery_confirmation(
-    peer: &NodeId, id: &konsensus_core::MessageId, rejection: Option<&str>, privileged: bool,
-    own_id: &NodeId, storage: &Arc<dyn konsensus_storage::Storage>,
-    timestamps: &tokio::sync::Mutex<std::collections::HashMap<konsensus_core::MessageId, std::time::Instant>>,
-    routing: &konsensus_routing::RoutingTable, ws: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    peer: &NodeId,
+    id: &konsensus_core::MessageId,
+    rejection: Option<&str>,
+    privileged: bool,
+    own_id: &NodeId,
+    storage: &Arc<dyn konsensus_storage::Storage>,
+    timestamps: &tokio::sync::Mutex<
+        std::collections::HashMap<konsensus_core::MessageId, std::time::Instant>,
+    >,
+    routing: &konsensus_routing::RoutingTable,
+    ws: &broadcast::Sender<Arc<WsDeliveryStatus>>,
     audit: &konsensus_api::audit::AuditLog,
     budget: &mut DeliveryConfirmationBudget,
 ) {
     if !budget.allow(peer, privileged, tokio::time::Instant::now()) {
-        audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
+        audit
+            .membrane()
+            .pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
         return;
     }
     let nonce_replay = rejection == Some("replay detected: nonce already used");
-    let hash_replay = rejection.and_then(|reason| reason.strip_prefix("payment proof already used: "))
+    let hash_replay = rejection
+        .and_then(|reason| reason.strip_prefix("payment proof already used: "))
         .filter(|hash| hash.len() == 64)
         .and_then(|hash| hex::decode(hash).ok())
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
     // The hash compatibility exception must consume the row atomically with
     // the exact payment binding; unrelated PaymentReused remains terminal.
     let hash_acked = if let Some(hash) = hash_replay {
-        match storage.acknowledge_pending_payment(id, peer, own_id, &hash).await {
+        match storage
+            .acknowledge_pending_payment(id, peer, own_id, &hash)
+            .await
+        {
             Ok(acked) => acked,
             Err(_) => return,
         }
-    } else { false };
+    } else {
+        false
+    };
     let legacy = nonce_replay || hash_acked;
     if rejection.is_none() || legacy {
-        if !hash_acked && !matches!(storage.acknowledge_pending(id, peer, own_id).await, Ok(true)) {
-            if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
+        if !hash_acked
+            && !matches!(
+                storage.acknowledge_pending(id, peer, own_id).await,
+                Ok(true)
+            )
+        {
+            if !privileged {
+                audit
+                    .membrane()
+                    .pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
+            }
             return;
         }
         if legacy {
-            audit.record("acked_legacy", &peer.to_hex(), Some(serde_json::json!({"message_id": id.to_hex()})));
+            audit.record(
+                "acked_legacy",
+                &peer.to_hex(),
+                Some(serde_json::json!({"message_id": id.to_hex()})),
+            );
         }
-        handle_message_acked(peer, id, timestamps, storage, routing, ws, privileged && !legacy).await;
+        handle_message_acked(
+            peer,
+            id,
+            timestamps,
+            storage,
+            routing,
+            ws,
+            privileged && !legacy,
+        )
+        .await;
     } else {
         let reason = rejection.unwrap_or_default();
         let terminal = terminal_paid_rejection(reason);
-        if !matches!(storage.reject_pending(id, peer, own_id, reason, terminal).await, Ok(true)) {
-            if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
+        if !matches!(
+            storage
+                .reject_pending(id, peer, own_id, reason, terminal)
+                .await,
+            Ok(true)
+        ) {
+            if !privileged {
+                audit
+                    .membrane()
+                    .pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
+            }
             return;
         }
         timestamps.lock().await.remove(id);
@@ -1146,7 +1265,9 @@ async fn handle_delivery_confirmation(
 async fn handle_message_acked(
     peer_id: &NodeId,
     message_id: &konsensus_core::types::MessageId,
-    send_timestamps: &tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>>,
+    send_timestamps: &tokio::sync::Mutex<
+        std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>,
+    >,
     storage: &Arc<dyn konsensus_storage::Storage>,
     routing: &konsensus_routing::RoutingTable,
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
@@ -1155,7 +1276,8 @@ async fn handle_message_acked(
     // Compute STDP latency from send timestamp.
     let latency_ms = {
         let mut timestamps = send_timestamps.lock().await;
-        let latency = timestamps.remove(message_id)
+        let latency = timestamps
+            .remove(message_id)
             .map(|sent_at| sent_at.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
         // Prune stale entries (>5 min) to prevent unbounded growth
@@ -1181,17 +1303,19 @@ async fn handle_message_acked(
     );
 
     // Hebbian learning: successful delivery strengthens routing weight.
-    if update_weights { routing.record_success(peer_id, latency_ms, payment_msat).await; }
+    if update_weights {
+        routing
+            .record_success(peer_id, latency_ms, payment_msat)
+            .await;
+    }
 
     // Broadcast delivery confirmation to WebSocket clients.
-    if let Err(e) = ws_delivery_tx.send(Arc::new(
-        WsDeliveryStatus {
-            event_type: "delivery_status",
-            message_id: message_id.to_hex(),
-            status: "delivered".to_string(),
-            reason: None,
-        },
-    )) {
+    if let Err(e) = ws_delivery_tx.send(Arc::new(WsDeliveryStatus {
+        event_type: "delivery_status",
+        message_id: message_id.to_hex(),
+        status: "delivered".to_string(),
+        reason: None,
+    })) {
         tracing::debug!(error = %e, "no WebSocket clients for delivery status");
     }
 }
@@ -1205,16 +1329,21 @@ async fn handle_message_rejected(
     update_weights: bool,
 ) {
     warn!(peer = %peer_id, msg_id = %message_id, reason = %konsensus_message::wire::sanitized_peer_reason(reason), "message rejected by peer");
-    if update_weights { routing.record_failure(peer_id).await; }
+    if update_weights {
+        routing.record_failure(peer_id).await;
+    }
 
-    if let Err(e) = ws_delivery_tx.send(Arc::new(
-        WsDeliveryStatus {
-            event_type: "delivery_status",
-            message_id: message_id.to_hex(),
-            status: if terminal_paid_rejection(reason) { "failed_paid" } else { "rejected" }.to_string(),
-            reason: Some(reason.to_string()),
-        },
-    )) {
+    if let Err(e) = ws_delivery_tx.send(Arc::new(WsDeliveryStatus {
+        event_type: "delivery_status",
+        message_id: message_id.to_hex(),
+        status: if terminal_paid_rejection(reason) {
+            "failed_paid"
+        } else {
+            "rejected"
+        }
+        .to_string(),
+        reason: Some(reason.to_string()),
+    })) {
         tracing::debug!(error = %e, "no WebSocket clients for delivery rejection");
     }
 }
@@ -1237,8 +1366,21 @@ async fn handle_price_query(
                     return;
                 }
             };
-            let frame = Frame::PriceResponse { kind, price_msat, block_height };
-            if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage, peer_id, &frame, pricing.as_ref(), min_admission_cost_msat).await {
+            let frame = Frame::PriceResponse {
+                kind,
+                price_msat,
+                block_height,
+            };
+            if let Err(e) = crate::delivery_prices::send_price_frame(
+                transport,
+                storage,
+                peer_id,
+                &frame,
+                pricing.as_ref(),
+                min_admission_cost_msat,
+            )
+            .await
+            {
                 warn!(peer = %peer_id, error = %e, "failed to send price response");
             }
         }
@@ -1269,7 +1411,9 @@ async fn handle_price_table_received(
         trust_discount,
         "received peer price table"
     );
-    peer_prices.update(peer_id, prices, block_height, valid_blocks, trust_discount).await;
+    peer_prices
+        .update(peer_id, prices, block_height, valid_blocks, trust_discount)
+        .await;
 }
 
 async fn handle_price_response_received(
@@ -1288,7 +1432,9 @@ async fn handle_price_response_received(
         peer = %peer_id, kind, price_msat, block_height,
         "received price response, updating peer cache"
     );
-    peer_prices.update_kind_price(peer_id, kind, price_msat, block_height).await;
+    peer_prices
+        .update_kind_price(peer_id, kind, price_msat, block_height)
+        .await;
 }
 
 /// Privilege-gated invoice dispatch. Strangers get only the bounded,
@@ -1337,15 +1483,30 @@ async fn handle_invoice_requested_gated(
             unix,
         ) {
             if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
-                send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED).await;
+                send_invoice_refusal(
+                    transport,
+                    peer_id,
+                    request_id,
+                    konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED,
+                )
+                .await;
             }
             return;
         }
         let Some(attempt_end) = admission_quote::expires_at(request_id, recipient, peer_id, unix)
-        else { return; };
+        else {
+            return;
+        };
         let (invoice, admission, description) = match prepare_admission_invoice(
-            pricing.as_ref(), readiness_height, lightning.as_ref(), request_id, attempt_end, min_admission_cost_msat,
-        ).await {
+            pricing.as_ref(),
+            readiness_height,
+            lightning.as_ref(),
+            request_id,
+            attempt_end,
+            min_admission_cost_msat,
+        )
+        .await
+        {
             Ok(invoice) => invoice,
             Err(reason) => {
                 if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
@@ -1389,7 +1550,13 @@ async fn handle_invoice_requested_gated(
         membrane.pre_payment_refused(PrePaymentReason::AdmissionRequired);
         let now = tokio::time::Instant::now();
         if last_admission_refusal.permit(source_ip, now) {
-            send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::ADMISSION_REQUIRED).await;
+            send_invoice_refusal(
+                transport,
+                peer_id,
+                request_id,
+                konsensus_api::invoice_refusal::ADMISSION_REQUIRED,
+            )
+            .await;
         }
         return;
     }
@@ -1446,6 +1613,7 @@ async fn handle_invoice_requested(
         }
         return;
     }
+    let mut rollback_rate = || invoices.rollback_issue(peer_id);
     let ceiling = match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         configured_price_ceiling(pricing.as_ref()),
@@ -1454,13 +1622,21 @@ async fn handle_invoice_requested(
     {
         Ok(Ok(ceiling)) => ceiling,
         _ => {
+            rollback_rate();
             if refusals.permit(source_ip, tokio::time::Instant::now()) {
-                send_invoice_refusal(transport, peer_id, request_id, "konsensus:price_unavailable").await;
+                send_invoice_refusal(
+                    transport,
+                    peer_id,
+                    request_id,
+                    "konsensus:price_unavailable",
+                )
+                .await;
             }
             return;
         }
     };
     if amount_msat == 0 || ceiling == 0 {
+        rollback_rate();
         if refusals.permit(source_ip, tokio::time::Instant::now()) {
             send_invoice_refusal(
                 transport,
@@ -1479,7 +1655,11 @@ async fn handle_invoice_requested(
     );
     let description = format!("konsensus:{request_id}");
     match lightning
-        .create_invoice(amount_msat, &description, crate::peer_invoices::INVOICE_EXPIRY_SECS)
+        .create_invoice(
+            amount_msat,
+            &description,
+            crate::peer_invoices::INVOICE_EXPIRY_SECS,
+        )
         .await
     {
         Ok(invoice) => {
@@ -1499,11 +1679,14 @@ async fn handle_invoice_requested(
             }
         }
         Err(e) => {
+            rollback_rate();
             warn!(
                 peer = %peer_id, %request_id, error = %e,
                 "failed to create invoice for peer request — sending error to peer"
             );
-            if !refusals.permit(source_ip, tokio::time::Instant::now()) { return; }
+            if !refusals.permit(source_ip, tokio::time::Instant::now()) {
+                return;
+            }
             let error_frame = invoice_error_frame(request_id, e);
             if let Err(send_err) = transport.enqueue_control_frame(peer_id, &error_frame).await {
                 warn!(peer = %peer_id, %request_id, error = %send_err, "failed to send invoice error frame");
@@ -1560,7 +1743,9 @@ fn invoice_error_frame(
 }
 
 /// Only fixed protocol codes may leave the node; backend details stay local.
-fn invoice_refusal_reason(error: konsensus_core::traits::lightning::LightningError) -> &'static str {
+fn invoice_refusal_reason(
+    error: konsensus_core::traits::lightning::LightningError,
+) -> &'static str {
     use konsensus_api::invoice_refusal::{CHAIN_UNAVAILABLE, NOT_SYNCED};
     use konsensus_core::traits::lightning::LightningError;
     match error {
@@ -1607,9 +1792,7 @@ impl ReadinessHeightCache {
                 None => true,
                 Some(lookup) => match lookup.peek() {
                     Some(Err(_)) => true,
-                    Some(Ok((_, fetched_at, _))) => {
-                        fetched_at.elapsed() >= Duration::from_secs(60)
-                    }
+                    Some(Ok((_, fetched_at, _))) => fetched_at.elapsed() >= Duration::from_secs(60),
                     // The slot owns one handle; callers clone only under this
                     // lock. With no other handle, every waiter has cancelled.
                     None => lookup.strong_count() == Some(1),
@@ -1621,11 +1804,10 @@ impl ReadinessHeightCache {
                     async move {
                         let observed_at = std::time::Instant::now();
                         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                        let height =
-                            tokio::time::timeout_at(deadline, chain.get_block_height())
-                                .await
-                                .map_err(|_| CHAIN_UNAVAILABLE)?
-                                .map_err(|_| CHAIN_UNAVAILABLE)?;
+                        let height = tokio::time::timeout_at(deadline, chain.get_block_height())
+                            .await
+                            .map_err(|_| CHAIN_UNAVAILABLE)?
+                            .map_err(|_| CHAIN_UNAVAILABLE)?;
                         let fetched_at = tokio::time::Instant::now();
                         // Timeout polls the response first. A delayed poll can
                         // therefore return success even after its deadline.
@@ -1674,7 +1856,8 @@ async fn prepare_admission_invoice(
     })
     .await
     .map_err(|_| CHAIN_UNAVAILABLE)??;
-    let (admission, message) = konsensus_core::introduction::first_contact_prices(price, min_admission_cost_msat);
+    let (admission, message) =
+        konsensus_core::introduction::first_contact_prices(price, min_admission_cost_msat);
     let description = format!("konsensus:{request_id}:message={message}");
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1726,7 +1909,9 @@ async fn handle_invoice_error_received(
     request_id: &str,
     reason: &str,
     privileged: bool,
-    invoice_requests: &tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>,
+    invoice_requests: &tokio::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
+    >,
 ) -> bool {
     let bound_quote = request_id.starts_with(&format!("v1:{peer_id}:"))
         && reason == "stateless_quote_unsupported";
@@ -1745,7 +1930,10 @@ async fn handle_invoice_error_received(
         return false;
     }
     if let Some(sender) = requests.remove(request_id) {
-        let _ = sender.send(Err(InvoiceResponseError { recipient: *peer_id, reason: reason.into() }));
+        let _ = sender.send(Err(InvoiceResponseError {
+            recipient: *peer_id,
+            reason: reason.into(),
+        }));
     }
     false
 }
@@ -1755,12 +1943,18 @@ async fn handle_invoice_response(
     request_id: &str,
     bolt11: String,
     payment_hash: String,
-    invoice_requests: &tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>,
+    invoice_requests: &tokio::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
+    >,
 ) {
     info!(peer = %peer_id, %request_id, "received invoice response from peer");
     let mut requests = invoice_requests.lock().await;
     if let Some(sender) = requests.remove(request_id) {
-        let data = InvoiceResponseData { recipient: *peer_id, bolt11, payment_hash };
+        let data = InvoiceResponseData {
+            recipient: *peer_id,
+            bolt11,
+            payment_hash,
+        };
         if sender.send(Ok(data)).is_err() {
             warn!(%request_id, "invoice response receiver already dropped (timeout?)");
         }
@@ -1770,9 +1964,14 @@ async fn handle_invoice_response(
 }
 
 async fn handle_peer_exchange_request(peer_id: &NodeId, transport: &Arc<NoiseTransport>) {
-    let _ = transport.enqueue_control_frame(peer_id, &Frame::PeerExchangeRefused {
-        reason: "peer_exchange_requires_quote_and_payment".into(),
-    }).await;
+    let _ = transport
+        .enqueue_control_frame(
+            peer_id,
+            &Frame::PeerExchangeRefused {
+                reason: "peer_exchange_requires_quote_and_payment".into(),
+            },
+        )
+        .await;
 }
 
 async fn handle_peer_exchange_received(
@@ -1911,7 +2110,10 @@ async fn handle_lightning_info_received(
         return false;
     }
 
-    peer_ln_pubkeys.lock().await.insert(*peer_id, ln_pubkey.to_string());
+    peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(*peer_id, ln_pubkey.to_string());
     debug!(peer = %peer_id, "stored peer Lightning info for keysend");
     true
 }
@@ -1945,7 +2147,10 @@ async fn handle_gossip_received(
     let kind = envelope.kind;
 
     // 1. Check recipient is Broadcast
-    if !matches!(envelope.recipient, konsensus_core::types::Recipient::Broadcast) {
+    if !matches!(
+        envelope.recipient,
+        konsensus_core::types::Recipient::Broadcast
+    ) {
         warn!(
             from = %from_peer,
             sender = %sender,

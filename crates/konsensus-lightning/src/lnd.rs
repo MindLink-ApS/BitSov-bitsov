@@ -15,7 +15,9 @@
 //!
 //! Auth: `Grpc-Metadata-macaroon` header with hex-encoded macaroon.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use reqwest::Client;
@@ -63,6 +65,7 @@ pub struct LndProvider {
     routing_fee_policy: konsensus_core::traits::lightning::RoutingFeePolicy,
     client: Client,
     invoice_attempts: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    invoice_expiries: Mutex<HashMap<String, u64>>,
     /// Set to `false` when a payment fails due to wallet/channel issues.
     /// Reset to `true` on successful payment.
     pub(crate) payment_capable: AtomicBool,
@@ -74,7 +77,9 @@ impl std::fmt::Debug for LndProvider {
             .field("config", &self.config)
             .field(
                 "payment_capable",
-                &self.payment_capable.load(std::sync::atomic::Ordering::Relaxed),
+                &self
+                    .payment_capable
+                    .load(std::sync::atomic::Ordering::Relaxed),
             )
             .finish()
     }
@@ -140,6 +145,26 @@ struct LndError {
     message: Option<String>,
     #[allow(dead_code)]
     code: Option<i32>,
+}
+
+#[derive(Serialize)]
+struct CancelInvoiceRequest {
+    payment_hash: String,
+}
+
+/// Response from GET /v1/invoices.
+#[derive(Debug, Deserialize)]
+struct ListInvoicesResponse {
+    invoices: Option<Vec<LndListedInvoice>>,
+    last_index_offset: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LndListedInvoice {
+    r_hash: Option<String>,
+    creation_date: Option<String>,
+    expiry: Option<String>,
+    state: Option<String>,
 }
 
 /// Response from GET /v1/invoice/{r_hash_str} (lookupinvoice).
@@ -223,7 +248,10 @@ struct LndPaymentEntry {
 }
 
 impl LndProvider {
-    pub fn with_routing_fee_policy(mut self, policy: konsensus_core::traits::lightning::RoutingFeePolicy) -> Self {
+    pub fn with_routing_fee_policy(
+        mut self,
+        policy: konsensus_core::traits::lightning::RoutingFeePolicy,
+    ) -> Self {
         self.routing_fee_policy = policy;
         self
     }
@@ -233,24 +261,45 @@ impl LndProvider {
     async fn require_fresh_invoice(&self, hash: &[u8]) -> Result<(), LightningError> {
         use base64::Engine;
         let hash = base64::engine::general_purpose::URL_SAFE.encode(hash);
-        let mut response = self.client.get(self.api_url(&format!("/v2/router/track/{hash}?no_inflight_updates=false")))
-            .header("Grpc-Metadata-macaroon", &self.config.macaroon_hex).send().await
-            .map_err(|e| LightningError::PaymentNotDispatched(format!("cannot verify fresh invoice: {e}")))?;
+        let mut response = self
+            .client
+            .get(self.api_url(&format!(
+                "/v2/router/track/{hash}?no_inflight_updates=false"
+            )))
+            .header("Grpc-Metadata-macaroon", &self.config.macaroon_hex)
+            .send()
+            .await
+            .map_err(|e| {
+                LightningError::PaymentNotDispatched(format!("cannot verify fresh invoice: {e}"))
+            })?;
         let status = response.status();
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|e| LightningError::PaymentNotDispatched(e.to_string()))? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| LightningError::PaymentNotDispatched(e.to_string()))?
+        {
             bytes.extend_from_slice(&chunk);
-            if bytes.len() > 16384 { break; }
+            if bytes.len() > 16384 {
+                break;
+            }
             let first = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
             if let Ok(frame) = serde_json::from_slice::<serde_json::Value>(first) {
-                let code = frame.get("code").or_else(|| frame.get("error").and_then(|e| e.get("code"))).and_then(|c| c.as_i64());
-                if (status.is_success() || status == reqwest::StatusCode::NOT_FOUND) && code == Some(5) {
+                let code = frame
+                    .get("code")
+                    .or_else(|| frame.get("error").and_then(|e| e.get("code")))
+                    .and_then(|c| c.as_i64());
+                if (status.is_success() || status == reqwest::StatusCode::NOT_FOUND)
+                    && code == Some(5)
+                {
                     return Ok(());
                 }
                 return Err(LightningError::PaymentNotDispatched("capped payments require a fresh invoice hash; track/reconcile existing payments".into()));
             }
         }
-        Err(LightningError::PaymentNotDispatched("cannot verify fresh invoice: missing or invalid LND tracking response".into()))
+        Err(LightningError::PaymentNotDispatched(
+            "cannot verify fresh invoice: missing or invalid LND tracking response".into(),
+        ))
     }
 
     /// Create a new LND provider with the given configuration.
@@ -259,8 +308,7 @@ impl LndProvider {
     /// client's trust store. Otherwise, LND must use a certificate trusted
     /// by the system CA roots, or the connection will fail.
     pub fn new(config: LndConfig) -> Result<Self, LightningError> {
-        let mut builder = Client::builder()
-            .timeout(std::time::Duration::from_secs(60));
+        let mut builder = Client::builder().timeout(std::time::Duration::from_secs(60));
 
         // If a TLS cert path is provided, load it as a custom CA
         if let Some(cert_path) = &config.tls_cert_path {
@@ -273,9 +321,8 @@ impl LndProvider {
                     "invalid TLS cert: file is empty or not PEM-encoded".into(),
                 ));
             }
-            let cert = reqwest::Certificate::from_pem(&cert_pem).map_err(|e| {
-                LightningError::Connection(format!("invalid TLS cert: {e}"))
-            })?;
+            let cert = reqwest::Certificate::from_pem(&cert_pem)
+                .map_err(|e| LightningError::Connection(format!("invalid TLS cert: {e}")))?;
             builder = builder
                 .add_root_certificate(cert)
                 .danger_accept_invalid_certs(false);
@@ -290,6 +337,7 @@ impl LndProvider {
             routing_fee_policy: Default::default(),
             client,
             invoice_attempts: Default::default(),
+            invoice_expiries: Mutex::new(HashMap::new()),
             payment_capable: AtomicBool::new(true),
         })
     }
@@ -301,8 +349,131 @@ impl LndProvider {
             routing_fee_policy: Default::default(),
             client,
             invoice_attempts: Default::default(),
+            invoice_expiries: Mutex::new(HashMap::new()),
             payment_capable: AtomicBool::new(true),
         }
+    }
+
+    fn remember_invoice_expiry(&self, payment_hash: &str, expires_at: u64) {
+        self.invoice_expiries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(payment_hash.to_string(), expires_at);
+    }
+
+    fn clear_invoice_expiry(&self, payment_hash: &str) {
+        self.invoice_expiries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(payment_hash);
+    }
+
+    fn payment_hash_lnd_base64(payment_hash_hex: &str) -> Result<String, LightningError> {
+        let bytes = hex::decode(payment_hash_hex)
+            .map_err(|e| LightningError::Backend(format!("invalid payment hash hex: {e}")))?;
+        if bytes.len() != 32 {
+            return Err(LightningError::Backend(
+                "payment hash must be 32 bytes".into(),
+            ));
+        }
+        use base64::Engine;
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    async fn cancel_open_invoice(&self, payment_hash: &str) -> Result<bool, LightningError> {
+        let body = CancelInvoiceRequest {
+            payment_hash: Self::payment_hash_lnd_base64(payment_hash)?,
+        };
+        let response = self
+            .client
+            .post(self.api_url("/v2/invoices/cancel"))
+            .header("Grpc-Metadata-macaroon", &self.config.macaroon_hex)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| LightningError::Connection(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(self.handle_error(response, "cancel_invoice").await);
+        }
+        let delete_url = self.api_url(&format!("/v1/invoices?invoice_hash={payment_hash}"));
+        let delete = self
+            .client
+            .delete(&delete_url)
+            .header("Grpc-Metadata-macaroon", &self.config.macaroon_hex)
+            .send()
+            .await
+            .map_err(|e| LightningError::Connection(e.to_string()))?;
+        if !delete.status().is_success() {
+            debug!(
+                payment_hash,
+                status = %delete.status(),
+                "LND canceled invoice but delete-canceled failed"
+            );
+        }
+        self.clear_invoice_expiry(payment_hash);
+        Ok(true)
+    }
+
+    async fn list_pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        let mut index_offset = "0".to_string();
+        let mut pending = Vec::new();
+        loop {
+            let url = self.api_url(&format!(
+                "/v1/invoices?pending_only=true&num_max_invoices=100&index_offset={index_offset}"
+            ));
+            let response = self
+                .client
+                .get(&url)
+                .header("Grpc-Metadata-macaroon", &self.config.macaroon_hex)
+                .send()
+                .await
+                .map_err(|e| LightningError::Connection(e.to_string()))?;
+            if !response.status().is_success() {
+                return Err(self.handle_error(response, "list_invoices").await);
+            }
+            let resp: ListInvoicesResponse = response
+                .json()
+                .await
+                .map_err(|e| LightningError::Backend(format!("parse list invoices: {e}")))?;
+            let batch = resp.invoices.unwrap_or_default();
+            if batch.is_empty() {
+                break;
+            }
+            let batch_len = batch.len();
+            for invoice in batch {
+                let state = invoice.state.as_deref().unwrap_or("OPEN");
+                if state != "OPEN" {
+                    continue;
+                }
+                let r_hash_raw = invoice
+                    .r_hash
+                    .ok_or_else(|| LightningError::Backend("LND invoice missing r_hash".into()))?;
+                let payment_hash = Self::decode_r_hash(&r_hash_raw)?;
+                let created = invoice
+                    .creation_date
+                    .as_deref()
+                    .map(Self::parse_u64)
+                    .unwrap_or(0);
+                let expiry_secs = invoice
+                    .expiry
+                    .as_deref()
+                    .map(Self::parse_u64)
+                    .unwrap_or(3600);
+                let expires_at = created.saturating_add(expiry_secs);
+                pending.push((payment_hash, expires_at));
+            }
+            if batch_len < 100 {
+                break;
+            }
+            let next = resp
+                .last_index_offset
+                .filter(|offset| *offset != index_offset);
+            match next {
+                Some(offset) => index_offset = offset,
+                None => break,
+            }
+        }
+        Ok(pending)
     }
 
     /// Probes whether LND is reachable and synced to chain.
@@ -355,11 +526,7 @@ impl LndProvider {
     }
 
     /// Convert an LND API error response into a LightningError.
-    async fn handle_error(
-        &self,
-        response: reqwest::Response,
-        context: &str,
-    ) -> LightningError {
+    async fn handle_error(&self, response: reqwest::Response, context: &str) -> LightningError {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         warn!(status = %status, body = %body, "{context} failed");
@@ -390,9 +557,8 @@ impl LndProvider {
 
     /// Satoshis to millisatoshis. A wrapping multiply would report a small settled amount.
     fn scale_sats(sats: u64) -> Result<u64, LightningError> {
-        sats.checked_mul(1_000).ok_or_else(|| {
-            LightningError::Backend("satoshi amount overflows millisatoshis".into())
-        })
+        sats.checked_mul(1_000)
+            .ok_or_else(|| LightningError::Backend("satoshi amount overflows millisatoshis".into()))
     }
 
     /// Amount from an LND payment or invoice. A settled record with no positive
@@ -443,13 +609,8 @@ impl LndProvider {
         use base64::Engine;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(r_hash)
-            .or_else(|_| {
-                base64::engine::general_purpose::URL_SAFE
-                    .decode(r_hash)
-            })
-            .map_err(|e| {
-                LightningError::Backend(format!("failed to decode r_hash base64: {e}"))
-            })?;
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(r_hash))
+            .map_err(|e| LightningError::Backend(format!("failed to decode r_hash base64: {e}")))?;
         Ok(hex::encode(bytes))
     }
 }
@@ -495,16 +656,17 @@ impl LightningProvider for LndProvider {
         // LND returns r_hash as base64
         let payment_hash = Self::decode_r_hash(&r_hash_raw)?;
 
-        let bolt11 = resp
-            .payment_request
-            .ok_or_else(|| {
-                LightningError::InvoiceCreation("no payment_request in response".into())
-            })?;
+        let bolt11 = resp.payment_request.ok_or_else(|| {
+            LightningError::InvoiceCreation("no payment_request in response".into())
+        })?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        let expires_at = now.saturating_add(u64::from(expiry_secs));
+        self.remember_invoice_expiry(&payment_hash, expires_at);
 
         debug!(payment_hash = %payment_hash, "LND invoice created");
 
@@ -518,30 +680,99 @@ impl LightningProvider for LndProvider {
         })
     }
 
-    #[instrument(skip(self, bolt11))]
-    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
-        let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse()
-            .map_err(|e| LightningError::InvalidBolt11(format!("{e}")))?;
-        let amount = invoice.amount_milli_satoshis()
-            .ok_or_else(|| LightningError::PaymentNotDispatched("amountless invoice".into()))?;
-        self.pay_invoice_with_fee_limit(bolt11, self.routing_fee_policy.ceiling(amount, None)).await
+    async fn forget_pending_invoice(&self, payment_hash: &str) -> Result<bool, LightningError> {
+        match self.get_payment_status(payment_hash).await {
+            Ok(details) if details.direction == PaymentDirection::Incoming => {
+                if details.status == PaymentStatus::Pending {
+                    return self.cancel_open_invoice(payment_hash).await;
+                }
+                self.clear_invoice_expiry(payment_hash);
+                Ok(false)
+            }
+            Ok(_) => {
+                self.clear_invoice_expiry(payment_hash);
+                Ok(false)
+            }
+            Err(LightningError::PaymentNotFound(_)) => {
+                self.clear_invoice_expiry(payment_hash);
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
-    fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy { self.routing_fee_policy }
+    async fn purge_expired_pending_invoices(&self, now_unix: u64) -> Result<u32, LightningError> {
+        let due: Vec<String> = self
+            .invoice_expiries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, expires_at)| **expires_at <= now_unix)
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        let mut removed = 0u32;
+        for hash in due {
+            if self.forget_pending_invoice(&hash).await? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
 
-    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        let listed = self.list_pending_invoice_expiries().await?;
+        {
+            let mut map = self
+                .invoice_expiries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.clear();
+            for (hash, expires_at) in &listed {
+                map.insert(hash.clone(), *expires_at);
+            }
+        }
+        Ok(listed)
+    }
+
+    #[instrument(skip(self, bolt11))]
+    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
+        let invoice: lightning_invoice::Bolt11Invoice = bolt11
+            .parse()
+            .map_err(|e| LightningError::InvalidBolt11(format!("{e}")))?;
+        let amount = invoice
+            .amount_milli_satoshis()
+            .ok_or_else(|| LightningError::PaymentNotDispatched("amountless invoice".into()))?;
+        self.pay_invoice_with_fee_limit(bolt11, self.routing_fee_policy.ceiling(amount, None))
+            .await
+    }
+
+    fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy {
+        self.routing_fee_policy
+    }
+
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        bolt11: &str,
+        max_fee_msat: u64,
+    ) -> Result<PaymentDetails, LightningError> {
         use bitcoin::hashes::Hash;
-        let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse()
+        let invoice: lightning_invoice::Bolt11Invoice = bolt11
+            .parse()
             .map_err(|e| LightningError::InvalidBolt11(format!("{e}")))?;
         if invoice.amount_milli_satoshis().is_none() {
-            return Err(LightningError::PaymentNotDispatched("amountless invoice".into()));
+            return Err(LightningError::PaymentNotDispatched(
+                "amountless invoice".into(),
+            ));
         }
         let hash = invoice.payment_hash().to_string();
         let mut attempts = self.invoice_attempts.lock().await;
         if attempts.contains(&hash) {
-            return Err(LightningError::PaymentNotDispatched("capped payments require a fresh invoice hash".into()));
+            return Err(LightningError::PaymentNotDispatched(
+                "capped payments require a fresh invoice hash".into(),
+            ));
         }
-        self.require_fresh_invoice(invoice.payment_hash().as_byte_array()).await?;
+        self.require_fresh_invoice(invoice.payment_hash().as_byte_array())
+            .await?;
         // Mark BEFORE POST: cancellation or an ambiguous response cannot retry
         // while LND may still be processing the first request.
         attempts.insert(hash);
@@ -599,9 +830,8 @@ impl LightningProvider for LndProvider {
             }
         }
 
-        let result = final_result.ok_or_else(|| {
-            LightningError::PaymentFailed("no payment result in response".into())
-        })?;
+        let result = final_result
+            .ok_or_else(|| LightningError::PaymentFailed("no payment result in response".into()))?;
 
         let status_str = result.status.as_deref().unwrap_or("UNKNOWN");
         let status = Self::payment_status_to_status(status_str);
@@ -610,13 +840,13 @@ impl LightningProvider for LndProvider {
         self.payment_capable.store(true, Ordering::Relaxed);
 
         let payment_hash = result.payment_hash.unwrap_or_default();
-        let preimage = result
-            .payment_preimage
-            .filter(|p| !p.is_empty() && p != "0000000000000000000000000000000000000000000000000000000000000000");
+        let preimage = result.payment_preimage.filter(|p| {
+            !p.is_empty() && p != "0000000000000000000000000000000000000000000000000000000000000000"
+        });
 
-        let invoice_msat = invoice.amount_milli_satoshis().ok_or_else(|| {
-            LightningError::PaymentNotDispatched("amountless invoice".into())
-        })?;
+        let invoice_msat = invoice
+            .amount_milli_satoshis()
+            .ok_or_else(|| LightningError::PaymentNotDispatched("amountless invoice".into()))?;
         let reported = match result.value_msat.as_deref() {
             Some(raw) => Some(Self::parse_amount_u64(raw)?),
             None => None,
@@ -692,7 +922,10 @@ impl LightningProvider for LndProvider {
                     // LND returns r_preimage as base64
                     Self::decode_r_hash(&p).ok()
                 })
-                .filter(|p| !p.is_empty() && p != "0000000000000000000000000000000000000000000000000000000000000000");
+                .filter(|p| {
+                    !p.is_empty()
+                        && p != "0000000000000000000000000000000000000000000000000000000000000000"
+                });
 
             let amount_msat = Self::reported_amount_msat(
                 status,
@@ -759,11 +992,7 @@ impl LightningProvider for LndProvider {
                     p.value_sat.as_deref(),
                 )?;
 
-                let timestamp = p
-                    .creation_date
-                    .as_deref()
-                    .map(Self::parse_u64)
-                    .unwrap_or(0);
+                let timestamp = p.creation_date.as_deref().map(Self::parse_u64).unwrap_or(0);
 
                 let fee_msat = match p.fee_msat.as_deref() {
                     Some(raw) => Some(Self::parse_amount_u64(raw)?),
@@ -914,8 +1143,16 @@ impl LightningProvider for LndProvider {
             .into_iter()
             .map(|ch| -> Result<ChannelInfo, LightningError> {
                 let capacity_sat = ch.capacity.as_deref().map(Self::parse_u64).unwrap_or(0);
-                let local_sat = ch.local_balance.as_deref().map(Self::parse_u64).unwrap_or(0);
-                let remote_sat = ch.remote_balance.as_deref().map(Self::parse_u64).unwrap_or(0);
+                let local_sat = ch
+                    .local_balance
+                    .as_deref()
+                    .map(Self::parse_u64)
+                    .unwrap_or(0);
+                let remote_sat = ch
+                    .remote_balance
+                    .as_deref()
+                    .map(Self::parse_u64)
+                    .unwrap_or(0);
 
                 Ok(ChannelInfo {
                     is_outbound: None,
@@ -955,11 +1192,21 @@ impl LightningProvider for LndProvider {
         amount_msat: u64,
         memo: Option<&str>,
     ) -> Result<PaymentDetails, LightningError> {
-        self.keysend_with_fee_limit(dest_pubkey, amount_msat, memo, self.routing_fee_policy.ceiling(amount_msat, None)).await
+        self.keysend_with_fee_limit(
+            dest_pubkey,
+            amount_msat,
+            memo,
+            self.routing_fee_policy.ceiling(amount_msat, None),
+        )
+        .await
     }
 
     async fn keysend_with_fee_limit(
-        &self, dest_pubkey: &str, amount_msat: u64, memo: Option<&str>, max_fee_msat: u64,
+        &self,
+        dest_pubkey: &str,
+        amount_msat: u64,
+        memo: Option<&str>,
+        max_fee_msat: u64,
     ) -> Result<PaymentDetails, LightningError> {
         // Generate random preimage for keysend
         let preimage_bytes: [u8; 32] = rand::random();
@@ -992,7 +1239,8 @@ impl LightningProvider for LndProvider {
             dest_custom_records: std::collections::HashMap<String, String>,
         }
 
-        let payment_hash_b64 = base64::engine::general_purpose::STANDARD.encode(hash_bytes.as_slice());
+        let payment_hash_b64 =
+            base64::engine::general_purpose::STANDARD.encode(hash_bytes.as_slice());
 
         let mut custom_records = std::collections::HashMap::new();
         // TLV type 5482373484 is the standard keysend preimage record
@@ -1043,9 +1291,8 @@ impl LightningProvider for LndProvider {
             }
         }
 
-        let result = final_result.ok_or_else(|| {
-            LightningError::PaymentFailed("no keysend result in response".into())
-        })?;
+        let result = final_result
+            .ok_or_else(|| LightningError::PaymentFailed("no keysend result in response".into()))?;
 
         let status_str = result.status.as_deref().unwrap_or("UNKNOWN");
         let status = Self::payment_status_to_status(status_str);

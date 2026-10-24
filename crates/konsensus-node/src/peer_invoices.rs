@@ -99,6 +99,15 @@ impl PeerInvoiceBook {
         Ok(())
     }
 
+    /// Undo a rate-slot reservation when invoice creation never commits a row.
+    pub(crate) fn rollback_issue(&mut self, peer: &NodeId) {
+        if let Some((_, count)) = self.rates.get_mut(peer) {
+            if *count > 0 {
+                *count -= 1;
+            }
+        }
+    }
+
     pub(crate) fn commit(&mut self, peer: NodeId, hash: String, expires_at: u64) {
         self.rows.push(Row {
             peer: Some(peer),
@@ -201,7 +210,7 @@ pub(crate) async fn purge_expired_peer_invoices(
     let mut deletions = stream::iter(expired.into_iter().map(|hash| async move {
         let forgotten = matches!(
             tokio::time::timeout(STATUS_BUDGET, lightning.forget_pending_invoice(&hash)).await,
-            Ok(Ok(_))
+            Ok(Ok(true))
         );
         (hash, forgotten)
     }))
@@ -318,6 +327,22 @@ mod tests {
         book.commit(peer, "old".into(), 20);
         assert_eq!(book.outstanding(Some(&peer), 20), 0);
         assert!(book.try_issue(&peer, now, 20).is_ok());
+    }
+
+    #[test]
+    fn failed_rate_reservation_rolls_back_on_refusal_paths() {
+        let mut book = PeerInvoiceBook {
+            reconciled: true,
+            ..Default::default()
+        };
+        let peer = peer(4);
+        let now = Instant::now();
+        let unix = 1_000u64;
+        for _ in 0..PEER_RATE_BURST {
+            book.try_issue(&peer, now, unix).unwrap();
+            book.rollback_issue(&peer);
+        }
+        assert!(book.try_issue(&peer, now, unix).is_ok());
     }
 
     #[test]

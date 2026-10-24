@@ -128,7 +128,7 @@ async fn is_payment_capable_reflects_flag() {
 // ── Mock HTTP server tests ──────────────────────────────────────────
 // These test the full request/response flow against a mock LND REST API.
 
-use axum::{Json, Router, routing::get, routing::post};
+use axum::{routing::get, routing::post, Json, Router};
 use std::net::SocketAddr;
 
 async fn start_mock_lnd() -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -665,7 +665,17 @@ async fn pay_invoice_streaming_uses_final_result() {
     let (addr, _handle) = start_mock_lnd_payment().await;
     let provider = test_provider(addr);
 
-    let result = provider.pay_invoice_with_fee_limit(&crate::MockLightningProvider::new().create_invoice(10000, "test", 3600).await.unwrap().bolt11, 5000).await.unwrap();
+    let result = provider
+        .pay_invoice_with_fee_limit(
+            &crate::MockLightningProvider::new()
+                .create_invoice(10000, "test", 3600)
+                .await
+                .unwrap()
+                .bolt11,
+            5000,
+        )
+        .await
+        .unwrap();
     // Should use the SUCCEEDED result, not the IN_FLIGHT one
     assert_eq!(result.status, PaymentStatus::Settled);
     assert_eq!(result.payment_hash, "abc123");
@@ -687,7 +697,17 @@ async fn pay_invoice_error_response_returns_payment_failed() {
     };
     let provider = LndProvider::with_client(config, Client::new());
 
-    let err = provider.pay_invoice_with_fee_limit(&crate::MockLightningProvider::new().create_invoice(10000, "test", 3600).await.unwrap().bolt11, 5000).await.unwrap_err();
+    let err = provider
+        .pay_invoice_with_fee_limit(
+            &crate::MockLightningProvider::new()
+                .create_invoice(10000, "test", 3600)
+                .await
+                .unwrap()
+                .bolt11,
+            5000,
+        )
+        .await
+        .unwrap_err();
     match err {
         LightningError::PaymentFailed(msg) => {
             assert!(msg.contains("no route found"), "got: {msg}");
@@ -709,7 +729,17 @@ async fn pay_invoice_empty_body_returns_error() {
     };
     let provider = LndProvider::with_client(config, Client::new());
 
-    let err = provider.pay_invoice_with_fee_limit(&crate::MockLightningProvider::new().create_invoice(10000, "test", 3600).await.unwrap().bolt11, 5000).await.unwrap_err();
+    let err = provider
+        .pay_invoice_with_fee_limit(
+            &crate::MockLightningProvider::new()
+                .create_invoice(10000, "test", 3600)
+                .await
+                .unwrap()
+                .bolt11,
+            5000,
+        )
+        .await
+        .unwrap_err();
     match err {
         LightningError::PaymentFailed(msg) => {
             assert!(msg.contains("no payment result"), "got: {msg}");
@@ -729,7 +759,17 @@ async fn pay_invoice_mixed_garbage_finds_valid_line() {
     };
     let provider = LndProvider::with_client(config, Client::new());
 
-    let result = provider.pay_invoice_with_fee_limit(&crate::MockLightningProvider::new().create_invoice(10000, "test", 3600).await.unwrap().bolt11, 5000).await.unwrap();
+    let result = provider
+        .pay_invoice_with_fee_limit(
+            &crate::MockLightningProvider::new()
+                .create_invoice(10000, "test", 3600)
+                .await
+                .unwrap()
+                .bolt11,
+            5000,
+        )
+        .await
+        .unwrap();
     assert_eq!(result.status, PaymentStatus::Settled);
     assert_eq!(result.payment_hash, "good");
     assert_eq!(result.amount_msat, 10_000);
@@ -883,7 +923,7 @@ async fn payment_status_zero_preimage_filtered() {
     // Zero preimage should be filtered to None
     assert!(details.preimage.is_none());
     assert_eq!(details.status, PaymentStatus::Pending); // "OPEN"
-    // value_msat not present, falls back to value * 1000
+                                                        // value_msat not present, falls back to value * 1000
     assert_eq!(details.amount_msat, 25_000);
 }
 
@@ -1373,4 +1413,108 @@ async fn unsupported_channel_push_is_never_dispatched() {
             matches!(error, LightningError::PaymentNotDispatched(ref message) if message.contains("push") && message.contains("not supported"))
         );
     }
+}
+
+#[tokio::test]
+async fn lnd_peer_invoice_hooks_cancel_and_inventory() {
+    use axum::extract::{Path, State};
+    use base64::Engine;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Store {
+        open: bool,
+        r_hash_b64: String,
+        payment_hash: String,
+    }
+
+    async fn mock_lookup(
+        Path(hash): Path<String>,
+        State(store): State<Arc<Mutex<Store>>>,
+    ) -> Json<serde_json::Value> {
+        let store = store.lock().unwrap();
+        if hash != store.payment_hash {
+            return Json(serde_json::json!({}));
+        }
+        let state = if store.open { "OPEN" } else { "CANCELED" };
+        Json(serde_json::json!({
+            "state": state,
+            "value_msat": "1000",
+            "creation_date": "1000",
+        }))
+    }
+
+    async fn mock_list(State(store): State<Arc<Mutex<Store>>>) -> Json<serde_json::Value> {
+        let store = store.lock().unwrap();
+        if !store.open {
+            return Json(serde_json::json!({"invoices": []}));
+        }
+        Json(serde_json::json!({
+            "invoices": [{
+                "r_hash": store.r_hash_b64,
+                "state": "OPEN",
+                "creation_date": "1000",
+                "expiry": "60",
+            }],
+        }))
+    }
+
+    async fn mock_cancel(State(store): State<Arc<Mutex<Store>>>) -> Json<serde_json::Value> {
+        store.lock().unwrap().open = false;
+        Json(serde_json::json!({}))
+    }
+
+    async fn mock_delete() -> Json<serde_json::Value> {
+        Json(serde_json::json!({}))
+    }
+
+    let hash_bytes = [0xab_u8; 32];
+    let payment_hash = hex::encode(hash_bytes);
+    let r_hash_b64 = base64::engine::general_purpose::STANDARD.encode(hash_bytes);
+    let store = Arc::new(Mutex::new(Store {
+        open: true,
+        r_hash_b64,
+        payment_hash: payment_hash.clone(),
+    }));
+
+    let app = Router::new()
+        .route("/v1/getinfo", get(mock_getinfo))
+        .route(
+            "/v1/invoices",
+            post(mock_addinvoice).get(mock_list).delete(mock_delete),
+        )
+        .route("/v1/invoice/:hash", get(mock_lookup))
+        .route("/v2/invoices/cancel", post(mock_cancel))
+        .with_state(store.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let provider = test_provider(addr);
+    let invoice = provider
+        .create_invoice(1_000, "peer service", 60)
+        .await
+        .unwrap();
+    assert_eq!(invoice.payment_hash, "ab".repeat(32));
+
+    let pending = provider.pending_invoice_expiries().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, "ab".repeat(32));
+    assert_eq!(pending[0].1, 1060);
+
+    assert!(provider
+        .forget_pending_invoice(&invoice.payment_hash)
+        .await
+        .unwrap());
+    assert!(!store.lock().unwrap().open);
+    assert!(provider
+        .pending_invoice_expiries()
+        .await
+        .unwrap()
+        .is_empty());
+
+    handle.abort();
 }
