@@ -466,6 +466,289 @@ async fn run(with_backup: bool) {
     proxy.abort();
 }
 
+/// Force-close with an in-flight HTLC: seed-only recovery sweeps only the static
+/// `to_remote` output, completes the hub self-test, and never re-signs the input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local bitcoind; seed-only recovery after force-close and data loss"]
+async fn recover_force_closed_channel_from_seed_after_data_loss() {
+    println!("recover scenario force-close seed-only");
+    let core = Core::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let h_dir = root.path().join("H");
+    let b_dir = root.path().join("B");
+    let restored = root.path().join("restored");
+    let mnemonic = bip39::Mnemonic::from_entropy(&[4; 32]).unwrap().to_string();
+    let seed = konsensus_lightning::scb_restore::derive_ldk_entropy_seed(&mnemonic, None).unwrap();
+    let b_store = b_dir.join("ldk");
+    let h_port = port();
+    let b_port = port();
+    let h = node(&core, &h_dir, [1; 64], h_port);
+    let b = node(&core, &b_store, seed, b_port);
+    core.mine(101, &[&h, &b]).await;
+    core.rpc(
+        "sendtoaddress",
+        json!([h.onchain_payment().new_address().unwrap().to_string(), 0.02]),
+    )
+    .await;
+    core.rpc(
+        "sendtoaddress",
+        json!([
+            b.onchain_payment().new_address().unwrap().to_string(),
+            0.0005
+        ]),
+    )
+    .await;
+    core.mine(6, &[&h, &b]).await;
+    h.open_channel(
+        b.node_id(),
+        format!("127.0.0.1:{b_port}").parse().unwrap(),
+        500_000,
+        None,
+        None,
+    )
+    .unwrap();
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        core.mine(1, &[&h, &b]).await;
+        if h.list_channels().iter().any(|c| c.is_channel_ready)
+            && b.list_channels().iter().any(|c| c.is_channel_ready)
+        {
+            break;
+        }
+    }
+    assert!(b.list_channels().iter().any(|c| c.is_channel_ready));
+    let channel = b.list_channels()[0].clone();
+    let funding = channel.funding_txo.unwrap();
+    let funding = OutPoint {
+        txid: funding.txid,
+        vout: funding.vout,
+    };
+    pay(&h, &b, 50_000).await;
+    let inflight_sats = 25_000;
+    let description = ldk_node::lightning_invoice::Bolt11InvoiceDescription::Direct(
+        ldk_node::lightning_invoice::Description::new("in-flight HTLC".into()).unwrap(),
+    );
+    let invoice = b
+        .bolt11_payment()
+        .receive(inflight_sats * 1000, &description, 3600)
+        .unwrap();
+    let inflight = h.bolt11_payment().send(&invoice, None).unwrap();
+    assert_eq!(
+        h.payment(&inflight).unwrap().status,
+        ldk_node::payment::PaymentStatus::Pending,
+        "HTLC must still be in flight when the channel is force-closed"
+    );
+    b.force_close_channel(
+        &channel.user_channel_id,
+        h.node_id(),
+        Some("regtest force-close".into()),
+    )
+    .unwrap();
+    for _ in 0..120 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        core.mine(1, &[&h, &b]).await;
+        if b.list_channels().is_empty() {
+            break;
+        }
+    }
+    assert!(
+        b.list_channels().is_empty(),
+        "force-close did not remove the channel"
+    );
+    b.stop().unwrap();
+    drop(b);
+    let master = Xpriv::new_master(Network::Regtest, &seed).unwrap();
+    let keys = RecoveryKeys::from_ldk_seed(&master.private_key.secret_bytes()).unwrap();
+    let scripts = recover::scripts(&keys, None);
+    let password_file = root.path().join("rpc-password");
+    std::fs::write(&password_file, "migration-test").unwrap();
+    let rpc = BitcoindConfig {
+        rpc_host: "127.0.0.1".into(),
+        rpc_port: core.port,
+        cookie_file: None,
+        rpc_user: Some("migration-test".into()),
+        rpc_password_file: Some(password_file),
+    };
+    let chain = BitcoindProvider::new(rpc.clone()).unwrap();
+    let mut close_tx = None;
+    for _ in 0..120 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        core.mine(1, &[&h]).await;
+        if let Some(close) = chain.funding_spend(funding).await.unwrap() {
+            if close.confirmations > 0 {
+                close_tx = Some(close.transaction);
+                break;
+            }
+        }
+    }
+    let close = close_tx.expect("force-close transaction never confirmed");
+    let recoverable: Vec<_> = close
+        .output
+        .iter()
+        .filter(|o| scripts.iter().any(|s| s.script_pubkey == o.script_pubkey))
+        .collect();
+    assert_eq!(
+        recoverable.len(),
+        1,
+        "only the static to_remote output is recoverable from the seed"
+    );
+    let outside: Vec<_> = close
+        .output
+        .iter()
+        .filter(|o| !scripts.iter().any(|s| s.script_pubkey == o.script_pubkey))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "in-flight HTLC outputs must remain outside the seed-only sweep"
+    );
+    println!(
+        "force-close has {} recoverable and {} non-recoverable outputs",
+        recoverable.len(),
+        outside.len()
+    );
+    std::fs::remove_dir_all(&b_dir).unwrap();
+    let broadcasts = Arc::new(Mutex::new(Vec::<Transaction>::new()));
+    let recorded = broadcasts.clone();
+    let url = core.url.clone();
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let recorded = recorded.clone();
+            let url = url.clone();
+            async move {
+                if body["method"] == "sendrawtransaction" {
+                    let raw = hex::decode(body["params"][0].as_str().unwrap()).unwrap();
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(bitcoin::consensus::deserialize(&raw).unwrap());
+                }
+                let response: Value = reqwest::Client::new()
+                    .post(url)
+                    .basic_auth("migration-test", Some("migration-test"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                axum::Json(response)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let proxy = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let proxy_rpc = BitcoindConfig {
+        rpc_host: "127.0.0.1".into(),
+        rpc_port: proxy_port,
+        cookie_file: None,
+        rpc_user: Some("migration-test".into()),
+        rpc_password_file: Some(root.path().join("rpc-password")),
+    };
+    let chain = BitcoindProvider::new(proxy_rpc.clone()).unwrap();
+    std::fs::create_dir(&restored).unwrap();
+    recover::initialize(&restored).unwrap();
+    let destination = recover::wallet_address(&seed, Network::Regtest).unwrap();
+    let plan = Plan::new(
+        konsensus_lightning::move_home::node_id_from_seed(&seed).unwrap(),
+        "regtest",
+        &destination.to_string(),
+        2,
+    )
+    .unwrap();
+    let mut job = Job::load_or_begin(&restored, plan.clone(), vec![]).unwrap();
+    let provider = LdkProvider::new_for_recovery(config(
+        &restored.join("recover-session-test"),
+        &mnemonic,
+        proxy_rpc.clone(),
+    ))
+    .await
+    .unwrap();
+    provider
+        .node()
+        .connect(
+            h.node_id(),
+            format!("127.0.0.1:{h_port}").parse().unwrap(),
+            true,
+        )
+        .unwrap();
+    let mut swept = None;
+    let mut ready = false;
+    for _ in 0..120 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        core.mine(1, &[&h, provider.node()]).await;
+        match job.advance(&chain, &keys, &scripts).await.unwrap() {
+            Progress::SweepPreview { sweep, inputs } => {
+                assert_eq!(inputs.len(), 1);
+                assert_eq!(inputs[0].outpoint.txid, close.compute_txid());
+                assert_eq!(
+                    inputs[0].txout.value.to_sat(),
+                    recoverable[0].value.to_sat()
+                );
+                assert_eq!(
+                    inputs[0].txout.script_pubkey,
+                    recoverable[0].script_pubkey
+                );
+                assert!(
+                    inputs
+                        .iter()
+                        .all(|i| i.outpoint.txid == close.compute_txid()),
+                    "sweep must not spend HTLC outputs outside the static to_remote key"
+                );
+                let tx = sweep.tx().unwrap();
+                assert!(tx.input.iter().all(|i| i.previous_output != funding));
+                swept = Some(tx.compute_txid());
+                job.approve(&chain, sweep, inputs).await.unwrap();
+            }
+            Progress::SelfTest => {
+                let checks = recover::self_test(&provider, &job, true).await.unwrap();
+                assert!(checks.contains("money_ready=true"));
+                ready = true;
+                break;
+            }
+            Progress::WaitingForHub | Progress::Confirming { .. } => {}
+            Progress::Complete => panic!("unexpected early completion"),
+        }
+    }
+    assert!(ready, "seed-only recovery did not reach the hub self-test");
+    let sent_count = broadcasts.lock().unwrap().len();
+    assert!(sent_count >= 1);
+    assert_eq!(
+        broadcasts.lock().unwrap().last().map(|t| t.compute_txid()),
+        swept
+    );
+    let (progress, _) = (
+        job.advance(&chain, &keys, &scripts).await.unwrap(),
+        (),
+    );
+    assert!(matches!(progress, Progress::SelfTest), "{progress:?}");
+    assert_eq!(
+        broadcasts.lock().unwrap().len(),
+        sent_count,
+        "rerunning recovery must not sign a second transaction for the same input"
+    );
+    provider.shutdown().await.unwrap();
+    verify_lightning(
+        &core,
+        &h,
+        h_port,
+        &restored,
+        &mnemonic,
+        proxy_rpc,
+        &mut job,
+        &chain,
+    )
+    .await;
+    assert!(job.done());
+    recover::ensure_normal_start(&restored).unwrap();
+    h.stop().unwrap();
+    proxy.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires local bitcoind; latest-state hub recovery with and without a stale backup"]
 async fn recover_latest_hub_state_with_and_without_stale_backup() {

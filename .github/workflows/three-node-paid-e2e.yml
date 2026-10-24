@@ -114,6 +114,20 @@ jobs:
           if [[ "$REGTEST_GHOST_AFTER_PR200" == 1 ]]; then
             grep -q '^GHOST UNFUNDED CHANNEL PASS:' regtest.log
           fi
+      - name: Seed-only recovery after force-close (#415)
+        shell: bash
+        run: |
+          set +e
+          scripts/regress/recover_regtest.sh 2>&1 | tee recover-regtest.log
+          result=${PIPESTATUS[0]}
+          set -e
+          if [[ "$result" == 77 ]]; then
+            echo '::error::Recover regtest skipped (77); this lane requires execution.'
+            exit 1
+          fi
+          if [[ "$result" != 0 ]]; then exit "$result"; fi
+          grep -q '^RECOVER REGTEST PASS;' recover-regtest.log
+          echo '### Recover regtest: force-close balance restored from seed (#415)' >> "$GITHUB_STEP_SUMMARY"
       - name: Retain evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -122,4 +136,5 @@ jobs:
           path: |
             regtest.log
             private-forwarding.log
+            recover-regtest.log
           if-no-files-found: ignore
