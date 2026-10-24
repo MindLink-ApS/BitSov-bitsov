@@ -525,6 +525,8 @@ async fn recover_force_closed_channel_from_seed_after_data_loss() {
     };
     pay(&h, &b, 50_000).await;
     let inflight_sats = 25_000;
+    let hub_seed = [1u8; 64];
+    let pre_commit = latest_holder(&h_dir, hub_seed);
     let description = ldk_node::lightning_invoice::Bolt11InvoiceDescription::Direct(
         ldk_node::lightning_invoice::Description::new("in-flight HTLC".into()).unwrap(),
     );
@@ -538,10 +540,46 @@ async fn recover_force_closed_channel_from_seed_after_data_loss() {
         ldk_node::payment::PaymentStatus::Pending,
         "HTLC must still be in flight when the channel is force-closed"
     );
-    b.force_close_channel(
-        &channel.user_channel_id,
-        h.node_id(),
-        Some("regtest force-close".into()),
+    let had_htlc_amount = pre_commit
+        .output
+        .iter()
+        .any(|o| o.value.to_sat() == inflight_sats);
+    let mut htlc_output = None;
+    for _ in 0..200 {
+        drain_events(&h);
+        drain_events(&b);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let commit = latest_holder(&h_dir, hub_seed);
+        if !had_htlc_amount {
+            if let Some(output) = commit
+                .output
+                .iter()
+                .find(|o| o.value.to_sat() == inflight_sats)
+            {
+                htlc_output = Some(output.clone());
+                break;
+            }
+        }
+        if h.payment(&inflight).unwrap().status
+            != ldk_node::payment::PaymentStatus::Pending
+        {
+            break;
+        }
+    }
+    let htlc_output = htlc_output.expect("HTLC must be on the hub commitment before force-close");
+    let settled_balance = b.list_channels()[0].outbound_capacity_msat / 1000
+        + b.list_channels()[0].unspendable_punishment_reserve.unwrap();
+    assert_eq!(
+        h.payment(&inflight).unwrap().status,
+        ldk_node::payment::PaymentStatus::Pending,
+        "HTLC must still be in flight when the channel is force-closed"
+    );
+    core.mine(1, &[&h, &b]).await;
+    let h_channel = h.list_channels()[0].clone();
+    h.force_close_channel(
+        &h_channel.user_channel_id,
+        b.node_id(),
+        Some("regtest hub force-close".into()),
     )
     .unwrap();
     for _ in 0..120 {
@@ -592,19 +630,28 @@ async fn recover_force_closed_channel_from_seed_after_data_loss() {
         1,
         "only the static to_remote output is recoverable from the seed"
     );
-    let outside: Vec<_> = close
-        .output
-        .iter()
-        .filter(|o| !scripts.iter().any(|s| s.script_pubkey == o.script_pubkey))
-        .collect();
+    assert_eq!(
+        recoverable[0].value.to_sat(),
+        settled_balance,
+        "hub commitment must pay B's settled balance to the static to_remote key"
+    );
     assert!(
-        !outside.is_empty(),
-        "in-flight HTLC outputs must remain outside the seed-only sweep"
+        close
+            .output
+            .iter()
+            .any(|o| o.script_pubkey == htlc_output.script_pubkey && o.value == htlc_output.value),
+        "force-close must include the in-flight HTLC output"
+    );
+    assert!(
+        !scripts
+            .iter()
+            .any(|s| s.script_pubkey == htlc_output.script_pubkey),
+        "HTLC output must not match seed-only recovery scripts"
     );
     println!(
-        "force-close has {} recoverable and {} non-recoverable outputs",
+        "force-close has {} recoverable output(s); HTLC value {} sats left on chain",
         recoverable.len(),
-        outside.len()
+        inflight_sats
     );
     std::fs::remove_dir_all(&b_dir).unwrap();
     let broadcasts = Arc::new(Mutex::new(Vec::<Transaction>::new()));
@@ -623,6 +670,10 @@ async fn recover_force_closed_channel_from_seed_after_data_loss() {
                         .unwrap()
                         .push(bitcoin::consensus::deserialize(&raw).unwrap());
                 }
+                assert_ne!(
+                    body["method"], "submitpackage",
+                    "record package broadcasts too if LDK changes its transport"
+                );
                 let response: Value = reqwest::Client::new()
                     .post(url)
                     .basic_auth("migration-test", Some("migration-test"))
@@ -678,6 +729,7 @@ async fn recover_force_closed_channel_from_seed_after_data_loss() {
         .unwrap();
     let mut swept = None;
     let mut ready = false;
+    let mut max_confirmations = 0u32;
     for _ in 0..120 {
         tokio::time::sleep(Duration::from_millis(300)).await;
         core.mine(1, &[&h, provider.node()]).await;
@@ -685,10 +737,7 @@ async fn recover_force_closed_channel_from_seed_after_data_loss() {
             Progress::SweepPreview { sweep, inputs } => {
                 assert_eq!(inputs.len(), 1);
                 assert_eq!(inputs[0].outpoint.txid, close.compute_txid());
-                assert_eq!(
-                    inputs[0].txout.value.to_sat(),
-                    recoverable[0].value.to_sat()
-                );
+                assert_eq!(inputs[0].txout.value.to_sat(), settled_balance);
                 assert_eq!(
                     inputs[0].txout.script_pubkey,
                     recoverable[0].script_pubkey
@@ -696,25 +745,43 @@ async fn recover_force_closed_channel_from_seed_after_data_loss() {
                 assert!(
                     inputs
                         .iter()
-                        .all(|i| i.outpoint.txid == close.compute_txid()),
-                    "sweep must not spend HTLC outputs outside the static to_remote key"
+                        .all(|i| i.txout.script_pubkey != htlc_output.script_pubkey),
+                    "sweep must not spend the in-flight HTLC output"
                 );
                 let tx = sweep.tx().unwrap();
                 assert!(tx.input.iter().all(|i| i.previous_output != funding));
+                assert_eq!(
+                    sweep.validate(&plan).unwrap(),
+                    settled_balance - sweep.fee_sats
+                );
                 swept = Some(tx.compute_txid());
                 job.approve(&chain, sweep, inputs).await.unwrap();
             }
             Progress::SelfTest => {
+                let sweep_txid = swept.expect("self-test without an approved sweep");
+                let confirmed = chain
+                    .transaction(sweep_txid)
+                    .await
+                    .unwrap()
+                    .expect("sweep transaction must be on chain");
+                max_confirmations = max_confirmations.max(confirmed.confirmations);
                 let checks = recover::self_test(&provider, &job, true).await.unwrap();
                 assert!(checks.contains("money_ready=true"));
                 ready = true;
                 break;
             }
-            Progress::WaitingForHub | Progress::Confirming { .. } => {}
+            Progress::WaitingForHub => {}
+            Progress::Confirming { confirmations, .. } => {
+                max_confirmations = max_confirmations.max(confirmations);
+            }
             Progress::Complete => panic!("unexpected early completion"),
         }
     }
     assert!(ready, "seed-only recovery did not reach the hub self-test");
+    assert!(
+        max_confirmations >= konsensus_lightning::move_home::FINAL_CONFIRMATIONS,
+        "sweep must reach six confirmations before the hub self-test (saw {max_confirmations})"
+    );
     let sent_count = broadcasts.lock().unwrap().len();
     assert!(sent_count >= 1);
     assert_eq!(
