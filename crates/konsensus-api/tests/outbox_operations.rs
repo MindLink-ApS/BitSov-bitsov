@@ -383,6 +383,53 @@ async fn cancellation_after_dispatch_reconciles_on_restart_and_ack_is_final() {
 }
 
 #[tokio::test]
+async fn inflight_keysend_retry_after_restart_never_dispatches_twice() {
+    let mut f = Fixture::new().await;
+    f.wallet.mode.store(1, Ordering::SeqCst);
+    f.wallet.pause_next_status_poll.store(true, Ordering::SeqCst);
+    let app = common::test_router(f.state.clone());
+    let request = f.request();
+    let job = tokio::spawn(async move { app.oneshot(request).await });
+    // Stop after the in-flight hash is durable, before settlement is observed.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        f.wallet.status_poll_started.notified(),
+    )
+    .await
+    .expect("compose must reach its post-checkpoint status poll");
+    let op = f.op().await;
+    assert_eq!(op.state, "paying");
+    let hash = op.payment_hash.unwrap();
+    assert_eq!(hash.len(), 64);
+    assert_eq!(
+        f.wallet.get_payment_status(&hash).await.unwrap().status,
+        PaymentStatus::InFlight
+    );
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+
+    f.restart().await;
+    for _ in 0..2 {
+        let (status, receipt) = f.post().await;
+        assert_eq!(status, StatusCode::CONFLICT, "{receipt}");
+        assert_eq!(receipt["retry_allowed"], false);
+        assert_eq!(f.op().await.payment_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+    }
+
+    // The original payment settles; retry recovers it under the same op id.
+    f.wallet.mode.store(0, Ordering::SeqCst);
+    let (status, receipt) = f.post().await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["operation_id"], f.id);
+    assert_eq!(receipt["payment_hash"], hash);
+    let settled = f.wallet.get_payment_status(&hash).await.unwrap();
+    assert_eq!(settled.status, PaymentStatus::Settled);
+    assert_eq!(settled.payment_hash, hash);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn untrackable_dispatch_is_not_retry_permission() {
     let mut f = Fixture::new().await;
     f.wallet.mode.store(3, Ordering::SeqCst);

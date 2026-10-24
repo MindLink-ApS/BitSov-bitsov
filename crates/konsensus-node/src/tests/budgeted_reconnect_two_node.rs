@@ -666,6 +666,17 @@ async fn budgeted_contact_is_readmitted_from_the_budget_without_a_prompt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_contact_without_a_budget_needs_the_one_time_confirmation_once() {
     let mut net = two_nodes(|bob| Some(budget(bob, None))).await;
+    // The quote endpoint uses the wallet policy (no caller fee override).
+    // Keep both 2-sat legs plus their 20% ceilings inside the six-sat cap.
+    let mut state = (*net.sender.state).clone();
+    state.lightning = Arc::new(RepricingFeeProvider {
+        wallet: Arc::clone(&net.sender.wallet),
+        dispatched_limits: std::sync::Mutex::new(Vec::new()),
+        lose_message_response: false,
+    });
+    net.sender.state = Arc::new(state);
+    net.sender.router = konsensus_api::build_router(Arc::clone(&net.sender.state))
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50_000))));
     let bob = net.bob_id;
     net.connect().await;
 
@@ -684,7 +695,7 @@ async fn a_contact_without_a_budget_needs_the_one_time_confirmation_once() {
         .post("/api/v1/messages/first-contact/quote", serde_json::json!({ "recipient": bob.to_hex() }))
         .await;
     assert_eq!(status, StatusCode::OK, "{quote}");
-    assert_eq!(quote["total_msat"], 14_000, "{quote}");
+    assert_eq!(quote["total_msat"], 4_800, "{quote}");
     let (status, grant) = net
         .sender
         .owner_confirm(
@@ -730,20 +741,20 @@ async fn failed_message_after_readmission_charges_admission_only_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_quote_is_reserved_into_the_grant_before_admission_pay() {
-    // Sender prices locally at 2_000; recipient quotes admission=7_000 and
-    // message=7_000. Both must be reserved against the grant before any pay
+    // Sender prices locally at 2_000; recipient quotes admission=3_000 and
+    // message=3_000. Both must be reserved against the grant before any pay
     // (Codex #111 finding 3) — previously admission paid then message refused.
-    let net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000))), 7_000).await;
+    let net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000))), 3_000).await;
     let bob = net.bob_id;
     net.connect().await;
     let (status, body) = net.sender.compose(&bob, "higher recipient price").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["amount_msat"], 7_000, "{body}");
-    assert_eq!(body["readmission_msat"], 7_000, "{body}");
-    assert_eq!(net.sender.paid_out().await, vec![7_000, 7_000]);
+    assert_eq!(body["amount_msat"], 3_000, "{body}");
+    assert_eq!(body["readmission_msat"], 3_000, "{body}");
+    assert_eq!(net.sender.paid_out().await, vec![3_000, 3_000]);
     let grant = net.sender.grant();
-    assert_eq!(grant.used_msat, 14_000);
-    assert_eq!(grant.used_by_recipient.get(&bob.to_hex()), Some(&14_000));
+    assert_eq!(grant.used_msat, 6_000);
+    assert_eq!(grant.used_by_recipient.get(&bob.to_hex()), Some(&6_000));
     net.shutdown();
 }
 
@@ -1093,8 +1104,8 @@ async fn capped_reconnect_rejects_quote_from_prior_connection_generation() {
     );
 }
 
-/// #111 review finding 2: a wallet whose routing ceiling is one principal's
-/// worth, recording every ceiling a dispatch was authorized with.
+/// #111 review finding 2: a wallet whose routing ceiling is 20% of the
+/// principal, recording every ceiling a dispatch was authorized with.
 struct RepricingFeeProvider {
     wallet: Arc<SharedMockProvider>,
     dispatched_limits: std::sync::Mutex<Vec<u64>>,
@@ -1107,7 +1118,7 @@ impl LightningProvider for RepricingFeeProvider {
     fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy {
         konsensus_core::traits::lightning::RoutingFeePolicy {
             minimum_msat: 0,
-            proportional_millionths: 1_000_000,
+            proportional_millionths: 200_000,
             maximum_msat: 10_000,
         }
     }
@@ -1159,12 +1170,12 @@ impl LightningProvider for RepricingFeeProvider {
 /// ones actually given to the wallet, never the stale local price's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repriced_readmission_reports_the_fee_ceilings_it_authorized() {
-    // The sender's cached/local message price is 2,000. The peer quotes 3,000
-    // admission + 3,000 message. The policy allows one principal's worth of
-    // routing fees per dispatch, so the actual authorized sum is 6,000.
+    // The sender's cached/local message price is 2,000. The peer quotes 2,500
+    // admission + 2,500 message. The policy allows 20% routing fees
+    // per dispatch: 500 + 500 msat, within the 6,000-msat all-in call cap.
     let mut net = two_nodes_with_price(
         |bob| Some(budget(bob, Some(50_000))),
-        3_000,
+        2_500,
     ).await;
     let provider = Arc::new(RepricingFeeProvider {
         wallet: Arc::clone(&net.sender.wallet),
@@ -1185,7 +1196,7 @@ async fn repriced_readmission_reports_the_fee_ceilings_it_authorized() {
             "recipient": net.bob_id.to_hex(),
             "kind": konsensus_core::kind::KIND_CHAT,
             "plaintext": "fresh price must update the reported fee allowance",
-            "max_total_msat": 12_000
+            "max_total_msat": 6_000
         }),
     ).await;
     let paid = net.sender.paid_out().await;
@@ -1194,9 +1205,9 @@ async fn repriced_readmission_reports_the_fee_ceilings_it_authorized() {
     net.shutdown();
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(paid, vec![3_000, 3_000], "{body}");
-    assert_eq!(limits, vec![3_000, 3_000], "{body}");
-    assert_eq!(grant_used, 6_000, "mock actual routing fee is zero");
+    assert_eq!(paid, vec![2_500, 2_500], "{body}");
+    assert_eq!(limits, vec![500, 500], "{body}");
+    assert_eq!(grant_used, 5_000, "mock actual routing fee is zero");
     assert_eq!(
         body["max_routing_fee_msat"],
         serde_json::json!(limits.iter().sum::<u64>()),
@@ -1208,7 +1219,7 @@ async fn repriced_readmission_reports_the_fee_ceilings_it_authorized() {
 /// reports the ceilings given to the wallet (admission + fresh message price).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repriced_readmission_error_reports_the_fee_ceilings_it_authorized() {
-    let mut net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000))), 3_000).await;
+    let mut net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000))), 2_500).await;
     let provider = Arc::new(RepricingFeeProvider {
         wallet: Arc::clone(&net.sender.wallet),
         dispatched_limits: std::sync::Mutex::new(Vec::new()),
@@ -1226,13 +1237,13 @@ async fn repriced_readmission_error_reports_the_fee_ceilings_it_authorized() {
             "recipient": net.bob_id.to_hex(),
             "kind": konsensus_core::kind::KIND_CHAT,
             "plaintext": "fresh price, unknown outcome",
-            "max_total_msat": 12_000
+            "max_total_msat": 6_000
         }),
     ).await;
     let limits = provider.dispatched_limits.lock().unwrap().clone();
     net.shutdown();
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["state"], "payment_unknown", "{body}");
-    assert_eq!(limits, vec![3_000, 3_000], "{body}");
-    assert_eq!(body["max_routing_fee_msat"], serde_json::json!(6_000), "{body}");
+    assert_eq!(limits, vec![500, 500], "{body}");
+    assert_eq!(body["max_routing_fee_msat"], serde_json::json!(1_000), "{body}");
 }

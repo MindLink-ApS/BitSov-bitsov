@@ -209,6 +209,14 @@ impl ApiError {
             }));
         }
         if let ApiError::BudgetExceeded(refusal) = &self {
+            if matches!(
+                refusal,
+                crate::spend_budget::BudgetRefusal::PerCall { .. }
+                    | crate::spend_budget::BudgetRefusal::MessagingGrant
+            )
+            {
+                tracing::info!(reason = refusal.reason(), "grant spend refused");
+            }
             let remaining = match refusal {
                 crate::spend_budget::BudgetRefusal::Total { remaining_msat }
                 | crate::spend_budget::BudgetRefusal::Recipient { remaining_msat, .. } => {
