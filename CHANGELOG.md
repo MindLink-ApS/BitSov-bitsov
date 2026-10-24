@@ -6,8 +6,8 @@ also live on the corresponding GitHub pre-release pages.
 ## Unreleased
 
 - Count a home-setup cancel only when a pairing is in progress, cap pending
-  pairing requests per client key, and let that key replace its own pending
-  request.
+  pairing requests per client key and in a shared pool, and refuse further
+  requests at either cap without evicting an existing ceremony.
 - Limit local sign-in challenges per source, rate-limit issuance, and apply
   the local token route's Host and Origin admission to challenge issuance.
 - Bound seed-only recovery chain reads: after a pass discovers hub close
