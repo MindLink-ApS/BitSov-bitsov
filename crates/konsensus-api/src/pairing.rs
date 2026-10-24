@@ -384,6 +384,13 @@ pub struct SpendGrant {
 }
 
 impl SpendGrant {
+    /// Existing signed provenance distinguishes messaging authority from
+    /// explicit console payment approvals; no stored schema change is needed.
+    fn is_messaging(&self) -> bool {
+        self.owner_approval.is_some()
+            || self.budget.as_ref().is_some_and(|b| b.recipients_only)
+    }
+
     /// Whether this grant can authorise anything at `now`: metered, unexpired,
     /// and no longer-lived than the 24-hour cap (a hand-edited expiry is not
     /// an extension).
@@ -744,6 +751,7 @@ type ReservationJournal<'a> = Box<dyn FnOnce(&Reservation) -> Result<(), BudgetR
 #[derive(Default)]
 struct ReservationAuthority<'a> {
     payment_ids: Vec<String>,
+    payment: bool,
     expected_op_id: Option<&'a str>,
     liquidity: bool,
     before_persist: Option<ReservationJournal<'a>>,
@@ -3203,6 +3211,7 @@ impl PairingService {
             charges,
             ReservationAuthority {
                 payment_ids,
+                payment: true,
                 ..Default::default()
             },
             || chrono::Utc::now().timestamp(),
@@ -3244,6 +3253,11 @@ impl PairingService {
         }) else {
             return Err(BudgetRefusal::NoGrant);
         };
+        // Check purpose under the same lock as the debit, even for a keysend
+        // without a hash or request ID. Recipient matching is not authority.
+        if authority.payment && inner.file.grants[idx].is_messaging() {
+            return Err(BudgetRefusal::MessagingGrant);
+        }
         if authority.liquidity
             && !inner.file.grants[idx]
                 .budget
