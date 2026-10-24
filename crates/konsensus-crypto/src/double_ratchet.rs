@@ -44,9 +44,14 @@ use zeroize::Zeroize;
 /// Errors from Double Ratchet operations.
 #[derive(Debug, Error)]
 pub enum RatchetError {
-    /// Decryption failed (wrong key, tampered ciphertext, or replay).
+    /// Decryption failed (wrong key or corrupt ciphertext).
     #[error("decryption failed: {0}")]
     DecryptionFailed(String),
+
+    /// The message number was already received on this chain and no skipped
+    /// key remains for it. The session state is unchanged.
+    #[error("message number already received")]
+    AlreadyReceived,
 
     /// Too many skipped messages (possible attack or severe reordering).
     #[error("too many skipped messages: {0} (max {1})")]
@@ -291,44 +296,79 @@ impl DoubleRatchet {
     ///
     /// Handles out-of-order delivery by checking skipped keys and performing
     /// DH ratchet steps as needed.
+    ///
+    /// Chain keys, counters, skipped-message keys, and any DH ratchet step are
+    /// applied on a scratch copy and copied back only after the AEAD tag
+    /// verifies. A failed tag check or a repeated message number leaves `self`
+    /// unchanged.
     pub fn decrypt(&mut self, message: &RatchetMessage) -> Result<Vec<u8>, RatchetError> {
-        // Check if we have a skipped key for this message
         let skip_key = (message.header.dh_public, message.header.message_number);
-        if let Some((message_key, _seq)) = self.skipped_keys.remove(&skip_key) {
-            return aead_decrypt(&message_key, &message.ciphertext, &self.aead_ad(&message.header));
+        if let Some((mut message_key, _)) = self.skipped_keys.get(&skip_key).copied() {
+            let ad = self.aead_ad(&message.header);
+            let result = aead_decrypt(&message_key, &message.ciphertext, &ad);
+            message_key.zeroize();
+            let plaintext = result?;
+            if let Some((mut stored, _)) = self.skipped_keys.remove(&skip_key) {
+                stored.zeroize();
+            }
+            return Ok(plaintext);
         }
 
         let remote_pub = PublicKey::from(message.header.dh_public);
-
-        // Check if this is a new DH ratchet key from the peer
         let is_new_ratchet = match &self.remote_dh_public {
             Some(current) => current.as_bytes() != &message.header.dh_public,
             None => true, // First message from peer
         };
 
-        if is_new_ratchet {
-            // Skip any remaining messages in the current receiving chain
-            if self.receiving_chain.is_some() {
-                self.skip_messages(message.header.previous_chain_length)?;
-            }
-
-            // Perform DH ratchet step
-            self.dh_ratchet(&remote_pub)?;
+        // A message number behind the current chain, with no skipped key left,
+        // was already received. Do not ratchet forward to "decrypt" it.
+        if !is_new_ratchet && message.header.message_number < self.recv_count {
+            return Err(RatchetError::AlreadyReceived);
         }
 
-        // Skip any messages before this one in the current chain
-        self.skip_messages(message.header.message_number)?;
+        let mut trial = self.trial_state();
+        if is_new_ratchet {
+            if trial.receiving_chain.is_some() {
+                trial.skip_messages(message.header.previous_chain_length)?;
+            }
+            trial.dh_ratchet(&remote_pub)?;
+        }
+        trial.skip_messages(message.header.message_number)?;
 
-        // Derive the message key
-        let chain = self
+        let chain = trial
             .receiving_chain
             .as_ref()
             .ok_or(RatchetError::NotInitialized)?;
-        let (next_chain, message_key) = chain.ratchet()?;
-        self.receiving_chain = Some(next_chain);
-        self.recv_count += 1;
+        let (next_chain, mut message_key) = chain.ratchet()?;
+        trial.receiving_chain = Some(next_chain);
+        trial.recv_count += 1;
 
-        aead_decrypt(&message_key, &message.ciphertext, &self.aead_ad(&message.header))
+        let ad = trial.aead_ad(&message.header);
+        let result = aead_decrypt(&message_key, &message.ciphertext, &ad);
+        message_key.zeroize();
+        let plaintext = result?;
+
+        *self = trial;
+        Ok(plaintext)
+    }
+
+    /// Copy the ratchet so a decrypt attempt can mutate the copy and discard
+    /// it when the tag check fails.
+    fn trial_state(&self) -> Self {
+        Self {
+            dh_secret: self.dh_secret.clone(),
+            dh_public: self.dh_public,
+            remote_dh_public: self.remote_dh_public,
+            root_key: self.root_key,
+            sending_chain: self.sending_chain.clone(),
+            receiving_chain: self.receiving_chain.clone(),
+            send_count: self.send_count,
+            recv_count: self.recv_count,
+            previous_chain_length: self.previous_chain_length,
+            skipped_keys: self.skipped_keys.clone(),
+            skipped_key_seq: self.skipped_key_seq,
+            associated_data: self.associated_data.clone(),
+        }
     }
 
     /// Get our current DH ratchet public key.

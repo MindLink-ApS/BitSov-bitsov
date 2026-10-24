@@ -1,4 +1,30 @@
 use super::*;
+use ed25519_dalek::Signer;
+
+#[test]
+fn staged_sender_keys_are_wiped_in_place_on_failure() {
+    let mut staged = vec![(4, [0xAB; 32]), (5, [0xCD; 32])];
+    let allocation = staged.as_ptr();
+    finish_staged_skips(&mut staged, None);
+    assert_eq!(staged.as_ptr(), allocation);
+    assert!(
+        staged.iter().all(|(_, key)| *key == [0; 32]),
+        "wipe the backing allocation before it is freed"
+    );
+}
+
+#[test]
+fn staged_sender_keys_are_wiped_in_place_after_commit() {
+    let mut staged = vec![(4, [0xAB; 32]), (5, [0xCD; 32])];
+    let mut committed = HashMap::new();
+    finish_staged_skips(&mut staged, Some(&mut committed));
+    assert_eq!(committed.get(&4), Some(&[0xAB; 32]));
+    assert_eq!(committed.get(&5), Some(&[0xCD; 32]));
+    assert!(
+        staged.iter().all(|(_, key)| *key == [0; 32]),
+        "committing keys must wipe the temporary copies too"
+    );
+}
 
 fn test_group_id() -> [u8; 32] {
     let mut id = [0u8; 32];
@@ -158,10 +184,7 @@ fn member_removal_rotates_keys() {
 
     // Alice sends with new key — Bob can decrypt
     let ct_after = alice.encrypt(b"after removal").unwrap();
-    assert_eq!(
-        bob.decrypt(&alice_id, &ct_after).unwrap(),
-        b"after removal"
-    );
+    assert_eq!(bob.decrypt(&alice_id, &ct_after).unwrap(), b"after removal");
 
     // Carol cannot decrypt the new message (she has the old key)
     assert!(carol.decrypt(&alice_id, &ct_after).is_err());
@@ -208,7 +231,10 @@ fn unknown_sender_rejected() {
     let ct = alice.encrypt(b"hello").unwrap();
     // Try to decrypt as if from an unknown sender
     let result = bob.decrypt(&unknown_id, &ct);
-    assert!(matches!(result.unwrap_err(), SenderKeyError::UnknownSender(_)));
+    assert!(matches!(
+        result.unwrap_err(),
+        SenderKeyError::UnknownSender(_)
+    ));
 }
 
 #[test]
@@ -388,7 +414,10 @@ fn debug_impl_redacts_chain_key() {
     let dist = alice.our_distribution();
     let debug_str = format!("{:?}", dist);
 
-    assert!(debug_str.contains("[REDACTED]"), "Distribution Debug must redact chain_key");
+    assert!(
+        debug_str.contains("[REDACTED]"),
+        "Distribution Debug must redact chain_key"
+    );
     let chain_hex = hex::encode(dist.chain_key);
     assert!(
         !debug_str.contains(&chain_hex),
@@ -633,4 +662,107 @@ fn aead_roundtrip_same_context_succeeds() {
     bob.process_distribution(&alice.our_distribution()).unwrap();
     let ct = alice.encrypt(b"post-rotation").unwrap();
     assert_eq!(bob.decrypt(&alice_id, &ct).unwrap(), b"post-rotation");
+}
+
+fn chain_index(session: &GroupSession, sender: &NodeId) -> u32 {
+    session.member_keys.get(sender).unwrap().chain_index
+}
+
+fn skipped_len(session: &GroupSession, sender: &NodeId) -> usize {
+    session.member_keys.get(sender).unwrap().skipped_keys.len()
+}
+
+/// Resign `message` so the signature matches a tampered ciphertext and the
+/// AEAD tag is what rejects it.
+fn resign(sender: &GroupSession, message: &mut GroupCiphertext) {
+    let payload = super::build_sig_payload(
+        message.generation,
+        message.message_number,
+        &message.ciphertext,
+    );
+    message.signature = sender.our_sender_key.signing_key.sign(&payload).to_bytes();
+}
+
+#[test]
+fn failed_decrypt_leaves_sender_chain_unchanged() {
+    let group_id = test_group_id();
+    let alice_id = make_node_id(1);
+    let bob_id = make_node_id(2);
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let mut bob = GroupSession::new(group_id, bob_id);
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+
+    let msg = alice.encrypt(b"honest").unwrap();
+    let mut corrupt = msg.clone();
+    corrupt.ciphertext[0] ^= 0xFF;
+    resign(&alice, &mut corrupt);
+
+    assert_eq!(chain_index(&bob, &alice_id), 0);
+    assert!(bob.decrypt(&alice_id, &corrupt).is_err());
+    assert_eq!(chain_index(&bob, &alice_id), 0);
+    assert_eq!(skipped_len(&bob, &alice_id), 0);
+    assert_eq!(bob.decrypt(&alice_id, &msg).unwrap(), b"honest");
+    assert_eq!(chain_index(&bob, &alice_id), 1);
+
+    assert!(bob.decrypt(&alice_id, &msg).is_err());
+    assert_eq!(chain_index(&bob, &alice_id), 1);
+
+    let next = alice.encrypt(b"next").unwrap();
+    assert_eq!(bob.decrypt(&alice_id, &next).unwrap(), b"next");
+    assert_eq!(chain_index(&bob, &alice_id), 2);
+}
+
+#[test]
+fn failed_ahead_sender_message_does_not_store_skipped_keys() {
+    let group_id = test_group_id();
+    let alice_id = make_node_id(1);
+    let bob_id = make_node_id(2);
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let mut bob = GroupSession::new(group_id, bob_id);
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+
+    let first = alice.encrypt(b"first").unwrap();
+    let second = alice.encrypt(b"second").unwrap();
+    let mut corrupt_second = second.clone();
+    corrupt_second.ciphertext[0] ^= 0xFF;
+    resign(&alice, &mut corrupt_second);
+
+    assert!(bob.decrypt(&alice_id, &corrupt_second).is_err());
+    assert_eq!(chain_index(&bob, &alice_id), 0);
+    assert_eq!(skipped_len(&bob, &alice_id), 0);
+    assert_eq!(bob.decrypt(&alice_id, &first).unwrap(), b"first");
+    assert_eq!(bob.decrypt(&alice_id, &second).unwrap(), b"second");
+}
+
+#[test]
+fn failed_skipped_sender_key_decrypt_keeps_the_key() {
+    let group_id = test_group_id();
+    let alice_id = make_node_id(1);
+    let bob_id = make_node_id(2);
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let mut bob = GroupSession::new(group_id, bob_id);
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+
+    let first = alice.encrypt(b"first").unwrap();
+    let second = alice.encrypt(b"second").unwrap();
+    assert_eq!(bob.decrypt(&alice_id, &second).unwrap(), b"second");
+    assert_eq!(chain_index(&bob, &alice_id), 2);
+    assert_eq!(skipped_len(&bob, &alice_id), 1);
+
+    let mut corrupt_first = first.clone();
+    corrupt_first.ciphertext[0] ^= 0xFF;
+    resign(&alice, &mut corrupt_first);
+    assert!(bob.decrypt(&alice_id, &corrupt_first).is_err());
+    assert_eq!(chain_index(&bob, &alice_id), 2);
+    assert_eq!(skipped_len(&bob, &alice_id), 1);
+    assert!(bob
+        .member_keys
+        .get(&alice_id)
+        .unwrap()
+        .skipped_keys
+        .contains_key(&first.message_number));
+
+    assert_eq!(bob.decrypt(&alice_id, &first).unwrap(), b"first");
+    assert_eq!(skipped_len(&bob, &alice_id), 0);
+    assert_eq!(chain_index(&bob, &alice_id), 2);
 }

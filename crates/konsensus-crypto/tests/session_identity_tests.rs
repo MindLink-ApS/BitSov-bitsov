@@ -654,9 +654,9 @@ fn double_decrypt_same_message_fails() {
     let plaintext = bob.decrypt(&msg).expect("first decrypt must succeed");
     assert_eq!(plaintext, b"single use");
 
-    // Second decrypt should fail (message key consumed)
+    // Second decrypt should fail without advancing the receiving chain.
     let err = bob.decrypt(&msg).unwrap_err();
-    assert!(matches!(err, konsensus_crypto::double_ratchet::RatchetError::DecryptionFailed(_)));
+    assert!(matches!(err, konsensus_crypto::double_ratchet::RatchetError::AlreadyReceived));
 }
 
 #[test]

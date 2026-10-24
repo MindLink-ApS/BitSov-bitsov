@@ -865,3 +865,104 @@ fn tampered_header_message_number_rejected() {
     let result = bob.decrypt(&msg);
     assert!(result.is_err(), "tampered message_number should cause decryption failure");
 }
+
+fn pair() -> (DoubleRatchet, DoubleRatchet) {
+    let shared_secret = [42u8; 32];
+    let ad = b"alice||bob".to_vec();
+    let bob_spk = x3dh::SignedPreKey::generate();
+    let alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let bob = DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
+    (alice, bob)
+}
+
+#[test]
+fn failed_decrypt_leaves_recv_chain_unchanged() {
+    let (mut alice, mut bob) = pair();
+    let msg = alice.encrypt(b"honest").unwrap();
+    let mut corrupt = msg.clone();
+    corrupt.ciphertext[0] ^= 0xFF;
+
+    assert_eq!(bob.recv_count, 0);
+    assert!(bob.skipped_keys.is_empty());
+    assert!(bob.decrypt(&corrupt).is_err());
+    assert_eq!(bob.recv_count, 0);
+    assert!(bob.skipped_keys.is_empty());
+    assert_eq!(bob.export_state().recv_count, 0);
+
+    assert_eq!(bob.decrypt(&msg).unwrap(), b"honest");
+    assert_eq!(bob.recv_count, 1);
+
+    // Replaying the delivered message must not move the chain either.
+    let before = bob.export_state();
+    assert!(matches!(
+        bob.decrypt(&msg),
+        Err(RatchetError::AlreadyReceived)
+    ));
+    assert_eq!(bob.recv_count, before.recv_count);
+    assert_eq!(bob.export_state().recv_count, before.recv_count);
+
+    let next = alice.encrypt(b"next").unwrap();
+    assert_eq!(bob.decrypt(&next).unwrap(), b"next");
+    assert_eq!(bob.recv_count, 2);
+}
+
+#[test]
+fn failed_ahead_message_does_not_store_skipped_keys() {
+    let (mut alice, mut bob) = pair();
+    let first = alice.encrypt(b"first").unwrap();
+    let second = alice.encrypt(b"second").unwrap();
+    let mut corrupt_second = second.clone();
+    corrupt_second.ciphertext[0] ^= 0xFF;
+
+    assert!(bob.decrypt(&corrupt_second).is_err());
+    assert_eq!(bob.recv_count, 0);
+    assert!(bob.skipped_keys.is_empty());
+    assert_eq!(bob.decrypt(&first).unwrap(), b"first");
+    assert_eq!(bob.decrypt(&second).unwrap(), b"second");
+}
+
+#[test]
+fn failed_skipped_key_decrypt_keeps_the_key() {
+    let (mut alice, mut bob) = pair();
+    let first = alice.encrypt(b"first").unwrap();
+    let second = alice.encrypt(b"second").unwrap();
+
+    assert_eq!(bob.decrypt(&second).unwrap(), b"second");
+    let skip_key = (first.header.dh_public, first.header.message_number);
+    assert!(bob.skipped_keys.contains_key(&skip_key));
+    let recv_after_skip = bob.recv_count;
+
+    let mut corrupt_first = first.clone();
+    corrupt_first.ciphertext[0] ^= 0xFF;
+    assert!(bob.decrypt(&corrupt_first).is_err());
+    assert!(bob.skipped_keys.contains_key(&skip_key));
+    assert_eq!(bob.recv_count, recv_after_skip);
+
+    assert_eq!(bob.decrypt(&first).unwrap(), b"first");
+    assert!(!bob.skipped_keys.contains_key(&skip_key));
+}
+
+#[test]
+fn failed_dh_ratchet_does_not_commit() {
+    let (mut alice, mut bob) = pair();
+    let opening = alice.encrypt(b"open").unwrap();
+    bob.decrypt(&opening).unwrap();
+
+    let reply = bob.encrypt(b"reply").unwrap();
+    let mut corrupt = reply.clone();
+    corrupt.ciphertext[0] ^= 0xFF;
+
+    let remote_before = alice.export_state().remote_dh_public;
+    let dh_before = *alice.public_key().as_bytes();
+    let recv_before = alice.recv_count;
+    let root_before = alice.root_key;
+
+    assert!(alice.decrypt(&corrupt).is_err());
+    assert_eq!(alice.recv_count, recv_before);
+    assert_eq!(alice.export_state().remote_dh_public, remote_before);
+    assert_eq!(*alice.public_key().as_bytes(), dh_before);
+    assert_eq!(alice.root_key, root_before);
+
+    assert_eq!(alice.decrypt(&reply).unwrap(), b"reply");
+    assert_ne!(alice.export_state().remote_dh_public, remote_before);
+}

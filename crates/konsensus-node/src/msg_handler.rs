@@ -689,7 +689,8 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
 /// Decrypts an incoming envelope and processes special message kinds (files, web content).
 ///
 /// Returns the plaintext string if decryption succeeded, or None if no session exists
-/// or decryption failed (triggers session re-negotiation).
+/// or decryption failed. One failure keeps the session. The session is removed and a
+/// prekey offer is sent only after the per-peer decrypt-failure budget is exceeded.
 #[allow(clippy::too_many_arguments)]
 async fn decrypt_and_process(
     envelope: &konsensus_core::UkmEnvelope,
@@ -722,24 +723,37 @@ async fn decrypt_and_process(
 
     let bytes = match session_mgr.decrypt(sender, &ratchet_msg).await {
         Ok(bytes) => bytes,
-        Err(e) => {
-            // Decryption failed — session is likely stale (peer re-established with different keys).
-            // Remove the broken session so the session handler can re-negotiate.
-            warn!(
+        Err(e) if !e.counts_toward_decrypt_budget() => {
+            debug!(
                 sender = %sender,
                 error = %e,
-                "decryption failed, removing stale session for re-negotiation"
+                "repeated message ignored; session unchanged"
             );
-            session_mgr.remove_session(sender).await;
-            // Send our PrekeyOffer to trigger re-negotiation
-            let bundle = session_mgr.prekey_bundle().await;
-            if let Ok(bundle_json) = serde_json::to_value(&bundle) {
-                let frame = Frame::PrekeyOffer {
-                    bundle: bundle_json,
-                };
-                if let Err(e) = transport.send_frame(sender, &frame).await {
-                    warn!(peer = %sender, error = %e, "failed to send PrekeyOffer for re-negotiation");
+            return None;
+        }
+        Err(e) => {
+            if session_mgr.record_decrypt_failure(sender).await {
+                warn!(
+                    sender = %sender,
+                    error = %e,
+                    "decryption failures exceeded the per-peer budget; removing session and re-offering prekeys"
+                );
+                session_mgr.remove_session(sender).await;
+                let bundle = session_mgr.prekey_bundle().await;
+                if let Ok(bundle_json) = serde_json::to_value(&bundle) {
+                    let frame = Frame::PrekeyOffer {
+                        bundle: bundle_json,
+                    };
+                    if let Err(e) = transport.send_frame(sender, &frame).await {
+                        warn!(peer = %sender, error = %e, "failed to send PrekeyOffer for re-negotiation");
+                    }
                 }
+            } else {
+                warn!(
+                    sender = %sender,
+                    error = %e,
+                    "decryption failed; keeping the existing session"
+                );
             }
             return None;
         }
