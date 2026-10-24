@@ -45,8 +45,8 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use konsensus_core::traits::lightning::{
-    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentStatus, WalletBalanceBreakdown,
-    WalletSync,
+    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentStatus,
+    WalletBalanceBreakdown, WalletSync,
 };
 
 /// Tunables for [`CircuitBreakerLightning`]. Conservative defaults; an operator
@@ -259,28 +259,51 @@ impl LightningProvider for CircuitBreakerLightning {
         self.inner.chain_sync_status()
     }
 
-    fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy { self.inner.routing_fee_policy() }
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, cap: u64) -> Result<PaymentDetails, LightningError> {
-        self.inner.keysend_with_fee_limit(dest, amount, memo, cap).await
+    fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy {
+        self.inner.routing_fee_policy()
+    }
+    async fn keysend_with_fee_limit(
+        &self,
+        dest: &str,
+        amount: u64,
+        memo: Option<&str>,
+        cap: u64,
+    ) -> Result<PaymentDetails, LightningError> {
+        self.inner
+            .keysend_with_fee_limit(dest, amount, memo, cap)
+            .await
     }
 
     fn liquidity_info(&self) -> konsensus_core::traits::liquidity::LiquidityInfo {
         self.inner.liquidity_info()
     }
-    async fn quote_liquidity(&self, owner: &str, gross: u64, cap: u64) -> Result<konsensus_core::traits::liquidity::LiquidityQuote, LightningError> {
+    async fn quote_liquidity(
+        &self,
+        owner: &str,
+        gross: u64,
+        cap: u64,
+    ) -> Result<konsensus_core::traits::liquidity::LiquidityQuote, LightningError> {
         self.inner.quote_liquidity(owner, gross, cap).await
     }
-    fn liquidity_quote(&self, owner: &str, id: &str) -> Result<konsensus_core::traits::liquidity::LiquidityQuote, LightningError> {
+    fn liquidity_quote(
+        &self,
+        owner: &str,
+        id: &str,
+    ) -> Result<konsensus_core::traits::liquidity::LiquidityQuote, LightningError> {
         self.inner.liquidity_quote(owner, id)
     }
     async fn accept_liquidity(&self, owner: &str, id: &str) -> Result<Invoice, LightningError> {
         self.inner.accept_liquidity(owner, id).await
     }
     async fn is_funding_payment(&self, hash: &str) -> Result<bool, LightningError> {
-        tokio::time::timeout(self.cfg.call_timeout, self.inner.is_funding_payment(hash)).await
+        tokio::time::timeout(self.cfg.call_timeout, self.inner.is_funding_payment(hash))
+            .await
             .map_err(|_| LightningError::Backend("funding-purpose lookup timeout".into()))?
     }
-    async fn liquidity_receipt(&self, hash: &str) -> Result<Option<konsensus_core::traits::liquidity::LiquidityReceipt>, LightningError> {
+    async fn liquidity_receipt(
+        &self,
+        hash: &str,
+    ) -> Result<Option<konsensus_core::traits::liquidity::LiquidityReceipt>, LightningError> {
         self.inner.liquidity_receipt(hash).await
     }
 
@@ -323,9 +346,11 @@ impl LightningProvider for CircuitBreakerLightning {
 
         // 4. The actual backend call, bounded by the timeout. Keep the slot until
         // its outcome is recorded, before waking the next queued caller.
-        let result =
-            tokio::time::timeout(self.cfg.call_timeout, self.inner.get_payment_status(payment_hash))
-                .await;
+        let result = tokio::time::timeout(
+            self.cfg.call_timeout,
+            self.inner.get_payment_status(payment_hash),
+        )
+        .await;
 
         match result {
             Err(_elapsed) => {
@@ -363,8 +388,14 @@ impl LightningProvider for CircuitBreakerLightning {
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
         self.inner.pay_invoice(bolt11).await
     }
-    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
-        self.inner.pay_invoice_with_fee_limit(bolt11, max_fee_msat).await
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        bolt11: &str,
+        max_fee_msat: u64,
+    ) -> Result<PaymentDetails, LightningError> {
+        self.inner
+            .pay_invoice_with_fee_limit(bolt11, max_fee_msat)
+            .await
     }
 
     async fn get_balance_msat(&self) -> Result<u64, LightningError> {
@@ -495,7 +526,11 @@ mod tests {
         ) -> Result<Invoice, LightningError> {
             Err(LightningError::Backend("n/a".into()))
         }
-        async fn pay_invoice_with_fee_limit(&self, bolt11: &str, cap: u64) -> Result<PaymentDetails, LightningError> {
+        async fn pay_invoice_with_fee_limit(
+            &self,
+            bolt11: &str,
+            cap: u64,
+        ) -> Result<PaymentDetails, LightningError> {
             assert_eq!(bolt11, "capped-test-invoice");
             let mut paid = settled_details();
             paid.fee_msat = Some(cap);
@@ -519,7 +554,10 @@ mod tests {
     async fn capped_payments_forward_the_exact_limit() {
         let inner = FakeProvider::new(Behavior::Settled);
         let wrapper = CircuitBreakerLightning::new(inner, fast_cfg());
-        let paid = wrapper.pay_invoice_with_fee_limit("capped-test-invoice", 123).await.unwrap();
+        let paid = wrapper
+            .pay_invoice_with_fee_limit("capped-test-invoice", 123)
+            .await
+            .unwrap();
         assert_eq!(paid.fee_msat, Some(123));
     }
 
@@ -541,7 +579,10 @@ mod tests {
         let cb = CircuitBreakerLightning::new(fake, fast_cfg());
         let start = Instant::now();
         let r = cb.get_payment_status("deadbeef").await;
-        assert!(r.is_err(), "a slow backend must fail closed, never hang/admit");
+        assert!(
+            r.is_err(),
+            "a slow backend must fail closed, never hang/admit"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "must time out fast, not wait for the slow backend"
@@ -800,7 +841,10 @@ mod tests {
     #[tokio::test]
     async fn concurrent_flood_stays_bounded_and_fails_closed() {
         let fake = FakeProvider::new(Behavior::SlowSettled(Duration::from_millis(200)));
-        let cb = Arc::new(CircuitBreakerLightning::new(Arc::clone(&fake) as Arc<_>, fast_cfg()));
+        let cb = Arc::new(CircuitBreakerLightning::new(
+            Arc::clone(&fake) as Arc<_>,
+            fast_cfg(),
+        ));
         let start = Instant::now();
         let mut handles = Vec::new();
         for i in 0..64 {

@@ -124,16 +124,39 @@ pub(crate) async fn whitelist_then_verify(
             konsensus_message::ReachabilityMode::PriceOpen => None,
         };
     let result = if commit_replay {
-        gate.verify(envelope, nonce_store, pricing, wl_arg, lightning, trust_discount, our_node_id).await.map(|()| false)
+        gate.verify(
+            envelope,
+            nonce_store,
+            pricing,
+            wl_arg,
+            lightning,
+            trust_discount,
+            our_node_id,
+        )
+        .await
+        .map(|()| false)
     } else {
-        gate.validate_received_paid_envelope(envelope, nonce_store, pricing, wl_arg, lightning, trust_discount, our_node_id).await
+        gate.validate_received_paid_envelope(
+            envelope,
+            nonce_store,
+            pricing,
+            wl_arg,
+            lightning,
+            trust_discount,
+            our_node_id,
+        )
+        .await
     };
     // Ordinary admission is observed only after the durable acceptance commit.
     // Return the same whitelist snapshot classification across that boundary.
     let first_contact = !whitelist.contains(&envelope.sender);
     match &result {
-        Ok(_) if commit_replay => { membrane.admitted(envelope, first_contact); }
-        Err(rejection) => { membrane.refused(envelope, rejection); }
+        Ok(_) if commit_replay => {
+            membrane.admitted(envelope, first_contact);
+        }
+        Err(rejection) => {
+            membrane.refused(envelope, rejection);
+        }
         _ => {}
     }
     result.map(|already_accepted| (first_contact, already_accepted))
@@ -201,9 +224,19 @@ async fn offer_prekey_after_promotion(
     };
     // Only on the exact connection this payment promoted, and only while it is
     // still privileged: a replacement that reconnected meanwhile is unpaid.
-    match transport.send_raw_frame_on(peer, promoted, konsensus_message::Standing::Privileged, &frame).await {
+    match transport
+        .send_raw_frame_on(
+            peer,
+            promoted,
+            konsensus_message::Standing::Privileged,
+            &frame,
+        )
+        .await
+    {
         Ok(()) => info!(peer = %peer, "sent PrekeyOffer to the payer just promoted (PSI-SPEED)"),
-        Err(e) => warn!(peer = %peer, error = %e, "failed to send eager PrekeyOffer after promotion"),
+        Err(e) => {
+            warn!(peer = %peer, error = %e, "failed to send eager PrekeyOffer after promotion")
+        }
     }
 }
 
@@ -1051,7 +1084,8 @@ async fn process_web_manifest(
     };
 
     let block_height = chain.get_block_height().await.unwrap_or(0);
-    let manifest = priced_manifest(cs, block_height, pricing.as_ref(), gate, trust_discount).await?;
+    let manifest =
+        priced_manifest(cs, block_height, pricing.as_ref(), gate, trust_discount).await?;
     info!(sender = %sender, pages = manifest.pages.len(), "served web manifest");
 
     if session_mgr.can_send(sender).await {
@@ -1100,8 +1134,14 @@ async fn process_page_request(
             .map(|d| d.as_secs())
             .unwrap_or(0);
         priced_card_response(
-            &page_req.request_id, front_door, identity, pricing.as_ref(), gate, now,
-        ).await
+            &page_req.request_id,
+            front_door,
+            identity,
+            pricing.as_ref(),
+            gate,
+            now,
+        )
+        .await
     } else if let Some(cs) = content_server {
         cs.handle_request(&page_req)
     } else {

@@ -693,8 +693,13 @@ impl RelayBindingStore for SqliteRelayStore {
         // rejects, the prune rolls back too and is re-applied on the next op, with
         // identical observable quota semantics (no test depends on a persisted
         // prune across a rejected hold). The gain is full atomicity.
-        let freed = prune_held_rows(&mut tx, recipient, deposit_received_at, from_i64(held_bytes))
-            .await?;
+        let freed = prune_held_rows(
+            &mut tx,
+            recipient,
+            deposit_received_at,
+            from_i64(held_bytes),
+        )
+        .await?;
         let held_after_prune = from_i64(held_bytes).saturating_sub(freed);
         // Total-quota gate.
         if held_after_prune.saturating_add(size) > quota_bytes {
@@ -901,7 +906,10 @@ mod tests {
         let store = InMemoryRelayStore::new();
         let r = node(1);
         assert_eq!(store.binding_count().await, 0);
-        store.register_binding(binding(r, 1000), 1024).await.unwrap();
+        store
+            .register_binding(binding(r, 1000), 1024)
+            .await
+            .unwrap();
         assert_eq!(store.binding_count().await, 1);
         assert_eq!(store.get_binding(&r).await.unwrap().recipient, r);
         // One binding per recipient.
@@ -919,8 +927,14 @@ mod tests {
     async fn register_binding_enforces_cap_atomically() {
         let store = InMemoryRelayStore::new();
         // Fill to a cap of 2 (no engine pre-check in the path — the store alone).
-        store.register_binding(binding(node(1), 1000), 2).await.unwrap();
-        store.register_binding(binding(node(2), 1000), 2).await.unwrap();
+        store
+            .register_binding(binding(node(1), 1000), 2)
+            .await
+            .unwrap();
+        store
+            .register_binding(binding(node(2), 1000), 2)
+            .await
+            .unwrap();
         // A third NEW recipient at the cap is refused by the store itself.
         assert_eq!(
             store.register_binding(binding(node(3), 1000), 2).await,
@@ -939,7 +953,10 @@ mod tests {
     async fn hold_assigns_monotonic_sequence_and_tracks_bytes() {
         let store = InMemoryRelayStore::new();
         let r = node(1);
-        store.register_binding(binding(r, 1000), 1024).await.unwrap();
+        store
+            .register_binding(binding(r, 1000), 1024)
+            .await
+            .unwrap();
 
         let s0 = store
             .hold_envelope(&r, mid(0), node(9), vec![0u8; 100], u64::MAX, 10, 110)
@@ -966,7 +983,9 @@ mod tests {
         let r = node(1);
         // No binding yet.
         assert_eq!(
-            store.hold_envelope(&r, mid(0), node(9), vec![0u8; 10], u64::MAX, 1, 11).await,
+            store
+                .hold_envelope(&r, mid(0), node(9), vec![0u8; 10], u64::MAX, 1, 11)
+                .await,
             Err(RelayStoreError::BindingNotFound)
         );
         store.register_binding(binding(r, 250), 1024).await.unwrap();
@@ -976,7 +995,9 @@ mod tests {
             .unwrap();
         // 200 + 100 > 250 quota.
         assert_eq!(
-            store.hold_envelope(&r, mid(2), node(9), vec![0u8; 100], u64::MAX, 2, 102).await,
+            store
+                .hold_envelope(&r, mid(2), node(9), vec![0u8; 100], u64::MAX, 2, 102)
+                .await,
             Err(RelayStoreError::QuotaExceeded)
         );
     }
@@ -989,34 +1010,54 @@ mod tests {
     async fn hold_enforces_per_depositor_sub_quota() {
         let store = InMemoryRelayStore::new();
         let r = node(1);
-        store.register_binding(binding(r, 1000), 1024).await.unwrap();
+        store
+            .register_binding(binding(r, 1000), 1024)
+            .await
+            .unwrap();
         let a = node(5);
         let b = node(6);
         let cap = 300u64; // per-depositor sub-quota, well under the 1000 binding quota
-        // A fills its 300-byte share.
-        store.hold_envelope(&r, mid(0), a, vec![0u8; 200], cap, 1, 101).await.unwrap();
-        store.hold_envelope(&r, mid(1), a, vec![0u8; 100], cap, 1, 101).await.unwrap();
+                          // A fills its 300-byte share.
+        store
+            .hold_envelope(&r, mid(0), a, vec![0u8; 200], cap, 1, 101)
+            .await
+            .unwrap();
+        store
+            .hold_envelope(&r, mid(1), a, vec![0u8; 100], cap, 1, 101)
+            .await
+            .unwrap();
         // A's next byte exceeds ITS share (300 + 1 > 300), though the binding has
         // 700 free — per-depositor, not total-quota, rejection.
         assert_eq!(
-            store.hold_envelope(&r, mid(2), a, vec![0u8; 1], cap, 1, 101).await,
+            store
+                .hold_envelope(&r, mid(2), a, vec![0u8; 1], cap, 1, 101)
+                .await,
             Err(RelayStoreError::PerDepositorQuotaExceeded)
         );
         // A different depositor B still has its own full 300-byte share.
-        store.hold_envelope(&r, mid(3), b, vec![0u8; 200], cap, 1, 101).await.unwrap();
+        store
+            .hold_envelope(&r, mid(3), b, vec![0u8; 200], cap, 1, 101)
+            .await
+            .unwrap();
         // Total held = 300 (A) + 200 (B) = 500, within the 1000 binding quota.
         assert_eq!(store.get_binding(&r).await.unwrap().held_bytes, 500);
         // After A acks one item, its share frees and a new A deposit fits again
         // (held Vec is the single source of truth — no counter to desync).
         store.ack_delete(&r, &[mid(0)]).await.unwrap();
-        store.hold_envelope(&r, mid(4), a, vec![0u8; 200], cap, 1, 101).await.unwrap();
+        store
+            .hold_envelope(&r, mid(4), a, vec![0u8; 200], cap, 1, 101)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn list_held_respects_max() {
         let store = InMemoryRelayStore::new();
         let r = node(1);
-        store.register_binding(binding(r, 10_000), 1024).await.unwrap();
+        store
+            .register_binding(binding(r, 10_000), 1024)
+            .await
+            .unwrap();
         for i in 0..5u8 {
             store
                 .hold_envelope(&r, mid(i), node(9), vec![0u8; 10], u64::MAX, 1, 101)
@@ -1057,7 +1098,10 @@ mod tests {
     async fn ack_delete_frees_bytes_and_is_idempotent() {
         let store = InMemoryRelayStore::new();
         let r = node(1);
-        store.register_binding(binding(r, 1000), 1024).await.unwrap();
+        store
+            .register_binding(binding(r, 1000), 1024)
+            .await
+            .unwrap();
         store
             .hold_envelope(&r, mid(0), node(9), vec![0u8; 100], u64::MAX, 1, 101)
             .await
@@ -1091,7 +1135,10 @@ mod tests {
     async fn remove_binding_revokes_and_frees_slot() {
         let store = InMemoryRelayStore::new();
         let r = node(1);
-        store.register_binding(binding(r, 1000), 1024).await.unwrap();
+        store
+            .register_binding(binding(r, 1000), 1024)
+            .await
+            .unwrap();
         store
             .hold_envelope(&r, mid(0), node(9), vec![0u8; 100], u64::MAX, 1, 101)
             .await
@@ -1228,7 +1275,10 @@ mod sqlite_tests {
         {
             let pool = file_pool(&path, true).await;
             let store = SqliteRelayStore::new(pool.clone());
-            store.register_binding(binding(r, 10_000), 16).await.unwrap();
+            store
+                .register_binding(binding(r, 10_000), 16)
+                .await
+                .unwrap();
             for (i, body) in bodies.iter().enumerate() {
                 store
                     .hold_envelope(&r, mid(i as u8), node(9), body.clone(), u64::MAX, 1, 10_000)
@@ -1319,8 +1369,14 @@ mod sqlite_tests {
     #[tokio::test]
     async fn atomic_binding_cap() {
         let store = mem_store().await;
-        store.register_binding(binding(node(1), 1000), 2).await.unwrap();
-        store.register_binding(binding(node(2), 1000), 2).await.unwrap();
+        store
+            .register_binding(binding(node(1), 1000), 2)
+            .await
+            .unwrap();
+        store
+            .register_binding(binding(node(2), 1000), 2)
+            .await
+            .unwrap();
         // A third NEW recipient at the cap is refused by the store itself.
         assert_eq!(
             store.register_binding(binding(node(3), 1000), 2).await,

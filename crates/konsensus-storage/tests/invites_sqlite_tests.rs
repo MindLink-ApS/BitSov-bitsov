@@ -81,9 +81,7 @@ async fn invites_sqlite_find_rejects_invalid_blob_lengths() {
 
 #[tokio::test]
 async fn accepted_invite_sqlite_round_trip_add_and_find() {
-    let storage = SqliteStorage::in_memory()
-        .await
-        .expect("sqlite in-memory");
+    let storage = SqliteStorage::in_memory().await.expect("sqlite in-memory");
 
     let record = AcceptedInviteRecord {
         nonce: [0x11; 16],

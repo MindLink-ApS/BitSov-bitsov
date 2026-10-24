@@ -587,9 +587,7 @@ async fn peer_update_clear_label() {
         .uri(format!("/api/v1/peers/{}", peer_id.to_hex()))
         .header("authorization", &auth)
         .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({ "label": "" }).to_string(),
-        ))
+        .body(Body::from(serde_json::json!({ "label": "" }).to_string()))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1230,9 +1228,7 @@ async fn peer_update_requires_auth() {
         .method("PUT")
         .uri(format!("/api/v1/peers/{}", "aa".repeat(32)))
         .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({"label": "test"}).to_string(),
-        ))
+        .body(Body::from(serde_json::json!({"label": "test"}).to_string()))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -1285,7 +1281,8 @@ async fn create_payment_proof_offline_peer_returns_error() {
     let state = test_state();
     let peer_id = NodeId::from_hex(&"cc".repeat(32)).unwrap();
 
-    let result = konsensus_api::handlers::messages::create_payment_proof(&state, 25_000, &peer_id).await;
+    let result =
+        konsensus_api::handlers::messages::create_payment_proof(&state, 25_000, &peer_id).await;
     assert!(result.is_err(), "offline peer should fail");
     let err = result.unwrap_err();
     let err_str = err.to_string();
@@ -1423,8 +1420,15 @@ async fn import_peers_rejects_oversized_label() {
 
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["imported"], 0, "peer with oversized label should not be imported");
-    assert_eq!(json["errors"].as_array().unwrap().len(), 1, "should have 1 error");
+    assert_eq!(
+        json["imported"], 0,
+        "peer with oversized label should not be imported"
+    );
+    assert_eq!(
+        json["errors"].as_array().unwrap().len(),
+        1,
+        "should have 1 error"
+    );
 }
 
 #[tokio::test]
@@ -1466,7 +1470,6 @@ async fn peer_import_too_many_rejected() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-
 // ─── Legacy Invite routes removed (410 Gone) ───────────────────────
 
 #[tokio::test]
@@ -1481,14 +1484,17 @@ async fn legacy_invite_issue_is_gone() {
         .header("content-type", "application/json")
         .header("authorization", &auth)
         .body(Body::from(
-            serde_json::json!({ "addr": "10.0.0.1:9735", "label": "Alice", "expiry_secs": 3600 }).to_string(),
+            serde_json::json!({ "addr": "10.0.0.1:9735", "label": "Alice", "expiry_secs": 3600 })
+                .to_string(),
         ))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::GONE);
     assert_eq!(
-        resp.headers().get("deprecation").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("deprecation")
+            .and_then(|v| v.to_str().ok()),
         Some("true")
     );
     assert!(
@@ -1512,7 +1518,8 @@ async fn legacy_invite_redeem_is_gone() {
         "",
     )
     .unwrap();
-    let token = konsensus_core::InviteToken::generate(&other, "10.0.0.2:9735", Some("Bob"), 0).unwrap();
+    let token =
+        konsensus_core::InviteToken::generate(&other, "10.0.0.2:9735", Some("Bob"), 0).unwrap();
     let app = build_router(Arc::clone(&state));
 
     let req = Request::builder()
@@ -1520,19 +1527,25 @@ async fn legacy_invite_redeem_is_gone() {
         .uri("/api/v1/invite/redeem")
         .header("content-type", "application/json")
         .header("authorization", &auth)
-        .body(Body::from(serde_json::json!({ "invite": token }).to_string()))
+        .body(Body::from(
+            serde_json::json!({ "invite": token }).to_string(),
+        ))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::GONE);
-    assert!(
-        resp.headers()
-            .get("link")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains("/api/v1/invites/accept"))
-    );
+    assert!(resp
+        .headers()
+        .get("link")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("/api/v1/invites/accept")));
     // Peer must not have been added.
-    assert!(state.peer_registry.read().await.get(other.node_id()).is_none());
+    assert!(state
+        .peer_registry
+        .read()
+        .await
+        .get(other.node_id())
+        .is_none());
 }
 
 /// A legacy base58 `InviteToken` must still NOT parse on the canonical accept route.
@@ -1540,9 +1553,11 @@ async fn legacy_invite_redeem_is_gone() {
 async fn canonical_accept_rejects_legacy_invite_token() {
     let state = test_state();
     let auth = auth_header(&state);
-    let other =
-        konsensus_core::NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
-            .unwrap();
+    let other = konsensus_core::NodeIdentity::from_mnemonic(
+        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+        "",
+    )
+    .unwrap();
     let token =
         konsensus_core::InviteToken::generate(&other, "10.0.0.2:9735", Some("Bob"), 0).unwrap();
     let app = build_router(Arc::clone(&state));
@@ -1722,8 +1737,11 @@ async fn gossip_status_returns_metrics() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap(),
-    ).unwrap();
+        &axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(body["dedup_entries"], 0);
     assert_eq!(body["tracked_senders"], 0);
     assert_eq!(body["max_per_sender_per_hour"], 60);
@@ -1965,11 +1983,9 @@ async fn peers_add_self_rejected() {
 async fn peers_add_overlong_label_rejected() {
     let state = test_state();
     let auth = auth_header(&state);
-    let other = NodeIdentity::from_mnemonic(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        "",
-    )
-    .unwrap();
+    let other =
+        NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+            .unwrap();
     let app = build_router(Arc::clone(&state));
 
     let req = Request::builder()
@@ -1996,11 +2012,9 @@ async fn peers_add_and_verify_fields() {
     let state = test_state();
     let auth = auth_header(&state);
 
-    let other = NodeIdentity::from_mnemonic(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        "",
-    )
-    .unwrap();
+    let other =
+        NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+            .unwrap();
     let peer_id = other.node_id().to_hex();
 
     let app = build_router(Arc::clone(&state));
@@ -2036,11 +2050,9 @@ async fn peers_remove_and_verify_empty() {
     let state = test_state();
     let auth = auth_header(&state);
 
-    let other = NodeIdentity::from_mnemonic(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        "",
-    )
-    .unwrap();
+    let other =
+        NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+            .unwrap();
     let peer_id = other.node_id().to_hex();
 
     // Add
@@ -2107,11 +2119,9 @@ async fn peers_connect_known_peer_succeeds() {
     let state = test_state();
     let auth = auth_header(&state);
 
-    let other = NodeIdentity::from_mnemonic(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        "",
-    )
-    .unwrap();
+    let other =
+        NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+            .unwrap();
     let peer_id = other.node_id().to_hex();
 
     // Add peer
@@ -2148,9 +2158,12 @@ async fn discover_peers_requires_explicit_quote_and_payment() {
     let state = test_state();
     let auth = auth_header(&state);
     let app = build_router(state);
-    let req = Request::builder().method("POST")
+    let req = Request::builder()
+        .method("POST")
         .uri(format!("/api/v1/peers/{}/discover", "ee".repeat(32)))
-        .header("Authorization", &auth).body(Body::empty()).unwrap();
+        .header("Authorization", &auth)
+        .body(Body::empty())
+        .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
@@ -2161,7 +2174,7 @@ async fn discover_peers_requires_explicit_quote_and_payment() {
 #[tokio::test]
 async fn contact_with_auto_connect_false_redials_and_removal_stops_it() {
     use konsensus_core::traits::transport::MessageTransport;
-    use konsensus_message::{NoiseTransport, TransportConfig, ReachabilityMode};
+    use konsensus_message::{NoiseTransport, ReachabilityMode, TransportConfig};
     use std::time::Duration;
     let original = test_state();
     let mut state = (*original).clone();
@@ -2178,13 +2191,24 @@ async fn contact_with_auto_connect_false_redials_and_removal_stops_it() {
     state.transport = transport.clone();
     let state = Arc::new(state);
     let auth = auth_header(&state);
-    let response = build_router(state.clone()).oneshot(Request::builder()
-        .method("POST").uri("/api/v1/peers")
-        .header("authorization", &auth).header("content-type", "application/json")
-        .body(Body::from(serde_json::json!({
-            "node_id": peer.to_hex(), "addr": remote.listen_addr().unwrap().to_string(),
-            "auto_connect": false
-        }).to_string())).unwrap()).await.unwrap();
+    let response = build_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/peers")
+                .header("authorization", &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "node_id": peer.to_hex(), "addr": remote.listen_addr().unwrap().to_string(),
+                        "auto_connect": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let wait = |previous| {
         let transport = transport.clone();
@@ -2192,19 +2216,31 @@ async fn contact_with_auto_connect_false_redials_and_removal_stops_it() {
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     if let Some(now) = transport.connected_since(&peer).await {
-                        if Some(now) != previous { return now; }
+                        if Some(now) != previous {
+                            return now;
+                        }
                     }
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-            }).await.expect("owner contact must connect/reconnect")
+            })
+            .await
+            .expect("owner contact must connect/reconnect")
         }
     };
     let first = wait(None).await;
     transport.disconnect(&peer).await.unwrap();
     wait(Some(first)).await;
-    let response = build_router(state.clone()).oneshot(Request::builder()
-        .method("DELETE").uri(format!("/api/v1/peers/{}", peer.to_hex()))
-        .header("authorization", &auth).body(Body::empty()).unwrap()).await.unwrap();
+    let response = build_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/peers/{}", peer.to_hex()))
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(!transport.is_connected(&peer).await);

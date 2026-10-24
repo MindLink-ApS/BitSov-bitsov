@@ -222,14 +222,15 @@ impl LnbitsProvider {
 
         // Try to create and self-pay a 1-sat invoice.
         // VoidWallet will fail the payment with "VoidWallet cannot pay invoices".
-        let invoice = match LightningProvider::create_invoice(self, 1000, "capability-probe", 60).await {
-            Ok(inv) => inv,
-            Err(e) => {
-                warn!(error = %e, "cannot create invoices — marking payment-incapable");
-                self.payment_capable.store(false, Ordering::Relaxed);
-                return;
-            }
-        };
+        let invoice =
+            match LightningProvider::create_invoice(self, 1000, "capability-probe", 60).await {
+                Ok(inv) => inv,
+                Err(e) => {
+                    warn!(error = %e, "cannot create invoices — marking payment-incapable");
+                    self.payment_capable.store(false, Ordering::Relaxed);
+                    return;
+                }
+            };
 
         match LightningProvider::pay_invoice(self, &invoice.bolt11).await {
             Ok(_) => {
@@ -256,11 +257,7 @@ impl LnbitsProvider {
     }
 
     /// Convert an LNbits API error response into a LightningError.
-    async fn handle_error(
-        &self,
-        response: reqwest::Response,
-        context: &str,
-    ) -> LightningError {
+    async fn handle_error(&self, response: reqwest::Response, context: &str) -> LightningError {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         warn!(status = %status, body = %body, "{context} failed");
@@ -449,21 +446,33 @@ impl LightningProvider for LnbitsProvider {
                 let pre = d.preimage.clone();
                 // LNbits amount is in msat (negative for outgoing)
                 let amt = d.amount.map(|a| a.unsigned_abs()).unwrap_or_else(|| {
-                    warn!(payment_hash, "LNbits payment details missing amount field, defaulting to 0");
+                    warn!(
+                        payment_hash,
+                        "LNbits payment details missing amount field, defaulting to 0"
+                    );
                     0
                 });
                 let raw_time = d.time.unwrap_or_else(|| {
-                    warn!(payment_hash, "LNbits payment details missing time field, defaulting to 0");
+                    warn!(
+                        payment_hash,
+                        "LNbits payment details missing time field, defaulting to 0"
+                    );
                     0
                 });
                 let ts = u64::try_from(raw_time).unwrap_or_else(|_| {
-                    warn!(payment_hash, raw_time, "LNbits payment has negative timestamp, clamping to 0");
+                    warn!(
+                        payment_hash,
+                        raw_time, "LNbits payment has negative timestamp, clamping to 0"
+                    );
                     0
                 });
                 (pre, amt, ts)
             }
             None => {
-                warn!(payment_hash, "LNbits payment response missing details block");
+                warn!(
+                    payment_hash,
+                    "LNbits payment response missing details block"
+                );
                 (None, 0, 0)
             }
         };
@@ -528,7 +537,10 @@ impl LightningProvider for LnbitsProvider {
 
         // Negative balance (debt state) should not silently become a huge positive number
         if balance < 0 {
-            warn!(balance, "LNbits reported negative balance (debt state), clamping to 0");
+            warn!(
+                balance,
+                "LNbits reported negative balance (debt state), clamping to 0"
+            );
         }
         Ok(u64::try_from(balance).unwrap_or(0))
     }

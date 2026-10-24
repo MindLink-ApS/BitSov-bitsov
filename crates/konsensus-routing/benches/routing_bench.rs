@@ -103,7 +103,9 @@ fn bench_record_success_table(c: &mut Criterion) {
         let peer = node_id(1);
         b.iter(|| {
             rt.block_on(async {
-                table.record_success(black_box(&peer), black_box(42.0), black_box(500)).await;
+                table
+                    .record_success(black_box(&peer), black_box(42.0), black_box(500))
+                    .await;
             });
         });
     });

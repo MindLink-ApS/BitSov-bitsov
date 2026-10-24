@@ -8,7 +8,7 @@
 //! File transfer uses `KIND_FILE_REF` (200) UKM envelopes. The plaintext
 //! payload is a JSON `FilePayload` containing metadata + base64 file data.
 
-use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::auth::scoped::{Admin, Read, ScopedAuth};
 use crate::metered::MeteredSpend;
 use crate::spend_budget::Charge;
 use std::sync::Arc;
@@ -27,9 +27,9 @@ use konsensus_storage::FileRecord;
 
 use crate::audit::events;
 use crate::error::ApiError;
+use crate::handlers::list_diagnostics::ListDiagnostics;
 use crate::handlers::messages::create_metered_payment_proof;
 use crate::state::AppState;
-use crate::handlers::list_diagnostics::ListDiagnostics;
 
 /// Maximum file size: 4 MiB (fits within 16 MiB wire frame with overhead).
 const MAX_FILE_SIZE: usize = crate::file_staging::MAX_FILE_BYTES;
@@ -57,7 +57,8 @@ impl FilePayload {
     /// Wrong-type numeric fields and unknown keys keep the shared token ceiling.
     pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, konsensus_core::wire_json::DecodeError> {
         konsensus_core::wire_json::from_slice_with_large_strings(
-            bytes, &[("data_b64", MAX_FILE_SIZE.div_ceil(3) * 4)],
+            bytes,
+            &[("data_b64", MAX_FILE_SIZE.div_ceil(3) * 4)],
         )
     }
 }
@@ -225,7 +226,9 @@ async fn upload_file(
     // Staging costs no Lightning principal. AuthUser revalidates the paired
     // grant on every request; do not use the paid-route Spend extractor here.
     if !auth.has(crate::auth::Scope::Admin) && !auth.has(crate::auth::Scope::Spend) {
-        return Err(ApiError::Forbidden("file upload requires spend or admin".into()));
+        return Err(ApiError::Forbidden(
+            "file upload requires spend or admin".into(),
+        ));
     }
     // Validate filename and MIME type
     validate_filename(&req.filename)?;
@@ -286,7 +289,10 @@ async fn upload_file(
 
     // Revalidate the current paired spend grant after body decoding; the
     // temporary blob never enters the permanent file table.
-    state.file_staging.lock().unwrap_or_else(|e| e.into_inner())
+    state
+        .file_staging
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(&state, &auth, file)?;
 
     state.audit_log.record(
@@ -329,8 +335,14 @@ async fn load_file(
 }
 
 /// Stored and staged timestamps can have different fractional precision.
-fn compare_file_positions(a: &konsensus_storage::ListCursor<String>, b: &konsensus_storage::ListCursor<String>) -> std::cmp::Ordering {
-    match (chrono::DateTime::parse_from_rfc3339(&a.timestamp), chrono::DateTime::parse_from_rfc3339(&b.timestamp)) {
+fn compare_file_positions(
+    a: &konsensus_storage::ListCursor<String>,
+    b: &konsensus_storage::ListCursor<String>,
+) -> std::cmp::Ordering {
+    match (
+        chrono::DateTime::parse_from_rfc3339(&a.timestamp),
+        chrono::DateTime::parse_from_rfc3339(&b.timestamp),
+    ) {
         (Ok(a_time), Ok(b_time)) => (a_time, &a.id).cmp(&(b_time, &b.id)),
         _ => (&a.timestamp, &a.id).cmp(&(&b.timestamp, &b.id)),
     }
@@ -366,9 +378,12 @@ async fn list_files(
     if params.before_id.is_some() && params.before.is_none() {
         return Err(ApiError::BadRequest("before_id requires before".into()));
     }
-    let cursor = params.before.map(|timestamp| konsensus_storage::ListCursor {
-        timestamp, id: params.before_id.unwrap_or_default(),
-    });
+    let cursor = params
+        .before
+        .map(|timestamp| konsensus_storage::ListCursor {
+            timestamp,
+            id: params.before_id.unwrap_or_default(),
+        });
     let rows = state
         .storage
         .file_page_with_diagnostics(params.limit.min(MAX_FILE_LIST_LIMIT), cursor.as_ref())
@@ -376,18 +391,37 @@ async fn list_files(
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 
     let mut diagnostics = ListDiagnostics::from(&rows);
-    let positions: std::collections::HashMap<_, _> = rows.readable_cursors.into_iter()
-        .map(|at| (at.id.clone(), at)).collect();
-    let position = |file: &konsensus_storage::FileMetadata| positions.get(&file.id).cloned()
-        .unwrap_or_else(|| konsensus_storage::ListCursor { timestamp: file.created_at.clone(), id: file.id.clone() });
+    let positions: std::collections::HashMap<_, _> = rows
+        .readable_cursors
+        .into_iter()
+        .map(|at| (at.id.clone(), at))
+        .collect();
+    let position = |file: &konsensus_storage::FileMetadata| {
+        positions
+            .get(&file.id)
+            .cloned()
+            .unwrap_or_else(|| konsensus_storage::ListCursor {
+                timestamp: file.created_at.clone(),
+                id: file.id.clone(),
+            })
+    };
     let mut files = rows.items;
-    let staged = state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).list(&state, &auth);
+    let staged = state
+        .file_staging
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .list(&state, &auth);
     // The next request excludes the raw boundary. Include staged files at or
     // above it now, and defer older uploads to the source window containing them.
     files.extend(staged.into_iter().filter(|file| {
         let at = position(file);
-        cursor.as_ref().is_none_or(|cursor| compare_file_positions(&at, cursor).is_lt())
-            && diagnostics.continuation.as_ref().is_none_or(|raw| !compare_file_positions(&at, raw).is_lt())
+        cursor
+            .as_ref()
+            .is_none_or(|cursor| compare_file_positions(&at, cursor).is_lt())
+            && diagnostics
+                .continuation
+                .as_ref()
+                .is_none_or(|raw| !compare_file_positions(&at, raw).is_lt())
     }));
     files.sort_by(|a, b| compare_file_positions(&position(b), &position(a)));
     let limit = params.limit.min(MAX_FILE_LIST_LIMIT) as usize;
@@ -397,12 +431,19 @@ async fn list_files(
     if limit > 0 && files.len() == limit {
         if let Some(last) = files.last() {
             let at = position(last);
-            if diagnostics.next_before.as_ref().is_none_or(|raw| compare_file_positions(&at, raw).is_gt()) {
+            if diagnostics
+                .next_before
+                .as_ref()
+                .is_none_or(|raw| compare_file_positions(&at, raw).is_gt())
+            {
                 diagnostics.next_before = Some(at);
             }
         }
     }
-    Ok((diagnostics, Json(files.into_iter().map(FileResponse::from).collect())))
+    Ok((
+        diagnostics,
+        Json(files.into_iter().map(FileResponse::from).collect()),
+    ))
 }
 
 /// `DELETE /api/v1/files/:id` — delete a file.
@@ -411,9 +452,19 @@ async fn delete_file(
     State(state): State<Arc<AppState>>,
     Path(file_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let staged = state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).remove(&file_id);
-    let deleted = if staged { true } else {
-        state.storage.delete_file(&file_id).await.map_err(|e| ApiError::Storage(e.to_string()))?
+    let staged = state
+        .file_staging
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&file_id);
+    let deleted = if staged {
+        true
+    } else {
+        state
+            .storage
+            .delete_file(&file_id)
+            .await
+            .map_err(|e| ApiError::Storage(e.to_string()))?
     };
 
     if deleted {
@@ -460,15 +511,28 @@ async fn send_file(
 ) -> Result<Json<SendFileResponse>, ApiError> {
     // Refuse before pricing, grant debits, staged-file claims, or ratchet changes.
     crate::error::require_money_ready(&state).await?;
-    let deadline = state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).deadline(&file_id);
+    let deadline = state
+        .file_staging
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .deadline(&file_id);
     // Keep authorized ceilings outside the cancelled future, including any
     // separately approved re-admission recorded before its wallet dispatch.
     let ceiling = std::sync::Mutex::new(None);
     // Files are not chat: a confirmed cap refuses reconnect re-admission before
     // any quote (Some(0)), matching pre-#111 fail-closed behaviour.
     let readmission = super::messages::Readmission::for_cap(req.max_total_msat.map(|_| 0));
-    let result = tokio::time::timeout_at(deadline, send_file_inner(auth, state, file_id, req, &ceiling, &readmission)).await
-        .unwrap_or_else(|_| Err(ApiError::PaymentUnresolved("file send deadline exceeded; payment may have dispatched; do not retry automatically".into())));
+    let result = tokio::time::timeout_at(
+        deadline,
+        send_file_inner(auth, state, file_id, req, &ceiling, &readmission),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(ApiError::PaymentUnresolved(
+            "file send deadline exceeded; payment may have dispatched; do not retry automatically"
+                .into(),
+        ))
+    });
     let approved = *ceiling.lock().unwrap_or_else(|e| e.into_inner());
     result.map_err(|error| match approved {
         Some(fee) => error.with_routing_fee(fee.saturating_add(readmission.fee_ceiling_msat())),
@@ -477,8 +541,12 @@ async fn send_file(
 }
 
 async fn send_file_inner(
-    auth: MeteredSpend, state: Arc<AppState>, file_id: String, req: SendFileRequest,
-    ceiling: &std::sync::Mutex<Option<u64>>, readmission: &super::messages::Readmission,
+    auth: MeteredSpend,
+    state: Arc<AppState>,
+    file_id: String,
+    req: SendFileRequest,
+    ceiling: &std::sync::Mutex<Option<u64>>,
+    readmission: &super::messages::Readmission,
 ) -> Result<Json<SendFileResponse>, ApiError> {
     // Parse recipient
     let peer_id = NodeId::from_hex(&req.recipient)
@@ -492,8 +560,14 @@ async fn send_file_inner(
         .await
         .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
 
-    let all_in = super::messages::caps::check_payment(&state, super::messages::caps::payable(price_msat), req.max_routing_fee_msat, req.max_total_msat)?;
-    *ceiling.lock().unwrap_or_else(|e| e.into_inner()) = Some(all_in - super::messages::caps::payable(price_msat));
+    let all_in = super::messages::caps::check_payment(
+        &state,
+        super::messages::caps::payable(price_msat),
+        req.max_routing_fee_msat,
+        req.max_total_msat,
+    )?;
+    *ceiling.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(all_in - super::messages::caps::payable(price_msat));
 
     // Do not retain bytes across pricing awaits: deletion or expiry could
     // otherwise release their quota while this future still owns the blob.
@@ -512,21 +586,30 @@ async fn send_file_inner(
 
     // Reject budget limits before advancing the ratchet or requesting an invoice.
     let peer_key = peer_id.to_hex();
-    let debit = auth.debit(
-        &state,
-        vec![Charge {
-            recipient: peer_key.clone(),
-            amount_msat: all_in,
-        }],
-    ).map_err(|e| e.with_routing_fee(all_in - super::messages::caps::payable(price_msat)))?.with_fee_limit(req.max_routing_fee_msat);
+    let debit = auth
+        .debit(
+            &state,
+            vec![Charge {
+                recipient: peer_key.clone(),
+                amount_msat: all_in,
+            }],
+        )
+        .map_err(|e| e.with_routing_fee(all_in - super::messages::caps::payable(price_msat)))?
+        .with_fee_limit(req.max_routing_fee_msat);
 
     // Reserve this staged blob through every await. Cap refusals leave it
     // available; an attempted send consumes it even on error/cancellation.
     let _staged_send = if file_id.starts_with("stage-") {
-        Some(crate::file_staging::FileStaging::claim(&state, &auth, &file_id)
-            .and_then(|file| file.ok_or_else(|| ApiError::NotFound("staged file expired".into())))
-            .inspect_err(|_| debit.released(&peer_key))?)
-    } else { None };
+        Some(
+            crate::file_staging::FileStaging::claim(&state, &auth, &file_id)
+                .and_then(|file| {
+                    file.ok_or_else(|| ApiError::NotFound("staged file expired".into()))
+                })
+                .inspect_err(|_| debit.released(&peer_key))?,
+        )
+    } else {
+        None
+    };
 
     // E2EE encrypt via Double Ratchet
     let ratchet_msg = state
@@ -543,23 +626,51 @@ async fn send_file_inner(
 
     // Create real payment proof — requests invoice from recipient (Principle 2).
     let mut admission = super::messages::FirstContactCharge::default();
-    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit, readmission, Some(KIND_FILE_REF), &mut admission).await.map_err(|error| admission.error(error));
-    if matches!(&paid, Err(ApiError::PaymentUnresolved(_))) && admission.readmission_blocks_message {
-        debit.settled(&peer_key, admission.settled_msat.saturating_sub(admission.readmission_msat));
+    let paid = create_metered_payment_proof(
+        &state,
+        price_msat,
+        &peer_id,
+        &debit,
+        readmission,
+        Some(KIND_FILE_REF),
+        &mut admission,
+    )
+    .await
+    .map_err(|error| admission.error(error));
+    if matches!(&paid, Err(ApiError::PaymentUnresolved(_))) && admission.readmission_blocks_message
+    {
+        debit.settled(
+            &peer_key,
+            admission
+                .settled_msat
+                .saturating_sub(admission.readmission_msat),
+        );
     } else if let Err(ApiError::PaymentProofUnavailable { amount_msat, .. }) = &paid {
-        debit.settled(&peer_key, amount_msat.saturating_sub(admission.readmission_msat));
+        debit.settled(
+            &peer_key,
+            amount_msat.saturating_sub(admission.readmission_msat),
+        );
     } else {
         debit.resolve_proof(&peer_key, &paid);
     }
-    let (payment_hash, preimage, amount_msat) = paid.map_err(|e| e.with_routing_fee(debit.fee_limit(&state, super::messages::caps::payable(price_msat)).saturating_add(readmission.fee_ceiling_msat())))?;
-    let proof =
-        konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
+    let (payment_hash, preimage, amount_msat) = paid.map_err(|e| {
+        e.with_routing_fee(
+            debit
+                .fee_limit(&state, super::messages::caps::payable(price_msat))
+                .saturating_add(readmission.fee_ceiling_msat()),
+        )
+    })?;
+    let proof = konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
     let amount_msat = amount_msat.saturating_add(admission.settled_msat);
 
     // Build envelope
     let sender = *state.identity.node_id();
     let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
-        KIND_FILE_REF, sender, recipient, ciphertext, proof,
+        KIND_FILE_REF,
+        sender,
+        recipient,
+        ciphertext,
+        proof,
     )
     .build();
 
@@ -568,27 +679,38 @@ async fn send_file_inner(
     envelope.signature = konsensus_core::Signature::from_ed25519(&sig);
 
     // Store message
-    state
-        .storage
-        .store_message(&envelope)
-        .await
-        .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("file payment settled but storing message failed: {e}") })?;
+    state.storage.store_message(&envelope).await.map_err(|e| {
+        ApiError::PaymentProofUnavailable {
+            amount_msat,
+            reason: format!("file payment settled but storing message failed: {e}"),
+        }
+    })?;
 
     // Update file record with message_id (best effort)
     // We don't have an update_file method, but the association is recorded
     // in the audit log below.
 
-    state.storage.prepare_delivery(&envelope.id, &peer_id).await.map_err(|e| ApiError::PaymentProofUnavailable {
-        amount_msat,
-        reason: format!("file payment settled; saved envelope {} requires delivery reconciliation: {e}", envelope.id.to_hex()),
-    })?;
+    state
+        .storage
+        .prepare_delivery(&envelope.id, &peer_id)
+        .await
+        .map_err(|e| ApiError::PaymentProofUnavailable {
+            amount_msat,
+            reason: format!(
+                "file payment settled; saved envelope {} requires delivery reconciliation: {e}",
+                envelope.id.to_hex()
+            ),
+        })?;
     // Deliver
     let delivered = if state.transport.is_connected(&peer_id).await {
         state
             .transport
             .send(&peer_id, &envelope)
             .await
-            .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("file payment settled but delivery failed: {e}") })?;
+            .map_err(|e| ApiError::PaymentProofUnavailable {
+                amount_msat,
+                reason: format!("file payment settled but delivery failed: {e}"),
+            })?;
         true
     } else {
         false
@@ -617,7 +739,8 @@ async fn send_file_inner(
     );
 
     Ok(Json(SendFileResponse {
-        max_routing_fee_msat: (all_in - super::messages::caps::payable(price_msat)).saturating_add(readmission.fee_ceiling_msat()),
+        max_routing_fee_msat: (all_in - super::messages::caps::payable(price_msat))
+            .saturating_add(readmission.fee_ceiling_msat()),
         message_id: envelope.id.to_hex(),
         delivered,
         amount_msat,
@@ -627,12 +750,15 @@ async fn send_file_inner(
 /// Registers file management routes for upload, download, list, delete, and send operations.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/v1/files", post(upload_file).get(list_files)
-            .layer(axum::extract::DefaultBodyLimit::max(MAX_FILE_SIZE * 4 / 3 + 2048)))
         .route(
-            "/api/v1/files/:id",
-            get(download_file).delete(delete_file),
+            "/api/v1/files",
+            post(upload_file)
+                .get(list_files)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    MAX_FILE_SIZE * 4 / 3 + 2048,
+                )),
         )
+        .route("/api/v1/files/:id", get(download_file).delete(delete_file))
         .route("/api/v1/files/:id/send", post(send_file_observed))
 }
 
@@ -640,7 +766,10 @@ pub fn routes() -> Router<Arc<AppState>> {
 mod tests {
     #[test]
     fn precise_file_positions_order_submillisecond_rows_before_id_ties() {
-        let cursor = |timestamp: &str, id: &str| konsensus_storage::ListCursor { timestamp: timestamp.into(), id: id.into() };
+        let cursor = |timestamp: &str, id: &str| konsensus_storage::ListCursor {
+            timestamp: timestamp.into(),
+            id: id.into(),
+        };
         let mut positions = [
             cursor("2026-01-01T00:00:00.123100Z", "b"),
             cursor("2026-01-01T00:00:00.123900Z", "a"),

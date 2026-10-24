@@ -212,9 +212,7 @@ async fn create_room_rejects_empty_name() {
         .uri("/api/v1/rooms")
         .header("authorization", &auth)
         .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({"name": ""}).to_string(),
-        ))
+        .body(Body::from(serde_json::json!({"name": ""}).to_string()))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
@@ -644,7 +642,11 @@ async fn room_full_lifecycle() {
     let resp = app.oneshot(req).await.unwrap();
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(list.as_array().unwrap().iter().any(|r| r["name"] == "lifecycle-room"));
+    assert!(list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["name"] == "lifecycle-room"));
 
     // 4. Add a member
     let peer_id = "aa".repeat(32);
@@ -767,7 +769,10 @@ async fn room_remove_member_requires_auth() {
 
     let req = Request::builder()
         .method("DELETE")
-        .uri(format!("/api/v1/rooms/{room_id}/members/{}", "aa".repeat(32)))
+        .uri(format!(
+            "/api/v1/rooms/{room_id}/members/{}",
+            "aa".repeat(32)
+        ))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -1014,8 +1019,16 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
     let room = Room::new("fanout-pricing".to_string(), *identity.node_id());
     let room_id = room.id;
     state.storage.create_room(&room).await.unwrap();
-    state.storage.add_room_member(&room_id, &member_a).await.unwrap();
-    state.storage.add_room_member(&room_id, &member_b).await.unwrap();
+    state
+        .storage
+        .add_room_member(&room_id, &member_a)
+        .await
+        .unwrap();
+    state
+        .storage
+        .add_room_member(&room_id, &member_b)
+        .await
+        .unwrap();
 
     // ── Compose to the room over HTTP ──
     let auth = auth_header(&state);
@@ -1064,7 +1077,8 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
             panic!("envelope sent to an unexpected peer: {}", peer.to_hex());
         };
         assert_eq!(
-            envelope.payment_proof.amount_msat, want,
+            envelope.payment_proof.amount_msat,
+            want,
             "member {} must be charged its single-discounted price",
             peer.to_hex()
         );

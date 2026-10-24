@@ -78,7 +78,11 @@ impl Default for MockChainProvider {
 #[async_trait]
 impl ChainProvider for MockChainProvider {
     fn chain_view(&self) -> konsensus_core::traits::chain::ChainView {
-        konsensus_core::traits::chain::ChainView { backend: "mock", trust_level: "simulated", host: None }
+        konsensus_core::traits::chain::ChainView {
+            backend: "mock",
+            trust_level: "simulated",
+            host: None,
+        }
     }
 
     fn trust_level(&self) -> TrustLevel {

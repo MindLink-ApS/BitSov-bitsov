@@ -413,11 +413,27 @@ use konsensus_core::traits::lightning::{
 };
 #[async_trait]
 impl LightningProvider for SlowSettlement {
-    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        invoice: &str,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.pay_invoice(invoice).await
     }
 
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn keysend_with_fee_limit(
+        &self,
+        dest: &str,
+        amount: u64,
+        memo: Option<&str>,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.keysend(dest, amount, memo).await
     }
 
@@ -472,7 +488,7 @@ async fn promotion_deadline_does_not_cancel_a_dispatched_payment() {
 #[tokio::test]
 async fn fourteen_minute_admission_resend_renews_same_paid_envelope() {
     use konsensus_core::traits::lightning::LightningProvider;
-    use konsensus_storage::{SqliteStorage, Storage, PaidAcceptance};
+    use konsensus_storage::{PaidAcceptance, SqliteStorage, Storage};
     let dir = tempfile::tempdir().unwrap();
     let sender_wallet = Arc::new(common::CountingLightning::default());
     let recipient_wallet = konsensus_lightning::MockLightningProvider::new();
@@ -487,22 +503,47 @@ async fn fourteen_minute_admission_resend_renews_same_paid_envelope() {
     // The journaled proof is re-sent on the connection it was never sent on:
     // this stub reports no connection generation, so it is not classified as
     // consumed by an earlier connection.
-    let transport = Arc::new(common::ConnectedStubTransport { since: None, ..common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()) });
+    let transport = Arc::new(common::ConnectedStubTransport {
+        since: None,
+        ..common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone())
+    });
     state.transport = transport.clone();
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    let mut old = UkmEnvelopeBuilder::new(konsensus_core::kind::KIND_CHAT,
-        *state.identity.node_id(), Recipient::Node(peer), b"konsensus:admission:v1".to_vec(),
-        PaymentProof::new(hex::decode(&hash).unwrap().try_into().unwrap(),
-            hex::decode(details.preimage.unwrap()).unwrap().try_into().unwrap(), 2000))
-        .timestamp(now.as_millis() as u64 - 840_000).build();
+    let mut old = UkmEnvelopeBuilder::new(
+        konsensus_core::kind::KIND_CHAT,
+        *state.identity.node_id(),
+        Recipient::Node(peer),
+        b"konsensus:admission:v1".to_vec(),
+        PaymentProof::new(
+            hex::decode(&hash).unwrap().try_into().unwrap(),
+            hex::decode(details.preimage.unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            2000,
+        ),
+    )
+    .timestamp(now.as_millis() as u64 - 840_000)
+    .build();
     old.signature = Signature::from_ed25519(&state.identity.sign(&old.signable_bytes()));
-    let journal = dir.path().join("admission-attempts"); std::fs::create_dir(&journal).unwrap();
-    std::fs::write(journal.join(peer.to_hex()), serde_json::to_vec(&serde_json::json!({
-        "payment_hash": hash, "amount_msat": 2000, "quote": [0, 2000], "envelope": old,
-        "settled_at_unix": now.as_secs() - 840, "original_reservation": null,
-        "message_may_have_dispatched": false
-    })).unwrap()).unwrap();
-    let token = auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, auth::Scope::all()).unwrap();
+    let journal = dir.path().join("admission-attempts");
+    std::fs::create_dir(&journal).unwrap();
+    std::fs::write(
+        journal.join(peer.to_hex()),
+        serde_json::to_vec(&serde_json::json!({
+            "payment_hash": hash, "amount_msat": 2000, "quote": [0, 2000], "envelope": old,
+            "settled_at_unix": now.as_secs() - 840, "original_reservation": null,
+            "message_may_have_dispatched": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let token = auth::create_token(
+        &state.identity.node_id().to_hex(),
+        &state.jwt_secret,
+        auth::Scope::all(),
+    )
+    .unwrap();
     let app = common::test_router(Arc::new(state));
     let response = app.oneshot(Request::builder().method("POST").uri("/api/v1/messages/compose")
         .header("authorization", format!("Bearer {token}"))
@@ -517,20 +558,45 @@ async fn fourteen_minute_admission_resend_renews_same_paid_envelope() {
         sent[0].1.clone()
     };
     assert!(renewed.timestamp > old.timestamp);
-    let mut expected = old.clone(); expected.timestamp = renewed.timestamp; expected.signature = renewed.signature;
+    let mut expected = old.clone();
+    expected.timestamp = renewed.timestamp;
+    expected.signature = renewed.signature;
     assert_eq!(renewed, expected);
-    assert!(db.get_message(&old.id).await.unwrap().is_none(), "admission must not appear as outgoing chat");
+    assert!(
+        db.get_message(&old.id).await.unwrap().is_none(),
+        "admission must not appear as outgoing chat"
+    );
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
-    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(journal.join(peer.to_hex())).unwrap()).unwrap();
-    assert_eq!(serde_json::from_value::<UkmEnvelope>(saved["envelope"].clone()).unwrap(), renewed);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(journal.join(peer.to_hex())).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_value::<UkmEnvelope>(saved["envelope"].clone()).unwrap(),
+        renewed
+    );
     let recipient_db = SqliteStorage::in_memory().await.unwrap();
     let gate = konsensus_core::gate::PaymentGate::with_config(konsensus_core::gate::GateConfig {
-        verify_lightning_settlement: true, ..Default::default()
+        verify_lightning_settlement: true,
+        ..Default::default()
     });
     let pricing = konsensus_pricing::StaticPricingEngine::new(Default::default());
-    gate.validate_paid_envelope(&renewed, &pricing, None, Some(&recipient_wallet), 0.0, Some(&peer)).await.unwrap();
-    assert_eq!(recipient_db.accept_paid_envelope(&renewed).await.unwrap(), PaidAcceptance::Accepted);
-    assert_eq!(recipient_db.accept_paid_envelope(&renewed).await.unwrap(), PaidAcceptance::AlreadyAccepted);
+    gate.validate_paid_envelope(
+        &renewed,
+        &pricing,
+        None,
+        Some(&recipient_wallet),
+        0.0,
+        Some(&peer),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recipient_db.accept_paid_envelope(&renewed).await.unwrap(),
+        PaidAcceptance::Accepted
+    );
+    assert_eq!(
+        recipient_db.accept_paid_envelope(&renewed).await.unwrap(),
+        PaidAcceptance::AlreadyAccepted
+    );
 }
 
 /// Peers that always refuse the message invoice with `admission_required`
@@ -624,12 +690,13 @@ async fn post_json(
         .await
         .unwrap();
     let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), 100_000).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 100_000)
+        .await
+        .unwrap();
     (
         status,
-        serde_json::from_slice(&bytes).unwrap_or_else(|_| {
-            serde_json::json!({"raw": String::from_utf8_lossy(&bytes)})
-        }),
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::json!({"raw": String::from_utf8_lossy(&bytes)})),
     )
 }
 
@@ -660,7 +727,13 @@ async fn capped_room_reconnect_refuses_readmission_and_pays_nothing() {
     )
     .unwrap();
 
-    let (_, room) = post_json(&state, &token, "/api/v1/rooms", serde_json::json!({"name": "cap"})).await;
+    let (_, room) = post_json(
+        &state,
+        &token,
+        "/api/v1/rooms",
+        serde_json::json!({"name": "cap"}),
+    )
+    .await;
     let id = room["id"].as_str().unwrap();
     for peer in [first, second] {
         assert_eq!(
@@ -699,12 +772,20 @@ async fn capped_room_reconnect_refuses_readmission_and_pays_nothing() {
     let rows = body["member_outcomes"].as_array().unwrap();
     assert_eq!(rows.len(), 2, "{body}");
     assert!(
-        rows.iter().all(|r| r["status"] == "refused" && r["amount_msat"] == 0),
+        rows.iter()
+            .all(|r| r["status"] == "refused" && r["amount_msat"] == 0),
         "{body}"
     );
     assert_eq!(body["amount_msat"], 0, "{body}");
-    assert!(body["readmission_msat"].is_null() || body["readmission_msat"] == 0, "{body}");
-    assert_eq!(wallet.money(), 0, "capped room must pay nothing on reconnect");
+    assert!(
+        body["readmission_msat"].is_null() || body["readmission_msat"] == 0,
+        "{body}"
+    );
+    assert_eq!(
+        wallet.money(),
+        0,
+        "capped room must pay nothing on reconnect"
+    );
     assert_eq!(
         transport.admission_requests.load(Ordering::SeqCst),
         0,
@@ -761,7 +842,11 @@ async fn capped_file_reconnect_refuses_readmission_before_pay() {
     .await;
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "price_cap_exceeded", "{body}");
-    assert_eq!(wallet.money(), 0, "capped file must pay nothing on reconnect");
+    assert_eq!(
+        wallet.money(),
+        0,
+        "capped file must pay nothing on reconnect"
+    );
     assert_eq!(
         transport.admission_requests.load(Ordering::SeqCst),
         0,

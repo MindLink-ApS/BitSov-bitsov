@@ -237,10 +237,7 @@ impl OperatorHostingContract {
         }
         if let Some(prev) = self.last_paid_at {
             if paid_at < prev {
-                return Err(HostingContractError::TimestampMonotonicity {
-                    prev,
-                    new: paid_at,
-                });
+                return Err(HostingContractError::TimestampMonotonicity { prev, new: paid_at });
             }
         }
         let mut updated = self.clone();
@@ -401,14 +398,9 @@ mod tests {
     #[test]
     fn mark_paid_at_rejects_time_rewind() {
         let started = 1_700_000_000;
-        let contract = OperatorHostingContract::new(
-            Uuid::nil(),
-            tenant(),
-            operator_pubkey(),
-            1,
-            started,
-        )
-        .expect("valid contract");
+        let contract =
+            OperatorHostingContract::new(Uuid::nil(), tenant(), operator_pubkey(), 1, started)
+                .expect("valid contract");
 
         let paid_first = contract
             .mark_paid_at(started + 2 * DAY_SECS)

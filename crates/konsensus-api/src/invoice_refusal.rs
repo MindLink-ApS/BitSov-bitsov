@@ -62,7 +62,13 @@ pub fn bind(request_id: &str, peer: NodeId) -> RequestBinding {
     let mut map = bindings();
     let bound = map.len() < MAX_BOUND_REQUESTS;
     if bound {
-        map.insert(request_id.to_string(), Binding { peer, refusal: None });
+        map.insert(
+            request_id.to_string(),
+            Binding {
+                peer,
+                refusal: None,
+            },
+        );
     }
     RequestBinding {
         request_id: request_id.to_string(),
@@ -121,10 +127,16 @@ mod tests {
     fn refusal_reaches_the_request_only_from_its_own_peer() {
         let request = uuid::Uuid::new_v4().to_string();
         let binding = bind(&request, node(1));
-        assert!(!record(&request, &node(2), ADMISSION_REQUIRED), "another peer cannot refuse it");
+        assert!(
+            !record(&request, &node(2), ADMISSION_REQUIRED),
+            "another peer cannot refuse it"
+        );
         assert!(record(&request, &node(1), ADMISSION_REQUIRED));
         assert_eq!(binding.finish().as_deref(), Some(ADMISSION_REQUIRED));
-        assert!(!record(&request, &node(1), ADMISSION_REQUIRED), "finished requests are unbound");
+        assert!(
+            !record(&request, &node(1), ADMISSION_REQUIRED),
+            "finished requests are unbound"
+        );
     }
 
     #[test]

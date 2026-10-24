@@ -81,9 +81,7 @@ const KIND_RESPONSE: u8 = 2;
 
 /// Operator-selectable pre-Noise cookie posture (a field of
 /// [`super::TransportConfig`]).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CookieMode {
     /// No pre-Noise cookie. The handshake is byte-identical to
@@ -163,8 +161,8 @@ impl CookieKeyring {
 
     /// `HMAC-SHA256(secret, ip-octets ‖ epoch_le)`, truncated to 16 bytes.
     fn mac(secret: &[u8; 32], ip: IpAddr, epoch: u64) -> [u8; 16] {
-        let mut mac = HmacSha256::new_from_slice(secret)
-            .expect("HMAC-SHA256 accepts a key of any length");
+        let mut mac =
+            HmacSha256::new_from_slice(secret).expect("HMAC-SHA256 accepts a key of any length");
         match ip {
             IpAddr::V4(v4) => mac.update(&v4.octets()),
             IpAddr::V6(v6) => mac.update(&v6.octets()),
@@ -476,7 +474,10 @@ mod tests {
     fn frame_round_trips_through_the_wire_layout() {
         let k = CookieKeyring::random();
         let cookie = k.issue(ip4(203, 0, 113, 7), 1_000_000);
-        for frame in [CookieFrame::challenge(cookie), CookieFrame::response(cookie)] {
+        for frame in [
+            CookieFrame::challenge(cookie),
+            CookieFrame::response(cookie),
+        ] {
             let bytes = frame.encode();
             assert_eq!(bytes.len(), COOKIE_FRAME_LEN);
             assert_eq!(&bytes[0..4], &COOKIE_MAGIC);
@@ -546,7 +547,10 @@ mod tests {
         // Last epoch of window 1, then the first epoch of window 2.
         let c = k.issue(ip, (2 * w - 1) * COOKIE_EPOCH_SECS);
         let (before, _) = k.secrets(2 * w - 1);
-        assert!(k.verify(ip, &c, 2 * w * COOKIE_EPOCH_SECS), "valid across rotation");
+        assert!(
+            k.verify(ip, &c, 2 * w * COOKIE_EPOCH_SECS),
+            "valid across rotation"
+        );
         let (after, prev) = k.secrets(2 * w);
         assert_ne!(*before, *after, "the secret rotated");
         assert_eq!(*prev.unwrap(), *before, "previous generation kept");
@@ -577,5 +581,4 @@ mod tests {
         let c = k.issue(ip, (20 * w - 1) * COOKIE_EPOCH_SECS);
         assert!(k.verify(ip, &c, (20 * w - 1) * COOKIE_EPOCH_SECS));
     }
-
 }

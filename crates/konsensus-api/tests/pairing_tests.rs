@@ -651,7 +651,10 @@ async fn live_pairing_flows_never_mint_admin() {
     // confer the Admin scope that authorizes it, even with an owner grant.
     assert!(!pairing::grantable_scopes().contains(&Scope::Admin));
     // `front_door` publishes the node's own card only; see front_door_scope_tests.
-    assert_eq!(pairing::grantable_scopes(), &[Scope::Spend, Scope::FrontDoor]);
+    assert_eq!(
+        pairing::grantable_scopes(),
+        &[Scope::Spend, Scope::FrontDoor]
+    );
 
     for owner_control in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
@@ -741,7 +744,10 @@ async fn bootstrap_pairing_never_mints_admin() {
     let (_, token) = pair_and_token(&app, &service, &key).await;
     let claims = konsensus_api::auth::validate_token(&token, &state.jwt_secret).unwrap();
     assert!(!claims.scp.contains(&Scope::Admin));
-    assert_eq!(claims.scp, vec![Scope::Read, Scope::Receive, Scope::Identity]);
+    assert_eq!(
+        claims.scp,
+        vec![Scope::Read, Scope::Receive, Scope::Identity]
+    );
 }
 
 #[tokio::test]
@@ -1442,9 +1448,12 @@ async fn websocket_pairing_binding_blocks_upgrade_and_post_revocation_plaintext(
         let addr = listener.local_addr().unwrap();
         let app = konsensus_api::build_router_for_addr(state.clone(), addr);
         let server = tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
         let (status, mut socket) = ws_connect(addr, &token, false).await;
         assert_eq!(
@@ -1515,33 +1524,83 @@ async fn paired_staging_never_writes_permanent_storage() {
     let tmp = tempfile::tempdir().unwrap();
     let (base, service, console) = state_with_pairing(tmp.path(), true);
     let db_path = tmp.path().join("staging.sqlite");
-    let storage = Arc::new(SqliteStorage::open(db_path.to_str().unwrap()).await.unwrap());
-    let state = Arc::new(AppState { storage: storage.clone(), ..(*base).clone() });
+    let storage = Arc::new(
+        SqliteStorage::open(db_path.to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    let state = Arc::new(AppState {
+        storage: storage.clone(),
+        ..(*base).clone()
+    });
     let app = test_router(state.clone());
     let key = SigningKey::from_bytes(&[93u8; 32]);
     let (client_id, read_token) = pair_and_token(&app, &service, &key).await;
     let body = serde_json::json!({"filename":"stage.bin", "data_b64":base64::engine::general_purpose::STANDARD.encode(vec![7u8; 1024*1024])});
-    assert_eq!(post(&app, "/api/v1/files", body.clone(), Some(&read_token)).await.0, StatusCode::FORBIDDEN);
-    let op = service.create_elevation_request(&client_id, vec![Scope::Spend]).unwrap();
-    service.grant_elevation(&op.op_id, &console.confirmation(&pairing::grant_confirmation_phrase(&op)), konsensus_api::spend_budget::GrantTerms::new(100_000)).unwrap();
+    assert_eq!(
+        post(&app, "/api/v1/files", body.clone(), Some(&read_token))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let op = service
+        .create_elevation_request(&client_id, vec![Scope::Spend])
+        .unwrap();
+    service
+        .grant_elevation(
+            &op.op_id,
+            &console.confirmation(&pairing::grant_confirmation_phrase(&op)),
+            konsensus_api::spend_budget::GrantTerms::new(100_000),
+        )
+        .unwrap();
     let challenge = service.issue_token_challenge(&client_id).unwrap();
-    let issued = service.issue_token(&state.identity.node_id().to_hex(), &state.jwt_secret, &client_id, &challenge, &hex::encode(key.sign(challenge.as_bytes()).to_bytes())).unwrap();
+    let issued = service
+        .issue_token(
+            &state.identity.node_id().to_hex(),
+            &state.jwt_secret,
+            &client_id,
+            &challenge,
+            &hex::encode(key.sign(challenge.as_bytes()).to_bytes()),
+        )
+        .unwrap();
     let before = state.lightning.get_balance_msat().await.unwrap();
     let mut ids = Vec::new();
     for _ in 0..8 {
-        let (status, uploaded) = post(&app, "/api/v1/files", body.clone(), Some(&issued.token)).await;
+        let (status, uploaded) =
+            post(&app, "/api/v1/files", body.clone(), Some(&issued.token)).await;
         assert_eq!(status, StatusCode::OK);
         ids.push(uploaded["file_id"].as_str().unwrap().to_string());
     }
-    assert_eq!(post(&app, "/api/v1/files", body.clone(), Some(&issued.token)).await.0, StatusCode::TOO_MANY_REQUESTS);
-    assert!(storage.list_files(100).await.unwrap().is_empty(), "paired staging must never enter permanent storage");
+    assert_eq!(
+        post(&app, "/api/v1/files", body.clone(), Some(&issued.token))
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert!(
+        storage.list_files(100).await.unwrap().is_empty(),
+        "paired staging must never enter permanent storage"
+    );
     service.revoke(&client_id).unwrap();
-    assert_eq!(post(&app, "/api/v1/files", body, Some(&issued.token)).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        post(&app, "/api/v1/files", body, Some(&issued.token))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(state.lightning.get_balance_msat().await.unwrap(), before);
-    let owner = konsensus_api::auth::AuthUser { node_id:state.identity.node_id().to_hex(), scopes:vec![Scope::Admin], pairing:None };
+    let owner = konsensus_api::auth::AuthUser {
+        node_id: state.identity.node_id().to_hex(),
+        scopes: vec![Scope::Admin],
+        pairing: None,
+    };
     let mut staging = state.file_staging.lock().unwrap();
     staging.sweep(&state);
-    assert!(ids.iter().all(|id| staging.get(&state, &owner, id).is_none()), "revocation sweep removes abandoned files");
+    assert!(
+        ids.iter()
+            .all(|id| staging.get(&state, &owner, id).is_none()),
+        "revocation sweep removes abandoned files"
+    );
 }
 
 #[tokio::test]
@@ -1573,10 +1632,11 @@ async fn membrane_ws_requires_local_pairing_and_rechecks_revocation() {
         let addr = listener.local_addr().unwrap();
         // Preserve the test router's fallback for the rate-limit extractor;
         // LocalConnection still requires actual ConnectInfo, not this mock.
-        let app = konsensus_api::build_router_for_addr(state.clone(), addr)
-            .layer(axum::extract::connect_info::MockConnectInfo(
+        let app = konsensus_api::build_router_for_addr(state.clone(), addr).layer(
+            axum::extract::connect_info::MockConnectInfo(
                 "127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap(),
-            ));
+            ),
+        );
         let app = match mode {
             "remote" => app.layer(axum::Extension(axum::extract::ConnectInfo(
                 "203.0.113.1:1234".parse::<std::net::SocketAddr>().unwrap(),
@@ -1722,8 +1782,9 @@ async fn staging_revoked_then_regranted_blob_stays_revoked() {
 // Exercise the actual remote route selection in memory; no listener or live node.
 fn remote_app(state: Arc<AppState>) -> axum::Router {
     use axum::extract::connect_info::MockConnectInfo;
-    konsensus_api::build_remote_router(state)
-        .layer(MockConnectInfo("127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap()))
+    konsensus_api::build_remote_router(state).layer(MockConnectInfo(
+        "127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap(),
+    ))
 }
 
 #[tokio::test]
@@ -1733,8 +1794,13 @@ async fn remote_elevation_asks_reads_and_cancels_without_granting() {
     let key = SigningKey::from_bytes(&[91; 32]);
     let (client_id, token) = pair_and_token(&test_router(state.clone()), &service, &key).await;
     let app = remote_app(state);
-    let (status, body) = post(&app, "/api/v1/pair/elevation-request",
-        serde_json::json!({"scopes": ["spend"], "budget": {"budget_msat": 10000}}), Some(&token)).await;
+    let (status, body) = post(
+        &app,
+        "/api/v1/pair/elevation-request",
+        serde_json::json!({"scopes": ["spend"], "budget": {"budget_msat": 10000}}),
+        Some(&token),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let op = body["op_id"].as_str().unwrap();
     for (method, path) in [
@@ -1742,14 +1808,29 @@ async fn remote_elevation_asks_reads_and_cancels_without_granting() {
         ("GET", "/api/v1/pair/grant".into()),
         ("DELETE", format!("/api/v1/pair/elevation/{op}")),
     ] {
-        let response = app.clone().oneshot(Request::builder().method(method).uri(&path)
-            .header("authorization", format!("Bearer {token}"))
-            .body(Body::empty()).unwrap()).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
-        let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        if method == "GET" && path.ends_with(op) { assert_eq!(value["status"], "pending"); }
-        if path.ends_with("/grant") { assert!(value["grant"].is_null()); }
+        if method == "GET" && path.ends_with(op) {
+            assert_eq!(value["status"], "pending");
+        }
+        if path.ends_with("/grant") {
+            assert!(value["grant"].is_null());
+        }
     }
     assert!(service.grant_view_for(&client_id).is_none());
 }
@@ -1765,22 +1846,48 @@ async fn remote_elevation_routes_require_auth_and_approval_routes_are_absent() {
         ("DELETE", "/api/v1/pair/elevation/unknown"),
         ("GET", "/api/v1/pair/grant"),
     ] {
-        let response = app.clone().oneshot(Request::builder().method(method).uri(path)
-            .header("content-type", "application/json").body(Body::from("{}"))
-            .unwrap()).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}"
+        );
     }
     // Even an owner token cannot reach an approval handler through this router.
-    let owner = konsensus_api::auth::create_token(&state.identity.node_id().to_hex(),
-        &state.jwt_secret, Scope::all()).unwrap();
+    let owner = konsensus_api::auth::create_token(
+        &state.identity.node_id().to_hex(),
+        &state.jwt_secret,
+        Scope::all(),
+    )
+    .unwrap();
     for path in [
-        "/api/v1/pair/grant", "/api/v1/pair/elevation/unknown",
-        "/api/v1/pair/elevation/unknown/grant", "/api/v1/pair/approve",
+        "/api/v1/pair/grant",
+        "/api/v1/pair/elevation/unknown",
+        "/api/v1/pair/elevation/unknown/grant",
+        "/api/v1/pair/approve",
         "/api/v1/pair/first-contact-grant",
-        "/api/v1/pair/device-key/request", "/api/v1/identity/approve-replacement",
+        "/api/v1/pair/device-key/request",
+        "/api/v1/identity/approve-replacement",
     ] {
         let (status, _) = post(&app, path, serde_json::json!({}), Some(&owner)).await;
-        assert!(matches!(status, StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED), "{path}: {status}");
+        assert!(
+            matches!(
+                status,
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{path}: {status}"
+        );
     }
 }
 
@@ -1791,14 +1898,21 @@ async fn elevation_status_is_private_on_remote_and_loopback() {
             let dir = tempfile::tempdir().unwrap();
             let (state, service, console) = state_with_pairing(dir.path(), owner_control);
             let local = test_router(state.clone());
-            let (a, token_a) = pair_and_token(&local, &service, &SigningKey::from_bytes(&[81; 32])).await;
+            let (a, token_a) =
+                pair_and_token(&local, &service, &SigningKey::from_bytes(&[81; 32])).await;
             service.open_pairing_window(std::time::Duration::from_secs(30));
-            let (_, token_b) = pair_and_token(&local, &service, &SigningKey::from_bytes(&[82; 32])).await;
+            let (_, token_b) =
+                pair_and_token(&local, &service, &SigningKey::from_bytes(&[82; 32])).await;
             let app = if remote { remote_app(state) } else { local };
             for scope in [Scope::Spend, Scope::FrontDoor] {
                 if !owner_control {
-                    let (status, body) = post(&app, "/api/v1/pair/elevation-request",
-                        serde_json::json!({"scopes": [scope.as_str()]}), Some(&token_a)).await;
+                    let (status, body) = post(
+                        &app,
+                        "/api/v1/pair/elevation-request",
+                        serde_json::json!({"scopes": [scope.as_str()]}),
+                        Some(&token_a),
+                    )
+                    .await;
                     assert_eq!(status, StatusCode::CONFLICT);
                     assert!(body.to_string().contains("owner_approval_unavailable"));
                     assert!(service.snapshot().pending_elevations.is_empty());
@@ -1811,53 +1925,108 @@ async fn elevation_status_is_private_on_remote_and_loopback() {
                         (&token_b, op.op_id.as_str(), StatusCode::NOT_FOUND),
                         (&token_b, "unknown", StatusCode::NOT_FOUND),
                     ] {
-                        let response = app.clone().oneshot(Request::builder()
-                            .uri(format!("/api/v1/pair/elevation/{id}"))
-                            .header("authorization", format!("Bearer {token}"))
-                            .body(Body::empty()).unwrap()).await.unwrap();
-                        assert_eq!(response.status(), expected, "remote={remote} owner={owner_control} phase={phase}");
-                        let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+                        let response = app
+                            .clone()
+                            .oneshot(
+                                Request::builder()
+                                    .uri(format!("/api/v1/pair/elevation/{id}"))
+                                    .header("authorization", format!("Bearer {token}"))
+                                    .body(Body::empty())
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            response.status(),
+                            expected,
+                            "remote={remote} owner={owner_control} phase={phase}"
+                        );
+                        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                            .await
+                            .unwrap();
                         if expected == StatusCode::NOT_FOUND {
-                            assert!(String::from_utf8_lossy(&bytes).contains("no such pending operation"));
+                            assert!(String::from_utf8_lossy(&bytes)
+                                .contains("no such pending operation"));
                         } else {
                             let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                            assert_eq!(body["status"], if phase == 0 { "pending" } else { "granted" });
+                            assert_eq!(
+                                body["status"],
+                                if phase == 0 { "pending" } else { "granted" }
+                            );
                         }
                     }
-                    if !owner_control || phase == 1 { break; }
+                    if !owner_control || phase == 1 {
+                        break;
+                    }
                     let code = console.owner_code(&op.op_id);
                     if scope == Scope::Spend {
-                        service.grant_elevation(&op.op_id, &code, konsensus_api::spend_budget::GrantTerms::new(1000)).unwrap();
+                        service
+                            .grant_elevation(
+                                &op.op_id,
+                                &code,
+                                konsensus_api::spend_budget::GrantTerms::new(1000),
+                            )
+                            .unwrap();
                     } else {
                         service.grant_front_door(&op.op_id, &code, 60).unwrap();
                     }
                 }
             }
             if owner_control {
-                let cancelled = service.create_elevation_request(&a, vec![Scope::Spend]).unwrap();
+                let cancelled = service
+                    .create_elevation_request(&a, vec![Scope::Spend])
+                    .unwrap();
                 service.cancel_pending(&a, &cancelled.op_id).unwrap();
                 // Voluntary withdrawal removes the operation entirely; neither
                 // client can subsequently query it (unlike lockout's lost status).
                 for token in [&token_a, &token_b] {
-                    let response = app.clone().oneshot(Request::builder()
-                        .uri(format!("/api/v1/pair/elevation/{}", cancelled.op_id))
-                        .header("authorization", format!("Bearer {token}"))
-                        .body(Body::empty()).unwrap()).await.unwrap();
-                    assert_eq!(response.status(), StatusCode::NOT_FOUND, "cancelled request privacy");
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri(format!("/api/v1/pair/elevation/{}", cancelled.op_id))
+                                .header("authorization", format!("Bearer {token}"))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::NOT_FOUND,
+                        "cancelled request privacy"
+                    );
                 }
-                let op = service.create_elevation_request(&a, vec![Scope::Spend]).unwrap();
+                let op = service
+                    .create_elevation_request(&a, vec![Scope::Spend])
+                    .unwrap();
                 for _ in 0..3 {
-                    let _ = service.grant_elevation(&op.op_id, "WRONG",
-                        konsensus_api::spend_budget::GrantTerms::new(1000));
+                    let _ = service.grant_elevation(
+                        &op.op_id,
+                        "WRONG",
+                        konsensus_api::spend_budget::GrantTerms::new(1000),
+                    );
                 }
-                for (token, expected) in [(&token_a, StatusCode::OK), (&token_b, StatusCode::NOT_FOUND)] {
-                    let response = app.clone().oneshot(Request::builder()
-                        .uri(format!("/api/v1/pair/elevation/{}", op.op_id))
-                        .header("authorization", format!("Bearer {token}"))
-                        .body(Body::empty()).unwrap()).await.unwrap();
+                for (token, expected) in [
+                    (&token_a, StatusCode::OK),
+                    (&token_b, StatusCode::NOT_FOUND),
+                ] {
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri(format!("/api/v1/pair/elevation/{}", op.op_id))
+                                .header("authorization", format!("Bearer {token}"))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
                     assert_eq!(response.status(), expected);
                     if expected == StatusCode::OK {
-                        let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+                        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                            .await
+                            .unwrap();
                         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                         assert_eq!(body["status"], "lost");
                     }
@@ -1877,15 +2046,31 @@ async fn pending_elevation_cap_is_per_client_and_releases_cancelled_slots() {
     let (b, _) = pair_and_token(&app, &service, &SigningKey::from_bytes(&[84; 32])).await;
     let mut ops = Vec::new();
     for _ in 0..4 {
-        ops.push(service.create_elevation_request(&a, vec![Scope::Spend]).unwrap());
+        ops.push(
+            service
+                .create_elevation_request(&a, vec![Scope::Spend])
+                .unwrap(),
+        );
     }
-    let (status, _) = post(&app, "/api/v1/pair/elevation-request",
-        serde_json::json!({"scopes":["spend"]}), Some(&token_a)).await;
+    let (status, _) = post(
+        &app,
+        "/api/v1/pair/elevation-request",
+        serde_json::json!({"scopes":["spend"]}),
+        Some(&token_a),
+    )
+    .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(service.reload_from_disk().unwrap().pending_elevations.len(), 4);
-    service.create_elevation_request(&b, vec![Scope::Spend]).unwrap();
+    assert_eq!(
+        service.reload_from_disk().unwrap().pending_elevations.len(),
+        4
+    );
+    service
+        .create_elevation_request(&b, vec![Scope::Spend])
+        .unwrap();
     service.cancel_pending(&a, &ops[0].op_id).unwrap();
-    service.create_elevation_request(&a, vec![Scope::Spend]).unwrap();
+    service
+        .create_elevation_request(&a, vec![Scope::Spend])
+        .unwrap();
 }
 
 struct NoOwnerTerminal;
@@ -2059,10 +2244,20 @@ fn headless_output_child() {
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-    let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let key =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
     let public = hex::encode(key.public_key().as_ref());
-    let proof = hex::encode(key.sign(&rng, pairing::device::registration_message("test", &client.client_id, &public).as_bytes()).unwrap().as_ref());
-    service.request_device_key(&client.client_id, &public, "device", &proof).unwrap();
+    let proof = hex::encode(
+        key.sign(
+            &rng,
+            pairing::device::registration_message("test", &client.client_id, &public).as_bytes(),
+        )
+        .unwrap()
+        .as_ref(),
+    );
+    service
+        .request_device_key(&client.client_id, &public, "device", &proof)
+        .unwrap();
     // Simulate process death so the parent can inspect the private code files.
     std::mem::forget(service);
 }
@@ -2117,9 +2312,16 @@ fn headless_codes_never_reach_stdout_stderr_or_tracing() {
 fn headless_front_door_can_be_granted_without_spend() {
     let dir = tempfile::tempdir().unwrap();
     let service = PairingService::open(dir.path(), "test".into(), true)
-        .unwrap().with_owner_console(Box::new(NoOwnerTerminal));
+        .unwrap()
+        .with_owner_console(Box::new(NoOwnerTerminal));
     let key = SigningKey::from_bytes(&[95; 32]);
-    let client = service.create_verified_remote_pairing("test", &hex::encode(key.verifying_key().to_bytes()), &[96; 32]).unwrap();
+    let client = service
+        .create_verified_remote_pairing(
+            "test",
+            &hex::encode(key.verifying_key().to_bytes()),
+            &[96; 32],
+        )
+        .unwrap();
     let op = service
         .create_elevation_request(&client.client_id, vec![Scope::FrontDoor])
         .unwrap();
@@ -2143,22 +2345,46 @@ async fn headless_device_and_replacement_without_delivery_return_conflict() {
         let base = test_state_with_data_dir(tmp.path().to_path_buf());
         let fp = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
         let owner = konsensus_core::OwnerApprovalKey::from_seed(&[7; 64], &[9; 32]).unwrap();
-        let service = Arc::new(PairingService::open(tmp.path(), fp.clone(), true).unwrap()
-            .with_owner_console(Box::new(NoOwnerTerminal)).without_stdout_code()
-            .with_owner_approval_key(owner.verifying_key()));
-        let app = test_router(Arc::new(AppState { pairing: Some(service.clone()), ..(*base).clone() }));
-        let (client, token) = pair_and_token(&app, &service, &SigningKey::from_bytes(&[93; 32])).await;
+        let service = Arc::new(
+            PairingService::open(tmp.path(), fp.clone(), true)
+                .unwrap()
+                .with_owner_console(Box::new(NoOwnerTerminal))
+                .without_stdout_code()
+                .with_owner_approval_key(owner.verifying_key()),
+        );
+        let app = test_router(Arc::new(AppState {
+            pairing: Some(service.clone()),
+            ..(*base).clone()
+        }));
+        let (client, token) =
+            pair_and_token(&app, &service, &SigningKey::from_bytes(&[93; 32])).await;
         let (route, body) = if device_request {
             let rng = ring::rand::SystemRandom::new();
-            let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-            let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+            let pkcs8 =
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+            let key =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                    .unwrap();
             let public = hex::encode(key.public_key().as_ref());
-            let proof = hex::encode(key.sign(&rng, pairing::device::registration_message(&fp, &client, &public).as_bytes()).unwrap().as_ref());
+            let proof = hex::encode(
+                key.sign(
+                    &rng,
+                    pairing::device::registration_message(&fp, &client, &public).as_bytes(),
+                )
+                .unwrap()
+                .as_ref(),
+            );
             // No protected-file delivery, but the paired token is still live.
             std::fs::rename(service.dir(), tmp.path().join("unavailable")).unwrap();
-            ("/api/v1/pair/device-key", serde_json::json!({"public_key": public, "name": "device", "proof": proof}))
+            (
+                "/api/v1/pair/device-key",
+                serde_json::json!({"public_key": public, "name": "device", "proof": proof}),
+            )
         } else {
-            ("/api/v1/identity/replacement-request", serde_json::json!({"mnemonic": REPLACEMENT_MNEMONIC}))
+            (
+                "/api/v1/identity/replacement-request",
+                serde_json::json!({"mnemonic": REPLACEMENT_MNEMONIC}),
+            )
         };
         let (status, body) = post(&app, route, body, Some(&token)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{route}: {body}");
@@ -2166,7 +2392,9 @@ async fn headless_device_and_replacement_without_delivery_return_conflict() {
         assert!(service.pending_device_keys().is_empty());
         assert!(service.snapshot().replacement_approvals.is_empty());
         if !device_request {
-            assert!(body.to_string().contains("identity replacement requires an owner terminal"));
+            assert!(body
+                .to_string()
+                .contains("identity replacement requires an owner terminal"));
         }
     }
 }

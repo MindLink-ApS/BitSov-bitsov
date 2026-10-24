@@ -49,7 +49,9 @@ async fn ws_handler(
         Ok(claims) => {
             match auth::check_pairing_binding(&state, &claims) {
                 Ok(Some(_)) => {}
-                Ok(None) => return (StatusCode::FORBIDDEN, "local paired read required").into_response(),
+                Ok(None) => {
+                    return (StatusCode::FORBIDDEN, "local paired read required").into_response()
+                }
                 Err(_) => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
             }
             // This endpoint authenticates itself rather than going through the

@@ -32,9 +32,7 @@ fn binding(recipient: NodeId, held: u64, root: [u8; 32]) -> RelayBindingView {
 /// before dispatch), so this uses the gate-folded mint directly.
 fn verified_prepaid(amount: u64, depositor: NodeId) -> DepositProof {
     DepositProof::Prepaid(VerifiedStoragePayment::from_message_gate(
-        [7u8; 32],
-        amount,
-        depositor,
+        [7u8; 32], amount, depositor,
     ))
 }
 

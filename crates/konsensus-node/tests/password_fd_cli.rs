@@ -226,7 +226,10 @@ fn wait_or_kill(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
 fn refusal_deadline_kills_and_reaps_a_child_that_keeps_running() {
     let mut child = Command::new("/bin/sleep").arg("120").spawn().unwrap();
     assert!(wait_or_kill(&mut child, Duration::ZERO).is_none());
-    assert!(child.try_wait().unwrap().is_some(), "timed-out child was not reaped");
+    assert!(
+        child.try_wait().unwrap().is_some(),
+        "timed-out child was not reaped"
+    );
 }
 
 fn directory_snapshot(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
@@ -309,8 +312,9 @@ fn local_owner_unavailable_verifier_refuses_start_without_writing_files() {
             .unwrap();
         // EOF above completes the password handoff. Allow slow debug Argon2
         // under load, but a regression that starts the node must not hang CI.
-        let status = wait_or_kill(&mut child, Duration::from_secs(120))
-            .unwrap_or_else(|| panic!("{case}: node did not refuse startup within 120s; child killed and reaped"));
+        let status = wait_or_kill(&mut child, Duration::from_secs(120)).unwrap_or_else(|| {
+            panic!("{case}: node did not refuse startup within 120s; child killed and reaped")
+        });
         drop(api_port);
         use std::os::unix::fs::FileExt;
         let mut bytes = vec![0; output.metadata().unwrap().len() as usize];

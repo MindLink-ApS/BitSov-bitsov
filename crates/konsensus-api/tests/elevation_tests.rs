@@ -131,7 +131,13 @@ fn spend_grant_binding_enforced() {
     // POSITIVE CONTROL: the owner's typed confirmation writes the grant, and it
     // reaches the client's token.
     let phrase = console.confirmation(&pairing::grant_confirmation_phrase(&op));
-    let grant = service.grant_elevation(&op.op_id, &phrase, konsensus_api::spend_budget::GrantTerms::new(1_000_000)).unwrap();
+    let grant = service
+        .grant_elevation(
+            &op.op_id,
+            &phrase,
+            konsensus_api::spend_budget::GrantTerms::new(1_000_000),
+        )
+        .unwrap();
     assert_eq!(grant.client_id, a.client_id);
     assert_eq!(grant.granted_by, "cli");
     assert_eq!(grant.scopes, vec![Scope::Spend]);
@@ -273,7 +279,9 @@ fn sidecar_reopen_does_not_inherit_owner_granted_spend() {
     // The sidecar must not report the grant as in effect either.
     let durable = sidecar.reload_from_disk().unwrap();
     assert_eq!(
-        sidecar.elevation_status(&client.client_id, &durable.grants[0].op_id).unwrap(),
+        sidecar
+            .elevation_status(&client.client_id, &durable.grants[0].op_id)
+            .unwrap(),
         pairing::ElevationStatus::Absent
     );
 
@@ -311,7 +319,13 @@ fn sidecar_elevation_unavailable() {
     assert!(matches!(err, PairingError::OwnerApprovalUnavailable));
     assert!(sidecar.snapshot().pending_elevations.is_empty());
 
-    let err = sidecar.grant_elevation("unknown", "unknown", konsensus_api::spend_budget::GrantTerms::new(1_000_000)).unwrap_err();
+    let err = sidecar
+        .grant_elevation(
+            "unknown",
+            "unknown",
+            konsensus_api::spend_budget::GrantTerms::new(1_000_000),
+        )
+        .unwrap_err();
     assert!(
         matches!(err, PairingError::OwnerChannelUnavailable),
         "sidecar elevation must be unavailable, got: {err}"
@@ -851,7 +865,13 @@ fn expired_approval_no_effect() {
         .unwrap();
     let phrase = pairing::grant_confirmation_phrase(&op);
     let (aged2, console2) = expire_approvals_on_disk(tmp.path());
-    let err = aged2.grant_elevation(&op.op_id, &phrase, konsensus_api::spend_budget::GrantTerms::new(1_000_000)).unwrap_err();
+    let err = aged2
+        .grant_elevation(
+            &op.op_id,
+            &phrase,
+            konsensus_api::spend_budget::GrantTerms::new(1_000_000),
+        )
+        .unwrap_err();
     assert!(matches!(err, PairingError::Expired), "{err}");
     assert!(
         aged2.reload_from_disk().unwrap().grants.is_empty(),
@@ -1101,11 +1121,7 @@ fn late_bootstrap_confirm_cannot_persist_identity_after_rebind() {
             .to_bytes(),
     );
     service
-        .confirm_pairing(
-            &req_a.pair_id,
-            &sig_a,
-            pairing::bootstrap_pairing_scopes(),
-        )
+        .confirm_pairing(&req_a.pair_id, &sig_a, pairing::bootstrap_pairing_scopes())
         .unwrap();
 
     // Commit/rebind: identity exists. Pending B is cleared, but clearing alone
@@ -1116,11 +1132,7 @@ fn late_bootstrap_confirm_cannot_persist_identity_after_rebind() {
     service.rebind_to_identity(&fingerprint).unwrap();
     assert!(
         service
-            .confirm_pairing(
-                &req_b.pair_id,
-                "00",
-                pairing::bootstrap_pairing_scopes(),
-            )
+            .confirm_pairing(&req_b.pair_id, "00", pairing::bootstrap_pairing_scopes(),)
             .is_err(),
         "pending B must not survive rebind"
     );
@@ -1362,7 +1374,11 @@ fn short_owner_code_grants_spend_and_front_door() {
     // The owner types it as they read it: case and dash do not matter.
     let typed = code.replace('-', " ").to_lowercase();
     let grant = service
-        .grant_elevation(&spend.op_id, &typed, konsensus_api::spend_budget::GrantTerms::new(1_000_000))
+        .grant_elevation(
+            &spend.op_id,
+            &typed,
+            konsensus_api::spend_budget::GrantTerms::new(1_000_000),
+        )
         .unwrap();
     assert_eq!(grant.client_id, a.client_id);
     assert_eq!(service.reload_from_disk().unwrap().grants.len(), 1);
@@ -1375,7 +1391,9 @@ fn short_owner_code_grants_spend_and_front_door() {
     assert_eq!(front_door_grants(&service), 1);
 
     // The code approved exactly once: the request is consumed.
-    let err = service.grant_front_door(&fd.op_id, &code, 3600).unwrap_err();
+    let err = service
+        .grant_front_door(&fd.op_id, &code, 3600)
+        .unwrap_err();
     assert!(matches!(err, PairingError::UnknownOperation), "{err}");
 }
 
@@ -1394,7 +1412,11 @@ fn a_code_approves_only_its_own_request() {
     assert_ne!(first_code, console.owner_code(&second.op_id));
 
     let err = service
-        .grant_elevation(&second.op_id, &first_code, konsensus_api::spend_budget::GrantTerms::new(1_000))
+        .grant_elevation(
+            &second.op_id,
+            &first_code,
+            konsensus_api::spend_budget::GrantTerms::new(1_000),
+        )
         .unwrap_err();
     assert!(matches!(err, PairingError::WrongOwnerCode(2)), "{err}");
     assert!(service.reload_from_disk().unwrap().grants.is_empty());
@@ -1412,23 +1434,42 @@ fn wrong_codes_cancel_the_request_without_effect() {
     let terms = || konsensus_api::spend_budget::GrantTerms::new(1_000_000);
 
     for left in [2u8, 1] {
-        let err = service.grant_elevation(&op.op_id, "AAAA-AAAA", terms()).unwrap_err();
-        assert!(matches!(err, PairingError::WrongOwnerCode(l) if l == left), "{err}");
-        assert_eq!(service.elevation_status(&a.client_id, &op.op_id).unwrap(), pairing::ElevationStatus::Pending);
+        let err = service
+            .grant_elevation(&op.op_id, "AAAA-AAAA", terms())
+            .unwrap_err();
+        assert!(
+            matches!(err, PairingError::WrongOwnerCode(l) if l == left),
+            "{err}"
+        );
+        assert_eq!(
+            service.elevation_status(&a.client_id, &op.op_id).unwrap(),
+            pairing::ElevationStatus::Pending
+        );
     }
-    let err = service.grant_elevation(&op.op_id, "AAAA-AAAA", terms()).unwrap_err();
+    let err = service
+        .grant_elevation(&op.op_id, "AAAA-AAAA", terms())
+        .unwrap_err();
     assert!(matches!(err, PairingError::ConfirmationLost), "{err}");
 
     // Cancelled: not even the right code or the full line approves it now.
     let phrase = console.confirmation(&pairing::grant_confirmation_phrase(&op));
     for right in [code.as_str(), phrase.as_str()] {
-        let err = service.grant_elevation(&op.op_id, right, terms()).unwrap_err();
+        let err = service
+            .grant_elevation(&op.op_id, right, terms())
+            .unwrap_err();
         assert!(matches!(err, PairingError::UnknownOperation), "{err}");
     }
     assert!(service.reload_from_disk().unwrap().grants.is_empty());
-    assert_eq!(service.elevation_status(&a.client_id, &op.op_id).unwrap(), pairing::ElevationStatus::Lost);
+    assert_eq!(
+        service.elevation_status(&a.client_id, &op.op_id).unwrap(),
+        pairing::ElevationStatus::Lost
+    );
     // Cancelled durably: a restart re-issues no code for it.
-    assert!(service.reload_from_disk().unwrap().pending_elevations.is_empty());
+    assert!(service
+        .reload_from_disk()
+        .unwrap()
+        .pending_elevations
+        .is_empty());
 
     // The owner saw each attempt on their own terminal.
     let text = console.text();
@@ -1448,7 +1489,11 @@ fn run_wide_cap_turns_short_codes_off_but_not_the_full_line() {
     let mut spent = 0;
     let mut round = 0;
     while spent < pairing::OWNER_CODE_FAILURES_PER_RUN {
-        let scope = if round % 2 == 0 { Scope::Spend } else { Scope::FrontDoor };
+        let scope = if round % 2 == 0 {
+            Scope::Spend
+        } else {
+            Scope::FrontDoor
+        };
         round += 1;
         let op = service
             .create_elevation_request(&a.client_id, vec![scope])
@@ -1458,16 +1503,25 @@ fn run_wide_cap_turns_short_codes_off_but_not_the_full_line() {
                 break;
             }
             let err = if scope == Scope::Spend {
-                service.grant_elevation(&op.op_id, "AAAA-AAAA", terms()).unwrap_err()
+                service
+                    .grant_elevation(&op.op_id, "AAAA-AAAA", terms())
+                    .unwrap_err()
             } else {
-                service.grant_front_door(&op.op_id, "AAAA-AAAA", 600).unwrap_err()
+                service
+                    .grant_front_door(&op.op_id, "AAAA-AAAA", 600)
+                    .unwrap_err()
             };
             spent += 1;
             // The 10th guess is still evaluated, not refused early.
-            assert!(!matches!(err, PairingError::ShortCodesOff), "guess {spent}: {err}");
+            assert!(
+                !matches!(err, PairingError::ShortCodesOff),
+                "guess {spent}: {err}"
+            );
         }
     }
-    assert!(console.text().contains("short codes are off until the node restarts"));
+    assert!(console
+        .text()
+        .contains("short codes are off until the node restarts"));
 
     // A new request prints no short code at all, and says to use the full line.
     let op = service
@@ -1477,13 +1531,17 @@ fn run_wide_cap_turns_short_codes_off_but_not_the_full_line() {
     let tail = &text[text.rfind(&op.op_id).unwrap()..];
     assert!(!tail.contains("type this code when it asks"), "{tail}");
     assert!(tail.contains("short codes are off"), "{tail}");
-    let err = service.grant_elevation(&op.op_id, "AAAA-AAAA", terms()).unwrap_err();
+    let err = service
+        .grant_elevation(&op.op_id, "AAAA-AAAA", terms())
+        .unwrap_err();
     assert!(matches!(err, PairingError::ShortCodesOff), "{err}");
     assert!(service.reload_from_disk().unwrap().grants.is_empty());
 
     // POSITIVE CONTROL: the full console line still approves.
     let phrase = console.confirmation(&pairing::grant_confirmation_phrase(&op));
-    service.grant_elevation(&op.op_id, &phrase, terms()).unwrap();
+    service
+        .grant_elevation(&op.op_id, &phrase, terms())
+        .unwrap();
     assert_eq!(service.reload_from_disk().unwrap().grants.len(), 1);
 }
 
@@ -1497,20 +1555,33 @@ fn a_request_from_before_a_restart_is_lost_not_pending() {
         .unwrap();
     let code = console.owner_code(&op.op_id);
     let phrase = console.confirmation(&pairing::grant_confirmation_phrase(&op));
-    assert_eq!(service.elevation_status(&a.client_id, &op.op_id).unwrap(), pairing::ElevationStatus::Pending);
+    assert_eq!(
+        service.elevation_status(&a.client_id, &op.op_id).unwrap(),
+        pairing::ElevationStatus::Pending
+    );
     drop(service);
 
     // Restart: the request is still on file, its codes are not.
     let (service, _) = owner_run_service(tmp.path());
-    assert_eq!(service.reload_from_disk().unwrap().pending_elevations.len(), 1);
-    assert_eq!(service.elevation_status(&a.client_id, &op.op_id).unwrap(), pairing::ElevationStatus::Lost);
+    assert_eq!(
+        service.reload_from_disk().unwrap().pending_elevations.len(),
+        1
+    );
+    assert_eq!(
+        service.elevation_status(&a.client_id, &op.op_id).unwrap(),
+        pairing::ElevationStatus::Lost
+    );
     assert_eq!(
         serde_json::to_value(pairing::ElevationStatus::Lost).unwrap(),
         serde_json::json!("lost")
     );
     for old in [code.as_str(), phrase.as_str()] {
         let err = service
-            .grant_elevation(&op.op_id, old, konsensus_api::spend_budget::GrantTerms::new(1_000))
+            .grant_elevation(
+                &op.op_id,
+                old,
+                konsensus_api::spend_budget::GrantTerms::new(1_000),
+            )
             .unwrap_err();
         assert!(matches!(err, PairingError::ConfirmationLost), "{err}");
     }
@@ -1518,13 +1589,23 @@ fn a_request_from_before_a_restart_is_lost_not_pending() {
 
     // The owner CLI is told before it asks for terms or a code.
     let ctx = ctx(&service, tmp.path());
-    match control::handle(&ctx, ControlRequest::Describe { op_id: op.op_id.clone() }) {
+    match control::handle(
+        &ctx,
+        ControlRequest::Describe {
+            op_id: op.op_id.clone(),
+        },
+    ) {
         ControlResponse::Error { message } => assert!(message.contains("Ask again"), "{message}"),
         other => panic!("a lost request must not be described as approvable: {other:?}"),
     }
     match control::handle(&ctx, ControlRequest::Status) {
-        ControlResponse::Status { pending_elevations, .. } => {
-            assert!(pending_elevations.iter().all(|e| e.lost), "{pending_elevations:?}")
+        ControlResponse::Status {
+            pending_elevations, ..
+        } => {
+            assert!(
+                pending_elevations.iter().all(|e| e.lost),
+                "{pending_elevations:?}"
+            )
         }
         other => panic!("{other:?}"),
     }
@@ -1535,11 +1616,25 @@ fn a_request_from_before_a_restart_is_lost_not_pending() {
     let again = service
         .create_elevation_request(&a.client_id, vec![Scope::Spend])
         .unwrap();
-    assert_eq!(service.elevation_status(&a.client_id, &again.op_id).unwrap(), pairing::ElevationStatus::Pending);
+    assert_eq!(
+        service
+            .elevation_status(&a.client_id, &again.op_id)
+            .unwrap(),
+        pairing::ElevationStatus::Pending
+    );
     service
-        .grant_elevation(&again.op_id, &console.owner_code(&again.op_id), konsensus_api::spend_budget::GrantTerms::new(1_000))
+        .grant_elevation(
+            &again.op_id,
+            &console.owner_code(&again.op_id),
+            konsensus_api::spend_budget::GrantTerms::new(1_000),
+        )
         .unwrap();
-    assert_eq!(service.elevation_status(&a.client_id, &again.op_id).unwrap(), pairing::ElevationStatus::Granted);
+    assert_eq!(
+        service
+            .elevation_status(&a.client_id, &again.op_id)
+            .unwrap(),
+        pairing::ElevationStatus::Granted
+    );
 }
 
 #[test]
@@ -1556,7 +1651,12 @@ fn the_owner_code_reaches_only_the_owner_terminal() {
     let ctx = ctx(&service, tmp.path());
     let replies = [
         control::handle(&ctx, ControlRequest::Status),
-        control::handle(&ctx, ControlRequest::Describe { op_id: op.op_id.clone() }),
+        control::handle(
+            &ctx,
+            ControlRequest::Describe {
+                op_id: op.op_id.clone(),
+            },
+        ),
     ];
     for reply in &replies {
         let json = serde_json::to_string(reply).unwrap();
@@ -1574,18 +1674,27 @@ fn owner_command_names_the_absolute_config_quoted_for_a_shell() {
         .unwrap()
         .with_owner_console(Box::new(console.clone()))
         .without_stdout_code()
-        .with_owner_config("/Users/owner/Library/Application Support/My Node/konsensus.toml".into());
+        .with_owner_config(
+            "/Users/owner/Library/Application Support/My Node/konsensus.toml".into(),
+        );
     assert_eq!(
         service.owner_grant_command("ab12"),
         "konsensus grant --op ab12 --config '/Users/owner/Library/Application Support/My Node/konsensus.toml'"
     );
     // Quotes and backslashes are left out rather than escaped: no escape is
     // safe in every shell (fish reads \' inside single quotes).
-    for awkward in ["/Users/o'neil/konsensus.toml", r"/a\' ; touch /tmp/p ; \'/k.toml"] {
+    for awkward in [
+        "/Users/o'neil/konsensus.toml",
+        r"/a\' ; touch /tmp/p ; \'/k.toml",
+    ] {
         let svc = PairingService::open(tmp.path(), current_fingerprint(), true)
             .unwrap()
             .with_owner_config(awkward.into());
-        assert_eq!(svc.owner_grant_command("ab12"), "konsensus grant --op ab12", "{awkward}");
+        assert_eq!(
+            svc.owner_grant_command("ab12"),
+            "konsensus grant --op ab12",
+            "{awkward}"
+        );
     }
     let plain = PairingService::open(tmp.path(), current_fingerprint(), true)
         .unwrap()
@@ -1598,16 +1707,20 @@ fn owner_command_names_the_absolute_config_quoted_for_a_shell() {
     let hostile = PairingService::open(tmp.path(), current_fingerprint(), true)
         .unwrap()
         .with_owner_config("/tmp/a\u{202E}lmot.toml".into());
-    assert_eq!(hostile.owner_grant_command("ab12"), "konsensus grant --op ab12");
+    assert_eq!(
+        hostile.owner_grant_command("ab12"),
+        "konsensus grant --op ab12"
+    );
 
     // The owner terminal prints the same command next to the code.
     let a = pair(&service, &client_key(1), "client A");
     let op = service
         .create_elevation_request(&a.client_id, vec![Scope::Spend])
         .unwrap();
-    assert!(console
-        .text()
-        .contains(&format!("To approve, run: {}", service.owner_grant_command(&op.op_id))));
+    assert!(console.text().contains(&format!(
+        "To approve, run: {}",
+        service.owner_grant_command(&op.op_id)
+    )));
 }
 
 #[test]
@@ -1637,17 +1750,30 @@ fn an_expired_request_reads_expired_not_lost_to_the_owner() {
     drop(service);
     let (service, _) = expire_approvals_on_disk(tmp.path());
     let ctx = ctx(&service, tmp.path());
-    match control::handle(&ctx, ControlRequest::Describe { op_id: op.op_id.clone() }) {
+    match control::handle(
+        &ctx,
+        ControlRequest::Describe {
+            op_id: op.op_id.clone(),
+        },
+    ) {
         ControlResponse::Error { message } => assert!(message.contains("expired"), "{message}"),
         other => panic!("{other:?}"),
     }
     match control::handle(&ctx, ControlRequest::Status) {
-        ControlResponse::Status { pending_elevations, .. } => {
-            assert!(pending_elevations.iter().all(|e| !e.lost), "{pending_elevations:?}")
+        ControlResponse::Status {
+            pending_elevations, ..
+        } => {
+            assert!(
+                pending_elevations.iter().all(|e| !e.lost),
+                "{pending_elevations:?}"
+            )
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(service.elevation_status(&a.client_id, &op.op_id).unwrap(), pairing::ElevationStatus::Expired);
+    assert_eq!(
+        service.elevation_status(&a.client_id, &op.op_id).unwrap(),
+        pairing::ElevationStatus::Expired
+    );
 }
 
 #[test]
@@ -1656,25 +1782,44 @@ fn pending_elevation_cap_survives_restart_and_releases_granted_and_expired_slots
     let (service, _) = owner_run_service(tmp.path());
     let a = pair(&service, &client_key(1), "client A");
     for _ in 0..pairing::MAX_PENDING_ELEVATIONS_PER_CLIENT {
-        service.create_elevation_request(&a.client_id, vec![Scope::Spend]).unwrap();
+        service
+            .create_elevation_request(&a.client_id, vec![Scope::Spend])
+            .unwrap();
     }
     drop(service);
     let (service, console) = owner_run_service(tmp.path());
     let before = console.text();
-    assert!(matches!(service.create_elevation_request(&a.client_id, vec![Scope::FrontDoor]),
-        Err(PairingError::TooManyPending)));
-    assert_eq!(console.text(), before, "a refused request must not print a challenge");
+    assert!(matches!(
+        service.create_elevation_request(&a.client_id, vec![Scope::FrontDoor]),
+        Err(PairingError::TooManyPending)
+    ));
+    assert_eq!(
+        console.text(),
+        before,
+        "a refused request must not print a challenge"
+    );
     service.reissue_owner_challenges().unwrap();
     let op = service.reload_from_disk().unwrap().pending_elevations[0].clone();
-    service.grant_elevation(&op.op_id, &console.owner_code(&op.op_id),
-        konsensus_api::spend_budget::GrantTerms::new(1000)).unwrap();
-    service.create_elevation_request(&a.client_id, vec![Scope::FrontDoor]).unwrap();
+    service
+        .grant_elevation(
+            &op.op_id,
+            &console.owner_code(&op.op_id),
+            konsensus_api::spend_budget::GrantTerms::new(1000),
+        )
+        .unwrap();
+    service
+        .create_elevation_request(&a.client_id, vec![Scope::FrontDoor])
+        .unwrap();
     drop(service);
     let (service, _) = expire_approvals_on_disk(tmp.path());
-    service.create_elevation_request(&a.client_id, vec![Scope::Spend]).unwrap();
-    assert_eq!(service.reload_from_disk().unwrap().pending_elevations.len(), 1);
+    service
+        .create_elevation_request(&a.client_id, vec![Scope::Spend])
+        .unwrap();
+    assert_eq!(
+        service.reload_from_disk().unwrap().pending_elevations.len(),
+        1
+    );
 }
-
 
 #[test]
 fn concurrent_elevation_requests_cannot_exceed_one_clients_cap() {
@@ -1683,16 +1828,26 @@ fn concurrent_elevation_requests_cannot_exceed_one_clients_cap() {
     let a = pair(&service, &client_key(1), "client A");
     let barrier = std::sync::Barrier::new(12);
     let admitted = std::thread::scope(|scope| {
-        let threads: Vec<_> = (0..12).map(|_| scope.spawn(|| {
-            barrier.wait();
-            service.create_elevation_request(&a.client_id, vec![Scope::Spend])
-        })).collect();
-        threads.into_iter().filter_map(|thread| match thread.join().unwrap() {
-            Ok(op) => Some(op),
-            Err(PairingError::TooManyPending) => None,
-            other => panic!("unexpected request result: {other:?}"),
-        }).count()
+        let threads: Vec<_> = (0..12)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    service.create_elevation_request(&a.client_id, vec![Scope::Spend])
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .filter_map(|thread| match thread.join().unwrap() {
+                Ok(op) => Some(op),
+                Err(PairingError::TooManyPending) => None,
+                other => panic!("unexpected request result: {other:?}"),
+            })
+            .count()
     });
     assert_eq!(admitted, 4);
-    assert_eq!(service.reload_from_disk().unwrap().pending_elevations.len(), 4);
+    assert_eq!(
+        service.reload_from_disk().unwrap().pending_elevations.len(),
+        4
+    );
 }

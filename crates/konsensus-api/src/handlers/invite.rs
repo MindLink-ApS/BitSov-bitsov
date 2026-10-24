@@ -42,7 +42,12 @@ fn gone(successor_link: &'static str, detail: &'static str) -> Response {
 }
 
 async fn legacy_invite_gone() -> Response {
-    tracing::warn!(deprecated = true, removed = true, route = "/api/v1/invite", "legacy InviteToken issue called");
+    tracing::warn!(
+        deprecated = true,
+        removed = true,
+        route = "/api/v1/invite",
+        "legacy InviteToken issue called"
+    );
     gone(
         SUCCESSOR_ISSUE,
         "POST /api/v1/invite (unbound InviteToken) has been removed. Issue an invitee-bound BitSovInvite via POST /api/v1/invites.",
@@ -50,7 +55,12 @@ async fn legacy_invite_gone() -> Response {
 }
 
 async fn legacy_redeem_gone() -> Response {
-    tracing::warn!(deprecated = true, removed = true, route = "/api/v1/invite/redeem", "legacy InviteToken redeem called");
+    tracing::warn!(
+        deprecated = true,
+        removed = true,
+        route = "/api/v1/invite/redeem",
+        "legacy InviteToken redeem called"
+    );
     gone(
         SUCCESSOR_ACCEPT,
         "POST /api/v1/invite/redeem (unbound InviteToken) has been removed. Accept a BitSovInvite via POST /api/v1/invites/accept.",

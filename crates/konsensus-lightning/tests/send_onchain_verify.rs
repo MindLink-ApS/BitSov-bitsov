@@ -67,7 +67,10 @@ async fn http_5xx_is_err() {
         .await;
 
     let result = esplora_tx_visible(&url, "xyz").await;
-    assert!(result.is_err(), "5xx should produce Err so caller treats as BroadcastUnconfirmed");
+    assert!(
+        result.is_err(),
+        "5xx should produce Err so caller treats as BroadcastUnconfirmed"
+    );
     mock.assert_async().await;
 }
 

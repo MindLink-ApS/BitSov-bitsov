@@ -5,12 +5,11 @@ use konsensus_core::identity::NodeIdentity;
 use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::types::NodeId;
 use konsensus_message::wire::{Capability, SovereigntyTier};
-use konsensus_message::{ReachabilityMode, NoiseTransport, TransportConfig};
+use konsensus_message::{NoiseTransport, ReachabilityMode, TransportConfig};
 use konsensus_storage::sqlite::SqliteStorage;
 use konsensus_storage::traits::Storage;
 
-const MNEMONIC: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon \
+const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon art";
 
@@ -71,10 +70,8 @@ async fn handshake_gate_with_invite_ref_invitee_initiated_connection_is_accepted
         .listen_addr()
         .expect("inviter listen addr present");
 
-    let transport_invitee = NoiseTransport::new(
-        Arc::clone(&invitee),
-        make_config(vec![inviter_id]),
-    );
+    let transport_invitee =
+        NoiseTransport::new(Arc::clone(&invitee), make_config(vec![inviter_id]));
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 

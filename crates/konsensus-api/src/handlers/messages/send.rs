@@ -68,13 +68,21 @@ pub(super) async fn send_message(
         if req.is_room {
             let room = konsensus_core::RoomId::parse(&req.recipient)
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-            let members = state.storage.get_room_members(&room).await.map_err(|e| ApiError::Storage(e.to_string()))?;
+            let members = state
+                .storage
+                .get_room_members(&room)
+                .await
+                .map_err(|e| ApiError::Storage(e.to_string()))?;
             for member in members.iter().filter(|m| *m != state.identity.node_id()) {
-                let cap = per.get(&member.to_hex()).ok_or_else(|| ApiError::PriceCapExceeded("recipient cap missing".into()))?;
+                let cap = per
+                    .get(&member.to_hex())
+                    .ok_or_else(|| ApiError::PriceCapExceeded("recipient cap missing".into()))?;
                 super::caps::check(req.amount_msat, Some(*cap))?;
             }
         } else {
-            let cap = per.get(&req.recipient).ok_or_else(|| ApiError::PriceCapExceeded("recipient cap missing".into()))?;
+            let cap = per
+                .get(&req.recipient)
+                .ok_or_else(|| ApiError::PriceCapExceeded("recipient cap missing".into()))?;
             super::caps::check(req.amount_msat, Some(*cap))?;
         }
     }
@@ -118,14 +126,9 @@ pub(super) async fn send_message(
 
     // Build envelope
     let sender = *state.identity.node_id();
-    let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
-        req.kind,
-        sender,
-        recipient,
-        ciphertext,
-        proof,
-    )
-    .build();
+    let mut envelope =
+        konsensus_core::UkmEnvelopeBuilder::new(req.kind, sender, recipient, ciphertext, proof)
+            .build();
 
     // Sign the envelope
     let sig = state.identity.sign(&envelope.signable_bytes());
@@ -162,9 +165,17 @@ pub(super) async fn send_message(
     // Attempt to deliver to connected peer; queue for later if offline
     let delivered = match &recipient {
         Recipient::Node(peer_id) => {
-            state.storage.queue_pending_delivery(&envelope.id, peer_id).await.map_err(|e| ApiError::Storage(e.to_string()))?;
+            state
+                .storage
+                .queue_pending_delivery(&envelope.id, peer_id)
+                .await
+                .map_err(|e| ApiError::Storage(e.to_string()))?;
             if state.transport.is_connected(peer_id).await {
-                state.storage.mark_pending_sent(&envelope.id, peer_id).await.map_err(|e| ApiError::Storage(e.to_string()))?;
+                state
+                    .storage
+                    .mark_pending_sent(&envelope.id, peer_id)
+                    .await
+                    .map_err(|e| ApiError::Storage(e.to_string()))?;
                 state
                     .transport
                     .send(peer_id, &envelope)
@@ -198,9 +209,17 @@ pub(super) async fn send_message(
                 if member == state.identity.node_id() {
                     continue;
                 }
-                state.storage.queue_pending_delivery(&envelope.id, member).await.map_err(|e| ApiError::Storage(e.to_string()))?;
+                state
+                    .storage
+                    .queue_pending_delivery(&envelope.id, member)
+                    .await
+                    .map_err(|e| ApiError::Storage(e.to_string()))?;
                 if state.transport.is_connected(member).await {
-                    state.storage.mark_pending_sent(&envelope.id, member).await.map_err(|e| ApiError::Storage(e.to_string()))?;
+                    state
+                        .storage
+                        .mark_pending_sent(&envelope.id, member)
+                        .await
+                        .map_err(|e| ApiError::Storage(e.to_string()))?;
                     if let Err(e) = state.transport.send(member, &envelope).await {
                         tracing::warn!(
                             peer = %member,

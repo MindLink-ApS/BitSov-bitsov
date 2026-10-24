@@ -12,7 +12,9 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 async fn post(state: &Arc<AppState>, path: &str, mut body: Value) -> (StatusCode, Value) {
-    if path == "/api/v1/messages/compose" || (path.starts_with("/api/v1/files/") && path.ends_with("/send")) {
+    if path == "/api/v1/messages/compose"
+        || (path.starts_with("/api/v1/files/") && path.ends_with("/send"))
+    {
         body["max_routing_fee_msat"] = json!(0);
     }
     let response = test_router(state.clone())
@@ -41,8 +43,11 @@ use konsensus_core::traits::lightning::{
     Invoice, LightningError, LightningProvider, PaymentDetails,
 };
 fn invoice_payee() -> String {
-    create_test_bolt11(1000).parse::<lightning_invoice::Bolt11Invoice>()
-        .unwrap().recover_payee_pub_key().to_string()
+    create_test_bolt11(1000)
+        .parse::<lightning_invoice::Bolt11Invoice>()
+        .unwrap()
+        .recover_payee_pub_key()
+        .to_string()
 }
 #[derive(Default)]
 struct MixedLightning {
@@ -68,11 +73,27 @@ impl MixedLightning {
 
 #[async_trait]
 impl LightningProvider for MixedLightning {
-    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        invoice: &str,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.pay_invoice(invoice).await
     }
 
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn keysend_with_fee_limit(
+        &self,
+        dest: &str,
+        amount: u64,
+        memo: Option<&str>,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.keysend(dest, amount, memo).await
     }
 
@@ -201,15 +222,19 @@ async fn review_fixture(
                 } else {
                     "invalid invoice".into()
                 },
-                payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
+                payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2"
+                    .into(),
             })
         });
     Arc::get_mut(&mut state).unwrap().transport = Arc::new(transport);
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer, if error_kind == 4 { invoice_payee() } else { "02aaaa".repeat(5) });
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        if error_kind == 4 {
+            invoice_payee()
+        } else {
+            "02aaaa".repeat(5)
+        },
+    );
     (state, peer, lightning, requests)
 }
 
@@ -333,9 +358,10 @@ async fn room_reserves_unknown_member_alongside_safe_fallback_within_total_cap()
             .with_invoice_responder(move |_, amount| {
                 counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Some(konsensus_api::state::InvoiceResponseData {
-                recipient: second,
+                    recipient: second,
                     bolt11: create_test_bolt11(amount),
-                    payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
+                    payment_hash:
+                        "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
                 })
             }),
     );

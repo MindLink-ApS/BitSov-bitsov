@@ -74,8 +74,7 @@ fn validated_rate_round_trips_through_ldk_fee_rate() {
     // catches it.
     for raw in [1.0_f32, 1.5, 50.0, 500.0, 9_999.9, 10_000.0] {
         let rate_u64 = validate_fee_rate_sat_per_vb(raw).unwrap();
-        let _ = ldk_node::bitcoin::FeeRate::from_sat_per_vb(rate_u64).unwrap_or_else(|| {
-            panic!("LDK rejected validated rate {rate_u64} (from input {raw})")
-        });
+        let _ = ldk_node::bitcoin::FeeRate::from_sat_per_vb(rate_u64)
+            .unwrap_or_else(|| panic!("LDK rejected validated rate {rate_u64} (from input {raw})"));
     }
 }

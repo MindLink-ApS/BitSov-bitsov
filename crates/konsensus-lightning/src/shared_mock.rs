@@ -114,7 +114,10 @@ impl LightningProvider for SharedMockProvider {
         })
     }
     async fn create_stateless_invoice(
-        &self, amount: u64, description: &str, expiry: u32,
+        &self,
+        amount: u64,
+        description: &str,
+        expiry: u32,
     ) -> Result<Invoice, LightningError> {
         let secret = PaymentSecret(rand::random());
         let preimage = Self::quote_preimage(&self.signing_key, &secret);
@@ -130,13 +133,20 @@ impl LightningProvider for SharedMockProvider {
             .build_signed(|h| Secp256k1::new().sign_ecdsa_recoverable(h, &self.signing_key))
             .map_err(err)?;
         Ok(Invoice {
-            bolt11: signed.to_string(), payment_hash: hash.to_string(), amount_msat: amount,
-            description: description.into(), expiry_secs: expiry,
+            bolt11: signed.to_string(),
+            payment_hash: hash.to_string(),
+            amount_msat: amount,
+            description: description.into(),
+            expiry_secs: expiry,
             created_at: signed.duration_since_epoch().as_secs(),
         })
     }
     // This test backend has no route and charges zero routing fees.
-    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, _max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        bolt11: &str,
+        _max_fee_msat: u64,
+    ) -> Result<PaymentDetails, LightningError> {
         let mut paid = self.pay_invoice(bolt11).await?;
         paid.fee_msat = Some(0);
         Ok(paid)
@@ -159,34 +169,47 @@ impl LightningProvider for SharedMockProvider {
                 "SELECT recipient,payer,bolt11,amount FROM invoices WHERE hash=?1",
                 [&hash],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            ).optional().map_err(err)?;
+            )
+            .optional()
+            .map_err(err)?;
         let mut stateless_preimage = None;
         let (recipient, payer, stored, amount) = if let Some(record) = existing {
             record
         } else {
             let payee = invoice.recover_payee_pub_key();
-            let owners = tx.prepare("SELECT owner FROM accounts").map_err(err)?
-                .query_map([], |r| r.get::<_, String>(0)).map_err(err)?
-                .collect::<Result<Vec<_>, _>>().map_err(err)?;
+            let owners = tx
+                .prepare("SELECT owner FROM accounts")
+                .map_err(err)?
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(err)?;
             let mut recipient = None;
             for owner in owners {
-                let bytes = sha256::Hash::hash(format!("INSECURE SHARED MOCK:{owner}").as_bytes()).to_byte_array();
+                let bytes = sha256::Hash::hash(format!("INSECURE SHARED MOCK:{owner}").as_bytes())
+                    .to_byte_array();
                 let key = SecretKey::from_slice(&bytes).map_err(err)?;
                 if key.public_key(&Secp256k1::new()) == payee {
                     let preimage = Self::quote_preimage(&key, invoice.payment_secret());
                     if sha256::Hash::hash(&preimage).to_string() != hash {
-                        return Err(LightningError::PaymentNotDispatched("unknown mock invoice".into()));
+                        return Err(LightningError::PaymentNotDispatched(
+                            "unknown mock invoice".into(),
+                        ));
                     }
                     stateless_preimage = Some(hex::encode(preimage));
                     recipient = Some(owner);
                     break;
                 }
             }
-            let recipient = recipient.ok_or_else(|| LightningError::PaymentNotDispatched("unknown mock payee".into()))?;
-            let amount = invoice.amount_milli_satoshis()
+            let recipient = recipient
+                .ok_or_else(|| LightningError::PaymentNotDispatched("unknown mock payee".into()))?;
+            let amount = invoice
+                .amount_milli_satoshis()
                 .filter(|amount| *amount > 0)
                 .and_then(|amount| i64::try_from(amount).ok())
-                .ok_or_else(|| LightningError::PaymentNotDispatched("invalid mock quote amount".into()))?;
+                .ok_or_else(|| {
+                    LightningError::PaymentNotDispatched("invalid mock quote amount".into())
+                })?;
             (recipient, None, bolt11.to_owned(), amount)
         };
         if stored != bolt11 || recipient == self.owner {
@@ -221,14 +244,26 @@ impl LightningProvider for SharedMockProvider {
             if let Some(preimage) = stateless_preimage {
                 // Atomically materialize the receipt with settlement, never a
                 // pending record. Failed payments roll the entire transaction back.
-                tx.execute("INSERT INTO invoices VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                    params![hash, recipient, self.owner, preimage, bolt11, amount,
-                        invoice.duration_since_epoch().as_secs(), invoice.description().to_string()]).map_err(err)?;
+                tx.execute(
+                    "INSERT INTO invoices VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        hash,
+                        recipient,
+                        self.owner,
+                        preimage,
+                        bolt11,
+                        amount,
+                        invoice.duration_since_epoch().as_secs(),
+                        invoice.description().to_string()
+                    ],
+                )
+                .map_err(err)?;
             } else {
                 tx.execute(
                     "UPDATE invoices SET payer=?1 WHERE hash=?2",
                     params![self.owner, hash],
-                ).map_err(err)?;
+                )
+                .map_err(err)?;
             }
         }
         let details = Self::details(&tx, &self.owner, &hash)?;
@@ -266,7 +301,11 @@ impl LightningProvider for SharedMockProvider {
         true
     }
     async fn keysend_with_fee_limit(
-        &self, dest: &str, amount: u64, memo: Option<&str>, _max_fee_msat: u64,
+        &self,
+        dest: &str,
+        amount: u64,
+        memo: Option<&str>,
+        _max_fee_msat: u64,
     ) -> Result<PaymentDetails, LightningError> {
         // This backend has zero routing fees, including a caller's zero cap.
         self.keysend(dest, amount, memo).await

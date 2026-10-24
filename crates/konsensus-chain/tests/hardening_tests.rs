@@ -40,7 +40,12 @@ async fn mock_error_server(
 #[tokio::test]
 async fn esplora_server_500_returns_backend_error() {
     let (config, _server) = mock_error_server(
-        get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "server error") }),
+        get(|| async {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "server error",
+            )
+        }),
         get(|| async { "{}" }),
         get(|| async { "{}" }),
     )
@@ -89,11 +94,10 @@ async fn esplora_empty_fee_estimates_returns_error() {
 #[tokio::test]
 async fn esplora_fee_single_target_always_selected() {
     // Server returns only one target
-    let app = Router::new()
-        .route(
-            "/api/fee-estimates",
-            get(|| async { axum::Json(serde_json::json!({"25": 8.5})) }),
-        );
+    let app = Router::new().route(
+        "/api/fee-estimates",
+        get(|| async { axum::Json(serde_json::json!({"25": 8.5})) }),
+    );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -162,10 +166,7 @@ async fn esplora_is_synced_false_on_connection_error() {
 #[tokio::test]
 async fn esplora_url_with_trailing_slash() {
     // URL with trailing slash should work (api_url trims it)
-    let app = Router::new().route(
-        "/api/blocks/tip/height",
-        get(|| async { "900000" }),
-    );
+    let app = Router::new().route("/api/blocks/tip/height", get(|| async { "900000" }));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -187,7 +188,11 @@ async fn esplora_url_with_trailing_slash() {
 #[tokio::test]
 async fn esplora_trust_levels() {
     // Test all trust levels work
-    for level in [TrustLevel::Spv, TrustLevel::ServerTrust, TrustLevel::FullValidation] {
+    for level in [
+        TrustLevel::Spv,
+        TrustLevel::ServerTrust,
+        TrustLevel::FullValidation,
+    ] {
         let config = EsploraConfig {
             api_url: "http://localhost:1".into(),
             trust_level: level,

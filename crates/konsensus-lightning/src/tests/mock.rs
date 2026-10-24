@@ -118,12 +118,10 @@ async fn pay_invoice_insufficient_balance() {
 
     let result = provider.pay_invoice(&invoice.bolt11).await;
     assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("insufficient mock balance")
-    );
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("insufficient mock balance"));
 }
 
 #[tokio::test]
@@ -251,12 +249,10 @@ async fn keysend_invalid_pubkey() {
     let provider = MockLightningProvider::new();
     let result = provider.keysend("not-a-pubkey", 1_000, None).await;
     assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid destination pubkey")
-    );
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("invalid destination pubkey"));
 }
 
 // ── HODL invoice tests ───────────────────────────────────────────────
@@ -321,12 +317,10 @@ async fn hodl_invoice_invalid_payment_hash() {
         .create_hodl_invoice("not-a-hash", 5_000, "bad", 3600)
         .await;
     assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid payment hash")
-    );
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("invalid payment hash"));
 }
 
 #[tokio::test]
@@ -587,21 +581,28 @@ async fn default_keysend_with_binding_fails_closed() {
         }
     }
 
-    let result = BareProvider.keysend_with_binding("02deadbeef", 1_000, b"x").await;
+    let result = BareProvider
+        .keysend_with_binding("02deadbeef", 1_000, b"x")
+        .await;
     assert!(
         result.is_err(),
         "default keysend_with_binding must fail closed, never send an unbindable payment"
     );
 }
 
-
 #[tokio::test]
 async fn capped_payment_keeps_known_fee_in_the_reconciliation_record() {
     let payer = MockLightningProvider::new();
     let receiver = MockLightningProvider::new();
     let invoice = receiver.create_invoice(1_000, "capped", 600).await.unwrap();
-    payer.pay_invoice_with_fee_limit(&invoice.bolt11, 0).await.unwrap();
-    let stored = payer.get_payment_status(&invoice.payment_hash).await.unwrap();
+    payer
+        .pay_invoice_with_fee_limit(&invoice.bolt11, 0)
+        .await
+        .unwrap();
+    let stored = payer
+        .get_payment_status(&invoice.payment_hash)
+        .await
+        .unwrap();
     assert_eq!(stored.fee_msat, Some(0));
 }
 
@@ -609,15 +610,28 @@ async fn capped_payment_keeps_known_fee_in_the_reconciliation_record() {
 async fn routing_fee_limit_refuses_before_debit_and_settles_actual_fee() {
     let mock = MockLightningProvider::new().with_routing_fee_msat(700);
     let before = mock.get_balance_msat().await.unwrap();
-    let invoice = MockLightningProvider::new().create_invoice(1000, "fee", 3600).await.unwrap();
-    assert!(matches!(mock.pay_invoice_with_fee_limit(&invoice.bolt11, 699).await,
-        Err(LightningError::PaymentNotDispatched(_))));
+    let invoice = MockLightningProvider::new()
+        .create_invoice(1000, "fee", 3600)
+        .await
+        .unwrap();
+    assert!(matches!(
+        mock.pay_invoice_with_fee_limit(&invoice.bolt11, 699).await,
+        Err(LightningError::PaymentNotDispatched(_))
+    ));
     let dest = format!("02{}", "aa".repeat(32));
-    assert!(matches!(mock.keysend_with_fee_limit(&dest, 1000, None, 699).await,
-        Err(LightningError::PaymentNotDispatched(_))));
+    assert!(matches!(
+        mock.keysend_with_fee_limit(&dest, 1000, None, 699).await,
+        Err(LightningError::PaymentNotDispatched(_))
+    ));
     assert_eq!(mock.get_balance_msat().await.unwrap(), before);
-    let invoice_paid = mock.pay_invoice_with_fee_limit(&invoice.bolt11, 700).await.unwrap();
-    let keysend_paid = mock.keysend_with_fee_limit(&dest, 1000, None, 700).await.unwrap();
+    let invoice_paid = mock
+        .pay_invoice_with_fee_limit(&invoice.bolt11, 700)
+        .await
+        .unwrap();
+    let keysend_paid = mock
+        .keysend_with_fee_limit(&dest, 1000, None, 700)
+        .await
+        .unwrap();
     assert_eq!(invoice_paid.fee_msat, Some(700));
     assert_eq!(keysend_paid.fee_msat, Some(700));
     assert_eq!(mock.get_balance_msat().await.unwrap(), before - 3400);

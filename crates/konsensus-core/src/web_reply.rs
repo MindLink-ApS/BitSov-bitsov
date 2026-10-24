@@ -42,19 +42,13 @@ pub fn expected_reply_kind(request_kind: u16) -> Option<u16> {
 /// Copies the requester's settled hash/preimage and sets amount to zero so the
 /// reply is not a new Lightning payment and never calls `generate_valid_proof`.
 pub fn reply_bound_proof(request_proof: &PaymentProof) -> PaymentProof {
-    PaymentProof::new(
-        request_proof.payment_hash,
-        request_proof.preimage,
-        0,
-    )
+    PaymentProof::new(request_proof.payment_hash, request_proof.preimage, 0)
 }
 
 /// True when this envelope is shaped as a web service reply bound to a paid request.
 pub fn is_web_service_reply(envelope: &UkmEnvelope) -> bool {
-    matches!(
-        envelope.kind,
-        KIND_PAGE_RESPONSE | KIND_WEB_MANIFEST
-    ) && envelope.payment_proof.amount_msat == 0
+    matches!(envelope.kind, KIND_PAGE_RESPONSE | KIND_WEB_MANIFEST)
+        && envelope.payment_proof.amount_msat == 0
         && !envelope.references.is_empty()
 }
 

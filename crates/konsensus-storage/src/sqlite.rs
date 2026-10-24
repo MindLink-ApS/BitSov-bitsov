@@ -10,8 +10,8 @@ use std::str::FromStr;
 
 use konsensus_core::{
     HostingContractState, MessageId, NodeId, Nonce, OperatorHostingContract,
-    OperatorHostingPayment, OperatorHostingPaymentDirection, PaymentProof, Recipient,
-    RoomId, Signature, UkmEnvelope,
+    OperatorHostingPayment, OperatorHostingPaymentDirection, PaymentProof, Recipient, RoomId,
+    Signature, UkmEnvelope,
 };
 
 use crate::calendar::{CalendarEventRecord, RsvpRecord};
@@ -156,45 +156,157 @@ pub(crate) struct EmbeddedMigrations;
 /// (`NNN_some_name.sql` → "some name").
 const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("../migrations/001_initial.sql")),
-    (2, "sessions", include_str!("../migrations/002_sessions.sql")),
-    (3, "pending deliveries", include_str!("../migrations/003_pending_deliveries.sql")),
+    (
+        2,
+        "sessions",
+        include_str!("../migrations/002_sessions.sql"),
+    ),
+    (
+        3,
+        "pending deliveries",
+        include_str!("../migrations/003_pending_deliveries.sql"),
+    ),
     (4, "files", include_str!("../migrations/004_files.sql")),
-    (5, "message plaintext", include_str!("../migrations/005_message_plaintext.sql")),
-    (6, "pending deliveries fk", include_str!("../migrations/006_pending_deliveries_fk.sql")),
-    (7, "fiat rate snapshots", include_str!("../migrations/007_fiat_rate_snapshots.sql")),
-    (8, "recovery", include_str!("../migrations/008_recovery.sql")),
-    (9, "contacts", include_str!("../migrations/009_contacts.sql")),
-    (10, "invites issued", include_str!("../migrations/010_invites_issued.sql")),
-    (11, "accepted invites", include_str!("../migrations/011_accepted_invites.sql")),
-    (12, "onboarding state", include_str!("../migrations/012_onboarding_state.sql")),
+    (
+        5,
+        "message plaintext",
+        include_str!("../migrations/005_message_plaintext.sql"),
+    ),
+    (
+        6,
+        "pending deliveries fk",
+        include_str!("../migrations/006_pending_deliveries_fk.sql"),
+    ),
+    (
+        7,
+        "fiat rate snapshots",
+        include_str!("../migrations/007_fiat_rate_snapshots.sql"),
+    ),
+    (
+        8,
+        "recovery",
+        include_str!("../migrations/008_recovery.sql"),
+    ),
+    (
+        9,
+        "contacts",
+        include_str!("../migrations/009_contacts.sql"),
+    ),
+    (
+        10,
+        "invites issued",
+        include_str!("../migrations/010_invites_issued.sql"),
+    ),
+    (
+        11,
+        "accepted invites",
+        include_str!("../migrations/011_accepted_invites.sql"),
+    ),
+    (
+        12,
+        "onboarding state",
+        include_str!("../migrations/012_onboarding_state.sql"),
+    ),
     (
         13,
         "operator hosting contracts",
         include_str!("../migrations/013_operator_hosting_contracts.sql"),
     ),
-    (14, "invite v2 fields", include_str!("../migrations/014_invite_v2_fields.sql")),
-    (15, "invite expired state", include_str!("../migrations/015_invite_expired_state.sql")),
-    (16, "invite opening state", include_str!("../migrations/016_invite_opening_state.sql")),
+    (
+        14,
+        "invite v2 fields",
+        include_str!("../migrations/014_invite_v2_fields.sql"),
+    ),
+    (
+        15,
+        "invite expired state",
+        include_str!("../migrations/015_invite_expired_state.sql"),
+    ),
+    (
+        16,
+        "invite opening state",
+        include_str!("../migrations/016_invite_opening_state.sql"),
+    ),
     (
         17,
         "onboarding state funding evidence",
         include_str!("../migrations/017_onboarding_state_funding_evidence.sql"),
     ),
-    (18, "onboarding state scope", include_str!("../migrations/018_onboarding_state_scope.sql")),
-    (19, "payment receipts", include_str!("../migrations/019_payment_receipts.sql")),
-    (20, "pending delivery state", include_str!("../migrations/020_pending_delivery_state.sql")),
-    (21, "paid delivery rejections", include_str!("../migrations/021_paid_delivery_rejections.sql")),
-    (22, "receipt bindings", include_str!("../migrations/022_receipt_bindings.sql")),
-    (23, "delivery price quotes", include_str!("../migrations/023_delivery_price_quotes.sql")),
-    (24, "outbox operations", include_str!("../migrations/024_outbox_operations.sql")),
-    (25, "outbox recovery", include_str!("../migrations/025_outbox_recovery.sql")),
-    (26, "outstanding web requests", include_str!("../migrations/026_outstanding_web_requests.sql")),
-    (27, "call state", include_str!("../migrations/027_call_state.sql")),
-    (28, "call request hold", include_str!("../migrations/028_call_request_hold.sql")),
-    (29, "operation abandon", include_str!("../migrations/029_operation_abandon.sql")),
-    (30, "channel open operations", include_str!("../migrations/030_channel_open_operations.sql")),
-    (31, "starter requests", include_str!("../migrations/031_starter_requests.sql")),
-    (32, "starter queries", include_str!("../migrations/032_starter_queries.sql")),
+    (
+        18,
+        "onboarding state scope",
+        include_str!("../migrations/018_onboarding_state_scope.sql"),
+    ),
+    (
+        19,
+        "payment receipts",
+        include_str!("../migrations/019_payment_receipts.sql"),
+    ),
+    (
+        20,
+        "pending delivery state",
+        include_str!("../migrations/020_pending_delivery_state.sql"),
+    ),
+    (
+        21,
+        "paid delivery rejections",
+        include_str!("../migrations/021_paid_delivery_rejections.sql"),
+    ),
+    (
+        22,
+        "receipt bindings",
+        include_str!("../migrations/022_receipt_bindings.sql"),
+    ),
+    (
+        23,
+        "delivery price quotes",
+        include_str!("../migrations/023_delivery_price_quotes.sql"),
+    ),
+    (
+        24,
+        "outbox operations",
+        include_str!("../migrations/024_outbox_operations.sql"),
+    ),
+    (
+        25,
+        "outbox recovery",
+        include_str!("../migrations/025_outbox_recovery.sql"),
+    ),
+    (
+        26,
+        "outstanding web requests",
+        include_str!("../migrations/026_outstanding_web_requests.sql"),
+    ),
+    (
+        27,
+        "call state",
+        include_str!("../migrations/027_call_state.sql"),
+    ),
+    (
+        28,
+        "call request hold",
+        include_str!("../migrations/028_call_request_hold.sql"),
+    ),
+    (
+        29,
+        "operation abandon",
+        include_str!("../migrations/029_operation_abandon.sql"),
+    ),
+    (
+        30,
+        "channel open operations",
+        include_str!("../migrations/030_channel_open_operations.sql"),
+    ),
+    (
+        31,
+        "starter requests",
+        include_str!("../migrations/031_starter_requests.sql"),
+    ),
+    (
+        32,
+        "starter queries",
+        include_str!("../migrations/032_starter_queries.sql"),
+    ),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -226,7 +338,9 @@ pub fn validate_external_migrations_dir(dir: &std::path::Path) -> Result<(), Sto
     })
 }
 
-fn migration_versions_in_dir(dir: &std::path::Path) -> Result<std::collections::BTreeSet<i64>, StorageError> {
+fn migration_versions_in_dir(
+    dir: &std::path::Path,
+) -> Result<std::collections::BTreeSet<i64>, StorageError> {
     let entries = std::fs::read_dir(dir).map_err(|e| {
         StorageError::Unsupported(format!(
             "KONSENSUS_SQLITE_MIGRATIONS_DIR={}: {e}",
@@ -235,10 +349,12 @@ fn migration_versions_in_dir(dir: &std::path::Path) -> Result<std::collections::
     })?;
     let mut versions = std::collections::BTreeSet::new();
     for entry in entries {
-        let entry = entry.map_err(|e| StorageError::Unsupported(format!(
-            "KONSENSUS_SQLITE_MIGRATIONS_DIR={}: {e}",
-            dir.display()
-        )))?;
+        let entry = entry.map_err(|e| {
+            StorageError::Unsupported(format!(
+                "KONSENSUS_SQLITE_MIGRATIONS_DIR={}: {e}",
+                dir.display()
+            ))
+        })?;
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -290,7 +406,10 @@ impl MigrationSource<'static> for EmbeddedMigrations {
     ) -> Pin<
         Box<
             dyn Future<
-                    Output = Result<Vec<Migration>, Box<dyn std::error::Error + Send + Sync + 'static>>,
+                    Output = Result<
+                        Vec<Migration>,
+                        Box<dyn std::error::Error + Send + Sync + 'static>,
+                    >,
                 > + Send
                 + 'static,
         >,
@@ -375,7 +494,8 @@ fn row_to_envelope(
 
     let refs: Vec<String> = serde_json::from_str(references_json)
         .map_err(|e| StorageError::Serialization(format!("references: {e}")))?;
-    let references: Result<Vec<MessageId>, _> = refs.iter().map(|s| MessageId::from_hex(s)).collect();
+    let references: Result<Vec<MessageId>, _> =
+        refs.iter().map(|s| MessageId::from_hex(s)).collect();
     let references =
         references.map_err(|e| StorageError::Conversion(format!("reference id: {e}")))?;
 
@@ -407,8 +527,7 @@ fn u64_to_i64(value: u64, field: &str) -> Result<i64, StorageError> {
 }
 
 fn i64_to_u64(value: i64, field: &str) -> Result<u64, StorageError> {
-    u64::try_from(value)
-        .map_err(|_| StorageError::Conversion(format!("{field} negative: {value}")))
+    u64::try_from(value).map_err(|_| StorageError::Conversion(format!("{field} negative: {value}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -489,7 +608,8 @@ const SESSIONS_SELECT: &str = "SELECT peer_id FROM sessions ORDER BY updated_at 
 /// enumerates the overflow recipients, so their own already-accepted messages are
 /// never flushed on reconnect — a Principle-2 fail-open. The `dbh2_guard` unit test
 /// asserts this constant never regains a `LIMIT`.
-const PENDING_PEERS_SELECT: &str = "SELECT DISTINCT recipient_id FROM pending_deliveries WHERE state != 'failed_paid'";
+const PENDING_PEERS_SELECT: &str =
+    "SELECT DISTINCT recipient_id FROM pending_deliveries WHERE state != 'failed_paid'";
 
 /// Room-membership query for the SQLite backend. Returns ALL members of a room —
 /// deliberately **no `LIMIT`** (DBH2).
@@ -583,8 +703,7 @@ const CALENDAR_EXCEPTIONS_IN_RANGE_SELECT: &str =
 /// caller's `[from_date, to_date]` window; not a full-table scan. Documented
 /// complete so a future cap (which would silently drop dates inside the
 /// requested window) is rejected by the guard test.
-const FIAT_RATE_SNAPSHOTS_SELECT: &str =
-    "SELECT date, currency, rate, source, created_at
+const FIAT_RATE_SNAPSHOTS_SELECT: &str = "SELECT date, currency, rate, source, created_at
      FROM fiat_rate_snapshots
      WHERE date >= ?1 AND date <= ?2
      ORDER BY date DESC, currency ASC";
@@ -621,31 +740,49 @@ const PEERS_SELECT: &str =
 
 #[async_trait]
 impl Storage for SqliteStorage {
-    async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
+    async fn starter_request_get(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         crate::starter_request::sqlite::get(&self.pool, id).await
     }
 
-    async fn starter_request_current(&self) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
+    async fn starter_request_current(
+        &self,
+    ) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         crate::starter_request::sqlite::current(&self.pool).await
     }
 
-    async fn starter_request_create(&self, r: &crate::starter_request::StarterRequest) -> Result<(crate::starter_request::StarterRequest, bool), StorageError> {
+    async fn starter_request_create(
+        &self,
+        r: &crate::starter_request::StarterRequest,
+    ) -> Result<(crate::starter_request::StarterRequest, bool), StorageError> {
         crate::starter_request::sqlite::create(&self.pool, r).await
     }
 
-    async fn starter_request_adopt(&self, r: &crate::starter_request::StarterRequest) -> Result<crate::starter_request::StarterRequest, StorageError> {
+    async fn starter_request_adopt(
+        &self,
+        r: &crate::starter_request::StarterRequest,
+    ) -> Result<crate::starter_request::StarterRequest, StorageError> {
         crate::starter_request::sqlite::adopt(&self.pool, r).await
     }
 
     async fn starter_request_rearm(&self, id: &str) -> Result<(), StorageError> {
-        crate::starter_request::sqlite::rearm(&self.pool,id).await
+        crate::starter_request::sqlite::rearm(&self.pool, id).await
     }
 
-    async fn starter_request_save(&self, r: &crate::starter_request::StarterRequest) -> Result<(), StorageError> {
+    async fn starter_request_save(
+        &self,
+        r: &crate::starter_request::StarterRequest,
+    ) -> Result<(), StorageError> {
         crate::starter_request::sqlite::save(&self.pool, r).await
     }
 
-    async fn starter_request_retry(&self, id: &str, now: i64) -> Result<crate::starter_request::StarterRequest, StorageError> {
+    async fn starter_request_retry(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<crate::starter_request::StarterRequest, StorageError> {
         crate::starter_request::sqlite::retry(&self.pool, id, now).await
     }
 
@@ -655,7 +792,10 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn insert_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
+    async fn insert_outbox_operation(
+        &self,
+        op: &crate::OutboxOperation,
+    ) -> Result<bool, StorageError> {
         Ok(sqlx::query("INSERT INTO outbox_operations (operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO NOTHING")
             .bind(&op.operation_id)
             .bind(&op.recipient)
@@ -678,7 +818,10 @@ impl Storage for SqliteStorage {
             .bind(op.recovery_compacted)
             .execute(&self.pool).await?.rows_affected() == 1)
     }
-    async fn update_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
+    async fn update_outbox_operation(
+        &self,
+        op: &crate::OutboxOperation,
+    ) -> Result<bool, StorageError> {
         Ok(sqlx::query("UPDATE outbox_operations SET state = ?, payment_hash = ?, admission_payment_hash = ?, message_id = ?, settled_msat = ?, readmission_msat = ?, updated_at = ?, last_sent_at = ?, attempts = ?, last_error = ?, recovery = ?, accounting_pending = ?, recovery_compacted = ?, version = version + 1 WHERE operation_id = ? AND version = ?")
             .bind(&op.state)
             .bind(&op.payment_hash)
@@ -697,10 +840,17 @@ impl Storage for SqliteStorage {
             .execute(&self.pool).await?.rows_affected() == 1)
     }
 
-    async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
+    async fn get_outbox_operation(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = ?").bind(id).fetch_optional(&self.pool).await?)
     }
-    async fn starter_update(&self, update: crate::starter::StarterUpdate, now: Option<i64>) -> Result<crate::starter::StarterOutcome, StorageError> {
+    async fn starter_update(
+        &self,
+        update: crate::starter::StarterUpdate,
+        now: Option<i64>,
+    ) -> Result<crate::starter::StarterOutcome, StorageError> {
         crate::starter::sqlite::update(&self.pool, update, now).await
     }
     async fn starter_grants(&self) -> Result<Vec<crate::starter::StarterGrant>, StorageError> {
@@ -718,7 +868,10 @@ impl Storage for SqliteStorage {
     async fn starter_counters(&self) -> Result<crate::starter::StarterCounters, StorageError> {
         crate::starter::sqlite::counters(&self.pool).await
     }
-    async fn insert_channel_open_operation(&self, op: &crate::ChannelOpenOperation) -> Result<bool, StorageError> {
+    async fn insert_channel_open_operation(
+        &self,
+        op: &crate::ChannelOpenOperation,
+    ) -> Result<bool, StorageError> {
         Ok(sqlx::query("INSERT INTO channel_open_operations (operation_id, request_hash, state, request, result, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO NOTHING")
             .bind(&op.operation_id)
             .bind(&op.request_hash)
@@ -730,10 +883,19 @@ impl Storage for SqliteStorage {
             .bind(op.updated_at)
             .execute(&self.pool).await?.rows_affected() == 1)
     }
-    async fn get_channel_open_operation(&self, id: &str) -> Result<Option<crate::ChannelOpenOperation>, StorageError> {
+    async fn get_channel_open_operation(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::ChannelOpenOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, request_hash, state, request, result, last_error, created_at, updated_at FROM channel_open_operations WHERE operation_id = ?").bind(id).fetch_optional(&self.pool).await?)
     }
-    async fn resolve_channel_open_operation(&self, id: &str, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
+    async fn resolve_channel_open_operation(
+        &self,
+        id: &str,
+        state: &str,
+        result: Option<&[u8]>,
+        last_error: Option<&str>,
+    ) -> Result<bool, StorageError> {
         Ok(sqlx::query("UPDATE channel_open_operations SET state = ?, result = ?, last_error = ?, updated_at = ? WHERE operation_id = ? AND state = 'pending'")
             .bind(state)
             .bind(result)
@@ -743,29 +905,54 @@ impl Storage for SqliteStorage {
             .execute(&self.pool).await?.rows_affected() == 1)
     }
     async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
-        Ok(sqlx::query("DELETE FROM channel_open_operations WHERE operation_id = ? AND state = 'pending'")
-            .bind(id)
-            .execute(&self.pool).await?.rows_affected() == 1)
+        Ok(sqlx::query(
+            "DELETE FROM channel_open_operations WHERE operation_id = ? AND state = 'pending'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1)
     }
-    async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+    async fn list_recoverable_operations(
+        &self,
+    ) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_recovery WHERE (accounting_pending = TRUE OR state IN ('paying', 'payment_unknown', 'paid', 'sent', 'rejected_retryable')) ORDER BY created_at").fetch_all(&self.pool).await?)
     }
     // Pin the partial index: without statistics SQLite can prefer the old
     // state index, walking all terminal history and sorting before LIMIT.
-    async fn list_failed_prepared_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+    async fn list_failed_prepared_operations(
+        &self,
+    ) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_state WHERE state = 'prepared' AND last_error IS NOT NULL ORDER BY created_at").fetch_all(&self.pool).await?)
     }
-    async fn list_compactable_operations(&self, before_ms: i64, limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+    async fn list_compactable_operations(
+        &self,
+        before_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_retention WHERE accounting_pending = FALSE AND recovery_compacted = FALSE AND state IN ('acked', 'failed_paid', 'released', 'abandoned') AND updated_at < ? ORDER BY updated_at LIMIT ?")
             .bind(before_ms).bind(i64::from(limit)).fetch_all(&self.pool).await?)
     }
 
-
     // ── Messages ───────────────────────────────────────────────────────
 
-    async fn commit_outbox_envelope(&self, op: &crate::OutboxOperation, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
-        if op.state != "paid" || op.message_id.as_deref() != Some(envelope.id.to_hex().as_str()) || envelope.recipient != Recipient::Node(NodeId::from_hex(&op.recipient).map_err(|e| StorageError::Conversion(e.to_string()))?) {
-            return Err(StorageError::Conversion("invalid paid operation binding".into()));
+    async fn commit_outbox_envelope(
+        &self,
+        op: &crate::OutboxOperation,
+        envelope: &UkmEnvelope,
+    ) -> Result<bool, StorageError> {
+        if op.state != "paid"
+            || op.message_id.as_deref() != Some(envelope.id.to_hex().as_str())
+            || envelope.recipient
+                != Recipient::Node(
+                    NodeId::from_hex(&op.recipient)
+                        .map_err(|e| StorageError::Conversion(e.to_string()))?,
+                )
+        {
+            return Err(StorageError::Conversion(
+                "invalid paid operation binding".into(),
+            ));
         }
         let mut tx = self.pool.begin().await?;
         let changed = sqlx::query("UPDATE outbox_operations SET state = ?, payment_hash = ?, admission_payment_hash = ?, message_id = ?, settled_msat = ?, readmission_msat = ?, updated_at = ?, last_sent_at = ?, attempts = ?, last_error = ?, recovery = ?, accounting_pending = ?, recovery_compacted = ?, version = version + 1 WHERE operation_id = ? AND version = ?")
@@ -784,18 +971,26 @@ impl Storage for SqliteStorage {
             .bind(op.recovery_compacted)
             .bind(&op.operation_id).bind(op.version)
             .execute(&mut *tx).await?.rows_affected() == 1;
-        if !changed { tx.rollback().await?; return Ok(false); }
+        if !changed {
+            tx.rollback().await?;
+            return Ok(false);
+        }
         let id = envelope.id.to_hex();
         let kind = i64::from(envelope.kind);
         let sender = envelope.sender.to_hex();
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ts = i64::try_from(envelope.timestamp)
-            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
+        let ts = i64::try_from(envelope.timestamp).map_err(|_| {
+            StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp))
+        })?;
         let ciphertext = &envelope.ciphertext;
         let ph = hex::encode(envelope.payment_proof.payment_hash);
         let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let amt = i64::try_from(envelope.payment_proof.amount_msat).map_err(|_| {
+            StorageError::Conversion(format!(
+                "amount_msat overflows i64: {}",
+                envelope.payment_proof.amount_msat
+            ))
+        })?;
         let sig = hex::encode(envelope.signature.as_bytes());
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
@@ -834,13 +1029,18 @@ impl Storage for SqliteStorage {
         let kind = i64::from(envelope.kind);
         let sender = envelope.sender.to_hex();
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ts = i64::try_from(envelope.timestamp)
-            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
+        let ts = i64::try_from(envelope.timestamp).map_err(|_| {
+            StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp))
+        })?;
         let ciphertext = &envelope.ciphertext;
         let ph = hex::encode(envelope.payment_proof.payment_hash);
         let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let amt = i64::try_from(envelope.payment_proof.amount_msat).map_err(|_| {
+            StorageError::Conversion(format!(
+                "amount_msat overflows i64: {}",
+                envelope.payment_proof.amount_msat
+            ))
+        })?;
         let sig = hex::encode(envelope.signature.as_bytes());
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
@@ -871,17 +1071,41 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn record_delivery_prices(&self, sender: &NodeId, prices: &[(String, u64)], excluded_kinds: &[u16], issued_at: u64, expires_at: u64) -> Result<(), StorageError> {
-        if expires_at <= issued_at || expires_at - issued_at > konsensus_core::gate::DELIVERY_PRICE_WINDOW_SECS {
-            return Err(StorageError::Conversion("invalid delivery price window".into()));
+    async fn record_delivery_prices(
+        &self,
+        sender: &NodeId,
+        prices: &[(String, u64)],
+        excluded_kinds: &[u16],
+        issued_at: u64,
+        expires_at: u64,
+    ) -> Result<(), StorageError> {
+        if expires_at <= issued_at
+            || expires_at - issued_at > konsensus_core::gate::DELIVERY_PRICE_WINDOW_SECS
+        {
+            return Err(StorageError::Conversion(
+                "invalid delivery price window".into(),
+            ));
         }
-        let issued = i64::try_from(issued_at).map_err(|_| StorageError::Conversion("quote time overflow".into()))?;
-        let expires = i64::try_from(expires_at).map_err(|_| StorageError::Conversion("quote expiry overflow".into()))?;
-        let exclusions = format!(",{},", excluded_kinds.iter().map(u16::to_string).collect::<Vec<_>>().join(","));
+        let issued = i64::try_from(issued_at)
+            .map_err(|_| StorageError::Conversion("quote time overflow".into()))?;
+        let expires = i64::try_from(expires_at)
+            .map_err(|_| StorageError::Conversion("quote expiry overflow".into()))?;
+        let exclusions = format!(
+            ",{},",
+            excluded_kinds
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM delivery_price_quotes WHERE expires_at < ?").bind(issued.saturating_sub(konsensus_core::gate::DELIVERY_PRICE_WINDOW_SECS as i64)).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM delivery_price_quotes WHERE expires_at < ?")
+            .bind(issued.saturating_sub(konsensus_core::gate::DELIVERY_PRICE_WINDOW_SECS as i64))
+            .execute(&mut *tx)
+            .await?;
         for (scope, amount) in prices {
-            let amount = i64::try_from(*amount).map_err(|_| StorageError::Conversion("quote amount overflow".into()))?;
+            let amount = i64::try_from(*amount)
+                .map_err(|_| StorageError::Conversion("quote amount overflow".into()))?;
             sqlx::query("INSERT INTO delivery_price_quotes (sender, scope, amount_msat, issued_at, expires_at, excluded_kinds) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING")
                 .bind(sender.to_hex()).bind(scope).bind(amount).bind(issued).bind(expires).bind(&exclusions).execute(&mut *tx).await?;
         }
@@ -889,26 +1113,51 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn delivery_price_floor(&self, envelope: &UkmEnvelope, paid_at: u64, now: u64) -> Result<Option<u64>, StorageError> {
+    async fn delivery_price_floor(
+        &self,
+        envelope: &UkmEnvelope,
+        paid_at: u64,
+        now: u64,
+    ) -> Result<Option<u64>, StorageError> {
         // Paid-at comes from our Lightning backend, never the signed wrapper.
-        if paid_at > now || now.saturating_sub(paid_at) > konsensus_core::gate::DELIVERY_PRICE_WINDOW_SECS { return Ok(None); }
-        let paid = i64::try_from(paid_at).map_err(|_| StorageError::Conversion("payment time overflow".into()))?;
-        let category = format!("category:{}", konsensus_core::kind::KindCategory::from_kind(envelope.kind).price_table_key());
+        if paid_at > now
+            || now.saturating_sub(paid_at) > konsensus_core::gate::DELIVERY_PRICE_WINDOW_SECS
+        {
+            return Ok(None);
+        }
+        let paid = i64::try_from(paid_at)
+            .map_err(|_| StorageError::Conversion("payment time overflow".into()))?;
+        let category = format!(
+            "category:{}",
+            konsensus_core::kind::KindCategory::from_kind(envelope.kind).price_table_key()
+        );
         let amount: Option<i64> = sqlx::query_scalar("SELECT MIN(amount_msat) FROM delivery_price_quotes WHERE sender = ? AND (scope = ? OR (scope = ? AND excluded_kinds NOT LIKE ?)) AND issued_at <= ? AND expires_at >= ?")
             .bind(envelope.sender.to_hex()).bind(format!("kind:{}", envelope.kind)).bind(category).bind(format!("%,{},%", envelope.kind)).bind(paid).bind(paid)
             .fetch_one(&self.pool).await?;
-        amount.map(|n| u64::try_from(n).map_err(|_| StorageError::Conversion("negative quoted price".into()))).transpose()
+        amount
+            .map(|n| {
+                u64::try_from(n)
+                    .map_err(|_| StorageError::Conversion("negative quoted price".into()))
+            })
+            .transpose()
     }
 
-    async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+    async fn is_paid_envelope_accepted(
+        &self,
+        envelope: &UkmEnvelope,
+    ) -> Result<bool, StorageError> {
         let id = envelope.id.to_hex();
         let kind = i64::from(envelope.kind);
         let sender = envelope.sender.to_hex();
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
         let ph = hex::encode(envelope.payment_proof.payment_hash);
         let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let amt = i64::try_from(envelope.payment_proof.amount_msat).map_err(|_| {
+            StorageError::Conversion(format!(
+                "amount_msat overflows i64: {}",
+                envelope.payment_proof.amount_msat
+            ))
+        })?;
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
         let refs_json =
@@ -918,12 +1167,16 @@ impl Storage for SqliteStorage {
             .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
             .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
             .fetch_one(&self.pool).await?;
-        if durable == 1 { return Ok(true); }
+        if durable == 1 {
+            return Ok(true);
+        }
         let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.message_id NOT IN (SELECT message_id FROM call_admission_hold) AND r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
             .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
             .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
             .fetch_one(&self.pool).await?;
-        if matched != 1 { return Ok(false); }
+        if matched != 1 {
+            return Ok(false);
+        }
         // A legacy full-message match is already accepted. Preserve its binding
         // before ACK so subsequent content retention cannot erase that evidence.
         // The guarded UPDATE never inserts a message or consumes a fresh proof.
@@ -934,24 +1187,34 @@ impl Storage for SqliteStorage {
             .execute(&self.pool).await?.rows_affected();
         if upgraded != 1 {
             // A retention race is retryable, never a current-price rejection.
-            return Err(StorageError::Conversion("legacy acceptance binding changed during lookup".into()));
+            return Err(StorageError::Conversion(
+                "legacy acceptance binding changed during lookup".into(),
+            ));
         }
         Ok(true)
     }
 
-    async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+    async fn accept_paid_envelope(
+        &self,
+        envelope: &UkmEnvelope,
+    ) -> Result<crate::PaidAcceptance, StorageError> {
         use crate::PaidAcceptance::*;
         let id = envelope.id.to_hex();
         let kind = i64::from(envelope.kind);
         let sender = envelope.sender.to_hex();
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ts = i64::try_from(envelope.timestamp)
-            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
+        let ts = i64::try_from(envelope.timestamp).map_err(|_| {
+            StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp))
+        })?;
         let ciphertext = &envelope.ciphertext;
         let ph = hex::encode(envelope.payment_proof.payment_hash);
         let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let amt = i64::try_from(envelope.payment_proof.amount_msat).map_err(|_| {
+            StorageError::Conversion(format!(
+                "amount_msat overflows i64: {}",
+                envelope.payment_proof.amount_msat
+            ))
+        })?;
         let sig = hex::encode(envelope.signature.as_bytes());
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
@@ -965,8 +1228,12 @@ impl Storage for SqliteStorage {
         if healing {
             // Serialize legacy healers on the receipt binding (SQLite already
             // holds the writer lock from the INSERT above).
-            let binding: (String, String, i32) = sqlx::query_as("SELECT message_id, sender, accepted FROM payment_receipts WHERE payment_hash = ?")
-                .bind(&ph).fetch_one(&mut *tx).await?;
+            let binding: (String, String, i32) = sqlx::query_as(
+                "SELECT message_id, sender, accepted FROM payment_receipts WHERE payment_hash = ?",
+            )
+            .bind(&ph)
+            .fetch_one(&mut *tx)
+            .await?;
             if binding.0 != id || binding.1 != sender {
                 tx.rollback().await?;
                 return Ok(PaymentReused);
@@ -992,7 +1259,9 @@ impl Storage for SqliteStorage {
                 return Ok(AlreadyAccepted);
             }
             let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
-                .bind(&id).fetch_one(&mut *tx).await?;
+                .bind(&id)
+                .fetch_one(&mut *tx)
+                .await?;
             if exists != 0 || binding.2 != 0 {
                 tx.rollback().await?;
                 return Ok(PaymentReused);
@@ -1000,11 +1269,18 @@ impl Storage for SqliteStorage {
             // Full gate validation precedes this transaction. The receipt
             // binds this paid identity; repair only its missing message row.
         }
-        let inserted = sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES (?, ?) ON CONFLICT DO NOTHING")
-            .bind(&nonce).bind(&sender).execute(&mut *tx).await?;
+        let inserted = sqlx::query(
+            "INSERT INTO nonces (nonce_hex, sender) VALUES (?, ?) ON CONFLICT DO NOTHING",
+        )
+        .bind(&nonce)
+        .bind(&sender)
+        .execute(&mut *tx)
+        .await?;
         if inserted.rows_affected() == 0 {
             let owner: String = sqlx::query_scalar("SELECT sender FROM nonces WHERE nonce_hex = ?")
-                .bind(&nonce).fetch_one(&mut *tx).await?;
+                .bind(&nonce)
+                .fetch_one(&mut *tx)
+                .await?;
             if !healing || owner != sender {
                 tx.rollback().await?;
                 return Ok(NonceReused);
@@ -1038,12 +1314,15 @@ impl Storage for SqliteStorage {
     }
 
     async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
-        let ts = i64::try_from(envelope.timestamp).map_err(|_| StorageError::Conversion("timestamp overflow".into()))?;
+        let ts = i64::try_from(envelope.timestamp)
+            .map_err(|_| StorageError::Conversion("timestamp overflow".into()))?;
         let result = sqlx::query("UPDATE messages SET timestamp_ms = ?, signature = ? WHERE id = ? AND sender = ? AND payment_hash = ?")
             .bind(ts).bind(hex::encode(envelope.signature.as_bytes())).bind(envelope.id.to_hex())
             .bind(envelope.sender.to_hex()).bind(hex::encode(envelope.payment_proof.payment_hash))
             .execute(&self.pool).await?;
-        if result.rows_affected() != 1 { return Err(StorageError::Conversion("missing paid envelope".into())); }
+        if result.rows_affected() != 1 {
+            return Err(StorageError::Conversion("missing paid envelope".into()));
+        }
         Ok(())
     }
 
@@ -1051,7 +1330,11 @@ impl Storage for SqliteStorage {
         let mut tx = self.pool.begin().await?;
         let changed = sqlx::query("UPDATE pending_deliveries SET dispatched = 1, retry_after_ms = 0 WHERE message_id = ? AND recipient_id = ? AND state != 'failed_paid' AND retry_after_ms <= CAST(strftime('%s', 'now') AS BIGINT) * 1000")
             .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?.rows_affected();
-        if changed != 1 { return Err(StorageError::Conversion("delivery is not eligible for dispatch".into())); }
+        if changed != 1 {
+            return Err(StorageError::Conversion(
+                "delivery is not eligible for dispatch".into(),
+            ));
+        }
         if changed == 1 {
             sqlx::query("UPDATE outbox_operations SET state = CASE WHEN state = 'rejected_retryable' THEN 'paid' ELSE state END, version = version + 1, updated_at = CAST(strftime('%s', 'now') AS BIGINT) * 1000, attempts = attempts + 1 WHERE message_id = ? AND recipient = ? AND state IN ('paid', 'sent', 'rejected_retryable')").bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
         }
@@ -1059,39 +1342,62 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn is_pending_dispatched(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+    async fn is_pending_dispatched(
+        &self,
+        id: &MessageId,
+        peer: &NodeId,
+        sender: &NodeId,
+    ) -> Result<bool, StorageError> {
         Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pending_deliveries p JOIN messages m ON m.id = p.message_id WHERE p.message_id = ? AND p.recipient_id = ? AND p.dispatched = 1 AND p.state != 'failed_paid' AND m.sender = ?)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex()).fetch_one(&self.pool).await?)
     }
 
-    async fn reject_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, reason: &str, terminal: bool) -> Result<bool, StorageError> {
+    async fn reject_pending(
+        &self,
+        id: &MessageId,
+        peer: &NodeId,
+        sender: &NodeId,
+        reason: &str,
+        terminal: bool,
+    ) -> Result<bool, StorageError> {
         let mut tx = self.pool.begin().await?;
         let changed = sqlx::query("UPDATE pending_deliveries SET state = ?, rejection_reason = ?, retry_after_ms = CAST(strftime('%s', 'now') AS BIGINT) * 1000 + MIN(3600000, 60000 * (1 << MIN(attempts, 6))), attempts = attempts + 1 WHERE message_id = ? AND recipient_id = ? AND dispatched = 1 AND state != 'failed_paid' AND retry_after_ms = 0 AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = ?)")
             .bind(if terminal { "failed_paid" } else { "pending" }).bind(reason)
             .bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
             .execute(&mut *tx).await?.rows_affected() == 1;
-            if changed {
+        if changed {
             sqlx::query("UPDATE outbox_operations SET state = ?, last_error = ?, version = version + 1, updated_at = CAST(strftime('%s', 'now') AS BIGINT) * 1000 WHERE message_id = ? AND recipient = ? AND state IN ('paid', 'sent', 'rejected_retryable')").bind(if terminal { "failed_paid" } else { "rejected_retryable" }).bind(reason).bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(changed)
     }
 
-    async fn acknowledge_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+    async fn acknowledge_pending(
+        &self,
+        id: &MessageId,
+        peer: &NodeId,
+        sender: &NodeId,
+    ) -> Result<bool, StorageError> {
         let mut tx = self.pool.begin().await?;
         let changed = sqlx::query("DELETE FROM pending_deliveries WHERE message_id = ? AND recipient_id = ? AND dispatched = 1 AND state != 'failed_paid' AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = ?)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
             .execute(&mut *tx).await?.rows_affected() == 1;
-            if changed {
+        if changed {
             sqlx::query("UPDATE outbox_operations SET state = 'acked', version = version + 1, updated_at = CAST(strftime('%s', 'now') AS BIGINT) * 1000 WHERE message_id = ? AND recipient = ? AND state IN ('paid', 'sent', 'rejected_retryable')").bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(changed)
     }
 
-    async fn acknowledge_pending_payment(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, hash: &[u8; 32]) -> Result<bool, StorageError> {
+    async fn acknowledge_pending_payment(
+        &self,
+        id: &MessageId,
+        peer: &NodeId,
+        sender: &NodeId,
+        hash: &[u8; 32],
+    ) -> Result<bool, StorageError> {
         let mut tx = self.pool.begin().await?;
         let changed = sqlx::query("DELETE FROM pending_deliveries WHERE message_id = ? AND recipient_id = ? AND dispatched = 1 AND state != 'failed_paid' AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = ? AND payment_hash = ?)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex()).bind(hex::encode(hash))
             .execute(&mut *tx).await?.rows_affected() == 1;
-            if changed {
+        if changed {
             sqlx::query("UPDATE outbox_operations SET state = 'acked', version = version + 1, updated_at = CAST(strftime('%s', 'now') AS BIGINT) * 1000 WHERE message_id = ? AND recipient = ? AND state IN ('paid', 'sent', 'rejected_retryable')").bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
         }
         tx.commit().await?;
@@ -1101,21 +1407,24 @@ impl Storage for SqliteStorage {
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
         let id_hex = id.to_hex();
 
-        let row = sqlx::query_as::<_, (
-            String,  // id
-            i64,     // kind
-            String,  // sender
-            String,  // recipient_type
-            String,  // recipient_id
-            i64,     // timestamp_ms
-            Vec<u8>, // ciphertext
-            String,  // payment_hash
-            String,  // preimage
-            i64,     // amount_msat
-            String,  // signature
-            String,  // nonce
-            String,  // references_json
-        )>(
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,  // id
+                i64,     // kind
+                String,  // sender
+                String,  // recipient_type
+                String,  // recipient_id
+                i64,     // timestamp_ms
+                Vec<u8>, // ciphertext
+                String,  // payment_hash
+                String,  // preimage
+                i64,     // amount_msat
+                String,  // signature
+                String,  // nonce
+                String,  // references_json
+            ),
+        >(
             "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
              ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
              FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND id = ?",
@@ -1127,8 +1436,7 @@ impl Storage for SqliteStorage {
         match row {
             Some(r) => {
                 let envelope = row_to_envelope(
-                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
-                    &r.12,
+                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11, &r.12,
                 )?;
                 Ok(Some(envelope))
             }
@@ -1136,54 +1444,155 @@ impl Storage for SqliteStorage {
         }
     }
 
-    async fn get_messages_for_recipient(&self, recipient: &Recipient, limit: u32, before_timestamp: Option<u64>) -> Result<Vec<UkmEnvelope>, StorageError> {
-        self.message_page(&crate::MessageListQuery::Recipient(recipient), limit, before_timestamp, None).await
+    async fn get_messages_for_recipient(
+        &self,
+        recipient: &Recipient,
+        limit: u32,
+        before_timestamp: Option<u64>,
+    ) -> Result<Vec<UkmEnvelope>, StorageError> {
+        self.message_page(
+            &crate::MessageListQuery::Recipient(recipient),
+            limit,
+            before_timestamp,
+            None,
+        )
+        .await
     }
 
-    async fn get_conversation_messages(&self, my_node_id: &str, peer_or_room_id: &str, is_room: bool, limit: u32, before_timestamp: Option<u64>) -> Result<Vec<UkmEnvelope>, StorageError> {
-        self.message_page(&crate::MessageListQuery::Conversation { me: my_node_id, peer: peer_or_room_id, is_room }, limit, before_timestamp, None).await
+    async fn get_conversation_messages(
+        &self,
+        my_node_id: &str,
+        peer_or_room_id: &str,
+        is_room: bool,
+        limit: u32,
+        before_timestamp: Option<u64>,
+    ) -> Result<Vec<UkmEnvelope>, StorageError> {
+        self.message_page(
+            &crate::MessageListQuery::Conversation {
+                me: my_node_id,
+                peer: peer_or_room_id,
+                is_room,
+            },
+            limit,
+            before_timestamp,
+            None,
+        )
+        .await
     }
 
-    async fn get_node_messages_of_kind(&self, my_node_id: &str, kind: u16, limit: u32, before_timestamp: Option<u64>) -> Result<Vec<UkmEnvelope>, StorageError> {
-        self.message_page(&crate::MessageListQuery::NodeKind { me: my_node_id, kind }, limit, before_timestamp, None).await
+    async fn get_node_messages_of_kind(
+        &self,
+        my_node_id: &str,
+        kind: u16,
+        limit: u32,
+        before_timestamp: Option<u64>,
+    ) -> Result<Vec<UkmEnvelope>, StorageError> {
+        self.message_page(
+            &crate::MessageListQuery::NodeKind {
+                me: my_node_id,
+                kind,
+            },
+            limit,
+            before_timestamp,
+            None,
+        )
+        .await
     }
 
-    async fn message_page(&self, scope: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<Vec<UkmEnvelope>, StorageError> {
+    async fn message_page(
+        &self,
+        scope: &crate::MessageListQuery<'_>,
+        limit: u32,
+        before: Option<u64>,
+        cursor: Option<&crate::ListCursor<u64>>,
+    ) -> Result<Vec<UkmEnvelope>, StorageError> {
         let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND "
         );
         match scope {
             crate::MessageListQuery::Recipient(recipient) => {
                 let (rtype, rid) = recipient_to_parts(recipient);
-                query.push("recipient_type = ").push_bind(rtype).push(" AND recipient_id = ").push_bind(rid);
+                query
+                    .push("recipient_type = ")
+                    .push_bind(rtype)
+                    .push(" AND recipient_id = ")
+                    .push_bind(rid);
             }
-            crate::MessageListQuery::Conversation { peer, is_room: true, .. } => {
-                query.push("recipient_type = 'room' AND recipient_id = ").push_bind(*peer);
+            crate::MessageListQuery::Conversation {
+                peer,
+                is_room: true,
+                ..
+            } => {
+                query
+                    .push("recipient_type = 'room' AND recipient_id = ")
+                    .push_bind(*peer);
             }
-            crate::MessageListQuery::Conversation { me, peer, is_room: false } => {
-                query.push("recipient_type = 'node' AND ((sender = ").push_bind(*peer)
-                    .push(" AND recipient_id = ").push_bind(*me)
-                    .push(") OR (sender = ").push_bind(*me)
-                    .push(" AND recipient_id = ").push_bind(*peer).push("))");
+            crate::MessageListQuery::Conversation {
+                me,
+                peer,
+                is_room: false,
+            } => {
+                query
+                    .push("recipient_type = 'node' AND ((sender = ")
+                    .push_bind(*peer)
+                    .push(" AND recipient_id = ")
+                    .push_bind(*me)
+                    .push(") OR (sender = ")
+                    .push_bind(*me)
+                    .push(" AND recipient_id = ")
+                    .push_bind(*peer)
+                    .push("))");
             }
             crate::MessageListQuery::NodeKind { me, kind } => {
-                query.push("kind = ").push_bind(i64::from(*kind))
-                    .push(" AND recipient_type = 'node' AND (sender = ").push_bind(*me)
-                    .push(" OR recipient_id = ").push_bind(*me).push(")");
+                query
+                    .push("kind = ")
+                    .push_bind(i64::from(*kind))
+                    .push(" AND recipient_type = 'node' AND (sender = ")
+                    .push_bind(*me)
+                    .push(" OR recipient_id = ")
+                    .push_bind(*me)
+                    .push(")");
             }
         }
-        query.push(" AND timestamp_ms < ").push_bind(before.map_or(i64::MAX, |t| t.min(i64::MAX as u64) as i64));
+        query
+            .push(" AND timestamp_ms < ")
+            .push_bind(before.map_or(i64::MAX, |t| t.min(i64::MAX as u64) as i64));
         if let Some(cursor) = cursor {
-            query.push(" AND (timestamp_ms, id) < (").push_bind(cursor.timestamp.min(i64::MAX as u64) as i64)
-                .push(", ").push_bind(&cursor.id).push(")");
+            query
+                .push(" AND (timestamp_ms, id) < (")
+                .push_bind(cursor.timestamp.min(i64::MAX as u64) as i64)
+                .push(", ")
+                .push_bind(&cursor.id)
+                .push(")");
         }
-        query.push(" ORDER BY timestamp_ms DESC, id DESC LIMIT ").push_bind(i64::from(limit));
-        let rows = query.build_query_as::<(
-            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String, String, String,
-        )>().fetch_all(&self.pool).await?;
-        rows.into_iter().map(|r| row_to_envelope(
-            &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11, &r.12,
-        )).collect()
+        query
+            .push(" ORDER BY timestamp_ms DESC, id DESC LIMIT ")
+            .push_bind(i64::from(limit));
+        let rows = query
+            .build_query_as::<(
+                String,
+                i64,
+                String,
+                String,
+                String,
+                i64,
+                Vec<u8>,
+                String,
+                String,
+                i64,
+                String,
+                String,
+                String,
+            )>()
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|r| {
+                row_to_envelope(
+                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11, &r.12,
+                )
+            })
+            .collect()
     }
 
     async fn delete_message(&self, id: &MessageId) -> Result<bool, StorageError> {
@@ -1216,13 +1625,15 @@ impl Storage for SqliteStorage {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(sender, recipient_type, recipient_id, ts, amount)| crate::models::EnergyRow {
-                sender,
-                recipient_type,
-                recipient_id,
-                timestamp_ms: u64::try_from(ts).unwrap_or(0),
-                amount_msat: u64::try_from(amount).unwrap_or(0),
-            })
+            .map(
+                |(sender, recipient_type, recipient_id, ts, amount)| crate::models::EnergyRow {
+                    sender,
+                    recipient_type,
+                    recipient_id,
+                    timestamp_ms: u64::try_from(ts).unwrap_or(0),
+                    amount_msat: u64::try_from(amount).unwrap_or(0),
+                },
+            )
             .collect())
     }
 
@@ -1237,8 +1648,8 @@ impl Storage for SqliteStorage {
     async fn create_room(&self, room: &Room) -> Result<(), StorageError> {
         let id = room.id.to_string();
         let created_by = room.created_by.to_hex();
-        let metadata =
-            serde_json::to_string(&room.metadata).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let metadata = serde_json::to_string(&room.metadata)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
         sqlx::query(
             "INSERT INTO rooms (id, name, created_by, created_at, metadata_json) \
@@ -1332,13 +1743,11 @@ impl Storage for SqliteStorage {
         let rid = room_id.to_string();
         let nid = member.to_hex();
 
-        sqlx::query(
-            "INSERT OR IGNORE INTO room_members (room_id, node_id) VALUES (?, ?)",
-        )
-        .bind(&rid)
-        .bind(&nid)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("INSERT OR IGNORE INTO room_members (room_id, node_id) VALUES (?, ?)")
+            .bind(&rid)
+            .bind(&nid)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
@@ -1364,9 +1773,9 @@ impl Storage for SqliteStorage {
         let rid = room_id.to_string();
 
         let rows = sqlx::query_as::<_, (String,)>(ROOM_MEMBERS_SELECT)
-        .bind(&rid)
-        .fetch_all(&self.pool)
-        .await?;
+            .bind(&rid)
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.into_iter()
             .map(|(nid,)| {
@@ -1460,26 +1869,35 @@ impl Storage for SqliteStorage {
     }
 
     async fn list_peers(&self) -> Result<Vec<Peer>, StorageError> {
-        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, String)>(
-            PEERS_SELECT,
-        )
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                String,
+            ),
+        >(PEERS_SELECT)
         .fetch_all(&self.pool)
         .await?;
 
         rows.into_iter()
-            .map(|(node_id, address, last_seen, display_name, metadata_json)| {
-                let nid = NodeId::from_hex(&node_id)
-                    .map_err(|e| StorageError::Conversion(format!("peer node_id: {e}")))?;
-                let metadata: serde_json::Value = serde_json::from_str(&metadata_json)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                Ok(Peer {
-                    node_id: nid,
-                    address,
-                    last_seen,
-                    display_name,
-                    metadata,
-                })
-            })
+            .map(
+                |(node_id, address, last_seen, display_name, metadata_json)| {
+                    let nid = NodeId::from_hex(&node_id)
+                        .map_err(|e| StorageError::Conversion(format!("peer node_id: {e}")))?;
+                    let metadata: serde_json::Value = serde_json::from_str(&metadata_json)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                    Ok(Peer {
+                        node_id: nid,
+                        address,
+                        last_seen,
+                        display_name,
+                        metadata,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -1495,17 +1913,33 @@ impl Storage for SqliteStorage {
     // ── Nonces ─────────────────────────────────────────────────────────
 
     async fn store_paid_nonce(
-        &self, nonce: &Nonce, payment_hash: &[u8; 32], sender: &NodeId, message_id: &MessageId,
+        &self,
+        nonce: &Nonce,
+        payment_hash: &[u8; 32],
+        sender: &NodeId,
+        message_id: &MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, StorageError> {
         use konsensus_core::gate::PaidReplay;
         let mut tx = self.pool.begin().await?;
-        let nonce_new = sqlx::query("INSERT OR IGNORE INTO nonces (nonce_hex, sender) VALUES (?, ?)")
-            .bind(hex::encode(nonce.as_bytes())).bind(sender.to_hex()).execute(&mut *tx).await?.rows_affected() != 0;
-        if !nonce_new { tx.rollback().await?; return Ok(PaidReplay::NonceReused); }
+        let nonce_new =
+            sqlx::query("INSERT OR IGNORE INTO nonces (nonce_hex, sender) VALUES (?, ?)")
+                .bind(hex::encode(nonce.as_bytes()))
+                .bind(sender.to_hex())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                != 0;
+        if !nonce_new {
+            tx.rollback().await?;
+            return Ok(PaidReplay::NonceReused);
+        }
         let payment_new = sqlx::query("INSERT OR IGNORE INTO payment_receipts (payment_hash, message_id, sender) VALUES (?, ?, ?)")
             .bind(hex::encode(payment_hash)).bind(message_id.to_hex()).bind(sender.to_hex())
             .execute(&mut *tx).await?.rows_affected() != 0;
-        if !payment_new { tx.rollback().await?; return Ok(PaidReplay::PaymentReused); }
+        if !payment_new {
+            tx.rollback().await?;
+            return Ok(PaidReplay::PaymentReused);
+        }
         tx.commit().await?;
         Ok(PaidReplay::Accepted)
     }
@@ -1514,13 +1948,11 @@ impl Storage for SqliteStorage {
         let nonce_hex = hex::encode(nonce.as_bytes());
         let sender_hex = sender.to_hex();
 
-        let result = sqlx::query(
-            "INSERT OR IGNORE INTO nonces (nonce_hex, sender) VALUES (?, ?)",
-        )
-        .bind(&nonce_hex)
-        .bind(&sender_hex)
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query("INSERT OR IGNORE INTO nonces (nonce_hex, sender) VALUES (?, ?)")
+            .bind(&nonce_hex)
+            .bind(&sender_hex)
+            .execute(&self.pool)
+            .await?;
 
         // rows_affected == 1 means new insert, 0 means duplicate (replay)
         Ok(result.rows_affected() > 0)
@@ -1554,7 +1986,8 @@ impl Storage for SqliteStorage {
         request: konsensus_core::web_reply::OutstandingWebRequest,
     ) -> Result<(), StorageError> {
         // Durable (#129 R1): a restart between paying and the reply keeps the binding.
-        let expires = i64::try_from(request.expires_at_ms).map_err(|_| StorageError::Conversion("web request expiry overflow".into()))?;
+        let expires = i64::try_from(request.expires_at_ms)
+            .map_err(|_| StorageError::Conversion("web request expiry overflow".into()))?;
         sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
             .bind(hex::encode(payment_hash))
             .bind(request.request_id.to_hex())
@@ -1580,8 +2013,13 @@ impl Storage for SqliteStorage {
         row.map(outstanding_from_row).transpose()
     }
 
-    async fn sweep_outstanding_web_requests(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
-        let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("sweep time overflow".into()))?;
+    async fn sweep_outstanding_web_requests(
+        &self,
+        now_ms: u64,
+        max: u32,
+    ) -> Result<u64, StorageError> {
+        let now = i64::try_from(now_ms)
+            .map_err(|_| StorageError::Conversion("sweep time overflow".into()))?;
         let result = sqlx::query("DELETE FROM outstanding_web_requests WHERE payment_hash IN (SELECT payment_hash FROM outstanding_web_requests WHERE expires_at_ms < ? ORDER BY expires_at_ms LIMIT ?)")
             .bind(now)
             .bind(i64::from(max))
@@ -1590,14 +2028,23 @@ impl Storage for SqliteStorage {
         Ok(result.rows_affected())
     }
 
-    async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+    async fn call_get(
+        &self,
+        peer: &konsensus_core::NodeId,
+        call_id: &str,
+    ) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
         let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash FROM call_state WHERE peer = ? AND call_id = ?")
             .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
         row.map(call_entry_from_row).transpose()
     }
 
-    async fn call_open_by_peer(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
+    async fn call_open_by_peer(
+        &self,
+        peer: &konsensus_core::NodeId,
+        now_ms: u64,
+    ) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        let now = i64::try_from(now_ms)
+            .map_err(|_| StorageError::Conversion("call time overflow".into()))?;
         let rows: Vec<(String, String, String, i64, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
             "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash FROM call_state \
              WHERE peer = ? AND (pending_operation_id IS NOT NULL OR (phase <> 'ended' AND deadline_ms > ?)) \
@@ -1605,13 +2052,25 @@ impl Storage for SqliteStorage {
             .bind(peer.to_hex()).bind(now)
             .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS_PER_PEER as i64)
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(id, side, phase, deadline, op, kind, hash)| {
-            Ok((id, call_entry_from_row((side, phase, deadline, op, kind, hash))?))
-        }).collect()
+        rows.into_iter()
+            .map(|(id, side, phase, deadline, op, kind, hash)| {
+                Ok((
+                    id,
+                    call_entry_from_row((side, phase, deadline, op, kind, hash))?,
+                ))
+            })
+            .collect()
     }
 
-    async fn call_put(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
-        let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
+    async fn call_put(
+        &self,
+        peer: &konsensus_core::NodeId,
+        call_id: &str,
+        entry: &konsensus_core::payloads::call::CallEntry,
+    ) -> Result<(), StorageError> {
+        let ms = |v: u64| {
+            i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()))
+        };
         sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
             ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash")
             .bind(peer.to_hex()).bind(call_id)
@@ -1624,14 +2083,26 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn call_delete(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(), StorageError> {
+    async fn call_delete(
+        &self,
+        peer: &konsensus_core::NodeId,
+        call_id: &str,
+    ) -> Result<(), StorageError> {
         sqlx::query("DELETE FROM call_state WHERE peer = ? AND call_id = ?")
-            .bind(peer.to_hex()).bind(call_id).execute(&self.pool).await?;
+            .bind(peer.to_hex())
+            .bind(call_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
-    async fn call_counts(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
-        let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
+    async fn call_counts(
+        &self,
+        peer: &konsensus_core::NodeId,
+        now_ms: u64,
+    ) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
+        let now = i64::try_from(now_ms)
+            .map_err(|_| StorageError::Conversion("call time overflow".into()))?;
         // Open: ours pending, or not ended and before its deadline. Burned: the rest, while protected.
         let (open_peer, open_total, burned_peer, burned_total): (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT \
@@ -1643,11 +2114,24 @@ impl Storage for SqliteStorage {
                    FROM call_state WHERE replay_until_ms > ? OR pending_operation_id IS NOT NULL) AS rows")
             .bind(peer.to_hex()).bind(peer.to_hex()).bind(now).bind(now).fetch_one(&self.pool).await?;
         let n = |v: i64| u64::try_from(v).unwrap_or(0);
-        Ok(konsensus_core::payloads::call::CallCounts { open_peer: n(open_peer), open_total: n(open_total), burned_peer: n(burned_peer), burned_total: n(burned_total) })
+        Ok(konsensus_core::payloads::call::CallCounts {
+            open_peer: n(open_peer),
+            open_total: n(open_total),
+            burned_peer: n(burned_peer),
+            burned_total: n(burned_total),
+        })
     }
 
-    async fn call_evict_burned(&self, peer: Option<&konsensus_core::NodeId>, replay_until_at_most: u64, now_ms: u64, max: u64) -> Result<u64, StorageError> {
-        let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call time overflow".into()));
+    async fn call_evict_burned(
+        &self,
+        peer: Option<&konsensus_core::NodeId>,
+        replay_until_at_most: u64,
+        now_ms: u64,
+        max: u64,
+    ) -> Result<u64, StorageError> {
+        let ms = |v: u64| {
+            i64::try_from(v).map_err(|_| StorageError::Conversion("call time overflow".into()))
+        };
         let done = sqlx::query(
             "DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state \
              WHERE (? IS NULL OR peer = ?) AND pending_operation_id IS NULL AND (phase = 'ended' OR deadline_ms <= ?) \
@@ -1658,39 +2142,74 @@ impl Storage for SqliteStorage {
         Ok(done.rows_affected())
     }
 
-    async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+    async fn call_pending(
+        &self,
+    ) -> Result<
+        Vec<(
+            konsensus_core::NodeId,
+            String,
+            konsensus_core::payloads::call::CallEntry,
+        )>,
+        StorageError,
+    > {
         let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
             "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash FROM call_state WHERE pending_operation_id IS NOT NULL")
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash)| {
-            let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
-            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash))?))
-        }).collect()
+        rows.into_iter()
+            .map(|(peer, id, side, phase, deadline, op, kind, hash)| {
+                let peer = konsensus_core::NodeId::from_hex(&peer)
+                    .map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
+                Ok((
+                    peer,
+                    id,
+                    call_entry_from_row((side, phase, deadline, op, kind, hash))?,
+                ))
+            })
+            .collect()
     }
 
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
-        let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
+        let now = i64::try_from(now_ms)
+            .map_err(|_| StorageError::Conversion("call time overflow".into()))?;
         let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= ? AND pending_operation_id IS NULL ORDER BY replay_until_ms LIMIT ?)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
         Ok(done.rows_affected())
     }
 
-    async fn reject_accepted_envelope(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
+    async fn reject_accepted_envelope(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+    ) -> Result<(), StorageError> {
         let id = envelope.id.to_hex();
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM messages WHERE id = ? AND sender = ?")
-            .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
-        sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE payment_hash = ? AND message_id = ?")
-            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(&id).execute(&mut *tx).await?;
+            .bind(&id)
+            .bind(envelope.sender.to_hex())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE payment_receipts SET accepted = -1 WHERE payment_hash = ? AND message_id = ?",
+        )
+        .bind(hex::encode(envelope.payment_proof.payment_hash))
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
-            .bind(&id).execute(&mut *tx).await?;
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
 
-    async fn call_admission_hold(&self, envelope: &konsensus_core::UkmEnvelope, now_ms: u64) -> Result<bool, StorageError> {
+    async fn call_admission_hold(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
         let id = envelope.id.to_hex();
-        let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
+        let now = i64::try_from(now_ms)
+            .map_err(|_| StorageError::Conversion("call time overflow".into()))?;
         let done = sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id = ?) ON CONFLICT DO NOTHING")
             .bind(&id).bind(envelope.sender.to_hex()).bind(now).bind(&id).execute(&self.pool).await?;
         Ok(done.rows_affected() == 1)
@@ -1698,13 +2217,18 @@ impl Storage for SqliteStorage {
 
     async fn call_admission_release(&self, id: &MessageId) -> Result<(), StorageError> {
         sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
-            .bind(id.to_hex()).execute(&self.pool).await?;
+            .bind(id.to_hex())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     async fn call_admission_held(&self, id: &MessageId) -> Result<bool, StorageError> {
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_admission_hold WHERE message_id = ?")
-            .bind(id.to_hex()).fetch_one(&self.pool).await?;
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM call_admission_hold WHERE message_id = ?")
+                .bind(id.to_hex())
+                .fetch_one(&self.pool)
+                .await?;
         Ok(n > 0)
     }
 
@@ -1716,7 +2240,9 @@ impl Storage for SqliteStorage {
         sqlx::query("DELETE FROM messages WHERE (id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < ?)")
             .bind(before).execute(&mut *tx).await?;
         let done = sqlx::query("DELETE FROM call_admission_hold WHERE held_at_ms < ?")
-            .bind(before).execute(&mut *tx).await?;
+            .bind(before)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(done.rows_affected())
     }
@@ -1724,12 +2250,10 @@ impl Storage for SqliteStorage {
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
         let nonce_hex = hex::encode(nonce.as_bytes());
 
-        let row = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM nonces WHERE nonce_hex = ?",
-        )
-        .bind(&nonce_hex)
-        .fetch_one(&self.pool)
-        .await?;
+        let row = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM nonces WHERE nonce_hex = ?")
+            .bind(&nonce_hex)
+            .fetch_one(&self.pool)
+            .await?;
 
         Ok(row.0 > 0)
     }
@@ -1747,11 +2271,7 @@ impl Storage for SqliteStorage {
 
     // ── E2EE Sessions ──────────────────────────────────────────────────
 
-    async fn store_session(
-        &self,
-        peer_id: &NodeId,
-        state_blob: &[u8],
-    ) -> Result<(), StorageError> {
+    async fn store_session(&self, peer_id: &NodeId, state_blob: &[u8]) -> Result<(), StorageError> {
         let pid = peer_id.to_hex();
 
         sqlx::query(
@@ -1769,18 +2289,14 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn load_session(
-        &self,
-        peer_id: &NodeId,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
+    async fn load_session(&self, peer_id: &NodeId) -> Result<Option<Vec<u8>>, StorageError> {
         let pid = peer_id.to_hex();
 
-        let row = sqlx::query_as::<_, (Vec<u8>,)>(
-            "SELECT state_blob FROM sessions WHERE peer_id = ?",
-        )
-        .bind(&pid)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query_as::<_, (Vec<u8>,)>("SELECT state_blob FROM sessions WHERE peer_id = ?")
+                .bind(&pid)
+                .fetch_optional(&self.pool)
+                .await?;
 
         Ok(row.map(|(blob,)| blob))
     }
@@ -1796,8 +2312,8 @@ impl Storage for SqliteStorage {
 
     async fn list_sessions(&self) -> Result<Vec<NodeId>, StorageError> {
         let rows = sqlx::query_as::<_, (String,)>(SESSIONS_SELECT)
-        .fetch_all(&self.pool)
-        .await?;
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.into_iter()
             .map(|(pid,)| {
@@ -1843,8 +2359,9 @@ impl Storage for SqliteStorage {
             .map(|(mid, attempts)| {
                 let id = MessageId::from_hex(&mid)
                     .map_err(|e| StorageError::Conversion(format!("pending message_id: {e}")))?;
-                let att = u32::try_from(attempts)
-                    .map_err(|_| StorageError::Conversion(format!("attempts out of u32 range: {attempts}")))?;
+                let att = u32::try_from(attempts).map_err(|_| {
+                    StorageError::Conversion(format!("attempts out of u32 range: {attempts}"))
+                })?;
                 Ok((id, att))
             })
             .collect()
@@ -1889,8 +2406,8 @@ impl Storage for SqliteStorage {
 
     async fn get_pending_peers(&self) -> Result<Vec<NodeId>, StorageError> {
         let rows = sqlx::query_as::<_, (String,)>(PENDING_PEERS_SELECT)
-        .fetch_all(&self.pool)
-        .await?;
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.into_iter()
             .map(|(rid,)| {
@@ -1901,11 +2418,9 @@ impl Storage for SqliteStorage {
     }
 
     async fn count_pending_deliveries(&self) -> Result<u64, StorageError> {
-        let row = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM pending_deliveries",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let row = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM pending_deliveries")
+            .fetch_one(&self.pool)
+            .await?;
 
         u64::try_from(row.0)
             .map_err(|_| StorageError::Conversion(format!("pending count negative: {}", row.0)))
@@ -1913,12 +2428,10 @@ impl Storage for SqliteStorage {
 
     async fn clear_pending_for_peer(&self, recipient: &NodeId) -> Result<u64, StorageError> {
         let recipient_hex = recipient.to_hex();
-        let result = sqlx::query(
-            "DELETE FROM pending_deliveries WHERE recipient_id = ?",
-        )
-        .bind(&recipient_hex)
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query("DELETE FROM pending_deliveries WHERE recipient_id = ?")
+            .bind(&recipient_hex)
+            .execute(&self.pool)
+            .await?;
 
         Ok(result.rows_affected())
     }
@@ -1967,21 +2480,35 @@ impl Storage for SqliteStorage {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.map(|(id, filename, mime_type, size_bytes, blake3_hash, sender, message_id, data, created_at)| {
-            let sz = u64::try_from(size_bytes)
-                .map_err(|_| StorageError::Conversion(format!("file size negative: {size_bytes}")))?;
-            Ok::<FileRecord, StorageError>(FileRecord {
+        row.map(
+            |(
                 id,
                 filename,
                 mime_type,
-                size_bytes: sz,
+                size_bytes,
                 blake3_hash,
                 sender,
                 message_id,
                 data,
                 created_at,
-            })
-        }).transpose()
+            )| {
+                let sz = u64::try_from(size_bytes).map_err(|_| {
+                    StorageError::Conversion(format!("file size negative: {size_bytes}"))
+                })?;
+                Ok::<FileRecord, StorageError>(FileRecord {
+                    id,
+                    filename,
+                    mime_type,
+                    size_bytes: sz,
+                    blake3_hash,
+                    sender,
+                    message_id,
+                    data,
+                    created_at,
+                })
+            },
+        )
+        .transpose()
     }
 
     async fn get_file_metadata(&self, id: &str) -> Result<Option<FileMetadata>, StorageError> {
@@ -1995,61 +2522,120 @@ impl Storage for SqliteStorage {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.map(|(id, filename, mime_type, size_bytes, blake3_hash, sender, message_id, created_at)| {
-            let sz = u64::try_from(size_bytes)
-                .map_err(|_| StorageError::Conversion(format!("file size negative: {size_bytes}")))?;
-            Ok::<FileMetadata, StorageError>(FileMetadata {
-                id,
-                filename,
-                mime_type,
-                size_bytes: sz,
-                blake3_hash,
-                sender,
-                message_id,
-                created_at,
-            })
-        }).transpose()
+        row.map(
+            |(id, filename, mime_type, size_bytes, blake3_hash, sender, message_id, created_at)| {
+                let sz = u64::try_from(size_bytes).map_err(|_| {
+                    StorageError::Conversion(format!("file size negative: {size_bytes}"))
+                })?;
+                Ok::<FileMetadata, StorageError>(FileMetadata {
+                    id,
+                    filename,
+                    mime_type,
+                    size_bytes: sz,
+                    blake3_hash,
+                    sender,
+                    message_id,
+                    created_at,
+                })
+            },
+        )
+        .transpose()
     }
 
     async fn list_files(&self, limit: u32) -> Result<Vec<FileMetadata>, StorageError> {
-        Ok(self.file_page(limit, None).await?.into_iter().map(|row| row.metadata).collect())
+        Ok(self
+            .file_page(limit, None)
+            .await?
+            .into_iter()
+            .map(|row| row.metadata)
+            .collect())
     }
 
-    async fn file_page(&self, limit: u32, cursor: Option<&crate::ListCursor<String>>) -> Result<Vec<crate::FileListRow>, StorageError> {
+    async fn file_page(
+        &self,
+        limit: u32,
+        cursor: Option<&crate::ListCursor<String>>,
+    ) -> Result<Vec<crate::FileListRow>, StorageError> {
         let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT id, filename, mime_type, size_bytes, blake3_hash, sender, message_id, created_at FROM files");
         if let Some(cursor) = cursor {
-            let staged_time = cursor.id.starts_with("stage-").then(|| chrono::DateTime::parse_from_rfc3339(&cursor.timestamp).ok()).flatten();
+            let staged_time = cursor
+                .id
+                .starts_with("stage-")
+                .then(|| chrono::DateTime::parse_from_rfc3339(&cursor.timestamp).ok())
+                .flatten();
             if let Some(time) = staged_time {
                 let sub_ms = time.timestamp_subsec_nanos() % 1_000_000 != 0;
                 let boundary = if sub_ms {
-                    time + chrono::Duration::nanoseconds(i64::from(1_000_000 - time.timestamp_subsec_nanos() % 1_000_000))
-                } else { time };
-                query.push(" WHERE (created_at, id) < (")
-                    .push_bind(boundary.with_timezone(&chrono::Utc).to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-                    .push(", ").push_bind(if sub_ms { "" } else { &cursor.id }).push(")");
+                    time + chrono::Duration::nanoseconds(i64::from(
+                        1_000_000 - time.timestamp_subsec_nanos() % 1_000_000,
+                    ))
+                } else {
+                    time
+                };
+                query
+                    .push(" WHERE (created_at, id) < (")
+                    .push_bind(
+                        boundary
+                            .with_timezone(&chrono::Utc)
+                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    )
+                    .push(", ")
+                    .push_bind(if sub_ms { "" } else { &cursor.id })
+                    .push(")");
             } else {
-                query.push(" WHERE (created_at, id) < (").push_bind(&cursor.timestamp).push(", ").push_bind(&cursor.id).push(")");
+                query
+                    .push(" WHERE (created_at, id) < (")
+                    .push_bind(&cursor.timestamp)
+                    .push(", ")
+                    .push_bind(&cursor.id)
+                    .push(")");
             }
         }
-        query.push(" ORDER BY created_at DESC, id DESC LIMIT ").push_bind(i64::from(limit));
-        let rows = query.build_query_as::<(
-            String, String, String, i64, String, String, Option<String>, String,
-        )>().fetch_all(&self.pool).await?;
+        query
+            .push(" ORDER BY created_at DESC, id DESC LIMIT ")
+            .push_bind(i64::from(limit));
+        let rows = query
+            .build_query_as::<(
+                String,
+                String,
+                String,
+                i64,
+                String,
+                String,
+                Option<String>,
+                String,
+            )>()
+            .fetch_all(&self.pool)
+            .await?;
 
-        rows.into_iter().map(|(id, filename, mime_type, size_bytes, blake3_hash, sender, message_id, created_at)| {
-            let sz = u64::try_from(size_bytes)
-                .map_err(|_| StorageError::Conversion(format!("file size negative: {size_bytes}")))?;
-            Ok(crate::FileListRow::from(FileMetadata {
-                id,
-                filename,
-                mime_type,
-                size_bytes: sz,
-                blake3_hash,
-                sender,
-                message_id,
-                created_at,
-            }))
-        }).collect()
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    filename,
+                    mime_type,
+                    size_bytes,
+                    blake3_hash,
+                    sender,
+                    message_id,
+                    created_at,
+                )| {
+                    let sz = u64::try_from(size_bytes).map_err(|_| {
+                        StorageError::Conversion(format!("file size negative: {size_bytes}"))
+                    })?;
+                    Ok(crate::FileListRow::from(FileMetadata {
+                        id,
+                        filename,
+                        mime_type,
+                        size_bytes: sz,
+                        blake3_hash,
+                        sender,
+                        message_id,
+                        created_at,
+                    }))
+                },
+            )
+            .collect()
     }
 
     async fn delete_file(&self, id: &str) -> Result<bool, StorageError> {
@@ -2075,10 +2661,7 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn get_message_plaintext(
-        &self,
-        id: &MessageId,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
+    async fn get_message_plaintext(&self, id: &MessageId) -> Result<Option<Vec<u8>>, StorageError> {
         let row: Option<(Option<Vec<u8>>,)> =
             sqlx::query_as("SELECT plaintext_enc FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND id = ?")
                 .bind(id.to_hex())
@@ -2087,9 +2670,7 @@ impl Storage for SqliteStorage {
         Ok(row.and_then(|(data,)| data))
     }
 
-    async fn invite_schema_capabilities(
-        &self,
-    ) -> Result<InviteSchemaCapabilities, StorageError> {
+    async fn invite_schema_capabilities(&self) -> Result<InviteSchemaCapabilities, StorageError> {
         let columns: Vec<String> =
             sqlx::query_scalar("SELECT name FROM pragma_table_info('invites_issued')")
                 .fetch_all(&self.pool)
@@ -2116,7 +2697,9 @@ impl Storage for SqliteStorage {
             .channel_open_intent_expiry_unix
             .map(i64::try_from)
             .transpose()
-            .map_err(|_| StorageError::Conversion("channel_open_intent_expiry_unix overflows i64".into()))?;
+            .map_err(|_| {
+                StorageError::Conversion("channel_open_intent_expiry_unix overflows i64".into())
+            })?;
         let created_at = i64::try_from(record.created_at).map_err(|_| {
             StorageError::Conversion(format!("created_at overflows i64: {}", record.created_at))
         })?;
@@ -2168,7 +2751,9 @@ impl Storage for SqliteStorage {
             .channel_open_intent_expiry_unix
             .map(i64::try_from)
             .transpose()
-            .map_err(|_| StorageError::Conversion("channel_open_intent_expiry_unix overflows i64".into()))?;
+            .map_err(|_| {
+                StorageError::Conversion("channel_open_intent_expiry_unix overflows i64".into())
+            })?;
         let created_at = i64::try_from(invite.created_at).map_err(|_| {
             StorageError::Conversion(format!("created_at overflows i64: {}", invite.created_at))
         })?;
@@ -2206,15 +2791,14 @@ impl Storage for SqliteStorage {
         .execute(&mut *tx)
         .await?;
 
-        let mut metadata = sqlx::query_as::<_, (String,)>(
-            "SELECT metadata_json FROM peers WHERE node_id = ?",
-        )
-        .bind(&node_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .and_then(|(json,)| serde_json::from_str::<serde_json::Value>(&json).ok())
-        .filter(|v| v.is_object())
-        .unwrap_or_else(|| serde_json::json!({}));
+        let mut metadata =
+            sqlx::query_as::<_, (String,)>("SELECT metadata_json FROM peers WHERE node_id = ?")
+                .bind(&node_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .and_then(|(json,)| serde_json::from_str::<serde_json::Value>(&json).ok())
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| serde_json::json!({}));
 
         metadata["invite_ref"] = serde_json::Value::String(invite.id.to_string());
         metadata["whitelist_source"] = serde_json::Value::String("invite".to_string());
@@ -2251,7 +2835,9 @@ impl Storage for SqliteStorage {
             .channel_open_intent_expiry_unix
             .map(i64::try_from)
             .transpose()
-            .map_err(|_| StorageError::Conversion("channel_open_intent_expiry_unix overflows i64".into()))?;
+            .map_err(|_| {
+                StorageError::Conversion("channel_open_intent_expiry_unix overflows i64".into())
+            })?;
         let created_at = i64::try_from(invite.created_at).map_err(|_| {
             StorageError::Conversion(format!("created_at overflows i64: {}", invite.created_at))
         })?;
@@ -2349,36 +2935,30 @@ impl Storage for SqliteStorage {
             let expiry_unix = u64::try_from(r.2).map_err(|_| {
                 StorageError::Conversion(format!("negative invites_issued.expiry_unix: {}", r.2))
             })?;
-            let channel_size_hint_sats = r
-                .3
-                .map(u32::try_from)
-                .transpose()
-                .map_err(|_| StorageError::Conversion("channel_size_hint_sats out of range".into()))?;
-            let max_fee_rate_sat_per_vb = r
-                .5
-                .map(u32::try_from)
-                .transpose()
-                .map_err(|_| StorageError::Conversion("max_fee_rate_sat_per_vb out of range".into()))?;
-            let channel_open_intent_expiry_unix = r
-                .6
-                .map(u64::try_from)
-                .transpose()
-                .map_err(|_| StorageError::Conversion("channel_open_intent_expiry_unix out of range".into()))?;
-            let state = InviteState::from_str(&r.8)
-                .map_err(|e| StorageError::Conversion(format!("invalid invites_issued.state: {e}")))?;
+            let channel_size_hint_sats = r.3.map(u32::try_from).transpose().map_err(|_| {
+                StorageError::Conversion("channel_size_hint_sats out of range".into())
+            })?;
+            let max_fee_rate_sat_per_vb = r.5.map(u32::try_from).transpose().map_err(|_| {
+                StorageError::Conversion("max_fee_rate_sat_per_vb out of range".into())
+            })?;
+            let channel_open_intent_expiry_unix =
+                r.6.map(u64::try_from).transpose().map_err(|_| {
+                    StorageError::Conversion("channel_open_intent_expiry_unix out of range".into())
+                })?;
+            let state = InviteState::from_str(&r.8).map_err(|e| {
+                StorageError::Conversion(format!("invalid invites_issued.state: {e}"))
+            })?;
             let created_at = u64::try_from(r.9).map_err(|_| {
                 StorageError::Conversion(format!("negative invites_issued.created_at: {}", r.9))
             })?;
-            let accepted_at = r
-                .10
-                .map(u64::try_from)
-                .transpose()
-                .map_err(|_| StorageError::Conversion("accepted_at out of range".into()))?;
-            let revoked_at = r
-                .11
-                .map(u64::try_from)
-                .transpose()
-                .map_err(|_| StorageError::Conversion("revoked_at out of range".into()))?;
+            let accepted_at =
+                r.10.map(u64::try_from)
+                    .transpose()
+                    .map_err(|_| StorageError::Conversion("accepted_at out of range".into()))?;
+            let revoked_at =
+                r.11.map(u64::try_from)
+                    .transpose()
+                    .map_err(|_| StorageError::Conversion("revoked_at out of range".into()))?;
 
             Ok(InviteIssuedRecord {
                 id: uuid::Uuid::from_bytes(id_bytes),
@@ -2425,9 +3005,7 @@ impl Storage for SqliteStorage {
                 Option<i64>,
                 Option<i64>,
             ),
-        >(
-            INVITES_ISSUED_SELECT,
-        )
+        >(INVITES_ISSUED_SELECT)
         .fetch_all(&self.pool)
         .await?;
 
@@ -2443,28 +3021,22 @@ impl Storage for SqliteStorage {
                     StorageError::Conversion("invalid invites_issued.nonce length".into())
                 })?;
                 let expiry_unix = u64::try_from(r.2).map_err(|_| {
-                    StorageError::Conversion(format!("negative invites_issued.expiry_unix: {}", r.2))
+                    StorageError::Conversion(format!(
+                        "negative invites_issued.expiry_unix: {}",
+                        r.2
+                    ))
                 })?;
-                let channel_size_hint_sats = r
-                    .3
-                    .map(u32::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        StorageError::Conversion("channel_size_hint_sats out of range".into())
-                    })?;
-                let max_fee_rate_sat_per_vb = r
-                    .5
-                    .map(u32::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        StorageError::Conversion("max_fee_rate_sat_per_vb out of range".into())
-                    })?;
-                let channel_open_intent_expiry_unix = r
-                    .6
-                    .map(u64::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        StorageError::Conversion("channel_open_intent_expiry_unix out of range".into())
+                let channel_size_hint_sats = r.3.map(u32::try_from).transpose().map_err(|_| {
+                    StorageError::Conversion("channel_size_hint_sats out of range".into())
+                })?;
+                let max_fee_rate_sat_per_vb = r.5.map(u32::try_from).transpose().map_err(|_| {
+                    StorageError::Conversion("max_fee_rate_sat_per_vb out of range".into())
+                })?;
+                let channel_open_intent_expiry_unix =
+                    r.6.map(u64::try_from).transpose().map_err(|_| {
+                        StorageError::Conversion(
+                            "channel_open_intent_expiry_unix out of range".into(),
+                        )
                     })?;
                 let state = InviteState::from_str(&r.8).map_err(|e| {
                     StorageError::Conversion(format!("invalid invites_issued.state: {e}"))
@@ -2472,16 +3044,14 @@ impl Storage for SqliteStorage {
                 let created_at = u64::try_from(r.9).map_err(|_| {
                     StorageError::Conversion(format!("negative invites_issued.created_at: {}", r.9))
                 })?;
-                let accepted_at = r
-                    .10
-                    .map(u64::try_from)
-                    .transpose()
-                    .map_err(|_| StorageError::Conversion("accepted_at out of range".into()))?;
-                let revoked_at = r
-                    .11
-                    .map(u64::try_from)
-                    .transpose()
-                    .map_err(|_| StorageError::Conversion("revoked_at out of range".into()))?;
+                let accepted_at =
+                    r.10.map(u64::try_from)
+                        .transpose()
+                        .map_err(|_| StorageError::Conversion("accepted_at out of range".into()))?;
+                let revoked_at =
+                    r.11.map(u64::try_from)
+                        .transpose()
+                        .map_err(|_| StorageError::Conversion("revoked_at out of range".into()))?;
 
                 Ok(InviteIssuedRecord {
                     id: uuid::Uuid::from_bytes(id_bytes),
@@ -2600,15 +3170,14 @@ impl Storage for SqliteStorage {
         invite_id: uuid::Uuid,
     ) -> Result<(), StorageError> {
         let node_id = NodeId::from_bytes(pubkey).to_hex();
-        let mut metadata = sqlx::query_as::<_, (String,)>(
-            "SELECT metadata_json FROM peers WHERE node_id = ?",
-        )
-        .bind(&node_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .and_then(|(json,)| serde_json::from_str::<serde_json::Value>(&json).ok())
-        .filter(|v| v.is_object())
-        .unwrap_or_else(|| serde_json::json!({}));
+        let mut metadata =
+            sqlx::query_as::<_, (String,)>("SELECT metadata_json FROM peers WHERE node_id = ?")
+                .bind(&node_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .and_then(|(json,)| serde_json::from_str::<serde_json::Value>(&json).ok())
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| serde_json::json!({}));
 
         metadata["invite_ref"] = serde_json::Value::String(invite_id.to_string());
         metadata["whitelist_source"] = serde_json::Value::String("invite".to_string());
@@ -2672,7 +3241,9 @@ impl Storage for SqliteStorage {
         .execute(&self.pool)
         .await
         .map_err(|e| match &e {
-            sqlx::Error::Database(db_err) if matches!(db_err.code().as_deref(), Some("2067" | "1555")) => {
+            sqlx::Error::Database(db_err)
+                if matches!(db_err.code().as_deref(), Some("2067" | "1555")) =>
+            {
                 StorageError::AlreadyExists("accepted invite already exists".into())
             }
             _ => StorageError::Database(e),
@@ -2721,13 +3292,13 @@ impl Storage for SqliteStorage {
         &self,
         now_unix: u64,
     ) -> Result<Vec<AcceptedInviteRecord>, StorageError> {
-        let now_unix = i64::try_from(now_unix).map_err(|_| {
-            StorageError::Conversion(format!("now_unix overflows i64: {now_unix}"))
-        })?;
-        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64, i64)>(ACTIVE_ACCEPTED_INVITES_SELECT)
-            .bind(now_unix)
-            .fetch_all(&self.pool)
-            .await?;
+        let now_unix = i64::try_from(now_unix)
+            .map_err(|_| StorageError::Conversion(format!("now_unix overflows i64: {now_unix}")))?;
+        let rows =
+            sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64, i64)>(ACTIVE_ACCEPTED_INVITES_SELECT)
+                .bind(now_unix)
+                .fetch_all(&self.pool)
+                .await?;
 
         rows.into_iter()
             .map(|r| {
@@ -2735,13 +3306,21 @@ impl Storage for SqliteStorage {
                     StorageError::Conversion("invalid accepted_invites.nonce length".into())
                 })?;
                 let inviter_pubkey: [u8; 32] = r.1.try_into().map_err(|_| {
-                    StorageError::Conversion("invalid accepted_invites.inviter_pubkey length".into())
+                    StorageError::Conversion(
+                        "invalid accepted_invites.inviter_pubkey length".into(),
+                    )
                 })?;
                 let expiry_unix = u64::try_from(r.2).map_err(|_| {
-                    StorageError::Conversion(format!("negative accepted_invites.expiry_unix: {}", r.2))
+                    StorageError::Conversion(format!(
+                        "negative accepted_invites.expiry_unix: {}",
+                        r.2
+                    ))
                 })?;
                 let accepted_at = u64::try_from(r.3).map_err(|_| {
-                    StorageError::Conversion(format!("negative accepted_invites.accepted_at: {}", r.3))
+                    StorageError::Conversion(format!(
+                        "negative accepted_invites.accepted_at: {}",
+                        r.3
+                    ))
                 })?;
 
                 Ok(AcceptedInviteRecord {
@@ -2811,36 +3390,73 @@ impl Storage for SqliteStorage {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.map(|(invite_id, inviter_pubkey, inviter_ln_pubkey, current_step, tier, funding_address, req, recv, last_poll_at, funding_evidence)| {
-            let invite_id = invite_id
-                .map(|value| uuid::Uuid::parse_str(&value).map_err(|e| StorageError::Conversion(format!("onboarding_state.invite_id: {e}"))))
-                .transpose()?;
-            let inviter_pubkey = inviter_pubkey
-                .map(|bytes| bytes.try_into().map_err(|_| StorageError::Conversion("onboarding_state.inviter_pubkey wrong length".into())))
-                .transpose()?;
-            let funding_amount_sats_required = req
-                .map(|value| u32::try_from(value).map_err(|_| StorageError::Conversion("onboarding_state.funding_amount_sats_required out of range".into())))
-                .transpose()?;
-            let funding_amount_sats_received = u32::try_from(recv).map_err(|_| {
-                StorageError::Conversion("onboarding_state.funding_amount_sats_received out of range".into())
-            })?;
-            let last_poll_at = last_poll_at
-                .map(|value| u64::try_from(value).map_err(|_| StorageError::Conversion("onboarding_state.last_poll_at negative".into())))
-                .transpose()?;
-
-            Ok(OnboardingStateRecord {
+        row.map(
+            |(
                 invite_id,
                 inviter_pubkey,
                 inviter_ln_pubkey,
                 current_step,
                 tier,
                 funding_address,
-                funding_amount_sats_required,
-                funding_amount_sats_received,
+                req,
+                recv,
                 last_poll_at,
                 funding_evidence,
-            })
-        })
+            )| {
+                let invite_id = invite_id
+                    .map(|value| {
+                        uuid::Uuid::parse_str(&value).map_err(|e| {
+                            StorageError::Conversion(format!("onboarding_state.invite_id: {e}"))
+                        })
+                    })
+                    .transpose()?;
+                let inviter_pubkey = inviter_pubkey
+                    .map(|bytes| {
+                        bytes.try_into().map_err(|_| {
+                            StorageError::Conversion(
+                                "onboarding_state.inviter_pubkey wrong length".into(),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                let funding_amount_sats_required = req
+                    .map(|value| {
+                        u32::try_from(value).map_err(|_| {
+                            StorageError::Conversion(
+                                "onboarding_state.funding_amount_sats_required out of range".into(),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                let funding_amount_sats_received = u32::try_from(recv).map_err(|_| {
+                    StorageError::Conversion(
+                        "onboarding_state.funding_amount_sats_received out of range".into(),
+                    )
+                })?;
+                let last_poll_at = last_poll_at
+                    .map(|value| {
+                        u64::try_from(value).map_err(|_| {
+                            StorageError::Conversion(
+                                "onboarding_state.last_poll_at negative".into(),
+                            )
+                        })
+                    })
+                    .transpose()?;
+
+                Ok(OnboardingStateRecord {
+                    invite_id,
+                    inviter_pubkey,
+                    inviter_ln_pubkey,
+                    current_step,
+                    tier,
+                    funding_address,
+                    funding_amount_sats_required,
+                    funding_amount_sats_received,
+                    last_poll_at,
+                    funding_evidence,
+                })
+            },
+        )
         .transpose()
     }
 
@@ -2881,7 +3497,10 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn get_calendar_event(&self, id: &str) -> Result<Option<CalendarEventRecord>, StorageError> {
+    async fn get_calendar_event(
+        &self,
+        id: &str,
+    ) -> Result<Option<CalendarEventRecord>, StorageError> {
         let row: Option<(
             String,
             Option<String>,
@@ -2907,8 +3526,22 @@ impl Storage for SqliteStorage {
         .await?;
 
         Ok(row.map(
-            |(id, message_id, organizer, title, description, start_ms, end_ms, tz,
-              location, attendees_json, recurrence_json, color, created_at, parent_id)| {
+            |(
+                id,
+                message_id,
+                organizer,
+                title,
+                description,
+                start_ms,
+                end_ms,
+                tz,
+                location,
+                attendees_json,
+                recurrence_json,
+                color,
+                created_at,
+                parent_id,
+            )| {
                 CalendarEventRecord {
                     id,
                     message_id,
@@ -2968,8 +3601,22 @@ impl Storage for SqliteStorage {
         Ok(rows
             .into_iter()
             .map(
-                |(id, message_id, organizer, title, description, start_ms, end_ms, tz,
-                  location, attendees_json, recurrence_json, color, created_at, parent_id)| {
+                |(
+                    id,
+                    message_id,
+                    organizer,
+                    title,
+                    description,
+                    start_ms,
+                    end_ms,
+                    tz,
+                    location,
+                    attendees_json,
+                    recurrence_json,
+                    color,
+                    created_at,
+                    parent_id,
+                )| {
                     CalendarEventRecord {
                         id,
                         message_id,
@@ -3022,8 +3669,22 @@ impl Storage for SqliteStorage {
         Ok(rows
             .into_iter()
             .map(
-                |(id, message_id, organizer, title, description, start_ms, end_ms, tz,
-                  location, attendees_json, recurrence_json, color, created_at, parent_id)| {
+                |(
+                    id,
+                    message_id,
+                    organizer,
+                    title,
+                    description,
+                    start_ms,
+                    end_ms,
+                    tz,
+                    location,
+                    attendees_json,
+                    recurrence_json,
+                    color,
+                    created_at,
+                    parent_id,
+                )| {
                     CalendarEventRecord {
                         id,
                         message_id,
@@ -3074,8 +3735,22 @@ impl Storage for SqliteStorage {
         Ok(rows
             .into_iter()
             .map(
-                |(id, message_id, organizer, title, description, start_ms, end_ms, tz,
-                  location, attendees_json, recurrence_json, color, created_at, parent_id)| {
+                |(
+                    id,
+                    message_id,
+                    organizer,
+                    title,
+                    description,
+                    start_ms,
+                    end_ms,
+                    tz,
+                    location,
+                    attendees_json,
+                    recurrence_json,
+                    color,
+                    created_at,
+                    parent_id,
+                )| {
                     CalendarEventRecord {
                         id,
                         message_id,
@@ -3126,8 +3801,22 @@ impl Storage for SqliteStorage {
         Ok(rows
             .into_iter()
             .map(
-                |(id, message_id, organizer, title, description, start_ms, end_ms, tz,
-                  location, attendees_json, recurrence_json, color, created_at, parent_id)| {
+                |(
+                    id,
+                    message_id,
+                    organizer,
+                    title,
+                    description,
+                    start_ms,
+                    end_ms,
+                    tz,
+                    location,
+                    attendees_json,
+                    recurrence_json,
+                    color,
+                    created_at,
+                    parent_id,
+                )| {
                     CalendarEventRecord {
                         id,
                         message_id,
@@ -3403,11 +4092,13 @@ impl Storage for SqliteStorage {
             .await?;
 
         rows.into_iter()
-            .map(|(hash, id, tenant, operator, amount, paid_at, direction, preimage, memo)| {
-                row_to_hosting_payment(
-                    hash, id, tenant, operator, amount, paid_at, direction, preimage, memo,
-                )
-            })
+            .map(
+                |(hash, id, tenant, operator, amount, paid_at, direction, preimage, memo)| {
+                    row_to_hosting_payment(
+                        hash, id, tenant, operator, amount, paid_at, direction, preimage, memo,
+                    )
+                },
+            )
             .collect()
     }
 }
@@ -3417,10 +4108,15 @@ impl Storage for SqliteStorage {
 #[async_trait]
 impl konsensus_core::gate::NonceStore for SqliteStorage {
     async fn check_and_store_paid(
-        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
-        sender: &konsensus_core::NodeId, message_id: &konsensus_core::MessageId,
+        &self,
+        nonce: &konsensus_core::Nonce,
+        payment_hash: &[u8; 32],
+        sender: &konsensus_core::NodeId,
+        message_id: &konsensus_core::MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.store_paid_nonce(nonce, payment_hash, sender, message_id).await?)
+        Ok(self
+            .store_paid_nonce(nonce, payment_hash, sender, message_id)
+            .await?)
     }
 
     async fn check_and_store(
@@ -3437,7 +4133,9 @@ impl konsensus_core::gate::NonceStore for SqliteStorage {
         sender: &NodeId,
         message_id: &MessageId,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.store_payment_receipt(payment_hash, sender, message_id).await?)
+        Ok(self
+            .store_payment_receipt(payment_hash, sender, message_id)
+            .await?)
     }
 }
 
@@ -3592,7 +4290,8 @@ fn outstanding_from_row(
 ) -> Result<konsensus_core::web_reply::OutstandingWebRequest, StorageError> {
     let bad = |what: &str| StorageError::Conversion(format!("outstanding web request: bad {what}"));
     Ok(konsensus_core::web_reply::OutstandingWebRequest {
-        request_id: konsensus_core::types::MessageId::from_hex(&request_id).map_err(|_| bad("request id"))?,
+        request_id: konsensus_core::types::MessageId::from_hex(&request_id)
+            .map_err(|_| bad("request id"))?,
         peer: konsensus_core::types::NodeId::from_hex(&peer).map_err(|_| bad("peer"))?,
         expected_reply_kind: u16::try_from(kind).map_err(|_| bad("reply kind"))?,
         expires_at_ms: u64::try_from(expires).map_err(|_| bad("expiry"))?,
@@ -3600,14 +4299,27 @@ fn outstanding_from_row(
 }
 
 /// `(side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash)` of `call_state`.
-type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>);
+type CallRow = (
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+);
 
 /// A stored call row. A corrupt row is an error, never a call.
-fn call_entry_from_row((side, phase, deadline, op, kind, hash): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
+fn call_entry_from_row(
+    (side, phase, deadline, op, kind, hash): CallRow,
+) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
     use konsensus_core::payloads::call::{CallEntry, Pending, Phase, Side};
     let bad = |what: &str| StorageError::Conversion(format!("call state: bad {what}"));
     let pending = match (op, kind) {
-        (Some(operation_id), Some(kind)) => Some(Pending { operation_id, kind: u16::try_from(kind).map_err(|_| bad("pending kind"))?, request_hash: hash.unwrap_or_default() }),
+        (Some(operation_id), Some(kind)) => Some(Pending {
+            operation_id,
+            kind: u16::try_from(kind).map_err(|_| bad("pending kind"))?,
+            request_hash: hash.unwrap_or_default(),
+        }),
         (None, None) => None,
         _ => return Err(bad("pending")),
     };

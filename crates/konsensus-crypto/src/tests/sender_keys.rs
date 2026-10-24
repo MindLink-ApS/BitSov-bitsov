@@ -158,10 +158,7 @@ fn member_removal_rotates_keys() {
 
     // Alice sends with new key — Bob can decrypt
     let ct_after = alice.encrypt(b"after removal").unwrap();
-    assert_eq!(
-        bob.decrypt(&alice_id, &ct_after).unwrap(),
-        b"after removal"
-    );
+    assert_eq!(bob.decrypt(&alice_id, &ct_after).unwrap(), b"after removal");
 
     // Carol cannot decrypt the new message (she has the old key)
     assert!(carol.decrypt(&alice_id, &ct_after).is_err());
@@ -208,7 +205,10 @@ fn unknown_sender_rejected() {
     let ct = alice.encrypt(b"hello").unwrap();
     // Try to decrypt as if from an unknown sender
     let result = bob.decrypt(&unknown_id, &ct);
-    assert!(matches!(result.unwrap_err(), SenderKeyError::UnknownSender(_)));
+    assert!(matches!(
+        result.unwrap_err(),
+        SenderKeyError::UnknownSender(_)
+    ));
 }
 
 #[test]
@@ -388,7 +388,10 @@ fn debug_impl_redacts_chain_key() {
     let dist = alice.our_distribution();
     let debug_str = format!("{:?}", dist);
 
-    assert!(debug_str.contains("[REDACTED]"), "Distribution Debug must redact chain_key");
+    assert!(
+        debug_str.contains("[REDACTED]"),
+        "Distribution Debug must redact chain_key"
+    );
     let chain_hex = hex::encode(dist.chain_key);
     assert!(
         !debug_str.contains(&chain_hex),

@@ -12,19 +12,28 @@ use konsensus_lightning::shared_mock::SharedMockProvider;
 
 async fn remote_approval_status(fx: &Fx, uri: &str, token: Option<&str>) -> (StatusCode, Value) {
     use axum::extract::connect_info::MockConnectInfo;
-    let app = konsensus_api::build_remote_router(fx.state.clone())
-        .layer(MockConnectInfo("127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap()));
+    let app = konsensus_api::build_remote_router(fx.state.clone()).layer(MockConnectInfo(
+        "127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap(),
+    ));
     let mut request = Request::builder().uri(uri);
     if let Some(token) = token {
         request = request.header("authorization", format!("Bearer {token}"));
     }
-    let response = app.oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
+    let response = app
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
     let status = response.status();
     if status == StatusCode::OK {
         assert_eq!(response.headers()["cache-control"], "no-store");
     }
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 // The control handler is the same boundary the owner CLI reaches over its
@@ -40,27 +49,58 @@ async fn remote_owner_approval_is_readable_only_by_its_client_and_consumed_once(
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["state"], "pending");
     assert_eq!(body["approval_window_secs"], 300);
-    assert_ne!(remote_approval_status(&s.fx, &uri, None).await.0, StatusCode::OK);
+    assert_ne!(
+        remote_approval_status(&s.fx, &uri, None).await.0,
+        StatusCode::OK
+    );
     // Issue a token for another client under THIS node's auth key.
-    s.fx.service.open_pairing_window(std::time::Duration::from_secs(300));
+    s.fx.service
+        .open_pairing_window(std::time::Duration::from_secs(300));
     let key = SigningKey::from_bytes(&[99; 32]);
-    let other = s.fx.service.create_verified_remote_pairing(
-        "other", &hex::encode(key.verifying_key().to_bytes()), &[98; 32]).unwrap();
-    let challenge = s.fx.service.issue_token_challenge(&other.client_id).unwrap();
-    let (_, issued) = s.fx.call("POST", "/api/v1/pair/token", Some(json!({
-        "client_id": other.client_id, "challenge": challenge,
-        "signature": hex::encode(key.sign(challenge.as_bytes()).to_bytes())
-    })), None).await;
+    let other =
+        s.fx.service
+            .create_verified_remote_pairing(
+                "other",
+                &hex::encode(key.verifying_key().to_bytes()),
+                &[98; 32],
+            )
+            .unwrap();
+    let challenge =
+        s.fx.service
+            .issue_token_challenge(&other.client_id)
+            .unwrap();
+    let (_, issued) =
+        s.fx.call(
+            "POST",
+            "/api/v1/pair/token",
+            Some(json!({
+                "client_id": other.client_id, "challenge": challenge,
+                "signature": hex::encode(key.sign(challenge.as_bytes()).to_bytes())
+            })),
+            None,
+        )
+        .await;
     let other_token = issued["token"].as_str().unwrap();
-    assert_eq!(remote_approval_status(&s.fx, &uri, Some(other_token)).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        remote_approval_status(&s.fx, &uri, Some(other_token))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
     let (status, body) = s.send(&token, Some(4000)).await;
     assert_budget_exceeded(status, &body, "first_contact");
     assert_eq!(s.spent().await, 0);
     let before = chrono::Utc::now().timestamp();
-    let result = control::handle(&s.fx.control(), ControlRequest::ApproveFirstContact {
-        client_id: s.fx.client_id.clone(), grant_op_id: op.clone(),
-        recipient: s.peer.to_hex(), max_total_msat: 4000, contact_budget_msat: None,
-    });
+    let result = control::handle(
+        &s.fx.control(),
+        ControlRequest::ApproveFirstContact {
+            client_id: s.fx.client_id.clone(),
+            grant_op_id: op.clone(),
+            recipient: s.peer.to_hex(),
+            max_total_msat: 4000,
+            contact_budget_msat: None,
+        },
+    );
     assert!(matches!(result, ControlResponse::Ok { .. }), "{result:?}");
     for _ in 0..2 {
         let (status, body) = remote_approval_status(&s.fx, &uri, Some(&token)).await;
@@ -72,17 +112,33 @@ async fn remote_owner_approval_is_readable_only_by_its_client_and_consumed_once(
         assert!(body["approval"]["expires_at"].as_i64().unwrap() >= before + 300);
         assert_eq!(s.spent().await, 0, "polling never pays");
     }
-    let wrong = format!("/api/v1/pair/first-contact-grant/{op}?recipient={}", "ff".repeat(32));
-    assert_eq!(remote_approval_status(&s.fx, &wrong, Some(&token)).await.1["state"], "pending");
+    let wrong = format!(
+        "/api/v1/pair/first-contact-grant/{op}?recipient={}",
+        "ff".repeat(32)
+    );
+    assert_eq!(
+        remote_approval_status(&s.fx, &wrong, Some(&token)).await.1["state"],
+        "pending"
+    );
     let (status, body) = s.send(&token, Some(4000)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(s.spent().await, 4000);
     assert_eq!(s.fx.used(), 4000);
-    assert_eq!(remote_approval_status(&s.fx, &uri, Some(&token)).await.1["state"], "consumed");
-    assert!(s.fx.service.take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex()).is_none());
+    assert_eq!(
+        remote_approval_status(&s.fx, &uri, Some(&token)).await.1["state"],
+        "consumed"
+    );
+    assert!(s
+        .fx
+        .service
+        .take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex())
+        .is_none());
     s.fx.grant(None, GrantTerms::new(10_000)).await;
     let fresh = s.fx.token().await;
-    assert_eq!(remote_approval_status(&s.fx, &uri, Some(&fresh)).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        remote_approval_status(&s.fx, &uri, Some(&fresh)).await.0,
+        StatusCode::NOT_FOUND
+    );
 }
 
 struct Stranger {
@@ -113,7 +169,11 @@ async fn stranger_with(message_msat: u64, establish: bool) -> Stranger {
     stranger_with_first_expiry(message_msat, establish, 55).await
 }
 
-async fn stranger_with_first_expiry(message_msat: u64, establish: bool, first_expiry: u32) -> Stranger {
+async fn stranger_with_first_expiry(
+    message_msat: u64,
+    establish: bool,
+    first_expiry: u32,
+) -> Stranger {
     let mut fx = fixture().await;
     let ledger = tempfile::tempdir().unwrap();
     let path = ledger.path().join("ledger.db");
@@ -172,8 +232,14 @@ async fn stranger_with_first_expiry(message_msat: u64, establish: bool, first_ex
 async fn expired_quote_after_owner_delay_is_requoted_and_paid_once() {
     let s = stranger_with_first_expiry(2000, true, 2).await;
     let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
-    let (status, quote) = s.fx.call("POST", "/api/v1/messages/first-contact/quote",
-        Some(json!({"recipient": s.peer.to_hex()})), Some(&token)).await;
+    let (status, quote) =
+        s.fx.call(
+            "POST",
+            "/api/v1/messages/first-contact/quote",
+            Some(json!({"recipient": s.peer.to_hex()})),
+            Some(&token),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{quote}");
     // Real BOLT11 expiry uses the wall clock, not Tokio's paused clock.
     let expires = quote["expires_at"].as_i64().unwrap();
@@ -184,10 +250,22 @@ async fn expired_quote_after_owner_delay_is_requoted_and_paid_once() {
     assert_eq!(s.confirm(&token, &s.peer, 4000).await.0, StatusCode::OK);
     let (status, body) = s.send(&token, Some(4000)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(s.invoices.load(Ordering::SeqCst), 3, "stale quote, fresh admission, message");
-    assert_eq!(s.spent().await, 4000, "only fresh admission and message were paid");
+    assert_eq!(
+        s.invoices.load(Ordering::SeqCst),
+        3,
+        "stale quote, fresh admission, message"
+    );
+    assert_eq!(
+        s.spent().await,
+        4000,
+        "only fresh admission and message were paid"
+    );
     assert_eq!(s.fx.used(), 4000);
-    assert!(s.fx.service.take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex()).is_none());
+    assert!(s
+        .fx
+        .service
+        .take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex())
+        .is_none());
 }
 
 impl Stranger {
@@ -195,12 +273,20 @@ impl Stranger {
         100_000 - self.sender_wallet.get_balance_msat().await.unwrap()
     }
 
-    async fn confirm(&self, _token: &str, recipient: &NodeId, max_total_msat: u64) -> (StatusCode, Value) {
-        self.fx.owner_confirm(&recipient.to_hex(), max_total_msat).await
+    async fn confirm(
+        &self,
+        _token: &str,
+        recipient: &NodeId,
+        max_total_msat: u64,
+    ) -> (StatusCode, Value) {
+        self.fx
+            .owner_confirm(&recipient.to_hex(), max_total_msat)
+            .await
     }
 
     async fn send(&self, token: &str, cap: Option<u64>) -> (StatusCode, Value) {
-        let mut body = json!({"recipient": self.peer.to_hex(), "kind": 0, "plaintext": "hello stranger"});
+        let mut body =
+            json!({"recipient": self.peer.to_hex(), "kind": 0, "plaintext": "hello stranger"});
         if let Some(cap) = cap {
             body["max_total_msat"] = json!(cap);
         }
@@ -221,13 +307,21 @@ async fn confirmed_first_contact_pays_both_legs_and_debits_the_budget_once() {
 
     let (status, body) = s.send(&token, Some(4000)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["amount_msat"], 4000, "admission + message under one cap");
+    assert_eq!(
+        body["amount_msat"], 4000,
+        "admission + message under one cap"
+    );
     assert_eq!(s.spent().await, 4000);
-    assert_eq!(s.fx.used(), 4000, "one debit, resolved once to what settled");
+    assert_eq!(
+        s.fx.used(),
+        4000,
+        "one debit, resolved once to what settled"
+    );
 
     // Single use: the confirmation is gone after the send.
     assert_eq!(
-        s.fx.service.take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex()),
+        s.fx.service
+            .take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex()),
         None
     );
     // The next confirmation must fit what is left of the budget (5,000 msat).
@@ -244,7 +338,11 @@ async fn no_confirmation_means_no_invoice_and_no_payment() {
     let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
     let (status, body) = s.send(&token, Some(4000)).await;
     assert_budget_exceeded(status, &body, "first_contact");
-    assert_eq!(s.invoices.load(Ordering::SeqCst), 0, "nothing asked of the stranger");
+    assert_eq!(
+        s.invoices.load(Ordering::SeqCst),
+        0,
+        "nothing asked of the stranger"
+    );
     assert_eq!(s.spent().await, 0);
     assert_eq!(s.fx.used(), 0);
 }
@@ -279,10 +377,9 @@ async fn the_confirmed_amount_caps_the_whole_first_contact() {
 #[tokio::test(start_paused = true)]
 async fn a_confirmation_must_fit_the_budget_grant() {
     let s = stranger(2000).await;
-    let token = s
-        .fx
-        .grant(None, GrantTerms::new(3_000).per_call(2_500))
-        .await;
+    let token =
+        s.fx.grant(None, GrantTerms::new(3_000).per_call(2_500))
+            .await;
     let (status, body) = s.confirm(&token, &s.peer, 2_600).await;
     assert_budget_exceeded(status, &body, "per_call");
     let token = s.fx.grant(None, GrantTerms::new(1_000_000)).await;
@@ -296,9 +393,19 @@ async fn a_confirmation_must_fit_the_budget_grant() {
 async fn no_budget_grant_means_no_first_contact_confirmation() {
     let s = stranger(2000).await;
     let read = s.fx.token().await;
-    let (status, _) = s.fx.call("POST", "/api/v1/pair/first-contact-grant",
-        Some(json!({"recipient": s.peer.to_hex(), "max_total_msat": 4000})), Some(&read)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "a paired client cannot mint owner approval");
+    let (status, _) =
+        s.fx.call(
+            "POST",
+            "/api/v1/pair/first-contact-grant",
+            Some(json!({"recipient": s.peer.to_hex(), "max_total_msat": 4000})),
+            Some(&read),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a paired client cannot mint owner approval"
+    );
     let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
     s.fx.service.revoke_grants(Some(&s.fx.client_id)).unwrap();
     let (status, body) = s.confirm(&token, &s.peer, 4000).await;
@@ -314,7 +421,8 @@ async fn revoking_the_budget_voids_an_unused_confirmation() {
     assert_eq!(status, StatusCode::OK);
     s.fx.service.revoke_grants(Some(&s.fx.client_id)).unwrap();
     assert_eq!(
-        s.fx.service.take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex()),
+        s.fx.service
+            .take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex()),
         None
     );
 }
@@ -323,9 +431,8 @@ async fn revoking_the_budget_voids_an_unused_confirmation() {
 async fn the_door_quote_is_the_invoice_the_send_pays() {
     let s = stranger(2000).await;
     let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
-    let (status, quote) = s
-        .fx
-        .call(
+    let (status, quote) =
+        s.fx.call(
             "POST",
             "/api/v1/messages/first-contact/quote",
             Some(json!({"recipient": s.peer.to_hex()})),
@@ -355,9 +462,8 @@ async fn a_quote_rejects_a_stale_token_after_grant_revocation() {
     let s = stranger(2000).await;
     let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
     s.fx.service.revoke_grants(Some(&s.fx.client_id)).unwrap();
-    let (status, _) = s
-        .fx
-        .call(
+    let (status, _) =
+        s.fx.call(
             "POST",
             "/api/v1/messages/first-contact/quote",
             Some(json!({"recipient": s.peer.to_hex()})),
@@ -378,11 +484,19 @@ async fn admission_paid_then_no_session_keeps_exactly_the_admission_charged() {
     assert_eq!(body["code"], "payment_settled_send_incomplete", "{body}");
     assert_eq!(body["amount_msat"], 2000);
     assert_eq!(s.spent().await, 2000, "only the admission left the wallet");
-    assert_eq!(s.fx.used(), 2000, "resolved once: the paid admission stays charged, the rest is released");
+    assert_eq!(
+        s.fx.used(),
+        2000,
+        "resolved once: the paid admission stays charged, the rest is released"
+    );
     let invoices = s.invoices.load(Ordering::SeqCst);
     let (status, body) = s.send(&token, Some(4000)).await;
     assert_budget_exceeded(status, &body, "first_contact");
-    assert_eq!(s.spent().await, 2000, "a consumed approval cannot pay again");
+    assert_eq!(
+        s.spent().await,
+        2000,
+        "a consumed approval cannot pay again"
+    );
     assert_eq!(s.invoices.load(Ordering::SeqCst), invoices);
 }
 
@@ -391,38 +505,75 @@ async fn admission_paid_then_no_session_keeps_exactly_the_admission_charged() {
 async fn regression_cached_chat_quote_does_not_pay_non_chat_first_contact() {
     let uncached = stranger(2000).await;
     let uncached_token = uncached.fx.grant(None, GrantTerms::new(10_000)).await;
-    assert_eq!(uncached.confirm(&uncached_token, &uncached.peer, 4000).await.0, StatusCode::OK);
+    assert_eq!(
+        uncached
+            .confirm(&uncached_token, &uncached.peer, 4000)
+            .await
+            .0,
+        StatusCode::OK
+    );
     let (status, body) = uncached.fx.call("POST", "/api/v1/messages/compose",
         Some(json!({"recipient": uncached.peer.to_hex(), "kind": 200, "plaintext": "non-chat", "max_total_msat": 4000})),
         Some(&uncached_token)).await;
-    println!("uncached control: {status} {body}; paid={}", uncached.spent().await);
+    println!(
+        "uncached control: {status} {body}; paid={}",
+        uncached.spent().await
+    );
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(uncached.spent().await, 0);
     let s = stranger(2000).await;
     let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
-    let (status, quote) = s.fx.call("POST", "/api/v1/messages/first-contact/quote",
-        Some(json!({"recipient": s.peer.to_hex()})), Some(&token)).await;
+    let (status, quote) =
+        s.fx.call(
+            "POST",
+            "/api/v1/messages/first-contact/quote",
+            Some(json!({"recipient": s.peer.to_hex()})),
+            Some(&token),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{quote}");
     assert_eq!(s.confirm(&token, &s.peer, 4000).await.0, StatusCode::OK);
     let (status, body) = s.fx.call("POST", "/api/v1/messages/compose",
         Some(json!({"recipient": s.peer.to_hex(), "kind": 200, "plaintext": "non-chat", "max_total_msat": 4000})),
         Some(&token)).await;
-    println!("non-chat response: {status} {body}; paid={}", s.spent().await);
-    assert_eq!(s.spent().await, 0, "chat-only quote must not authorize a file-kind first contact");
+    println!(
+        "non-chat response: {status} {body}; paid={}",
+        s.spent().await
+    );
+    assert_eq!(
+        s.spent().await,
+        0,
+        "chat-only quote must not authorize a file-kind first contact"
+    );
 }
 
 #[tokio::test(start_paused = true)]
 async fn regression_advertised_expiry_does_not_outlive_signed_invoice() {
     let s = stranger(2000).await;
     let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
-    let (status, quote) = s.fx.call("POST", "/api/v1/messages/first-contact/quote",
-        Some(json!({"recipient": s.peer.to_hex()})), Some(&token)).await;
+    let (status, quote) =
+        s.fx.call(
+            "POST",
+            "/api/v1/messages/first-contact/quote",
+            Some(json!({"recipient": s.peer.to_hex()})),
+            Some(&token),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{quote}");
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     // This fixture issues a BOLT11 with a signed 55-second expiry.
     let advertised = quote["expires_at"].as_u64().unwrap();
-    println!("advertised={advertised}; latest possible signed expiry={}", now + 55);
-    assert!(advertised <= now + 55, "advertised quote validity exceeds signed invoice expiry");
+    println!(
+        "advertised={advertised}; latest possible signed expiry={}",
+        now + 55
+    );
+    assert!(
+        advertised <= now + 55,
+        "advertised quote validity exceeds signed invoice expiry"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -431,16 +582,27 @@ async fn regression_paired_budget_token_cannot_self_confirm_stranger() {
     let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
     // All remaining operations are ordinary paired-client HTTP requests.
     // No owner terminal/control operation or owner proof is supplied.
-    let (status, confirmation) = s.fx.call("POST", "/api/v1/pair/first-contact-grant", Some(json!({
-        "client_id": s.fx.client_id,
-        "grant_op_id": s.fx.service.grant_view_for(&s.fx.client_id).unwrap().op_id,
-        "recipient": s.peer.to_hex(), "max_total_msat": 4000,
-    })), Some(&token)).await;
+    let (status, confirmation) =
+        s.fx.call(
+            "POST",
+            "/api/v1/pair/first-contact-grant",
+            Some(json!({
+                "client_id": s.fx.client_id,
+                "grant_op_id": s.fx.service.grant_view_for(&s.fx.client_id).unwrap().op_id,
+                "recipient": s.peer.to_hex(), "max_total_msat": 4000,
+            })),
+            Some(&token),
+        )
+        .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     println!("paired self-confirmation: {status} {confirmation}");
     let (status, body) = s.send(&token, Some(4000)).await;
     println!("paired send: {status} {body}; paid={}", s.spent().await);
-    assert_eq!(s.spent().await, 0, "paired program must not replace owner confirmation");
+    assert_eq!(
+        s.spent().await,
+        0,
+        "paired program must not replace owner confirmation"
+    );
 }
 
 #[tokio::test]
@@ -448,11 +610,17 @@ async fn regression_consumed_confirmation_cannot_move_to_replacement_grant() {
     let s = stranger(2000).await;
     let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
     assert_eq!(s.confirm(&token, &s.peer, 4000).await.0, StatusCode::OK);
-    let approval = s.fx.service.take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex()).unwrap();
+    let approval =
+        s.fx.service
+            .take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex())
+            .unwrap();
     let original = s.fx.service.grant_view_for(&s.fx.client_id).unwrap().op_id;
     // Exact interleaving: consumption under A, replacement by B, then debit.
     s.fx.grant(None, GrantTerms::new(10_000)).await;
-    assert_ne!(s.fx.service.grant_view_for(&s.fx.client_id).unwrap().op_id, original);
+    assert_ne!(
+        s.fx.service.grant_view_for(&s.fx.client_id).unwrap().op_id,
+        original
+    );
     let debit = s.fx.service.reserve_first_contact(approval, None);
     assert_eq!(debit, Err(BudgetRefusal::NoGrant));
     assert_eq!(s.fx.used(), 0);
@@ -471,26 +639,56 @@ async fn owner_socket_first_contact_checks_tuple_and_consumes_once() {
     let body = json!({"op":"approve-first-contact", "client_id":fx.client_id,
         "grant_op_id":fx.service.grant_view_for(&fx.client_id).unwrap().op_id,
         "recipient":fx.peer.to_hex(), "max_total_msat":4000, "contact_budget_msat":8000});
-    for (field, wrong) in [("client_id", json!("wrong")), ("grant_op_id", json!("wrong")),
-        ("recipient", json!("invalid")), ("max_total_msat", json!(10001)),
-        ("contact_budget_msat", json!(0)), ("contact_budget_msat", json!(3999)),
-        ("contact_budget_msat", json!(10001))] {
+    for (field, wrong) in [
+        ("client_id", json!("wrong")),
+        ("grant_op_id", json!("wrong")),
+        ("recipient", json!("invalid")),
+        ("max_total_msat", json!(10001)),
+        ("contact_budget_msat", json!(0)),
+        ("contact_budget_msat", json!(3999)),
+        ("contact_budget_msat", json!(10001)),
+    ] {
         let mut bad = body.clone();
         bad[field] = wrong;
         let req = serde_json::from_value(bad).unwrap();
-        assert!(matches!(control::send(&path, &req).await.unwrap(), ControlResponse::Error { .. }));
-        assert!(fx.service.take_first_contact(&fx.client_id, 1, &fx.peer.to_hex()).is_none());
+        assert!(matches!(
+            control::send(&path, &req).await.unwrap(),
+            ControlResponse::Error { .. }
+        ));
+        assert!(fx
+            .service
+            .take_first_contact(&fx.client_id, 1, &fx.peer.to_hex())
+            .is_none());
     }
     let req = serde_json::from_value(body.clone()).unwrap();
-    assert!(matches!(control::send(&path, &req).await.unwrap(), ControlResponse::Ok { .. }));
+    assert!(matches!(
+        control::send(&path, &req).await.unwrap(),
+        ControlResponse::Ok { .. }
+    ));
     let mut changed = body;
     changed["contact_budget_msat"] = json!(7000);
     let req = serde_json::from_value(changed).unwrap();
-    assert!(matches!(control::send(&path, &req).await.unwrap(), ControlResponse::Error { .. }));
-    assert!(fx.service.take_first_contact(&fx.client_id, 1, &"ff".repeat(32)).is_none());
-    let approval = fx.service.take_first_contact(&fx.client_id, 1, &fx.peer.to_hex()).unwrap();
-    assert!(fx.service.take_first_contact(&fx.client_id, 1, &fx.peer.to_hex()).is_none(), "authorization cannot replay");
-    fx.service.reserve_first_contact(approval, Some(4001)).unwrap();
+    assert!(matches!(
+        control::send(&path, &req).await.unwrap(),
+        ControlResponse::Error { .. }
+    ));
+    assert!(fx
+        .service
+        .take_first_contact(&fx.client_id, 1, &"ff".repeat(32))
+        .is_none());
+    let approval = fx
+        .service
+        .take_first_contact(&fx.client_id, 1, &fx.peer.to_hex())
+        .unwrap();
+    assert!(
+        fx.service
+            .take_first_contact(&fx.client_id, 1, &fx.peer.to_hex())
+            .is_none(),
+        "authorization cannot replay"
+    );
+    fx.service
+        .reserve_first_contact(approval, Some(4001))
+        .unwrap();
     assert_eq!(fx.used(), 4000, "send cannot exceed approved cap");
     let (status, _) = fx.call("POST", "/api/v1/pair/first-contact-grant", Some(json!({
         "client_id":fx.client_id, "grant_op_id":fx.service.grant_view_for(&fx.client_id).unwrap().op_id,
@@ -507,20 +705,34 @@ async fn read_receive_pairing_can_quote_without_a_grant_or_reservation() {
     let token = s.fx.token().await;
     s.fx.state = Arc::new(AppState {
         rate_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::with_window(
-            1, std::time::Duration::from_secs(60))),
+            1,
+            std::time::Duration::from_secs(60),
+        )),
         ..(*s.fx.state).clone()
     });
     let body = json!({"recipient": s.peer.to_hex()});
-    let (status, quote) = s.fx.call("POST", "/api/v1/messages/first-contact/quote",
-        Some(body.clone()), Some(&token)).await;
+    let (status, quote) =
+        s.fx.call(
+            "POST",
+            "/api/v1/messages/first-contact/quote",
+            Some(body.clone()),
+            Some(&token),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{quote}");
     assert_eq!(quote["total_msat"], 14_000); // 2,000 + 2,000 + two 5,000 routing ceilings
     assert_eq!(s.spent().await, 0);
     assert_eq!(s.fx.used(), 0);
     assert!(s.fx.service.grant_view_for(&s.fx.client_id).is_none());
     assert!(!s.fx.state.session_manager.has_session(&s.peer).await);
-    let (status, _) = s.fx.call("POST", "/api/v1/messages/first-contact/quote",
-        Some(body), Some(&token)).await;
+    let (status, _) =
+        s.fx.call(
+            "POST",
+            "/api/v1/messages/first-contact/quote",
+            Some(body),
+            Some(&token),
+        )
+        .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(s.spent().await, 0);
 }

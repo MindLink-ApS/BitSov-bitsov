@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use konsensus_storage::{EnergyRow, StorageError};
 
-use crate::local_read::LocalPairedRead;
 use crate::error::ApiError;
+use crate::local_read::LocalPairedRead;
 use crate::membrane::{MembraneEvent, Totals, MEMBRANE_CAPACITY};
 use crate::state::AppState;
 

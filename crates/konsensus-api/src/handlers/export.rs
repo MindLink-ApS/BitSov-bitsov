@@ -35,7 +35,7 @@
 //!   encrypted recovery set out. It does NOT by itself make hosted operation
 //!   sovereign (a hosted operator still holds the runtime keys + metadata).
 
-use crate::auth::scoped::{ScopedAuth, Admin};
+use crate::auth::scoped::{Admin, ScopedAuth};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -347,6 +347,9 @@ mod tests {
             .decode(&scb_b64)
             .expect("valid base64");
         assert_eq!(decoded, scb_bytes, "SCB attached verbatim as ciphertext");
-        assert!(bundle.scb_age_seconds.is_some(), "fresh snapshot has an age");
+        assert!(
+            bundle.scb_age_seconds.is_some(),
+            "fresh snapshot has an age"
+        );
     }
 }

@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 
 use konsensus_core::introduction::Introduction;
 use konsensus_core::sponsor::{self as core, FundingRequest, SponsorOffer};
-use konsensus_core::traits::lightning::{LightningError, PaymentDetails, PaymentDirection, PaymentStatus};
+use konsensus_core::traits::lightning::{
+    LightningError, PaymentDetails, PaymentDirection, PaymentStatus,
+};
 use konsensus_core::types::{MessageId, NodeId};
 
 use crate::auth::scoped::{Read, Receive, ScopedAuth};
@@ -65,22 +67,46 @@ pub struct SponsorPolicy {
 
 impl SponsorPolicy {
     /// The policy as configured, refused if it exceeds a spec ceiling.
-    pub fn new(enabled: bool, gift_msat: u64, fee_msat: u64, purse_msat: u64, kits_per_day: u32) -> Result<Self, String> {
-        let p = Self { enabled, gift_msat, fee_msat, purse_msat, kits_per_day };
+    pub fn new(
+        enabled: bool,
+        gift_msat: u64,
+        fee_msat: u64,
+        purse_msat: u64,
+        kits_per_day: u32,
+    ) -> Result<Self, String> {
+        let p = Self {
+            enabled,
+            gift_msat,
+            fee_msat,
+            purse_msat,
+            kits_per_day,
+        };
         if !enabled {
             return Ok(p);
         }
         if gift_msat == 0 || gift_msat.saturating_add(fee_msat) > core::MAX_KIT_MSAT {
-            return Err(format!("[sponsor] gift + fee must be 1..={} sats", core::MAX_KIT_MSAT / 1000));
+            return Err(format!(
+                "[sponsor] gift + fee must be 1..={} sats",
+                core::MAX_KIT_MSAT / 1000
+            ));
         }
         if fee_msat > core::MAX_FEE_MSAT {
-            return Err(format!("[sponsor] fee ceiling above {} sats", core::MAX_FEE_MSAT / 1000));
+            return Err(format!(
+                "[sponsor] fee ceiling above {} sats",
+                core::MAX_FEE_MSAT / 1000
+            ));
         }
         if purse_msat > core::MAX_PURSE_MSAT || purse_msat < gift_msat.saturating_add(fee_msat) {
-            return Err(format!("[sponsor] purse must cover one kit and stay ≤ {} sats", core::MAX_PURSE_MSAT / 1000));
+            return Err(format!(
+                "[sponsor] purse must cover one kit and stay ≤ {} sats",
+                core::MAX_PURSE_MSAT / 1000
+            ));
         }
         if kits_per_day == 0 || kits_per_day > core::MAX_KITS_PER_DAY {
-            return Err(format!("[sponsor] kits_per_day must be 1..={}", core::MAX_KITS_PER_DAY));
+            return Err(format!(
+                "[sponsor] kits_per_day must be 1..={}",
+                core::MAX_KITS_PER_DAY
+            ));
         }
         Ok(p)
     }
@@ -167,7 +193,8 @@ impl Kit {
 
     fn in_day(&self, now: u64) -> bool {
         // A reservation dated after `now` (clock moved back) still counts.
-        self.approved_at.is_some_and(|at| at.saturating_add(DAY_SECS) > now)
+        self.approved_at
+            .is_some_and(|at| at.saturating_add(DAY_SECS) > now)
     }
 
     /// What this kit holds against the purse.
@@ -177,9 +204,14 @@ impl Kit {
             // An unknown fee keeps the complete approved maximum held until
             // its definitive outcome, regardless of elapsed time.
             KitState::Funded if self.reserved_msat > 0 => self.reserved_msat,
-            KitState::Funded if self.settled_at.or(self.approved_at)
-                .is_some_and(|at| at.saturating_add(DAY_SECS) > now) =>
-                self.paid_msat.saturating_add(self.fee_paid_msat),
+            KitState::Funded
+                if self
+                    .settled_at
+                    .or(self.approved_at)
+                    .is_some_and(|at| at.saturating_add(DAY_SECS) > now) =>
+            {
+                self.paid_msat.saturating_add(self.fee_paid_msat)
+            }
             _ => 0,
         }
     }
@@ -200,7 +232,10 @@ impl Ledger {
         self.last_observed_time = self.last_observed_time.max(wall_now);
         let now = self.last_observed_time;
         for kit in &mut self.kits {
-            let deadline = kit.candidate.as_ref().map_or(kit.expires_at, |c| kit.expires_at.min(c.expires_at));
+            let deadline = kit
+                .candidate
+                .as_ref()
+                .map_or(kit.expires_at, |c| kit.expires_at.min(c.expires_at));
             if matches!(kit.state, KitState::Offered | KitState::Candidate) && deadline <= now {
                 kit.state = KitState::Expired;
             }
@@ -210,7 +245,9 @@ impl Ledger {
 
     pub fn purse_used(&self, now: u64) -> u64 {
         let now = now.max(self.last_observed_time);
-        self.kits.iter().fold(0u64, |used, k| used.saturating_add(k.charge(now)))
+        self.kits
+            .iter()
+            .fold(0u64, |used, k| used.saturating_add(k.charge(now)))
     }
 
     pub fn kits_today(&self, now: u64) -> u32 {
@@ -227,7 +264,9 @@ impl Ledger {
         self.kits
             .iter_mut()
             .find(|k| k.intro_id == intro_id)
-            .ok_or_else(|| ApiError::NotFound("sponsor_kit_unknown: no kit for that introduction".into()))
+            .ok_or_else(|| {
+                ApiError::NotFound("sponsor_kit_unknown: no kit for that introduction".into())
+            })
     }
 
     /// Before a new offer: sponsoring on, nothing else open, and room left
@@ -237,7 +276,9 @@ impl Ledger {
             return Err(ApiError::Conflict("sponsor_disabled: the owner has not turned sponsoring on ([sponsor] in the node config)".into()));
         }
         if self.active(now) >= core::MAX_ACTIVE_KITS {
-            return Err(ApiError::Conflict("sponsor_kit_open: finish or cancel the open kit first".into()));
+            return Err(ApiError::Conflict(
+                "sponsor_kit_open: finish or cancel the open kit first".into(),
+            ));
         }
         self.check_room(policy, policy.kit_msat(), now)
     }
@@ -267,7 +308,8 @@ static LEDGER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 // this process: it could describe an earlier failed attempt for the invoice.
 // Only the live caller records its result. Cancellation drops this marker,
 // leaving the durable unknown reservation available for reconciliation.
-static ACTIVE_DISPATCHES: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
+static ACTIVE_DISPATCHES: std::sync::Mutex<Vec<(PathBuf, String)>> =
+    std::sync::Mutex::new(Vec::new());
 
 struct ActiveDispatch((PathBuf, String));
 
@@ -275,27 +317,35 @@ impl ActiveDispatch {
     // Called while holding LEDGER_LOCK, before the first backend poll.
     fn start(dir: PathBuf, intro_id: String) -> Self {
         let key = (dir, intro_id);
-        ACTIVE_DISPATCHES.lock().unwrap_or_else(|e| e.into_inner()).push(key.clone());
+        ACTIVE_DISPATCHES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(key.clone());
         Self(key)
     }
 
     fn contains(dir: &Path, intro_id: &str) -> bool {
-        ACTIVE_DISPATCHES.lock().unwrap_or_else(|e| e.into_inner()).iter()
+        ACTIVE_DISPATCHES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
             .any(|(d, id)| d == dir && id == intro_id)
     }
 }
 
 impl Drop for ActiveDispatch {
     fn drop(&mut self) {
-        ACTIVE_DISPATCHES.lock().unwrap_or_else(|e| e.into_inner()).retain(|key| key != &self.0);
+        ACTIVE_DISPATCHES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|key| key != &self.0);
     }
 }
 
 fn ledger_dir(state: &AppState) -> Result<PathBuf, ApiError> {
-    let dir = state
-        .data_dir
-        .as_ref()
-        .ok_or_else(|| ApiError::Conflict("sponsor_unavailable: this node has no data directory".into()))?;
+    let dir = state.data_dir.as_ref().ok_or_else(|| {
+        ApiError::Conflict("sponsor_unavailable: this node has no data directory".into())
+    })?;
     Ok(dir.join("sponsor"))
 }
 
@@ -305,7 +355,10 @@ fn load(dir: &Path) -> Result<Ledger, ApiError> {
             let mut ledger: Ledger = serde_json::from_slice(&bytes)
                 .map_err(|e| ApiError::Internal(format!("sponsor ledger unreadable: {e}")))?;
             if ledger.version != LEDGER_VERSION {
-                return Err(ApiError::Internal(format!("sponsor ledger version {} not supported", ledger.version)));
+                return Err(ApiError::Internal(format!(
+                    "sponsor ledger version {} not supported",
+                    ledger.version
+                )));
             }
             // Older ledgers used approval time for late settlements and
             // stored an unknown fee as zero. Do not treat those fields as
@@ -313,15 +366,21 @@ fn load(dir: &Path) -> Result<Ledger, ApiError> {
             // accounting rules before releasing their approved maximum.
             for kit in &mut ledger.kits {
                 if kit.state == KitState::Funded && kit.settled_at.is_none() {
-                    kit.reserved_msat = kit.reserved_msat
+                    kit.reserved_msat = kit
+                        .reserved_msat
                         .max(kit.gift_msat.saturating_add(kit.fee_msat))
                         .max(kit.paid_msat.saturating_add(kit.fee_paid_msat));
                 }
             }
             Ok(ledger)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Ledger { version: LEDGER_VERSION, ..Ledger::default() }),
-        Err(e) => Err(ApiError::Internal(format!("sponsor ledger unreadable: {e}"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Ledger {
+            version: LEDGER_VERSION,
+            ..Ledger::default()
+        }),
+        Err(e) => Err(ApiError::Internal(format!(
+            "sponsor ledger unreadable: {e}"
+        ))),
     }
 }
 
@@ -331,7 +390,9 @@ fn save(dir: &Path, ledger: &Ledger) -> Result<(), ApiError> {
     crate::pairing::restrict_dir(dir).map_err(io)?;
     let bytes = serde_json::to_vec_pretty(ledger).map_err(|e| ApiError::Internal(e.to_string()))?;
     let tmp = dir.join("kits.json.tmp");
-    if let Err(e) = crate::pairing::write_protected(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, dir.join("kits.json"))) {
+    if let Err(e) = crate::pairing::write_protected(&tmp, &bytes)
+        .and_then(|()| std::fs::rename(&tmp, dir.join("kits.json")))
+    {
         let _ = std::fs::remove_file(&tmp);
         return Err(io(e));
     }
@@ -352,7 +413,10 @@ fn load_observed(dir: &Path, wall_now: u64) -> Result<Ledger, ApiError> {
 }
 
 /// Run `edit` under the lock with durable, nondecreasing effective time.
-async fn with_ledger<T>(state: &AppState, edit: impl FnOnce(&mut Ledger, u64) -> Result<T, ApiError>) -> Result<T, ApiError> {
+async fn with_ledger<T>(
+    state: &AppState,
+    edit: impl FnOnce(&mut Ledger, u64) -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
     let _guard = LEDGER_LOCK.lock().await;
     let dir = ledger_dir(state)?;
     let mut ledger = load_observed(&dir, state.introduction.clock.now()?)?;
@@ -364,7 +428,10 @@ async fn with_ledger<T>(state: &AppState, edit: impl FnOnce(&mut Ledger, u64) ->
 
 fn network(state: &AppState) -> Result<String, ApiError> {
     state.introduction.network.clone().ok_or_else(|| {
-        ApiError::Conflict("sponsor_unavailable: this node's Lightning backend does not state a Bitcoin network".into())
+        ApiError::Conflict(
+            "sponsor_unavailable: this node's Lightning backend does not state a Bitcoin network"
+                .into(),
+        )
     })
 }
 
@@ -399,23 +466,37 @@ pub struct OfferResponse {
 /// offer of this node's configured gift, for that card only. Sharing it
 /// moves nothing. Opens the one active kit; refused past the daily count or
 /// purse. Spend authority: it is the start of a payment the owner allowed.
-async fn create_offer(_auth: MeteredSpend, State(state): State<Arc<AppState>>) -> Result<Json<OfferResponse>, ApiError> {
+async fn create_offer(
+    _auth: MeteredSpend,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<OfferResponse>, ApiError> {
     let policy = state.sponsor.clone();
     // Check first, so a refused offer signs nothing.
     let now = with_ledger(&state, |l, now| {
         l.check_new_kit(&policy, now)?;
         Ok(now)
-    }).await?;
+    })
+    .await?;
     let card = super::introduction::issue_card(&state).await?;
-    let intro_id: [u8; 16] = hex::decode(&card.intro_id).ok().and_then(|b| b.try_into().ok())
+    let intro_id: [u8; 16] = hex::decode(&card.intro_id)
+        .ok()
+        .and_then(|b| b.try_into().ok())
         .ok_or_else(|| ApiError::Internal("card id".into()))?;
     let expires_at = card.expires_at.min(now + core::OFFER_LIFETIME_SECS);
-    let offer = SponsorOffer::sign(state.identity.ed25519_signing_key(), &card.network, intro_id, policy.gift_msat, expires_at)
-        .map_err(|e| ApiError::Internal(format!("offer: {e}")))?;
+    let offer = SponsorOffer::sign(
+        state.identity.ed25519_signing_key(),
+        &card.network,
+        intro_id,
+        policy.gift_msat,
+        expires_at,
+    )
+    .map_err(|e| ApiError::Internal(format!("offer: {e}")))?;
     with_ledger(&state, |l, now| {
         l.check_new_kit(&policy, now)?;
         if expires_at <= now {
-            return Err(ApiError::Conflict("sponsor_kit_expired: introduction has expired".into()));
+            return Err(ApiError::Conflict(
+                "sponsor_kit_expired: introduction has expired".into(),
+            ));
         }
         l.kits.push(Kit {
             intro_id: card.intro_id.clone(),
@@ -436,8 +517,19 @@ async fn create_offer(_auth: MeteredSpend, State(state): State<Arc<AppState>>) -
         Ok(())
     })
     .await?;
-    let link = format!("{}{}{}", card.to_link(), core::OFFER_SEPARATOR, offer.encode());
-    Ok(Json(OfferResponse { card, gift_msat: policy.gift_msat, fee_msat: policy.fee_msat, expires_at, link }))
+    let link = format!(
+        "{}{}{}",
+        card.to_link(),
+        core::OFFER_SEPARATOR,
+        offer.encode()
+    );
+    Ok(Json(OfferResponse {
+        card,
+        gift_msat: policy.gift_msat,
+        fee_msat: policy.fee_msat,
+        expires_at,
+        link,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -478,13 +570,21 @@ async fn add_candidate(
     }
     // The invoice must be exactly what the newcomer signed: its amount, its
     // hash, and payable to the Lightning key the request binds.
-    let invoice = req.bolt11.parse::<lightning_invoice::Bolt11Invoice>().map_err(|e| invalid(format!("invoice: {e}")))?;
+    let invoice = req
+        .bolt11
+        .parse::<lightning_invoice::Bolt11Invoice>()
+        .map_err(|e| invalid(format!("invoice: {e}")))?;
     if invoice.currency() != invoice_currency(&net)? {
         return Err(invalid("invoice network differs from this sponsor"));
     }
-    let payee = invoice.payee_pub_key().copied().unwrap_or_else(|| invoice.recover_payee_pub_key());
+    let payee = invoice
+        .payee_pub_key()
+        .copied()
+        .unwrap_or_else(|| invoice.recover_payee_pub_key());
     if payee.serialize() != req.newcomer_ln {
-        return Err(invalid("the invoice is not payable to the key the request names"));
+        return Err(invalid(
+            "the invoice is not payable to the key the request names",
+        ));
     }
     if invoice.amount_milli_satoshis() != Some(req.amount_msat) {
         return Err(invalid("the invoice amount differs from the request"));
@@ -503,7 +603,9 @@ async fn add_candidate(
         payment_hash: hex::encode(req.payment_hash),
         bolt11: req.bolt11.clone(),
         code: code.clone(),
-        expires_at: req.expires_at.min(invoice.expires_at().map_or(0, |d| d.as_secs())),
+        expires_at: req
+            .expires_at
+            .min(invoice.expires_at().map_or(0, |d| d.as_secs())),
     };
     let (gift_msat, fee_msat, expires_at) = with_ledger(&state, |l, now| {
         req.verify(now, &net).map_err(invalid)?;
@@ -531,7 +633,15 @@ async fn add_candidate(
         Ok((kit.gift_msat, kit.fee_msat, kit.expires_at.min(candidate.expires_at)))
     })
     .await?;
-    Ok(Json(CandidateResponse { intro_id, newcomer: candidate.newcomer, payment_hash: candidate.payment_hash, gift_msat, fee_max_msat: fee_msat, code, expires_at }))
+    Ok(Json(CandidateResponse {
+        intro_id,
+        newcomer: candidate.newcomer,
+        payment_hash: candidate.payment_hash,
+        gift_msat,
+        fee_max_msat: fee_msat,
+        code,
+        expires_at,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -573,7 +683,9 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for SponsorOwner {
         // Same authority boundary as first_contact_grant: a delegated budget
         // cannot mint the independent owner's consent.
         if auth.is_metered() {
-            return Err(ApiError::Conflict("sponsor_owner_approval_required".into()).into_response());
+            return Err(
+                ApiError::Conflict("sponsor_owner_approval_required".into()).into_response()
+            );
         }
         Ok(Self(auth))
     }
@@ -612,46 +724,78 @@ pub(crate) async fn approve_owner(
         let now = ledger.last_observed_time;
         let policy = &state.sponsor;
         if !policy.enabled {
-            return Err(ApiError::Conflict("sponsor_disabled: the owner has turned sponsoring off".into()));
+            return Err(ApiError::Conflict(
+                "sponsor_disabled: the owner has turned sponsoring off".into(),
+            ));
         }
         let kit = ledger.kit_mut(&body.intro_id)?.clone();
         if kit.state != KitState::Candidate {
-            return Err(ApiError::Conflict("sponsor_kit_not_ready: no candidate waiting on this kit".into()));
+            return Err(ApiError::Conflict(
+                "sponsor_kit_not_ready: no candidate waiting on this kit".into(),
+            ));
         }
         if kit.gift_msat > policy.gift_msat || kit.fee_msat > policy.fee_msat {
             return Err(ApiError::Conflict("sponsor_policy_changed: this candidate exceeds the current owner policy; make a new offer".into()));
         }
         if ledger.active(now) > core::MAX_ACTIVE_KITS {
-            return Err(ApiError::Conflict("sponsor_kit_open: another kit is active".into()));
+            return Err(ApiError::Conflict(
+                "sponsor_kit_open: another kit is active".into(),
+            ));
         }
         ledger.check_room(policy, kit.gift_msat.saturating_add(kit.fee_msat), now)?;
-        let candidate = kit.candidate.clone().ok_or_else(|| ApiError::Internal("candidate".into()))?;
-        if body.newcomer != candidate.newcomer || body.payment_hash != candidate.payment_hash
-            || body.gift_msat != kit.gift_msat || body.fee_max_msat != kit.fee_msat {
+        let candidate = kit
+            .candidate
+            .clone()
+            .ok_or_else(|| ApiError::Internal("candidate".into()))?;
+        if body.newcomer != candidate.newcomer
+            || body.payment_hash != candidate.payment_hash
+            || body.gift_msat != kit.gift_msat
+            || body.fee_max_msat != kit.fee_msat
+        {
             return Err(invalid("approval differs from the frozen funding intent"));
         }
         let deadline = kit.expires_at.min(candidate.expires_at);
-        let invoice = candidate.bolt11.parse::<lightning_invoice::Bolt11Invoice>().map_err(invalid)?;
+        let invoice = candidate
+            .bolt11
+            .parse::<lightning_invoice::Bolt11Invoice>()
+            .map_err(invalid)?;
         if invoice.currency() != invoice_currency(&network(&state)?)? {
             return Err(invalid("invoice network differs from this sponsor"));
         }
         let deadline = deadline.min(invoice.expires_at().map_or(0, |d| d.as_secs()));
         if deadline <= now {
-            return Err(ApiError::Conflict("sponsor_kit_expired: the request or invoice dispatch window has passed".into()));
+            return Err(ApiError::Conflict(
+                "sponsor_kit_expired: the request or invoice dispatch window has passed".into(),
+            ));
         }
-        if body.code.len() != 6 || !body.code.bytes().all(|b| b.is_ascii_digit()) || body.code != candidate.code {
-            return Err(ApiError::BadRequest("sponsor_code_mismatch: the code does not match this candidate; nothing was paid".into()));
+        if body.code.len() != 6
+            || !body.code.bytes().all(|b| b.is_ascii_digit())
+            || body.code != candidate.code
+        {
+            return Err(ApiError::BadRequest(
+                "sponsor_code_mismatch: the code does not match this candidate; nothing was paid"
+                    .into(),
+            ));
         }
         let (gift_msat, payee) = super::payments::invoice_terms(&candidate.bolt11)?;
         let pending = ledger.kit_mut(&body.intro_id)?;
         pending.state = KitState::Paying;
         pending.approved_at = Some(now);
         pending.reserved_msat = kit.gift_msat.saturating_add(kit.fee_msat);
-        let debit = auth.debit_linked(&state, vec![Charge { recipient: payee, amount_msat: gift_msat.saturating_add(kit.fee_msat) }], |reservation| {
-            ledger.kit_mut(&body.intro_id).map_err(|e| BudgetRefusal::Ledger(e.to_string()))?
-                .grant_reservation = reservation.cloned();
-            save(&dir, &ledger).map_err(|e| BudgetRefusal::Ledger(e.to_string()))
-        });
+        let debit = auth.debit_linked(
+            &state,
+            vec![Charge {
+                recipient: payee,
+                amount_msat: gift_msat.saturating_add(kit.fee_msat),
+            }],
+            |reservation| {
+                ledger
+                    .kit_mut(&body.intro_id)
+                    .map_err(|e| BudgetRefusal::Ledger(e.to_string()))?
+                    .grant_reservation = reservation.cloned();
+                save(&dir, &ledger).map_err(|e| BudgetRefusal::Ledger(e.to_string()))
+            },
+        );
         let debit = match debit {
             Ok(debit) => debit,
             Err(error) => {
@@ -669,36 +813,56 @@ pub(crate) async fn approve_owner(
     // timestamps). Sponsor gifts only dispatch fresh invoices. Persist the
     // proof before calling the backend so failure reconciliation survives a
     // process restart. Lookup errors other than absence fail before dispatch.
-    let preflight = match state.lightning.get_payment_status(&candidate.payment_hash).await {
+    let preflight = match state
+        .lightning
+        .get_payment_status(&candidate.payment_hash)
+        .await
+    {
         Err(LightningError::PaymentNotFound(_)) => {
             with_ledger(&state, |ledger, _now| {
                 ledger.kit_mut(&body.intro_id)?.fresh_payment_hash = true;
                 Ok(())
-            }).await?;
+            })
+            .await?;
             Ok(())
         }
-        Ok(_) => Err(LightningError::PaymentNotDispatched("sponsor invoice already has a payment record; request a fresh invoice".into())),
-        Err(e) => Err(LightningError::PaymentNotDispatched(format!("cannot establish a fresh sponsor invoice: {e}"))),
+        Ok(_) => Err(LightningError::PaymentNotDispatched(
+            "sponsor invoice already has a payment record; request a fresh invoice".into(),
+        )),
+        Err(e) => Err(LightningError::PaymentNotDispatched(format!(
+            "cannot establish a fresh sponsor invoice: {e}"
+        ))),
     };
-    let result = debit.dispatch(async {
-        preflight?;
-        let now = with_ledger(&state, |_, now| Ok(now)).await
-            .map_err(|e| LightningError::PaymentNotDispatched(e.to_string()))?;
-        if now >= deadline {
-            return Err(LightningError::PaymentNotDispatched("sponsor request expired before dispatch".into()));
-        }
-        state.lightning.pay_invoice_with_fee_limit(&candidate.bolt11, fee_msat).await
-    }).await;
+    let result = debit
+        .dispatch(async {
+            preflight?;
+            let now = with_ledger(&state, |_, now| Ok(now))
+                .await
+                .map_err(|e| LightningError::PaymentNotDispatched(e.to_string()))?;
+            if now >= deadline {
+                return Err(LightningError::PaymentNotDispatched(
+                    "sponsor request expired before dispatch".into(),
+                ));
+            }
+            state
+                .lightning
+                .pay_invoice_with_fee_limit(&candidate.bolt11, fee_msat)
+                .await
+        })
+        .await;
     let paid = match result {
         Ok(paid) => paid,
-        Err(ApiError::BudgetExceeded(e)) => Err(LightningError::PaymentNotDispatched(e.to_string())),
+        Err(ApiError::BudgetExceeded(e)) => {
+            Err(LightningError::PaymentNotDispatched(e.to_string()))
+        }
         Err(e) => Err(LightningError::Backend(e.to_string())),
     };
     let outcome = with_ledger(&state, |ledger, now| {
         let kit = ledger.kit_mut(&body.intro_id)?;
         record_outcome(kit, &paid, now, true);
         Ok(kit.clone())
-    }).await?;
+    })
+    .await?;
     resolve_grant(&state, &outcome);
     if outcome.state == KitState::Failed {
         // Resolve this kit before exposing non-dispatch. A terminal payment
@@ -710,7 +874,9 @@ pub(crate) async fn approve_owner(
     }
     if outcome.state == KitState::Unknown {
         if let Err(error) = paid {
-            return Err(ApiError::PaymentUnresolved(format!("sponsor payment outcome unknown: {error}")));
+            return Err(ApiError::PaymentUnresolved(format!(
+                "sponsor payment outcome unknown: {error}"
+            )));
         }
     }
     Ok(Json(ApproveResponse {
@@ -724,15 +890,30 @@ pub(crate) async fn approve_owner(
 
 /// Only the outgoing record for the exact approved operation may release a
 /// reservation. Terminal outcomes are monotonic across concurrent callers.
-fn record_outcome(kit: &mut Kit, result: &Result<PaymentDetails, LightningError>, now: u64, from_dispatch: bool) {
-    if matches!(kit.state, KitState::Failed | KitState::Cancelled | KitState::Expired)
-        || (kit.state == KitState::Funded && kit.reserved_msat == 0) {
+fn record_outcome(
+    kit: &mut Kit,
+    result: &Result<PaymentDetails, LightningError>,
+    now: u64,
+    from_dispatch: bool,
+) {
+    if matches!(
+        kit.state,
+        KitState::Failed | KitState::Cancelled | KitState::Expired
+    ) || (kit.state == KitState::Funded && kit.reserved_msat == 0)
+    {
         return;
     }
-    let valid = |d: &PaymentDetails| d.direction == PaymentDirection::Outgoing
-        && kit.candidate.as_ref().is_some_and(|c| c.payment_hash == d.payment_hash);
+    let valid = |d: &PaymentDetails| {
+        d.direction == PaymentDirection::Outgoing
+            && kit
+                .candidate
+                .as_ref()
+                .is_some_and(|c| c.payment_hash == d.payment_hash)
+    };
     match result {
-        Ok(d) if valid(d) && d.status == PaymentStatus::Settled && d.amount_msat == kit.gift_msat => {
+        Ok(d)
+            if valid(d) && d.status == PaymentStatus::Settled && d.amount_msat == kit.gift_msat =>
+        {
             kit.state = KitState::Funded;
             kit.paid_msat = d.amount_msat;
             match d.fee_msat {
@@ -745,17 +926,25 @@ fn record_outcome(kit: &mut Kit, result: &Result<PaymentDetails, LightningError>
                 }
                 _ => {
                     // Missing/invalid fee information cannot free any allowance.
-                    kit.reserved_msat = kit.gift_msat.saturating_add(kit.fee_msat)
+                    kit.reserved_msat = kit
+                        .gift_msat
+                        .saturating_add(kit.fee_msat)
                         .max(d.amount_msat.saturating_add(d.fee_msat.unwrap_or(0)));
                 }
             }
         }
-        Ok(d) if valid(d) && matches!(d.status, PaymentStatus::Failed | PaymentStatus::Expired)
-            && kit.state != KitState::Funded && (from_dispatch || kit.fresh_payment_hash) => {
-                kit.state = KitState::Failed;
-                kit.reserved_msat = 0;
-            }
-        Err(LightningError::PaymentNotDispatched(_) | LightningError::NotReady) if kit.state != KitState::Funded => {
+        Ok(d)
+            if valid(d)
+                && matches!(d.status, PaymentStatus::Failed | PaymentStatus::Expired)
+                && kit.state != KitState::Funded
+                && (from_dispatch || kit.fresh_payment_hash) =>
+        {
+            kit.state = KitState::Failed;
+            kit.reserved_msat = 0;
+        }
+        Err(LightningError::PaymentNotDispatched(_) | LightningError::NotReady)
+            if kit.state != KitState::Funded =>
+        {
             kit.state = KitState::Failed;
             kit.reserved_msat = 0;
         }
@@ -768,12 +957,15 @@ fn record_outcome(kit: &mut Kit, result: &Result<PaymentDetails, LightningError>
 /// and idempotent; retrying a terminal kit repairs a failed grant-store write.
 fn resolve_grant(state: &AppState, kit: &Kit) {
     let actual = match kit.state {
-        KitState::Funded if kit.reserved_msat == 0 => kit.paid_msat.saturating_add(kit.fee_paid_msat),
+        KitState::Funded if kit.reserved_msat == 0 => {
+            kit.paid_msat.saturating_add(kit.fee_paid_msat)
+        }
         KitState::Failed => 0,
         _ => return,
     };
     if let (Some(service), Some(reservation), Some(candidate)) =
-        (&state.pairing, &kit.grant_reservation, &kit.candidate) {
+        (&state.pairing, &kit.grant_reservation, &kit.candidate)
+    {
         service.resolve_spend(reservation, &candidate.newcomer_ln, actual);
     }
 }
@@ -788,7 +980,9 @@ async fn cancel(
     with_ledger(&state, |l, _now| {
         let kit = l.kit_mut(&intro_id)?;
         if !matches!(kit.state, KitState::Offered | KitState::Candidate) {
-            return Err(ApiError::Conflict("sponsor_kit_dispatched: only an undispatched kit can be cancelled".into()));
+            return Err(ApiError::Conflict(
+                "sponsor_kit_dispatched: only an undispatched kit can be cancelled".into(),
+            ));
         }
         kit.state = KitState::Cancelled;
         Ok(kit.clone())
@@ -807,22 +1001,40 @@ async fn reconcile(
 ) -> Result<Json<Kit>, ApiError> {
     let (snapshot, active) = with_ledger(&state, |ledger, _now| {
         let kit = ledger.kit_mut(&intro_id)?;
-        if !matches!(kit.state, KitState::Unknown | KitState::Paying | KitState::Funded | KitState::Failed) {
-            return Err(ApiError::Conflict("sponsor_kit_not_dispatched: nothing to reconcile".into()));
+        if !matches!(
+            kit.state,
+            KitState::Unknown | KitState::Paying | KitState::Funded | KitState::Failed
+        ) {
+            return Err(ApiError::Conflict(
+                "sponsor_kit_not_dispatched: nothing to reconcile".into(),
+            ));
         }
-        Ok((kit.clone(), ActiveDispatch::contains(&ledger_dir(&state)?, &intro_id)))
-    }).await?;
+        Ok((
+            kit.clone(),
+            ActiveDispatch::contains(&ledger_dir(&state)?, &intro_id),
+        ))
+    })
+    .await?;
     if active {
         return Ok(Json(snapshot));
     }
-    if snapshot.state == KitState::Failed || (snapshot.state == KitState::Funded && snapshot.reserved_msat == 0) {
+    if snapshot.state == KitState::Failed
+        || (snapshot.state == KitState::Funded && snapshot.reserved_msat == 0)
+    {
         resolve_grant(&state, &snapshot);
         return Ok(Json(snapshot));
     }
-    let hash = &snapshot.candidate.as_ref().ok_or_else(|| ApiError::Internal("candidate".into()))?.payment_hash;
+    let hash = &snapshot
+        .candidate
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal("candidate".into()))?
+        .payment_hash;
     // A lookup error says nothing definitive about dispatch, even if a
     // backend happens to reuse a pre-dispatch error variant here.
-    let details = state.lightning.get_payment_status(hash).await
+    let details = state
+        .lightning
+        .get_payment_status(hash)
+        .await
         .map_err(|e| LightningError::Backend(e.to_string()));
     // Re-read under lock: another reconciliation or the original approval
     // may have completed while the backend was awaited.
@@ -830,7 +1042,8 @@ async fn reconcile(
         let kit = ledger.kit_mut(&intro_id)?;
         record_outcome(kit, &details, now, false);
         Ok(kit.clone())
-    }).await?;
+    })
+    .await?;
     resolve_grant(&state, &outcome);
     Ok(Json(outcome))
 }
@@ -849,7 +1062,10 @@ pub struct StatusResponse {
 
 /// `GET /api/v1/sponsor` — the policy, the rolling purse and the kits
 /// (newest first). Bolt11 strings are left out of this read.
-async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> Result<Json<StatusResponse>, ApiError> {
+async fn status(
+    _auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<StatusResponse>, ApiError> {
     let p = state.sponsor.clone();
     let now = state.introduction.clock.now()?;
     let _guard = LEDGER_LOCK.lock().await;
@@ -910,7 +1126,8 @@ async fn request_funding(
     let now = state.introduction.clock.now()?;
     let net = network(&state)?;
     let (_, offer_text) = core::split_introduction_link(&body.link);
-    let offer_text = offer_text.ok_or_else(|| invalid("this introduction offers no starter bitcoin"))?;
+    let offer_text =
+        offer_text.ok_or_else(|| invalid("this introduction offers no starter bitcoin"))?;
     let card = super::introduction::verified_card(&state, &body.link)?;
     let offer = SponsorOffer::decode(&offer_text).map_err(invalid)?;
     offer.verify(now, &net).map_err(invalid)?;
@@ -920,27 +1137,53 @@ async fn request_funding(
     if offer.sponsor == *state.identity.node_id().as_bytes() {
         return Err(invalid("this is your own offer"));
     }
-    let expiry = offer.expires_at.saturating_sub(now).clamp(60, core::OFFER_LIFETIME_SECS) as u32;
+    let expiry = offer
+        .expires_at
+        .saturating_sub(now)
+        .clamp(60, core::OFFER_LIFETIME_SECS) as u32;
     let description = format!("bitsov starter bitcoin {}", &card.intro_id[..8]);
     let invoice = state
         .lightning
         .create_invoice(offer.gift_msat, &description, expiry)
         .await
         .map_err(ApiError::from)?;
-    let hash: [u8; 32] = hex::decode(&invoice.payment_hash).ok().and_then(|b| b.try_into().ok())
+    let hash: [u8; 32] = hex::decode(&invoice.payment_hash)
+        .ok()
+        .and_then(|b| b.try_into().ok())
         .ok_or_else(|| ApiError::Internal("invoice hash".into()))?;
     // Funding-only BEFORE the invoice leaves this node: the gate's durable
     // receipt table now holds this hash, so an envelope proving payment with
     // it is refused as a reused payment. Fail closed if it cannot be stored.
-    let sentinel = MessageId::from_bytes(*blake3::hash(&[b"bitsov-sponsor-funding/v1".as_slice(), &hash].concat()).as_bytes());
+    let sentinel = MessageId::from_bytes(
+        *blake3::hash(&[b"bitsov-sponsor-funding/v1".as_slice(), &hash].concat()).as_bytes(),
+    );
     let own = NodeId::from_bytes(*state.identity.node_id().as_bytes());
-    match state.storage.store_payment_receipt(&hash, &own, &sentinel).await {
+    match state
+        .storage
+        .store_payment_receipt(&hash, &own, &sentinel)
+        .await
+    {
         Ok(true) => {}
-        Ok(false) => return Err(ApiError::Conflict("sponsor_hash_in_use: the invoice hash is already a receipt; nothing was requested".into())),
-        Err(e) => return Err(ApiError::Storage(format!("could not mark the funding invoice funding-only; nothing was requested: {e}"))),
+        Ok(false) => {
+            return Err(ApiError::Conflict(
+                "sponsor_hash_in_use: the invoice hash is already a receipt; nothing was requested"
+                    .into(),
+            ))
+        }
+        Err(e) => {
+            return Err(ApiError::Storage(format!(
+                "could not mark the funding invoice funding-only; nothing was requested: {e}"
+            )))
+        }
     }
-    let parsed = invoice.bolt11.parse::<lightning_invoice::Bolt11Invoice>().map_err(|e| ApiError::Internal(format!("own invoice: {e}")))?;
-    let payee = parsed.payee_pub_key().copied().unwrap_or_else(|| parsed.recover_payee_pub_key());
+    let parsed = invoice
+        .bolt11
+        .parse::<lightning_invoice::Bolt11Invoice>()
+        .map_err(|e| ApiError::Internal(format!("own invoice: {e}")))?;
+    let payee = parsed
+        .payee_pub_key()
+        .copied()
+        .unwrap_or_else(|| parsed.recover_payee_pub_key());
     let request = FundingRequest::sign(
         state.identity.ed25519_signing_key(),
         &offer,
@@ -978,11 +1221,21 @@ async fn funding_status(
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(invalid("payment hash must be 64 hex"));
     }
-    let received = state.lightning.get_payment_status(&hash).await.ok()
-        .filter(|d| d.direction == PaymentDirection::Incoming && d.status == PaymentStatus::Settled);
+    let received = state
+        .lightning
+        .get_payment_status(&hash)
+        .await
+        .ok()
+        .filter(|d| {
+            d.direction == PaymentDirection::Incoming && d.status == PaymentStatus::Settled
+        });
     Ok(Json(FundingStatus {
         payment_hash: hash,
-        state: if received.is_some() { "received" } else { "waiting" },
+        state: if received.is_some() {
+            "received"
+        } else {
+            "waiting"
+        },
         amount_msat: received.map_or(0, |d| d.amount_msat),
     }))
 }
@@ -1026,22 +1279,46 @@ mod tests {
 
     #[test]
     fn unknown_outcomes_keep_their_reservation_in_the_purse() {
-        let l = Ledger { version: 1, last_observed_time: 0, kits: vec![kit(KitState::Unknown, Some(NOW - 10), 21_000, 0)] };
+        let l = Ledger {
+            version: 1,
+            last_observed_time: 0,
+            kits: vec![kit(KitState::Unknown, Some(NOW - 10), 21_000, 0)],
+        };
         assert_eq!(l.purse_used(NOW), 21_000);
-        assert_eq!(l.active(NOW), 1, "an unknown kit blocks a new one until reconciled");
-        let failed = Ledger { version: 1, last_observed_time: 0, kits: vec![kit(KitState::Failed, Some(NOW - 10), 0, 0)] };
+        assert_eq!(
+            l.active(NOW),
+            1,
+            "an unknown kit blocks a new one until reconciled"
+        );
+        let failed = Ledger {
+            version: 1,
+            last_observed_time: 0,
+            kits: vec![kit(KitState::Failed, Some(NOW - 10), 0, 0)],
+        };
         assert_eq!(failed.purse_used(NOW), 0);
-        assert_eq!(failed.kits_today(NOW), 1, "a failed approval still used a daily kit");
+        assert_eq!(
+            failed.kits_today(NOW),
+            1,
+            "a failed approval still used a daily kit"
+        );
     }
 
     #[test]
     fn a_clock_moved_back_cannot_refresh_the_purse() {
         // Approved "in the future" relative to a clock that went back: still counts.
-        let l = Ledger { version: 1, last_observed_time: 0, kits: vec![kit(KitState::Funded, Some(NOW + 3_600), 0, 20_000)] };
+        let l = Ledger {
+            version: 1,
+            last_observed_time: 0,
+            kits: vec![kit(KitState::Funded, Some(NOW + 3_600), 0, 20_000)],
+        };
         assert_eq!(l.purse_used(NOW), 20_000);
         assert_eq!(l.kits_today(NOW), 1);
         // A day after approval it leaves the window.
-        let old = Ledger { version: 1, last_observed_time: 0, kits: vec![kit(KitState::Funded, Some(NOW - DAY_SECS), 0, 20_000)] };
+        let old = Ledger {
+            version: 1,
+            last_observed_time: 0,
+            kits: vec![kit(KitState::Funded, Some(NOW - DAY_SECS), 0, 20_000)],
+        };
         assert_eq!(old.purse_used(NOW), 0);
     }
 
@@ -1049,7 +1326,11 @@ mod tests {
     fn an_expired_offer_no_longer_blocks_a_new_kit() {
         let mut k = kit(KitState::Offered, None, 0, 0);
         k.expires_at = NOW - 1;
-        let l = Ledger { version: 1, last_observed_time: 0, kits: vec![k] };
+        let l = Ledger {
+            version: 1,
+            last_observed_time: 0,
+            kits: vec![k],
+        };
         assert_eq!(l.active(NOW), 0);
         let policy = SponsorPolicy::new(true, 20_000, 1_000, 100_000, 2).unwrap();
         assert!(l.check_new_kit(&policy, NOW).is_ok());
@@ -1062,7 +1343,15 @@ mod tests {
         a.intro_id = "A".into();
         a.created_at = 1000;
         a.expires_at = 1600;
-        save(dir.path(), &Ledger { version: 1, kits: vec![a], ..Ledger::default() }).unwrap();
+        save(
+            dir.path(),
+            &Ledger {
+                version: 1,
+                kits: vec![a],
+                ..Ledger::default()
+            },
+        )
+        .unwrap();
         let mut ledger = load_observed(dir.path(), 1601).unwrap();
         assert_eq!(ledger.active(1601), 0);
         let mut b = kit(KitState::Offered, None, 0, 0);
@@ -1089,7 +1378,15 @@ mod tests {
         candidate.state = KitState::Candidate;
         candidate.reserved_msat = 0;
         let (unknown, _) = pending_with_record();
-        save(dir.path(), &Ledger { version: 1, kits: vec![candidate, unknown], ..Ledger::default() }).unwrap();
+        save(
+            dir.path(),
+            &Ledger {
+                version: 1,
+                kits: vec![candidate, unknown],
+                ..Ledger::default()
+            },
+        )
+        .unwrap();
         let ledger = load_observed(dir.path(), NOW + 50).unwrap();
         assert_eq!(ledger.kits[0].state, KitState::Expired);
         assert_eq!(ledger.kits[1].state, KitState::Unknown);
@@ -1099,14 +1396,22 @@ mod tests {
     fn pending_with_record() -> (Kit, PaymentDetails) {
         let mut k = kit(KitState::Unknown, Some(NOW - 10), 21_000, 0);
         k.candidate = Some(Candidate {
-            newcomer: "11".repeat(32), newcomer_ln: "02".repeat(33),
-            payment_hash: "33".repeat(32), bolt11: String::new(),
-            code: "123456".into(), expires_at: NOW + 50,
+            newcomer: "11".repeat(32),
+            newcomer_ln: "02".repeat(33),
+            payment_hash: "33".repeat(32),
+            bolt11: String::new(),
+            code: "123456".into(),
+            expires_at: NOW + 50,
         });
         let d = PaymentDetails {
-            payment_hash: "33".repeat(32), preimage: None, amount_msat: 20_000,
-            status: PaymentStatus::Settled, direction: PaymentDirection::Outgoing,
-            timestamp: NOW - 10, memo: None, fee_msat: Some(100),
+            payment_hash: "33".repeat(32),
+            preimage: None,
+            amount_msat: 20_000,
+            status: PaymentStatus::Settled,
+            direction: PaymentDirection::Outgoing,
+            timestamp: NOW - 10,
+            memo: None,
+            fee_msat: Some(100),
         };
         (k, d)
     }

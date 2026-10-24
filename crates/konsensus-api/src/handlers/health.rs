@@ -336,6 +336,7 @@ async fn status(
                 crate::membrane::CAPABILITY,
                 crate::spend_budget::CAPABILITY,
                 crate::spend_budget::RELATION_ENVELOPE_ID_CAPABILITY,
+                crate::pairing::device::RELATION_INTENT_V2_CAPABILITY,
                 crate::spend_budget::FIRST_CONTACT_CAPABILITY,
                 super::introduction::CAPABILITY,
                 super::front_door::CAPABILITY,
@@ -346,7 +347,9 @@ async fn status(
                 konsensus_core::payloads::call::MEETING_CAPABILITY,
                 konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY,
             ];
-            if state.starter.config.enabled { capabilities.push("starter_channel_request_v1"); }
+            if state.starter.config.enabled {
+                capabilities.push("starter_channel_request_v1");
+            }
             if state
                 .pairing
                 .as_ref()

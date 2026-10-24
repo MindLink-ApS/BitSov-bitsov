@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use konsensus_core::payloads::call::{self as rules, CallEntry, CallRefusal, CallSignal, Settlement};
+use konsensus_core::payloads::call::{
+    self as rules, CallEntry, CallRefusal, CallSignal, Settlement,
+};
 use konsensus_core::types::NodeId;
 use konsensus_storage::Storage;
 
@@ -46,16 +48,27 @@ fn now_ms() -> u64 {
 
 /// Whether `kind` is 1:1 call signalling (400-403).
 pub fn is_call_kind(kind: u16) -> bool {
-    (konsensus_core::kind::KIND_CALL_INVITE..=konsensus_core::kind::KIND_CALL_HANGUP).contains(&kind)
+    (konsensus_core::kind::KIND_CALL_INVITE..=konsensus_core::kind::KIND_CALL_HANGUP)
+        .contains(&kind)
 }
 
 type Store<'a> = &'a dyn Storage;
 
-async fn current(store: Store<'_>, peer: &NodeId, call_id: &str, now: u64) -> Result<Option<CallEntry>, konsensus_storage::StorageError> {
+async fn current(
+    store: Store<'_>,
+    peer: &NodeId,
+    call_id: &str,
+    now: u64,
+) -> Result<Option<CallEntry>, konsensus_storage::StorageError> {
     Ok(store.call_get(peer, call_id).await?.and_then(|e| e.at(now)))
 }
 
-async fn write(store: Store<'_>, peer: &NodeId, call_id: &str, entry: Option<&CallEntry>) -> Result<(), konsensus_storage::StorageError> {
+async fn write(
+    store: Store<'_>,
+    peer: &NodeId,
+    call_id: &str,
+    entry: Option<&CallEntry>,
+) -> Result<(), konsensus_storage::StorageError> {
     match entry {
         Some(e) => store.call_put(peer, call_id, e).await,
         None => store.call_delete(peer, call_id).await,
@@ -68,20 +81,33 @@ async fn write(store: Store<'_>, peer: &NodeId, call_id: &str, entry: Option<&Ca
 /// the node for the whole tombstone (Fable N3); younger ones are never
 /// dropped, and if they alone fill a bound the call is refused.
 async fn room(store: Store<'_>, peer: &NodeId, now: u64) -> Result<(), CallRefusal> {
-    let unavailable = |_: konsensus_storage::StorageError| CallRefusal::Invalid("call state unavailable");
+    let unavailable =
+        |_: konsensus_storage::StorageError| CallRefusal::Invalid("call state unavailable");
     let counts = store.call_counts(peer, now).await.map_err(unavailable)?;
     rules::has_room(&counts)?;
     let until = rules::evictable_until(now);
     let excess = rules::burned_excess(counts.burned_peer, rules::MAX_BURNED_PER_PEER);
     let mut freed = 0;
     if excess > 0 {
-        freed = store.call_evict_burned(Some(peer), until, now, excess).await.map_err(unavailable)?;
+        freed = store
+            .call_evict_burned(Some(peer), until, now, excess)
+            .await
+            .map_err(unavailable)?;
         if freed < excess {
             return Err(CallRefusal::Full);
         }
     }
-    let excess = rules::burned_excess(counts.burned_total.saturating_sub(freed), rules::MAX_BURNED_CALLS);
-    if excess > 0 && store.call_evict_burned(None, until, now, excess).await.map_err(unavailable)? < excess {
+    let excess = rules::burned_excess(
+        counts.burned_total.saturating_sub(freed),
+        rules::MAX_BURNED_CALLS,
+    );
+    if excess > 0
+        && store
+            .call_evict_burned(None, until, now, excess)
+            .await
+            .map_err(unavailable)?
+            < excess
+    {
         return Err(CallRefusal::Full);
     }
     Ok(())
@@ -91,20 +117,33 @@ async fn room(store: Store<'_>, peer: &NodeId, now: u64) -> Result<(), CallRefus
 /// gate). A refusal means it must not reach the app (the caller also
 /// withdraws the stored message). A meeting leg must come from the earlier
 /// participant of its roster.
-pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind: u16, plaintext: Option<&str>) -> Result<CallSignal, CallRefusal> {
-    let signal = CallSignal::parse(kind, plaintext.ok_or(CallRefusal::Invalid("undecryptable"))?)?;
+pub async fn admit_incoming(
+    store: Store<'_>,
+    own: &NodeId,
+    peer: &NodeId,
+    kind: u16,
+    plaintext: Option<&str>,
+) -> Result<CallSignal, CallRefusal> {
+    let signal = CallSignal::parse(
+        kind,
+        plaintext.ok_or(CallRefusal::Invalid("undecryptable"))?,
+    )?;
     signal.check_leg(peer, own)?;
     let _g = lock().lock().await;
     let now = now_ms();
     let unavailable = |_| CallRefusal::Invalid("call state unavailable");
-    let entry = current(store, peer, &signal.call_id, now).await.map_err(unavailable)?;
+    let entry = current(store, peer, &signal.call_id, now)
+        .await
+        .map_err(unavailable)?;
     // Only an offer opens a new call id; an unknown-id answer/ICE/hangup is
     // refused below and must never make room by evicting a burned id (Fable R2).
     if entry.is_none() && kind == konsensus_core::kind::KIND_CALL_INVITE {
         room(store, peer, now).await?;
     }
     let next = rules::receive(entry, kind, now)?;
-    write(store, peer, &signal.call_id, Some(&next)).await.map_err(unavailable)?;
+    write(store, peer, &signal.call_id, Some(&next))
+        .await
+        .map_err(unavailable)?;
     Ok(signal)
 }
 
@@ -189,11 +228,24 @@ pub async fn reserve_outgoing(
 
 /// Commit or release the reservation of exactly this request; anything else
 /// (another request's reservation, none at all) is left alone.
-async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &str, request_hash: &str, how: Settlement) -> Result<(), konsensus_storage::StorageError> {
+async fn settle(
+    store: Store<'_>,
+    peer: &NodeId,
+    call_id: &str,
+    operation_id: &str,
+    request_hash: &str,
+    how: Settlement,
+) -> Result<(), konsensus_storage::StorageError> {
     let _g = lock().lock().await;
     let now = now_ms();
-    let Some(entry) = store.call_get(peer, call_id).await? else { return Ok(()) };
-    if !entry.pending.as_ref().is_some_and(|p| p.is(operation_id, request_hash)) {
+    let Some(entry) = store.call_get(peer, call_id).await? else {
+        return Ok(());
+    };
+    if !entry
+        .pending
+        .as_ref()
+        .is_some_and(|p| p.is(operation_id, request_hash))
+    {
         return Ok(());
     }
     let next = match how {
@@ -208,9 +260,26 @@ async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &s
 /// envelope goes out, so the peer's reply finds a paid call. Never fails the
 /// send (money already moved): a store error is logged and `resolve` or
 /// `recover` commits later from the operation journal.
-pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) {
-    let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else { return };
-    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, request_hash, Settlement::Paid).await {
+pub async fn commit_outgoing(
+    store: Store<'_>,
+    peer: &NodeId,
+    plaintext: &str,
+    operation_id: &str,
+    request_hash: &str,
+) {
+    let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else {
+        return;
+    };
+    if let Err(e) = settle(
+        store,
+        peer,
+        &signal.call_id,
+        operation_id,
+        request_hash,
+        Settlement::Paid,
+    )
+    .await
+    {
         tracing::warn!(peer = %peer, error = %e, "call commit after settlement failed; recovery will retry");
     }
 }
@@ -219,20 +288,41 @@ pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, o
 /// another request (other payload, kind or recipient) never paid for it
 /// (Fable N2 / R1): unpaid, and since `settle` only touches this request's own
 /// reservation, never the winner's.
-fn journal_settlement(op: Option<&konsensus_storage::OutboxOperation>, peer: &NodeId, kind: u16, request_hash: &str) -> Settlement {
+fn journal_settlement(
+    op: Option<&konsensus_storage::OutboxOperation>,
+    peer: &NodeId,
+    kind: u16,
+    request_hash: &str,
+) -> Settlement {
     match op {
-        Some(op) if op.request_hash != request_hash || op.kind != i64::from(kind) || op.recipient != peer.to_hex() => Settlement::Unpaid,
+        Some(op)
+            if op.request_hash != request_hash
+                || op.kind != i64::from(kind)
+                || op.recipient != peer.to_hex() =>
+        {
+            Settlement::Unpaid
+        }
         op => rules::settlement(op.map(|o| o.state.as_str())),
     }
 }
 
 /// After compose returned (either way): read the operation journal and commit,
 /// release (definite nonpayment) or keep (ambiguous) this request's reservation.
-pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) {
-    let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else { return };
+pub async fn resolve_outgoing(
+    store: Store<'_>,
+    peer: &NodeId,
+    plaintext: &str,
+    operation_id: &str,
+    request_hash: &str,
+) {
+    let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else {
+        return;
+    };
     // The reservation's own kind (an ICE reserves nothing; then this is moot).
     let kind = match store.call_get(peer, &signal.call_id).await {
-        Ok(Some(CallEntry { pending: Some(p), .. })) => p.kind,
+        Ok(Some(CallEntry {
+            pending: Some(p), ..
+        })) => p.kind,
         _ => return,
     };
     let how = match store.get_outbox_operation(operation_id).await {
@@ -242,7 +332,16 @@ pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, 
             return;
         }
     };
-    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, request_hash, how).await {
+    if let Err(e) = settle(
+        store,
+        peer,
+        &signal.call_id,
+        operation_id,
+        request_hash,
+        how,
+    )
+    .await
+    {
         tracing::warn!(peer = %peer, error = %e, "call reservation not resolved; recovery will retry");
     }
 }
@@ -255,11 +354,17 @@ pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, 
 /// passes `release = false`: an unpaid operation it is about to pay again
 /// keeps its reservation. Ambiguous stays reserved. Never fails the caller; a
 /// store error leaves it for the next sweep or the compose resolve.
-pub async fn settle_operation(store: Store<'_>, op: &konsensus_storage::OutboxOperation, release: bool) {
+pub async fn settle_operation(
+    store: Store<'_>,
+    op: &konsensus_storage::OutboxOperation,
+    release: bool,
+) {
     if !u16::try_from(op.kind).is_ok_and(is_call_kind) {
         return;
     }
-    let Ok(peer) = NodeId::from_hex(&op.recipient) else { return };
+    let Ok(peer) = NodeId::from_hex(&op.recipient) else {
+        return;
+    };
     let how = rules::settlement(Some(&op.state));
     if how == Settlement::Ambiguous || (how == Settlement::Unpaid && !release) {
         return;
@@ -272,8 +377,21 @@ pub async fn settle_operation(store: Store<'_>, op: &konsensus_storage::OutboxOp
         }
     };
     for (p, call_id, entry) in pending {
-        if p == peer && entry.pending.is_some_and(|x| x.is(&op.operation_id, &op.request_hash) && i64::from(x.kind) == op.kind) {
-            if let Err(e) = settle(store, &peer, &call_id, &op.operation_id, &op.request_hash, how).await {
+        if p == peer
+            && entry.pending.is_some_and(|x| {
+                x.is(&op.operation_id, &op.request_hash) && i64::from(x.kind) == op.kind
+            })
+        {
+            if let Err(e) = settle(
+                store,
+                &peer,
+                &call_id,
+                &op.operation_id,
+                &op.request_hash,
+                how,
+            )
+            .await
+            {
                 tracing::warn!(operation_id = %op.operation_id, error = %e, "call reservation not settled; next sweep retries");
             }
         }
@@ -284,10 +402,17 @@ pub async fn settle_operation(store: Store<'_>, op: &konsensus_storage::OutboxOp
 /// holds its operation lock and has already persisted the tombstone: a
 /// cancelled POST may have reserved a signal before inserting any operation
 /// metadata. Keep the pending row on write failure so a retry/sweep finds it.
-pub(crate) async fn release_abandoned(store: Store<'_>, operation_id: &str) -> Result<(), konsensus_storage::StorageError> {
+pub(crate) async fn release_abandoned(
+    store: Store<'_>,
+    operation_id: &str,
+) -> Result<(), konsensus_storage::StorageError> {
     let _g = lock().lock().await;
     for (peer, call_id, entry) in store.call_pending().await? {
-        if entry.pending.as_ref().is_some_and(|p| p.operation_id == operation_id) {
+        if entry
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.operation_id == operation_id)
+        {
             let next = rules::release(entry, operation_id);
             write(store, &peer, &call_id, next.as_ref()).await?;
         }
@@ -301,14 +426,30 @@ pub(crate) async fn release_abandoned(store: Store<'_>, operation_id: &str) -> R
 pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_storage::StorageError> {
     let (mut committed, mut released) = (0, 0);
     for (peer, call_id, entry) in store.call_pending().await? {
-        let Some(p) = entry.pending.clone() else { continue };
+        let Some(p) = entry.pending.clone() else {
+            continue;
+        };
         let op = store.get_outbox_operation(&p.operation_id).await?;
         // A legacy reservation without a request hash follows its operation.
-        let hash = if p.request_hash.is_empty() { op.as_ref().map(|o| o.request_hash.clone()).unwrap_or_default() } else { p.request_hash.clone() };
+        let hash = if p.request_hash.is_empty() {
+            op.as_ref()
+                .map(|o| o.request_hash.clone())
+                .unwrap_or_default()
+        } else {
+            p.request_hash.clone()
+        };
         // Startup commits only if the journal row is this request: same
         // payload hash, kind and recipient (Fable R1).
         let how = journal_settlement(op.as_ref(), &peer, p.kind, &hash);
-        settle(store, &peer, &call_id, &p.operation_id, &p.request_hash, how).await?;
+        settle(
+            store,
+            &peer,
+            &call_id,
+            &p.operation_id,
+            &p.request_hash,
+            how,
+        )
+        .await?;
         match how {
             Settlement::Paid => committed += 1,
             Settlement::Unpaid => released += 1,
@@ -324,7 +465,10 @@ pub const HOLD_MAX_MS: u64 = 5 * 60 * 1000;
 
 /// Hold an incoming call signal before its paid acceptance (Codex delta2 #4):
 /// until released, it is invisible to history, resync and duplicate ACKs.
-pub async fn hold_incoming(store: Store<'_>, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, konsensus_storage::StorageError> {
+pub async fn hold_incoming(
+    store: Store<'_>,
+    envelope: &konsensus_core::UkmEnvelope,
+) -> Result<bool, konsensus_storage::StorageError> {
     store.call_admission_hold(envelope, now_ms()).await
 }
 
@@ -332,8 +476,15 @@ pub async fn hold_incoming(store: Store<'_>, envelope: &konsensus_core::UkmEnvel
 /// cleanup failed, or a crash): message and plaintext deleted, receipt marked
 /// application-rejected. `all` at startup, before the receive loop runs;
 /// otherwise only holds older than [`HOLD_MAX_MS`].
-pub async fn withdraw_held(store: Store<'_>, all: bool) -> Result<u64, konsensus_storage::StorageError> {
-    let before = if all { u64::MAX } else { now_ms().saturating_sub(HOLD_MAX_MS) };
+pub async fn withdraw_held(
+    store: Store<'_>,
+    all: bool,
+) -> Result<u64, konsensus_storage::StorageError> {
+    let before = if all {
+        u64::MAX
+    } else {
+        now_ms().saturating_sub(HOLD_MAX_MS)
+    };
     store.call_admission_withdraw(before).await
 }
 
@@ -365,7 +516,11 @@ pub async fn peer_call_price(state: &AppState, peer: &NodeId) -> Result<u64, Api
     // send fails, so nobody waits for an answer to a query never sent.
     let (asked, send) = {
         let mut last = last_query().lock().unwrap_or_else(|e| e.into_inner());
-        match last.get(peer).copied().filter(|t| now.duration_since(*t) < PRICE_QUERY_MIN_INTERVAL) {
+        match last
+            .get(peer)
+            .copied()
+            .filter(|t| now.duration_since(*t) < PRICE_QUERY_MIN_INTERVAL)
+        {
             Some(recent) => (recent, false),
             None => {
                 if last.len() >= 4096 {
@@ -376,11 +531,23 @@ pub async fn peer_call_price(state: &AppState, peer: &NodeId) -> Result<u64, Api
             }
         }
     };
-    let still_asked = || last_query().lock().unwrap_or_else(|e| e.into_inner()).get(peer).is_some_and(|t| *t >= asked);
+    let still_asked = || {
+        last_query()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(peer)
+            .is_some_and(|t| *t >= asked)
+    };
     if send {
         let sent = match (konsensus_message::Frame::PriceQuery { kind }).to_bytes() {
-            Ok(frame) => state.transport.send_raw_frame(peer, &frame).await.map_err(|_| unknown()),
-            Err(e) => Err(ApiError::Internal(format!("frame serialization error: {e}"))),
+            Ok(frame) => state
+                .transport
+                .send_raw_frame(peer, &frame)
+                .await
+                .map_err(|_| unknown()),
+            Err(e) => Err(ApiError::Internal(format!(
+                "frame serialization error: {e}"
+            ))),
         };
         if let Err(e) = sent {
             let mut last = last_query().lock().unwrap_or_else(|e| e.into_inner());
@@ -392,7 +559,12 @@ pub async fn peer_call_price(state: &AppState, peer: &NodeId) -> Result<u64, Api
     }
     tokio::time::timeout(PRICE_QUERY_TIMEOUT, async {
         loop {
-            if state.peer_prices.kind_answered_at(peer, kind).await.is_some_and(|at| at >= asked) {
+            if state
+                .peer_prices
+                .kind_answered_at(peer, kind)
+                .await
+                .is_some_and(|at| at >= asked)
+            {
                 return Ok(());
             }
             if !send && !still_asked() {
@@ -406,5 +578,9 @@ pub async fn peer_call_price(state: &AppState, peer: &NodeId) -> Result<u64, Api
     .map_err(|_| unknown())?
     .map_err(|()| unknown())?;
     let height = state.chain.get_block_height().await.unwrap_or(0);
-    state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, PRICE_ANSWER_MAX_AGE).await.ok_or_else(unknown)
+    state
+        .peer_prices
+        .get_fresh_discounted_peer_price(peer, kind, height, PRICE_ANSWER_MAX_AGE)
+        .await
+        .ok_or_else(unknown)
 }

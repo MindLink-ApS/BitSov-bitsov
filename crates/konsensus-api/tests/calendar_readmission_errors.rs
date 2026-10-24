@@ -64,7 +64,9 @@ impl MessageTransport for ReadmitTransport {
     async fn connected_since(&self, peer: &NodeId) -> Option<std::time::Instant> {
         // One live connection, established before this test's first payment.
         static SINCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        self.is_connected(peer).await.then(|| *SINCE.get_or_init(std::time::Instant::now))
+        self.is_connected(peer)
+            .await
+            .then(|| *SINCE.get_or_init(std::time::Instant::now))
     }
     async fn connected_peers(&self) -> Vec<NodeId> {
         vec![self.peer, self.earlier_peer]

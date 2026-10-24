@@ -34,7 +34,10 @@ impl AdmissionQuotes {
     /// Restart/quarantine behavior is covered separately below with explicit times.
     #[cfg(test)]
     pub(crate) fn started_at_for_test(started_at_unix: u64) -> Self {
-        Self { started_at_unix, ..Self::default() }
+        Self {
+            started_at_unix,
+            ..Self::default()
+        }
     }
 
     pub(crate) fn permit(

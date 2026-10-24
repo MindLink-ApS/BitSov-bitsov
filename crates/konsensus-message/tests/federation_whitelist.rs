@@ -17,12 +17,12 @@
 
 use std::sync::Arc;
 
-use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_core::identity::NodeIdentity;
 use konsensus_core::traits::transport::{MessageTransport, TransportError};
 use konsensus_core::types::{NodeId, Nonce, PaymentProof, Recipient, Signature};
+use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_message::wire::{Capability, SovereigntyTier};
-use konsensus_message::{ReachabilityMode, NoiseTransport, TransportConfig};
+use konsensus_message::{NoiseTransport, ReachabilityMode, TransportConfig};
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------

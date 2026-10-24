@@ -132,12 +132,7 @@ impl RoutingTable {
     ///
     /// Called when a `MessageAck` is received from the peer. The `latency_ms`
     /// is the time between sending the message and receiving the ack.
-    pub async fn record_success(
-        &self,
-        peer: &NodeId,
-        latency_ms: f64,
-        payment_msat: u64,
-    ) {
+    pub async fn record_success(&self, peer: &NodeId, latency_ms: f64, payment_msat: u64) {
         let mut weights = self.weights.write().await;
         let weight = weights.entry(*peer).or_insert_with(SynapticWeight::new);
         weight.record_success(latency_ms, payment_msat);
@@ -186,10 +181,13 @@ impl RoutingTable {
         let mut relays = self.relays.write().await;
         let tracker = relays.entry(*via_peer).or_default();
         let dest_key = destination.to_string();
-        let entry = tracker.counts.entry(dest_key).or_insert_with(|| RelayEntry {
-            count: 0,
-            last_relayed: Instant::now(),
-        });
+        let entry = tracker
+            .counts
+            .entry(dest_key)
+            .or_insert_with(|| RelayEntry {
+                count: 0,
+                last_relayed: Instant::now(),
+            });
         entry.count = entry.count.saturating_add(1);
         entry.last_relayed = Instant::now();
 
@@ -209,10 +207,7 @@ impl RoutingTable {
 
     /// Check if we should suggest a direct connection to a destination
     /// (dendritic growth: relayed too many times through intermediaries).
-    pub async fn should_suggest_direct(
-        &self,
-        destination: &NodeId,
-    ) -> bool {
+    pub async fn should_suggest_direct(&self, destination: &NodeId) -> bool {
         let relays = self.relays.read().await;
         let dest_key = destination.to_string();
         for tracker in relays.values() {
@@ -260,7 +255,9 @@ impl RoutingTable {
             }
         }
 
-        let suggest_direct = self.should_suggest_direct_inner(destination, &self.relays).await;
+        let suggest_direct = self
+            .should_suggest_direct_inner(destination, &self.relays)
+            .await;
 
         best.map(|(next_hop, score)| RoutingDecision {
             next_hop,
@@ -1005,7 +1002,9 @@ mod tests {
             let w = weights.get_mut(&peer).unwrap();
             w.set_weight(0.001);
             // Set below_threshold_since to 25 hours ago (past grace period)
-            w.set_below_threshold_since(Some(std::time::Instant::now() - Duration::from_secs(25 * 3600)));
+            w.set_below_threshold_since(Some(
+                std::time::Instant::now() - Duration::from_secs(25 * 3600),
+            ));
         }
 
         let pruned = table.prune().await;
@@ -1202,8 +1201,7 @@ mod tests {
             let mut relays = table.relays.write().await;
             let tracker = relays.get_mut(&peer).unwrap();
             let entry = tracker.counts.get_mut(&dest.to_string()).unwrap();
-            entry.last_relayed =
-                Instant::now() - RELAY_DESTINATION_TTL - Duration::from_secs(1);
+            entry.last_relayed = Instant::now() - RELAY_DESTINATION_TTL - Duration::from_secs(1);
         }
 
         table.prune().await;

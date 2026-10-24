@@ -11,7 +11,6 @@ use konsensus_api::state::AppState;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-
 // ─── Tests ──────────────────────────────────────────────────────────
 
 async fn fetch_auth_challenge(app: Router) -> String {
@@ -76,7 +75,10 @@ async fn preflight_returns_ok_when_operator_probes_enabled() {
     assert_eq!(json["status"], "ok");
     assert_eq!(json["version"], 2);
     assert!(json["uptime_secs"].is_number());
-    assert!(json.get("node_id").is_none(), "preflight must not expose node identity");
+    assert!(
+        json.get("node_id").is_none(),
+        "preflight must not expose node identity"
+    );
 }
 
 #[tokio::test]
@@ -279,9 +281,10 @@ async fn local_auth_rejects_non_localhost() {
     // rate-limit middleware (which fails closed only on a *missing* IP,
     // not on a public one) and reaches the auth/local handler, which then
     // rejects the request because the caller is not on localhost.
-    let app = konsensus_api::build_router(state).layer(MockConnectInfo(
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 40000),
-    ));
+    let app = konsensus_api::build_router(state).layer(MockConnectInfo(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        40000,
+    )));
 
     let req = Request::builder()
         .method("POST")
@@ -299,12 +302,9 @@ async fn local_auth_rejects_non_localhost() {
 async fn remote_router_never_mounts_local_token_mint() {
     use axum::extract::connect_info::MockConnectInfo;
 
-    let app = konsensus_api::build_remote_router(test_state())
-        .layer(MockConnectInfo(
-            "127.0.0.1:19001"
-                .parse::<std::net::SocketAddr>()
-                .unwrap(),
-        ));
+    let app = konsensus_api::build_remote_router(test_state()).layer(MockConnectInfo(
+        "127.0.0.1:19001".parse::<std::net::SocketAddr>().unwrap(),
+    ));
     let request = Request::builder()
         .method("POST")
         .uri("/api/v1/auth/local")
@@ -336,9 +336,7 @@ async fn remote_router_excludes_local_surfaces_but_keeps_authenticated_api() {
         ..(*base).clone()
     });
     let app = konsensus_api::build_remote_router(state).layer(MockConnectInfo(
-        "127.0.0.1:19002"
-            .parse::<std::net::SocketAddr>()
-            .unwrap(),
+        "127.0.0.1:19002".parse::<std::net::SocketAddr>().unwrap(),
     ));
 
     for (method, path) in [
@@ -385,11 +383,7 @@ async fn remote_rate_exhaustion_does_not_consume_local_budget() {
         rate_limiter: Arc::new(RateLimiter::new(1)),
         ..(*base).clone()
     });
-    let peer = MockConnectInfo(
-        "127.0.0.1:19003"
-            .parse::<std::net::SocketAddr>()
-            .unwrap(),
-    );
+    let peer = MockConnectInfo("127.0.0.1:19003".parse::<std::net::SocketAddr>().unwrap());
     let remote = konsensus_api::build_remote_router(Arc::clone(&state)).layer(peer);
     let local = konsensus_api::build_router(state).layer(peer);
 
@@ -473,7 +467,10 @@ async fn health_endpoint_returns_public_counters_and_redacts_secrets() {
 
     // Sensitive fields are redacted from the unauthenticated /health endpoint;
     // they are served only by the owner-only /api/v1/status (A1 drift-kill).
-    assert!(json.get("node_id").is_none(), "unauth /health must not expose node_id");
+    assert!(
+        json.get("node_id").is_none(),
+        "unauth /health must not expose node_id"
+    );
     assert!(
         json.get("connected_peer_ids").is_none(),
         "unauth /health must not expose peer IDs (social graph)"
@@ -512,7 +509,11 @@ async fn audit_log_records_events() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let log = AuditLog::open(tmp.path()).unwrap();
 
-    log.record("test.event", "actor1", Some(serde_json::json!({"key": "value"})));
+    log.record(
+        "test.event",
+        "actor1",
+        Some(serde_json::json!({"key": "value"})),
+    );
     log.record("test.event2", "actor2", None);
 
     let contents = std::fs::read_to_string(tmp.path()).unwrap();
@@ -548,10 +549,7 @@ async fn auth_rejects_malformed_hex_signature() {
 
     let resp = app.oneshot(req).await.unwrap();
     // Should return 400 (bad request) or 401 (unauthorized)
-    assert!(
-        resp.status() == StatusCode::BAD_REQUEST
-            || resp.status() == StatusCode::UNAUTHORIZED
-    );
+    assert!(resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -571,10 +569,7 @@ async fn auth_rejects_truncated_signature() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert!(
-        resp.status() == StatusCode::BAD_REQUEST
-            || resp.status() == StatusCode::UNAUTHORIZED
-    );
+    assert!(resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::UNAUTHORIZED);
 }
 
 // ─── Session endpoint tests ────────────────────────────────────────
@@ -1390,12 +1385,10 @@ async fn reveal_mnemonic_is_rate_limited() {
     let base = test_state_with_data_dir(dir.path().to_path_buf());
     // Tight limiter: 2 attempts per (long) window so the test is deterministic.
     let state = Arc::new(AppState {
-        mnemonic_reveal_limiter: Arc::new(
-            konsensus_api::rate_limit::RateLimiter::with_window(
-                2,
-                std::time::Duration::from_secs(300),
-            ),
-        ),
+        mnemonic_reveal_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::with_window(
+            2,
+            std::time::Duration::from_secs(300),
+        )),
         ..(*base).clone()
     });
     let auth = auth_header(&state);
@@ -1556,9 +1549,7 @@ async fn auth_token_missing_signature_field() {
         .method("POST")
         .uri("/api/v1/auth/token")
         .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({}).to_string(),
-        ))
+        .body(Body::from(serde_json::json!({}).to_string()))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
@@ -1908,8 +1899,7 @@ async fn auth_user_rejection_body_is_uniform_across_failure_classes() {
     let mint = |header: &str, claims: &str, sign_secret: &str| -> String {
         let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
         let p = URL_SAFE_NO_PAD.encode(claims.as_bytes());
-        let mut mac =
-            hmac::Hmac::<sha2::Sha256>::new_from_slice(sign_secret.as_bytes()).unwrap();
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(sign_secret.as_bytes()).unwrap();
         mac.update(h.as_bytes());
         mac.update(b".");
         mac.update(p.as_bytes());
@@ -1922,7 +1912,11 @@ async fn auth_user_rejection_body_is_uniform_across_failure_classes() {
         ("malformed (not a JWT)", "garbage-not-a-jwt".to_string()),
         (
             "bad signature (signed with a different secret)",
-            mint(r#"{"alg":"HS256","typ":"JWT"}"#, good_claims, "another-secret-entirely-000000"),
+            mint(
+                r#"{"alg":"HS256","typ":"JWT"}"#,
+                good_claims,
+                "another-secret-entirely-000000",
+            ),
         ),
         (
             "unsupported alg (valid MAC, HS512 header)",
@@ -1954,7 +1948,11 @@ async fn auth_user_rejection_body_is_uniform_across_failure_classes() {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{label}: expected 401");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{label}: expected 401"
+        );
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body = String::from_utf8_lossy(&body);
         assert_eq!(
@@ -1973,14 +1971,28 @@ async fn status_reports_stun_port_only_when_listening() {
         if auth {
             req = req.header("authorization", auth_header(state));
         }
-        let resp = build_router(Arc::clone(state)).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let resp = build_router(Arc::clone(state))
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap()).unwrap()
+        serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1 << 16)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
     }
     let off = test_state();
-    assert!(get(&off, "/api/v1/status", true).await.get("stun_port").is_none());
+    assert!(get(&off, "/api/v1/status", true)
+        .await
+        .get("stun_port")
+        .is_none());
 
-    let on = Arc::new(AppState { stun_port: Some(3478), ..(*test_state()).clone() });
+    let on = Arc::new(AppState {
+        stun_port: Some(3478),
+        ..(*test_state()).clone()
+    });
     let status = get(&on, "/api/v1/status", true).await;
     assert_eq!(status["stun_port"], 3478);
     assert!(status.get("stun_url").is_none(), "no dialable host, no URL");
@@ -1995,7 +2007,10 @@ async fn status_reports_stun_port_only_when_listening() {
         ),
         ..(*test_state()).clone()
     });
-    assert_eq!(get(&public, "/api/v1/status", true).await["stun_url"], "stun:node.example.org:3478");
+    assert_eq!(
+        get(&public, "/api/v1/status", true).await["stun_url"],
+        "stun:node.example.org:3478"
+    );
     let status = get(&public, "/api/v1/status", true).await;
     assert_eq!(status["peer_endpoint"], "node.example.org:9000");
     assert_eq!(status["peer_endpoint_source"], "advertised");
@@ -2003,23 +2018,58 @@ async fn status_reports_stun_port_only_when_listening() {
 
     // Discovery still pending/failed: the reason is visible to the owner.
     let intro = konsensus_api::handlers::introduction::IntroductionSettings::default();
-    intro.set_discovered(konsensus_api::handlers::introduction::PeerEndpointView::missing("stun_unreachable"));
-    let failed = Arc::new(AppState { introduction: intro.clone(), ..(*test_state()).clone() });
+    intro.set_discovered(
+        konsensus_api::handlers::introduction::PeerEndpointView::missing("stun_unreachable"),
+    );
+    let failed = Arc::new(AppState {
+        introduction: intro.clone(),
+        ..(*test_state()).clone()
+    });
     let status = get(&failed, "/api/v1/status", true).await;
     assert!(status.get("peer_endpoint").is_none());
     assert_eq!(status["peer_endpoint_reason"], "stun_unreachable");
-    intro.set_discovered(konsensus_api::handlers::introduction::PeerEndpointView::found("93.184.216.34:9000".into(), "stun"));
+    intro.set_discovered(
+        konsensus_api::handlers::introduction::PeerEndpointView::found(
+            "93.184.216.34:9000".into(),
+            "stun",
+        ),
+    );
     let status = get(&failed, "/api/v1/status", true).await;
-    assert_eq!((status["peer_endpoint"].as_str(), status["peer_endpoint_source"].as_str()), (Some("93.184.216.34:9000"), Some("stun")));
+    assert_eq!(
+        (
+            status["peer_endpoint"].as_str(),
+            status["peer_endpoint_source"].as_str()
+        ),
+        (Some("93.184.216.34:9000"), Some("stun"))
+    );
 }
 
 #[test]
 fn stun_url_uses_the_dialable_host_only() {
     use konsensus_api::handlers::health::stun_url;
-    assert_eq!(stun_url(Some("203.0.113.5:9000"), Some(3478)).as_deref(), Some("stun:203.0.113.5:3478"));
-    assert_eq!(stun_url(Some("[2001:db8::1]:9000"), Some(3478)).as_deref(), Some("stun:[2001:db8::1]:3478"));
-    assert_eq!(stun_url(Some(" node.example.org:9000 "), Some(1)).as_deref(), Some("stun:node.example.org:1"));
-    for bad in ["127.0.0.1:9000", "[::1]:9000", "0.0.0.0:9000", "localhost:9000", "nohost", ":9000", "a b:1", "user@h:1", "2001:db8::1:9000"] {
+    assert_eq!(
+        stun_url(Some("203.0.113.5:9000"), Some(3478)).as_deref(),
+        Some("stun:203.0.113.5:3478")
+    );
+    assert_eq!(
+        stun_url(Some("[2001:db8::1]:9000"), Some(3478)).as_deref(),
+        Some("stun:[2001:db8::1]:3478")
+    );
+    assert_eq!(
+        stun_url(Some(" node.example.org:9000 "), Some(1)).as_deref(),
+        Some("stun:node.example.org:1")
+    );
+    for bad in [
+        "127.0.0.1:9000",
+        "[::1]:9000",
+        "0.0.0.0:9000",
+        "localhost:9000",
+        "nohost",
+        ":9000",
+        "a b:1",
+        "user@h:1",
+        "2001:db8::1:9000",
+    ] {
         assert_eq!(stun_url(Some(bad), Some(3478)), None, "{bad}");
     }
     assert_eq!(stun_url(None, Some(3478)), None);
@@ -2036,9 +2086,17 @@ async fn status_reports_custody_mode_to_the_owner_only() {
         if auth {
             req = req.header("authorization", auth_header(state));
         }
-        let resp = build_router(Arc::clone(state)).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let resp = build_router(Arc::clone(state))
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap()).unwrap()
+        serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1 << 16)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
     }
     for (mode, wire) in [
         (CustodyMode::LocalSeed, "local_seed"),
@@ -2047,8 +2105,17 @@ async fn status_reports_custody_mode_to_the_owner_only() {
         (CustodyMode::MoneySigner, "money_signer"),
         (CustodyMode::RemoteSigner, "remote_signer"),
     ] {
-        let state = Arc::new(AppState { custody_mode: mode, ..(*test_state()).clone() });
-        assert_eq!(get(&state, "/api/v1/status", true).await["custody_mode"], wire);
-        assert!(get(&state, "/api/v1/health", false).await.get("custody_mode").is_none());
+        let state = Arc::new(AppState {
+            custody_mode: mode,
+            ..(*test_state()).clone()
+        });
+        assert_eq!(
+            get(&state, "/api/v1/status", true).await["custody_mode"],
+            wire
+        );
+        assert!(get(&state, "/api/v1/health", false)
+            .await
+            .get("custody_mode")
+            .is_none());
     }
 }

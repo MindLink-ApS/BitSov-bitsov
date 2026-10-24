@@ -179,7 +179,10 @@ async fn file_and_calendar_queue_failures_report_settlement_and_preserve_reconci
             );
             assert_eq!(json["code"], "payment_settled_send_incomplete");
             assert_eq!(json["amount_msat"], spent);
-            assert_eq!(json["max_routing_fee_msat"], if fanout { 10000 } else { 5000 });
+            assert_eq!(
+                json["max_routing_fee_msat"],
+                if fanout { 10000 } else { 5000 }
+            );
             assert_eq!(
                 transport.sent_envelopes.lock().unwrap().len(),
                 usize::from(fanout)

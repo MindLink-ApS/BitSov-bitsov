@@ -29,8 +29,8 @@
 //! without a new dependency being threaded through.
 
 mod pre_payment;
-pub use pre_payment::{PrePaymentReason, PrePaymentRefusals};
 use pre_payment::PrePaymentCounters;
+pub use pre_payment::{PrePaymentReason, PrePaymentRefusals};
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -197,7 +197,9 @@ pub fn classify(rejection: &GateRejection) -> (Code, Option<u64>, bool) {
 #[must_use]
 pub fn outbound_code(err: &ApiError) -> Option<Code> {
     match err {
-        ApiError::Operation { source, .. } | ApiError::RoutingFee { source, .. } | ApiError::Reasoned { source, .. } => outbound_code(source),
+        ApiError::Operation { source, .. }
+        | ApiError::RoutingFee { source, .. }
+        | ApiError::Reasoned { source, .. } => outbound_code(source),
         ApiError::PriceCapExceeded(_) => Some(Code::PriceCapExceeded),
         ApiError::BudgetExceeded(_) => Some(Code::BudgetExceeded),
         _ => None,

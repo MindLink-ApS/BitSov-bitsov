@@ -4,7 +4,7 @@
 //! kept to provide an explicit fail-closed response instead of silently
 //! creating a payment-gate bypass.
 
-use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::auth::scoped::{Admin, Read, ScopedAuth};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -13,8 +13,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_core::types::{PaymentProof, Recipient, Signature};
+use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_message::Frame;
 
 use crate::error::ApiError;

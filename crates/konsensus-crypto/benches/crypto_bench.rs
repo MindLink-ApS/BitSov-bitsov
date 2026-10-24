@@ -5,7 +5,7 @@
 //! 2. Noise encrypt/decrypt (transport layer)
 //! 3. X3DH key agreement (one-time per session)
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use ed25519_dalek::Signer;
 use konsensus_crypto::noise::NoiseSession;
 use konsensus_crypto::x3dh::{self, OneTimePreKey, SignedPreKey};

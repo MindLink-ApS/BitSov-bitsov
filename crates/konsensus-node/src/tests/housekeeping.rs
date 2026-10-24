@@ -16,7 +16,11 @@ fn make_proof() -> PaymentProof {
     PaymentProof::new(hash, preimage, 100)
 }
 
-fn make_envelope_with_timestamp(sender: NodeId, recipient: NodeId, timestamp_ms: u64) -> konsensus_core::UkmEnvelope {
+fn make_envelope_with_timestamp(
+    sender: NodeId,
+    recipient: NodeId,
+    timestamp_ms: u64,
+) -> konsensus_core::UkmEnvelope {
     UkmEnvelopeBuilder::new(
         konsensus_core::kind::KIND_CHAT,
         sender,
@@ -78,7 +82,10 @@ async fn nonce_cleanup_preserves_fresh_nonces() {
     // With max_age=3600, a just-inserted nonce should survive
     let removed = storage.cleanup_expired_nonces(3600).await.unwrap();
     assert_eq!(removed, 0);
-    assert!(storage.has_nonce(&nonce).await.unwrap(), "fresh nonce should survive");
+    assert!(
+        storage.has_nonce(&nonce).await.unwrap(),
+        "fresh nonce should survive"
+    );
 }
 
 /// Empty nonces table — cleanup returns zero without error.
@@ -136,12 +143,21 @@ async fn pending_cleanup_marks_high_attempt_keeps_both() {
     let env_fresh = make_envelope_with_timestamp(sender, peer, 1_700_000_001_000);
     storage.store_message(&env_stale).await.unwrap();
     storage.store_message(&env_fresh).await.unwrap();
-    storage.queue_pending_delivery(&env_stale.id, &peer).await.unwrap();
-    storage.queue_pending_delivery(&env_fresh.id, &peer).await.unwrap();
+    storage
+        .queue_pending_delivery(&env_stale.id, &peer)
+        .await
+        .unwrap();
+    storage
+        .queue_pending_delivery(&env_fresh.id, &peer)
+        .await
+        .unwrap();
 
     // Push stale entry past threshold
     for _ in 0..11 {
-        storage.increment_pending_attempts(&env_stale.id, &peer).await.unwrap();
+        storage
+            .increment_pending_attempts(&env_stale.id, &peer)
+            .await
+            .unwrap();
     }
 
     let removed = storage.cleanup_stale_pending(10).await.unwrap();
@@ -168,17 +184,26 @@ async fn pending_cleanup_boundary_at_max_attempts() {
 
     let env = make_envelope_with_timestamp(sender, peer, 1_700_000_000_000);
     storage.store_message(&env).await.unwrap();
-    storage.queue_pending_delivery(&env.id, &peer).await.unwrap();
+    storage
+        .queue_pending_delivery(&env.id, &peer)
+        .await
+        .unwrap();
 
     // Increment to exactly 9 (below threshold of 10)
     for _ in 0..9 {
-        storage.increment_pending_attempts(&env.id, &peer).await.unwrap();
+        storage
+            .increment_pending_attempts(&env.id, &peer)
+            .await
+            .unwrap();
     }
     let removed = storage.cleanup_stale_pending(10).await.unwrap();
     assert_eq!(removed, 0, "9 attempts should survive threshold of 10");
 
     // One more → exactly 10
-    storage.increment_pending_attempts(&env.id, &peer).await.unwrap();
+    storage
+        .increment_pending_attempts(&env.id, &peer)
+        .await
+        .unwrap();
     let removed = storage.cleanup_stale_pending(10).await.unwrap();
     assert_eq!(removed, 1, "10 attempts should be cleaned at threshold 10");
 }
@@ -195,19 +220,34 @@ async fn pending_cleanup_multi_peer() {
     let env_b = make_envelope_with_timestamp(sender, peer_b, 1_700_000_001_000);
     storage.store_message(&env_a).await.unwrap();
     storage.store_message(&env_b).await.unwrap();
-    storage.queue_pending_delivery(&env_a.id, &peer_a).await.unwrap();
-    storage.queue_pending_delivery(&env_b.id, &peer_b).await.unwrap();
+    storage
+        .queue_pending_delivery(&env_a.id, &peer_a)
+        .await
+        .unwrap();
+    storage
+        .queue_pending_delivery(&env_b.id, &peer_b)
+        .await
+        .unwrap();
 
     // Only peer_a's entry exceeds threshold
     for _ in 0..10 {
-        storage.increment_pending_attempts(&env_a.id, &peer_a).await.unwrap();
+        storage
+            .increment_pending_attempts(&env_a.id, &peer_a)
+            .await
+            .unwrap();
     }
 
     let removed = storage.cleanup_stale_pending(10).await.unwrap();
     assert_eq!(removed, 1);
 
-    assert_eq!(storage.get_pending_for_peer(&peer_a).await.unwrap().len(), 1);
-    assert_eq!(storage.get_pending_for_peer(&peer_b).await.unwrap().len(), 1);
+    assert_eq!(
+        storage.get_pending_for_peer(&peer_a).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        storage.get_pending_for_peer(&peer_b).await.unwrap().len(),
+        1
+    );
 }
 
 // ── Timestamps cleanup ────────────────────────────────────
@@ -239,7 +279,10 @@ async fn timestamps_cleanup_logic_removes_stale_entries() {
     {
         let mut ts = timestamps.lock().await;
         // Stale: 10 minutes ago (older than 5-minute max_age)
-        ts.insert(stale_id, std::time::Instant::now() - std::time::Duration::from_secs(600));
+        ts.insert(
+            stale_id,
+            std::time::Instant::now() - std::time::Duration::from_secs(600),
+        );
         // Fresh: just now
         ts.insert(fresh_id, std::time::Instant::now());
     }
@@ -253,7 +296,10 @@ async fn timestamps_cleanup_logic_removes_stale_entries() {
     }
 
     let ts = timestamps.lock().await;
-    assert!(!ts.contains_key(&stale_id), "stale timestamp should be removed");
+    assert!(
+        !ts.contains_key(&stale_id),
+        "stale timestamp should be removed"
+    );
     assert!(ts.contains_key(&fresh_id), "fresh timestamp should be kept");
 }
 
@@ -268,11 +314,20 @@ async fn timestamps_cleanup_logic_mixed_ages() {
     let fresh = random_message_id();
 
     // 10 min ago — stale
-    timestamps.insert(very_stale, std::time::Instant::now() - std::time::Duration::from_secs(600));
+    timestamps.insert(
+        very_stale,
+        std::time::Instant::now() - std::time::Duration::from_secs(600),
+    );
     // 6 min ago — stale (>5 min)
-    timestamps.insert(borderline_stale, std::time::Instant::now() - std::time::Duration::from_secs(360));
+    timestamps.insert(
+        borderline_stale,
+        std::time::Instant::now() - std::time::Duration::from_secs(360),
+    );
     // 1 min ago — fresh
-    timestamps.insert(fresh, std::time::Instant::now() - std::time::Duration::from_secs(60));
+    timestamps.insert(
+        fresh,
+        std::time::Instant::now() - std::time::Duration::from_secs(60),
+    );
 
     let cutoff = std::time::Instant::now() - max_age;
     timestamps.retain(|_, sent_at| *sent_at > cutoff);
@@ -362,7 +417,11 @@ async fn retention_deletes_old_messages_keeps_recent() {
         .as_millis() as u64;
 
     // Old message: 60 days ago
-    let old_env = make_envelope_with_timestamp(sender, recipient, now_ms.saturating_sub(60 * 24 * 3600 * 1000));
+    let old_env = make_envelope_with_timestamp(
+        sender,
+        recipient,
+        now_ms.saturating_sub(60 * 24 * 3600 * 1000),
+    );
     storage.store_message(&old_env).await.unwrap();
 
     // Recent message: now
@@ -374,8 +433,14 @@ async fn retention_deletes_old_messages_keeps_recent() {
     let removed = storage.delete_messages_older_than(cutoff_ms).await.unwrap();
     assert_eq!(removed, 1);
 
-    assert!(storage.get_message(&old_env.id).await.unwrap().is_none(), "old message should be deleted");
-    assert!(storage.get_message(&recent_env.id).await.unwrap().is_some(), "recent message should survive");
+    assert!(
+        storage.get_message(&old_env.id).await.unwrap().is_none(),
+        "old message should be deleted"
+    );
+    assert!(
+        storage.get_message(&recent_env.id).await.unwrap().is_some(),
+        "recent message should survive"
+    );
 }
 
 /// Retention with cutoff_ms=0 deletes nothing (all timestamps are > 0).
@@ -405,16 +470,27 @@ async fn retention_preserves_pending_deliveries() {
         .unwrap()
         .as_millis() as u64;
 
-    let old_env = make_envelope_with_timestamp(sender, recipient, now_ms.saturating_sub(60 * 24 * 3600 * 1000));
+    let old_env = make_envelope_with_timestamp(
+        sender,
+        recipient,
+        now_ms.saturating_sub(60 * 24 * 3600 * 1000),
+    );
     storage.store_message(&old_env).await.unwrap();
-    storage.queue_pending_delivery(&old_env.id, &recipient).await.unwrap();
+    storage
+        .queue_pending_delivery(&old_env.id, &recipient)
+        .await
+        .unwrap();
 
     let cutoff_ms = now_ms.saturating_sub(24 * 3600 * 1000);
     storage.delete_messages_older_than(cutoff_ms).await.unwrap();
 
     // Pending delivery should be gone too (FK cascade)
     let pending = storage.get_pending_for_peer(&recipient).await.unwrap();
-    assert_eq!(pending.len(), 1, "retention must preserve unacknowledged delivery");
+    assert_eq!(
+        pending.len(),
+        1,
+        "retention must preserve unacknowledged delivery"
+    );
 }
 
 // ── Gossip eviction ──────────────────────────────────────
@@ -460,7 +536,11 @@ async fn gossip_eviction_clears_expired_entries() {
 
     // Evict — with dedup_ttl=0, the entry should be removed
     validator.evict_expired();
-    assert_eq!(validator.store().len(), 0, "expired entries should be evicted");
+    assert_eq!(
+        validator.store().len(),
+        0,
+        "expired entries should be evicted"
+    );
 }
 
 // ── Price refresh ────────────────────────────────────────
@@ -494,7 +574,12 @@ async fn price_refresh_shuts_down_on_signal() {
 
     let handle = tokio::spawn(run_price_refresh(
         Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap()),
-        transport, pricing, chain, routing, config, shutdown_rx,
+        transport,
+        pricing,
+        chain,
+        routing,
+        config,
+        shutdown_rx,
     ));
     shutdown_tx.send(true).unwrap();
 
@@ -565,7 +650,10 @@ async fn peer_ln_pubkeys_cleanup_all_connected_retains_all() {
 /// Dropped receiver → sender.is_closed() == true → entry removed.
 #[tokio::test]
 async fn invoice_requests_cleanup_removes_closed_senders() {
-    let mut map: HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>> = HashMap::new();
+    let mut map: HashMap<
+        String,
+        tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>,
+    > = HashMap::new();
 
     // Create two requests: one with a live receiver, one with a dropped receiver
     let (tx_live, _rx_live) = tokio::sync::oneshot::channel();
@@ -588,7 +676,10 @@ async fn invoice_requests_cleanup_removes_closed_senders() {
 /// All senders are live: nothing is removed.
 #[tokio::test]
 async fn invoice_requests_cleanup_retains_live_senders() {
-    let mut map: HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>> = HashMap::new();
+    let mut map: HashMap<
+        String,
+        tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>,
+    > = HashMap::new();
 
     let (tx1, _rx1) = tokio::sync::oneshot::channel();
     let (tx2, _rx2) = tokio::sync::oneshot::channel();
@@ -603,7 +694,10 @@ async fn invoice_requests_cleanup_retains_live_senders() {
 /// Empty map: cleanup is a no-op.
 #[tokio::test]
 async fn invoice_requests_cleanup_empty_is_noop() {
-    let mut map: HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>> = HashMap::new();
+    let mut map: HashMap<
+        String,
+        tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>,
+    > = HashMap::new();
     let before = map.len();
     map.retain(|_, sender| !sender.is_closed());
     assert_eq!(before, 0);

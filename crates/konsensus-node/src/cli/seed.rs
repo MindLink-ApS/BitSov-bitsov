@@ -75,7 +75,8 @@ fn prompt_new_password() -> Result<Zeroizing<String>> {
 fn refuse_if_node_running(config_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        let socket = crate::owner_cmd::data_dir_of(config_path).join(konsensus_api::control::SOCKET_FILE);
+        let socket =
+            crate::owner_cmd::data_dir_of(config_path).join(konsensus_api::control::SOCKET_FILE);
         if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
             anyhow::bail!(
                 "the node is running (its control socket answers at {}). Stop it first; nothing was changed.",
@@ -105,12 +106,18 @@ pub fn encrypt_seed(
         );
     }
     if mnemonic_crypto::is_encrypted_path(&plaintext) {
-        anyhow::bail!("the recovery phrase at {} is already encrypted; nothing to do", plaintext.display());
+        anyhow::bail!(
+            "the recovery phrase at {} is already encrypted; nothing to do",
+            plaintext.display()
+        );
     }
     let meta = std::fs::symlink_metadata(&plaintext)
         .with_context(|| format!("cannot read {}", plaintext.display()))?;
     if !meta.is_file() {
-        anyhow::bail!("{} is not a regular file (a symlink?); nothing was changed", plaintext.display());
+        anyhow::bail!(
+            "{} is not a regular file (a symlink?); nothing was changed",
+            plaintext.display()
+        );
     }
     #[cfg(unix)]
     {
@@ -128,7 +135,10 @@ pub fn encrypt_seed(
     let lock_path = plaintext.with_extension("encrypting.lock");
     // Nothing this command creates, reads or removes may be a file a config
     // save writes or replaces: that save could destroy the recovery phrase.
-    let writer_paths = [config_path.to_path_buf(), NodeConfig::write_atomic_temp(config_path)];
+    let writer_paths = [
+        config_path.to_path_buf(),
+        NodeConfig::write_atomic_temp(config_path),
+    ];
     for ours in [&plaintext, &encrypted, &lock_path] {
         for theirs in &writer_paths {
             if same_location(ours, theirs) {
@@ -158,8 +168,12 @@ pub fn encrypt_seed(
             encrypted.display()
         );
     }
-    let mnemonic = mnemonic_crypto::read_mnemonic(&plaintext, None)
-        .with_context(|| format!("failed to read the recovery phrase at {}", plaintext.display()))?;
+    let mnemonic = mnemonic_crypto::read_mnemonic(&plaintext, None).with_context(|| {
+        format!(
+            "failed to read the recovery phrase at {}",
+            plaintext.display()
+        )
+    })?;
     let passphrase = config.identity.passphrase.as_str();
     let node_id = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, passphrase)
         .context("the recovery phrase does not derive an identity; nothing was changed")?
@@ -170,33 +184,52 @@ pub fn encrypt_seed(
     //    a symlink), owner-only from the first byte, and make it durable.
     let bytes = mnemonic_crypto::encrypt_mnemonic(&mnemonic, password.as_str())
         .context("failed to encrypt the recovery phrase; nothing was changed")?;
-    create_private(&encrypted, &bytes)
-        .with_context(|| format!("failed to create {}; nothing was changed", encrypted.display()))?;
-    let abandon = |why: String| -> anyhow::Error { keep_or_remove_encrypted(config_path, &node_id, &encrypted, why) };
+    create_private(&encrypted, &bytes).with_context(|| {
+        format!(
+            "failed to create {}; nothing was changed",
+            encrypted.display()
+        )
+    })?;
+    let abandon = |why: String| -> anyhow::Error {
+        keep_or_remove_encrypted(config_path, &node_id, &encrypted, why)
+    };
 
     // 2. Read it back: same words, same identity.
     let back = mnemonic_crypto::read_mnemonic(&encrypted, Some(password.as_str()))
         .map_err(|e| abandon(format!("the encrypted file did not decrypt ({e})")))?;
     let back_id = konsensus_core::NodeIdentity::from_mnemonic(&back, passphrase)
-        .map_err(|e| abandon(format!("the decrypted phrase does not derive an identity ({e})")))?
+        .map_err(|e| {
+            abandon(format!(
+                "the decrypted phrase does not derive an identity ({e})"
+            ))
+        })?
         .node_id()
         .to_hex();
     if *back != *mnemonic || back_id != node_id {
-        return Err(abandon("the encrypted file does not derive the same identity".into()));
+        return Err(abandon(
+            "the encrypted file does not derive the same identity".into(),
+        ));
     }
 
     // 3. Point the config at it, and check it reloads that way. If anything
     //    fails here, undo only what can be proven undone.
-    let repointed = crate::owner_cmd::align_config_mnemonic(config_path, &encrypted).and_then(|()| {
-        let reloaded = NodeConfig::load_before_identity_validation(config_path)?;
-        anyhow::ensure!(
-            reloaded.identity.mnemonic_file == encrypted,
-            "the updated config does not point at the encrypted file"
-        );
-        Ok(())
-    });
+    let repointed =
+        crate::owner_cmd::align_config_mnemonic(config_path, &encrypted).and_then(|()| {
+            let reloaded = NodeConfig::load_before_identity_validation(config_path)?;
+            anyhow::ensure!(
+                reloaded.identity.mnemonic_file == encrypted,
+                "the updated config does not point at the encrypted file"
+            );
+            Ok(())
+        });
     if let Err(e) = repointed {
-        return Err(rollback_config(config_path, &plaintext, &encrypted, &node_id, e));
+        return Err(rollback_config(
+            config_path,
+            &plaintext,
+            &encrypted,
+            &node_id,
+            e,
+        ));
     }
 
     // 4. Only now remove the plaintext: overwrite, flush, delete, flush the dir.
@@ -207,7 +240,11 @@ pub fn encrypt_seed(
             plaintext.display()
         )
     })?;
-    Ok(Encrypted { encrypted, removed: plaintext, node_id })
+    Ok(Encrypted {
+        encrypted,
+        removed: plaintext,
+        node_id,
+    })
 }
 
 /// After a failed repoint: try to put the config back on the plaintext, then
@@ -233,7 +270,12 @@ fn rollback_config(
 /// that exists and reads back to the **same node identity**. A config that
 /// merely names the right path is not enough. Otherwise keep every file and
 /// say exactly where the seed is.
-fn keep_or_remove_encrypted(config_path: &Path, node_id: &str, encrypted: &Path, why: String) -> anyhow::Error {
+fn keep_or_remove_encrypted(
+    config_path: &Path,
+    node_id: &str,
+    encrypted: &Path,
+    why: String,
+) -> anyhow::Error {
     let config = NodeConfig::load_before_identity_validation(config_path).ok();
     let points_at = config.as_ref().map(|c| c.identity.mnemonic_file.clone());
     let intact = config.as_ref().is_some_and(|c| {
@@ -258,9 +300,13 @@ fn keep_or_remove_encrypted(config_path: &Path, node_id: &str, encrypted: &Path,
          written 24 words also restore it.",
         encrypted.display(),
         config_path.display(),
-        points_at.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "an unreadable path".into()),
+        points_at
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "an unreadable path".into()),
         match points_at.as_deref() {
-            Some(p) if p == encrypted => " (the encrypted file: start with that password)".to_string(),
+            Some(p) if p == encrypted =>
+                " (the encrypted file: start with that password)".to_string(),
             Some(p) if p.exists() => ", which does not read back as the same phrase".to_string(),
             _ => ", which does not exist".to_string(),
         },
@@ -282,7 +328,10 @@ fn same_location(a: &Path, b: &Path) -> bool {
         }
     }
     let norm = |p: &Path| -> Option<String> {
-        let parent = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let parent = p
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
         Some(parent.join(p.file_name()?).to_string_lossy().to_lowercase())
     };
@@ -366,9 +415,13 @@ pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
     let before = std::fs::symlink_metadata(path)
         .with_context(|| format!("cannot read the password file {}", path.display()))?;
     if !before.is_file() {
-        anyhow::bail!("{} is not a regular file (symlinks are refused)", path.display());
+        anyhow::bail!(
+            "{} is not a regular file (symlinks are refused)",
+            path.display()
+        );
     }
-    let mut file = std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     // Check the file actually opened, not just the name: a swap between the
     // check and the open is refused.
     let meta = file.metadata()?;
@@ -376,7 +429,10 @@ pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if (meta.dev(), meta.ino()) != (before.dev(), before.ino()) || !meta.is_file() {
-            anyhow::bail!("{} changed while it was being opened; refusing it", path.display());
+            anyhow::bail!(
+                "{} changed while it was being opened; refusing it",
+                path.display()
+            );
         }
         let mode = meta.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
@@ -392,7 +448,8 @@ pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
         }
     }
     let mut raw = Zeroizing::new(String::new());
-    std::io::Read::read_to_string(&mut file, &mut raw).with_context(|| format!("cannot read {}", path.display()))?;
+    std::io::Read::read_to_string(&mut file, &mut raw)
+        .with_context(|| format!("cannot read {}", path.display()))?;
     let pw = Zeroizing::new(raw.trim_end_matches(['\n', '\r']).to_string());
     if pw.is_empty() {
         anyhow::bail!("the password file {} is empty", path.display());
@@ -410,9 +467,13 @@ mod tests {
 
     fn node() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let phrase = mnemonic_crypto::write_mnemonic(&dir.path().join("mnemonic.txt"), PHRASE, None).unwrap();
+        let phrase =
+            mnemonic_crypto::write_mnemonic(&dir.path().join("mnemonic.txt"), PHRASE, None)
+                .unwrap();
         let config = dir.path().join("konsensus.toml");
-        NodeConfig::default_for_tier(NodeTier::Light, phrase.clone(), dir.path()).save(&config).unwrap();
+        NodeConfig::default_for_tier(NodeTier::Light, phrase.clone(), dir.path())
+            .save(&config)
+            .unwrap();
         (dir, config, phrase)
     }
 
@@ -421,7 +482,10 @@ mod tests {
     }
 
     fn node_id() -> String {
-        konsensus_core::NodeIdentity::from_mnemonic(PHRASE, "").unwrap().node_id().to_hex()
+        konsensus_core::NodeIdentity::from_mnemonic(PHRASE, "")
+            .unwrap()
+            .node_id()
+            .to_hex()
     }
 
     #[test]
@@ -434,16 +498,24 @@ mod tests {
         // The config now points at it, and it decrypts to the same identity.
         let reloaded = NodeConfig::load_before_identity_validation(&config).unwrap();
         assert_eq!(reloaded.identity.mnemonic_file, done.encrypted);
-        let back = mnemonic_crypto::read_mnemonic(&done.encrypted, Some("correct horse battery")).unwrap();
+        let back =
+            mnemonic_crypto::read_mnemonic(&done.encrypted, Some("correct horse battery")).unwrap();
         assert_eq!(&*back, PHRASE);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&done.encrypted).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(&done.encrypted)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600);
         }
         // A second run has nothing to do and changes nothing.
-        assert!(encrypt_seed(&config, pw("correct horse battery")).unwrap_err().to_string().contains("already encrypted"));
+        assert!(encrypt_seed(&config, pw("correct horse battery"))
+            .unwrap_err()
+            .to_string()
+            .contains("already encrypted"));
     }
 
     #[test]
@@ -474,8 +546,14 @@ mod tests {
         assert!(encrypt_seed(&config, || anyhow::bail!("the passwords did not match")).is_err());
         // An existing .enc is never overwritten.
         std::fs::write(dir.path().join("mnemonic.enc"), b"other").unwrap();
-        assert!(encrypt_seed(&config, pw("correct horse battery")).unwrap_err().to_string().contains("refusing to overwrite"));
-        assert_eq!(std::fs::read(dir.path().join("mnemonic.enc")).unwrap(), b"other");
+        assert!(encrypt_seed(&config, pw("correct horse battery"))
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to overwrite"));
+        assert_eq!(
+            std::fs::read(dir.path().join("mnemonic.enc")).unwrap(),
+            b"other"
+        );
         // Through all of it: plaintext intact, config untouched.
         assert_eq!(std::fs::read_to_string(&plaintext).unwrap().trim(), PHRASE);
         assert_eq!(std::fs::read(&config).unwrap(), before);
@@ -490,11 +568,20 @@ mod tests {
         std::fs::create_dir(&tmp).unwrap();
         std::fs::write(tmp.join("block"), b"x").unwrap();
         let err = encrypt_seed(&config, pw("correct horse battery")).unwrap_err();
-        assert!(err.to_string().contains("holds the same recovery phrase"), "{err}");
+        assert!(
+            err.to_string().contains("holds the same recovery phrase"),
+            "{err}"
+        );
         assert!(plaintext.exists(), "plaintext kept");
-        assert!(!dir.path().join("mnemonic.enc").exists(), "new file removed");
+        assert!(
+            !dir.path().join("mnemonic.enc").exists(),
+            "new file removed"
+        );
         let reloaded = NodeConfig::load_before_identity_validation(&config).unwrap();
-        assert_eq!(reloaded.identity.mnemonic_file, plaintext, "config unchanged");
+        assert_eq!(
+            reloaded.identity.mnemonic_file, plaintext,
+            "config unchanged"
+        );
     }
 
     #[test]
@@ -506,12 +593,21 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-            assert!(read_password_file(&file).unwrap_err().to_string().contains("chmod 600"));
+            assert!(read_password_file(&file)
+                .unwrap_err()
+                .to_string()
+                .contains("chmod 600"));
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-            assert_eq!(&*read_password_file(&file).unwrap(), "correct horse battery");
+            assert_eq!(
+                &*read_password_file(&file).unwrap(),
+                "correct horse battery"
+            );
             let link = dir.path().join("link");
             std::os::unix::fs::symlink(&file, &link).unwrap();
-            assert!(read_password_file(&link).unwrap_err().to_string().contains("symlinks"));
+            assert!(read_password_file(&link)
+                .unwrap_err()
+                .to_string()
+                .contains("symlinks"));
             let empty = dir.path().join("empty");
             std::fs::write(&empty, "\n").unwrap();
             std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -555,7 +651,11 @@ mod tests {
         // A dangling symlink where the .enc would go is not followed.
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(dir.path().join("elsewhere"), dir.path().join("mnemonic.enc")).unwrap();
+            std::os::unix::fs::symlink(
+                dir.path().join("elsewhere"),
+                dir.path().join("mnemonic.enc"),
+            )
+            .unwrap();
             let err = encrypt_seed(&config, pw("correct horse battery")).unwrap_err();
             assert!(err.to_string().contains("refusing to overwrite"), "{err}");
             assert!(!dir.path().join("elsewhere").exists());
@@ -575,9 +675,18 @@ mod tests {
         let tmp = config.with_extension("toml.tmp");
         std::fs::create_dir(&tmp).unwrap();
         std::fs::write(tmp.join("block"), b"x").unwrap();
-        let err = rollback_config(&config, &plaintext, &encrypted, &node_id(), anyhow::anyhow!("reload failed"));
+        let err = rollback_config(
+            &config,
+            &plaintext,
+            &encrypted,
+            &node_id(),
+            anyhow::anyhow!("reload failed"),
+        );
         assert!(err.to_string().contains("KEPT"), "{err}");
-        assert!(encrypted.exists() && plaintext.exists(), "nothing the config may name is deleted");
+        assert!(
+            encrypted.exists() && plaintext.exists(),
+            "nothing the config may name is deleted"
+        );
     }
 
     #[test]
@@ -605,10 +714,19 @@ mod tests {
     /// (write_atomic) would itself delete a file at the temp path.
     fn point_config_at(config: &Path, path: &Path) {
         let text = std::fs::read_to_string(config).unwrap();
-        let old = NodeConfig::load_before_identity_validation(config).unwrap().identity.mnemonic_file;
+        let old = NodeConfig::load_before_identity_validation(config)
+            .unwrap()
+            .identity
+            .mnemonic_file;
         let text = text.replace(&*old.to_string_lossy(), &path.to_string_lossy());
         std::fs::write(config, text).unwrap();
-        assert_eq!(NodeConfig::load_before_identity_validation(config).unwrap().identity.mnemonic_file, path);
+        assert_eq!(
+            NodeConfig::load_before_identity_validation(config)
+                .unwrap()
+                .identity
+                .mnemonic_file,
+            path
+        );
     }
 
     fn phrase_at(path: &Path, password: Option<&str>) -> bool {
@@ -626,7 +744,11 @@ mod tests {
         point_config_at(&config, &alias);
         crate::config::fail_next_config_dir_sync();
         let err = encrypt_seed(&config, pw("correct horse battery")).unwrap_err();
-        assert!(err.to_string().contains("which saving the config writes or replaces"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("which saving the config writes or replaces"),
+            "{err}"
+        );
         assert!(phrase_at(&alias, None), "the phrase is intact where it was");
         assert!(!dir.path().join("konsensus.toml.enc").exists());
         // The armed failure was not consumed by a config save.
@@ -639,12 +761,19 @@ mod tests {
         let (dir, config, plaintext) = node();
         let link = dir.path().join("linked");
         std::os::unix::fs::symlink(dir.path(), &link).unwrap();
-        for alias in [link.join("konsensus.toml.tmp"), dir.path().join("KONSENSUS.TOML.TMP")] {
+        for alias in [
+            link.join("konsensus.toml.tmp"),
+            dir.path().join("KONSENSUS.TOML.TMP"),
+        ] {
             std::fs::copy(&plaintext, dir.path().join("staging")).unwrap();
             std::fs::rename(dir.path().join("staging"), &alias).unwrap();
             point_config_at(&config, &alias);
             let err = encrypt_seed(&config, pw("correct horse battery")).unwrap_err();
-            assert!(err.to_string().contains("which saving the config writes or replaces"), "{alias:?}: {err}");
+            assert!(
+                err.to_string()
+                    .contains("which saving the config writes or replaces"),
+                "{alias:?}: {err}"
+            );
             assert!(phrase_at(&alias, None));
             std::fs::remove_file(&alias).unwrap();
         }
@@ -654,12 +783,19 @@ mod tests {
     fn an_encrypted_file_that_would_be_the_config_is_refused() {
         // Config at node.enc; plaintext node.txt would encrypt to node.enc.
         let dir = tempfile::tempdir().unwrap();
-        let phrase = mnemonic_crypto::write_mnemonic(&dir.path().join("node.txt"), PHRASE, None).unwrap();
+        let phrase =
+            mnemonic_crypto::write_mnemonic(&dir.path().join("node.txt"), PHRASE, None).unwrap();
         let config = dir.path().join("node.enc");
-        NodeConfig::default_for_tier(NodeTier::Light, phrase.clone(), dir.path()).save(&config).unwrap();
+        NodeConfig::default_for_tier(NodeTier::Light, phrase.clone(), dir.path())
+            .save(&config)
+            .unwrap();
         let before = std::fs::read(&config).unwrap();
         let err = encrypt_seed(&config, pw("correct horse battery")).unwrap_err();
-        assert!(err.to_string().contains("which saving the config writes or replaces"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("which saving the config writes or replaces"),
+            "{err}"
+        );
         assert_eq!(std::fs::read(&config).unwrap(), before);
         assert!(phrase_at(&phrase, None));
     }
@@ -675,7 +811,10 @@ mod tests {
         assert!(err.to_string().contains("injected sync failure"), "{err}");
         assert!(phrase_at(&plaintext, None), "plaintext intact");
         let reloaded = NodeConfig::load_before_identity_validation(&config).unwrap();
-        assert_eq!(reloaded.identity.mnemonic_file, plaintext, "config back on the plaintext");
+        assert_eq!(
+            reloaded.identity.mnemonic_file, plaintext,
+            "config back on the plaintext"
+        );
         assert!(!dir.path().join("mnemonic.enc").exists());
     }
 
@@ -684,22 +823,51 @@ mod tests {
         // The general invariant: restoring the config string is not enough.
         let (dir, config, plaintext) = node();
         let encrypted = dir.path().join("mnemonic.enc");
-        std::fs::write(&encrypted, mnemonic_crypto::encrypt_mnemonic(PHRASE, "correct horse battery").unwrap()).unwrap();
+        std::fs::write(
+            &encrypted,
+            mnemonic_crypto::encrypt_mnemonic(PHRASE, "correct horse battery").unwrap(),
+        )
+        .unwrap();
         std::fs::remove_file(&plaintext).unwrap();
-        let err = rollback_config(&config, &plaintext, &encrypted, &node_id(), anyhow::anyhow!("sync failed"));
+        let err = rollback_config(
+            &config,
+            &plaintext,
+            &encrypted,
+            &node_id(),
+            anyhow::anyhow!("sync failed"),
+        );
         let msg = err.to_string();
-        assert!(msg.contains("KEPT") && msg.contains("does not exist"), "{msg}");
-        assert!(phrase_at(&encrypted, Some("correct horse battery")), "the only copy survives");
+        assert!(
+            msg.contains("KEPT") && msg.contains("does not exist"),
+            "{msg}"
+        );
+        assert!(
+            phrase_at(&encrypted, Some("correct horse battery")),
+            "the only copy survives"
+        );
     }
 
     #[test]
     fn rollback_keeps_the_enc_when_the_plaintext_reads_as_another_identity() {
         let (dir, config, plaintext) = node();
         let encrypted = dir.path().join("mnemonic.enc");
-        std::fs::write(&encrypted, mnemonic_crypto::encrypt_mnemonic(PHRASE, "correct horse battery").unwrap()).unwrap();
-        std::fs::write(&plaintext, "legal winner thank year wave sausage worth useful legal winner thank yellow").unwrap();
-        let err = keep_or_remove_encrypted(&config, &node_id(), &encrypted, "read-back failed".into());
-        assert!(err.to_string().contains("does not read back as the same phrase"), "{err}");
+        std::fs::write(
+            &encrypted,
+            mnemonic_crypto::encrypt_mnemonic(PHRASE, "correct horse battery").unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &plaintext,
+            "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        )
+        .unwrap();
+        let err =
+            keep_or_remove_encrypted(&config, &node_id(), &encrypted, "read-back failed".into());
+        assert!(
+            err.to_string()
+                .contains("does not read back as the same phrase"),
+            "{err}"
+        );
         assert!(encrypted.exists());
     }
 
@@ -707,10 +875,17 @@ mod tests {
     fn rollback_keeps_the_enc_when_the_config_still_names_it() {
         let (dir, config, _plaintext) = node();
         let encrypted = dir.path().join("mnemonic.enc");
-        std::fs::write(&encrypted, mnemonic_crypto::encrypt_mnemonic(PHRASE, "correct horse battery").unwrap()).unwrap();
+        std::fs::write(
+            &encrypted,
+            mnemonic_crypto::encrypt_mnemonic(PHRASE, "correct horse battery").unwrap(),
+        )
+        .unwrap();
         crate::owner_cmd::align_config_mnemonic(&config, &encrypted).unwrap();
         let err = keep_or_remove_encrypted(&config, &node_id(), &encrypted, "reload failed".into());
-        assert!(err.to_string().contains("start with that password"), "{err}");
+        assert!(
+            err.to_string().contains("start with that password"),
+            "{err}"
+        );
         assert!(encrypted.exists());
     }
 }

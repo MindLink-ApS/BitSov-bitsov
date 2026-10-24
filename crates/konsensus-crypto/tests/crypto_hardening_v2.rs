@@ -45,7 +45,8 @@ fn make_ratchet_pair() -> (DoubleRatchet, DoubleRatchet) {
     let shared_secret = [42u8; 32];
     let ad = b"alice||bob".to_vec();
     let bob_spk = SignedPreKey::generate();
-    let alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).expect("test setup");
+    let alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone())
+        .expect("test setup");
     let bob = DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
     (alice, bob)
 }
@@ -262,7 +263,10 @@ fn x3dh_shared_secret_debug_redacted() {
 
     let init = x3dh::initiate(&alice_secret, &alice_public, &bundle).unwrap();
     let debug = format!("{:?}", init.shared_secret);
-    assert!(debug.contains("REDACTED"), "secret should be redacted in Debug output");
+    assert!(
+        debug.contains("REDACTED"),
+        "secret should be redacted in Debug output"
+    );
     // Ensure no raw hex bytes leak
     let hex_chars: usize = debug.chars().filter(|c| c.is_ascii_hexdigit()).count();
     assert!(hex_chars < 32, "should not contain full hex secret");
@@ -278,12 +282,7 @@ fn ratchet_receiver_cannot_send_before_first_decrypt() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = SignedPreKey::generate();
 
-    let bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let bob = DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Bob's sending chain isn't initialized until he decrypts Alice's first message
     assert!(!bob.can_send());
@@ -295,7 +294,8 @@ fn ratchet_sender_can_send_immediately() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = SignedPreKey::generate();
 
-    let alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad).expect("test setup");
+    let alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad).expect("test setup");
     assert!(alice.can_send());
 }
 
@@ -409,7 +409,10 @@ fn ratchet_tampered_dh_public_in_header_fails() {
 
     // Decryption should fail because AEAD AD includes the header
     let err = bob.decrypt(&msg).unwrap_err();
-    assert!(matches!(err, konsensus_crypto::double_ratchet::RatchetError::DecryptionFailed(_)));
+    assert!(matches!(
+        err,
+        konsensus_crypto::double_ratchet::RatchetError::DecryptionFailed(_)
+    ));
 }
 
 #[test]
@@ -421,7 +424,10 @@ fn ratchet_tampered_previous_chain_length_fails() {
 
     // AEAD includes header, so tampering causes decryption failure
     let err = bob.decrypt(&msg).unwrap_err();
-    assert!(matches!(err, konsensus_crypto::double_ratchet::RatchetError::DecryptionFailed(_)));
+    assert!(matches!(
+        err,
+        konsensus_crypto::double_ratchet::RatchetError::DecryptionFailed(_)
+    ));
 }
 
 #[test]
@@ -452,7 +458,8 @@ fn ratchet_state_export_preserves_counts() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).expect("test setup");
+    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone())
+        .expect("test setup");
     let mut bob =
         DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
@@ -504,8 +511,7 @@ fn ratchet_state_with_no_remote_dh() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = SignedPreKey::generate();
 
-    let bob =
-        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
+    let bob = DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     let state = bob.export_state();
     assert!(state.remote_dh_public.is_none());
@@ -521,9 +527,9 @@ fn ratchet_independent_sessions_dont_interfere() {
     let shared2 = [99u8; 32];
     let ad2 = b"carol||dave".to_vec();
     let dave_spk = SignedPreKey::generate();
-    let mut carol = DoubleRatchet::init_sender(&shared2, &dave_spk.public, ad2.clone()).expect("test setup");
-    let mut dave =
-        DoubleRatchet::init_receiver(&shared2, dave_spk.secret(), &dave_spk.public, ad2);
+    let mut carol =
+        DoubleRatchet::init_sender(&shared2, &dave_spk.public, ad2.clone()).expect("test setup");
+    let mut dave = DoubleRatchet::init_receiver(&shared2, dave_spk.secret(), &dave_spk.public, ad2);
 
     // Messages in session 1
     let msg1 = alice1.encrypt(b"session1").unwrap();
@@ -536,7 +542,10 @@ fn ratchet_independent_sessions_dont_interfere() {
     // Cross-session decryption must fail (wrong shared secret → decryption failure)
     let msg3 = alice1.encrypt(b"for bob").unwrap();
     let err = dave.decrypt(&msg3).unwrap_err();
-    assert!(matches!(err, konsensus_crypto::double_ratchet::RatchetError::DecryptionFailed(_)));
+    assert!(matches!(
+        err,
+        konsensus_crypto::double_ratchet::RatchetError::DecryptionFailed(_)
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -636,7 +645,10 @@ fn sender_keys_unknown_sender_fails() {
 
     // Try decrypting with unknown sender ID
     let err = bob.decrypt(&unknown_id, &ct).unwrap_err();
-    assert!(matches!(err, konsensus_crypto::sender_keys::SenderKeyError::UnknownSender(_)));
+    assert!(matches!(
+        err,
+        konsensus_crypto::sender_keys::SenderKeyError::UnknownSender(_)
+    ));
 }
 
 #[test]
@@ -724,8 +736,8 @@ async fn session_manager_prekey_bundle_fields() {
 
     let bundle = mgr.prekey_bundle().await;
     // Fields are hex-encoded: 32 bytes → 64 hex chars, 64 bytes → 128 hex chars
-    assert_eq!(bundle.identity_key.len(), 64);     // X25519 public (32 bytes hex)
-    assert_eq!(bundle.signed_prekey.len(), 64);    // X25519 public (32 bytes hex)
+    assert_eq!(bundle.identity_key.len(), 64); // X25519 public (32 bytes hex)
+    assert_eq!(bundle.signed_prekey.len(), 64); // X25519 public (32 bytes hex)
     assert_eq!(bundle.signed_prekey_sig.len(), 128); // Ed25519 sig (64 bytes hex)
     assert!(!bundle.node_id.is_empty());
     assert!(bundle.one_time_prekey.is_some());
@@ -782,7 +794,10 @@ async fn session_manager_encrypt_no_session_fails() {
     let fake_peer = make_node_id(99);
 
     let err = mgr_a.encrypt(&fake_peer, b"hello").await.unwrap_err();
-    assert!(matches!(err, konsensus_crypto::session::SessionError::NoSession(_)));
+    assert!(matches!(
+        err,
+        konsensus_crypto::session::SessionError::NoSession(_)
+    ));
 }
 
 #[tokio::test]
@@ -801,7 +816,10 @@ async fn session_manager_decrypt_no_session_fails() {
         ciphertext: vec![0u8; 64],
     };
     let err = mgr_a.decrypt(&fake_peer, &fake_msg).await.unwrap_err();
-    assert!(matches!(err, konsensus_crypto::session::SessionError::NoSession(_)));
+    assert!(matches!(
+        err,
+        konsensus_crypto::session::SessionError::NoSession(_)
+    ));
 }
 
 #[tokio::test]
@@ -845,7 +863,10 @@ async fn session_manager_multiple_peers() {
 
     // B can't decrypt C's message (different ratchet state)
     let err = mgr_b.decrypt(&node_a, &ct_c).await.unwrap_err();
-    assert!(matches!(err, konsensus_crypto::session::SessionError::Ratchet(_)));
+    assert!(matches!(
+        err,
+        konsensus_crypto::session::SessionError::Ratchet(_)
+    ));
 }
 
 #[tokio::test]
@@ -871,7 +892,10 @@ async fn session_manager_remove_session() {
 
     // Encrypt should fail after removal
     let err = mgr_a.encrypt(&node_b, b"hello").await.unwrap_err();
-    assert!(matches!(err, konsensus_crypto::session::SessionError::NoSession(_)));
+    assert!(matches!(
+        err,
+        konsensus_crypto::session::SessionError::NoSession(_)
+    ));
 }
 
 #[tokio::test]
@@ -953,13 +977,16 @@ fn ratchet_message_bytes_too_short_fails() {
     // Less than 40 bytes (header size)
     let short = vec![0u8; 39];
     let err = ratchet_message_from_bytes(&short).unwrap_err();
-    assert!(matches!(err, konsensus_crypto::session::SessionError::InvalidPeerData(_)));
+    assert!(matches!(
+        err,
+        konsensus_crypto::session::SessionError::InvalidPeerData(_)
+    ));
 }
 
 #[test]
 fn ratchet_message_bytes_exact_header_no_ciphertext() {
-    use konsensus_crypto::session::{ratchet_message_from_bytes, ratchet_message_to_bytes};
     use konsensus_crypto::double_ratchet::RatchetMessage;
+    use konsensus_crypto::session::{ratchet_message_from_bytes, ratchet_message_to_bytes};
 
     // A message with empty ciphertext (40 bytes header only)
     let msg = RatchetMessage {

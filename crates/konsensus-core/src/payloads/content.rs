@@ -45,7 +45,9 @@ pub fn is_site_page(path: &str) -> bool {
         && !name.starts_with('.')
         && (name.ends_with(".md") || name.ends_with(".txt"))
         && !name.contains("..")
-        && !name.chars().any(|c| matches!(c, '/' | '\\' | '%') || c.is_control())
+        && !name
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | '%') || c.is_control())
 }
 
 /// Every path a porch answers with content: the card, or a site page.
@@ -341,9 +343,21 @@ mod tests {
             assert!(is_porch_path(ok), "{ok}");
         }
         for bad in [
-            "", "/", "index.md", "/.md", "/.draft.md", "/blog/post.md", "/../x.md",
-            "/a..b.md", "/x%2e.md", "/a\\b.md", "/a\0.md", "/page.html",
-            "/front-door.seq", "/front-door.json.tmp", "/cards/abc.json",
+            "",
+            "/",
+            "index.md",
+            "/.md",
+            "/.draft.md",
+            "/blog/post.md",
+            "/../x.md",
+            "/a..b.md",
+            "/x%2e.md",
+            "/a\\b.md",
+            "/a\0.md",
+            "/page.html",
+            "/front-door.seq",
+            "/front-door.json.tmp",
+            "/cards/abc.json",
         ] {
             assert!(!is_porch_path(bad), "{bad:?}");
         }

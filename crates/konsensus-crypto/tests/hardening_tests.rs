@@ -45,7 +45,8 @@ fn make_ratchet_pair() -> (DoubleRatchet, DoubleRatchet) {
     let shared_secret = [42u8; 32];
     let ad = b"alice||bob".to_vec();
     let bob_spk = SignedPreKey::generate();
-    let alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).expect("test setup");
+    let alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone())
+        .expect("test setup");
     let bob = DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
     (alice, bob)
 }
@@ -73,7 +74,8 @@ fn ratchet_state_json_roundtrip_after_many_ratchet_steps() {
     let aj = serde_json::to_vec(&alice_state).unwrap();
     let bj = serde_json::to_vec(&bob_state).unwrap();
 
-    let mut alice2 = DoubleRatchet::from_state(&serde_json::from_slice::<RatchetState>(&aj).unwrap());
+    let mut alice2 =
+        DoubleRatchet::from_state(&serde_json::from_slice::<RatchetState>(&aj).unwrap());
     let mut bob2 = DoubleRatchet::from_state(&serde_json::from_slice::<RatchetState>(&bj).unwrap());
 
     let msg = alice2.encrypt(b"post-restore").unwrap();
@@ -106,7 +108,8 @@ fn ratchet_state_associated_data_preserved() {
     let shared_secret = [42u8; 32];
     let ad = b"custom-associated-data-12345".to_vec();
     let bob_spk = SignedPreKey::generate();
-    let alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).expect("test setup");
+    let alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone())
+        .expect("test setup");
 
     let state = alice.export_state();
     assert_eq!(state.associated_data, ad);
@@ -140,14 +143,8 @@ fn skipped_keys_bounded_by_max_total() {
     assert_eq!(state.skipped_keys.len(), 499);
 
     // Now verify those skipped messages can still be decrypted
-    assert_eq!(
-        bob.decrypt(&pending_msgs[0]).unwrap(),
-        b"msg0"
-    );
-    assert_eq!(
-        bob.decrypt(&pending_msgs[250]).unwrap(),
-        b"msg250"
-    );
+    assert_eq!(bob.decrypt(&pending_msgs[0]).unwrap(), b"msg0");
+    assert_eq!(bob.decrypt(&pending_msgs[250]).unwrap(), b"msg250");
 }
 
 #[test]
@@ -161,7 +158,9 @@ fn skip_exactly_max_skip_succeeds() {
     }
 
     // Bob receives the last one — skips exactly 999 (within MAX_SKIP=1000)
-    let plaintext = bob.decrypt(&msgs[999]).expect("skip exactly MAX_SKIP must succeed");
+    let plaintext = bob
+        .decrypt(&msgs[999])
+        .expect("skip exactly MAX_SKIP must succeed");
     assert_eq!(plaintext, b"m999");
 }
 
@@ -272,7 +271,9 @@ fn sender_key_generation_mismatch_rejected() {
     // Manually craft a distribution with higher generation
     // by removing a fake member to trigger rotation
     let fake_id = make_node_id(99);
-    alice.process_distribution(&GroupSession::new(group_id, fake_id).our_distribution()).unwrap();
+    alice
+        .process_distribution(&GroupSession::new(group_id, fake_id).our_distribution())
+        .unwrap();
     let _ = alice.remove_member(&fake_id);
 
     // Alice is now at gen 1 but Bob still has gen 0
@@ -407,7 +408,10 @@ impl SessionStore for MemorySessionStore {
         peer_id: &NodeId,
         state_json: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.data.write().await.insert(*peer_id, state_json.to_vec());
+        self.data
+            .write()
+            .await
+            .insert(*peer_id, state_json.to_vec());
         Ok(())
     }
     async fn load_session(
@@ -423,9 +427,7 @@ impl SessionStore for MemorySessionStore {
         self.data.write().await.remove(peer_id);
         Ok(())
     }
-    async fn list_sessions(
-        &self,
-    ) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.data.read().await.keys().copied().collect())
     }
 }
@@ -511,7 +513,10 @@ async fn session_persist_with_store_and_concurrent_operations() {
 
     // Send 5 messages sequentially (each persists state)
     for i in 0..5u32 {
-        let msg = mgr_a.encrypt(&node_b, format!("m{i}").as_bytes()).await.unwrap();
+        let msg = mgr_a
+            .encrypt(&node_b, format!("m{i}").as_bytes())
+            .await
+            .unwrap();
         mgr_b.decrypt(&node_a, &msg).await.unwrap();
     }
 
@@ -525,7 +530,10 @@ async fn session_persist_with_store_and_concurrent_operations() {
 
     // Verify can continue
     let msg = mgr_a2.encrypt(&node_b, b"after-restore").await.unwrap();
-    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"after-restore");
+    assert_eq!(
+        mgr_b.decrypt(&node_a, &msg).await.unwrap(),
+        b"after-restore"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

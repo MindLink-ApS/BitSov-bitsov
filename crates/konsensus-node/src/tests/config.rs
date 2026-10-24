@@ -3654,7 +3654,8 @@ fn privacy_node_ids_still_deserialize_from_toml() {
     let id = "ab".repeat(32);
     let config: crate::config::PrivacyConfig = toml::from_str(&format!(
         "shareable_peers = [\"{id}\"]\nshare_peer_labels = [\"{id}\"]\n"
-    )).unwrap();
+    ))
+    .unwrap();
     assert_eq!(config.shareable_peers[0].to_hex(), id);
     assert_eq!(config.share_peer_labels[0].to_hex(), id);
 }

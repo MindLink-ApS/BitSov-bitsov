@@ -20,7 +20,11 @@ pub(crate) struct PendingHandlerDeps {
     pub storage: Arc<dyn konsensus_storage::Storage>,
     pub transport: Arc<dyn MessageTransport>,
     pub audit_log: Arc<AuditLog>,
-    pub send_timestamps: Arc<tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>>>,
+    pub send_timestamps: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>,
+        >,
+    >,
     pub pending_rx: tokio::sync::mpsc::Receiver<NodeId>,
     pub shutdown_rx: watch::Receiver<bool>,
 }
@@ -70,7 +74,9 @@ async fn flush_peer(
     storage: &dyn konsensus_storage::Storage,
     transport: &dyn MessageTransport,
     audit: &AuditLog,
-    send_timestamps: &tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>>,
+    send_timestamps: &tokio::sync::Mutex<
+        std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>,
+    >,
     identity: &konsensus_core::identity::NodeIdentity,
     include_stalled: bool,
 ) {
@@ -94,7 +100,9 @@ async fn flush_peer(
 
     for (message_id, attempts) in &pending {
         // Stalled deliveries only retry on the 60-second scan, avoiding reconnect storms.
-        if *attempts >= 10 && !include_stalled { continue; }
+        if *attempts >= 10 && !include_stalled {
+            continue;
+        }
         // Load the full envelope from storage
         let mut envelope = match storage.get_message(message_id).await {
             Ok(Some(env)) => env,
@@ -109,7 +117,10 @@ async fn flush_peer(
                     error = %e,
                     "failed to load pending envelope"
                 );
-                if let Err(e) = storage.increment_pending_attempts(message_id, peer_id).await {
+                if let Err(e) = storage
+                    .increment_pending_attempts(message_id, peer_id)
+                    .await
+                {
                     warn!(error = %e, "failed to increment pending attempts");
                 }
                 continue;
@@ -129,8 +140,11 @@ async fn flush_peer(
             continue;
         }
 
-        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default().as_millis().min(u64::MAX as u128) as u64;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
         match envelope.refresh_for_resend(identity, now_ms) {
             Ok(true) => {
                 if let Err(e) = storage.update_message_wrapper(&envelope).await {
@@ -139,14 +153,20 @@ async fn flush_peer(
                 }
             }
             Ok(false) => {}
-            Err(e) => { warn!(error = %e, "cannot rewrap paid envelope"); continue; }
+            Err(e) => {
+                warn!(error = %e, "cannot rewrap paid envelope");
+                continue;
+            }
         }
         if let Err(e) = storage.mark_pending_sent(message_id, peer_id).await {
             warn!(error = %e, "cannot persist dispatch intent");
             continue;
         }
         // Record before send: ACK can arrive before the write returns.
-        send_timestamps.lock().await.insert(*message_id, std::time::Instant::now());
+        send_timestamps
+            .lock()
+            .await
+            .insert(*message_id, std::time::Instant::now());
         match transport.send(peer_id, &envelope).await {
             Ok(()) => {
                 if let Err(error) = storage.record_outbox_sent(message_id, peer_id).await {
@@ -172,7 +192,10 @@ async fn flush_peer(
                     error = %e,
                     "failed to deliver pending message"
                 );
-                if let Err(inc_err) = storage.increment_pending_attempts(message_id, peer_id).await {
+                if let Err(inc_err) = storage
+                    .increment_pending_attempts(message_id, peer_id)
+                    .await
+                {
                     warn!(error = %inc_err, "failed to increment pending attempts");
                 }
             }

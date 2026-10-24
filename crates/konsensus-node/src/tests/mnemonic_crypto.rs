@@ -131,8 +131,14 @@ fn different_encryptions_produce_different_output() {
     // Different salt/nonce means different output
     assert_ne!(enc1, enc2);
     // But both decrypt to the same mnemonic
-    assert_eq!(decrypt_mnemonic(&enc1, "password").unwrap().as_str(), mnemonic);
-    assert_eq!(decrypt_mnemonic(&enc2, "password").unwrap().as_str(), mnemonic);
+    assert_eq!(
+        decrypt_mnemonic(&enc1, "password").unwrap().as_str(),
+        mnemonic
+    );
+    assert_eq!(
+        decrypt_mnemonic(&enc2, "password").unwrap().as_str(),
+        mnemonic
+    );
 }
 
 #[test]

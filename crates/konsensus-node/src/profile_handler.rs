@@ -169,11 +169,7 @@ fn derive_key(sender_id: &NodeId, recipient_id: &NodeId) -> [u8; 32] {
 }
 
 /// AES-256-GCM encrypt `plaintext` using the first 12 bytes of the envelope nonce.
-fn aes_encrypt(
-    plaintext: &[u8],
-    key_bytes: &[u8; 32],
-    nonce: &Nonce,
-) -> anyhow::Result<Vec<u8>> {
+fn aes_encrypt(plaintext: &[u8], key_bytes: &[u8; 32], nonce: &Nonce) -> anyhow::Result<Vec<u8>> {
     let key = Key::<Aes256Gcm>::from_slice(key_bytes);
     let cipher = Aes256Gcm::new(key);
     // AES-GCM uses a 12-byte nonce; take the first 12 of the 24-byte envelope nonce.

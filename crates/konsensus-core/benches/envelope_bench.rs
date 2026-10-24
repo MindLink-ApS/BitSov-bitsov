@@ -3,7 +3,7 @@
 //! These are the hot-path operations for every message in the mesh.
 //! Target: <1ms per message at scale on commodity hardware.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ed25519_dalek::Verifier;
 use konsensus_core::{
     NodeId, NodeIdentity, Nonce, PaymentProof, Recipient, Signature, UkmEnvelope,

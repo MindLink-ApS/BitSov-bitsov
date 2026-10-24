@@ -23,7 +23,8 @@ fn make_ratchet_pair() -> (DoubleRatchet, DoubleRatchet) {
     let ad = b"alice||bob".to_vec();
     let bob_spk = SignedPreKey::generate();
 
-    let alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).expect("test setup");
+    let alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone())
+        .expect("test setup");
     let bob = DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
     (alice, bob)
 }
@@ -114,7 +115,10 @@ fn ratchet_skip_limit_enforced() {
 
     // Decrypting message at index 1001 requires skipping 1001 messages > MAX_SKIP
     let result = bob.decrypt(&messages[1001]);
-    assert!(result.is_err(), "should reject when skip count exceeds MAX_SKIP");
+    assert!(
+        result.is_err(),
+        "should reject when skip count exceeds MAX_SKIP"
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -145,10 +149,16 @@ fn x3dh_ephemeral_key_is_unique_per_initiation() {
     let init2 = x3dh::initiate(&alice_secret, &alice_public, &bundle).unwrap();
 
     // Ephemeral keys must differ across initiations
-    assert_ne!(init1.ephemeral_key.as_bytes(), init2.ephemeral_key.as_bytes());
+    assert_ne!(
+        init1.ephemeral_key.as_bytes(),
+        init2.ephemeral_key.as_bytes()
+    );
 
     // Shared secrets must also differ (due to different ephemeral keys)
-    assert_ne!(init1.shared_secret.as_bytes(), init2.shared_secret.as_bytes());
+    assert_ne!(
+        init1.shared_secret.as_bytes(),
+        init2.shared_secret.as_bytes()
+    );
 }
 
 #[test]

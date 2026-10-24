@@ -22,7 +22,7 @@ mod store;
 mod validator;
 
 pub use store::GossipStore;
-pub use validator::{GossipConfig, GossipValidator, GossipError};
+pub use validator::{GossipConfig, GossipError, GossipValidator};
 
 /// Default maximum gossip messages per sender per hour.
 pub const DEFAULT_MAX_GOSSIP_PER_SENDER_PER_HOUR: u32 = 60;
@@ -48,7 +48,10 @@ mod tests {
         let id = MessageId::from_bytes([1u8; 32]);
         let sender = NodeId::from_bytes([2u8; 32]);
 
-        assert!(!store.is_seen(&id), "fresh store should not have seen the ID");
+        assert!(
+            !store.is_seen(&id),
+            "fresh store should not have seen the ID"
+        );
         store.mark_seen(id, sender);
         assert!(store.is_seen(&id), "should be seen after mark_seen");
     }
@@ -276,13 +279,20 @@ mod tests {
         // mark_seen with same ID but different sender should be idempotent
         // (we dedup by MessageId, not by sender)
         store.mark_seen(id, sender_b);
-        assert_eq!(store.len(), 1, "same message ID should be deduplicated regardless of sender");
+        assert_eq!(
+            store.len(),
+            1,
+            "same message ID should be deduplicated regardless of sender"
+        );
     }
 
     #[test]
     fn config_default_values() {
         let config = GossipConfig::default();
-        assert_eq!(config.max_per_sender_per_hour, DEFAULT_MAX_GOSSIP_PER_SENDER_PER_HOUR);
+        assert_eq!(
+            config.max_per_sender_per_hour,
+            DEFAULT_MAX_GOSSIP_PER_SENDER_PER_HOUR
+        );
         assert_eq!(config.max_age_secs, DEFAULT_MAX_AGE_SECS);
         assert_eq!(config.dedup_ttl_secs, DEFAULT_DEDUP_TTL_SECS);
         assert_eq!(config.max_future_secs, 300);
@@ -313,7 +323,11 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
 
         validator.evict_expired();
-        assert_eq!(validator.tracked_senders(), 0, "expired rate limit entry should be evicted");
+        assert_eq!(
+            validator.tracked_senders(),
+            0,
+            "expired rate limit entry should be evicted"
+        );
     }
 
     #[test]
@@ -334,7 +348,11 @@ mod tests {
 
         validator.validate(&id, &sender, now_ms).unwrap();
         validator.evict_expired();
-        assert_eq!(validator.tracked_senders(), 1, "active rate limit entry should survive eviction");
+        assert_eq!(
+            validator.tracked_senders(),
+            1,
+            "active rate limit entry should survive eviction"
+        );
     }
 
     #[test]
@@ -366,7 +384,11 @@ mod tests {
 
         assert_eq!(validator.tracked_senders(), 2);
         validator.evict_expired();
-        assert_eq!(validator.tracked_senders(), 1, "only stale sender should be evicted");
+        assert_eq!(
+            validator.tracked_senders(),
+            1,
+            "only stale sender should be evicted"
+        );
     }
 
     // ── Boundary condition tests ─────────────────────────────────────
@@ -389,7 +411,10 @@ mod tests {
             - 60_000;
 
         let result = validator.validate(&id, &sender, boundary_ts);
-        assert!(result.is_ok(), "message exactly at max_age boundary should be accepted");
+        assert!(
+            result.is_ok(),
+            "message exactly at max_age boundary should be accepted"
+        );
     }
 
     #[test]
@@ -409,7 +434,13 @@ mod tests {
             - 61_000;
 
         let result = validator.validate(&id, &sender, past_boundary_ts);
-        assert!(matches!(result, Err(GossipError::TooOld { age_secs: 61, max_secs: 60 })));
+        assert!(matches!(
+            result,
+            Err(GossipError::TooOld {
+                age_secs: 61,
+                max_secs: 60
+            })
+        ));
     }
 
     #[test]
@@ -430,7 +461,10 @@ mod tests {
             + 300_000;
 
         let result = validator.validate(&id, &sender, boundary_ts);
-        assert!(result.is_ok(), "message exactly at max_future boundary should be accepted");
+        assert!(
+            result.is_ok(),
+            "message exactly at max_future boundary should be accepted"
+        );
     }
 
     #[test]
@@ -450,7 +484,10 @@ mod tests {
             + 301_000;
 
         let result = validator.validate(&id, &sender, future_ts);
-        assert!(matches!(result, Err(GossipError::FromFuture { max_secs: 300, .. })));
+        assert!(matches!(
+            result,
+            Err(GossipError::FromFuture { max_secs: 300, .. })
+        ));
     }
 
     #[test]
@@ -467,7 +504,10 @@ mod tests {
             + 10_000;
 
         let result = validator.validate(&id, &sender, future_ts);
-        assert!(result.is_ok(), "message slightly in the future should be accepted");
+        assert!(
+            result.is_ok(),
+            "message slightly in the future should be accepted"
+        );
     }
 
     // ── Store get_sender tests ───────────────────────────────────────
@@ -478,9 +518,16 @@ mod tests {
         let id = MessageId::from_bytes([180u8; 32]);
         let sender = NodeId::from_bytes([181u8; 32]);
 
-        assert!(store.get_sender(&id).is_none(), "unknown ID should return None");
+        assert!(
+            store.get_sender(&id).is_none(),
+            "unknown ID should return None"
+        );
         store.mark_seen(id, sender);
-        assert_eq!(store.get_sender(&id), Some(sender), "should return the original sender");
+        assert_eq!(
+            store.get_sender(&id),
+            Some(sender),
+            "should return the original sender"
+        );
     }
 
     #[test]
@@ -492,7 +539,11 @@ mod tests {
 
         store.mark_seen(id, sender_first);
         store.mark_seen(id, sender_second); // or_insert = no-op
-        assert_eq!(store.get_sender(&id), Some(sender_first), "first sender should be preserved");
+        assert_eq!(
+            store.get_sender(&id),
+            Some(sender_first),
+            "first sender should be preserved"
+        );
     }
 
     // ── Rate limit exact boundary tests ──────────────────────────────
@@ -546,7 +597,10 @@ mod tests {
         assert!(validator.validate(&id1, &sender, now_ms).is_ok());
 
         let id2 = MessageId::from_bytes([203u8; 32]);
-        assert!(matches!(validator.validate(&id2, &sender, now_ms), Err(GossipError::RateLimited { .. })));
+        assert!(matches!(
+            validator.validate(&id2, &sender, now_ms),
+            Err(GossipError::RateLimited { .. })
+        ));
     }
 
     // ── Concurrent access test ───────────────────────────────────────
@@ -589,8 +643,15 @@ mod tests {
 
         let total_accepted: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
         // 8 threads * 10 unique messages each = 80 total
-        assert_eq!(total_accepted, 80, "all unique messages should be accepted across threads");
-        assert_eq!(validator.tracked_senders(), 8, "all 8 senders should be tracked");
+        assert_eq!(
+            total_accepted, 80,
+            "all unique messages should be accepted across threads"
+        );
+        assert_eq!(
+            validator.tracked_senders(),
+            8,
+            "all 8 senders should be tracked"
+        );
     }
 
     // ── Timestamp edge cases ─────────────────────────────────────────
@@ -611,7 +672,10 @@ mod tests {
             .as_millis() as u64;
 
         let result = validator.validate(&id, &sender, now_ms);
-        assert!(result.is_ok(), "message with current timestamp should always be accepted");
+        assert!(
+            result.is_ok(),
+            "message with current timestamp should always be accepted"
+        );
     }
 
     #[test]

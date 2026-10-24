@@ -17,20 +17,29 @@ where
     F: FnMut(ChannelId) -> Fut,
     Fut: std::future::Future<Output = Result<bool, LightningError>>,
 {
-    let removed: HashSet<_> = balances.lightning_balances.iter().filter_map(|balance| {
-        match balance {
+    let removed: HashSet<_> = balances
+        .lightning_balances
+        .iter()
+        .filter_map(|balance| match balance {
             LightningBalance::ClaimableOnChannelClose { channel_id, .. }
-                if !open.contains(channel_id) => Some(*channel_id),
+                if !open.contains(channel_id) =>
+            {
+                Some(*channel_id)
+            }
             _ => None,
-        }
-    }).collect();
+        })
+        .collect();
     let mut absent = HashSet::new();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         for channel_id in removed {
-            if !resolve(channel_id).await? { absent.insert(channel_id); }
+            if !resolve(channel_id).await? {
+                absent.insert(channel_id);
+            }
         }
         Ok::<_, LightningError>(())
-    }).await.map_err(|_| LightningError::Backend("channel funding verification timed out".into()))??;
+    })
+    .await
+    .map_err(|_| LightningError::Backend("channel funding verification timed out".into()))??;
     filter_unfunded_closures(balances, open, &absent);
     Ok(())
 }
@@ -42,9 +51,15 @@ pub(crate) fn filter_unfunded_closures(
     absent: &HashSet<ChannelId>,
 ) {
     balances.lightning_balances.retain(|balance| {
-        if let LightningBalance::ClaimableOnChannelClose { channel_id, amount_satoshis, .. } = balance {
+        if let LightningBalance::ClaimableOnChannelClose {
+            channel_id,
+            amount_satoshis,
+            ..
+        } = balance
+        {
             if !open.contains(channel_id) && absent.contains(channel_id) {
-                balances.total_lightning_balance_sats = balances.total_lightning_balance_sats
+                balances.total_lightning_balance_sats = balances
+                    .total_lightning_balance_sats
                     .saturating_sub(*amount_satoshis);
                 return false;
             }
@@ -181,7 +196,8 @@ mod tests {
             balances.total_lightning_balance_sats = 123;
             let result = verify_closed_funding(&mut balances, &HashSet::new(), |_| async {
                 evidence.map_err(|error| LightningError::Backend(error.into()))
-            }).await;
+            })
+            .await;
             if let Some(amount) = expected {
                 result.unwrap();
                 assert_eq!(balances.total_lightning_balance_sats, amount);
@@ -200,12 +216,18 @@ mod tests {
         balances.total_lightning_balance_sats = 123;
         let open = HashSet::new();
         assert!(verify_closed_funding(&mut balances, &open, |_| async {
-            Err(LightningError::Backend("missing monitor or unavailable history".into()))
-        }).await.is_err());
+            Err(LightningError::Backend(
+                "missing monitor or unavailable history".into(),
+            ))
+        })
+        .await
+        .is_err());
         assert_eq!(balances.total_lightning_balance_sats, 123);
         assert!(verify_closed_funding(&mut balances, &open, |_| {
             std::future::pending::<Result<bool, LightningError>>()
-        }).await.is_err());
+        })
+        .await
+        .is_err());
         assert_eq!(balances.total_lightning_balance_sats, 123);
         assert_eq!(balances.lightning_balances.len(), 1);
     }
@@ -221,24 +243,37 @@ mod tests {
         balances.total_lightning_balance_sats = 246;
         verify_closed_funding(&mut balances, &HashSet::new(), |id| async move {
             Ok(id == ChannelId([2; 32]))
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert_eq!(balances.total_lightning_balance_sats, 123);
         assert_eq!(breakdown(&balances, []).closing_sats, Some(123));
-        verify_closed_funding(&mut balances, &HashSet::from([ChannelId([2; 32])]), |_| async {
-            panic!("open channels must not trigger funding queries")
-        }).await.unwrap();
+        verify_closed_funding(
+            &mut balances,
+            &HashSet::from([ChannelId([2; 32])]),
+            |_| async { panic!("open channels must not trigger funding queries") },
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
     fn ghost_channel_is_excluded_from_closing_and_aggregate() {
         let mut balances = balances();
         let mut ghost = on_close();
-        if let LightningBalance::ClaimableOnChannelClose { amount_satoshis, .. } = &mut ghost {
+        if let LightningBalance::ClaimableOnChannelClose {
+            amount_satoshis, ..
+        } = &mut ghost
+        {
             *amount_satoshis = 79_638;
         }
         balances.lightning_balances = vec![ghost];
         balances.total_lightning_balance_sats = 79_638;
-        filter_unfunded_closures(&mut balances, &HashSet::new(), &HashSet::from([ChannelId([1; 32])]));
+        filter_unfunded_closures(
+            &mut balances,
+            &HashSet::new(),
+            &HashSet::from([ChannelId([1; 32])]),
+        );
         assert_eq!(breakdown(&balances, []).closing_sats, Some(0));
         assert_eq!(balances.total_lightning_balance_sats, 0);
         assert_eq!(balances.total_onchain_balance_sats, 100_000);
@@ -252,8 +287,7 @@ mod tests {
             balances.total_lightning_balance_sats = 123;
             let ids = HashSet::from([ChannelId([1; 32])]);
             let empty = HashSet::new();
-            filter_unfunded_closures(&mut balances,
-                if open { &ids } else { &empty }, &empty);
+            filter_unfunded_closures(&mut balances, if open { &ids } else { &empty }, &empty);
             assert_eq!(balances.total_lightning_balance_sats, 123);
             assert_eq!(balances.lightning_balances.len(), 1);
         }
