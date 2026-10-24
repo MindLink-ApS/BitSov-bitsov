@@ -105,7 +105,7 @@ pub struct FirstContactApprovalStatus {
     pub approval: Option<FirstContactGrant>,
 }
 
-/// Ceiling for every non-payment call (including fan-out and routing fees).
+/// All-in ceiling per paid message/member, excluding separately authorized admission.
 pub const MESSAGING_PER_CALL_MAX_MSAT: u64 = 6_000;
 
 /// Longest a spend grant may live: 24 hours. Also the default.
@@ -209,8 +209,8 @@ pub struct GrantTerms {
     pub allow_liquidity_fees: bool,
     /// Total the client may spend inside the window, in millisatoshis.
     pub budget_msat: u64,
-    /// Most one API call may reserve, in millisatoshis. A room message is one
-    /// call, so this bounds the whole fan-out, not each member.
+    /// Owner payment limit in millisatoshis. Messaging derives its per-member
+    /// all-in cap from this value, at most 6,000 msat.
     pub per_call_max_msat: u64,
     /// Optional per-recipient budgets, keyed by lowercase hex: a node id for
     /// messages and files, a Lightning pubkey for pay and keysend. A recipient
@@ -470,6 +470,7 @@ impl GrantBudget {
         &self,
         per_recipient: &BTreeMap<&str, u64>,
         now: i64,
+        messaging: bool,
     ) -> Result<(), BudgetRefusal> {
         if !self.recipients_only {
             return Ok(());
@@ -490,7 +491,7 @@ impl GrantBudget {
                 .get(*recipient)
                 .copied()
                 .unwrap_or(0);
-            if *amount > per_act {
+            if messaging && *amount > per_act {
                 return Err(BudgetRefusal::PerCall { max_msat: per_act });
             }
         }
@@ -508,14 +509,19 @@ impl GrantBudget {
             || recipients.all(|r| self.recipient_expires_at.get(r).is_some_and(|at| *at > now))
     }
 
-    /// [`Self::reserve`], first holding a relation grant to its envelopes.
+    /// Reserve under the stored limit, first checking live relation envelopes.
     pub fn reserve_at(&mut self, charges: &[Charge], now: i64) -> Result<(), BudgetRefusal> {
+        self.reserve_act_at(charges, now, self.per_call_max_msat, true)
+    }
+
+    /// Transient act limits never rewrite stored owner terms or signed receipts.
+    pub(crate) fn reserve_act_at(&mut self, charges: &[Charge], now: i64, max_msat: u64, messaging: bool) -> Result<(), BudgetRefusal> {
         let mut per_recipient: BTreeMap<&str, u64> = BTreeMap::new();
         for charge in charges {
             let entry = per_recipient.entry(charge.recipient.as_str()).or_insert(0);
             *entry = entry.saturating_add(charge.amount_msat);
         }
-        self.check_envelopes(&per_recipient, now)?;
+        self.check_envelopes(&per_recipient, now, messaging)?;
         let now = self.breaker_state.last_at.map_or(now, |last| now.max(last));
         let count = charges.iter().filter(|c| c.amount_msat > 0).count() as u64;
         let total = charges
@@ -566,7 +572,7 @@ impl GrantBudget {
         {
             return Err(BudgetRefusal::VelocityLimit);
         }
-        self.reserve(charges)?;
+        self.reserve_with_limit(charges, max_msat)?;
         if count > 0 {
             self.breaker_state
                 .buckets
@@ -712,7 +718,7 @@ impl GrantBudget {
         self.breaker_state = BreakerState::default();
     }
 
-    /// Effective non-payment limit, including grants issued before this cap.
+    /// Effective message/member limit, including grants issued before this cap.
     /// Keep stored terms intact: payment authority and signed receipts use them.
     pub(crate) fn messaging_per_call_max_msat(&self) -> u64 {
         self.per_call_max_msat.min(MESSAGING_PER_CALL_MAX_MSAT)
@@ -725,7 +731,12 @@ impl GrantBudget {
 
     /// Check a call's charges against every bound and, only if all pass,
     /// reserve them. Either every charge is reserved or none is.
+    #[cfg(test)]
     fn reserve(&mut self, charges: &[Charge]) -> Result<(), BudgetRefusal> {
+        self.reserve_with_limit(charges, self.per_call_max_msat)
+    }
+
+    fn reserve_with_limit(&mut self, charges: &[Charge], max_msat: u64) -> Result<(), BudgetRefusal> {
         let mut call_total: u64 = 0;
         let mut per_recipient: BTreeMap<&str, u64> = BTreeMap::new();
         for charge in charges {
@@ -742,18 +753,18 @@ impl GrantBudget {
                 call_total
                     .checked_add(charge.amount_msat)
                     .ok_or(BudgetRefusal::PerCall {
-                        max_msat: self.per_call_max_msat,
+                        max_msat,
                     })?;
             let entry = per_recipient.entry(charge.recipient.as_str()).or_insert(0);
             *entry = entry
                 .checked_add(charge.amount_msat)
                 .ok_or(BudgetRefusal::PerCall {
-                    max_msat: self.per_call_max_msat,
+                    max_msat,
                 })?;
         }
-        if call_total > self.per_call_max_msat {
+        if call_total > max_msat {
             return Err(BudgetRefusal::PerCall {
-                max_msat: self.per_call_max_msat,
+                max_msat,
             });
         }
         if call_total > self.remaining_msat() {
@@ -928,6 +939,30 @@ impl BudgetRefusal {
     }
 }
 
+/// Derived display contract; amounts include maximum routing fees.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActCaps {
+    pub message_all_in_msat: u64,
+    pub room_member_all_in_msat: u64,
+    /// Combined admission/message safety ceiling; the quote shows separate lines.
+    pub first_contact_max_all_in_msat: u64,
+    pub readmission_max_all_in_msat: u64,
+    pub payment_all_in_msat: u64,
+}
+
+impl ActCaps {
+    pub fn new(payment_limit: u64) -> Self {
+        let message = payment_limit.min(MESSAGING_PER_CALL_MAX_MSAT);
+        Self {
+            message_all_in_msat: message,
+            room_member_all_in_msat: message,
+            first_contact_max_all_in_msat: FIRST_CONTACT_MAX_MSAT,
+            readmission_max_all_in_msat: FIRST_CONTACT_MAX_MSAT,
+            payment_all_in_msat: payment_limit,
+        }
+    }
+}
+
 /// A grant as reported to the client that holds it and to the owner.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GrantView {
@@ -952,8 +987,12 @@ pub struct GrantView {
     pub used_msat: u64,
     /// Left, msat.
     pub remaining_msat: u64,
-    /// Effective non-payment per-call maximum, msat.
+    /// Effective all-in message / room-member maximum, msat.
     pub per_call_max_msat: u64,
+    /// Stored owner payment limit, independent of messaging authority.
+    pub payment_per_call_max_msat: u64,
+    pub payment_authorized: bool,
+    pub act_caps: ActCaps,
     /// Per-recipient budgets, msat.
     pub per_recipient_msat: BTreeMap<String, u64>,
     /// Per-recipient usage, msat.
@@ -976,8 +1015,9 @@ pub struct GrantView {
 /// Render terms for a human before they approve them.
 pub fn describe_terms(terms: &GrantTerms) -> String {
     let mut out = format!(
-        "  budget:        {} sats in total\n  per call:      at most {} sats\n  window:        {}",
+        "  budget:        {} sats in total\n  message:       at most {} sats all-in\n  room post:     N paid members x their message all-in cap, one total\n  admission:     quoted price + maximum fee, separate from message (100-sat safety ceiling)\n  payment:       at most {} sats all-in\n  window:        {}",
         sats(terms.budget_msat),
+        sats(terms.per_call_max_msat.min(MESSAGING_PER_CALL_MAX_MSAT)),
         sats(terms.per_call_max_msat),
         human_duration(terms.ttl_secs)
     );

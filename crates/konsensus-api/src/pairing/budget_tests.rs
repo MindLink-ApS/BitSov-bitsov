@@ -675,39 +675,25 @@ fn legacy_relation_cap_applies_on_first_reservation_without_rewriting_terms() {
 }
 
 #[test]
-fn console_first_contact_and_readmission_share_six_sat_call_cap() {
+fn admission_has_its_own_all_in_cap() {
     let dir = tempfile::tempdir().unwrap();
     let service = first_contact_service(dir.path());
     let client = service.snapshot().clients[0].client_id.clone();
     let recipient = "aa".repeat(32);
-    assert!(matches!(
-        service.grant_first_contact(&client, "grant", &recipient, 7_000, None),
-        Err(BudgetRefusal::PerCall { max_msat: 6_000 })
-    ));
-    service
-        .grant_first_contact(&client, "grant", &recipient, 6_000, None)
-        .unwrap();
-    let parent = service
-        .reserve_spend(
-            &client,
-            1,
-            vec![Charge {
-                recipient: recipient.clone(),
-                amount_msat: 4_000,
-            }],
-        )
-        .unwrap();
-    // Both the message repricing and admission must fit the original call.
-    assert!(matches!(
-        service.reserve_quoted_readmission(&parent, &recipient, 5_000, 2_000, 4_000, None),
-        Err(BudgetRefusal::PerCall { max_msat: 6_000 })
-    ));
-    assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 4_000);
-    let (total, _) = service
-        .reserve_quoted_readmission(&parent, &recipient, 4_000, 2_000, 4_000, None)
-        .unwrap();
-    assert_eq!(total, 6_000);
-    assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 6_000);
+    service.grant_first_contact(&client, "grant", &recipient, 9_000, None).unwrap();
+    let approval = service.take_first_contact(&client, 1, &recipient).unwrap();
+    let first = service.reserve_first_contact(approval, None).unwrap();
+    assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 9_000);
+    service.resolve_spend(&first, &recipient, 0);
+    service.grant_first_contact(&client, "grant", &recipient, 9_000, None).unwrap();
+    let parent = service.reserve_spend(&client, 1, vec![Charge {
+        recipient: recipient.clone(), amount_msat: 2_000,
+    }]).unwrap();
+    assert!(matches!(service.reserve_quoted_readmission(&parent, &recipient, 6_001, 1_000, 2_000, None),
+        Err(BudgetRefusal::PerCall { .. })));
+    let (total, _) = service.reserve_quoted_readmission(&parent, &recipient, 2_000, 7_000, 2_000, None).unwrap();
+    assert_eq!(total, 9_000);
+    assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 9_000);
 }
 
 #[test]
@@ -728,10 +714,42 @@ fn console_fanout_cap_checks_the_whole_call_before_any_reservation() {
         ]
     };
     assert!(matches!(
-        service.reserve_spend(&client, 1, charges(3_500)),
+        service.reserve_spend(&client, 1, charges(6_001)),
         Err(BudgetRefusal::PerCall { max_msat: 6_000 })
     ));
     assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 0);
-    service.reserve_spend(&client, 1, charges(3_000)).unwrap();
-    assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 6_000);
+    service.reserve_spend(&client, 1, charges(4_000)).unwrap();
+    assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 8_000);
+}
+
+#[test]
+fn payment_class_helpers_use_owner_limit_and_reject_messaging_grants() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let recipient = "aa".repeat(32);
+    let charges = |amount_msat| vec![Charge { recipient: recipient.clone(), amount_msat }];
+    {
+        let mut inner = service.lock();
+        let budget = inner.file.grants[0].budget.as_mut().unwrap();
+        budget.allow_liquidity_fees = true;
+        budget.per_call_max_msat = 8_000;
+    }
+    assert!(matches!(service.reserve_liquidity_fee(&client, 1, charges(8_001)), Err(BudgetRefusal::PerCall {max_msat:8_000})));
+    let liquidity = service.reserve_liquidity_fee(&client, 1, charges(7_000)).unwrap();
+    service.resolve_spend(&liquidity, &recipient, 0);
+    let sponsor = service.reserve_spend_linked(&client, 1, charges(8_000), |_| Ok(())).unwrap();
+    service.resolve_spend(&sponsor, &recipient, 0);
+    // Even a legacy messaging grant with the LSP flag is not payment authority.
+    {
+        let mut inner = service.lock();
+        inner.file.grants[0].budget.as_mut().unwrap().recipients_only = true;
+    }
+    assert!(matches!(service.reserve_liquidity_fee(&client, 1, charges(1_000)), Err(BudgetRefusal::MessagingGrant)));
+    let mut journal_written = false;
+    assert!(matches!(service.reserve_spend_linked(&client, 1, charges(1_000), |_| {
+        journal_written = true; Ok(())
+    }), Err(BudgetRefusal::MessagingGrant)));
+    assert!(!journal_written);
+    assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 0);
 }

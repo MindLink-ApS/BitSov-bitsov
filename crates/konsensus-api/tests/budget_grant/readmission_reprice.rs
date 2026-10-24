@@ -258,10 +258,10 @@ async fn resumed_in_flight_admission_never_pays_the_quoted_message_above_the_cap
 
 #[tokio::test]
 async fn grant_reservation_refusal_reports_no_admission_fee_ceiling() {
-    // Cap fits (admission+message+fees), but the grant's per-call max does not.
+    // Aggregate cap fits, but the fresh message price exceeds its own act cap.
     // Nothing is dispatched, so the error must not include the admission ceiling.
     const FEE: u64 = 100;
-    let p = Probe::with_terms(Some(GrantTerms::new(100_000).per_call(3_000))).await;
+    let p = Probe::with_terms(Some(GrantTerms::new(100_000).per_call(1_999))).await;
     let (status, body) = p.compose_with_fee("grant cannot reserve", 10_000, Some(FEE)).await;
     assert_budget_exceeded(status, &body, "per_call");
     assert_eq!(p.spent().await, 0, "grant refusal pays nothing: {body}");
@@ -270,4 +270,16 @@ async fn grant_reservation_refusal_reports_no_admission_fee_ceiling() {
         Some(FEE),
         "admission ceiling was never given to the wallet: {body}"
     );
+}
+
+#[tokio::test]
+async fn quoted_readmission_has_separate_fee_line_above_six_sats() {
+    let p = Probe::with_terms(Some(GrantTerms::new(100_000).per_call(6_000))).await;
+    let (status, body) = p.compose_with_fee("separate admission", 13_000, Some(10_000)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["readmission_msat"], 2_000);
+    assert_eq!(body["amount_msat"], 2_000);
+    assert_eq!(body["max_routing_fee_msat"], 9_000);
+    assert_eq!(p.spent().await, 4_000);
+    assert_eq!(p.fx.used(), 4_000);
 }

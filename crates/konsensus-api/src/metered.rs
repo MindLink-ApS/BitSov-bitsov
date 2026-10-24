@@ -242,6 +242,7 @@ pub struct Debit {
     operation: Option<crate::handlers::messages::operations::Operation>,
     held: Option<(Arc<PairingService>, Reservation)>,
     max_routing_fee_msat: Option<u64>,
+    message_caps: crate::handlers::messages::caps::MessageCaps,
     // None means a settled payment's fee is still unknown. Never release that liability.
     fees: std::sync::Mutex<std::collections::BTreeMap<String, Option<u64>>>,
     // Shared by every member of a room fan-out. Reservations consume this
@@ -266,6 +267,15 @@ impl Debit {
         self.max_routing_fee_msat = limit;
         self
     }
+    pub(crate) fn with_message_caps(mut self, caps: crate::handlers::messages::caps::MessageCaps) -> Self {
+        self.message_caps.tighten(caps); self
+    }
+    pub(crate) fn message_fee_limit(&self, state: &AppState, peer: &str, principal: u64) -> u64 {
+        self.message_caps.fee(state, peer, principal, self.max_routing_fee_msat)
+    }
+    pub(crate) fn message_all_in(&self, state: &AppState, peer: &str, principal: u64) -> Result<u64, ApiError> {
+        self.message_caps.all_in(state, peer, principal, self.max_routing_fee_msat)
+    }
     pub(crate) fn fee_limit(&self, state: &AppState, principal: u64) -> u64 {
         state.lightning.routing_fee_policy().ceiling(principal, self.max_routing_fee_msat)
     }
@@ -284,12 +294,15 @@ impl Debit {
 
     /// Owner-only paths have no grant to revalidate.
     pub(crate) fn unmetered() -> Self {
-        Self { operation: None, max_routing_fee_msat: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
+        Self { operation: None, message_caps: Default::default(), max_routing_fee_msat: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
     }
 
     fn reserved(service: Arc<PairingService>, reservation: Reservation) -> Self {
         let total = reservation.charges.iter().map(|c| c.amount_msat).sum();
-        Self { operation: None, max_routing_fee_msat: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
+        // Bind message authority to the grant actually reserved, including when
+        // a first-contact approval was consumed after a grant replacement.
+        let message_caps = crate::handlers::messages::caps::MessageCaps::for_reservation(&service, &reservation);
+        Self { operation: None, message_caps, max_routing_fee_msat: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
     }
 
     /// Whether this debit is held against a budget grant.

@@ -8,7 +8,13 @@ request `max_routing_fee_msat: 0` and authorize only a zero-fee route.
 Ordinary invoice, keysend, compose, and file requests accept an optional
 `max_routing_fee_msat`. It tightens the node policy; it cannot widen it.
 The default is `min(max(5000, floor(principal / 100)), 10000)` msat per
-payment. Zero-price messages create no payment and reserve no fee. LDK always
+payment. For paired messaging, the fee is further bounded by the message's
+all-in cap minus its price: 1 sat allows up to 5 sats in fees, 2 sats up to 4.
+The 6-sat cap applies per paid room member; the room reserves their sum as one
+total. Admission has its own quoted all-in line and is not limited by that
+message cap. Payment routing policy retains its normal floor. See
+[per-act grant caps](../SPEND_BUDGET_GRANTS.md).
+Zero-price messages create no payment and reserve no fee. LDK always
 receives `RouteParametersConfig.max_total_routing_fee_msat`, including bound
 keysend and internal callers using the ordinary provider methods. Unsupported
 fee-limited provider methods refuse before dispatch.

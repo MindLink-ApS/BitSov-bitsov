@@ -627,9 +627,7 @@ async fn readmit_then_pay(
     }
     // Capped non-chat (rooms/files/kind != chat) uses Some(0). Refuse before any
     // quote so we do not spend the payee's per-source admission window.
-    let message_all_in = amount_msat
-        .checked_add(debit.fee_limit(state, amount_msat))
-        .ok_or_else(|| ApiError::PriceCapExceeded("message all-in overflow".into()))?;
+    let message_all_in = debit.message_all_in(state, &peer_id.to_hex(), amount_msat)?;
     // One call-wide ceiling: admissions already settled in this compose consume
     // the confirmed cap and must not be re-authorized for a mid-call reconnect
     // (Codex #111 finding 4).
@@ -724,9 +722,7 @@ async fn readmit_then_pay(
     // in-flight admission, or a connection already covered), the message price
     // it produced is checked again here, before the message is paid (#127
     // review finding 1). Nothing new is paid on a refusal.
-    let message_all_in = amount_msat
-        .checked_add(debit.fee_limit(state, amount_msat))
-        .ok_or_else(|| ApiError::PriceCapExceeded("message all-in overflow".into()))?;
+    let message_all_in = debit.message_all_in(state, &peer_id.to_hex(), amount_msat)?;
     // A paired caller pays an increase only if this call reserved it (the
     // fresh quote's top-up); otherwise the grant never checked it.
     if debit.is_metered() && amount_msat > reserved_msat
@@ -787,13 +783,16 @@ async fn try_keysend(
     let updates = SettlementUpdates::subscribe(state.lightning.as_ref());
     let details = match debit.dispatch_message(state, None, amount_msat, state
         .lightning
-        .keysend_with_fee_limit(ln_pubkey, amount_msat, Some("konsensus message"), debit.fee_limit(state, amount_msat)))
+        .keysend_with_fee_limit(ln_pubkey, amount_msat, Some("konsensus message"), debit.message_fee_limit(state, &peer_id.to_hex(), amount_msat)))
         .await?
     {
         Ok(details) => details,
         Err(LightningError::NotReady) => return Err(ApiError::NotReady),
         Err(LightningError::PaymentNotDispatched(reason)) if reason == "disk_low" => {
             return Err(ApiError::NotDispatched(reason));
+        }
+        Err(LightningError::PaymentNotDispatched(reason)) if reason.contains("fee") || reason.contains("route") || reason == "Failed to send the given payment." => {
+            return Err(ApiError::NotDispatched(super::caps::MESSAGE_ROUTE_REFUSAL.into()));
         }
         Err(LightningError::PaymentNotDispatched(reason)) => {
             tracing::warn!(peer = %peer_id, %reason, "keysend rejected before dispatch");
@@ -979,10 +978,11 @@ async fn create_payment_proof_via_invoice(
     let updates = SettlementUpdates::subscribe(state.lightning.as_ref());
     let details = debit.dispatch_message(state, Some(invoice.payment_hash().to_string()), invoice_amount_msat, state
         .lightning
-        .pay_invoice_with_fee_limit(&response.bolt11, debit.fee_limit(state, invoice_amount_msat)))
+        .pay_invoice_with_fee_limit(&response.bolt11, debit.message_fee_limit(state, &peer_id.to_hex(), invoice_amount_msat)))
         .await?
         .map_err(|e| match e {
             LightningError::NotReady => ApiError::NotReady,
+            LightningError::PaymentNotDispatched(reason) if reason.contains("fee") || reason.contains("route") || reason == "Failed to send the given payment." => ApiError::NotDispatched(super::caps::MESSAGE_ROUTE_REFUSAL.into()),
             LightningError::PaymentNotDispatched(reason) => ApiError::NotDispatched(reason),
             other => ApiError::PaymentUnresolved(format!("failed to pay recipient invoice: {other}")),
         })?;
@@ -2255,6 +2255,8 @@ pub struct FirstContactQuoteResponse {
     pub recipient: String,
     /// The target's admission price, msat (paid once).
     pub admission_msat: u64,
+    pub admission_all_in_msat: u64,
+    pub message_all_in_msat: u64,
     /// The target's price for this first message, msat (signed in the quote).
     pub message_msat: u64,
     /// Admission plus first message plus both routing ceilings: cap to confirm, msat.
@@ -2271,10 +2273,11 @@ pub struct FirstContactQuoteResponse {
 /// nothing and creates no obligation. Needs only `read`; HTTP and recipient
 /// quote rate limits still apply. Sending separately requires spend authority.
 pub(super) async fn first_contact_quote(
-    _auth: crate::auth::scoped::ScopedAuth<crate::auth::scoped::Read>,
+    auth: crate::auth::scoped::ScopedAuth<crate::auth::scoped::Read>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<FirstContactQuoteRequest>,
 ) -> Result<Json<FirstContactQuoteResponse>, ApiError> {
+    let message_caps = super::caps::MessageCaps::for_user(&state, &auth);
     let peer_id = NodeId::from_hex(&req.recipient)
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
     let _reconnect = state.transport.retain_peer(&peer_id).await;
@@ -2296,8 +2299,12 @@ pub(super) async fn first_contact_quote(
         // Reuse the quote the refused send already fetched: the target
         // rate-limits quotes, and the send pays exactly this invoice.
         let quote = validate_admission_invoice(&state, &peer_id, &request_id, &response).await?;
-        let total_msat = super::caps::first_contact_total(super::caps::all_in(&state, quote.admission_msat, None)?, super::caps::all_in(&state, quote.message_price, None)?, None)?;
+        let admission_all_in_msat = super::caps::all_in(&state, quote.admission_msat, None)?;
+        let message_all_in_msat = message_caps.all_in(&state, &peer_id.to_hex(), quote.message_price, None)?;
+        let total_msat = super::caps::first_contact_total(admission_all_in_msat, message_all_in_msat, None)?;
         return Ok(Json(FirstContactQuoteResponse {
+            admission_all_in_msat,
+            message_all_in_msat,
             max_routing_fee_msat: total_msat - quote.admission_msat - quote.message_price,
             recipient: peer_id.to_hex(),
             admission_msat: quote.admission_msat,
@@ -2318,7 +2325,9 @@ pub(super) async fn first_contact_quote(
         &state, &peer_id, konsensus_core::kind::KIND_CHAT, &Debit::unmetered(),
     ).await?;
     let quote = validate_admission_invoice(&state, &peer_id, &request_id, &response).await?;
-    let total_msat = super::caps::first_contact_total(super::caps::all_in(&state, quote.admission_msat, None)?, super::caps::all_in(&state, quote.message_price, None)?, None)?;
+    let admission_all_in_msat = super::caps::all_in(&state, quote.admission_msat, None)?;
+    let message_all_in_msat = message_caps.all_in(&state, &peer_id.to_hex(), quote.message_price, None)?;
+    let total_msat = super::caps::first_contact_total(admission_all_in_msat, message_all_in_msat, None)?;
     // Bound to the generation that obtained it, never the one live after the
     // response: a reconnect at any point before the send pays means a new quote.
     if state.transport.connected_since(&peer_id).await != generation {
@@ -2328,6 +2337,8 @@ pub(super) async fn first_contact_quote(
         Duration::from_secs(quote.expires_at_unix.saturating_sub(now_unix()))).await;
     cache_quote(peer_id, request_id, response, quote.expires_at_unix, generation);
     Ok(Json(FirstContactQuoteResponse {
+        admission_all_in_msat,
+        message_all_in_msat,
         max_routing_fee_msat: total_msat - quote.admission_msat - quote.message_price,
         recipient: peer_id.to_hex(),
         admission_msat: quote.admission_msat,
@@ -2740,7 +2751,7 @@ async fn first_contact_admission_at(
     // The target is authoritative for BOTH prices. A stale local price cannot
     // spuriously reject a stranger or cause an additional unchecked payment.
     let admission_all_in = admission_msat.checked_add(debit.fee_limit(state, admission_msat)).ok_or_else(|| ApiError::PriceCapExceeded("admission debit overflow".into()))?;
-    let message_all_in = message_price.checked_add(debit.fee_limit(state, message_price)).ok_or_else(|| ApiError::PriceCapExceeded("message debit overflow".into()))?;
+    let message_all_in = debit.message_all_in(state, &peer_id.to_hex(), message_price)?;
     if let Err(error) = super::caps::first_contact_total(
         admission_all_in,
         message_all_in,
@@ -3209,6 +3220,7 @@ pub(super) async fn compose_message_with_policy(
     req: ComposeRequest,
     policy: ComposePolicy,
 ) -> Result<Json<ComposeResponse>, ApiError> {
+    let message_caps = super::caps::MessageCaps::for_user(&state, &auth.user);
     // Validate plaintext size
     if req.plaintext.is_empty() {
         return Err(ApiError::BadRequest("message plaintext is empty".into()));
@@ -3289,7 +3301,7 @@ pub(super) async fn compose_message_with_policy(
             }));
         }
         let debit_prices = prices.iter().map(|(peer, price)|
-            super::caps::all_in(&state, *price, req.max_routing_fee_msat).map(|total| (*peer, total))
+            message_caps.all_in(&state, &peer.to_hex(), *price, req.max_routing_fee_msat).map(|total| (*peer, total))
         ).collect::<Result<Vec<_>, _>>()?;
         let max_routing_fee_msat = debit_prices.iter().zip(&prices)
             .try_fold(0u64, |sum, ((_, total), (_, principal))| sum.checked_add(total - principal))
@@ -3306,7 +3318,7 @@ pub(super) async fn compose_message_with_policy(
                     amount_msat: *price,
                 })
                 .collect(),
-        ).map_err(|e| e.with_routing_fee(max_routing_fee_msat))?.with_fee_limit(req.max_routing_fee_msat);
+        ).map_err(|e| e.with_routing_fee(max_routing_fee_msat))?.with_fee_limit(req.max_routing_fee_msat).with_message_caps(message_caps.clone());
 
         // Fan out to members with bounded parallelism. Each member future is
         // fully independent (its own payment proof + envelope — Principle 2 is
@@ -3450,6 +3462,7 @@ pub(super) async fn compose_peer(
     references: Vec<MessageId>, operation: super::operations::Operation,
     policy: ComposePolicy,
 ) -> Result<Json<ComposeResponse>, ApiError> {
+    let message_caps = super::caps::MessageCaps::for_user(&state, &auth.user);
     let policy = if req.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
         ComposePolicy { allow_initial_admission: false, allow_readmission: false }
     } else { policy };
@@ -3519,7 +3532,8 @@ pub(super) async fn compose_peer(
             cap = Some(cap.map_or(confirmed.max_total_msat, |asked| asked.min(confirmed.max_total_msat)));
         }
         if !first_contact {
-            super::caps::check_payment(&state, price_msat, req.max_routing_fee_msat, cap)?;
+            let all_in = message_caps.all_in(&state, &peer_id.to_hex(), price_msat, req.max_routing_fee_msat)?;
+            super::caps::check(all_in, cap).map_err(|e| e.with_routing_fee(all_in - price_msat))?;
         } else if cap.is_none() {
             auth.refuse_unpriced("first contact requires an aggregate cap")?;
         }
@@ -3528,10 +3542,10 @@ pub(super) async fn compose_peer(
         let peer_key = peer_id.to_hex();
         let debit = auth.debit_operation(&state, vec![Charge {
             recipient: peer_key.clone(),
-            amount_msat: if first_contact { cap.unwrap_or(ADMISSION_MAX_MSAT) } else { super::caps::all_in(&state, price_msat, req.max_routing_fee_msat)? },
+            amount_msat: if first_contact { cap.unwrap_or(ADMISSION_MAX_MSAT) } else { message_caps.all_in(&state, &peer_id.to_hex(), price_msat, req.max_routing_fee_msat)? },
         }], confirmation, cap, &operation)
-            .map_err(|e| e.with_routing_fee(state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat)))?
-            .with_fee_limit(req.max_routing_fee_msat);
+            .map_err(|e| e.with_routing_fee(message_caps.fee(&state, &peer_id.to_hex(), price_msat, req.max_routing_fee_msat)))?
+            .with_fee_limit(req.max_routing_fee_msat).with_message_caps(message_caps.clone());
         let debit = debit.with_operation(operation.clone());
         if let Err(error) = operation.attach_debit(&debit).await {
             // No payment/invoice future has been polled under this debit.
@@ -3633,7 +3647,7 @@ pub(super) async fn compose_peer(
         };
         super::caps::first_contact_total(
             super::caps::all_in(&state, admission.settled_msat, req.max_routing_fee_msat)?,
-            super::caps::all_in(&state, price_msat, req.max_routing_fee_msat)?, cap)?;
+            debit.message_all_in(&state, &peer_id.to_hex(), price_msat)?, cap)?;
         let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
         let draft = konsensus_core::UkmEnvelopeBuilder::new(
@@ -3641,7 +3655,7 @@ pub(super) async fn compose_peer(
             konsensus_core::PaymentProof::new([0; 32], [0; 32], 0),
         ).references(references).build();
         operation.draft(draft, price_msat,
-            debit.fee_limit(&state, price_msat).saturating_add(admission.fee_ceiling_msat),
+            debit.message_fee_limit(&state, &peer_id.to_hex(), price_msat).saturating_add(admission.fee_ceiling_msat),
             admission.settled_msat.saturating_sub(admission.readmission_msat)).await?;
 
         // Create payment proof — requests invoice from recipient's wallet (Principle 2).
@@ -3672,7 +3686,7 @@ pub(super) async fn compose_peer(
         let proof =
             konsensus_core::PaymentProof::new(payment_hash, preimage_bytes, amount_msat);
 
-        let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
+        let envelope = operation.settled_envelope(proof, debit.message_fee_limit(&state, &peer_id.to_hex(), amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
         if crate::calls::is_call_kind(req.kind) {
             // Paid: publish the call transition before the envelope goes out.
             let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
@@ -3762,7 +3776,7 @@ pub(super) async fn compose_peer(
             payment_hash: Some(hex::encode(payment_hash)), retry_allowed: true,
             // The public operation response derives fees from durable settlement evidence.
             fee_paid_msat: None,
-            max_routing_fee_msat: debit.fee_limit(&state, admission.message_authorized.unwrap_or(price_msat)).saturating_add(admission.fee_ceiling_msat),
+            max_routing_fee_msat: debit.message_fee_limit(&state, &peer_id.to_hex(), admission.message_authorized.unwrap_or(price_msat)).saturating_add(admission.fee_ceiling_msat),
             member_outcomes: None,
             message_id: envelope.id.to_hex(),
             delivered,
@@ -3779,7 +3793,7 @@ pub(super) async fn compose_peer(
             Err(_) => debit.released(&peer_key),
         }
         let message_msat = admission.message_authorized.unwrap_or(price_msat);
-        result.map_err(|e| e.with_routing_fee(debit.fee_limit(&state, message_msat).saturating_add(admission.fee_ceiling_msat)))
+        result.map_err(|e| e.with_routing_fee(debit.message_fee_limit(&state, &peer_id.to_hex(), message_msat).saturating_add(admission.fee_ceiling_msat)))
 }
 
 #[cfg(test)]

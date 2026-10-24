@@ -413,6 +413,7 @@ async fn first_contact_is_bounded_and_consumed_once_in_home_and_console_modes() 
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        // Admission approval may exceed the message cap, but not the contact budget.
         let request = |max| json!({"kind":"first_contact","terms":{"recipient":PEER,"max_total_msat":max,"budget_msat":50000}});
         let (status, op) = f
             .call(
@@ -420,7 +421,7 @@ async fn first_contact_is_bounded_and_consumed_once_in_home_and_console_modes() 
                 true,
                 "POST",
                 "/api/v1/pair/approval-request",
-                request(1000),
+                request(10001),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{op}");
@@ -453,7 +454,7 @@ async fn first_contact_is_bounded_and_consumed_once_in_home_and_console_modes() 
                 true,
                 "POST",
                 "/api/v1/pair/approval-request",
-                request(10001),
+                request(50001),
             )
             .await;
         assert_eq!(status, StatusCode::OK);

@@ -751,6 +751,7 @@ type ReservationJournal<'a> = Box<dyn FnOnce(&Reservation) -> Result<(), BudgetR
 struct ReservationAuthority<'a> {
     payment_ids: Vec<String>,
     payment: bool,
+    admission: bool,
     expected_op_id: Option<&'a str>,
     liquidity: bool,
     before_persist: Option<ReservationJournal<'a>>,
@@ -3109,6 +3110,7 @@ impl PairingService {
             charges,
             ReservationAuthority {
                 liquidity: true,
+                payment: true,
                 ..Default::default()
             },
             || chrono::Utc::now().timestamp(),
@@ -3188,6 +3190,7 @@ impl PairingService {
             charges,
             ReservationAuthority {
                 before_persist: Some(Box::new(before_persist)),
+                payment: true,
                 ..Default::default()
             },
             || chrono::Utc::now().timestamp(),
@@ -3296,24 +3299,27 @@ impl PairingService {
                 "too many unresolved reservations".into(),
             ));
         }
-        // Purpose, not grant provenance, determines the effective ceiling.
-        // Enforce it without changing stored/signed terms, so live grants are
-        // covered immediately and explicit payments retain the owner's limit.
+        // Each act has its own all-in ceiling. Room members are validated
+        // individually and reserved atomically as one total.
         let purpose_limit = if authority.payment {
-            Ok(())
+            Ok(budget.per_call_max_msat)
+        } else if authority.admission {
+            Ok(crate::spend_budget::FIRST_CONTACT_MAX_MSAT)
         } else {
             let max_msat = budget.messaging_per_call_max_msat();
-            charges
-                .iter()
-                .try_fold(0u64, |total, charge| {
-                    total
-                        .checked_add(charge.amount_msat)
-                        .filter(|total| *total <= max_msat)
-                        .ok_or(BudgetRefusal::PerCall { max_msat })
-                })
-                .map(|_| ())
+            let mut recipients = std::collections::BTreeMap::new();
+            let mut result = Ok(0u64);
+            for charge in &charges {
+                let amount = recipients.entry(&charge.recipient).or_insert(0u64);
+                match amount.checked_add(charge.amount_msat).filter(|n| *n <= max_msat) {
+                    Some(total) => *amount = total,
+                    None => { result = Err(BudgetRefusal::PerCall { max_msat }); break; }
+                }
+            }
+            result.and_then(|_| recipients.values().try_fold(0u64, |sum, amount|
+                sum.checked_add(*amount).ok_or(BudgetRefusal::PerCall { max_msat })))
         };
-        if let Err(refusal) = purpose_limit.and_then(|()| budget.reserve_at(&charges, now)) {
+        if let Err(refusal) = purpose_limit.and_then(|limit| budget.reserve_act_at(&charges, now, limit, !authority.admission)) {
             if budget.record_breaker_refusal(&refusal, now) {
                 if let Err(e) = self.persist(&mut inner.file) {
                     if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
@@ -3377,7 +3383,7 @@ impl PairingService {
     /// cannot reach this operation. `grant_op_id` binds the reviewed budget.
     ///
     /// Only for a client holding a live budget grant, and only within it: the
-    /// amount must fit the grant's per-call maximum, what is left of the
+    /// amount must fit the first-contact safety ceiling, what is left of the
     /// budget and, if set, the recipient's budget. Nothing is reserved here;
     /// the send debits the budget grant once, before any invoice or payment.
     /// Replaces any earlier unused first-contact grant of this client.
@@ -3448,7 +3454,7 @@ impl PairingService {
         };
         let epoch = grant.epoch;
         let budget = grant.budget.as_ref().ok_or(BudgetRefusal::NoGrant)?;
-        let max_msat = budget.messaging_per_call_max_msat();
+        let max_msat = crate::spend_budget::FIRST_CONTACT_MAX_MSAT;
         if max_total_msat > max_msat {
             return Err(BudgetRefusal::PerCall { max_msat });
         }
@@ -3647,7 +3653,7 @@ impl PairingService {
     ///
     /// CoS decision (2026-09-27): a budget may pay re-admission for a contact
     /// the owner already budgeted — the grant caps that contact, and the
-    /// reservation must fit the cap, the per-call maximum and what is left.
+    /// reservation must fit the contact budget, admission safety ceiling and what is left.
     /// Never for a stranger to the grant without the owner's one-time
     /// confirmation for exactly that contact, which this consumes (single use)
     /// and which bounds the amount. There is no durable admission object: the
@@ -3723,16 +3729,19 @@ impl PairingService {
             return Err(BudgetRefusal::NoGrant);
         };
         let message_top_up = quoted_message_all_in.saturating_sub(old_message);
-        let max_msat = budget.messaging_per_call_max_msat();
-        let need = message_top_up
-            .checked_add(admission_all_in)
-            .ok_or(BudgetRefusal::PerCall { max_msat })?;
-        let total = call_reserved_msat
-            .checked_add(need)
-            .ok_or(BudgetRefusal::PerCall { max_msat })?;
-        if total > max_msat {
+        let max_msat = budget.messaging_per_call_max_msat().min(
+            budget.per_act_max_by_recipient.get(&recipient).copied().unwrap_or(u64::MAX));
+        if quoted_message_all_in > max_msat {
             return Err(BudgetRefusal::PerCall { max_msat });
         }
+        let max_msat = crate::spend_budget::FIRST_CONTACT_MAX_MSAT;
+        if admission_all_in > max_msat {
+            return Err(BudgetRefusal::PerCall { max_msat });
+        }
+        let need = message_top_up.checked_add(admission_all_in)
+            .ok_or(BudgetRefusal::PerCall { max_msat })?;
+        let total = call_reserved_msat.checked_add(need)
+            .ok_or(BudgetRefusal::PerCall { max_msat })?;
         if let Some(max_msat) = confirmed {
             if let Some(pending) = inner.first_contact.get_mut(&parent.client_id) {
                 pending.consumed = true;
@@ -3781,6 +3790,7 @@ impl PairingService {
             }],
             ReservationAuthority {
                 expected_op_id: Some(&parent.op_id),
+                admission: true,
                 operation,
                 ..Default::default()
             },
@@ -3835,6 +3845,7 @@ impl PairingService {
             }],
             ReservationAuthority {
                 expected_op_id: Some(&approval.budget_op_id),
+                admission: true,
                 operation,
                 ..Default::default()
             },
@@ -4221,6 +4232,9 @@ fn grant_view(g: &SpendGrant) -> Option<GrantView> {
         used_msat: b.used_msat,
         remaining_msat: b.remaining_msat(),
         per_call_max_msat: b.messaging_per_call_max_msat(),
+        payment_per_call_max_msat: b.per_call_max_msat,
+        payment_authorized: !g.is_messaging(),
+        act_caps: crate::spend_budget::ActCaps::new(b.per_call_max_msat),
         per_recipient_msat: b.per_recipient_msat.clone(),
         used_by_recipient: b.used_by_recipient.clone(),
         recipients_only: b.recipients_only,

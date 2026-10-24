@@ -99,6 +99,8 @@ async fn messaging_fixture(relation: bool, requested_cap: u64) -> (Fx, String) {
                 },
             )
             .unwrap();
+        assert_eq!(approval.act_caps.as_ref().unwrap().message_all_in_msat, requested_cap.min(6_000));
+        assert_eq!(approval.act_caps.as_ref().unwrap().room_member_all_in_msat, requested_cap.min(6_000));
         fx.service
             .approve_owner_request(
                 &owner.client_id,
@@ -221,6 +223,9 @@ async fn console_grant_caps_messages_but_allows_twenty_sat_payments() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["grant"]["per_call_max_msat"], 6_000);
+    assert_eq!(body["grant"]["payment_per_call_max_msat"], 20_000);
+    assert_eq!(body["grant"]["act_caps"]["message_all_in_msat"], 6_000);
+    assert_eq!(body["grant"]["act_caps"]["room_member_all_in_msat"], 6_000);
     let (status, body) = fx.keysend(&token, PEER_LN, 20_000).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = fx
@@ -258,7 +263,7 @@ async fn messaging_grants_preserve_tighter_approved_limits() {
 }
 
 #[tokio::test]
-async fn console_room_fanout_is_capped_as_one_call() {
+async fn console_room_fanout_caps_each_member_and_reserves_one_total() {
     let mut fx = fixture().await;
     let mut members = Vec::new();
     for n in 0..2 {
@@ -314,12 +319,12 @@ async fn console_room_fanout_is_capped_as_one_call() {
         );
     }
     let token = fx
-        .grant(None, GrantTerms::new(200_000).per_call(20_000))
+        .grant(None, GrantTerms::new(200_000).per_call(6_000))
         .await;
     for peer in &members {
         fx.state
             .peer_prices
-            .update_kind_price(*peer, 100, 3_500, 850_000)
+            .update_kind_price(*peer, 100, 6_001, 850_000)
             .await;
     }
     let body = json!({"recipient": id, "is_room": true, "kind": 100, "plaintext": "capped", "max_total_msat": 20_000});
@@ -337,13 +342,128 @@ async fn console_room_fanout_is_capped_as_one_call() {
     for peer in &members {
         fx.state
             .peer_prices
-            .update_kind_price(*peer, 100, 3_000, 850_000)
+            .update_kind_price(*peer, 100, 6_000, 850_000)
             .await;
     }
     let (status, result) = fx
-        .call("POST", "/api/v1/messages/compose", Some(body), Some(&token))
+        .call("POST", "/api/v1/messages/compose", Some(body.clone()), Some(&token))
         .await;
     assert_eq!(status, StatusCode::OK, "{result}");
-    assert_eq!(fx.wallet.left(), 6_000);
-    assert_eq!(fx.used(), 6_000);
+    assert_eq!(fx.wallet.left(), 12_000);
+    assert_eq!(fx.used(), 12_000);
+    // With routing fees the displayed room total is still checked atomically.
+    for peer in &members {
+        fx.state.peer_prices.update_kind_price(*peer, 100, 2_000, 850_000).await;
+    }
+    fx.wallet.fee.store(4_000, Ordering::SeqCst);
+    let mut paid = body;
+    paid["max_routing_fee_msat"] = json!(10_000);
+    paid["max_total_msat"] = json!(11_999);
+    let (status, _) = fx.call("POST", "/api/v1/messages/compose", Some(paid.clone()), Some(&token)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(fx.used(), 12_000);
+    paid["max_total_msat"] = json!(12_000);
+    let (status, result) = fx.call("POST", "/api/v1/messages/compose", Some(paid), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["max_routing_fee_msat"], 8_000);
+    assert_eq!(fx.used(), 24_000);
+}
+
+#[tokio::test]
+async fn message_fee_budget_is_cap_minus_price() {
+    for (price, fee) in [(1_000, 5_000), (2_000, 4_000), (6_000, 0)] {
+        let fx = fixture().await;
+        let token = fx.grant(None, GrantTerms::new(100_000)).await;
+        fx.state.peer_prices.update_kind_price(fx.peer, 100, price, 850_000).await;
+        fx.wallet.fee.store(fee, Ordering::SeqCst);
+        let (status, body) = fx.call("POST", "/api/v1/messages/compose", Some(json!({
+            "recipient": fx.peer.to_hex(), "kind":100, "plaintext":"fee budget",
+            "max_routing_fee_msat": 10_000
+        })), Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["max_routing_fee_msat"], fee);
+        assert_eq!(fx.used(), 6_000);
+    }
+}
+
+#[tokio::test]
+async fn liquidity_cannot_use_messaging_authority() {
+    for relation in [true, false] {
+        let (fx, _) = messaging_fixture(relation, 20_000).await;
+        let result = fx.service.reserve_liquidity_fee(&fx.client_id, 1,
+            vec![Charge {recipient: PEER_LN.into(), amount_msat: 1_000}]);
+        assert!(matches!(result, Err(BudgetRefusal::MessagingGrant)), "{result:?}");
+        assert_eq!(fx.used(), 0);
+    }
+}
+
+#[tokio::test]
+async fn message_route_over_remaining_fee_budget_refuses_without_spending() {
+    for ldk in [false, true] {
+    let fx = fixture().await;
+    fx.wallet.ldk_route_refusal.store(ldk, Ordering::SeqCst);
+    let token = fx.grant(None, GrantTerms::new(100_000)).await;
+    fx.state.peer_prices.update_kind_price(fx.peer, 100, 2_000, 850_000).await;
+    fx.wallet.fee.store(4_001, Ordering::SeqCst);
+    let (status, body) = fx.call("POST", "/api/v1/messages/compose", Some(json!({
+        "recipient": fx.peer.to_hex(), "kind":100, "plaintext":"too costly",
+        "max_routing_fee_msat":10_000
+    })), Some(&token)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "The route cannot fit within the approved message total. The message payment was not dispatched.");
+    assert_eq!(fx.wallet.left(), 0);
+    assert_eq!(fx.used(), 0);
+    }
+}
+
+#[tokio::test]
+async fn payment_keeps_its_five_sat_fee_floor_and_owner_limit() {
+    let fx = fixture().await;
+    let token = fx.grant(None, GrantTerms::new(100_000).per_call(20_000)).await;
+    fx.wallet.fee.store(5_000, Ordering::SeqCst);
+    let (status, body) = fx.call("POST", "/api/v1/payments/keysend", Some(json!({
+        "dest_pubkey": PEER_LN, "amount_msat":15_000, "max_routing_fee_msat":null
+    })), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["max_routing_fee_msat"], 5_000);
+    assert_eq!(fx.used(), 20_000);
+    let (status, body) = fx.call("POST", "/api/v1/payments/keysend", Some(json!({
+        "dest_pubkey": PEER_LN, "amount_msat":15_001, "max_routing_fee_msat":null
+    })), Some(&token)).await;
+    assert_budget_exceeded(status, &body, "per_call");
+    assert_eq!(fx.used(), 20_000);
+}
+
+#[tokio::test]
+async fn file_uses_remaining_message_fee_budget() {
+    let fx = fixture().await;
+    let token = fx.grant(None, GrantTerms::new(100_000).per_call(3_000)).await;
+    let path = lifecycle::upload_probe_file(&fx).await;
+    fx.wallet.fee.store(2_000, Ordering::SeqCst);
+    let (status, body) = fx.call("POST", &path, Some(json!({
+        "recipient":fx.peer.to_hex(), "max_routing_fee_msat":null
+    })), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["max_routing_fee_msat"], 2_000);
+    assert_eq!(fx.used(), 3_000);
+}
+
+#[tokio::test]
+async fn early_total_cap_refusal_reports_the_message_fee_allowance() {
+    for file in [false, true] {
+        let fx = fixture().await;
+        let token = fx.grant(None, GrantTerms::new(100_000).per_call(3_000)).await;
+        let path = if file { lifecycle::upload_probe_file(&fx).await } else { "/api/v1/messages/compose".into() };
+        let mut request = json!({"recipient":fx.peer.to_hex(), "max_total_msat":2_999, "max_routing_fee_msat":null});
+        if !file {
+            request["kind"] = json!(100);
+            request["plaintext"] = json!("cap refusal");
+        }
+        let (status, body) = fx.call("POST", &path, Some(request), Some(&token)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "price_cap_exceeded");
+        assert_eq!(body["max_routing_fee_msat"], 2_000);
+        assert_eq!(fx.used(), 0);
+        assert_eq!(fx.wallet.money(), 0);
+    }
 }

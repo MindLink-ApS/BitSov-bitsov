@@ -284,7 +284,9 @@ async fn a_confirmation_must_fit_the_budget_grant() {
         .grant(None, GrantTerms::new(3_000).per_call(2_500))
         .await;
     let (status, body) = s.confirm(&token, &s.peer, 2_600).await;
-    assert_budget_exceeded(status, &body, "per_call");
+    assert_eq!(status, StatusCode::OK, "admission has its own cap: {body}");
+    let (status, body) = s.confirm(&token, &s.peer, 3_001).await;
+    assert_budget_exceeded(status, &body, "total");
     let token = s.fx.grant(None, GrantTerms::new(1_000_000)).await;
     let (status, body) = s.confirm(&token, &s.peer, 100_001).await;
     assert_budget_exceeded(status, &body, "first_contact");
@@ -335,8 +337,8 @@ async fn the_door_quote_is_the_invoice_the_send_pays() {
     assert_eq!(status, StatusCode::OK, "{quote}");
     assert_eq!(quote["admission_msat"], 2000);
     assert_eq!(quote["message_msat"], 2000);
-    assert_eq!(quote["total_msat"], 14000);
-    assert_eq!(quote["max_routing_fee_msat"], 10000);
+    assert_eq!(quote["total_msat"], 13000);
+    assert_eq!(quote["max_routing_fee_msat"], 9000);
     assert_eq!(s.spent().await, 0, "a quote pays nothing");
     assert_eq!(s.fx.used(), 0, "a quote reserves nothing");
     assert_eq!(s.invoices.load(Ordering::SeqCst), 1);
@@ -514,7 +516,7 @@ async fn read_receive_pairing_can_quote_without_a_grant_or_reservation() {
     let (status, quote) = s.fx.call("POST", "/api/v1/messages/first-contact/quote",
         Some(body.clone()), Some(&token)).await;
     assert_eq!(status, StatusCode::OK, "{quote}");
-    assert_eq!(quote["total_msat"], 14_000); // 2,000 + 2,000 + two 5,000 routing ceilings
+    assert_eq!(quote["total_msat"], 13_000); // 2,000 + 5,000 admission; 2,000 + 4,000 message
     assert_eq!(s.spent().await, 0);
     assert_eq!(s.fx.used(), 0);
     assert!(s.fx.service.grant_view_for(&s.fx.client_id).is_none());
@@ -523,4 +525,80 @@ async fn read_receive_pairing_can_quote_without_a_grant_or_reservation() {
         Some(body), Some(&token)).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(s.spent().await, 0);
+}
+
+#[tokio::test]
+async fn admission_quote_exposes_separate_all_in_lines_above_message_cap() {
+    let s = stranger(2_000).await;
+    let token = s.fx.grant(None, GrantTerms::new(100_000).per_call(6_000)).await;
+    let (status, quote) = s.fx.call("POST", "/api/v1/messages/first-contact/quote",
+        Some(json!({"recipient": s.peer.to_hex()})), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{quote}");
+    assert_eq!(quote["admission_all_in_msat"], 7_000);
+    assert_eq!(quote["message_all_in_msat"], 6_000);
+    assert_eq!(quote["total_msat"], 13_000);
+    assert_eq!(s.confirm(&token, &s.peer, 13_000).await.0, StatusCode::OK);
+    let (status, body) = s.fx.call("POST", "/api/v1/messages/compose", Some(json!({
+        "recipient": s.peer.to_hex(), "kind":0, "plaintext":"admission and message",
+        "max_total_msat":13_000, "max_routing_fee_msat":null
+    })), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(s.spent().await, 4_000);
+    assert_eq!(s.fx.used(), 4_000);
+    assert_eq!(body["max_routing_fee_msat"], 9_000);
+}
+
+struct PriceGateChain {
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    armed: AtomicBool,
+}
+#[async_trait]
+impl konsensus_core::traits::chain::ChainProvider for PriceGateChain {
+    fn trust_level(&self) -> konsensus_core::traits::chain::TrustLevel { StubChain.trust_level() }
+    async fn get_block_height(&self) -> Result<u64, konsensus_core::traits::chain::ChainError> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
+        StubChain.get_block_height().await
+    }
+    async fn get_block_header(&self, h: u64) -> Result<konsensus_core::traits::chain::BlockHeader, konsensus_core::traits::chain::ChainError> { StubChain.get_block_header(h).await }
+    async fn estimate_fee(&self, n: u32) -> Result<konsensus_core::traits::chain::FeeEstimate, konsensus_core::traits::chain::ChainError> { StubChain.estimate_fee(n).await }
+    async fn is_tx_confirmed(&self, tx: &str, n: u32) -> Result<bool, konsensus_core::traits::chain::ChainError> { StubChain.is_tx_confirmed(tx, n).await }
+    async fn is_synced(&self) -> bool { true }
+}
+
+#[tokio::test]
+async fn replacement_before_admission_consumption_cannot_reuse_wider_message_cap() {
+    for (replacement_cap, total_cap, fee_cap) in [(1_000, 4_000, Some(0)), (3_000, 10_000, None)] {
+        let mut s = stranger(2_000).await;
+        let token = s.fx.grant(None, GrantTerms::new(100_000).per_call(6_000)).await;
+        let chain = Arc::new(PriceGateChain {
+            entered: Default::default(), resume: Default::default(), armed: AtomicBool::new(true),
+        });
+        s.fx.state = Arc::new(AppState { chain: chain.clone(), ..(*s.fx.state).clone() });
+        let state = s.fx.state.clone();
+        let peer = s.peer;
+        let sending = tokio::spawn(async move {
+            call(&state, "POST", "/api/v1/messages/compose", Some(json!({
+                "recipient":peer.to_hex(), "kind":0, "plaintext":"replacement race", "max_total_msat":total_cap, "max_routing_fee_msat":fee_cap
+            })), Some(&token)).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), chain.entered.notified()).await.unwrap();
+        let token = s.fx.grant(None, GrantTerms::new(100_000).per_call(replacement_cap)).await;
+        assert_eq!(s.confirm(&token, &s.peer, total_cap).await.0, StatusCode::OK);
+        chain.resume.notify_one();
+        let (status, body) = sending.await.unwrap();
+        if replacement_cap < 2_000 {
+            assert_budget_exceeded(status, &body, "per_call");
+            assert_eq!(s.spent().await, 0);
+            assert_eq!(s.fx.used(), 0);
+        } else {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["max_routing_fee_msat"], 6_000);
+            assert_eq!(s.spent().await, 4_000);
+            assert_eq!(s.fx.used(), 4_000);
+        }
+    }
 }

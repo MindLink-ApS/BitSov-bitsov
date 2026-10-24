@@ -10,13 +10,47 @@ store is now version 8. Older nodes refuse to open it rather than ignore
 allowlists, payment deduplication, circuit breakers, device-reset limits or
 envelope identities; existing version 2–7 grants remain readable.
 
-Every non-payment call (messages, room fan-out, first contact, re-admission,
-files and porch pages) is limited to `min(per_call_max_msat, 6_000)` msat,
-including routing fees. This applies at reservation time to every grant type,
-including console grants and existing live grants, without migration or changes
-to signed terms. The grant view and `pair-status` report this effective limit.
-Explicit invoice payments and keysend retain the console grant's owner-approved
-per-call limit; messaging-only grants cannot fund them.
+Caps apply **per act type**, and every displayed amount is **all-in** (price
+plus the maximum routing fee). They are derived at reservation time for existing
+and new grants; no storage migration or rewriting of signed terms is required.
+
+| Act | All-in cap |
+|---|---|
+| Message, file or porch page | `min(stored per_call_max_msat, 6_000)` msat; any tighter recipient per-act cap also applies |
+| Room post | Sum of the paid members' per-member all-in caps (N × the value when identical), reserved as one total |
+| First contact | Quoted admission + its maximum fee, shown separately from the capped message; the approved combined total still cannot exceed the 100,000-msat F1 safety ceiling |
+| Re-admission | Quoted admission + its maximum fee as its own act, at most 100,000 msat, alongside the capped message |
+| Payment | Stored owner-approved per-call limit, unchanged |
+
+The message fee budget is **cap minus price**, further tightened by the caller
+and routing policy: a 1-sat message may use 5 sats in fees, a 2-sat message 4.
+It is never a fixed 5-sat fee added above the message cap. A route that cannot
+fit is refused with fixed plain text; no fee policy is relaxed for payments.
+Free members do not consume a paid-member allowance. Totals, recipient budgets,
+allowlists, expiry, circuit breakers and original-grant dispatch checks still
+apply to all reservations. Admission does not consume the message's 6-sat cap.
+
+`GET /pair/grant`, owner status and `pair-status` expose the effective messaging
+`per_call_max_msat` alongside `payment_per_call_max_msat` (the stored owner
+limit), `payment_authorized`, and `act_caps`. The latter contains
+`message_all_in_msat`, `room_member_all_in_msat`,
+`first_contact_max_all_in_msat`, `readmission_max_all_in_msat`, and
+`payment_all_in_msat`. The room total is computed from the actual paid-member
+snapshot; recipient-specific limits may narrow its individual lines. The
+first-contact quote includes `admission_all_in_msat` and `message_all_in_msat`
+for separate display before approval; their sum is `total_msat`. Never add fees
+to an all-in field a second time.
+
+Liquidity deductions and sponsor-gift fees are **payment-class acts**. They
+never ride a messaging grant, even if a legacy record contains an LSP flag.
+Liquidity requires an independent owner console payment grant with
+`--allow-liquidity-fees`, and is bounded by its stored payment limit. Until that
+approval exists, acceptance fails closed. Sponsor gifts require the existing
+explicit owner approval of the frozen gift and maximum fee, under the owner's
+sponsor payment policy and purse; paired approval remains refused. The
+operation-linked reservation helper also applies payment authority and the
+payment limit, so it cannot become a messaging-authority bypass. Device
+messaging approval does not create either payment approval.
 
 ## Owner flow (one command per budget window)
 
@@ -335,8 +369,9 @@ backs that one answer with a short, single-use **first-contact grant**.
      card. If the budget grant has no cap for this contact yet, it becomes one
      (bounded by the grant's total). This only narrows the grant, and it makes
      the contact *budgeted* (next section).
-   - It needs a live budget grant, and the amount must fit it: per-call maximum,
-     what is left of the budget, and the recipient's budget if set. It is at most
+   - It needs a live budget grant, and the amount must fit what is left of
+     the budget and the recipient's budget if set. The message cap does not
+     limit this separately approved admission. It is at most
      100,000 msat (F1's first-contact ceiling).
    - Nothing is reserved yet.
    - The grant expires after 300 s, or with the budget grant if that is sooner.
@@ -428,9 +463,8 @@ the owner already budgeted**, without a prompt.
 - The node first asks for the recipient's signed quote, then reserves exactly
   the quoted admission plus its routing ceiling against the grant before paying anything. The
   reservation must fit the contact's cap and what is left. The message and
-  every re-admission in the same API call share one per-call maximum, including
-  all members of a room fan-out. Separate reservations track their financial
-  outcomes without granting a separate per-call allowance. Eligibility and
+  re-admission have separate all-in act limits. Separate reservations track
+  their financial outcomes against the same total and recipient budgets. Eligibility and
   reservation use the same ledger transaction and the same original grant.
 - The payment is resolved once (settled, released if never dispatched, kept
   reserved if unknown). The sender records it as an outbound N2 membrane event
