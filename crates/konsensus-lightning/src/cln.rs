@@ -641,6 +641,35 @@ impl ClnProvider {
         }
         Ok(info)
     }
+
+    async fn purge_terminal_invoices(&self, statuses: &[&str]) -> Result<u32, LightningError> {
+        let mut removed = 0u32;
+        let mut start = 0u64;
+        loop {
+            let response: Invoices = self
+                .rpc(
+                    "listinvoices",
+                    json!({"index": "created", "start": start, "limit": 100}),
+                )
+                .await?;
+            if response.invoices.is_empty() {
+                break;
+            }
+            let mut next = start;
+            for row in response.invoices {
+                next = next.max(next_index(row.created_index, start)?);
+                if !statuses.contains(&row.status.as_str()) {
+                    continue;
+                }
+                let payment_hash = hex32(&row.payment_hash)?;
+                if self.forget_pending_invoice(&payment_hash).await? {
+                    removed += 1;
+                }
+            }
+            start = next;
+        }
+        Ok(removed)
+    }
 }
 
 #[async_trait]
@@ -734,13 +763,13 @@ impl LightningProvider for ClnProvider {
     }
 
     async fn purge_expired_pending_invoices(&self, now_unix: u64) -> Result<u32, LightningError> {
-        let due = self.pending_invoice_inventory().await?;
         let mut removed = 0u32;
-        for (hash, expires_at) in due {
+        for (hash, expires_at) in self.pending_invoice_inventory().await? {
             if expires_at <= now_unix && self.forget_pending_invoice(&hash).await? {
                 removed += 1;
             }
         }
+        removed += self.purge_terminal_invoices(&["expired"]).await?;
         Ok(removed)
     }
 
@@ -850,6 +879,9 @@ impl LightningProvider for ClnProvider {
     }
     async fn money_ready(&self) -> bool {
         false
+    }
+    async fn receive_invoice_capable(&self) -> bool {
+        self.is_available().await
     }
 }
 

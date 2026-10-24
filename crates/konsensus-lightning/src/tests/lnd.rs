@@ -1339,6 +1339,30 @@ async fn payment_status_falls_through_to_outgoing_payments() {
 }
 
 #[tokio::test]
+async fn payment_status_surfaces_list_payments_failures() {
+    use axum::http::StatusCode;
+    async fn invoice_not_found(
+        axum::extract::Path(_hash): axum::extract::Path<String>,
+    ) -> (StatusCode, &'static str) {
+        (StatusCode::NOT_FOUND, r#"{"error":"invoice not found"}"#)
+    }
+    async fn list_payments_error() -> (StatusCode, &'static str) {
+        (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"boom"}"#)
+    }
+    let app = Router::new()
+        .route("/v1/invoice/:hash", get(invoice_not_found))
+        .route("/v2/payments", get(list_payments_error));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let provider = test_provider(addr);
+    let err = provider.get_payment_status("hash").await.unwrap_err();
+    assert!(matches!(err, LightningError::Backend(_)));
+}
+
+#[tokio::test]
 async fn payment_status_not_found_in_either() {
     let (addr, _handle) = start_mock_lnd_outgoing_payment_status().await;
 

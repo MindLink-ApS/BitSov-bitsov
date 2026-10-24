@@ -949,6 +949,8 @@ impl LightningProvider for LndProvider {
                 memo: resp.memo,
                 fee_msat: None,
             });
+        } else if response.status().as_u16() != 404 {
+            return Err(self.handle_error(response, "lookup_invoice").await);
         }
 
         // If not found as invoice, look up as outgoing payment
@@ -964,7 +966,7 @@ impl LightningProvider for LndProvider {
             .map_err(|e| LightningError::Connection(e.to_string()))?;
 
         if !list_response.status().is_success() {
-            return Err(LightningError::PaymentNotFound(payment_hash.to_string()));
+            return Err(self.handle_error(list_response, "list_payments").await);
         }
 
         let list_resp: ListPaymentsResponse = list_response

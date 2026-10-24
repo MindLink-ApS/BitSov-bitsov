@@ -205,6 +205,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let mut peer_invoices = crate::peer_invoices::PeerInvoiceBook::default();
     let mut invoice_maintenance = tokio::task::JoinSet::new();
     let readiness_height = ReadinessHeightCache::new(chain.clone());
+    let price_ceiling = ConfiguredPriceCeilingCache::new();
     // PSI-SPEED: bounds our prekey replies to a paid payee's offer. Separate
     // from the other two eager limiters on purpose; see `eager_offers` in the
     // compose handler.
@@ -395,7 +396,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } => {
                         handle_invoice_requested_gated(
                             &peer_id, &request_id, amount_msat, &purpose, privileged,
-                            &pricing, &readiness_height, &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
+                            &pricing, &readiness_height, &price_ceiling, &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
                             audit_log.membrane(), &mut last_admission_refusal, min_admission_cost_msat,
                             &mut peer_invoices,
                         ).await;
@@ -1453,6 +1454,7 @@ async fn handle_invoice_requested_gated(
     privileged: bool,
     pricing: &Arc<dyn PricingEngine>,
     readiness_height: &ReadinessHeightCache,
+    price_ceiling: &ConfiguredPriceCeilingCache,
     lightning: &Arc<dyn LightningProvider>,
     transport: &Arc<NoiseTransport>,
     recipient: &NodeId,
@@ -1580,6 +1582,7 @@ async fn handle_invoice_requested_gated(
         amount_msat,
         purpose,
         pricing,
+        price_ceiling,
         lightning,
         transport,
         source_ip,
@@ -1596,6 +1599,7 @@ async fn handle_invoice_requested(
     amount_msat: u64,
     purpose: &str,
     pricing: &Arc<dyn PricingEngine>,
+    price_ceiling: &ConfiguredPriceCeilingCache,
     lightning: &Arc<dyn LightningProvider>,
     transport: &Arc<NoiseTransport>,
     source_ip: std::net::IpAddr,
@@ -1614,9 +1618,22 @@ async fn handle_invoice_requested(
         return;
     }
     let mut rollback_rate = || invoices.rollback_issue(peer_id);
+    if amount_msat == 0 {
+        rollback_rate();
+        if refusals.permit(source_ip, tokio::time::Instant::now()) {
+            send_invoice_refusal(
+                transport,
+                peer_id,
+                request_id,
+                konsensus_api::invoice_refusal::INVOICE_UNAVAILABLE,
+            )
+            .await;
+        }
+        return;
+    }
     let ceiling = match tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        configured_price_ceiling(pricing.as_ref()),
+        price_ceiling.get(pricing.clone()),
     )
     .await
     {
@@ -1635,7 +1652,7 @@ async fn handle_invoice_requested(
             return;
         }
     };
-    if amount_msat == 0 || ceiling == 0 {
+    if ceiling == 0 {
         rollback_rate();
         if refusals.permit(source_ip, tokio::time::Instant::now()) {
             send_invoice_refusal(
@@ -1730,6 +1747,73 @@ async fn configured_price_ceiling(pricing: &dyn PricingEngine) -> Result<u64, &'
         return Err("konsensus:price_unavailable");
     }
     Ok(ceiling)
+}
+
+const MAX_CONCURRENT_PRICE_CEILING_LOOKUPS: usize = 8;
+
+type PriceCeilingLookup =
+    futures::future::Shared<futures::future::BoxFuture<'static, Result<u64, &'static str>>>;
+
+/// Coalesces configured price-ceiling reads so slow pricing cannot stall the
+/// control loop. At most [`MAX_CONCURRENT_PRICE_CEILING_LOOKUPS`] lookups run at
+/// once; additional callers fail fast with `konsensus:price_unavailable`.
+pub(crate) struct ConfiguredPriceCeilingCache {
+    lookup: tokio::sync::Mutex<Option<PriceCeilingLookup>>,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ConfiguredPriceCeilingCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            lookup: tokio::sync::Mutex::new(None),
+            active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    async fn get(&self, pricing: Arc<dyn PricingEngine>) -> Result<u64, &'static str> {
+        use futures::FutureExt;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let lookup = {
+            let mut slot = self.lookup.lock().await;
+            let refresh = match slot.as_ref() {
+                None => true,
+                Some(lookup) => match lookup.peek() {
+                    Some(Ok(_)) => false,
+                    Some(Err(_)) => true,
+                    None => lookup.strong_count() == Some(1),
+                },
+            };
+            if refresh {
+                if self.active.fetch_add(1, Ordering::SeqCst)
+                    >= MAX_CONCURRENT_PRICE_CEILING_LOOKUPS
+                {
+                    self.active.fetch_sub(1, Ordering::SeqCst);
+                    return Err("konsensus:price_unavailable");
+                }
+                let active = self.active.clone();
+                *slot = Some(
+                    async move {
+                        let ceiling = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            configured_price_ceiling(pricing.as_ref()),
+                        )
+                        .await
+                        .map_err(|_| "konsensus:price_unavailable")??;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(ceiling)
+                    }
+                    .boxed()
+                    .shared(),
+                );
+            }
+            slot.as_ref()
+                .expect("price ceiling lookup initialized")
+                .clone()
+        };
+        lookup.await
+    }
 }
 
 fn invoice_error_frame(

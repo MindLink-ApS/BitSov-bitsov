@@ -560,6 +560,12 @@ pub trait LightningProvider: Send + Sync {
         self.is_available().await
     }
 
+    /// Safe to import inbound invoice inventory for cap accounting. Receive-only
+    /// backends may be available while outbound payment readiness is false.
+    async fn receive_invoice_capable(&self) -> bool {
+        self.money_ready().await
+    }
+
     async fn readiness(&self) -> LightningReadiness {
         let money_ready = self.money_ready().await;
         LightningReadiness {

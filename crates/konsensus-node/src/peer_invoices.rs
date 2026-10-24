@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use konsensus_core::traits::lightning::{LightningError, LightningProvider, PaymentStatus};
+use konsensus_core::traits::lightning::{LightningProvider, PaymentStatus};
 use konsensus_core::types::NodeId;
 
 use konsensus_api::invoice_refusal::INVOICE_LIMITED;
@@ -169,7 +169,7 @@ pub(crate) async fn reconcile(
     };
     let mut before: HashSet<_> = snapshot.rows.iter().map(|row| row.hash.clone()).collect();
     let _ = tokio::time::timeout(RECONCILIATION_BUDGET, async {
-        if !lightning.money_ready().await {
+        if !lightning.receive_invoice_capable().await {
             return;
         }
         let Ok(imported) = lightning.pending_invoice_expiries().await else {
@@ -242,15 +242,31 @@ pub(crate) async fn purge_expired_peer_invoices(
 /// record is left untouched here; expiry deletion is a separate step.
 async fn release_closed_rows(book: &mut PeerInvoiceBook, lightning: &dyn LightningProvider) {
     use futures::{stream, StreamExt};
-    let mut statuses = stream::iter(book.rows.iter().map(|row| row.hash.clone()).collect::<Vec<_>>().into_iter().map(|hash| async move {
-        let status = tokio::time::timeout(STATUS_BUDGET, lightning.get_payment_status(&hash)).await;
-        let closed = matches!(status,
-            Ok(Ok(ref details)) if matches!(details.status, PaymentStatus::Settled | PaymentStatus::Failed | PaymentStatus::Expired))
-            || matches!(status, Ok(Err(LightningError::PaymentNotFound(_))));
-        (hash, closed)
-    })).buffer_unordered(8);
+    let mut statuses = stream::iter(
+        book.rows
+            .iter()
+            .map(|row| row.hash.clone())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|hash| async move {
+                let status =
+                    tokio::time::timeout(STATUS_BUDGET, lightning.get_payment_status(&hash)).await;
+                let closed = matches!(
+                    status,
+                    Ok(Ok(ref details))
+                        if matches!(
+                            details.status,
+                            PaymentStatus::Settled | PaymentStatus::Failed | PaymentStatus::Expired
+                        )
+                );
+                (hash, closed)
+            }),
+    )
+    .buffer_unordered(8);
     while let Some((hash, is_closed)) = statuses.next().await {
         if is_closed {
+            let _ =
+                tokio::time::timeout(STATUS_BUDGET, lightning.forget_pending_invoice(&hash)).await;
             book.rows.retain(|row| row.hash != hash);
         }
     }
@@ -343,6 +359,122 @@ mod tests {
             book.rollback_issue(&peer);
         }
         assert!(book.try_issue(&peer, now, unix).is_ok());
+    }
+
+    #[tokio::test]
+    async fn inconclusive_status_lookup_keeps_the_cap_slot() {
+        use async_trait::async_trait;
+        use konsensus_core::traits::lightning::{
+            Invoice, LightningError, LightningProvider as LP, PaymentDetails,
+        };
+        use std::sync::Arc;
+
+        struct LookupFails {
+            inventory: Vec<(String, u64)>,
+        }
+
+        #[async_trait]
+        impl LP for LookupFails {
+            async fn receive_invoice_capable(&self) -> bool {
+                true
+            }
+            async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+                Ok(self.inventory.clone())
+            }
+            async fn get_payment_status(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+                Err(LightningError::PaymentNotFound("missing".into()))
+            }
+            async fn create_invoice(
+                &self,
+                _: u64,
+                _: &str,
+                _: u32,
+            ) -> Result<Invoice, LightningError> {
+                Err(LightningError::Backend("unused".into()))
+            }
+            async fn pay_invoice(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+                Err(LightningError::Backend("unused".into()))
+            }
+            async fn get_balance_msat(&self) -> Result<u64, LightningError> {
+                Ok(0)
+            }
+            async fn is_available(&self) -> bool {
+                true
+            }
+        }
+
+        let lightning: Arc<dyn LightningProvider> = Arc::new(LookupFails {
+            inventory: vec![("aa".repeat(32), 9_999)],
+        });
+        let mut book = PeerInvoiceBook::default();
+        for n in 0..PEER_OUTSTANDING_CAP {
+            book.commit(peer(1), format!("open-{n}"), 120);
+        }
+        let result = reconcile(book.clone(), lightning, 0).await;
+        book.apply_reconciliation(result);
+        assert!(book.try_issue(&peer(2), Instant::now(), 0).is_ok());
+        assert_eq!(
+            book.rows
+                .iter()
+                .filter(|row| row.peer == Some(peer(1)))
+                .count(),
+            PEER_OUTSTANDING_CAP
+        );
+        assert_eq!(
+            book.try_issue(&peer(1), Instant::now(), 0),
+            Err(InvoiceLimit::PeerOutstanding)
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_capable_backends_reconcile_without_money_ready() {
+        use async_trait::async_trait;
+        use konsensus_core::traits::lightning::{
+            Invoice, LightningError, LightningProvider as LP, PaymentDetails,
+        };
+        use std::sync::Arc;
+
+        struct ReceiveOnly;
+
+        #[async_trait]
+        impl LP for ReceiveOnly {
+            async fn money_ready(&self) -> bool {
+                false
+            }
+            async fn receive_invoice_capable(&self) -> bool {
+                true
+            }
+            async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+                Ok(vec![("bb".repeat(32), 500)])
+            }
+            async fn create_invoice(
+                &self,
+                _: u64,
+                _: &str,
+                _: u32,
+            ) -> Result<Invoice, LightningError> {
+                Err(LightningError::Backend("unused".into()))
+            }
+            async fn pay_invoice(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+                Err(LightningError::Backend("unused".into()))
+            }
+            async fn get_payment_status(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+                Err(LightningError::PaymentNotFound("missing".into()))
+            }
+            async fn get_balance_msat(&self) -> Result<u64, LightningError> {
+                Ok(0)
+            }
+            async fn is_available(&self) -> bool {
+                true
+            }
+        }
+
+        let lightning: Arc<dyn LightningProvider> = Arc::new(ReceiveOnly);
+        let mut book = PeerInvoiceBook::default();
+        let result = reconcile(book.clone(), lightning, 0).await;
+        book.apply_reconciliation(result);
+        assert!(book.try_issue(&peer(1), Instant::now(), 0).is_ok());
+        assert!(book.rows.iter().any(|row| row.hash == "bb".repeat(32)));
     }
 
     #[test]

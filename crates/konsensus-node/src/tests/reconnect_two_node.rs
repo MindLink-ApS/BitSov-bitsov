@@ -494,6 +494,7 @@ async fn start_recipient(
                         &super::ReadinessHeightCache::new(Arc::new(
                             konsensus_chain::MockChainProvider::new(),
                         )),
+                        &super::ConfiguredPriceCeilingCache::new(),
                         &lightning,
                         &transport,
                         &recipient,

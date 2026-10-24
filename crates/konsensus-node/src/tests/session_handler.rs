@@ -1306,6 +1306,7 @@ async fn invoice_requested_creates_invoice_on_local_wallet() {
         25_000,
         "konsensus message",
         &admission_pricing(),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
         &lightning,
         &transport,
         "127.0.0.1".parse().unwrap(),
@@ -1361,6 +1362,7 @@ async fn invoice_requested_sends_error_on_lightning_failure() {
         25_000,
         "konsensus message",
         &admission_pricing(),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
         &lightning,
         &transport,
         "127.0.0.1".parse().unwrap(),
@@ -1397,6 +1399,7 @@ async fn privileged_invoice_amount_is_clamped_to_configured_price() {
         true,
         &pricing,
         &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
         &lightning,
         &transport,
         &test_peer_id(),
@@ -1416,6 +1419,7 @@ async fn privileged_invoice_amount_is_clamped_to_configured_price() {
         true,
         &pricing,
         &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
         &lightning,
         &transport,
         &test_peer_id(),
@@ -1458,6 +1462,7 @@ async fn issue_privileged_invoice(
         true,
         pricing,
         &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
         lightning,
         transport,
         &test_peer_id(),
@@ -1603,7 +1608,10 @@ async fn settled_peer_invoice_frees_its_slot_and_remains_in_the_wallet() {
         crate::peer_invoices::PEER_OUTSTANDING_CAP
     );
     lightning.pay_invoice(&paid.bolt11).await.unwrap();
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let result = crate::peer_invoices::reconcile(invoices.clone(), lightning.clone(), now).await;
     invoices.apply_reconciliation(result);
     issue_privileged_invoice(
@@ -1627,6 +1635,27 @@ async fn settled_peer_invoice_frees_its_slot_and_remains_in_the_wallet() {
         .unwrap();
     assert_eq!(settled.status, PaymentStatus::Settled);
     assert_eq!(settled.direction, PaymentDirection::Incoming);
+}
+
+#[tokio::test]
+async fn zero_amount_service_invoice_is_refused_without_wallet_work() {
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+    let mut invoices = ready_invoice_book().await;
+    issue_privileged_invoice(
+        &test_peer_id(),
+        "zero",
+        0,
+        "konsensus message",
+        &lightning,
+        &transport,
+        &pricing,
+        &mut invoices,
+    )
+    .await;
+    assert!(lightning.list_payments(10).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1676,6 +1705,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
         false,
         &pricing,
         &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
         &lightning,
         &transport,
         &test_peer_id(),
@@ -1716,6 +1746,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
             false,
             &pricing,
             &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            &crate::session_handler::ConfiguredPriceCeilingCache::new(),
             &lightning,
             &transport,
             &test_peer_id(),
@@ -1924,6 +1955,7 @@ async fn stranger_cannot_quote_file_or_other_service_kinds() {
             false,
             &pricing,
             &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            &crate::session_handler::ConfiguredPriceCeilingCache::new(),
             &lightning,
             &transport,
             &test_peer_id(),
@@ -2190,6 +2222,7 @@ async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
         false,
         &admission_pricing(),
         &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
         &provider,
         &target,
         &recipient,
@@ -2281,6 +2314,7 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
                         &ReadinessHeightCache::new(Arc::new(
                             konsensus_chain::MockChainProvider::new(),
                         )),
+                        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
                         &lightning,
                         &target,
                         &recipient,
@@ -3995,10 +4029,18 @@ async fn peer_rejection_logs_strip_controls_at_downstream_handlers() {
     use tracing_subscriber::layer::SubscriberExt;
     struct Reasons(Arc<std::sync::Mutex<Vec<String>>>);
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Reasons {
-        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
             struct Fields<'a>(&'a mut Vec<String>);
             impl tracing::field::Visit for Fields<'_> {
-                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
                     if field.name() == "reason" {
                         self.0.push(format!("{value:?}"));
                     }
@@ -4014,13 +4056,22 @@ async fn peer_rejection_logs_strip_controls_at_downstream_handlers() {
     let (ws_tx, mut ws_rx) = broadcast::channel(4);
     let reason = "peer\n\r\x1b\u{85}\u{2028}\u{2029}reason";
     handle_message_rejected(
-        &test_peer_id(), &konsensus_core::MessageId::from_bytes([0; 32]),
-        reason, &routing, &ws_tx, false,
-    ).await;
+        &test_peer_id(),
+        &konsensus_core::MessageId::from_bytes([0; 32]),
+        reason,
+        &routing,
+        &ws_tx,
+        false,
+    )
+    .await;
     handle_invoice_error_received(
-        &test_peer_id(), "log-test", reason, true,
+        &test_peer_id(),
+        "log-test",
+        reason,
+        true,
         &tokio::sync::Mutex::new(std::collections::HashMap::new()),
-    ).await;
+    )
+    .await;
     assert_eq!(ws_rx.recv().await.unwrap().reason.as_deref(), Some(reason));
     let captured = captured.lock().unwrap();
     assert_eq!(captured.len(), 2);
@@ -4263,12 +4314,26 @@ async fn session_decode_logs_do_not_echo_peer_json() {
     // include this string, while the peer-facing adapter must discard it.
     let hostile = serde_json::json!("peer-controlled-secret");
     handle_prekey_offer(
-        &peer, hostile.clone(), *identity.node_id(), &manager, &storage,
-        &transport, &audit, &mut negotiations,
-    ).await;
+        &peer,
+        hostile.clone(),
+        *identity.node_id(),
+        &manager,
+        &storage,
+        &transport,
+        &audit,
+        &mut negotiations,
+    )
+    .await;
     handle_session_init(
-        &peer, hostile, &manager, &storage, &transport, &audit, &mut negotiations,
-    ).await;
+        &peer,
+        hostile,
+        &manager,
+        &storage,
+        &transport,
+        &audit,
+        &mut negotiations,
+    )
+    .await;
     assert!(!manager.has_session(&peer).await);
     assert!(negotiations.is_empty());
     assert_eq!(
@@ -4308,9 +4373,16 @@ impl LightningProvider for SlowInvoiceStatus {
         konsensus_core::traits::lightning::LightningError,
     > {
         if hash == "closed" {
-            return Err(
-                konsensus_core::traits::lightning::LightningError::PaymentNotFound(hash.into()),
-            );
+            return Ok(konsensus_core::traits::lightning::PaymentDetails {
+                payment_hash: hash.to_string(),
+                preimage: Some("00".repeat(32)),
+                amount_msat: 1,
+                status: konsensus_core::traits::lightning::PaymentStatus::Settled,
+                direction: konsensus_core::traits::lightning::PaymentDirection::Incoming,
+                timestamp: 0,
+                memo: None,
+                fee_msat: None,
+            });
         }
         std::future::pending().await
     }

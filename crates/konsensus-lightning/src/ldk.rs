@@ -1138,7 +1138,10 @@ impl LdkProvider {
     }
 
     fn remember_invoice_expiry(&self, hash: &str, expires_at: u64) -> Result<(), LightningError> {
-        let mut map = self.invoice_expiries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .invoice_expiries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.insert(hash.to_string(), expires_at);
         if let Some(path) = &self.invoice_expiry_path {
             store_invoice_expiries(path, &map)?;
@@ -1147,7 +1150,10 @@ impl LdkProvider {
     }
 
     fn take_due_invoice_expiries(&self, now_unix: u64) -> Vec<String> {
-        let map = self.invoice_expiries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self
+            .invoice_expiries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.iter()
             .filter(|(_, expires_at)| **expires_at <= now_unix)
             .map(|(hash, _)| hash.clone())
@@ -1155,7 +1161,10 @@ impl LdkProvider {
     }
 
     fn clear_invoice_expiry(&self, hash: &str) -> Result<(), LightningError> {
-        let mut map = self.invoice_expiries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .invoice_expiries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The wallet record is already absent or terminal. Drop its memory
         // entry even if the durable clear fails, so repeated failed issuance
         // cannot accumulate phantom holds. Load reconciliation removes any
@@ -1447,10 +1456,7 @@ impl LdkProvider {
                     "LDK: payment failed"
                 );
             }
-            ldk_node::Event::ChannelReady {
-                channel_id,
-                ..
-            } => {
+            ldk_node::Event::ChannelReady { channel_id, .. } => {
                 info!(channel_id = %channel_id, "LDK: channel ready");
             }
             ldk_node::Event::ChannelClosed {
@@ -1603,29 +1609,69 @@ impl Drop for LdkProvider {
 
 #[async_trait]
 impl LightningProvider for LdkProvider {
-    fn starter_network(&self) -> Option<String> { Some(self.node.config().network.to_string()) }
-    async fn sign_message(&self, message: &[u8]) -> Result<String, LightningError> { Ok(self.node.sign_message(message)) }
-    async fn verify_message(&self, message: &[u8], signature: &str, pubkey: &str) -> Result<bool, LightningError> {
-        let Ok(key) = pubkey.parse() else { return Ok(false); };
+    fn starter_network(&self) -> Option<String> {
+        Some(self.node.config().network.to_string())
+    }
+    async fn sign_message(&self, message: &[u8]) -> Result<String, LightningError> {
+        Ok(self.node.sign_message(message))
+    }
+    async fn verify_message(
+        &self,
+        message: &[u8],
+        signature: &str,
+        pubkey: &str,
+    ) -> Result<bool, LightningError> {
+        let Ok(key) = pubkey.parse() else {
+            return Ok(false);
+        };
         Ok(self.node.verify_signature(message, signature, &key))
     }
-    async fn connect_peer(&self, pubkey: &str, address: &str, persist: bool) -> Result<(), LightningError> {
-        let key = pubkey.parse().map_err(|_| LightningError::PaymentNotDispatched("invalid peer key".into()))?;
-        let address = address.parse().map_err(|_| LightningError::PaymentNotDispatched("invalid peer address".into()))?;
+    async fn connect_peer(
+        &self,
+        pubkey: &str,
+        address: &str,
+        persist: bool,
+    ) -> Result<(), LightningError> {
+        let key = pubkey
+            .parse()
+            .map_err(|_| LightningError::PaymentNotDispatched("invalid peer key".into()))?;
+        let address = address
+            .parse()
+            .map_err(|_| LightningError::PaymentNotDispatched("invalid peer address".into()))?;
         let node = self.node.clone();
-        tokio::task::spawn_blocking(move || node.connect(key,address,persist)).await
+        tokio::task::spawn_blocking(move || node.connect(key, address, persist))
+            .await
             .map_err(|_| LightningError::Backend("peer worker failed".into()))?
             .map_err(|_| LightningError::Backend("peer connection failed".into()))
     }
-    async fn list_peers(&self) -> Result<Vec<konsensus_core::traits::lightning::LightningPeer>, LightningError> {
-        Ok(self.node.list_peers().into_iter().map(|p| konsensus_core::traits::lightning::LightningPeer { pubkey:p.node_id.to_string(),address:p.address.to_string(),connected:p.is_connected }).collect())
+    async fn list_peers(
+        &self,
+    ) -> Result<Vec<konsensus_core::traits::lightning::LightningPeer>, LightningError> {
+        Ok(self
+            .node
+            .list_peers()
+            .into_iter()
+            .map(|p| konsensus_core::traits::lightning::LightningPeer {
+                pubkey: p.node_id.to_string(),
+                address: p.address.to_string(),
+                connected: p.is_connected,
+            })
+            .collect())
     }
     async fn suppress_peer_address(&self, pubkey: &str) -> Result<(), LightningError> {
-        let key = pubkey.parse().map_err(|_| LightningError::PaymentNotDispatched("invalid peer key".into()))?;
-        self.node.suppress_peer_address(key).map_err(|_| LightningError::PaymentNotDispatched("peer privacy persistence failed".into()))
+        let key = pubkey
+            .parse()
+            .map_err(|_| LightningError::PaymentNotDispatched("invalid peer key".into()))?;
+        self.node.suppress_peer_address(key).map_err(|_| {
+            LightningError::PaymentNotDispatched("peer privacy persistence failed".into())
+        })
     }
     async fn channel_is_ready(&self, id: &str) -> Result<bool, LightningError> {
-        Ok(self.node.list_channels().iter().any(|c| c.channel_id.to_string()==id && c.is_channel_ready))
+        Ok(self
+            .node
+            .list_channels()
+            .iter()
+            .any(|c| c.channel_id.to_string() == id && c.is_channel_ready))
     }
 
     fn channel_safety(&self) -> Option<konsensus_core::traits::lightning::ChannelSafetyStatus> {
@@ -1801,11 +1847,16 @@ impl LightningProvider for LdkProvider {
     }
 
     async fn forget_pending_invoice(&self, payment_hash: &str) -> Result<bool, LightningError> {
-        let Ok(bytes) = hex::decode(payment_hash) else { return Ok(false); };
-        if bytes.len() != 32 { return Ok(false); }
+        let Ok(bytes) = hex::decode(payment_hash) else {
+            return Ok(false);
+        };
+        if bytes.len() != 32 {
+            return Ok(false);
+        }
         let payment = self.node.list_payments().into_iter().find(|payment| {
             payment.direction == ldk_node::payment::PaymentDirection::Inbound
-                && payment_hash_from_kind(&payment.kind).is_some_and(|hash| hash.0.as_slice() == bytes.as_slice())
+                && payment_hash_from_kind(&payment.kind)
+                    .is_some_and(|hash| hash.0.as_slice() == bytes.as_slice())
         });
         let Some(payment) = payment else {
             self.clear_invoice_expiry(payment_hash)?;
@@ -1816,9 +1867,12 @@ impl LightningProvider for LdkProvider {
             return Ok(false);
         }
         let payment_id = payment.id;
-        let removed = self.node.remove_pending_inbound_payment(&payment_id).map_err(|error| {
-            LightningError::Backend(format!("LDK pending payment removal failed: {error}"))
-        })?;
+        let removed = self
+            .node
+            .remove_pending_inbound_payment(&payment_id)
+            .map_err(|error| {
+                LightningError::Backend(format!("LDK pending payment removal failed: {error}"))
+            })?;
         self.clear_invoice_expiry(payment_hash)?;
         Ok(removed)
     }
@@ -1835,8 +1889,14 @@ impl LightningProvider for LdkProvider {
     }
 
     async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
-        let map = self.invoice_expiries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(map.iter().map(|(hash, expires_at)| (hash.clone(), *expires_at)).collect())
+        let map = self
+            .invoice_expiries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(map
+            .iter()
+            .map(|(hash, expires_at)| (hash.clone(), *expires_at))
+            .collect())
     }
 
     async fn create_stateless_invoice(
@@ -2605,7 +2665,10 @@ fn load_invoice_expiries(
     // Both legacy and atomic writers terminate every record with a newline.
     // A crash may truncate inside the decimal expiry; that is still a valid
     // integer, but is not a committed record and must use orphan recovery.
-    for line in text.split_inclusive('\n').filter(|line| line.ends_with('\n')) {
+    for line in text
+        .split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+    {
         let mut parts = line.split_whitespace();
         let (Some(hash), Some(expires_at)) = (parts.next(), parts.next()) else {
             continue;
@@ -2622,11 +2685,32 @@ fn load_invoice_expiries(
     Ok(map)
 }
 
+/// Service invoices use the peer cap expiry; LSPS2 funding previews are Bolt11Jit
+/// and never occupy the service-invoice sidecar.
+const SERVICE_INVOICE_ORPHAN_SECS: u64 = 120;
+
+fn legacy_orphan_expiry_guess(timestamp: u64) -> u64 {
+    timestamp.saturating_add(u64::from(u32::MAX))
+}
+
+pub(crate) fn migrate_service_invoice_expiry(
+    recorded: Option<u64>,
+    latest_update_timestamp: u64,
+) -> u64 {
+    let min_payable = latest_update_timestamp.saturating_add(SERVICE_INVOICE_ORPHAN_SECS);
+    match recorded {
+        Some(expires_at) if expires_at >= legacy_orphan_expiry_guess(latest_update_timestamp) => {
+            min_payable
+        }
+        Some(expires_at) => expires_at.max(min_payable),
+        None => min_payable,
+    }
+}
+
 /// Repair the existing sidecar against durable wallet state, without a schema
-/// migration. LDK does not retain BOLT11 expiry in PaymentDetails. If metadata
-/// was lost (including a crash between receive and sidecar commit), count the
-/// invoice until the maximum lifetime accepted by our u32 expiry API. Never
-/// guess a shorter expiry and delete a still-payable invoice.
+/// migration. LDK does not retain BOLT11 expiry in PaymentDetails. Missing
+/// metadata uses a short orphan window for cap accounting; legacy rows that
+/// used the u32::MAX orphan guess are clamped on load.
 fn reconcile_invoice_expiries(
     node: &ldk_node::Node,
     mut recorded: std::collections::HashMap<String, u64>,
@@ -2640,16 +2724,17 @@ fn reconcile_invoice_expiries(
                 return None;
             }
             let hash = match &payment.kind {
-                LdkPaymentKind::Bolt11 { hash, .. } | LdkPaymentKind::Bolt11Jit { hash, .. } => {
-                    hex::encode(hash.0)
+                LdkPaymentKind::Bolt11 { hash, .. } => hex::encode(hash.0),
+                LdkPaymentKind::Bolt11Jit { hash, .. } => {
+                    recorded.remove(&hex::encode(hash.0));
+                    return None;
                 }
                 _ => return None,
             };
-            let expires_at = recorded.remove(&hash).unwrap_or_else(|| {
-                payment
-                    .latest_update_timestamp
-                    .saturating_add(u64::from(u32::MAX))
-            });
+            let expires_at = migrate_service_invoice_expiry(
+                recorded.remove(&hash),
+                payment.latest_update_timestamp,
+            );
             Some((hash, expires_at))
         })
         .collect()

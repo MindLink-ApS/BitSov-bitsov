@@ -191,6 +191,7 @@ async fn connects_with_header_only_and_reports_preview_status() {
     assert_eq!(provider.get_node_pubkey().await.as_deref(), Some(PUBKEY));
     assert!(!provider.is_payment_capable().await);
     assert!(!provider.money_ready().await);
+    assert!(provider.receive_invoice_capable().await);
     assert!(!provider.readiness().await.money_ready);
     for request in server.requests.lock().unwrap().iter() {
         let (head, body) = request.split_once("\r\n\r\n").unwrap();
