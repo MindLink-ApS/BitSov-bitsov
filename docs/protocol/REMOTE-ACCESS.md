@@ -219,7 +219,7 @@ use the bridge's loopback source address to mint an unbound local JWT. Apps
 obtain and present ordinary paired JWTs through `GET /api/v1/pair/challenge`
 and `POST /api/v1/pair/token`; `POST /api/v1/pair/rotate` remains available.
 
-It also exposes exactly these spend-request/read routes, using the same
+It also exposes these spend-request/read and signed-intent routes, using the same
 handlers and authorization as loopback:
 
 | Method | Path | Effect |
@@ -228,11 +228,22 @@ handlers and authorization as loopback:
 | GET | `/api/v1/pair/elevation/{op_id}` | Read only the caller's operation status; other clients' IDs return the same 404 as unknown IDs |
 | DELETE | `/api/v1/pair/elevation/{op_id}` | Cancel the caller's own pending request |
 | GET | `/api/v1/pair/grant` | Read the caller's own live grant, or `null` |
+| POST | `/api/v1/pair/relation-intent` | Write a contact budget with a registered device key's signature bound to the node, client and device key ID, plus a fresh nonce; the server enforces the key record's epoch against the token epoch |
 
-All require `read`; asking, cancelling and reading a grant also require a live
-paired-client binding. No remote grant/approve handler is mounted, including
-first-contact grants, device-key management or relation intents. The owner
-still grants spend through `<data_dir>/control.sock`.
+All require `read`; asking, cancelling, reading a grant and submitting an intent
+also require a live paired-client binding. Provisional sessions cannot submit
+relation intents. `/pair/approve` and `POST /pair/first-contact-grant` remain
+absent remotely, as does device-key self-revocation. Console spend grants still
+require `<data_dir>/control.sock`. Non-2xx relation-intent responses log only the
+path, HTTP status, numeric code and a fixed refusal reason at info level, never
+bodies, keys, signatures or nonces. The reason is internal logging metadata;
+HTTP responses retain their existing codes and messages.
+
+The v1 signed message has no epoch field. Epoch binding comes from the registered
+key record and the token; an epoch bump invalidates registered keys. If the same
+public key is approved again in a new epoch within the clock window, an unused
+captured v1 intent can still verify. The clock window remains ±300 seconds; a
+fast device clock can therefore extend acceptance to 10 minutes of node time.
 
 A read-only pairing may obtain a first-contact price via
 `POST /api/v1/messages/first-contact/quote` before requesting spend. This remains

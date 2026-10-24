@@ -3,11 +3,8 @@
 use std::path::Path;
 
 pub async fn run(test: &str, dir: &Path, endpoint: &str, primary: &str, fallback: &str) -> String {
-    const {
-        assert!(
-            cfg!(any(target_os = "macos", target_os = "linux")),
-            "the no-fallback network guard requires macOS or Linux"
-        );
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        panic!("the no-fallback network guard requires macOS or Linux");
     }
     let library = dir.join(if cfg!(target_os = "macos") {
         "guard.dylib"

@@ -756,7 +756,9 @@ pub fn routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
 /// file-challenge ceremony and owner-management routes are not exposed here.
 /// Device-key requests, status, cancellation and listing confer no authority;
 /// owner-device ticket issuance and SAS delegation require an enrolled key.
-/// Console approval, key revocation and relation intents stay owner-local.
+/// Relation intents require a registered device key's signature bound to the
+/// node, client and epoch, with a fresh nonce; provisional sessions cannot use
+/// them. Console approval, key revocation and first-contact grants stay owner-local.
 /// Locked mode uses its own four-route router, never this one.
 pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
     if !pairing_enabled {
@@ -825,6 +827,10 @@ pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
         .route(
             "/api/v1/pair/device-keys",
             get(super::device_routes::list_device_keys),
+        )
+        .route(
+            "/api/v1/pair/relation-intent",
+            post(super::device_routes::relation_intent),
         )
 }
 

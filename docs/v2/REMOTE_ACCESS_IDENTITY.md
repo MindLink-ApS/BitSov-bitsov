@@ -124,7 +124,7 @@ Primary device (D_p, has mnemonic)        New device (D_n)
 
 The user's instinct ("Lightning transaction from a whitelisted pubkey") is **not** needed for cryptographic authentication — Ed25519 signature suffices. But it has legitimate use: **anti-Sybil at relay onboarding**.
 
-Recommendation: at **first pairing to a new relay**, the user's home node issues a 1-sat keysend to the relay's pubkey, with TLV payload binding the keysend to `(identity_pubkey, device_pubkey, issued_at)`. Relay records this as one-shot proof-of-funds. Future devices paired to **same** identity inherit this anchor — no per-device keysend.
+Recommendation: at **first pairing to a new relay**, the user's home node issues a 1-sat keysend to the relay's pubkey, with TLV payload binding the keysend to `(identity_pubkey, device_pubkey, issued_at)`. Relay records this as one-shot proof-of-funds. Future devices paired to **same** identity inherit this proof-of-funds — no per-device keysend. The keysend shows that the identity holder controls spendable sats; it does not define or anchor the identity, which is the Ed25519 key.
 
 This is **not** auth (auth is the Ed25519 signature). It is admission policy. Relay operator may waive for known whitelisted identities.
 
@@ -244,7 +244,7 @@ The whitelist is small append-only log of `DeviceAttestation` + `DeviceRevocatio
 
 - **Primary copy:** user's home node(s) hold canonical state
 - **Relay copy:** stores log as **opaque AES-256-GCM ciphertext** keyed by `NodeIdentity::aes_key()` of the user. Relay cannot read; only confirms "signature came from key the user's biscuit-root authorized" — proven by biscuit, not whitelist.
-- **No on-chain storage** — Bitcoin OP_RETURN doesn't scale to 5M devices × N revocations. Reserve chain for genuine timestamp anchors (identity birth certificate — §C).
+- **No on-chain storage** — Bitcoin OP_RETURN doesn't scale to 5M devices × N revocations. At most, the chain could timestamp a recovery event (§C); identity itself stays in keys, never on-chain.
 - **No "primary must be online":** attestation is self-verifying offline. Primary only needed when **adding** or **revoking**.
 
 Matches Cell Test (DNA in nucleus = whitelist in home nodes; receptors on surface = attestations on devices); scales (~5 KB ciphertext per tenant); no third party; sovereignty-preserving (relay can't enumerate user's devices).
@@ -289,7 +289,7 @@ Maya loses every device, has only 24 words.
 - Every identity has `birth_cert`: `{ identity_pubkey, generation: u64, issued_at, signature_by_mnemonic_key }`. Generation increments **only on mnemonic recovery** (legitimately wipes whitelist). New generation invalidates **all** prior attestations + revocations under that identity.
 - birth_cert anchored lazily in **federation gossip envelope** (not on-chain — too slow for recovery). Relays accept higher-generation birth_cert from legitimate mnemonic.
 - After recovery: walk relay re-onboarding once per relay (one Lightning keysend, §2.4). Past **channels** recovered via LDK's `keys_manager` + same mnemonic — already in L5d recovery drill. **Channel recovery and identity recovery share mnemonic; don't need to share recovery flow.**
-- **Bitcoin anchor (optional, future ADR):** publish `blake3(birth_cert)` in OP_RETURN at generation creation. Relays refuse generation bump unless seeing anchor in confirmed Bitcoin tx ≥ N blocks deep. Defeats "attacker stole mnemonic, rotates whitelist faster than user reacts" — gives user window to publish own anchor first. **Do not require for v2; design field, leave optional.**
+- **Bitcoin timestamp (optional, future ADR; this would timestamp a generation bump, not define the identity — Bitcoin anchors energy and admission, never identity):** publish `blake3(birth_cert)` in OP_RETURN at generation creation. Relays refuse generation bump unless seeing anchor in confirmed Bitcoin tx ≥ N blocks deep. Defeats "attacker stole mnemonic, rotates whitelist faster than user reacts" — gives user window to publish own anchor first. **Do not require for v2; design field, leave optional.**
 
 ### D. Pairing without prior contact (new user) — **Layer 0: install ⇒ generate**
 
@@ -333,7 +333,7 @@ If she has neither mnemonic nor paired device: **cannot access BitSov.** Correct
 | L1 — pairing new device | **No** | Signature sufficient. LN here would block legitimate user mid-pairing if channel closed. |
 | L2 — establishing session | **No** | 5M LN payments/day to log in × 1M users × 5 devices. Breaks Lightning UX. |
 | L3 — per request | **Never** | Explicit Principle-2 boundary: payment gates **messages**, not authentication. |
-| First connection to new relay | **Yes — one 1-sat keysend** | Anti-Sybil + ties identity to Bitcoin-spendable key. Relay's policy. |
+| First connection to new relay | **Yes — one 1-sat keysend** | Anti-Sybil admission: proves the identity holder controls spendable sats. It does not bind identity to Bitcoin. Relay's policy. |
 | Recovery from mnemonic | **No for identity, yes for channels** | Identity recovery is signature-only. Channel recovery uses BIP-32 LDK paths (separate flow, L5d). |
 | Generation bump | **Not required, recommended OP_RETURN anchor** | See §C. |
 | Borrowed-browser | **No** | Cost is typing mnemonic, not sats. |

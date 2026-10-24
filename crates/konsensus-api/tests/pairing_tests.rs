@@ -1872,7 +1872,7 @@ async fn remote_elevation_routes_require_auth_and_approval_routes_are_absent() {
     for path in [
         "/api/v1/pair/grant", "/api/v1/pair/elevation/unknown",
         "/api/v1/pair/elevation/unknown/grant", "/api/v1/pair/approve",
-        "/api/v1/pair/first-contact-grant", "/api/v1/pair/relation-intent",
+        "/api/v1/pair/first-contact-grant",
         "/api/v1/pair/device-key/request", "/api/v1/identity/approve-replacement",
     ] {
         let (status, _) = post(&app, path, serde_json::json!({}), Some(&owner)).await;
