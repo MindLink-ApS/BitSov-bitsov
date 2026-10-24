@@ -3,6 +3,15 @@
 > **Status:** Architectural revelation — supersedes COMMS_STACK_ANALYSIS.md
 > **Date:** 2026-03-11
 > **Principle:** One protocol. Typed payloads. Payment-gated transport. Topology-driven intelligence.
+>
+> **Public-beta note (2026-10-23):** this is the design vision, not a status
+> report. Shipped today: the UKM envelope, the kind registry and the payment
+> gate, in a closed beta on signet test nodes. Not shipped: the real-time media
+> transport inside the node (calls are a regtest-proven prototype whose media
+> goes app to app, see `CALLS-PROTOTYPE.md`), relay store-and-forward as a
+> service (relay code is default-off and unpromoted; `RELAY_PROTOCOL.md` is
+> Proposed), offline delivery, CRDT sync, Tor and DHT discovery, and the crate
+> layout in §8. Nothing here is scale-tested.
 
 ---
 

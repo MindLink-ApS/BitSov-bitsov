@@ -1,7 +1,9 @@
 # BitSov/Konsensus v2 — Core Stack Specification
 
-> **Status:** At rest — pending v1 field testing
-> **Related:** [PRD.md](PRD.md) | [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) | [CURRENT_GAPS.md](CURRENT_GAPS.md)
+> **Status:** Historical v2 design reference. It describes a design target, not
+> the shipped node. Nothing below is a claim that a feature exists today.
+> **Related:** the PRD, development plan and gap list it cites are not in this
+> public tree.
 
 > **Public-core note (2026-05-20):** This is an early v2 reference document.
 > The launch boundary is now governed by `CHARTER.md`,
@@ -10,6 +12,16 @@
 > Full/Infrastructure resource profiles, not custodial hosting. Any hosted or
 > relay deployment must remain non-custodial: user-held identity keys,
 > encrypted storage, and ciphertext-only relay surfaces.
+
+> **Public-beta note (2026-10-23):** the node today is a closed beta on signet
+> test nodes (regtest for tests); mainnet is not supported for the public beta.
+> Not shipped, and described below only as design: PQXDH and MLS (the node uses
+> X3DH and the Double Ratchet), Tor hidden services and `.onion` peers, the
+> `[tor]` tables, DHT and `.well-known` discovery, Neutrino, gRPC Lightning
+> backends (CLN is a clnrest preview, see `docs/CLN.md`), and the Tier-2 relay
+> (see `RELAY_PROTOCOL.md`, Proposed). The identity model is keys: Bitcoin
+> anchors energy and admission, never identity. For what is reachable today see
+> `docs/operations/reachability.md`.
 
 ---
 
@@ -650,6 +662,9 @@ Sender Node                                              Recipient Node
 
 ## 5. End-to-End Encryption Stack
 
+> Design target. The shipped node uses X3DH and the Double Ratchet
+> (`crates/konsensus-crypto`); PQXDH and MLS are not implemented.
+
 ### 1:1 Messages — PQXDH (Post-Quantum Extended Diffie-Hellman)
 
 PQXDH extends the Signal protocol's X3DH with post-quantum key encapsulation (ML-KEM/Kyber), providing forward secrecy and post-quantum resistance.
@@ -748,7 +763,7 @@ Properties:
 
 ## 6. DNS-Free Discovery
 
-v2 supports multiple peer discovery mechanisms that operate concurrently. No single mechanism is required — nodes use whatever is available and configured.
+This design describes multiple peer discovery mechanisms that would operate concurrently. Today only static peers are shipped; `.well-known`, Tor and DHT discovery are not implemented, and endpoints are learned out of band (invites, QR codes, manual entry).
 
 ### Discovery Mechanisms
 
@@ -799,7 +814,7 @@ GET /.well-known/konsensus-server.json
 
 ### Tor Hidden Service
 
-Nodes can expose a Tor `.onion` address for DNS-free, censorship-resistant connectivity:
+In this design a node would expose a Tor `.onion` address for DNS-free, censorship-resistant connectivity. Not shipped: there is no `[tor]` table, SOCKS proxy or onion service today (`docs/operations/reachability.md`).
 
 ```toml
 [tor]
@@ -811,7 +826,7 @@ hidden_service = true
 
 ### DHT (Distributed Hash Table)
 
-Kademlia-based DHT for decentralized peer discovery:
+Kademlia-based DHT for decentralized peer discovery (design only; no DHT is implemented, and the design reasoning doc records it as an open question):
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -978,7 +993,7 @@ backend = "ldk"
 
 [lightning.ldk]
 channel_dir = "/var/lib/konsensus/channels"
-network = "mainnet"
+network = "signet"  # public beta: signet or regtest only
 # Auto-connect to well-known LSPs for initial channel
 auto_channel = true
 
@@ -1021,7 +1036,7 @@ provider = "bitcoind"
 rpc_url = "http://127.0.0.1:8332"
 rpc_user = "konsensus"
 rpc_password_file = "/var/lib/konsensus/bitcoind_rpc.pass"
-network = "mainnet"
+network = "signet"  # public beta: signet or regtest only
 
 [lightning]
 backend = "lnd"
@@ -1090,7 +1105,7 @@ provider = "bitcoind"
 rpc_url = "http://127.0.0.1:8332"
 rpc_user = "konsensus"
 rpc_password_file = "/var/lib/konsensus/bitcoind_rpc.pass"
-network = "mainnet"
+network = "signet"  # public beta: signet or regtest only
 # Archival node — no pruning
 txindex = true
 

@@ -30,7 +30,7 @@ const PER_HOUR: usize = 30;
 pub enum ApprovalRequest {
     /// Reset the requesting pairing's current grant; every term comes from the node.
     BreakerReset {},
-    /// A bounded ordinary spend window. Breakers cannot be weakened by the client.
+    /// A messaging budget. Explicit payments require separate owner approval.
     SpendGrant {
         /// Total budget in millisatoshis.
         budget_msat: u64,
@@ -103,6 +103,15 @@ impl ApprovalRequest {
                 ))
             }
             _ => {}
+        }
+        // Cap the request before presenting/signing it, so the receipt and
+        // the grant carry the same effective terms. Preserve tighter limits.
+        if let Self::SpendGrant {
+            per_call_max_msat, ..
+        } = &mut self
+        {
+            *per_call_max_msat =
+                (*per_call_max_msat).min(crate::spend_budget::MESSAGING_PER_CALL_MAX_MSAT);
         }
         Ok(self)
     }
