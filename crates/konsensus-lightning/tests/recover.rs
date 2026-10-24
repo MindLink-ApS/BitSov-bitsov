@@ -13,12 +13,27 @@ struct Chain {
     outputs: Mutex<Vec<FoundOutput>>,
     transactions: Mutex<Vec<ChainTransaction>>,
     sent: Mutex<Vec<Transaction>>,
+    /// Number of scripts requested by each `scan` call, in order.
+    scanned: Mutex<Vec<usize>>,
 }
 #[async_trait::async_trait]
 impl Scanner for Chain {
     type Error = ChainError;
-    async fn scan(&self, _: &[RecoveryScript]) -> Result<Vec<FoundOutput>, ChainError> {
-        Ok(self.outputs.lock().unwrap().clone())
+    async fn scan(&self, scripts: &[RecoveryScript]) -> Result<Vec<FoundOutput>, ChainError> {
+        self.scanned.lock().unwrap().push(scripts.len());
+        // Like a real chain source, only outputs on the requested scripts are visible.
+        Ok(self
+            .outputs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| {
+                scripts
+                    .iter()
+                    .any(|s| s.script_pubkey == o.txout.script_pubkey)
+            })
+            .cloned()
+            .collect())
     }
 }
 #[async_trait::async_trait]
@@ -115,6 +130,7 @@ fn fixture() -> (tempfile::TempDir, RecoveryKeys, Chain, Plan) {
             confirmations: 1,
         }]),
         sent: Mutex::new(vec![]),
+        scanned: Mutex::new(vec![]),
     };
     let plan = Plan::new(
         "node".into(),
@@ -388,4 +404,112 @@ fn verification_resumes_only_its_designated_new_store() {
     assert!(resumed.begin_verification("another hub".into()).is_err());
     std::fs::remove_file(dir.path().join("RECOVERY_STORE")).unwrap();
     assert!(Job::load_or_begin(dir.path(), plan, vec![]).is_err());
+}
+
+#[tokio::test]
+async fn seed_only_passes_poll_discovered_scripts_until_the_sweep_confirms() {
+    let (dir, keys, chain, plan) = fixture();
+    let mut job = Job::load_or_begin(dir.path(), plan.clone(), vec![]).unwrap();
+    chain.outputs.lock().unwrap()[0].confirmations = 0;
+    // First pass: every derived script, hub close still unconfirmed.
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[2000]);
+    // Later passes poll only the discovered output's script.
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+    chain.outputs.lock().unwrap()[0].confirmations = 1;
+    let Progress::SweepPreview { sweep, inputs } =
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap()
+    else {
+        panic!("preview");
+    };
+    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[2000, 1, 1]);
+    assert_eq!(inputs.len(), 1);
+    job.approve(&chain, sweep, inputs).await.unwrap();
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::Confirming { .. }
+    ));
+    // Broadcasting and confirming never scan the key space.
+    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[2000, 1, 1]);
+    chain
+        .transactions
+        .lock()
+        .unwrap()
+        .last_mut()
+        .unwrap()
+        .confirmations = 6;
+    // Once the sweep confirms, the next pass scans everything again so a late
+    // hub close on another channel is not stranded by the narrowed focus.
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::SelfTest
+    ));
+    let scanned = chain.scanned.lock().unwrap().clone();
+    assert_eq!(scanned.last(), Some(&2000), "{scanned:?}");
+    assert_eq!(scanned.iter().filter(|n| **n == 2000).count(), 2);
+}
+
+#[tokio::test]
+async fn narrowed_pass_that_finds_nothing_falls_back_to_a_full_scan() {
+    let (dir, keys, chain, plan) = fixture();
+    let mut job = Job::load_or_begin(dir.path(), plan.clone(), vec![]).unwrap();
+    chain.outputs.lock().unwrap()[0].confirmations = 0;
+    let unconfirmed = chain.outputs.lock().unwrap().clone();
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+    // The unconfirmed close is evicted before it confirms: the narrowed pass
+    // finds nothing and rescans every script within the same pass, so no
+    // decision is ever taken on a stale focus.
+    chain.outputs.lock().unwrap().clear();
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[2000, 1, 2000]);
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+    assert_eq!(
+        chain.scanned.lock().unwrap().as_slice(),
+        &[2000, 1, 2000, 2000]
+    );
+    // A restart always begins with a full pass: the focus is never persisted.
+    *chain.outputs.lock().unwrap() = unconfirmed;
+    job.advance(&chain, &keys, keys.scripts()).await.unwrap();
+    assert_eq!(
+        chain.scanned.lock().unwrap().as_slice(),
+        &[2000, 1, 2000, 2000, 2000]
+    );
+    drop(job);
+    let mut job = Job::load_or_begin(dir.path(), plan, vec![]).unwrap();
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+    assert_eq!(chain.scanned.lock().unwrap().last(), Some(&2000));
+}
+
+#[tokio::test]
+async fn backup_index_keeps_scanning_every_active_channel_script() {
+    let (dir, keys, chain, plan) = fixture();
+    // Three active channels in the backup; only one has closed so far.
+    let active = &keys.scripts()[..3];
+    let mut job = Job::load_or_begin(dir.path(), plan, vec![OutPoint::null()]).unwrap();
+    chain.outputs.lock().unwrap()[0].confirmations = 0;
+    for _ in 0..3 {
+        assert!(matches!(
+            job.advance(&chain, &keys, active).await.unwrap(),
+            Progress::WaitingForHub
+        ));
+    }
+    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[3, 3, 3]);
 }

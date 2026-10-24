@@ -8,6 +8,7 @@ pub use journal::{
 };
 use konsensus_chain::recovery::RecoveryChain;
 use konsensus_recovery::{BackupIndex, FoundOutput, RecoveryKeys, RecoveryScript};
+use std::borrow::Cow;
 
 #[derive(Debug)]
 pub enum Progress {
@@ -82,7 +83,14 @@ impl Job {
         if let Some(progress) = self.resume_sweeps(chain).await? {
             return Ok(progress);
         }
-        let outputs = chain.scan(scripts).await?;
+        let targets = self.scan_targets(scripts);
+        let mut outputs = chain.scan(&targets).await?;
+        if outputs.is_empty() && matches!(targets, Cow::Owned(_)) {
+            // The focused outputs are gone (spent, replaced or reorged): decide
+            // on a full scan in this same pass, never on a stale focus.
+            outputs = chain.scan(scripts).await?;
+        }
+        self.refocus(&outputs);
         if outputs.iter().any(|o| o.confirmations == 0) {
             return Ok(Progress::WaitingForHub);
         }
@@ -110,6 +118,41 @@ impl Job {
             return Ok(Progress::WaitingForHub);
         }
         Ok(Progress::SelfTest)
+    }
+
+    /// Seed-only recovery scans every derived script until a pass discovers hub
+    /// close outputs; later 30-second passes poll only those outputs' scripts,
+    /// so chain reads are bounded by what was found rather than by the 2000
+    /// derived scripts. A backup index already bounds the scan to its active
+    /// channels and is always scanned in full. An empty focus means a full scan.
+    fn scan_targets<'a>(&self, scripts: &'a [RecoveryScript]) -> Cow<'a, [RecoveryScript]> {
+        if self.focus.is_empty() {
+            return Cow::Borrowed(scripts);
+        }
+        let narrowed: Vec<_> = scripts
+            .iter()
+            .filter(|s| self.focus.contains(&s.script_pubkey))
+            .cloned()
+            .collect();
+        if narrowed.is_empty() {
+            Cow::Borrowed(scripts)
+        } else {
+            Cow::Owned(narrowed)
+        }
+    }
+
+    /// Focus the next pass on the scripts just discovered; nothing found means
+    /// the next pass is a full scan again.
+    fn refocus(&mut self, outputs: &[FoundOutput]) {
+        self.focus.clear();
+        if !self.funding().is_empty() {
+            return;
+        }
+        for output in outputs {
+            if !self.focus.contains(&output.txout.script_pubkey) {
+                self.focus.push(output.txout.script_pubkey.clone());
+            }
+        }
     }
 
     /// Resume previously authorized sweeps without opening/replacing any LDK
@@ -214,6 +257,9 @@ impl Job {
         self.authenticate_closes(chain, &inputs).await?;
         // Persist before the first possible broadcast, including an interrupted command.
         self.save_sweep(sweep, inputs)?;
+        // The approved inputs are about to be spent: once the sweep confirms, the
+        // next pass scans every script again so late hub closes are not missed.
+        self.focus.clear();
         Ok(())
     }
 }
