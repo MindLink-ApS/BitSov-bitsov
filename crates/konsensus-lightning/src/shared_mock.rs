@@ -149,21 +149,18 @@ impl LightningProvider for SharedMockProvider {
         }
         Ok(removed)
     }
-    async fn pending_invoice_expiries(&self) -> Vec<(String, u64)> {
-        let Ok(db) = self.db.lock() else { return Vec::new(); };
-        let Ok(mut stmt) = db.prepare("SELECT bolt11 FROM invoices WHERE recipient=?1 AND payer IS NULL") else {
-            return Vec::new();
-        };
-        let Ok(rows) = stmt.query_map(params![self.owner], |row| row.get::<_, String>(0)) else {
-            return Vec::new();
-        };
-        rows.filter_map(|row| row.ok()).filter_map(|bolt11| {
-            let invoice = bolt11.parse::<Bolt11Invoice>().ok()?;
-            let hash = invoice.payment_hash().to_string();
-            let expires_at = invoice.expires_at()?.as_secs();
-            Some((hash, expires_at))
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        let db = self.db.lock().map_err(|_| LightningError::Backend("invoice database lock poisoned".into()))?;
+        let mut stmt = db.prepare("SELECT bolt11 FROM invoices WHERE recipient=?1 AND payer IS NULL").map_err(err)?;
+        let rows = stmt.query_map(params![self.owner], |row| row.get::<_, String>(0)).map_err(err)?;
+        rows.map(|row| {
+            let bolt11 = row.map_err(err)?;
+            let invoice = bolt11.parse::<Bolt11Invoice>().map_err(err)?;
+            let expires_at = invoice.expires_at().ok_or_else(|| LightningError::Backend("invalid invoice expiry".into()))?.as_secs();
+            Ok((invoice.payment_hash().to_string(), expires_at))
         }).collect()
     }
+
     async fn create_stateless_invoice(
         &self, amount: u64, description: &str, expiry: u32,
     ) -> Result<Invoice, LightningError> {

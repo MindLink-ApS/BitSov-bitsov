@@ -6,6 +6,7 @@
 //! when the backend still has them as pending.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use konsensus_core::traits::lightning::{LightningError, LightningProvider, PaymentStatus};
@@ -25,12 +26,16 @@ pub(crate) const RATE_WINDOW: Duration = Duration::from_secs(10);
 pub(crate) const INVOICE_EXPIRY_SECS: u32 = 120;
 pub(crate) const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
+pub(crate) const RECONCILIATION_BUDGET: Duration = Duration::from_secs(2);
+const STATUS_BUDGET: Duration = Duration::from_millis(100);
+
 const MAX_RATE_PEERS: usize = 1024;
 const MAX_FORGET_RETRIES: usize = 64;
 
 /// Why a service invoice was refused. Callers answer with [`INVOICE_LIMITED`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvoiceLimit {
+    Recovering,
     Rate,
     PeerOutstanding,
     Global,
@@ -39,12 +44,12 @@ pub(crate) enum InvoiceLimit {
 impl InvoiceLimit {
     pub(crate) fn reason(self) -> &'static str {
         match self {
-            Self::Rate | Self::PeerOutstanding | Self::Global => INVOICE_LIMITED,
+            Self::Recovering | Self::Rate | Self::PeerOutstanding | Self::Global => INVOICE_LIMITED,
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Row {
     /// `None` is an invoice restored after restart. It counts toward the global
     /// cap only; this process no longer knows which peer asked for it.
@@ -53,8 +58,9 @@ struct Row {
     expires_at: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct PeerInvoiceBook {
+    reconciled: bool,
     rates: HashMap<NodeId, (Instant, usize)>,
     rows: Vec<Row>,
 }
@@ -68,6 +74,9 @@ impl PeerInvoiceBook {
         now: Instant,
         now_unix: u64,
     ) -> Result<(), InvoiceLimit> {
+        if !self.reconciled {
+            return Err(InvoiceLimit::Recovering);
+        }
         self.rates
             .retain(|_, (start, _)| now.saturating_duration_since(*start) < RATE_WINDOW);
         if self.outstanding(Some(peer), now_unix) >= PEER_OUTSTANDING_CAP {
@@ -100,11 +109,26 @@ impl PeerInvoiceBook {
 
     /// Count a still-pending invoice whose peer was not kept across restart.
     pub(crate) fn note_unattributed(&mut self, hash: String, expires_at: u64) {
+        if self.rows.iter().any(|row| row.hash == hash) {
+            return;
+        }
         self.rows.push(Row {
             peer: None,
             hash,
             expires_at,
         });
+    }
+
+    /// Merge only observations from the snapshot. Requests may have committed
+    /// new invoices while the worker was running; never replace the live book.
+    pub(crate) fn apply_reconciliation(&mut self, result: Reconciliation) {
+        self.reconciled = result.ready;
+        self.rows.retain(|row| !result.removed.contains(&row.hash));
+        for (hash, expires_at) in result.imported {
+            if !result.removed.contains(&hash) {
+                self.note_unattributed(hash, expires_at);
+            }
+        }
     }
 
     fn outstanding(&self, peer: Option<&NodeId>, now_unix: u64) -> usize {
@@ -113,6 +137,48 @@ impl PeerInvoiceBook {
             .filter(|row| now_unix < row.expires_at && peer.is_none_or(|id| row.peer == Some(*id)))
             .count()
     }
+}
+
+pub(crate) struct Reconciliation {
+    ready: bool,
+    imported: Vec<(String, u64)>,
+    removed: HashSet<String>,
+}
+
+/// One worker owns a snapshot, with a total budget independent of backend RPC
+/// timeouts. Cancellation conservatively retains any unconfirmed cap slots.
+/// Run in a separate task so no wallet lookup can stall control dispatch.
+pub(crate) async fn reconcile(
+    mut snapshot: PeerInvoiceBook,
+    lightning: Arc<dyn LightningProvider>,
+    now_unix: u64,
+) -> Reconciliation {
+    let mut result = Reconciliation {
+        ready: false,
+        imported: Vec::new(),
+        removed: HashSet::new(),
+    };
+    let mut before: HashSet<_> = snapshot.rows.iter().map(|row| row.hash.clone()).collect();
+    let _ = tokio::time::timeout(RECONCILIATION_BUDGET, async {
+        if !lightning.money_ready().await {
+            return;
+        }
+        let Ok(imported) = lightning.pending_invoice_expiries().await else {
+            return;
+        };
+        for (hash, expires_at) in &imported {
+            before.insert(hash.clone());
+            snapshot.note_unattributed(hash.clone(), *expires_at);
+        }
+        result.imported = imported;
+        result.ready = true;
+        purge_expired_peer_invoices(&mut snapshot, lightning.as_ref(), now_unix).await;
+    })
+    .await;
+    // Completed observations survive cancellation of the remaining sweep.
+    let after: HashSet<_> = snapshot.rows.iter().map(|row| row.hash.clone()).collect();
+    result.removed = before.difference(&after).cloned().collect();
+    result
 }
 
 /// Drop rows that are no longer an unpaid hold, then delete expired pending
@@ -131,15 +197,18 @@ pub(crate) async fn purge_expired_peer_invoices(
         .filter(|row| now_unix >= row.expires_at)
         .map(|row| row.hash.clone())
         .collect();
-    let mut forgotten = HashSet::new();
-    for hash in &expired {
-        match lightning.forget_pending_invoice(hash).await {
-            Ok(_) => {
-                forgotten.insert(hash.clone());
-            }
-            Err(error) => {
-                tracing::debug!(error = %error, "pending invoice cleanup will retry");
-            }
+    use futures::{stream, StreamExt};
+    let mut deletions = stream::iter(expired.into_iter().map(|hash| async move {
+        let forgotten = matches!(
+            tokio::time::timeout(STATUS_BUDGET, lightning.forget_pending_invoice(&hash)).await,
+            Ok(Ok(_))
+        );
+        (hash, forgotten)
+    }))
+    .buffer_unordered(8);
+    while let Some((hash, forgotten)) = deletions.next().await {
+        if forgotten {
+            book.rows.retain(|row| row.hash != hash);
         }
     }
     let mut failed = 0usize;
@@ -147,13 +216,15 @@ pub(crate) async fn purge_expired_peer_invoices(
         if now_unix < row.expires_at {
             return true;
         }
-        if forgotten.contains(&row.hash) {
-            return false;
-        }
         failed += 1;
         failed <= MAX_FORGET_RETRIES
     });
-    if let Err(error) = lightning.purge_expired_pending_invoices(now_unix).await {
+    if let Ok(Err(error)) = tokio::time::timeout(
+        STATUS_BUDGET,
+        lightning.purge_expired_pending_invoices(now_unix),
+    )
+    .await
+    {
         tracing::debug!(error = %error, "backend invoice expiry sweep failed");
     }
 }
@@ -161,25 +232,18 @@ pub(crate) async fn purge_expired_peer_invoices(
 /// A paid, failed, or missing invoice no longer holds a cap slot. The wallet
 /// record is left untouched here; expiry deletion is a separate step.
 async fn release_closed_rows(book: &mut PeerInvoiceBook, lightning: &dyn LightningProvider) {
-    let mut closed = HashSet::new();
-    for row in &book.rows {
-        match lightning.get_payment_status(&row.hash).await {
-            Ok(details) => match details.status {
-                PaymentStatus::Pending | PaymentStatus::InFlight => {}
-                PaymentStatus::Settled | PaymentStatus::Failed | PaymentStatus::Expired => {
-                    closed.insert(row.hash.clone());
-                }
-            },
-            Err(LightningError::PaymentNotFound(_)) => {
-                closed.insert(row.hash.clone());
-            }
-            Err(error) => {
-                tracing::debug!(error = %error, "leaving peer invoice slot until status is known");
-            }
+    use futures::{stream, StreamExt};
+    let mut statuses = stream::iter(book.rows.iter().map(|row| row.hash.clone()).collect::<Vec<_>>().into_iter().map(|hash| async move {
+        let status = tokio::time::timeout(STATUS_BUDGET, lightning.get_payment_status(&hash)).await;
+        let closed = matches!(status,
+            Ok(Ok(ref details)) if matches!(details.status, PaymentStatus::Settled | PaymentStatus::Failed | PaymentStatus::Expired))
+            || matches!(status, Ok(Err(LightningError::PaymentNotFound(_))));
+        (hash, closed)
+    })).buffer_unordered(8);
+    while let Some((hash, is_closed)) = statuses.next().await {
+        if is_closed {
+            book.rows.retain(|row| row.hash != hash);
         }
-    }
-    if !closed.is_empty() {
-        book.rows.retain(|row| !closed.contains(&row.hash));
     }
 }
 
@@ -193,7 +257,10 @@ mod tests {
 
     #[test]
     fn outstanding_caps_hold_for_one_peer_and_for_the_node() {
-        let mut book = PeerInvoiceBook::default();
+        let mut book = PeerInvoiceBook {
+            reconciled: true,
+            ..Default::default()
+        };
         let now = Instant::now();
         let unix = 1_000_000u64;
         let first = peer(1);
@@ -223,7 +290,10 @@ mod tests {
 
     #[test]
     fn rate_limit_holds_after_outstanding_rows_expire() {
-        let mut book = PeerInvoiceBook::default();
+        let mut book = PeerInvoiceBook {
+            reconciled: true,
+            ..Default::default()
+        };
         let peer = peer(7);
         let now = Instant::now();
         let unix = 5_000u64;
@@ -238,7 +308,10 @@ mod tests {
 
     #[test]
     fn expired_rows_stop_counting_before_they_are_forgotten() {
-        let mut book = PeerInvoiceBook::default();
+        let mut book = PeerInvoiceBook {
+            reconciled: true,
+            ..Default::default()
+        };
         let peer = peer(3);
         let now = Instant::now();
         book.try_issue(&peer, now, 10).unwrap();
@@ -249,7 +322,10 @@ mod tests {
 
     #[test]
     fn restored_invoices_count_toward_the_global_cap_only() {
-        let mut book = PeerInvoiceBook::default();
+        let mut book = PeerInvoiceBook {
+            reconciled: true,
+            ..Default::default()
+        };
         let now = Instant::now();
         let unix = 1_000u64;
         for i in 0..GLOBAL_OUTSTANDING_CAP {

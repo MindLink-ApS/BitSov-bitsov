@@ -593,9 +593,10 @@ pub trait LightningProvider: Send + Sync {
     /// Pending invoices this backend can still expire, as `(payment_hash, expires_at_unix)`.
     ///
     /// The default is empty. Callers use it to keep counting invoices that
-    /// outlived a process restart. Settled payments are not included.
-    async fn pending_invoice_expiries(&self) -> Vec<(String, u64)> {
-        Vec::new()
+    /// outlived a process restart. Settled payments are not included. An unavailable
+    /// inventory must return an error rather than an empty successful snapshot.
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        Ok(Vec::new())
     }
 
     /// Issue a signed quote without retaining any pending invoice/payment record.

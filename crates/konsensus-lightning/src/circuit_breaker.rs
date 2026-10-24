@@ -368,7 +368,7 @@ impl LightningProvider for CircuitBreakerLightning {
         self.inner.purge_expired_pending_invoices(now_unix).await
     }
 
-    async fn pending_invoice_expiries(&self) -> Vec<(String, u64)> {
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
         self.inner.pending_invoice_expiries().await
     }
 

@@ -374,6 +374,11 @@ async fn start_recipient(
             let mut last_refusal = crate::invoice_refusals::RefusalLimits::default();
             let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
             let mut peer_invoices = crate::peer_invoices::PeerInvoiceBook::default();
+            // This focused control-plane harness bypasses run(), so perform
+            // the same initial inventory import before accepting invoices.
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let restored = crate::peer_invoices::reconcile(peer_invoices.clone(), lightning.clone(), now).await;
+            peer_invoices.apply_reconciliation(restored);
             while let Some(event) = transport.recv_control().await {
                 if let ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose, privileged, source_ip } = event {
                     let privileged = privileged && !refuse_once.swap(false, std::sync::atomic::Ordering::AcqRel);

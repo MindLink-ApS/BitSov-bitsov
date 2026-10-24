@@ -192,16 +192,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let exchange_nonces = konsensus_storage::StorageNonceAdapter::new(storage.clone());
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
     let mut peer_invoices = crate::peer_invoices::PeerInvoiceBook::default();
-    let restarted_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    for (hash, expires_at) in lightning.pending_invoice_expiries().await {
-        let remaining = expires_at.saturating_sub(restarted_at);
-        if remaining > 0 && remaining <= u64::from(crate::peer_invoices::INVOICE_EXPIRY_SECS) {
-            peer_invoices.note_unattributed(hash, expires_at);
-        }
-    }
+    let mut invoice_maintenance = tokio::task::JoinSet::new();
     let readiness_height = ReadinessHeightCache::new(chain.clone());
     // PSI-SPEED: bounds our prekey replies to a paid payee's offer. Separate
     // from the other two eager limiters on purpose; see `eager_offers` in the
@@ -598,17 +589,15 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     );
                 }
             }
-            _ = invoice_cleanup_interval.tick() => {
+            Some(result) = invoice_maintenance.join_next(), if !invoice_maintenance.is_empty() => {
+                if let Ok(result) = result { peer_invoices.apply_reconciliation(result); }
+            }
+            _ = invoice_cleanup_interval.tick(), if invoice_maintenance.is_empty() => {
                 let now_unix = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                crate::peer_invoices::purge_expired_peer_invoices(
-                    &mut peer_invoices,
-                    lightning.as_ref(),
-                    now_unix,
-                )
-                .await;
+                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                invoice_maintenance.spawn(crate::peer_invoices::reconcile(
+                    peer_invoices.clone(), lightning.clone(), now_unix,
+                ));
             }
             _ = session_self_heal_interval.tick() => {
                 refresh_recovered_lightning(
@@ -1450,7 +1439,6 @@ async fn handle_invoice_requested(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    crate::peer_invoices::purge_expired_peer_invoices(invoices, lightning.as_ref(), now_unix).await;
     if let Err(limit) = invoices.try_issue(peer_id, std::time::Instant::now(), now_unix) {
         debug!(peer = %peer_id, %request_id, ?limit, "refusing peer invoice request");
         if refusals.permit(source_ip, tokio::time::Instant::now()) {

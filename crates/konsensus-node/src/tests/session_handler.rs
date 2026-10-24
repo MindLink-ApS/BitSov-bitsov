@@ -1,6 +1,7 @@
 use super::*;
 use konsensus_storage::{OnboardingStateRecord, Storage};
 use sha2::Digest;
+use std::time::Duration;
 
 fn test_peer_id() -> NodeId {
     NodeId::from_bytes([1u8; 32])
@@ -1309,7 +1310,7 @@ async fn invoice_requested_creates_invoice_on_local_wallet() {
         &transport,
         "127.0.0.1".parse().unwrap(),
         &mut crate::invoice_refusals::RefusalLimits::default(),
-        &mut crate::peer_invoices::PeerInvoiceBook::default(),
+        &mut ready_invoice_book().await,
     )
     .await;
 
@@ -1364,7 +1365,7 @@ async fn invoice_requested_sends_error_on_lightning_failure() {
         &transport,
         "127.0.0.1".parse().unwrap(),
         &mut crate::invoice_refusals::RefusalLimits::default(),
-        &mut crate::peer_invoices::PeerInvoiceBook::default(),
+        &mut ready_invoice_book().await,
     )
     .await;
     // No panic = success
@@ -1386,7 +1387,7 @@ async fn privileged_invoice_amount_is_clamped_to_configured_price() {
         Arc::new(konsensus_lightning::MockLightningProvider::new());
     let pricing = admission_pricing();
     let ceiling = configured_price_ceiling(pricing.as_ref()).await.unwrap();
-    let mut invoices = crate::peer_invoices::PeerInvoiceBook::default();
+    let mut invoices = ready_invoice_book().await;
 
     handle_invoice_requested_gated(
         &peer_id,
@@ -1490,7 +1491,7 @@ async fn privileged_invoice_flood_holds_peer_and_global_caps() {
     let lightning: Arc<dyn LightningProvider> =
         Arc::new(konsensus_lightning::MockLightningProvider::new());
     let pricing = admission_pricing();
-    let mut invoices = crate::peer_invoices::PeerInvoiceBook::default();
+    let mut invoices = ready_invoice_book().await;
     let peer_cap = crate::peer_invoices::PEER_OUTSTANDING_CAP;
     let global_cap = crate::peer_invoices::GLOBAL_OUTSTANDING_CAP;
 
@@ -1532,7 +1533,7 @@ async fn expired_unpaid_peer_invoice_is_removed() {
     let lightning: Arc<dyn LightningProvider> =
         Arc::new(konsensus_lightning::MockLightningProvider::new());
     let pricing = admission_pricing();
-    let mut invoices = crate::peer_invoices::PeerInvoiceBook::default();
+    let mut invoices = ready_invoice_book().await;
     issue_privileged_invoice(
         &test_peer_id(),
         "cleanup",
@@ -1576,7 +1577,7 @@ async fn settled_peer_invoice_frees_its_slot_and_remains_in_the_wallet() {
         .unwrap();
     let lightning: Arc<dyn LightningProvider> = Arc::new(mock);
     let pricing = admission_pricing();
-    let mut invoices = crate::peer_invoices::PeerInvoiceBook::default();
+    let mut invoices = ready_invoice_book().await;
     let peer_id = test_peer_id();
     invoices.commit(
         peer_id,
@@ -1602,6 +1603,9 @@ async fn settled_peer_invoice_frees_its_slot_and_remains_in_the_wallet() {
         crate::peer_invoices::PEER_OUTSTANDING_CAP
     );
     lightning.pay_invoice(&paid.bolt11).await.unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let result = crate::peer_invoices::reconcile(invoices.clone(), lightning.clone(), now).await;
+    invoices.apply_reconciliation(result);
     issue_privileged_invoice(
         &peer_id,
         "after-payment",
@@ -1631,7 +1635,7 @@ async fn privileged_legacy_admission_requests_create_no_invoice() {
     let lightning: Arc<dyn LightningProvider> =
         Arc::new(konsensus_lightning::MockLightningProvider::new());
     let pricing = admission_pricing();
-    let mut invoices = crate::peer_invoices::PeerInvoiceBook::default();
+    let mut invoices = ready_invoice_book().await;
     for purpose in ["konsensus:admission", "konsensus:admission:200"] {
         issue_privileged_invoice(
             &test_peer_id(),
@@ -1662,7 +1666,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
     let pricing = admission_pricing();
     let membrane = konsensus_api::membrane::Membrane::with_capacity(8);
     let mut last_refusal = crate::invoice_refusals::RefusalLimits::default();
-    let mut invoices = crate::peer_invoices::PeerInvoiceBook::default();
+    let mut invoices = ready_invoice_book().await;
 
     handle_invoice_requested_gated(
         &peer_id,
@@ -1928,7 +1932,7 @@ async fn stranger_cannot_quote_file_or_other_service_kinds() {
             &konsensus_api::membrane::Membrane::with_capacity(8),
             &mut crate::invoice_refusals::RefusalLimits::default(),
             0,
-            &mut crate::peer_invoices::PeerInvoiceBook::default(),
+            &mut ready_invoice_book().await,
         )
         .await;
     }
@@ -2194,7 +2198,7 @@ async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
         &konsensus_api::membrane::Membrane::with_capacity(8),
         &mut crate::invoice_refusals::RefusalLimits::default(),
         0,
-        &mut crate::peer_invoices::PeerInvoiceBook::default(),
+        &mut ready_invoice_book().await,
     )
     .await;
     let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control())
@@ -2254,7 +2258,7 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
         tokio::spawn(async move {
             let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
             let mut limits = crate::invoice_refusals::RefusalLimits::default();
-            let mut peer_invoices = crate::peer_invoices::PeerInvoiceBook::default();
+            let mut peer_invoices = ready_invoice_book().await;
             let mut max_handling_time = Duration::ZERO;
             while let Some(event) = target.recv_control().await {
                 if let ControlEvent::InvoiceRequested {
@@ -4271,4 +4275,257 @@ async fn session_decode_logs_do_not_echo_peer_json() {
         *captured.lock().unwrap(),
         vec!["invalid wire JSON", "invalid wire JSON"],
     );
+}
+
+struct SlowInvoiceStatus(konsensus_lightning::MockLightningProvider, bool);
+#[async_trait::async_trait]
+impl LightningProvider for SlowInvoiceStatus {
+    async fn create_invoice(
+        &self,
+        amount: u64,
+        description: &str,
+        expiry: u32,
+    ) -> Result<
+        konsensus_core::traits::lightning::Invoice,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.0.create_invoice(amount, description, expiry).await
+    }
+    async fn pay_invoice(
+        &self,
+        invoice: &str,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.0.pay_invoice(invoice).await
+    }
+    async fn get_payment_status(
+        &self,
+        hash: &str,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        if hash == "closed" {
+            return Err(
+                konsensus_core::traits::lightning::LightningError::PaymentNotFound(hash.into()),
+            );
+        }
+        std::future::pending().await
+    }
+
+    async fn pending_invoice_expiries(
+        &self,
+    ) -> Result<Vec<(String, u64)>, konsensus_core::traits::lightning::LightningError> {
+        if self.1 {
+            std::future::pending().await
+        } else {
+            self.0.pending_invoice_expiries().await
+        }
+    }
+    async fn get_balance_msat(
+        &self,
+    ) -> Result<u64, konsensus_core::traits::lightning::LightningError> {
+        self.0.get_balance_msat().await
+    }
+    async fn is_available(&self) -> bool {
+        true
+    }
+    async fn list_payments(
+        &self,
+        limit: u32,
+    ) -> Result<
+        Vec<konsensus_core::traits::lightning::PaymentDetails>,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.0.list_payments(limit).await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_invoice_status_cannot_delay_refusal_or_unrelated_peer() {
+    let lightning: Arc<dyn LightningProvider> = Arc::new(SlowInvoiceStatus(
+        konsensus_lightning::MockLightningProvider::new(),
+        false,
+    ));
+    let transport = make_gossip_test_transport();
+    let pricing = admission_pricing();
+    let mut invoices = ready_invoice_book().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let peer = test_peer_id();
+    for i in 0..4 {
+        invoices.commit(peer, format!("slow-{i}"), now + 120);
+    }
+    let started = tokio::time::Instant::now();
+    let worker = tokio::spawn(crate::peer_invoices::reconcile(
+        invoices.clone(),
+        lightning.clone(),
+        now,
+    ));
+    tokio::time::timeout(Duration::from_millis(100), async {
+        issue_privileged_invoice(
+            &peer,
+            "refused",
+            1000,
+            "service",
+            &lightning,
+            &transport,
+            &pricing,
+            &mut invoices,
+        )
+        .await;
+        issue_privileged_invoice(
+            &NodeId::from_bytes([99; 32]),
+            "other-peer",
+            1000,
+            "service",
+            &lightning,
+            &transport,
+            &pricing,
+            &mut invoices,
+        )
+        .await;
+    })
+    .await
+    .expect("status reconciliation blocked shared request handler");
+    assert_eq!(pending_incoming_count(&lightning).await, 1);
+    invoices.apply_reconciliation(worker.await.unwrap());
+    assert!(started.elapsed() <= crate::peer_invoices::RECONCILIATION_BUDGET);
+    // Applying an old snapshot must retain the new peer's invoice and its cap.
+    for n in 0..5 {
+        issue_privileged_invoice(
+            &NodeId::from_bytes([99; 32]),
+            &format!("concurrent-{n}"),
+            1000,
+            "service",
+            &lightning,
+            &transport,
+            &pricing,
+            &mut invoices,
+        )
+        .await;
+    }
+    assert_eq!(pending_incoming_count(&lightning).await, 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn delayed_lightning_recovery_imports_invoices_before_issuance() {
+    use konsensus_core::traits::lightning::LightningError;
+    let backend: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    for _ in 0..32 {
+        backend
+            .create_invoice(1000, "before restart", 120)
+            .await
+            .unwrap();
+    }
+    let recovered = backend.clone();
+    let mut first = true;
+    let recovering = konsensus_lightning::RecoveringLightning::new(
+        move || {
+            let fail = std::mem::replace(&mut first, false);
+            let backend = recovered.clone();
+            async move {
+                if fail {
+                    Err(LightningError::ChainSourceUnavailable {
+                        network: "regtest".into(),
+                        service: "test".into(),
+                        attempts: 1,
+                        elapsed_ms: 0,
+                        cause: "offline".into(),
+                    })
+                } else {
+                    Ok(backend)
+                }
+            }
+        },
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let lightning: Arc<dyn LightningProvider> = Arc::new(recovering);
+    let mut book = crate::peer_invoices::PeerInvoiceBook::default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let result = crate::peer_invoices::reconcile(book.clone(), lightning.clone(), now).await;
+    book.apply_reconciliation(result);
+    assert!(book
+        .try_issue(&test_peer_id(), std::time::Instant::now(), now)
+        .is_err());
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+    assert!(lightning.money_ready().await);
+    // Recovery alone must not open the gate before the pending list is imported.
+    assert!(book
+        .try_issue(&test_peer_id(), std::time::Instant::now(), now)
+        .is_err());
+    let result = crate::peer_invoices::reconcile(book.clone(), lightning.clone(), now).await;
+    book.apply_reconciliation(result);
+    assert_eq!(
+        book.try_issue(&test_peer_id(), std::time::Instant::now(), now),
+        Err(crate::peer_invoices::InvoiceLimit::Global)
+    );
+    assert_eq!(pending_incoming_count(&backend).await, 32);
+    lightning.shutdown().await.unwrap();
+}
+
+async fn ready_invoice_book() -> crate::peer_invoices::PeerInvoiceBook {
+    let mut book = crate::peer_invoices::PeerInvoiceBook::default();
+    let result = crate::peer_invoices::reconcile(
+        book.clone(),
+        Arc::new(konsensus_lightning::MockLightningProvider::new()),
+        0,
+    )
+    .await;
+    book.apply_reconciliation(result);
+    book
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_invoice_inventory_has_a_total_budget_and_keeps_issuance_closed() {
+    let lightning: Arc<dyn LightningProvider> = Arc::new(SlowInvoiceStatus(
+        konsensus_lightning::MockLightningProvider::new(),
+        true,
+    ));
+    let mut book = crate::peer_invoices::PeerInvoiceBook::default();
+    let started = tokio::time::Instant::now();
+    let result = crate::peer_invoices::reconcile(book.clone(), lightning, 0).await;
+    assert!(started.elapsed() <= Duration::from_secs(2));
+    book.apply_reconciliation(result);
+    assert!(book
+        .try_issue(&test_peer_id(), std::time::Instant::now(), 0)
+        .is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn invoice_reconciliation_timeout_retains_completed_observations() {
+    let lightning: Arc<dyn LightningProvider> = Arc::new(SlowInvoiceStatus(
+        konsensus_lightning::MockLightningProvider::new(),
+        false,
+    ));
+    let mut book = ready_invoice_book().await;
+    let peer = test_peer_id();
+    book.commit(peer, "closed".into(), 120);
+    for n in 0..3 {
+        book.commit(peer, format!("pending-{n}"), 120);
+    }
+    // A recovered backlog exceeds the worker budget. The already-observed
+    // closed invoice must still release its peer slot when the worker times out.
+    for n in 0..200 {
+        book.commit(NodeId::from_bytes([99; 32]), format!("expired-{n}"), 0);
+    }
+    assert_eq!(
+        book.try_issue(&peer, std::time::Instant::now(), 0),
+        Err(crate::peer_invoices::InvoiceLimit::PeerOutstanding)
+    );
+    let result = crate::peer_invoices::reconcile(book.clone(), lightning, 0).await;
+    book.apply_reconciliation(result);
+    assert!(book.try_issue(&peer, std::time::Instant::now(), 0).is_ok());
 }

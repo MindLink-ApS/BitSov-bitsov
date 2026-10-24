@@ -1680,3 +1680,79 @@ fn starter_open_and_ready_info_logs_exclude_lightning_identity_and_socket() {
     assert!(!log.contains(CHANNEL_PEER));
     assert!(!log.contains("192.0.2.23"));
 }
+
+#[test]
+fn invoice_expiry_atomic_replace_failure_preserves_previous_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("expiry.tsv");
+    let before = std::collections::HashMap::from([("11".repeat(32), 123)]);
+    store_invoice_expiries(&path, &before).unwrap();
+    // Fail creation of the same-directory staging file, before replacement.
+    std::fs::create_dir(path.with_extension("tmp")).unwrap();
+    let after = std::collections::HashMap::from([("22".repeat(32), 456)]);
+    assert!(store_invoice_expiries(&path, &after).is_err());
+    assert_eq!(load_invoice_expiries(&path).unwrap(), before);
+    std::fs::remove_dir(path.with_extension("tmp")).unwrap();
+    store_invoice_expiries(&path, &after).unwrap();
+    assert_eq!(load_invoice_expiries(&path).unwrap(), after);
+}
+
+#[tokio::test]
+async fn invoice_persistence_failure_refuses_and_removes_unpublished_invoice() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ldk_node::Builder::new();
+    builder.set_network(bitcoin::Network::Regtest);
+    builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+    let node = Arc::new(builder.build().unwrap());
+    let mut provider = LdkProvider::from_node(node.clone());
+    let path = dir.path().join("expiry.tsv");
+    std::fs::create_dir(path.with_extension("tmp")).unwrap();
+    provider.invoice_expiry_path = Some(path);
+    assert!(provider
+        .create_invoice(1000, "unpublished", 120)
+        .await
+        .is_err());
+    assert!(node.list_payments().is_empty());
+    assert!(provider.pending_invoice_expiries().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn invoice_restart_reconciles_missing_metadata_and_discards_orphan_sidecar_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ldk_node::Builder::new();
+    builder.set_network(bitcoin::Network::Regtest);
+    builder.set_entropy_seed_bytes([45; 64]);
+    builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+    let node = Arc::new(builder.build().unwrap());
+    let provider = LdkProvider::from_node(node.clone());
+    let invoice = provider.create_invoice(1000, "restart", 120).await.unwrap();
+    drop(provider);
+    drop(node);
+    let node = builder.build().unwrap();
+    let path = dir.path().join("expiry.tsv");
+    // Simulate a legacy truncated sidecar: unrelated valid line and partial hash.
+    std::fs::write(&path, format!("{} 10\npartial", "ff".repeat(32))).unwrap();
+    let map = reconcile_invoice_expiries(&node, load_invoice_expiries(&path).unwrap());
+    assert_eq!(map.len(), 1);
+    assert!(map[&invoice.payment_hash] >= invoice.created_at + 120);
+    store_invoice_expiries(&path, &map).unwrap();
+    assert_eq!(load_invoice_expiries(&path).unwrap(), map);
+}
+
+#[tokio::test]
+async fn invoice_restart_does_not_trust_truncated_numeric_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ldk_node::Builder::new();
+    builder.set_network(bitcoin::Network::Regtest);
+    builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+    let node = Arc::new(builder.build().unwrap());
+    let provider = LdkProvider::from_node(node.clone());
+    let invoice = provider
+        .create_invoice(1000, "truncated timestamp", 120)
+        .await
+        .unwrap();
+    let path = dir.path().join("expiry.tsv");
+    std::fs::write(&path, format!("{} 1792", invoice.payment_hash)).unwrap();
+    let map = reconcile_invoice_expiries(&node, load_invoice_expiries(&path).unwrap());
+    assert!(map[&invoice.payment_hash] >= invoice.created_at + 120);
+}

@@ -217,7 +217,7 @@ impl LightningProvider for GuardedLightning {
     async fn purge_expired_pending_invoices(&self, now_unix: u64) -> Result<u32, LightningError> {
         self.inner.purge_expired_pending_invoices(now_unix).await
     }
-    async fn pending_invoice_expiries(&self) -> Vec<(String, u64)> {
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
         self.inner.pending_invoice_expiries().await
     }
     async fn create_stateless_invoice(

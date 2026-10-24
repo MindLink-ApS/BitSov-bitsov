@@ -367,8 +367,8 @@ impl LightningProvider for MockLightningProvider {
         Ok(removed)
     }
 
-    async fn pending_invoice_expiries(&self) -> Vec<(String, u64)> {
-        self.invoice_expiry.lock().await.iter().map(|(hash, expires_at)| (hash.clone(), *expires_at)).collect()
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        Ok(self.invoice_expiry.lock().await.iter().map(|(hash, expires_at)| (hash.clone(), *expires_at)).collect())
     }
 
     #[instrument(skip(self, bolt11))]
