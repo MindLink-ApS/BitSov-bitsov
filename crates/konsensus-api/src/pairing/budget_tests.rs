@@ -29,6 +29,148 @@ fn first_contact_service(dir: &Path) -> PairingService {
     service
 }
 
+// An on-disk grant from before per-act approval wording, including grants
+// which already carried normal rolling circuit breakers.
+fn pre_act_service(dir: &Path, per_call: u64, unlimited_breakers: bool) -> PairingService {
+    let service = first_contact_service(dir);
+    {
+        let mut inner = service.lock();
+        let budget = inner.file.grants[0].budget.as_mut().unwrap();
+        budget.budget_msat = 200_000;
+        budget.per_call_max_msat = per_call;
+        for recipient in ["aa".repeat(32), "bb".repeat(32)] {
+            budget.per_recipient_msat.insert(recipient, 100_000);
+        }
+        if unlimited_breakers {
+            budget.breakers = crate::spend_budget::BreakerLimits::legacy();
+        }
+        service.persist(&mut inner.file).unwrap();
+    }
+    let mut file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&service.file_path).unwrap()).unwrap();
+    file["grants"][0]["budget"]
+        .as_object_mut()
+        .unwrap()
+        .remove("per_act_limits");
+    std::fs::write(&service.file_path, serde_json::to_vec(&file).unwrap()).unwrap();
+    drop(service);
+    PairingService::open(dir, "identity".into(), true).unwrap()
+}
+
+#[test]
+fn stored_grants_keep_whole_call_room_limit_with_any_breakers() {
+    for unlimited in [false, true] {
+        for (stored_cap, cap) in [(4_000, 4_000), (200_000, 6_000)] {
+            let dir = tempfile::tempdir().unwrap();
+            let service = pre_act_service(dir.path(), stored_cap, unlimited);
+            let client = service.snapshot().clients[0].client_id.clone();
+            let before = service.snapshot().grants[0].budget.clone();
+            let result = service.reserve_spend(
+                &client,
+                1,
+                vec![
+                    Charge {
+                        recipient: "aa".repeat(32),
+                        amount_msat: cap,
+                    },
+                    Charge {
+                        recipient: "bb".repeat(32),
+                        amount_msat: 1,
+                    },
+                ],
+            );
+            assert!(
+                matches!(result, Err(BudgetRefusal::PerCall { max_msat }) if max_msat == cap),
+                "{result:?}"
+            );
+            assert_eq!(service.reload_from_disk().unwrap().grants[0].budget, before);
+        }
+    }
+}
+
+#[test]
+fn stored_grants_keep_first_contact_within_whole_call_limit() {
+    for unlimited in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let service = pre_act_service(dir.path(), 4_000, unlimited);
+        let client = service.snapshot().clients[0].client_id.clone();
+        let recipient = "aa".repeat(32);
+        let caps = service.grant_view_for(&client).unwrap().act_caps;
+        assert_eq!(caps.first_contact_max_all_in_msat, 4_000);
+        assert_eq!(caps.readmission_max_all_in_msat, 4_000);
+        assert_eq!(caps.whole_call_max_all_in_msat, Some(4_000));
+        assert!(matches!(
+            service.grant_first_contact(&client, "grant", &recipient, 4_001, None),
+            Err(BudgetRefusal::PerCall { max_msat: 4_000 })
+        ));
+        service
+            .grant_first_contact(&client, "grant", &recipient, 4_000, None)
+            .unwrap();
+        let approval = service.take_first_contact(&client, 1, &recipient).unwrap();
+        service.reserve_first_contact(approval, None).unwrap();
+        assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 4_000);
+    }
+}
+
+#[test]
+fn stored_grants_count_readmission_and_settled_room_members_in_whole_call_limit() {
+    for unlimited in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let service = pre_act_service(dir.path(), 4_000, unlimited);
+        let client = service.snapshot().clients[0].client_id.clone();
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        let parent = service
+            .reserve_spend(
+                &client,
+                1,
+                vec![
+                    Charge {
+                        recipient: a.clone(),
+                        amount_msat: 1_000,
+                    },
+                    Charge {
+                        recipient: b.clone(),
+                        amount_msat: 1_000,
+                    },
+                ],
+            )
+            .unwrap();
+        let before = service.snapshot().grants[0].budget.clone();
+        assert!(matches!(
+            service.reserve_quoted_readmission(
+                &parent,
+                &a,
+                2_000,
+                1_001,
+                CallReservationTotals::messages(2_000),
+                None,
+            ),
+            Err(BudgetRefusal::PerCall { max_msat: 4_000 })
+        ));
+        assert_eq!(service.reload_from_disk().unwrap().grants[0].budget, before);
+        let (total, admission) = service
+            .reserve_quoted_readmission(
+                &parent,
+                &a,
+                2_000,
+                1_000,
+                CallReservationTotals::messages(2_000),
+                None,
+            )
+            .unwrap();
+        assert_eq!(total.all_in_msat, 4_000);
+        service.resolve_spend(&parent, &a, 2_000);
+        service.resolve_spend(&admission, &a, 1_000);
+        let before = service.snapshot().grants[0].budget.clone();
+        assert!(matches!(
+            service.reserve_quoted_readmission(&parent, &b, 1_000, 1, total, None,),
+            Err(BudgetRefusal::PerCall { max_msat: 4_000 })
+        ));
+        assert_eq!(service.reload_from_disk().unwrap().grants[0].budget, before);
+    }
+}
+
 #[test]
 fn first_contact_expiry_is_observable_but_never_spendable() {
     use crate::spend_budget::FirstContactApprovalState as State;
@@ -755,18 +897,8 @@ fn console_fanout_cap_checks_the_whole_call_before_any_reservation() {
 fn legacy_unlimited_breakers_keep_the_total_room_call_cap_after_restart() {
     for (stored_cap, total_cap) in [(200_000, 6_000), (4_000, 4_000)] {
         let dir = tempfile::tempdir().unwrap();
-        let service = first_contact_service(dir.path());
+        let service = pre_act_service(dir.path(), stored_cap, true);
         let client = service.snapshot().clients[0].client_id.clone();
-        {
-            let mut inner = service.lock();
-            let budget = inner.file.grants[0].budget.as_mut().unwrap();
-            budget.budget_msat = 2_000_000;
-            budget.per_call_max_msat = stored_cap;
-            budget.breakers = crate::spend_budget::BreakerLimits::legacy();
-            service.persist(&mut inner.file).unwrap();
-        }
-        drop(service);
-        let service = PairingService::open(dir.path(), "identity".into(), true).unwrap();
         let before = service.snapshot().grants[0].budget.clone().unwrap();
         let charges = (0..256)
             .map(|n| Charge {
@@ -810,21 +942,10 @@ fn legacy_unlimited_breakers_keep_the_total_room_call_cap_after_restart() {
 #[test]
 fn legacy_room_repricing_keeps_the_message_total_across_settled_members() {
     let dir = tempfile::tempdir().unwrap();
-    let service = first_contact_service(dir.path());
+    let service = pre_act_service(dir.path(), 200_000, true);
     let client = service.snapshot().clients[0].client_id.clone();
     let a = "aa".repeat(32);
     let b = "bb".repeat(32);
-    {
-        let mut inner = service.lock();
-        let budget = inner.file.grants[0].budget.as_mut().unwrap();
-        *budget = GrantBudget::from_terms(
-            &GrantTerms::new(200_000)
-                .recipient(&a, 100_000)
-                .recipient(&b, 100_000),
-        );
-        budget.breakers = crate::spend_budget::BreakerLimits::legacy();
-        service.persist(&mut inner.file).unwrap();
-    }
     let parent = service
         .reserve_spend(
             &client,
@@ -859,23 +980,22 @@ fn legacy_room_repricing_keeps_the_message_total_across_settled_members() {
             .as_ref(),
         Some(&before)
     );
-    // 5,000 + 1,000 message msat fits; the independent admission may exceed
-    // the message ceiling without consuming another member's allowance.
+    // Messages and admission must share the old grant's 6,000-msat ceiling.
     let (total, admission) = service
         .reserve_quoted_readmission(
             &parent,
             &a,
-            5_000,
-            7_000,
+            4_000,
+            1_000,
             CallReservationTotals::messages(2_000),
             None,
         )
         .unwrap();
-    assert_eq!(total.all_in_msat, 13_000);
-    service.resolve_spend(&parent, &a, 5_000);
-    service.resolve_spend(&admission, &a, 7_000);
+    assert_eq!(total.all_in_msat, 6_000);
+    service.resolve_spend(&parent, &a, 4_000);
+    service.resolve_spend(&admission, &a, 1_000);
     let before = service.snapshot().grants[0].budget.clone().unwrap();
-    // A has settled and left pending, but its 5,000 still counts in this call.
+    // A has settled and left pending, but its message and admission still count.
     assert!(matches!(
         service.reserve_quoted_readmission(&parent, &b, 2_000, 1_000, total, None),
         Err(BudgetRefusal::PerCall { max_msat: 6_000 })

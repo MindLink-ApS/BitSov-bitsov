@@ -332,6 +332,11 @@ pub fn canonical_recipient(key: &str) -> Option<String> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GrantBudget {
+    /// The owner approved per-member room totals and a separate admission cap.
+    /// Missing on older grants, which retain their whole-call ceiling regardless
+    /// of their circuit-breaker settings. Only a fresh grant opts in.
+    #[serde(default)]
+    pub(crate) per_act_limits: bool,
     #[serde(default = "BreakerLimits::legacy")]
     pub breakers: BreakerLimits,
     #[serde(default)]
@@ -398,6 +403,7 @@ impl GrantBudget {
     /// A fresh meter for approved terms.
     pub fn from_terms(terms: &GrantTerms) -> Self {
         Self {
+            per_act_limits: true,
             breakers: terms.breakers.clone(),
             breaker_state: BreakerState::default(),
             device_breaker_resets: Vec::new(),
@@ -728,6 +734,23 @@ impl GrantBudget {
         self.per_call_max_msat.min(MESSAGING_PER_CALL_MAX_MSAT)
     }
 
+    pub(crate) fn admission_max_msat(&self) -> u64 {
+        if self.per_act_limits {
+            FIRST_CONTACT_MAX_MSAT
+        } else {
+            self.messaging_per_call_max_msat()
+        }
+    }
+
+    pub(crate) fn act_caps(&self) -> ActCaps {
+        let mut caps = ActCaps::new(self.per_call_max_msat);
+        caps.first_contact_max_all_in_msat = self.admission_max_msat();
+        caps.readmission_max_all_in_msat = self.admission_max_msat();
+        caps.whole_call_max_all_in_msat =
+            (!self.per_act_limits).then(|| self.messaging_per_call_max_msat());
+        caps
+    }
+
     /// Budget left, msat.
     pub fn remaining_msat(&self) -> u64 {
         self.budget_msat.saturating_sub(self.used_msat)
@@ -968,6 +991,9 @@ pub struct ActCaps {
     pub first_contact_max_all_in_msat: u64,
     pub readmission_max_all_in_msat: u64,
     pub payment_all_in_msat: u64,
+    /// Older approvals share this ceiling across every non-payment act in a call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_call_max_all_in_msat: Option<u64>,
 }
 
 impl ActCaps {
@@ -979,6 +1005,7 @@ impl ActCaps {
             first_contact_max_all_in_msat: FIRST_CONTACT_MAX_MSAT,
             readmission_max_all_in_msat: FIRST_CONTACT_MAX_MSAT,
             payment_all_in_msat: payment_limit,
+            whole_call_max_all_in_msat: None,
         }
     }
 }
@@ -1034,14 +1061,7 @@ pub struct GrantView {
 
 /// Render terms for a human before they approve them.
 pub fn describe_terms(terms: &GrantTerms) -> String {
-    let room = if terms.breakers == BreakerLimits::legacy() {
-        format!(
-            "at most {} sats all-in for the whole call (legacy unlimited breakers)",
-            sats(terms.per_call_max_msat.min(MESSAGING_PER_CALL_MAX_MSAT))
-        )
-    } else {
-        "N paid members x their message all-in cap, one total".into()
-    };
+    let room = "N paid members x their message all-in cap, one total";
     let mut out = format!(
         "  budget:        {} sats in total\n  message:       at most {} sats all-in\n  room post:     {room}\n  admission:     quoted price + maximum fee, separate from message (100-sat safety ceiling)\n  payment:       at most {} sats all-in\n  window:        {}",
         sats(terms.budget_msat),

@@ -3303,8 +3303,13 @@ impl PairingService {
         // individually and reserved atomically as one total.
         let purpose_limit = if authority.payment {
             Ok(budget.per_call_max_msat)
+        } else if !budget.per_act_limits {
+            // Breakers do not identify approval semantics: grants already on
+            // disk may have ordinary rolling limits and still authorize only
+            // one whole-call ceiling.
+            Ok(budget.messaging_per_call_max_msat())
         } else if authority.admission {
-            Ok(crate::spend_budget::FIRST_CONTACT_MAX_MSAT)
+            Ok(budget.admission_max_msat())
         } else {
             let max_msat = budget.messaging_per_call_max_msat();
             let mut recipients = std::collections::BTreeMap::new();
@@ -3322,23 +3327,12 @@ impl PairingService {
                     }
                 }
             }
-            result
-                .and_then(|_| {
-                    recipients.values().try_fold(0u64, |sum, amount| {
-                        sum.checked_add(*amount)
-                            .ok_or(BudgetRefusal::PerCall { max_msat })
-                    })
+            result.and_then(|_| {
+                recipients.values().try_fold(0u64, |sum, amount| {
+                    sum.checked_add(*amount)
+                        .ok_or(BudgetRefusal::PerCall { max_msat })
                 })
-                .map(|total| {
-                    // Legacy grants have no rolling breakers. Preserve their
-                    // previous whole-call ceiling instead of multiplying it
-                    // by an arbitrarily large room membership.
-                    if budget.breakers == crate::spend_budget::BreakerLimits::legacy() {
-                        total.min(max_msat)
-                    } else {
-                        total
-                    }
-                })
+            })
         };
         if let Err(refusal) =
             purpose_limit.and_then(|limit| budget.reserve_act_at(&charges, now, limit))
@@ -3477,7 +3471,7 @@ impl PairingService {
         };
         let epoch = grant.epoch;
         let budget = grant.budget.as_ref().ok_or(BudgetRefusal::NoGrant)?;
-        let max_msat = crate::spend_budget::FIRST_CONTACT_MAX_MSAT;
+        let max_msat = budget.admission_max_msat();
         if max_total_msat > max_msat {
             return Err(BudgetRefusal::PerCall { max_msat });
         }
@@ -3767,13 +3761,7 @@ impl PairingService {
             .message_all_in_msat
             .checked_add(message_top_up)
             .ok_or(BudgetRefusal::PerCall { max_msat })?;
-        if budget.breakers == crate::spend_budget::BreakerLimits::legacy()
-            && message_top_up > 0
-            && message_total > max_msat
-        {
-            return Err(BudgetRefusal::PerCall { max_msat });
-        }
-        let max_msat = crate::spend_budget::FIRST_CONTACT_MAX_MSAT;
+        let max_msat = budget.admission_max_msat();
         if admission_all_in > max_msat {
             return Err(BudgetRefusal::PerCall { max_msat });
         }
@@ -3784,6 +3772,9 @@ impl PairingService {
             .all_in_msat
             .checked_add(need)
             .ok_or(BudgetRefusal::PerCall { max_msat })?;
+        if !budget.per_act_limits && total > max_msat {
+            return Err(BudgetRefusal::PerCall { max_msat });
+        }
         if let Some(max_msat) = confirmed {
             if let Some(pending) = inner.first_contact.get_mut(&parent.client_id) {
                 pending.consumed = true;
@@ -4282,7 +4273,7 @@ fn grant_view(g: &SpendGrant) -> Option<GrantView> {
         per_call_max_msat: b.messaging_per_call_max_msat(),
         payment_per_call_max_msat: b.per_call_max_msat,
         payment_authorized: !g.is_messaging(),
-        act_caps: crate::spend_budget::ActCaps::new(b.per_call_max_msat),
+        act_caps: b.act_caps(),
         per_recipient_msat: b.per_recipient_msat.clone(),
         used_by_recipient: b.used_by_recipient.clone(),
         recipients_only: b.recipients_only,

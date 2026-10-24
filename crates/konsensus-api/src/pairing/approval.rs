@@ -179,6 +179,10 @@ impl BreakerResetTerms {
 /// Public exact terms, all binding fields supplied by the node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalOperation {
+    /// Signed opt-in to per-member room totals and separate admission caps.
+    /// Old receipts omit this and retain whole-call limits.
+    #[serde(default)]
+    pub per_act_limits: bool,
     /// Server-issued operation id.
     pub op_id: String,
     /// Node fingerprint at creation.
@@ -240,7 +244,14 @@ impl ApprovalOperation {
                 "-".into(),
             ),
         };
-        format!("bitsov-owner-approval-v1\nnode:{}\nkind:{}\nclient:{}\nclient_pubkey:{}\nepoch:{}\ngrant_op:{}\nrecipient:{}\nmax_total_msat:{}\nbudget_msat:{}\nper_call_max_msat:{}\nwindow_secs:{}\nop_id:{}\nnonce:{}\nexpires_at:{}", self.node, self.request.kind(), self.client_id, self.client_pubkey, self.epoch, self.grant_op.as_deref().unwrap_or("-"), recipient, max, budget, per_call, window, self.op_id, self.nonce, self.expires_at) + &self.breaker_reset.as_ref().map_or_else(String::new, BreakerResetTerms::message)
+        let mut message = format!("bitsov-owner-approval-v1\nnode:{}\nkind:{}\nclient:{}\nclient_pubkey:{}\nepoch:{}\ngrant_op:{}\nrecipient:{}\nmax_total_msat:{}\nbudget_msat:{}\nper_call_max_msat:{}\nwindow_secs:{}\nop_id:{}\nnonce:{}\nexpires_at:{}", self.node, self.request.kind(), self.client_id, self.client_pubkey, self.epoch, self.grant_op.as_deref().unwrap_or("-"), recipient, max, budget, per_call, window, self.op_id, self.nonce, self.expires_at) + &self.breaker_reset.as_ref().map_or_else(String::new, BreakerResetTerms::message);
+        if self.per_act_limits {
+            if let Ok(terms) = self.request.spend_terms() {
+                message.push_str("\nspend_limits:per_act_v1\n");
+                message.push_str(&crate::spend_budget::describe_terms(&terms));
+            }
+        }
+        message
     }
 }
 /// A status read conveys no authority.
@@ -274,7 +285,9 @@ impl Pending {
             operation: self.operation.clone(),
             approval_message: self.operation.message(),
             act_caps: match &self.operation.request {
-                ApprovalRequest::SpendGrant { per_call_max_msat, .. } => Some(crate::spend_budget::ActCaps::new(*per_call_max_msat)),
+                ApprovalRequest::SpendGrant {
+                    per_call_max_msat, ..
+                } => Some(crate::spend_budget::ActCaps::new(*per_call_max_msat)),
                 _ => None,
             },
             status: if self.consumed {
@@ -380,6 +393,7 @@ impl ApprovalReceipt {
         grant.granted_at.checked_add(terms.ttl_secs) == Some(grant.expires_at)
             && budget.budget_msat == terms.budget_msat
             && budget.per_call_max_msat == terms.per_call_max_msat
+            && budget.per_act_limits == op.per_act_limits
             && budget.breakers == terms.breakers
             && budget.payee_allowlist == terms.payee_allowlist
             && !budget.allow_liquidity_fees
@@ -472,6 +486,7 @@ impl PairingService {
         let mut nonce = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut nonce);
         let op = ApprovalOperation {
+            per_act_limits: matches!(request, ApprovalRequest::SpendGrant { .. }),
             op_id: uuid::Uuid::new_v4().to_string(),
             node: inner.identity_fingerprint.clone(),
             client_id: client_id.into(),
@@ -633,6 +648,8 @@ impl PairingService {
             }
             ApprovalRequest::SpendGrant { .. } => {
                 let terms = op.request.spend_terms()?;
+                let mut budget = GrantBudget::from_terms(&terms);
+                budget.per_act_limits = op.per_act_limits;
                 let grant = SpendGrant {
                     op_id: op.op_id.clone(),
                     client_id: op.client_id.clone(),
@@ -642,7 +659,7 @@ impl PairingService {
                     identity_fingerprint: op.node.clone(),
                     epoch: op.epoch,
                     granted_by: format!("device:{key_id}"),
-                    budget: Some(GrantBudget::from_terms(&terms)),
+                    budget: Some(budget),
                     owner_approval: Some(ApprovalReceipt {
                         operation: op.clone(),
                         approver,
@@ -1099,6 +1116,96 @@ mod tests {
         assert!(!f.svc.permits_spend_grant(&grant));
     }
     #[test]
+    fn stored_signed_grant_requires_new_owner_approval_for_per_act_limits() {
+        let f = Fixture::new();
+        let op = f.request();
+        f.approve(&op).unwrap();
+        {
+            let mut inner = f.svc.lock();
+            let grant = inner.file.grants.last_mut().unwrap();
+            let receipt = grant.owner_approval.as_mut().unwrap();
+            let mut operation = serde_json::to_value(&receipt.operation).unwrap();
+            operation.as_object_mut().unwrap().remove("per_act_limits");
+            receipt.operation = serde_json::from_value(operation).unwrap();
+            receipt.signature = hex::encode(
+                f.key
+                    .sign(
+                        &ring::rand::SystemRandom::new(),
+                        receipt.operation.message().as_bytes(),
+                    )
+                    .unwrap()
+                    .as_ref(),
+            );
+            let mut budget = serde_json::to_value(grant.budget.as_ref().unwrap()).unwrap();
+            budget.as_object_mut().unwrap().remove("per_act_limits");
+            grant.budget = Some(serde_json::from_value(budget).unwrap());
+            assert!(f.svc.permits_spend_grant(grant));
+            f.svc.persist(&mut inner.file).unwrap();
+        }
+        let restarted = PairingService::open(f._dir.path(), "node-test".into(), true)
+            .unwrap()
+            .with_owner_approval_key(*f.svc.owner_approval_key.as_ref().unwrap());
+        let charges = || {
+            vec![
+                crate::spend_budget::Charge {
+                    recipient: "aa".repeat(32),
+                    amount_msat: 4_000,
+                },
+                crate::spend_budget::Charge {
+                    recipient: "bb".repeat(32),
+                    amount_msat: 4_000,
+                },
+            ]
+        };
+        assert!(matches!(
+            restarted.reserve_spend(&f.requester.client_id, f.requester.epoch, charges(),),
+            Err(BudgetRefusal::PerCall { max_msat: 6_000 })
+        ));
+        drop(restarted);
+        let renewed = f.request();
+        f.approve(&renewed).unwrap();
+        f.svc
+            .reserve_spend(&f.requester.client_id, f.requester.epoch, charges())
+            .unwrap();
+        assert_eq!(
+            f.svc
+                .grant_view_for(&f.requester.client_id)
+                .unwrap()
+                .used_msat,
+            8_000
+        );
+    }
+
+    #[test]
+    fn spend_approval_rejects_signature_over_legacy_wording() {
+        let f = Fixture::new();
+        let op = f.request();
+        let mut operation = serde_json::to_value(&op.operation).unwrap();
+        operation.as_object_mut().unwrap().remove("per_act_limits");
+        let legacy: ApprovalOperation = serde_json::from_value(operation).unwrap();
+        let signature = hex::encode(
+            f.key
+                .sign(
+                    &ring::rand::SystemRandom::new(),
+                    legacy.message().as_bytes(),
+                )
+                .unwrap()
+                .as_ref(),
+        );
+        assert!(f
+            .svc
+            .approve_owner_request(
+                &f.owner.client_id,
+                f.owner.epoch,
+                &op.operation.op_id,
+                &f.key_id,
+                &signature,
+            )
+            .is_err());
+        f.inert();
+    }
+
+    #[test]
     fn signed_spend_receipt_rejects_larger_budget_and_lifetime() {
         let f = Fixture::new();
         let op = f.request();
@@ -1108,6 +1215,9 @@ mod tests {
         grant.budget.as_mut().unwrap().budget_msat += 1;
         assert!(!f.svc.permits_spend_grant(&grant));
         grant.budget.as_mut().unwrap().budget_msat -= 1;
+        grant.budget.as_mut().unwrap().per_act_limits = false;
+        assert!(!f.svc.permits_spend_grant(&grant));
+        grant.budget.as_mut().unwrap().per_act_limits = true;
         grant.expires_at += 1;
         assert!(!f.svc.permits_spend_grant(&grant));
     }
