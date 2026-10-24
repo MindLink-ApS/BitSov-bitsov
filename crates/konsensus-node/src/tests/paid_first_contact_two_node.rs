@@ -478,7 +478,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         transport: Arc::new(Hooked { inner: Arc::clone(&transport), pause: Arc::clone(&pause) }) as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&sessions),
         jwt_secret: JWT_SECRET.into(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,

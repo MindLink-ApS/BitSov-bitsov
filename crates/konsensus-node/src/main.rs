@@ -1654,7 +1654,7 @@ async fn start_node_services<'a>(
         session_manager,
         jwt_secret,
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         cors_enabled: config.api.cors_enabled,
         operator_probes_enabled: config
             .api

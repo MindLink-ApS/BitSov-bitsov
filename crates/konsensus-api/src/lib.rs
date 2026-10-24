@@ -36,7 +36,8 @@
 //!   probes mounted only when `AppState::operator_probes_enabled` is true.
 //!   They do not query Lightning, chain, storage, peers, or user state.
 //! - `GET  /api/v1/auth/challenge` — emits a short-lived single-use
-//!   Ed25519 challenge. Cannot require a JWT to issue one.
+//!   Ed25519 challenge. Cannot require a JWT to issue one. On the local
+//!   listener, Host and Origin use the same admission as local token minting.
 //! - `POST /api/v1/auth/token` — JWT bootstrap via Ed25519 signature over
 //!   that challenge. Cannot require a JWT to issue one.
 //! - `POST /api/v1/auth/local` — JWT bootstrap restricted to loopback
@@ -55,6 +56,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod auth_challenge;
 pub mod bootstrap;
 pub mod calls;
 pub mod control;
@@ -81,6 +83,7 @@ mod local_request;
 pub mod membrane;
 
 pub use audit::AuditLog;
+pub use auth_challenge::AuthChallenges;
 pub use rate_limit::RateLimiter;
 pub use state::{AppState, InvoiceResponseData, WsMessage};
 
@@ -393,7 +396,10 @@ mod tests {
     #[test]
     fn cors_rejects_wildcard_and_null_origin() {
         let origins = parse_cors_allowed_origins("*, null, NULL, http://localhost:1420");
-        assert_eq!(origins, vec![HeaderValue::from_static("http://localhost:1420")]);
+        assert_eq!(
+            origins,
+            vec![HeaderValue::from_static("http://localhost:1420")]
+        );
     }
 
     #[test]

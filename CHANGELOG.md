@@ -5,6 +5,11 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Count a home-setup cancel only when a pairing is in progress, cap pending
+  pairing requests per client key, and let that key replace its own pending
+  request.
+- Limit local sign-in challenges per source, rate-limit issuance, and apply
+  the local token route's Host and Origin admission to challenge issuance.
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'
   scripts instead of all 2000 derived scripts. Before each focused sweep preview,
