@@ -105,7 +105,7 @@ pub struct FirstContactApprovalStatus {
     pub approval: Option<FirstContactGrant>,
 }
 
-/// Default ceiling for one messaging call (including fan-out and routing fees).
+/// Ceiling for every non-payment call (including fan-out and routing fees).
 pub const MESSAGING_PER_CALL_MAX_MSAT: u64 = 6_000;
 
 /// Longest a spend grant may live: 24 hours. Also the default.
@@ -353,7 +353,7 @@ pub struct GrantBudget {
     pub allow_liquidity_fees: bool,
     /// Total budget, msat.
     pub budget_msat: u64,
-    /// Per-call maximum, msat.
+    /// Stored owner-approved per-call maximum, msat.
     pub per_call_max_msat: u64,
     /// Per-recipient budgets, msat.
     #[serde(default)]
@@ -712,6 +712,12 @@ impl GrantBudget {
         self.breaker_state = BreakerState::default();
     }
 
+    /// Effective non-payment limit, including grants issued before this cap.
+    /// Keep stored terms intact: payment authority and signed receipts use them.
+    pub(crate) fn messaging_per_call_max_msat(&self) -> u64 {
+        self.per_call_max_msat.min(MESSAGING_PER_CALL_MAX_MSAT)
+    }
+
     /// Budget left, msat.
     pub fn remaining_msat(&self) -> u64 {
         self.budget_msat.saturating_sub(self.used_msat)
@@ -946,7 +952,7 @@ pub struct GrantView {
     pub used_msat: u64,
     /// Left, msat.
     pub remaining_msat: u64,
-    /// Per-call maximum, msat.
+    /// Effective non-payment per-call maximum, msat.
     pub per_call_max_msat: u64,
     /// Per-recipient budgets, msat.
     pub per_recipient_msat: BTreeMap<String, u64>,

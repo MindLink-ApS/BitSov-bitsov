@@ -84,6 +84,30 @@ async fn pair_status_shows_six_sat_messaging_cap_with_original_budget() {
             )),
         )
         .unwrap();
+    let console_client = service
+        .create_ticket_remote_pairing(
+            "console app",
+            &hex::encode(
+                ed25519_dalek::SigningKey::from_bytes(&[8; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            ),
+            &[3; 32],
+        )
+        .unwrap();
+    let request = service
+        .create_elevation_request(
+            &console_client.client_id,
+            vec![konsensus_api::auth::Scope::Spend],
+        )
+        .unwrap();
+    service
+        .grant_elevation(
+            &request.op_id,
+            &console.confirmation(&konsensus_api::pairing::grant_confirmation_phrase(&request)),
+            konsensus_api::spend_budget::GrantTerms::new(200_000).per_call(20_000),
+        )
+        .unwrap();
     let response: ControlResponse = serde_json::from_value(serde_json::json!({
         "result": "status", "clients": [], "pending_elevations": [], "pending_replacements": [],
         "grants": service.grant_views(),
@@ -120,6 +144,6 @@ async fn pair_status_shows_six_sat_messaging_cap_with_original_budget() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("per-call<=6 sats"), "{stdout}");
+    assert_eq!(stdout.matches("per-call<=6 sats").count(), 2, "{stdout}");
     assert!(stdout.contains("200 of 200 sats left"), "{stdout}");
 }

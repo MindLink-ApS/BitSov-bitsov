@@ -387,8 +387,7 @@ impl SpendGrant {
     /// Existing signed provenance distinguishes messaging authority from
     /// explicit console payment approvals; no stored schema change is needed.
     fn is_messaging(&self) -> bool {
-        self.owner_approval.is_some()
-            || self.budget.as_ref().is_some_and(|b| b.recipients_only)
+        self.owner_approval.is_some() || self.budget.as_ref().is_some_and(|b| b.recipients_only)
     }
 
     /// Whether this grant can authorise anything at `now`: metered, unexpired,
@@ -3297,7 +3296,24 @@ impl PairingService {
                 "too many unresolved reservations".into(),
             ));
         }
-        if let Err(refusal) = budget.reserve_at(&charges, now) {
+        // Purpose, not grant provenance, determines the effective ceiling.
+        // Enforce it without changing stored/signed terms, so live grants are
+        // covered immediately and explicit payments retain the owner's limit.
+        let purpose_limit = if authority.payment {
+            Ok(())
+        } else {
+            let max_msat = budget.messaging_per_call_max_msat();
+            charges
+                .iter()
+                .try_fold(0u64, |total, charge| {
+                    total
+                        .checked_add(charge.amount_msat)
+                        .filter(|total| *total <= max_msat)
+                        .ok_or(BudgetRefusal::PerCall { max_msat })
+                })
+                .map(|_| ())
+        };
+        if let Err(refusal) = purpose_limit.and_then(|()| budget.reserve_at(&charges, now)) {
             if budget.record_breaker_refusal(&refusal, now) {
                 if let Err(e) = self.persist(&mut inner.file) {
                     if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
@@ -3432,10 +3448,9 @@ impl PairingService {
         };
         let epoch = grant.epoch;
         let budget = grant.budget.as_ref().ok_or(BudgetRefusal::NoGrant)?;
-        if max_total_msat > budget.per_call_max_msat {
-            return Err(BudgetRefusal::PerCall {
-                max_msat: budget.per_call_max_msat,
-            });
+        let max_msat = budget.messaging_per_call_max_msat();
+        if max_total_msat > max_msat {
+            return Err(BudgetRefusal::PerCall { max_msat });
         }
         if max_total_msat > budget.remaining_msat() {
             return Err(BudgetRefusal::Total {
@@ -3708,7 +3723,7 @@ impl PairingService {
             return Err(BudgetRefusal::NoGrant);
         };
         let message_top_up = quoted_message_all_in.saturating_sub(old_message);
-        let max_msat = budget.per_call_max_msat;
+        let max_msat = budget.messaging_per_call_max_msat();
         let need = message_top_up
             .checked_add(admission_all_in)
             .ok_or(BudgetRefusal::PerCall { max_msat })?;
@@ -4205,7 +4220,7 @@ fn grant_view(g: &SpendGrant) -> Option<GrantView> {
         budget_msat: b.budget_msat,
         used_msat: b.used_msat,
         remaining_msat: b.remaining_msat(),
-        per_call_max_msat: b.per_call_max_msat,
+        per_call_max_msat: b.messaging_per_call_max_msat(),
         per_recipient_msat: b.per_recipient_msat.clone(),
         used_by_recipient: b.used_by_recipient.clone(),
         recipients_only: b.recipients_only,
