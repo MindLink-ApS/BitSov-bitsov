@@ -136,11 +136,13 @@ random-key channel recovery.
 Without a backup, the command scans 2,000 seed-derived v2 scripts (anchor and
 non-anchor). Esplora can require at least one HTTP request per script per scan,
 reveals those scripts to the configured service, and is subject to its rate
-limits. Once a pass has found hub close outputs, the 30-second passes that
-follow poll only those outputs' scripts until the sweep confirms; one full
-rescan then checks for late closes before the self-test. A focused sweep that
-cannot cover fees or would produce dust retries a full scan in the same pass
-to include funds on other scripts. Finding nothing does
+limits. Once a pass has found hub close outputs, the 30-second unconfirmed-close
+polls read only those outputs' scripts. Before previewing a sweep, a full scan
+in the same pass includes closes on other scripts, even when the focused output
+alone can pay the fee. This avoids leaving a small close that cannot fund its
+own sweep. A vanished focus and the late-close check after a sweep confirms also
+trigger full scans. The Esplora rate limit must cover these full-scan bursts.
+Finding nothing does
 **not** mean recovery is complete. Seed-only
 recovery cannot prove that all old channels have closed; retain the seed for
 late closes even after a completed run.

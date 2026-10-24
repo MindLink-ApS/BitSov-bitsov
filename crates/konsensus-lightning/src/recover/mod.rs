@@ -7,7 +7,7 @@ pub use journal::{
     JournalState, Report, Status, Verification,
 };
 use konsensus_chain::recovery::RecoveryChain;
-use konsensus_recovery::{BackupIndex, FoundOutput, RecoveryError, RecoveryKeys, RecoveryScript};
+use konsensus_recovery::{BackupIndex, FoundOutput, RecoveryKeys, RecoveryScript};
 use std::borrow::Cow;
 
 #[derive(Debug)]
@@ -99,23 +99,19 @@ impl Job {
             if outputs.is_empty() {
                 break;
             }
+            if matches!(targets, Cow::Owned(_)) {
+                // Other closes may have confirmed while we polled this focus.
+                // Combine them before previewing, even if the focus alone can
+                // pay: a small leftover might never fund its own sweep.
+                targets = Cow::Borrowed(scripts);
+                continue;
+            }
             self.authenticate_closes(chain, &outputs).await?;
-            let signed = match keys.build_sweep(
+            let signed = keys.build_sweep(
                 &outputs,
                 self.plan().address()?.script_pubkey(),
                 FeeRate::from_sat_per_vb(self.plan().fee_rate_sat_vb).ok_or("invalid fee rate")?,
-            ) {
-                Ok(signed) => signed,
-                Err(RecoveryError::DustOutput | RecoveryError::InsufficientFunds)
-                    if matches!(targets, Cow::Owned(_)) =>
-                {
-                    // Other scripts may hold enough funds to make the sweep viable.
-                    // Retry once in full, including confirmation/authentication checks.
-                    targets = Cow::Borrowed(scripts);
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
+            )?;
             let sweep = Sweep {
                 transaction: bitcoin::consensus::encode::serialize_hex(&signed.transaction),
                 fee_sats: signed.fee.to_sat(),
@@ -136,10 +132,11 @@ impl Job {
     }
 
     /// Seed-only recovery scans every derived script until a pass discovers hub
-    /// close outputs; later 30-second passes poll only those outputs' scripts,
-    /// so chain reads are bounded by what was found rather than by the 2000
-    /// derived scripts. A backup index already bounds the scan to its active
-    /// channels and is always scanned in full. An empty focus means a full scan.
+    /// close outputs; later 30-second unconfirmed polls read only those outputs'
+    /// scripts. Sweep previews, a vanished focus, and the post-sweep late-close
+    /// check require a full scan. A backup index already bounds the
+    /// scan to its active channels and is always scanned in full. An empty focus
+    /// means a full scan.
     fn scan_targets<'a>(&self, scripts: &'a [RecoveryScript]) -> Cow<'a, [RecoveryScript]> {
         if self.focus.is_empty() {
             return Cow::Borrowed(scripts);

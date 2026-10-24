@@ -428,7 +428,10 @@ async fn seed_only_passes_poll_discovered_scripts_until_the_sweep_confirms() {
     else {
         panic!("preview");
     };
-    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[2000, 1, 1]);
+    assert_eq!(
+        chain.scanned.lock().unwrap().as_slice(),
+        &[2000, 1, 1, 2000]
+    );
     assert_eq!(inputs.len(), 1);
     job.approve(&chain, sweep, inputs).await.unwrap();
     assert!(matches!(
@@ -436,7 +439,10 @@ async fn seed_only_passes_poll_discovered_scripts_until_the_sweep_confirms() {
         Progress::Confirming { .. }
     ));
     // Broadcasting and confirming never scan the key space.
-    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[2000, 1, 1]);
+    assert_eq!(
+        chain.scanned.lock().unwrap().as_slice(),
+        &[2000, 1, 1, 2000]
+    );
     chain
         .transactions
         .lock()
@@ -452,7 +458,7 @@ async fn seed_only_passes_poll_discovered_scripts_until_the_sweep_confirms() {
     ));
     let scanned = chain.scanned.lock().unwrap().clone();
     assert_eq!(scanned.last(), Some(&2000), "{scanned:?}");
-    assert_eq!(scanned.iter().filter(|n| **n == 2000).count(), 2);
+    assert_eq!(scanned.iter().filter(|n| **n == 2000).count(), 3);
 }
 
 #[tokio::test]
@@ -496,6 +502,82 @@ async fn narrowed_pass_that_finds_nothing_falls_back_to_a_full_scan() {
         Progress::WaitingForHub
     ));
     assert_eq!(chain.scanned.lock().unwrap().last(), Some(&2000));
+}
+
+#[tokio::test]
+async fn viable_focused_sweep_includes_a_later_dust_close_before_preview() {
+    let (dir, keys, chain, plan) = fixture();
+    let mut job = Job::load_or_begin(dir.path(), plan.clone(), vec![]).unwrap();
+    chain.outputs.lock().unwrap()[0].confirmations = 0;
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+
+    // While the 90,000-sat focused close was unconfirmed, another script closed.
+    // Its 600 sats cannot pay for a separate sweep at the frozen 2 sat/vB rate.
+    let mut later_close = chain.transactions.lock().unwrap()[0].transaction.clone();
+    later_close.output[0] = TxOut {
+        value: Amount::from_sat(600),
+        script_pubkey: keys.scripts()[0].script_pubkey.clone(),
+    };
+    let later_output = FoundOutput {
+        outpoint: OutPoint {
+            txid: later_close.compute_txid(),
+            vout: 0,
+        },
+        txout: later_close.output[0].clone(),
+        confirmations: 1,
+    };
+    assert_eq!(
+        keys.build_sweep(
+            std::slice::from_ref(&later_output),
+            plan.address().unwrap().script_pubkey(),
+            FeeRate::from_sat_per_vb(2).unwrap(),
+        )
+        .unwrap_err(),
+        RecoveryError::DustOutput
+    );
+    chain.transactions.lock().unwrap().push(ChainTransaction {
+        transaction: later_close,
+        confirmations: 1,
+    });
+    chain.outputs.lock().unwrap()[0].confirmations = 1;
+    chain.outputs.lock().unwrap().push(later_output);
+    let all_outputs = chain.outputs.lock().unwrap().clone();
+
+    let Progress::SweepPreview { sweep, inputs } =
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap()
+    else {
+        panic!("combined preview");
+    };
+    assert_eq!(inputs, all_outputs);
+    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[2000, 1, 2000]);
+    assert_eq!(sweep.tx().unwrap().input.len(), 2);
+    assert_eq!(sweep.validate(&plan).unwrap(), 90_600 - sweep.fee_sats);
+    assert!(chain.sent.lock().unwrap().is_empty());
+    job.approve(&chain, sweep, inputs).await.unwrap();
+    drop(job);
+
+    let mut job = Job::load_or_begin(dir.path(), plan, vec![]).unwrap();
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::Confirming { .. }
+    ));
+    assert!(chain.outputs.lock().unwrap().is_empty());
+    chain
+        .transactions
+        .lock()
+        .unwrap()
+        .last_mut()
+        .unwrap()
+        .confirmations = 6;
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::SelfTest
+    ));
+    job.finish(&chain, "tested".into()).await.unwrap();
+    assert!(recover::ensure_normal_start(dir.path()).is_ok());
 }
 
 #[tokio::test]

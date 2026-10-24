@@ -74,14 +74,15 @@ fn chain(config: &ChainConfig) -> Result<Box<dyn RecoveryChain>> {
 }
 
 /// Esplora costs at least one HTTP request per scanned script. A seed-only
-/// pass scans every derived script until it finds hub close outputs; the
-/// 30-second passes after that poll only the discovered outputs. A backup index
-/// bounds every pass to its active channels instead.
+/// pass scans every derived script until it finds hub close outputs. Only
+/// unconfirmed-close polls stay narrowed; full-scan bursts still occur before
+/// previews, when focus disappears, and after sweep confirmation. A backup
+/// index bounds every pass to its active channels instead.
 fn esplora_request_warning(scripts: usize, backup: bool) -> String {
     let bound = if backup {
         format!("at least {scripts} HTTP requests per 30-second pass (one per active backup channel script)")
     } else {
-        format!("at least {scripts} HTTP requests per 30-second pass until a hub close output is found, then only a few requests per discovered output")
+        format!("at least {scripts} HTTP requests per 30-second pass until a hub close output is found; unconfirmed-close polls use a few requests per discovered output, but a full scan of all {scripts} scripts runs if the focus disappears, before a sweep preview (including uneconomic focused sweeps), and after a sweep confirms; the rate limit must cover these full-scan bursts")
     };
     format!("Esplora recovery can cost {bound} and reveals these scripts to the configured service; rate limits apply.")
 }
@@ -319,7 +320,21 @@ mod tests {
         assert!(seed_only.contains(
             "at least 2000 HTTP requests per 30-second pass until a hub close output is found"
         ));
-        assert!(seed_only.contains("then only a few requests per discovered output"));
+        assert!(
+            seed_only.contains("unconfirmed-close polls use a few requests per discovered output")
+        );
+        for reason in [
+            "focus disappears",
+            "before a sweep preview",
+            "after a sweep confirms",
+        ] {
+            assert!(
+                seed_only.contains(reason),
+                "missing full-scan reason: {reason}"
+            );
+        }
+        assert!(seed_only.contains("full scan of all 2000 scripts"));
+        assert!(seed_only.contains("rate limit must cover these full-scan bursts"));
         let backup = super::esplora_request_warning(3, true);
         assert!(backup.contains(
             "at least 3 HTTP requests per 30-second pass (one per active backup channel script)"

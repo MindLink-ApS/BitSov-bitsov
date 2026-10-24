@@ -1,7 +1,8 @@
 //! BITCOIND_EXE=/path/to/bitcoind cargo test -p konsensus-lightning --test recover_esplora_regtest -- --ignored --nocapture
 //! Seed-only recovery against a real regtest chain through a request-counting
 //! Esplora shim: every derived script is read until the hub close is found,
-//! then each 30-second pass reads only the discovered output. No downloads.
+//! then unconfirmed polls read only the discovered output. The preview pass
+//! rescans every script to combine confirmed closes. No downloads.
 #[allow(dead_code)]
 #[path = "support/core.rs"]
 mod core;
@@ -291,10 +292,10 @@ async fn seed_only_esplora_recovery_bounds_reads_after_the_first_pass() {
         panic!("{progress:?}");
     };
     assert!(
-        polled <= NARROWED_PASS_MAXIMUM,
-        "confirmed poll read {polled}"
+        polled >= FULL_PASS_MINIMUM,
+        "pre-preview rescan read {polled}"
     );
-    println!("confirmed-close poll: {polled} HTTP requests");
+    println!("pre-preview rescan: {polled} HTTP requests");
     assert_eq!(inputs.len(), 1);
     assert_eq!(inputs[0].outpoint.txid, close);
     assert_eq!(inputs[0].txout.value.to_sat(), 90_000);

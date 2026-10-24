@@ -1,5 +1,6 @@
 //! Seed-only recovery over a request-counting Esplora stand-in: the first pass
-//! reads every derived script, later passes read only the discovered outputs.
+//! reads every derived script, unconfirmed polls read only discovered outputs,
+//! and the preview pass rescans all scripts to combine confirmed closes.
 //! No bitcoind: the chain is a synthetic regtest view served over HTTP.
 use bitcoin::{
     absolute,
@@ -20,7 +21,7 @@ use std::sync::{
 };
 
 /// Every derived script costs one request. Narrowed passes read the discovered
-/// output, its transaction, its spend status and the tip: a handful.
+/// unconfirmed output, its transaction, its spend status and the tip: a handful.
 const FULL_PASS_MINIMUM: usize = 2000;
 const NARROWED_PASS_MAXIMUM: usize = 32;
 
@@ -152,7 +153,7 @@ async fn pass(
 }
 
 #[tokio::test]
-async fn seed_only_recovery_reads_every_script_once_then_only_discovered_outputs() {
+async fn seed_only_recovery_bounds_unconfirmed_polls_and_rescans_before_preview() {
     let keys = RecoveryKeys::from_ldk_seed(&[9; 32]).unwrap();
     assert_eq!(keys.scripts().len(), FULL_PASS_MINIMUM);
     // The hub's close pays B's static to_remote key; in the mempool at first.
@@ -213,8 +214,8 @@ async fn seed_only_recovery_reads_every_script_once_then_only_discovered_outputs
         panic!("{progress:?}");
     };
     assert!(
-        polled <= NARROWED_PASS_MAXIMUM,
-        "confirmed-close poll read {polled} requests"
+        polled >= FULL_PASS_MINIMUM,
+        "pre-preview rescan read {polled} requests"
     );
     assert_eq!(inputs.len(), 1);
     assert_eq!(sweep.validate(&plan).unwrap(), 90_000 - sweep.fee_sats);
