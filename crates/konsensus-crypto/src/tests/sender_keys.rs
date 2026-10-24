@@ -1,6 +1,31 @@
 use super::*;
 use ed25519_dalek::Signer;
 
+#[test]
+fn staged_sender_keys_are_wiped_in_place_on_failure() {
+    let mut staged = vec![(4, [0xAB; 32]), (5, [0xCD; 32])];
+    let allocation = staged.as_ptr();
+    finish_staged_skips(&mut staged, None);
+    assert_eq!(staged.as_ptr(), allocation);
+    assert!(
+        staged.iter().all(|(_, key)| *key == [0; 32]),
+        "wipe the backing allocation before it is freed"
+    );
+}
+
+#[test]
+fn staged_sender_keys_are_wiped_in_place_after_commit() {
+    let mut staged = vec![(4, [0xAB; 32]), (5, [0xCD; 32])];
+    let mut committed = HashMap::new();
+    finish_staged_skips(&mut staged, Some(&mut committed));
+    assert_eq!(committed.get(&4), Some(&[0xAB; 32]));
+    assert_eq!(committed.get(&5), Some(&[0xCD; 32]));
+    assert!(
+        staged.iter().all(|(_, key)| *key == [0; 32]),
+        "committing keys must wipe the temporary copies too"
+    );
+}
+
 fn test_group_id() -> [u8; 32] {
     let mut id = [0u8; 32];
     id[..5].copy_from_slice(b"test!");
@@ -159,10 +184,7 @@ fn member_removal_rotates_keys() {
 
     // Alice sends with new key — Bob can decrypt
     let ct_after = alice.encrypt(b"after removal").unwrap();
-    assert_eq!(
-        bob.decrypt(&alice_id, &ct_after).unwrap(),
-        b"after removal"
-    );
+    assert_eq!(bob.decrypt(&alice_id, &ct_after).unwrap(), b"after removal");
 
     // Carol cannot decrypt the new message (she has the old key)
     assert!(carol.decrypt(&alice_id, &ct_after).is_err());
@@ -209,7 +231,10 @@ fn unknown_sender_rejected() {
     let ct = alice.encrypt(b"hello").unwrap();
     // Try to decrypt as if from an unknown sender
     let result = bob.decrypt(&unknown_id, &ct);
-    assert!(matches!(result.unwrap_err(), SenderKeyError::UnknownSender(_)));
+    assert!(matches!(
+        result.unwrap_err(),
+        SenderKeyError::UnknownSender(_)
+    ));
 }
 
 #[test]
@@ -389,7 +414,10 @@ fn debug_impl_redacts_chain_key() {
     let dist = alice.our_distribution();
     let debug_str = format!("{:?}", dist);
 
-    assert!(debug_str.contains("[REDACTED]"), "Distribution Debug must redact chain_key");
+    assert!(
+        debug_str.contains("[REDACTED]"),
+        "Distribution Debug must redact chain_key"
+    );
     let chain_hex = hex::encode(dist.chain_key);
     assert!(
         !debug_str.contains(&chain_hex),
