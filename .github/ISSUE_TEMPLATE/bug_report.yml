@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a reproducible, non-security bug.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For security vulnerabilities, follow [SECURITY.md](https://github.com/MindLink-ApS/BitSov-bitsov/blob/main/SECURITY.md) and use GitHub's private "Report a vulnerability" flow. Do not disclose vulnerabilities in public issues.
+        Remove secrets and private infrastructure details from all text, logs, and attachments. Use regtest or signet for reproductions; do not spend mainnet funds.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Release candidate tag or commit SHA, plus how you installed or built it.
+    validations:
+      required: true
+  - type: input
+    id: network
+    attributes:
+      label: Network
+      description: Which network was in use (regtest, signet, testnet, or mainnet)? Do not include peer addresses.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, architecture, and Rust version if built from source.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide a minimal reproduction using test funds only.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs with secrets removed
+      description: Paste relevant logs, or explain why none are available. Remove seed phrases, private keys, tokens, credentials, payment preimages, private messages, and internal hostnames, IPs, and email addresses.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Before submitting
+      options:
+        - label: I removed secrets and private infrastructure details from this report and its attachments.
+          required: true
+        - label: This is not a security vulnerability report.
+          required: true
