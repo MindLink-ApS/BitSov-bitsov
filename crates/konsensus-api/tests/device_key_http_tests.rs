@@ -815,6 +815,7 @@ async fn register_device_over_http(headless: bool, remote: bool) {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["grant"]["recipients_only"], true);
+    assert_eq!(body["grant"]["per_call_max_msat"], 6_000);
     let envelope_a = body["envelope_id"]
         .as_str()
         .expect("relation-intent envelope_id");

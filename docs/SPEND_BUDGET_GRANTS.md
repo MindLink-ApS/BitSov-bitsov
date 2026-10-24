@@ -10,6 +10,14 @@ store is now version 8. Older nodes refuse to open it rather than ignore
 allowlists, payment deduplication, circuit breakers, device-reset limits or
 envelope identities; existing version 2–7 grants remain readable.
 
+Every non-payment call (messages, room fan-out, first contact, re-admission,
+files and porch pages) is limited to `min(per_call_max_msat, 6_000)` msat,
+including routing fees. This applies at reservation time to every grant type,
+including console grants and existing live grants, without migration or changes
+to signed terms. The grant view and `pair-status` report this effective limit.
+Explicit invoice payments and keysend retain the console grant's owner-approved
+per-call limit; messaging-only grants cannot fund them.
+
 ## Owner flow (one command per budget window)
 
 1. The app asks: `POST /api/v1/pair/elevation-request` with

@@ -6,6 +6,9 @@ also live on the corresponding GitHub pre-release pages.
 ## Unreleased
 
 - Bind device-signed relation intents to the pairing epoch (`bitsov-relation-intent-v2`; `relation_intent_v2`). v1 signatures are refused. The remote route uses the same authenticated Noise session as the other signed tunnel intents. `GET /api/v1/pair/device-keys` returns that epoch.
+- Pin the development and CI Rust toolchain to 1.99.1 in `rust-toolchain.toml`;
+  every workflow installs the version from that file instead of floating
+  `stable`, and a guard script fails CI if a workflow or the pin drifts (#394).
 - Raise the source-build MSRV to Rust 1.89 to match locked `uuid` 1.28.0.
 - Discard serde diagnostics from peer session-value decodes; add relay and
   file-payload guard regressions and use unique temporary mutation-log directories.

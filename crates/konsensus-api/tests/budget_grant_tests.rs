@@ -2910,3 +2910,6 @@ async fn confirmed_payment_failures_pause_the_grant_at_the_http_boundary() {
     assert_budget_exceeded(status, &response, "grant_paused");
     assert_eq!(fx.wallet.money(), 2);
 }
+
+#[path = "budget_grant/messaging_cap.rs"]
+mod messaging_cap;
