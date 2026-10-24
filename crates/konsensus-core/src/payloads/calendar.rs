@@ -225,7 +225,8 @@ mod tests {
 
     #[test]
     fn event_payload_no_recurrence_defaults() {
-        let json = r#"{"event_id":"e1","title":"T","start_ms":1,"end_ms":2,"tz":"UTC","organizer":"aa"}"#;
+        let json =
+            r#"{"event_id":"e1","title":"T","start_ms":1,"end_ms":2,"tz":"UTC","organizer":"aa"}"#;
         let p: CalendarEventPayload = serde_json::from_str(json).unwrap();
         assert!(p.recurrence.is_none());
         assert!(p.description.is_none());

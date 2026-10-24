@@ -99,15 +99,16 @@ async fn accept_liquidity(
     let result = debit
         .dispatch(state.lightning.accept_liquidity(&owner, &req.quote_id))
         .await?;
-    if matches!(&result, Err(LightningError::PaymentNotDispatched(_) | LightningError::NotReady)) {
+    if matches!(
+        &result,
+        Err(LightningError::PaymentNotDispatched(_) | LightningError::NotReady)
+    ) {
         debit.released(&q.provider);
     }
     // Publication commits bounded future deductions. Keep the durable debit on
     // success, cancellation, timeout and unknown outcome, even across restart.
     // Expiry alone cannot prove no HTLC is in flight. Never retry automatically.
-    result
-        .map(Json)
-        .map_err(ApiError::from)
+    result.map(Json).map_err(ApiError::from)
 }
 
 pub fn routes() -> Router<Arc<AppState>> {

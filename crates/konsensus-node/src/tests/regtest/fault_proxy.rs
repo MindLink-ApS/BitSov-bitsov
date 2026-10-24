@@ -78,7 +78,10 @@ impl FaultProxy {
                 if gate.load(Ordering::SeqCst) {
                     count.fetch_add(1, Ordering::SeqCst);
                     if is_read {
-                        response_log.lock().unwrap().push((path.to_owned(), axum::http::StatusCode::TOO_MANY_REQUESTS));
+                        response_log
+                            .lock()
+                            .unwrap()
+                            .push((path.to_owned(), axum::http::StatusCode::TOO_MANY_REQUESTS));
                     }
                     return (
                         axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -106,7 +109,10 @@ impl FaultProxy {
                     Err(_) => axum::http::StatusCode::BAD_GATEWAY.into_response(),
                 };
                 if is_read {
-                    response_log.lock().unwrap().push((path.to_owned(), response.status()));
+                    response_log
+                        .lock()
+                        .unwrap()
+                        .push((path.to_owned(), response.status()));
                 }
                 response
             }
@@ -132,7 +138,12 @@ impl FaultProxy {
         self.drop_broadcasts.store(true, Ordering::SeqCst);
     }
     pub fn broadcasts(&self) -> Vec<bitcoin::Transaction> {
-        self.broadcasts.lock().unwrap().iter().map(|(_, tx)| tx.clone()).collect()
+        self.broadcasts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, tx)| tx.clone())
+            .collect()
     }
     pub fn broadcast_attempts(&self) -> Vec<(std::time::Instant, bitcoin::Transaction)> {
         self.broadcasts.lock().unwrap().clone()

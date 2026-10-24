@@ -1746,7 +1746,8 @@ async fn finalize_remote(
         .map(|n| n.binding);
     let bad = || ceremony_error(StatusCode::BAD_REQUEST, "invalid_finalize_body");
     let raw = crate::locked::body::read(request).await.ok_or_else(bad)?;
-    let wire: RemoteFinalizeBody<'_> = konsensus_core::wire_json::from_slice(&raw).map_err(|_| bad())?;
+    let wire: RemoteFinalizeBody<'_> =
+        konsensus_core::wire_json::from_slice(&raw).map_err(|_| bad())?;
     let password = crate::locked::body::decode_password(wire.password.get()).map_err(|_| bad())?;
     let body = FinalizeBody {
         ceremony_id: wire.ceremony_id,

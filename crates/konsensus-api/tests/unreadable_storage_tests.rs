@@ -296,16 +296,31 @@ async fn below_threshold_sends_count_without_mismatch_and_resync_keeps_original_
 
 #[tokio::test]
 async fn unreadable_blocks_refill_and_bounded_scans_can_continue() {
-    let store = Arc::new(EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]));
+    let store = Arc::new(EncryptedStorage::new(
+        SqliteStorage::in_memory().await.unwrap(),
+        &[7; 32],
+    ));
     let state = common::test_state_with_storage(store.clone());
     let owner = *state.identity.node_id();
     let sender = NodeId::from_bytes([3; 32]);
-    let make = |n: u64| UkmEnvelopeBuilder::new(KIND_CHAT, sender, Recipient::Node(owner),
-        n.to_le_bytes().to_vec(), PaymentProof::new([1; 32], [2; 32], 10)).timestamp(n).build();
+    let make = |n: u64| {
+        UkmEnvelopeBuilder::new(
+            KIND_CHAT,
+            sender,
+            Recipient::Node(owner),
+            n.to_le_bytes().to_vec(),
+            PaymentProof::new([1; 32], [2; 32], 10),
+        )
+        .timestamp(n)
+        .build()
+    };
     for n in 1..=13 {
         let env = make(n);
-        if n == 1 || n == 13 { store.store_message(&env).await.unwrap(); }
-        else { store.inner().store_message(&env).await.unwrap(); }
+        if n == 1 || n == 13 {
+            store.store_message(&env).await.unwrap();
+        } else {
+            store.inner().store_message(&env).await.unwrap();
+        }
     }
     let (_, headers, body) = call(&state, "/api/v1/messages?limit=2", None, true).await;
     assert_eq!(body.as_array().unwrap().len(), 2);
@@ -316,9 +331,13 @@ async fn unreadable_blocks_refill_and_bounded_scans_can_continue() {
     assert_eq!(body, json!([]));
     assert_eq!(headers["X-BitSov-Unreadable-Count"], "10");
     assert_eq!(headers["X-BitSov-Oldest-Scanned-Timestamp"], "3");
-    let uri = format!("/api/v1/messages?limit=1&before={}&before_id={}",
-        headers["X-BitSov-Oldest-Scanned-Timestamp"].to_str().unwrap(),
-        headers["X-BitSov-Oldest-Scanned-Id"].to_str().unwrap());
+    let uri = format!(
+        "/api/v1/messages?limit=1&before={}&before_id={}",
+        headers["X-BitSov-Oldest-Scanned-Timestamp"]
+            .to_str()
+            .unwrap(),
+        headers["X-BitSov-Oldest-Scanned-Id"].to_str().unwrap()
+    );
     let (_, headers, body) = call(&state, &uri, None, true).await;
     assert_eq!(body[0]["timestamp"], 1);
     assert_eq!(headers["X-BitSov-Oldest-Scanned-Timestamp"], "1");
@@ -326,17 +345,35 @@ async fn unreadable_blocks_refill_and_bounded_scans_can_continue() {
 
 #[tokio::test]
 async fn resync_refills_past_its_raw_row_limit() {
-    let store = Arc::new(EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]));
+    let store = Arc::new(EncryptedStorage::new(
+        SqliteStorage::in_memory().await.unwrap(),
+        &[7; 32],
+    ));
     let state = common::test_state_with_storage(store.clone());
     let sender = NodeId::from_bytes([3; 32]);
     for n in 1u64..=1002 {
-        let env = UkmEnvelopeBuilder::new(KIND_CHAT, sender, Recipient::Node(*state.identity.node_id()),
-            n.to_le_bytes().to_vec(), PaymentProof::new([1; 32], [2; 32], 10)).timestamp(n).build();
-        if n == 1 { store.store_message(&env).await.unwrap(); }
-        else { store.inner().store_message(&env).await.unwrap(); }
+        let env = UkmEnvelopeBuilder::new(
+            KIND_CHAT,
+            sender,
+            Recipient::Node(*state.identity.node_id()),
+            n.to_le_bytes().to_vec(),
+            PaymentProof::new([1; 32], [2; 32], 10),
+        )
+        .timestamp(n)
+        .build();
+        if n == 1 {
+            store.store_message(&env).await.unwrap();
+        } else {
+            store.inner().store_message(&env).await.unwrap();
+        }
     }
-    let (status, headers, body) = call(&state, "/api/v1/messages/resync",
-        Some(json!({"phase":"discover", "peer_id":sender.to_hex(), "from_ms":0, "to_ms":2000})), true).await;
+    let (status, headers, body) = call(
+        &state,
+        "/api/v1/messages/resync",
+        Some(json!({"phase":"discover", "peer_id":sender.to_hex(), "from_ms":0, "to_ms":2000})),
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_count"], 1);
     assert_eq!(body["messages"][0]["timestamp"], 1);
@@ -345,17 +382,36 @@ async fn resync_refills_past_its_raw_row_limit() {
 
 #[tokio::test]
 async fn resync_scan_bound_exposes_a_cursor_that_reaches_older_history() {
-    let store = Arc::new(EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]));
+    let store = Arc::new(EncryptedStorage::new(
+        SqliteStorage::in_memory().await.unwrap(),
+        &[7; 32],
+    ));
     let state = common::test_state_with_storage(store.clone());
     let sender = NodeId::from_bytes([3; 32]);
     for n in 1u64..=5002 {
-        let env = UkmEnvelopeBuilder::new(KIND_CHAT, sender, Recipient::Node(*state.identity.node_id()),
-            n.to_le_bytes().to_vec(), PaymentProof::new([1; 32], [2; 32], 10)).timestamp(n).build();
-        if n == 1 { store.store_message(&env).await.unwrap(); }
-        else { store.inner().store_message(&env).await.unwrap(); }
+        let env = UkmEnvelopeBuilder::new(
+            KIND_CHAT,
+            sender,
+            Recipient::Node(*state.identity.node_id()),
+            n.to_le_bytes().to_vec(),
+            PaymentProof::new([1; 32], [2; 32], 10),
+        )
+        .timestamp(n)
+        .build();
+        if n == 1 {
+            store.store_message(&env).await.unwrap();
+        } else {
+            store.inner().store_message(&env).await.unwrap();
+        }
     }
     let request = json!({"phase":"discover", "peer_id":sender.to_hex(), "from_ms":0, "to_ms":6000});
-    let (status, headers, body) = call(&state, "/api/v1/messages/resync", Some(request.clone()), true).await;
+    let (status, headers, body) = call(
+        &state,
+        "/api/v1/messages/resync",
+        Some(request.clone()),
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_count"], 0);
     assert_eq!(headers["X-BitSov-Unreadable-Count"], "5000");
@@ -373,20 +429,41 @@ async fn resync_scan_bound_exposes_a_cursor_that_reaches_older_history() {
 
 #[tokio::test]
 async fn staged_files_do_not_skip_readable_rows_at_the_scan_boundary() {
-    let store = Arc::new(EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]));
+    let store = Arc::new(EncryptedStorage::new(
+        SqliteStorage::in_memory().await.unwrap(),
+        &[7; 32],
+    ));
     let state = common::test_state_with_storage(store.clone());
     for n in 1..=22 {
         let file = FileRecord {
-            id: format!("{n:02}"), filename: "name".into(), mime_type: "text/plain".into(),
-            size_bytes: 0, blake3_hash: "hash".into(), sender: state.identity.node_id().to_hex(),
-            message_id: None, data: vec![], created_at: String::new(),
+            id: format!("{n:02}"),
+            filename: "name".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 0,
+            blake3_hash: "hash".into(),
+            sender: state.identity.node_id().to_hex(),
+            message_id: None,
+            data: vec![],
+            created_at: String::new(),
         };
-        if n == 1 || n == 22 { store.store_file(&file).await.unwrap(); }
-        else { store.inner().store_file(&file).await.unwrap(); }
+        if n == 1 || n == 22 {
+            store.store_file(&file).await.unwrap();
+        } else {
+            store.inner().store_file(&file).await.unwrap();
+        }
     }
-    sqlx::query("UPDATE files SET created_at = '2026-01-01T00:00:00Z'").execute(store.inner().pool()).await.unwrap();
+    sqlx::query("UPDATE files SET created_at = '2026-01-01T00:00:00Z'")
+        .execute(store.inner().pool())
+        .await
+        .unwrap();
     for _ in 0..2 {
-        let (status, _, _) = call(&state, "/api/v1/files", Some(json!({"filename":"staged.txt", "data_b64":"aGk="})), true).await;
+        let (status, _, _) = call(
+            &state,
+            "/api/v1/files",
+            Some(json!({"filename":"staged.txt", "data_b64":"aGk="})),
+            true,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
     }
     let (status, headers, body) = call(&state, "/api/v1/files?limit=2", None, true).await;
@@ -395,8 +472,14 @@ async fn staged_files_do_not_skip_readable_rows_at_the_scan_boundary() {
     assert!(body[0]["id"].as_str().unwrap().starts_with("stage-"));
     assert!(body[1]["id"].as_str().unwrap().starts_with("stage-"));
     assert_eq!(headers["X-BitSov-Oldest-Scanned-Id"], "03");
-    let uri = format!("/api/v1/files?limit=2&before={}&before_id={}",
-        headers["X-BitSov-Next-Before"].to_str().unwrap().replace('+', "%2B"), headers["X-BitSov-Next-Before-Id"].to_str().unwrap());
+    let uri = format!(
+        "/api/v1/files?limit=2&before={}&before_id={}",
+        headers["X-BitSov-Next-Before"]
+            .to_str()
+            .unwrap()
+            .replace('+', "%2B"),
+        headers["X-BitSov-Next-Before-Id"].to_str().unwrap()
+    );
     let (status, _, body) = call(&state, &uri, None, true).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body[0]["id"], "22");
@@ -448,12 +531,19 @@ async fn bounded_file_pages_return_every_readable_and_staged_file_exactly_once()
             sqlx::query("UPDATE files SET created_at = ? WHERE id = ?")
                 .bind(&record.created_at)
                 .bind(&record.id)
-                .execute(store.inner().pool()).await.unwrap();
+                .execute(store.inner().pool())
+                .await
+                .unwrap();
         }
         for n in [0, 2, 21, 22, 23, 42, 43, 44, 64, 65, 66] {
             let record = file(format!("stage-{n:02}"), n);
             expected.insert(record.id.clone());
-            state.file_staging.lock().unwrap().insert(&state, &auth, record).unwrap();
+            state
+                .file_staging
+                .lock()
+                .unwrap()
+                .insert(&state, &auth, record)
+                .unwrap();
         }
 
         // Exercise full, short and empty bounded pages, including changing limits.
@@ -468,7 +558,10 @@ async fn bounded_file_pages_return_every_readable_and_staged_file_exactly_once()
                 assert_eq!(status, StatusCode::OK, "{body}");
                 for item in body.as_array().unwrap() {
                     let id = item["id"].as_str().unwrap().to_owned();
-                    assert!(seen.insert(id.clone()), "duplicate {id}: tied={tied}, {uri}");
+                    assert!(
+                        seen.insert(id.clone()),
+                        "duplicate {id}: tied={tied}, {uri}"
+                    );
                 }
                 if headers.contains_key("X-BitSov-Oldest-Scanned-Id") {
                     bounded_pages += 1;
@@ -476,9 +569,11 @@ async fn bounded_file_pages_return_every_readable_and_staged_file_exactly_once()
                 let Some(before) = headers.get("X-BitSov-Next-Before") else {
                     break;
                 };
-                cursor = format!("&before={}&before_id={}",
+                cursor = format!(
+                    "&before={}&before_id={}",
                     before.to_str().unwrap().replace('+', "%2B"),
-                    headers["X-BitSov-Next-Before-Id"].to_str().unwrap());
+                    headers["X-BitSov-Next-Before-Id"].to_str().unwrap()
+                );
                 assert!(page < 99, "pagination did not terminate");
             }
             assert!(bounded_pages > 0, "fixture must reach the raw scan bound");
@@ -489,23 +584,53 @@ async fn bounded_file_pages_return_every_readable_and_staged_file_exactly_once()
 
 #[tokio::test]
 async fn search_continuation_preserves_matches_not_yet_returned() {
-    let store = Arc::new(EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]));
+    let store = Arc::new(EncryptedStorage::new(
+        SqliteStorage::in_memory().await.unwrap(),
+        &[7; 32],
+    ));
     let state = common::test_state_with_storage_and_cipher(store.clone());
     for n in 1u64..=5002 {
-        let env = UkmEnvelopeBuilder::new(KIND_CHAT, NodeId::from_bytes([3; 32]), Recipient::Node(*state.identity.node_id()),
-            n.to_le_bytes().to_vec(), PaymentProof::new([1; 32], [2; 32], 10)).timestamp(n).build();
+        let env = UkmEnvelopeBuilder::new(
+            KIND_CHAT,
+            NodeId::from_bytes([3; 32]),
+            Recipient::Node(*state.identity.node_id()),
+            n.to_le_bytes().to_vec(),
+            PaymentProof::new([1; 32], [2; 32], 10),
+        )
+        .timestamp(n)
+        .build();
         if n >= 5001 {
             store.store_message(&env).await.unwrap();
-            store.store_message_plaintext(&env.id, &common::test_plaintext_cipher().encrypt(b"match").unwrap()).await.unwrap();
-        } else { store.inner().store_message(&env).await.unwrap(); }
+            store
+                .store_message_plaintext(
+                    &env.id,
+                    &common::test_plaintext_cipher().encrypt(b"match").unwrap(),
+                )
+                .await
+                .unwrap();
+        } else {
+            store.inner().store_message(&env).await.unwrap();
+        }
     }
-    let (status, headers, body) = call(&state, "/api/v1/messages/search?q=match&limit=1", None, true).await;
+    let (status, headers, body) = call(
+        &state,
+        "/api/v1/messages/search?q=match&limit=1",
+        None,
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body[0]["timestamp"], 5002);
     assert_eq!(headers["X-BitSov-Oldest-Scanned-Timestamp"], "3");
     assert_eq!(headers["X-BitSov-Next-Before"], "5002");
-    let uri = format!("/api/v1/messages/search?q=match&limit=1&before={}&before_id={}",
-        headers["X-BitSov-Next-Before"].to_str().unwrap().replace('+', "%2B"), headers["X-BitSov-Next-Before-Id"].to_str().unwrap());
+    let uri = format!(
+        "/api/v1/messages/search?q=match&limit=1&before={}&before_id={}",
+        headers["X-BitSov-Next-Before"]
+            .to_str()
+            .unwrap()
+            .replace('+', "%2B"),
+        headers["X-BitSov-Next-Before-Id"].to_str().unwrap()
+    );
     let (status, _, body) = call(&state, &uri, None, true).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body[0]["timestamp"], 5001);
@@ -514,21 +639,43 @@ async fn search_continuation_preserves_matches_not_yet_returned() {
 #[tokio::test]
 async fn room_source_checkpoints_are_separate_from_logical_pages() {
     use konsensus_core::payloads::room::RoomBinding;
-    let store = Arc::new(EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]));
+    let store = Arc::new(EncryptedStorage::new(
+        SqliteStorage::in_memory().await.unwrap(),
+        &[7; 32],
+    ));
     let state = common::test_state_with_storage_and_cipher(store.clone());
     let owner = *state.identity.node_id();
     let peers = [NodeId::from_bytes([3; 32]), NodeId::from_bytes([4; 32])];
     let room = RoomBinding::create(&[owner, peers[0], peers[1]]).unwrap();
-    let plaintext = json!({"v":1, "room":room, "msg":"ab".repeat(16), "text":"copies across chunks"}).to_string();
+    let plaintext =
+        json!({"v":1, "room":room, "msg":"ab".repeat(16), "text":"copies across chunks"})
+            .to_string();
     let mut expected_copies = std::collections::BTreeSet::new();
     for n in 1u64..=5002 {
-        let env = UkmEnvelopeBuilder::new(KIND_CHAT, owner, Recipient::Node(if n == 1 { peers[0] } else { peers[1] }),
-            n.to_le_bytes().to_vec(), PaymentProof::new([1; 32], [2; 32], 10)).timestamp(n).build();
+        let env = UkmEnvelopeBuilder::new(
+            KIND_CHAT,
+            owner,
+            Recipient::Node(if n == 1 { peers[0] } else { peers[1] }),
+            n.to_le_bytes().to_vec(),
+            PaymentProof::new([1; 32], [2; 32], 10),
+        )
+        .timestamp(n)
+        .build();
         if n == 1 || n == 5002 {
             expected_copies.insert(env.id.to_hex());
             store.store_message(&env).await.unwrap();
-            store.store_message_plaintext(&env.id, &common::test_plaintext_cipher().encrypt(plaintext.as_bytes()).unwrap()).await.unwrap();
-        } else { store.inner().store_message(&env).await.unwrap(); }
+            store
+                .store_message_plaintext(
+                    &env.id,
+                    &common::test_plaintext_cipher()
+                        .encrypt(plaintext.as_bytes())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        } else {
+            store.inner().store_message(&env).await.unwrap();
+        }
     }
     let uri = format!("/api/v1/messages?room={}&limit=1", room.id);
     let (status, headers, first) = call(&state, &uri, None, true).await;
@@ -540,7 +687,10 @@ async fn room_source_checkpoints_are_separate_from_logical_pages() {
     let (_, _, drained) = call(&state, &format!("{uri}&before=5002"), None, true).await;
     assert_eq!(drained, json!([]));
     // Explicit raw-source continuation reaches older copies for client-side merging.
-    let resume = format!("{uri}&scan_before=3&scan_before_id={}", headers["X-BitSov-Oldest-Scanned-Id"].to_str().unwrap());
+    let resume = format!(
+        "{uri}&scan_before=3&scan_before_id={}",
+        headers["X-BitSov-Oldest-Scanned-Id"].to_str().unwrap()
+    );
     let (status, headers, older) = call(&state, &resume, None, true).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(older[0]["timestamp"], 1);

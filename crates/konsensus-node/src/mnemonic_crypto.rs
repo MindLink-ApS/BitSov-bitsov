@@ -75,7 +75,10 @@ fn derive_key(password: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, Mnemo
     // Argon2 0.5's zeroize feature wipes internal temporaries and implements
     // Zeroize for Block, but its allocating helper does not wipe the working
     // buffer. Own it here so all 64 MiB are wiped on success and error paths.
-    let mut memory = Zeroizing::new(vec![argon2::Block::default(); argon2.params().block_count()]);
+    let mut memory = Zeroizing::new(vec![
+        argon2::Block::default();
+        argon2.params().block_count()
+    ]);
     argon2
         .hash_password_into_with_memory(password, salt, key.as_mut(), memory.as_mut_slice())
         .map_err(|e| MnemonicCryptoError::KeyDerivation(e.to_string()))?;
@@ -85,7 +88,10 @@ fn derive_key(password: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, Mnemo
 /// The owner secret behind the owner-approval key: argon2id (the same cost as
 /// the file encryption) over the recovery-phrase password, salted per node.
 /// A copy of the seed without this password does not yield the owner key.
-pub fn owner_secret(password: &str, node_id_hex: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, MnemonicCryptoError> {
+pub fn owner_secret(
+    password: &str,
+    node_id_hex: &str,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, MnemonicCryptoError> {
     let salt = blake3::keyed_hash(
         blake3::hash(b"bitsov-owner-approval-salt-v1").as_bytes(),
         node_id_hex.as_bytes(),
@@ -138,9 +144,7 @@ pub fn decrypt_mnemonic(
 ) -> Result<Zeroizing<String>, MnemonicCryptoError> {
     if encrypted.len() < HEADER_LEN + 16 {
         // Minimum: header + 16-byte GCM tag (even empty plaintext has a tag)
-        return Err(MnemonicCryptoError::InvalidFormat(
-            "file too short".into(),
-        ));
+        return Err(MnemonicCryptoError::InvalidFormat("file too short".into()));
     }
 
     let version = encrypted[0];
@@ -222,7 +226,10 @@ pub fn write_mnemonic(
             let encrypted = encrypt_mnemonic(mnemonic, pw)?;
             (enc_path, Zeroizing::new(encrypted))
         }
-        None => (path.to_path_buf(), Zeroizing::new(mnemonic.as_bytes().to_vec())),
+        None => (
+            path.to_path_buf(),
+            Zeroizing::new(mnemonic.as_bytes().to_vec()),
+        ),
     };
 
     std::fs::write(&final_path, data.as_slice())?;

@@ -78,9 +78,7 @@ impl SessionStore for MemorySessionStore {
         self.data.write().await.remove(peer_id);
         Ok(())
     }
-    async fn list_sessions(
-        &self,
-    ) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.data.read().await.keys().copied().collect())
     }
 }
@@ -118,8 +116,7 @@ async fn l0b_session_restore_downgrade_resistance() {
     {
         let identity = make_identity();
         let store = MemorySessionStore::new();
-        let manager =
-            SessionManager::with_store(Arc::clone(&identity), Arc::clone(&store) as _);
+        let manager = SessionManager::with_store(Arc::clone(&identity), Arc::clone(&store) as _);
 
         let peer_id = make_node_id(7);
         let attacker_blob = attacker_plaintext_ratchet_blob();
@@ -141,8 +138,7 @@ async fn l0b_session_restore_downgrade_resistance() {
     {
         let identity = make_identity();
         let store = MemorySessionStore::new();
-        let manager =
-            SessionManager::with_store(Arc::clone(&identity), Arc::clone(&store) as _);
+        let manager = SessionManager::with_store(Arc::clone(&identity), Arc::clone(&store) as _);
 
         let peer_identity = Arc::new(
             NodeIdentity::from_mnemonic(
@@ -191,8 +187,7 @@ async fn l0b_session_restore_downgrade_resistance() {
     {
         let identity = make_identity();
         let store = MemorySessionStore::new();
-        let manager =
-            SessionManager::with_store(Arc::clone(&identity), Arc::clone(&store) as _);
+        let manager = SessionManager::with_store(Arc::clone(&identity), Arc::clone(&store) as _);
 
         let peer_id = make_node_id(11);
         let plaintext_blob = attacker_plaintext_ratchet_blob();

@@ -69,17 +69,18 @@ async fn list_channels_default_still_works_alongside_shutdown_default() {
     let p = DefaultProvider;
     // Sanity: another defaulted method still composes — no accidental
     // breakage from adding shutdown to the trait.
-    assert!(
-        <DefaultProvider as LightningProvider>::list_channels(&p)
-            .await
-            .map(|v: Vec<ChannelInfo>| v.is_empty())
-            .unwrap_or(false)
-    );
+    assert!(<DefaultProvider as LightningProvider>::list_channels(&p)
+        .await
+        .map(|v: Vec<ChannelInfo>| v.is_empty())
+        .unwrap_or(false));
 }
 
 #[tokio::test]
 async fn unsupported_keysend_proves_no_payment_was_dispatched() {
-    let err = DefaultProvider.keysend("unused", 1000, None).await.unwrap_err();
+    let err = DefaultProvider
+        .keysend("unused", 1000, None)
+        .await
+        .unwrap_err();
     assert!(matches!(err, LightningError::PaymentNotDispatched(_)));
 }
 

@@ -87,7 +87,9 @@ pub trait MessageTransport: Send + Sync {
     /// quote and a per-act payment; transports must not send unpaid discovery.
     async fn request_peer_exchange(&self, peer: &NodeId) -> Result<(), TransportError> {
         let _ = peer;
-        Err(TransportError::Other("peer exchange not supported by this transport".into()))
+        Err(TransportError::Other(
+            "peer exchange not supported by this transport".into(),
+        ))
     }
 
     /// Send pre-serialized frame bytes to a connected peer.
@@ -96,9 +98,15 @@ pub trait MessageTransport: Send + Sync {
     /// request/response) without the transport trait depending on the Frame
     /// type (which lives in `konsensus-message`). The caller is responsible
     /// for serializing the frame to bytes.
-    async fn send_raw_frame(&self, peer: &NodeId, frame_bytes: &[u8]) -> Result<(), TransportError> {
+    async fn send_raw_frame(
+        &self,
+        peer: &NodeId,
+        frame_bytes: &[u8],
+    ) -> Result<(), TransportError> {
         let _ = (peer, frame_bytes);
-        Err(TransportError::Other("send_raw_frame not supported by this transport".into()))
+        Err(TransportError::Other(
+            "send_raw_frame not supported by this transport".into(),
+        ))
     }
 
     /// Get federation handshake info for a connected peer.
@@ -125,7 +133,9 @@ pub trait MessageTransport: Send + Sync {
 
     /// Whether we settled an admission payment on this live connection. This
     /// volatile guard lasts until disconnect, independently of proof-cache TTLs.
-    async fn admission_paid_on_connection(&self, _peer: &NodeId) -> bool { false }
+    async fn admission_paid_on_connection(&self, _peer: &NodeId) -> bool {
+        false
+    }
 
     /// Mark settlement only if the connection generation still matches.
     async fn mark_admission_paid(&self, _peer: &NodeId, _since: std::time::Instant) {}
@@ -168,7 +178,9 @@ pub trait MessageTransport: Send + Sync {
         frame_bytes: &[u8],
     ) -> Result<(), TransportError> {
         let _ = (peer, since, frame_bytes);
-        Err(TransportError::NotConnected("connection generations not tracked by this transport".into()))
+        Err(TransportError::NotConnected(
+            "connection generations not tracked by this transport".into(),
+        ))
     }
 
     /// Add a peer to the transport whitelist (Principle 3: Closed Mesh).
@@ -189,7 +201,9 @@ pub trait MessageTransport: Send + Sync {
     /// Hold a local reconnect reason while a quote/payment operation is running.
     /// Dropping the last handle releases it. Does not admit, pay or replay work.
     /// Only a previously validated local dial endpoint can be retained.
-    async fn retain_peer(&self, _peer: &NodeId) -> Option<std::sync::Arc<()>> { None }
+    async fn retain_peer(&self, _peer: &NodeId) -> Option<std::sync::Arc<()>> {
+        None
+    }
 
     /// Retain reconnect interest until a displayed quote expires.
     async fn reconnect_for(&self, _peer: &NodeId, _duration: std::time::Duration) {}

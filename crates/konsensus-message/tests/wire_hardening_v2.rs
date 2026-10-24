@@ -57,7 +57,12 @@ fn hello_empty_capabilities() {
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {
-        Frame::Hello { capabilities, version, tier, .. } => {
+        Frame::Hello {
+            capabilities,
+            version,
+            tier,
+            ..
+        } => {
             assert!(capabilities.is_empty());
             assert_eq!(version, 2);
             assert_eq!(tier, SovereigntyTier::T1);
@@ -79,7 +84,14 @@ fn hello_ack_roundtrip() {
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {
-        Frame::HelloAck { version, tier, capabilities, x25519_sig, x25519_public, .. } => {
+        Frame::HelloAck {
+            version,
+            tier,
+            capabilities,
+            x25519_sig,
+            x25519_public,
+            ..
+        } => {
             assert_eq!(version, 2);
             assert_eq!(tier, SovereigntyTier::T4);
             assert_eq!(capabilities.len(), 2);
@@ -128,11 +140,15 @@ fn prekey_offer_roundtrip() {
         "signed_prekey_sig": "deadbeef",
         "node_id": "00112233",
     });
-    let frame = Frame::PrekeyOffer { bundle: bundle.clone() };
+    let frame = Frame::PrekeyOffer {
+        bundle: bundle.clone(),
+    };
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {
-        Frame::PrekeyOffer { bundle: decoded_bundle } => {
+        Frame::PrekeyOffer {
+            bundle: decoded_bundle,
+        } => {
             assert_eq!(decoded_bundle, bundle);
         }
         _ => panic!("expected PrekeyOffer"),
@@ -146,7 +162,9 @@ fn session_init_roundtrip() {
         "ephemeral_key": "ccdd",
         "one_time_prekey_id": 42,
     });
-    let frame = Frame::SessionInit { init_data: init_data.clone() };
+    let frame = Frame::SessionInit {
+        init_data: init_data.clone(),
+    };
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {
@@ -169,7 +187,11 @@ fn request_invoice_zero_amount() {
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {
-        Frame::RequestInvoice { request_id, amount_msat, purpose } => {
+        Frame::RequestInvoice {
+            request_id,
+            amount_msat,
+            purpose,
+        } => {
             assert_eq!(request_id, "req-zero");
             assert_eq!(amount_msat, 0);
             assert_eq!(purpose, "free tier");
@@ -188,7 +210,11 @@ fn request_invoice_max_amount() {
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {
-        Frame::RequestInvoice { request_id, amount_msat, .. } => {
+        Frame::RequestInvoice {
+            request_id,
+            amount_msat,
+            ..
+        } => {
             assert_eq!(request_id, "req-max");
             assert_eq!(amount_msat, u64::MAX);
         }
@@ -207,7 +233,11 @@ fn invoice_response_roundtrip() {
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {
-        Frame::InvoiceResponse { request_id, bolt11, payment_hash } => {
+        Frame::InvoiceResponse {
+            request_id,
+            bolt11,
+            payment_hash,
+        } => {
             assert_eq!(request_id, "req-roundtrip");
             assert!(bolt11.starts_with("lnbc"));
             assert_eq!(payment_hash.len(), 64);
@@ -231,7 +261,12 @@ fn price_table_empty_prices() {
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {
-        Frame::PriceTable { prices, block_height, valid_blocks, trust_discount: _ } => {
+        Frame::PriceTable {
+            prices,
+            block_height,
+            valid_blocks,
+            trust_discount: _,
+        } => {
             assert!(prices.is_empty());
             assert_eq!(block_height, 0);
             assert_eq!(valid_blocks, 0);
@@ -255,7 +290,12 @@ fn price_table_many_categories() {
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {
-        Frame::PriceTable { prices: dp, block_height, valid_blocks, trust_discount: _ } => {
+        Frame::PriceTable {
+            prices: dp,
+            block_height,
+            valid_blocks,
+            trust_discount: _,
+        } => {
             assert_eq!(dp.len(), 20);
             assert_eq!(block_height, u64::MAX);
             assert_eq!(valid_blocks, u32::MAX);
@@ -328,7 +368,9 @@ fn peer_exchange_response_many_peers() {
         })
         .collect();
 
-    let frame = Frame::PeerExchangeResponse { peers: peers.clone() };
+    let frame = Frame::PeerExchangeResponse {
+        peers: peers.clone(),
+    };
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {
@@ -442,10 +484,15 @@ fn decode_consumed_bytes_correct() {
 
 #[test]
 fn decode_frame_rejects_oversize_control_field_under_frame_limit() {
-    let frame = Frame::Disconnect { reason: "x".repeat(1024 * 1024) };
+    let frame = Frame::Disconnect {
+        reason: "x".repeat(1024 * 1024),
+    };
     let encoded = encode_frame(&frame).unwrap();
     assert!(encoded.len() < MAX_FRAME_BYTES);
-    assert!(matches!(decode_frame(&encoded), Err(WireError::Serialization(_))));
+    assert!(matches!(
+        decode_frame(&encoded),
+        Err(WireError::Serialization(_))
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -702,7 +749,9 @@ fn disconnect_reason_empty() {
 #[test]
 fn ratchet_init_large_payload() {
     let payload = vec![0xFFu8; 64 * 1024]; // 64 KB
-    let frame = Frame::RatchetInit { payload: payload.clone() };
+    let frame = Frame::RatchetInit {
+        payload: payload.clone(),
+    };
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {

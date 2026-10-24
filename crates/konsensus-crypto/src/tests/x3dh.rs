@@ -38,12 +38,7 @@ fn x3dh_full_exchange_with_one_time_prekey() {
     let (bundle, spk, opk) = make_bob_bundle(&bob_identity_secret, &bob_signing_key);
 
     // Alice initiates
-    let initiation = initiate(
-        &alice_identity_secret,
-        &alice_identity_public,
-        &bundle,
-    )
-    .unwrap();
+    let initiation = initiate(&alice_identity_secret, &alice_identity_public, &bundle).unwrap();
 
     // Bob responds
     let bob_secret = respond(
@@ -57,10 +52,7 @@ fn x3dh_full_exchange_with_one_time_prekey() {
     .unwrap();
 
     // Both derived the same shared secret
-    assert_eq!(
-        initiation.shared_secret.as_bytes(),
-        bob_secret.as_bytes()
-    );
+    assert_eq!(initiation.shared_secret.as_bytes(), bob_secret.as_bytes());
 
     // Associated data matches
     assert_eq!(
@@ -93,12 +85,7 @@ fn x3dh_without_one_time_prekey() {
         one_time_prekey_id: None,
     };
 
-    let initiation = initiate(
-        &alice_identity_secret,
-        &alice_identity_public,
-        &bundle,
-    )
-    .unwrap();
+    let initiation = initiate(&alice_identity_secret, &alice_identity_public, &bundle).unwrap();
 
     let bob_secret = respond(
         &bob_identity_secret,
@@ -110,10 +97,7 @@ fn x3dh_without_one_time_prekey() {
     )
     .unwrap();
 
-    assert_eq!(
-        initiation.shared_secret.as_bytes(),
-        bob_secret.as_bytes()
-    );
+    assert_eq!(initiation.shared_secret.as_bytes(), bob_secret.as_bytes());
     assert_eq!(initiation.one_time_prekey_id, None);
 }
 
@@ -142,14 +126,13 @@ fn x3dh_rejects_bad_signature() {
         one_time_prekey_id: None,
     };
 
-    let result = initiate(
-        &alice_identity_secret,
-        &alice_identity_public,
-        &bundle,
-    );
+    let result = initiate(&alice_identity_secret, &alice_identity_public, &bundle);
 
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), X3dhError::InvalidSignature(_)));
+    assert!(matches!(
+        result.unwrap_err(),
+        X3dhError::InvalidSignature(_)
+    ));
 }
 
 #[test]
@@ -169,7 +152,10 @@ fn x3dh_different_alice_different_secret() {
     let init2 = initiate(&alice2_secret, &alice2_public, &bundle).unwrap();
 
     // Different Alices produce different shared secrets
-    assert_ne!(init1.shared_secret.as_bytes(), init2.shared_secret.as_bytes());
+    assert_ne!(
+        init1.shared_secret.as_bytes(),
+        init2.shared_secret.as_bytes()
+    );
 
     // Bob can derive each independently
     let bob_secret1 = respond(
@@ -312,13 +298,15 @@ fn associated_data_order_depends_on_role() {
 
     // Alice's AD should equal Bob's AD (both compute IK_A || IK_B in same order)
     assert_eq!(
-        init.shared_secret.associated_data,
-        bob_shared.associated_data,
+        init.shared_secret.associated_data, bob_shared.associated_data,
         "Initiator and responder must agree on associated data"
     );
 
     // Verify the first 32 bytes are Alice's key (the initiator)
-    assert_eq!(&init.shared_secret.associated_data[..32], alice_public.as_bytes());
+    assert_eq!(
+        &init.shared_secret.associated_data[..32],
+        alice_public.as_bytes()
+    );
     // And the second 32 bytes are Bob's key (the responder)
     assert_eq!(
         &init.shared_secret.associated_data[32..],

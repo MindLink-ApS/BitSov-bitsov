@@ -34,9 +34,9 @@ use tracing::warn;
 
 use konsensus_core::kind;
 use konsensus_core::types::{NodeId, Recipient};
+use konsensus_core::wire_json;
 use konsensus_core::{MessageId, UkmEnvelope};
 use konsensus_message::wire::{self as bounded, envelope_from_bytes, Frame};
-use konsensus_core::wire_json;
 
 use super::engine::{DepositAuth, RelayEngine};
 
@@ -92,11 +92,15 @@ where
     konsensus_core::wire_json::strings::sequence(deserializer, AckIdVisitor)
 }
 
-fn bounded_merkle_path<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error> {
+fn bounded_merkle_path<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Vec<u8>>, D::Error> {
     struct Path;
     impl<'de> Visitor<'de> for Path {
         type Value = Vec<Vec<u8>>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("bounded merkle path") }
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("bounded merkle path")
+        }
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
             #[derive(Deserialize)]
             struct Hash(#[serde(deserialize_with = "bounded::vec_u8::<_, 32>")] Vec<u8>);
@@ -158,7 +162,9 @@ struct AckBody {
 struct DepositBody {
     #[serde(deserialize_with = "bounded::vec_u8::<_, 32>")]
     binding_recipient: Vec<u8>,
-    #[serde(deserialize_with = "bounded::vec_u8::<_, { konsensus_core::envelope::MAX_CIPHERTEXT_BYTES }>")]
+    #[serde(
+        deserialize_with = "bounded::vec_u8::<_, { konsensus_core::envelope::MAX_CIPHERTEXT_BYTES }>"
+    )]
     inner_envelope_bytes: Vec<u8>,
     inner_kind: u16,
     ttl_secs: u32,
@@ -270,7 +276,13 @@ pub(crate) async fn handle_relay_control(
                 )
                 .await
             {
-                Ok(()) => reply(sender, Frame::MessageAck { id, duplicate: false }),
+                Ok(()) => reply(
+                    sender,
+                    Frame::MessageAck {
+                        id,
+                        duplicate: false,
+                    },
+                ),
                 Err(e) => reply(sender, reject(id, format!("relay register: {e:?}"))),
             }
         }
@@ -283,7 +295,13 @@ pub(crate) async fn handle_relay_control(
                 Err(_) => return reply(sender, reject(id, "relay_ack_invalid_body".into())),
             };
             match engine.handle_ack(sender, &body.message_ids).await {
-                Ok(_count) => reply(sender, Frame::MessageAck { id, duplicate: false }),
+                Ok(_count) => reply(
+                    sender,
+                    Frame::MessageAck {
+                        id,
+                        duplicate: false,
+                    },
+                ),
                 Err(e) => reply(sender, reject(id, format!("relay ack: {e:?}"))),
             }
         }
@@ -304,19 +322,13 @@ pub(crate) async fn handle_relay_control(
                     )
                 }
             };
-            let inner_envelope: UkmEnvelope =
-                match envelope_from_bytes(&body.inner_envelope_bytes) {
-                    Ok(env) => env,
-                    Err(_) => {
-                        return reply(
-                            sender,
-                            reject(
-                                id,
-                                "relay_deposit_invalid_envelope".into(),
-                            ),
-                        )
-                    }
-                };
+            let inner_envelope: UkmEnvelope = match envelope_from_bytes(&body.inner_envelope_bytes)
+            {
+                Ok(env) => env,
+                Err(_) => {
+                    return reply(sender, reject(id, "relay_deposit_invalid_envelope".into()))
+                }
+            };
             // seam-4: the held item is keyed by its own `MessageId` (the recipient
             // acks by it). Bind that id to the ciphertext so the stored key IS the
             // canonical blake3(ciphertext‖nonce) — a depositor cannot plant a
@@ -418,7 +430,13 @@ pub(crate) async fn handle_relay_control(
                 )
                 .await
             {
-                Ok(_seq) => reply(sender, Frame::MessageAck { id, duplicate: false }),
+                Ok(_seq) => reply(
+                    sender,
+                    Frame::MessageAck {
+                        id,
+                        duplicate: false,
+                    },
+                ),
                 Err(e) => reply(sender, reject(id, format!("relay deposit: {e:?}"))),
             }
         }
@@ -457,7 +475,13 @@ pub(crate) async fn handle_relay_control(
             }
             if out.is_empty() {
                 // Nothing deliverable — ack so the drainer knows the drain ran.
-                out.push((sender, Frame::MessageAck { id, duplicate: false }));
+                out.push((
+                    sender,
+                    Frame::MessageAck {
+                        id,
+                        duplicate: false,
+                    },
+                ));
             }
             out
         }
@@ -465,11 +489,20 @@ pub(crate) async fn handle_relay_control(
             // §0: the binding owner is the authenticated sender; revoking its own
             // binding needs no body. Killing the registration trap = revocability.
             match engine.handle_unregister(sender).await {
-                Ok(()) => reply(sender, Frame::MessageAck { id, duplicate: false }),
+                Ok(()) => reply(
+                    sender,
+                    Frame::MessageAck {
+                        id,
+                        duplicate: false,
+                    },
+                ),
                 Err(e) => reply(sender, reject(id, format!("relay unregister: {e:?}"))),
             }
         }
-        other => reply(sender, reject(id, format!("unsupported relay kind {other}"))),
+        other => reply(
+            sender,
+            reject(id, format!("unsupported relay kind {other}")),
+        ),
     }
 }
 

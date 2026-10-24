@@ -208,21 +208,36 @@ impl<S: Storage + ?Sized> StorageNonceAdapter<S> {
 
 #[async_trait::async_trait]
 impl<S: Storage + ?Sized> konsensus_core::gate::NonceStore for StorageNonceAdapter<S> {
-    async fn delivery_price_floor(&self, envelope: &konsensus_core::UkmEnvelope, paid_at: u64, now: u64)
-        -> Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.inner.delivery_price_floor(envelope, paid_at, now).await?)
+    async fn delivery_price_floor(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+        paid_at: u64,
+        now: u64,
+    ) -> Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .inner
+            .delivery_price_floor(envelope, paid_at, now)
+            .await?)
     }
 
-    async fn is_paid_envelope_accepted(&self, envelope: &konsensus_core::UkmEnvelope)
-        -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    async fn is_paid_envelope_accepted(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.inner.is_paid_envelope_accepted(envelope).await?)
     }
 
     async fn check_and_store_paid(
-        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
-        sender: &konsensus_core::NodeId, message_id: &konsensus_core::MessageId,
+        &self,
+        nonce: &konsensus_core::Nonce,
+        payment_hash: &[u8; 32],
+        sender: &konsensus_core::NodeId,
+        message_id: &konsensus_core::MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.inner.store_paid_nonce(nonce, payment_hash, sender, message_id).await?)
+        Ok(self
+            .inner
+            .store_paid_nonce(nonce, payment_hash, sender, message_id)
+            .await?)
     }
 
     async fn check_and_store(
@@ -262,7 +277,10 @@ impl<S: Storage + ?Sized> konsensus_core::gate::NonceStore for StorageNonceAdapt
     async fn take_outstanding_web_request(
         &self,
         payment_hash: &[u8; 32],
-    ) -> Result<Option<konsensus_core::web_reply::OutstandingWebRequest>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        Option<konsensus_core::web_reply::OutstandingWebRequest>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         self.inner
             .take_outstanding_web_request(payment_hash)
             .await
@@ -277,7 +295,9 @@ pub mod channel_open;
 pub use channel_open::ChannelOpenOperation;
 
 pub mod list;
-pub use list::{FileListRow, ListCursor, MessageListQuery, MAX_LIST_SCAN, StorageList, StorageReadHealth};
+pub use list::{
+    FileListRow, ListCursor, MessageListQuery, StorageList, StorageReadHealth, MAX_LIST_SCAN,
+};
 
 pub mod starter;
 pub mod starter_request;

@@ -37,7 +37,9 @@ use x25519_dalek::PublicKey as X25519Public;
 use konsensus_core::identity::NodeIdentity;
 use konsensus_core::types::NodeId;
 
-use crate::double_ratchet::{DoubleRatchet, MessageHeader, RatchetError, RatchetMessage, RatchetState};
+use crate::double_ratchet::{
+    DoubleRatchet, MessageHeader, RatchetError, RatchetMessage, RatchetState,
+};
 use crate::x3dh::{self, OneTimePreKey, PrekeyBundle, SignedPreKey, X3dhError};
 
 /// Errors from session management.
@@ -137,9 +139,7 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// List all peer IDs with stored sessions.
-    async fn list_sessions(
-        &self,
-    ) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// An active E2EE session with a peer.
@@ -347,7 +347,11 @@ impl SessionManager {
             }
         }
 
-        debug!(count = restored, total = peer_ids.len(), "session restore complete");
+        debug!(
+            count = restored,
+            total = peer_ids.len(),
+            "session restore complete"
+        );
         restored
     }
 
@@ -787,9 +791,9 @@ pub fn ratchet_message_from_bytes(data: &[u8]) -> Result<RatchetMessage, Session
 fn parse_x25519_key(hex_str: &str) -> Result<X25519Public, SessionError> {
     let bytes = hex::decode(hex_str)
         .map_err(|e| SessionError::InvalidPeerData(format!("invalid hex: {e}")))?;
-    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-        SessionError::InvalidPeerData("expected 32-byte X25519 key".into())
-    })?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| SessionError::InvalidPeerData("expected 32-byte X25519 key".into()))?;
     Ok(X25519Public::from(arr))
 }
 

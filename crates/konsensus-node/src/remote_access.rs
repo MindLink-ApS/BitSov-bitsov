@@ -808,7 +808,8 @@ async fn handle_connection(
         let ciphertext = wire::read_frame(&mut remote_reader, wire::MAX_TRANSPORT_FRAME).await?;
         let plaintext = wire::decode_transport(&mut noise, &ciphertext, wire::MAX_AUTH_PLAINTEXT)
             .map_err(anyhow::Error::msg)?;
-        konsensus_core::wire_json::from_slice::<AuthRequest>(&plaintext).context("invalid remote auth request")
+        konsensus_core::wire_json::from_slice::<AuthRequest>(&plaintext)
+            .context("invalid remote auth request")
     };
     let request = tokio::select! {
         _ = shutdown.changed() => return Ok(()),

@@ -484,7 +484,10 @@ async fn a_sidecar_never_honours_a_front_door_grant() {
     assert_eq!(fx.publish(&token, "Ada").await.0, StatusCode::FORBIDDEN);
     let (status, op) = fx.ask(json!({"scopes": ["front_door"]})).await;
     assert_eq!(status, StatusCode::CONFLICT, "{op}");
-    assert!(op["error"].as_str().unwrap().contains("owner_approval_unavailable"));
+    assert!(op["error"]
+        .as_str()
+        .unwrap()
+        .contains("owner_approval_unavailable"));
     assert!(fx.service.snapshot().pending_elevations.is_empty());
 }
 
@@ -546,7 +549,12 @@ async fn a_request_that_died_in_a_restart_reads_lost_and_asking_again_works() {
         pairing: Some(Arc::clone(&service)),
         ..(*fx.state).clone()
     });
-    let restarted = Fx { state, service, console, ..fx };
+    let restarted = Fx {
+        state,
+        service,
+        console,
+        ..fx
+    };
 
     let (read, _) = restarted.token().await;
     let (_, after) = call(&restarted.state, "GET", &path, None, Some(&read)).await;
@@ -562,7 +570,10 @@ async fn a_request_that_died_in_a_restart_reads_lost_and_asking_again_works() {
         format!("konsensus grant --op {again_id} --config /Users/owner/bitsov/konsensus.toml")
     );
     let code = restarted.console.owner_code(again_id);
-    assert!(!again.to_string().contains(&code), "the app never sees the code");
+    assert!(
+        !again.to_string().contains(&code),
+        "the app never sees the code"
+    );
     let (_, live) = call(
         &restarted.state,
         "GET",

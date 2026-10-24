@@ -36,9 +36,18 @@ pub fn binding(kind: u16, plaintext: &str) -> Result<Option<RoomBinding>, RoomRe
 /// Admit a chat this node (`own`) received from `sender` (after the gate). A
 /// refusal must not reach the app. Undecryptable chat carries no binding we
 /// can see and is admitted as before.
-pub fn admit_incoming(own: &NodeId, sender: &NodeId, kind: u16, plaintext: Option<&str>) -> Result<Option<RoomBinding>, RoomRefusal> {
-    let Some(text) = plaintext else { return Ok(None) };
-    let Some(room) = binding(kind, text)? else { return Ok(None) };
+pub fn admit_incoming(
+    own: &NodeId,
+    sender: &NodeId,
+    kind: u16,
+    plaintext: Option<&str>,
+) -> Result<Option<RoomBinding>, RoomRefusal> {
+    let Some(text) = plaintext else {
+        return Ok(None);
+    };
+    let Some(room) = binding(kind, text)? else {
+        return Ok(None);
+    };
     room.check(sender, own)?;
     Ok(Some(room))
 }
@@ -50,8 +59,14 @@ pub(crate) fn refused(e: RoomRefusal) -> ApiError {
 }
 
 /// The binding of a chat we (`own`) compose, which must list us.
-pub(crate) fn outgoing(own: &NodeId, kind: u16, plaintext: &str) -> Result<Option<RoomBinding>, ApiError> {
-    let Some(room) = binding(kind, plaintext).map_err(refused)? else { return Ok(None) };
+pub(crate) fn outgoing(
+    own: &NodeId,
+    kind: u16,
+    plaintext: &str,
+) -> Result<Option<RoomBinding>, ApiError> {
+    let Some(room) = binding(kind, plaintext).map_err(refused)? else {
+        return Ok(None);
+    };
     if !room.contains(own) {
         return Err(refused(RoomRefusal::SenderNotMember));
     }
@@ -61,13 +76,21 @@ pub(crate) fn outgoing(own: &NodeId, kind: u16, plaintext: &str) -> Result<Optio
 /// Whether `peer`'s live connection advertised [`ROOM_BINDING_CAPABILITY`].
 pub async fn advertises(transport: &dyn MessageTransport, peer: &NodeId) -> bool {
     let want = format!("Custom({ROOM_BINDING_CAPABILITY:?})");
-    transport.peer_info(peer).await.is_some_and(|info| info.capabilities.contains(&want))
+    transport
+        .peer_info(peer)
+        .await
+        .is_some_and(|info| info.capabilities.contains(&want))
 }
 
 /// A room-bound chat to one member (not a fan-out): both ends in the roster,
 /// the member's node lists the capability, and we have an E2EE session (a
 /// room never pays a first contact). Refused before any payment.
-pub(crate) async fn check_one(state: &AppState, own: &NodeId, peer: &NodeId, room: &RoomBinding) -> Result<(), ApiError> {
+pub(crate) async fn check_one(
+    state: &AppState,
+    own: &NodeId,
+    peer: &NodeId,
+    room: &RoomBinding,
+) -> Result<(), ApiError> {
     room.check(own, peer).map_err(refused)?;
     if !advertises(state.transport.as_ref(), peer).await {
         return Err(ApiError::NotDispatched(format!(
@@ -83,5 +106,6 @@ pub(crate) async fn check_one(state: &AppState, own: &NodeId, peer: &NodeId, roo
 
 /// No E2EE session with the member: a room never pays a first contact.
 pub(crate) fn no_session() -> ApiError {
-    ApiError::NotDispatched("no E2EE session with this member; nothing was paid".into()).with_reason(NO_SESSION)
+    ApiError::NotDispatched("no E2EE session with this member; nothing was paid".into())
+        .with_reason(NO_SESSION)
 }

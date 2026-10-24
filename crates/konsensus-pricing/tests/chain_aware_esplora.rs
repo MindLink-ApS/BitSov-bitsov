@@ -15,13 +15,10 @@ use konsensus_pricing::{ChainAwarePricingConfig, ChainAwarePricingEngine, Static
 #[tokio::test]
 #[ignore]
 async fn chain_aware_with_real_esplora() {
-    let esplora_config = EsploraConfig::custom(
-        "https://mempool.space".to_string(),
-        TrustLevel::ServerTrust,
-    );
-    let chain = Arc::new(
-        EsploraProvider::new(esplora_config).expect("failed to create Esplora provider"),
-    );
+    let esplora_config =
+        EsploraConfig::custom("https://mempool.space".to_string(), TrustLevel::ServerTrust);
+    let chain =
+        Arc::new(EsploraProvider::new(esplora_config).expect("failed to create Esplora provider"));
 
     let config = ChainAwarePricingConfig {
         base: StaticPricingConfig::default(),
@@ -45,9 +42,7 @@ async fn chain_aware_with_real_esplora() {
     // (This could theoretically fail if fee rate is exactly 0.0, but that
     // never happens on mainnet.)
     let height = engine.current_block_height().await;
-    println!(
-        "Chain-aware chat price: {price} msat (base: 10 msat), block height: {height:?}"
-    );
+    println!("Chain-aware chat price: {price} msat (base: 10 msat), block height: {height:?}");
 
     // Block height should be cached after the price query.
     assert!(height.is_some(), "block height should be cached");

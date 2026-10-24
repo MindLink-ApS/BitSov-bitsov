@@ -48,9 +48,15 @@ async fn stateless_quote_writes_only_at_settlement_and_survives_reopen() {
     let b = SharedMockProvider::new(&path, "b", 0).unwrap();
     let c = SharedMockProvider::new(&path, "c", 0).unwrap();
     let db = rusqlite::Connection::open(&path).unwrap();
-    let count = || db.query_row("SELECT COUNT(*) FROM invoices", [], |r| r.get::<_, u64>(0)).unwrap();
+    let count = || {
+        db.query_row("SELECT COUNT(*) FROM invoices", [], |r| r.get::<_, u64>(0))
+            .unwrap()
+    };
     assert_eq!(count(), 0);
-    let quote = b.create_stateless_invoice(2345, "bound quote", 60).await.unwrap();
+    let quote = b
+        .create_stateless_invoice(2345, "bound quote", 60)
+        .await
+        .unwrap();
     assert_eq!(count(), 0, "quote persisted before settlement");
     assert!(b.list_payments(10).await.unwrap().is_empty());
     assert!(b.get_payment_status(&quote.payment_hash).await.is_err());

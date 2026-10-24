@@ -298,9 +298,13 @@ pub fn respond(
     alice_ephemeral_key: &PublicKey,
 ) -> Result<X3dhSharedSecret, X3dhError> {
     // Compute DH values (same as Alice but with Bob's private keys)
-    let dh1 = bob_signed_prekey.secret().diffie_hellman(alice_identity_key);
+    let dh1 = bob_signed_prekey
+        .secret()
+        .diffie_hellman(alice_identity_key);
     let dh2 = bob_identity_secret.diffie_hellman(alice_ephemeral_key);
-    let dh3 = bob_signed_prekey.secret().diffie_hellman(alice_ephemeral_key);
+    let dh3 = bob_signed_prekey
+        .secret()
+        .diffie_hellman(alice_ephemeral_key);
 
     // L0c (2026-04-30): same zeroize discipline as `initiate` — wrap the
     // DH accumulator so the buffer is zeroed on drop.

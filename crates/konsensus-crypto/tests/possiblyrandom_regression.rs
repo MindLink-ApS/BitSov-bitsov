@@ -8,7 +8,13 @@ fn default_features_use_os_randomness_for_hashdos_and_jitter_defense() {
     let mut second = [0u8; 32];
     possiblyrandom::getpossiblyrandom(&mut first);
     possiblyrandom::getpossiblyrandom(&mut second);
-    assert_ne!(first, [0; 32], "OS randomness unexpectedly fell back to zeros");
-    assert_ne!(second, [0; 32], "OS randomness unexpectedly fell back to zeros");
+    assert_ne!(
+        first, [0; 32],
+        "OS randomness unexpectedly fell back to zeros"
+    );
+    assert_ne!(
+        second, [0; 32],
+        "OS randomness unexpectedly fell back to zeros"
+    );
     assert_ne!(first, second, "independent calls must not be deterministic");
 }

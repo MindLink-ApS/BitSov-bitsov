@@ -1,9 +1,5 @@
 //! Durable recipient offers for paid messages waiting in a sender's outbox.
-use konsensus_core::{
-    gate::price_with_floor_msat,
-    traits::transport::TransportError,
-    NodeId,
-};
+use konsensus_core::{gate::price_with_floor_msat, traits::transport::TransportError, NodeId};
 use konsensus_message::{Frame, NoiseTransport};
 use konsensus_pricing::peer_prices::{apply_trust_discount, ADMISSION_FLOOR_KEY};
 use konsensus_storage::Storage;
@@ -19,8 +15,19 @@ pub(crate) async fn send_price_frame(
     pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
     min_admission_cost_msat: u64,
 ) -> Result<(), TransportError> {
-    if matches!(frame, Frame::PriceTable { block_height: 0, .. } | Frame::PriceResponse { block_height: 0, .. }) {
-        return Err(TransportError::Other("konsensus:not_ready:chain_unavailable".into()));
+    if matches!(
+        frame,
+        Frame::PriceTable {
+            block_height: 0,
+            ..
+        } | Frame::PriceResponse {
+            block_height: 0,
+            ..
+        }
+    ) {
+        return Err(TransportError::Other(
+            "konsensus:not_ready:chain_unavailable".into(),
+        ));
     }
     let mut advertised = frame.clone();
     if let Frame::PriceTable { prices, .. } = &mut advertised {
@@ -128,10 +135,7 @@ mod tests {
     #[test]
     fn discounted_offer_applies_admission_floor() {
         for (admission, expected) in [(0, 1000), (2000, 2000)] {
-            assert_eq!(
-                advertised_price(1000, 0.5, admission),
-                expected
-            );
+            assert_eq!(advertised_price(1000, 0.5, admission), expected);
         }
     }
 
@@ -142,7 +146,9 @@ mod tests {
             identity::NodeIdentity,
             PaymentProof, Recipient, Signature, UkmEnvelopeBuilder,
         };
-        use konsensus_pricing::{peer_prices::PeerPriceEntry, StaticPricingConfig, StaticPricingEngine};
+        use konsensus_pricing::{
+            peer_prices::PeerPriceEntry, StaticPricingConfig, StaticPricingEngine,
+        };
         use sha2::{Digest, Sha256};
         use std::time::Instant;
 
@@ -172,7 +178,8 @@ mod tests {
                     ..Default::default()
                 });
                 for discount in [0.0, 0.5] {
-                    let mut prices = konsensus_pricing::peer_prices::build_price_table(&pricing).await;
+                    let mut prices =
+                        konsensus_pricing::peer_prices::build_price_table(&pricing).await;
                     // Relay storage is advertised separately from the standard table.
                     prices.insert("relay_storage".into(), base);
                     prices.insert(ADMISSION_FLOOR_KEY.into(), admission);
@@ -192,7 +199,10 @@ mod tests {
                             continue; // Reserved kinds have no advertised price.
                         };
                         let offered = advertised_price(base, discount, admission);
-                        assert_eq!(cached, offered, "kind={kind}, base={base}, discount={discount}, admission={admission}");
+                        assert_eq!(
+                            cached, offered,
+                            "kind={kind}, base={base}, discount={discount}, admission={admission}"
+                        );
                         assert!(offered >= 1000 && offered >= admission);
                         if kind > 1000 && kind < u16::MAX && kind % 64 != 0 {
                             continue;
@@ -203,11 +213,13 @@ mod tests {
                             Recipient::Node(NodeId::from_bytes([7; 32])),
                             vec![1],
                             PaymentProof::new(payment_hash, preimage, offered),
-                        ).build();
-                        envelope.signature = Signature::from_ed25519(&sender.sign(&envelope.signable_bytes()));
-                        let result = gate.validate_paid_envelope(
-                            &envelope, &pricing, None, None, discount, None,
-                        ).await;
+                        )
+                        .build();
+                        envelope.signature =
+                            Signature::from_ed25519(&sender.sign(&envelope.signable_bytes()));
+                        let result = gate
+                            .validate_paid_envelope(&envelope, &pricing, None, None, discount, None)
+                            .await;
                         assert!(result.is_ok(), "kind={kind}, base={base}, discount={discount}, admission={admission}: {result:?}");
                     }
                 }

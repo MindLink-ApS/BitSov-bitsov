@@ -112,7 +112,13 @@ fn logs(file: &std::fs::File) -> String {
 // The ceremony performs multiple 64 MiB Argon2 derivations in a debug build.
 // Allow CPU contention, but keep every request and readiness wait bounded.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-async fn ready(node: &mut Node, http: &reqwest::Client, base: &str, log: &std::fs::File, bootstrap: bool) {
+async fn ready(
+    node: &mut Node,
+    http: &reqwest::Client,
+    base: &str,
+    log: &std::fs::File,
+    bootstrap: bool,
+) {
     let (route, field, expected) = if bootstrap {
         ("/api/v1/bootstrap/state", "state", "bootstrap")
     } else {
@@ -120,9 +126,16 @@ async fn ready(node: &mut Node, http: &reqwest::Client, base: &str, log: &std::f
     };
     tokio::time::timeout(Duration::from_secs(120), async {
         loop {
-            assert!(node.0.try_wait().unwrap().is_none(), "node exited: {}", logs(log));
-            if let Ok(response) = http.get(format!("{base}{route}"))
-                .timeout(Duration::from_secs(5)).send().await
+            assert!(
+                node.0.try_wait().unwrap().is_none(),
+                "node exited: {}",
+                logs(log)
+            );
+            if let Ok(response) = http
+                .get(format!("{base}{route}"))
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
             {
                 if response.status().is_success() {
                     if let Ok(body) = response.json::<Value>().await {
@@ -134,7 +147,9 @@ async fn ready(node: &mut Node, http: &reqwest::Client, base: &str, log: &std::f
             }
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
-    }).await.unwrap_or_else(|_| panic!("node did not become ready at {route}: {}", logs(log)));
+    })
+    .await
+    .unwrap_or_else(|_| panic!("node did not become ready at {route}: {}", logs(log)));
 }
 
 async fn post(http: &reqwest::Client, base: &str, route: &str, token: &str, body: Value) -> Value {

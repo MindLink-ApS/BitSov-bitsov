@@ -16,7 +16,7 @@ use konsensus_core::types::NodeId;
 use konsensus_crypto::{SerializablePrekeyBundle, SerializableSessionInit};
 
 use crate::audit::events;
-use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::auth::scoped::{Admin, Read, ScopedAuth};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -173,16 +173,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/sessions/prekey", get(get_prekey_bundle))
         .route("/api/v1/sessions", get(list_sessions))
-        .route(
-            "/api/v1/sessions/:peer_id",
-            get(get_session_status),
-        )
-        .route(
-            "/api/v1/sessions/:peer_id/initiate",
-            post(initiate_session),
-        )
-        .route(
-            "/api/v1/sessions/:peer_id/accept",
-            post(accept_session),
-        )
+        .route("/api/v1/sessions/:peer_id", get(get_session_status))
+        .route("/api/v1/sessions/:peer_id/initiate", post(initiate_session))
+        .route("/api/v1/sessions/:peer_id/accept", post(accept_session))
 }

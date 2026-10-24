@@ -254,27 +254,52 @@ impl LightningProvider for FailingSync {
             },
         )
     }
-    async fn money_ready(&self) -> bool { true }
-    async fn is_available(&self) -> bool { true }
-    async fn create_invoice(&self, amount: u64, description: &str, expiry: u32)
-        -> Result<konsensus_core::traits::lightning::Invoice, LightningError> {
-        MockLightningProvider::new().create_invoice(amount, description, expiry).await
+    async fn money_ready(&self) -> bool {
+        true
     }
-    async fn pay_invoice(&self, _: &str)
-        -> Result<konsensus_core::traits::lightning::PaymentDetails, LightningError> { unreachable!() }
-    async fn get_payment_status(&self, _: &str)
-        -> Result<konsensus_core::traits::lightning::PaymentDetails, LightningError> { unreachable!() }
-    async fn get_balance_msat(&self) -> Result<u64, LightningError> { Ok(1) }
+    async fn is_available(&self) -> bool {
+        true
+    }
+    async fn create_invoice(
+        &self,
+        amount: u64,
+        description: &str,
+        expiry: u32,
+    ) -> Result<konsensus_core::traits::lightning::Invoice, LightningError> {
+        MockLightningProvider::new()
+            .create_invoice(amount, description, expiry)
+            .await
+    }
+    async fn pay_invoice(
+        &self,
+        _: &str,
+    ) -> Result<konsensus_core::traits::lightning::PaymentDetails, LightningError> {
+        unreachable!()
+    }
+    async fn get_payment_status(
+        &self,
+        _: &str,
+    ) -> Result<konsensus_core::traits::lightning::PaymentDetails, LightningError> {
+        unreachable!()
+    }
+    async fn get_balance_msat(&self) -> Result<u64, LightningError> {
+        Ok(1)
+    }
 }
 
 #[tokio::test(start_paused = true)]
 async fn sync_failure_is_diagnostic_only_before_and_after_next_poll() {
     let backend = Arc::new(FailingSync(std::sync::atomic::AtomicBool::new(false)));
     let factory_backend = backend.clone();
-    let provider = RecoveringLightning::new(move || {
-        let backend = factory_backend.clone();
-        async { Ok(backend as Arc<dyn LightningProvider>) }
-    }, Default::default()).await.unwrap();
+    let provider = RecoveringLightning::new(
+        move || {
+            let backend = factory_backend.clone();
+            async { Ok(backend as Arc<dyn LightningProvider>) }
+        },
+        Default::default(),
+    )
+    .await
+    .unwrap();
     tokio::task::yield_now().await;
     assert!(provider.money_ready().await);
     assert!(provider.readiness().await.money_ready);
@@ -289,7 +314,10 @@ async fn sync_failure_is_diagnostic_only_before_and_after_next_poll() {
         assert_eq!(readiness.events.last().unwrap().state, "ready");
         assert!(readiness.events.last().unwrap().money_ready);
         assert!(provider.is_payment_capable().await);
-        assert_eq!(provider.wallet_sync().await, konsensus_core::traits::lightning::WalletSync::Live);
+        assert_eq!(
+            provider.wallet_sync().await,
+            konsensus_core::traits::lightning::WalletSync::Live
+        );
         assert!(provider.create_invoice(1, "x", 60).await.is_ok());
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;

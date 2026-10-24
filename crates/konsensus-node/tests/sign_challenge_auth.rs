@@ -38,9 +38,13 @@ async fn owner_router(identity: Arc<NodeIdentity>) -> axum::Router {
         lightning: Arc::new(konsensus_lightning::MockLightningProvider::new())
             as Arc<dyn LightningProvider>,
         chain: Arc::new(konsensus_chain::MockChainProvider::new()),
-        pricing: Arc::new(konsensus_pricing::StaticPricingEngine::new(konsensus_pricing::StaticPricingConfig::default())),
+        pricing: Arc::new(konsensus_pricing::StaticPricingEngine::new(
+            konsensus_pricing::StaticPricingConfig::default(),
+        )),
         gate: Arc::new(konsensus_core::PaymentGate::new()),
-        peer_registry: Arc::new(tokio::sync::RwLock::new(konsensus_message::PeerRegistry::new())),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(
+            konsensus_message::PeerRegistry::new(),
+        )),
         transport: Arc::clone(&transport) as Arc<dyn MessageTransport>,
         session_manager: sessions,
         jwt_secret: "sign-challenge-e2e-jwt-secret".into(),
@@ -162,7 +166,11 @@ async fn cli_sign_challenge_accepted_by_auth_token_wrong_nonce_refused() {
         )
         .await
         .unwrap();
-    assert_eq!(ok.status(), StatusCode::OK, "CLI signature must mint a token");
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "CLI signature must mint a token"
+    );
     let token_body = axum::body::to_bytes(ok.into_body(), 4096).await.unwrap();
     let token_json: serde_json::Value = serde_json::from_slice(&token_body).unwrap();
     assert!(token_json["token"].as_str().unwrap().contains('.'));
@@ -184,10 +192,7 @@ async fn cli_sign_challenge_accepted_by_auth_token_wrong_nonce_refused() {
     let wrong_nonce_challenge = {
         // Same shape, different 32-byte nonce hex, keep the expiry suffix.
         let expiry = live_challenge.rsplit(':').next().unwrap();
-        format!(
-            "bitsov-auth-v1:{}:{expiry}",
-            "11".repeat(32)
-        )
+        format!("bitsov-auth-v1:{}:{expiry}", "11".repeat(32))
     };
     let wrong_sig = cli_sign(&mnemonic_path, &wrong_nonce_challenge);
     let refused = app

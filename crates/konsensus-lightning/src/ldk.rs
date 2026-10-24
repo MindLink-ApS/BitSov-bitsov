@@ -1395,10 +1395,7 @@ impl LdkProvider {
                     "LDK: payment failed"
                 );
             }
-            ldk_node::Event::ChannelReady {
-                channel_id,
-                ..
-            } => {
+            ldk_node::Event::ChannelReady { channel_id, .. } => {
                 info!(channel_id = %channel_id, "LDK: channel ready");
             }
             ldk_node::Event::ChannelClosed {
@@ -1551,29 +1548,69 @@ impl Drop for LdkProvider {
 
 #[async_trait]
 impl LightningProvider for LdkProvider {
-    fn starter_network(&self) -> Option<String> { Some(self.node.config().network.to_string()) }
-    async fn sign_message(&self, message: &[u8]) -> Result<String, LightningError> { Ok(self.node.sign_message(message)) }
-    async fn verify_message(&self, message: &[u8], signature: &str, pubkey: &str) -> Result<bool, LightningError> {
-        let Ok(key) = pubkey.parse() else { return Ok(false); };
+    fn starter_network(&self) -> Option<String> {
+        Some(self.node.config().network.to_string())
+    }
+    async fn sign_message(&self, message: &[u8]) -> Result<String, LightningError> {
+        Ok(self.node.sign_message(message))
+    }
+    async fn verify_message(
+        &self,
+        message: &[u8],
+        signature: &str,
+        pubkey: &str,
+    ) -> Result<bool, LightningError> {
+        let Ok(key) = pubkey.parse() else {
+            return Ok(false);
+        };
         Ok(self.node.verify_signature(message, signature, &key))
     }
-    async fn connect_peer(&self, pubkey: &str, address: &str, persist: bool) -> Result<(), LightningError> {
-        let key = pubkey.parse().map_err(|_| LightningError::PaymentNotDispatched("invalid peer key".into()))?;
-        let address = address.parse().map_err(|_| LightningError::PaymentNotDispatched("invalid peer address".into()))?;
+    async fn connect_peer(
+        &self,
+        pubkey: &str,
+        address: &str,
+        persist: bool,
+    ) -> Result<(), LightningError> {
+        let key = pubkey
+            .parse()
+            .map_err(|_| LightningError::PaymentNotDispatched("invalid peer key".into()))?;
+        let address = address
+            .parse()
+            .map_err(|_| LightningError::PaymentNotDispatched("invalid peer address".into()))?;
         let node = self.node.clone();
-        tokio::task::spawn_blocking(move || node.connect(key,address,persist)).await
+        tokio::task::spawn_blocking(move || node.connect(key, address, persist))
+            .await
             .map_err(|_| LightningError::Backend("peer worker failed".into()))?
             .map_err(|_| LightningError::Backend("peer connection failed".into()))
     }
-    async fn list_peers(&self) -> Result<Vec<konsensus_core::traits::lightning::LightningPeer>, LightningError> {
-        Ok(self.node.list_peers().into_iter().map(|p| konsensus_core::traits::lightning::LightningPeer { pubkey:p.node_id.to_string(),address:p.address.to_string(),connected:p.is_connected }).collect())
+    async fn list_peers(
+        &self,
+    ) -> Result<Vec<konsensus_core::traits::lightning::LightningPeer>, LightningError> {
+        Ok(self
+            .node
+            .list_peers()
+            .into_iter()
+            .map(|p| konsensus_core::traits::lightning::LightningPeer {
+                pubkey: p.node_id.to_string(),
+                address: p.address.to_string(),
+                connected: p.is_connected,
+            })
+            .collect())
     }
     async fn suppress_peer_address(&self, pubkey: &str) -> Result<(), LightningError> {
-        let key = pubkey.parse().map_err(|_| LightningError::PaymentNotDispatched("invalid peer key".into()))?;
-        self.node.suppress_peer_address(key).map_err(|_| LightningError::PaymentNotDispatched("peer privacy persistence failed".into()))
+        let key = pubkey
+            .parse()
+            .map_err(|_| LightningError::PaymentNotDispatched("invalid peer key".into()))?;
+        self.node.suppress_peer_address(key).map_err(|_| {
+            LightningError::PaymentNotDispatched("peer privacy persistence failed".into())
+        })
     }
     async fn channel_is_ready(&self, id: &str) -> Result<bool, LightningError> {
-        Ok(self.node.list_channels().iter().any(|c| c.channel_id.to_string()==id && c.is_channel_ready))
+        Ok(self
+            .node
+            .list_channels()
+            .iter()
+            .any(|c| c.channel_id.to_string() == id && c.is_channel_ready))
     }
 
     fn channel_safety(&self) -> Option<konsensus_core::traits::lightning::ChannelSafetyStatus> {

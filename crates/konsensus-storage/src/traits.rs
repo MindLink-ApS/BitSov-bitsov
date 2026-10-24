@@ -17,42 +17,66 @@ use crate::reactions::ReactionRecord;
 
 /// Outcome of the durable recipient acceptance transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaidAcceptance { Accepted, AlreadyAccepted, NonceReused, PaymentReused }
+pub enum PaidAcceptance {
+    Accepted,
+    AlreadyAccepted,
+    NonceReused,
+    PaymentReused,
+}
 
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
-    async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
+    async fn starter_request_get(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         let _ = id;
         Err(StorageError::Unsupported("starter newcomer".into()))
     }
 
-    async fn starter_request_current(&self) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
-
+    async fn starter_request_current(
+        &self,
+    ) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         Err(StorageError::Unsupported("starter newcomer".into()))
     }
 
-    async fn starter_request_create(&self, r: &crate::starter_request::StarterRequest) -> Result<(crate::starter_request::StarterRequest, bool), StorageError> {
+    async fn starter_request_create(
+        &self,
+        r: &crate::starter_request::StarterRequest,
+    ) -> Result<(crate::starter_request::StarterRequest, bool), StorageError> {
         let _ = r;
         Err(StorageError::Unsupported("starter newcomer".into()))
     }
 
-    async fn starter_request_adopt(&self, r: &crate::starter_request::StarterRequest) -> Result<crate::starter_request::StarterRequest, StorageError> {
+    async fn starter_request_adopt(
+        &self,
+        r: &crate::starter_request::StarterRequest,
+    ) -> Result<crate::starter_request::StarterRequest, StorageError> {
         let _ = r;
         Err(StorageError::Unsupported("starter newcomer".into()))
     }
 
     async fn starter_request_rearm(&self, id: &str) -> Result<(), StorageError> {
-        let _=id; Err(StorageError::Unsupported("starter newcomer".into()))
+        let _ = id;
+        Err(StorageError::Unsupported("starter newcomer".into()))
     }
 
-    async fn starter_request_save(&self, r: &crate::starter_request::StarterRequest) -> Result<(), StorageError> {
+    async fn starter_request_save(
+        &self,
+        r: &crate::starter_request::StarterRequest,
+    ) -> Result<(), StorageError> {
         let _ = r;
         Err(StorageError::Unsupported("starter newcomer".into()))
     }
 
-    async fn starter_request_retry(&self, id: &str, now: i64) -> Result<crate::starter_request::StarterRequest, StorageError> {
-        let _ = id; let _ = now;
+    async fn starter_request_retry(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<crate::starter_request::StarterRequest, StorageError> {
+        let _ = id;
+        let _ = now;
         Err(StorageError::Unsupported("starter newcomer".into()))
     }
 
@@ -84,25 +108,67 @@ pub trait Storage: Send + Sync {
     }
 
     /// Raw bounded keyset read. Backends must preserve timestamp/id ordering.
-    async fn message_page(&self, query: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<Vec<UkmEnvelope>, StorageError> {
-        if cursor.is_some() { return Err(StorageError::Unsupported("message keyset pagination".into())); }
+    async fn message_page(
+        &self,
+        query: &crate::MessageListQuery<'_>,
+        limit: u32,
+        before: Option<u64>,
+        cursor: Option<&crate::ListCursor<u64>>,
+    ) -> Result<Vec<UkmEnvelope>, StorageError> {
+        if cursor.is_some() {
+            return Err(StorageError::Unsupported(
+                "message keyset pagination".into(),
+            ));
+        }
         match query {
-            crate::MessageListQuery::Recipient(recipient) => self.get_messages_for_recipient(recipient, limit, before).await,
-            crate::MessageListQuery::Conversation { me, peer, is_room } => self.get_conversation_messages(me, peer, *is_room, limit, before).await,
-            crate::MessageListQuery::NodeKind { me, kind } => self.get_node_messages_of_kind(me, *kind, limit, before).await,
+            crate::MessageListQuery::Recipient(recipient) => {
+                self.get_messages_for_recipient(recipient, limit, before)
+                    .await
+            }
+            crate::MessageListQuery::Conversation { me, peer, is_room } => {
+                self.get_conversation_messages(me, peer, *is_room, limit, before)
+                    .await
+            }
+            crate::MessageListQuery::NodeKind { me, kind } => {
+                self.get_node_messages_of_kind(me, *kind, limit, before)
+                    .await
+            }
         }
     }
 
-    async fn message_page_with_diagnostics(&self, query: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
-        Ok(crate::StorageList::readable(self.message_page(query, limit, before, cursor).await?))
+    async fn message_page_with_diagnostics(
+        &self,
+        query: &crate::MessageListQuery<'_>,
+        limit: u32,
+        before: Option<u64>,
+        cursor: Option<&crate::ListCursor<u64>>,
+    ) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        Ok(crate::StorageList::readable(
+            self.message_page(query, limit, before, cursor).await?,
+        ))
     }
 
-    async fn file_page(&self, limit: u32, cursor: Option<&crate::ListCursor<String>>) -> Result<Vec<crate::FileListRow>, StorageError> {
-        if cursor.is_some() { return Err(StorageError::Unsupported("file keyset pagination".into())); }
-        Ok(self.list_files(limit).await?.into_iter().map(Into::into).collect())
+    async fn file_page(
+        &self,
+        limit: u32,
+        cursor: Option<&crate::ListCursor<String>>,
+    ) -> Result<Vec<crate::FileListRow>, StorageError> {
+        if cursor.is_some() {
+            return Err(StorageError::Unsupported("file keyset pagination".into()));
+        }
+        Ok(self
+            .list_files(limit)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
-    async fn file_page_with_diagnostics(&self, limit: u32, cursor: Option<&crate::ListCursor<String>>) -> Result<crate::StorageList<FileMetadata>, StorageError> {
+    async fn file_page_with_diagnostics(
+        &self,
+        limit: u32,
+        cursor: Option<&crate::ListCursor<String>>,
+    ) -> Result<crate::StorageList<FileMetadata>, StorageError> {
         let rows = self.file_page(limit, cursor).await?;
         let mut result = crate::StorageList::readable(Vec::with_capacity(rows.len()));
         for row in rows {
@@ -113,18 +179,51 @@ pub trait Storage: Send + Sync {
     }
 
     /// This scan's readable rows and exact unreadable count. Database errors stay errors.
-    async fn get_messages_for_recipient_with_diagnostics(&self, recipient: &Recipient, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
-        Ok(crate::StorageList::readable(self.get_messages_for_recipient(recipient, limit, before_timestamp).await?))
+    async fn get_messages_for_recipient_with_diagnostics(
+        &self,
+        recipient: &Recipient,
+        limit: u32,
+        before_timestamp: Option<u64>,
+    ) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        Ok(crate::StorageList::readable(
+            self.get_messages_for_recipient(recipient, limit, before_timestamp)
+                .await?,
+        ))
     }
 
     /// This scan's readable rows and exact unreadable count. Database errors stay errors.
-    async fn get_conversation_messages_with_diagnostics(&self, my_node_id: &str, peer_or_room_id: &str, is_room: bool, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
-        Ok(crate::StorageList::readable(self.get_conversation_messages(my_node_id, peer_or_room_id, is_room, limit, before_timestamp).await?))
+    async fn get_conversation_messages_with_diagnostics(
+        &self,
+        my_node_id: &str,
+        peer_or_room_id: &str,
+        is_room: bool,
+        limit: u32,
+        before_timestamp: Option<u64>,
+    ) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        Ok(crate::StorageList::readable(
+            self.get_conversation_messages(
+                my_node_id,
+                peer_or_room_id,
+                is_room,
+                limit,
+                before_timestamp,
+            )
+            .await?,
+        ))
     }
 
     /// This scan's readable rows and exact unreadable count. Database errors stay errors.
-    async fn get_node_messages_of_kind_with_diagnostics(&self, my_node_id: &str, kind: u16, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
-        Ok(crate::StorageList::readable(self.get_node_messages_of_kind(my_node_id, kind, limit, before_timestamp).await?))
+    async fn get_node_messages_of_kind_with_diagnostics(
+        &self,
+        my_node_id: &str,
+        kind: u16,
+        limit: u32,
+        before_timestamp: Option<u64>,
+    ) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        Ok(crate::StorageList::readable(
+            self.get_node_messages_of_kind(my_node_id, kind, limit, before_timestamp)
+                .await?,
+        ))
     }
 
     /// This scan's readable rows and exact unreadable count. Database errors stay errors.
@@ -138,43 +237,79 @@ pub trait Storage: Send + Sync {
     }
 
     /// This scan's readable rows and exact unreadable count. Database errors stay errors.
-    async fn list_files_with_diagnostics(&self, limit: u32) -> Result<crate::StorageList<FileMetadata>, StorageError> {
+    async fn list_files_with_diagnostics(
+        &self,
+        limit: u32,
+    ) -> Result<crate::StorageList<FileMetadata>, StorageError> {
         Ok(crate::StorageList::readable(self.list_files(limit).await?))
     }
 
     /// This scan's readable rows and exact unreadable count. Database errors stay errors.
-    async fn list_recoverable_operations_with_diagnostics(&self) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
-        Ok(crate::StorageList::readable(self.list_recoverable_operations().await?))
+    async fn list_recoverable_operations_with_diagnostics(
+        &self,
+    ) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
+        Ok(crate::StorageList::readable(
+            self.list_recoverable_operations().await?,
+        ))
     }
 
     /// This scan's readable rows and exact unreadable count. Database errors stay errors.
-    async fn list_failed_prepared_operations_with_diagnostics(&self) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
-        Ok(crate::StorageList::readable(self.list_failed_prepared_operations().await?))
+    async fn list_failed_prepared_operations_with_diagnostics(
+        &self,
+    ) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
+        Ok(crate::StorageList::readable(
+            self.list_failed_prepared_operations().await?,
+        ))
     }
 
     /// This scan's readable rows and exact unreadable count. Database errors stay errors.
-    async fn list_compactable_operations_with_diagnostics(&self, before_ms: i64, limit: u32) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
-        Ok(crate::StorageList::readable(self.list_compactable_operations(before_ms, limit).await?))
+    async fn list_compactable_operations_with_diagnostics(
+        &self,
+        before_ms: i64,
+        limit: u32,
+    ) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
+        Ok(crate::StorageList::readable(
+            self.list_compactable_operations(before_ms, limit).await?,
+        ))
     }
 
     /// Record transport write success without regressing an immediate ACK/reject.
-    async fn record_outbox_sent(&self, _id: &MessageId, _peer: &NodeId) -> Result<(), StorageError> { Ok(()) }
+    async fn record_outbox_sent(
+        &self,
+        _id: &MessageId,
+        _peer: &NodeId,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
 
     /// Atomically publish the paid envelope, pending queue entry and operation.
     /// Uses the same version CAS as update_outbox_operation; false writes nothing.
-    async fn commit_outbox_envelope(&self, _op: &crate::OutboxOperation, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+    async fn commit_outbox_envelope(
+        &self,
+        _op: &crate::OutboxOperation,
+        _envelope: &UkmEnvelope,
+    ) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
 
     /// Insert once. A duplicate never overwrites the request binding.
-    async fn insert_outbox_operation(&self, _op: &crate::OutboxOperation) -> Result<bool, StorageError> {
+    async fn insert_outbox_operation(
+        &self,
+        _op: &crate::OutboxOperation,
+    ) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
     /// Compare-and-swap using op.version; a successful write increments it.
-    async fn update_outbox_operation(&self, _op: &crate::OutboxOperation) -> Result<bool, StorageError> {
+    async fn update_outbox_operation(
+        &self,
+        _op: &crate::OutboxOperation,
+    ) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
-    async fn get_outbox_operation(&self, _id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
+    async fn get_outbox_operation(
+        &self,
+        _id: &str,
+    ) -> Result<Option<crate::OutboxOperation>, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
 
@@ -184,10 +319,16 @@ pub trait Storage: Send + Sync {
 
     /// Insert once, before dispatch. False when the id already exists; a
     /// duplicate never overwrites the request binding.
-    async fn insert_channel_open_operation(&self, _op: &crate::ChannelOpenOperation) -> Result<bool, StorageError> {
+    async fn insert_channel_open_operation(
+        &self,
+        _op: &crate::ChannelOpenOperation,
+    ) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("channel open operations".into()))
     }
-    async fn get_channel_open_operation(&self, _id: &str) -> Result<Option<crate::ChannelOpenOperation>, StorageError> {
+    async fn get_channel_open_operation(
+        &self,
+        _id: &str,
+    ) -> Result<Option<crate::ChannelOpenOperation>, StorageError> {
         Err(StorageError::Unsupported("channel open operations".into()))
     }
     /// Move a `pending` record to `state` (`opened` or `uncertain`). Records
@@ -209,19 +350,27 @@ pub trait Storage: Send + Sync {
     /// Complete recovery authority: never silently truncate unpaid/paid work.
     /// Select unresolved accounting/payment intents and undelivered envelopes
     /// through the recovery index; resolved terminal history is excluded.
-    async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+    async fn list_recoverable_operations(
+        &self,
+    ) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
 
     /// `prepared` rows that recorded a failure (`last_error`): compose attempts
     /// that stopped before paying. Recovery proves each unpaid and releases it.
-    async fn list_failed_prepared_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+    async fn list_failed_prepared_operations(
+        &self,
+    ) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Ok(Vec::new())
     }
 
     /// Bounded terminal payload retention. Permanent operation identity and
     /// recipient receipt bindings must never be deleted by this maintenance.
-    async fn list_compactable_operations(&self, _before_ms: i64, _limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+    async fn list_compactable_operations(
+        &self,
+        _before_ms: i64,
+        _limit: u32,
+    ) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Ok(Vec::new())
     }
 
@@ -233,23 +382,41 @@ pub trait Storage: Send + Sync {
     /// Commit replay keys and the validated envelope together, or write nothing.
     /// Call only after full payment-gate validation. At-rest wrappers may encrypt
     /// ciphertext; backends compare the validated ID and immutable metadata.
-    async fn accept_paid_envelope(&self, _envelope: &UkmEnvelope) -> Result<PaidAcceptance, StorageError> {
+    async fn accept_paid_envelope(
+        &self,
+        _envelope: &UkmEnvelope,
+    ) -> Result<PaidAcceptance, StorageError> {
         Err(StorageError::Unsupported("accept_paid_envelope".into()))
     }
 
     /// Match immutable acceptance without reserving replay keys or writing messages.
     /// Legacy full-message evidence is backfilled into the receipt before returning.
-    async fn is_paid_envelope_accepted(&self, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+    async fn is_paid_envelope_accepted(
+        &self,
+        _envelope: &UkmEnvelope,
+    ) -> Result<bool, StorageError> {
         Ok(false)
     }
 
     /// Persist recipient-issued kind/category offers before publication, for at most one hour.
-    async fn record_delivery_prices(&self, _sender: &NodeId, _prices: &[(String, u64)], _excluded_kinds: &[u16], _issued_at: u64, _expires_at: u64) -> Result<(), StorageError> {
+    async fn record_delivery_prices(
+        &self,
+        _sender: &NodeId,
+        _prices: &[(String, u64)],
+        _excluded_kinds: &[u16],
+        _issued_at: u64,
+        _expires_at: u64,
+    ) -> Result<(), StorageError> {
         Err(StorageError::Unsupported("record_delivery_prices".into()))
     }
 
     /// Find an unexpired offer issued to this sender before its inbound settlement.
-    async fn delivery_price_floor(&self, _envelope: &UkmEnvelope, _paid_at: u64, _now: u64) -> Result<Option<u64>, StorageError> {
+    async fn delivery_price_floor(
+        &self,
+        _envelope: &UkmEnvelope,
+        _paid_at: u64,
+        _now: u64,
+    ) -> Result<Option<u64>, StorageError> {
         Ok(None)
     }
 
@@ -264,24 +431,49 @@ pub trait Storage: Send + Sync {
     }
 
     /// Match a non-destructive rejection to an already dispatched outbox entry.
-    async fn is_pending_dispatched(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId) -> Result<bool, StorageError> {
+    async fn is_pending_dispatched(
+        &self,
+        _id: &MessageId,
+        _peer: &NodeId,
+        _sender: &NodeId,
+    ) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("is_pending_dispatched".into()))
     }
 
     /// Record one rejection per dispatch, retaining the paid envelope. Terminal
     /// failures never retry; transient failures back off durably (60s to 1h).
-    async fn reject_pending(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId, _reason: &str, _terminal: bool) -> Result<bool, StorageError> {
+    async fn reject_pending(
+        &self,
+        _id: &MessageId,
+        _peer: &NodeId,
+        _sender: &NodeId,
+        _reason: &str,
+        _terminal: bool,
+    ) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("reject_pending".into()))
     }
 
     /// Atomically consume a dispatched outbox entry bound to our identity and peer.
-    async fn acknowledge_pending(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId) -> Result<bool, StorageError> {
+    async fn acknowledge_pending(
+        &self,
+        _id: &MessageId,
+        _peer: &NodeId,
+        _sender: &NodeId,
+    ) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("acknowledge_pending".into()))
     }
 
     /// Legacy hash-reuse completion additionally binds the exact stored payment.
-    async fn acknowledge_pending_payment(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId, _hash: &[u8; 32]) -> Result<bool, StorageError> {
-        Err(StorageError::Unsupported("acknowledge_pending_payment".into()))
+    async fn acknowledge_pending_payment(
+        &self,
+        _id: &MessageId,
+        _peer: &NodeId,
+        _sender: &NodeId,
+        _hash: &[u8; 32],
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported(
+            "acknowledge_pending_payment".into(),
+        ))
     }
 
     /// Queue before every first dispatch; retries retain the same row until ACK.
@@ -427,10 +619,16 @@ pub trait Storage: Send + Sync {
     /// Atomically consume nonce and payment replay keys, or write neither.
     /// Unsupported backends fail closed.
     async fn store_paid_nonce(
-        &self, nonce: &Nonce, payment_hash: &[u8; 32], sender: &NodeId, message_id: &MessageId,
+        &self,
+        nonce: &Nonce,
+        payment_hash: &[u8; 32],
+        sender: &NodeId,
+        message_id: &MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, StorageError> {
         let _ = (nonce, payment_hash, sender, message_id);
-        Err(StorageError::Unsupported("atomic paid replay protection not implemented".into()))
+        Err(StorageError::Unsupported(
+            "atomic paid replay protection not implemented".into(),
+        ))
     }
 
     /// Store a nonce; returns `false` if it already exists.
@@ -1085,7 +1283,11 @@ pub trait Storage: Send + Sync {
     /// `now_ms`. Returns how many were removed. An expired entry can never
     /// bind a reply (`reply_matches_outstanding` checks expiry), so this only
     /// reclaims space.
-    async fn sweep_outstanding_web_requests(&self, _now_ms: u64, _max: u32) -> Result<u64, StorageError> {
+    async fn sweep_outstanding_web_requests(
+        &self,
+        _now_ms: u64,
+        _max: u32,
+    ) -> Result<u64, StorageError> {
         Ok(0)
     }
 
@@ -1093,43 +1295,79 @@ pub trait Storage: Send + Sync {
     // Defaults refuse: a backend without durable call state cannot take calls.
 
     /// The stored state of `(peer, call_id)`, as written (not yet aged).
-    async fn call_get(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+    async fn call_get(
+        &self,
+        _peer: &konsensus_core::NodeId,
+        _call_id: &str,
+    ) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
         Err(StorageError::Unsupported("call state".into()))
     }
 
     /// Read at most `MAX_OPEN_CALLS_PER_PEER` open calls for exactly this peer.
     /// Pending reservations survive expiry and sort first, then by call id.
     /// Returns stored (not aged) state; never sweeps or reconciles it.
-    async fn call_open_by_peer(&self, _peer: &konsensus_core::NodeId, _now_ms: u64) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+    async fn call_open_by_peer(
+        &self,
+        _peer: &konsensus_core::NodeId,
+        _now_ms: u64,
+    ) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         Err(StorageError::Unsupported("call state".into()))
     }
 
     /// Insert or replace `(peer, call_id)`.
-    async fn call_put(&self, _peer: &konsensus_core::NodeId, _call_id: &str, _entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+    async fn call_put(
+        &self,
+        _peer: &konsensus_core::NodeId,
+        _call_id: &str,
+        _entry: &konsensus_core::payloads::call::CallEntry,
+    ) -> Result<(), StorageError> {
         Err(StorageError::Unsupported("call state".into()))
     }
 
     /// Forget `(peer, call_id)` (an offer that was never paid).
-    async fn call_delete(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<(), StorageError> {
+    async fn call_delete(
+        &self,
+        _peer: &konsensus_core::NodeId,
+        _call_id: &str,
+    ) -> Result<(), StorageError> {
         Err(StorageError::Unsupported("call state".into()))
     }
 
     /// Open calls and burned ids as of `now_ms`, for this peer and in total.
     /// Open: a pending signal of ours, or reserved/ringing/live before its
     /// deadline. Burned: otherwise, while replay protection runs past `now_ms`.
-    async fn call_counts(&self, _peer: &konsensus_core::NodeId, _now_ms: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
+    async fn call_counts(
+        &self,
+        _peer: &konsensus_core::NodeId,
+        _now_ms: u64,
+    ) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
         Err(StorageError::Unsupported("call state".into()))
     }
 
     /// Drop up to `max` burned ids (of `peer`, or of anyone) whose replay
     /// protection ends at or before `replay_until_at_most`, oldest first. Never
     /// an open call or a row with a pending signal. Returns how many went.
-    async fn call_evict_burned(&self, _peer: Option<&konsensus_core::NodeId>, _replay_until_at_most: u64, _now_ms: u64, _max: u64) -> Result<u64, StorageError> {
+    async fn call_evict_burned(
+        &self,
+        _peer: Option<&konsensus_core::NodeId>,
+        _replay_until_at_most: u64,
+        _now_ms: u64,
+        _max: u64,
+    ) -> Result<u64, StorageError> {
         Err(StorageError::Unsupported("call state".into()))
     }
 
     /// Every entry with a reserved, unsettled signal of ours.
-    async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+    async fn call_pending(
+        &self,
+    ) -> Result<
+        Vec<(
+            konsensus_core::NodeId,
+            String,
+            konsensus_core::payloads::call::CallEntry,
+        )>,
+        StorageError,
+    > {
         Ok(Vec::new())
     }
 
@@ -1143,7 +1381,10 @@ pub trait Storage: Send + Sync {
     /// plaintext and mark its receipt application-rejected (`accepted = -1`), so
     /// history, resync and duplicate ACKs never present it as delivered, while
     /// its payment hash and nonce stay burned.
-    async fn reject_accepted_envelope(&self, _envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
+    async fn reject_accepted_envelope(
+        &self,
+        _envelope: &konsensus_core::UkmEnvelope,
+    ) -> Result<(), StorageError> {
         Err(StorageError::Unsupported("reject accepted envelope".into()))
     }
 
@@ -1152,7 +1393,11 @@ pub trait Storage: Send + Sync {
 
     /// Hold `envelope` before its paid acceptance, unless a message with its
     /// id is already stored. Returns whether this call placed the hold.
-    async fn call_admission_hold(&self, _envelope: &konsensus_core::UkmEnvelope, _now_ms: u64) -> Result<bool, StorageError> {
+    async fn call_admission_hold(
+        &self,
+        _envelope: &konsensus_core::UkmEnvelope,
+        _now_ms: u64,
+    ) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("call admission hold".into()))
     }
 

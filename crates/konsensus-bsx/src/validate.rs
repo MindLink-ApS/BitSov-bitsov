@@ -5,8 +5,8 @@
 //! dimensions, etc. Returns hard errors and soft warnings separately.
 
 use crate::model::{
-    BsxBlock, BsxPage, MAX_BLOCKS, MAX_FORM_FIELDS, MAX_GRID_COLS, MAX_LIST_ITEMS,
-    MAX_RESOURCES, MAX_TABLE_COLS, MAX_TABLE_ROWS, MAX_TEXT_LENGTH,
+    BsxBlock, BsxPage, MAX_BLOCKS, MAX_FORM_FIELDS, MAX_GRID_COLS, MAX_LIST_ITEMS, MAX_RESOURCES,
+    MAX_TABLE_COLS, MAX_TABLE_ROWS, MAX_TEXT_LENGTH,
 };
 use crate::sanitize::{extract_markdown_links, is_allowed_link};
 
@@ -285,9 +285,7 @@ fn validate_block(
         BsxBlock::Code { content, .. } => {
             check_text_length(index, content, errors);
         }
-        BsxBlock::Table {
-            headers, rows, ..
-        } => {
+        BsxBlock::Table { headers, rows, .. } => {
             if headers.len() > MAX_TABLE_COLS {
                 errors.push(ValidationError::TooManyTableCols {
                     index,
@@ -469,17 +467,21 @@ mod tests {
         doc.meta.title = "".into();
         let result = validate_document(&doc);
         assert!(!result.is_valid());
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::EmptyTitle)));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::EmptyTitle)));
     }
 
     #[test]
     fn too_many_blocks() {
         let mut doc = minimal_doc();
-        doc.blocks = (0..MAX_BLOCKS + 1)
-            .map(|_| BsxBlock::Divider {})
-            .collect();
+        doc.blocks = (0..MAX_BLOCKS + 1).map(|_| BsxBlock::Divider {}).collect();
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::TooManyBsxBlocks { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::TooManyBsxBlocks { .. })));
     }
 
     #[test]
@@ -494,7 +496,10 @@ mod tests {
             })
             .collect();
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::TooManyResources { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::TooManyResources { .. })));
     }
 
     #[test]
@@ -507,7 +512,10 @@ mod tests {
             alt: None,
         }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::InvalidResourceHash { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidResourceHash { .. })));
     }
 
     #[test]
@@ -519,7 +527,10 @@ mod tests {
             alt: None,
         }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::UndeclaredResource { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::UndeclaredResource { .. })));
     }
 
     #[test]
@@ -543,17 +554,29 @@ mod tests {
     #[test]
     fn invalid_heading_level_zero() {
         let mut doc = minimal_doc();
-        doc.blocks = vec![BsxBlock::Heading { level: 0, text: "Bad".into() }];
+        doc.blocks = vec![BsxBlock::Heading {
+            level: 0,
+            text: "Bad".into(),
+        }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::InvalidHeadingLevel { level: 0, .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidHeadingLevel { level: 0, .. })));
     }
 
     #[test]
     fn invalid_heading_level_seven() {
         let mut doc = minimal_doc();
-        doc.blocks = vec![BsxBlock::Heading { level: 7, text: "Bad".into() }];
+        doc.blocks = vec![BsxBlock::Heading {
+            level: 7,
+            text: "Bad".into(),
+        }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::InvalidHeadingLevel { level: 7, .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidHeadingLevel { level: 7, .. })));
     }
 
     #[test]
@@ -563,7 +586,10 @@ mod tests {
             content: "x".repeat(MAX_TEXT_LENGTH + 1),
         }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::TextTooLong { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::TextTooLong { .. })));
     }
 
     #[test]
@@ -575,7 +601,10 @@ mod tests {
             rows: (0..MAX_TABLE_ROWS + 1).map(|_| vec!["x".into()]).collect(),
         }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::TooManyTableRows { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::TooManyTableRows { .. })));
     }
 
     #[test]
@@ -583,26 +612,43 @@ mod tests {
         let mut doc = minimal_doc();
         doc.blocks = vec![BsxBlock::List {
             ordered: false,
-            items: (0..MAX_LIST_ITEMS + 1).map(|i| format!("item {i}")).collect(),
+            items: (0..MAX_LIST_ITEMS + 1)
+                .map(|i| format!("item {i}"))
+                .collect(),
         }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::TooManyListItems { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::TooManyListItems { .. })));
     }
 
     #[test]
     fn zero_grid_cols() {
         let mut doc = minimal_doc();
-        doc.blocks = vec![BsxBlock::Grid { columns: 0, items: vec![] }];
+        doc.blocks = vec![BsxBlock::Grid {
+            columns: 0,
+            items: vec![],
+        }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::ZeroGridCols { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ZeroGridCols { .. })));
     }
 
     #[test]
     fn too_many_grid_cols() {
         let mut doc = minimal_doc();
-        doc.blocks = vec![BsxBlock::Grid { columns: 13, items: vec![] }];
+        doc.blocks = vec![BsxBlock::Grid {
+            columns: 13,
+            items: vec![],
+        }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::TooManyGridCols { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::TooManyGridCols { .. })));
     }
 
     #[test]
@@ -610,10 +656,16 @@ mod tests {
         let mut doc = minimal_doc();
         doc.blocks = vec![BsxBlock::Grid {
             columns: 2,
-            items: vec![BsxBlock::Heading { level: 0, text: "Bad".into() }],
+            items: vec![BsxBlock::Heading {
+                level: 0,
+                text: "Bad".into(),
+            }],
         }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::InvalidHeadingLevel { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidHeadingLevel { .. })));
     }
 
     #[test]
@@ -622,7 +674,10 @@ mod tests {
         doc.blocks = vec![];
         let result = validate_document(&doc);
         assert!(result.is_valid()); // warnings are not errors
-        assert!(result.warnings.iter().any(|w| matches!(w, ValidationWarning::EmptyDocument)));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::EmptyDocument)));
     }
 
     #[test]
@@ -635,7 +690,10 @@ mod tests {
         }];
         let result = validate_document(&doc);
         assert!(result.is_valid()); // warnings, not errors
-        assert!(result.warnings.iter().any(|w| matches!(w, ValidationWarning::InconsistentTableRow { .. })));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::InconsistentTableRow { .. })));
     }
 
     #[test]
@@ -648,7 +706,10 @@ mod tests {
         });
         let result = validate_document(&doc);
         assert!(result.is_valid());
-        assert!(result.warnings.iter().any(|w| matches!(w, ValidationWarning::InvalidAccentColor(_))));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::InvalidAccentColor(_))));
     }
 
     #[test]
@@ -658,7 +719,10 @@ mod tests {
             content: "click [here](https://evil.com) now".into(),
         }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::ForbiddenLinkScheme { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ForbiddenLinkScheme { .. })));
     }
 
     #[test]
@@ -688,7 +752,10 @@ mod tests {
             content: "click [me](javascript:alert(1))".into(),
         }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::ForbiddenLinkScheme { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ForbiddenLinkScheme { .. })));
     }
 
     #[test]
@@ -699,7 +766,10 @@ mod tests {
             items: vec!["safe".into(), "bad [link](http://evil.com)".into()],
         }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::ForbiddenLinkScheme { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ForbiddenLinkScheme { .. })));
     }
 
     #[test]
@@ -710,7 +780,10 @@ mod tests {
             content: "see [docs](https://external.com)".into(),
         }];
         let result = validate_document(&doc);
-        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::ForbiddenLinkScheme { .. })));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ForbiddenLinkScheme { .. })));
     }
 
     #[test]

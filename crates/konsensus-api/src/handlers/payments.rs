@@ -881,8 +881,13 @@ async fn replay_channel_open(
             .saturating_sub(op.created_at)
             > 10 * 60 * 1000
     {
-        let matched = channels.as_deref().and_then(|channels|
-            konsensus_core::traits::lightning::unique_channel_match(channels, &req.peer_pubkey, req.amount_sats));
+        let matched = channels.as_deref().and_then(|channels| {
+            konsensus_core::traits::lightning::unique_channel_match(
+                channels,
+                &req.peer_pubkey,
+                req.amount_sats,
+            )
+        });
         let recovered = matched.map(|channel| serde_json::json!({
                 "channel_id": channel.channel_id,
                 "user_channel_id": channel.user_channel_id,

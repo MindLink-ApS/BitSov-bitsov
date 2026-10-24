@@ -7,7 +7,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 
-use crate::auth::scoped::{ScopedAuth, Read};
+use crate::auth::scoped::{Read, ScopedAuth};
 use crate::state::AppState;
 
 /// Routing table summary response.

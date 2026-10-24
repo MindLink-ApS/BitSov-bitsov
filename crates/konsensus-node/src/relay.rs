@@ -40,7 +40,9 @@ use tokio::time::Instant;
 
 pub(crate) use engine::RelayEngine;
 pub(crate) use storage_payment::VerifiedStoragePayment;
-pub(crate) use store::{open_durable_pool, InMemoryRelayStore, RelayBindingStore, SqliteRelayStore};
+pub(crate) use store::{
+    open_durable_pool, InMemoryRelayStore, RelayBindingStore, SqliteRelayStore,
+};
 
 /// Per-peer cooldown on `RelayRegister` (FINDING 1). Mirrors the
 /// `session_handler` admission-invoice cooldown: a peer may open a binding, but

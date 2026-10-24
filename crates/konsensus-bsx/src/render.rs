@@ -198,7 +198,9 @@ fn render_block(html: &mut String, block: &BsxBlock) {
             submit_label,
             payment_amount,
         } => {
-            html.push_str("<form class=\"bsx-form\" method=\"post\" action=\"konsensus://form/submit\">");
+            html.push_str(
+                "<form class=\"bsx-form\" method=\"post\" action=\"konsensus://form/submit\">",
+            );
             for field in fields {
                 html.push_str("<div class=\"bsx-form-field\">");
                 html.push_str("<label>");
@@ -508,8 +510,14 @@ mod tests {
     fn render_heading_levels() {
         let mut doc = minimal_doc();
         doc.blocks = vec![
-            BsxBlock::Heading { level: 1, text: "H1".into() },
-            BsxBlock::Heading { level: 3, text: "H3".into() },
+            BsxBlock::Heading {
+                level: 1,
+                text: "H1".into(),
+            },
+            BsxBlock::Heading {
+                level: 3,
+                text: "H3".into(),
+            },
         ];
         let html = render_to_html(&doc);
         assert!(html.contains("<h1 class=\"bsx-heading\">H1</h1>"));
@@ -638,8 +646,14 @@ mod tests {
     fn render_callout_variants() {
         let mut doc = minimal_doc();
         doc.blocks = vec![
-            BsxBlock::Callout { variant: CalloutVariant::Warning, content: "Watch out".into() },
-            BsxBlock::Callout { variant: CalloutVariant::Success, content: "Done".into() },
+            BsxBlock::Callout {
+                variant: CalloutVariant::Warning,
+                content: "Watch out".into(),
+            },
+            BsxBlock::Callout {
+                variant: CalloutVariant::Success,
+                content: "Done".into(),
+            },
         ];
         let html = render_to_html(&doc);
         assert!(html.contains("bsx-callout-warning"));
@@ -652,8 +666,12 @@ mod tests {
         doc.blocks = vec![BsxBlock::Grid {
             columns: 2,
             items: vec![
-                BsxBlock::Text { content: "col1".into() },
-                BsxBlock::Text { content: "col2".into() },
+                BsxBlock::Text {
+                    content: "col1".into(),
+                },
+                BsxBlock::Text {
+                    content: "col2".into(),
+                },
             ],
         }];
         let html = render_to_html(&doc);
@@ -725,10 +743,7 @@ mod tests {
     #[test]
     fn inline_markdown_unclosed_bold() {
         // Unclosed ** should be left as-is
-        assert_eq!(
-            render_inline_markdown("hello **world"),
-            "hello **world"
-        );
+        assert_eq!(render_inline_markdown("hello **world"), "hello **world");
     }
 
     #[test]

@@ -47,7 +47,11 @@ impl Default for EagerOfferLimiter {
 
 impl EagerOfferLimiter {
     pub fn new() -> Self {
-        Self { last: HashMap::new(), window_start: None, in_window: 0 }
+        Self {
+            last: HashMap::new(),
+            window_start: None,
+            in_window: 0,
+        }
     }
 
     /// `true` (and the offer is counted) if an eager offer to `peer` may go
@@ -73,7 +77,8 @@ impl EagerOfferLimiter {
             }
         }
         if self.last.len() >= MAX_ENTRIES {
-            self.last.retain(|_, t| now.saturating_duration_since(*t) < PER_PEER_COOLDOWN);
+            self.last
+                .retain(|_, t| now.saturating_duration_since(*t) < PER_PEER_COOLDOWN);
         }
         self.in_window += 1;
         self.last.insert(*peer, now);
@@ -104,11 +109,18 @@ mod tests {
     fn a_flood_of_distinct_peers_is_capped_per_window() {
         let mut limiter = EagerOfferLimiter::new();
         let t0 = Instant::now();
-        let allowed = (0..1_000u16).filter(|n| limiter.allow(&peer(*n), t0)).count();
-        assert_eq!(allowed, GLOBAL_MAX as usize, "one window admits GLOBAL_MAX offers");
+        let allowed = (0..1_000u16)
+            .filter(|n| limiter.allow(&peer(*n), t0))
+            .count();
+        assert_eq!(
+            allowed, GLOBAL_MAX as usize,
+            "one window admits GLOBAL_MAX offers"
+        );
         // The next window admits another GLOBAL_MAX, never more.
         let t1 = t0 + GLOBAL_WINDOW;
-        let allowed = (1_000..2_000u16).filter(|n| limiter.allow(&peer(*n), t1)).count();
+        let allowed = (1_000..2_000u16)
+            .filter(|n| limiter.allow(&peer(*n), t1))
+            .count();
         assert_eq!(allowed, GLOBAL_MAX as usize);
     }
 
@@ -120,7 +132,10 @@ mod tests {
             assert!(limiter.allow(&peer(n), t0));
         }
         assert!(!limiter.allow(&peer(999), t0), "cap spent");
-        assert!(limiter.allow(&peer(999), t0 + GLOBAL_WINDOW), "not cooling down from a refusal");
+        assert!(
+            limiter.allow(&peer(999), t0 + GLOBAL_WINDOW),
+            "not cooling down from a refusal"
+        );
     }
 
     #[test]

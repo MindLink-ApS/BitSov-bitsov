@@ -557,7 +557,9 @@ async fn invites_reissue_rejected_while_pending() {
 
     let second = app.oneshot(mk_req()).await.unwrap();
     assert_eq!(second.status(), StatusCode::CONFLICT);
-    let body = axum::body::to_bytes(second.into_body(), 65536).await.unwrap();
+    let body = axum::body::to_bytes(second.into_body(), 65536)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["error"]
         .as_str()
@@ -695,7 +697,11 @@ async fn invites_accept_replay_is_convergent_and_restores_derived_state() {
 
     // Simulate a crash/lost response after the authority row committed but
     // before all derived runtime state was finalized.
-    state.storage.delete_peer(&inviter).await.expect("delete peer");
+    state
+        .storage
+        .delete_peer(&inviter)
+        .await
+        .expect("delete peer");
     {
         let mut registry = state.peer_registry.write().await;
         registry.remove(&inviter);

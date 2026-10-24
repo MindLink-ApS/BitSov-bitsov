@@ -18,7 +18,7 @@ use konsensus_core::kind::KindCategory;
 use konsensus_core::traits::chain::TrustLevel;
 use konsensus_pricing::peer_prices::{category_to_string, compute_valid_blocks};
 
-use crate::auth::scoped::{ScopedAuth, Read};
+use crate::auth::scoped::{Read, ScopedAuth};
 use crate::error::ApiError;
 use crate::freshness::DataFreshness;
 use crate::state::AppState;
@@ -96,8 +96,14 @@ async fn get_own_pricing(
     State(state): State<Arc<AppState>>,
 ) -> Result<(DataFreshness, Json<OwnPricingResponse>), ApiError> {
     let read_at = SystemTime::now();
-    let block_height = state.chain.get_block_height().await.map_err(|_| ApiError::NotReady)?;
-    if block_height == 0 { return Err(ApiError::NotReady); }
+    let block_height = state
+        .chain
+        .get_block_height()
+        .await
+        .map_err(|_| ApiError::NotReady)?;
+    if block_height == 0 {
+        return Err(ApiError::NotReady);
+    }
 
     // Build price table from our own pricing engine
     let categories = [
@@ -281,7 +287,9 @@ async fn get_peer_pricing(
         .peer_prices
         .get_peer_entry(&peer_id)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("no price table cached for peer {peer_id_hex}")))?;
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("no price table cached for peer {peer_id_hex}"))
+        })?;
 
     let stale = entry.is_stale(block_height, max_age);
     Ok(Json(PeerPriceResponse {
@@ -310,15 +318,33 @@ async fn get_peer_call_pricing(
     State(state): State<Arc<AppState>>,
     Path(peer_id): Path<String>,
 ) -> Result<Json<PeerCallPriceResponse>, ApiError> {
-    let peer = konsensus_core::NodeId::from_hex(&peer_id).map_err(|e| ApiError::BadRequest(format!("invalid peer id: {e}")))?;
+    let peer = konsensus_core::NodeId::from_hex(&peer_id)
+        .map_err(|e| ApiError::BadRequest(format!("invalid peer id: {e}")))?;
     let offer_msat = crate::calls::peer_call_price(&state, &peer).await?;
     let height = state.chain.get_block_height().await.unwrap_or(0);
     let answer = konsensus_core::kind::KIND_CALL_ANSWER;
-    let signal_msat = match state.peer_prices.get_fresh_discounted_peer_price(&peer, answer, height, std::time::Duration::from_secs(3600)).await {
+    let signal_msat = match state
+        .peer_prices
+        .get_fresh_discounted_peer_price(
+            &peer,
+            answer,
+            height,
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+    {
         Some(p) => p,
-        None => state.pricing.get_price_msat(answer).await.map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?,
+        None => state
+            .pricing
+            .get_price_msat(answer)
+            .await
+            .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?,
     };
-    Ok(Json(PeerCallPriceResponse { peer_id: peer.to_hex(), offer_msat, signal_msat }))
+    Ok(Json(PeerCallPriceResponse {
+        peer_id: peer.to_hex(),
+        offer_msat,
+        signal_msat,
+    }))
 }
 
 pub fn routes() -> Router<Arc<AppState>> {

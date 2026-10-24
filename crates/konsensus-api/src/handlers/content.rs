@@ -4,7 +4,7 @@
 //! ContentServer. Pages are markdown files stored in the node's content
 //! directory. All endpoints require authentication.
 
-use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::auth::scoped::{Admin, Read, ScopedAuth};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -289,9 +289,8 @@ async fn read_page(
         return Err(ApiError::NotFound(format!("page not found: /{filename}")));
     }
 
-    let content = std::fs::read_to_string(&file_path).map_err(|e| {
-        ApiError::Internal(format!("failed to read page: {e}"))
-    })?;
+    let content = std::fs::read_to_string(&file_path)
+        .map_err(|e| ApiError::Internal(format!("failed to read page: {e}")))?;
 
     let title = extract_title(&content).unwrap_or_else(|| filename.clone());
 
@@ -316,21 +315,21 @@ async fn write_page(
 
     // Enforce max page size: 4 MiB
     if body.content.len() > 4 * 1024 * 1024 {
-        return Err(ApiError::BadRequest("page content too large (max 4 MiB)".to_string()));
+        return Err(ApiError::BadRequest(
+            "page content too large (max 4 MiB)".to_string(),
+        ));
     }
 
     let file_path = content_dir.join(&filename);
 
     // Ensure content directory exists
     if !content_dir.exists() {
-        std::fs::create_dir_all(content_dir).map_err(|e| {
-            ApiError::Internal(format!("failed to create content directory: {e}"))
-        })?;
+        std::fs::create_dir_all(content_dir)
+            .map_err(|e| ApiError::Internal(format!("failed to create content directory: {e}")))?;
     }
 
-    std::fs::write(&file_path, &body.content).map_err(|e| {
-        ApiError::Internal(format!("failed to write page: {e}"))
-    })?;
+    std::fs::write(&file_path, &body.content)
+        .map_err(|e| ApiError::Internal(format!("failed to write page: {e}")))?;
 
     let title = extract_title(&body.content).unwrap_or_else(|| filename.clone());
 
@@ -355,9 +354,8 @@ async fn delete_page(
         return Err(ApiError::NotFound(format!("page not found: /{filename}")));
     }
 
-    std::fs::remove_file(&file_path).map_err(|e| {
-        ApiError::Internal(format!("failed to delete page: {e}"))
-    })?;
+    std::fs::remove_file(&file_path)
+        .map_err(|e| ApiError::Internal(format!("failed to delete page: {e}")))?;
 
     Ok(Json(serde_json::json!({
         "deleted": format!("/{filename}")
@@ -372,9 +370,8 @@ async fn get_manifest(
     _user: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ManifestResponse>, ApiError> {
-    let default_price_msat = super::front_door::porch_page_price(
-        state.pricing.as_ref(), &state.gate,
-    ).await?;
+    let default_price_msat =
+        super::front_door::porch_page_price(state.pricing.as_ref(), &state.gate).await?;
     let content_dir = match &state.content_dir {
         Some(dir) => dir,
         None => {
@@ -391,43 +388,45 @@ async fn get_manifest(
     let mut pages = Vec::new();
 
     match std::fs::read_dir(content_dir) {
-        Ok(entries) => { for entry in entries.flatten() {
-            if pages.len() >= MAX_PAGE_LISTING {
-                tracing::warn!(
-                    limit = MAX_PAGE_LISTING,
-                    "manifest page listing truncated at limit"
-                );
-                break;
-            }
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if pages.len() >= MAX_PAGE_LISTING {
+                    tracing::warn!(
+                        limit = MAX_PAGE_LISTING,
+                        "manifest page listing truncated at limit"
+                    );
+                    break;
+                }
 
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let filename = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            if !(filename.ends_with(".md") || filename.ends_with(".txt")) {
-                continue;
-            }
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let filename = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                if !(filename.ends_with(".md") || filename.ends_with(".txt")) {
+                    continue;
+                }
 
-            let title = if filename.ends_with(".md") {
-                std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|c| extract_title(&c))
-                    .unwrap_or_else(|| filename.clone())
-            } else {
-                filename.clone()
-            };
+                let title = if filename.ends_with(".md") {
+                    std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|c| extract_title(&c))
+                        .unwrap_or_else(|| filename.clone())
+                } else {
+                    filename.clone()
+                };
 
-            pages.push(ManifestPageInfo {
-                path: format!("/{filename}"),
-                title,
-                description: String::new(),
-                price_msat: None,
-            });
-        } }
+                pages.push(ManifestPageInfo {
+                    path: format!("/{filename}"),
+                    title,
+                    description: String::new(),
+                    price_msat: None,
+                });
+            }
+        }
         Err(e) => {
             tracing::warn!(dir = %content_dir.display(), error = %e, "failed to read content directory");
         }

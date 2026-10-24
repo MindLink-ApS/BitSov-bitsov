@@ -11,12 +11,18 @@ async fn invoice_fixture() -> Fx {
             let bolt11 = create_test_bolt11(amount);
             let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse().unwrap();
             Some(konsensus_api::state::InvoiceResponseData {
-                payment_hash: invoice.payment_hash().to_string(), recipient: peer, bolt11,
+                payment_hash: invoice.payment_hash().to_string(),
+                recipient: peer,
+                bolt11,
             })
         });
     fx.state.peer_ln_pubkeys.lock().await.clear();
     fx.state = Arc::new(AppState {
-        storage: Arc::new(SqliteStorage::open(fx.tmp.path().join("outbox.db").to_str().unwrap()).await.unwrap()),
+        storage: Arc::new(
+            SqliteStorage::open(fx.tmp.path().join("outbox.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        ),
         transport: Arc::new(transport),
         ..(*fx.state).clone()
     });
@@ -26,7 +32,11 @@ async fn invoice_fixture() -> Fx {
 pub(super) async fn recover(fx: &mut Fx) {
     fx.restart();
     fx.state = Arc::new(AppState {
-        storage: Arc::new(SqliteStorage::open(fx.tmp.path().join("outbox.db").to_str().unwrap()).await.unwrap()),
+        storage: Arc::new(
+            SqliteStorage::open(fx.tmp.path().join("outbox.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        ),
         ..(*fx.state).clone()
     });
     reconcile_operations(&fx.state).await.unwrap();
@@ -40,7 +50,14 @@ async fn invoice_non_dispatch_retry_cannot_release_a_later_unknown_attempt() {
     let request = json!({"operation_id":id,"recipient":fx.peer.to_hex(),"kind":100,
         "plaintext":"retry", "max_routing_fee_msat":500});
     fx.wallet.fee.store(501, Ordering::SeqCst);
-    let (status, body) = fx.call("POST", "/api/v1/messages/compose", Some(request.clone()), Some(&token)).await;
+    let (status, body) = fx
+        .call(
+            "POST",
+            "/api/v1/messages/compose",
+            Some(request.clone()),
+            Some(&token),
+        )
+        .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["code"], "not_dispatched");
     assert_eq!(body["operation_id"], id);
@@ -52,18 +69,40 @@ async fn invoice_non_dispatch_retry_cannot_release_a_later_unknown_attempt() {
     assert_eq!(fx.used(), 0);
     fx.wallet.fee.store(0, Ordering::SeqCst);
     fx.wallet.set(UNKNOWN);
-    let (status, body) = fx.call("POST", "/api/v1/messages/compose", Some(request.clone()), Some(&token)).await;
+    let (status, body) = fx
+        .call(
+            "POST",
+            "/api/v1/messages/compose",
+            Some(request.clone()),
+            Some(&token),
+        )
+        .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_ne!(body["code"], "not_dispatched");
     assert_eq!(body["state"], "payment_unknown");
     assert_eq!(fx.used(), 1500);
     for _ in 0..2 {
         recover(&mut fx).await;
-        assert_eq!(fx.used(), 1500, "the previous release cannot consume this attempt");
-        let (status, _) = fx.call("POST", "/api/v1/messages/compose", Some(request.clone()), Some(&token)).await;
+        assert_eq!(
+            fx.used(),
+            1500,
+            "the previous release cannot consume this attempt"
+        );
+        let (status, _) = fx
+            .call(
+                "POST",
+                "/api/v1/messages/compose",
+                Some(request.clone()),
+                Some(&token),
+            )
+            .await;
         assert_eq!(status, StatusCode::CONFLICT);
     }
-    assert_eq!(fx.wallet.money(), 1, "unknown attempts cannot be dispatched again");
+    assert_eq!(
+        fx.wallet.money(),
+        1,
+        "unknown attempts cannot be dispatched again"
+    );
 }
 
 #[tokio::test]
@@ -82,15 +121,29 @@ async fn invoice_refusal_leaves_an_older_unknown_operation_held() {
     for _ in 0..2 {
         recover(&mut fx).await;
         assert_eq!(fx.used(), 1000, "only the refused attempt is released");
-        assert_eq!(fx.service.reload_from_disk().unwrap().grants[0].budget.as_ref().unwrap().pending.len(), 1);
+        assert_eq!(
+            fx.service.reload_from_disk().unwrap().grants[0]
+                .budget
+                .as_ref()
+                .unwrap()
+                .pending
+                .len(),
+            1
+        );
     }
 }
 
 #[tokio::test]
 async fn channel_and_onchain_validation_is_not_dispatched_but_backend_errors_are_502() {
     for (route, request) in [
-        ("open-channel", json!({"peer_pubkey":PEER_LN,"peer_addr":"127.0.0.1:9735","amount_sats":10000})),
-        ("send-onchain", json!({"address":"bcrt1test","amount_sats":1000})),
+        (
+            "open-channel",
+            json!({"peer_pubkey":PEER_LN,"peer_addr":"127.0.0.1:9735","amount_sats":10000}),
+        ),
+        (
+            "send-onchain",
+            json!({"address":"bcrt1test","amount_sats":1000}),
+        ),
     ] {
         let fx = fixture().await;
         let owner = auth_header(&fx.state);

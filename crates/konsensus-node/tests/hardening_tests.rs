@@ -41,10 +41,8 @@ fn make_request(path: &str) -> PageRequest {
 
 #[test]
 fn content_server_unicode_filename() {
-    let (server, _dir) = setup_content_server(
-        vec![("日本語.md", "# Unicode\nHello 世界")],
-        1024 * 1024,
-    );
+    let (server, _dir) =
+        setup_content_server(vec![("日本語.md", "# Unicode\nHello 世界")], 1024 * 1024);
 
     let resp = server.handle_request(&make_request("/日本語.md"));
     assert_eq!(resp.status, PageStatus::Ok);
@@ -66,10 +64,7 @@ fn content_server_deeply_nested_path_not_served() {
 
 #[test]
 fn content_server_double_slash_path() {
-    let (server, _dir) = setup_content_server(
-        vec![("test.md", "# Test\ncontent")],
-        1024 * 1024,
-    );
+    let (server, _dir) = setup_content_server(vec![("test.md", "# Test\ncontent")], 1024 * 1024);
 
     let resp = server.handle_request(&make_request("//test.md"));
     // Double slash should normalize or return 404, not panic
@@ -78,10 +73,7 @@ fn content_server_double_slash_path() {
 
 #[test]
 fn content_server_encoded_traversal_rejected() {
-    let (server, _dir) = setup_content_server(
-        vec![("test.md", "# Test")],
-        1024 * 1024,
-    );
+    let (server, _dir) = setup_content_server(vec![("test.md", "# Test")], 1024 * 1024);
 
     // URL-encoded path traversal (..%2f)
     let resp = server.handle_request(&make_request("/..%2f..%2fetc%2fpasswd"));
@@ -117,10 +109,8 @@ fn content_server_manifest_unicode_h1() {
 
 #[test]
 fn content_server_manifest_h1_with_inline_code() {
-    let (server, _dir) = setup_content_server(
-        vec![("code.md", "# `Hello` World\nBody")],
-        1024 * 1024,
-    );
+    let (server, _dir) =
+        setup_content_server(vec![("code.md", "# `Hello` World\nBody")], 1024 * 1024);
 
     let manifest = server.build_manifest(850_000, 25);
     let page = manifest.pages.iter().find(|p| p.path == "/code.md");
@@ -177,10 +167,7 @@ fn content_server_binary_file_rejected_from_manifest() {
 
 #[test]
 fn content_server_request_id_preserved() {
-    let (server, _dir) = setup_content_server(
-        vec![("test.md", "# Test")],
-        1024 * 1024,
-    );
+    let (server, _dir) = setup_content_server(vec![("test.md", "# Test")], 1024 * 1024);
 
     let req = PageRequest {
         request_id: "unique-request-id-12345".into(),
@@ -212,10 +199,7 @@ fn content_server_not_found_request_id_preserved() {
 /// Markdown and plain text only: no HTML is served (docs/protocol/BROWSE.md §4).
 #[test]
 fn content_server_html_not_served() {
-    let (server, _dir) = setup_content_server(
-        vec![("page.html", "<h1>Hello</h1>")],
-        1024 * 1024,
-    );
+    let (server, _dir) = setup_content_server(vec![("page.html", "<h1>Hello</h1>")], 1024 * 1024);
 
     let resp = server.handle_request(&make_request("/page.html"));
     assert_eq!(resp.status, PageStatus::NotFound);
@@ -223,10 +207,8 @@ fn content_server_html_not_served() {
 
 #[test]
 fn content_server_content_type_txt() {
-    let (server, _dir) = setup_content_server(
-        vec![("readme.txt", "Plain text content")],
-        1024 * 1024,
-    );
+    let (server, _dir) =
+        setup_content_server(vec![("readme.txt", "Plain text content")], 1024 * 1024);
 
     let resp = server.handle_request(&make_request("/readme.txt"));
     assert_eq!(resp.status, PageStatus::Ok);
@@ -340,10 +322,8 @@ fn content_server_manifest_block_height() {
 
 #[test]
 fn content_server_markdown_content_type() {
-    let (server, _dir) = setup_content_server(
-        vec![("page.md", "# Markdown\nTest content")],
-        1024 * 1024,
-    );
+    let (server, _dir) =
+        setup_content_server(vec![("page.md", "# Markdown\nTest content")], 1024 * 1024);
 
     let resp = server.handle_request(&make_request("/page.md"));
     assert_eq!(resp.status, PageStatus::Ok);
@@ -380,10 +360,7 @@ fn content_server_error_response_zero_cache() {
 
 #[test]
 fn content_server_complete_response_metadata() {
-    let (server, _dir) = setup_content_server(
-        vec![("test.md", "# Hello\nWorld")],
-        1024 * 1024,
-    );
+    let (server, _dir) = setup_content_server(vec![("test.md", "# Hello\nWorld")], 1024 * 1024);
 
     let resp = server.handle_request(&make_request("/test.md"));
     assert!(resp.is_complete);

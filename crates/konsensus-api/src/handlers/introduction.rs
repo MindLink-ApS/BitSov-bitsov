@@ -82,12 +82,20 @@ pub struct PeerEndpointView {
 impl PeerEndpointView {
     /// A known endpoint.
     pub fn found(endpoint: String, source: &'static str) -> Self {
-        Self { endpoint: Some(endpoint), source: Some(source), reason: None }
+        Self {
+            endpoint: Some(endpoint),
+            source: Some(source),
+            reason: None,
+        }
     }
 
     /// No endpoint, for `reason`.
     pub fn missing(reason: &'static str) -> Self {
-        Self { endpoint: None, source: None, reason: Some(reason) }
+        Self {
+            endpoint: None,
+            source: None,
+            reason: Some(reason),
+        }
     }
 }
 
@@ -140,7 +148,10 @@ pub struct IntroductionSettings {
 impl IntroductionSettings {
     /// Override time for deterministic integration tests. Never enabled by default.
     #[cfg(feature = "test-support")]
-    pub fn with_test_clock(mut self, clock: impl Fn() -> Result<u64, ApiError> + Send + Sync + 'static) -> Self {
+    pub fn with_test_clock(
+        mut self,
+        clock: impl Fn() -> Result<u64, ApiError> + Send + Sync + 'static,
+    ) -> Self {
         self.clock = UnixClock::new(clock);
         self
     }
@@ -170,7 +181,11 @@ impl IntroductionSettings {
                 reason: None,
             };
         }
-        let mut view = self.discovered.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut view = self
+            .discovered
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if view.endpoint.is_none() && view.reason.is_none() {
             view.reason = Some(reason::NO_DIALABLE_ENDPOINT);
         }
@@ -287,7 +302,8 @@ pub(crate) async fn issue_card(state: &AppState) -> Result<Introduction, ApiErro
         .get_price_msat(konsensus_core::kind::KIND_CHAT)
         .await
         .map_err(|e| ApiError::Internal(format!("price unavailable: {e}")))?;
-    let (admission_msat, message_msat) = first_contact_prices(chat, state.gate.min_admission_cost_msat());
+    let (admission_msat, message_msat) =
+        first_contact_prices(chat, state.gate.min_admission_cost_msat());
     let height = state.chain.get_block_height().await.unwrap_or(0);
     let mut intro_id = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut intro_id);
@@ -318,7 +334,8 @@ pub(crate) fn verified_card(state: &AppState, text: &str) -> Result<Introduction
             "introduction_unavailable: this node's Lightning backend does not state a Bitcoin network".into(),
         )
     })?;
-    card.verify(state.introduction.clock.now()?, network).map_err(invalid)?;
+    card.verify(state.introduction.clock.now()?, network)
+        .map_err(invalid)?;
     Ok(card)
 }
 
@@ -340,16 +357,14 @@ async fn verify_introduction(
 async fn pin_endpoint(card: &Introduction) -> Result<SocketAddr, ApiError> {
     let (host, port) = split_endpoint(&card.endpoint)
         .map_err(|e| ApiError::BadRequest(format!("introduction_invalid: {e}")))?;
-    let addrs: Vec<SocketAddr> = match tokio::time::timeout(
-        DNS_TIMEOUT,
-        tokio::net::lookup_host((host.as_str(), port)),
-    )
-    .await
-    {
-        Ok(Ok(addrs)) => addrs.collect(),
-        Ok(Err(e)) => return Err(ApiError::Transport(format!("cannot resolve {host}: {e}"))),
-        Err(_) => return Err(ApiError::Transport(format!("resolving {host} timed out"))),
-    };
+    let addrs: Vec<SocketAddr> =
+        match tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((host.as_str(), port)))
+            .await
+        {
+            Ok(Ok(addrs)) => addrs.collect(),
+            Ok(Err(e)) => return Err(ApiError::Transport(format!("cannot resolve {host}: {e}"))),
+            Err(_) => return Err(ApiError::Transport(format!("resolving {host} timed out"))),
+        };
     if addrs.is_empty() {
         return Err(ApiError::Transport(format!("{host} has no address")));
     }
@@ -387,7 +402,9 @@ async fn open_introduction(
     let card = verified_card(&state, &req.card)?;
     let node = card.node().map_err(invalid)?;
     if node == *state.identity.node_id() {
-        return Err(ApiError::BadRequest("introduction_invalid: this is your own introduction".into()));
+        return Err(ApiError::BadRequest(
+            "introduction_invalid: this is your own introduction".into(),
+        ));
     }
     if card.reach == Reach::Local && !req.allow_local {
         return Err(ApiError::BadRequest(

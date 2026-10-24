@@ -206,11 +206,27 @@ struct FaultBackend {
 }
 #[async_trait::async_trait]
 impl LightningProvider for FaultBackend {
-    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        invoice: &str,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.pay_invoice(invoice).await
     }
 
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn keysend_with_fee_limit(
+        &self,
+        dest: &str,
+        amount: u64,
+        memo: Option<&str>,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.keysend(dest, amount, memo).await
     }
 
@@ -314,7 +330,14 @@ async fn lost_admission_response_never_pays_twice_but_explicit_non_dispatch_can_
             let response=app.clone().oneshot(Request::builder().method("POST").uri("/api/v1/messages/compose")
                 .header("authorization",format!("Bearer {token}")).header("content-type","application/json")
                 .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"retry","max_total_msat":14000}).to_string())).unwrap()).await.unwrap();
-            assert_eq!(response.status(), if attempt == 0 && !lose_response { StatusCode::BAD_REQUEST } else { StatusCode::BAD_GATEWAY });
+            assert_eq!(
+                response.status(),
+                if attempt == 0 && !lose_response {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            );
             let bytes = axum::body::to_bytes(response.into_body(), 16384)
                 .await
                 .unwrap();
@@ -329,7 +352,10 @@ async fn lost_admission_response_never_pays_twice_but_explicit_non_dispatch_can_
                 );
                 if lose_response {
                     assert_ne!(error["code"], "not_dispatched");
-                    assert!(error["error"].as_str().unwrap().contains("unknown"), "{error}");
+                    assert!(
+                        error["error"].as_str().unwrap().contains("unknown"),
+                        "{error}"
+                    );
                 } else {
                     assert_eq!(error["code"], "not_dispatched");
                     assert_eq!(error["error"], "local rejection");
@@ -375,7 +401,10 @@ async fn admission_invoice_time_case(future_timestamp: bool) {
                     // Model one second of target/backend latency. The invoice
                     // is current, but a fresh 300-second TTL exceeds the attempt.
                     std::thread::sleep(Duration::from_millis(1100));
-                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
                 };
                 let invoice = InvoiceBuilder::new(Currency::Regtest)
                     .description(format!("konsensus:{request_id}:message=2000"))
@@ -385,9 +414,10 @@ async fn admission_invoice_time_case(future_timestamp: bool) {
                     .min_final_cltv_expiry_delta(18)
                     .amount_milli_satoshis(2000)
                     .expiry_time(Duration::from_secs(300))
-                    .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(
-                        hash, &SecretKey::from_slice(&[7; 32]).unwrap(),
-                    ))
+                    .build_signed(|hash| {
+                        Secp256k1::new()
+                            .sign_ecdsa_recoverable(hash, &SecretKey::from_slice(&[7; 32]).unwrap())
+                    })
                     .unwrap();
                 Some(InvoiceResponseData {
                     recipient: peer,
@@ -396,16 +426,33 @@ async fn admission_invoice_time_case(future_timestamp: bool) {
                 })
             }),
     );
-    let token = auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, auth::Scope::all()).unwrap();
+    let token = auth::create_token(
+        &state.identity.node_id().to_hex(),
+        &state.jwt_secret,
+        auth::Scope::all(),
+    )
+    .unwrap();
     let response = common::test_router(state).oneshot(Request::builder()
         .method("POST").uri("/api/v1/messages/compose")
         .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"hello","max_total_msat":14000}).to_string())).unwrap()).await.unwrap();
     let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), 16_384).await.unwrap();
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{}", String::from_utf8_lossy(&body));
-    assert_eq!(payer.calls.load(Ordering::SeqCst), 0, "invalid invoice time must be rejected before dispatch: {}", String::from_utf8_lossy(&body));
+    let body = axum::body::to_bytes(response.into_body(), 16_384)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        payer.calls.load(Ordering::SeqCst),
+        0,
+        "invalid invoice time must be rejected before dispatch: {}",
+        String::from_utf8_lossy(&body)
+    );
     assert_eq!(payer.get_balance_msat().await.unwrap(), 100_000);
 }
 
@@ -424,15 +471,23 @@ async fn unsupported_quote_surfaces_code_without_payment() {
     use konsensus_api::state::InvoiceResponseError;
     let mut state = common::test_state();
     let peer = NodeId::from_bytes([87; 32]);
-    Arc::get_mut(&mut state).unwrap().transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
+    Arc::get_mut(&mut state).unwrap().transport = Arc::new(common::ConnectedStubTransport::new(
+        vec![peer],
+        state.invoice_requests.clone(),
+    ));
     let requests = state.invoice_requests.clone();
     let refused = tokio::spawn(async move {
         loop {
             let mut pending = requests.lock().await;
             if let Some(id) = pending.keys().next().cloned() {
-                pending.remove(&id).unwrap().send(Err(InvoiceResponseError {
-                    recipient: peer, reason: "stateless_quote_unsupported".into(),
-                })).unwrap();
+                pending
+                    .remove(&id)
+                    .unwrap()
+                    .send(Err(InvoiceResponseError {
+                        recipient: peer,
+                        reason: "stateless_quote_unsupported".into(),
+                    }))
+                    .unwrap();
                 break;
             }
             drop(pending);
@@ -440,13 +495,20 @@ async fn unsupported_quote_surfaces_code_without_payment() {
         }
     });
     let balance = state.lightning.get_balance_msat().await.unwrap();
-    let token = auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, auth::Scope::all()).unwrap();
+    let token = auth::create_token(
+        &state.identity.node_id().to_hex(),
+        &state.jwt_secret,
+        auth::Scope::all(),
+    )
+    .unwrap();
     let response = common::test_router(state.clone()).oneshot(Request::builder().method("POST")
         .uri("/api/v1/messages/compose").header("authorization",format!("Bearer {token}"))
         .header("content-type","application/json")
         .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"hello","max_total_msat":14000}).to_string())).unwrap()).await.unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
     let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(error["code"], "stateless_quote_unsupported");
     assert_eq!(state.lightning.get_balance_msat().await.unwrap(), balance);

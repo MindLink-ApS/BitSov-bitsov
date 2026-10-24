@@ -150,10 +150,10 @@ impl MessageTransport for FlapTransport {
 #[tokio::test]
 async fn first_contact_then_flap_must_not_spend_original_cap_twice() {
     let dir = tempfile::tempdir().unwrap();
-    let payer = Arc::new(
-        SharedMockProvider::new(&dir.path().join("ledger.db"), "payer", 100_000).unwrap(),
-    );
-    let payee = Arc::new(SharedMockProvider::new(&dir.path().join("ledger.db"), "payee", 0).unwrap());
+    let payer =
+        Arc::new(SharedMockProvider::new(&dir.path().join("ledger.db"), "payer", 100_000).unwrap());
+    let payee =
+        Arc::new(SharedMockProvider::new(&dir.path().join("ledger.db"), "payee", 0).unwrap());
     let mut state = common::test_state_with_lightning(payer.clone());
     let (_, identity) = NodeIdentity::generate().unwrap();
     let peer = *identity.node_id();

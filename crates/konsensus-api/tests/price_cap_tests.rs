@@ -1,125 +1,216 @@
 #![allow(dead_code)]
 mod common;
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
 use common::*;
-use std::sync::Arc;
-use axum::{body::Body, http::{Request, StatusCode}};
-use tower::ServiceExt;
-use serde_json::{json, Value};
 use konsensus_api::state::AppState;
 use konsensus_core::types::NodeId;
+use serde_json::{json, Value};
+use std::sync::Arc;
+use tower::ServiceExt;
 
 async fn fixture() -> (Arc<AppState>, NodeId, Arc<CountingLightning>) {
     let lightning = Arc::new(CountingLightning::default());
     let mut state = test_state_with_lightning(lightning.clone());
     let peer = setup_e2ee_session(&state.session_manager).await;
-    Arc::get_mut(&mut state).unwrap().transport = Arc::new(ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
-    state.peer_ln_pubkeys.lock().await.insert(peer, "02aaaa".repeat(5));
+    Arc::get_mut(&mut state).unwrap().transport = Arc::new(ConnectedStubTransport::new(
+        vec![peer],
+        state.invoice_requests.clone(),
+    ));
+    state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(peer, "02aaaa".repeat(5));
     (state, peer, lightning)
 }
 async fn post(state: &Arc<AppState>, path: &str, mut body: Value) -> (StatusCode, Value) {
     // Exercise caller tightening independently of the node's default floor.
-    if (path == "/api/v1/messages/compose" || (path.starts_with("/api/v1/files/") && path.ends_with("/send")))
-        && body.get("max_routing_fee_msat").is_none() {
+    if (path == "/api/v1/messages/compose"
+        || (path.starts_with("/api/v1/files/") && path.ends_with("/send")))
+        && body.get("max_routing_fee_msat").is_none()
+    {
         body["max_routing_fee_msat"] = json!(1000);
     }
-    let response = test_router(state.clone()).oneshot(Request::builder().method("POST").uri(path)
-        .header("authorization", auth_header(state)).header("content-type","application/json")
-        .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+    let response = test_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", auth_header(state))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), 100000).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(json!({"raw":String::from_utf8_lossy(&bytes)})))
+    let bytes = axum::body::to_bytes(response.into_body(), 100000)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(json!({"raw":String::from_utf8_lossy(&bytes)})),
+    )
 }
 #[tokio::test]
 async fn cap_refuses_before_any_invoice_or_payment_and_exact_cap_succeeds() {
     let (state, peer, lightning) = fixture().await;
-    let mut body = json!({"recipient":peer.to_hex(),"kind":100,"plaintext":"cap", "max_total_msat":999});
-    let (status, error) = post(&state,"/api/v1/messages/compose",body.clone()).await;
+    let mut body =
+        json!({"recipient":peer.to_hex(),"kind":100,"plaintext":"cap", "max_total_msat":999});
+    let (status, error) = post(&state, "/api/v1/messages/compose", body.clone()).await;
     assert_eq!(status, StatusCode::CONFLICT, "{error}");
     assert_eq!(error["code"], "price_cap_exceeded");
-    assert_eq!((lightning.money(),lightning.invoices()),(0,0));
+    assert_eq!((lightning.money(), lightning.invoices()), (0, 0));
     tokio::task::yield_now().await; // timeout cleanup runs in its spawned task
     assert!(state.invoice_requests.lock().await.is_empty());
     body["max_total_msat"] = json!(2000);
-    let (status, receipt) = post(&state,"/api/v1/messages/compose",body).await;
+    let (status, receipt) = post(&state, "/api/v1/messages/compose", body).await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
-    assert_eq!(receipt["amount_msat"],1000);
-    assert_eq!(lightning.money(),1);
+    assert_eq!(receipt["amount_msat"], 1000);
+    assert_eq!(lightning.money(), 1);
 }
 #[tokio::test]
 async fn status_advertises_enforced_cap_and_room_outcomes() {
-    let (state,_,_) = fixture().await;
-    let response = test_router(state.clone()).oneshot(Request::builder().uri("/api/v1/status")
-        .header("authorization",auth_header(&state)).body(Body::empty()).unwrap()).await.unwrap();
-    let bytes=axum::body::to_bytes(response.into_body(),100000).await.unwrap();
-    let body:Value=serde_json::from_slice(&bytes).unwrap();
-    assert!(body["api_capabilities"].as_array().unwrap().contains(&json!("paid_send_caps_v1")));
-    assert!(body["api_capabilities"].as_array().unwrap().contains(&json!("room_terminal_outcomes_v1")));
+    let (state, _, _) = fixture().await;
+    let response = test_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/status")
+                .header("authorization", auth_header(&state))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 100000)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(body["api_capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("paid_send_caps_v1")));
+    assert!(body["api_capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("room_terminal_outcomes_v1")));
 }
 #[tokio::test]
 async fn room_checks_entire_budget_before_any_payment_and_reports_refused_member() {
-    let (state,peer,lightning)=fixture().await;
-    let (_,room)=post(&state,"/api/v1/rooms",json!({"name":"cap"})).await;
-    let id=room["id"].as_str().unwrap();
-    let other="bb".repeat(32);
-    for member in [peer.to_hex(),other.clone()] {
-        assert_eq!(post(&state,&format!("/api/v1/rooms/{id}/members"),json!({"node_id":member})).await.0,StatusCode::OK);
+    let (state, peer, lightning) = fixture().await;
+    let (_, room) = post(&state, "/api/v1/rooms", json!({"name":"cap"})).await;
+    let id = room["id"].as_str().unwrap();
+    let other = "bb".repeat(32);
+    for member in [peer.to_hex(), other.clone()] {
+        assert_eq!(
+            post(
+                &state,
+                &format!("/api/v1/rooms/{id}/members"),
+                json!({"node_id":member})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
     }
-    let mut body=json!({"recipient":id,"is_room":true,"kind":100,"plaintext":"room", "max_total_msat":1999,
+    let mut body = json!({"recipient":id,"is_room":true,"kind":100,"plaintext":"room", "max_total_msat":1999,
         "max_recipient_msat":{peer.to_hex():2000,other.clone():2000}});
-    let (status,error)=post(&state,"/api/v1/messages/compose",body.clone()).await;
-    assert_eq!(status,StatusCode::CONFLICT,"{error}");
-    assert_eq!(lightning.money(),0);
-    body["max_total_msat"]=json!(4000);
-    body["max_recipient_msat"][&other]=json!(999);
-    assert_eq!(post(&state,"/api/v1/messages/compose",body.clone()).await.0,StatusCode::CONFLICT);
-    assert_eq!(lightning.money(),0);
-    body["max_recipient_msat"][&other]=json!(2000);
-    body["max_recipient_msat"]["cc".repeat(32)]=json!(1000);
-    assert_eq!(post(&state,"/api/v1/messages/compose",body.clone()).await.0,StatusCode::CONFLICT);
-    assert_eq!(lightning.money(),0, "removed members must be refused before fanout");
-    body["max_recipient_msat"].as_object_mut().unwrap().remove(&"cc".repeat(32));
-    let (status,receipt)=post(&state,"/api/v1/messages/compose",body).await;
-    assert_eq!(status,StatusCode::OK,"{receipt}");
-    let rows=receipt["member_outcomes"].as_array().unwrap();
-    assert_eq!(rows.len(),2);
-    assert!(rows.iter().any(|r|r["recipient"]==peer.to_hex() && r["status"]=="settled"));
-    assert!(rows.iter().any(|r|r["recipient"]==other && r["status"]=="refused"));
-    assert_eq!(lightning.money(),1);
+    let (status, error) = post(&state, "/api/v1/messages/compose", body.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(lightning.money(), 0);
+    body["max_total_msat"] = json!(4000);
+    body["max_recipient_msat"][&other] = json!(999);
+    assert_eq!(
+        post(&state, "/api/v1/messages/compose", body.clone())
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(lightning.money(), 0);
+    body["max_recipient_msat"][&other] = json!(2000);
+    body["max_recipient_msat"]["cc".repeat(32)] = json!(1000);
+    assert_eq!(
+        post(&state, "/api/v1/messages/compose", body.clone())
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        lightning.money(),
+        0,
+        "removed members must be refused before fanout"
+    );
+    body["max_recipient_msat"]
+        .as_object_mut()
+        .unwrap()
+        .remove(&"cc".repeat(32));
+    let (status, receipt) = post(&state, "/api/v1/messages/compose", body).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let rows = receipt["member_outcomes"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .any(|r| r["recipient"] == peer.to_hex() && r["status"] == "settled"));
+    assert!(rows
+        .iter()
+        .any(|r| r["recipient"] == other && r["status"] == "refused"));
+    assert_eq!(lightning.money(), 1);
 }
 #[tokio::test]
 async fn preencrypted_send_rejects_amount_above_cap_before_storing() {
-    let (state,peer,lightning)=fixture().await;
+    let (state, peer, lightning) = fixture().await;
     let (status,error)=post(&state,"/api/v1/messages",json!({"recipient":peer.to_hex(),"kind":100,"ciphertext":"aa",
       "payment_hash":"bb".repeat(32),"preimage":"cc".repeat(32),"amount_msat":1000,"max_total_msat":999})).await;
-    assert_eq!(status,StatusCode::CONFLICT,"{error}");
-    assert_eq!(error["code"],"price_cap_exceeded");
-    assert_eq!(lightning.money(),0);
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(error["code"], "price_cap_exceeded");
+    assert_eq!(lightning.money(), 0);
 }
 
 #[tokio::test]
 async fn file_cap_is_checked_before_payment_and_exact_cap_is_paid_once() {
-    let (state,peer,lightning)=fixture().await;
-    let (status,file)=post(&state,"/api/v1/files",json!({"filename":"hi.txt","mime_type":"text/plain","data_b64":"aGk="})).await;
-    assert_eq!(status,StatusCode::OK,"{file}");
-    let path=format!("/api/v1/files/{}/send",file["file_id"].as_str().unwrap());
-    let (status,error)=post(&state,&path,json!({"recipient":peer.to_hex(),"max_total_msat":999})).await;
-    assert_eq!(status,StatusCode::CONFLICT,"{error}");
-    assert_eq!(error["code"],"price_cap_exceeded");
-    assert_eq!((lightning.money(),lightning.invoices()),(0,0));
-    let (status,receipt)=post(&state,&path,json!({"recipient":peer.to_hex(),"max_total_msat":2000})).await;
-    assert_eq!(status,StatusCode::OK,"{receipt}");
-    assert_eq!(receipt["amount_msat"],1000);
-    assert_eq!(lightning.money(),1);
+    let (state, peer, lightning) = fixture().await;
+    let (status, file) = post(
+        &state,
+        "/api/v1/files",
+        json!({"filename":"hi.txt","mime_type":"text/plain","data_b64":"aGk="}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{file}");
+    let path = format!("/api/v1/files/{}/send", file["file_id"].as_str().unwrap());
+    let (status, error) = post(
+        &state,
+        &path,
+        json!({"recipient":peer.to_hex(),"max_total_msat":999}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(error["code"], "price_cap_exceeded");
+    assert_eq!((lightning.money(), lightning.invoices()), (0, 0));
+    let (status, receipt) = post(
+        &state,
+        &path,
+        json!({"recipient":peer.to_hex(),"max_total_msat":2000}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["amount_msat"], 1000);
+    assert_eq!(lightning.money(), 1);
 }
 
 #[tokio::test(start_paused = true)]
 async fn capped_first_contact_cannot_pay_an_unquoted_admission() {
-    let (mut state,_,lightning)=fixture().await;
-    let stranger=NodeId::from_hex(&"cc".repeat(32)).unwrap();
-    Arc::get_mut(&mut state).unwrap().transport=Arc::new(ConnectedStubTransport::new(vec![stranger],state.invoice_requests.clone()));
+    let (mut state, _, lightning) = fixture().await;
+    let stranger = NodeId::from_hex(&"cc".repeat(32)).unwrap();
+    Arc::get_mut(&mut state).unwrap().transport = Arc::new(ConnectedStubTransport::new(
+        vec![stranger],
+        state.invoice_requests.clone(),
+    ));
     let (status,error)=post(&state,"/api/v1/messages/compose",json!({"recipient":stranger.to_hex(),"kind":0,"plaintext":"hello","max_total_msat":1000000})).await;
-    assert_eq!(status,StatusCode::INTERNAL_SERVER_ERROR,"{error}");
-    assert_eq!((lightning.money(),lightning.invoices()),(0,0));
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{error}");
+    assert_eq!((lightning.money(), lightning.invoices()), (0, 0));
     tokio::task::yield_now().await; // timeout cleanup runs in its spawned task
     assert!(state.invoice_requests.lock().await.is_empty());
 }
@@ -137,30 +228,66 @@ async fn room_preserves_settlement_when_payment_proof_is_unavailable() {
     mixed_room("no-proof", "settled", 2000).await;
 }
 async fn mixed_room(mode: &str, expected: &str, total: u64) {
-    let lightning=Arc::new(MixedLightning::default());
-    let mut state=test_state_with_lightning(lightning.clone());
-    let first=setup_e2ee_session(&state.session_manager).await;
-    let second=setup_e2ee_session_with_mnemonic(&state.session_manager,"legal winner thank year wave sausage worth useful legal winner thank yellow").await;
-    Arc::get_mut(&mut state).unwrap().transport=Arc::new(ConnectedStubTransport::new(vec![first,second],state.invoice_requests.clone()));
-    state.peer_ln_pubkeys.lock().await.extend([(first,"settled".into()),(second,mode.into())]);
-    let (_,room)=post(&state,"/api/v1/rooms",json!({"name":"mixed"})).await;
-    let id=room["id"].as_str().unwrap();
-    for peer in [first,second] {
-        assert_eq!(post(&state,&format!("/api/v1/rooms/{id}/members"),json!({"node_id":peer.to_hex()})).await.0,StatusCode::OK);
+    let lightning = Arc::new(MixedLightning::default());
+    let mut state = test_state_with_lightning(lightning.clone());
+    let first = setup_e2ee_session(&state.session_manager).await;
+    let second = setup_e2ee_session_with_mnemonic(
+        &state.session_manager,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )
+    .await;
+    Arc::get_mut(&mut state).unwrap().transport = Arc::new(ConnectedStubTransport::new(
+        vec![first, second],
+        state.invoice_requests.clone(),
+    ));
+    state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .extend([(first, "settled".into()), (second, mode.into())]);
+    let (_, room) = post(&state, "/api/v1/rooms", json!({"name":"mixed"})).await;
+    let id = room["id"].as_str().unwrap();
+    for peer in [first, second] {
+        assert_eq!(
+            post(
+                &state,
+                &format!("/api/v1/rooms/{id}/members"),
+                json!({"node_id":peer.to_hex()})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
     }
-    let (status,receipt)=post(&state,"/api/v1/messages/compose",json!({"recipient":id,"is_room":true,"kind":100,"plaintext":"mixed",
-        "max_total_msat":4000,"max_recipient_msat":{first.to_hex():2000,second.to_hex():2000}})).await;
-    assert_eq!(status,StatusCode::OK,"{receipt}");
-    let rows=receipt["member_outcomes"].as_array().unwrap();
-    assert_eq!(rows.len(),2);
-    assert!(rows.iter().any(|r|r["recipient"]==first.to_hex() && r["status"]=="settled"));
-    assert!(rows.iter().any(|r|r["recipient"]==second.to_hex() && r["status"]==expected));
-    assert_eq!(receipt["amount_msat"],total);
-    assert_eq!(lightning.money_calls.load(std::sync::atomic::Ordering::SeqCst),2);
+    let (status, receipt) = post(
+        &state,
+        "/api/v1/messages/compose",
+        json!({"recipient":id,"is_room":true,"kind":100,"plaintext":"mixed",
+        "max_total_msat":4000,"max_recipient_msat":{first.to_hex():2000,second.to_hex():2000}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let rows = receipt["member_outcomes"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .any(|r| r["recipient"] == first.to_hex() && r["status"] == "settled"));
+    assert!(rows
+        .iter()
+        .any(|r| r["recipient"] == second.to_hex() && r["status"] == expected));
+    assert_eq!(receipt["amount_msat"], total);
+    assert_eq!(
+        lightning
+            .money_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
 }
 
 use async_trait::async_trait;
-use konsensus_core::traits::lightning::{LightningProvider, LightningError, Invoice, PaymentDetails, PaymentStatus};
+use konsensus_core::traits::lightning::{
+    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentStatus,
+};
 #[derive(Default)]
 struct MixedLightning {
     /// Incremented by `pay_invoice`, `keysend`, `send_onchain` and `open_channel`.
@@ -183,11 +310,27 @@ impl MixedLightning {
 
 #[async_trait]
 impl LightningProvider for MixedLightning {
-    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        invoice: &str,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.pay_invoice(invoice).await
     }
 
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn keysend_with_fee_limit(
+        &self,
+        dest: &str,
+        amount: u64,
+        memo: Option<&str>,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.keysend(dest, amount, memo).await
     }
 
@@ -222,10 +365,20 @@ impl LightningProvider for MixedLightning {
         memo: Option<&str>,
     ) -> Result<PaymentDetails, LightningError> {
         Self::bump(&self.money_calls);
-        let mut result = StubLightning.keysend(dest_pubkey, amount_msat, memo).await?;
-        if dest_pubkey == "unknown" { result.status=PaymentStatus::InFlight; result.preimage=None; }
-        if dest_pubkey == "failed" { result.status=PaymentStatus::Failed; result.preimage=None; }
-        if dest_pubkey == "no-proof" { result.preimage=None; }
+        let mut result = StubLightning
+            .keysend(dest_pubkey, amount_msat, memo)
+            .await?;
+        if dest_pubkey == "unknown" {
+            result.status = PaymentStatus::InFlight;
+            result.preimage = None;
+        }
+        if dest_pubkey == "failed" {
+            result.status = PaymentStatus::Failed;
+            result.preimage = None;
+        }
+        if dest_pubkey == "no-proof" {
+            result.preimage = None;
+        }
         Ok(result)
     }
     async fn is_available(&self) -> bool {
@@ -255,7 +408,13 @@ impl LightningProvider for MixedLightning {
     ) -> Result<String, LightningError> {
         Self::bump(&self.money_calls);
         StubLightning
-            .open_channel(peer_pubkey, peer_addr, amount_sats, announce, fee_rate_sat_per_vb)
+            .open_channel(
+                peer_pubkey,
+                peer_addr,
+                amount_sats,
+                announce,
+                fee_rate_sat_per_vb,
+            )
             .await
     }
     async fn close_channel(
@@ -270,9 +429,14 @@ impl LightningProvider for MixedLightning {
 #[tokio::test]
 async fn one_sat_principal_cap_refuses_fee_exposure() {
     let (state, peer, lightning) = fixture().await;
-    let (status, error) = post(&state, "/api/v1/messages/compose", json!({
-        "recipient":peer.to_hex(), "kind":100, "plaintext":"all in", "max_total_msat":1000
-    })).await;
+    let (status, error) = post(
+        &state,
+        "/api/v1/messages/compose",
+        json!({
+            "recipient":peer.to_hex(), "kind":100, "plaintext":"all in", "max_total_msat":1000
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT, "{error}");
     assert_eq!(lightning.money(), 0);
 }
@@ -280,13 +444,22 @@ async fn one_sat_principal_cap_refuses_fee_exposure() {
 #[tokio::test]
 async fn one_sat_message_wallet_debit_stays_within_all_in_cap() {
     use konsensus_core::traits::lightning::LightningProvider;
-    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new().with_routing_fee_msat(1000));
+    let wallet =
+        Arc::new(konsensus_lightning::MockLightningProvider::new().with_routing_fee_msat(1000));
     let before = wallet.get_balance_msat().await.unwrap();
     let mut state = test_state_with_lightning(wallet.clone());
     let peer = setup_e2ee_session(&state.session_manager).await;
-    Arc::get_mut(&mut state).unwrap().transport = Arc::new(ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
-    state.peer_ln_pubkeys.lock().await.insert(peer, format!("02{}", "aa".repeat(32)));
-    let body = json!({"recipient":peer.to_hex(),"kind":100,"plaintext":"fee bound","max_total_msat":2000});
+    Arc::get_mut(&mut state).unwrap().transport = Arc::new(ConnectedStubTransport::new(
+        vec![peer],
+        state.invoice_requests.clone(),
+    ));
+    state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(peer, format!("02{}", "aa".repeat(32)));
+    let body =
+        json!({"recipient":peer.to_hex(),"kind":100,"plaintext":"fee bound","max_total_msat":2000});
     let (status, receipt) = post(&state, "/api/v1/messages/compose", body).await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(receipt["max_routing_fee_msat"], 1000);

@@ -278,7 +278,9 @@ async fn pricing_own_chain_aware_reports_mode() {
     // Build a state with ChainAwarePricingEngine to verify mode detection
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
 
     let base_config = konsensus_pricing::StaticPricingConfig::default();
     let chain: Arc<dyn ChainProvider> = Arc::new(StubChain);
@@ -290,10 +292,8 @@ async fn pricing_own_chain_aware_reports_mode() {
         fee_rate_ema_alpha: 0.3,
         category_fee_targets: HashMap::new(),
     };
-    let chain_engine = konsensus_pricing::ChainAwarePricingEngine::new(
-        chain_config,
-        Arc::clone(&chain),
-    );
+    let chain_engine =
+        konsensus_pricing::ChainAwarePricingEngine::new(chain_config, Arc::clone(&chain));
 
     let state = Arc::new(AppState {
         starter: Default::default(),
@@ -317,7 +317,9 @@ async fn pricing_own_chain_aware_reports_mode() {
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::new(100)),
-        mnemonic_reveal_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::mnemonic_reveal_default()),
+        mnemonic_reveal_limiter: Arc::new(
+            konsensus_api::rate_limit::RateLimiter::mnemonic_reveal_default(),
+        ),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -392,7 +394,10 @@ async fn pricing_peers_with_cached_table() {
     let mut prices = std::collections::HashMap::new();
     prices.insert("communication".to_string(), 20u64);
     prices.insert("files_media".to_string(), 200u64);
-    state.peer_prices.update(peer_id, prices, 886_000, 144, 0.0).await;
+    state
+        .peer_prices
+        .update(peer_id, prices, 886_000, 144, 0.0)
+        .await;
 
     let app = build_router(Arc::clone(&state));
 
@@ -427,7 +432,10 @@ async fn pricing_peer_by_id() {
     let peer_id = NodeId::from_bytes([0xBB; 32]);
     let mut prices = std::collections::HashMap::new();
     prices.insert("communication".to_string(), 30u64);
-    state.peer_prices.update(peer_id, prices, 886_000, 72, 0.0).await;
+    state
+        .peer_prices
+        .update(peer_id, prices, 886_000, 72, 0.0)
+        .await;
 
     let app = build_router(Arc::clone(&state));
 
@@ -696,9 +704,7 @@ async fn pay_invoice_rejects_empty_bolt11() {
         .uri("/api/v1/payments/pay")
         .header("authorization", &auth)
         .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({"bolt11": ""}).to_string(),
-        ))
+        .body(Body::from(serde_json::json!({"bolt11": ""}).to_string()))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
@@ -830,7 +836,8 @@ async fn create_payment_proof_lightning_unavailable_returns_error() {
     let state = test_state();
     let peer_id = NodeId::from_hex(&"dd".repeat(32)).unwrap();
 
-    let result = konsensus_api::handlers::messages::create_payment_proof(&state, 100, &peer_id).await;
+    let result =
+        konsensus_api::handlers::messages::create_payment_proof(&state, 100, &peer_id).await;
     assert!(result.is_err(), "should fail when payment cannot be made");
 }
 
@@ -851,7 +858,7 @@ async fn invoice_request_oneshot_channel_works() {
 
     // Simulate receiving an InvoiceResponse (what main.rs would do).
     let data = konsensus_api::state::InvoiceResponseData {
-                recipient: *state.identity.node_id(),
+        recipient: *state.identity.node_id(),
         bolt11: "lnbc250n1pj...test".into(),
         payment_hash: "ab".repeat(32),
     };
@@ -897,11 +904,14 @@ async fn invoice_request_timeout_cleanup() {
         .expect("should be in map");
 
     let data = konsensus_api::state::InvoiceResponseData {
-                recipient: *state.identity.node_id(),
+        recipient: *state.identity.node_id(),
         bolt11: "lnbc...".into(),
         payment_hash: "ab".repeat(32),
     };
-    assert!(sender.send(Ok(data)).is_err(), "send should fail when receiver is dropped");
+    assert!(
+        sender.send(Ok(data)).is_err(),
+        "send should fail when receiver is dropped"
+    );
 }
 
 #[tokio::test]
@@ -1283,17 +1293,31 @@ async fn health_lightning_unavailable_shows_null_balance() {
 
     #[async_trait]
     impl LightningProvider for UnavailableLightning {
-    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
-        self.pay_invoice(invoice).await
-    }
+        async fn pay_invoice_with_fee_limit(
+            &self,
+            invoice: &str,
+            _cap: u64,
+        ) -> Result<
+            konsensus_core::traits::lightning::PaymentDetails,
+            konsensus_core::traits::lightning::LightningError,
+        > {
+            self.pay_invoice(invoice).await
+        }
 
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
-        self.keysend(dest, amount, memo).await
-    }
+        async fn keysend_with_fee_limit(
+            &self,
+            dest: &str,
+            amount: u64,
+            memo: Option<&str>,
+            _cap: u64,
+        ) -> Result<
+            konsensus_core::traits::lightning::PaymentDetails,
+            konsensus_core::traits::lightning::LightningError,
+        > {
+            self.keysend(dest, amount, memo).await
+        }
 
-        async fn create_invoice(
-            &self, _: u64, _: &str, _: u32,
-        ) -> Result<Invoice, LightningError> {
+        async fn create_invoice(&self, _: u64, _: &str, _: u32) -> Result<Invoice, LightningError> {
             Err(LightningError::Connection("offline".into()))
         }
         async fn pay_invoice(&self, _: &str) -> Result<PaymentDetails, LightningError> {
@@ -1308,7 +1332,12 @@ async fn health_lightning_unavailable_shows_null_balance() {
         async fn list_payments(&self, _: u32) -> Result<Vec<PaymentDetails>, LightningError> {
             Err(LightningError::Connection("offline".into()))
         }
-        async fn keysend(&self, _: &str, _: u64, _: Option<&str>) -> Result<PaymentDetails, LightningError> {
+        async fn keysend(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<&str>,
+        ) -> Result<PaymentDetails, LightningError> {
             Err(LightningError::Connection("offline".into()))
         }
         async fn is_available(&self) -> bool {
@@ -1318,7 +1347,9 @@ async fn health_lightning_unavailable_shows_null_balance() {
 
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
     let state = Arc::new(AppState {
         starter: Default::default(),
         identity: Arc::clone(&identity),
@@ -1511,9 +1542,7 @@ async fn payments_pay_empty_bolt11_rejected() {
         .uri("/api/v1/payments/pay")
         .header("authorization", &auth)
         .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({ "bolt11": "" }).to_string(),
-        ))
+        .body(Body::from(serde_json::json!({ "bolt11": "" }).to_string()))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
@@ -1823,7 +1852,9 @@ async fn chain_status_with_failing_provider() {
 
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
 
     let state = Arc::new(AppState {
         starter: Default::default(),
@@ -1895,8 +1926,14 @@ async fn chain_status_with_failing_provider() {
     // Error field should contain the error messages
     assert!(json["error"].is_string());
     let error = json["error"].as_str().unwrap();
-    assert!(error.contains("block height"), "error should mention block height: {error}");
-    assert!(error.contains("connection refused"), "error should contain reason: {error}");
+    assert!(
+        error.contains("block height"),
+        "error should mention block height: {error}"
+    );
+    assert!(
+        error.contains("connection refused"),
+        "error should contain reason: {error}"
+    );
 }
 
 #[tokio::test]
@@ -1942,7 +1979,9 @@ async fn chain_status_partial_failure() {
 
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
 
     let state = Arc::new(AppState {
         starter: Default::default(),
@@ -2037,7 +2076,10 @@ async fn chain_status_response_has_correct_fields() {
     // Verify all expected fields are present
     assert!(json.get("block_height").is_some(), "missing block_height");
     assert!(json.get("fee_rate_fast").is_some(), "missing fee_rate_fast");
-    assert!(json.get("fee_rate_medium").is_some(), "missing fee_rate_medium");
+    assert!(
+        json.get("fee_rate_medium").is_some(),
+        "missing fee_rate_medium"
+    );
     assert!(json.get("fee_rate_slow").is_some(), "missing fee_rate_slow");
     assert!(json.get("available").is_some(), "missing available");
 
@@ -2236,13 +2278,29 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
 
     #[async_trait]
     impl LightningProvider for UnconfirmedLightning {
-    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
-        self.pay_invoice(invoice).await
-    }
+        async fn pay_invoice_with_fee_limit(
+            &self,
+            invoice: &str,
+            _cap: u64,
+        ) -> Result<
+            konsensus_core::traits::lightning::PaymentDetails,
+            konsensus_core::traits::lightning::LightningError,
+        > {
+            self.pay_invoice(invoice).await
+        }
 
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
-        self.keysend(dest, amount, memo).await
-    }
+        async fn keysend_with_fee_limit(
+            &self,
+            dest: &str,
+            amount: u64,
+            memo: Option<&str>,
+            _cap: u64,
+        ) -> Result<
+            konsensus_core::traits::lightning::PaymentDetails,
+            konsensus_core::traits::lightning::LightningError,
+        > {
+            self.keysend(dest, amount, memo).await
+        }
 
         async fn create_invoice(
             &self,
@@ -2273,9 +2331,7 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
             _amount_sats: u64,
             _fee_rate_sat_per_vb: Option<f32>,
         ) -> Result<String, LightningError> {
-            Err(LightningError::BroadcastUnconfirmed {
-                txid: test_txid(),
-            })
+            Err(LightningError::BroadcastUnconfirmed { txid: test_txid() })
         }
     }
 
@@ -2469,17 +2525,24 @@ async fn liquidity_is_discoverable_and_off_by_default() {
     let state = test_state();
     let auth = auth_header(&state);
     let app = build_router(state);
-    let response = app.oneshot(Request::builder()
-        .uri("/api/v1/payments/liquidity")
-        .header("authorization", auth)
-        .body(Body::empty()).unwrap()).await.unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/payments/liquidity")
+                .header("authorization", auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["enabled"], false);
     assert_eq!(json["providers"], serde_json::json!([]));
 }
-
 
 #[tokio::test]
 async fn channel_fee_unsupported_rate_returns_not_dispatched() {

@@ -140,7 +140,10 @@ const CTX_SECP256K1: &str = "konsensus-v2 secp256k1 bitcoin key";
 const CTX_AES256: &str = "konsensus-v2 aes256 storage key";
 const CTX_OWNER_APPROVAL: &str = "konsensus-v2 ed25519 owner-approval key v2 (seed+owner secret)";
 
-fn mnemonic_seed(mnemonic_str: &str, passphrase: &str) -> Result<Zeroizing<[u8; 64]>, IdentityError> {
+fn mnemonic_seed(
+    mnemonic_str: &str,
+    passphrase: &str,
+) -> Result<Zeroizing<[u8; 64]>, IdentityError> {
     let mnemonic = bip39::Mnemonic::parse(mnemonic_str)
         .map_err(|e| IdentityError::InvalidMnemonic(e.to_string()))?;
     // Offline fallback: pbkdf2 is unavailable in the workspace/cache. bip39
@@ -303,8 +306,7 @@ impl NodeIdentity {
 mod tests {
     use super::*;
 
-    const TEST_MNEMONIC: &str =
-        "abandon abandon abandon abandon abandon abandon abandon abandon \
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon art";
 
@@ -458,11 +460,11 @@ mod tests {
             id1.ed25519_signing.to_bytes(),
             id2.ed25519_signing.to_bytes()
         );
+        assert_eq!(id1.x25519_public.as_bytes(), id2.x25519_public.as_bytes());
         assert_eq!(
-            id1.x25519_public.as_bytes(),
-            id2.x25519_public.as_bytes()
+            id1.secp_secret_key().as_ref(),
+            id2.secp_secret_key().as_ref()
         );
-        assert_eq!(id1.secp_secret_key().as_ref(), id2.secp_secret_key().as_ref());
     }
 
     #[test]
@@ -656,12 +658,16 @@ mod tests {
         let owner = OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "", &secret).unwrap();
         // Deterministic for the same seed and secret.
         assert_eq!(
-            OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "", &secret).unwrap().verifying_key(),
+            OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "", &secret)
+                .unwrap()
+                .verifying_key(),
             owner.verifying_key()
         );
         // The seed alone is not enough: another secret, another key.
         assert_ne!(
-            OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "", &[8u8; 32]).unwrap().verifying_key(),
+            OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "", &[8u8; 32])
+                .unwrap()
+                .verifying_key(),
             owner.verifying_key()
         );
         // Unlinkable to the node identity key and every other subkey.
@@ -671,12 +677,23 @@ mod tests {
         assert_ne!(pk[..], id.aes_key()[..]);
         // A different passphrase is a different owner.
         assert_ne!(
-            OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "x", &secret).unwrap().verifying_key(),
+            OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "x", &secret)
+                .unwrap()
+                .verifying_key(),
             owner.verifying_key()
         );
         let sig = owner.sign(b"approve");
-        assert!(owner.verifying_key().verify_strict(b"approve", &sig).is_ok());
-        assert!(id.ed25519_verifying_key().verify_strict(b"approve", &sig).is_err());
-        assert!(matches!(OwnerApprovalKey::from_seed(&[0u8; 32], &secret), Err(IdentityError::InvalidSeedLength(32))));
+        assert!(owner
+            .verifying_key()
+            .verify_strict(b"approve", &sig)
+            .is_ok());
+        assert!(id
+            .ed25519_verifying_key()
+            .verify_strict(b"approve", &sig)
+            .is_err());
+        assert!(matches!(
+            OwnerApprovalKey::from_seed(&[0u8; 32], &secret),
+            Err(IdentityError::InvalidSeedLength(32))
+        ));
     }
 }

@@ -323,11 +323,16 @@ mod bounded {
             .map_err(|error| WireError::Serialization(error.into()))
     }
 
-    pub fn snapshot_serialize<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    pub fn snapshot_serialize<S: serde::Serializer>(
+        bytes: &[u8],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&hex::encode(bytes))
     }
 
-    pub fn snapshot_deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    pub fn snapshot_deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
         let encoded = limited_string::<D, 49152>(deserializer)?;
         hex::decode(encoded).map_err(de::Error::custom)
     }
@@ -335,21 +340,30 @@ mod bounded {
     use super::bounded_json;
     pub use bounded_json::{enum_value, limited_string, parsed_string};
 
-    pub fn hex_24<'de, D: Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> Result<T, D::Error> {
+    pub fn hex_24<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+        deserializer: D,
+    ) -> Result<T, D::Error> {
         bounded_json::string_value::<D, T, 48>(deserializer)
     }
 
-    pub fn hex_32<'de, D: Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> Result<T, D::Error> {
+    pub fn hex_32<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+        deserializer: D,
+    ) -> Result<T, D::Error> {
         bounded_json::string_value::<D, T, 64>(deserializer)
     }
 
-    pub fn hex_64<'de, D: Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> Result<T, D::Error> {
+    pub fn hex_64<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+        deserializer: D,
+    ) -> Result<T, D::Error> {
         bounded_json::string_value::<D, T, 128>(deserializer)
     }
 
-    pub fn optional_uuid<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<uuid::Uuid>, D::Error> {
-        limited_opt_string::<D, 45>(deserializer)?.map(|s| s.parse()
-            .map_err(|_| de::Error::custom("invalid UUID"))).transpose()
+    pub fn optional_uuid<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<uuid::Uuid>, D::Error> {
+        limited_opt_string::<D, 45>(deserializer)?
+            .map(|s| s.parse().map_err(|_| de::Error::custom("invalid UUID")))
+            .transpose()
     }
 
     struct LimitedString<const MAX: usize>(String);
@@ -412,7 +426,9 @@ mod bounded {
                 A: SeqAccess<'de>,
             {
                 let mut out: Vec<u8> = Vec::new();
-                while let Some(bounded_json::Byte(byte)) = seq.next_element::<bounded_json::Byte>()? {
+                while let Some(bounded_json::Byte(byte)) =
+                    seq.next_element::<bounded_json::Byte>()?
+                {
                     if out.len() >= MAX {
                         return Err(de::Error::custom(format!(
                             "byte array exceeds maximum of {MAX} elements"
@@ -554,7 +570,9 @@ mod bounded {
             {
                 let mut out: std::collections::HashMap<String, u64> =
                     std::collections::HashMap::new();
-                while let Some((key, value)) = map.next_entry::<LimitedString<MAX_PRICE_KEY_BYTES>, u64>()? {
+                while let Some((key, value)) =
+                    map.next_entry::<LimitedString<MAX_PRICE_KEY_BYTES>, u64>()?
+                {
                     if out.len() >= MAX_PRICE_ENTRIES {
                         return Err(de::Error::custom(format!(
                             "price table exceeds maximum of {MAX_PRICE_ENTRIES} entries"
@@ -620,7 +638,8 @@ mod bounded {
             counter.charge::<D::Error>()?;
             let value = limited_string::<_, MAX_JSON_STRING_BYTES>(
                 &mut serde_json::Deserializer::from_str(raw.get()),
-            ).map_err(de::Error::custom)?;
+            )
+            .map_err(de::Error::custom)?;
             return Ok(serde_json::Value::String(value));
         }
         let deserializer = &mut serde_json::Deserializer::from_str(raw.get());
@@ -731,10 +750,12 @@ mod bounded {
             }
         }
 
-        deserializer.deserialize_any(ValueVisitor {
-            counter,
-            depth_remaining,
-        }).map_err(de::Error::custom)
+        deserializer
+            .deserialize_any(ValueVisitor {
+                counter,
+                depth_remaining,
+            })
+            .map_err(de::Error::custom)
     }
 
     /// Concrete entry point for key/signature byte vectors (cap
@@ -787,7 +808,10 @@ pub enum Capability {
     /// capability's encoding.
     Relay,
     /// Application-defined capability.
-    Custom(#[serde(deserialize_with = "bounded::limited_string::<_, MAX_CUSTOM_CAPABILITY_BYTES>")] String),
+    Custom(
+        #[serde(deserialize_with = "bounded::limited_string::<_, MAX_CUSTOM_CAPABILITY_BYTES>")]
+        String,
+    ),
 }
 
 /// The sovereignty tier of a node.
@@ -995,7 +1019,10 @@ pub enum Frame {
         request_id: uuid::Uuid,
         #[serde(deserialize_with = "bounded::limited_string::<_, MAX_STARTER_STATE_BYTES>")]
         state: String,
-        #[serde(default, deserialize_with = "bounded::limited_opt_string::<_, MAX_STARTER_REASON_BYTES>")]
+        #[serde(
+            default,
+            deserialize_with = "bounded::limited_opt_string::<_, MAX_STARTER_REASON_BYTES>"
+        )]
         reason: Option<String>,
         retry_after_unix: Option<u64>,
         #[serde(default, deserialize_with = "bounded::optional_uuid")]
@@ -1007,7 +1034,10 @@ pub enum Frame {
             deserialize_with = "bounded::limited_opt_string::<_, MAX_STARTER_CHANNEL_ID_BYTES>"
         )]
         channel_id: Option<String>,
-        #[serde(default, deserialize_with = "bounded::limited_opt_string::<_, MAX_STARTER_TXID_BYTES>")]
+        #[serde(
+            default,
+            deserialize_with = "bounded::limited_opt_string::<_, MAX_STARTER_TXID_BYTES>"
+        )]
         funding_txid: Option<String>,
     },
 
@@ -1115,7 +1145,11 @@ pub enum Frame {
     /// Recipient's binding price and sealed response snapshot; no peers in clear.
     PeerExchangeQuote { quote: Box<PeerExchangeQuote> },
     /// A fresh UKM proof for precisely this quote (kind 903).
-    PeerExchangePaidRequest { quote: Box<PeerExchangeQuote>, #[serde(deserialize_with = "bounded_envelope::deserialize")] envelope: Box<UkmEnvelope> },
+    PeerExchangePaidRequest {
+        quote: Box<PeerExchangeQuote>,
+        #[serde(deserialize_with = "bounded_envelope::deserialize")]
+        envelope: Box<UkmEnvelope>,
+    },
     /// Explicit refusal. Quote refusals occur before an invoice/payment exists.
     PeerExchangeRefused {
         #[serde(deserialize_with = "bounded::limited_string::<_, 1024>")]
@@ -1212,7 +1246,10 @@ pub struct PeerExchangeQuote {
     /// Exact principal, frozen until expiry.
     pub amount_msat: u64,
     /// Opaque AES-GCM snapshot, at most 50 bounded peer records.
-    #[serde(serialize_with = "bounded::snapshot_serialize", deserialize_with = "bounded::snapshot_deserialize")]
+    #[serde(
+        serialize_with = "bounded::snapshot_serialize",
+        deserialize_with = "bounded::snapshot_deserialize"
+    )]
     pub snapshot: Vec<u8>,
     /// Stateless invoice; its description commits to the sealed snapshot.
     #[serde(deserialize_with = "bounded::limited_string::<_, 8192>")]
@@ -1260,7 +1297,9 @@ pub struct PeerExchangeEntry {
 
 /// Decode a standalone peer or relay-mailbox envelope through the same field
 /// adapters as Frame::Message. Errors never retain serde's peer-controlled text.
-pub fn envelope_from_bytes(data: &[u8]) -> Result<UkmEnvelope, konsensus_core::wire_json::DecodeError> {
+pub fn envelope_from_bytes(
+    data: &[u8],
+) -> Result<UkmEnvelope, konsensus_core::wire_json::DecodeError> {
     #[derive(Deserialize)]
     struct Envelope(#[serde(deserialize_with = "bounded_envelope::deserialize")] Box<UkmEnvelope>);
     konsensus_core::wire_json::from_slice::<Envelope>(data).map(|envelope| *envelope.0)
@@ -1283,9 +1322,8 @@ impl Frame {
             .map_err(|_| WireError::Serialization("invalid UTF-8".into()))?;
         bounded_json::check_enum_tag(raw)
             .map_err(|error| WireError::Serialization(error.into()))?;
-        let frame: Self =
-            serde_json::from_slice(data)
-                .map_err(|_| WireError::Serialization("invalid frame JSON".into()))?;
+        let frame: Self = serde_json::from_slice(data)
+            .map_err(|_| WireError::Serialization("invalid frame JSON".into()))?;
         frame.validate()?;
         Ok(frame)
     }
@@ -1520,20 +1558,41 @@ mod tests {
     fn duplicate_ack_is_compatible_with_legacy_wire_shape() {
         // a3d05c9's tagged enum has no duplicate field and accepts unknown fields.
         #[derive(serde::Deserialize)]
-        enum LegacyFrame { MessageAck { id: MessageId } }
+        enum LegacyFrame {
+            MessageAck { id: MessageId },
+        }
         let id = MessageId::from_bytes([42; 32]);
-        let bytes = Frame::MessageAck { id, duplicate: true }.to_bytes().unwrap();
+        let bytes = Frame::MessageAck {
+            id,
+            duplicate: true,
+        }
+        .to_bytes()
+        .unwrap();
         let LegacyFrame::MessageAck { id: old_id } = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(old_id, id);
-        let old = Frame::MessageAck { id, duplicate: false }.to_bytes().unwrap();
+        let old = Frame::MessageAck {
+            id,
+            duplicate: false,
+        }
+        .to_bytes()
+        .unwrap();
         assert!(!String::from_utf8_lossy(&old).contains("duplicate"));
-        assert!(matches!(Frame::from_bytes(&old).unwrap(), Frame::MessageAck { duplicate: false, .. }));
+        assert!(matches!(
+            Frame::from_bytes(&old).unwrap(),
+            Frame::MessageAck {
+                duplicate: false,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn frame_message_ack_roundtrip() {
         let id = MessageId::compute(b"test", &Nonce::from_bytes([1u8; 24]));
-        let frame = Frame::MessageAck { id, duplicate: false };
+        let frame = Frame::MessageAck {
+            id,
+            duplicate: false,
+        };
 
         let bytes = frame.to_bytes().unwrap();
         let decoded = Frame::from_bytes(&bytes).unwrap();
@@ -2354,7 +2413,9 @@ mod tests {
         let bytes = frame.to_bytes().unwrap();
         let decoded = Frame::from_bytes(&bytes).unwrap();
         match decoded {
-            Frame::MessageReject { reason, .. } => assert_eq!(reason.len(), MAX_CONTROL_REASON_BYTES),
+            Frame::MessageReject { reason, .. } => {
+                assert_eq!(reason.len(), MAX_CONTROL_REASON_BYTES)
+            }
             _ => panic!("expected MessageReject frame"),
         }
     }
@@ -2379,12 +2440,16 @@ mod tests {
     #[test]
     fn encode_frame_size_boundary() {
         // Large legitimate payloads still round-trip below the outer frame cap.
-        let frame = Frame::RatchetInit { payload: vec![0; MAX_RATCHET_PAYLOAD_BYTES] };
+        let frame = Frame::RatchetInit {
+            payload: vec![0; MAX_RATCHET_PAYLOAD_BYTES],
+        };
         let encoded = encode_frame(&frame).unwrap();
         assert!(encoded.len() < MAX_FRAME_SIZE + 4);
         let (decoded, consumed) = decode_frame(&encoded).unwrap().unwrap();
         assert_eq!(consumed, encoded.len());
-        assert!(matches!(decoded, Frame::RatchetInit { payload } if payload.len() == MAX_RATCHET_PAYLOAD_BYTES));
+        assert!(
+            matches!(decoded, Frame::RatchetInit { payload } if payload.len() == MAX_RATCHET_PAYLOAD_BYTES)
+        );
     }
 
     #[test]
@@ -3054,16 +3119,28 @@ mod porch_quote_bounds_tests {
     #[test]
     fn porch_quote_rejects_oversized_fields_before_dispatch() {
         for response in [false, true] {
-            for (id_len, path_len, accepted) in [(64, 128, true), (65, 128, false), (64, 129, false)] {
+            for (id_len, path_len, accepted) in
+                [(64, 128, true), (65, 128, false), (64, 129, false)]
+            {
                 let request_id = "r".repeat(id_len);
                 let path = "p".repeat(path_len);
                 let frame = if response {
-                    Frame::PorchQuoteResponse { request_id, path, status: konsensus_core::payloads::content::PageStatus::Ok, amount_msat: Some(1000), admission_required: false }
+                    Frame::PorchQuoteResponse {
+                        request_id,
+                        path,
+                        status: konsensus_core::payloads::content::PageStatus::Ok,
+                        amount_msat: Some(1000),
+                        admission_required: false,
+                    }
                 } else {
                     Frame::PorchQuoteRequest { request_id, path }
                 };
                 let decoded = Frame::from_bytes(&frame.to_bytes().unwrap());
-                assert_eq!(decoded.is_ok(), accepted, "response={response}, id={id_len}, path={path_len}");
+                assert_eq!(
+                    decoded.is_ok(),
+                    accepted,
+                    "response={response}, id={id_len}, path={path_len}"
+                );
             }
         }
     }

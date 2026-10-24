@@ -1,8 +1,8 @@
 use super::*;
 use async_trait::async_trait;
+use konsensus_core::identity::NodeIdentity;
 use konsensus_core::traits::transport::TransportError;
 use konsensus_core::{PaymentProof, Recipient, Signature, UkmEnvelope, UkmEnvelopeBuilder};
-use konsensus_core::identity::NodeIdentity;
 use konsensus_storage::{SqliteStorage, Storage};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -100,15 +100,16 @@ async fn flush_peer_delivers_pending_messages() {
     let id_alice = make_identity(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     );
-    let id_bob = make_identity(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-    );
+    let id_bob = make_identity("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
     let bob_id = *id_bob.node_id();
 
     let env = make_test_envelope(&id_alice, bob_id);
     let msg_id = env.id;
     storage.store_message(&env).await.unwrap();
-    storage.queue_pending_delivery(&msg_id, &bob_id).await.unwrap();
+    storage
+        .queue_pending_delivery(&msg_id, &bob_id)
+        .await
+        .unwrap();
 
     flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), true).await;
 
@@ -118,10 +119,17 @@ async fn flush_peer_delivers_pending_messages() {
     drop(sent);
 
     let pending = storage.get_pending_for_peer(&bob_id).await.unwrap();
-    assert_eq!(pending.len(), 1, "pending must survive a transport write until ACK");
+    assert_eq!(
+        pending.len(),
+        1,
+        "pending must survive a transport write until ACK"
+    );
 
     let ts = timestamps.lock().await;
-    assert!(ts.contains_key(&msg_id), "send timestamp should be recorded");
+    assert!(
+        ts.contains_key(&msg_id),
+        "send timestamp should be recorded"
+    );
 }
 
 #[tokio::test]
@@ -132,9 +140,7 @@ async fn flush_peer_no_pending_is_noop() {
     let audit = make_audit(&tmpdir);
     let timestamps = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    let id_bob = make_identity(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-    );
+    let id_bob = make_identity("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
 
     flush_peer(id_bob.node_id(), storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), true).await;
     assert_eq!(transport.send_count.load(Ordering::SeqCst), 0);
@@ -151,15 +157,16 @@ async fn flush_peer_removes_stale_when_message_deleted() {
     let id_alice = make_identity(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     );
-    let id_bob = make_identity(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-    );
+    let id_bob = make_identity("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
     let bob_id = *id_bob.node_id();
 
     let env = make_test_envelope(&id_alice, bob_id);
     let msg_id = env.id;
     storage.store_message(&env).await.unwrap();
-    storage.queue_pending_delivery(&msg_id, &bob_id).await.unwrap();
+    storage
+        .queue_pending_delivery(&msg_id, &bob_id)
+        .await
+        .unwrap();
     storage.delete_message(&msg_id).await.unwrap();
 
     flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), true).await;
@@ -181,21 +188,26 @@ async fn flush_peer_increments_attempts_on_send_failure() {
     let id_alice = make_identity(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     );
-    let id_bob = make_identity(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-    );
+    let id_bob = make_identity("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
     let bob_id = *id_bob.node_id();
 
     let env = make_test_envelope(&id_alice, bob_id);
     let msg_id = env.id;
     storage.store_message(&env).await.unwrap();
-    storage.queue_pending_delivery(&msg_id, &bob_id).await.unwrap();
+    storage
+        .queue_pending_delivery(&msg_id, &bob_id)
+        .await
+        .unwrap();
 
     flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), true).await;
     flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), true).await;
 
     let pending = storage.get_pending_for_peer(&bob_id).await.unwrap();
-    assert_eq!(pending.len(), 1, "pending entry should still exist after failures");
+    assert_eq!(
+        pending.len(),
+        1,
+        "pending entry should still exist after failures"
+    );
 }
 
 #[tokio::test]
@@ -209,15 +221,16 @@ async fn flush_peer_delivers_multiple_pending() {
     let id_alice = make_identity(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     );
-    let id_bob = make_identity(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-    );
+    let id_bob = make_identity("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
     let bob_id = *id_bob.node_id();
 
     for _ in 0..3 {
         let env = make_test_envelope(&id_alice, bob_id);
         storage.store_message(&env).await.unwrap();
-        storage.queue_pending_delivery(&env.id, &bob_id).await.unwrap();
+        storage
+            .queue_pending_delivery(&env.id, &bob_id)
+            .await
+            .unwrap();
     }
 
     flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), true).await;
@@ -269,14 +282,15 @@ async fn run_flushes_on_channel_notification() {
     let id_alice = make_identity(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     );
-    let id_bob = make_identity(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-    );
+    let id_bob = make_identity("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
     let bob_id = *id_bob.node_id();
 
     let env = make_test_envelope(&id_alice, bob_id);
     storage.store_message(&env).await.unwrap();
-    storage.queue_pending_delivery(&env.id, &bob_id).await.unwrap();
+    storage
+        .queue_pending_delivery(&env.id, &bob_id)
+        .await
+        .unwrap();
 
     let handle = tokio::spawn(run(PendingHandlerDeps {
         identity: make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"),
@@ -310,9 +324,7 @@ async fn flush_multiple_connected_peers() {
     let id_alice = make_identity(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     );
-    let id_bob = make_identity(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-    );
+    let id_bob = make_identity("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
     // Use a third identity
     let id_charlie = make_identity(
         "legal winner thank year wave sausage worth useful legal winner thank yellow",
@@ -325,8 +337,14 @@ async fn flush_multiple_connected_peers() {
     let env_charlie = make_test_envelope(&id_alice, charlie_id);
     storage.store_message(&env_bob).await.unwrap();
     storage.store_message(&env_charlie).await.unwrap();
-    storage.queue_pending_delivery(&env_bob.id, &bob_id).await.unwrap();
-    storage.queue_pending_delivery(&env_charlie.id, &charlie_id).await.unwrap();
+    storage
+        .queue_pending_delivery(&env_bob.id, &bob_id)
+        .await
+        .unwrap();
+    storage
+        .queue_pending_delivery(&env_charlie.id, &charlie_id)
+        .await
+        .unwrap();
 
     // Simulate periodic scan: iterate connected peers and flush each
     let connected = vec![bob_id, charlie_id];
@@ -335,8 +353,16 @@ async fn flush_multiple_connected_peers() {
     }
 
     assert_eq!(transport.send_count.load(Ordering::SeqCst), 2);
-    assert!(!storage.get_pending_for_peer(&bob_id).await.unwrap().is_empty());
-    assert!(!storage.get_pending_for_peer(&charlie_id).await.unwrap().is_empty());
+    assert!(!storage
+        .get_pending_for_peer(&bob_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!storage
+        .get_pending_for_peer(&charlie_id)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// When transport fails for a pending message, the attempt counter
@@ -351,9 +377,7 @@ async fn flush_peer_partial_failure_increments_failed_only() {
     let id_alice = make_identity(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     );
-    let id_bob = make_identity(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-    );
+    let id_bob = make_identity("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
     let bob_id = *id_bob.node_id();
 
     // Queue two pending messages
@@ -361,8 +385,14 @@ async fn flush_peer_partial_failure_increments_failed_only() {
     let env2 = make_test_envelope(&id_alice, bob_id);
     storage.store_message(&env1).await.unwrap();
     storage.store_message(&env2).await.unwrap();
-    storage.queue_pending_delivery(&env1.id, &bob_id).await.unwrap();
-    storage.queue_pending_delivery(&env2.id, &bob_id).await.unwrap();
+    storage
+        .queue_pending_delivery(&env1.id, &bob_id)
+        .await
+        .unwrap();
+    storage
+        .queue_pending_delivery(&env2.id, &bob_id)
+        .await
+        .unwrap();
 
     // Transport succeeds for first message, then fails for subsequent
     let transport = Arc::new(MockTransport::new());
@@ -370,7 +400,11 @@ async fn flush_peer_partial_failure_increments_failed_only() {
     // First flush: both succeed
     flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), true).await;
     assert_eq!(transport.send_count.load(Ordering::SeqCst), 2);
-    assert!(!storage.get_pending_for_peer(&bob_id).await.unwrap().is_empty());
+    assert!(!storage
+        .get_pending_for_peer(&bob_id)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// Verify that flush_peer records send timestamps for delivered messages.
@@ -385,9 +419,7 @@ async fn flush_peer_records_send_timestamps() {
     let id_alice = make_identity(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     );
-    let id_bob = make_identity(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-    );
+    let id_bob = make_identity("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
     let bob_id = *id_bob.node_id();
 
     let env1 = make_test_envelope(&id_alice, bob_id);
@@ -396,14 +428,26 @@ async fn flush_peer_records_send_timestamps() {
     let msg_id2 = env2.id;
     storage.store_message(&env1).await.unwrap();
     storage.store_message(&env2).await.unwrap();
-    storage.queue_pending_delivery(&env1.id, &bob_id).await.unwrap();
-    storage.queue_pending_delivery(&env2.id, &bob_id).await.unwrap();
+    storage
+        .queue_pending_delivery(&env1.id, &bob_id)
+        .await
+        .unwrap();
+    storage
+        .queue_pending_delivery(&env2.id, &bob_id)
+        .await
+        .unwrap();
 
     flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), true).await;
 
     let ts = timestamps.lock().await;
-    assert!(ts.contains_key(&msg_id1), "should record timestamp for msg1");
-    assert!(ts.contains_key(&msg_id2), "should record timestamp for msg2");
+    assert!(
+        ts.contains_key(&msg_id1),
+        "should record timestamp for msg1"
+    );
+    assert!(
+        ts.contains_key(&msg_id2),
+        "should record timestamp for msg2"
+    );
     assert_eq!(ts.len(), 2);
 }
 
@@ -417,41 +461,107 @@ async fn six_minute_queue_and_eleven_failures_preserve_paid_identity_until_ack()
     let wallet = konsensus_lightning::MockLightningProvider::new();
     let hash = wallet.inject_inbound_keysend(10_000, None).await;
     let details = wallet.get_payment_status(&hash).await.unwrap();
-    env.payment_proof = PaymentProof::new(hex::decode(&hash).unwrap().try_into().unwrap(),
-        hex::decode(details.preimage.unwrap()).unwrap().try_into().unwrap(), 10_000);
+    env.payment_proof = PaymentProof::new(
+        hex::decode(&hash).unwrap().try_into().unwrap(),
+        hex::decode(details.preimage.unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        10_000,
+    );
     env.timestamp -= 360_000;
     env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
     db.store_message(&env).await.unwrap();
-    db.queue_pending_delivery(&env.id, bob.node_id()).await.unwrap();
-    let transport = MockTransport::new(); transport.set_fail_sends(true);
-    let dir = tempfile::tempdir().unwrap(); let audit = make_audit(&dir);
+    db.queue_pending_delivery(&env.id, bob.node_id())
+        .await
+        .unwrap();
+    let transport = MockTransport::new();
+    transport.set_fail_sends(true);
+    let dir = tempfile::tempdir().unwrap();
+    let audit = make_audit(&dir);
     let timestamps = tokio::sync::Mutex::new(HashMap::new());
-    for _ in 0..11 { flush_peer(bob.node_id(), &db, &transport, &audit, &timestamps, &alice, true).await; }
+    for _ in 0..11 {
+        flush_peer(
+            bob.node_id(),
+            &db,
+            &transport,
+            &audit,
+            &timestamps,
+            &alice,
+            true,
+        )
+        .await;
+    }
     assert_eq!(db.cleanup_stale_pending(10).await.unwrap(), 1);
-    let stalled: String = sqlx::query_scalar("SELECT state FROM pending_deliveries").fetch_one(db.pool()).await.unwrap();
+    let stalled: String = sqlx::query_scalar("SELECT state FROM pending_deliveries")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
     assert_eq!(stalled, "stalled");
-    assert_eq!(db.get_pending_for_peer(bob.node_id()).await.unwrap()[0].1, 11);
+    assert_eq!(
+        db.get_pending_for_peer(bob.node_id()).await.unwrap()[0].1,
+        11
+    );
     transport.set_fail_sends(false);
-    flush_peer(bob.node_id(), &db, &transport, &audit, &timestamps, &alice, false).await;
-    assert!(transport.sent.lock().await.is_empty(), "stalled row must wait for periodic scan");
-    flush_peer(bob.node_id(), &db, &transport, &audit, &timestamps, &alice, true).await;
+    flush_peer(
+        bob.node_id(),
+        &db,
+        &transport,
+        &audit,
+        &timestamps,
+        &alice,
+        false,
+    )
+    .await;
+    assert!(
+        transport.sent.lock().await.is_empty(),
+        "stalled row must wait for periodic scan"
+    );
+    flush_peer(
+        bob.node_id(),
+        &db,
+        &transport,
+        &audit,
+        &timestamps,
+        &alice,
+        true,
+    )
+    .await;
     assert_eq!(transport.sent.lock().await.len(), 1);
     let renewed = db.get_message(&env.id).await.unwrap().unwrap();
     assert!(renewed.timestamp > env.timestamp);
-    let mut expected = env.clone(); expected.timestamp = renewed.timestamp; expected.signature = renewed.signature;
+    let mut expected = env.clone();
+    expected.timestamp = renewed.timestamp;
+    expected.signature = renewed.signature;
     assert_eq!(renewed, expected, "only timestamp and signature may change");
     let key = alice.node_id().to_verifying_key().unwrap();
     use ed25519_dalek::Verifier;
-    key.verify(&renewed.signable_bytes(), &renewed.signature.to_ed25519()).unwrap();
+    key.verify(&renewed.signable_bytes(), &renewed.signature.to_ed25519())
+        .unwrap();
     let gate = konsensus_core::gate::PaymentGate::with_config(konsensus_core::gate::GateConfig {
-        verify_lightning_settlement: true, ..Default::default()
+        verify_lightning_settlement: true,
+        ..Default::default()
     });
-    gate.validate_paid_envelope(&renewed, &konsensus_pricing::StaticPricingEngine::new(Default::default()),
-        None, Some(&wallet), 0.0, Some(bob.node_id())).await.unwrap();
+    gate.validate_paid_envelope(
+        &renewed,
+        &konsensus_pricing::StaticPricingEngine::new(Default::default()),
+        None,
+        Some(&wallet),
+        0.0,
+        Some(bob.node_id()),
+    )
+    .await
+    .unwrap();
     let recipient_db = SqliteStorage::in_memory().await.unwrap();
-    assert_eq!(recipient_db.accept_paid_envelope(&renewed).await.unwrap(), konsensus_storage::PaidAcceptance::Accepted);
+    assert_eq!(
+        recipient_db.accept_paid_envelope(&renewed).await.unwrap(),
+        konsensus_storage::PaidAcceptance::Accepted
+    );
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 1);
-    assert!(db.acknowledge_pending(&env.id, bob.node_id(), alice.node_id()).await.unwrap());
+    assert!(db
+        .acknowledge_pending(&env.id, bob.node_id(), alice.node_id())
+        .await
+        .unwrap());
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
 }
 
@@ -461,21 +571,51 @@ async fn generic_flusher_never_sends_legacy_admission_after_sixteen_minute_flap(
     let alice = make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
     let bob = make_identity("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
     let proof = PaymentProof::new(Sha256::digest([4; 32]).into(), [4; 32], 1000);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-    let mut old = UkmEnvelopeBuilder::new(konsensus_core::kind::KIND_CHAT, *alice.node_id(),
-        Recipient::Node(*bob.node_id()), b"konsensus:admission:v1".to_vec(), proof)
-        .timestamp(now - 960_000).build();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut old = UkmEnvelopeBuilder::new(
+        konsensus_core::kind::KIND_CHAT,
+        *alice.node_id(),
+        Recipient::Node(*bob.node_id()),
+        b"konsensus:admission:v1".to_vec(),
+        proof,
+    )
+    .timestamp(now - 960_000)
+    .build();
     old.signature = Signature::from_ed25519(&alice.sign(&old.signable_bytes()));
     // A database left by the pre-rework #103 can still contain this row.
     db.store_message(&old).await.unwrap();
     db.prepare_delivery(&old.id, bob.node_id()).await.unwrap();
     let transport = MockTransport::new();
-    let dir = tempfile::tempdir().unwrap(); let audit = make_audit(&dir);
+    let dir = tempfile::tempdir().unwrap();
+    let audit = make_audit(&dir);
     let timestamps = tokio::sync::Mutex::new(HashMap::new());
     for periodic in [false, true] {
-        flush_peer(bob.node_id(), &db, &transport, &audit, &timestamps, &alice, periodic).await;
+        flush_peer(
+            bob.node_id(),
+            &db,
+            &transport,
+            &audit,
+            &timestamps,
+            &alice,
+            periodic,
+        )
+        .await;
     }
-    assert_eq!(transport.send_count.load(Ordering::SeqCst), 0, "only the generation-bound journal path can send admission");
-    assert!(db.get_pending_for_peer(bob.node_id()).await.unwrap().is_empty());
-    assert!(db.get_message(&old.id).await.unwrap().is_none(), "legacy marker must not be visible as chat");
+    assert_eq!(
+        transport.send_count.load(Ordering::SeqCst),
+        0,
+        "only the generation-bound journal path can send admission"
+    );
+    assert!(db
+        .get_pending_for_peer(bob.node_id())
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        db.get_message(&old.id).await.unwrap().is_none(),
+        "legacy marker must not be visible as chat"
+    );
 }

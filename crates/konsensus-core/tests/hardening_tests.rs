@@ -11,8 +11,7 @@ use konsensus_core::types::*;
 use konsensus_core::UkmEnvelopeBuilder;
 use sha2::{Digest, Sha256};
 
-const TEST_MNEMONIC: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon \
+const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon art";
 
@@ -198,7 +197,8 @@ fn envelope_large_ciphertext_validates() {
     .nonce(Nonce::from_bytes([5u8; 24]))
     .build();
 
-    env.validate().expect("large ciphertext envelope must pass validation");
+    env.validate()
+        .expect("large ciphertext envelope must pass validation");
     assert_eq!(env.ciphertext.len(), 1024 * 1024);
     assert_eq!(env.kind, KIND_FILE_REF);
 }
@@ -257,8 +257,14 @@ fn kind_category_boundary_values() {
     assert_eq!(KindCategory::from_kind(399), KindCategory::Collaboration);
 
     // RealTimeSignaling boundaries
-    assert_eq!(KindCategory::from_kind(400), KindCategory::RealTimeSignaling);
-    assert_eq!(KindCategory::from_kind(499), KindCategory::RealTimeSignaling);
+    assert_eq!(
+        KindCategory::from_kind(400),
+        KindCategory::RealTimeSignaling
+    );
+    assert_eq!(
+        KindCategory::from_kind(499),
+        KindCategory::RealTimeSignaling
+    );
 
     // WebContent boundaries
     assert_eq!(KindCategory::from_kind(500), KindCategory::WebContent);
@@ -270,7 +276,10 @@ fn kind_category_boundary_values() {
 
     // AppExtension boundaries
     assert_eq!(KindCategory::from_kind(1000), KindCategory::AppExtension);
-    assert_eq!(KindCategory::from_kind(u16::MAX), KindCategory::AppExtension);
+    assert_eq!(
+        KindCategory::from_kind(u16::MAX),
+        KindCategory::AppExtension
+    );
 }
 
 #[test]
@@ -289,42 +298,117 @@ fn kind_category_gap_ranges_are_unknown() {
 #[test]
 fn kind_constants_are_in_correct_category() {
     // Communication
-    assert_eq!(KindCategory::from_kind(KIND_CHAT), KindCategory::Communication);
-    assert_eq!(KindCategory::from_kind(KIND_LONGFORM), KindCategory::Communication);
-    assert_eq!(KindCategory::from_kind(KIND_REPLY), KindCategory::Communication);
-    assert_eq!(KindCategory::from_kind(KIND_REACTION), KindCategory::Communication);
-    assert_eq!(KindCategory::from_kind(KIND_EDIT), KindCategory::Communication);
-    assert_eq!(KindCategory::from_kind(KIND_DELETE), KindCategory::Communication);
-    assert_eq!(KindCategory::from_kind(KIND_FORWARD), KindCategory::Communication);
+    assert_eq!(
+        KindCategory::from_kind(KIND_CHAT),
+        KindCategory::Communication
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_LONGFORM),
+        KindCategory::Communication
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_REPLY),
+        KindCategory::Communication
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_REACTION),
+        KindCategory::Communication
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_EDIT),
+        KindCategory::Communication
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_DELETE),
+        KindCategory::Communication
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_FORWARD),
+        KindCategory::Communication
+    );
 
     // Structured data
-    assert_eq!(KindCategory::from_kind(KIND_CALENDAR_EVENT), KindCategory::StructuredData);
-    assert_eq!(KindCategory::from_kind(KIND_RSVP), KindCategory::StructuredData);
-    assert_eq!(KindCategory::from_kind(KIND_CONTACT), KindCategory::StructuredData);
-    assert_eq!(KindCategory::from_kind(KIND_PROFILE), KindCategory::StructuredData);
-    assert_eq!(KindCategory::from_kind(KIND_CALENDAR_UPDATE), KindCategory::StructuredData);
+    assert_eq!(
+        KindCategory::from_kind(KIND_CALENDAR_EVENT),
+        KindCategory::StructuredData
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_RSVP),
+        KindCategory::StructuredData
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_CONTACT),
+        KindCategory::StructuredData
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_PROFILE),
+        KindCategory::StructuredData
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_CALENDAR_UPDATE),
+        KindCategory::StructuredData
+    );
 
     // Files
-    assert_eq!(KindCategory::from_kind(KIND_FILE_REF), KindCategory::FilesMedia);
-    assert_eq!(KindCategory::from_kind(KIND_INLINE_IMAGE), KindCategory::FilesMedia);
-    assert_eq!(KindCategory::from_kind(KIND_VOICE_MEMO), KindCategory::FilesMedia);
+    assert_eq!(
+        KindCategory::from_kind(KIND_FILE_REF),
+        KindCategory::FilesMedia
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_INLINE_IMAGE),
+        KindCategory::FilesMedia
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_VOICE_MEMO),
+        KindCategory::FilesMedia
+    );
 
     // Collaboration
-    assert_eq!(KindCategory::from_kind(KIND_CRDT_OP), KindCategory::Collaboration);
-    assert_eq!(KindCategory::from_kind(KIND_DOC_SNAPSHOT), KindCategory::Collaboration);
+    assert_eq!(
+        KindCategory::from_kind(KIND_CRDT_OP),
+        KindCategory::Collaboration
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_DOC_SNAPSHOT),
+        KindCategory::Collaboration
+    );
 
     // Web content
-    assert_eq!(KindCategory::from_kind(KIND_PAGE_REQUEST), KindCategory::WebContent);
-    assert_eq!(KindCategory::from_kind(KIND_PAGE_RESPONSE), KindCategory::WebContent);
-    assert_eq!(KindCategory::from_kind(KIND_WEB_MANIFEST), KindCategory::WebContent);
+    assert_eq!(
+        KindCategory::from_kind(KIND_PAGE_REQUEST),
+        KindCategory::WebContent
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_PAGE_RESPONSE),
+        KindCategory::WebContent
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_WEB_MANIFEST),
+        KindCategory::WebContent
+    );
 
     // Control
     assert_eq!(KindCategory::from_kind(KIND_TYPING), KindCategory::Control);
-    assert_eq!(KindCategory::from_kind(KIND_READ_RECEIPT), KindCategory::Control);
-    assert_eq!(KindCategory::from_kind(KIND_PRESENCE), KindCategory::Control);
-    assert_eq!(KindCategory::from_kind(KIND_ROOM_CREATE), KindCategory::Control);
-    assert_eq!(KindCategory::from_kind(KIND_KEY_EXCHANGE), KindCategory::Control);
-    assert_eq!(KindCategory::from_kind(KIND_MLS_WELCOME), KindCategory::Control);
+    assert_eq!(
+        KindCategory::from_kind(KIND_READ_RECEIPT),
+        KindCategory::Control
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_PRESENCE),
+        KindCategory::Control
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_ROOM_CREATE),
+        KindCategory::Control
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_KEY_EXCHANGE),
+        KindCategory::Control
+    );
+    assert_eq!(
+        KindCategory::from_kind(KIND_MLS_WELCOME),
+        KindCategory::Control
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -429,7 +513,9 @@ fn payment_proof_verify_correct_preimage() {
     let preimage = [0x55u8; 32];
     let hash: [u8; 32] = Sha256::digest(preimage).into();
     let proof = PaymentProof::new(hash, preimage, 100);
-    proof.verify_preimage().expect("valid preimage must pass verification");
+    proof
+        .verify_preimage()
+        .expect("valid preimage must pass verification");
 }
 
 #[test]
@@ -448,7 +534,9 @@ fn payment_proof_zero_amount_valid_if_preimage_matches() {
     let hash: [u8; 32] = Sha256::digest(preimage).into();
     let proof = PaymentProof::new(hash, preimage, 0);
     // Zero amount is structurally valid — price enforcement is gate's job
-    proof.verify_preimage().expect("zero-amount proof with valid preimage must pass");
+    proof
+        .verify_preimage()
+        .expect("zero-amount proof with valid preimage must pass");
     assert_eq!(proof.amount_msat, 0);
 }
 
@@ -499,7 +587,9 @@ fn signature_serde_roundtrip() {
 fn federation_empty_payload_signs_and_verifies() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
     let signed = SignedMessage::sign(&identity, Vec::new(), 1_700_000_000_000);
-    signed.verify_signature().expect("empty payload must sign and verify");
+    signed
+        .verify_signature()
+        .expect("empty payload must sign and verify");
 }
 
 #[test]
@@ -507,7 +597,9 @@ fn federation_large_payload_signs_and_verifies() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
     let payload = vec![0xFFu8; 100_000]; // 100 KB
     let signed = SignedMessage::sign(&identity, payload, 1_700_000_000_000);
-    signed.verify_signature().expect("large payload must sign and verify");
+    signed
+        .verify_signature()
+        .expect("large payload must sign and verify");
 }
 
 #[test]
@@ -553,7 +645,9 @@ fn federation_timestamp_within_future_tolerance() {
     let now = 1_700_000_000_000u64;
     // Message 15 seconds in the future (within 30s tolerance)
     let signed = SignedMessage::sign(&identity, b"hello".to_vec(), now + 15_000);
-    signed.verify_with_timestamp(now, 60_000).expect("within future tolerance must pass");
+    signed
+        .verify_with_timestamp(now, 60_000)
+        .expect("within future tolerance must pass");
 }
 
 #[test]

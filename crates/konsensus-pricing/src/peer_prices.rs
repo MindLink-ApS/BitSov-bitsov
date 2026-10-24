@@ -16,8 +16,8 @@
 //! per peer connection + once per price update (rare).
 
 use std::collections::HashMap;
-use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use konsensus_core::kind::KindCategory;
 use konsensus_core::types::NodeId;
@@ -160,7 +160,11 @@ impl PeerPriceCache {
         let mut entries = self.entries.write().await;
         // Never replace a usable table with an unknown/expired tip, or
         // refresh its wall-clock validity merely because a peer is retrying.
-        if block_height == 0 || entries.get(&peer_id).is_some_and(|old| self.keep_cached_price(old, block_height, valid_blocks)) {
+        if block_height == 0
+            || entries
+                .get(&peer_id)
+                .is_some_and(|old| self.keep_cached_price(old, block_height, valid_blocks))
+        {
             return;
         }
         // Clamp trust_discount to valid range [0.0, MAX_TRUST_DISCOUNT]
@@ -227,7 +231,8 @@ impl PeerPriceCache {
         max_age: std::time::Duration,
     ) -> Option<u64> {
         if current_block_height > 0 {
-            self.current_height.store(current_block_height, Ordering::Relaxed);
+            self.current_height
+                .store(current_block_height, Ordering::Relaxed);
         }
         let entries = self.entries.read().await;
         let entry = entries.get(peer_id)?;
@@ -262,7 +267,8 @@ impl PeerPriceCache {
         max_age: std::time::Duration,
     ) -> Option<u64> {
         if current_block_height > 0 {
-            self.current_height.store(current_block_height, Ordering::Relaxed);
+            self.current_height
+                .store(current_block_height, Ordering::Relaxed);
         }
         let entries = self.entries.read().await;
         let entry = entries.get(peer_id)?;
@@ -315,7 +321,9 @@ impl PeerPriceCache {
         let known_tip = self.current_height.load(Ordering::Relaxed);
         if block_height == 0
             || block_height.saturating_add(valid_blocks as u64) < known_tip
-            || entries.get(&peer_id).is_some_and(|old| self.keep_cached_price(old, block_height, valid_blocks))
+            || entries
+                .get(&peer_id)
+                .is_some_and(|old| self.keep_cached_price(old, block_height, valid_blocks))
         {
             return;
         }
@@ -370,13 +378,20 @@ impl PeerPriceCache {
 
     /// When `peer` last answered a price query for `kind` (see `kind_answers`).
     pub async fn kind_answered_at(&self, peer_id: &NodeId, kind: u16) -> Option<Instant> {
-        self.kind_answers.read().await.get(&(*peer_id, kind)).copied()
+        self.kind_answers
+            .read()
+            .await
+            .get(&(*peer_id, kind))
+            .copied()
     }
 
     /// Remove a peer's cached pricing (e.g., on disconnect).
     pub async fn remove(&self, peer_id: &NodeId) {
         self.entries.write().await.remove(peer_id);
-        self.kind_answers.write().await.retain(|(peer, _), _| peer != peer_id);
+        self.kind_answers
+            .write()
+            .await
+            .retain(|(peer, _), _| peer != peer_id);
     }
 
     /// Number of cached peer price tables.
@@ -575,7 +590,10 @@ pub async fn build_price_table(
     // The call offer is the per-call admission. When it differs from the
     // realtime category, peers need it by kind to pay it (and nothing else).
     let call = konsensus_core::kind::KIND_CALL_INVITE;
-    if pricing.category_price_overrides().is_some_and(|k| k.contains(&call)) {
+    if pricing
+        .category_price_overrides()
+        .is_some_and(|k| k.contains(&call))
+    {
         if let Ok(price) = pricing.get_price_msat(call).await {
             prices.insert(kind_key(call), price);
         }
@@ -597,7 +615,9 @@ pub async fn build_full_price_table(
     let prices = build_price_table(pricing).await;
     // Zero is an unknown tip, never a price validity anchor. Preserve the
     // existing typed readiness contract without leaking backend diagnostics.
-    let block_height = chain.get_block_height().await
+    let block_height = chain
+        .get_block_height()
+        .await
         .map_err(|_| konsensus_core::traits::lightning::LightningError::NotReady)?;
     if block_height == 0 {
         return Err(konsensus_core::traits::lightning::LightningError::NotReady);

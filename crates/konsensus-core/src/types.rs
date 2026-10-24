@@ -228,7 +228,12 @@ impl NodeId {
             // Pick source bytes from hash1 (first 8 groups) or hash2 (last 4)
             let src = if i < 8 { bytes } else { bytes2 };
             let offset = (i % 8) * 4;
-            let val = u32::from_be_bytes([src[offset], src[offset + 1], src[offset + 2], src[offset + 3]]);
+            let val = u32::from_be_bytes([
+                src[offset],
+                src[offset + 1],
+                src[offset + 2],
+                src[offset + 3],
+            ]);
             groups.push(format!("{:05}", val % 100_000));
         }
         groups.join(" ")
@@ -277,8 +282,7 @@ impl RoomId {
 
     /// Parse from a string (standard UUID format).
     pub fn parse(s: &str) -> Result<Self, CoreError> {
-        let uuid = uuid::Uuid::parse_str(s)
-            .map_err(|e| CoreError::InvalidRoomId(e.to_string()))?;
+        let uuid = uuid::Uuid::parse_str(s).map_err(|e| CoreError::InvalidRoomId(e.to_string()))?;
         Ok(Self(uuid))
     }
 
@@ -643,7 +647,11 @@ mod tests {
         assert_eq!(groups.len(), 12, "safety number should have 12 groups");
         for group in &groups {
             assert_eq!(group.len(), 5, "each group should be 5 digits: {}", group);
-            assert!(group.chars().all(|c| c.is_ascii_digit()), "group should be digits only: {}", group);
+            assert!(
+                group.chars().all(|c| c.is_ascii_digit()),
+                "group should be digits only: {}",
+                group
+            );
         }
     }
 
@@ -652,7 +660,11 @@ mod tests {
         let a = NodeId::from_bytes([42u8; 32]);
         let fp = a.short_fingerprint();
         assert_eq!(fp.len(), 8, "fingerprint should be 8 hex chars");
-        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()), "should be hex: {}", fp);
+        assert!(
+            fp.chars().all(|c| c.is_ascii_hexdigit()),
+            "should be hex: {}",
+            fp
+        );
     }
 
     #[test]
@@ -694,7 +706,10 @@ mod tests {
         let room = RoomId::new();
         let node_json = serde_json::to_string(&Recipient::Node(node)).unwrap();
         let room_json = serde_json::to_string(&Recipient::Room(room)).unwrap();
-        assert_ne!(node_json, room_json, "Node and Room must serialize differently");
+        assert_ne!(
+            node_json, room_json,
+            "Node and Room must serialize differently"
+        );
     }
 
     // ── Nonce constructor tests ────────────────────────────────────────

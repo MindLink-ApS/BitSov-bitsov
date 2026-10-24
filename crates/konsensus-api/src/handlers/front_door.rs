@@ -439,13 +439,16 @@ async fn put_front_door(
             "front_door_unavailable: this node's Lightning backend does not state a Bitcoin network".into(),
         )
     })?;
-    let endpoint = state.introduction.require_endpoint("front_door_unavailable")?;
+    let endpoint = state
+        .introduction
+        .require_endpoint("front_door_unavailable")?;
     let chat = state
         .pricing
         .get_price_msat(konsensus_core::kind::KIND_CHAT)
         .await
         .map_err(|e| ApiError::Internal(format!("price unavailable: {e}")))?;
-    let (default_admission, default_message) = first_contact_prices(chat, state.gate.min_admission_cost_msat());
+    let (default_admission, default_message) =
+        first_contact_prices(chat, state.gate.min_admission_cost_msat());
     let page_msat = porch_page_price(state.pricing.as_ref(), &state.gate).await?;
     let height = state.chain.get_block_height().await.unwrap_or(0);
 
@@ -494,8 +497,16 @@ async fn put_front_door(
     // Logged like the grant that allowed it: who published which sequence.
     tracing::info!(
         seq = card.seq,
-        paired_client = auth.pairing.as_ref().map(|p| p.client_id.as_str()).unwrap_or("-"),
-        via = if auth.has(crate::auth::Scope::Admin) { "admin" } else { "front_door grant" },
+        paired_client = auth
+            .pairing
+            .as_ref()
+            .map(|p| p.client_id.as_str())
+            .unwrap_or("-"),
+        via = if auth.has(crate::auth::Scope::Admin) {
+            "admin"
+        } else {
+            "front_door grant"
+        },
         "front door published"
     );
     *floor = card.seq;

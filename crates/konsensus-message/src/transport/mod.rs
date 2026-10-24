@@ -210,7 +210,12 @@ pub enum ControlEvent {
     },
 
     /// Porch metadata requests require admission; replies require correlation.
-    PorchQuote { peer_id: NodeId, frame: Box<Frame>, privileged: bool, source_ip: std::net::IpAddr },
+    PorchQuote {
+        peer_id: NodeId,
+        frame: Box<Frame>,
+        privileged: bool,
+        source_ip: std::net::IpAddr,
+    },
 
     /// Quote negotiation and paid redemption have their own per-act gate.
     PeerExchangeAct { peer_id: NodeId, frame: Box<Frame> },
@@ -334,7 +339,6 @@ pub enum ControlEvent {
     },
 
     // ── Real-time Signaling (KIND range 400–499) ──────────────────────────
-
     /// Peer sent a WebRTC call offer (SDP offer).
     CallOfferReceived {
         /// The peer initiating the call.
@@ -678,7 +682,8 @@ pub struct NoiseTransport {
     supervision: supervisor::SupervisionMap,
     dial_locks: DialLocks,
     /// Only session existence is consulted; this confers no admission authority.
-    reconnect_sessions: Arc<std::sync::RwLock<Option<std::sync::Weak<konsensus_crypto::SessionManager>>>>,
+    reconnect_sessions:
+        Arc<std::sync::RwLock<Option<std::sync::Weak<konsensus_crypto::SessionManager>>>>,
     /// Actual bound address after `start_listener()` (may differ from config if port 0 was used).
     actual_listen_addr: tokio::sync::watch::Sender<Option<SocketAddr>>,
     /// Receiver for the actual listen address.
@@ -729,15 +734,16 @@ async fn write_noise_message(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     data: &[u8],
 ) -> Result<(), WireError> {
-    let len = u32::try_from(data.len()).map_err(|_| {
-        WireError::FrameTooLarge {
-            size: data.len(),
-            max: u32::MAX as usize,
-        }
+    let len = u32::try_from(data.len()).map_err(|_| WireError::FrameTooLarge {
+        size: data.len(),
+        max: u32::MAX as usize,
     })?;
     // Dropping a partially written Noise frame must permanently close the
     // socket: encryption has already consumed a nonce, so reuse is invalid.
-    let mut guard = NoiseWriteGuard { writer, complete: false };
+    let mut guard = NoiseWriteGuard {
+        writer,
+        complete: false,
+    };
     guard.writer.write_all(&len.to_be_bytes()).await?;
     guard.writer.write_all(data).await?;
     guard.writer.flush().await?;
@@ -817,10 +823,12 @@ async fn read_noise_message(
         Ok(buf)
     })
     .await
-    .map_err(|_| WireError::Io(std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        "read timed out (slowloris protection)",
-    )))?
+    .map_err(|_| {
+        WireError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "read timed out (slowloris protection)",
+        ))
+    })?
 }
 /// Encrypt and write one envelope on an already captured connection.
 async fn write_envelope(conn: &Connection, envelope: &UkmEnvelope) -> Result<(), TransportError> {
@@ -887,7 +895,8 @@ impl MessageTransport for NoiseTransport {
         // Check whitelist (Principle 3). In PriceOpen mode the outbound wall is
         // skipped so a stranger can be dialed UNPRIVILEGED; the per-message
         // PaymentGate remains the sole admission authority.
-        if self.config.admission_mode == ReachabilityMode::Whitelist && !self.is_whitelisted(peer).await
+        if self.config.admission_mode == ReachabilityMode::Whitelist
+            && !self.is_whitelisted(peer).await
         {
             return Err(TransportError::Rejected(format!(
                 "peer {} not in whitelist",
@@ -930,7 +939,9 @@ impl MessageTransport for NoiseTransport {
             // Close on cancellation too, even while waiting for a busy writer.
             struct CloseOnDrop(Arc<Connection>);
             impl Drop for CloseOnDrop {
-                fn drop(&mut self) { self.0.close(); }
+                fn drop(&mut self) {
+                    self.0.close();
+                }
             }
             let _close = CloseOnDrop(Arc::clone(&conn));
             let _ = tokio::time::timeout(Duration::from_secs(1), async {
@@ -958,10 +969,16 @@ impl MessageTransport for NoiseTransport {
 
     async fn request_peer_exchange(&self, peer: &NodeId) -> Result<(), TransportError> {
         let _ = peer;
-        Err(TransportError::Other("peer exchange requires a signed quote and per-request payment".into()))
+        Err(TransportError::Other(
+            "peer exchange requires a signed quote and per-request payment".into(),
+        ))
     }
 
-    async fn send_raw_frame(&self, peer: &NodeId, frame_bytes: &[u8]) -> Result<(), TransportError> {
+    async fn send_raw_frame(
+        &self,
+        peer: &NodeId,
+        frame_bytes: &[u8],
+    ) -> Result<(), TransportError> {
         let conn = {
             let peers = self.peers.read().await;
             Arc::clone(
@@ -994,7 +1011,11 @@ impl MessageTransport for NoiseTransport {
         let conn = conn.lock().await;
         Some(ConnectedPeerInfo {
             tier: format!("{:?}", conn.tier),
-            capabilities: conn.capabilities.iter().map(|c| format!("{:?}", c)).collect(),
+            capabilities: conn
+                .capabilities
+                .iter()
+                .map(|c| format!("{:?}", c))
+                .collect(),
         })
     }
 
@@ -1007,12 +1028,18 @@ impl MessageTransport for NoiseTransport {
     }
 
     async fn admission_paid_on_connection(&self, peer: &NodeId) -> bool {
-        self.peers.read().await.get(peer).is_some_and(|conn| conn.admission_paid.load(std::sync::atomic::Ordering::Acquire))
+        self.peers.read().await.get(peer).is_some_and(|conn| {
+            conn.admission_paid
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     async fn mark_admission_paid(&self, peer: &NodeId, since: Instant) {
         if let Some(conn) = self.peers.read().await.get(peer) {
-            if conn.connected_at == since { conn.admission_paid.store(true, std::sync::atomic::Ordering::Release); }
+            if conn.connected_at == since {
+                conn.admission_paid
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
         }
     }
 
@@ -1030,10 +1057,12 @@ impl MessageTransport for NoiseTransport {
                 .get(peer)
                 .filter(|conn| Some(conn.connected_at) == since)
                 .map(Arc::clone)
-                .ok_or_else(|| TransportError::NotConnected(format!(
-                    "{}: connection generation replaced or gone",
-                    peer.to_hex()
-                )))?
+                .ok_or_else(|| {
+                    TransportError::NotConnected(format!(
+                        "{}: connection generation replaced or gone",
+                        peer.to_hex()
+                    ))
+                })?
         };
         write_envelope(&conn, envelope).await
     }
@@ -1044,7 +1073,8 @@ impl MessageTransport for NoiseTransport {
         since: Instant,
         frame_bytes: &[u8],
     ) -> Result<(), TransportError> {
-        self.send_raw_frame_on(peer, since, messaging::Standing::AdmissionPaid, frame_bytes).await
+        self.send_raw_frame_on(peer, since, messaging::Standing::AdmissionPaid, frame_bytes)
+            .await
     }
 
     /// Adding a peer is the owner's explicit admission of that NodeId, so it
@@ -1116,8 +1146,7 @@ mod tests {
          abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon art";
 
-    pub(super) const TEST_MNEMONIC_B: &str =
-        "zoo zoo zoo zoo zoo zoo zoo zoo \
+    pub(super) const TEST_MNEMONIC_B: &str = "zoo zoo zoo zoo zoo zoo zoo zoo \
          zoo zoo zoo zoo zoo zoo zoo zoo \
          zoo zoo zoo zoo zoo zoo zoo vote";
 
@@ -1190,7 +1219,9 @@ mod tests {
 
         let transport_b = Arc::new(NoiseTransport::new(Arc::clone(&identity_b), config_b_fixed));
         transport_b.start_listener().await?;
-        let listen_addr = transport_b.listen_addr().expect("should have actual listen addr");
+        let listen_addr = transport_b
+            .listen_addr()
+            .expect("should have actual listen addr");
 
         // Give the listener a moment to start
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1213,13 +1244,11 @@ mod tests {
         transport_a.send(&node_b_id, &envelope).await?;
 
         // B receives the message
-        let received = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            transport_b.recv(),
-        )
-        .await
-        .expect("recv timed out")
-        .expect("channel closed");
+        let received =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), transport_b.recv())
+                .await
+                .expect("recv timed out")
+                .expect("channel closed");
 
         assert_eq!(received.id, envelope.id);
         assert_eq!(received.sender, node_a_id);
@@ -1230,13 +1259,11 @@ mod tests {
         transport_b.send(&node_a_id, &reply).await?;
 
         // A receives the reply
-        let received_reply = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            transport_a.recv(),
-        )
-        .await
-        .expect("recv timed out")
-        .expect("channel closed");
+        let received_reply =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), transport_a.recv())
+                .await
+                .expect("recv timed out")
+                .expect("channel closed");
 
         assert_eq!(received_reply.id, reply.id);
         assert_eq!(received_reply.sender, node_b_id);
@@ -1269,9 +1296,7 @@ mod tests {
         let transport_a = NoiseTransport::new(Arc::clone(&identity_a), config_a);
 
         // Trying to connect should be rejected by our own whitelist check
-        let result = transport_a
-            .connect(&node_b_id, "127.0.0.1:19999")
-            .await;
+        let result = transport_a.connect(&node_b_id, "127.0.0.1:19999").await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1288,11 +1313,7 @@ mod tests {
         use ed25519_dalek::Signer;
         let sig = identity.ed25519_signing_key().sign(&x25519_public);
 
-        let result = verify_identity_binding(
-            identity.node_id(),
-            &x25519_public,
-            &sig.to_bytes(),
-        );
+        let result = verify_identity_binding(identity.node_id(), &x25519_public, &sig.to_bytes());
         assert!(result.is_ok());
     }
 
@@ -1328,8 +1349,8 @@ mod tests {
     /// 7. Decryption on the receiving end
     #[tokio::test]
     async fn e2e_encrypted_message_exchange() -> Result<(), Box<dyn std::error::Error>> {
-        use konsensus_crypto::SessionManager;
         use konsensus_crypto::ratchet_message_to_bytes;
+        use konsensus_crypto::SessionManager;
         use sha2::{Digest, Sha256};
 
         // Create two node identities
@@ -1385,7 +1406,9 @@ mod tests {
 
         let transport_b = Arc::new(NoiseTransport::new(Arc::clone(&identity_b), config_b));
         transport_b.start_listener().await?;
-        let listen_addr = transport_b.listen_addr().expect("should have actual listen addr");
+        let listen_addr = transport_b
+            .listen_addr()
+            .expect("should have actual listen addr");
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let transport_a = Arc::new(NoiseTransport::new(Arc::clone(&identity_a), config_a));
@@ -1438,23 +1461,24 @@ mod tests {
         transport_a.send(&node_b_id, &envelope).await?;
 
         // Step 4: B receives and decrypts the message
-        let received = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            transport_b.recv(),
-        )
-        .await
-        .expect("recv timed out")
-        .expect("channel closed");
+        let received =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), transport_b.recv())
+                .await
+                .expect("recv timed out")
+                .expect("channel closed");
 
         assert_eq!(received.id, envelope.id);
         assert_eq!(received.sender, node_a_id);
 
         // Verify envelope integrity on receiving end
-        received.validate().expect("received envelope should be valid");
+        received
+            .validate()
+            .expect("received envelope should be valid");
 
         // Decrypt the ciphertext via Double Ratchet
-        let ratchet_msg_received = konsensus_crypto::ratchet_message_from_bytes(&received.ciphertext)
-            .expect("should deserialize ratchet message");
+        let ratchet_msg_received =
+            konsensus_crypto::ratchet_message_from_bytes(&received.ciphertext)
+                .expect("should deserialize ratchet message");
         let decrypted = session_mgr_b
             .decrypt(&node_a_id, &ratchet_msg_received)
             .await
@@ -1489,16 +1513,15 @@ mod tests {
 
         transport_b.send(&node_a_id, &reply_envelope).await?;
 
-        let received_reply = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            transport_a.recv(),
-        )
-        .await
-        .expect("recv timed out")
-        .expect("channel closed");
+        let received_reply =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), transport_a.recv())
+                .await
+                .expect("recv timed out")
+                .expect("channel closed");
 
-        let reply_ratchet_msg = konsensus_crypto::ratchet_message_from_bytes(&received_reply.ciphertext)
-            .expect("should deserialize reply ratchet message");
+        let reply_ratchet_msg =
+            konsensus_crypto::ratchet_message_from_bytes(&received_reply.ciphertext)
+                .expect("should deserialize reply ratchet message");
         let decrypted_reply = session_mgr_a
             .decrypt(&node_b_id, &reply_ratchet_msg)
             .await
@@ -1515,8 +1538,8 @@ mod tests {
     /// Test that a message with invalid payment proof is detected.
     #[tokio::test]
     async fn e2e_invalid_payment_proof_detected() -> Result<(), Box<dyn std::error::Error>> {
-        use konsensus_crypto::SessionManager;
         use konsensus_crypto::ratchet_message_to_bytes;
+        use konsensus_crypto::SessionManager;
 
         let identity_a = make_identity(TEST_MNEMONIC_A);
         let identity_b = make_identity(TEST_MNEMONIC_B);
@@ -1534,9 +1557,7 @@ mod tests {
         session_mgr_b.accept_session(&node_a_id, &init_data).await?;
 
         // Encrypt a message
-        let ratchet_msg = session_mgr_a
-            .encrypt(&node_b_id, b"test message")
-            .await?;
+        let ratchet_msg = session_mgr_a.encrypt(&node_b_id, b"test message").await?;
         let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
         // Create an INVALID payment proof (preimage doesn't match hash)
@@ -1594,7 +1615,9 @@ mod tests {
         // Start B's listener
         let transport_b = Arc::new(NoiseTransport::new(Arc::clone(&identity_b), config_b));
         transport_b.start_listener().await?;
-        let listen_addr = transport_b.listen_addr().expect("should have actual listen addr");
+        let listen_addr = transport_b
+            .listen_addr()
+            .expect("should have actual listen addr");
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // A starts with supervisor for B
@@ -1688,7 +1711,9 @@ mod tests {
 
         let transport_b = Arc::new(NoiseTransport::new(Arc::clone(&identity_b), config_b));
         transport_b.start_listener().await?;
-        let listen_addr = transport_b.listen_addr().expect("should have actual listen addr");
+        let listen_addr = transport_b
+            .listen_addr()
+            .expect("should have actual listen addr");
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let transport_a = Arc::new(NoiseTransport::new(Arc::clone(&identity_a), config_a));
@@ -1709,8 +1734,7 @@ mod tests {
             let ping = Frame::Ping { nonce };
             let bytes = ping.to_bytes()?;
             let encrypted = conn.noise.encrypt(&bytes)?;
-            write_noise_message(&mut conn.writer, &encrypted)
-                .await?;
+            write_noise_message(&mut conn.writer, &encrypted).await?;
         }
 
         // Wait for B to respond with Pong (reader task handles it)
@@ -1757,30 +1781,24 @@ mod tests {
         let transport_b = NoiseTransport::new(id_b, config_b);
 
         transport_b.start_listener().await?;
-        let addr_b = transport_b.listen_addr().expect("should have actual listen addr");
+        let addr_b = transport_b
+            .listen_addr()
+            .expect("should have actual listen addr");
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // A connects to B
-        transport_a
-            .connect(&node_b_id, &addr_b.to_string())
-            .await?;
+        transport_a.connect(&node_b_id, &addr_b.to_string()).await?;
 
         // Both sides should receive PeerConnected events
-        let event_a = tokio::time::timeout(
-            Duration::from_secs(2),
-            transport_a.recv_control(),
-        )
-        .await
-        .expect("timeout waiting for control event A")
-        .expect("control channel closed");
+        let event_a = tokio::time::timeout(Duration::from_secs(2), transport_a.recv_control())
+            .await
+            .expect("timeout waiting for control event A")
+            .expect("control channel closed");
 
-        let event_b = tokio::time::timeout(
-            Duration::from_secs(2),
-            transport_b.recv_control(),
-        )
-        .await
-        .expect("timeout waiting for control event B")
-        .expect("control channel closed");
+        let event_b = tokio::time::timeout(Duration::from_secs(2), transport_b.recv_control())
+            .await
+            .expect("timeout waiting for control event B")
+            .expect("control channel closed");
 
         // Verify PeerConnected events
         match event_a {
@@ -1827,7 +1845,9 @@ mod tests {
         let transport_b = NoiseTransport::new(id_b, config_b);
 
         transport_b.start_listener().await.unwrap();
-        let addr_b = transport_b.listen_addr().expect("should have actual listen addr");
+        let addr_b = transport_b
+            .listen_addr()
+            .expect("should have actual listen addr");
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         transport_a
@@ -1850,16 +1870,15 @@ mod tests {
         transport_a.send_frame(&node_b_id, &frame).await.unwrap();
 
         // B should receive the PrekeyOffer as a control event
-        let event = tokio::time::timeout(
-            Duration::from_secs(2),
-            transport_b.recv_control(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(Duration::from_secs(2), transport_b.recv_control())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match event {
-            ControlEvent::PrekeyOffer { peer_id, bundle, .. } => {
+            ControlEvent::PrekeyOffer {
+                peer_id, bundle, ..
+            } => {
                 assert_eq!(peer_id, node_a_id);
                 assert_eq!(bundle, test_bundle);
             }
@@ -1919,13 +1938,10 @@ mod tests {
         };
         transport_a.send_frame(&node_b_id, &frame).await.unwrap();
 
-        let event = tokio::time::timeout(
-            Duration::from_secs(2),
-            transport_b.recv_control(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(Duration::from_secs(2), transport_b.recv_control())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match event {
             ControlEvent::SessionInit {
@@ -1945,13 +1961,10 @@ mod tests {
             .await
             .unwrap();
 
-        let event = tokio::time::timeout(
-            Duration::from_secs(2),
-            transport_a.recv_control(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(Duration::from_secs(2), transport_a.recv_control())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match event {
             ControlEvent::SessionAck { peer_id, .. } => {
@@ -2007,20 +2020,21 @@ mod tests {
             b"test",
             &konsensus_core::types::Nonce::generate(),
         );
-        let ack = Frame::MessageAck { id: test_id, duplicate: false };
+        let ack = Frame::MessageAck {
+            id: test_id,
+            duplicate: false,
+        };
         transport_b.send_frame(&node_a_id, &ack).await.unwrap();
 
-        let event = tokio::time::timeout(
-            Duration::from_secs(2),
-            transport_a.recv_control(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(Duration::from_secs(2), transport_a.recv_control())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match event {
             ControlEvent::MessageAcked {
-                duplicate: false,                peer_id,
+                duplicate: false,
+                peer_id,
                 message_id,
                 ..
             } => {
@@ -2037,13 +2051,10 @@ mod tests {
         };
         transport_b.send_frame(&node_a_id, &reject).await.unwrap();
 
-        let event = tokio::time::timeout(
-            Duration::from_secs(2),
-            transport_a.recv_control(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(Duration::from_secs(2), transport_a.recv_control())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match event {
             ControlEvent::MessageRejected {
@@ -2092,7 +2103,9 @@ mod tests {
         let transport_b = NoiseTransport::new(Arc::clone(&id_b), config_b);
 
         transport_b.start_listener().await.unwrap();
-        let addr_b = transport_b.listen_addr().expect("should have actual listen addr");
+        let addr_b = transport_b
+            .listen_addr()
+            .expect("should have actual listen addr");
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         transport_a
@@ -2126,13 +2139,10 @@ mod tests {
         transport_a.send_frame(&node_b_id, &frame).await.unwrap();
 
         // B should receive PriceTableReceived control event
-        let event = tokio::time::timeout(
-            Duration::from_secs(2),
-            transport_b.recv_control(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(Duration::from_secs(2), transport_b.recv_control())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match event {
             ControlEvent::PriceTableReceived {
@@ -2169,13 +2179,10 @@ mod tests {
         transport_a.send_frame(&node_b_id, &query).await.unwrap();
 
         // B receives PriceQueryReceived
-        let event = tokio::time::timeout(
-            Duration::from_secs(2),
-            transport_b.recv_control(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(Duration::from_secs(2), transport_b.recv_control())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match event {
             ControlEvent::PriceQueryReceived { peer_id, kind, .. } => {
@@ -2194,13 +2201,10 @@ mod tests {
         transport_b.send_frame(&node_a_id, &response).await.unwrap();
 
         // A receives PriceResponseReceived
-        let event = tokio::time::timeout(
-            Duration::from_secs(2),
-            transport_a.recv_control(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(Duration::from_secs(2), transport_a.recv_control())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match event {
             ControlEvent::PriceResponseReceived {
@@ -2236,13 +2240,10 @@ mod tests {
             .unwrap();
 
         // B receives PeerExchangeRequested
-        let event = tokio::time::timeout(
-            Duration::from_secs(2),
-            transport_b.recv_control(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(Duration::from_secs(2), transport_b.recv_control())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match event {
             ControlEvent::PeerExchangeRequested { peer_id, .. } => {
@@ -2265,13 +2266,10 @@ mod tests {
         transport_b.send_frame(&node_a_id, &response).await.unwrap();
 
         // A receives PeerExchangeReceived
-        let event = tokio::time::timeout(
-            Duration::from_secs(2),
-            transport_a.recv_control(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(Duration::from_secs(2), transport_a.recv_control())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match event {
             ControlEvent::PeerExchangeReceived { peer_id, peers, .. } => {
@@ -2301,13 +2299,10 @@ mod tests {
         transport_a.send_frame(&node_b_id, &frame).await.unwrap();
 
         // B should receive RatchetInit control event
-        let event = tokio::time::timeout(
-            Duration::from_secs(2),
-            transport_b.recv_control(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(Duration::from_secs(2), transport_b.recv_control())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match event {
             ControlEvent::RatchetInit {
@@ -2397,9 +2392,7 @@ mod tests {
         let transport_a = NoiseTransport::new(id_a, config_a);
 
         // Try connecting to an address where nothing is listening
-        let result = transport_a
-            .connect(&node_b_id, "127.0.0.1:1")
-            .await;
+        let result = transport_a.connect(&node_b_id, "127.0.0.1:1").await;
 
         assert!(result.is_err());
         transport_a.shutdown();
@@ -2436,11 +2429,12 @@ mod tests {
         let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
 
         // Should fail — A's empty whitelist rejects all outbound
-        let result = transport_a
-            .connect(&node_b_id, &addr_b.to_string())
-            .await;
+        let result = transport_a.connect(&node_b_id, &addr_b.to_string()).await;
 
-        assert!(result.is_err(), "empty whitelist must reject all connections");
+        assert!(
+            result.is_err(),
+            "empty whitelist must reject all connections"
+        );
         assert!(!transport_a.is_connected(&node_b_id).await);
 
         transport_a.shutdown();
@@ -2479,9 +2473,7 @@ mod tests {
         // A can connect (A whitelists B), but B will reject the inbound
         // connection after the federation handshake. A may or may not get
         // an error from connect(), but B should not register A as a peer.
-        let _ = transport_a
-            .connect(&node_b_id, &addr_b.to_string())
-            .await;
+        let _ = transport_a.connect(&node_b_id, &addr_b.to_string()).await;
 
         // Give B time to process and reject
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2662,13 +2654,20 @@ mod tests {
         let addr_b = transport_b.listen_addr().unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
-        transport_a.connect(&node_b_id, &addr_b.to_string()).await.unwrap();
+        transport_a
+            .connect(&node_b_id, &addr_b.to_string())
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // A starts UNPRIVILEGED on B.
         {
             let peers = transport_b.peers.read().await;
-            let conn = peers.get(&node_a_id).expect("stranger present").lock().await;
+            let conn = peers
+                .get(&node_a_id)
+                .expect("stranger present")
+                .lock()
+                .await;
             assert!(!conn.privileged, "stranger must start unprivileged");
         }
 
@@ -2679,8 +2678,15 @@ mod tests {
         );
         {
             let peers = transport_b.peers.read().await;
-            let conn = peers.get(&node_a_id).expect("stranger present").lock().await;
-            assert!(conn.privileged, "promote_to_privileged must flip the flag to true");
+            let conn = peers
+                .get(&node_a_id)
+                .expect("stranger present")
+                .lock()
+                .await;
+            assert!(
+                conn.privileged,
+                "promote_to_privileged must flip the flag to true"
+            );
         }
 
         // Promoting an unknown sender returns false (no connection to promote).
@@ -2697,12 +2703,39 @@ mod tests {
     /// Each frame B can send A, and whether it completes an act A paid for.
     fn frames_from_payee(payee: &NodeIdentity, payer: &NodeId) -> Vec<(Frame, bool)> {
         vec![
-            (Frame::PrekeyOffer { bundle: serde_json::json!({}) }, true),
-            (Frame::SessionInit { init_data: serde_json::json!({}) }, true),
+            (
+                Frame::PrekeyOffer {
+                    bundle: serde_json::json!({}),
+                },
+                true,
+            ),
+            (
+                Frame::SessionInit {
+                    init_data: serde_json::json!({}),
+                },
+                true,
+            ),
             (Frame::SessionAck, true),
-            (Frame::RatchetInit { payload: vec![1, 2, 3] }, true),
-            (Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([1u8; 32]), duplicate: false }, true),
-            (Frame::MessageReject { id: konsensus_core::types::MessageId::from_bytes([2u8; 32]), reason: "r".into() }, true),
+            (
+                Frame::RatchetInit {
+                    payload: vec![1, 2, 3],
+                },
+                true,
+            ),
+            (
+                Frame::MessageAck {
+                    id: konsensus_core::types::MessageId::from_bytes([1u8; 32]),
+                    duplicate: false,
+                },
+                true,
+            ),
+            (
+                Frame::MessageReject {
+                    id: konsensus_core::types::MessageId::from_bytes([2u8; 32]),
+                    reason: "r".into(),
+                },
+                true,
+            ),
             (
                 Frame::PriceTable {
                     prices: HashMap::from([("chat".to_string(), 2_000)]),
@@ -2712,13 +2745,36 @@ mod tests {
                 },
                 true,
             ),
-            (Frame::PriceResponse { kind: 0, price_msat: 2_000, block_height: 1 }, true),
+            (
+                Frame::PriceResponse {
+                    kind: 0,
+                    price_msat: 2_000,
+                    block_height: 1,
+                },
+                true,
+            ),
             (Frame::PriceQuery { kind: 0 }, false),
-            (Frame::RequestInvoice { request_id: "r".into(), amount_msat: 1_000, purpose: "konsensus message".into() }, false),
+            (
+                Frame::RequestInvoice {
+                    request_id: "r".into(),
+                    amount_msat: 1_000,
+                    purpose: "konsensus message".into(),
+                },
+                false,
+            ),
             (Frame::PeerExchangeRequest, false),
             (Frame::PeerExchangeResponse { peers: vec![] }, false),
-            (Frame::LightningInfo { ln_pubkey: "02".repeat(33), ln_addr: None }, false),
-            (Frame::Gossip(Box::new(make_test_envelope(payee, payer))), false),
+            (
+                Frame::LightningInfo {
+                    ln_pubkey: "02".repeat(33),
+                    ln_addr: None,
+                },
+                false,
+            ),
+            (
+                Frame::Gossip(Box::new(make_test_envelope(payee, payer))),
+                false,
+            ),
         ]
     }
 
@@ -2790,7 +2846,17 @@ mod tests {
         // callers), and the payee gets nothing from our payment.
         assert_eq!(transport_a.connected_session_peers().await, vec![node_b_id]);
         assert!(transport_a.connected_privileged_peers().await.is_empty());
-        assert!(!transport_a.peers.read().await.get(&node_b_id).unwrap().lock().await.privileged);
+        assert!(
+            !transport_a
+                .peers
+                .read()
+                .await
+                .get(&node_b_id)
+                .unwrap()
+                .lock()
+                .await
+                .privileged
+        );
         assert!(transport_b.connected_privileged_peers().await.is_empty());
         assert!(!transport_b.admission_paid_on_connection(&node_a_id).await);
 
@@ -2802,25 +2868,51 @@ mod tests {
         transport_a.mark_admission_paid(&node_b_id, since).await;
         assert!(!transport_a.admission_paid_on_connection(&node_b_id).await);
         assert!(transport_a.connected_session_peers().await.is_empty());
-        transport_b.send_frame(&node_a_id, &Frame::PrekeyOffer { bundle: serde_json::json!({}) }).await.unwrap();
-        assert!(!next_stamp(&transport_a).await, "a new connection starts unpaid");
+        transport_b
+            .send_frame(
+                &node_a_id,
+                &Frame::PrekeyOffer {
+                    bundle: serde_json::json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !next_stamp(&transport_a).await,
+            "a new connection starts unpaid"
+        );
 
         // Review P1: a proof bound to the old generation is never written to
         // its replacement; `NotConnected` proves nothing went out.
         let proof = make_test_envelope(&id_a, &node_b_id);
-        let replaced = transport_a.send_on_connection(&node_b_id, Some(since), &proof).await;
-        assert!(matches!(replaced, Err(TransportError::NotConnected(_))), "{replaced:?}");
+        let replaced = transport_a
+            .send_on_connection(&node_b_id, Some(since), &proof)
+            .await;
+        assert!(
+            matches!(replaced, Err(TransportError::NotConnected(_))),
+            "{replaced:?}"
+        );
         assert!(matches!(
-            transport_a.send_on_connection(&node_b_id, None, &proof).await,
+            transport_a
+                .send_on_connection(&node_b_id, None, &proof)
+                .await,
             Err(TransportError::NotConnected(_))
         ));
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), transport_b.recv()).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(300), transport_b.recv())
+                .await
+                .is_err(),
             "the proof reached the replacement connection"
         );
         let live = transport_a.connected_since(&node_b_id).await;
-        transport_a.send_on_connection(&node_b_id, live, &proof).await.unwrap();
-        let got = tokio::time::timeout(Duration::from_secs(5), transport_b.recv()).await.unwrap().unwrap();
+        transport_a
+            .send_on_connection(&node_b_id, live, &proof)
+            .await
+            .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), transport_b.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.id, proof.id, "sent on the live generation");
 
         // A connection captured before it was replaced (closed) is refused
@@ -2828,7 +2920,10 @@ mod tests {
         let captured = Arc::clone(transport_a.peers.read().await.get(&node_b_id).unwrap());
         captured.close();
         let closed = write_envelope(&captured, &make_test_envelope(&id_a, &node_b_id)).await;
-        assert!(matches!(closed, Err(TransportError::NotConnected(_))), "{closed:?}");
+        assert!(
+            matches!(closed, Err(TransportError::NotConnected(_))),
+            "{closed:?}"
+        );
 
         transport_a.shutdown();
         transport_b.shutdown();
@@ -2854,25 +2949,42 @@ mod tests {
         let transport_a = NoiseTransport::new(Arc::clone(&id_a), open());
         transport_a.connect(&node_b_id, &addr_b).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let offer = Frame::PrekeyOffer { bundle: serde_json::json!({}) }.to_bytes().unwrap();
+        let offer = Frame::PrekeyOffer {
+            bundle: serde_json::json!({}),
+        }
+        .to_bytes()
+        .unwrap();
         // Whether `t` receives a PrekeyOffer within a short window.
         async fn offered(t: &NoiseTransport) -> bool {
             let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
             while let Ok(Some(event)) = tokio::time::timeout_at(deadline, t.recv_control()).await {
-                if matches!(event, ControlEvent::PrekeyOffer { .. }) { return true; }
+                if matches!(event, ControlEvent::PrekeyOffer { .. }) {
+                    return true;
+                }
             }
             false
         }
 
         // Payer side: A paid B's admission on generation g1.
         let g1 = transport_a.connected_since(&node_b_id).await.unwrap();
-        let unpaid = transport_a.send_raw_frame_on(&node_b_id, g1, Standing::AdmissionPaid, &offer).await;
-        assert!(matches!(unpaid, Err(TransportError::NotConnected(_))), "not paid yet: {unpaid:?}");
-        assert!(!offered(&transport_b).await, "an unpaid connection got the offer");
+        let unpaid = transport_a
+            .send_raw_frame_on(&node_b_id, g1, Standing::AdmissionPaid, &offer)
+            .await;
+        assert!(
+            matches!(unpaid, Err(TransportError::NotConnected(_))),
+            "not paid yet: {unpaid:?}"
+        );
+        assert!(
+            !offered(&transport_b).await,
+            "an unpaid connection got the offer"
+        );
         transport_a.mark_admission_paid(&node_b_id, g1).await;
 
         // Payee side: B promotes A's connection after A's payment.
-        let promoted = transport_b.promote_to_privileged_at(&node_a_id).await.expect("live connection");
+        let promoted = transport_b
+            .promote_to_privileged_at(&node_a_id)
+            .await
+            .expect("live connection");
 
         // Both connections are replaced by a reconnect: the checks passed for
         // g1 / `promoted`; the replacement is unpaid and unprivileged.
@@ -2882,29 +2994,69 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let g2 = transport_a.connected_since(&node_b_id).await.unwrap();
         assert_ne!(g1, g2);
-        let stale = transport_a.send_raw_frame_on(&node_b_id, g1, Standing::AdmissionPaid, &offer).await;
-        assert!(matches!(stale, Err(TransportError::NotConnected(_))), "{stale:?}");
-        assert!(!offered(&transport_b).await, "the payer's offer reached the unpaid replacement");
-        let stale = transport_b.send_raw_frame_on(&node_a_id, promoted, Standing::Privileged, &offer).await;
-        assert!(matches!(stale, Err(TransportError::NotConnected(_))), "{stale:?}");
-        assert!(!offered(&transport_a).await, "the payee's offer reached the unpromoted replacement");
+        let stale = transport_a
+            .send_raw_frame_on(&node_b_id, g1, Standing::AdmissionPaid, &offer)
+            .await;
+        assert!(
+            matches!(stale, Err(TransportError::NotConnected(_))),
+            "{stale:?}"
+        );
+        assert!(
+            !offered(&transport_b).await,
+            "the payer's offer reached the unpaid replacement"
+        );
+        let stale = transport_b
+            .send_raw_frame_on(&node_a_id, promoted, Standing::Privileged, &offer)
+            .await;
+        assert!(
+            matches!(stale, Err(TransportError::NotConnected(_))),
+            "{stale:?}"
+        );
+        assert!(
+            !offered(&transport_a).await,
+            "the payee's offer reached the unpromoted replacement"
+        );
         // The live replacement without the standing gets nothing either.
         let live_b = transport_b.connected_since(&node_a_id).await.unwrap();
-        let unpromoted = transport_b.send_raw_frame_on(&node_a_id, live_b, Standing::Privileged, &offer).await;
-        assert!(matches!(unpromoted, Err(TransportError::NotConnected(_))), "{unpromoted:?}");
-        let unpaid = transport_a.send_raw_frame_on(&node_b_id, g2, Standing::AdmissionPaid, &offer).await;
-        assert!(matches!(unpaid, Err(TransportError::NotConnected(_))), "{unpaid:?}");
+        let unpromoted = transport_b
+            .send_raw_frame_on(&node_a_id, live_b, Standing::Privileged, &offer)
+            .await;
+        assert!(
+            matches!(unpromoted, Err(TransportError::NotConnected(_))),
+            "{unpromoted:?}"
+        );
+        let unpaid = transport_a
+            .send_raw_frame_on(&node_b_id, g2, Standing::AdmissionPaid, &offer)
+            .await;
+        assert!(
+            matches!(unpaid, Err(TransportError::NotConnected(_))),
+            "{unpaid:?}"
+        );
         assert!(!offered(&transport_b).await && !offered(&transport_a).await);
 
         // Once g2 is paid for, the offer goes on it.
         transport_a.mark_admission_paid(&node_b_id, g2).await;
-        transport_a.send_raw_frame_on(&node_b_id, g2, Standing::AdmissionPaid, &offer).await.unwrap();
+        transport_a
+            .send_raw_frame_on(&node_b_id, g2, Standing::AdmissionPaid, &offer)
+            .await
+            .unwrap();
         assert!(offered(&transport_b).await, "sent on the paid generation");
 
         // A captured connection that is closed before the write gets nothing.
-        transport_a.peers.read().await.get(&node_b_id).unwrap().close();
-        let closed = transport_a.send_raw_frame_on(&node_b_id, g2, Standing::AdmissionPaid, &offer).await;
-        assert!(matches!(closed, Err(TransportError::NotConnected(_))), "{closed:?}");
+        transport_a
+            .peers
+            .read()
+            .await
+            .get(&node_b_id)
+            .unwrap()
+            .close();
+        let closed = transport_a
+            .send_raw_frame_on(&node_b_id, g2, Standing::AdmissionPaid, &offer)
+            .await;
+        assert!(
+            matches!(closed, Err(TransportError::NotConnected(_))),
+            "{closed:?}"
+        );
 
         transport_a.shutdown();
         transport_b.shutdown();
@@ -2923,17 +3075,26 @@ mod tests {
         let transport_b = NoiseTransport::new(Arc::clone(&id_b), open());
         transport_b.start_listener().await.unwrap();
         let transport_a = NoiseTransport::new(Arc::clone(&id_a), open());
-        transport_a.connect(&node_b_id, &transport_b.listen_addr().unwrap().to_string()).await.unwrap();
+        transport_a
+            .connect(&node_b_id, &transport_b.listen_addr().unwrap().to_string())
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(transport_b.connected_privileged_peers().await.is_empty());
 
         // The owner adds A: B's live connection to A is privileged at once.
         transport_b.add_to_whitelist(&node_a_id).await;
-        assert_eq!(transport_b.connected_privileged_peers().await, vec![node_a_id]);
+        assert_eq!(
+            transport_b.connected_privileged_peers().await,
+            vec![node_a_id]
+        );
         // Only on B's side, and removal does not demote a live connection.
         assert!(transport_a.connected_privileged_peers().await.is_empty());
         transport_b.remove_from_whitelist(&node_a_id).await;
-        assert_eq!(transport_b.connected_privileged_peers().await, vec![node_a_id]);
+        assert_eq!(
+            transport_b.connected_privileged_peers().await,
+            vec![node_a_id]
+        );
 
         transport_a.shutdown();
         transport_b.shutdown();
@@ -2972,7 +3133,10 @@ mod tests {
         let addr_b = transport_b.listen_addr().unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
-        transport_a.connect(&node_b_id, &addr_b.to_string()).await.unwrap();
+        transport_a
+            .connect(&node_b_id, &addr_b.to_string())
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // A is CONNECTED to B but UNPRIVILEGED: present in connected_peers,
@@ -3041,8 +3205,14 @@ mod tests {
 
         let transport_a = NoiseTransport::new(Arc::clone(&id_a), open(vec![]));
         let transport_c = NoiseTransport::new(Arc::clone(&id_c), open(vec![]));
-        transport_a.connect(&node_b_id, &addr_b.to_string()).await.unwrap();
-        transport_c.connect(&node_b_id, &addr_b.to_string()).await.unwrap();
+        transport_a
+            .connect(&node_b_id, &addr_b.to_string())
+            .await
+            .unwrap();
+        transport_c
+            .connect(&node_b_id, &addr_b.to_string())
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Both strangers are connected and unprivileged on B.
@@ -3054,7 +3224,10 @@ mod tests {
         {
             let peers = transport_b.peers.read().await;
             let a = peers.get(&node_a_id).unwrap().lock().await;
-            assert!(a.privileged, "the paying sender's own connection is promoted");
+            assert!(
+                a.privileged,
+                "the paying sender's own connection is promoted"
+            );
         }
         {
             let peers = transport_b.peers.read().await;
@@ -3102,29 +3275,46 @@ mod tests {
         let addr_b = transport_b.listen_addr().unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
-        transport_a.connect(&node_b_id, &addr_b.to_string()).await.unwrap();
+        transport_a
+            .connect(&node_b_id, &addr_b.to_string())
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Drain B's PeerConnected for A.
         let _ = tokio::time::timeout(Duration::from_secs(1), transport_b.recv_control()).await;
 
         // A → B PriceQuery; B's reader stamps privileged == false (stranger).
-        transport_a.send_frame(&node_b_id, &Frame::PriceQuery { kind: 0 }).await.unwrap();
+        transport_a
+            .send_frame(&node_b_id, &Frame::PriceQuery { kind: 0 })
+            .await
+            .unwrap();
         let ev = loop {
             let ev = tokio::time::timeout(Duration::from_secs(2), transport_b.recv_control())
                 .await
                 .expect("timeout")
                 .expect("closed");
-            if let ControlEvent::PriceQueryReceived { privileged, peer_id, .. } = ev {
+            if let ControlEvent::PriceQueryReceived {
+                privileged,
+                peer_id,
+                ..
+            } = ev
+            {
                 assert_eq!(peer_id, node_a_id);
                 break privileged;
             }
         };
-        assert!(!ev, "unprivileged stranger's PriceQuery must be stamped privileged == false");
+        assert!(
+            !ev,
+            "unprivileged stranger's PriceQuery must be stamped privileged == false"
+        );
 
         // Promote A, then a SECOND PriceQuery must be stamped privileged == true.
         assert!(transport_b.promote_to_privileged(&node_a_id).await);
-        transport_a.send_frame(&node_b_id, &Frame::PriceQuery { kind: 0 }).await.unwrap();
+        transport_a
+            .send_frame(&node_b_id, &Frame::PriceQuery { kind: 0 })
+            .await
+            .unwrap();
         let ev2 = loop {
             let ev = tokio::time::timeout(Duration::from_secs(2), transport_b.recv_control())
                 .await
@@ -3134,7 +3324,10 @@ mod tests {
                 break privileged;
             }
         };
-        assert!(ev2, "after promotion the next frame must be stamped privileged == true");
+        assert!(
+            ev2,
+            "after promotion the next frame must be stamped privileged == true"
+        );
 
         transport_a.shutdown();
         transport_b.shutdown();
@@ -3178,9 +3371,7 @@ mod tests {
 
         let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
 
-        let _ = transport_a
-            .connect(&node_b_id, &addr_b.to_string())
-            .await;
+        let _ = transport_a.connect(&node_b_id, &addr_b.to_string()).await;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -3303,14 +3494,14 @@ mod tests {
         // A tries to connect to B. The federation handshake should fail
         // because A sends Hello with version=2, B expects version=99
         // and responds with HelloAck version=99, which A rejects.
-        let result = transport_a
-            .connect(&node_b_id, &addr_b.to_string())
-            .await;
+        let result = transport_a.connect(&node_b_id, &addr_b.to_string()).await;
 
         assert!(result.is_err());
         let err_msg = format!("{:?}", result.unwrap_err());
         assert!(
-            err_msg.contains("version") || err_msg.contains("mismatch") || err_msg.contains("Rejected"),
+            err_msg.contains("version")
+                || err_msg.contains("mismatch")
+                || err_msg.contains("Rejected"),
             "expected version mismatch error, got: {err_msg}"
         );
 
@@ -3324,11 +3515,7 @@ mod tests {
         let x25519_public = identity.x25519_public().as_bytes().to_vec();
 
         // Empty signature should fail
-        let result = verify_identity_binding(
-            identity.node_id(),
-            &x25519_public,
-            &[],
-        );
+        let result = verify_identity_binding(identity.node_id(), &x25519_public, &[]);
         assert!(result.is_err());
     }
 
@@ -3342,11 +3529,7 @@ mod tests {
         let sig_bytes = sig.to_bytes();
 
         // Truncate to 32 bytes (Ed25519 sig is 64 bytes)
-        let result = verify_identity_binding(
-            identity.node_id(),
-            &x25519_public,
-            &sig_bytes[..32],
-        );
+        let result = verify_identity_binding(identity.node_id(), &x25519_public, &sig_bytes[..32]);
         assert!(result.is_err());
     }
 
@@ -3359,11 +3542,7 @@ mod tests {
         // Sign a different message (not the x25519 public key)
         let sig = identity.ed25519_signing_key().sign(b"wrong message");
 
-        let result = verify_identity_binding(
-            identity.node_id(),
-            &x25519_public,
-            &sig.to_bytes(),
-        );
+        let result = verify_identity_binding(identity.node_id(), &x25519_public, &sig.to_bytes());
         assert!(result.is_err());
     }
 
@@ -3494,7 +3673,9 @@ mod tests {
         let oversized = Frame::InvoiceError {
             request_id: "cap-ban".into(),
             reason: "x".repeat(crate::wire::MAX_CONTROL_REASON_BYTES + 1),
-        }.to_bytes().unwrap();
+        }
+        .to_bytes()
+        .unwrap();
         assert_invalid_frames_ban_peer(&oversized).await;
     }
 
@@ -3516,21 +3697,34 @@ mod tests {
             setup_connected_pair().await;
         // Valid JSON and a known variant must still consume the invalid budget.
         for _ in 0..20 {
-            if transport_a.send_raw_bytes(&node_b_id, oversized).await.is_err() {
+            if transport_a
+                .send_raw_bytes(&node_b_id, oversized)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
         let banned = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if transport_b.banned_peers.read().await.contains_key(&node_a_id) {
+                if transport_b
+                    .banned_peers
+                    .read()
+                    .await
+                    .contains_key(&node_a_id)
+                {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await;
+        })
+        .await;
         transport_a.shutdown();
         transport_b.shutdown();
-        assert!(banned.is_ok(), "oversized fields must exhaust the invalid-frame budget");
+        assert!(
+            banned.is_ok(),
+            "oversized fields must exhaust the invalid-frame budget"
+        );
         assert!(!transport_b.is_connected(&node_a_id).await);
     }
 
@@ -3788,9 +3982,7 @@ mod tests {
         // A tries to connect — the TCP + Noise handshake succeeds (B can't check
         // ban until federation handshake reveals A's identity), but the federation
         // handshake responder rejects A after identifying them.
-        let _result = transport_a
-            .connect(&node_b_id, &addr_b.to_string())
-            .await;
+        let _result = transport_a.connect(&node_b_id, &addr_b.to_string()).await;
 
         // The connection may fail with a rejection error, or the TCP might succeed
         // but B drops A immediately after. Either way, A should not end up connected.
@@ -3811,18 +4003,23 @@ mod tests {
 
         // A should see B's tier and capabilities
         let info = transport_a.peer_info(&node_b_id).await;
-        assert!(info.is_some(), "peer_info should return Some for connected peer");
+        assert!(
+            info.is_some(),
+            "peer_info should return Some for connected peer"
+        );
         let info = info.unwrap();
         // Default TransportConfig uses T1 tier
         assert_eq!(info.tier, "T1");
         // Default capabilities include X3dh and FileTransfer
-        assert!(!info.capabilities.is_empty(), "should have at least one capability");
+        assert!(
+            !info.capabilities.is_empty(),
+            "should have at least one capability"
+        );
 
         // Disconnected peer returns None
-        let unknown = NodeId::from_hex(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
+        let unknown =
+            NodeId::from_hex("0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
         assert!(
             transport_a.peer_info(&unknown).await.is_none(),
             "peer_info should return None for unknown peer"
@@ -3870,7 +4067,10 @@ mod tests {
 
         // Attempt to connect — should fail (B not in A's whitelist)
         let result = transport_a.connect(&node_b_id, &addr_b.to_string()).await;
-        assert!(result.is_err(), "connection should fail with empty whitelist");
+        assert!(
+            result.is_err(),
+            "connection should fail with empty whitelist"
+        );
 
         // Dynamically add B to A's whitelist
         transport_a.add_to_whitelist(&node_b_id).await;
@@ -3936,7 +4136,10 @@ mod tests {
 
         // Attempting to reconnect should now fail
         let result = transport_a.connect(&node_b_id, &addr_b.to_string()).await;
-        assert!(result.is_err(), "connection should fail after whitelist removal");
+        assert!(
+            result.is_err(),
+            "connection should fail after whitelist removal"
+        );
 
         transport_a.shutdown();
         transport_b.shutdown();
@@ -3985,7 +4188,9 @@ mod tests {
         assert!(!transport_a.is_connected(&node_b_id).await);
 
         // Dynamically supervise B (simulates invite redemption path)
-        transport_a.supervise_peer(&node_b_id, &addr_b.to_string()).await;
+        transport_a
+            .supervise_peer(&node_b_id, &addr_b.to_string())
+            .await;
 
         // Wait for supervisor to establish connection
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -4036,7 +4241,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Start dynamic supervision
-        transport_a.supervise_peer(&node_b_id, &addr_b.to_string()).await;
+        transport_a
+            .supervise_peer(&node_b_id, &addr_b.to_string())
+            .await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(transport_a.is_connected(&node_b_id).await);
 
@@ -4091,7 +4298,10 @@ mod tests {
             ..Default::default()
         };
         let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
-        transport_a.connect(&node_b_id, &addr_b.to_string()).await.unwrap();
+        transport_a
+            .connect(&node_b_id, &addr_b.to_string())
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // The expired ban entry should have been removed
@@ -4187,8 +4397,14 @@ mod tests {
         // Only the active ban should remain
         let bans = transport_b.banned_peers.read().await;
         assert_eq!(bans.len(), 1, "only active ban should remain");
-        assert!(bans.contains_key(&node_c_id), "C's active ban should persist");
-        assert!(!bans.contains_key(&node_a_id), "A's expired ban should be evicted");
+        assert!(
+            bans.contains_key(&node_c_id),
+            "C's active ban should persist"
+        );
+        assert!(
+            !bans.contains_key(&node_a_id),
+            "A's expired ban should be evicted"
+        );
 
         transport_b.shutdown();
     }
@@ -4228,7 +4444,10 @@ mod tests {
 
         transport_b.start_listener().await.unwrap();
         let listen_addr = transport_b.listen_addr().expect("should have listen addr");
-        transport_a.connect(&node_b_id, &listen_addr.to_string()).await.unwrap();
+        transport_a
+            .connect(&node_b_id, &listen_addr.to_string())
+            .await
+            .unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -4292,7 +4511,10 @@ mod tests {
 
         transport_b.start_listener().await.unwrap();
         let listen_addr = transport_b.listen_addr().expect("should have listen addr");
-        transport_a.connect(&node_b_id, &listen_addr.to_string()).await.unwrap();
+        transport_a
+            .connect(&node_b_id, &listen_addr.to_string())
+            .await
+            .unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -4326,23 +4548,36 @@ mod cancelled_noise_write_tests {
     async fn cancelled_partial_frame_closes_socket_before_next_send() {
         let mut sender = NoiseSession::initiator(&[11; 32]).unwrap();
         let mut receiver = NoiseSession::responder(&[22; 32]).unwrap();
-        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
-        sender.read_handshake(&receiver.write_handshake(&[]).unwrap()).unwrap();
-        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
+        receiver
+            .read_handshake(&sender.write_handshake(&[]).unwrap())
+            .unwrap();
+        sender
+            .read_handshake(&receiver.write_handshake(&[]).unwrap())
+            .unwrap();
+        receiver
+            .read_handshake(&sender.write_handshake(&[]).unwrap())
+            .unwrap();
         assert!(sender.try_finish_handshake().unwrap());
         assert!(receiver.try_finish_handshake().unwrap());
         let encrypted = sender.encrypt(&vec![0x5a; 4 * 1024 * 1024]).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (client, accepted) = tokio::join!(
-            TcpStream::connect(listener.local_addr().unwrap()), listener.accept()
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
         );
         let (_reader, mut writer) = client.unwrap().into_split();
         let (mut server, _) = accepted.unwrap();
         // Same outer cancellation as files.rs timeout_at; the peer deliberately
         // does not read until the deadline, ensuring TCP backpressure.
-        assert!(tokio::time::timeout(
-            Duration::from_millis(30), write_noise_message(&mut writer, &encrypted)
-        ).await.is_err(), "large frame must be backpressured");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(30),
+                write_noise_message(&mut writer, &encrypted)
+            )
+            .await
+            .is_err(),
+            "large frame must be backpressured"
+        );
         let next = sender.encrypt(b"next unrelated message").unwrap();
         let next_for_send = next.clone();
         let draining = tokio::spawn(async move {
@@ -4350,15 +4585,32 @@ mod cancelled_noise_write_tests {
             server.read_to_end(&mut bytes).await.unwrap();
             bytes
         });
-        assert!(write_noise_message(&mut writer, &next_for_send).await.is_err(), "abandoned Noise write must close the connection");
+        assert!(
+            write_noise_message(&mut writer, &next_for_send)
+                .await
+                .is_err(),
+            "abandoned Noise write must close the connection"
+        );
         let _ = writer.shutdown().await;
-        let wire = tokio::time::timeout(Duration::from_secs(2), draining).await.unwrap().unwrap();
+        let wire = tokio::time::timeout(Duration::from_secs(2), draining)
+            .await
+            .unwrap()
+            .unwrap();
         let advertised = u32::from_be_bytes(wire[..4].try_into().unwrap()) as usize;
         assert_eq!(advertised, encrypted.len());
-        assert!(wire.len() > 4 + next.len(), "first frame was partially written");
-        assert!(wire.len() < 4 + advertised, "the cancelled frame must remain incomplete");
+        assert!(
+            wire.len() > 4 + next.len(),
+            "first frame was partially written"
+        );
+        assert!(
+            wire.len() < 4 + advertised,
+            "the cancelled frame must remain incomplete"
+        );
         assert!(!wire.ends_with(&next));
-        assert!(receiver.decrypt(&next).is_err(), "even recovering the next frame cannot recover skipped Noise nonce");
+        assert!(
+            receiver.decrypt(&next).is_err(),
+            "even recovering the next frame cannot recover skipped Noise nonce"
+        );
     }
 }
 

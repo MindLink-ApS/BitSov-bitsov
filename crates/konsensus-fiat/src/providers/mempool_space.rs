@@ -104,19 +104,18 @@ impl FiatRateProvider for MempoolSpaceProvider {
             })?
             .json()
             .await
-            .map_err(|e| FiatError::Parse(format!("failed to parse mempool.space response: {e}")))?;
+            .map_err(|e| {
+                FiatError::Parse(format!("failed to parse mempool.space response: {e}"))
+            })?;
 
         let key = currency.to_string();
-        let rate = response
-            .get(&key)
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| {
-                warn!(
-                    currency = %key,
-                    "mempool.space response did not include a rate for this currency"
-                );
-                FiatError::UnsupportedCurrency(currency)
-            })?;
+        let rate = response.get(&key).and_then(|v| v.as_f64()).ok_or_else(|| {
+            warn!(
+                currency = %key,
+                "mempool.space response did not include a rate for this currency"
+            );
+            FiatError::UnsupportedCurrency(currency)
+        })?;
 
         if rate <= 0.0 {
             return Err(FiatError::Parse(format!(

@@ -125,13 +125,16 @@ impl RoomChat {
         // oversized field could hide a top-level room binding from validation.
         crate::wire_json::check_payload(plaintext.as_bytes(), &[])
             .map_err(|_| RoomRefusal::Invalid("room payload exceeds JSON limits"))?;
-        let Ok(object) = crate::wire_json::from_str::<serde_json::Map<String, serde_json::Value>>(plaintext) else {
+        let Ok(object) =
+            crate::wire_json::from_str::<serde_json::Map<String, serde_json::Value>>(plaintext)
+        else {
             return Ok(None);
         };
         if !object.contains_key("room") {
             return Ok(None);
         }
-        let chat: RoomChat = serde_json::from_value(serde_json::Value::Object(object)).map_err(|_| RoomRefusal::Invalid("not a room chat"))?;
+        let chat: RoomChat = serde_json::from_value(serde_json::Value::Object(object))
+            .map_err(|_| RoomRefusal::Invalid("not a room chat"))?;
         if chat.v != ROOM_CHAT_VERSION {
             return Err(RoomRefusal::Invalid("unsupported version"));
         }
@@ -159,8 +162,14 @@ impl RoomBinding {
     pub fn with_salt(members: &[NodeId], salt: [u8; ROOM_SALT_LEN]) -> Result<Self, RoomRefusal> {
         let mut roster: Vec<String> = members.iter().map(NodeId::to_hex).collect();
         roster.sort();
-        let room = RoomBinding { id: String::new(), roster, salt: hex::encode(salt) };
-        let id = room.derived_id().ok_or(RoomRefusal::Invalid("roster entries must be node ids"))?;
+        let room = RoomBinding {
+            id: String::new(),
+            roster,
+            salt: hex::encode(salt),
+        };
+        let id = room
+            .derived_id()
+            .ok_or(RoomRefusal::Invalid("roster entries must be node ids"))?;
         let room = RoomBinding { id, ..room };
         room.validate()?;
         Ok(room)
@@ -169,7 +178,11 @@ impl RoomBinding {
     /// [`room_id`] of this roster and salt, if they parse.
     fn derived_id(&self) -> Option<String> {
         let salt: [u8; ROOM_SALT_LEN] = hex::decode(&self.salt).ok()?.try_into().ok()?;
-        let members = self.roster.iter().map(|id| NodeId::from_hex(id).ok()).collect::<Option<Vec<_>>>()?;
+        let members = self
+            .roster
+            .iter()
+            .map(|id| NodeId::from_hex(id).ok())
+            .collect::<Option<Vec<_>>>()?;
         Some(room_id(&members, &salt))
     }
 
@@ -184,13 +197,19 @@ impl RoomBinding {
             return Err(RoomRefusal::Invalid("a room has 2 to 4 members"));
         }
         if !self.roster.iter().all(|id| is_lower_hex(id, 64)) {
-            return Err(RoomRefusal::Invalid("roster entries must be 64 lowercase hex node ids"));
+            return Err(RoomRefusal::Invalid(
+                "roster entries must be 64 lowercase hex node ids",
+            ));
         }
         if !self.roster.windows(2).all(|w| w[0] < w[1]) {
-            return Err(RoomRefusal::Invalid("roster must be sorted ascending without duplicates"));
+            return Err(RoomRefusal::Invalid(
+                "roster must be sorted ascending without duplicates",
+            ));
         }
         if self.derived_id().as_deref() != Some(self.id.as_str()) {
-            return Err(RoomRefusal::Invalid("room id does not commit to this roster and salt"));
+            return Err(RoomRefusal::Invalid(
+                "room id does not commit to this roster and salt",
+            ));
         }
         Ok(())
     }
@@ -212,7 +231,10 @@ impl RoomBinding {
 
     /// The roster as node ids.
     pub fn members(&self) -> Vec<NodeId> {
-        self.roster.iter().filter_map(|id| NodeId::from_hex(id).ok()).collect()
+        self.roster
+            .iter()
+            .filter_map(|id| NodeId::from_hex(id).ok())
+            .collect()
     }
 }
 
@@ -250,17 +272,30 @@ mod tests {
 
     #[test]
     fn ordinary_chat_has_no_binding() {
-        for text in ["hello", "", "{not json", "{\"text\":\"a json note\"}", "[1,2]", "  {\"roomy\":1}"] {
+        for text in [
+            "hello",
+            "",
+            "{not json",
+            "{\"text\":\"a json note\"}",
+            "[1,2]",
+            "  {\"roomy\":1}",
+        ] {
             assert_eq!(RoomChat::parse(text), Ok(None), "{text}");
         }
     }
 
     #[test]
     fn a_room_chat_parses_with_2_to_4_sorted_members() {
-        let parsed = RoomChat::parse(&chat(&room(&[4, 2, 3, 1]))).unwrap().unwrap();
+        let parsed = RoomChat::parse(&chat(&room(&[4, 2, 3, 1])))
+            .unwrap()
+            .unwrap();
         assert_eq!(parsed.room.roster.len(), MAX_ROOM_MEMBERS);
         assert_eq!((parsed.text.as_str(), parsed.msg.as_str()), ("hi", MSG));
-        assert_eq!(parsed.room.members(), nodes(&[1, 2, 3, 4]), "created in any order, stored sorted");
+        assert_eq!(
+            parsed.room.members(),
+            nodes(&[1, 2, 3, 4]),
+            "created in any order, stored sorted"
+        );
         assert!(RoomChat::parse(&chat(&room(&[1, 2]))).unwrap().is_some());
     }
 
@@ -275,56 +310,175 @@ mod tests {
             pre.extend_from_slice(&[b; 32]);
         }
         pre.extend_from_slice(&SALT);
-        assert_eq!(r.id, hex::encode(Sha256::digest(&pre)), "documented preimage");
+        assert_eq!(
+            r.id,
+            hex::encode(Sha256::digest(&pre)),
+            "documented preimage"
+        );
         assert_eq!(r, room(&[3, 1, 2]), "deterministic for one roster and salt");
-        assert_ne!(r.id, RoomBinding::with_salt(&nodes(&[1, 2, 3]), [8; ROOM_SALT_LEN]).unwrap().id, "the salt separates rooms");
-        assert_ne!(RoomBinding::create(&nodes(&[1, 2])).unwrap().id, RoomBinding::create(&nodes(&[1, 2])).unwrap().id);
+        assert_ne!(
+            r.id,
+            RoomBinding::with_salt(&nodes(&[1, 2, 3]), [8; ROOM_SALT_LEN])
+                .unwrap()
+                .id,
+            "the salt separates rooms"
+        );
+        assert_ne!(
+            RoomBinding::create(&nodes(&[1, 2])).unwrap().id,
+            RoomBinding::create(&nodes(&[1, 2])).unwrap().id
+        );
 
-        let mismatch = |text: &str| RoomChat::parse(text) == Err(RoomRefusal::Invalid("room id does not commit to this roster and salt"));
+        let mismatch = |text: &str| {
+            RoomChat::parse(text)
+                == Err(RoomRefusal::Invalid(
+                    "room id does not commit to this roster and salt",
+                ))
+        };
         // An outsider swapped in, a member dropped, a member added: all refused.
-        assert!(mismatch(&with_roster(&r, nodes(&[1, 2, 9]).iter().map(NodeId::to_hex).collect())));
-        assert!(mismatch(&with_roster(&r, nodes(&[1, 2]).iter().map(NodeId::to_hex).collect())));
-        assert!(mismatch(&with_roster(&r, nodes(&[1, 2, 3, 4]).iter().map(NodeId::to_hex).collect())));
-        assert!(mismatch(&chat_json(serde_json::json!({"id": r.id, "roster": r.roster, "salt": "08".repeat(16)}))));
-        assert!(mismatch(&chat_json(serde_json::json!({"id": "ab".repeat(32), "roster": r.roster, "salt": r.salt}))));
+        assert!(mismatch(&with_roster(
+            &r,
+            nodes(&[1, 2, 9]).iter().map(NodeId::to_hex).collect()
+        )));
+        assert!(mismatch(&with_roster(
+            &r,
+            nodes(&[1, 2]).iter().map(NodeId::to_hex).collect()
+        )));
+        assert!(mismatch(&with_roster(
+            &r,
+            nodes(&[1, 2, 3, 4]).iter().map(NodeId::to_hex).collect()
+        )));
+        assert!(mismatch(&chat_json(
+            serde_json::json!({"id": r.id, "roster": r.roster, "salt": "08".repeat(16)})
+        )));
+        assert!(mismatch(&chat_json(
+            serde_json::json!({"id": "ab".repeat(32), "roster": r.roster, "salt": r.salt})
+        )));
     }
 
     #[test]
     fn a_malformed_binding_is_refused_not_treated_as_text() {
-        let invalid = |plaintext: &str| matches!(RoomChat::parse(plaintext), Err(RoomRefusal::Invalid(_)));
+        let invalid =
+            |plaintext: &str| matches!(RoomChat::parse(plaintext), Err(RoomRefusal::Invalid(_)));
         let five: Vec<String> = nodes(&[1, 2, 3, 4, 5]).iter().map(NodeId::to_hex).collect();
         let r = room(&[1, 2]);
         assert!(invalid(&with_roster(&r, five)), "5 members");
         assert!(RoomBinding::with_salt(&nodes(&[1, 2, 3, 4, 5]), SALT).is_err());
         assert!(RoomBinding::with_salt(&nodes(&[1]), SALT).is_err(), "alone");
-        assert!(RoomBinding::with_salt(&nodes(&[1, 1, 2]), SALT).is_err(), "duplicate");
-        assert!(invalid(&with_roster(&r, vec![node(2).to_hex(), node(1).to_hex()])), "unsorted");
-        assert!(invalid(&with_roster(&r, vec![node(1).to_hex(), node(0xab).to_hex().to_uppercase()])), "uppercase");
-        assert!(invalid(&with_roster(&r, vec![node(1).to_hex(), node(2).to_hex()[..62].to_string()])), "short id");
+        assert!(
+            RoomBinding::with_salt(&nodes(&[1, 1, 2]), SALT).is_err(),
+            "duplicate"
+        );
+        assert!(
+            invalid(&with_roster(&r, vec![node(2).to_hex(), node(1).to_hex()])),
+            "unsorted"
+        );
+        assert!(
+            invalid(&with_roster(
+                &r,
+                vec![node(1).to_hex(), node(0xab).to_hex().to_uppercase()]
+            )),
+            "uppercase"
+        );
+        assert!(
+            invalid(&with_roster(
+                &r,
+                vec![node(1).to_hex(), node(2).to_hex()[..62].to_string()]
+            )),
+            "short id"
+        );
         let v = serde_json::to_value(&r).unwrap();
-        assert!(invalid(&chat_json(serde_json::json!({"id": &r.id[..32], "roster": r.roster, "salt": r.salt}))), "room id length");
-        assert!(invalid(&chat_json(serde_json::json!({"id": r.id, "roster": r.roster}))), "no salt");
-        assert!(invalid(&chat_json(serde_json::json!({"id": r.id, "roster": r.roster, "salt": "07"}))), "short salt");
-        assert!(invalid(&serde_json::json!({"v": 2, "room": v, "msg": MSG, "text": "hi"}).to_string()), "version");
-        assert!(invalid(&serde_json::json!({"v": 1, "room": v, "msg": MSG, "text": ""}).to_string()), "empty text");
-        assert!(invalid(&serde_json::json!({"v": 1, "room": v, "msg": MSG}).to_string()), "no text");
-        assert!(invalid(&serde_json::json!({"v": 1, "room": v, "text": "hi"}).to_string()), "no msg");
-        assert!(invalid(&serde_json::json!({"v": 1, "room": v, "msg": "ABC", "text": "hi"}).to_string()), "bad msg");
-        assert!(invalid(&chat_json(serde_json::json!({"id": r.id, "roster": r.roster, "salt": r.salt, "epoch": 1}))), "unknown binding field");
-        assert!(invalid(&serde_json::json!({"v": 1, "room": v, "msg": MSG, "text": "hi", "seq": 1}).to_string()), "unknown field");
-        assert!(invalid(&serde_json::json!({"room": null, "text": "hi"}).to_string()), "null room");
+        assert!(
+            invalid(&chat_json(
+                serde_json::json!({"id": &r.id[..32], "roster": r.roster, "salt": r.salt})
+            )),
+            "room id length"
+        );
+        assert!(
+            invalid(&chat_json(
+                serde_json::json!({"id": r.id, "roster": r.roster})
+            )),
+            "no salt"
+        );
+        assert!(
+            invalid(&chat_json(
+                serde_json::json!({"id": r.id, "roster": r.roster, "salt": "07"})
+            )),
+            "short salt"
+        );
+        assert!(
+            invalid(&serde_json::json!({"v": 2, "room": v, "msg": MSG, "text": "hi"}).to_string()),
+            "version"
+        );
+        assert!(
+            invalid(&serde_json::json!({"v": 1, "room": v, "msg": MSG, "text": ""}).to_string()),
+            "empty text"
+        );
+        assert!(
+            invalid(&serde_json::json!({"v": 1, "room": v, "msg": MSG}).to_string()),
+            "no text"
+        );
+        assert!(
+            invalid(&serde_json::json!({"v": 1, "room": v, "text": "hi"}).to_string()),
+            "no msg"
+        );
+        assert!(
+            invalid(
+                &serde_json::json!({"v": 1, "room": v, "msg": "ABC", "text": "hi"}).to_string()
+            ),
+            "bad msg"
+        );
+        assert!(
+            invalid(&chat_json(
+                serde_json::json!({"id": r.id, "roster": r.roster, "salt": r.salt, "epoch": 1})
+            )),
+            "unknown binding field"
+        );
+        assert!(
+            invalid(
+                &serde_json::json!({"v": 1, "room": v, "msg": MSG, "text": "hi", "seq": 1})
+                    .to_string()
+            ),
+            "unknown field"
+        );
+        assert!(
+            invalid(&serde_json::json!({"room": null, "text": "hi"}).to_string()),
+            "null room"
+        );
     }
 
     #[test]
     fn both_ends_must_be_in_the_roster() {
-        let room = RoomChat::parse(&chat(&room(&[1, 2, 3]))).unwrap().unwrap().room;
+        let room = RoomChat::parse(&chat(&room(&[1, 2, 3])))
+            .unwrap()
+            .unwrap()
+            .room;
         assert_eq!(room.check(&node(1), &node(3)), Ok(()));
-        assert_eq!(room.check(&node(3), &node(1)), Ok(()), "no order: any member writes to any other");
-        assert_eq!(room.check(&node(9), &node(1)), Err(RoomRefusal::SenderNotMember));
-        assert_eq!(room.check(&node(1), &node(9)), Err(RoomRefusal::RecipientNotMember));
-        assert_eq!(room.check(&node(1), &node(1)), Err(RoomRefusal::RecipientNotMember), "not to oneself");
-        assert_eq!(RoomRefusal::SenderNotMember.code(), "room_sender_not_member");
-        assert_eq!(RoomRefusal::RecipientNotMember.code(), "room_recipient_not_member");
+        assert_eq!(
+            room.check(&node(3), &node(1)),
+            Ok(()),
+            "no order: any member writes to any other"
+        );
+        assert_eq!(
+            room.check(&node(9), &node(1)),
+            Err(RoomRefusal::SenderNotMember)
+        );
+        assert_eq!(
+            room.check(&node(1), &node(9)),
+            Err(RoomRefusal::RecipientNotMember)
+        );
+        assert_eq!(
+            room.check(&node(1), &node(1)),
+            Err(RoomRefusal::RecipientNotMember),
+            "not to oneself"
+        );
+        assert_eq!(
+            RoomRefusal::SenderNotMember.code(),
+            "room_sender_not_member"
+        );
+        assert_eq!(
+            RoomRefusal::RecipientNotMember.code(),
+            "room_recipient_not_member"
+        );
         assert_eq!(RoomRefusal::Invalid("x").code(), "room_binding_invalid");
     }
 }

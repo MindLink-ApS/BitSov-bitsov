@@ -378,7 +378,10 @@ mod tests {
         };
         let json = serde_json::to_string(&inline).unwrap();
         // Verify the data field serializes as a base64 string, not an array
-        assert!(json.contains('"'), "data field should be a quoted base64 string");
+        assert!(
+            json.contains('"'),
+            "data field should be a quoted base64 string"
+        );
         let decoded: AvatarInline = serde_json::from_str(&json).unwrap();
         assert_eq!(inline, decoded);
     }

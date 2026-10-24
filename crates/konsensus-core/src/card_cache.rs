@@ -81,7 +81,12 @@ mod tests {
                 endpoint: "node.example.org:9000".into(),
                 seq,
                 issued_at,
-                prices: FrontDoorPrices { admission_msat: 2_000, message_msat: 2_000, page_msat: 1_000, price_epoch: 0 },
+                prices: FrontDoorPrices {
+                    admission_msat: 2_000,
+                    message_msat: 2_000,
+                    page_msat: 1_000,
+                    price_epoch: 0,
+                },
                 profile: FrontDoorProfile {
                     kind: ProfileKind::Person,
                     display_name: format!("seq {seq}"),
@@ -106,12 +111,28 @@ mod tests {
     fn higher_seq_replaces_and_lower_or_equal_is_stale() {
         let id = node();
         let mut cache = CardCache::default();
-        assert_eq!(cache.offer(card(&id, 2, 1_700_000_000)).unwrap(), Offer::Stored);
-        assert_eq!(cache.offer(card(&id, 1, 1_700_000_100)).unwrap(), Offer::Stale { held_seq: 2 });
-        assert_eq!(cache.offer(card(&id, 2, 1_700_000_200)).unwrap(), Offer::Stale { held_seq: 2 });
+        assert_eq!(
+            cache.offer(card(&id, 2, 1_700_000_000)).unwrap(),
+            Offer::Stored
+        );
+        assert_eq!(
+            cache.offer(card(&id, 1, 1_700_000_100)).unwrap(),
+            Offer::Stale { held_seq: 2 }
+        );
+        assert_eq!(
+            cache.offer(card(&id, 2, 1_700_000_200)).unwrap(),
+            Offer::Stale { held_seq: 2 }
+        );
         let held = cache.get(&card(&id, 2, 0).node_id).unwrap();
-        assert_eq!((held.seq, held.issued_at), (2, 1_700_000_000), "a rollback never replaces the held card");
-        assert_eq!(cache.offer(card(&id, 3, 1_700_000_300)).unwrap(), Offer::Stored);
+        assert_eq!(
+            (held.seq, held.issued_at),
+            (2, 1_700_000_000),
+            "a rollback never replaces the held card"
+        );
+        assert_eq!(
+            cache.offer(card(&id, 3, 1_700_000_300)).unwrap(),
+            Offer::Stored
+        );
         assert_eq!(cache.len(), 1);
     }
 
@@ -136,9 +157,15 @@ mod tests {
         }
         assert_eq!(cache.len(), MAX_CACHED_CARDS);
         let newcomer = node();
-        assert_eq!(cache.offer(card(&newcomer, 1, base + 10_000)).unwrap(), Offer::Stored);
+        assert_eq!(
+            cache.offer(card(&newcomer, 1, base + 10_000)).unwrap(),
+            Offer::Stored
+        );
         assert_eq!(cache.len(), MAX_CACHED_CARDS);
-        assert!(cache.get(&oldest.node_id().to_hex()).is_none(), "the earliest-expiring card made room");
+        assert!(
+            cache.get(&oldest.node_id().to_hex()).is_none(),
+            "the earliest-expiring card made room"
+        );
         assert!(cache.get(&newcomer.node_id().to_hex()).is_some());
     }
 }

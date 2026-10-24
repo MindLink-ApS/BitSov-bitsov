@@ -289,7 +289,12 @@ async fn stale_dial_keeps_readded_inbound_only_contact_whitelisted_without_a_gap
     .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(*transport.live.lock().unwrap(), (false, false, false));
-    assert!(!state.peer_registry.read().await.whitelist_set().contains(&id));
+    assert!(!state
+        .peer_registry
+        .read()
+        .await
+        .whitelist_set()
+        .contains(&id));
     assert!(state.storage.get_peer(&id).await.unwrap().is_none());
 
     let req = Request::builder()
@@ -297,27 +302,50 @@ async fn stale_dial_keeps_readded_inbound_only_contact_whitelisted_without_a_gap
         .uri("/api/v1/peers/import")
         .header("authorization", common::auth_header(&state))
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::json!({
-            "backup": {
-                "version": 1, "exported_at": "test", "exported_by": "owner",
-                "peers": [{
-                    "node_id": id.to_hex(), "addr": "0.0.0.0:0",
-                    "label": "Inbound only", "auto_connect": false
-                }]
-            }
-        }).to_string()))
+        .body(Body::from(
+            serde_json::json!({
+                "backup": {
+                    "version": 1, "exported_at": "test", "exported_by": "owner",
+                    "peers": [{
+                        "node_id": id.to_hex(), "addr": "0.0.0.0:0",
+                        "label": "Inbound only", "auto_connect": false
+                    }]
+                }
+            })
+            .to_string(),
+        ))
         .unwrap();
-    let response = common::test_router(state.clone()).oneshot(req).await.unwrap();
+    let response = common::test_router(state.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(*transport.live.lock().unwrap(), (true, false, false));
-    assert!(state.peer_registry.read().await.whitelist_set().contains(&id));
+    assert!(state
+        .peer_registry
+        .read()
+        .await
+        .whitelist_set()
+        .contains(&id));
 
     transport.finish_dial.notify_one();
     assert!(add.await.unwrap().unwrap().dialed.is_err());
     assert_eq!(*transport.live.lock().unwrap(), (true, true, false));
-    assert!(state.peer_registry.read().await.whitelist_set().contains(&id));
+    assert!(state
+        .peer_registry
+        .read()
+        .await
+        .whitelist_set()
+        .contains(&id));
     assert_eq!(
-        state.storage.get_peer(&id).await.unwrap().unwrap().address.as_deref(),
+        state
+            .storage
+            .get_peer(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .address
+            .as_deref(),
         Some("0.0.0.0:0")
     );
     // DELETE revokes admission once; stale cleanup must never revoke it again,

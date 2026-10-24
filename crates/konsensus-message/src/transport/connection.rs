@@ -812,7 +812,10 @@ mod edge_regressions {
             assert!(!limiter.try_admit(ip, now));
         }
         // ...without burning the /64's last token, so a tracked host still gets in.
-        assert!(limiter.try_admit(a, now), "refused hosts must not drain the /64 budget");
+        assert!(
+            limiter.try_admit(a, now),
+            "refused hosts must not drain the /64 budget"
+        );
     }
 
     #[test]

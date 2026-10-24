@@ -217,7 +217,10 @@ async fn unregister_revokes_own_binding_t_revoke() {
     // A deposit to a's binding would be held while the binding exists (covered by
     // deposit tests). Revoke it.
     assert!(
-        is_ack(&dispatch(&eng, &ctrl(kind::KIND_RELAY_UNREGISTER, a, b"{}".to_vec())).await, a),
+        is_ack(
+            &dispatch(&eng, &ctrl(kind::KIND_RELAY_UNREGISTER, a, b"{}".to_vec())).await,
+            a
+        ),
         "unregister of own binding acks"
     );
     // The binding is gone: a deposit addressed to a now rejects (no binding).
@@ -503,15 +506,26 @@ fn setup_drain_cap(batch: usize) -> (RelayEngine, Arc<InMemoryRelayStore>) {
 /// to the relay — serialized with serde_json (the envelope wire codec).
 fn inner_envelope(sender: NodeId, recipient: NodeId) -> UkmEnvelope {
     let proof = PaymentProof::new([3u8; 32], [4u8; 32], 50);
-    UkmEnvelopeBuilder::new(0, sender, Recipient::Node(recipient), b"sealed-ct".to_vec(), proof)
-        .build()
+    UkmEnvelopeBuilder::new(
+        0,
+        sender,
+        Recipient::Node(recipient),
+        b"sealed-ct".to_vec(),
+        proof,
+    )
+    .build()
 }
 
 fn drain_body(max: usize) -> Vec<u8> {
     serde_json::to_vec(&DrainBody { max }).unwrap()
 }
 
-async fn deposit_envelope(eng: &RelayEngine, depositor: NodeId, recipient: NodeId, inner: &UkmEnvelope) {
+async fn deposit_envelope(
+    eng: &RelayEngine,
+    depositor: NodeId,
+    recipient: NodeId,
+    inner: &UkmEnvelope,
+) {
     let bytes = serde_json::to_vec(inner).unwrap();
     let env = ctrl(
         kind::KIND_RELAY_DEPOSIT,
@@ -536,12 +550,22 @@ async fn drain_reinjects_held_envelope_byte_identical_t_drain1() {
     deposit_envelope(&eng, node(1), recipient, &inner).await;
 
     // The recipient drains (kind-603 sender = recipient).
-    let replies = dispatch(&eng, &ctrl(kind::KIND_RELAY_DRAIN, recipient, drain_body(10))).await;
+    let replies = dispatch(
+        &eng,
+        &ctrl(kind::KIND_RELAY_DRAIN, recipient, drain_body(10)),
+    )
+    .await;
     match replies.as_slice() {
         [(peer, Frame::Message(env))] => {
             assert_eq!(*peer, recipient, "re-injected to the drainer");
-            assert_eq!(**env, inner, "held envelope returned byte-identical (proof intact)");
-            assert_eq!(env.payment_proof, inner.payment_proof, "inner proof preserved");
+            assert_eq!(
+                **env, inner,
+                "held envelope returned byte-identical (proof intact)"
+            );
+            assert_eq!(
+                env.payment_proof, inner.payment_proof,
+                "inner proof preserved"
+            );
         }
         other => panic!("expected one re-injected Frame::Message, got {other:?}"),
     }
@@ -561,7 +585,11 @@ async fn drain_then_ack_by_message_id_frees_quota_t_ack() {
     deposit_envelope(&eng, node(1), recipient, &inner).await;
 
     // Drain → the recipient receives the envelope and reads its id.
-    let drained = dispatch(&eng, &ctrl(kind::KIND_RELAY_DRAIN, recipient, drain_body(10))).await;
+    let drained = dispatch(
+        &eng,
+        &ctrl(kind::KIND_RELAY_DRAIN, recipient, drain_body(10)),
+    )
+    .await;
     let acked_id = match drained.as_slice() {
         [(_, Frame::Message(env))] => env.id,
         other => panic!("expected one drained Frame::Message, got {other:?}"),
@@ -577,8 +605,15 @@ async fn drain_then_ack_by_message_id_frees_quota_t_ack() {
     assert!(is_ack(&replies, recipient), "ack-by-MessageId acks");
 
     // The held item is gone and its quota freed; a re-drain returns nothing.
-    assert!(store.list_held(&recipient, 10, unix_secs()).await.is_empty());
-    let redrain = dispatch(&eng, &ctrl(kind::KIND_RELAY_DRAIN, recipient, drain_body(10))).await;
+    assert!(store
+        .list_held(&recipient, 10, unix_secs())
+        .await
+        .is_empty());
+    let redrain = dispatch(
+        &eng,
+        &ctrl(kind::KIND_RELAY_DRAIN, recipient, drain_body(10)),
+    )
+    .await;
     assert!(is_ack(&redrain, recipient), "post-ack re-drain is empty");
 }
 
@@ -588,14 +623,22 @@ async fn drain_egress_is_capped() {
     let recipient = node(2);
     register(&eng, recipient).await;
     for _ in 0..3 {
-        deposit_envelope(&eng, node(1), recipient, &inner_envelope(node(5), recipient)).await;
+        deposit_envelope(
+            &eng,
+            node(1),
+            recipient,
+            &inner_envelope(node(5), recipient),
+        )
+        .await;
     }
     // Ask for 10 but the egress cap (2) bounds it.
-    let replies = dispatch(&eng, &ctrl(kind::KIND_RELAY_DRAIN, recipient, drain_body(10))).await;
+    let replies = dispatch(
+        &eng,
+        &ctrl(kind::KIND_RELAY_DRAIN, recipient, drain_body(10)),
+    )
+    .await;
     assert!(replies.len() <= 2, "drain egress capped at max_drain_batch");
-    assert!(replies
-        .iter()
-        .all(|(_, f)| matches!(f, Frame::Message(_))));
+    assert!(replies.iter().all(|(_, f)| matches!(f, Frame::Message(_))));
 }
 
 #[tokio::test]
@@ -603,7 +646,11 @@ async fn drain_empty_binding_acks() {
     let (eng, _store) = setup();
     let recipient = node(2);
     register(&eng, recipient).await;
-    let replies = dispatch(&eng, &ctrl(kind::KIND_RELAY_DRAIN, recipient, drain_body(10))).await;
+    let replies = dispatch(
+        &eng,
+        &ctrl(kind::KIND_RELAY_DRAIN, recipient, drain_body(10)),
+    )
+    .await;
     assert!(is_ack(&replies, recipient), "empty drain acks");
 }
 
@@ -647,7 +694,10 @@ async fn deposit_rejects_forged_inner_envelope_id() {
         deposit_body(recipient, serde_json::to_vec(&inner).unwrap(), 0, 3600),
     );
     assert!(is_reject(&dispatch(&eng, &env).await, depositor));
-    assert!(store.list_held(&recipient, 10, unix_secs()).await.is_empty());
+    assert!(store
+        .list_held(&recipient, 10, unix_secs())
+        .await
+        .is_empty());
 }
 
 #[tokio::test]
@@ -660,9 +710,11 @@ async fn drain_scoped_to_sender_t_auth() {
     deposit_envelope(&eng, node(1), r1, &inner_envelope(node(5), r1)).await;
     // r2 drains: cannot see r1's held mail (store keyed by authenticated sender).
     let replies = dispatch(&eng, &ctrl(kind::KIND_RELAY_DRAIN, r2, drain_body(10))).await;
-    assert!(is_ack(&replies, r2), "r2 has no holds → empty ack, never r1's mail");
+    assert!(
+        is_ack(&replies, r2),
+        "r2 has no holds → empty ack, never r1's mail"
+    );
 }
-
 
 #[tokio::test]
 async fn malformed_relay_bodies_return_fixed_wire_compatible_reasons() {
@@ -681,8 +733,13 @@ async fn malformed_relay_bodies_return_fixed_wire_compatible_reasons() {
         "binding_recipient": vec![0u8; 32],
         "inner_envelope_bytes": hostile,
         "inner_kind": 0, "ttl_secs": 60
-    })).unwrap();
-    cases.push((kind::KIND_RELAY_DEPOSIT, inner, "relay_deposit_invalid_envelope"));
+    }))
+    .unwrap();
+    cases.push((
+        kind::KIND_RELAY_DEPOSIT,
+        inner,
+        "relay_deposit_invalid_envelope",
+    ));
     for (kind, body, code) in cases {
         let replies = dispatch(&eng, &ctrl(kind, node(1), body)).await;
         let [(peer, frame @ Frame::MessageReject { reason, .. })] = replies.as_slice() else {

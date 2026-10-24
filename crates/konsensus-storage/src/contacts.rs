@@ -436,28 +436,32 @@ impl ContactRepo for PostgresContactRepo {
             String,
             String,
         )> = match blocked {
-            Some(b) => sqlx::query_as(
-                "SELECT node_id, local_alias, claimed_name, profile_json, avatar_blake3,
+            Some(b) => {
+                sqlx::query_as(
+                    "SELECT node_id, local_alias, claimed_name, profile_json, avatar_blake3,
                         verified_identities_json, muted, blocked, tags_json, notes,
                         created_at, updated_at
                  FROM contacts WHERE blocked = $1
                  ORDER BY updated_at DESC LIMIT $2",
-            )
-            .bind(b)
-            .bind(lim)
-            .fetch_all(&self.pool)
-            .await?,
+                )
+                .bind(b)
+                .bind(lim)
+                .fetch_all(&self.pool)
+                .await?
+            }
 
-            None => sqlx::query_as(
-                "SELECT node_id, local_alias, claimed_name, profile_json, avatar_blake3,
+            None => {
+                sqlx::query_as(
+                    "SELECT node_id, local_alias, claimed_name, profile_json, avatar_blake3,
                         verified_identities_json, muted, blocked, tags_json, notes,
                         created_at, updated_at
                  FROM contacts
                  ORDER BY updated_at DESC LIMIT $1",
-            )
-            .bind(lim)
-            .fetch_all(&self.pool)
-            .await?,
+                )
+                .bind(lim)
+                .fetch_all(&self.pool)
+                .await?
+            }
         };
 
         Ok(rows
@@ -596,7 +600,11 @@ mod tests {
         assert!(!accepted, "stale write should be rejected");
 
         let got = repo.get_contact("aabbcc").await.unwrap().unwrap();
-        assert_eq!(got.local_alias.as_deref(), Some("Alice"), "original data should be preserved");
+        assert_eq!(
+            got.local_alias.as_deref(),
+            Some("Alice"),
+            "original data should be preserved"
+        );
     }
 
     #[tokio::test]
@@ -617,8 +625,12 @@ mod tests {
     #[tokio::test]
     async fn test_list_contacts() {
         let repo = make_repo().await;
-        repo.upsert_contact(&make_row("aa", "2026-01-01T00:00:00.000Z")).await.unwrap();
-        repo.upsert_contact(&make_row("bb", "2026-02-01T00:00:00.000Z")).await.unwrap();
+        repo.upsert_contact(&make_row("aa", "2026-01-01T00:00:00.000Z"))
+            .await
+            .unwrap();
+        repo.upsert_contact(&make_row("bb", "2026-02-01T00:00:00.000Z"))
+            .await
+            .unwrap();
 
         let all = repo.list_contacts(None, 100).await.unwrap();
         assert_eq!(all.len(), 2);
@@ -630,7 +642,11 @@ mod tests {
     async fn test_list_contacts_filter_blocked() {
         let repo = make_repo().await;
         let unblocked = make_row("aa", "2026-01-01T00:00:00.000Z");
-        let blocked = ContactRow { blocked: true, node_id: "bb".into(), ..make_row("bb", "2026-02-01T00:00:00.000Z") };
+        let blocked = ContactRow {
+            blocked: true,
+            node_id: "bb".into(),
+            ..make_row("bb", "2026-02-01T00:00:00.000Z")
+        };
         repo.upsert_contact(&unblocked).await.unwrap();
         repo.upsert_contact(&blocked).await.unwrap();
 
