@@ -360,6 +360,18 @@ impl LightningProvider for CircuitBreakerLightning {
             .await
     }
 
+    async fn forget_pending_invoice(&self, payment_hash: &str) -> Result<bool, LightningError> {
+        self.inner.forget_pending_invoice(payment_hash).await
+    }
+
+    async fn purge_expired_pending_invoices(&self, now_unix: u64) -> Result<u32, LightningError> {
+        self.inner.purge_expired_pending_invoices(now_unix).await
+    }
+
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        self.inner.pending_invoice_expiries().await
+    }
+
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
         self.inner.pay_invoice(bolt11).await
     }

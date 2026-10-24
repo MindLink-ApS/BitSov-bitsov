@@ -1860,6 +1860,15 @@ impl Node {
 		self.payment_store.remove(&payment_id)
 	}
 
+	/// Remove an inbound payment only while it is pending. The status check and
+	/// durable removal are serialized with settlement updates to preserve receipts.
+	pub fn remove_pending_inbound_payment(&self, payment_id: &PaymentId) -> Result<bool, Error> {
+		self.payment_store.remove_if(payment_id, |payment| {
+			payment.direction == payment::PaymentDirection::Inbound
+				&& payment.status == payment::PaymentStatus::Pending
+		})
+	}
+
 	/// Configure indexed funding verification for a non-Esplora source.
 	/// Return `Ok(false)` ONLY for proven absence under the configured source's
 	/// indexing/sync rules. Errors are inconclusive and never suppress a spend.
