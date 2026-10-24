@@ -1444,7 +1444,7 @@ async fn handle_price_response_received(
 /// invoice services require an already privileged connection. Legacy admission
 /// requests are refused even on a paid connection. Service invoices are capped
 /// per peer and for the node, cannot exceed this node's highest configured
-/// price, and expire quickly.
+/// price, must meet the admission floor, and expire quickly.
 #[allow(clippy::too_many_arguments)]
 async fn handle_invoice_requested_gated(
     peer_id: &NodeId,
@@ -1628,6 +1628,21 @@ async fn handle_invoice_requested(
                 peer_id,
                 request_id,
                 konsensus_api::invoice_refusal::INVOICE_UNAVAILABLE,
+            )
+            .await;
+        }
+        return;
+    }
+    // Refuse sub-floor requests before any pricing or wallet work.
+    let floor = konsensus_core::gate::price_with_floor_msat(0, min_admission_cost_msat);
+    if amount_msat < floor {
+        rollback_rate();
+        if refusals.permit(source_ip, tokio::time::Instant::now()) {
+            send_invoice_refusal(
+                transport,
+                peer_id,
+                request_id,
+                konsensus_api::invoice_refusal::BELOW_ADMISSION_FLOOR,
             )
             .await;
         }

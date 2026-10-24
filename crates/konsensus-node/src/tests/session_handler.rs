@@ -1660,6 +1660,265 @@ async fn zero_amount_service_invoice_is_refused_without_wallet_work() {
     assert!(lightning.list_payments(10).await.unwrap().is_empty());
 }
 
+struct SwitchPricing {
+    fail: std::sync::atomic::AtomicBool,
+    price: u64,
+}
+
+#[async_trait::async_trait]
+impl konsensus_core::traits::pricing::PricingEngine for SwitchPricing {
+    async fn get_price_msat(
+        &self,
+        _: u16,
+    ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        self.quote()
+    }
+
+    async fn get_category_price_msat(
+        &self,
+        _: konsensus_core::kind::KindCategory,
+    ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        self.quote()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl SwitchPricing {
+    fn quote(&self) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(konsensus_core::traits::pricing::PricingError::Other(
+                "unavailable".into(),
+            ))
+        } else {
+            Ok(self.price)
+        }
+    }
+}
+
+struct VariablePricing {
+    price: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl konsensus_core::traits::pricing::PricingEngine for VariablePricing {
+    async fn get_price_msat(
+        &self,
+        _: u16,
+    ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        Ok(self.price.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    async fn get_category_price_msat(
+        &self,
+        _: konsensus_core::kind::KindCategory,
+    ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        Ok(self.price.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[tokio::test]
+async fn failed_price_ceiling_lookups_release_their_in_flight_slot() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let pricing = Arc::new(SwitchPricing {
+        fail: AtomicBool::new(true),
+        price: 4_000,
+    });
+    let cache = ConfiguredPriceCeilingCache::new();
+    let engine: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = pricing.clone();
+    for _ in 0..super::MAX_CONCURRENT_PRICE_CEILING_LOOKUPS {
+        assert_eq!(
+            cache.get(engine.clone()).await,
+            Err("konsensus:price_unavailable")
+        );
+    }
+    pricing.fail.store(false, Ordering::SeqCst);
+    assert_eq!(cache.get(engine).await, Ok(4_000));
+}
+
+#[tokio::test(start_paused = true)]
+async fn configured_price_ceiling_refreshes_after_price_changes() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let pricing = Arc::new(VariablePricing {
+        price: AtomicU64::new(2_000),
+    });
+    let cache = ConfiguredPriceCeilingCache::new();
+    let engine: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = pricing.clone();
+    assert_eq!(cache.get(engine.clone()).await.unwrap(), 2_000);
+    pricing.price.store(7_000, Ordering::SeqCst);
+    assert_eq!(
+        cache.get(engine.clone()).await.unwrap(),
+        7_000,
+        "a changed tariff must not be truncated by a previously successful ceiling"
+    );
+    pricing.price.store(9_000, Ordering::SeqCst);
+    assert_eq!(cache.get(engine).await.unwrap(), 9_000);
+}
+
+#[tokio::test]
+async fn below_admission_floor_service_invoice_is_refused_and_releases_its_rate_slot() {
+    use konsensus_message::{ReachabilityMode, TransportConfig};
+    let (_, requester_id) = NodeIdentity::generate().unwrap();
+    let (_, recipient_id) = NodeIdentity::generate().unwrap();
+    let peer = *requester_id.node_id();
+    let recipient = *recipient_id.node_id();
+    let make = |id: NodeIdentity| {
+        Arc::new(NoiseTransport::new(
+            Arc::new(id),
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                whitelist: vec![],
+                ..Default::default()
+            },
+        ))
+    };
+    let source = make(requester_id);
+    let target = make(recipient_id);
+    target.start_listener().await.unwrap();
+    source
+        .connect(&recipient, &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+    let ceiling = configured_price_ceiling(pricing.as_ref()).await.unwrap();
+    let floor = 8_000u64;
+    assert!(floor > 1_000 && floor < ceiling);
+    let mut invoices = ready_invoice_book().await;
+    handle_invoice_requested_gated(
+        &peer,
+        "below-floor",
+        floor - 1,
+        "konsensus message",
+        true,
+        &pricing,
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &ConfiguredPriceCeilingCache::new(),
+        &lightning,
+        &target,
+        &recipient,
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &konsensus_api::membrane::Membrane::with_capacity(8),
+        &mut crate::invoice_refusals::RefusalLimits::default(),
+        floor,
+        &mut invoices,
+    )
+    .await;
+    let refusal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match source.recv_control().await {
+                Some(ControlEvent::PeerConnected { .. }) => {}
+                Some(event) => break event,
+                None => panic!("control channel closed before the floor refusal"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    match refusal {
+        ControlEvent::InvoiceErrorReceived {
+            request_id, reason, ..
+        } => {
+            assert_eq!(request_id, "below-floor");
+            assert_eq!(
+                reason,
+                konsensus_api::invoice_refusal::BELOW_ADMISSION_FLOOR
+            );
+        }
+        other => panic!("expected an admission-floor refusal, got {other:?}"),
+    }
+    assert!(lightning.list_payments(10).await.unwrap().is_empty());
+
+    let mut refusals = crate::invoice_refusals::RefusalLimits::default();
+    for n in 1..crate::peer_invoices::PEER_RATE_BURST {
+        handle_invoice_requested_gated(
+            &peer,
+            &format!("below-{n}"),
+            floor - 1,
+            "konsensus message",
+            true,
+            &pricing,
+            &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            &ConfiguredPriceCeilingCache::new(),
+            &lightning,
+            &target,
+            &recipient,
+            "127.0.0.1".parse().unwrap(),
+            &mut crate::admission_quotes::AdmissionQuotes::default(),
+            &konsensus_api::membrane::Membrane::with_capacity(8),
+            &mut refusals,
+            floor,
+            &mut invoices,
+        )
+        .await;
+    }
+    assert!(
+        lightning.list_payments(10).await.unwrap().is_empty(),
+        "a burst of below-floor requests must not mint invoices"
+    );
+
+    handle_invoice_requested_gated(
+        &peer,
+        "clamped-under-floor",
+        ceiling.saturating_mul(2),
+        "konsensus message",
+        true,
+        &pricing,
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &ConfiguredPriceCeilingCache::new(),
+        &lightning,
+        &target,
+        &recipient,
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &konsensus_api::membrane::Membrane::with_capacity(8),
+        &mut refusals,
+        ceiling.saturating_add(1),
+        &mut invoices,
+    )
+    .await;
+    let payments = lightning.list_payments(10).await.unwrap();
+    assert_eq!(payments.len(), 1);
+    assert_eq!(payments[0].amount_msat, ceiling.saturating_add(1));
+
+    handle_invoice_requested_gated(
+        &peer,
+        "at-floor",
+        floor,
+        "konsensus message",
+        true,
+        &pricing,
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &ConfiguredPriceCeilingCache::new(),
+        &lightning,
+        &target,
+        &recipient,
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &konsensus_api::membrane::Membrane::with_capacity(8),
+        &mut refusals,
+        floor,
+        &mut invoices,
+    )
+    .await;
+    let payments = lightning.list_payments(10).await.unwrap();
+    let mut amounts: Vec<_> = payments
+        .into_iter()
+        .map(|payment| payment.amount_msat)
+        .collect();
+    amounts.sort_unstable();
+    assert_eq!(amounts, vec![floor, ceiling.saturating_add(1)]);
+}
+
 #[tokio::test]
 async fn privileged_legacy_admission_requests_create_no_invoice() {
     let transport = make_gossip_test_transport();

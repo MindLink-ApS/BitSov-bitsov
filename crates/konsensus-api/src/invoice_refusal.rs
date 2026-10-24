@@ -33,6 +33,10 @@ pub const INVOICE_LIMITED: &str = "konsensus:invoice_limited";
 /// The node will not issue an invoice for this request.
 pub const INVOICE_UNAVAILABLE: &str = "konsensus:invoice_unavailable";
 
+/// A paid peer asked for a service invoice below this node's admission floor.
+/// The request is refused; the amount is not raised to the floor.
+pub const BELOW_ADMISSION_FLOOR: &str = "konsensus:below_admission_floor";
+
 /// Readiness refusals use the existing authenticated InvoiceError frame.
 pub const CHAIN_UNAVAILABLE: &str = "konsensus:not_ready:chain_unavailable";
 pub const NOT_SYNCED: &str = "konsensus:not_ready:not_synced";
@@ -69,7 +73,13 @@ pub fn bind(request_id: &str, peer: NodeId) -> RequestBinding {
     let mut map = bindings();
     let bound = map.len() < MAX_BOUND_REQUESTS;
     if bound {
-        map.insert(request_id.to_string(), Binding { peer, refusal: None });
+        map.insert(
+            request_id.to_string(),
+            Binding {
+                peer,
+                refusal: None,
+            },
+        );
     }
     RequestBinding {
         request_id: request_id.to_string(),
@@ -128,10 +138,16 @@ mod tests {
     fn refusal_reaches_the_request_only_from_its_own_peer() {
         let request = uuid::Uuid::new_v4().to_string();
         let binding = bind(&request, node(1));
-        assert!(!record(&request, &node(2), ADMISSION_REQUIRED), "another peer cannot refuse it");
+        assert!(
+            !record(&request, &node(2), ADMISSION_REQUIRED),
+            "another peer cannot refuse it"
+        );
         assert!(record(&request, &node(1), ADMISSION_REQUIRED));
         assert_eq!(binding.finish().as_deref(), Some(ADMISSION_REQUIRED));
-        assert!(!record(&request, &node(1), ADMISSION_REQUIRED), "finished requests are unbound");
+        assert!(
+            !record(&request, &node(1), ADMISSION_REQUIRED),
+            "finished requests are unbound"
+        );
     }
 
     #[test]

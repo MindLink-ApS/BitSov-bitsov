@@ -1860,6 +1860,13 @@ async fn review_regression_invoice_restart_preserves_unknown_expiry_and_discards
     );
     assert_eq!(
         provider
+            .purge_expired_pending_invoices(invoice.created_at + 3_601)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        provider
             .get_payment_status(&invoice.payment_hash)
             .await
             .unwrap()
@@ -1873,6 +1880,16 @@ fn review_regression_legacy_orphan_expiry_guess_is_never_shortened() {
     let timestamp = 1_700_000_000u64;
     let legacy = timestamp.saturating_add(u64::from(u32::MAX));
     assert_eq!(super::migrate_service_invoice_expiry(Some(legacy)), legacy);
+}
+
+#[test]
+fn missing_invoice_expiry_is_not_due_at_a_guessed_deadline() {
+    let created = 1_700_000_000u64;
+    let expires = super::migrate_service_invoice_expiry(None);
+    // Sponsor and owner invoices may outlive the old peer path's one-hour
+    // default. Neither guessed deadline may trigger wallet cancellation.
+    assert!(created + 120 < expires);
+    assert!(created + 7_200 < expires);
 }
 
 #[tokio::test]
