@@ -10,6 +10,13 @@ also live on the corresponding GitHub pre-release pages.
   request.
 - Limit local sign-in challenges per source, rate-limit issuance, and apply
   the local token route's Host and Origin admission to challenge issuance.
+- Bound seed-only recovery chain reads: after a pass discovers hub close
+  outputs, the 30-second unconfirmed-close polls read only those outputs'
+  scripts instead of all 2000 derived scripts. Before each focused sweep preview,
+  a full scan combines other closes so small outputs are not stranded. A vanished
+  focus and the post-sweep late-close check also scan in full. A backup index
+  still scans its active channels every pass. The Esplora warning includes these
+  full-scan bursts (#414).
 - Pin the development and CI Rust toolchain to 1.99.1 in `rust-toolchain.toml`;
   every workflow installs the version from that file instead of floating
   `stable`, and a guard script fails CI if a workflow or the pin drifts (#394).

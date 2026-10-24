@@ -8,6 +8,7 @@ pub use journal::{
 };
 use konsensus_chain::recovery::RecoveryChain;
 use konsensus_recovery::{BackupIndex, FoundOutput, RecoveryKeys, RecoveryScript};
+use std::borrow::Cow;
 
 #[derive(Debug)]
 pub enum Progress {
@@ -82,11 +83,29 @@ impl Job {
         if let Some(progress) = self.resume_sweeps(chain).await? {
             return Ok(progress);
         }
-        let outputs = chain.scan(scripts).await?;
-        if outputs.iter().any(|o| o.confirmations == 0) {
-            return Ok(Progress::WaitingForHub);
-        }
-        if !outputs.is_empty() {
+        let mut targets = self.scan_targets(scripts);
+        loop {
+            let outputs = chain.scan(&targets).await?;
+            if outputs.is_empty() && matches!(&targets, Cow::Owned(_)) {
+                // The focused outputs are gone (spent, replaced or reorged): decide
+                // on a full scan in this same pass, never on a stale focus.
+                targets = Cow::Borrowed(scripts);
+                continue;
+            }
+            self.refocus(&outputs);
+            if outputs.iter().any(|o| o.confirmations == 0) {
+                return Ok(Progress::WaitingForHub);
+            }
+            if outputs.is_empty() {
+                break;
+            }
+            if matches!(&targets, Cow::Owned(_)) {
+                // Other closes may have confirmed while we polled this focus.
+                // Combine them before previewing, even if the focus alone can
+                // pay: a small leftover might never fund its own sweep.
+                targets = Cow::Borrowed(scripts);
+                continue;
+            }
             self.authenticate_closes(chain, &outputs).await?;
             let signed = keys.build_sweep(
                 &outputs,
@@ -110,6 +129,42 @@ impl Job {
             return Ok(Progress::WaitingForHub);
         }
         Ok(Progress::SelfTest)
+    }
+
+    /// Seed-only recovery scans every derived script until a pass discovers hub
+    /// close outputs; later 30-second unconfirmed polls read only those outputs'
+    /// scripts. Sweep previews, a vanished focus, and the post-sweep late-close
+    /// check require a full scan. A backup index already bounds the
+    /// scan to its active channels and is always scanned in full. An empty focus
+    /// means a full scan.
+    fn scan_targets<'a>(&self, scripts: &'a [RecoveryScript]) -> Cow<'a, [RecoveryScript]> {
+        if self.focus.is_empty() {
+            return Cow::Borrowed(scripts);
+        }
+        let narrowed: Vec<_> = scripts
+            .iter()
+            .filter(|s| self.focus.contains(&s.script_pubkey))
+            .cloned()
+            .collect();
+        if narrowed.is_empty() {
+            Cow::Borrowed(scripts)
+        } else {
+            Cow::Owned(narrowed)
+        }
+    }
+
+    /// Focus the next pass on the scripts just discovered; nothing found means
+    /// the next pass is a full scan again.
+    fn refocus(&mut self, outputs: &[FoundOutput]) {
+        self.focus.clear();
+        if !self.funding().is_empty() {
+            return;
+        }
+        for output in outputs {
+            if !self.focus.contains(&output.txout.script_pubkey) {
+                self.focus.push(output.txout.script_pubkey.clone());
+            }
+        }
     }
 
     /// Resume previously authorized sweeps without opening/replacing any LDK
@@ -214,6 +269,9 @@ impl Job {
         self.authenticate_closes(chain, &inputs).await?;
         // Persist before the first possible broadcast, including an interrupted command.
         self.save_sweep(sweep, inputs)?;
+        // The approved inputs are about to be spent: once the sweep confirms, the
+        // next pass scans every script again so late hub closes are not missed.
+        self.focus.clear();
         Ok(())
     }
 }
