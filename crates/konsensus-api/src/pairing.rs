@@ -66,7 +66,7 @@ pub mod second_device;
 mod second_device_tests;
 pub mod ticket;
 use crate::spend_budget::{
-    BudgetRefusal, Charge, GrantBudget, GrantTerms, GrantView, Reservation,
+    BudgetRefusal, CallReservationTotals, Charge, GrantBudget, GrantTerms, GrantView, Reservation,
     MAX_SPEND_GRANT_TTL_SECS,
 };
 pub use device::{
@@ -3311,15 +3311,38 @@ impl PairingService {
             let mut result = Ok(0u64);
             for charge in &charges {
                 let amount = recipients.entry(&charge.recipient).or_insert(0u64);
-                match amount.checked_add(charge.amount_msat).filter(|n| *n <= max_msat) {
+                match amount
+                    .checked_add(charge.amount_msat)
+                    .filter(|n| *n <= max_msat)
+                {
                     Some(total) => *amount = total,
-                    None => { result = Err(BudgetRefusal::PerCall { max_msat }); break; }
+                    None => {
+                        result = Err(BudgetRefusal::PerCall { max_msat });
+                        break;
+                    }
                 }
             }
-            result.and_then(|_| recipients.values().try_fold(0u64, |sum, amount|
-                sum.checked_add(*amount).ok_or(BudgetRefusal::PerCall { max_msat })))
+            result
+                .and_then(|_| {
+                    recipients.values().try_fold(0u64, |sum, amount| {
+                        sum.checked_add(*amount)
+                            .ok_or(BudgetRefusal::PerCall { max_msat })
+                    })
+                })
+                .map(|total| {
+                    // Legacy grants have no rolling breakers. Preserve their
+                    // previous whole-call ceiling instead of multiplying it
+                    // by an arbitrarily large room membership.
+                    if budget.breakers == crate::spend_budget::BreakerLimits::legacy() {
+                        total.min(max_msat)
+                    } else {
+                        total
+                    }
+                })
         };
-        if let Err(refusal) = purpose_limit.and_then(|limit| budget.reserve_act_at(&charges, now, limit, !authority.admission)) {
+        if let Err(refusal) =
+            purpose_limit.and_then(|limit| budget.reserve_act_at(&charges, now, limit))
+        {
             if budget.record_breaker_refusal(&refusal, now) {
                 if let Err(e) = self.persist(&mut inner.file) {
                     if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
@@ -3681,7 +3704,7 @@ impl PairingService {
             recipient,
             0,
             amount_msat,
-            call_reserved_msat,
+            CallReservationTotals::messages(call_reserved_msat),
             operation,
         )
         .map(|(_, admission)| admission)
@@ -3700,9 +3723,9 @@ impl PairingService {
         recipient: &str,
         quoted_message_all_in: u64,
         admission_all_in: u64,
-        call_reserved_msat: u64,
+        call_reserved: CallReservationTotals,
         operation: Option<crate::spend_budget::OperationReservationLink>,
-    ) -> Result<(u64, Reservation), BudgetRefusal> {
+    ) -> Result<(CallReservationTotals, Reservation), BudgetRefusal> {
         let recipient =
             crate::spend_budget::canonical_recipient(recipient).ok_or(BudgetRefusal::NoGrant)?;
         let mut inner = self.lock();
@@ -3730,17 +3753,36 @@ impl PairingService {
         };
         let message_top_up = quoted_message_all_in.saturating_sub(old_message);
         let max_msat = budget.messaging_per_call_max_msat().min(
-            budget.per_act_max_by_recipient.get(&recipient).copied().unwrap_or(u64::MAX));
+            budget
+                .per_act_max_by_recipient
+                .get(&recipient)
+                .copied()
+                .unwrap_or(u64::MAX),
+        );
         if quoted_message_all_in > max_msat {
+            return Err(BudgetRefusal::PerCall { max_msat });
+        }
+        let max_msat = budget.messaging_per_call_max_msat();
+        let message_total = call_reserved
+            .message_all_in_msat
+            .checked_add(message_top_up)
+            .ok_or(BudgetRefusal::PerCall { max_msat })?;
+        if budget.breakers == crate::spend_budget::BreakerLimits::legacy()
+            && message_top_up > 0
+            && message_total > max_msat
+        {
             return Err(BudgetRefusal::PerCall { max_msat });
         }
         let max_msat = crate::spend_budget::FIRST_CONTACT_MAX_MSAT;
         if admission_all_in > max_msat {
             return Err(BudgetRefusal::PerCall { max_msat });
         }
-        let need = message_top_up.checked_add(admission_all_in)
+        let need = message_top_up
+            .checked_add(admission_all_in)
             .ok_or(BudgetRefusal::PerCall { max_msat })?;
-        let total = call_reserved_msat.checked_add(need)
+        let total = call_reserved
+            .all_in_msat
+            .checked_add(need)
             .ok_or(BudgetRefusal::PerCall { max_msat })?;
         if let Some(max_msat) = confirmed {
             if let Some(pending) = inner.first_contact.get_mut(&parent.client_id) {
@@ -3797,7 +3839,13 @@ impl PairingService {
             || chrono::Utc::now().timestamp(),
         );
         match admission {
-            Ok(admission) => Ok((total, admission)),
+            Ok(admission) => Ok((
+                CallReservationTotals {
+                    all_in_msat: total,
+                    message_all_in_msat: message_total,
+                },
+                admission,
+            )),
             Err(e) => {
                 if let Some(g) = inner
                     .file

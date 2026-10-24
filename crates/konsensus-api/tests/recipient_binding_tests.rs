@@ -18,15 +18,32 @@ struct RejectedKeysend {
     expected_peer_key: String,
     keysend_calls: AtomicUsize,
     invoice_payments: AtomicUsize,
+    refusal: &'static str,
 }
 
 #[async_trait]
 impl LightningProvider for RejectedKeysend {
-    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        invoice: &str,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.pay_invoice(invoice).await
     }
 
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn keysend_with_fee_limit(
+        &self,
+        dest: &str,
+        amount: u64,
+        memo: Option<&str>,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.keysend(dest, amount, memo).await
     }
 
@@ -52,9 +69,7 @@ impl LightningProvider for RejectedKeysend {
     ) -> Result<PaymentDetails, LightningError> {
         assert_eq!(destination, self.expected_peer_key);
         self.keysend_calls.fetch_add(1, Ordering::SeqCst);
-        Err(LightningError::PaymentNotDispatched(
-            "mock keysend unavailable before dispatch".into(),
-        ))
+        Err(LightningError::PaymentNotDispatched(self.refusal.into()))
     }
 
     async fn get_payment_status(&self, hash: &str) -> Result<PaymentDetails, LightningError> {
@@ -71,6 +86,15 @@ impl LightningProvider for RejectedKeysend {
 }
 
 async fn recipient_fallback_case(wrong_payee: bool) {
+    keysend_refusal_case(
+        wrong_payee,
+        "mock keysend unavailable before dispatch",
+        false,
+    )
+    .await;
+}
+
+async fn keysend_refusal_case(wrong_payee: bool, refusal: &'static str, fee_refusal: bool) {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("mock-ledger.db");
     let intended = SharedMockProvider::new(&ledger, "recipient-b", 0).unwrap();
@@ -107,6 +131,7 @@ async fn recipient_fallback_case(wrong_payee: bool) {
         expected_peer_key: intended_key.clone(),
         keysend_calls: AtomicUsize::new(0),
         invoice_payments: AtomicUsize::new(0),
+        refusal,
     });
     let mut state = common::test_state_with_lightning(sender.clone());
     let (_, identity) = konsensus_core::identity::NodeIdentity::generate().unwrap();
@@ -136,6 +161,12 @@ async fn recipient_fallback_case(wrong_payee: bool) {
     eprintln!("recipient-binding repro: proof_ok={}, keysend_calls={}, pay_invoice_calls={}, A={a}, B={b}, C={c}",
         result.is_ok(), sender.keysend_calls.load(Ordering::SeqCst), sender.invoice_payments.load(Ordering::SeqCst));
     assert_eq!(sender.keysend_calls.load(Ordering::SeqCst), 1);
+    if fee_refusal {
+        assert!(result.is_err());
+        assert_eq!(sender.invoice_payments.load(Ordering::SeqCst), 0);
+        assert_eq!((a, b, c), (10_000, 0, 0));
+        return;
+    }
     if !wrong_payee {
         assert!(result.is_ok());
         assert_eq!(sender.invoice_payments.load(Ordering::SeqCst), 1);
@@ -155,4 +186,24 @@ async fn known_recipient_fallback_must_reject_third_party_payee_before_payment()
 #[tokio::test]
 async fn known_recipient_fallback_pays_matching_payee_once() {
     recipient_fallback_case(false).await;
+}
+
+#[tokio::test]
+async fn generic_ldk_keysend_refusal_falls_back_to_invoice_once() {
+    keysend_refusal_case(false, "Failed to send the given payment.", false).await;
+}
+
+#[tokio::test]
+async fn unavailable_keysend_route_falls_back_to_invoice_once() {
+    keysend_refusal_case(false, "no route to destination", false).await;
+}
+
+#[tokio::test]
+async fn explicit_keysend_fee_ceiling_refusal_never_pays_an_invoice() {
+    for refusal in [
+        "route exceeds fee ceiling",
+        "routing fee exceeds max_routing_fee_msat=100",
+    ] {
+        keysend_refusal_case(false, refusal, true).await;
+    }
 }

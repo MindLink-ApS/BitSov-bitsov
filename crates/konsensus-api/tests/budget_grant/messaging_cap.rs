@@ -4,7 +4,14 @@ use konsensus_api::pairing::device;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
 async fn messaging_fixture(relation: bool, requested_cap: u64) -> (Fx, String) {
-    let mut fx = fixture().await;
+    messaging_fixture_for(fixture().await, relation, requested_cap).await
+}
+
+pub(super) async fn messaging_fixture_for(
+    mut fx: Fx,
+    relation: bool,
+    requested_cap: u64,
+) -> (Fx, String) {
     let root = konsensus_core::OwnerApprovalKey::from_mnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
         "", &[9; 32],
@@ -99,8 +106,14 @@ async fn messaging_fixture(relation: bool, requested_cap: u64) -> (Fx, String) {
                 },
             )
             .unwrap();
-        assert_eq!(approval.act_caps.as_ref().unwrap().message_all_in_msat, requested_cap.min(6_000));
-        assert_eq!(approval.act_caps.as_ref().unwrap().room_member_all_in_msat, requested_cap.min(6_000));
+        assert_eq!(
+            approval.act_caps.as_ref().unwrap().message_all_in_msat,
+            requested_cap.min(6_000)
+        );
+        assert_eq!(
+            approval.act_caps.as_ref().unwrap().room_member_all_in_msat,
+            requested_cap.min(6_000)
+        );
         fx.service
             .approve_owner_request(
                 &owner.client_id,
@@ -346,24 +359,41 @@ async fn console_room_fanout_caps_each_member_and_reserves_one_total() {
             .await;
     }
     let (status, result) = fx
-        .call("POST", "/api/v1/messages/compose", Some(body.clone()), Some(&token))
+        .call(
+            "POST",
+            "/api/v1/messages/compose",
+            Some(body.clone()),
+            Some(&token),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(fx.wallet.left(), 12_000);
     assert_eq!(fx.used(), 12_000);
     // With routing fees the displayed room total is still checked atomically.
     for peer in &members {
-        fx.state.peer_prices.update_kind_price(*peer, 100, 2_000, 850_000).await;
+        fx.state
+            .peer_prices
+            .update_kind_price(*peer, 100, 2_000, 850_000)
+            .await;
     }
     fx.wallet.fee.store(4_000, Ordering::SeqCst);
     let mut paid = body;
     paid["max_routing_fee_msat"] = json!(10_000);
     paid["max_total_msat"] = json!(11_999);
-    let (status, _) = fx.call("POST", "/api/v1/messages/compose", Some(paid.clone()), Some(&token)).await;
+    let (status, _) = fx
+        .call(
+            "POST",
+            "/api/v1/messages/compose",
+            Some(paid.clone()),
+            Some(&token),
+        )
+        .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(fx.used(), 12_000);
     paid["max_total_msat"] = json!(12_000);
-    let (status, result) = fx.call("POST", "/api/v1/messages/compose", Some(paid), Some(&token)).await;
+    let (status, result) = fx
+        .call("POST", "/api/v1/messages/compose", Some(paid), Some(&token))
+        .await;
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(result["max_routing_fee_msat"], 8_000);
     assert_eq!(fx.used(), 24_000);
@@ -374,12 +404,22 @@ async fn message_fee_budget_is_cap_minus_price() {
     for (price, fee) in [(1_000, 5_000), (2_000, 4_000), (6_000, 0)] {
         let fx = fixture().await;
         let token = fx.grant(None, GrantTerms::new(100_000)).await;
-        fx.state.peer_prices.update_kind_price(fx.peer, 100, price, 850_000).await;
+        fx.state
+            .peer_prices
+            .update_kind_price(fx.peer, 100, price, 850_000)
+            .await;
         fx.wallet.fee.store(fee, Ordering::SeqCst);
-        let (status, body) = fx.call("POST", "/api/v1/messages/compose", Some(json!({
-            "recipient": fx.peer.to_hex(), "kind":100, "plaintext":"fee budget",
-            "max_routing_fee_msat": 10_000
-        })), Some(&token)).await;
+        let (status, body) = fx
+            .call(
+                "POST",
+                "/api/v1/messages/compose",
+                Some(json!({
+                    "recipient": fx.peer.to_hex(), "kind":100, "plaintext":"fee budget",
+                    "max_routing_fee_msat": 10_000
+                })),
+                Some(&token),
+            )
+            .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["max_routing_fee_msat"], fee);
         assert_eq!(fx.used(), 6_000);
@@ -390,9 +430,18 @@ async fn message_fee_budget_is_cap_minus_price() {
 async fn liquidity_cannot_use_messaging_authority() {
     for relation in [true, false] {
         let (fx, _) = messaging_fixture(relation, 20_000).await;
-        let result = fx.service.reserve_liquidity_fee(&fx.client_id, 1,
-            vec![Charge {recipient: PEER_LN.into(), amount_msat: 1_000}]);
-        assert!(matches!(result, Err(BudgetRefusal::MessagingGrant)), "{result:?}");
+        let result = fx.service.reserve_liquidity_fee(
+            &fx.client_id,
+            1,
+            vec![Charge {
+                recipient: PEER_LN.into(),
+                amount_msat: 1_000,
+            }],
+        );
+        assert!(
+            matches!(result, Err(BudgetRefusal::MessagingGrant)),
+            "{result:?}"
+        );
         assert_eq!(fx.used(), 0);
     }
 }
@@ -400,36 +449,88 @@ async fn liquidity_cannot_use_messaging_authority() {
 #[tokio::test]
 async fn message_route_over_remaining_fee_budget_refuses_without_spending() {
     for ldk in [false, true] {
-    let fx = fixture().await;
-    fx.wallet.ldk_route_refusal.store(ldk, Ordering::SeqCst);
-    let token = fx.grant(None, GrantTerms::new(100_000)).await;
-    fx.state.peer_prices.update_kind_price(fx.peer, 100, 2_000, 850_000).await;
-    fx.wallet.fee.store(4_001, Ordering::SeqCst);
-    let (status, body) = fx.call("POST", "/api/v1/messages/compose", Some(json!({
-        "recipient": fx.peer.to_hex(), "kind":100, "plaintext":"too costly",
-        "max_routing_fee_msat":10_000
-    })), Some(&token)).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"], "The route cannot fit within the approved message total. The message payment was not dispatched.");
-    assert_eq!(fx.wallet.left(), 0);
-    assert_eq!(fx.used(), 0);
+        let mut fx = fixture().await;
+        fx.wallet.ldk_route_refusal.store(ldk, Ordering::SeqCst);
+        if ldk {
+            // A generic LDK refusal first falls back to the peer's invoice;
+            // that payment must enforce the same remaining fee allowance.
+            let peer = fx.peer;
+            let transport =
+                ConnectedStubTransport::new(vec![peer], fx.state.invoice_requests.clone())
+                    .with_invoice_responder(move |_, amount| {
+                        let bolt11 = create_test_bolt11(amount);
+                        let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
+                        Some(konsensus_api::state::InvoiceResponseData {
+                            recipient: peer,
+                            payment_hash: invoice.payment_hash().to_string(),
+                            bolt11,
+                        })
+                    });
+            fx.state = Arc::new(AppState {
+                transport: Arc::new(transport),
+                ..(*fx.state).clone()
+            });
+            let payee = create_test_bolt11(1_000)
+                .parse::<lightning_invoice::Bolt11Invoice>()
+                .unwrap()
+                .recover_payee_pub_key()
+                .to_string();
+            fx.state.peer_ln_pubkeys.lock().await.insert(peer, payee);
+        }
+        let token = fx.grant(None, GrantTerms::new(100_000)).await;
+        fx.state
+            .peer_prices
+            .update_kind_price(fx.peer, 100, 2_000, 850_000)
+            .await;
+        fx.wallet.fee.store(4_001, Ordering::SeqCst);
+        let (status, body) = fx
+            .call(
+                "POST",
+                "/api/v1/messages/compose",
+                Some(json!({
+                    "recipient": fx.peer.to_hex(), "kind":100, "plaintext":"too costly",
+                    "max_routing_fee_msat":10_000
+                })),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "The route cannot fit within the approved message total. The message payment was not dispatched.");
+        assert_eq!(fx.wallet.left(), 0);
+        assert_eq!(fx.used(), 0);
     }
 }
 
 #[tokio::test]
 async fn payment_keeps_its_five_sat_fee_floor_and_owner_limit() {
     let fx = fixture().await;
-    let token = fx.grant(None, GrantTerms::new(100_000).per_call(20_000)).await;
+    let token = fx
+        .grant(None, GrantTerms::new(100_000).per_call(20_000))
+        .await;
     fx.wallet.fee.store(5_000, Ordering::SeqCst);
-    let (status, body) = fx.call("POST", "/api/v1/payments/keysend", Some(json!({
-        "dest_pubkey": PEER_LN, "amount_msat":15_000, "max_routing_fee_msat":null
-    })), Some(&token)).await;
+    let (status, body) = fx
+        .call(
+            "POST",
+            "/api/v1/payments/keysend",
+            Some(json!({
+                "dest_pubkey": PEER_LN, "amount_msat":15_000, "max_routing_fee_msat":null
+            })),
+            Some(&token),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["max_routing_fee_msat"], 5_000);
     assert_eq!(fx.used(), 20_000);
-    let (status, body) = fx.call("POST", "/api/v1/payments/keysend", Some(json!({
-        "dest_pubkey": PEER_LN, "amount_msat":15_001, "max_routing_fee_msat":null
-    })), Some(&token)).await;
+    let (status, body) = fx
+        .call(
+            "POST",
+            "/api/v1/payments/keysend",
+            Some(json!({
+                "dest_pubkey": PEER_LN, "amount_msat":15_001, "max_routing_fee_msat":null
+            })),
+            Some(&token),
+        )
+        .await;
     assert_budget_exceeded(status, &body, "per_call");
     assert_eq!(fx.used(), 20_000);
 }
@@ -437,12 +538,21 @@ async fn payment_keeps_its_five_sat_fee_floor_and_owner_limit() {
 #[tokio::test]
 async fn file_uses_remaining_message_fee_budget() {
     let fx = fixture().await;
-    let token = fx.grant(None, GrantTerms::new(100_000).per_call(3_000)).await;
+    let token = fx
+        .grant(None, GrantTerms::new(100_000).per_call(3_000))
+        .await;
     let path = lifecycle::upload_probe_file(&fx).await;
     fx.wallet.fee.store(2_000, Ordering::SeqCst);
-    let (status, body) = fx.call("POST", &path, Some(json!({
-        "recipient":fx.peer.to_hex(), "max_routing_fee_msat":null
-    })), Some(&token)).await;
+    let (status, body) = fx
+        .call(
+            "POST",
+            &path,
+            Some(json!({
+                "recipient":fx.peer.to_hex(), "max_routing_fee_msat":null
+            })),
+            Some(&token),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["max_routing_fee_msat"], 2_000);
     assert_eq!(fx.used(), 3_000);
@@ -452,8 +562,14 @@ async fn file_uses_remaining_message_fee_budget() {
 async fn early_total_cap_refusal_reports_the_message_fee_allowance() {
     for file in [false, true] {
         let fx = fixture().await;
-        let token = fx.grant(None, GrantTerms::new(100_000).per_call(3_000)).await;
-        let path = if file { lifecycle::upload_probe_file(&fx).await } else { "/api/v1/messages/compose".into() };
+        let token = fx
+            .grant(None, GrantTerms::new(100_000).per_call(3_000))
+            .await;
+        let path = if file {
+            lifecycle::upload_probe_file(&fx).await
+        } else {
+            "/api/v1/messages/compose".into()
+        };
         let mut request = json!({"recipient":fx.peer.to_hex(), "max_total_msat":2_999, "max_routing_fee_msat":null});
         if !file {
             request["kind"] = json!(100);

@@ -17,9 +17,9 @@ and new grants; no storage migration or rewriting of signed terms is required.
 | Act | All-in cap |
 |---|---|
 | Message, file or porch page | `min(stored per_call_max_msat, 6_000)` msat; any tighter recipient per-act cap also applies |
-| Room post | Sum of the paid members' per-member all-in caps (N × the value when identical), reserved as one total |
+| Room post | Sum of the paid members' per-member all-in caps (N × the value when identical), reserved as one total; legacy grants with unlimited breakers retain a whole-call ceiling of `min(stored per_call_max_msat, 6_000)` msat |
 | First contact | Quoted admission + its maximum fee, shown separately from the capped message; the approved combined total still cannot exceed the 100,000-msat F1 safety ceiling |
-| Re-admission | Quoted admission + its maximum fee as its own act, at most 100,000 msat, alongside the capped message |
+| Re-admission | Quoted admission + its maximum fee as its own act, at most 100,000 msat and any tighter signed recipient per-act cap, alongside the capped message |
 | Payment | Stored owner-approved per-call limit, unchanged |
 
 The message fee budget is **cap minus price**, further tightened by the caller

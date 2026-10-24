@@ -470,7 +470,6 @@ impl GrantBudget {
         &self,
         per_recipient: &BTreeMap<&str, u64>,
         now: i64,
-        messaging: bool,
     ) -> Result<(), BudgetRefusal> {
         if !self.recipients_only {
             return Ok(());
@@ -491,7 +490,7 @@ impl GrantBudget {
                 .get(*recipient)
                 .copied()
                 .unwrap_or(0);
-            if messaging && *amount > per_act {
+            if *amount > per_act {
                 return Err(BudgetRefusal::PerCall { max_msat: per_act });
             }
         }
@@ -511,17 +510,22 @@ impl GrantBudget {
 
     /// Reserve under the stored limit, first checking live relation envelopes.
     pub fn reserve_at(&mut self, charges: &[Charge], now: i64) -> Result<(), BudgetRefusal> {
-        self.reserve_act_at(charges, now, self.per_call_max_msat, true)
+        self.reserve_act_at(charges, now, self.per_call_max_msat)
     }
 
     /// Transient act limits never rewrite stored owner terms or signed receipts.
-    pub(crate) fn reserve_act_at(&mut self, charges: &[Charge], now: i64, max_msat: u64, messaging: bool) -> Result<(), BudgetRefusal> {
+    pub(crate) fn reserve_act_at(
+        &mut self,
+        charges: &[Charge],
+        now: i64,
+        max_msat: u64,
+    ) -> Result<(), BudgetRefusal> {
         let mut per_recipient: BTreeMap<&str, u64> = BTreeMap::new();
         for charge in charges {
             let entry = per_recipient.entry(charge.recipient.as_str()).or_insert(0);
             *entry = entry.saturating_add(charge.amount_msat);
         }
-        self.check_envelopes(&per_recipient, now, messaging)?;
+        self.check_envelopes(&per_recipient, now)?;
         let now = self.breaker_state.last_at.map_or(now, |last| now.max(last));
         let count = charges.iter().filter(|c| c.amount_msat > 0).count() as u64;
         let total = charges
@@ -736,7 +740,11 @@ impl GrantBudget {
         self.reserve_with_limit(charges, self.per_call_max_msat)
     }
 
-    fn reserve_with_limit(&mut self, charges: &[Charge], max_msat: u64) -> Result<(), BudgetRefusal> {
+    fn reserve_with_limit(
+        &mut self,
+        charges: &[Charge],
+        max_msat: u64,
+    ) -> Result<(), BudgetRefusal> {
         let mut call_total: u64 = 0;
         let mut per_recipient: BTreeMap<&str, u64> = BTreeMap::new();
         for charge in charges {
@@ -749,23 +757,16 @@ impl GrantBudget {
                     recipient: charge.recipient.clone(),
                 });
             }
-            call_total =
-                call_total
-                    .checked_add(charge.amount_msat)
-                    .ok_or(BudgetRefusal::PerCall {
-                        max_msat,
-                    })?;
+            call_total = call_total
+                .checked_add(charge.amount_msat)
+                .ok_or(BudgetRefusal::PerCall { max_msat })?;
             let entry = per_recipient.entry(charge.recipient.as_str()).or_insert(0);
             *entry = entry
                 .checked_add(charge.amount_msat)
-                .ok_or(BudgetRefusal::PerCall {
-                    max_msat,
-                })?;
+                .ok_or(BudgetRefusal::PerCall { max_msat })?;
         }
         if call_total > max_msat {
-            return Err(BudgetRefusal::PerCall {
-                max_msat,
-            });
+            return Err(BudgetRefusal::PerCall { max_msat });
         }
         if call_total > self.remaining_msat() {
             return Err(BudgetRefusal::Total {
@@ -819,6 +820,25 @@ impl GrantBudget {
         }
         if *used == 0 {
             self.used_by_recipient.remove(recipient);
+        }
+    }
+}
+
+/// Call-wide reservations, retained after individual room members settle.
+/// Admission is included in the total, but has its own ceiling independently
+/// of the legacy whole-call message ceiling. These counters are transient;
+/// each underlying reservation remains in the durable grant ledger.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CallReservationTotals {
+    pub all_in_msat: u64,
+    pub message_all_in_msat: u64,
+}
+
+impl CallReservationTotals {
+    pub(crate) fn messages(amount_msat: u64) -> Self {
+        Self {
+            all_in_msat: amount_msat,
+            message_all_in_msat: amount_msat,
         }
     }
 }
@@ -1014,8 +1034,16 @@ pub struct GrantView {
 
 /// Render terms for a human before they approve them.
 pub fn describe_terms(terms: &GrantTerms) -> String {
+    let room = if terms.breakers == BreakerLimits::legacy() {
+        format!(
+            "at most {} sats all-in for the whole call (legacy unlimited breakers)",
+            sats(terms.per_call_max_msat.min(MESSAGING_PER_CALL_MAX_MSAT))
+        )
+    } else {
+        "N paid members x their message all-in cap, one total".into()
+    };
     let mut out = format!(
-        "  budget:        {} sats in total\n  message:       at most {} sats all-in\n  room post:     N paid members x their message all-in cap, one total\n  admission:     quoted price + maximum fee, separate from message (100-sat safety ceiling)\n  payment:       at most {} sats all-in\n  window:        {}",
+        "  budget:        {} sats in total\n  message:       at most {} sats all-in\n  room post:     {room}\n  admission:     quoted price + maximum fee, separate from message (100-sat safety ceiling)\n  payment:       at most {} sats all-in\n  window:        {}",
         sats(terms.budget_msat),
         sats(terms.per_call_max_msat.min(MESSAGING_PER_CALL_MAX_MSAT)),
         sats(terms.per_call_max_msat),
