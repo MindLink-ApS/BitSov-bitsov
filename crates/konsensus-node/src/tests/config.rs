@@ -81,6 +81,146 @@ fn remote_access_requires_loopback_api_but_allows_auto_endpoints() {
     config.api.listen_addr = "0.0.0.0:18080".parse().unwrap();
     let error = config.validate().unwrap_err().to_string();
     assert!(error.contains("must be loopback"), "{error}");
+
+    // The non-loopback opt-in does not waive the remote-access loopback rule.
+    config.api.allow_non_loopback_bind = true;
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("must be loopback"), "{error}");
+    assert!(
+        error.contains("plaintext HTTP"),
+        "opt-in must not replace the remote-access refusal: {error}"
+    );
+}
+
+fn api_bind_config(listen_addr: &str, opt_in: Option<bool>) -> NodeConfig {
+    let flag = match opt_in {
+        Some(true) => "allow_non_loopback_bind = true\n",
+        Some(false) => "allow_non_loopback_bind = false\n",
+        None => "",
+    };
+    let toml = format!(
+        r#"
+[identity]
+mnemonic_file = "/dev/null"
+
+[network]
+listen_addr = "0.0.0.0:9736"
+
+[lightning]
+backend = "mock"
+
+[chain]
+backend = "mock"
+
+[storage]
+backend = "sqlite"
+
+[api]
+listen_addr = "{listen_addr}"
+{flag}"#
+    );
+    toml::from_str(&toml).unwrap_or_else(|error| panic!("parse {listen_addr}: {error}"))
+}
+
+fn assert_api_bind_rejected(listen_addr: &str) {
+    for opt_in in [None, Some(false)] {
+        let config = api_bind_config(listen_addr, opt_in);
+        assert!(
+            !config.api.allow_non_loopback_bind,
+            "{listen_addr} opt_in={opt_in:?} must stay opted out"
+        );
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("must be loopback")
+                && error.contains("allow_non_loopback_bind = true")
+                && error.contains("[api]"),
+            "{listen_addr} opt_in={opt_in:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn validate_rejects_unspecified_ipv4_api_bind_without_opt_in() {
+    assert_api_bind_rejected("0.0.0.0:3141");
+}
+
+#[test]
+fn validate_rejects_lan_api_bind_without_opt_in() {
+    assert_api_bind_rejected("192.168.1.20:3141");
+}
+
+#[test]
+fn validate_rejects_unspecified_ipv6_api_bind_without_opt_in() {
+    assert_api_bind_rejected("[::]:3141");
+}
+
+#[test]
+fn validate_accepts_non_loopback_api_bind_with_opt_in() {
+    for listen_addr in ["0.0.0.0:3141", "192.168.1.20:3141", "[::]:3141"] {
+        let config = api_bind_config(listen_addr, Some(true));
+        assert!(config.api.allow_non_loopback_bind);
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("{listen_addr} with opt-in must validate: {error}"));
+    }
+}
+
+#[test]
+fn validate_accepts_default_loopback_api_bind() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    assert_eq!(
+        config.api.listen_addr,
+        "127.0.0.1:3141".parse().unwrap(),
+        "the owner API default stays loopback"
+    );
+    assert!(!config.api.allow_non_loopback_bind);
+    config
+        .validate()
+        .expect("default loopback API must validate without the opt-in");
+
+    // Remote access already requires loopback and must not need the new flag.
+    config.remote_access.listen_addr = Some("127.0.0.1:18443".parse().unwrap());
+    config
+        .validate()
+        .expect("remote access on a loopback API needs no extra flag");
+
+    let ipv6_loopback = api_bind_config("[::1]:3141", None);
+    assert!(!ipv6_loopback.api.allow_non_loopback_bind);
+    ipv6_loopback
+        .validate()
+        .expect("IPv6 loopback must validate without the opt-in");
+}
+
+#[test]
+fn init_output_validates_with_loopback_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let mnemonic_path = dir.path().join("mnemonic.txt");
+    std::fs::write(&mnemonic_path, "test-mnemonic").unwrap();
+
+    for tier in [NodeTier::Cloud, NodeTier::Light, NodeTier::Full] {
+        let config = NodeConfig::default_for_tier(tier, mnemonic_path.clone(), dir.path());
+        assert!(
+            config.api.listen_addr.ip().is_loopback(),
+            "{tier:?} init must keep the API on loopback"
+        );
+        assert!(!config.api.allow_non_loopback_bind);
+
+        let path = dir.path().join(format!("{tier:?}.toml"));
+        config.save(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("allow_non_loopback_bind = false"),
+            "{tier:?} init output must document the default opt-in: {raw}"
+        );
+        let loaded = NodeConfig::load(&path)
+            .unwrap_or_else(|error| panic!("{tier:?} init output must validate: {error}"));
+        assert!(loaded.api.listen_addr.ip().is_loopback());
+        assert!(!loaded.api.allow_non_loopback_bind);
+    }
 }
 
 #[test]
@@ -1536,9 +1676,11 @@ fn validate_same_port_different_specific_ips_ok() {
         Path::new("/tmp"),
     );
     config.peers.clear();
-    // Two distinct specific IPs on same port should not collide
+    // Two distinct specific IPs on same port should not collide. The LAN API
+    // address is legal only with the explicit non-loopback opt-in.
     config.network.listen_addr = "10.0.0.1:3141".parse().unwrap();
     config.api.listen_addr = "10.0.0.2:3141".parse().unwrap();
+    config.api.allow_non_loopback_bind = true;
     assert!(config.validate().is_ok());
 }
 
@@ -3669,7 +3811,8 @@ fn privacy_node_ids_still_deserialize_from_toml() {
     let id = "ab".repeat(32);
     let config: crate::config::PrivacyConfig = toml::from_str(&format!(
         "shareable_peers = [\"{id}\"]\nshare_peer_labels = [\"{id}\"]\n"
-    )).unwrap();
+    ))
+    .unwrap();
     assert_eq!(config.shareable_peers[0].to_hex(), id);
     assert_eq!(config.share_peer_labels[0].to_hex(), id);
 }

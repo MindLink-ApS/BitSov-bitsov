@@ -906,10 +906,9 @@ impl LightningConfig {
                 ("advertised_address", advertised_address),
                 ("listening_address", listening_address),
             ] {
-                if address
-                    .as_ref()
-                    .is_some_and(|address| address.len() > konsensus_message::wire::MAX_LN_ADDR_BYTES)
-                {
+                if address.as_ref().is_some_and(|address| {
+                    address.len() > konsensus_message::wire::MAX_LN_ADDR_BYTES
+                }) {
                     anyhow::bail!(
                         "Lightning address lightning.{field} exceeds the wire limit of {} UTF-8 bytes",
                         konsensus_message::wire::MAX_LN_ADDR_BYTES
@@ -1463,8 +1462,22 @@ impl Default for BackupConfig {
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
     /// Address to listen on for API connections.
+    ///
+    /// Defaults to loopback `127.0.0.1:3141`. `0.0.0.0`, `::`, and any other
+    /// non-loopback address fail validation unless
+    /// [`Self::allow_non_loopback_bind`] is set.
     #[serde(default = "default_api_addr")]
     pub listen_addr: SocketAddr,
+
+    /// Opt in to binding the owner API outside loopback.
+    ///
+    /// Default `false`. Leave this unset so the owner API stays on `127.0.0.1`
+    /// or `::1`. Set `allow_non_loopback_bind = true` only to accept `0.0.0.0`,
+    /// `::`, or a LAN address in `listen_addr`. This does not relax remote
+    /// access: with `[remote_access]` enabled, `listen_addr` must still be
+    /// loopback.
+    #[serde(default)]
+    pub allow_non_loopback_bind: bool,
 
     /// JWT secret for API authentication. If not set, a random secret
     /// is generated at startup (tokens won't survive restarts).
@@ -1495,6 +1508,7 @@ impl std::fmt::Debug for ApiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiConfig")
             .field("listen_addr", &self.listen_addr)
+            .field("allow_non_loopback_bind", &self.allow_non_loopback_bind)
             .field("jwt_secret", &"<redacted>")
             .field("rate_limit_rps", &self.rate_limit_rps)
             .field("cors_enabled", &self.cors_enabled)
@@ -1508,6 +1522,7 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             listen_addr: default_api_addr(),
+            allow_non_loopback_bind: false,
             jwt_secret: None,
             rate_limit_rps: default_rate_limit(),
             cors_enabled: true,
@@ -1705,11 +1720,16 @@ impl NodeConfig {
         Ok(())
     }
 
-    pub(crate) fn starter_settings(&self) -> konsensus_api::handlers::starter_channel::StarterSettings {
+    pub(crate) fn starter_settings(
+        &self,
+    ) -> konsensus_api::handlers::starter_channel::StarterSettings {
         let mut settings = konsensus_api::handlers::starter_channel::StarterSettings {
             config: self.starter.clone(),
             network: self.lightning.bitcoin_network().unwrap_or_default(),
-            hub_whitelisted: self.peers.iter().any(|p| p.node_id == self.starter.hub_node_id),
+            hub_whitelisted: self
+                .peers
+                .iter()
+                .any(|p| p.node_id == self.starter.hub_node_id),
             ..Default::default()
         };
         if let LightningConfig::Ldk { liquidity, .. } = &self.lightning {
@@ -1725,9 +1745,32 @@ impl NodeConfig {
     pub(crate) fn validate_starter_hub(&self, lockable: bool) -> anyhow::Result<()> {
         let network = self.lightning.bitcoin_network();
         self.starter
-            .validate(network.as_deref(), matches!(self.lightning, LightningConfig::Ldk { .. }))
+            .validate(
+                network.as_deref(),
+                matches!(self.lightning, LightningConfig::Ldk { .. }),
+            )
             .map_err(anyhow::Error::msg)?;
-        self.starter_hub.validate(network.as_deref(), self.lightning.channel_capacity_limits().map(|l| l.max_channel_capacity_sats), lockable)
+        self.starter_hub.validate(
+            network.as_deref(),
+            self.lightning
+                .channel_capacity_limits()
+                .map(|l| l.max_channel_capacity_sats),
+            lockable,
+        )
+    }
+
+    /// Refuse `0.0.0.0`, `::`, and every other non-loopback owner API bind
+    /// unless `[api].allow_non_loopback_bind` is explicitly true.
+    fn reject_non_loopback_api_bind(&self) -> anyhow::Result<()> {
+        if self.api.listen_addr.ip().is_loopback() || self.api.allow_non_loopback_bind {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "[api].listen_addr ({}) must be loopback (127.0.0.1 or ::1). \
+             Binding 0.0.0.0, ::, or a LAN address exposes the owner API. \
+             To opt in, set allow_non_loopback_bind = true in the [api] section",
+            self.api.listen_addr
+        );
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
@@ -1807,6 +1850,12 @@ impl NodeConfig {
                  remote access closed"
             );
         }
+
+        // Owner HTTP stays on loopback unless the operator opts in. Remote
+        // access already refused a non-loopback API above, and that refusal
+        // stands even when the opt-in is set: plaintext HTTP must not be the
+        // remote listener.
+        self.reject_non_loopback_api_bind()?;
 
         // Check P2P and Lightning (LDK) ports don't collide.
         //

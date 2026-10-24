@@ -19,7 +19,9 @@ Remote access is closed by default:
 Setting `listen_addr` enables the public TCP listener. `advertised_endpoint` is
 optional and takes priority over discovered LAN and Tailscale endpoints.
 Wildcard IPv6 listeners are explicitly dual-stack. When enabled,
-`[api].listen_addr` must be loopback.
+`[api].listen_addr` must be loopback. `[api].allow_non_loopback_bind` (default
+false) can permit a non-loopback owner API only while remote access is closed;
+it does not waive this rule.
 Startup refuses TCP port collisions with the API, BitSov P2P, or embedded
 Lightning listener. The implementation also creates an ephemeral internal
 Axum listener on `127.0.0.1:0`; plaintext HTTP is never bound non-loopback.
