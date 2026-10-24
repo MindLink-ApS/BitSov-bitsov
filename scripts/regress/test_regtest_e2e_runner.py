@@ -219,5 +219,128 @@ sys.exit(main_exit or (int(os.environ['GHOST_EXIT']) if '--skip' not in sys.argv
                                  not enabled)
 
 
+# Stand in for Cargo under the nightly 1:1 call lane (#411). Prints what
+# libtest prints for `--ignored --nocapture` runs, minus whatever CALLS_MODE
+# withholds, so the gate's log checks are exercised without LDK or bitcoind.
+FAKE_CALLS_CARGO = """#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['PROBE'], 'a') as probe:
+    probe.write(json.dumps(sys.argv[1:]) + '\\n')
+mode = os.environ['CALLS_MODE']
+steps = [
+    'STEP PASS chain + 3 real LDK nodes started: 4.0s (elapsed 4.0s)',
+    "STEP PASS call offer paid at call_msat and forwarded to B's WS: 1.0s (elapsed 30.0s)",
+    'STEP PASS answer, ICE and hangup paid and delivered both ways: 1.1s (elapsed 31.1s)',
+    'STEP PASS ICE after hangup refused before paying: 0.1s (elapsed 31.2s)',
+    'STEP PASS msat reconciliation: channels and budgets: 0.2s (elapsed 31.4s)',
+    'REGTEST-CALLS PASS; offer, answer, ICE and hangup paid and delivered; complete in 40.1s',
+]
+if mode == 'filtered':
+    print('running 0 tests')
+    print()
+    print('test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 212 filtered out; finished in 0.00s')
+    sys.exit(0)
+print('running 1 test')
+print('test regtest_e2e::real_ldk_regtest_calls ... ', end='')
+if mode == 'fail':
+    print(steps[0])
+    print('thread panicked at offer: assertion failed')
+    print('FAILED')
+    print()
+    print('test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 211 filtered out; finished in 9.00s')
+    sys.exit(101)
+withheld = {'no-hangup': 'STEP PASS answer, ICE and hangup', 'no-verdict': 'REGTEST-CALLS PASS;'}.get(mode)
+for line in steps:
+    if withheld is None or withheld not in line:
+        print(line)
+print('ok')
+print()
+print('test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 211 filtered out; finished in 40.10s')
+sys.exit(0)
+"""
+
+
+class CallsLaneGate(unittest.TestCase):
+    """scripts/regress/calls_e2e.sh fails unless the calls regtest ran to the end."""
+
+    def run_lane(self, mode, fixtures=True, extra_env=None):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            cargo = directory / "cargo"
+            cargo.write_text(FAKE_CALLS_CARGO)
+            cargo.chmod(0o755)
+            probe = directory / "args"
+            log = directory / "calls.log"
+            fixture = shutil.which("true") if fixtures else str(directory / "missing")
+            env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
+                       BITCOIND_EXE=fixture, ELECTRS_EXE=fixture, PROBE=str(probe),
+                       CALLS_MODE=mode, REGTEST_CALLS_LOG=str(log))
+            env.pop("REGTEST_TEST", None)
+            env.update(extra_env or {})
+            result = subprocess.run(["bash", str(RUNNER.with_name("calls_e2e.sh"))],
+                                    env=env, capture_output=True, text=True, timeout=15, cwd=temporary)
+            calls = [json.loads(line) for line in probe.read_text().splitlines()] if probe.exists() else []
+            return result, calls, log.read_text() if log.exists() else ""
+
+    def test_complete_run_passes_and_selects_only_the_calls_test(self):
+        result, calls, log = self.run_lane("full")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(calls), 1, "one supervised Cargo invocation")
+        args = calls[0]
+        self.assertIn("regtest_e2e::real_ldk_regtest_calls", args)
+        self.assertIn("--ignored", args)
+        self.assertIn("regtest-e2e", args)
+        self.assertNotIn("--no-run", args)
+        self.assertNotIn("regtest_e2e::", args, "the lane runs one proof, not the whole suite")
+        self.assertIn("REGTEST-CALLS PASS;", log, "the log is retained for evidence")
+        self.assertIn("REAL-LDK CALLS LANE PASS", result.stdout)
+
+    def test_zero_tests_is_a_failure_even_though_cargo_exits_zero(self):
+        result, calls, _ = self.run_lane("filtered")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("did not run", result.stdout)
+        self.assertNotIn("REAL-LDK CALLS LANE PASS", result.stdout)
+
+    def test_missing_phase_or_verdict_fails(self):
+        for mode, marker in (("no-hangup", "STEP PASS answer, ICE and hangup"), ("no-verdict", "REGTEST-CALLS PASS;")):
+            with self.subTest(mode=mode):
+                result, calls, _ = self.run_lane(mode)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("incomplete; missing: " + marker, result.stdout)
+
+    def test_cargo_failure_code_propagates(self):
+        result, calls, _ = self.run_lane("fail")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
+        self.assertNotIn("REAL-LDK CALLS LANE PASS", result.stdout)
+
+    def test_gate_markers_are_printed_by_the_rust_test(self):
+        # The gate greps for prose the Rust test prints; a renamed step must
+        # fail here, offline, rather than silently turn the nightly red.
+        import re
+        gate = RUNNER.with_name("calls_e2e.sh").read_text()
+        block = re.search(r"required=\((.*?)\)", gate, re.S).group(1)
+        markers = [m[0] or m[1] for m in re.findall(r'"((?:[^"\\]|\\.)*)"|\'([^\']*)\'', block)]
+        markers = [m for m in markers if m]
+        self.assertEqual(len(markers), 4, markers)
+        source = (RUNNER.parents[2] / "crates/konsensus-node/src/tests/regtest_e2e.rs").read_text()
+        calls = source[source.index("async fn real_ldk_regtest_calls()"):source.index("async fn real_ldk_regtest_meeting()")]
+        for marker in markers:
+            text = marker.removeprefix("STEP PASS ")
+            with self.subTest(marker=marker):
+                self.assertTrue(text in calls, f"gate marker not printed by real_ldk_regtest_calls: {marker}")
+
+    def test_missing_fixtures_fail_instead_of_skipping(self):
+        # REGTEST_ALLOW_MISSING=1 would let the shared runner compile and SKIP (77);
+        # the calls lane ignores it: no fixtures means no Cargo run and exit 1.
+        result, calls, _ = self.run_lane("full", fixtures=False, extra_env={"REGTEST_ALLOW_MISSING": "1"})
+        self.assertEqual(calls, [], "Cargo must not run without fixtures")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("SKIP", result.stdout)
+        self.assertNotIn("REAL-LDK CALLS LANE PASS", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

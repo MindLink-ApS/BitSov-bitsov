@@ -44,6 +44,10 @@ embedded in the workflow before extraction/use, caches Cargo dependencies, then
 runs the offline runner. The hash provenance is the pinned `corepc-node 0.10.1`
 and `electrsd 0.36.1` checksum manifests. Exit 77 is reported as **SKIPPED** in
 the job summary and fails the job; exit zero also requires the runtime PASS marker.
+A second job in the same workflow, `calls-regtest`, runs the real-LDK 1:1 call
+proof `regtest_e2e::real_ldk_regtest_calls` through
+`scripts/regress/calls_e2e.sh` (#411): it fails unless exactly one test passed
+and the log carries the offer, answer/ICE/hangup and `REGTEST-CALLS PASS;` markers.
 
 PR #200 is merged. The ghost/unfunded-channel scenario still requires explicit
 selection through the existing `REGTEST_GHOST_AFTER_PR200=1` runner gate (or the

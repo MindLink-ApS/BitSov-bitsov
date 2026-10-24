@@ -936,7 +936,12 @@ async fn real_ldk_regtest_calls() {
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
     c.stop().unwrap();
-    println!("REGTEST-CALLS complete in {:?}", steps.started.elapsed());
+    // Stable verdict line for the nightly lane (#411): printed only after
+    // every step above (offer, answer, ICE, hangup, reconnect) has passed.
+    println!(
+        "REGTEST-CALLS PASS; offer, answer, ICE and hangup paid and delivered; complete in {:?}",
+        steps.started.elapsed()
+    );
 }
 
 /// Mesh meeting of three over real LDK on regtest (small group meetings,
