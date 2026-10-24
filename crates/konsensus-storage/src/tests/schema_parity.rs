@@ -56,6 +56,29 @@ async fn fresh_sqlite_catalog_matches_postgres_shape() {
 }
 
 #[tokio::test]
+async fn main_032_sqlite_plus_033_matches_fresh_install() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("fixtures/main_032/sqlite.sql"))
+        .execute(&pool)
+        .await
+        .expect("apply frozen main migrations through 032");
+    sqlx::raw_sql(include_str!(
+        "../../migrations/033_calendar_and_schema_parity.sql"
+    ))
+        .execute(&pool)
+        .await
+        .expect("upgrade main with only migration 033");
+    let upgraded = schema_catalog::load_sqlite(&pool).await;
+    schema_catalog::assert_parity(&upgraded);
+    let fresh = fresh_sqlite().await;
+    assert_eq!(upgraded, schema_catalog::load_sqlite(fresh.pool()).await);
+}
+
+#[tokio::test]
 async fn fresh_sqlite_fiat_and_calendar_round_trip_without_hand_built_tables() {
     let db = fresh_sqlite().await;
 

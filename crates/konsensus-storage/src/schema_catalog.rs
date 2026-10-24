@@ -30,7 +30,7 @@ struct TableCatalog {
     checks: BTreeSet<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ParityCatalog {
     tables: BTreeMap<String, TableCatalog>,
     fits_u32: BTreeMap<String, bool>,

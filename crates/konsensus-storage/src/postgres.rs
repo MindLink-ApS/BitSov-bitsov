@@ -261,21 +261,6 @@ impl PostgresStorage {
                 "#,
             ),
             (
-                7,
-                "fiat rate snapshots",
-                include_str!("../migrations/postgres/007_fiat_rate_snapshots.sql"),
-            ),
-            (
-                8,
-                "recovery",
-                include_str!("../migrations/postgres/008_recovery.sql"),
-            ),
-            (
-                9,
-                "contacts",
-                include_str!("../migrations/postgres/009_contacts.sql"),
-            ),
-            (
                 10,
                 "invites_issued",
                 r#"
@@ -3815,12 +3800,17 @@ mod schema_parity_tests {
     use crate::schema_catalog;
 
     #[test]
-    fn pg_migration_versions_are_contiguous_through_schema_parity() {
+    fn pg_schema_parity_does_not_backfill_old_migration_numbers() {
         let versions: Vec<i32> = PostgresStorage::pg_migrations()
             .iter()
             .map(|(version, _, _)| *version)
             .collect();
-        assert_eq!(versions, (1..=33).collect::<Vec<_>>());
+        assert_eq!(
+            versions,
+            (1..=33)
+                .filter(|v| !matches!(v, 7..=9))
+                .collect::<Vec<_>>()
+        );
         let sql = include_str!("../migrations/postgres/033_calendar_and_schema_parity.sql");
         assert!(
             !sql.starts_with("-- no-transaction"),
@@ -3851,6 +3841,53 @@ mod schema_parity_tests {
             .execute(admin)
             .await
             .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn main_032_postgres_plus_033_matches_fresh_install() {
+        let (admin, url) = admin_pool().await;
+        let upgrade_name = disposable_name("main032");
+        let fresh_name = disposable_name("fresh033");
+        let upgrade_url = create_database(&admin, &url, &upgrade_name).await;
+        let fresh_url = create_database(&admin, &url, &fresh_name).await;
+        let db = PostgresStorage {
+            pool: PgPool::connect(&upgrade_url).await.unwrap(),
+        };
+        sqlx::raw_sql(include_str!("tests/fixtures/main_032/postgres.sql"))
+            .execute(db.pool())
+            .await
+            .expect("apply frozen main migrations through 032");
+        let migration = include_str!("../migrations/postgres/033_calendar_and_schema_parity.sql");
+        sqlx::raw_sql(migration)
+            .execute(db.pool())
+            .await
+            .expect("upgrade main with only migration 033");
+        let upgraded = schema_catalog::load_postgres(db.pool()).await;
+        schema_catalog::assert_parity(&upgraded);
+        let fresh = PostgresStorage::connect(&fresh_url).await.unwrap();
+        assert_eq!(upgraded, schema_catalog::load_postgres(fresh.pool()).await);
+
+        // Even nodes that recorded 007–009 must converge using 033 alone.
+        sqlx::raw_sql(
+            "INSERT INTO _konsensus_migrations (version, name) VALUES
+             (7, 'fiat rate snapshots'), (8, 'recovery'), (9, 'contacts')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.run_migrations().await.unwrap();
+        sqlx::raw_sql(migration)
+            .execute(db.pool())
+            .await
+            .expect("migration 033 must be idempotent");
+        assert_eq!(upgraded, schema_catalog::load_postgres(db.pool()).await);
+        assert_secondary_unique_counts(db.pool()).await;
+        db.pool.close().await;
+        fresh.pool.close().await;
+        drop_database(&admin, &upgrade_name).await;
+        drop_database(&admin, &fresh_name).await;
+        admin.close().await;
     }
 
     /// One secondary unique index per column set. A second index on the same
@@ -4110,26 +4147,19 @@ mod schema_parity_tests {
             let db = PostgresStorage {
                 pool: sqlx::PgPool::connect(&db_url).await.unwrap(),
             };
+            sqlx::raw_sql(include_str!("tests/fixtures/main_032/postgres.sql"))
+                .execute(db.pool())
+                .await
+                .expect("apply frozen main migrations through 032");
+            // Simulate nodes that already marked these versions applied. Only
+            // the forward migration may repair the hand-built tables below.
             sqlx::raw_sql(
-                "CREATE TABLE _konsensus_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+                "INSERT INTO _konsensus_migrations (version, name) VALUES
+                 (7, 'fiat rate snapshots'), (8, 'recovery'), (9, 'contacts')",
             )
             .execute(db.pool())
             .await
             .unwrap();
-            for (version, migration_name, sql) in PostgresStorage::pg_migrations() {
-                if matches!(version, 7 | 8 | 9 | 33) {
-                    continue;
-                }
-                sqlx::raw_sql(sql).execute(db.pool()).await.unwrap_or_else(|e| {
-                    panic!("apply old version {version} ({migration_name}): {e}")
-                });
-                sqlx::query("INSERT INTO _konsensus_migrations (version, name) VALUES ($1, $2)")
-                    .bind(version)
-                    .bind(migration_name)
-                    .execute(db.pool())
-                    .await
-                    .unwrap();
-            }
 
             let peer = NodeId::from_bytes([9u8; 32]);
             sqlx::query("INSERT INTO peers (node_id, metadata_json) VALUES ($1, '{}')")
@@ -4213,7 +4243,7 @@ mod schema_parity_tests {
             .unwrap();
 
             // A hand-built boolean contact book and recovery tables that already
-            // have their unique keys. Version 8/9 must keep the rows and must
+            // have their unique keys. Version 33 must keep the rows and must
             // not add a second unique index.
             sqlx::raw_sql(
                 "CREATE TABLE contacts (
