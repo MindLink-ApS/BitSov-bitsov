@@ -86,7 +86,7 @@ impl Job {
         let mut targets = self.scan_targets(scripts);
         loop {
             let outputs = chain.scan(&targets).await?;
-            if outputs.is_empty() && matches!(targets, Cow::Owned(_)) {
+            if outputs.is_empty() && matches!(&targets, Cow::Owned(_)) {
                 // The focused outputs are gone (spent, replaced or reorged): decide
                 // on a full scan in this same pass, never on a stale focus.
                 targets = Cow::Borrowed(scripts);
@@ -99,7 +99,7 @@ impl Job {
             if outputs.is_empty() {
                 break;
             }
-            if matches!(targets, Cow::Owned(_)) {
+            if matches!(&targets, Cow::Owned(_)) {
                 // Other closes may have confirmed while we polled this focus.
                 // Combine them before previewing, even if the focus alone can
                 // pay: a small leftover might never fund its own sweep.

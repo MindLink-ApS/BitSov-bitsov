@@ -505,6 +505,97 @@ async fn narrowed_pass_that_finds_nothing_falls_back_to_a_full_scan() {
 }
 
 #[tokio::test]
+async fn vanished_multi_script_focus_can_refocus_and_preview_a_later_close() {
+    let (dir, keys, chain, plan) = fixture();
+    let mut job = Job::load_or_begin(dir.path(), plan.clone(), vec![]).unwrap();
+    let mut original_close = chain.transactions.lock().unwrap()[0].transaction.clone();
+    original_close.output.push(TxOut {
+        value: Amount::from_sat(40_000),
+        script_pubkey: keys.scripts()[2].script_pubkey.clone(),
+    });
+    chain.transactions.lock().unwrap()[0] = ChainTransaction {
+        transaction: original_close.clone(),
+        confirmations: 0,
+    };
+    *chain.outputs.lock().unwrap() = original_close
+        .output
+        .iter()
+        .enumerate()
+        .map(|(vout, txout)| FoundOutput {
+            outpoint: OutPoint {
+                txid: original_close.compute_txid(),
+                vout: vout as u32,
+            },
+            txout: txout.clone(),
+            confirmations: 0,
+        })
+        .collect();
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+
+    // Both focused scripts disappear. The same pass must discover a new close
+    // elsewhere, then retain that new focus while it remains unconfirmed.
+    let mut later_close = original_close;
+    later_close.output = vec![TxOut {
+        value: Amount::from_sat(50_000),
+        script_pubkey: keys.scripts()[0].script_pubkey.clone(),
+    }];
+    let mut later_output = FoundOutput {
+        outpoint: OutPoint {
+            txid: later_close.compute_txid(),
+            vout: 0,
+        },
+        txout: later_close.output[0].clone(),
+        confirmations: 0,
+    };
+    chain.transactions.lock().unwrap().push(ChainTransaction {
+        transaction: later_close,
+        confirmations: 0,
+    });
+    *chain.outputs.lock().unwrap() = vec![later_output.clone()];
+    for _ in 0..2 {
+        assert!(matches!(
+            job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+            Progress::WaitingForHub
+        ));
+    }
+    assert_eq!(
+        chain.scanned.lock().unwrap().as_slice(),
+        &[2000, 2, 2000, 1]
+    );
+
+    // Once confirmed, the owned focus must still trigger the second full-scan
+    // check and preserve the output used to build the preview.
+    later_output.confirmations = 1;
+    *chain.outputs.lock().unwrap() = vec![later_output.clone()];
+    chain
+        .transactions
+        .lock()
+        .unwrap()
+        .last_mut()
+        .unwrap()
+        .confirmations = 1;
+    let Progress::SweepPreview { sweep, inputs } =
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap()
+    else {
+        panic!("later close preview");
+    };
+    assert_eq!(inputs, vec![later_output.clone()]);
+    assert_eq!(
+        sweep.tx().unwrap().input[0].previous_output,
+        later_output.outpoint
+    );
+    assert_eq!(sweep.validate(&plan).unwrap(), 50_000 - sweep.fee_sats);
+    assert_eq!(
+        chain.scanned.lock().unwrap().as_slice(),
+        &[2000, 2, 2000, 1, 1, 2000]
+    );
+    assert!(chain.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn viable_focused_sweep_includes_a_later_dust_close_before_preview() {
     let (dir, keys, chain, plan) = fixture();
     let mut job = Job::load_or_begin(dir.path(), plan.clone(), vec![]).unwrap();
