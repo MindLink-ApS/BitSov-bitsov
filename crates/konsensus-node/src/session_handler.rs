@@ -1012,6 +1012,13 @@ async fn handle_ratchet_init(
     _storage: &Arc<dyn konsensus_storage::Storage>,
     transport: &Arc<NoiseTransport>,
 ) {
+    // The opener only initializes an acceptor's sending chain. A sender may
+    // retry a frame that reached us before its transport reported failure.
+    // Once ready, replaying that consumed ciphertext must not delete the session.
+    if session_manager.can_send(peer_id).await {
+        debug!(peer = %peer_id, "ratchet init already applied");
+        return;
+    }
     match konsensus_crypto::ratchet_message_from_bytes(payload) {
         Ok(ratchet_msg) => {
             match session_manager.decrypt(peer_id, &ratchet_msg).await {

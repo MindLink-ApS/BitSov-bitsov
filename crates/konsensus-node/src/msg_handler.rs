@@ -938,10 +938,10 @@ async fn decrypt_incoming(
     trust_discount: f64,
     drop_session_on_auth_failure: bool,
 ) -> IncomingPlaintext {
-    // The receive key has already been consumed when reply encryption fails.
     // Rebuild read-only web replies from the authenticated, encrypted-at-rest
-    // request cache, including after a restart. Completed requests are ACKed
-    // above without rebuilding a response or advancing the sending ratchet.
+    // request cache, including after a restart. The cache is written before the
+    // receive ratchet, so recovery must also finish that commit if it failed.
+    // Completed requests are ACKed above without rebuilding a response.
     let cached = if is_web_request(envelope) && !drop_session_on_auth_failure {
         match storage.get_message_plaintext(&envelope.id).await {
             Ok(cached) => cached,
@@ -954,7 +954,7 @@ async fn decrypt_incoming(
         None
     };
     let bytes = if let Some(cached) = cached {
-        match plaintext_cipher.decrypt(&cached) {
+        let request = match plaintext_cipher.decrypt(&cached) {
             Ok(bytes) => match bytes.strip_prefix(pending_web_reply_prefix(envelope).as_slice()) {
                 Some(request) => request.to_vec(),
                 None => return IncomingPlaintext::Unavailable,
@@ -963,7 +963,24 @@ async fn decrypt_incoming(
                 warn!(error = %e, "failed to decrypt cached web request");
                 return IncomingPlaintext::ReplyPending;
             }
+        };
+        let ratchet_msg = match konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext) {
+            Ok(message) => message,
+            Err(_) => return IncomingPlaintext::ReplyPending,
+        };
+        match session_mgr.decrypt(sender, &ratchet_msg).await {
+            Ok(_) => {} // Cache survived a failed receive save; it is committed now.
+            Err(konsensus_crypto::SessionError::Ratchet(_)) => {
+                // Already consumed. The envelope-bound authenticated cache is
+                // sufficient to resume a reply without accepting a replay as new work.
+            }
+            Err(konsensus_crypto::SessionError::Persist(error)) => {
+                warn!(sender = %sender, error = %error, "cached web request receive state was not saved");
+                return IncomingPlaintext::Unsaved;
+            }
+            Err(_) => return IncomingPlaintext::ReplyPending,
         }
+        request
     } else {
         if !session_mgr.has_session(sender).await {
             debug!(sender = %sender, "no E2EE session, cannot decrypt");
@@ -978,7 +995,33 @@ async fn decrypt_incoming(
             }
         };
 
-        let bytes = match session_mgr.decrypt(sender, &ratchet_msg).await {
+        let bytes = match session_mgr
+            .decrypt_with_precommit(sender, &ratchet_msg, |bytes| async move {
+                if is_web_request(envelope) {
+                    // A paid request must remain recoverable if either write fails.
+                    // Never consume its receive key before the pending cache is durable.
+                    let pending = [
+                        pending_web_reply_prefix(envelope).as_slice(),
+                        bytes.as_slice(),
+                    ]
+                    .concat();
+                    cache_incoming_plaintext(
+                        envelope,
+                        &pending,
+                        plaintext_cipher,
+                        storage.as_ref(),
+                    )
+                    .await
+                    .map_err(|()| {
+                        konsensus_crypto::SessionError::Persist(
+                            "pending web request cache was not saved".into(),
+                        )
+                    })?;
+                }
+                Ok(())
+            })
+            .await
+        {
             Ok(bytes) => bytes,
             Err(konsensus_crypto::SessionError::Persist(error)) => {
                 // Authentication ran on a copy that was not saved. Leave the session
@@ -1017,22 +1060,9 @@ async fn decrypt_incoming(
             }
         };
 
-        // Mark a web request unfinished before building its reply. A saved
-        // receive ratchet alone must never turn a reply failure into completion.
-        let cache_bytes = if is_web_request(envelope) {
-            [
-                pending_web_reply_prefix(envelope).as_slice(),
-                bytes.as_slice(),
-            ]
-            .concat()
-        } else {
-            bytes.clone()
-        };
-        let cached =
-            cache_incoming_plaintext(envelope, &cache_bytes, plaintext_cipher, storage.as_ref())
+        if !is_web_request(envelope) {
+            let _ = cache_incoming_plaintext(envelope, &bytes, plaintext_cipher, storage.as_ref())
                 .await;
-        if is_web_request(envelope) && cached.is_err() {
-            return IncomingPlaintext::ReplyPending;
         }
 
         bytes

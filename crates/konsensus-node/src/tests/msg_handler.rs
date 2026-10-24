@@ -3643,7 +3643,27 @@ async fn web_reply_save_failure_retries_cached_request() {
         konsensus_core::kind::KIND_PAGE_REQUEST,
         konsensus_core::kind::KIND_WEB_MANIFEST,
     ] {
-        recovered_message_case(kind, true).await;
+        recovered_message_case(kind, RecoveryFailure::ReplySave).await;
+    }
+}
+
+#[tokio::test]
+async fn web_plaintext_cache_failure_leaves_receive_key_retryable() {
+    for kind in [
+        konsensus_core::kind::KIND_PAGE_REQUEST,
+        konsensus_core::kind::KIND_WEB_MANIFEST,
+    ] {
+        recovered_message_case(kind, RecoveryFailure::PlaintextCache).await;
+    }
+}
+
+#[tokio::test]
+async fn web_receive_save_failure_retries_cached_request_after_restart() {
+    for kind in [
+        konsensus_core::kind::KIND_PAGE_REQUEST,
+        konsensus_core::kind::KIND_WEB_MANIFEST,
+    ] {
+        recovered_message_case(kind, RecoveryFailure::ReceiveSave).await;
     }
 }
 
@@ -3653,15 +3673,26 @@ async fn recovered_non_chat_without_plaintext_is_rejected() {
         konsensus_core::kind::KIND_FILE_REF,
         konsensus_core::kind::KIND_CALENDAR_EVENT,
     ] {
-        recovered_message_case(kind, false).await;
+        recovered_message_case(kind, RecoveryFailure::ReceiveSave).await;
     }
 }
 
-async fn recovered_message_case(kind: u16, web_reply: bool) {
+#[derive(Clone, Copy)]
+enum RecoveryFailure {
+    ReceiveSave,
+    ReplySave,
+    PlaintextCache,
+}
+
+async fn recovered_message_case(kind: u16, failure: RecoveryFailure) {
     use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
     use std::sync::atomic::Ordering;
     use std::time::Duration;
     let dir = tempfile::tempdir().unwrap();
+    let web_reply = matches!(
+        kind,
+        konsensus_core::kind::KIND_PAGE_REQUEST | konsensus_core::kind::KIND_WEB_MANIFEST
+    );
     let alice = alice_identity();
     let bob = bob_identity();
     let transport = |id| {
@@ -3690,7 +3721,7 @@ async fn recovered_message_case(kind: u16, web_reply: bool) {
     let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
     let sessions_a = SessionManager::new(alice.clone());
     let session_store = FlakySessionStore::new();
-    let sessions_b = Arc::new(SessionManager::with_store(
+    let mut sessions_b = Arc::new(SessionManager::with_store(
         bob.clone(),
         session_store.clone(),
     ));
@@ -3701,7 +3732,7 @@ async fn recovered_message_case(kind: u16, web_reply: bool) {
     let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
         konsensus_pricing::StaticPricingEngine::new(Default::default()),
     );
-    let start_handler = |shutdown_rx| {
+    let start_handler = |sessions_b: Arc<SessionManager>, shutdown_rx| {
         tokio::spawn(run(MsgHandlerDeps {
             transport: target.clone(),
             transport_ack: target.clone(),
@@ -3737,7 +3768,7 @@ async fn recovered_message_case(kind: u16, web_reply: bool) {
         }))
     };
 
-    let mut worker = start_handler(shutdown_rx);
+    let mut worker = start_handler(sessions_b.clone(), shutdown_rx);
 
     let body = br#"{"request_id":"retry-page","path":"/missing.md","method":"GET"}"#;
     let hash = wallet.inject_inbound_keysend(10_000, None).await;
@@ -3762,19 +3793,31 @@ async fn recovered_message_case(kind: u16, web_reply: bool) {
     )
     .build();
     env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
-    // Web requests save the receive step, then fail while saving the reply.
-    // Other messages fail the receive save and lose the session before retry.
-    session_store
-        .saves_before_failure
-        .store(usize::from(web_reply), Ordering::SeqCst);
+    let before_receive = session_store.blob(alice.node_id()).await;
+    if matches!(failure, RecoveryFailure::PlaintextCache) {
+        sqlx::raw_sql("CREATE TRIGGER fail_plaintext_cache BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(FAIL, 'injected plaintext cache failure'); END")
+            .execute(db.pool()).await.unwrap();
+    } else {
+        session_store.saves_before_failure.store(
+            usize::from(matches!(failure, RecoveryFailure::ReplySave)),
+            Ordering::SeqCst,
+        );
+    }
     source.send(bob.node_id(), &env).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while session_store.failed_saves.load(Ordering::SeqCst) == 0 {
+        while if matches!(failure, RecoveryFailure::PlaintextCache) {
+            db.get_message(&env.id).await.unwrap().is_none()
+        } else {
+            session_store.failed_saves.load(Ordering::SeqCst) == 0
+        } {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
+    // Finish the active receive before inspecting state, even if the cache write failed.
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
     let terminal = |source: Arc<NoiseTransport>| async move {
         loop {
             match source.recv_control().await.unwrap() {
@@ -3788,28 +3831,40 @@ async fn recovered_message_case(kind: u16, web_reply: bool) {
         tokio::time::timeout(Duration::from_millis(150), terminal(source.clone()))
             .await
             .is_err(),
-        "failed session save must not complete the request"
+        "failed recovery-data save must not complete the request"
     );
     assert!(ws_rx.try_recv().is_err());
     assert_eq!(
         db.get_message_plaintext(&env.id).await.unwrap().is_some(),
-        web_reply
+        web_reply && !matches!(failure, RecoveryFailure::PlaintextCache)
     );
+    if matches!(failure, RecoveryFailure::PlaintextCache) {
+        assert!(
+            session_store.blob(alice.node_id()).await == before_receive,
+            "a failed plaintext cache write consumed the paid request's receive key"
+        );
+        sqlx::raw_sql("DROP TRIGGER fail_plaintext_cache")
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
     session_store
         .saves_before_failure
         .store(usize::MAX, Ordering::SeqCst);
     session_store.fail_saves.store(false, Ordering::SeqCst);
     if web_reply {
-        // Pending status must survive a handler restart, rather than live only
-        // in a task-local retry set.
-        shutdown.send(true).unwrap();
-        worker.await.unwrap();
-        let (next_shutdown, next_rx) = watch::channel(false);
-        shutdown = next_shutdown;
-        worker = start_handler(next_rx);
+        // Both the ratchet and pending request must survive a process restart.
+        sessions_b = Arc::new(SessionManager::with_store(
+            bob.clone(),
+            session_store.clone(),
+        ));
+        assert_eq!(sessions_b.restore_sessions().await, 1);
     } else {
         sessions_b.remove_session(alice.node_id()).await;
     }
+    let (next_shutdown, next_rx) = watch::channel(false);
+    shutdown = next_shutdown;
+    worker = start_handler(sessions_b.clone(), next_rx);
     source.send(bob.node_id(), &env).await.unwrap();
     let outcome = tokio::time::timeout(Duration::from_secs(5), terminal(source.clone()))
         .await

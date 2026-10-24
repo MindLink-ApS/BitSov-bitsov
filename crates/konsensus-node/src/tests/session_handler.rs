@@ -4064,6 +4064,66 @@ async fn session_decode_logs_do_not_echo_peer_json() {
 }
 
 #[tokio::test]
+async fn duplicate_ratchet_init_preserves_the_ready_session() {
+    let (_, identity) = NodeIdentity::generate().unwrap();
+    let alice = Arc::new(identity);
+    let (_, identity) = NodeIdentity::generate().unwrap();
+    let bob = Arc::new(identity);
+    let sender = SessionManager::new(alice.clone());
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn konsensus_storage::Storage> = db.clone();
+    let receiver = SessionManager::with_store(
+        bob.clone(),
+        Arc::new(crate::StorageSessionAdapter {
+            storage: storage.clone(),
+        }),
+    );
+    let init = sender
+        .initiate_session(bob.node_id(), &receiver.prekey_bundle().await)
+        .await
+        .unwrap();
+    receiver
+        .accept_session(alice.node_id(), &init)
+        .await
+        .unwrap();
+    let transport = Arc::new(NoiseTransport::new(bob.clone(), Default::default()));
+    let opener = konsensus_crypto::ratchet_message_to_bytes(
+        &sender
+            .encrypt(bob.node_id(), b"ratchet-init")
+            .await
+            .unwrap(),
+    );
+    handle_ratchet_init(alice.node_id(), &opener, &receiver, &storage, &transport).await;
+    assert!(receiver.can_send(alice.node_id()).await);
+    let before_duplicate = db.load_session(alice.node_id()).await.unwrap();
+    handle_ratchet_init(alice.node_id(), &opener, &receiver, &storage, &transport).await;
+    assert!(
+        receiver.can_send(alice.node_id()).await,
+        "a duplicate opener deleted the live session"
+    );
+    assert_eq!(
+        db.load_session(alice.node_id()).await.unwrap(),
+        before_duplicate
+    );
+    let reply = receiver
+        .encrypt(alice.node_id(), b"still ready")
+        .await
+        .unwrap();
+    assert_eq!(
+        sender.decrypt(bob.node_id(), &reply).await.unwrap(),
+        b"still ready"
+    );
+    let next = sender
+        .encrypt(bob.node_id(), b"next message")
+        .await
+        .unwrap();
+    assert_eq!(
+        receiver.decrypt(alice.node_id(), &next).await.unwrap(),
+        b"next message"
+    );
+}
+
+#[tokio::test]
 async fn failed_ratchet_init_send_retries_without_advancing_session() {
     ratchet_init_retry_case(false, false).await;
 }

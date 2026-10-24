@@ -9,16 +9,13 @@ use konsensus_crypto::{SessionManager, SessionStore};
 use konsensus_storage::{SqliteStorage, Storage};
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::{Arc, Mutex},
 };
 use tower::ServiceExt;
 
 #[derive(Default)]
 struct FailingSessionStore {
-    fail: AtomicBool,
+    fail_for: Mutex<Option<NodeId>>,
     sessions: tokio::sync::Mutex<HashMap<NodeId, Vec<u8>>>,
 }
 
@@ -29,7 +26,7 @@ impl SessionStore for FailingSessionStore {
         peer: &NodeId,
         bytes: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.fail.load(Ordering::SeqCst) {
+        if *self.fail_for.lock().unwrap() == Some(*peer) {
             return Err("injected session save failure".into());
         }
         self.sessions.lock().await.insert(*peer, bytes.to_vec());
@@ -55,12 +52,27 @@ impl SessionStore for FailingSessionStore {
 
 #[tokio::test]
 async fn calendar_encryption_failure_is_not_reported_as_queued() {
+    calendar_encryption_failure_case(false).await;
+}
+
+#[tokio::test]
+async fn calendar_encryption_failure_preserves_paid_attendees_and_continues_fanout() {
+    calendar_encryption_failure_case(true).await;
+}
+
+async fn calendar_encryption_failure_case(mixed: bool) {
+    use konsensus_core::traits::lightning::LightningProvider;
+
     for update in [false, true] {
         for missing_session in [false, true] {
             let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
             sqlx::raw_sql("CREATE TABLE calendar_events (id TEXT PRIMARY KEY, message_id TEXT, organizer TEXT NOT NULL, title TEXT NOT NULL, description TEXT, start_ms BIGINT, end_ms BIGINT, tz TEXT, location TEXT, attendees_json TEXT, recurrence_json TEXT, color TEXT, created_at TEXT NOT NULL DEFAULT '', parent_id TEXT)").execute(db.pool()).await.unwrap();
             let store = Arc::new(FailingSessionStore::default());
-            let mut state = common::test_state();
+            let wallet = Arc::new(
+                konsensus_lightning::MockLightningProvider::new().with_routing_fee_msat(400),
+            );
+            let balance_before = wallet.get_balance_msat().await.unwrap();
+            let mut state = common::test_state_with_lightning(wallet.clone());
             let sessions = Arc::new(SessionManager::with_store(
                 state.identity.clone(),
                 store.clone(),
@@ -74,9 +86,39 @@ async fn calendar_encryption_failure_is_not_reported_as_queued() {
                     .await
                     .unwrap();
             }
+            let mut healthy = Vec::new();
+            if mixed {
+                for _ in 0..2 {
+                    let (_, identity) = NodeIdentity::generate().unwrap();
+                    let id = *identity.node_id();
+                    let recipient = SessionManager::new(Arc::new(identity));
+                    sessions
+                        .initiate_session(&id, &recipient.prekey_bundle().await)
+                        .await
+                        .unwrap();
+                    healthy.push(id);
+                }
+            }
+            let attendees = if mixed {
+                vec![healthy[0], peer, healthy[1]]
+            } else {
+                vec![peer]
+            };
+            let transport = Arc::new(common::ConnectedStubTransport::new(
+                attendees.clone(),
+                state.invoice_requests.clone(),
+            ));
             let mutable = Arc::get_mut(&mut state).unwrap();
             mutable.storage = db.clone();
             mutable.session_manager = sessions;
+            mutable.transport = transport.clone();
+            for id in &attendees {
+                state
+                    .peer_ln_pubkeys
+                    .lock()
+                    .await
+                    .insert(*id, format!("02{}", "aa".repeat(32)));
+            }
             db.store_calendar_event(&konsensus_storage::CalendarEventRecord {
                 id: "event".into(),
                 message_id: None,
@@ -87,7 +129,11 @@ async fn calendar_encryption_failure_is_not_reported_as_queued() {
                 end_ms: 2000,
                 tz: "UTC".into(),
                 location: None,
-                attendees_json: serde_json::json!([peer.to_hex()]).to_string(),
+                attendees_json: serde_json::json!(attendees
+                    .iter()
+                    .map(NodeId::to_hex)
+                    .collect::<Vec<_>>())
+                .to_string(),
                 recurrence_json: None,
                 color: None,
                 created_at: String::new(),
@@ -96,11 +142,11 @@ async fn calendar_encryption_failure_is_not_reported_as_queued() {
             .await
             .unwrap();
             let before = store.load_session(&peer).await.unwrap();
-            store.fail.store(true, Ordering::SeqCst);
+            *store.fail_for.lock().unwrap() = Some(peer);
             let payload = if update {
                 serde_json::json!({"title":"updated"})
             } else {
-                serde_json::json!({"title":"test", "start":1000, "end":2000, "attendees":[peer.to_hex()]})
+                serde_json::json!({"title":"test", "start":1000, "end":2000, "attendees":attendees.iter().map(NodeId::to_hex).collect::<Vec<_>>()})
             };
             let request = Request::builder()
                 .method(if update { "PUT" } else { "POST" })
@@ -119,7 +165,7 @@ async fn calendar_encryption_failure_is_not_reported_as_queued() {
                 .unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::OK,
                 "update={update}, missing={missing_session}"
             );
             let body: serde_json::Value = serde_json::from_slice(
@@ -128,12 +174,33 @@ async fn calendar_encryption_failure_is_not_reported_as_queued() {
                     .unwrap(),
             )
             .unwrap();
-            assert!(body.get("queued_for").is_none());
-            if !missing_session {
-                assert!(body["error"].as_str().unwrap().contains("session"));
-            }
+            assert_eq!(body["failed_for"], serde_json::json!([peer.to_hex()]));
+            assert_eq!(body["queued_for"], serde_json::json!([]));
+            assert_eq!(
+                body["delivered_to"],
+                serde_json::json!(healthy.iter().map(NodeId::to_hex).collect::<Vec<_>>())
+            );
+            assert_eq!(body["amount_msat"], if mixed { 2000 } else { 0 });
+            assert_eq!(body["max_routing_fee_msat"], if mixed { 10000 } else { 0 });
+            assert_eq!(
+                balance_before - wallet.get_balance_msat().await.unwrap(),
+                if mixed { 2800 } else { 0 }
+            );
+            assert_eq!(
+                transport.sent_envelopes.lock().unwrap().len(),
+                healthy.len()
+            );
+            assert_eq!(body["message_id"].is_string(), mixed);
+            assert!(db
+                .get_calendar_event(body["event_id"].as_str().unwrap())
+                .await
+                .unwrap()
+                .is_some());
             assert_eq!(store.load_session(&peer).await.unwrap(), before);
-            assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
+            assert_eq!(
+                db.count_pending_deliveries().await.unwrap(),
+                healthy.len() as u64
+            );
             assert!(db
                 .get_messages_for_recipient(&konsensus_core::Recipient::Node(peer), 10, None)
                 .await

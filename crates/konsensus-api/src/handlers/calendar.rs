@@ -239,6 +239,8 @@ pub struct EventActionResponse {
     pub message_id: Option<String>,
     pub delivered_to: Vec<String>,
     pub queued_for: Vec<String>,
+    /// Attendees whose encryption failed; no payment or delivery was attempted.
+    pub failed_for: Vec<String>,
     pub amount_msat: u64,
 }
 
@@ -542,6 +544,7 @@ async fn create_event(
     let result = async {
     let mut delivered_to = Vec::new();
     let mut queued_for = Vec::new();
+    let mut failed_for = Vec::new();
     let mut total_msat: u64 = 0;
     let mut last_message_id: Option<String> = None;
 
@@ -562,11 +565,16 @@ async fn create_event(
         let payload_bytes = serde_json::to_vec(&payload)
             .map_err(|e| ApiError::Internal(format!("payload serialization: {e}")))?;
 
-        let ratchet_msg = state.session_manager.encrypt(peer_id, &payload_bytes).await
-            .map_err(|e| match e {
-                konsensus_crypto::SessionError::Persist(error) => ApiError::Storage(error),
-                error => ApiError::Internal(format!("E2EE encryption failed for attendee: {error}")),
-            })?;
+        let ratchet_msg = match state.session_manager.encrypt(peer_id, &payload_bytes).await {
+            Ok(message) => message,
+            Err(error) => {
+                // Earlier attendees may already be paid. Preserve their receipts
+                // and continue without charging this attendee or claiming a queue entry.
+                tracing::warn!(peer = %peer_id, error = %error, "calendar attendee encryption failed");
+                failed_for.push(peer_id.to_hex());
+                continue;
+            }
+        };
         let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
         let price_msat = state
@@ -634,6 +642,7 @@ async fn create_event(
             "title": req.title,
             "delivered_to": delivered_to,
             "queued_for": queued_for,
+            "failed_for": failed_for,
             "amount_msat": total_msat,
         })),
     );
@@ -644,6 +653,7 @@ async fn create_event(
         message_id: last_message_id,
         delivered_to,
         queued_for,
+        failed_for,
         amount_msat: total_msat,
     }))
     }.await;
@@ -737,6 +747,7 @@ async fn update_event(
     let result = async {
     let mut delivered_to = Vec::new();
     let mut queued_for = Vec::new();
+    let mut failed_for = Vec::new();
     let mut total_msat: u64 = 0;
     let mut last_message_id: Option<String> = None;
 
@@ -757,11 +768,16 @@ async fn update_event(
         let payload_bytes = serde_json::to_vec(&payload)
             .map_err(|e| ApiError::Internal(format!("payload serialization: {e}")))?;
 
-        let ratchet_msg = state.session_manager.encrypt(peer_id, &payload_bytes).await
-            .map_err(|e| match e {
-                konsensus_crypto::SessionError::Persist(error) => ApiError::Storage(error),
-                error => ApiError::Internal(format!("E2EE encryption failed for attendee: {error}")),
-            })?;
+        let ratchet_msg = match state.session_manager.encrypt(peer_id, &payload_bytes).await {
+            Ok(message) => message,
+            Err(error) => {
+                // Earlier attendees may already be paid. Preserve their receipts
+                // and continue without charging this attendee or claiming a queue entry.
+                tracing::warn!(peer = %peer_id, error = %error, "calendar attendee encryption failed");
+                failed_for.push(peer_id.to_hex());
+                continue;
+            }
+        };
         let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
         let price_msat = state
@@ -825,6 +841,7 @@ async fn update_event(
         message_id: last_message_id,
         delivered_to,
         queued_for,
+        failed_for,
         amount_msat: total_msat,
     }))
     }.await;

@@ -690,6 +690,28 @@ impl SessionManager {
         peer_id: &NodeId,
         message: &RatchetMessage,
     ) -> Result<Vec<u8>, SessionError> {
+        self.decrypt_with_precommit(peer_id, message, |_| async { Ok(()) })
+            .await
+    }
+
+    /// Authenticate a message and persist application recovery data before
+    /// committing its receive ratchet. The callback runs only after successful
+    /// authentication, while competing ratchet operations are excluded. A
+    /// callback error leaves both the live and stored ratchets unchanged.
+    ///
+    /// The callback's write may outlive a failed ratchet save. Callers must
+    /// reconcile that recovery data on retry before acting on the plaintext.
+    /// The callback must not call back into this session manager.
+    pub async fn decrypt_with_precommit<F, Fut>(
+        &self,
+        peer_id: &NodeId,
+        message: &RatchetMessage,
+        before_commit: F,
+    ) -> Result<Vec<u8>, SessionError>
+    where
+        F: FnOnce(Vec<u8>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), SessionError>>,
+    {
         let store = self.store.clone();
         let cipher = &self.session_cipher;
         // Same lock as `encrypt`: held across the store await so a concurrent
@@ -706,6 +728,7 @@ impl SessionManager {
             (plaintext, trial, state)
         };
 
+        before_commit(plaintext.clone()).await?;
         write_session_state(store.as_ref(), cipher, peer_id, &state).await?;
         match sessions.get_mut(peer_id) {
             Some(session) => session.ratchet = trial,
