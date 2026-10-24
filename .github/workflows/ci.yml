@@ -24,6 +24,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned in the cache key below. cargo-audit 0.22.2 parses the current
+  # advisory database; cargo-deny 0.20.2 is the advisory gate. security-scan.yml
+  # must stay on this same cargo-audit version.
+  CARGO_AUDIT_VERSION: "0.22.2"
+  CARGO_DENY_VERSION: "0.20.2"
 
 jobs:
   changes:
@@ -38,7 +43,8 @@ jobs:
       # security policy changed, or when the PR carries `full-ci`.
       rust: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') || steps.filter.outputs.rust == 'true' || steps.filter.outputs.security_policy == 'true' }}
       # Non-PR events run everything without querying changed files. PRs run
-      # Cargo Audit for advisory inputs or an existing `full-ci` label.
+      # the supply-chain job for advisory inputs (including deny.toml) or an
+      # existing `full-ci` label.
       audit: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') || steps.audit_paths.outputs.audit == 'true' || steps.filter.outputs.security_policy == 'true' }}
     steps:
       # PR-only: paths-filter uses the PR files API. Other events would need
@@ -84,6 +90,7 @@ jobs:
               - 'Cargo.lock'
               - '**/Cargo.lock'
               - '.cargo/audit.toml'
+              - 'deny.toml'
               - 'SECURITY.md'
               - 'scripts/check-security-key.sh'
               - 'scripts/test-security-key.sh'
@@ -197,8 +204,10 @@ jobs:
       - name: Check disk space
         run: df -h /
 
+      # `--workspace` selects every member. `-p konsensus-fiat` only asserts
+      # that member is present; on current Cargo it does not narrow the set.
       - name: cargo check
-        run: cargo check --workspace
+        run: cargo check --locked --workspace -p konsensus-fiat
 
       # Only drop ldk-node artifacts when the runner is actually short on
       # disk. Unconditional deletion threw away the restored rlibs and forced
@@ -216,15 +225,17 @@ jobs:
           fi
           df -h /
 
-      - name: cargo test (core crates only — ldk-node too large for CI runner)
+      - name: cargo test (workspace crates — vendored ldk-node is a separate job)
         run: |
-          cargo test -p konsensus-recovery -p konsensus-core -p konsensus-crypto -p konsensus-storage \
+          cargo test --locked -p konsensus-recovery -p konsensus-core -p konsensus-crypto -p konsensus-storage \
             -p konsensus-message -p konsensus-pricing -p konsensus-chain \
             -p konsensus-routing -p konsensus-gossip -p konsensus-bsx \
-            -p konsensus-lightning -p konsensus-api -p konsensus-node
+            -p konsensus-lightning -p konsensus-api -p konsensus-node \
+            -p konsensus-fiat
 
+      # Same `-p` presence check as `cargo check`; `--workspace` still selects every member.
       - name: cargo clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --locked --workspace -p konsensus-fiat -- -D warnings
 
       - name: sccache stats
         if: always()
@@ -275,10 +286,12 @@ jobs:
     name: Cargo Audit
     needs: changes
     # Fail closed if classification did not succeed. Otherwise run only when
-    # the advisory inputs changed, on all non-PR events, or with an existing
-    # `full-ci` label. Adding the label runs the optional full-ci.yml instead.
-    # A daily security-scan.yml run covers new advisories on unchanged inputs. A skipped required check
-    # still reports success, same as the docs-only path.
+    # the advisory inputs changed, on all non-PR events (main, tags, merge
+    # queue), or with an existing `full-ci` label. Adding the label runs the
+    # optional full-ci.yml instead. This job is the blocking supply-chain gate:
+    # pinned cargo-deny (advisories, bans, sources) and pinned cargo-audit.
+    # A daily security-scan.yml run covers new advisories on unchanged inputs.
+    # A skipped required check still reports success, same as the docs-only path.
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.audit == 'true') }}
     runs-on: ubuntu-latest
     steps:
@@ -297,19 +310,58 @@ jobs:
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
-            ~/.cargo/bin/
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-deny
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          # Version is part of the key. restore-keys stay on that same prefix
+          # so a lockfile change cannot restore an older scanner.
+          key: ${{ runner.os }}-supply-chain-audit-${{ env.CARGO_AUDIT_VERSION }}-deny-${{ env.CARGO_DENY_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-audit-
+            ${{ runner.os }}-supply-chain-audit-${{ env.CARGO_AUDIT_VERSION }}-deny-${{ env.CARGO_DENY_VERSION }}-
 
-      - name: Install cargo-audit
+      - name: Install cargo-audit ${{ env.CARGO_AUDIT_VERSION }}
+        env:
+          CARGO_BUILD_JOBS: "2"
         run: |
-          if ! command -v cargo-audit >/dev/null 2>&1; then
-            cargo install cargo-audit --locked
+          set -euo pipefail
+          # `cargo audit --version` prints `cargo-audit-audit <ver>` (clap
+          # names the audit subcommand). A direct binary prints
+          # `cargo-audit <ver>`. Accept either. Anything else is reinstalled,
+          # including a scanner restored from cache.
+          got="$(cargo audit --version 2>/dev/null || true)"
+          want_sub="cargo-audit-audit ${CARGO_AUDIT_VERSION}"
+          want_bin="cargo-audit ${CARGO_AUDIT_VERSION}"
+          if [ "$got" != "$want_sub" ] && [ "$got" != "$want_bin" ]; then
+            cargo install cargo-audit --version "${CARGO_AUDIT_VERSION}" --locked --force
+            got="$(cargo audit --version 2>/dev/null || true)"
+            if [ "$got" != "$want_sub" ] && [ "$got" != "$want_bin" ]; then
+              echo "cargo-audit resolved to '${got}', want ${CARGO_AUDIT_VERSION}" >&2
+              exit 1
+            fi
           fi
+
+      - name: Install cargo-deny ${{ env.CARGO_DENY_VERSION }}
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set -euo pipefail
+          got="$(cargo deny --version 2>/dev/null || true)"
+          want="cargo-deny ${CARGO_DENY_VERSION}"
+          if [ "$got" != "$want" ]; then
+            cargo install cargo-deny --version "${CARGO_DENY_VERSION}" --locked --force
+            got="$(cargo deny --version 2>/dev/null || true)"
+            if [ "$got" != "$want" ]; then
+              echo "cargo-deny resolved to '${got}', want ${CARGO_DENY_VERSION}" >&2
+              exit 1
+            fi
+          fi
+
+      # Licenses stay off. bans and sources passed on the current lockfile.
+      # An unignored advisory is an error and fails this step.
+      - name: cargo deny check advisories bans sources
+        run: cargo deny --locked check advisories bans sources
 
       - name: cargo audit
         run: cargo audit
