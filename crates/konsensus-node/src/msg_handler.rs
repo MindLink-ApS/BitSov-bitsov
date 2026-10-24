@@ -643,6 +643,16 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             !recover_saved_ciphertext,
                         ).await;
                         let plaintext = match incoming {
+                            IncomingPlaintext::Consumed if held_duplicate => {
+                                let reason = if konsensus_api::calls::is_call_kind(envelope.kind) { "call signal withdrawn" } else { "message withdrawn" };
+                                let _ = transport_for_ack.send_frame(&sender, &Frame::MessageReject { id: msg_id, reason: reason.into() }).await;
+                                continue;
+                            }
+                            IncomingPlaintext::Consumed => {
+                                let reject = Frame::MessageReject { id: msg_id, reason: "message plaintext lost: receive key already consumed".into() };
+                                let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                continue;
+                            }
                             IncomingPlaintext::ReplyPending => {
                                 // The receive ratchet and cached request are durable, but
                                 // its reply is unfinished. A retry resumes from the cache.
@@ -668,10 +678,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             IncomingPlaintext::Unavailable if recover_saved_ciphertext => {
                                 // A receipt alone does not prove that the application
                                 // obtained plaintext. Never complete an unreadable retry.
-                                let response = if matches!(storage_for_recv.get_message_plaintext(&msg_id).await, Ok(Some(_))) {
-                                    Frame::MessageAck { id: msg_id, duplicate: true }
-                                } else {
-                                    Frame::MessageReject { id: msg_id, reason: "message plaintext unavailable".into() }
+                                let response = match storage_for_recv.get_message_plaintext(&msg_id).await {
+                                    Ok(Some(_)) => Frame::MessageAck { id: msg_id, duplicate: true },
+                                    Ok(None) => Frame::MessageReject { id: msg_id, reason: "message plaintext unavailable".into() },
+                                    Err(_) => Frame::MessageReject { id: msg_id, reason: "storage error".into() },
                                 };
                                 let _ = transport_for_ack.send_frame(&sender, &response).await;
                                 continue;
@@ -808,11 +818,13 @@ enum IncomingPlaintext {
     Ready(String),
     /// No session, unreadable framing, or authentication failure.
     Unavailable,
-    /// The tag matched a copy of the ratchet, and that copy was not saved.
-    /// The live session is unchanged and the plaintext was not accepted.
+    /// The receive ratchet or plaintext recovery data could not be saved.
+    /// The plaintext was not accepted; a pending cache can finish on retry.
     Unsaved,
-    /// Request plaintext is cached, but its web reply has not been sent.
+    /// Cached plaintext still needs its receive commit or web reply completed.
     ReplyPending,
+    /// The receive key was consumed but no durable plaintext is available.
+    Consumed,
 }
 
 impl IncomingPlaintext {
@@ -820,7 +832,7 @@ impl IncomingPlaintext {
     fn into_option(self) -> Option<String> {
         match self {
             Self::Ready(text) => Some(text),
-            Self::Unavailable | Self::Unsaved | Self::ReplyPending => None,
+            Self::Unavailable | Self::Unsaved | Self::ReplyPending | Self::Consumed => None,
         }
     }
 }
@@ -877,12 +889,59 @@ fn is_web_request(envelope: &konsensus_core::UkmEnvelope) -> bool {
 /// the envelope ID prevents user-chosen plaintext from posing as retry state.
 /// It is removed on completion, restoring the original cache format; legacy
 /// unmarked requests remain completed duplicates. No schema change is needed.
-fn pending_web_reply_prefix(envelope: &konsensus_core::UkmEnvelope) -> Vec<u8> {
-    [
-        b"\xffkonsensus:pending-web-reply:v1:".as_slice(),
-        envelope.id.as_bytes(),
-    ]
-    .concat()
+fn pending_plaintext_prefix(envelope: &konsensus_core::UkmEnvelope) -> Vec<u8> {
+    let prefix: &[u8] = if is_web_request(envelope) {
+        b"\xffkonsensus:pending-web-reply:v1:"
+    } else {
+        b"\xffkonsensus:pending-receive:v1:"
+    };
+    [prefix, envelope.id.as_bytes()].concat()
+}
+
+fn uses_pending_plaintext(envelope: &konsensus_core::UkmEnvelope) -> bool {
+    // Admission holds already force chat/call retries through decryption and
+    // deliberately conceal their cache until admission completes.
+    !konsensus_api::calls::is_call_kind(envelope.kind)
+        && !konsensus_api::room_binding::is_candidate(envelope.kind)
+}
+
+fn receive_retention_key(envelope: &konsensus_core::UkmEnvelope) -> String {
+    format!("received:{}", envelope.id)
+}
+
+async fn receive_was_committed(
+    envelope: &konsensus_core::UkmEnvelope,
+    header: &konsensus_crypto::MessageHeader,
+    sessions: &SessionManager,
+) -> bool {
+    sessions
+        .recovery_data(&envelope.sender, &receive_retention_key(envelope))
+        .await
+        .is_some_and(|saved| saved.as_slice() == header.to_bytes().as_slice())
+        || sessions.has_consumed(&envelope.sender, header).await
+}
+
+fn web_reply_retention_key(envelope: &konsensus_core::UkmEnvelope) -> String {
+    format!("web-reply:{}", envelope.id)
+}
+
+async fn clear_web_reply(envelope: &konsensus_core::UkmEnvelope, sessions: &SessionManager) {
+    if let Err(error) = sessions
+        .clear_recovery_data(&envelope.sender, &web_reply_retention_key(envelope))
+        .await
+    {
+        warn!(msg_id = %envelope.id, %error, "completed web reply recovery data could not be cleared");
+    }
+    clear_receive_receipt(envelope, sessions).await;
+}
+
+async fn clear_receive_receipt(envelope: &konsensus_core::UkmEnvelope, sessions: &SessionManager) {
+    if let Err(error) = sessions
+        .clear_recovery_data(&envelope.sender, &receive_retention_key(envelope))
+        .await
+    {
+        warn!(msg_id = %envelope.id, %error, "completed receive recovery data could not be cleared");
+    }
 }
 
 async fn needs_plaintext_recovery(
@@ -891,8 +950,8 @@ async fn needs_plaintext_recovery(
     cipher: &PlaintextCacheCipher,
 ) -> bool {
     match storage.get_message_plaintext(&envelope.id).await {
-        Ok(Some(cached)) if is_web_request(envelope) => match cipher.decrypt(&cached) {
-            Ok(bytes) => bytes.starts_with(&pending_web_reply_prefix(envelope)),
+        Ok(Some(cached)) if uses_pending_plaintext(envelope) => match cipher.decrypt(&cached) {
+            Ok(bytes) => bytes.starts_with(&pending_plaintext_prefix(envelope)),
             Err(_) => true,
         },
         Ok(Some(_)) => false,
@@ -938,15 +997,15 @@ async fn decrypt_incoming(
     trust_discount: f64,
     drop_session_on_auth_failure: bool,
 ) -> IncomingPlaintext {
-    // Rebuild read-only web replies from the authenticated, encrypted-at-rest
-    // request cache, including after a restart. The cache is written before the
+    // Resume from the authenticated, encrypted-at-rest pending request cache,
+    // including after a restart. The cache is written before the
     // receive ratchet, so recovery must also finish that commit if it failed.
     // Completed requests are ACKed above without rebuilding a response.
-    let cached = if is_web_request(envelope) && !drop_session_on_auth_failure {
+    let cached = if uses_pending_plaintext(envelope) && !drop_session_on_auth_failure {
         match storage.get_message_plaintext(&envelope.id).await {
             Ok(cached) => cached,
             Err(e) => {
-                warn!(error = %e, "failed to load cached web request");
+                warn!(error = %e, "failed to load cached request");
                 return IncomingPlaintext::ReplyPending;
             }
         }
@@ -955,7 +1014,7 @@ async fn decrypt_incoming(
     };
     let bytes = if let Some(cached) = cached {
         let request = match plaintext_cipher.decrypt(&cached) {
-            Ok(bytes) => match bytes.strip_prefix(pending_web_reply_prefix(envelope).as_slice()) {
+            Ok(bytes) => match bytes.strip_prefix(pending_plaintext_prefix(envelope).as_slice()) {
                 Some(request) => request.to_vec(),
                 None => return IncomingPlaintext::Unavailable,
             },
@@ -968,11 +1027,20 @@ async fn decrypt_incoming(
             Ok(message) => message,
             Err(_) => return IncomingPlaintext::ReplyPending,
         };
-        match session_mgr.decrypt(sender, &ratchet_msg).await {
+        match session_mgr
+            .decrypt_with_recovery(
+                sender,
+                &ratchet_msg,
+                Some(&receive_retention_key(envelope)),
+                |_| async { Ok(()) },
+            )
+            .await
+        {
             Ok(_) => {} // Cache survived a failed receive save; it is committed now.
             Err(konsensus_crypto::SessionError::Ratchet(_)) => {
-                // Already consumed. The envelope-bound authenticated cache is
-                // sufficient to resume a reply without accepting a replay as new work.
+                if !receive_was_committed(envelope, &ratchet_msg.header, session_mgr).await {
+                    return IncomingPlaintext::ReplyPending;
+                }
             }
             Err(konsensus_crypto::SessionError::Persist(error)) => {
                 warn!(sender = %sender, error = %error, "cached web request receive state was not saved");
@@ -995,31 +1063,50 @@ async fn decrypt_incoming(
             }
         };
 
+        let receipt_key = uses_pending_plaintext(envelope).then(|| receive_retention_key(envelope));
         let bytes = match session_mgr
-            .decrypt_with_precommit(sender, &ratchet_msg, |bytes| async move {
-                if is_web_request(envelope) {
-                    // A paid request must remain recoverable if either write fails.
-                    // Never consume its receive key before the pending cache is durable.
-                    let pending = [
-                        pending_web_reply_prefix(envelope).as_slice(),
-                        bytes.as_slice(),
-                    ]
-                    .concat();
-                    cache_incoming_plaintext(
-                        envelope,
-                        &pending,
-                        plaintext_cipher,
-                        storage.as_ref(),
-                    )
-                    .await
-                    .map_err(|()| {
-                        konsensus_crypto::SessionError::Persist(
-                            "pending web request cache was not saved".into(),
+            .decrypt_with_recovery(
+                sender,
+                &ratchet_msg,
+                receipt_key.as_deref(),
+                |bytes| async move {
+                    if uses_pending_plaintext(envelope) {
+                        // A paid request must remain recoverable if either write fails.
+                        // Never consume its receive key before the pending cache is durable.
+                        let pending = [
+                            pending_plaintext_prefix(envelope).as_slice(),
+                            bytes.as_slice(),
+                        ]
+                        .concat();
+                        cache_incoming_plaintext(
+                            envelope,
+                            &pending,
+                            plaintext_cipher,
+                            storage.as_ref(),
                         )
-                    })?;
-                }
-                Ok(())
-            })
+                        .await
+                        .map_err(|()| {
+                            konsensus_crypto::SessionError::Persist(
+                                "pending plaintext cache was not saved".into(),
+                            )
+                        })?;
+                    } else {
+                        cache_incoming_plaintext(
+                            envelope,
+                            &bytes,
+                            plaintext_cipher,
+                            storage.as_ref(),
+                        )
+                        .await
+                        .map_err(|()| {
+                            konsensus_crypto::SessionError::Persist(
+                                "plaintext cache was not saved".into(),
+                            )
+                        })?;
+                    }
+                    Ok(())
+                },
+            )
             .await
         {
             Ok(bytes) => bytes,
@@ -1036,6 +1123,9 @@ async fn decrypt_incoming(
             Err(e) => {
                 if !drop_session_on_auth_failure {
                     debug!(sender = %sender, error = %e, "saved envelope did not decrypt; session left in place");
+                    if receive_was_committed(envelope, &ratchet_msg.header, session_mgr).await {
+                        return IncomingPlaintext::Consumed;
+                    }
                     return IncomingPlaintext::Unavailable;
                 }
                 // Decryption failed — session is likely stale (peer re-established with different keys).
@@ -1060,13 +1150,41 @@ async fn decrypt_incoming(
             }
         };
 
-        if !is_web_request(envelope) {
-            let _ = cache_incoming_plaintext(envelope, &bytes, plaintext_cipher, storage.as_ref())
-                .await;
-        }
-
         bytes
     };
+
+    if uses_pending_plaintext(envelope) && !is_web_request(envelope) {
+        // Finish the receive commit before running file/calendar/RSVP side
+        // effects. Until this write succeeds a duplicate must resume recovery.
+        if cache_incoming_plaintext(envelope, &bytes, plaintext_cipher, storage.as_ref())
+            .await
+            .is_err()
+        {
+            return IncomingPlaintext::Unsaved;
+        }
+        clear_receive_receipt(envelope, session_mgr).await;
+    }
+
+    // A reply already built before a crash or completion-cache failure takes
+    // precedence over rebuilding content or consuming another sending key.
+    if is_web_request(envelope) {
+        if let Some(wire) = session_mgr
+            .recovery_data(sender, &web_reply_retention_key(envelope))
+            .await
+        {
+            if send_saved_web_reply(sender, &wire, identity, transport)
+                .await
+                .is_err()
+                || cache_incoming_plaintext(envelope, &bytes, plaintext_cipher, storage.as_ref())
+                    .await
+                    .is_err()
+            {
+                return IncomingPlaintext::ReplyPending;
+            }
+            clear_web_reply(envelope, session_mgr).await;
+            return IncomingPlaintext::Ready("[web request]".into());
+        }
+    }
 
     // Route based on message kind
     let text = if envelope.kind == konsensus_core::kind::KIND_FILE_REF {
@@ -1117,6 +1235,7 @@ async fn decrypt_incoming(
                 {
                     return IncomingPlaintext::ReplyPending;
                 }
+                clear_web_reply(envelope, session_mgr).await;
                 text
             }
             Err(()) => return IncomingPlaintext::ReplyPending,
@@ -1144,6 +1263,7 @@ async fn decrypt_incoming(
                 {
                     return IncomingPlaintext::ReplyPending;
                 }
+                clear_web_reply(envelope, session_mgr).await;
                 text
             }
             Err(()) => return IncomingPlaintext::ReplyPending,
@@ -1520,32 +1640,59 @@ async fn send_encrypted_response<T: serde::Serialize>(
         return Err(());
     }
 
-    // Encrypt saves the advanced ratchet before returning. An error means this
-    // response was not built and is not sent.
-    let ratchet_msg = match session_mgr.encrypt(peer_id, &json_bytes).await {
-        Ok(msg) => msg,
-        Err(e) => {
-            warn!(peer = %peer_id, error = %e, "failed to encrypt response; response was not sent");
-            return Err(());
-        }
-    };
+    // Retain the signed envelope atomically with the advanced send ratchet.
+    // Completion-cache and transport retries preserve ciphertext and identity.
+    let wire = session_mgr
+        .encrypt_retained(
+            peer_id,
+            &web_reply_retention_key(request),
+            &json_bytes,
+            |ratchet_msg| {
+                let ciphertext = konsensus_crypto::ratchet_message_to_bytes(ratchet_msg);
+                let proof = konsensus_core::reply_bound_proof(&request.payment_proof);
+                let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
+                    kind,
+                    *identity.node_id(),
+                    konsensus_core::Recipient::Node(*peer_id),
+                    ciphertext,
+                    proof,
+                )
+                .references(vec![request.id])
+                .build();
+                envelope.signature = konsensus_core::Signature::from_ed25519(
+                    &identity.sign(&envelope.signable_bytes()),
+                );
+                serde_json::to_vec(&envelope)
+                    .map_err(|e| konsensus_crypto::SessionError::InvalidPeerData(e.to_string()))
+            },
+        )
+        .await
+        .map_err(|e| {
+            warn!(peer = %peer_id, error = %e, "failed to save response; response was not sent");
+        })?;
+    send_saved_web_reply(peer_id, &wire, identity, transport).await
+}
 
-    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
-    let our_id = *identity.node_id();
-    let proof = konsensus_core::reply_bound_proof(&request.payment_proof);
-    let mut resp_envelope = konsensus_core::UkmEnvelopeBuilder::new(
-        kind,
-        our_id,
-        konsensus_core::Recipient::Node(*peer_id),
-        ciphertext,
-        proof,
-    )
-    .references(vec![request.id])
-    .build();
-    let sig = identity.sign(&resp_envelope.signable_bytes());
-    resp_envelope.signature = konsensus_core::Signature::from_ed25519(&sig);
-
-    if let Err(e) = transport.send(peer_id, &resp_envelope).await {
+/// Keep the ratchet ciphertext and message identity stable while renewing an
+/// expired signed wrapper, just as the paid outbox does after a long outage.
+async fn send_saved_web_reply(
+    peer_id: &konsensus_core::NodeId,
+    wire: &[u8],
+    identity: &NodeIdentity,
+    transport: &NoiseTransport,
+) -> Result<(), ()> {
+    let mut envelope: konsensus_core::UkmEnvelope = serde_json::from_slice(wire).map_err(|e| {
+        warn!(peer = %peer_id, error = %e, "invalid retained web response");
+    })?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    envelope.refresh_for_resend(identity, now_ms).map_err(|e| {
+        warn!(peer = %peer_id, error = %e, "failed to renew retained web response");
+    })?;
+    if let Err(e) = transport.send(peer_id, &envelope).await {
         warn!(peer = %peer_id, error = %e, "failed to send response envelope");
         return Err(());
     }

@@ -3488,7 +3488,7 @@ async fn unsaved_chat_retry_releases_admission_hold() {
         .unwrap()
         .unwrap_or(0);
         if row == 1
-            && plain_missing == 1
+            && plain_missing == 0
             && db.call_admission_held(&env.id).await.unwrap()
             && session_store.failed_saves.load(Ordering::SeqCst) > failed_before
         {
@@ -3648,6 +3648,16 @@ async fn web_reply_save_failure_retries_cached_request() {
 }
 
 #[tokio::test]
+async fn web_completion_cache_failure_resends_identical_reply_after_restart() {
+    for kind in [
+        konsensus_core::kind::KIND_PAGE_REQUEST,
+        konsensus_core::kind::KIND_WEB_MANIFEST,
+    ] {
+        recovered_message_case(kind, RecoveryFailure::CompletionCache).await;
+    }
+}
+
+#[tokio::test]
 async fn web_plaintext_cache_failure_leaves_receive_key_retryable() {
     for kind in [
         konsensus_core::kind::KIND_PAGE_REQUEST,
@@ -3682,6 +3692,354 @@ enum RecoveryFailure {
     ReceiveSave,
     ReplySave,
     PlaintextCache,
+    CompletionCache,
+}
+
+// Exercise the real cache and ratchet stores without a receive-loop admission hold.
+async fn retry_decrypt(
+    envelope: &konsensus_core::UkmEnvelope,
+    sessions: &SessionManager,
+    storage: &Arc<dyn Storage>,
+    bob: &Arc<NodeIdentity>,
+    first_attempt: bool,
+) -> IncomingPlaintext {
+    decrypt_incoming(
+        envelope,
+        &envelope.sender,
+        sessions,
+        &PlaintextCacheCipher::new(bob.aes_key()),
+        storage,
+        &None,
+        &Default::default(),
+        &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
+        &(Arc::new(konsensus_pricing::StaticPricingEngine::new(
+            Default::default(),
+        )) as Arc<dyn PricingEngine>),
+        bob,
+        &make_transport(bob),
+        &make_audit_log(),
+        &PaymentGate::new(),
+        0.0,
+        first_attempt,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn ordinary_plaintext_cache_failure_preserves_receive_key_after_restart() {
+    for kind in [
+        konsensus_core::kind::KIND_CHAT,
+        konsensus_core::kind::KIND_FILE_REF,
+        konsensus_core::kind::KIND_CALENDAR_EVENT,
+        konsensus_core::kind::KIND_CALENDAR_UPDATE,
+        konsensus_core::kind::KIND_RSVP,
+    ] {
+        let alice = alice_identity();
+        let bob = bob_identity();
+        let sender = SessionManager::new(alice.clone());
+        let store = FlakySessionStore::new();
+        let receiver = SessionManager::with_store(bob.clone(), store.clone());
+        establish_sessions(&sender, &receiver, &alice, &bob).await;
+        let msg = sender
+            .encrypt(bob.node_id(), b"paid message")
+            .await
+            .unwrap();
+        let envelope = make_envelope(
+            &alice,
+            *bob.node_id(),
+            kind,
+            konsensus_crypto::ratchet_message_to_bytes(&msg),
+        );
+        let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+        let storage: Arc<dyn Storage> = db.clone();
+        db.store_message(&envelope).await.unwrap();
+        let before = store.blob(alice.node_id()).await;
+        sqlx::raw_sql("CREATE TRIGGER fail_cache BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(FAIL, 'injected cache failure'); END").execute(db.pool()).await.unwrap();
+        assert!(
+            matches!(
+                retry_decrypt(&envelope, &receiver, &storage, &bob, true).await,
+                IncomingPlaintext::Unsaved
+            ),
+            "cache failure must withhold acceptance for kind {kind}"
+        );
+        assert!(
+            store.blob(alice.node_id()).await == before,
+            "cache failure consumed receive key for kind {kind}"
+        );
+        let restored = SessionManager::with_store(bob, store);
+        assert_eq!(restored.restore_sessions().await, 1);
+        assert_eq!(
+            restored.decrypt(alice.node_id(), &msg).await.unwrap(),
+            b"paid message"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cached_web_retry_does_not_advance_an_unrelated_session() {
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let sender = SessionManager::new(alice.clone());
+    let store = FlakySessionStore::new();
+    let receiver = SessionManager::with_store(bob.clone(), store.clone());
+    establish_sessions(&sender, &receiver, &alice, &bob).await;
+    let body = br#"{"request_id":"retry","path":"/missing.md","method":"GET"}"#;
+    let msg = sender.encrypt(bob.node_id(), body).await.unwrap();
+    let envelope = make_envelope(
+        &alice,
+        *bob.node_id(),
+        konsensus_core::kind::KIND_PAGE_REQUEST,
+        konsensus_crypto::ratchet_message_to_bytes(&msg),
+    );
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
+    // Authentication succeeds and saves the request, but the receive commit fails.
+    store
+        .fail_saves
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        retry_decrypt(&envelope, &receiver, &storage, &bob, true).await,
+        IncomingPlaintext::Unsaved
+    ));
+    store
+        .fail_saves
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    // Replace the session, leaving the authenticated request cache intact.
+    sender.remove_session(bob.node_id()).await;
+    receiver.remove_session(alice.node_id()).await;
+    establish_sessions(&sender, &receiver, &alice, &bob).await;
+    let opener = sender.encrypt(bob.node_id(), b"opener").await.unwrap();
+    receiver.decrypt(alice.node_id(), &opener).await.unwrap();
+    let before = store.blob(alice.node_id()).await;
+    assert!(matches!(
+        retry_decrypt(&envelope, &receiver, &storage, &bob, false).await,
+        IncomingPlaintext::ReplyPending
+    ));
+    assert!(
+        store.blob(alice.node_id()).await == before,
+        "a ratchet authentication error was mistaken for a consumed request"
+    );
+}
+
+#[tokio::test]
+async fn consumed_message_without_plaintext_is_a_terminal_paid_failure() {
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let sender = SessionManager::new(alice.clone());
+    let receiver = SessionManager::new(bob.clone());
+    establish_sessions(&sender, &receiver, &alice, &bob).await;
+    let msg = sender
+        .encrypt(bob.node_id(), b"lost legacy plaintext")
+        .await
+        .unwrap();
+    receiver.decrypt(alice.node_id(), &msg).await.unwrap();
+    let envelope = make_envelope(
+        &alice,
+        *bob.node_id(),
+        konsensus_core::kind::KIND_FILE_REF,
+        konsensus_crypto::ratchet_message_to_bytes(&msg),
+    );
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
+    assert!(matches!(
+        retry_decrypt(&envelope, &receiver, &storage, &bob, false).await,
+        IncomingPlaintext::Consumed
+    ));
+    assert!(receiver.has_session(alice.node_id()).await);
+}
+
+#[tokio::test]
+async fn ordinary_receive_save_failure_resumes_application_after_restart() {
+    ordinary_receive_recovery_case(false).await;
+}
+
+#[tokio::test]
+async fn retained_web_reply_renews_expired_wrapper_without_changing_ciphertext() {
+    use std::time::Duration;
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let buyer = SessionManager::new(alice.clone());
+    let seller = SessionManager::new(bob.clone());
+    establish_sessions(&buyer, &seller, &alice, &bob).await;
+    let opener = buyer.encrypt(bob.node_id(), b"request").await.unwrap();
+    seller.decrypt(alice.node_id(), &opener).await.unwrap();
+    let request = make_envelope(
+        &alice,
+        *bob.node_id(),
+        konsensus_core::kind::KIND_PAGE_REQUEST,
+        konsensus_crypto::ratchet_message_to_bytes(&opener),
+    );
+    let wire = seller
+        .encrypt_retained(
+            alice.node_id(),
+            &web_reply_retention_key(&request),
+            b"saved response",
+            |message| {
+                let mut reply = konsensus_core::UkmEnvelopeBuilder::new(
+                    konsensus_core::kind::KIND_PAGE_RESPONSE,
+                    *bob.node_id(),
+                    Recipient::Node(*alice.node_id()),
+                    konsensus_crypto::ratchet_message_to_bytes(message),
+                    konsensus_core::reply_bound_proof(&request.payment_proof),
+                )
+                .references(vec![request.id])
+                .build();
+                reply.timestamp = 1;
+                reply.signature = Signature::from_ed25519(&bob.sign(&reply.signable_bytes()));
+                Ok(serde_json::to_vec(&reply).unwrap())
+            },
+        )
+        .await
+        .unwrap();
+    let saved: konsensus_core::UkmEnvelope = serde_json::from_slice(&wire).unwrap();
+    let target = make_transport(&alice);
+    let source = make_transport(&bob);
+    target.add_to_whitelist(bob.node_id()).await;
+    source.add_to_whitelist(alice.node_id()).await;
+    target.start_listener().await.unwrap();
+    source
+        .connect(alice.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    send_encrypted_response(
+        alice.node_id(),
+        &request,
+        &"new content",
+        konsensus_core::kind::KIND_PAGE_RESPONSE,
+        &bob,
+        &seller,
+        &source,
+    )
+    .await
+    .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), target.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reply.timestamp > 1, "expired reply wrapper was not renewed");
+    assert_eq!(reply.id, saved.id);
+    assert_eq!(reply.nonce, saved.nonce);
+    assert_eq!(reply.references, vec![request.id]);
+    assert!(reply.ciphertext == saved.ciphertext);
+    assert!(reply.payment_proof == saved.payment_proof);
+    use ed25519_dalek::Verifier;
+    bob.ed25519_signing_key()
+        .verifying_key()
+        .verify(&reply.signable_bytes(), &reply.signature.to_ed25519())
+        .unwrap();
+    let message = konsensus_crypto::ratchet_message_from_bytes(&reply.ciphertext).unwrap();
+    assert_eq!(
+        buyer.decrypt(bob.node_id(), &message).await.unwrap(),
+        b"saved response"
+    );
+    source.shutdown();
+    target.shutdown();
+}
+
+#[tokio::test]
+async fn ordinary_completion_cache_failure_recovers_after_dh_rotation() {
+    ordinary_receive_recovery_case(true).await;
+}
+
+async fn ordinary_receive_recovery_case(completion_failure: bool) {
+    for kind in [
+        konsensus_core::kind::KIND_FILE_REF,
+        konsensus_core::kind::KIND_CALENDAR_EVENT,
+        konsensus_core::kind::KIND_CALENDAR_UPDATE,
+        konsensus_core::kind::KIND_RSVP,
+    ] {
+        let alice = alice_identity();
+        let bob = bob_identity();
+        let sender = SessionManager::new(alice.clone());
+        let store = FlakySessionStore::new();
+        let receiver = SessionManager::with_store(bob.clone(), store.clone());
+        establish_sessions(&sender, &receiver, &alice, &bob).await;
+        let payload = match kind {
+            konsensus_core::kind::KIND_FILE_REF => serde_json::json!({
+                "filename":"retry.txt", "mime_type":"text/plain", "size_bytes":5,
+                "data_b64":"aGVsbG8=", "blake3_hash":blake3::hash(b"hello").to_hex().to_string()
+            }),
+            konsensus_core::kind::KIND_RSVP => {
+                serde_json::json!({"event_id":"retry-event", "response":"accepted"})
+            }
+            _ => {
+                serde_json::json!({"event_id":"retry-event", "title":"Retry event", "start_ms":1000, "end_ms":2000, "tz":"UTC", "organizer":alice.node_id().to_hex()})
+            }
+        };
+        let body = serde_json::to_vec(&payload).unwrap();
+        let message = sender.encrypt(bob.node_id(), &body).await.unwrap();
+        let envelope = make_envelope(
+            &alice,
+            *bob.node_id(),
+            kind,
+            konsensus_crypto::ratchet_message_to_bytes(&message),
+        );
+        let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+        let storage: Arc<dyn Storage> = db.clone();
+        // Calendar tables are provisioned by the calendar integration, not the
+        // core in-memory storage fixture. Match its existing test schema here.
+        sqlx::raw_sql("CREATE TABLE calendar_events (id TEXT PRIMARY KEY, message_id TEXT, organizer TEXT NOT NULL, title TEXT NOT NULL, description TEXT, start_ms BIGINT, end_ms BIGINT, tz TEXT, location TEXT, attendees_json TEXT, recurrence_json TEXT, color TEXT, created_at TEXT NOT NULL DEFAULT '', parent_id TEXT); CREATE TABLE calendar_rsvps (id TEXT PRIMARY KEY, event_id TEXT, responder TEXT, response TEXT, comment TEXT, created_at TEXT NOT NULL DEFAULT '', UNIQUE(event_id, responder))")
+            .execute(db.pool()).await.unwrap();
+        storage.store_message(&envelope).await.unwrap();
+        if completion_failure {
+            sqlx::raw_sql("CREATE TRIGGER fail_completion BEFORE UPDATE OF plaintext_enc ON messages WHEN OLD.plaintext_enc IS NOT NULL BEGIN SELECT RAISE(FAIL, 'injected completion failure'); END").execute(db.pool()).await.unwrap();
+        } else {
+            store
+                .fail_saves
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert!(matches!(
+            retry_decrypt(&envelope, &receiver, &storage, &bob, true).await,
+            IncomingPlaintext::Unsaved
+        ));
+        assert!(
+            needs_plaintext_recovery(
+                &envelope,
+                storage.as_ref(),
+                &PlaintextCacheCipher::new(bob.aes_key())
+            )
+            .await,
+            "cached plaintext bypassed the failed receive commit for kind {kind}"
+        );
+        store
+            .fail_saves
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if completion_failure {
+            let reply = receiver
+                .encrypt(alice.node_id(), b"rotate DH")
+                .await
+                .unwrap();
+            sender.decrypt(bob.node_id(), &reply).await.unwrap();
+            let next = sender.encrypt(bob.node_id(), b"next DH").await.unwrap();
+            receiver.decrypt(alice.node_id(), &next).await.unwrap();
+            sqlx::raw_sql("DROP TRIGGER fail_completion")
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let restored = SessionManager::with_store(bob.clone(), store);
+        assert_eq!(restored.restore_sessions().await, 1);
+        assert!(matches!(
+            retry_decrypt(&envelope, &restored, &storage, &bob, false).await,
+            IncomingPlaintext::Ready(_)
+        ));
+        let table = match kind {
+            konsensus_core::kind::KIND_FILE_REF => "files",
+            konsensus_core::kind::KIND_RSVP => "calendar_rsvps",
+            _ => "calendar_events",
+        };
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "application side effect was lost for kind {kind}");
+        assert!(
+            !needs_plaintext_recovery(
+                &envelope,
+                storage.as_ref(),
+                &PlaintextCacheCipher::new(bob.aes_key())
+            )
+            .await
+        );
+    }
 }
 
 async fn recovered_message_case(kind: u16, failure: RecoveryFailure) {
@@ -3797,6 +4155,9 @@ async fn recovered_message_case(kind: u16, failure: RecoveryFailure) {
     if matches!(failure, RecoveryFailure::PlaintextCache) {
         sqlx::raw_sql("CREATE TRIGGER fail_plaintext_cache BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(FAIL, 'injected plaintext cache failure'); END")
             .execute(db.pool()).await.unwrap();
+    } else if matches!(failure, RecoveryFailure::CompletionCache) {
+        sqlx::raw_sql("CREATE TRIGGER fail_plaintext_cache BEFORE UPDATE OF plaintext_enc ON messages WHEN OLD.plaintext_enc IS NOT NULL BEGIN SELECT RAISE(FAIL, 'injected completion cache failure'); END")
+            .execute(db.pool()).await.unwrap();
     } else {
         session_store.saves_before_failure.store(
             usize::from(matches!(failure, RecoveryFailure::ReplySave)),
@@ -3804,8 +4165,20 @@ async fn recovered_message_case(kind: u16, failure: RecoveryFailure) {
         );
     }
     source.send(bob.node_id(), &env).await.unwrap();
+    let first_reply = if matches!(failure, RecoveryFailure::CompletionCache) {
+        Some(
+            tokio::time::timeout(Duration::from_secs(5), source.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
     tokio::time::timeout(Duration::from_secs(5), async {
-        while if matches!(failure, RecoveryFailure::PlaintextCache) {
+        while if matches!(failure, RecoveryFailure::CompletionCache) {
+            false
+        } else if matches!(failure, RecoveryFailure::PlaintextCache) {
             db.get_message(&env.id).await.unwrap().is_none()
         } else {
             session_store.failed_saves.load(Ordering::SeqCst) == 0
@@ -3815,6 +4188,25 @@ async fn recovered_message_case(kind: u16, failure: RecoveryFailure) {
     })
     .await
     .unwrap();
+    let first_reply_plaintext = if let Some(reply) = &first_reply {
+        let reply_message =
+            konsensus_crypto::ratchet_message_from_bytes(&reply.ciphertext).unwrap();
+        let plaintext = sessions_a
+            .decrypt(bob.node_id(), &reply_message)
+            .await
+            .unwrap();
+        let follow_on = sessions_a
+            .encrypt(bob.node_id(), b"follow-on traffic")
+            .await
+            .unwrap();
+        sessions_b
+            .decrypt(alice.node_id(), &follow_on)
+            .await
+            .unwrap();
+        Some(plaintext)
+    } else {
+        None
+    };
     // Finish the active receive before inspecting state, even if the cache write failed.
     shutdown.send(true).unwrap();
     worker.await.unwrap();
@@ -3836,7 +4228,7 @@ async fn recovered_message_case(kind: u16, failure: RecoveryFailure) {
     assert!(ws_rx.try_recv().is_err());
     assert_eq!(
         db.get_message_plaintext(&env.id).await.unwrap().is_some(),
-        web_reply && !matches!(failure, RecoveryFailure::PlaintextCache)
+        !matches!(failure, RecoveryFailure::PlaintextCache)
     );
     if matches!(failure, RecoveryFailure::PlaintextCache) {
         assert!(
@@ -3860,11 +4252,38 @@ async fn recovered_message_case(kind: u16, failure: RecoveryFailure) {
         ));
         assert_eq!(sessions_b.restore_sessions().await, 1);
     } else {
+        // Simulate a legacy crash window with no durable plaintext.
+        sqlx::query("UPDATE messages SET plaintext_enc = NULL WHERE id = ?")
+            .bind(env.id.to_hex())
+            .execute(db.pool())
+            .await
+            .unwrap();
         sessions_b.remove_session(alice.node_id()).await;
     }
     let (next_shutdown, next_rx) = watch::channel(false);
     shutdown = next_shutdown;
     worker = start_handler(sessions_b.clone(), next_rx);
+    if let Some(first) = &first_reply {
+        // Keep the completion fault active through a restart and another resend.
+        source.send(bob.node_id(), &env).await.unwrap();
+        let repeated = tokio::time::timeout(Duration::from_secs(5), source.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown.send(true).unwrap();
+        worker.await.unwrap();
+        assert!(
+            serde_json::to_vec(&repeated).unwrap() == serde_json::to_vec(first).unwrap(),
+            "completion failure encrypted a new reply"
+        );
+        sqlx::raw_sql("DROP TRIGGER fail_plaintext_cache")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let (next_shutdown, next_rx) = watch::channel(false);
+        shutdown = next_shutdown;
+        worker = start_handler(sessions_b.clone(), next_rx);
+    }
     source.send(bob.node_id(), &env).await.unwrap();
     let outcome = tokio::time::timeout(Duration::from_secs(5), terminal(source.clone()))
         .await
@@ -3877,8 +4296,14 @@ async fn recovered_message_case(kind: u16, failure: RecoveryFailure) {
             .unwrap();
         assert_eq!(reply.references, vec![env.id]);
         assert_eq!(reply.payment_proof.amount_msat, 0);
+        if let Some(first) = first_reply {
+            assert!(serde_json::to_vec(&reply).unwrap() == serde_json::to_vec(&first).unwrap());
+        }
         let message = konsensus_crypto::ratchet_message_from_bytes(&reply.ciphertext).unwrap();
-        let plaintext = sessions_a.decrypt(bob.node_id(), &message).await.unwrap();
+        let plaintext = match first_reply_plaintext {
+            Some(plaintext) => plaintext,
+            None => sessions_a.decrypt(bob.node_id(), &message).await.unwrap(),
+        };
         let payload: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
         if kind == konsensus_core::kind::KIND_PAGE_REQUEST {
             assert_eq!(reply.kind, konsensus_core::kind::KIND_PAGE_RESPONSE);

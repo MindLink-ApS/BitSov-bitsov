@@ -3,13 +3,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::*;
 
-const TEST_MNEMONIC_A: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon \
+const TEST_MNEMONIC_A: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon art";
 
-const TEST_MNEMONIC_B: &str =
-    "zoo zoo zoo zoo zoo zoo zoo zoo \
+const TEST_MNEMONIC_B: &str = "zoo zoo zoo zoo zoo zoo zoo zoo \
      zoo zoo zoo zoo zoo zoo zoo zoo \
      zoo zoo zoo zoo zoo zoo zoo vote";
 
@@ -201,10 +199,10 @@ async fn one_time_prekey_consumed() {
     let opk_id = bundle.one_time_prekey_id.unwrap();
 
     // Initiate session (consumes OPK)
-    let init_data = mgr_a.initiate_session(
-        &NodeId::from_hex(&bundle.node_id).unwrap(),
-        &bundle,
-    ).await.unwrap();
+    let init_data = mgr_a
+        .initiate_session(&NodeId::from_hex(&bundle.node_id).unwrap(), &bundle)
+        .await
+        .unwrap();
 
     // Accept session (should consume the OPK on Bob's side)
     mgr_b.accept_session(&node_a, &init_data).await.unwrap();
@@ -234,7 +232,10 @@ impl super::SessionStore for MemorySessionStore {
         peer_id: &NodeId,
         state_json: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.data.write().await.insert(*peer_id, state_json.to_vec());
+        self.data
+            .write()
+            .await
+            .insert(*peer_id, state_json.to_vec());
         Ok(())
     }
     async fn load_session(
@@ -250,9 +251,7 @@ impl super::SessionStore for MemorySessionStore {
         self.data.write().await.remove(peer_id);
         Ok(())
     }
-    async fn list_sessions(
-        &self,
-    ) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.data.read().await.keys().copied().collect())
     }
 }
@@ -278,9 +277,15 @@ async fn session_persistence_and_restore() {
 
     // Exchange some messages to advance the ratchet
     let msg1 = mgr_a.encrypt(&node_b, b"hello from A").await.unwrap();
-    assert_eq!(mgr_b.decrypt(&node_a, &msg1).await.unwrap(), b"hello from A");
+    assert_eq!(
+        mgr_b.decrypt(&node_a, &msg1).await.unwrap(),
+        b"hello from A"
+    );
     let msg2 = mgr_b.encrypt(&node_a, b"hello from B").await.unwrap();
-    assert_eq!(mgr_a.decrypt(&node_b, &msg2).await.unwrap(), b"hello from B");
+    assert_eq!(
+        mgr_a.decrypt(&node_b, &msg2).await.unwrap(),
+        b"hello from B"
+    );
 
     // Verify sessions were persisted
     assert!(store_a.data.read().await.contains_key(&node_b));
@@ -304,10 +309,16 @@ async fn session_persistence_and_restore() {
 
     // Verify restored sessions can continue communicating
     let msg3 = mgr_a2.encrypt(&node_b, b"after restart A").await.unwrap();
-    assert_eq!(mgr_b2.decrypt(&node_a, &msg3).await.unwrap(), b"after restart A");
+    assert_eq!(
+        mgr_b2.decrypt(&node_a, &msg3).await.unwrap(),
+        b"after restart A"
+    );
 
     let msg4 = mgr_b2.encrypt(&node_a, b"after restart B").await.unwrap();
-    assert_eq!(mgr_a2.decrypt(&node_b, &msg4).await.unwrap(), b"after restart B");
+    assert_eq!(
+        mgr_a2.decrypt(&node_b, &msg4).await.unwrap(),
+        b"after restart B"
+    );
 }
 
 #[tokio::test]
@@ -373,7 +384,10 @@ async fn session_stored_encrypted_not_plaintext() {
     );
 
     // It should start with a 12-byte nonce + AES-GCM ciphertext
-    assert!(stored_blob.len() > 12, "encrypted blob must contain nonce + ciphertext");
+    assert!(
+        stored_blob.len() > 12,
+        "encrypted blob must contain nonce + ciphertext"
+    );
 }
 
 #[tokio::test]
@@ -411,8 +425,10 @@ async fn restore_migrates_plaintext_to_encrypted() {
     {
         let data = store.data.read().await;
         let blob = data.get(&node_b).unwrap();
-        assert!(serde_json::from_slice::<serde_json::Value>(blob).is_ok(),
-            "should be plaintext JSON before migration");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(blob).is_ok(),
+            "should be plaintext JSON before migration"
+        );
     }
 
     // Phase 2: Create new manager with store and restore.
@@ -505,9 +521,7 @@ fn ratchet_message_from_bytes_under_minimum_header() {
                     "error for {size}-byte payload should mention 'too short', got: {msg}"
                 );
             }
-            other => panic!(
-                "expected InvalidPeerData for {size}-byte payload, got: {other:?}"
-            ),
+            other => panic!("expected InvalidPeerData for {size}-byte payload, got: {other:?}"),
         }
     }
 }
@@ -524,10 +538,7 @@ fn ratchet_message_from_bytes_exactly_minimum_header() {
     assert_eq!(bytes.len(), 40);
 
     let result = ratchet_message_from_bytes(&bytes);
-    assert!(
-        result.is_ok(),
-        "exactly 40 bytes should parse successfully"
-    );
+    assert!(result.is_ok(), "exactly 40 bytes should parse successfully");
     let msg = result.unwrap();
     assert_eq!(msg.header.dh_public, [7u8; 32]);
     assert_eq!(msg.header.previous_chain_length, 3);
@@ -821,6 +832,117 @@ async fn peek_send(mgr: &SessionManager, peer: &NodeId) -> ([u8; 32], [u8; 12]) 
         .ratchet
         .next_send_key_and_nonce()
         .expect("sending chain")
+}
+
+#[tokio::test]
+async fn retained_send_is_atomic_with_ratchet_and_survives_receive_and_restart() {
+    let alice = make_identity(TEST_MNEMONIC_A);
+    let bob = make_identity(TEST_MNEMONIC_B);
+    let store = FlakySessionStore::new();
+    let sender = SessionManager::with_store(alice.clone(), store.clone());
+    let receiver = SessionManager::new(bob.clone());
+    let init = sender
+        .initiate_session(bob.node_id(), &receiver.prekey_bundle().await)
+        .await
+        .unwrap();
+    receiver
+        .accept_session(alice.node_id(), &init)
+        .await
+        .unwrap();
+    let before = peek_send(&sender, bob.node_id()).await;
+    store.fail_saves.store(true, Ordering::SeqCst);
+    let encode = |msg: &RatchetMessage| Ok(ratchet_message_to_bytes(msg));
+    assert!(matches!(
+        sender
+            .encrypt_retained(bob.node_id(), "reply", b"one response", encode)
+            .await,
+        Err(SessionError::Persist(_))
+    ));
+    assert!(sender.recovery_data(bob.node_id(), "reply").await.is_none());
+    assert!(peek_send(&sender, bob.node_id()).await == before);
+    store.fail_saves.store(false, Ordering::SeqCst);
+    let wire = sender
+        .encrypt_retained(bob.node_id(), "reply", b"one response", encode)
+        .await
+        .unwrap();
+    let opener = ratchet_message_from_bytes(&wire).unwrap();
+    assert_eq!(
+        receiver.decrypt(alice.node_id(), &opener).await.unwrap(),
+        b"one response"
+    );
+    let reply = receiver
+        .encrypt(alice.node_id(), b"received")
+        .await
+        .unwrap();
+    sender.decrypt(bob.node_id(), &reply).await.unwrap();
+    let restored = SessionManager::with_store(alice, store.clone());
+    assert_eq!(restored.restore_sessions().await, 1);
+    let saved = store.blob(bob.node_id()).await;
+    assert!(
+        restored
+            .encrypt_retained(bob.node_id(), "reply", b"changed content", |_| panic!(
+                "retry encoded another response"
+            ))
+            .await
+            .unwrap()
+            == wire
+    );
+    assert!(store.blob(bob.node_id()).await == saved);
+    store.fail_saves.store(true, Ordering::SeqCst);
+    assert!(restored
+        .clear_recovery_data(bob.node_id(), "reply")
+        .await
+        .is_err());
+    assert!(
+        restored
+            .recovery_data(bob.node_id(), "reply")
+            .await
+            .unwrap()
+            == wire
+    );
+    store.fail_saves.store(false, Ordering::SeqCst);
+    restored
+        .clear_recovery_data(bob.node_id(), "reply")
+        .await
+        .unwrap();
+    let restarted = SessionManager::with_store(make_identity(TEST_MNEMONIC_A), store);
+    assert_eq!(restarted.restore_sessions().await, 1);
+    assert!(restarted
+        .recovery_data(bob.node_id(), "reply")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn consumed_header_proof_excludes_skipped_keys_and_other_generations() {
+    let alice = make_identity(TEST_MNEMONIC_A);
+    let bob = make_identity(TEST_MNEMONIC_B);
+    let sender = SessionManager::new(alice.clone());
+    let store = FlakySessionStore::new();
+    let receiver = SessionManager::with_store(bob.clone(), store.clone());
+    let init = sender
+        .initiate_session(bob.node_id(), &receiver.prekey_bundle().await)
+        .await
+        .unwrap();
+    receiver
+        .accept_session(alice.node_id(), &init)
+        .await
+        .unwrap();
+    let first = sender.encrypt(bob.node_id(), b"first").await.unwrap();
+    let second = sender.encrypt(bob.node_id(), b"second").await.unwrap();
+    receiver.decrypt(alice.node_id(), &second).await.unwrap();
+    let restored = SessionManager::with_store(bob, store);
+    assert_eq!(restored.restore_sessions().await, 1);
+    assert!(!restored.has_consumed(alice.node_id(), &first.header).await);
+    assert!(restored.has_consumed(alice.node_id(), &second.header).await);
+    let mut unknown = second.header.clone();
+    unknown.dh_public = [0x44; 32];
+    assert!(!restored.has_consumed(alice.node_id(), &unknown).await);
+    assert_eq!(
+        restored.decrypt(alice.node_id(), &first).await.unwrap(),
+        b"first"
+    );
+    assert!(restored.has_consumed(alice.node_id(), &first.header).await);
 }
 
 async fn ratchet_state_json(mgr: &SessionManager, peer: &NodeId) -> Vec<u8> {

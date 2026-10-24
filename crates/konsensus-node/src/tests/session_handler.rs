@@ -2433,6 +2433,10 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
         "insufficient payment: required 2000 msat, got 1000 msat",
         "recipient mismatch: envelope addressed to a, this node is b",
         "invalid signature: bad signature",
+        "message plaintext lost: receive key already consumed",
+        "message plaintext unavailable",
+        "message withdrawn",
+        "call signal withdrawn",
         "storage error",
         "lightning verification failed: offline",
     ] {
@@ -4125,25 +4129,30 @@ async fn duplicate_ratchet_init_preserves_the_ready_session() {
 
 #[tokio::test]
 async fn failed_ratchet_init_send_retries_without_advancing_session() {
-    ratchet_init_retry_case(false, false).await;
+    ratchet_init_retry_case(false, false, false).await;
+}
+
+#[tokio::test]
+async fn failed_ratchet_init_send_survives_restart() {
+    ratchet_init_retry_case(false, false, true).await;
 }
 
 #[tokio::test]
 async fn pending_ratchet_init_is_discarded_after_session_replacement() {
-    ratchet_init_retry_case(true, false).await;
+    ratchet_init_retry_case(true, false, false).await;
 }
 
 #[tokio::test]
 async fn replacement_session_ack_builds_a_new_ratchet_init() {
-    ratchet_init_retry_case(true, true).await;
+    ratchet_init_retry_case(true, true, false).await;
 }
 
-async fn ratchet_init_retry_case(replace_session: bool, replacement_ack: bool) {
+async fn ratchet_init_retry_case(replace_session: bool, replacement_ack: bool, restart: bool) {
     use std::time::Duration;
     let alice = identity_from_mnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
     let bob = identity_from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
     let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
-    let sessions = SessionManager::with_store(
+    let mut sessions = SessionManager::with_store(
         alice.clone(),
         Arc::new(crate::StorageSessionAdapter {
             storage: db.clone(),
@@ -4216,6 +4225,16 @@ async fn ratchet_init_retry_case(replace_session: bool, replacement_ack: bool) {
     }
     let saved = db.load_session(bob.node_id()).await.unwrap();
     assert!(saved.is_some());
+    if restart {
+        sessions = SessionManager::with_store(
+            alice.clone(),
+            Arc::new(crate::StorageSessionAdapter {
+                storage: db.clone(),
+            }),
+        );
+        assert_eq!(sessions.restore_sessions().await, 1);
+        pending.clear();
+    }
     assert!(!receiver.can_send(alice.node_id()).await);
     source.add_to_whitelist(bob.node_id()).await;
     target.add_to_whitelist(alice.node_id()).await;
@@ -4250,11 +4269,6 @@ async fn ratchet_init_retry_case(replace_session: bool, replacement_ack: bool) {
         return;
     }
     let payload = payload.expect("self-heal must retry the saved RatchetInit after a failed send");
-    assert_eq!(
-        db.load_session(bob.node_id()).await.unwrap(),
-        saved,
-        "retry must not encrypt again"
-    );
     assert!(pending.is_empty());
     assert_eq!(
         (Frame::RatchetInit {
@@ -4270,6 +4284,19 @@ async fn ratchet_init_retry_case(replace_session: bool, replacement_ack: bool) {
         b"ratchet-init"
     );
     assert!(receiver.can_send(alice.node_id()).await);
+    let next = sessions
+        .encrypt(bob.node_id(), b"next message")
+        .await
+        .unwrap();
+    assert_eq!(
+        next.header.message_number, 1,
+        "retry must not encrypt again"
+    );
+    assert_eq!(next.header.dh_public, message.header.dh_public);
+    assert_eq!(
+        receiver.decrypt(alice.node_id(), &next).await.unwrap(),
+        b"next message"
+    );
     source.shutdown();
     target.shutdown();
 }

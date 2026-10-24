@@ -944,9 +944,17 @@ async fn handle_session_ack(
     // Encrypt saves the advanced ratchet before returning. On error the frame
     // is not built and nothing is sent. A save failure leaves the session in
     // place so a later attempt can send; other failures still drop it.
-    match session_manager.encrypt(peer_id, b"ratchet-init").await {
-        Ok(ratchet_msg) => {
-            let payload = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
+    match session_manager
+        .encrypt_retained(peer_id, "ratchet-init", b"ratchet-init", |message| {
+            Ok(konsensus_crypto::ratchet_message_to_bytes(message))
+        })
+        .await
+    {
+        Ok(payload) => {
+            let ratchet_msg = match konsensus_crypto::ratchet_message_from_bytes(&payload) {
+                Ok(message) => message,
+                Err(_) => return,
+            };
             let frame = Frame::RatchetInit { payload };
             pending_ratchet_inits.insert(
                 *peer_id,
@@ -983,6 +991,19 @@ async fn retry_ratchet_init(
     transport: &NoiseTransport,
     pending: &mut PendingRatchetInits,
 ) -> bool {
+    if !pending.contains_key(peer_id) {
+        if let Some(payload) = session_manager.recovery_data(peer_id, "ratchet-init").await {
+            if let Ok(message) = konsensus_crypto::ratchet_message_from_bytes(&payload) {
+                pending.insert(
+                    *peer_id,
+                    PendingRatchetInit {
+                        frame: Frame::RatchetInit { payload },
+                        ratchet_key: message.header.dh_public,
+                    },
+                );
+            }
+        }
+    }
     if let Some(init) = pending.get(peer_id) {
         // Sessions can also be replaced through the API, outside this handler.
         if !session_manager
@@ -990,11 +1011,20 @@ async fn retry_ratchet_init(
             .await
         {
             pending.remove(peer_id);
+            let _ = session_manager
+                .clear_recovery_data(peer_id, "ratchet-init")
+                .await;
             return false;
         }
         match transport.send_frame(peer_id, &init.frame).await {
             Ok(()) => {
                 pending.remove(peer_id);
+                if let Err(error) = session_manager
+                    .clear_recovery_data(peer_id, "ratchet-init")
+                    .await
+                {
+                    warn!(peer = %peer_id, %error, "sent RatchetInit recovery data could not be cleared");
+                }
             }
             Err(e) => {
                 warn!(peer = %peer_id, error = %e, "failed to send RatchetInit; retained for self-heal")
@@ -1186,11 +1216,16 @@ async fn send_prekey_offer(
 /// Wire reasons are the gate's stable Display prefixes; unknown reasons stay
 /// retryable so older peers and temporary gate failures cannot burn delivery.
 fn terminal_paid_rejection(reason: &str) -> bool {
+    if matches!(reason, "message withdrawn" | "call signal withdrawn") {
+        return true;
+    }
     [
         "payment proof already used:",
         "insufficient payment:",
         "recipient mismatch:",
         "invalid signature:",
+        "message plaintext lost:",
+        "message plaintext unavailable",
         "room_binding_invalid:",
         "room_sender_not_member:",
         "room_recipient_not_member:",

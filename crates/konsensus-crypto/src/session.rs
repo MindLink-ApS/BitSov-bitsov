@@ -149,9 +149,22 @@ pub trait SessionStore: Send + Sync {
 }
 
 /// An active E2EE session with a peer.
+#[derive(Clone)]
 struct PeerSession {
     /// The Double Ratchet for this session.
     ratchet: DoubleRatchet,
+    /// Pending wire ciphertext and receive receipts saved with their ratchet.
+    recovery_data: HashMap<String, Vec<u8>>,
+}
+
+/// Keep the original ratchet JSON fields so existing encrypted sessions restore
+/// without a schema migration. Missing recovery data defaults to an empty map.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredSession {
+    #[serde(flatten)]
+    ratchet: RatchetState,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    recovery_data: HashMap<String, Vec<u8>>,
 }
 
 /// Domain-separation context for deriving the session-encryption key from the
@@ -321,13 +334,16 @@ impl SessionManager {
                         None => continue,
                     };
 
-                    match serde_json::from_slice::<RatchetState>(&json_bytes) {
+                    match serde_json::from_slice::<StoredSession>(&json_bytes) {
                         Ok(state) => {
-                            let ratchet = DoubleRatchet::from_state(&state);
-                            self.sessions
-                                .write()
-                                .await
-                                .insert(*peer_id, PeerSession { ratchet });
+                            let ratchet = DoubleRatchet::from_state(&state.ratchet);
+                            self.sessions.write().await.insert(
+                                *peer_id,
+                                PeerSession {
+                                    ratchet,
+                                    recovery_data: state.recovery_data,
+                                },
+                            );
                             restored += 1;
                             debug!(peer = %peer_id, "restored E2EE session from storage");
 
@@ -479,11 +495,11 @@ impl SessionManager {
         // can save a newer state while this snapshot is pending, and this save
         // can overwrite it, reusing a sent key and nonce after restart.
         let sessions = self.sessions.read().await;
-        let state = match sessions.get(peer_id) {
-            Some(session) => session.ratchet.export_state(),
+        let session = match sessions.get(peer_id) {
+            Some(session) => session,
             None => return Ok(()),
         };
-        write_session_state(self.store.as_ref(), &self.session_cipher, peer_id, &state).await
+        write_session_state(self.store.as_ref(), &self.session_cipher, peer_id, session).await
     }
 
     /// Get our prekey bundle for distribution to peers.
@@ -549,10 +565,13 @@ impl SessionManager {
         let ratchet_key = *ratchet.public_key().as_bytes();
 
         // Store session
-        self.sessions
-            .write()
-            .await
-            .insert(*peer_id, PeerSession { ratchet });
+        self.sessions.write().await.insert(
+            *peer_id,
+            PeerSession {
+                ratchet,
+                recovery_data: HashMap::new(),
+            },
+        );
 
         // Persist to storage. No message ciphertext exists yet; a later send
         // saves the advanced ratchet before returning ciphertext.
@@ -620,10 +639,13 @@ impl SessionManager {
         );
 
         // Store session
-        self.sessions
-            .write()
-            .await
-            .insert(*peer_id, PeerSession { ratchet });
+        self.sessions.write().await.insert(
+            *peer_id,
+            PeerSession {
+                ratchet,
+                recovery_data: HashMap::new(),
+            },
+        );
 
         // Persist to storage. No message ciphertext exists yet; a later send
         // saves the advanced ratchet before returning ciphertext.
@@ -659,22 +681,95 @@ impl SessionManager {
         // and installed it. The cost is that every other session operation on
         // this manager waits out that write.
         let mut sessions = self.sessions.write().await;
-        let (msg, trial, state) = {
+        let (msg, trial) = {
             let session = sessions
                 .get_mut(peer_id)
                 .ok_or(SessionError::NoSession(*peer_id))?;
-            let mut trial = session.ratchet.clone();
-            let msg = trial.encrypt(plaintext)?;
-            let state = trial.export_state();
-            (msg, trial, state)
+            let mut trial = session.clone();
+            let msg = trial.ratchet.encrypt(plaintext)?;
+            (msg, trial)
         };
 
-        write_session_state(store.as_ref(), cipher, peer_id, &state).await?;
+        write_session_state(store.as_ref(), cipher, peer_id, &trial).await?;
         match sessions.get_mut(peer_id) {
-            Some(session) => session.ratchet = trial,
+            Some(session) => *session = trial,
             None => return Err(SessionError::NoSession(*peer_id)),
         }
         Ok(msg)
+    }
+
+    /// Encrypt once and retain the encoded wire message in the same encrypted
+    /// snapshot as its advanced ratchet. Retries, including after restore,
+    /// return the exact saved bytes without consuming another sending key.
+    /// `encode` must only construct the wire message; it must not transmit it.
+    pub async fn encrypt_retained<F>(
+        &self,
+        peer_id: &NodeId,
+        retention_key: &str,
+        plaintext: &[u8],
+        encode: F,
+    ) -> Result<Vec<u8>, SessionError>
+    where
+        F: FnOnce(&RatchetMessage) -> Result<Vec<u8>, SessionError>,
+    {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get_mut(peer_id)
+            .ok_or(SessionError::NoSession(*peer_id))?;
+        if let Some(saved) = session.recovery_data.get(retention_key) {
+            return Ok(saved.clone());
+        }
+        let mut trial = session.clone();
+        let message = trial.ratchet.encrypt(plaintext)?;
+        let wire = encode(&message)?;
+        trial
+            .recovery_data
+            .insert(retention_key.to_owned(), wire.clone());
+        write_session_state(self.store.as_ref(), &self.session_cipher, peer_id, &trial).await?;
+        *session = trial;
+        Ok(wire)
+    }
+
+    /// Read recovery bytes retained with this session.
+    pub async fn recovery_data(&self, peer_id: &NodeId, retention_key: &str) -> Option<Vec<u8>> {
+        self.sessions
+            .read()
+            .await
+            .get(peer_id)?
+            .recovery_data
+            .get(retention_key)
+            .cloned()
+    }
+
+    /// Forget completed recovery data. A failed save preserves its bytes.
+    pub async fn clear_recovery_data(
+        &self,
+        peer_id: &NodeId,
+        retention_key: &str,
+    ) -> Result<(), SessionError> {
+        let mut sessions = self.sessions.write().await;
+        let Some(session) = sessions.get_mut(peer_id) else {
+            return Ok(());
+        };
+        if !session.recovery_data.contains_key(retention_key) {
+            return Ok(());
+        }
+        let mut trial = session.clone();
+        trial.recovery_data.remove(retention_key);
+        write_session_state(self.store.as_ref(), &self.session_cipher, peer_id, &trial).await?;
+        *session = trial;
+        Ok(())
+    }
+
+    /// Prove that the committed receive chain has passed this header and no
+    /// skipped key remains. A different DH generation is unknown, not proof of
+    /// consumption; callers must not mistake an authentication error for replay.
+    pub async fn has_consumed(&self, peer_id: &NodeId, header: &MessageHeader) -> bool {
+        self.sessions
+            .read()
+            .await
+            .get(peer_id)
+            .is_some_and(|session| session.ratchet.has_consumed(header))
     }
 
     /// Decrypt a ciphertext message from a peer.
@@ -712,26 +807,49 @@ impl SessionManager {
         F: FnOnce(Vec<u8>) -> Fut,
         Fut: std::future::Future<Output = Result<(), SessionError>>,
     {
+        self.decrypt_with_recovery(peer_id, message, None, before_commit)
+            .await
+    }
+
+    /// Authenticate and save a receive receipt alongside the committed ratchet.
+    /// The receipt contains the authenticated header bytes under the caller's
+    /// envelope-bound recovery key. It proves consumption across later DH
+    /// generations until the caller completes and clears its recovery data.
+    pub async fn decrypt_with_recovery<F, Fut>(
+        &self,
+        peer_id: &NodeId,
+        message: &RatchetMessage,
+        receipt_key: Option<&str>,
+        before_commit: F,
+    ) -> Result<Vec<u8>, SessionError>
+    where
+        F: FnOnce(Vec<u8>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), SessionError>>,
+    {
         let store = self.store.clone();
         let cipher = &self.session_cipher;
         // Same lock as `encrypt`: held across the store await so a concurrent
         // send cannot derive a key from the ratchet this decrypt is replacing.
         // Other session operations wait for the write.
         let mut sessions = self.sessions.write().await;
-        let (plaintext, trial, state) = {
+        let (plaintext, mut trial) = {
             let session = sessions
                 .get_mut(peer_id)
                 .ok_or(SessionError::NoSession(*peer_id))?;
-            let mut trial = session.ratchet.clone();
-            let plaintext = trial.decrypt(message)?;
-            let state = trial.export_state();
-            (plaintext, trial, state)
+            let mut trial = session.clone();
+            let plaintext = trial.ratchet.decrypt(message)?;
+            (plaintext, trial)
         };
 
         before_commit(plaintext.clone()).await?;
-        write_session_state(store.as_ref(), cipher, peer_id, &state).await?;
+        if let Some(key) = receipt_key {
+            trial
+                .recovery_data
+                .insert(key.to_owned(), message.header.to_bytes().to_vec());
+        }
+        write_session_state(store.as_ref(), cipher, peer_id, &trial).await?;
         match sessions.get_mut(peer_id) {
-            Some(session) => session.ratchet = trial,
+            Some(session) => *session = trial,
             None => return Err(SessionError::NoSession(*peer_id)),
         }
         Ok(plaintext)
@@ -899,13 +1017,17 @@ async fn write_session_state(
     store: Option<&Arc<dyn SessionStore>>,
     cipher: &Aes256Gcm,
     peer_id: &NodeId,
-    state: &RatchetState,
+    session: &PeerSession,
 ) -> Result<(), SessionError> {
     let Some(store) = store else {
         return Ok(());
     };
 
-    let mut json_blob = serde_json::to_vec(state)
+    let state = StoredSession {
+        ratchet: session.ratchet.export_state(),
+        recovery_data: session.recovery_data.clone(),
+    };
+    let mut json_blob = serde_json::to_vec(&state)
         .map_err(|e| SessionError::Persist(format!("serialize session state: {e}")))?;
     let encrypted = seal_session_blob(cipher, &json_blob);
     json_blob.zeroize();
