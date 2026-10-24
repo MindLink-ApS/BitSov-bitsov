@@ -861,6 +861,114 @@ fn assert_unique_keys(sent: &[Forwarded]) {
     }
 }
 
+/// Delay only the first save, without locking the backing store. Later saves
+/// can replace the blob first, just as the SQL backends allow.
+struct DelayedSessionStore {
+    inner: Arc<MemorySessionStore>,
+    saves_started: AtomicUsize,
+    release_first_save: tokio::sync::Notify,
+    save_order: tokio::sync::Mutex<Vec<usize>>,
+}
+
+#[async_trait]
+impl super::SessionStore for DelayedSessionStore {
+    async fn save_session(
+        &self,
+        peer_id: &NodeId,
+        state_json: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let sequence = self.saves_started.fetch_add(1, Ordering::SeqCst);
+        if sequence == 0 {
+            self.release_first_save.notified().await;
+        }
+        self.inner.save_session(peer_id, state_json).await?;
+        self.save_order.lock().await.push(sequence);
+        Ok(())
+    }
+
+    async fn load_session(
+        &self,
+        peer_id: &NodeId,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.load_session(peer_id).await
+    }
+
+    async fn delete_session(
+        &self,
+        peer_id: &NodeId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.delete_session(peer_id).await
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_sessions().await
+    }
+}
+
+#[tokio::test]
+async fn delayed_establishment_save_cannot_reuse_sent_key_after_restart() {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_a = *id_a.node_id();
+    let node_b = *id_b.node_id();
+    let store = Arc::new(DelayedSessionStore {
+        inner: MemorySessionStore::new(),
+        saves_started: AtomicUsize::new(0),
+        release_first_save: tokio::sync::Notify::new(),
+        save_order: tokio::sync::Mutex::new(Vec::new()),
+    });
+    let mgr_a = SessionManager::with_store(Arc::clone(&id_a), store.clone());
+    let mgr_b = SessionManager::new(id_b);
+    let bundle_b = mgr_b.prekey_bundle().await;
+    let mut sent = Vec::new();
+
+    let (init_data, sent_before_establishment_saved) = {
+        let mut initiation = Box::pin(mgr_a.initiate_session(&node_b, &bundle_b));
+        // Poll to the store's explicit gate: S0 is pending, but the session
+        // is already published. No sleeps or scheduler timing are involved.
+        assert!(poll_fn(|cx| Poll::Ready(initiation.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        assert_eq!(store.saves_started.load(Ordering::SeqCst), 1);
+        assert!(mgr_a.can_send(&node_b).await);
+
+        let mut send = Box::pin(forward_if_saved(&mgr_a, &node_b, b"first", &mut sent));
+        let early_send = poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx))).await;
+        let sent_early = early_send.is_ready();
+        // With the bug, the send has now saved S1 and returned ciphertext.
+        // Release S0 only afterward, deterministically overwriting S1. With
+        // the fix, the send is waiting for the establishment read guard.
+        store.release_first_save.notify_one();
+        let init_data = initiation.await.unwrap();
+        match early_send {
+            Poll::Ready(result) => result.unwrap(),
+            Poll::Pending => send.await.unwrap(),
+        }
+        (init_data, sent_early)
+    };
+    mgr_b.accept_session(&node_a, &init_data).await.unwrap();
+
+    drop(mgr_a);
+    let restored = SessionManager::with_store(id_a, store.clone());
+    assert_eq!(restored.restore_sessions().await, 1);
+    forward_if_saved(&restored, &node_b, b"after restart", &mut sent)
+        .await
+        .unwrap();
+    // On the broken implementation this fails on the actual reused message
+    // key, after the store completed saves in the order S1, S0, S1.
+    assert_unique_keys(&sent);
+    assert!(!sent_before_establishment_saved);
+    assert_eq!(*store.save_order.lock().await, vec![0, 1, 2]);
+    assert_eq!(sent.len(), 2);
+    for (item, plaintext) in sent.iter().zip([b"first".as_slice(), b"after restart"]) {
+        let message = ratchet_message_from_bytes(&item.bytes).unwrap();
+        assert_eq!(mgr_b.decrypt(&node_a, &message).await.unwrap(), plaintext);
+    }
+}
+
 #[tokio::test]
 async fn persist_failure_sends_nothing_and_restart_does_not_reuse_keys() {
     let id_a = make_identity(TEST_MNEMONIC_A);

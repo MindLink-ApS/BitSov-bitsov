@@ -471,12 +471,13 @@ impl SessionManager {
     /// while holding the session write lock. Establishment still logs a failure
     /// and continues, because that path has not produced a message ciphertext.
     async fn persist_session(&self, peer_id: &NodeId) -> Result<(), SessionError> {
-        let state = {
-            let sessions = self.sessions.read().await;
-            match sessions.get(peer_id) {
-                Some(session) => session.ratchet.export_state(),
-                None => return Ok(()),
-            }
+        // Hold the read guard through the save. Otherwise an encrypt/decrypt
+        // can save a newer state while this snapshot is pending, and this save
+        // can overwrite it, reusing a sent key and nonce after restart.
+        let sessions = self.sessions.read().await;
+        let state = match sessions.get(peer_id) {
+            Some(session) => session.ratchet.export_state(),
+            None => return Ok(()),
         };
         write_session_state(self.store.as_ref(), &self.session_cipher, peer_id, &state).await
     }
