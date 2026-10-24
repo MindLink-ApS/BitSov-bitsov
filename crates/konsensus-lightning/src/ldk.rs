@@ -1155,7 +1155,9 @@ impl LdkProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.iter()
-            .filter(|(_, expires_at)| **expires_at <= now_unix)
+            .filter(|(_, expires_at)| {
+                **expires_at != UNKNOWN_INVOICE_EXPIRY && **expires_at <= now_unix
+            })
             .map(|(hash, _)| hash.clone())
             .collect()
     }
@@ -2685,32 +2687,18 @@ fn load_invoice_expiries(
     Ok(map)
 }
 
-/// Service invoices use the peer cap expiry; LSPS2 funding previews are Bolt11Jit
-/// and never occupy the service-invoice sidecar.
-const SERVICE_INVOICE_ORPHAN_SECS: u64 = 120;
+/// LDK PaymentDetails does not retain BOLT11 expiry. Missing metadata must
+/// never become an inferred cancellation deadline. Keep such invoices until
+/// the wallet reports a terminal status; the sentinel still accounts for their
+/// outstanding slots after restart.
+const UNKNOWN_INVOICE_EXPIRY: u64 = u64::MAX;
 
-fn legacy_orphan_expiry_guess(timestamp: u64) -> u64 {
-    timestamp.saturating_add(u64::from(u32::MAX))
+fn migrate_service_invoice_expiry(recorded: Option<u64>) -> u64 {
+    recorded.unwrap_or(UNKNOWN_INVOICE_EXPIRY)
 }
 
-pub(crate) fn migrate_service_invoice_expiry(
-    recorded: Option<u64>,
-    latest_update_timestamp: u64,
-) -> u64 {
-    let min_payable = latest_update_timestamp.saturating_add(SERVICE_INVOICE_ORPHAN_SECS);
-    match recorded {
-        Some(expires_at) if expires_at >= legacy_orphan_expiry_guess(latest_update_timestamp) => {
-            min_payable
-        }
-        Some(expires_at) => expires_at.max(min_payable),
-        None => min_payable,
-    }
-}
-
-/// Repair the existing sidecar against durable wallet state, without a schema
-/// migration. LDK does not retain BOLT11 expiry in PaymentDetails. Missing
-/// metadata uses a short orphan window for cap accounting; legacy rows that
-/// used the u32::MAX orphan guess are clamped on load.
+/// Repair the sidecar against durable wallet state without guessing expiry.
+/// Preserve saved BOLT11 deadlines exactly, including long legacy estimates.
 fn reconcile_invoice_expiries(
     node: &ldk_node::Node,
     mut recorded: std::collections::HashMap<String, u64>,
@@ -2731,10 +2719,7 @@ fn reconcile_invoice_expiries(
                 }
                 _ => return None,
             };
-            let expires_at = migrate_service_invoice_expiry(
-                recorded.remove(&hash),
-                payment.latest_update_timestamp,
-            );
+            let expires_at = migrate_service_invoice_expiry(recorded.remove(&hash));
             Some((hash, expires_at))
         })
         .collect()

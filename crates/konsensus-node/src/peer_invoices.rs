@@ -30,7 +30,6 @@ pub(crate) const RECONCILIATION_BUDGET: Duration = Duration::from_secs(2);
 const STATUS_BUDGET: Duration = Duration::from_millis(100);
 
 const MAX_RATE_PEERS: usize = 1024;
-const MAX_FORGET_RETRIES: usize = 64;
 
 /// Why a service invoice was refused. Callers answer with [`INVOICE_LIMITED`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,8 +189,8 @@ pub(crate) async fn reconcile(
     result
 }
 
-/// Drop rows that are no longer an unpaid hold, then delete expired pending
-/// invoices from the wallet. A settled invoice stays in the wallet and stops
+/// Delete expired pending invoices, then drop rows that are no longer an
+/// unpaid hold. A settled invoice stays in the wallet and stops
 /// occupying a cap slot. A failed delete stays in the book, without counting
 /// toward the caps, until a later sweep.
 pub(crate) async fn purge_expired_peer_invoices(
@@ -199,7 +198,9 @@ pub(crate) async fn purge_expired_peer_invoices(
     lightning: &dyn LightningProvider,
     now_unix: u64,
 ) {
-    release_closed_rows(book, lightning).await;
+    // Deletion verifies that each wallet record is still pending. Give expiry
+    // retries the sweep budget before status reads, which can otherwise starve
+    // all deletes once a large backlog accumulates during a wallet outage.
     let expired: Vec<String> = book
         .rows
         .iter()
@@ -220,14 +221,7 @@ pub(crate) async fn purge_expired_peer_invoices(
             book.rows.retain(|row| row.hash != hash);
         }
     }
-    let mut failed = 0usize;
-    book.rows.retain(|row| {
-        if now_unix < row.expires_at {
-            return true;
-        }
-        failed += 1;
-        failed <= MAX_FORGET_RETRIES
-    });
+    release_closed_rows(book, lightning).await;
     if let Ok(Err(error)) = tokio::time::timeout(
         STATUS_BUDGET,
         lightning.purge_expired_pending_invoices(now_unix),

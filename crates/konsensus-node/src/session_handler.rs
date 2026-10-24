@@ -1587,6 +1587,7 @@ async fn handle_invoice_requested_gated(
         transport,
         source_ip,
         last_admission_refusal,
+        min_admission_cost_msat,
         invoices,
     )
     .await;
@@ -1604,6 +1605,7 @@ async fn handle_invoice_requested(
     transport: &Arc<NoiseTransport>,
     source_ip: std::net::IpAddr,
     refusals: &mut crate::invoice_refusals::RefusalLimits,
+    min_admission_cost_msat: u64,
     invoices: &mut crate::peer_invoices::PeerInvoiceBook,
 ) {
     let now_unix = std::time::SystemTime::now()
@@ -1652,19 +1654,8 @@ async fn handle_invoice_requested(
             return;
         }
     };
-    if ceiling == 0 {
-        rollback_rate();
-        if refusals.permit(source_ip, tokio::time::Instant::now()) {
-            send_invoice_refusal(
-                transport,
-                peer_id,
-                request_id,
-                konsensus_api::invoice_refusal::INVOICE_UNAVAILABLE,
-            )
-            .await;
-        }
-        return;
-    }
+    // Match the prices advertised to payers and enforced by the payment gate.
+    let ceiling = konsensus_core::gate::price_with_floor_msat(ceiling, min_admission_cost_msat);
     let amount_msat = amount_msat.min(ceiling);
     info!(
         peer = %peer_id, %request_id, amount_msat, %purpose,
@@ -1743,7 +1734,7 @@ async fn configured_price_ceiling(pricing: &dyn PricingEngine) -> Result<u64, &'
             ceiling = ceiling.max(price);
         }
     }
-    if !priced || ceiling == 0 {
+    if !priced {
         return Err("konsensus:price_unavailable");
     }
     Ok(ceiling)
@@ -1751,11 +1742,23 @@ async fn configured_price_ceiling(pricing: &dyn PricingEngine) -> Result<u64, &'
 
 const MAX_CONCURRENT_PRICE_CEILING_LOOKUPS: usize = 8;
 
+/// Releases a lookup slot on success, error, timeout, or abandonment. Construct
+/// before the async block so even an unpolled shared future owns its slot.
+struct PriceCeilingLookupPermit(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for PriceCeilingLookupPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 type PriceCeilingLookup =
     futures::future::Shared<futures::future::BoxFuture<'static, Result<u64, &'static str>>>;
 
-/// Coalesces configured price-ceiling reads so slow pricing cannot stall the
-/// control loop. At most [`MAX_CONCURRENT_PRICE_CEILING_LOOKUPS`] lookups run at
+/// Coalesces in-flight price-ceiling reads so slow pricing cannot stall the
+/// control loop. Completed results are refreshed on the next request: pricing
+/// engines own their freshness policy, and a stale cap can truncate a valid
+/// newly advertised price. At most [`MAX_CONCURRENT_PRICE_CEILING_LOOKUPS`] lookups run at
 /// once; additional callers fail fast with `konsensus:price_unavailable`.
 pub(crate) struct ConfiguredPriceCeilingCache {
     lookup: tokio::sync::Mutex<Option<PriceCeilingLookup>>,
@@ -1780,28 +1783,29 @@ impl ConfiguredPriceCeilingCache {
             let refresh = match slot.as_ref() {
                 None => true,
                 Some(lookup) => match lookup.peek() {
-                    Some(Ok(_)) => false,
-                    Some(Err(_)) => true,
+                    Some(_) => true,
                     None => lookup.strong_count() == Some(1),
                 },
             };
             if refresh {
+                // Drop an abandoned lookup before reserving its replacement.
+                *slot = None;
                 if self.active.fetch_add(1, Ordering::SeqCst)
                     >= MAX_CONCURRENT_PRICE_CEILING_LOOKUPS
                 {
                     self.active.fetch_sub(1, Ordering::SeqCst);
                     return Err("konsensus:price_unavailable");
                 }
-                let active = self.active.clone();
+                let permit = PriceCeilingLookupPermit(self.active.clone());
                 *slot = Some(
                     async move {
+                        let _permit = permit;
                         let ceiling = tokio::time::timeout(
                             Duration::from_secs(5),
                             configured_price_ceiling(pricing.as_ref()),
                         )
                         .await
                         .map_err(|_| "konsensus:price_unavailable")??;
-                        active.fetch_sub(1, Ordering::SeqCst);
                         Ok(ceiling)
                     }
                     .boxed()
