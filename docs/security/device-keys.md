@@ -1,7 +1,6 @@
 # Paired device keys and signed relation intents
 
-Relation ladder, Before-Mexico steps 1–3. Direction:
-`MindLink-Private/pm/projects/bitsov/research/RELATION-LADDER-AND-DEVICE-KEYS.md`.
+Relation ladder, Before-Mexico steps 1–3. Direction: an internal design note.
 
 ## What changes for the owner
 
