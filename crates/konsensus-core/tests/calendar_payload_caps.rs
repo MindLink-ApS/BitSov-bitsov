@@ -123,13 +123,23 @@ fn oversize_field_is_refused_before_copy() {
 }
 
 /// An attendee list over the count cap is refused at entry `cap + 1`; the
-/// declared length never drives an allocation, so the bytes requested are
-/// bounded by the cap, not by the list.
+/// declared length never drives an allocation. The fixture is fifty times the
+/// cap in short entries, so the allocation calls (one per copied entry) show
+/// where the guard stopped: without it they would run into the thousands.
 #[test]
 fn oversize_attendee_list_is_refused_at_the_cap() {
-    let bytes = event_json(0, 2 * MAX_ATTENDEES, "null");
+    let entries = 50 * MAX_ATTENDEES;
+    let list = std::iter::repeat_n("\"abcdefgh\"", entries)
+        .collect::<Vec<_>>()
+        .join(",");
+    let bytes = format!(
+        r#"{{"event_id":"evt-1","title":"Standup","start_ms":1700000000000,"end_ms":1700003600000,"tz":"UTC","organizer":"{}","attendees":[{}]}}"#,
+        "cd".repeat(32),
+        list
+    )
+    .into_bytes();
     assert!(bytes.len() <= MAX_CALENDAR_PAYLOAD_BYTES);
-    let (result, _calls, total) = measured(|| CalendarEventPayload::decode(&bytes));
+    let (result, calls, total) = measured(|| CalendarEventPayload::decode(&bytes));
     assert_eq!(
         result,
         Err(CalendarPayloadError::TooManyEntries {
@@ -137,13 +147,13 @@ fn oversize_attendee_list_is_refused_at_the_cap() {
             max: MAX_ATTENDEES
         })
     );
-    // Up to `MAX_ATTENDEES` 64-byte strings plus Vec growth and the error
-    // message; the second hundred entries must not have been copied.
-    let one_cap_of_attendees = MAX_ATTENDEES * 64;
+    // At most one allocation per admitted entry plus Vec growth, the decoder's
+    // scratch and the error message; the other 4900 entries were never copied.
     assert!(
-        total < 4 * one_cap_of_attendees,
-        "attendees past the cap must not be copied (requested {total} bytes)"
+        calls <= MAX_ATTENDEES + 32,
+        "attendees past the cap were copied ({calls} allocation calls for {entries} entries)"
     );
+    assert!(total < 16 * 1024, "requested {total} bytes");
 }
 
 /// A recurrence that would expand past the cap is refused at decode. Nothing
@@ -161,7 +171,7 @@ fn recurrence_past_cap_is_refused_without_expansion() {
     assert_eq!(
         result,
         Err(CalendarPayloadError::RecurrenceTooLarge {
-            estimated: 401 * MAX_BYDAY as u64,
+            estimated: 402 * MAX_BYDAY as u64,
             max: MAX_RECURRENCE_INSTANCES
         })
     );

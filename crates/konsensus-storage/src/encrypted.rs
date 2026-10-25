@@ -878,6 +878,11 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.reject_accepted_envelope(envelope).await
     }
 
+    async fn is_application_rejected(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, StorageError> {
+        // Receipt matching uses immutable metadata, never the at-rest ciphertext.
+        self.inner.is_application_rejected(envelope).await
+    }
+
     async fn call_admission_hold(&self, envelope: &konsensus_core::UkmEnvelope, now_ms: u64) -> Result<bool, StorageError> {
         self.inner.call_admission_hold(envelope, now_ms).await
     }

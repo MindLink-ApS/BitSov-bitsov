@@ -1150,6 +1150,16 @@ pub trait Storage: Send + Sync {
     // ── Incoming call signal admission hold (Codex delta2 #4) ──────────
     // A held message is invisible to history, resync and duplicate ACKs.
 
+    /// Whether `envelope` is a replay of a paid envelope this node accepted and
+    /// then refused at the application (`reject_accepted_envelope`, or the hold
+    /// sweep): its receipt is bound to this exact id and sender with
+    /// `accepted = -1`. The receive loop answers such a replay with a terminal
+    /// application rejection instead of a payment-reuse reason, which an older
+    /// sender would read as a legacy acknowledgement.
+    async fn is_application_rejected(&self, _envelope: &konsensus_core::UkmEnvelope) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
     /// Hold `envelope` before its paid acceptance, unless a message with its
     /// id is already stored. Returns whether this call placed the hold.
     async fn call_admission_hold(&self, _envelope: &konsensus_core::UkmEnvelope, _now_ms: u64) -> Result<bool, StorageError> {

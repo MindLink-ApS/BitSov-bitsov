@@ -4059,12 +4059,23 @@ async fn calendar_refusals_are_terminal_and_never_deliver_later() {
         CalendarPayloadError::Malformed,
     ];
     assert_eq!(refusals.len(), CalendarPayloadError::CODES.len());
-    for refusal in refusals {
-        let reason = crate::msg_handler::calendar_reject_reason(&refusal);
+    let mut reasons: Vec<String> = refusals
+        .iter()
+        .map(|refusal| {
+            // The bare code without the separator is not a refusal line.
+            assert!(!terminal_paid_rejection(refusal.code()));
+            assert!(!terminal_paid_rejection(&format!("{}x: y", refusal.code())));
+            crate::msg_handler::calendar_reject_reason(refusal)
+        })
+        .collect();
+    // The reject frame was lost and the sender retried: the recipient answers
+    // the replay of a withdrawn envelope with this reason instead of a
+    // payment-reuse one, which the compatibility path below would take as an
+    // acknowledgement.
+    reasons.push(crate::msg_handler::application_rejected_reason());
+    assert!(!terminal_paid_rejection("application_rejected"));
+    for reason in reasons {
         assert!(terminal_paid_rejection(&reason), "{reason}");
-        // The bare code without the separator is not a refusal line.
-        assert!(!terminal_paid_rejection(refusal.code()));
-        assert!(!terminal_paid_rejection(&format!("{}x: y", refusal.code())));
 
         let mut limits = DeliveryConfirmationBudget::default();
         let own = make_peer_id(71);

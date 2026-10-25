@@ -424,8 +424,11 @@ impl WireRRule {
     /// and/or `UNTIL`, computed without expanding anything. `None` means the
     /// rule is open-ended (neither `COUNT` nor `UNTIL`) and the reader's
     /// window bounds it. The `UNTIL` estimate uses the shortest period a
-    /// frequency can have (28-day months, 365-day years) and counts every
-    /// `BYDAY` entry per weekly step, so it never under-counts the expander.
+    /// frequency can have (28-day months, 365-day years), counts every
+    /// `BYDAY` entry per weekly step, and allows one extra step for timezone
+    /// transitions (the expander steps in local wall-clock time, so a daylight
+    /// saving shift can fit one more occurrence under `UNTIL` than the UTC
+    /// span suggests), so it never under-counts the expander.
     pub fn implied_instances(&self, start_ms: u64) -> Option<u64> {
         let by_until = self.until.map(|until| {
             let unit_ms = match self.freq.as_str() {
@@ -435,7 +438,8 @@ impl WireRRule {
                 _ => MS_PER_DAY,
             };
             let period_ms = unit_ms.saturating_mul(u64::from(self.interval.max(1)));
-            let steps = until.saturating_sub(start_ms) / period_ms + 1;
+            // `+ 1` for the anchor occurrence, `+ 1` for a wall-clock shift.
+            let steps = until.saturating_sub(start_ms) / period_ms + 2;
             let per_step = if self.freq == "WEEKLY" {
                 self.byday.len().max(1) as u64
             } else {
@@ -771,10 +775,12 @@ mod tests {
             );
         }
         // Escapes count by decoded size, so an escaped over-cap string is
-        // refused too, and an escaped in-cap string is accepted.
+        // refused too, and an escaped in-cap string is accepted. `r"\u0078"`
+        // is the six-byte JSON escape for `x` (raw string: the backslash is
+        // literal), so the document is six times the decoded size.
         let over = format!(
             r#"{{"event_id":"e","title":"{}","start_ms":1,"end_ms":2,"tz":"UTC","organizer":"aa"}}"#,
-            r"x".repeat(MAX_TITLE_BYTES + 1)
+            r"\u0078".repeat(MAX_TITLE_BYTES + 1)
         );
         assert_eq!(
             CalendarEventPayload::decode(over.as_bytes()),
@@ -785,10 +791,13 @@ mod tests {
         );
         let exact = format!(
             r#"{{"event_id":"e","title":"{}","start_ms":1,"end_ms":2,"tz":"UTC","organizer":"aa"}}"#,
-            r"x".repeat(MAX_TITLE_BYTES)
+            r"\u0078".repeat(MAX_TITLE_BYTES)
         );
+        assert!(exact.contains("\\u0078") && !exact.contains("xx"));
+        assert!(exact.len() > 6 * MAX_TITLE_BYTES);
         let p = CalendarEventPayload::decode(exact.as_bytes()).unwrap();
         assert_eq!(p.title.len(), MAX_TITLE_BYTES);
+        assert!(p.title.bytes().all(|b| b == b'x'));
     }
 
     /// The attendee list is capped by count and each entry by size; a
@@ -850,7 +859,8 @@ mod tests {
         );
         assert_eq!(err.code(), "calendar_recurrence_too_large");
         assert!(err.is_cap());
-        // UNTIL spanning (cap + 1) days, daily.
+        // UNTIL spanning cap days, daily: cap + 1 occurrences, plus the one
+        // step of wall-clock slack.
         let until = start + max * MS_PER_DAY;
         let err = decode_json(with_recurrence(serde_json::json!({
             "freq": "DAILY", "until": until
@@ -859,11 +869,11 @@ mod tests {
         assert_eq!(
             err,
             CalendarPayloadError::RecurrenceTooLarge {
-                estimated: max + 1,
+                estimated: max + 2,
                 max
             }
         );
-        // Weekly with BYDAY multiplies per step: 16 codes x 313 weeks > cap.
+        // Weekly with BYDAY multiplies per step: 16 codes x (313 + 1) weeks > cap.
         let until = start + 312 * 7 * MS_PER_DAY;
         let err = decode_json(with_recurrence(serde_json::json!({
             "freq": "WEEKLY", "until": until, "byday": vec!["MO"; MAX_BYDAY]
@@ -872,7 +882,7 @@ mod tests {
         assert_eq!(
             err,
             CalendarPayloadError::RecurrenceTooLarge {
-                estimated: 313 * MAX_BYDAY as u64,
+                estimated: 314 * MAX_BYDAY as u64,
                 max
             }
         );
@@ -905,12 +915,13 @@ mod tests {
             p.recurrence.unwrap().implied_instances(start),
             Some(MAX_RECURRENCE_INSTANCES)
         );
-        // Ten years of monthly: 28-day months over-count to 131, still in cap.
+        // Ten years of monthly: 28-day months and the slack step over-count
+        // to 132, still in cap.
         let p = decode_json(with_recurrence(serde_json::json!({
             "freq": "MONTHLY", "until": start + 3650 * MS_PER_DAY
         })))
         .unwrap();
-        assert_eq!(p.recurrence.unwrap().implied_instances(start), Some(131));
+        assert_eq!(p.recurrence.unwrap().implied_instances(start), Some(132));
         // A huge interval saturates the period rather than overflowing.
         let p = decode_json(with_recurrence(serde_json::json!({
             "freq": "YEARLY", "interval": u32::MAX, "until": u64::MAX
@@ -990,6 +1001,70 @@ mod tests {
             }
         }
         assert_eq!(checked, 4 * 3 * 3 * 4);
+    }
+
+    /// The expander steps in local wall-clock time, so across a daylight
+    /// saving shift one more occurrence can fit under `UNTIL` than the UTC
+    /// span suggests. With the exact UTC estimate this daily series in
+    /// Europe/Copenhagen would be admitted at 5000 and expand to 5001; the
+    /// slack step refuses it.
+    #[test]
+    fn dst_shift_cannot_slip_past_the_recurrence_cap() {
+        use crate::calendar::{expand_occurrences, CalendarEvent, Freq, RRule};
+        let start = 1_672_560_000_000u64; // 2023-01-01 09:00 Europe/Copenhagen
+        let until = 2_104_556_400_000u64;
+        let wire = WireRRule {
+            freq: "DAILY".into(),
+            interval: 1,
+            until: Some(until),
+            count: None,
+            byday: vec![],
+        };
+        // The exact UTC span holds 5000 instances; the estimate allows one
+        // wall-clock shift on top and refuses.
+        assert_eq!(
+            until.saturating_sub(start) / MS_PER_DAY + 1,
+            MAX_RECURRENCE_INSTANCES
+        );
+        assert_eq!(
+            wire.implied_instances(start),
+            Some(MAX_RECURRENCE_INSTANCES + 1)
+        );
+        assert_eq!(
+            wire.validate(start),
+            Err(CalendarPayloadError::RecurrenceTooLarge {
+                estimated: MAX_RECURRENCE_INSTANCES + 1,
+                max: MAX_RECURRENCE_INSTANCES
+            })
+        );
+        let expanded = |tz: &str| {
+            let event = CalendarEvent {
+                id: "e".into(),
+                organizer: "o".into(),
+                title: "t".into(),
+                description: None,
+                start,
+                end: start + 3_600_000,
+                tz: tz.into(),
+                location: None,
+                attendees: vec![],
+                recurrence: Some(RRule {
+                    freq: Freq::Daily,
+                    interval: 1,
+                    until: Some(until),
+                    count: None,
+                    byday: vec![],
+                    bymonthday: vec![],
+                }),
+                color: None,
+                created_at: String::new(),
+                parent_id: None,
+            };
+            expand_occurrences(&event, 0, u64::MAX / 2, &[]).len() as u64
+        };
+        assert_eq!(expanded("UTC"), MAX_RECURRENCE_INSTANCES);
+        assert_eq!(expanded("Europe/Copenhagen"), MAX_RECURRENCE_INSTANCES + 1);
+        assert!(wire.implied_instances(start).unwrap() >= expanded("Europe/Copenhagen"));
     }
 
     /// Malformed rules are refused with a typed reason instead of being

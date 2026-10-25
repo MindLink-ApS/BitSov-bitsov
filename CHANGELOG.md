@@ -13,9 +13,15 @@ also live on the corresponding GitHub pre-release pages.
   the plaintext cache, the stored record or any recurrence expansion. An
   over-cap payload is withdrawn and refused with a typed `calendar_*` reason
   the sender can read; the sender records such a refusal as final
-  (`failed_paid`) and never retries it. The owner API refuses the same
-  payloads before they are stored or paid for, including a partial update
-  whose retained recurrence would exceed the cap from its new start.
+  (`failed_paid`) and never retries it. Calendar envelopes are held from
+  before paid acceptance until the caps pass, like call signals and room
+  chats, so a failed withdrawal leaves them hidden for the hold sweep. A
+  resend of any envelope this node withdrew at the application is answered
+  with a terminal `application_rejected:` reason instead of a payment-reuse
+  one, which a sender's compatibility path could read as delivered. The owner
+  API refuses the same payloads before they are stored or paid for,
+  including a partial update whose retained recurrence would exceed the cap
+  from its new start.
 
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'

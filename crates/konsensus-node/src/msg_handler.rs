@@ -320,7 +320,8 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // is final; a hold that outlives this handler is withdrawn
                         // by the startup/periodic sweep (Codex delta2 #4, #155).
                         let held_kind = konsensus_api::calls::is_call_kind(envelope.kind)
-                            || konsensus_api::room_binding::is_candidate(envelope.kind);
+                            || konsensus_api::room_binding::is_candidate(envelope.kind)
+                            || is_calendar_kind(envelope.kind);
                         let mut call_hold = false;
                         if gate_result.is_ok() && !is_relay_control && held_kind {
                             match konsensus_api::calls::hold_incoming(storage_for_recv.as_ref(), &envelope).await {
@@ -359,6 +360,25 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     let ack = Frame::MessageAck { id: msg_id, duplicate: true };
                                     if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
                                         warn!(error = %e, "failed to send duplicate ACK");
+                                    }
+                                    continue;
+                                }
+                                Ok(PaidAcceptance::NonceReused | PaidAcceptance::PaymentReused)
+                                    if storage_for_recv.is_application_rejected(&envelope).await.unwrap_or(false) =>
+                                {
+                                    // A resend of a paid envelope this node accepted and
+                                    // then refused at the application (a withdrawn call
+                                    // signal, room chat or calendar payload, or one the
+                                    // hold sweep withdrew). The proof is burned, so the
+                                    // answer is a terminal application rejection: a
+                                    // payment-reuse reason here would be read by the
+                                    // sender's legacy-ACK compatibility path as delivered.
+                                    if call_hold {
+                                        let _ = storage_for_recv.call_admission_release(&msg_id).await;
+                                    }
+                                    let reject = Frame::MessageReject { id: msg_id, reason: application_rejected_reason() };
+                                    if let Err(e) = transport_for_ack.send_frame(&sender, &reject).await {
+                                        warn!(peer = %sender, error = %e, "failed to send MessageReject");
                                     }
                                     continue;
                                 }
@@ -584,7 +604,9 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 // before it is cached, copied, stored or expanded. Like
                                 // a refused call signal: the paid envelope is withdrawn
                                 // (payment hash and nonce stay burned) and the sender
-                                // gets a typed reason it can act on.
+                                // gets a typed reason it can act on. The envelope was
+                                // held before acceptance, so if the withdrawal fails it
+                                // stays hidden and the sweep withdraws it.
                                 warn!(sender = %sender, kind = envelope.kind, reason = %refusal, "calendar payload refused; not stored");
                                 if let Err(e) = storage_for_recv.reject_accepted_envelope(&envelope).await {
                                     error!(msg_id = %msg_id, error = %e, "failed to withdraw a refused calendar payload; it stays held until the sweep");
@@ -601,6 +623,19 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 continue;
                             }
                         };
+
+                        // Calendar: the payload passed the inbound caps (or there was no
+                        // session to decrypt it); lift the hold before the app sees it.
+                        // If that write fails the envelope stays held and the sweep
+                        // withdraws it: fail closed, the peer gets a reject, not an ACK.
+                        if call_hold && is_calendar_kind(envelope.kind) {
+                            if let Err(e) = storage_for_recv.call_admission_release(&msg_id).await {
+                                error!(msg_id = %msg_id, error = %e, "admitted calendar payload could not be released; withheld");
+                                let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                continue;
+                            }
+                        }
 
                         // 1:1 calls: the gate made this envelope paid and single-use;
                         // the call registry makes the offer single-use per call id and
@@ -894,6 +929,26 @@ async fn decrypt_and_process(
         }
     };
     Ok(plaintext)
+}
+
+/// Calendar kinds are held from before paid acceptance until their payload has
+/// passed the inbound caps, like call signals and room chats.
+pub(crate) fn is_calendar_kind(kind: u16) -> bool {
+    matches!(
+        kind,
+        konsensus_core::kind::KIND_CALENDAR_EVENT
+            | konsensus_core::kind::KIND_CALENDAR_UPDATE
+            | konsensus_core::kind::KIND_RSVP
+    )
+}
+
+/// Reason prefix for a resend of a paid envelope this node withdrew at the
+/// application. Terminal for the sender (`terminal_paid_rejection`): the proof
+/// is burned and nothing will be delivered.
+pub(crate) const APPLICATION_REJECTED_PREFIX: &str = "application_rejected:";
+
+pub(crate) fn application_rejected_reason() -> String {
+    format!("{APPLICATION_REJECTED_PREFIX} the recipient withdrew this message; it will not be delivered")
 }
 
 /// The `MessageReject` reason for a refused calendar payload: the stable code,

@@ -3574,11 +3574,16 @@ async fn calendar_caps_do_not_apply_to_other_kinds() {
     assert!(storage.has_plaintext(&envelope.id));
 }
 
-/// Receive side, end to end over Noise through the real receive loop: a paid
-/// calendar invite over the inbound caps is refused with the typed reason, the
-/// gate-accepted envelope is withdrawn (message gone, receipt marked
-/// application-rejected, nothing cached), the app never sees it, and the
-/// reason the sender gets back is one its delivery tracking treats as terminal.
+/// Receive side, end to end over Noise through the real receive loop. A paid
+/// calendar invite is held from before its acceptance; one over the inbound
+/// caps is refused with the typed reason, withdrawn (message gone, receipt
+/// application-rejected, hold released, nothing cached or forwarded), and the
+/// reason the sender gets back is terminal for its delivery tracking. A resend
+/// of the withdrawn envelope is answered with a terminal application rejection,
+/// never a payment-reuse reason the sender's compatibility path could take as
+/// delivered. If the withdrawal fails the invite stays held and hidden, a
+/// resend is refused, and the sweep withdraws it. An in-cap invite is released
+/// and acknowledged.
 #[tokio::test]
 async fn over_cap_calendar_invite_is_refused_withdrawn_and_terminal_for_the_sender() {
     use konsensus_core::payloads::calendar::{CalendarPayloadError, MAX_CALENDAR_PAYLOAD_BYTES};
@@ -3652,50 +3657,86 @@ async fn over_cap_calendar_invite_is_refused_withdrawn_and_terminal_for_the_send
         shutdown_rx,
     }));
 
-    // Alice pays Bob's calendar price and sends an invite over the byte cap.
+    // Alice pays Bob's calendar price and sends one invite.
+    let invite = |plaintext: Vec<u8>| {
+        let (wallet, sessions_a, alice, bob) =
+            (wallet.clone(), &sessions_a, alice.clone(), bob.clone());
+        async move {
+            let hash = wallet.inject_inbound_keysend(price, None).await;
+            let payment = wallet.get_payment_status(&hash).await.unwrap();
+            let proof = PaymentProof::new(
+                hex::decode(&hash).unwrap().try_into().unwrap(),
+                hex::decode(payment.preimage.unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                price,
+            );
+            let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+                &sessions_a.encrypt(bob.node_id(), &plaintext).await.unwrap(),
+            );
+            let mut env = UkmEnvelopeBuilder::new(
+                konsensus_core::kind::KIND_CALENDAR_EVENT,
+                *alice.node_id(),
+                Recipient::Node(*bob.node_id()),
+                ciphertext,
+                proof,
+            )
+            .build();
+            env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+            env
+        }
+    };
+    let outcome = |source: Arc<NoiseTransport>| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source.recv_control().await.unwrap() {
+                    ControlEvent::MessageAcked { duplicate, .. } => break Ok(duplicate),
+                    ControlEvent::MessageRejected { reason, .. } => break Err(reason),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap()
+    };
+    let hidden = |env: konsensus_core::UkmEnvelope| {
+        let db = db.clone();
+        async move {
+            assert!(db.get_message(&env.id).await.unwrap().is_none(), "visible");
+            assert!(
+                db.get_message_plaintext(&env.id).await.unwrap().is_none(),
+                "plaintext cached"
+            );
+            assert!(
+                !db.is_paid_envelope_accepted(&env).await.unwrap(),
+                "would be duplicate-ACKed"
+            );
+        }
+    };
+    let receipt_accepted = |env: konsensus_core::UkmEnvelope| {
+        let db = db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT accepted FROM payment_receipts WHERE message_id = ?",
+            )
+            .bind(env.id.to_hex())
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+        }
+    };
+
+    // Over the byte cap: refused with the typed reason, exactly as the
+    // receive side formats it, and terminal for the sender.
     let plaintext = calendar_json(
         &"d".repeat(MAX_CALENDAR_PAYLOAD_BYTES),
         1,
         serde_json::Value::Null,
     );
-    let hash = wallet.inject_inbound_keysend(price, None).await;
-    let payment = wallet.get_payment_status(&hash).await.unwrap();
-    let proof = PaymentProof::new(
-        hex::decode(&hash).unwrap().try_into().unwrap(),
-        hex::decode(payment.preimage.unwrap())
-            .unwrap()
-            .try_into()
-            .unwrap(),
-        price,
-    );
-    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
-        &sessions_a.encrypt(bob.node_id(), &plaintext).await.unwrap(),
-    );
-    let mut env = UkmEnvelopeBuilder::new(
-        konsensus_core::kind::KIND_CALENDAR_EVENT,
-        *alice.node_id(),
-        Recipient::Node(*bob.node_id()),
-        ciphertext,
-        proof,
-    )
-    .build();
-    env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+    let env = invite(plaintext.clone()).await;
     source.send(bob.node_id(), &env).await.unwrap();
-
-    let reason = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match source.recv_control().await.unwrap() {
-                ControlEvent::MessageAcked { .. } => panic!("over-cap invite was acknowledged"),
-                ControlEvent::MessageRejected { reason, .. } => break reason,
-                _ => {}
-            }
-        }
-    })
-    .await
-    .unwrap();
-
-    // The typed reason, exactly as the receive side formats it, and terminal
-    // for the sender's delivery tracking.
+    let reason = outcome(source.clone()).await.unwrap_err();
     let expected = CalendarPayloadError::TooLarge {
         actual: plaintext.len(),
         max: MAX_CALENDAR_PAYLOAD_BYTES,
@@ -3704,49 +3745,97 @@ async fn over_cap_calendar_invite_is_refused_withdrawn_and_terminal_for_the_send
     assert!(reason.starts_with("calendar_too_large: "));
     assert!(crate::session_handler::terminal_paid_rejection(&reason));
 
-    // Withdrawn on the recipient: the gate-accepted message is gone, its
-    // receipt is application-rejected, nothing was cached or forwarded.
-    assert!(db.get_message(&env.id).await.unwrap().is_none());
-    let accepted: i64 =
-        sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE message_id = ?")
-            .bind(env.id.to_hex())
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-    assert_eq!(accepted, -1, "receipt must be marked application-rejected");
-    assert!(db.get_message_plaintext(&env.id).await.unwrap().is_none());
+    // Withdrawn: message gone, receipt application-rejected, hold released,
+    // nothing cached or forwarded, refusal audited by code.
+    hidden(env.clone()).await;
+    assert_eq!(receipt_accepted(env.clone()).await, -1);
+    assert!(!db.call_admission_held(&env.id).await.unwrap());
+    assert!(db.is_application_rejected(&env).await.unwrap());
     assert!(
         ws_rx.try_recv().is_err(),
         "a refused invite must not reach the app"
     );
-    assert!(
-        std::fs::read_to_string(dir.path().join("audit.jsonl"))
-            .unwrap()
-            .contains("calendar_too_large"),
-        "the refusal is audited by code"
-    );
+    assert!(std::fs::read_to_string(dir.path().join("audit.jsonl"))
+        .unwrap()
+        .contains("calendar_too_large"));
 
-    // The payment stays burned: a resend of the same paid envelope is a replay.
-    source.send(bob.node_id(), &env).await.unwrap();
-    let again = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match source.recv_control().await.unwrap() {
-                ControlEvent::MessageAcked { duplicate, .. } => break Ok(duplicate),
-                ControlEvent::MessageRejected { reason, .. } => break Err(reason),
-                _ => {}
-            }
-        }
-    })
-    .await
-    .unwrap();
-    match again {
-        Err(reason) => assert!(
-            crate::session_handler::terminal_paid_rejection(&reason),
-            "{reason}"
-        ),
-        Ok(duplicate) => assert!(duplicate, "a withdrawn envelope cannot be freshly accepted"),
+    // The reject frame was lost and the sender retried: the resend is answered
+    // with a terminal application rejection, not `payment proof already used`
+    // (which the sender's compatibility path would record as delivered) and
+    // not a duplicate ACK. Nothing is re-accepted.
+    for _ in 0..2 {
+        source.send(bob.node_id(), &env).await.unwrap();
+        let again = outcome(source.clone()).await.unwrap_err();
+        assert!(
+            again.starts_with(APPLICATION_REJECTED_PREFIX),
+            "resend of a withdrawn invite answered with: {again}"
+        );
+        assert!(crate::session_handler::terminal_paid_rejection(&again));
+        hidden(env.clone()).await;
+        assert_eq!(receipt_accepted(env.clone()).await, -1);
+        assert!(!db.call_admission_held(&env.id).await.unwrap());
+        assert!(ws_rx.try_recv().is_err());
     }
-    assert!(db.get_message(&env.id).await.unwrap().is_none());
+
+    // The withdrawal fails: still held, so hidden; a resend is refused, not
+    // duplicate-ACKed; the startup sweep withdraws it and a later resend gets
+    // the terminal application rejection.
+    sqlx::raw_sql("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let stuck = invite(plaintext.clone()).await;
+    source.send(bob.node_id(), &stuck).await.unwrap();
+    assert!(outcome(source.clone())
+        .await
+        .unwrap_err()
+        .starts_with("calendar_too_large: "));
+    assert!(db.call_admission_held(&stuck.id).await.unwrap());
+    hidden(stuck.clone()).await;
+    assert_eq!(
+        receipt_accepted(stuck.clone()).await,
+        1,
+        "withdrawal rolled back"
+    );
+    source.send(bob.node_id(), &stuck).await.unwrap();
+    assert_eq!(
+        outcome(source.clone()).await,
+        Err("message withdrawn".into())
+    );
+    assert!(ws_rx.try_recv().is_err());
+    sqlx::raw_sql("DROP TRIGGER fail_withdraw")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        konsensus_api::calls::withdraw_held(db.as_ref(), true)
+            .await
+            .unwrap(),
+        1
+    );
+    hidden(stuck.clone()).await;
+    assert_eq!(receipt_accepted(stuck.clone()).await, -1);
+    assert!(!db.call_admission_held(&stuck.id).await.unwrap());
+    source.send(bob.node_id(), &stuck).await.unwrap();
+    let again = outcome(source.clone()).await.unwrap_err();
+    assert!(again.starts_with(APPLICATION_REJECTED_PREFIX), "{again}");
+
+    // In cap: acknowledged, released before the app sees it, and forwarded.
+    let ok = invite(calendar_json("agenda", 1, serde_json::Value::Null)).await;
+    source.send(bob.node_id(), &ok).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    assert!(!db.call_admission_held(&ok.id).await.unwrap());
+    assert!(db.get_message(&ok.id).await.unwrap().is_some());
+    assert_eq!(receipt_accepted(ok.clone()).await, 1);
+    let shown = tokio::time::timeout(Duration::from_secs(5), ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.envelope.id, ok.id);
+    assert_eq!(shown.plaintext.as_deref(), Some("[calendar: Standup]"));
+    // The same paid envelope again is a duplicate of an admitted message.
+    source.send(bob.node_id(), &ok).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(true));
 
     shutdown.send(true).unwrap();
     worker.await.unwrap();

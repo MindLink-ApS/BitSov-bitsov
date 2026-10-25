@@ -1047,6 +1047,7 @@ pub(crate) fn terminal_paid_rejection(reason: &str) -> bool {
     [
         "payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:",
         "room_binding_invalid:", "room_sender_not_member:", "room_recipient_not_member:",
+        crate::msg_handler::APPLICATION_REJECTED_PREFIX,
     ]
     .iter().any(|prefix| reason.starts_with(prefix))
         || konsensus_core::payloads::calendar::CalendarPayloadError::CODES
