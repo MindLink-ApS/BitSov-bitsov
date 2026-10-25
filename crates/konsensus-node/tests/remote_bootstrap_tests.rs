@@ -538,7 +538,7 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
         .post(format!("{page_url}/setup/approve"))
         .header("cookie", &cookie)
         .header("x-csrf-token", &csrf)
-        .json(&json!({"ceremony_id":p["ceremony_id"],"sas_digest":digest.to_hex().to_string()}))
+        .json(&json!({"ceremony_id":p["ceremony_id"],"words":page_state["words"]}))
         .send()
         .await
         .unwrap();

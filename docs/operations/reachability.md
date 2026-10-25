@@ -33,6 +33,19 @@ advertised_endpoint = "100.88.12.34:9737"
 - `[network] advertised_addr` is the peer endpoint signed into your front-door
   card. Leave `stun_server` unset: with an endpoint configured the node never
   sends a STUN query.
+
+### STUN for calls (ICE, owner app only)
+
+For WebRTC calls the owner app may need a `stun:host:port` URL. The node
+reports at most one on **owner-only** `GET /api/v1/status`, in this order: (1)
+its own `[calls] stun_listen` responder when it has a dialable public host
+(`stun_source: own`), (2) else a valid owner-set `[network] stun_server`
+(`stun_source: configured`), (3) else nothing — no default and never a public
+third-party server. Public `GET /api/v1/health` does not expose `stun_url`,
+`stun_source`, or a configured `stun_server`. Pointing `stun_server` at a hub
+you run (for example on a public address) lets a home node's app learn that URL
+from `/status`; that server sees each caller's public IP on STUN binding
+requests. STUN reflects addresses only; call media does not traverse it.
 - `[remote_access] advertised_endpoint` is the endpoint written into the
   pairing link at `<data_dir>/pairing/remote-access-link`. It is required once
   `listen_addr` is set.

@@ -22,7 +22,13 @@ also live on the corresponding GitHub pre-release pages.
   API refuses the same payloads before they are stored or paid for,
   including a partial update whose retained recurrence would exceed the cap
   from its new start.
-
+- Add owner-authenticated claim-code display for app onboarding:
+  `GET /api/v1/owner/claim-code` on the owner-local API only (loopback source,
+  local console session or enrolled owner device), rate limited, `no-store`,
+  never logged, returning the code only while a claim-bound enrollment is
+  pending and a clear `claimed`/`closed`/`unavailable` state otherwise. The LAN
+  box page no longer publishes the SAS digest (the finalize proof derived from
+  the claim code); `/setup/approve` now takes the four compared words.
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'
   scripts instead of all 2000 derived scripts. Before each focused sweep preview,
