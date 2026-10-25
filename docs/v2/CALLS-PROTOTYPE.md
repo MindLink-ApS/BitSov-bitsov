@@ -194,8 +194,6 @@ a fixed roster. The offer (400) of a leg carries one optional field:
   meeting leg after it was paid: apps send a leg only to a connected peer
   with the advert, from a node that lists it. `Custom` is an existing
   variant, so older nodes still decode the Hello.
-- Design and open decisions: MindLink-Private
-  `pm/projects/bitsov/research/MESH-MEETINGS-DESIGN.md`.
 - Rooms (chat, up to 4) follow the same pattern with a binding on ordinary
   chat and the advert `room_binding_v1`: `docs/protocol/ROOMS.md`.
 
