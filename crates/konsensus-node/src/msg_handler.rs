@@ -371,19 +371,18 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             continue;
                         }
 
-                        // A call signal, a chat (a candidate room chat: its
-                        // binding is only visible after decryption) and a file
-                        // (received only once decoded, verified and stored) is
-                        // held (invisible to history, plaintext, resync and
-                        // duplicate ACKs) from before its paid acceptance until
-                        // its admission is final; a hold that outlives this
-                        // handler is withdrawn by the startup/periodic sweep
-                        // (Codex delta2 #4, #155).
-                        let held_kind = konsensus_api::calls::is_call_kind(envelope.kind)
-                            || konsensus_api::room_binding::is_candidate(envelope.kind)
-                            || envelope.kind == konsensus_core::kind::KIND_FILE_REF;
+                        // Every paid envelope is held (invisible to history,
+                        // plaintext, resync and duplicate ACKs) from before its
+                        // paid acceptance until its admission is final: a call
+                        // signal and a candidate room chat by their admission
+                        // checks, everything else once its plaintext is produced
+                        // and kept (a file once stored). A refusal withdraws the
+                        // hold with the envelope; should that withdrawal fail, the
+                        // hold still keeps the envelope hidden and unacknowledged
+                        // until the startup/periodic sweep withdraws it (Codex
+                        // delta2 #4, #155).
                         let mut call_hold = false;
-                        if gate_result.is_ok() && !is_relay_control && held_kind {
+                        if gate_result.is_ok() && !is_relay_control {
                             match konsensus_api::calls::hold_incoming(storage_for_recv.as_ref(), &envelope).await {
                                 Ok(placed) => call_hold = placed,
                                 Err(e) => {
@@ -406,9 +405,9 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     audit_for_recv.membrane().admitted(&envelope, gate_result.as_ref().expect("validated").0);
                                 }
                                 Ok(PaidAcceptance::AlreadyAccepted) => {
-                                    // A call signal or chat still held was never admitted:
-                                    // never acknowledge it as delivered.
-                                    if held_kind
+                                    // An envelope still held was never admitted: never
+                                    // acknowledge it as delivered.
+                                    if !is_relay_control
                                         && storage_for_recv.call_admission_held(&msg_id).await.unwrap_or(true)
                                     {
                                         let reason = if konsensus_api::calls::is_call_kind(envelope.kind) { "call signal withdrawn" } else { "message withdrawn" };
@@ -681,12 +680,17 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             }
                         };
 
-                        // A file is held until it is stored; lift the hold only
-                        // now. If that write fails the file stays held and the
+                        // The plaintext is produced and kept (a file stored): lift
+                        // the hold now, except for a call signal or a candidate
+                        // room chat, whose admission checks below lift their own.
+                        // If that write fails the envelope stays held and the
                         // sweep withdraws it: fail closed, a reject, not an ACK.
-                        if call_hold && envelope.kind == konsensus_core::kind::KIND_FILE_REF {
+                        if call_hold
+                            && !konsensus_api::calls::is_call_kind(envelope.kind)
+                            && !konsensus_api::room_binding::is_candidate(envelope.kind)
+                        {
                             if let Err(e) = storage_for_recv.call_admission_release(&msg_id).await {
-                                error!(msg_id = %msg_id, error = %e, "stored file could not be released; withheld");
+                                error!(msg_id = %msg_id, error = %e, "admitted message could not be released; withheld");
                                 let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
                                 let _ = transport_for_ack.send_frame(&sender, &reject).await;
                                 continue;

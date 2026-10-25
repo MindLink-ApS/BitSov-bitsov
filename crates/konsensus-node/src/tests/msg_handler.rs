@@ -4005,3 +4005,164 @@ async fn file_withdrawal_failure_keeps_the_file_hidden_and_refuses_a_resend() {
     assert!(net.ws_rx.try_recv().is_err());
     net.stop().await;
 }
+
+/// Every paid envelope is held until it is kept, whatever its kind. A
+/// long-form message whose plaintext store and withdrawal both fail stays
+/// hidden and unacknowledged; a resend is refused as withdrawn, the sweep
+/// finishes the withdrawal, and a sound message of the same kind is received
+/// and released as usual.
+#[tokio::test]
+async fn any_kind_withdrawal_failure_keeps_the_message_hidden_and_refuses_a_resend() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_plaintext BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_LONGFORM,
+            net.ciphertext(b"a long one").await,
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "not_persisted: the plaintext could not be stored"
+    ));
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+        .bind(env.id.to_hex())
+        .fetch_one(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "the delete was rolled back");
+    assert!(
+        net.db.call_admission_held(&env.id).await.unwrap(),
+        "the hold keeps it hidden"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "hidden from history"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(net.receipt_state(&env).await, Some(1));
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it");
+
+    // A resend is refused as withdrawn, never acknowledged as a duplicate.
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    // The sweep finishes the withdrawal once the store recovers; the resend
+    // is still refused, now from the rejected receipt.
+    sqlx::query("DROP TRIGGER fail_withdraw")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER fail_plaintext")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(net.db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    // A sound message of the same kind is received, released and published.
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_LONGFORM,
+            net.ciphertext(b"another long one").await,
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageAcked {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert!(
+        !net.db.call_admission_held(&env.id).await.unwrap(),
+        "released once kept"
+    );
+    assert_eq!(
+        net.db.get_message(&env.id).await.unwrap().map(|m| m.id),
+        Some(env.id)
+    );
+    let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.plaintext.as_deref(), Some("another long one"));
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageAcked {
+            duplicate: true,
+            ..
+        }
+    ));
+    net.stop().await;
+}
+
+/// A corrupted file whose withdrawal also fails stays hidden and
+/// unacknowledged; a resend is refused as withdrawn.
+#[tokio::test]
+async fn corrupted_file_with_failed_withdrawal_stays_hidden() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let damaged = net
+        .ciphertext(&file_payload("damaged.bin", b"sent", b"arrived"))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, damaged)
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "file_corrupted: the file data does not match its hash"
+    ));
+    assert!(
+        net.db.call_admission_held(&env.id).await.unwrap(),
+        "the hold keeps it hidden"
+    );
+    assert!(net.db.get_message(&env.id).await.unwrap().is_none());
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(net.db.list_files(10).await.unwrap().is_empty());
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it arrive");
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+    sqlx::query("DROP TRIGGER fail_withdraw")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(net.db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    net.stop().await;
+}
