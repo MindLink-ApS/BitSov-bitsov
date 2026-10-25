@@ -213,6 +213,16 @@ async fn offer_prekey_after_promotion(
 /// never read.
 const ADMISSION_ENVELOPE_MARKER: &[u8] = b"konsensus:admission:v1";
 
+/// Whether `envelope` is a first-contact admission proof: the shape the
+/// compose handler builds and the outbox and pending flusher recognise, a
+/// `KIND_CHAT` whose ciphertext is exactly the marker. The gate has already
+/// bound its recipient, settlement and signature. Any other kind carrying the
+/// marker is an ordinary paid envelope and must decrypt like one.
+fn is_admission_proof(envelope: &konsensus_core::UkmEnvelope) -> bool {
+    envelope.kind == konsensus_core::kind::KIND_CHAT
+        && envelope.ciphertext == ADMISSION_ENVELOPE_MARKER
+}
+
 /// Why a paid envelope that passed the gate and was stored is refused instead
 /// of acknowledged as delivered: this node could not produce its plaintext and
 /// keep it. The envelope is withdrawn (`reject_accepted_envelope`), so history
@@ -785,7 +795,7 @@ async fn decrypt_and_process(
 ) -> Result<Option<String>, ReceiptRefusal> {
     // A first-contact admission proof carries nothing to read; it is
     // acknowledged as received whether or not a session exists yet.
-    if envelope.ciphertext == ADMISSION_ENVELOPE_MARKER {
+    if is_admission_proof(envelope) {
         debug!(sender = %sender, "admission proof envelope; nothing to decrypt");
         return Ok(None);
     }

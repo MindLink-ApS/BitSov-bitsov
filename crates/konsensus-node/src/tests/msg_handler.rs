@@ -3708,3 +3708,228 @@ async fn corrupted_file_is_failed_to_the_app_and_the_sender() {
     assert_eq!(shown.plaintext.as_deref(), Some("[file: intact.bin]"));
     net.stop().await;
 }
+
+/// The admission-proof carve-out is the compose handler's exact shape: a
+/// `KIND_CHAT` carrying the marker is acknowledged as received; the marker
+/// under any other kind is an ordinary paid envelope and is refused like one,
+/// never acknowledged, never published.
+#[tokio::test]
+async fn admission_proof_is_acknowledged_but_the_marker_under_another_kind_is_refused() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+
+    let proof = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_CHAT,
+            ADMISSION_ENVELOPE_MARKER.to_vec(),
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&proof).await,
+        ControlEvent::MessageAcked {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(net.receipt_state(&proof).await, Some(1));
+    let published = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.envelope.id, proof.id);
+    assert!(
+        published.plaintext.is_none(),
+        "a proof carries nothing to read"
+    );
+
+    let file = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_FILE_REF,
+            ADMISSION_ENVELOPE_MARKER.to_vec(),
+        )
+        .await;
+    let verdict = net.verdict(&file).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == file.id && reason == "undecryptable: ciphertext is not a ratchet message"),
+        "the marker under another kind is no proof: {verdict:?}"
+    );
+    assert!(net.db.list_files(10).await.unwrap().is_empty());
+    assert!(
+        net.db.get_message(&file.id).await.unwrap().is_none(),
+        "withdrawn"
+    );
+    assert_eq!(net.receipt_state(&file).await, Some(-1));
+    assert!(net.ws_rx.try_recv().is_err(), "never published");
+    net.stop().await;
+}
+
+/// A chat whose plaintext cannot be stored is refused, not acknowledged: the
+/// envelope is withdrawn, the receipt stays burned as application-rejected,
+/// the app sees nothing, and the session is unharmed for the next chat.
+#[tokio::test]
+async fn plaintext_store_failure_is_refused_not_acknowledged() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_plaintext BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_CHAT,
+            net.ciphertext(b"cannot be kept").await,
+        )
+        .await;
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason == "not_persisted: the plaintext could not be stored"),
+        "{verdict:?}"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "withdrawn"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it");
+    // The replay keys stay consumed: the same bytes are refused, not acknowledged.
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason.starts_with("payment proof already used:")
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    sqlx::query("DROP TRIGGER fail_plaintext")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_CHAT,
+            net.ciphertext(b"kept").await,
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageAcked {
+            duplicate: false,
+            ..
+        }
+    ));
+    let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.plaintext.as_deref(), Some("kept"));
+    net.stop().await;
+}
+
+/// A file that cannot be stored is refused, not acknowledged, and never
+/// surfaced as received.
+#[tokio::test]
+async fn file_store_failure_is_refused_not_acknowledged() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_file BEFORE INSERT ON files BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let intact = net
+        .ciphertext(&file_payload("intact.bin", b"intact", b"intact"))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, intact)
+        .await;
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason == "not_persisted: the file could not be stored"),
+        "{verdict:?}"
+    );
+    assert!(net.db.list_files(10).await.unwrap().is_empty());
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "withdrawn"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it arrive");
+    net.stop().await;
+}
+
+/// When even the withdrawal fails, the refused chat is still never
+/// acknowledged or published: its admission hold keeps it hidden, a resend is
+/// refused as withdrawn, and the sweep withdraws it later.
+#[tokio::test]
+async fn withdrawal_failure_still_refuses_and_keeps_the_chat_hidden() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_plaintext BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_CHAT,
+            net.ciphertext(b"cannot be kept").await,
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "not_persisted: the plaintext could not be stored"
+    ));
+    // The withdrawal rolled back whole: the row is still there, still held,
+    // and the hold hides it from history.
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+        .bind(env.id.to_hex())
+        .fetch_one(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "the delete was rolled back");
+    assert!(
+        net.db.call_admission_held(&env.id).await.unwrap(),
+        "the hold keeps it hidden"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "hidden from history"
+    );
+    assert_eq!(net.receipt_state(&env).await, Some(1));
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it");
+
+    // A resend is refused as withdrawn, never acknowledged as a duplicate.
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    // The sweep finishes the withdrawal once the store recovers.
+    sqlx::query("DROP TRIGGER fail_withdraw")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(net.db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    assert!(net.db.get_message(&env.id).await.unwrap().is_none());
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    net.stop().await;
+}
