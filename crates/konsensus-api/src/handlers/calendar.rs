@@ -734,9 +734,23 @@ async fn update_event(
         .or(existing.recurrence_json.clone());
 
     // Parse attendees; refuse an update the attendees' nodes would refuse at
-    // their inbound caps before it is stored or paid for.
+    // their inbound caps before it is stored or paid for. A partial update that
+    // keeps the stored recurrence is checked with that rule against the new
+    // start, since the retained series is what the record will imply.
     let attendees: Vec<String> = serde_json::from_str(&existing.attendees_json)
         .map_err(|e| ApiError::Internal(format!("attendees deserialization: {e}")))?;
+    let effective_rrule: Option<WireRRule> = match &wire_rrule {
+        Some(rule) => Some(rule.clone()),
+        None => recurrence_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|_| {
+                calendar_cap_rejected(CalendarPayloadError::RecurrenceInvalid(
+                    "the stored recurrence cannot be decoded; supply a replacement",
+                ))
+            })?,
+    };
     CalendarEventPayload {
         event_id: event_id.clone(),
         title: title.clone(),
@@ -747,7 +761,7 @@ async fn update_event(
         location: location.clone(),
         organizer: existing.organizer.clone(),
         attendees: attendees.clone(),
-        recurrence: wire_rrule.clone(),
+        recurrence: effective_rrule,
         color: color.clone(),
     }
     .validate()

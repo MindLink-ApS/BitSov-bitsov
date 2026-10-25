@@ -594,7 +594,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     &sender.to_hex(),
                                     Some(serde_json::json!({ "reason": refusal.code(), "kind": envelope.kind })),
                                 );
-                                let reject = Frame::MessageReject { id: msg_id, reason: format!("{}: {refusal}", refusal.code()) };
+                                let reject = Frame::MessageReject { id: msg_id, reason: calendar_reject_reason(&refusal) };
                                 if let Err(e) = transport_for_ack.send_frame(&sender, &reject).await {
                                     warn!(peer = %sender, error = %e, "failed to send MessageReject");
                                 }
@@ -894,6 +894,14 @@ async fn decrypt_and_process(
         }
     };
     Ok(plaintext)
+}
+
+/// The `MessageReject` reason for a refused calendar payload: the stable code,
+/// then the static description. The sender's `terminal_paid_rejection` matches
+/// the `<code>:` prefix, so the refusal is final there (the payment proof is
+/// consumed) and is never retried.
+pub(crate) fn calendar_reject_reason(refusal: &CalendarPayloadError) -> String {
+    format!("{}: {refusal}", refusal.code())
 }
 
 /// A calendar payload decoded under the inbound caps, ahead of the plaintext cache.

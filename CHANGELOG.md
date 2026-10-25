@@ -12,8 +12,10 @@ also live on the corresponding GitHub pre-release pages.
   after the transport's per-peer byte budget and the payment gate and before
   the plaintext cache, the stored record or any recurrence expansion. An
   over-cap payload is withdrawn and refused with a typed `calendar_*` reason
-  the sender can read. The owner API refuses the same payloads before they
-  are stored or paid for.
+  the sender can read; the sender records such a refusal as final
+  (`failed_paid`) and never retries it. The owner API refuses the same
+  payloads before they are stored or paid for, including a partial update
+  whose retained recurrence would exceed the cap from its new start.
 
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'

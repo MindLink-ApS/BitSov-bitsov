@@ -1041,12 +1041,17 @@ async fn send_prekey_offer(
 
 /// Wire reasons are the gate's stable Display prefixes; unknown reasons stay
 /// retryable so older peers and temporary gate failures cannot burn delivery.
-fn terminal_paid_rejection(reason: &str) -> bool {
+/// Room and calendar refusals are application rejections of a paid, withdrawn
+/// envelope: the proof is consumed, so they are terminal too.
+pub(crate) fn terminal_paid_rejection(reason: &str) -> bool {
     [
         "payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:",
         "room_binding_invalid:", "room_sender_not_member:", "room_recipient_not_member:",
     ]
     .iter().any(|prefix| reason.starts_with(prefix))
+        || konsensus_core::payloads::calendar::CalendarPayloadError::CODES
+            .iter()
+            .any(|code| reason.strip_prefix(code).is_some_and(|rest| rest.starts_with(':')))
 }
 
 /// Bound storage work before looking up an unprivileged confirmation. A

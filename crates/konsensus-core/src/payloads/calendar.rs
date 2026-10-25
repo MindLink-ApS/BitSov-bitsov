@@ -93,6 +93,18 @@ pub enum CalendarPayloadError {
 }
 
 impl CalendarPayloadError {
+    /// Every refusal code, for the sender's terminal-rejection classifier: a
+    /// `MessageReject` whose reason starts with one of these followed by `:`
+    /// consumed the payment proof and must never be retried.
+    pub const CODES: [&'static str; 6] = [
+        "calendar_too_large",
+        "calendar_field_too_long",
+        "calendar_too_many_entries",
+        "calendar_recurrence_too_large",
+        "calendar_recurrence_invalid",
+        "calendar_malformed",
+    ];
+
     /// Stable refusal code, sent to the peer as the `MessageReject` reason prefix.
     pub fn code(&self) -> &'static str {
         match self {
@@ -1132,8 +1144,13 @@ mod tests {
         ];
         for (err, code) in cases {
             assert_eq!(err.code(), code);
+            assert!(
+                CalendarPayloadError::CODES.contains(&code),
+                "{code} missing from CODES"
+            );
             assert!(!err.to_string().is_empty());
         }
+        assert_eq!(CalendarPayloadError::CODES.len(), cases.len());
         // Unknown marker text (never produced) is Malformed, not a cap.
         assert_eq!(
             classify_serde_error("calendar cap field:nope at line 1"),
