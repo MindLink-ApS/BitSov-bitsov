@@ -281,7 +281,7 @@ fn call_id(n: u128) -> String {
     format!("{n:032x}")
 }
 
-// ── GET /api/v1/status: stun_url for own / configured / absent ──────────────
+// ── GET /api/v1/status: stun_url / stun_source for own, configured, absent ──
 
 /// Own responder with a dialable advertised host: `stun_url` names it.
 #[tokio::test]
@@ -292,6 +292,8 @@ async fn status_stun_own_matches_golden() {
         ..(*common::test_state()).clone()
     });
     let (status, body) = render(&state, "GET", "/api/v1/status", None).await;
+    // Pinned before the mask hides it: the value, not only the shape.
+    assert_eq!(body["node_id"], state.identity.node_id().to_hex());
     check_golden("status_stun_own", "GET /api/v1/status", status, body);
 }
 
@@ -304,23 +306,24 @@ async fn status_stun_absent_matches_golden() {
         ..(*common::test_state()).clone()
     });
     let (status, body) = render(&state, "GET", "/api/v1/status", None).await;
+    assert_eq!(body["node_id"], state.identity.node_id().to_hex());
     check_golden("status_stun_absent", "GET /api/v1/status", status, body);
 }
 
-/// TODO(#426): the configured-STUN fallback and `stun_source` are not on
-/// `main` yet. Once #426 lands, build the state with `stun_port: Some(3478)`,
-/// no dialable endpoint and the configured `[network] stun_server`
-/// (`stun.example.org:3478`), render `GET /api/v1/status`, and check it
-/// against `status_stun_configured.json` (expected: `stun_url`
-/// `"stun:stun.example.org:3478"`, `stun_source` `"configured"`); the own and
-/// absent fixtures then gain `stun_source` `"own"` / absent respectively.
+/// Own responder without a dialable host, but a valid `[network]
+/// stun_server`: `stun_url` names the configured server, `stun_source` is
+/// `configured` (#426).
 #[tokio::test]
-#[ignore = "TODO(#426): configured_stun_server / stun_source are not on main yet"]
 async fn status_stun_configured_matches_golden() {
-    panic!(
-        "TODO(#426): AppState has no configured_stun_server yet; add the fixture \
-         status_stun_configured.json once the field and stun_source exist"
-    );
+    let state = Arc::new(AppState {
+        stun_port: Some(3478),
+        introduction: IntroductionSettings::fixed(Some("regtest"), None),
+        configured_stun_server: Some("stun.example.org:3478".into()),
+        ..(*common::test_state()).clone()
+    });
+    let (status, body) = render(&state, "GET", "/api/v1/status", None).await;
+    assert_eq!(body["node_id"], state.identity.node_id().to_hex());
+    check_golden("status_stun_configured", "GET /api/v1/status", status, body);
 }
 
 // ── Calls: invite (compose), refusal, open calls, call price ─────────────────
@@ -373,6 +376,10 @@ async fn call_invite_and_call_state_match_goldens() {
         None,
     )
     .await;
+    assert_eq!(
+        body["peer_id"], peer_hex,
+        "the requested peer, before the mask hides it"
+    );
     check_golden(
         "peer_call_price",
         "GET /api/v1/pricing/peers/:id/call",
@@ -467,6 +474,10 @@ async fn call_invite_and_call_state_match_goldens() {
         None,
     )
     .await;
+    assert_eq!(
+        body[0]["created"], 1_790_000_000_000_u64,
+        "the bound journal row's time, before the mask hides it"
+    );
     check_golden(
         "calls_open_by_peer",
         "GET /api/v1/calls?peer=<node-id>",

@@ -67,6 +67,7 @@
     "storage_key_mismatch": false,
     "storage_unreadable_rows": 0,
     "stun_port": 3478,
+    "stun_source": "own",
     "stun_url": "stun:node.example.org:3478",
     "uptime_secs": "<uint>",
     "version": 2

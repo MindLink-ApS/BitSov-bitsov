@@ -71,9 +71,9 @@ on either side fails there and here before it reaches a user.
 
 | Fixture | Request | Status | Contract |
 |---|---|---|---|
-| `status_stun_own.json` | `GET /api/v1/status` | 200 | Own STUN responder (`[calls] stun_listen`) at a dialable advertised host: `stun_port`, `stun_url` (`stun:<peer host>:<stun_port>`), `peer_endpoint`, `peer_endpoint_source` `advertised`. |
-| `status_stun_absent.json` | `GET /api/v1/status` | 200 | No responder and no dialable host: `stun_port`, `stun_url`, `peer_endpoint` and `peer_endpoint_source` are absent; `peer_endpoint_reason` `no_dialable_endpoint`. |
-| `status_stun_configured.json` | `GET /api/v1/status` | 200 | **TODO(#426)**: own responder without a dialable host but a valid `[network] stun_server`: `stun_url` from the configured server and `stun_source` `configured` (`own` in the first fixture, absent in the second). Added with #426; until then `stun_source` is not served. |
+| `status_stun_own.json` | `GET /api/v1/status` | 200 | Own STUN responder (`[calls] stun_listen`) at a dialable advertised host: `stun_port`, `stun_url` (`stun:<peer host>:<stun_port>`), `stun_source` `own`, `peer_endpoint`, `peer_endpoint_source` `advertised`. |
+| `status_stun_configured.json` | `GET /api/v1/status` | 200 | Own responder without a dialable host but a valid `[network] stun_server`: `stun_port`, `stun_url` from the configured server, `stun_source` `configured`, `peer_endpoint_reason` `no_dialable_endpoint`. |
+| `status_stun_absent.json` | `GET /api/v1/status` | 200 | No responder, no dialable host, no configured server: `stun_port`, `stun_url`, `stun_source`, `peer_endpoint` and `peer_endpoint_source` are absent; `peer_endpoint_reason` `no_dialable_endpoint`. |
 | `peer_call_price.json` | `GET /api/v1/pricing/peers/:id/call` | 200 | The callee's live call price: `peer_id`, `offer_msat` (kind 400, asked of the callee), `signal_msat` (kind 401). |
 | `call_invite_accepted.json` | `POST /api/v1/messages/compose` (kind 400, `wait_ack_ms: 0`) | 200 | A paid, dispatched invite: `operation_id` (echoed), `state` `sent`, `accepted` `false` (no acceptance receipt was awaited), `payment_hash`, `retry_allowed`, `max_routing_fee_msat`, `message_id`, `delivered`, `amount_msat`. See [exactly-once operations](EXACTLY-ONCE-OPERATIONS.md). |
 | `call_invite_refused_call_id_used.json` | `POST /api/v1/messages/compose` (kind 400) | 400 | A new operation reusing a call id: `error`, `code` `not_dispatched`, `reason` `call_id_used` (the refusal table above). |
