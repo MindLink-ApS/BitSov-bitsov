@@ -276,15 +276,21 @@ pub async fn conclude_unfetched(
         }
         Phase::AwaitingDevice if now_ms < raw.deadline_ms => Ok(Unfetched::Waiting { until_ms: raw.deadline_ms }),
         Phase::AwaitingDevice => {
-            let Some(missed) = raw.at(now_ms) else {
-                return Ok(Unfetched::Other);
-            };
-            if missed.phase != Phase::Unreachable {
-                return Ok(Unfetched::Other);
+            let already = outcome.as_deref() == Some(INVITE_UNREACHABLE);
+            match raw.at(now_ms) {
+                Some(missed) if missed.phase == Phase::Unreachable => {
+                    write(store, peer, call_id, Some(&missed)).await?;
+                    remember_invite_outcome(store, receipt, INVITE_UNREACHABLE).await;
+                    Ok(Unfetched::BecameNotReachable)
+                }
+                // Past the tombstone, `at` drops the row. The sweep has not run,
+                // so the invite was never fetched: this resend is not a success.
+                None => {
+                    remember_invite_outcome(store, receipt, INVITE_UNREACHABLE).await;
+                    Ok(if already { Unfetched::AlreadyNotReachable } else { Unfetched::BecameNotReachable })
+                }
+                Some(_) => Ok(Unfetched::Other),
             }
-            write(store, peer, call_id, Some(&missed)).await?;
-            remember_invite_outcome(store, receipt, INVITE_UNREACHABLE).await;
-            Ok(Unfetched::BecameNotReachable)
         }
         Phase::Reserved | Phase::Ended => Ok(Unfetched::Other),
     }
@@ -377,18 +383,33 @@ pub async fn deliver_invite_to_device(state: &AppState, sender_hex: &str, messag
 
 /// The caller's first ringing acknowledgement anchors its 60 s clock.
 /// Returns whether this ack was the one that anchored it.
-pub async fn note_caller_ringing(store: Store<'_>, peer: &NodeId, call_id: &str) -> Result<bool, konsensus_storage::StorageError> {
+///
+/// `receipt` must be the message id stored on the caller's current invite.
+/// An acknowledgement of an older invite, after the call id is reused, does
+/// not anchor and does not move the deadline.
+pub async fn note_caller_ringing(store: Store<'_>, peer: &NodeId, call_id: &str, receipt: &MessageId) -> Result<bool, konsensus_storage::StorageError> {
     let _g = lock().lock().await;
-    let now = now_ms();
     let Some(raw) = store.call_get(peer, call_id).await? else { return Ok(false) };
-    let Some(entry) = raw.at(now) else { return Ok(false) };
-    match rules::note_ringing_ack(entry, now) {
+    match rules::anchor_caller_ack(raw, receipt, now_ms()) {
         rules::RingAck::Started(next) => {
             write(store, peer, call_id, Some(&next)).await?;
             Ok(true)
         }
         rules::RingAck::Unchanged(_) | rules::RingAck::Ignored => Ok(false),
     }
+}
+
+/// Consume the callee's ringing acknowledgement and anchor the caller's clock
+/// in one storage transaction, before any caller is told the invite was delivered.
+pub async fn acknowledge_caller_invite(
+    store: Store<'_>,
+    id: &MessageId,
+    peer: &NodeId,
+    sender: &NodeId,
+    call_id: &str,
+) -> Result<konsensus_storage::PendingAck, konsensus_storage::StorageError> {
+    let _g = lock().lock().await;
+    store.acknowledge_ringing_invite(id, peer, sender, call_id, now_ms()).await
 }
 
 /// How a resend of an accepted invite should be answered.
@@ -495,15 +516,36 @@ pub async fn reserve_outgoing(
 
 /// Commit or release the reservation of exactly this request; anything else
 /// (another request's reservation, none at all) is left alone.
-async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &str, request_hash: &str, how: Settlement) -> Result<(), konsensus_storage::StorageError> {
+fn paid_invite_id(kind: u16, message_id: Option<&str>) -> Option<MessageId> {
+    if kind != konsensus_core::kind::KIND_CALL_INVITE {
+        return None;
+    }
+    message_id.and_then(|hex| MessageId::from_hex(hex).ok())
+}
+
+async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &str, request_hash: &str, how: Settlement, invite_id: Option<MessageId>) -> Result<(), konsensus_storage::StorageError> {
     let _g = lock().lock().await;
     let now = now_ms();
-    let Some(entry) = store.call_get(peer, call_id).await? else { return Ok(()) };
-    if !entry.pending.as_ref().is_some_and(|p| p.is(operation_id, request_hash)) {
+    let Some(mut entry) = store.call_get(peer, call_id).await? else { return Ok(()) };
+    let Some(pending) = entry.pending.clone().filter(|p| p.is(operation_id, request_hash)) else {
         return Ok(());
-    }
+    };
     let next = match how {
-        Settlement::Paid => Some(rules::commit(entry, operation_id, now)),
+        Settlement::Paid => {
+            if pending.kind == konsensus_core::kind::KIND_CALL_INVITE {
+                if entry.invite_message_id.is_none() {
+                    entry.invite_message_id = invite_id;
+                }
+                if let Some(id) = entry.invite_message_id {
+                    match store.bind_call_invite(&id, peer, call_id).await {
+                        Ok(()) => {}
+                        Err(konsensus_storage::StorageError::Unsupported(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            Some(rules::commit(entry, operation_id, now))
+        }
         Settlement::Unpaid => rules::release(entry, operation_id),
         Settlement::Ambiguous => return Ok(()),
     };
@@ -514,9 +556,9 @@ async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &s
 /// envelope goes out, so the peer's reply finds a paid call. Never fails the
 /// send (money already moved): a store error is logged and `resolve` or
 /// `recover` commits later from the operation journal.
-pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) {
+pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str, invite_id: Option<MessageId>) {
     let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else { return };
-    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, request_hash, Settlement::Paid).await {
+    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, request_hash, Settlement::Paid, invite_id).await {
         tracing::warn!(peer = %peer, error = %e, "call commit after settlement failed; recovery will retry");
     }
 }
@@ -548,7 +590,7 @@ pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, 
             return;
         }
     };
-    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, request_hash, how).await {
+    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, request_hash, how, None).await {
         tracing::warn!(peer = %peer, error = %e, "call reservation not resolved; recovery will retry");
     }
 }
@@ -579,7 +621,8 @@ pub async fn settle_operation(store: Store<'_>, op: &konsensus_storage::OutboxOp
     };
     for (p, call_id, entry) in pending {
         if p == peer && entry.pending.is_some_and(|x| x.is(&op.operation_id, &op.request_hash) && i64::from(x.kind) == op.kind) {
-            if let Err(e) = settle(store, &peer, &call_id, &op.operation_id, &op.request_hash, how).await {
+            let invite_id = paid_invite_id(u16::try_from(op.kind).unwrap_or(0), op.message_id.as_deref());
+            if let Err(e) = settle(store, &peer, &call_id, &op.operation_id, &op.request_hash, how, invite_id).await {
                 tracing::warn!(operation_id = %op.operation_id, error = %e, "call reservation not settled; next sweep retries");
             }
         }
@@ -614,7 +657,8 @@ pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_stora
         // Startup commits only if the journal row is this request: same
         // payload hash, kind and recipient (Fable R1).
         let how = journal_settlement(op.as_ref(), &peer, p.kind, &hash);
-        settle(store, &peer, &call_id, &p.operation_id, &p.request_hash, how).await?;
+        let invite_id = op.as_ref().and_then(|row| paid_invite_id(p.kind, row.message_id.as_deref()));
+        settle(store, &peer, &call_id, &p.operation_id, &p.request_hash, how, invite_id).await?;
         match how {
             Settlement::Paid => committed += 1,
             Settlement::Unpaid => released += 1,

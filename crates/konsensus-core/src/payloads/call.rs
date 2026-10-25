@@ -341,8 +341,10 @@ pub struct CallEntry {
     pub ring_anchored: bool,
     /// Message id of the invite this row admits. A device receipt counts only
     /// when it is this message, so a reused call id cannot be rung by an
-    /// older retained invite. `None` on rows written before the binding, and
-    /// on the caller's own offer (the callee's row is the one that rings).
+    /// older retained invite. The caller's paid invite stores that message
+    /// id here too: a ringing acknowledgement anchors the clock only when it
+    /// names this message. `None` is a row written before the binding and
+    /// still accepts any receipt.
     pub invite_message_id: Option<MessageId>,
 }
 
@@ -556,6 +558,73 @@ pub fn note_ringing_ack(entry: CallEntry, now_ms: u64) -> RingAck {
         (Side::Caller, Phase::Ringing, true) => RingAck::Unchanged(entry),
         (Side::Caller, Phase::Reserved | Phase::AwaitingDevice | Phase::Live | Phase::Ended | Phase::Unreachable, _)
         | (Side::Callee, _, _) => RingAck::Ignored,
+    }
+}
+
+/// Publish a paid caller invite and remember the envelope that carries it.
+///
+/// `None` when `entry` is not `operation_id`'s reserved invite. The message
+/// id is stored before [`commit`], so the ringing row and the delivery name
+/// the same invite.
+pub fn bind_paid_caller_invite(entry: CallEntry, operation_id: &str, invite: MessageId, now_ms: u64) -> Option<CallEntry> {
+    let mine = entry.pending.as_ref().is_some_and(|p| p.operation_id == operation_id && p.kind == KIND_CALL_INVITE);
+    if !mine {
+        return None;
+    }
+    let stamped = CallEntry { invite_message_id: Some(invite), ..entry };
+    Some(commit(stamped, operation_id, now_ms))
+}
+
+/// Anchor the caller's ring clock when `invite` is this row's paid invite.
+///
+/// A stored id that differs is [`RingAck::Ignored`] and leaves the row
+/// unchanged, so a delayed acknowledgement of an older invite cannot start
+/// the clock after the call id is reused. `None` still accepts any receipt.
+pub fn anchor_caller_ack(entry: CallEntry, invite: &MessageId, now_ms: u64) -> RingAck {
+    if entry.invite_message_id.is_some_and(|id| id != *invite) {
+        return RingAck::Ignored;
+    }
+    let Some(entry) = entry.at(now_ms) else {
+        return RingAck::Ignored;
+    };
+    note_ringing_ack(entry, now_ms)
+}
+
+/// What to commit with one delivery acknowledgement of a caller invite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallerDelivery {
+    /// Write `entry` and consume the delivery in the same transaction.
+    Anchor(CallEntry),
+    /// Consume the delivery. The ring clock is not this acknowledgement's to move.
+    Accept,
+    /// Leave the delivery queued. The paid invite is not ringing yet.
+    Hold,
+}
+
+/// Decide the caller's delivery acknowledgement.
+///
+/// A missing row, a different invite, or a clock that is already anchored is
+/// [`CallerDelivery::Accept`]: the delivery can complete without writing call
+/// state. The current unanchored ringing invite is [`CallerDelivery::Anchor`].
+/// A caller still reserved for this invite is [`CallerDelivery::Hold`], so the
+/// acknowledgement can be retried once the paid envelope is visible.
+pub fn caller_delivery(entry: Option<CallEntry>, invite: &MessageId, now_ms: u64) -> CallerDelivery {
+    let Some(entry) = entry else {
+        return CallerDelivery::Accept;
+    };
+    if entry.invite_message_id.is_some_and(|id| id != *invite) {
+        return CallerDelivery::Accept;
+    }
+    match anchor_caller_ack(entry.clone(), invite, now_ms) {
+        RingAck::Started(next) => CallerDelivery::Anchor(next),
+        RingAck::Unchanged(_) => CallerDelivery::Accept,
+        RingAck::Ignored => {
+            if entry.side == Side::Caller && !entry.ring_anchored && entry.phase == Phase::Reserved {
+                CallerDelivery::Hold
+            } else {
+                CallerDelivery::Accept
+            }
+        }
     }
 }
 
@@ -901,5 +970,23 @@ mod tests {
         };
         assert!(reserve(Some(callee.clone()), KIND_ICE_CANDIDATE, "ice", "h", paid_at).is_ok());
         assert!(receive(Some(callee), KIND_ICE_CANDIDATE, paid_at + 1_001).is_ok());
+    }
+
+    #[test]
+    fn older_ack_does_not_anchor_a_reused_caller_invite() {
+        let paid_at = 1_000u64;
+        let current = MessageId::from_bytes([1; 32]);
+        let older = MessageId::from_bytes([2; 32]);
+        let mut caller = commit(reserve(None, KIND_CALL_INVITE, "op", "h", paid_at).unwrap(), "op", paid_at);
+        caller.invite_message_id = Some(current);
+        assert!(matches!(anchor_caller_ack(caller.clone(), &older, paid_at + 10), RingAck::Ignored));
+        match anchor_caller_ack(caller, &current, paid_at + 10) {
+            RingAck::Started(entry) => {
+                assert!(entry.ring_anchored);
+                assert_eq!(entry.invite_message_id, Some(current));
+                assert_eq!(entry.deadline_ms, paid_at + 10 + RING_TIMEOUT_MS);
+            }
+            other => panic!("the current invite's ack anchors the clock, got {other:?}"),
+        }
     }
 }

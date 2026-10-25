@@ -241,7 +241,7 @@ async fn caller_ring_deadline_anchors_at_the_ringing_ack() {
     assert_eq!(loaded.deadline_ms, caller.deadline_ms);
 
     let anchored_at = calls::now_ms();
-    assert!(calls::note_caller_ringing(&store, &peer, &call).await.unwrap());
+    assert!(calls::note_caller_ringing(&store, &peer, &call, &receipt()).await.unwrap());
     let stored = store.call_get(&peer, &call).await.unwrap().unwrap();
     assert!(stored.ring_anchored);
     assert!(stored.deadline_ms >= anchored_at + RING_TIMEOUT_MS);
@@ -265,7 +265,7 @@ async fn caller_ring_deadline_anchors_at_the_ringing_ack() {
     let released = release(roundtrip, "hang").unwrap();
     store.call_put(&peer, &call, &released).await.unwrap();
 
-    assert!(!calls::note_caller_ringing(&store, &peer, &call)
+    assert!(!calls::note_caller_ringing(&store, &peer, &call, &receipt())
         .await
         .unwrap());
     let again = store.call_get(&peer, &call).await.unwrap().unwrap();
@@ -702,4 +702,210 @@ async fn historical_invite_fetch_after_call_id_reuse_does_not_start_the_new_ring
         DeviceTook::Started { deadline_ms } => assert_eq!(deadline_ms, fetch_at + RING_TIMEOUT_MS),
         other => panic!("the current invite's fetch starts the clock, got {other:?}"),
     }
+}
+
+/// The paid envelope and its invite binding commit together. A binding write
+/// failure publishes nothing, so a later acknowledgement still finds the row
+/// and caller ICE is no longer refused for an unanchored ring.
+#[tokio::test]
+async fn paid_invite_binding_commits_with_the_envelope_and_ack_allows_ice() {
+    use konsensus_core::payloads::call::reserve;
+    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
+    use konsensus_storage::OutboxOperation;
+
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([0x42; 32]);
+    let call = id(21);
+    let op_id = "op-invite-bind";
+    calls::reserve_outgoing(&store, &own(), &peer, 400, &offer(&call), op_id, "h")
+        .await
+        .unwrap();
+    let env = UkmEnvelopeBuilder::new(
+        400,
+        own(),
+        Recipient::Node(peer),
+        vec![7],
+        PaymentProof::new([9; 32], [9; 32], 1000),
+    )
+    .build();
+    let mut op = OutboxOperation::prepared(op_id.into(), peer.to_hex(), 400, "h".into());
+    assert!(store.insert_outbox_operation(&op).await.unwrap());
+    op.state = "paid".into();
+    op.message_id = Some(env.id.to_hex());
+
+    sqlx::raw_sql(
+        "CREATE TRIGGER fail_invite_bind BEFORE INSERT ON call_invite_binding BEGIN SELECT RAISE(ABORT, 'bind failed'); END",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert!(
+        store.commit_outbox_envelope(&op, &env).await.is_err(),
+        "binding failure must roll back the paid envelope and its queue entry"
+    );
+    assert!(store.get_message(&env.id).await.unwrap().is_none());
+    assert_eq!(store.count_pending_deliveries().await.unwrap(), 0);
+    assert!(store.call_invite_binding(&env.id).await.unwrap().is_none());
+    assert!(
+        store
+            .call_get(&peer, &call)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending
+            .is_some(),
+        "the reservation survives the rolled-back publish"
+    );
+
+    sqlx::raw_sql("DROP TRIGGER fail_invite_bind")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert!(store.commit_outbox_envelope(&op, &env).await.unwrap());
+    assert_eq!(
+        store.call_invite_binding(&env.id).await.unwrap(),
+        Some((peer, call.clone())),
+        "the binding is visible as soon as the envelope can be dispatched"
+    );
+    let ringing = store.call_get(&peer, &call).await.unwrap().unwrap();
+    assert_eq!(ringing.phase, Phase::Ringing);
+    assert_eq!(ringing.invite_message_id, Some(env.id));
+    assert!(!ringing.ring_anchored);
+    assert!(calls::note_caller_ringing(&store, &peer, &call, &env.id)
+        .await
+        .unwrap());
+    let anchored = store.call_get(&peer, &call).await.unwrap().unwrap();
+    assert!(anchored.ring_anchored);
+    assert!(
+        reserve(
+            Some(anchored),
+            konsensus_core::kind::KIND_ICE_CANDIDATE,
+            "ice",
+            "h2",
+            calls::now_ms(),
+        )
+        .is_ok(),
+        "an acknowledged invite accepts caller ICE"
+    );
+}
+
+/// Startup recovery of a paid invite that never recorded its binding must
+/// still anchor on the ringing acknowledgement, then accept ICE.
+#[tokio::test]
+async fn recovery_binds_a_paid_invite_before_its_ack_and_ice() {
+    use konsensus_core::payloads::call::reserve;
+    use konsensus_storage::OutboxOperation;
+
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([0x43; 32]);
+    let call = id(22);
+    let op = "00000000-0000-4000-8000-0000000000b1";
+    let msg = MessageId::from_bytes([6; 32]);
+    calls::reserve_outgoing(&store, &own(), &peer, 400, &offer(&call), op, "h")
+        .await
+        .unwrap();
+    let mut row = OutboxOperation::prepared(op.into(), peer.to_hex(), 400, "h".into());
+    assert!(store.insert_outbox_operation(&row).await.unwrap());
+    row.state = "paid".into();
+    row.message_id = Some(msg.to_hex());
+    assert!(store.update_outbox_operation(&row).await.unwrap());
+
+    assert_eq!(calls::recover(&store).await.unwrap().0, 1);
+    assert_eq!(
+        store.call_invite_binding(&msg).await.unwrap(),
+        Some((peer, call.clone()))
+    );
+    let ringing = store.call_get(&peer, &call).await.unwrap().unwrap();
+    assert_eq!(ringing.phase, Phase::Ringing);
+    assert_eq!(ringing.invite_message_id, Some(msg));
+    assert!(calls::note_caller_ringing(&store, &peer, &call, &msg)
+        .await
+        .unwrap());
+    let anchored = store.call_get(&peer, &call).await.unwrap().unwrap();
+    assert!(
+        reserve(
+            Some(anchored),
+            konsensus_core::kind::KIND_ICE_CANDIDATE,
+            "ice",
+            "h2",
+            calls::now_ms(),
+        )
+        .is_ok(),
+        "recovery then acknowledgement accepts caller ICE"
+    );
+}
+
+/// Downtime past the tombstone leaves the unfetched invite row in place until
+/// the sweep. A resend before that sweep is not a success acknowledgement.
+#[tokio::test]
+async fn unswept_unfetched_invite_past_the_tombstone_is_not_acknowledged() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([0x42; 32]);
+    let call = id(23);
+    let msg = MessageId::from_bytes([7; 32]);
+    calls::admit_incoming_id(&store, &own(), &peer, 400, Some(&offer(&call)), Some(msg))
+        .await
+        .unwrap();
+    store.bind_call_invite(&msg, &peer, &call).await.unwrap();
+    let grace_end = store
+        .call_get(&peer, &call)
+        .await
+        .unwrap()
+        .unwrap()
+        .deadline_ms;
+    let past_tombstone = grace_end + TOMBSTONE_MS;
+    assert!(
+        store.call_get(&peer, &call).await.unwrap().is_some(),
+        "the row has not been swept"
+    );
+    let first = calls::conclude_unfetched(&store, &peer, &call, &msg, past_tombstone)
+        .await
+        .unwrap();
+    assert_eq!(
+        calls::invite_retry_decision(Ok(first)),
+        calls::InviteRetry::NotReachable,
+        "an expired awaiting-device row is unreachable, not a success ack"
+    );
+    assert!(
+        store.call_get(&peer, &call).await.unwrap().is_some(),
+        "classification does not sweep the row"
+    );
+    let second = calls::conclude_unfetched(&store, &peer, &call, &msg, past_tombstone + 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        calls::invite_retry_decision(Ok(second)),
+        calls::InviteRetry::NotReachable,
+        "a retry before the first sweep is still not a success ack"
+    );
+}
+
+/// A delayed acknowledgement of an older invite must not anchor the caller's
+/// newer invite after the call id is reused.
+#[tokio::test]
+async fn delayed_ack_of_an_older_invite_does_not_anchor_the_reused_call() {
+    use konsensus_core::payloads::call::{commit, reserve};
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([0x44; 32]);
+    let call = id(24);
+    let old_id = MessageId::from_bytes([8; 32]);
+    let new_id = MessageId::from_bytes([9; 32]);
+    let now = calls::now_ms();
+    let mut entry = commit(reserve(None, 400, "op", "h", now).unwrap(), "op", now);
+    entry.invite_message_id = Some(new_id);
+    store.call_put(&peer, &call, &entry).await.unwrap();
+
+    assert!(!calls::note_caller_ringing(&store, &peer, &call, &old_id).await.unwrap());
+    let still = store.call_get(&peer, &call).await.unwrap().unwrap();
+    assert!(!still.ring_anchored, "the older acknowledgement must not anchor the newer invite");
+    assert_eq!(still.deadline_ms, entry.deadline_ms);
+    assert_eq!(still.invite_message_id, Some(new_id));
+
+    assert!(calls::note_caller_ringing(&store, &peer, &call, &new_id).await.unwrap());
+    let anchored = store.call_get(&peer, &call).await.unwrap().unwrap();
+    assert!(anchored.ring_anchored);
+    assert!(
+        reserve(Some(anchored), konsensus_core::kind::KIND_ICE_CANDIDATE, "ice", "h2", calls::now_ms()).is_ok(),
+        "the current invite's acknowledgement accepts caller ICE"
+    );
 }

@@ -18,10 +18,12 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use konsensus_core::identity::NodeIdentity;
+use konsensus_core::kind::KIND_CALL_INVITE;
 use konsensus_core::traits::chain::ChainProvider;
 use konsensus_core::traits::lightning::LightningProvider;
 use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::types::NodeId;
+use konsensus_storage::PendingAck;
 use konsensus_crypto::SessionManager;
 use konsensus_message::peer::PeerRegistry;
 use konsensus_message::{ControlEvent, Frame, NoiseTransport};
@@ -1077,6 +1079,101 @@ impl DeliveryConfirmationBudget {
     }
 }
 
+/// Test-only gate in front of a caller-invite acknowledgement. Production
+/// builds leave [`invite_ack_barrier`] empty. A test scopes the gate onto the
+/// handler task so it can observe that `delivered` is unpublished until the
+/// anchor transaction commits.
+#[cfg(test)]
+pub(crate) mod invite_ack_gate {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    tokio::task_local! {
+        pub static INVITE_ACK_GATE: Arc<InviteAckGate>;
+    }
+
+    pub struct InviteAckGate {
+        released: AtomicBool,
+        entered: AtomicUsize,
+        notify: tokio::sync::Notify,
+    }
+
+    impl InviteAckGate {
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self {
+                released: AtomicBool::new(false),
+                entered: AtomicUsize::new(0),
+                notify: tokio::sync::Notify::new(),
+            })
+        }
+
+        pub fn entered(&self) -> usize {
+            self.entered.load(Ordering::SeqCst)
+        }
+
+        pub fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+
+        pub async fn wait(&self) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            loop {
+                if self.released.load(Ordering::SeqCst) {
+                    return;
+                }
+                let notified = self.notify.notified();
+                if self.released.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+}
+
+async fn invite_ack_barrier() {
+    #[cfg(test)]
+    if let Ok(gate) = invite_ack_gate::INVITE_ACK_GATE.try_with(std::sync::Arc::clone) {
+        gate.wait().await;
+    }
+}
+
+enum RingPrep {
+    /// Not a caller invite this path anchors.
+    Ordinary,
+    /// The delivery stays queued and nothing is published.
+    Stop,
+    /// The delivery was consumed and the ring anchor, when required, committed.
+    Accepted,
+    /// The acknowledgement did not commit. Do not publish delivery.
+    Failed,
+}
+
+async fn prepare_ringing_ack(
+    peer: &NodeId,
+    id: &konsensus_core::MessageId,
+    own_id: &NodeId,
+    storage: &Arc<dyn konsensus_storage::Storage>,
+) -> RingPrep {
+    let call_id = match storage.call_invite_binding(id).await {
+        Ok(Some((bound, call_id))) if bound == *peer => call_id,
+        Ok(Some(_)) | Err(konsensus_storage::StorageError::Unsupported(_)) => return RingPrep::Ordinary,
+        Ok(None) => match storage.get_message(id).await {
+            Ok(Some(env)) if env.kind == KIND_CALL_INVITE => return RingPrep::Stop,
+            Ok(_) | Err(konsensus_storage::StorageError::Unsupported(_)) => return RingPrep::Ordinary,
+            Err(_) => return RingPrep::Stop,
+        },
+        Err(_) => return RingPrep::Stop,
+    };
+    invite_ack_barrier().await;
+    match konsensus_api::calls::acknowledge_caller_invite(storage.as_ref(), id, peer, own_id, &call_id).await {
+        Ok(PendingAck::Accepted) => RingPrep::Accepted,
+        Ok(PendingAck::Held) => RingPrep::Stop,
+        Ok(PendingAck::Absent) | Err(_) => RingPrep::Failed,
+    }
+}
+
 /// Delivery confirmations cannot grant admission or mutate unrelated deliveries.
 #[allow(clippy::too_many_arguments)]
 async fn handle_delivery_confirmation(
@@ -1106,9 +1203,26 @@ async fn handle_delivery_confirmation(
     } else { false };
     let legacy = nonce_replay || hash_acked;
     if rejection.is_none() || legacy {
-        if !hash_acked && !matches!(storage.acknowledge_pending(id, peer, own_id).await, Ok(true)) {
-            if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
-            return;
+        if !hash_acked {
+            let ringing = if rejection.is_none() {
+                prepare_ringing_ack(peer, id, own_id, storage).await
+            } else {
+                RingPrep::Ordinary
+            };
+            match ringing {
+                RingPrep::Accepted => {}
+                RingPrep::Stop => return,
+                RingPrep::Failed => {
+                    if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
+                    return;
+                }
+                RingPrep::Ordinary => {
+                    if !matches!(storage.acknowledge_pending(id, peer, own_id).await, Ok(true)) {
+                        if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
+                        return;
+                    }
+                }
+            }
         }
         if legacy {
             audit.record("acked_legacy", &peer.to_hex(), Some(serde_json::json!({"message_id": id.to_hex()})));
@@ -1176,16 +1290,6 @@ async fn handle_message_acked(
         },
     )) {
         tracing::debug!(error = %e, "no WebSocket clients for delivery status");
-    }
-
-    // The callee's ringing ack is this delivery. Anchor our 60 s clock to it
-    // once; a duplicate ack does not move the deadline.
-    if let Ok(Some((bound, call_id))) = storage.call_invite_binding(message_id).await {
-        if bound == *peer_id {
-            if let Err(e) = konsensus_api::calls::note_caller_ringing(storage.as_ref(), peer_id, &call_id).await {
-                warn!(peer = %peer_id, error = %e, "caller ring deadline not anchored");
-            }
-        }
     }
 }
 

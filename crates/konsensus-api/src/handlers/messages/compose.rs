@@ -3674,16 +3674,12 @@ pub(super) async fn compose_peer(
 
         let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
         if crate::calls::is_call_kind(req.kind) {
-            // Paid: publish the call transition before the envelope goes out.
+            // The paid-envelope transaction binds a call invite to this message
+            // before the delivery is visible. Commit the reservation as well
+            // when that transaction did not see the row (recovery does the same).
             let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
-            crate::calls::commit_outgoing(state.storage.as_ref(), &peer_id, &req.plaintext, &operation.id, &request_hash).await;
-            if req.kind == konsensus_core::kind::KIND_CALL_INVITE {
-                if let Ok(signal) = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext) {
-                    if let Err(e) = state.storage.bind_call_invite(&envelope.id, &peer_id, &signal.call_id).await {
-                        tracing::warn!(msg_id = %envelope.id, error = %e, "call invite binding not stored");
-                    }
-                }
-            }
+            let invite_id = (req.kind == konsensus_core::kind::KIND_CALL_INVITE).then_some(envelope.id);
+            crate::calls::commit_outgoing(state.storage.as_ref(), &peer_id, &req.plaintext, &operation.id, &request_hash, invite_id).await;
         }
 
         if let Some(expected) = konsensus_core::expected_reply_kind(req.kind) {

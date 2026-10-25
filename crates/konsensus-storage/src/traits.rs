@@ -19,6 +19,17 @@ use crate::reactions::ReactionRecord;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaidAcceptance { Accepted, AlreadyAccepted, NonceReused, PaymentReused }
 
+/// Outcome of acknowledging one dispatched delivery together with its ring anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingAck {
+    /// The delivery was consumed. Any ring anchor required for it is committed.
+    Accepted,
+    /// Nothing dispatched was waiting. No call state was written.
+    Absent,
+    /// The caller invite is not ringing yet. The delivery stays queued.
+    Held,
+}
+
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
@@ -282,6 +293,26 @@ pub trait Storage: Send + Sync {
     /// Legacy hash-reuse completion additionally binds the exact stored payment.
     async fn acknowledge_pending_payment(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId, _hash: &[u8; 32]) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("acknowledge_pending_payment".into()))
+    }
+
+    /// Consume a dispatched delivery and, when `call_id` is the caller's current
+    /// unanchored invite, write that ring anchor in the same transaction.
+    ///
+    /// The default consumes the delivery the way [`Self::acknowledge_pending`]
+    /// does and does not touch call state. Backends that store call state
+    /// override it.
+    async fn acknowledge_ringing_invite(
+        &self,
+        id: &MessageId,
+        peer: &NodeId,
+        sender: &NodeId,
+        _call_id: &str,
+        _now_ms: u64,
+    ) -> Result<PendingAck, StorageError> {
+        match self.acknowledge_pending(id, peer, sender).await? {
+            true => Ok(PendingAck::Accepted),
+            false => Ok(PendingAck::Absent),
+        }
     }
 
     /// Queue before every first dispatch; retries retain the same row until ACK.

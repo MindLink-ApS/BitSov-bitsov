@@ -617,6 +617,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.acknowledge_pending_payment(id, peer, sender, hash).await
     }
 
+    async fn acknowledge_ringing_invite(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, call_id: &str, now_ms: u64) -> Result<crate::PendingAck, StorageError> {
+        self.inner.acknowledge_ringing_invite(id, peer, sender, call_id, now_ms).await
+    }
+
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
         // The stored ID is based on encrypted ciphertext, so we can't look up
         // by the original ID directly. We need to search differently.

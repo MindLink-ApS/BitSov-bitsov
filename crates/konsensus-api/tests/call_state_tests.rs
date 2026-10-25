@@ -417,7 +417,7 @@ async fn call_state_survives_a_restart() {
         calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &theirs))).await.unwrap();
         calls::admit_incoming(&store, &own(), &peer, 403, Some(&body(403, &theirs))).await.unwrap();
         calls::reserve_outgoing(&store, &own(), &peer, 400, &body(400, &mine), "op-mine", "h").await.unwrap();
-        calls::commit_outgoing(&store, &peer, &body(400, &mine), "op-mine", "h").await;
+        calls::commit_outgoing(&store, &peer, &body(400, &mine), "op-mine", "h", None).await;
         store.pool().close().await;
     }
     let store = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();

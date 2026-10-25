@@ -4030,3 +4030,220 @@ async fn session_decode_logs_do_not_echo_peer_json() {
         vec!["invalid wire JSON", "invalid wire JSON"],
     );
 }
+
+fn caller_ringing(invite: konsensus_core::MessageId) -> konsensus_core::payloads::call::CallEntry {
+    use konsensus_core::payloads::call::{commit, reserve};
+    let paid_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut entry = commit(reserve(None, 400, "op", "h", paid_at).unwrap(), "op", paid_at);
+    entry.invite_message_id = Some(invite);
+    entry
+}
+
+async fn dispatch_invite(
+    db: &konsensus_storage::SqliteStorage,
+    own: NodeId,
+    peer: NodeId,
+    mark: u8,
+) -> konsensus_core::MessageId {
+    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
+    let env = UkmEnvelopeBuilder::new(
+        konsensus_core::kind::KIND_CALL_INVITE,
+        own,
+        Recipient::Node(peer),
+        vec![mark],
+        PaymentProof::new(sha2::Sha256::digest([mark; 32]).into(), [mark; 32], 1000),
+    )
+    .build();
+    db.store_message(&env).await.unwrap();
+    db.queue_pending_delivery(&env.id, &peer).await.unwrap();
+    db.mark_pending_sent(&env.id, &peer).await.unwrap();
+    env.id
+}
+
+async fn confirm_delivery(
+    db: &Arc<konsensus_storage::SqliteStorage>,
+    own: &NodeId,
+    peer: &NodeId,
+    id: &konsensus_core::MessageId,
+    ws: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    budget: &mut DeliveryConfirmationBudget,
+) {
+    let storage: Arc<dyn Storage> = db.clone();
+    let routing = konsensus_routing::RoutingTable::new(Default::default());
+    let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
+    let dir = tempfile::tempdir().unwrap();
+    let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+    handle_delivery_confirmation(
+        peer, id, None, true, own, &storage, &timestamps, &routing, ws, &audit, budget,
+    )
+    .await;
+}
+
+/// An anchor write that fails must not consume the delivery or publish
+/// `delivered`. The retry, after storage recovers, anchors before any ICE.
+#[tokio::test]
+async fn ring_anchor_failure_keeps_the_delivery_and_a_retry_anchors_before_ice() {
+    use konsensus_core::payloads::call::reserve;
+    let own = make_peer_id(71);
+    let peer = make_peer_id(72);
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let call = "ab".repeat(16);
+    let msg = dispatch_invite(&db, own, peer, 11).await;
+    db.call_put(&peer, &call, &caller_ringing(msg)).await.unwrap();
+    db.bind_call_invite(&msg, &peer, &call).await.unwrap();
+    sqlx::raw_sql(
+        "CREATE TRIGGER fail_ring_anchor BEFORE UPDATE ON call_state WHEN NEW.ring_anchored = 1 AND OLD.ring_anchored = 0 BEGIN SELECT RAISE(ABORT, 'anchor write failed'); END",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let (ws, mut updates) = broadcast::channel(8);
+    let mut budget = DeliveryConfirmationBudget::default();
+    confirm_delivery(&db, &own, &peer, &msg, &ws, &mut budget).await;
+    assert_eq!(
+        db.count_pending_deliveries().await.unwrap(),
+        1,
+        "a failed anchor must not consume the delivery"
+    );
+    assert!(
+        updates.try_recv().is_err(),
+        "delivered is not published when the anchor did not commit"
+    );
+    assert!(!db.call_get(&peer, &call).await.unwrap().unwrap().ring_anchored);
+
+    sqlx::raw_sql("DROP TRIGGER fail_ring_anchor")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    confirm_delivery(&db, &own, &peer, &msg, &ws, &mut budget).await;
+    assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
+    assert_eq!(updates.try_recv().unwrap().status, "delivered");
+    let anchored = db.call_get(&peer, &call).await.unwrap().unwrap();
+    assert!(anchored.ring_anchored);
+    assert!(
+        reserve(
+            Some(anchored),
+            konsensus_core::kind::KIND_ICE_CANDIDATE,
+            "ice",
+            "h2",
+            1_700_000_000_000,
+        )
+        .is_ok(),
+        "once delivered is published the ring is anchored, so ICE is accepted"
+    );
+}
+
+/// A delayed acknowledgement of an older invite must not anchor the caller's
+/// newer invite after the call id is reused. The current invite's own ack does.
+#[tokio::test]
+async fn older_invite_ack_does_not_anchor_a_reused_call_id() {
+    use konsensus_core::payloads::call::reserve;
+    let own = make_peer_id(73);
+    let peer = make_peer_id(74);
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let call = "cd".repeat(16);
+    let old_msg = dispatch_invite(&db, own, peer, 21).await;
+    let new_msg = dispatch_invite(&db, own, peer, 22).await;
+    db.call_put(&peer, &call, &caller_ringing(new_msg)).await.unwrap();
+    db.bind_call_invite(&old_msg, &peer, &call).await.unwrap();
+    db.bind_call_invite(&new_msg, &peer, &call).await.unwrap();
+    let (ws, mut updates) = broadcast::channel(8);
+    let mut budget = DeliveryConfirmationBudget::default();
+    confirm_delivery(&db, &own, &peer, &old_msg, &ws, &mut budget).await;
+    let after_old = db.call_get(&peer, &call).await.unwrap().unwrap();
+    assert!(
+        !after_old.ring_anchored,
+        "the older invite's acknowledgement must not anchor the newer invite"
+    );
+    assert_eq!(after_old.invite_message_id, Some(new_msg));
+    let _ = updates.try_recv();
+    confirm_delivery(&db, &own, &peer, &new_msg, &ws, &mut budget).await;
+    let anchored = db.call_get(&peer, &call).await.unwrap().unwrap();
+    assert!(anchored.ring_anchored);
+    assert_eq!(updates.try_recv().unwrap().message_id, new_msg.to_hex());
+    assert!(
+        reserve(
+            Some(anchored),
+            konsensus_core::kind::KIND_ICE_CANDIDATE,
+            "ice",
+            "h2",
+            1_700_000_000_000,
+        )
+        .is_ok()
+    );
+}
+
+/// `delivered` stays unpublished until the acknowledgement and the ring anchor
+/// have committed. A client that reacts to that event can send ICE immediately.
+#[tokio::test]
+async fn delivered_is_not_visible_before_the_ring_anchor_commits() {
+    use konsensus_core::payloads::call::reserve;
+    let own = make_peer_id(75);
+    let peer = make_peer_id(76);
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let call = "ef".repeat(16);
+    let msg = dispatch_invite(&db, own, peer, 31).await;
+    db.call_put(&peer, &call, &caller_ringing(msg)).await.unwrap();
+    db.bind_call_invite(&msg, &peer, &call).await.unwrap();
+    let gate = super::invite_ack_gate::InviteAckGate::new();
+    let release_on_drop = ReleaseGate(Arc::clone(&gate));
+    let (ws, mut updates) = broadcast::channel(8);
+
+    let start = |gate: Arc<super::invite_ack_gate::InviteAckGate>| {
+        let db = Arc::clone(&db);
+        let ws = ws.clone();
+        tokio::spawn(super::invite_ack_gate::INVITE_ACK_GATE.scope(gate, async move {
+            let mut budget = DeliveryConfirmationBudget::default();
+            confirm_delivery(&db, &own, &peer, &msg, &ws, &mut budget).await;
+        }))
+    };
+    let first = start(Arc::clone(&gate));
+    let second = start(Arc::clone(&gate));
+    let reached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while gate.entered() < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(reached.is_ok(), "the acknowledgement must reach the anchor before publishing");
+    assert!(updates.try_recv().is_err(), "delivered before the anchor");
+
+    let db_ice = Arc::clone(&db);
+    let peer_ice = peer;
+    let call_ice = call.clone();
+    let mut ice_rx = ws.subscribe();
+    let seen_deadline = Arc::new(tokio::sync::Mutex::new(None));
+    let deadline_slot = Arc::clone(&seen_deadline);
+    let ice = tokio::spawn(async move {
+        let status = ice_rx.recv().await.expect("delivered");
+        assert_eq!(status.status, "delivered");
+        let anchored = db_ice.call_get(&peer_ice, &call_ice).await.unwrap().unwrap();
+        assert!(anchored.ring_anchored, "the ring is anchored before delivered is visible");
+        *deadline_slot.lock().await = Some(anchored.deadline_ms);
+        assert!(
+            reserve(Some(anchored), konsensus_core::kind::KIND_ICE_CANDIDATE, "ice", "h2", 1_700_000_000_000).is_ok(),
+            "ICE sent on delivery finds an anchored ring"
+        );
+    });
+
+    gate.release();
+    first.await.unwrap();
+    second.await.unwrap();
+    ice.await.unwrap();
+    let after = db.call_get(&peer, &call).await.unwrap().unwrap();
+    assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
+    assert_eq!(after.deadline_ms, seen_deadline.lock().await.expect("deadline"));
+    assert!(after.ring_anchored);
+    drop(release_on_drop);
+}
+
+struct ReleaseGate(Arc<super::invite_ack_gate::InviteAckGate>);
+
+impl Drop for ReleaseGate {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}

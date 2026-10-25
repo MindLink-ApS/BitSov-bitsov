@@ -935,6 +935,9 @@ impl Storage for PostgresStorage {
 
         sqlx::query("INSERT INTO pending_deliveries (message_id, recipient_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
             .bind(envelope.id.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
+        if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE {
+            bind_materialized_invite(&mut tx, envelope, op).await?;
+        }
         tx.commit().await?;
         Ok(true)
     }
@@ -1206,6 +1209,24 @@ impl Storage for PostgresStorage {
         }
         tx.commit().await?;
         Ok(changed)
+    }
+
+    async fn acknowledge_ringing_invite(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, call_id: &str, now_ms: u64) -> Result<crate::PendingAck, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, ring_anchored, invite_message_id FROM call_state WHERE peer = $1 AND call_id = $2")
+            .bind(peer.to_hex()).bind(call_id).fetch_optional(&mut *tx).await?;
+        let entry = row.map(call_entry_from_row).transpose()?;
+        match konsensus_core::payloads::call::caller_delivery(entry, id, now_ms) {
+            konsensus_core::payloads::call::CallerDelivery::Hold => {
+                tx.rollback().await?;
+                Ok(crate::PendingAck::Held)
+            }
+            konsensus_core::payloads::call::CallerDelivery::Accept => ack_pending_in_tx(tx, id, peer, sender).await,
+            konsensus_core::payloads::call::CallerDelivery::Anchor(next) => {
+                upsert_call(&mut tx, &peer.to_hex(), call_id, &next).await?;
+                ack_pending_in_tx(tx, id, peer, sender).await
+            }
+        }
     }
 
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
@@ -3780,6 +3801,8 @@ fn outstanding_from_row(
 
 /// `(side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, ring_anchored, invite_message_id)` of `call_state`.
 type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>, i64, Option<String>);
+/// A reserved invite row: `call_id` plus [`CallRow`].
+type PendingInviteRow = (String, String, String, i64, Option<String>, Option<i64>, Option<String>, i64, Option<String>);
 
 /// A stored call row. A corrupt row is an error, never a call.
 fn call_entry_from_row((side, phase, deadline, op, kind, hash, anchored, invite): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
@@ -3798,4 +3821,63 @@ fn call_entry_from_row((side, phase, deadline, op, kind, hash, anchored, invite)
         ring_anchored: anchored != 0,
         invite_message_id: invite.map(|hex| konsensus_core::MessageId::from_hex(&hex).map_err(|_| bad("invite message"))).transpose()?,
     })
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+async fn upsert_call(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, peer_hex: &str, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+    let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
+    sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, ring_anchored, invite_message_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+        ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, ring_anchored = excluded.ring_anchored, invite_message_id = excluded.invite_message_id")
+        .bind(peer_hex).bind(call_id)
+        .bind(entry.side.as_str()).bind(entry.phase.as_str())
+        .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
+        .bind(entry.pending.as_ref().map(|p| p.operation_id.clone()))
+        .bind(entry.pending.as_ref().map(|p| i64::from(p.kind)))
+        .bind(entry.pending.as_ref().map(|p| p.request_hash.clone()))
+        .bind(i64::from(entry.ring_anchored))
+        .bind(entry.invite_message_id.map(|id| id.to_hex()))
+        .execute(&mut **tx).await?;
+    Ok(())
+}
+
+async fn ack_pending_in_tx(mut tx: sqlx::Transaction<'_, sqlx::Postgres>, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<crate::PendingAck, StorageError> {
+    let changed = sqlx::query("DELETE FROM pending_deliveries WHERE message_id = $1 AND recipient_id = $2 AND dispatched = 1 AND state != 'failed_paid' AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = $3)")
+        .bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
+        .execute(&mut *tx).await?.rows_affected() == 1;
+    if !changed {
+        tx.rollback().await?;
+        return Ok(crate::PendingAck::Absent);
+    }
+    sqlx::query("UPDATE outbox_operations SET state = 'acked', version = version + 1, updated_at = CAST(EXTRACT(EPOCH FROM NOW()) * 1000 AS BIGINT) WHERE message_id = $1 AND recipient = $2 AND state IN ('paid', 'sent', 'rejected_retryable')")
+        .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(crate::PendingAck::Accepted)
+}
+
+/// Stamp the caller's reserved invite and record its binding before the
+/// envelope transaction commits. No reserved invite is not an error: the
+/// payment already settled, and recovery binds a reservation this write missed.
+async fn bind_materialized_invite(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, envelope: &UkmEnvelope, op: &crate::OutboxOperation) -> Result<(), StorageError> {
+    let rows: Vec<PendingInviteRow> = sqlx::query_as(
+        "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, ring_anchored, invite_message_id FROM call_state WHERE peer = $1 AND pending_operation_id = $2 AND pending_kind = $3",
+    )
+    .bind(&op.recipient)
+    .bind(&op.operation_id)
+    .bind(i64::from(konsensus_core::kind::KIND_CALL_INVITE))
+    .fetch_all(&mut **tx)
+    .await?;
+    for (call_id, side, phase, deadline, pending_op, kind, hash, anchored, invite) in rows {
+        let entry = call_entry_from_row((side, phase, deadline, pending_op, kind, hash, anchored, invite))?;
+        let Some(next) = konsensus_core::payloads::call::bind_paid_caller_invite(entry, &op.operation_id, envelope.id, unix_ms()) else {
+            continue;
+        };
+        upsert_call(tx, &op.recipient, &call_id, &next).await?;
+        sqlx::query("INSERT INTO call_invite_binding (message_id, peer, call_id) VALUES ($1, $2, $3) ON CONFLICT(message_id) DO UPDATE SET peer = excluded.peer, call_id = excluded.call_id")
+            .bind(envelope.id.to_hex()).bind(&op.recipient).bind(&call_id)
+            .execute(&mut **tx).await?;
+    }
+    Ok(())
 }
