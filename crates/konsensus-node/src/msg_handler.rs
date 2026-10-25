@@ -11,6 +11,7 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use konsensus_core::identity::NodeIdentity;
+use konsensus_core::payloads::calendar::{CalendarEventPayload, CalendarPayloadError, RsvpPayload};
 use konsensus_core::traits::chain::ChainProvider;
 use konsensus_core::traits::lightning::LightningProvider;
 use konsensus_core::traits::transport::MessageTransport;
@@ -561,7 +562,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         }
 
                         // Attempt to decrypt ciphertext via Double Ratchet session
-                        let plaintext = decrypt_and_process(
+                        let plaintext = match decrypt_and_process(
                             &envelope,
                             &sender,
                             &session_mgr_for_recv,
@@ -576,7 +577,30 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             &audit_for_recv,
                             &gate_for_recv,
                             trust_discount,
-                        ).await;
+                        ).await {
+                            Ok(plaintext) => plaintext,
+                            Err(refusal) => {
+                                // A calendar payload over the inbound caps is refused
+                                // before it is cached, copied, stored or expanded. Like
+                                // a refused call signal: the paid envelope is withdrawn
+                                // (payment hash and nonce stay burned) and the sender
+                                // gets a typed reason it can act on.
+                                warn!(sender = %sender, kind = envelope.kind, reason = %refusal, "calendar payload refused; not stored");
+                                if let Err(e) = storage_for_recv.reject_accepted_envelope(&envelope).await {
+                                    error!(msg_id = %msg_id, error = %e, "failed to withdraw a refused calendar payload; it stays held until the sweep");
+                                }
+                                audit_for_recv.record(
+                                    konsensus_api::audit::events::MESSAGE_REJECTED,
+                                    &sender.to_hex(),
+                                    Some(serde_json::json!({ "reason": refusal.code(), "kind": envelope.kind })),
+                                );
+                                let reject = Frame::MessageReject { id: msg_id, reason: format!("{}: {refusal}", refusal.code()) };
+                                if let Err(e) = transport_for_ack.send_frame(&sender, &reject).await {
+                                    warn!(peer = %sender, error = %e, "failed to send MessageReject");
+                                }
+                                continue;
+                            }
+                        };
 
                         // 1:1 calls: the gate made this envelope paid and single-use;
                         // the call registry makes the offer single-use per call id and
@@ -688,8 +712,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
 
 /// Decrypts an incoming envelope and processes special message kinds (files, web content).
 ///
-/// Returns the plaintext string if decryption succeeded, or None if no session exists
-/// or decryption failed (triggers session re-negotiation).
+/// Returns the plaintext string if decryption succeeded, or `Ok(None)` if no session
+/// exists or decryption failed (triggers session re-negotiation). `Err` is a calendar
+/// payload refused by the inbound caps: nothing of it was cached, copied or stored, and
+/// the caller withdraws the envelope and tells the sender why.
 #[allow(clippy::too_many_arguments)]
 async fn decrypt_and_process(
     envelope: &konsensus_core::UkmEnvelope,
@@ -706,17 +732,17 @@ async fn decrypt_and_process(
     audit: &Arc<AuditLog>,
     gate: &PaymentGate,
     trust_discount: f64,
-) -> Option<String> {
+) -> Result<Option<String>, CalendarPayloadError> {
     if !session_mgr.has_session(sender).await {
         debug!(sender = %sender, "no E2EE session, cannot decrypt");
-        return None;
+        return Ok(None);
     }
 
     let ratchet_msg = match konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext) {
         Ok(msg) => msg,
         Err(e) => {
             debug!(sender = %sender, error = %e, "ciphertext is not a valid ratchet message");
-            return None;
+            return Ok(None);
         }
     };
 
@@ -741,8 +767,27 @@ async fn decrypt_and_process(
                     warn!(peer = %sender, error = %e, "failed to send PrekeyOffer for re-negotiation");
                 }
             }
-            return None;
+            return Ok(None);
         }
+    };
+
+    // Calendar payloads are bounded BEFORE the plaintext cache below and before
+    // any record is built: the transport's per-peer byte budget and the payment
+    // gate already ran on the envelope; the decode-time caps (bytes, field
+    // lengths, attendee count, implied recurrence size) run here, so an
+    // over-cap payload is refused with nothing copied, stored or expanded.
+    let calendar = match envelope.kind {
+        konsensus_core::kind::KIND_CALENDAR_EVENT | konsensus_core::kind::KIND_CALENDAR_UPDATE => {
+            Some(CalendarInbound::Event(Box::new(CalendarEventPayload::decode(&bytes).inspect_err(|e| {
+                debug!(sender = %sender, reason = %e, "calendar event payload refused at decode");
+            })?)))
+        }
+        konsensus_core::kind::KIND_RSVP => {
+            Some(CalendarInbound::Rsvp(RsvpPayload::decode(&bytes).inspect_err(|e| {
+                debug!(sender = %sender, reason = %e, "RSVP payload refused at decode");
+            })?))
+        }
+        _ => None,
     };
 
     // Cache decrypted plaintext (encrypted at rest) for API access
@@ -761,14 +806,17 @@ async fn decrypt_and_process(
     }
 
     // Route based on message kind
-    if envelope.kind == konsensus_core::kind::KIND_FILE_REF {
+    let plaintext = if envelope.kind == konsensus_core::kind::KIND_FILE_REF {
         process_file_message(&bytes, sender, envelope, storage, audit).await
-    } else if envelope.kind == konsensus_core::kind::KIND_CALENDAR_EVENT
-        || envelope.kind == konsensus_core::kind::KIND_CALENDAR_UPDATE
-    {
-        process_calendar_event(&bytes, sender, envelope, storage).await
-    } else if envelope.kind == konsensus_core::kind::KIND_RSVP {
-        process_rsvp(&bytes, sender, envelope, storage).await
+    } else if let Some(calendar) = calendar {
+        match calendar {
+            CalendarInbound::Event(payload) => {
+                process_calendar_event(*payload, sender, envelope, storage).await
+            }
+            CalendarInbound::Rsvp(payload) => {
+                process_rsvp(payload, sender, envelope, storage).await
+            }
+        }
     } else if konsensus_core::is_web_service_reply(envelope) {
         // 510/501 reply bound to our paid request: deliver plaintext to the
         // frontend, never treat it as a fresh manifest/page request (F3).
@@ -844,7 +892,14 @@ async fn decrypt_and_process(
                 None
             }
         }
-    }
+    };
+    Ok(plaintext)
+}
+
+/// A calendar payload decoded under the inbound caps, ahead of the plaintext cache.
+enum CalendarInbound {
+    Event(Box<CalendarEventPayload>),
+    Rsvp(RsvpPayload),
 }
 
 /// Process an incoming file transfer message (KIND_FILE_REF).
@@ -934,21 +989,14 @@ async fn process_file_message(
 }
 
 /// Process an incoming calendar event (KIND_CALENDAR_EVENT or KIND_CALENDAR_UPDATE).
+/// The payload was already decoded under the inbound caps; this only builds and
+/// stores the record.
 async fn process_calendar_event(
-    bytes: &[u8],
+    payload: CalendarEventPayload,
     sender: &konsensus_core::types::NodeId,
     envelope: &konsensus_core::UkmEnvelope,
     storage: &Arc<dyn konsensus_storage::Storage>,
 ) -> Option<String> {
-    let payload: konsensus_core::payloads::calendar::CalendarEventPayload =
-        match konsensus_core::wire_json::from_slice(bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                debug!(sender = %sender, error = %e, "calendar event payload not valid JSON");
-                return None;
-            }
-        };
-
     let attendees_json = serde_json::to_string(&payload.attendees).unwrap_or_else(|_| "[]".into());
     let recurrence_json = payload
         .recurrence
@@ -991,22 +1039,14 @@ async fn process_calendar_event(
     Some(format!("[calendar: {}]", payload.title))
 }
 
-/// Process an incoming RSVP (KIND_RSVP).
+/// Process an incoming RSVP (KIND_RSVP). The payload was already decoded under
+/// the inbound caps.
 async fn process_rsvp(
-    bytes: &[u8],
+    payload: RsvpPayload,
     sender: &konsensus_core::types::NodeId,
     envelope: &konsensus_core::UkmEnvelope,
     storage: &Arc<dyn konsensus_storage::Storage>,
 ) -> Option<String> {
-    let payload: konsensus_core::payloads::calendar::RsvpPayload =
-        match konsensus_core::wire_json::from_slice(bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                debug!(sender = %sender, error = %e, "RSVP payload not valid JSON");
-                return None;
-            }
-        };
-
     let response_str = format!("{:?}", payload.response).to_lowercase();
     let record = konsensus_storage::RsvpRecord {
         id: uuid::Uuid::new_v4().to_string(),

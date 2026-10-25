@@ -16,6 +16,9 @@ struct TestStorage {
     messages: Mutex<HashMap<String, konsensus_core::UkmEnvelope>>,
     files: Mutex<HashMap<String, FileRecord>>,
     plaintexts: Mutex<HashMap<String, Vec<u8>>>,
+    /// Calendar records the inbound path asked to store (counter, not timing).
+    calendar_events: Mutex<Vec<konsensus_storage::CalendarEventRecord>>,
+    rsvps: Mutex<Vec<konsensus_storage::RsvpRecord>>,
 }
 
 impl TestStorage {
@@ -24,7 +27,17 @@ impl TestStorage {
             messages: Mutex::new(HashMap::new()),
             files: Mutex::new(HashMap::new()),
             plaintexts: Mutex::new(HashMap::new()),
+            calendar_events: Mutex::new(Vec::new()),
+            rsvps: Mutex::new(Vec::new()),
         }
+    }
+
+    fn calendar_event_count(&self) -> usize {
+        self.calendar_events.lock().unwrap().len()
+    }
+
+    fn rsvp_count(&self) -> usize {
+        self.rsvps.lock().unwrap().len()
     }
 
     fn file_count(&self) -> usize {
@@ -238,6 +251,17 @@ impl Storage for TestStorage {
     }
     async fn get_message_plaintext(&self, id: &MessageId) -> Result<Option<Vec<u8>>, StorageError> {
         Ok(self.plaintexts.lock().unwrap().get(&id.to_hex()).cloned())
+    }
+    async fn store_calendar_event(
+        &self,
+        record: &konsensus_storage::CalendarEventRecord,
+    ) -> Result<(), StorageError> {
+        self.calendar_events.lock().unwrap().push(record.clone());
+        Ok(())
+    }
+    async fn store_rsvp(&self, record: &konsensus_storage::RsvpRecord) -> Result<(), StorageError> {
+        self.rsvps.lock().unwrap().push(record.clone());
+        Ok(())
     }
 }
 
@@ -472,7 +496,8 @@ async fn decrypt_no_session_returns_none() {
         &PaymentGate::new(),
         0.0,
     )
-    .await;
+    .await
+    .expect("not a calendar refusal");
 
     assert!(result.is_none(), "no session should return None");
 }
@@ -518,7 +543,8 @@ async fn decrypt_invalid_ratchet_message_returns_none() {
         &PaymentGate::new(),
         0.0,
     )
-    .await;
+    .await
+    .expect("not a calendar refusal");
 
     assert!(
         result.is_none(),
@@ -573,7 +599,8 @@ async fn decrypt_valid_message_returns_plaintext_and_caches() {
         &PaymentGate::new(),
         0.0,
     )
-    .await;
+    .await
+    .expect("not a calendar refusal");
 
     assert_eq!(result, Some("Hello from Alice!".to_string()));
     // Verify plaintext was cached in storage
@@ -639,7 +666,8 @@ async fn decrypt_file_ref_stores_and_returns_label() {
         &PaymentGate::new(),
         0.0,
     )
-    .await;
+    .await
+    .expect("not a calendar refusal");
 
     assert_eq!(result, Some("[file: report.pdf]".to_string()));
     assert_eq!(storage.file_count(), 1);
@@ -1021,7 +1049,8 @@ async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
         &PaymentGate::new(),
         0.0,
     )
-    .await;
+    .await
+    .expect("not a calendar refusal");
 
     // Decryption failed → returns None
     assert!(result.is_none());
@@ -1078,7 +1107,8 @@ async fn decrypt_non_utf8_returns_none() {
         &PaymentGate::new(),
         0.0,
     )
-    .await;
+    .await
+    .expect("not a calendar refusal");
 
     // Non-UTF8 for a chat message returns None
     assert!(result.is_none());
@@ -3346,4 +3376,200 @@ async fn porch_card_repricing_failure_returns_correlated_error() {
         !response.body.contains("page_msat"),
         "never serve the stale price"
     );
+}
+
+// ── inbound calendar caps ───────────────────────────────────────────
+
+/// Alice encrypts `plaintext` for Bob and Bob's node runs `decrypt_and_process`
+/// on it as `kind`. Returns the result and Bob's storage for counter checks.
+async fn deliver_to_bob(
+    kind: u16,
+    plaintext: &[u8],
+) -> (
+    Result<Option<String>, konsensus_core::payloads::calendar::CalendarPayloadError>,
+    Arc<TestStorage>,
+    konsensus_core::UkmEnvelope,
+) {
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let bob_mgr = SessionManager::new(Arc::clone(&bob));
+    let alice_mgr = SessionManager::new(Arc::clone(&alice));
+    let plaintext_cipher = PlaintextCacheCipher::new(bob.aes_key());
+    let storage = Arc::new(TestStorage::new());
+    let audit = make_audit_log();
+    let transport = make_transport(&bob);
+    establish_sessions(&alice_mgr, &bob_mgr, &alice, &bob).await;
+
+    let ratchet_msg = alice_mgr.encrypt(bob.node_id(), plaintext).await.unwrap();
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
+    let envelope = make_envelope(alice.as_ref(), *bob.node_id(), kind, ciphertext);
+    let sender = *alice.node_id();
+    let storage_dyn: Arc<dyn Storage> = Arc::clone(&storage) as _;
+
+    let result = decrypt_and_process(
+        &envelope,
+        &sender,
+        &bob_mgr,
+        &plaintext_cipher,
+        &storage_dyn,
+        &None,
+        &Default::default(),
+        &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
+        &(Arc::new(konsensus_pricing::StaticPricingEngine::new(
+            Default::default(),
+        )) as Arc<dyn konsensus_core::traits::pricing::PricingEngine>),
+        &bob,
+        &transport,
+        &audit,
+        &PaymentGate::new(),
+        0.0,
+    )
+    .await;
+    (result, storage, envelope)
+}
+
+fn calendar_json(description: &str, attendees: usize, recurrence: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "event_id": "evt-1",
+        "title": "Standup",
+        "description": description,
+        "start_ms": 1_700_000_000_000u64,
+        "end_ms": 1_700_003_600_000u64,
+        "tz": "UTC",
+        "organizer": "ab".repeat(32),
+        "attendees": vec!["cd".repeat(32); attendees],
+        "recurrence": recurrence,
+    }))
+    .unwrap()
+}
+
+/// An in-cap invite is cached, stored once and summarised for the frontend.
+#[tokio::test]
+async fn calendar_event_within_caps_is_stored() {
+    use konsensus_core::payloads::calendar::MAX_ATTENDEES;
+    let plaintext = calendar_json(
+        "agenda",
+        MAX_ATTENDEES,
+        serde_json::json!({ "freq": "WEEKLY", "byday": ["MO", "WE"] }),
+    );
+    let (result, storage, envelope) =
+        deliver_to_bob(konsensus_core::kind::KIND_CALENDAR_EVENT, &plaintext).await;
+    assert_eq!(result, Ok(Some("[calendar: Standup]".to_string())));
+    assert_eq!(storage.calendar_event_count(), 1);
+    assert!(
+        storage.has_plaintext(&envelope.id),
+        "in-cap payload is cached"
+    );
+    let stored = &storage.calendar_events.lock().unwrap()[0];
+    assert_eq!(stored.id, "evt-1");
+    assert_eq!(
+        stored.message_id.as_deref(),
+        Some(envelope.id.to_hex().as_str())
+    );
+}
+
+/// A payload over the byte cap is refused before the plaintext cache and
+/// before any record is built or stored. The refusal is typed and readable.
+#[tokio::test]
+async fn calendar_event_over_byte_cap_is_refused_before_cache_and_store() {
+    use konsensus_core::payloads::calendar::{CalendarPayloadError, MAX_CALENDAR_PAYLOAD_BYTES};
+    let plaintext = calendar_json(
+        &"d".repeat(MAX_CALENDAR_PAYLOAD_BYTES),
+        1,
+        serde_json::Value::Null,
+    );
+    let (result, storage, envelope) =
+        deliver_to_bob(konsensus_core::kind::KIND_CALENDAR_UPDATE, &plaintext).await;
+    let refusal = result.expect_err("over-cap payload must be refused");
+    assert_eq!(
+        refusal,
+        CalendarPayloadError::TooLarge {
+            actual: plaintext.len(),
+            max: MAX_CALENDAR_PAYLOAD_BYTES
+        }
+    );
+    assert_eq!(refusal.code(), "calendar_too_large");
+    assert_eq!(storage.calendar_event_count(), 0, "nothing stored");
+    assert!(!storage.has_plaintext(&envelope.id), "nothing cached");
+}
+
+/// Too many attendees: refused at the count cap, nothing stored.
+#[tokio::test]
+async fn calendar_event_with_too_many_attendees_is_refused() {
+    use konsensus_core::payloads::calendar::{CalendarPayloadError, MAX_ATTENDEES};
+    let plaintext = calendar_json("", MAX_ATTENDEES + 1, serde_json::Value::Null);
+    let (result, storage, envelope) =
+        deliver_to_bob(konsensus_core::kind::KIND_CALENDAR_EVENT, &plaintext).await;
+    assert_eq!(
+        result,
+        Err(CalendarPayloadError::TooManyEntries {
+            field: "attendees",
+            max: MAX_ATTENDEES
+        })
+    );
+    assert_eq!(storage.calendar_event_count(), 0);
+    assert!(!storage.has_plaintext(&envelope.id));
+}
+
+/// A recurrence that would expand past the cap is refused at decode; the
+/// event never reaches storage, so no reader can be made to expand it.
+#[tokio::test]
+async fn calendar_recurrence_past_cap_is_refused() {
+    use konsensus_core::payloads::calendar::{CalendarPayloadError, MAX_RECURRENCE_INSTANCES};
+    let plaintext = calendar_json(
+        "",
+        1,
+        serde_json::json!({ "freq": "DAILY", "count": MAX_RECURRENCE_INSTANCES + 1 }),
+    );
+    let (result, storage, envelope) =
+        deliver_to_bob(konsensus_core::kind::KIND_CALENDAR_EVENT, &plaintext).await;
+    assert_eq!(
+        result,
+        Err(CalendarPayloadError::RecurrenceTooLarge {
+            estimated: MAX_RECURRENCE_INSTANCES + 1,
+            max: MAX_RECURRENCE_INSTANCES
+        })
+    );
+    assert_eq!(storage.calendar_event_count(), 0);
+    assert!(!storage.has_plaintext(&envelope.id));
+}
+
+/// RSVPs: in-cap stored, over-cap refused with nothing stored or cached.
+#[tokio::test]
+async fn rsvp_caps_apply_on_the_inbound_path() {
+    use konsensus_core::payloads::calendar::{CalendarPayloadError, MAX_RSVP_COMMENT_BYTES};
+    let ok = br#"{"event_id":"evt-1","response":"accepted","comment":"see you"}"#;
+    let (result, storage, envelope) = deliver_to_bob(konsensus_core::kind::KIND_RSVP, ok).await;
+    assert_eq!(result, Ok(Some("[rsvp: accepted]".to_string())));
+    assert_eq!(storage.rsvp_count(), 1);
+    assert!(storage.has_plaintext(&envelope.id));
+
+    let long = serde_json::to_vec(&serde_json::json!({
+        "event_id": "evt-1",
+        "response": "accepted",
+        "comment": "c".repeat(MAX_RSVP_COMMENT_BYTES + 1),
+    }))
+    .unwrap();
+    let (result, storage, envelope) = deliver_to_bob(konsensus_core::kind::KIND_RSVP, &long).await;
+    assert_eq!(
+        result,
+        Err(CalendarPayloadError::FieldTooLong {
+            field: "comment",
+            max: MAX_RSVP_COMMENT_BYTES
+        })
+    );
+    assert_eq!(storage.rsvp_count(), 0);
+    assert!(!storage.has_plaintext(&envelope.id));
+}
+
+/// Non-calendar kinds are untouched by the calendar caps: a large chat
+/// still decrypts and is cached as before.
+#[tokio::test]
+async fn calendar_caps_do_not_apply_to_other_kinds() {
+    use konsensus_core::payloads::calendar::MAX_CALENDAR_PAYLOAD_BYTES;
+    let big = "x".repeat(MAX_CALENDAR_PAYLOAD_BYTES + 1);
+    let (result, storage, envelope) =
+        deliver_to_bob(konsensus_core::kind::KIND_CHAT, big.as_bytes()).await;
+    assert_eq!(result, Ok(Some(big)));
+    assert!(storage.has_plaintext(&envelope.id));
 }

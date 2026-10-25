@@ -5,6 +5,16 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Bound inbound calendar payloads before any copy or expansion: invites,
+  updates and RSVPs from peers are decoded under byte caps (64 KiB per event,
+  4 KiB per RSVP), per-field string caps, an attendee cap (100) and a
+  recurrence cap (5000 implied instances by `COUNT` or `UNTIL`), checked
+  after the transport's per-peer byte budget and the payment gate and before
+  the plaintext cache, the stored record or any recurrence expansion. An
+  over-cap payload is withdrawn and refused with a typed `calendar_*` reason
+  the sender can read. The owner API refuses the same payloads before they
+  are stored or paid for.
+
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'
   scripts instead of all 2000 derived scripts. Before each focused sweep preview,
