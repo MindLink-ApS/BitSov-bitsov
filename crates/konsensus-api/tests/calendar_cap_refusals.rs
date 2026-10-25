@@ -261,4 +261,15 @@ async fn over_cap_rsvp_is_refused_before_ratchet_and_payment() {
         !cap_code(&result),
         "in-cap RSVP refused by the caps: {result}"
     );
+    // Past the caps the handler encrypted the RSVP for the organizer, so the
+    // ratchet has advanced exactly once; the stub transport then reports the
+    // organizer offline, which is not a cap refusal.
+    assert!(
+        !ratchet_unused(&state, &organizer).await,
+        "in-cap RSVP never reached encryption: {result}"
+    );
+    assert_eq!(
+        result["error"].as_str().unwrap_or_default(),
+        "Recipient is offline. Message will be queued and sent when they reconnect."
+    );
 }

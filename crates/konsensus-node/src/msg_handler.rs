@@ -608,7 +608,16 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             trust_discount,
                         ).await {
                             Ok(plaintext) => plaintext,
-                            Err(refusal) => {
+                            Err(InboundRefusal::HoldNotReleased) => {
+                                // The calendar envelope passed the caps but its hold
+                                // could not be lifted: nothing of it was persisted, it
+                                // stays held and hidden for the sweep, and the sender
+                                // gets a transient reject, not an ACK.
+                                let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                continue;
+                            }
+                            Err(InboundRefusal::Calendar(refusal)) => {
                                 // A calendar payload over the inbound caps is refused
                                 // before it is cached, copied, stored or expanded. Like
                                 // a refused call signal: the paid envelope is withdrawn
@@ -632,21 +641,6 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 continue;
                             }
                         };
-
-                        // Calendar: the payload passed the inbound caps (or there was no
-                        // session to decrypt it); lift the hold before the app sees it,
-                        // whether this attempt placed it or inherited it from an earlier
-                        // attempt whose acceptance rolled back and whose cleanup failed.
-                        // If that write fails the envelope stays held and the sweep
-                        // withdraws it: fail closed, the peer gets a reject, not an ACK.
-                        if is_calendar_kind(envelope.kind) {
-                            if let Err(e) = storage_for_recv.call_admission_release(&msg_id).await {
-                                error!(msg_id = %msg_id, error = %e, "admitted calendar payload could not be released; withheld");
-                                let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
-                                let _ = transport_for_ack.send_frame(&sender, &reject).await;
-                                continue;
-                            }
-                        }
 
                         // 1:1 calls: the gate made this envelope paid and single-use;
                         // the call registry makes the offer single-use per call id and
@@ -760,8 +754,14 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
 ///
 /// Returns the plaintext string if decryption succeeded, or `Ok(None)` if no session
 /// exists or decryption failed (triggers session re-negotiation). `Err` is a calendar
-/// payload refused by the inbound caps: nothing of it was cached, copied or stored, and
-/// the caller withdraws the envelope and tells the sender why.
+/// envelope the caller must not acknowledge: a payload refused by the inbound caps
+/// (nothing of it was cached, copied or stored; the caller withdraws the envelope and
+/// tells the sender why) or a hold that could not be released (nothing was persisted;
+/// the envelope stays held for the sweep).
+///
+/// Calendar order: decode under the caps, cache the plaintext, release the admission
+/// hold, and only then persist the event or RSVP. A refusal therefore never follows a
+/// calendar mutation, and a mutation never lands on an envelope that stays held.
 #[allow(clippy::too_many_arguments)]
 async fn decrypt_and_process(
     envelope: &konsensus_core::UkmEnvelope,
@@ -778,9 +778,10 @@ async fn decrypt_and_process(
     audit: &Arc<AuditLog>,
     gate: &PaymentGate,
     trust_discount: f64,
-) -> Result<Option<String>, CalendarPayloadError> {
+) -> Result<Option<String>, InboundRefusal> {
     if !session_mgr.has_session(sender).await {
         debug!(sender = %sender, "no E2EE session, cannot decrypt");
+        release_calendar_hold(storage.as_ref(), envelope).await?;
         return Ok(None);
     }
 
@@ -788,6 +789,7 @@ async fn decrypt_and_process(
         Ok(msg) => msg,
         Err(e) => {
             debug!(sender = %sender, error = %e, "ciphertext is not a valid ratchet message");
+            release_calendar_hold(storage.as_ref(), envelope).await?;
             return Ok(None);
         }
     };
@@ -813,6 +815,7 @@ async fn decrypt_and_process(
                     warn!(peer = %sender, error = %e, "failed to send PrekeyOffer for re-negotiation");
                 }
             }
+            release_calendar_hold(storage.as_ref(), envelope).await?;
             return Ok(None);
         }
     };
@@ -824,13 +827,15 @@ async fn decrypt_and_process(
     // over-cap payload is refused with nothing copied, stored or expanded.
     let calendar = match envelope.kind {
         konsensus_core::kind::KIND_CALENDAR_EVENT | konsensus_core::kind::KIND_CALENDAR_UPDATE => {
-            Some(CalendarInbound::Event(Box::new(CalendarEventPayload::decode(&bytes).inspect_err(|e| {
+            Some(CalendarInbound::Event(Box::new(CalendarEventPayload::decode(&bytes).map_err(|e| {
                 debug!(sender = %sender, reason = %e, "calendar event payload refused at decode");
+                InboundRefusal::Calendar(e)
             })?)))
         }
         konsensus_core::kind::KIND_RSVP => {
-            Some(CalendarInbound::Rsvp(RsvpPayload::decode(&bytes).inspect_err(|e| {
+            Some(CalendarInbound::Rsvp(RsvpPayload::decode(&bytes).map_err(|e| {
                 debug!(sender = %sender, reason = %e, "RSVP payload refused at decode");
+                InboundRefusal::Calendar(e)
             })?))
         }
         _ => None,
@@ -849,6 +854,16 @@ async fn decrypt_and_process(
         Err(e) => {
             warn!(msg_id = %envelope.id, error = %e, "failed to encrypt plaintext for cache");
         }
+    }
+
+    // The calendar payload passed the caps: lift the admission hold BEFORE the
+    // event or RSVP is persisted, whether this attempt placed the hold or
+    // inherited it from an attempt whose acceptance rolled back and whose cleanup
+    // failed. If the release fails nothing has been written yet: the envelope
+    // stays held and hidden for the sweep and the caller rejects, so a withdrawn
+    // envelope can never leave a calendar change behind.
+    if calendar.is_some() {
+        release_calendar_hold(storage.as_ref(), envelope).await?;
     }
 
     // Route based on message kind
@@ -940,6 +955,33 @@ async fn decrypt_and_process(
         }
     };
     Ok(plaintext)
+}
+
+/// Why `decrypt_and_process` refused to admit an envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InboundRefusal {
+    /// A calendar payload failed the inbound caps: the caller withdraws the
+    /// envelope and tells the sender the typed reason.
+    Calendar(CalendarPayloadError),
+    /// A calendar envelope passed the caps but its admission hold could not be
+    /// released. Nothing was persisted; it stays held for the sweep and the
+    /// caller answers with a transient storage error.
+    HoldNotReleased,
+}
+
+/// Lift a calendar envelope's admission hold; a no-op for other kinds. Fails
+/// closed: on a storage error the hold stays and the envelope is not admitted.
+async fn release_calendar_hold(
+    storage: &dyn konsensus_storage::Storage,
+    envelope: &konsensus_core::UkmEnvelope,
+) -> Result<(), InboundRefusal> {
+    if !is_calendar_kind(envelope.kind) {
+        return Ok(());
+    }
+    storage.call_admission_release(&envelope.id).await.map_err(|e| {
+        error!(msg_id = %envelope.id, error = %e, "calendar envelope could not be released; withheld for the sweep");
+        InboundRefusal::HoldNotReleased
+    })
 }
 
 /// Calendar kinds are held from before paid acceptance until their payload has

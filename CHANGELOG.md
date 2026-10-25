@@ -15,7 +15,9 @@ also live on the corresponding GitHub pre-release pages.
   the sender can read; the sender records such a refusal as final
   (`failed_paid`) and never retries it. Calendar envelopes are held from
   before paid acceptance until the caps pass, like call signals and room
-  chats, so a failed withdrawal leaves them hidden for the hold sweep. A
+  chats, and the hold is released before any event or RSVP is written, so a
+  failed withdrawal leaves them hidden for the hold sweep with no calendar
+  change behind. A
   resend of any envelope this node withdrew at the application is answered
   with a terminal `application_rejected:` reason instead of a payment-reuse
   one, which a sender's compatibility path could read as delivered. The owner
