@@ -1336,8 +1336,9 @@ stun_listen = "0.0.0.0:3478"   # UDP; omit to keep it off (default)
 - **Firewall:** open **UDP** on the chosen port to hosts that should learn their mapped
   address (typically the public Internet, or a VPN path). Binding fails boot if the
   address cannot be listened on.
-- Owner-only `GET /api/v1/status` reports `stun_port` and, when the node has a dialable
-  public host, `stun_url` (`stun:host:port`). `/health` reports neither.
+- Owner-only `GET /api/v1/status` reports `stun_port` and, when applicable,
+  `stun_url` (`stun:host:port`) with `stun_source` (`own` or `configured` for a
+  valid `[network] stun_server` fallback). `/health` reports neither.
 - In the app, Settings → Calls still requires the owner to set (or confirm) a
   `stun:host[:port]`; nothing switches on automatically. With no STUN URL saved, calls
   use host candidates only (same network / VPN). TURN is unsupported.
@@ -1595,7 +1596,7 @@ a node implementation is not a claim that a matching app screen has shipped.
   Preserve device/owner-approval keys, pairing scope/revocation state, and
   encrypted seed configuration; older binaries cannot be assumed to read them.
 - **Calls/custody:** gate mesh legs on `call_meeting_v1`; kinds 400–403 remain
-  a regtest signalling prototype. Optional `stun_port`, `stun_url`,
+  a regtest signalling prototype. Optional `stun_port`, `stun_url`, `stun_source`,
   `peer_endpoint`, `peer_endpoint_source`, `peer_endpoint_reason` are owner status
   metadata, not automatic app settings. `custody_mode` reports `local_seed`,
   `encrypted_seed`, or `hosted_custody`; `money_signer` and `remote_signer`

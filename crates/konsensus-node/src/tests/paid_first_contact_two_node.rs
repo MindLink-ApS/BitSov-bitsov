@@ -509,6 +509,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         front_door: front_door.clone(),
         sponsor: Default::default(),
         stun_port: None,
+        configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         recovery_dir: None,
         gossip_validator: None,

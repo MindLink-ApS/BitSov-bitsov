@@ -217,12 +217,15 @@ stun_listen = "0.0.0.0:3478"   # UDP; omit to keep it off (default)
   in total per 10 s; the source table is bounded (16 384) and a full table
   refuses new sources. Answers are ≤ 44 bytes, so it is a poor amplifier.
 - A configured address that cannot be bound fails boot.
-- The owner-only `GET /api/v1/status` reports `stun_port` while it runs, and
-  `stun_url` (`stun:host:port`) when the node has a dialable peer host
-  (`[network] advertised_addr`, a concrete `listen_addr`, or the public IP
-  learned from `[network] stun_server`; not loopback or a wildcard). The public
-  `/health` reports neither. The app may *offer* that URL as the STUN server;
-  the owner confirms it, it is never switched on automatically.
+- **STUN URL precedence (owner app, option E):** (1) this node's own
+  `[calls] stun_listen` responder when it has a dialable peer host
+  (`stun_source: own`), then (2) the owner's `[network] stun_server` when set
+  and valid (`stun_source: configured`), then (3) nothing — no default and never
+  a public third-party server. Only the owner-only `GET /api/v1/status` reports
+  `stun_port` (while the responder runs), `stun_url` (`stun:host:port`), and
+  `stun_source`; the public `GET /api/v1/health` reports none of these. The app
+  may *offer* the URL from `/status`; the owner confirms it, it is never switched
+  on automatically.
 - `[network] stun_server = "stun:host:port"` (owner-set, no default) makes the
   node query a STUN server for its public IP when `advertised_addr` is unset
   and `listen_addr` is a wildcard. The endpoint is that IP plus the TCP
@@ -230,6 +233,12 @@ stun_listen = "0.0.0.0:3478"   # UDP; omit to keep it off (default)
   (`advertised`/`listen`/`stun`) and, when missing, `peer_endpoint_reason`
   (`no_dialable_endpoint`, `stun_pending`, `stun_unreachable`,
   `stun_invalid_response`). An explicit `advertised_addr` is never replaced.
+  The same setting is also reported as `/status` `stun_url` (with
+  `stun_source: configured`) when this node has no dialable host for its own
+  `[calls] stun_listen` responder — for example, point it at a hub you run with
+  a public address so your home node's app gets a STUN server. That server
+  sees the caller's public IP on each binding request (normal STUN behaviour);
+  STUN only reflects addresses and call media never passes through it.
 - It helps apps that reach the node from outside its network (the owner away
   from home, or a contact). An app behind the same router as the node would
   mostly learn its local address (router hairpinning varies).
