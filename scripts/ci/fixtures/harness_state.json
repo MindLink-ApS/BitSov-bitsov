@@ -1,0 +1,68 @@
+{
+  "repository": "MindLink-ApS/BitSov-bitsov",
+  "now": "2026-10-25T12:00:00Z",
+  "pulls": [
+    {
+      "number": 10, "title": "Fix | table <tag> @someone `code`\nnext", "state": "open",
+      "created_at": "2026-10-24T00:00:00Z", "updated_at": "2026-10-25T11:00:00Z",
+      "draft": false, "labels": [{"name": "security"}, {"name": "builder:claude"}],
+      "head": {"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, "mergeable_state": "behind",
+      "comments": [
+        {"id": 3, "created_at": "2026-10-25T08:00:00Z", "body": "CODEX-VERDICT FAIL aaaaaaaaaaaa"},
+        {"id": 1, "created_at": "2026-10-24T10:00:00Z", "body": "CODEX-VERDICT FAIL bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+        {"id": 2, "created_at": "2026-10-25T07:00:00Z", "body": "CLAUDE-VERDICT FAIL aaaaaaa"},
+        {"id": 4, "created_at": "2026-10-25T10:00:00Z", "body": "FABLE-VERDICT PASS aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nReview"},
+        {"id": 5, "created_at": "2026-10-25T11:00:00Z", "body": "Example CODEX-VERDICT PASS aaaaaaa; not a verdict line\n> CODEX-VERDICT PASS aaaaaaa\n```\nCODEX-VERDICT PASS aaaaaaa\n```"}
+      ],
+      "reviews": [
+        {"id": 6, "submitted_at": "2026-10-25T09:00:00Z", "body": "CODEX-VERDICT PASS AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
+      ],
+      "statuses": [
+        {"id": 1, "context": "review-gate", "state": "failure", "updated_at": "2026-10-25T08:00:00Z"},
+        {"id": 2, "context": "review-gate", "state": "success", "updated_at": "2026-10-25T10:00:00Z"},
+        {"id": 3, "context": "review/codex", "state": "failure", "updated_at": "2026-10-25T08:00:00Z"}
+      ],
+      "check_runs": [
+        {"id": 1, "name": "Rust", "status": "completed", "conclusion": "failure", "app": {"id": 1}},
+        {"id": 2, "name": "Rust", "status": "completed", "conclusion": "success", "app": {"id": 1}},
+        {"id": 3, "name": "Docs", "status": "completed", "conclusion": "skipped", "app": {"id": 1}}
+      ]
+    },
+    {
+      "number": 11, "title": "Draft", "state": "open", "created_at": "2026-10-25T00:00:00Z",
+      "updated_at": "2026-10-25T10:00:00Z", "draft": true, "labels": [],
+      "head": {"sha": "cccccccccccccccccccccccccccccccccccccccc"}, "mergeable_state": "dirty",
+      "comments": [], "reviews": [], "statuses": [],
+      "check_runs": [{"id": 4, "name": "Build", "status": "in_progress", "conclusion": null}]
+    },
+    {
+      "number": 12, "title": "Merged today", "state": "closed", "created_at": "2026-10-20T00:00:00Z",
+      "merged_at": "2026-10-24T12:00:00Z", "comments": [
+        {"id": 7, "created_at": "2026-10-22T10:00:00Z", "body": "GEMINI-VERDICT PASS bbbbbbb"}
+      ], "reviews": []
+    },
+    {
+      "number": 13, "title": "Merged at seven-day boundary", "state": "closed", "created_at": "2026-10-10T00:00:00Z",
+      "merged_at": "2026-10-18T12:00:00Z", "comments": [
+        {"id": 8, "created_at": "2026-10-18T12:00:00Z", "body": "CUSTOM-VERDICT PASS ddddddd"}
+      ], "reviews": []
+    },
+    {
+      "number": 14, "title": "Closed unmerged", "state": "closed", "merged_at": null,
+      "comments": [
+        {"id": 9, "created_at": "2026-10-18T11:59:59Z", "body": "CODEX-VERDICT FAIL eeeeeee"},
+        {"id": 10, "created_at": "2026-10-24T10:00:00Z", "body": "CODEX-VERDICT PASS eeeeeee"}
+      ], "reviews": []
+    },
+    {
+      "number": 15, "title": "Merged too early", "state": "closed", "merged_at": "2026-10-18T11:59:59Z",
+      "comments": [], "reviews": []
+    }
+  ],
+  "e2e_runs": [
+    {"id": 2, "head_branch": "main", "status": "in_progress", "conclusion": null, "created_at": "2026-10-25T11:00:00Z", "html_url": "https://github.com/MindLink-ApS/BitSov-bitsov/actions/runs/2"},
+    {"id": 1, "head_branch": "main", "head_sha": "dddddddddddddddddddddddddddddddddddddddd", "status": "completed", "conclusion": "failure", "created_at": "2026-10-25T02:00:00Z", "updated_at": "2026-10-25T03:00:00Z", "html_url": "https://github.com/MindLink-ApS/BitSov-bitsov/actions/runs/1"},
+    {"id": 3, "head_branch": "feature", "status": "completed", "conclusion": "success", "created_at": "2026-10-25T11:30:00Z"}
+  ],
+  "checklist_body": "- [x] Done\n  - [X] Nested\n* [ ] Pending\n+ [x] Another\n1. [x] Numbered\n```md\n- [x] Example\n```\nText [x] is not a task\n- [x]one is malformed\n"
+}

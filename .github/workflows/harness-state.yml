@@ -1,0 +1,44 @@
+name: Harness state
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: read
+  actions: read
+  contents: read
+
+# Serialize discovery/create/update so overlapping runs cannot create two issues.
+concurrency:
+  group: harness-state
+  cancel-in-progress: false
+
+jobs:
+  state:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Fetch the reporter from the workflow commit and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No checkout, PR code, third-party actions, models, or installations.
+          gh api --method GET \
+            "repos/${GH_REPO}/contents/scripts/ci/harness_state.py" \
+            -f ref="$GITHUB_SHA" > "$RUNNER_TEMP/harness-state-source.json"
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          source = json.loads((root / "harness-state-source.json").read_text())
+          (root / "harness_state.py").write_bytes(base64.b64decode(source["content"]))
+          PY
+          python3 "$RUNNER_TEMP/harness_state.py" --repo "$GH_REPO"
