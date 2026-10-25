@@ -5,6 +5,13 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Add owner-authenticated claim-code display for app onboarding:
+  `GET /api/v1/owner/claim-code` on the owner-local API only (loopback source,
+  local console session or enrolled owner device), rate limited, `no-store`,
+  never logged, returning the code only while a claim-bound enrollment is
+  pending and a clear `claimed`/`closed`/`unavailable` state otherwise. The LAN
+  box page no longer publishes the SAS digest (the finalize proof derived from
+  the claim code); `/setup/approve` now takes the four compared words.
 - Validate a peer's `PrekeyOffer` or `SessionInit` in full (key formats, the
   node id the bundle names, the signed pre-key signature, a one-time pre-key
   this node holds) before touching the session it replaces; the working
