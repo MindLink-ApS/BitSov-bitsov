@@ -12,6 +12,8 @@ import unittest
 
 
 RUNNER = Path(__file__).with_name("regtest_e2e.sh")
+RECOVER_RUNNER = Path(__file__).with_name("recover_regtest.sh")
+SUPERVISED_RUNNERS = (RUNNER, RECOVER_RUNNER)
 # Stand in for Cargo and its node/daemon descendants. The descendants ignore
 # SIGTERM deliberately, so cleaning up just Cargo cannot satisfy the test.
 FAKE_CARGO = '''#!/usr/bin/env python3
@@ -85,7 +87,7 @@ def wait_until(check, timeout=10):
 
 
 class RunnerCleanup(unittest.TestCase):
-    def check_cleanup(self, mode, expected, sig=None, group=False, launch=False):
+    def check_cleanup(self, mode, expected, sig=None, group=False, launch=False, script=RUNNER):
         with tempfile.TemporaryDirectory(prefix="bitsov-runner-check-") as temporary:
             directory = Path(temporary)
             cargo = directory / "cargo"
@@ -102,7 +104,7 @@ class RunnerCleanup(unittest.TestCase):
                 env["PYTHONPATH"] = str(directory)
             data = None
             with (directory / "runner.log").open("w+") as log:
-                runner = subprocess.Popen(["bash", str(RUNNER)], env=env,
+                runner = subprocess.Popen(["bash", str(script)], env=env,
                                           stdout=log, stderr=log,
                                           start_new_session=True)
                 try:
@@ -112,7 +114,11 @@ class RunnerCleanup(unittest.TestCase):
                         kill(runner.pid, sig, group=group)
                     result = runner.wait(timeout=15)
                     log.seek(0)
-                    self.assertEqual(result, expected, log.read())
+                    output = log.read()
+                    self.assertEqual(result, expected, output)
+                    if script == RECOVER_RUNNER:
+                        self.assertEqual("RECOVER REGTEST PASS;" in output, mode == "success")
+                        self.assertEqual("RECOVER-REGTEST timeout" in output, mode == "timeout")
                     self.assertFalse(Path(data["root"]).exists(), "data root leaked")
                     pids = [data["supervisor"], data["cargo"], *data["descendants"]]
                     wait_until(lambda: not any(alive(pid) for pid in pids))
@@ -128,18 +134,49 @@ class RunnerCleanup(unittest.TestCase):
                         shutil.rmtree(data["root"], ignore_errors=True)
 
     def test_normal_exit_failure_and_timeout(self):
-        for mode, expected in (("success", 0), ("failure", 17), ("timeout", 124)):
-            with self.subTest(mode=mode):
-                self.check_cleanup(mode, expected)
+        for script in SUPERVISED_RUNNERS:
+            for mode, expected in (("success", 0), ("failure", 17), ("timeout", 124)):
+                with self.subTest(script=script.name, mode=mode):
+                    self.check_cleanup(mode, expected, script=script)
 
     def test_signals_to_runner_pid_and_group(self):
-        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-            for group in (False, True):
-                with self.subTest(signal=sig.name, group=group):
-                    self.check_cleanup("signal", 128 + sig, sig, group)
+        for script in SUPERVISED_RUNNERS:
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                for group in (False, True):
+                    with self.subTest(script=script.name, signal=sig.name, group=group):
+                        self.check_cleanup("signal", 128 + sig, sig, group, script=script)
 
     def test_signal_during_child_launch(self):
-        self.check_cleanup("signal", 143, launch=True)
+        for script in SUPERVISED_RUNNERS:
+            with self.subTest(script=script.name):
+                self.check_cleanup("signal", 143, launch=True, script=script)
+
+
+class RecoverMissingFixtures(unittest.TestCase):
+    def test_missing_bitcoind_compiles_only_when_allowed(self):
+        cases = (("0", 0, 1), ("1", 0, 77), ("1", 17, 17))
+        for allow, build_exit, expected in cases:
+            with self.subTest(allow=allow, build_exit=build_exit), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                cargo = directory / "cargo"
+                cargo.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PROBE\"\nexit " + str(build_exit) + "\n")
+                cargo.chmod(0o755)
+                probe = directory / "args"
+                env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
+                           BITCOIND_EXE=str(directory / "missing-bitcoind"),
+                           PROBE=str(probe), REGTEST_ALLOW_MISSING=allow)
+                result = subprocess.run(["bash", str(RECOVER_RUNNER)],
+                                        env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if allow != "1":
+                    self.assertFalse(probe.exists(), result.stdout + result.stderr)
+                    continue
+                args = probe.read_text().splitlines()
+                for required in ("--offline", "--locked", "--no-run", "recover_regtest"):
+                    self.assertIn(required, args)
+                self.assertNotIn("--ignored", args)
+                self.assertEqual("SKIP recover regtest:" in result.stdout, build_exit == 0)
+                self.assertNotIn("RECOVER REGTEST PASS;", result.stdout)
 
 
 class MissingFixtures(unittest.TestCase):
