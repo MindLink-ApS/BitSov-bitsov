@@ -8,9 +8,10 @@ marked.
 **What this is and is not.** BitSov is in closed beta on signet test nodes.
 Paid admission was proven on mainnet on 1 July 2026, but **mainnet is not
 supported for the public beta**: this guide never uses it and nothing here
-funds a mainnet wallet. Signet coins have no value. There are no signed
-binaries yet; you build from source. Every step below was run as written in
-the session that produced this guide unless it is marked **untested in CI**;
+funds a mainnet wallet. Signet coins have no value. There is no final signed
+release yet (only pre-release candidates); this guide builds from source. Every
+step below was run as written in the session that produced this guide unless it
+is marked **untested in CI**;
 the [appendix](#appendix-what-was-tested) says exactly what ran where.
 
 You need two nodes to exchange a paid message: yours and a contact's. "Contact"
@@ -28,8 +29,9 @@ energy and admission, never identity.
 
 Rust is the only build dependency. `Cargo.toml` sets the minimum at **1.89**
 and the release build pins **1.91.1** (`scripts/release-toolchain`); use that
-exact version for a build that matches the release. CI builds on current
-stable, and this guide was run on stable 1.97.0, so a newer stable also works.
+exact version for a build that matches the release. CI and a plain `cargo`
+in the checkout use the exact version pinned in `rust-toolchain.toml`, and this
+guide was run on stable 1.97.0, so a newer stable also works.
 
 ```sh
 rustup toolchain install 1.91.1
