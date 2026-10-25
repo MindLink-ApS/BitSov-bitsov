@@ -1,5 +1,5 @@
+use crate::auth::scoped::{Read, Receive, ScopedAuth};
 use crate::auth::Scope;
-use crate::auth::scoped::{ScopedAuth, Read, Receive};
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -79,7 +79,10 @@ fn map_state(record: OnboardingStateRecord) -> OnboardingStateResponse {
     }
 }
 
-fn parse_optional_pubkey_hex(value: Option<String>, field: &str) -> Result<Option<[u8; 32]>, ApiError> {
+fn parse_optional_pubkey_hex(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<[u8; 32]>, ApiError> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -103,7 +106,9 @@ async fn spawn_funding_poll_if_needed(state: Arc<AppState>) {
 
     tokio::spawn(async move {
         loop {
-            let Some(mut onboarding_state) = state.storage.get_onboarding_state().await.ok().flatten() else {
+            let Some(mut onboarding_state) =
+                state.storage.get_onboarding_state().await.ok().flatten()
+            else {
                 break;
             };
             if onboarding_state.current_step != "funding" {
@@ -117,13 +122,19 @@ async fn spawn_funding_poll_if_needed(state: Arc<AppState>) {
 
             match state.lightning.get_balance_msat().await {
                 Ok(balance_msat) => {
-                    onboarding_state.funding_amount_sats_received = (balance_msat / 1000).min(u64::from(u32::MAX)) as u32;
+                    onboarding_state.funding_amount_sats_received =
+                        (balance_msat / 1000).min(u64::from(u32::MAX)) as u32;
                     onboarding_state.last_poll_at = Some(now_unix());
                     if onboarding_state.funding_amount_sats_received >= required {
                         onboarding_state.current_step = "funding-seen".to_string();
-                        onboarding_state.funding_evidence = Some(FUNDING_EVIDENCE_WALLET_BALANCE_OBSERVED.to_string());
+                        onboarding_state.funding_evidence =
+                            Some(FUNDING_EVIDENCE_WALLET_BALANCE_OBSERVED.to_string());
                     }
-                    if let Err(e) = state.storage.upsert_onboarding_state(&onboarding_state).await {
+                    if let Err(e) = state
+                        .storage
+                        .upsert_onboarding_state(&onboarding_state)
+                        .await
+                    {
                         warn!(error=%e, "onboarding funding poll write failed");
                     }
                 }
@@ -181,19 +192,21 @@ async fn start_onboarding(
                 last_poll_at: None,
                 funding_evidence: None,
             };
-            state.storage.upsert_onboarding_state(&record).await.map_err(|e| ApiError::Storage(e.to_string()))?;
+            state
+                .storage
+                .upsert_onboarding_state(&record)
+                .await
+                .map_err(|e| ApiError::Storage(e.to_string()))?;
             Ok(Json(map_state(record)))
         }
         "full" => {
-            let required = req
-                .funding_amount_sats
-                .ok_or_else(|| ApiError::BadRequest("funding_amount_sats required for full tier".into()))?;
+            let required = req.funding_amount_sats.ok_or_else(|| {
+                ApiError::BadRequest("funding_amount_sats required for full tier".into())
+            })?;
             crate::error::require_money_ready(&state).await?;
-            let funding_address = state
-                .lightning
-                .get_funding_address()
-                .await
-                .ok_or_else(|| ApiError::Lightning("lightning backend does not expose a funding address".into()))?;
+            let funding_address = state.lightning.get_funding_address().await.ok_or_else(|| {
+                ApiError::Lightning("lightning backend does not expose a funding address".into())
+            })?;
 
             let record = OnboardingStateRecord {
                 invite_id: req.invite_id,
@@ -207,11 +220,17 @@ async fn start_onboarding(
                 last_poll_at: None,
                 funding_evidence: None,
             };
-            state.storage.upsert_onboarding_state(&record).await.map_err(|e| ApiError::Storage(e.to_string()))?;
+            state
+                .storage
+                .upsert_onboarding_state(&record)
+                .await
+                .map_err(|e| ApiError::Storage(e.to_string()))?;
             spawn_funding_poll_if_needed(Arc::clone(&state)).await;
             Ok(Json(map_state(record)))
         }
-        _ => Err(ApiError::BadRequest("tier must be 'light' or 'full'".into())),
+        _ => Err(ApiError::BadRequest(
+            "tier must be 'light' or 'full'".into(),
+        )),
     }
 }
 

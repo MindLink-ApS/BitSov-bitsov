@@ -27,11 +27,10 @@ use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::types::{NodeId, Nonce, PaymentProof, Recipient, Signature};
 use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_message::wire::{Capability, SovereigntyTier};
-use konsensus_message::{ReachabilityMode, NoiseTransport, TransportConfig};
+use konsensus_message::{NoiseTransport, ReachabilityMode, TransportConfig};
 use sha2::{Digest, Sha256};
 
-const MNEMONIC: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon \
+const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon art";
 
@@ -117,9 +116,7 @@ async fn send_lock_concurrency_does_not_starve_registry_reads() {
         for i in 0..30u8 {
             let t = Arc::clone(&transport_alice);
             let env = make_envelope(&alice, &bob_id, i.wrapping_add(1));
-            send_handles.push(tokio::spawn(async move {
-                t.send(&bob_id, &env).await
-            }));
+            send_handles.push(tokio::spawn(async move { t.send(&bob_id, &env).await }));
         }
 
         // 60 concurrent registry-read calls (is_connected, connected_peers,
@@ -161,8 +158,5 @@ async fn send_lock_concurrency_does_not_starve_registry_reads() {
 
     // Final sanity: registry still consistent with reality after the storm.
     assert!(transport_alice.is_connected(&bob_id).await);
-    assert!(transport_alice
-        .peer_info(&bob_id)
-        .await
-        .is_some());
+    assert!(transport_alice.peer_info(&bob_id).await.is_some());
 }

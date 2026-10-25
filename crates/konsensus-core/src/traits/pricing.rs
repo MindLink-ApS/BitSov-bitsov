@@ -64,7 +64,9 @@ pub trait PricingEngine: Send + Sync {
     /// that every other priceable kind uses its category price. Engines unable
     /// to provide that guarantee must return `None` (no durable category offer).
     /// This applicability is persisted with an offer, never recomputed at redemption.
-    fn category_price_overrides(&self) -> Option<Vec<u16>> { None }
+    fn category_price_overrides(&self) -> Option<Vec<u16>> {
+        None
+    }
 
     /// Downcast to concrete type for engine-specific operations.
     ///

@@ -43,7 +43,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use konsensus_api::handlers::introduction::{reason, source, IntroductionSettings, PeerEndpointView};
+use konsensus_api::handlers::introduction::{
+    reason, source, IntroductionSettings, PeerEndpointView,
+};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -104,7 +106,8 @@ pub fn parse_binding_request(buf: &[u8]) -> Option<[u8; 12]> {
             if attr_len != 4 || value + 4 != buf.len() {
                 return None;
             }
-            let want = u32::from_be_bytes([buf[value], buf[value + 1], buf[value + 2], buf[value + 3]]);
+            let want =
+                u32::from_be_bytes([buf[value], buf[value + 1], buf[value + 2], buf[value + 3]]);
             if crc32(&buf[..at]) ^ FINGERPRINT_XOR != want {
                 return None;
             }
@@ -128,7 +131,10 @@ pub fn binding_success(txid: &[u8; 12], source: SocketAddr) -> Vec<u8> {
             let mut key = [0u8; 16];
             key[..4].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
             key[4..].copy_from_slice(txid);
-            (0x02, v6.octets().iter().zip(key).map(|(a, k)| a ^ k).collect())
+            (
+                0x02,
+                v6.octets().iter().zip(key).map(|(a, k)| a ^ k).collect(),
+            )
         }
     };
     let attr_len = 4 + addr.len();
@@ -199,8 +205,7 @@ impl ListenerFamily {
 /// local/`advertised_addr` endpoints stay available through the configured
 /// endpoint path and are never overwritten by STUN.
 pub fn discovered_mapped_ok(ip: IpAddr) -> bool {
-    konsensus_core::introduction::ip_reach(ip)
-        == Some(konsensus_core::introduction::Reach::Public)
+    konsensus_core::introduction::ip_reach(ip) == Some(konsensus_core::introduction::Reach::Public)
 }
 
 /// A Binding Request with no attributes.
@@ -215,7 +220,10 @@ pub fn binding_request(txid: &[u8; 12]) -> [u8; HEADER_LEN] {
 /// Whether `buf` is a STUN message carrying `txid` (so a reply to our request,
 /// whatever it says).
 fn is_reply_to(buf: &[u8], txid: &[u8; 12]) -> bool {
-    buf.len() >= HEADER_LEN && buf[0] & 0xC0 == 0 && buf[4..8] == MAGIC_COOKIE.to_be_bytes() && buf[8..HEADER_LEN] == txid[..]
+    buf.len() >= HEADER_LEN
+        && buf[0] & 0xC0 == 0
+        && buf[4..8] == MAGIC_COOKIE.to_be_bytes()
+        && buf[8..HEADER_LEN] == txid[..]
 }
 
 /// The mapped address of a Binding Success for `txid`, or `None` if the
@@ -276,7 +284,10 @@ fn parse_xor_mapped(v: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
 }
 
 /// Accept a parsed Binding Success only when it is public and matches `family`.
-pub(crate) fn accept_discovered(mapped: SocketAddr, family: ListenerFamily) -> Result<SocketAddr, QueryError> {
+pub(crate) fn accept_discovered(
+    mapped: SocketAddr,
+    family: ListenerFamily,
+) -> Result<SocketAddr, QueryError> {
     if !family.matches(mapped) {
         return Err(QueryError::FamilyMismatch);
     }
@@ -293,7 +304,11 @@ pub(crate) fn accept_discovered(mapped: SocketAddr, family: ListenerFamily) -> R
 /// may drop it). Datagrams from other hosts or for other transactions are
 /// ignored, so an off-path host cannot inject an answer without also guessing
 /// the random transaction id and the server's address.
-pub async fn query(server: &str, timeout: Duration, family: ListenerFamily) -> Result<SocketAddr, QueryError> {
+pub async fn query(
+    server: &str,
+    timeout: Duration,
+    family: ListenerFamily,
+) -> Result<SocketAddr, QueryError> {
     const TRIES: u32 = 3;
     let deadline = tokio::time::Instant::now() + timeout;
     let resolved: Vec<SocketAddr> = tokio::time::timeout(timeout, tokio::net::lookup_host(server))
@@ -310,8 +325,13 @@ pub async fn query(server: &str, timeout: Duration, family: ListenerFamily) -> R
     } else {
         ([0u16; 8], 0).into()
     };
-    let socket = UdpSocket::bind(bind).await.map_err(|_| QueryError::Unreachable)?;
-    socket.connect(target).await.map_err(|_| QueryError::Unreachable)?;
+    let socket = UdpSocket::bind(bind)
+        .await
+        .map_err(|_| QueryError::Unreachable)?;
+    socket
+        .connect(target)
+        .await
+        .map_err(|_| QueryError::Unreachable)?;
 
     let mut txid = [0u8; 12];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut txid);
@@ -320,7 +340,10 @@ pub async fn query(server: &str, timeout: Duration, family: ListenerFamily) -> R
     let mut buf = [0u8; 1024];
     let mut failure = QueryError::Unreachable;
     for _ in 0..TRIES {
-        socket.send(&request).await.map_err(|_| QueryError::Unreachable)?;
+        socket
+            .send(&request)
+            .await
+            .map_err(|_| QueryError::Unreachable)?;
         let until = (tokio::time::Instant::now() + per_try).min(deadline);
         // `connect` makes the kernel drop datagrams from any other source.
         while let Ok(Ok(n)) = tokio::time::timeout_at(until, socket.recv(&mut buf)).await {
@@ -354,7 +377,9 @@ pub async fn discover_peer_endpoint(
     family: ListenerFamily,
 ) -> PeerEndpointView {
     match query(server, timeout, family).await {
-        Ok(mapped) => PeerEndpointView::found(endpoint_from_mapped(mapped, peer_port), source::STUN),
+        Ok(mapped) => {
+            PeerEndpointView::found(endpoint_from_mapped(mapped, peer_port), source::STUN)
+        }
         Err(e) => PeerEndpointView::missing(e.reason()),
     }
 }
@@ -371,7 +396,11 @@ pub const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 /// records the reason while nothing has been found yet. Returns success.
 pub fn record(settings: &IntroductionSettings, attempt: PeerEndpointView) -> bool {
     let ok = attempt.endpoint.is_some();
-    let current = settings.discovered.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let current = settings
+        .discovered
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     if ok && current.endpoint != attempt.endpoint {
         info!(endpoint = ?attempt.endpoint, "peer endpoint discovered via [network] stun_server");
     }
@@ -411,7 +440,11 @@ pub async fn refresh_loop(
             &settings,
             discover_peer_endpoint(&server, peer_port, ATTEMPT_TIMEOUT, family).await,
         );
-        backoff = if ok { RETRY_MIN } else { (backoff * 2).min(RETRY_MAX) };
+        backoff = if ok {
+            RETRY_MIN
+        } else {
+            (backoff * 2).min(RETRY_MAX)
+        };
     }
 }
 
@@ -421,7 +454,11 @@ fn crc32(data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= u32::from(byte);
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -444,7 +481,12 @@ impl Default for Limits {
     /// A call gathers candidates with a handful of requests (plus
     /// retransmissions); 20 per 10 s per source leaves room for a few calls.
     fn default() -> Self {
-        Self { per_source: 20, total: 2_000, window: Duration::from_secs(10), max_sources: 16_384 }
+        Self {
+            per_source: 20,
+            total: 2_000,
+            window: Duration::from_secs(10),
+            max_sources: 16_384,
+        }
     }
 }
 
@@ -460,7 +502,12 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(limits: Limits, now: Instant) -> Self {
-        Self { limits, sources: HashMap::new(), total: (now, 0), last_prune: now }
+        Self {
+            limits,
+            sources: HashMap::new(),
+            total: (now, 0),
+            last_prune: now,
+        }
     }
 
     /// Whether to answer `ip` now; counts the answer if so.
@@ -480,7 +527,8 @@ impl RateLimiter {
                 return false;
             }
             self.last_prune = now;
-            self.sources.retain(|_, (start, _)| now.duration_since(*start) < window);
+            self.sources
+                .retain(|_, (start, _)| now.duration_since(*start) < window);
             if self.sources.len() >= self.limits.max_sources {
                 return false;
             }
@@ -558,11 +606,16 @@ pub async fn serve(socket: Arc<UdpSocket>, limits: Limits, mut shutdown_rx: watc
         if !answerable_source(source) {
             continue;
         }
-        let Some(txid) = parse_binding_request(&buf[..n]) else { continue };
+        let Some(txid) = parse_binding_request(&buf[..n]) else {
+            continue;
+        };
         if !limiter.allow(source.ip(), Instant::now()) {
             continue;
         }
-        if let Err(e) = socket.send_to(&binding_success(&txid, source), source).await {
+        if let Err(e) = socket
+            .send_to(&binding_success(&txid, source), source)
+            .await
+        {
             debug!(error = %e, "stun send failed");
         }
     }
@@ -593,7 +646,9 @@ mod tests {
         b
     }
 
-    const TXID: [u8; 12] = [0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae];
+    const TXID: [u8; 12] = [
+        0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
+    ];
 
     #[test]
     fn crc32_matches_the_standard_check_value() {
@@ -646,12 +701,19 @@ mod tests {
         b[3] = 5;
         assert_eq!(parse_binding_request(&b), None);
         // Attribute running past the end.
-        assert_eq!(parse_binding_request(&request(TXID, &[0x80, 0x22, 0x00, 0x08, 0, 0, 0, 0])), None);
+        assert_eq!(
+            parse_binding_request(&request(TXID, &[0x80, 0x22, 0x00, 0x08, 0, 0, 0, 0])),
+            None
+        );
         // Comprehension-required attributes (USERNAME, PRIORITY, MESSAGE-INTEGRITY).
         for t in [0x0006u16, 0x0024, 0x0008] {
             let mut attrs = t.to_be_bytes().to_vec();
             attrs.extend_from_slice(&[0x00, 0x04, 1, 2, 3, 4]);
-            assert_eq!(parse_binding_request(&request(TXID, &attrs)), None, "attr {t:#06x}");
+            assert_eq!(
+                parse_binding_request(&request(TXID, &attrs)),
+                None,
+                "attr {t:#06x}"
+            );
         }
         // Bad FINGERPRINT, and FINGERPRINT not last.
         let mut b = with_fingerprint(request(TXID, &[]));
@@ -670,12 +732,14 @@ mod tests {
         // RFC 5769 §2.1: an ICE connectivity check (USERNAME, PRIORITY,
         // MESSAGE-INTEGRITY). That belongs to the peer, not a STUN server.
         let req = [
-            0x00, 0x01, 0x00, 0x58, 0x21, 0x12, 0xa4, 0x42, 0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87,
-            0xdf, 0xae, 0x80, 0x22, 0x00, 0x10, 0x53, 0x54, 0x55, 0x4e, 0x20, 0x74, 0x65, 0x73, 0x74, 0x20, 0x63, 0x6c,
-            0x69, 0x65, 0x6e, 0x74, 0x00, 0x24, 0x00, 0x04, 0x6e, 0x00, 0x01, 0xff, 0x80, 0x29, 0x00, 0x08, 0x93, 0x2f,
-            0xf9, 0xb1, 0x51, 0x26, 0x3b, 0x36, 0x00, 0x06, 0x00, 0x09, 0x65, 0x76, 0x74, 0x6a, 0x3a, 0x68, 0x36, 0x76,
-            0x59, 0x20, 0x20, 0x20, 0x00, 0x08, 0x00, 0x14, 0x9a, 0xea, 0xa7, 0x0c, 0xbf, 0xd8, 0xcb, 0x56, 0x78, 0x1e,
-            0xf2, 0xb5, 0xb2, 0xd3, 0xf2, 0x49, 0xc1, 0xb5, 0x71, 0xa2, 0x80, 0x28, 0x00, 0x04, 0xe5, 0x7a, 0x3b, 0xcf,
+            0x00, 0x01, 0x00, 0x58, 0x21, 0x12, 0xa4, 0x42, 0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34,
+            0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae, 0x80, 0x22, 0x00, 0x10, 0x53, 0x54, 0x55, 0x4e,
+            0x20, 0x74, 0x65, 0x73, 0x74, 0x20, 0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x00, 0x24,
+            0x00, 0x04, 0x6e, 0x00, 0x01, 0xff, 0x80, 0x29, 0x00, 0x08, 0x93, 0x2f, 0xf9, 0xb1,
+            0x51, 0x26, 0x3b, 0x36, 0x00, 0x06, 0x00, 0x09, 0x65, 0x76, 0x74, 0x6a, 0x3a, 0x68,
+            0x36, 0x76, 0x59, 0x20, 0x20, 0x20, 0x00, 0x08, 0x00, 0x14, 0x9a, 0xea, 0xa7, 0x0c,
+            0xbf, 0xd8, 0xcb, 0x56, 0x78, 0x1e, 0xf2, 0xb5, 0xb2, 0xd3, 0xf2, 0x49, 0xc1, 0xb5,
+            0x71, 0xa2, 0x80, 0x28, 0x00, 0x04, 0xe5, 0x7a, 0x3b, 0xcf,
         ];
         // Transcribed correctly: its FINGERPRINT checks out.
         assert_eq!(crc32(&req[..100]) ^ FINGERPRINT_XOR, 0xe57a_3bcf);
@@ -687,20 +751,31 @@ mod tests {
         // RFC 5769 §2.2: 192.0.2.1:32853 → 0001 a147 e112a643.
         let v4 = binding_success(&TXID, "192.0.2.1:32853".parse().unwrap());
         assert_eq!(&v4[..4], &[0x01, 0x01, 0x00, 0x0c]);
-        assert_eq!(&v4[20..], &[0x00, 0x20, 0x00, 0x08, 0x00, 0x01, 0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43]);
+        assert_eq!(
+            &v4[20..],
+            &[0x00, 0x20, 0x00, 0x08, 0x00, 0x01, 0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43]
+        );
         // RFC 5769 §2.3: [2001:db8:1234:5678:11:2233:4455:6677]:32853.
-        let v6 = binding_success(&TXID, "[2001:db8:1234:5678:11:2233:4455:6677]:32853".parse().unwrap());
+        let v6 = binding_success(
+            &TXID,
+            "[2001:db8:1234:5678:11:2233:4455:6677]:32853"
+                .parse()
+                .unwrap(),
+        );
         assert_eq!(&v6[..4], &[0x01, 0x01, 0x00, 0x18]);
         assert_eq!(
             &v6[20..],
             &[
-                0x00, 0x20, 0x00, 0x14, 0x00, 0x02, 0xa1, 0x47, 0x01, 0x13, 0xa9, 0xfa, 0xa5, 0xd3, 0xf1, 0x79, 0xbc, 0x25,
-                0xf4, 0xb5, 0xbe, 0xd2, 0xb9, 0xd9,
+                0x00, 0x20, 0x00, 0x14, 0x00, 0x02, 0xa1, 0x47, 0x01, 0x13, 0xa9, 0xfa, 0xa5, 0xd3,
+                0xf1, 0x79, 0xbc, 0x25, 0xf4, 0xb5, 0xbe, 0xd2, 0xb9, 0xd9,
             ]
         );
         assert_eq!(&v6[8..20], &TXID);
         // A dual-stack socket sees IPv4 as ::ffff:a.b.c.d; answer IPv4.
-        let mapped = SocketAddr::new(IpAddr::V6(Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped()), 32853);
+        let mapped = SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped()),
+            32853,
+        );
         assert_eq!(binding_success(&TXID, mapped), v4);
     }
 
@@ -708,11 +783,19 @@ mod tests {
     fn response_is_small() {
         let v6 = binding_success(&TXID, SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 1));
         assert_eq!(v6.len(), 44);
-        assert_eq!(binding_success(&TXID, "1.2.3.4:5".parse().unwrap()).len(), 32);
+        assert_eq!(
+            binding_success(&TXID, "1.2.3.4:5".parse().unwrap()).len(),
+            32
+        );
     }
 
     fn limits() -> Limits {
-        Limits { per_source: 3, total: 5, window: Duration::from_secs(10), max_sources: 2 }
+        Limits {
+            per_source: 3,
+            total: 5,
+            window: Duration::from_secs(10),
+            max_sources: 2,
+        }
     }
 
     #[test]
@@ -728,8 +811,16 @@ mod tests {
     #[test]
     fn total_limit_caps_all_sources() {
         let t0 = Instant::now();
-        let mut l = RateLimiter::new(Limits { max_sources: 100, ..limits() }, t0);
-        let ips: Vec<IpAddr> = (1..=6).map(|i| IpAddr::V4(Ipv4Addr::new(10, 0, 0, i))).collect();
+        let mut l = RateLimiter::new(
+            Limits {
+                max_sources: 100,
+                ..limits()
+            },
+            t0,
+        );
+        let ips: Vec<IpAddr> = (1..=6)
+            .map(|i| IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)))
+            .collect();
         let answered = ips.iter().filter(|ip| l.allow(**ip, t0)).count();
         assert_eq!(answered, 5);
         assert!(l.allow(ips[5], t0 + Duration::from_secs(10)));
@@ -739,7 +830,9 @@ mod tests {
     fn ipv6_is_limited_per_64() {
         let t0 = Instant::now();
         let mut l = RateLimiter::new(limits(), t0);
-        let hosts: Vec<IpAddr> = (1..=4).map(|i| format!("2001:db8::{i}").parse().unwrap()).collect();
+        let hosts: Vec<IpAddr> = (1..=4)
+            .map(|i| format!("2001:db8::{i}").parse().unwrap())
+            .collect();
         assert_eq!(hosts.iter().filter(|ip| l.allow(**ip, t0)).count(), 3);
         assert!(l.allow("2001:db8:0:1::1".parse().unwrap(), t0));
     }
@@ -747,7 +840,13 @@ mod tests {
     #[test]
     fn source_table_is_bounded_and_fails_closed() {
         let t0 = Instant::now();
-        let mut l = RateLimiter::new(Limits { total: 100, ..limits() }, t0);
+        let mut l = RateLimiter::new(
+            Limits {
+                total: 100,
+                ..limits()
+            },
+            t0,
+        );
         let ip = |i| IpAddr::V4(Ipv4Addr::new(10, 0, 0, i));
         assert!(l.allow(ip(1), t0));
         assert!(l.allow(ip(2), t0));
@@ -764,16 +863,34 @@ mod tests {
     fn multicast_broadcast_unspecified_and_port_zero_are_not_answered() {
         let ok = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
         assert!(answerable_source(ok));
-        assert!(!answerable_source(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3478)));
-        assert!(!answerable_source(SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 3478)));
-        assert!(!answerable_source(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)), 3478)));
-        assert!(!answerable_source(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 3478)));
+        assert!(!answerable_source(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            3478
+        )));
+        assert!(!answerable_source(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            3478
+        )));
+        assert!(!answerable_source(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            3478
+        )));
+        assert!(!answerable_source(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            3478
+        )));
         assert!(!answerable_source(SocketAddr::new(
             IpAddr::V6("ff02::1".parse().unwrap()),
             3478,
         )));
-        assert!(!answerable_source(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)));
-        assert!(answerable_source(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 3478)));
+        assert!(!answerable_source(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            0
+        )));
+        assert!(answerable_source(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            3478
+        )));
     }
 
     // ── client ────────────────────────────────────────────────────────
@@ -786,12 +903,21 @@ mod tests {
     #[test]
     fn client_parses_binding_success() {
         let v4: SocketAddr = "203.0.113.9:40000".parse().unwrap();
-        assert_eq!(parse_binding_success(&binding_success(&TXID, v4), &TXID), Some(v4));
+        assert_eq!(
+            parse_binding_success(&binding_success(&TXID, v4), &TXID),
+            Some(v4)
+        );
         let v6: SocketAddr = "[2001:db8::7]:40000".parse().unwrap();
-        assert_eq!(parse_binding_success(&binding_success(&TXID, v6), &TXID), Some(v6));
+        assert_eq!(
+            parse_binding_success(&binding_success(&TXID, v6), &TXID),
+            Some(v6)
+        );
         // RFC 5769 §2.2 vector, byte for byte.
         let rfc = binding_success(&TXID, "192.0.2.1:32853".parse().unwrap());
-        assert_eq!(parse_binding_success(&rfc, &TXID), Some("192.0.2.1:32853".parse().unwrap()));
+        assert_eq!(
+            parse_binding_success(&rfc, &TXID),
+            Some("192.0.2.1:32853".parse().unwrap())
+        );
         // The mapped port is the UDP mapping; the peer endpoint uses the TCP port.
         assert_eq!(endpoint_from_mapped(v4, 9000), "203.0.113.9:9000");
         assert_eq!(endpoint_from_mapped(v6, 9000), "[2001:db8::7]:9000");
@@ -802,8 +928,16 @@ mod tests {
         let good = binding_success(&TXID, "203.0.113.9:40000".parse().unwrap());
         let mut other = TXID;
         other[11] ^= 1;
-        assert_eq!(parse_binding_success(&good, &other), None, "wrong transaction");
-        assert_eq!(parse_binding_success(&good[..good.len() - 1], &TXID), None, "truncated");
+        assert_eq!(
+            parse_binding_success(&good, &other),
+            None,
+            "wrong transaction"
+        );
+        assert_eq!(
+            parse_binding_success(&good[..good.len() - 1], &TXID),
+            None,
+            "truncated"
+        );
         assert_eq!(parse_binding_success(&[], &TXID), None);
         let mut b = good.clone();
         b[0..2].copy_from_slice(&0x0111u16.to_be_bytes());
@@ -841,9 +975,15 @@ mod tests {
             "2001:db8::7",
         ] {
             let ip: IpAddr = bad.parse().unwrap();
-            assert!(!discovered_mapped_ok(ip), "{bad} must not be advertised from STUN");
+            assert!(
+                !discovered_mapped_ok(ip),
+                "{bad} must not be advertised from STUN"
+            );
             assert_eq!(
-                accept_discovered(SocketAddr::new(ip, 3478), ListenerFamily::of(SocketAddr::new(ip, 0))),
+                accept_discovered(
+                    SocketAddr::new(ip, 3478),
+                    ListenerFamily::of(SocketAddr::new(ip, 0))
+                ),
                 Err(QueryError::InvalidResponse),
                 "{bad}"
             );
@@ -860,12 +1000,24 @@ mod tests {
     fn discovery_rejects_mapped_family_that_listener_does_not_serve() {
         let v4: SocketAddr = "8.8.8.8:3478".parse().unwrap();
         let v6: SocketAddr = "[2606:4700::1]:3478".parse().unwrap();
-        assert_eq!(ListenerFamily::of("0.0.0.0:9000".parse().unwrap()), ListenerFamily::V4);
-        assert_eq!(ListenerFamily::of("[::]:9000".parse().unwrap()), ListenerFamily::V6);
+        assert_eq!(
+            ListenerFamily::of("0.0.0.0:9000".parse().unwrap()),
+            ListenerFamily::V4
+        );
+        assert_eq!(
+            ListenerFamily::of("[::]:9000".parse().unwrap()),
+            ListenerFamily::V6
+        );
         assert_eq!(accept_discovered(v4, ListenerFamily::V4), Ok(v4));
         assert_eq!(accept_discovered(v6, ListenerFamily::V6), Ok(v6));
-        assert_eq!(accept_discovered(v4, ListenerFamily::V6), Err(QueryError::FamilyMismatch));
-        assert_eq!(accept_discovered(v6, ListenerFamily::V4), Err(QueryError::FamilyMismatch));
+        assert_eq!(
+            accept_discovered(v4, ListenerFamily::V6),
+            Err(QueryError::FamilyMismatch)
+        );
+        assert_eq!(
+            accept_discovered(v6, ListenerFamily::V4),
+            Err(QueryError::FamilyMismatch)
+        );
         assert_eq!(QueryError::FamilyMismatch.reason(), "stun_family_mismatch");
     }
 
@@ -881,18 +1033,30 @@ mod tests {
         tokio::spawn(async move {
             let mut buf = [0u8; 64];
             loop {
-                let Ok((n, from)) = serve.recv_from(&mut buf).await else { return };
+                let Ok((n, from)) = serve.recv_from(&mut buf).await else {
+                    return;
+                };
                 if let Some(txid) = parse_binding_request(&buf[..n]) {
                     let _ = serve.send_to(&binding_success(&txid, public), from).await;
                 }
             }
         });
 
-        let mapped = query(&server.to_string(), Duration::from_secs(2), ListenerFamily::V4)
-            .await
-            .unwrap();
+        let mapped = query(
+            &server.to_string(),
+            Duration::from_secs(2),
+            ListenerFamily::V4,
+        )
+        .await
+        .unwrap();
         assert_eq!(mapped.ip(), public.ip());
-        let view = discover_peer_endpoint(&server.to_string(), 9000, Duration::from_secs(2), ListenerFamily::V4).await;
+        let view = discover_peer_endpoint(
+            &server.to_string(),
+            9000,
+            Duration::from_secs(2),
+            ListenerFamily::V4,
+        )
+        .await;
         assert_eq!(view, PeerEndpointView::found("8.8.8.8:9000".into(), "stun"));
     }
 
@@ -904,14 +1068,28 @@ mod tests {
         let task = tokio::spawn(serve(socket, Limits::default(), rx));
 
         assert_eq!(
-            query(&server.to_string(), Duration::from_secs(2), ListenerFamily::V4).await,
+            query(
+                &server.to_string(),
+                Duration::from_secs(2),
+                ListenerFamily::V4
+            )
+            .await,
             Err(QueryError::InvalidResponse)
         );
-        let view = discover_peer_endpoint(&server.to_string(), 9000, Duration::from_secs(2), ListenerFamily::V4).await;
+        let view = discover_peer_endpoint(
+            &server.to_string(),
+            9000,
+            Duration::from_secs(2),
+            ListenerFamily::V4,
+        )
+        .await;
         assert_eq!(view, PeerEndpointView::missing("stun_invalid_response"));
 
         tx.send(true).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -924,7 +1102,13 @@ mod tests {
             query(&server, Duration::from_millis(300), ListenerFamily::V6).await,
             Err(QueryError::FamilyMismatch)
         );
-        let view = discover_peer_endpoint(&server, 9000, Duration::from_millis(300), ListenerFamily::V6).await;
+        let view = discover_peer_endpoint(
+            &server,
+            9000,
+            Duration::from_millis(300),
+            ListenerFamily::V6,
+        )
+        .await;
         assert_eq!(view, PeerEndpointView::missing("stun_family_mismatch"));
     }
 
@@ -937,10 +1121,17 @@ mod tests {
             query(&addr, Duration::from_millis(300), ListenerFamily::V4).await,
             Err(QueryError::Unreachable)
         );
-        let view = discover_peer_endpoint(&addr, 9000, Duration::from_millis(300), ListenerFamily::V4).await;
+        let view =
+            discover_peer_endpoint(&addr, 9000, Duration::from_millis(300), ListenerFamily::V4)
+                .await;
         assert_eq!(view, PeerEndpointView::missing("stun_unreachable"));
         assert_eq!(
-            query("not a host:1", Duration::from_millis(300), ListenerFamily::V4).await,
+            query(
+                "not a host:1",
+                Duration::from_millis(300),
+                ListenerFamily::V4
+            )
+            .await,
             Err(QueryError::Unreachable)
         );
 
@@ -951,7 +1142,9 @@ mod tests {
         tokio::spawn(async move {
             let mut buf = [0u8; 64];
             loop {
-                let Ok((n, from)) = answer.recv_from(&mut buf).await else { return };
+                let Ok((n, from)) = answer.recv_from(&mut buf).await else {
+                    return;
+                };
                 if let Some(txid) = parse_binding_request(&buf[..n]) {
                     // Binding success with no attributes.
                     let mut reply = binding_success(&txid, from)[..HEADER_LEN].to_vec();
@@ -964,21 +1157,34 @@ mod tests {
             query(&addr, Duration::from_secs(1), ListenerFamily::V4).await,
             Err(QueryError::InvalidResponse)
         );
-        let view = discover_peer_endpoint(&addr, 9000, Duration::from_secs(1), ListenerFamily::V4).await;
+        let view =
+            discover_peer_endpoint(&addr, 9000, Duration::from_secs(1), ListenerFamily::V4).await;
         assert_eq!(view, PeerEndpointView::missing("stun_invalid_response"));
     }
 
     #[test]
     fn a_failed_refresh_keeps_the_last_good_endpoint_and_never_touches_configured() {
         let settings = IntroductionSettings::default();
-        assert!(!record(&settings, PeerEndpointView::missing("stun_unreachable")));
+        assert!(!record(
+            &settings,
+            PeerEndpointView::missing("stun_unreachable")
+        ));
         assert_eq!(settings.endpoint_view().reason, Some("stun_unreachable"));
-        assert!(record(&settings, PeerEndpointView::found("198.51.100.4:9000".into(), "stun")));
-        assert!(!record(&settings, PeerEndpointView::missing("stun_unreachable")));
+        assert!(record(
+            &settings,
+            PeerEndpointView::found("198.51.100.4:9000".into(), "stun")
+        ));
+        assert!(!record(
+            &settings,
+            PeerEndpointView::missing("stun_unreachable")
+        ));
         assert_eq!(settings.endpoint().as_deref(), Some("198.51.100.4:9000"));
 
         let fixed = IntroductionSettings::fixed(None, Some("node.example.org:9000"));
-        record(&fixed, PeerEndpointView::found("198.51.100.4:9000".into(), "stun"));
+        record(
+            &fixed,
+            PeerEndpointView::found("198.51.100.4:9000".into(), "stun"),
+        );
         assert_eq!(fixed.endpoint().as_deref(), Some("node.example.org:9000"));
     }
 
@@ -996,7 +1202,14 @@ mod tests {
         let socket = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let server = socket.local_addr().unwrap();
         let (tx, rx) = watch::channel(false);
-        let task = tokio::spawn(serve(socket, Limits { per_source: 2, ..Limits::default() }, rx));
+        let task = tokio::spawn(serve(
+            socket,
+            Limits {
+                per_source: 2,
+                ..Limits::default()
+            },
+            rx,
+        ));
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.connect(server).await.unwrap();
@@ -1006,7 +1219,9 @@ mod tests {
         assert_eq!(roundtrip(&client, b"hello").await, None);
         assert_eq!(roundtrip(&client, &[0u8; 20]).await, None);
 
-        let resp = roundtrip(&client, &request(TXID, &[])).await.expect("answered");
+        let resp = roundtrip(&client, &request(TXID, &[]))
+            .await
+            .expect("answered");
         assert_eq!(resp, binding_success(&TXID, me));
         let mut other = TXID;
         other[0] ^= 1;
@@ -1015,7 +1230,10 @@ mod tests {
         assert_eq!(roundtrip(&client, &request(TXID, &[])).await, None);
 
         tx.send(true).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

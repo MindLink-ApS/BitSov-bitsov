@@ -40,13 +40,20 @@ impl IntoResponseParts for ListDiagnostics {
             );
         }
         if let Some(cursor) = self.continuation {
-            if let (Ok(timestamp), Ok(id)) = (HeaderValue::from_str(&cursor.timestamp), HeaderValue::from_str(&cursor.id)) {
-                res.headers_mut().insert("x-bitsov-oldest-scanned-timestamp", timestamp);
+            if let (Ok(timestamp), Ok(id)) = (
+                HeaderValue::from_str(&cursor.timestamp),
+                HeaderValue::from_str(&cursor.id),
+            ) {
+                res.headers_mut()
+                    .insert("x-bitsov-oldest-scanned-timestamp", timestamp);
                 res.headers_mut().insert("x-bitsov-oldest-scanned-id", id);
             }
         }
         if let Some(cursor) = self.next_before {
-            if let (Ok(timestamp), Ok(id)) = (HeaderValue::from_str(&cursor.timestamp), HeaderValue::from_str(&cursor.id)) {
+            if let (Ok(timestamp), Ok(id)) = (
+                HeaderValue::from_str(&cursor.timestamp),
+                HeaderValue::from_str(&cursor.id),
+            ) {
                 res.headers_mut().insert("x-bitsov-next-before", timestamp);
                 res.headers_mut().insert("x-bitsov-next-before-id", id);
             }
@@ -57,15 +64,25 @@ impl IntoResponseParts for ListDiagnostics {
 
 /// Timestamp-only callers retain the existing exclusive `before` semantics.
 /// A paired ID resumes within a timestamp without losing tied rows.
-pub fn message_cursor(before: Option<u64>, before_id: Option<&str>) -> Result<Option<konsensus_storage::ListCursor<u64>>, crate::error::ApiError> {
+pub fn message_cursor(
+    before: Option<u64>,
+    before_id: Option<&str>,
+) -> Result<Option<konsensus_storage::ListCursor<u64>>, crate::error::ApiError> {
     match (before, before_id) {
         (Some(timestamp), Some(id)) => {
             if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(crate::error::ApiError::BadRequest("invalid before_id: expected a message ID".into()));
+                return Err(crate::error::ApiError::BadRequest(
+                    "invalid before_id: expected a message ID".into(),
+                ));
             }
-            Ok(Some(konsensus_storage::ListCursor { timestamp, id: id.to_ascii_lowercase() }))
+            Ok(Some(konsensus_storage::ListCursor {
+                timestamp,
+                id: id.to_ascii_lowercase(),
+            }))
         }
-        (None, Some(_)) => Err(crate::error::ApiError::BadRequest("before_id requires before".into())),
+        (None, Some(_)) => Err(crate::error::ApiError::BadRequest(
+            "before_id requires before".into(),
+        )),
         _ => Ok(None),
     }
 }

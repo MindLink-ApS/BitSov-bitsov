@@ -8,7 +8,10 @@ use std::sync::Arc;
 
 use axum::{body::Body, http::Request};
 use konsensus_api::calls;
-use konsensus_core::payloads::call::{CallEntry, CallSignal, Phase, Side, BURN_MIN_MS, MAX_BURNED_PER_PEER, MAX_OPEN_CALLS_PER_PEER, TOMBSTONE_MS};
+use konsensus_core::payloads::call::{
+    CallEntry, CallSignal, Phase, Side, BURN_MIN_MS, MAX_BURNED_PER_PEER, MAX_OPEN_CALLS_PER_PEER,
+    TOMBSTONE_MS,
+};
 use konsensus_core::traits::lightning::LightningProvider;
 use konsensus_core::{NodeId, PaymentProof, Recipient, UkmEnvelopeBuilder};
 use konsensus_storage::{SqliteStorage, Storage};
@@ -28,13 +31,21 @@ fn id(n: usize) -> String {
     format!("{n:032x}")
 }
 
-async fn sqlite_state(wallet: Arc<konsensus_lightning::MockLightningProvider>) -> Arc<konsensus_api::AppState> {
+async fn sqlite_state(
+    wallet: Arc<konsensus_lightning::MockLightningProvider>,
+) -> Arc<konsensus_api::AppState> {
     let mut state = common::test_state_with_lightning(wallet);
     Arc::get_mut(&mut state).unwrap().storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
     state
 }
 
-async fn compose(state: &Arc<konsensus_api::AppState>, op: &str, peer: &NodeId, kind: u16, plaintext: &str) -> serde_json::Value {
+async fn compose(
+    state: &Arc<konsensus_api::AppState>,
+    op: &str,
+    peer: &NodeId,
+    kind: u16,
+    plaintext: &str,
+) -> serde_json::Value {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/messages/compose")
@@ -44,8 +55,16 @@ async fn compose(state: &Arc<konsensus_api::AppState>, op: &str, peer: &NodeId, 
             serde_json::json!({"operation_id": op, "recipient": peer.to_hex(), "kind": kind, "plaintext": plaintext, "wait_ack_ms": 0}).to_string(),
         ))
         .unwrap();
-    let response = common::test_router(Arc::clone(state)).oneshot(req).await.unwrap();
-    serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 65536).await.unwrap()).unwrap()
+    let response = common::test_router(Arc::clone(state))
+        .oneshot(req)
+        .await
+        .unwrap();
+    serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
 }
 
 /// Probe `failed_unpaid_compose_burns_id_and_accepts_answer`, fixed: an unpaid
@@ -61,18 +80,50 @@ async fn an_unpaid_offer_burns_nothing_and_accepts_no_answer() {
     let first = compose(&state, &op, &peer, 400, &body(400, &call)).await;
     println!("offer: {first}");
     let reason = first["reason"].as_str().unwrap().to_string();
-    assert!(["call_needs_contact", "call_price_unknown"].contains(&reason.as_str()), "{first}");
+    assert!(
+        ["call_needs_contact", "call_price_unknown"].contains(&reason.as_str()),
+        "{first}"
+    );
     assert!(wallet.list_payments(100).await.unwrap().is_empty());
     let retry = compose(&state, &op, &peer, 400, &body(400, &call)).await;
-    assert_eq!(retry["reason"], reason.as_str(), "same operation, same refusal, not call_id_used: {retry}");
-    assert!(calls::admit_incoming(state.storage.as_ref(), &own(), &peer, 401, Some(&body(401, &call))).await.is_err());
+    assert_eq!(
+        retry["reason"],
+        reason.as_str(),
+        "same operation, same refusal, not call_id_used: {retry}"
+    );
+    assert!(calls::admit_incoming(
+        state.storage.as_ref(),
+        &own(),
+        &peer,
+        401,
+        Some(&body(401, &call))
+    )
+    .await
+    .is_err());
     // Released: the id was never sent, so another operation may offer it.
-    assert!(calls::reserve_outgoing(state.storage.as_ref(), &own(), &peer, 400, &body(400, &call), "other-op", "h").await.is_ok());
+    assert!(calls::reserve_outgoing(
+        state.storage.as_ref(),
+        &own(),
+        &peer,
+        400,
+        &body(400, &call),
+        "other-op",
+        "h"
+    )
+    .await
+    .is_ok());
 }
 
 fn meeting_offer(call: &str, roster: &[&NodeId]) -> String {
-    let roster = roster.iter().map(|r| format!("\"{}\"", r.to_hex())).collect::<Vec<_>>().join(",");
-    format!(r#"{{"v":1,"call_id":"{call}","media":"audio","sdp":"v=0","meeting":{{"id":"{}","roster":[{roster}]}}}}"#, id(0x4d))
+    let roster = roster
+        .iter()
+        .map(|r| format!("\"{}\"", r.to_hex()))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"v":1,"call_id":"{call}","media":"audio","sdp":"v=0","meeting":{{"id":"{}","roster":[{roster}]}}}}"#,
+        id(0x4d)
+    )
 }
 
 /// Mesh meetings: a leg out of roster order (or to someone outside the
@@ -86,35 +137,99 @@ async fn a_meeting_leg_out_of_roster_order_is_refused_before_reservation_or_paym
     let (host, later) = (NodeId::from_bytes([91; 32]), NodeId::from_bytes([92; 32]));
     let stranger = NodeId::from_bytes([93; 32]);
     let cases = [
-        (host, id(0x9100), vec![&host, &me]),       // we are after the callee: they place this leg
-        (stranger, id(0x9101), vec![&host, &me]),   // callee not in the roster
-        (later, id(0x9102), vec![&host, &later]),   // we are not in the roster
+        (host, id(0x9100), vec![&host, &me]), // we are after the callee: they place this leg
+        (stranger, id(0x9101), vec![&host, &me]), // callee not in the roster
+        (later, id(0x9102), vec![&host, &later]), // we are not in the roster
     ];
     for (peer, call, roster) in cases {
         let op = uuid::Uuid::new_v4().to_string();
         let reply = compose(&state, &op, &peer, 400, &meeting_offer(&call, &roster)).await;
         assert_eq!(reply["reason"], "call_signal_invalid", "{reply}");
-        assert!(state.storage.call_get(&peer, &call).await.unwrap().is_none(), "nothing reserved");
+        assert!(
+            state
+                .storage
+                .call_get(&peer, &call)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing reserved"
+        );
     }
-    assert!(wallet.list_payments(100).await.unwrap().is_empty(), "nothing paid");
+    assert!(
+        wallet.list_payments(100).await.unwrap().is_empty(),
+        "nothing paid"
+    );
     // In order: the leg reaches the ordinary 1:1 path (here it stops there,
     // as any call without a contact does), so the meeting check itself passed.
     let call = id(0x9103);
-    let reply = compose(&state, &uuid::Uuid::new_v4().to_string(), &later, 400, &meeting_offer(&call, &[&host, &me, &later])).await;
-    assert!(["call_needs_contact", "call_price_unknown"].contains(&reply["reason"].as_str().unwrap()), "{reply}");
+    let reply = compose(
+        &state,
+        &uuid::Uuid::new_v4().to_string(),
+        &later,
+        400,
+        &meeting_offer(&call, &[&host, &me, &later]),
+    )
+    .await;
+    assert!(
+        ["call_needs_contact", "call_price_unknown"].contains(&reply["reason"].as_str().unwrap()),
+        "{reply}"
+    );
 
     // Incoming, own = me: only an earlier participant may ring us.
     let store = state.storage.as_ref();
     let wrong = id(0x9104);
-    assert!(calls::admit_incoming(store, &me, &later, 400, Some(&meeting_offer(&wrong, &[&host, &me, &later]))).await.is_err());
-    assert!(store.call_get(&later, &wrong).await.unwrap().is_none(), "refused before call state");
-    assert!(calls::admit_incoming(store, &me, &stranger, 400, Some(&meeting_offer(&id(0x9105), &[&host, &me]))).await.is_err());
+    assert!(calls::admit_incoming(
+        store,
+        &me,
+        &later,
+        400,
+        Some(&meeting_offer(&wrong, &[&host, &me, &later]))
+    )
+    .await
+    .is_err());
+    assert!(
+        store.call_get(&later, &wrong).await.unwrap().is_none(),
+        "refused before call state"
+    );
+    assert!(calls::admit_incoming(
+        store,
+        &me,
+        &stranger,
+        400,
+        Some(&meeting_offer(&id(0x9105), &[&host, &me]))
+    )
+    .await
+    .is_err());
     let right = id(0x9106);
-    calls::admit_incoming(store, &me, &host, 400, Some(&meeting_offer(&right, &[&host, &me, &later]))).await.unwrap();
+    calls::admit_incoming(
+        store,
+        &me,
+        &host,
+        400,
+        Some(&meeting_offer(&right, &[&host, &me, &later])),
+    )
+    .await
+    .unwrap();
     // From here it is an ordinary call: answer, then hangup.
-    assert_eq!(store.call_get(&host, &right).await.unwrap().unwrap().phase, Phase::Ringing);
-    calls::admit_incoming(store, &me, &host, 403, Some(&body(403, &right))).await.unwrap();
-    assert!(calls::admit_incoming(store, &me, &host, 400, Some(&meeting_offer(&right, &[&host, &me, &later]))).await.is_err(), "a leg id is single-use too");
+    assert_eq!(
+        store.call_get(&host, &right).await.unwrap().unwrap().phase,
+        Phase::Ringing
+    );
+    calls::admit_incoming(store, &me, &host, 403, Some(&body(403, &right)))
+        .await
+        .unwrap();
+    assert!(
+        calls::admit_incoming(
+            store,
+            &me,
+            &host,
+            400,
+            Some(&meeting_offer(&right, &[&host, &me, &later]))
+        )
+        .await
+        .is_err(),
+        "a leg id is single-use too"
+    );
 }
 
 /// Probe `unpaid_failed_answer_advances_call_and_blocks_retry`, fixed: the call
@@ -125,7 +240,15 @@ async fn an_unpaid_answer_leaves_the_call_ringing_and_retryable() {
     let state = sqlite_state(wallet.clone()).await;
     let peer = NodeId::from_bytes([84; 32]);
     let call = id(0x8400);
-    calls::admit_incoming(state.storage.as_ref(), &own(), &peer, 400, Some(&body(400, &call))).await.unwrap();
+    calls::admit_incoming(
+        state.storage.as_ref(),
+        &own(),
+        &peer,
+        400,
+        Some(&body(400, &call)),
+    )
+    .await
+    .unwrap();
     let op = uuid::Uuid::new_v4().to_string();
     let first = compose(&state, &op, &peer, 401, &body(401, &call)).await;
     println!("answer: {first}");
@@ -138,14 +261,21 @@ async fn an_unpaid_answer_leaves_the_call_ringing_and_retryable() {
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 /// Offer and hang up `n` calls from `peer`, one at a time (ids `from..from+n`).
 async fn burn(store: &SqliteStorage, peer: &NodeId, from: usize, n: usize) {
     for i in from..from + n {
-        calls::admit_incoming(store, &own(), peer, 400, Some(&body(400, &id(i)))).await.unwrap();
-        calls::admit_incoming(store, &own(), peer, 403, Some(&body(403, &id(i)))).await.unwrap();
+        calls::admit_incoming(store, &own(), peer, 400, Some(&body(400, &id(i))))
+            .await
+            .unwrap();
+        calls::admit_incoming(store, &own(), peer, 403, Some(&body(403, &id(i))))
+            .await
+            .unwrap();
     }
 }
 
@@ -158,14 +288,36 @@ async fn young_burned_ids_are_never_dropped_and_only_block_their_own_pair() {
     let store = SqliteStorage::in_memory().await.unwrap();
     let peer = NodeId::from_bytes([80; 32]);
     burn(&store, &peer, 0, MAX_BURNED_PER_PEER as usize).await;
-    let err = calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(100_000)))).await.unwrap_err();
+    let err = calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(100_000))))
+        .await
+        .unwrap_err();
     assert_eq!(err.to_string(), "too many calls tracked; try again later");
-    assert!(calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(0)))).await.is_err(), "burned id stays burned");
-    assert!(store.call_get(&peer, &id(0)).await.unwrap().is_some(), "nothing young was evicted");
+    assert!(
+        calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(0))))
+            .await
+            .is_err(),
+        "burned id stays burned"
+    );
+    assert!(
+        store.call_get(&peer, &id(0)).await.unwrap().is_some(),
+        "nothing young was evicted"
+    );
     // Another pair is unaffected, and so is our own call to someone else.
     let other = NodeId::from_bytes([79; 32]);
-    calls::admit_incoming(&store, &own(), &other, 400, Some(&body(400, &id(100_001)))).await.unwrap();
-    calls::reserve_outgoing(&store, &own(), &NodeId::from_bytes([78; 32]), 400, &body(400, &id(100_002)), "op-elsewhere", "h").await.unwrap();
+    calls::admit_incoming(&store, &own(), &other, 400, Some(&body(400, &id(100_001))))
+        .await
+        .unwrap();
+    calls::reserve_outgoing(
+        &store,
+        &own(),
+        &NodeId::from_bytes([78; 32]),
+        400,
+        &body(400, &id(100_002)),
+        "op-elsewhere",
+        "h",
+    )
+    .await
+    .unwrap();
 }
 
 /// Fable N3: past `BURN_MIN_MS`, the oldest burned ids of a pair make room for
@@ -179,17 +331,40 @@ async fn burned_ids_older_than_the_minimum_make_room_oldest_first() {
     // 255 calls that ended more than BURN_MIN_MS ago (oldest = id 0) ...
     for i in 0..MAX_BURNED_PER_PEER as usize - 1 {
         let ended = now - BURN_MIN_MS - 60_000 * (MAX_BURNED_PER_PEER - i as u64);
-        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None };
+        let entry = CallEntry {
+            side: Side::Callee,
+            phase: Phase::Ended,
+            deadline_ms: ended + TOMBSTONE_MS,
+            pending: None,
+        };
         store.call_put(&peer, &id(i), &entry).await.unwrap();
     }
     // ... and one that just ended.
     let young = MAX_BURNED_PER_PEER as usize - 1;
     burn(&store, &peer, young, 1).await;
-    calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(1_000)))).await.unwrap();
-    assert!(store.call_get(&peer, &id(0)).await.unwrap().is_none(), "the oldest burned id made room");
-    assert!(store.call_get(&peer, &id(1)).await.unwrap().is_some(), "only as many as needed");
-    assert!(calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(young)))).await.is_err(), "the young id stays burned");
-    assert!(calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(1)))).await.is_err(), "an old id not needed for room stays burned");
+    calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(1_000))))
+        .await
+        .unwrap();
+    assert!(
+        store.call_get(&peer, &id(0)).await.unwrap().is_none(),
+        "the oldest burned id made room"
+    );
+    assert!(
+        store.call_get(&peer, &id(1)).await.unwrap().is_some(),
+        "only as many as needed"
+    );
+    assert!(
+        calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(young))))
+            .await
+            .is_err(),
+        "the young id stays burned"
+    );
+    assert!(
+        calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(1))))
+            .await
+            .is_err(),
+        "an old id not needed for room stays burned"
+    );
 }
 
 /// Fable N3: open calls have their own small bound, and ending one frees it.
@@ -198,12 +373,22 @@ async fn open_calls_are_bounded_per_peer_and_freed_by_hangup() {
     let store = SqliteStorage::in_memory().await.unwrap();
     let peer = NodeId::from_bytes([76; 32]);
     for i in 0..MAX_OPEN_CALLS_PER_PEER as usize {
-        calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(i)))).await.unwrap();
+        calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(i))))
+            .await
+            .unwrap();
     }
     let next = id(MAX_OPEN_CALLS_PER_PEER as usize);
-    assert!(calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &next))).await.is_err());
-    calls::admit_incoming(&store, &own(), &peer, 403, Some(&body(403, &id(0)))).await.unwrap();
-    calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &next))).await.unwrap();
+    assert!(
+        calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &next)))
+            .await
+            .is_err()
+    );
+    calls::admit_incoming(&store, &own(), &peer, 403, Some(&body(403, &id(0))))
+        .await
+        .unwrap();
+    calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &next)))
+        .await
+        .unwrap();
 }
 
 /// Fable N2: one operation id pays for one signal of one call. Reusing it for
@@ -216,9 +401,39 @@ async fn an_operation_id_reused_for_another_call_is_refused_before_reserving() {
     let store = state.storage.as_ref();
     let peer = NodeId::from_bytes([75; 32]);
     // Still reserved under the operation.
-    calls::reserve_outgoing(store, &own(), &peer, 400, &body(400, &id(1)), "op-reused", "h").await.unwrap();
-    calls::reserve_outgoing(store, &own(), &peer, 400, &body(400, &id(1)), "op-reused", "h").await.unwrap();
-    let err = calls::reserve_outgoing(store, &own(), &peer, 400, &body(400, &id(2)), "op-reused", "h").await.unwrap_err();
+    calls::reserve_outgoing(
+        store,
+        &own(),
+        &peer,
+        400,
+        &body(400, &id(1)),
+        "op-reused",
+        "h",
+    )
+    .await
+    .unwrap();
+    calls::reserve_outgoing(
+        store,
+        &own(),
+        &peer,
+        400,
+        &body(400, &id(1)),
+        "op-reused",
+        "h",
+    )
+    .await
+    .unwrap();
+    let err = calls::reserve_outgoing(
+        store,
+        &own(),
+        &peer,
+        400,
+        &body(400, &id(2)),
+        "op-reused",
+        "h",
+    )
+    .await
+    .unwrap_err();
     assert!(format!("{err:?}").contains("operation_mismatch"), "{err:?}");
     assert!(store.call_get(&peer, &id(2)).await.unwrap().is_none());
     // In the journal (the first request was refused and released).
@@ -227,8 +442,16 @@ async fn an_operation_id_reused_for_another_call_is_refused_before_reserving() {
     assert!(first["reason"].is_string(), "{first}");
     let second = compose(&state, &op, &peer, 400, &body(400, &id(4))).await;
     assert_eq!(second["code"], "operation_mismatch", "{second}");
-    assert!(store.call_get(&peer, &id(4)).await.unwrap().is_none(), "no reservation for the second call");
-    assert!(calls::admit_incoming(store, &own(), &peer, 401, Some(&body(401, &id(4)))).await.is_err(), "nothing to answer");
+    assert!(
+        store.call_get(&peer, &id(4)).await.unwrap().is_none(),
+        "no reservation for the second call"
+    );
+    assert!(
+        calls::admit_incoming(store, &own(), &peer, 401, Some(&body(401, &id(4))))
+            .await
+            .is_err(),
+        "nothing to answer"
+    );
     assert!(wallet.list_payments(100).await.unwrap().is_empty());
 }
 
@@ -239,13 +462,22 @@ async fn an_unrelated_price_response_is_not_a_call_quote() {
     let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
     let mut state = common::test_state_with_lightning(wallet);
     let peer = NodeId::from_bytes([82; 32]);
-    let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
+    let transport = Arc::new(common::ConnectedStubTransport::new(
+        vec![peer],
+        state.invoice_requests.clone(),
+    ));
     Arc::get_mut(&mut state).unwrap().transport = transport;
-    state.peer_prices.update_kind_price(peer, 400, 10_000, 850_000).await;
+    state
+        .peer_prices
+        .update_kind_price(peer, 400, 10_000, 850_000)
+        .await;
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     let update = async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        state.peer_prices.update_kind_price(peer, 0, 2_000, 850_000).await;
+        state
+            .peer_prices
+            .update_kind_price(peer, 0, 2_000, 850_000)
+            .await;
     };
     let (price, ()) = tokio::join!(calls::peer_call_price(&state, &peer), update);
     let err = price.unwrap_err();
@@ -253,7 +485,10 @@ async fn an_unrelated_price_response_is_not_a_call_quote() {
     // A real kind-400 answer after the query does count.
     let answer = async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        state.peer_prices.update_kind_price(peer, 400, 12_000, 850_000).await;
+        state
+            .peer_prices
+            .update_kind_price(peer, 400, 12_000, 850_000)
+            .await;
     };
     tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
     let (price, ()) = tokio::join!(calls::peer_call_price(&state, &peer), answer);
@@ -266,16 +501,39 @@ async fn price_queries_to_one_peer_are_rate_limited() {
     let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
     let mut state = common::test_state_with_lightning(wallet);
     let peer = NodeId::from_bytes([85; 32]);
-    let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
+    let transport = Arc::new(common::ConnectedStubTransport::new(
+        vec![peer],
+        state.invoice_requests.clone(),
+    ));
     Arc::get_mut(&mut state).unwrap().transport = Arc::clone(&transport) as _;
     let answer = async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        state.peer_prices.update_kind_price(peer, 400, 10_000, 850_000).await;
+        state
+            .peer_prices
+            .update_kind_price(peer, 400, 10_000, 850_000)
+            .await;
     };
-    let (a, b, c, ()) = tokio::join!(calls::peer_call_price(&state, &peer), calls::peer_call_price(&state, &peer), calls::peer_call_price(&state, &peer), answer);
-    assert_eq!((a.unwrap(), b.unwrap(), c.unwrap()), (10_000, 10_000, 10_000));
-    let queries = transport.raw_frames.lock().unwrap().iter()
-        .filter(|f| matches!(konsensus_message::wire::Frame::from_bytes(f), Ok(konsensus_message::wire::Frame::PriceQuery { kind: 400 })))
+    let (a, b, c, ()) = tokio::join!(
+        calls::peer_call_price(&state, &peer),
+        calls::peer_call_price(&state, &peer),
+        calls::peer_call_price(&state, &peer),
+        answer
+    );
+    assert_eq!(
+        (a.unwrap(), b.unwrap(), c.unwrap()),
+        (10_000, 10_000, 10_000)
+    );
+    let queries = transport
+        .raw_frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| {
+            matches!(
+                konsensus_message::wire::Frame::from_bytes(f),
+                Ok(konsensus_message::wire::Frame::PriceQuery { kind: 400 })
+            )
+        })
         .count();
     assert_eq!(queries, 1);
 }
@@ -291,17 +549,35 @@ async fn a_price_query_that_was_not_sent_does_not_hold_the_slot() {
     let started = std::time::Instant::now();
     let err = calls::peer_call_price(&state, &peer).await.unwrap_err();
     assert!(format!("{err:?}").contains("call_price_unknown"), "{err:?}");
-    assert!(started.elapsed() < std::time::Duration::from_secs(1), "no wait for an unsent query");
-    let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "no wait for an unsent query"
+    );
+    let transport = Arc::new(common::ConnectedStubTransport::new(
+        vec![peer],
+        state.invoice_requests.clone(),
+    ));
     Arc::get_mut(&mut state).unwrap().transport = Arc::clone(&transport) as _;
     let answer = async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        state.peer_prices.update_kind_price(peer, 400, 10_000, 850_000).await;
+        state
+            .peer_prices
+            .update_kind_price(peer, 400, 10_000, 850_000)
+            .await;
     };
     let (price, ()) = tokio::join!(calls::peer_call_price(&state, &peer), answer);
     assert_eq!(price.unwrap(), 10_000);
-    let queries = transport.raw_frames.lock().unwrap().iter()
-        .filter(|f| matches!(konsensus_message::wire::Frame::from_bytes(f), Ok(konsensus_message::wire::Frame::PriceQuery { kind: 400 })))
+    let queries = transport
+        .raw_frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| {
+            matches!(
+                konsensus_message::wire::Frame::from_bytes(f),
+                Ok(konsensus_message::wire::Frame::PriceQuery { kind: 400 })
+            )
+        })
         .count();
     assert_eq!(queries, 1, "within the 2 s window, the retry still asked");
 }
@@ -317,16 +593,41 @@ async fn a_refused_signal_is_not_delivered_by_resync_or_counted_accepted() {
     Arc::get_mut(&mut state).unwrap().plaintext_cipher = Some(cipher.clone());
     let peer = NodeId::from_bytes([83; 32]);
     let text = body(402, &id(0x8300));
-    let env = UkmEnvelopeBuilder::new(402, peer, Recipient::Node(*state.identity.node_id()), vec![], PaymentProof::new([2; 32], [3; 32], 1000)).build();
+    let env = UkmEnvelopeBuilder::new(
+        402,
+        peer,
+        Recipient::Node(*state.identity.node_id()),
+        vec![],
+        PaymentProof::new([2; 32], [3; 32], 1000),
+    )
+    .build();
     // As the receive path leaves it: paid acceptance stored, plaintext cached.
-    assert!(matches!(state.storage.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::Accepted));
-    state.storage.store_message_plaintext(&env.id, &cipher.encrypt(text.as_bytes()).unwrap()).await.unwrap();
-    assert!(calls::admit_incoming(state.storage.as_ref(), &own(), &peer, 402, Some(&text)).await.is_err());
+    assert!(matches!(
+        state.storage.accept_paid_envelope(&env).await.unwrap(),
+        konsensus_storage::PaidAcceptance::Accepted
+    ));
+    state
+        .storage
+        .store_message_plaintext(&env.id, &cipher.encrypt(text.as_bytes()).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        calls::admit_incoming(state.storage.as_ref(), &own(), &peer, 402, Some(&text))
+            .await
+            .is_err()
+    );
     state.storage.reject_accepted_envelope(&env).await.unwrap();
     assert!(state.storage.get_message(&env.id).await.unwrap().is_none());
-    assert!(!state.storage.is_paid_envelope_accepted(&env).await.unwrap(), "no duplicate-ACK path");
+    assert!(
+        !state.storage.is_paid_envelope_accepted(&env).await.unwrap(),
+        "no duplicate-ACK path"
+    );
     // A resend of the same paid envelope is not re-accepted.
-    assert!(!matches!(state.storage.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::Accepted | konsensus_storage::PaidAcceptance::AlreadyAccepted));
+    assert!(!matches!(
+        state.storage.accept_paid_envelope(&env).await.unwrap(),
+        konsensus_storage::PaidAcceptance::Accepted
+            | konsensus_storage::PaidAcceptance::AlreadyAccepted
+    ));
     let mut ws = state.ws_broadcast.subscribe();
     let req = Request::builder()
         .method("POST")
@@ -349,15 +650,39 @@ async fn call_state_survives_a_restart() {
     let (theirs, mine) = (id(1), id(2));
     {
         let store = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
-        calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &theirs))).await.unwrap();
-        calls::admit_incoming(&store, &own(), &peer, 403, Some(&body(403, &theirs))).await.unwrap();
-        calls::reserve_outgoing(&store, &own(), &peer, 400, &body(400, &mine), "op-mine", "h").await.unwrap();
+        calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &theirs)))
+            .await
+            .unwrap();
+        calls::admit_incoming(&store, &own(), &peer, 403, Some(&body(403, &theirs)))
+            .await
+            .unwrap();
+        calls::reserve_outgoing(
+            &store,
+            &own(),
+            &peer,
+            400,
+            &body(400, &mine),
+            "op-mine",
+            "h",
+        )
+        .await
+        .unwrap();
         calls::commit_outgoing(&store, &peer, &body(400, &mine), "op-mine", "h").await;
         store.pool().close().await;
     }
     let store = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
-    assert!(calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &theirs))).await.is_err(), "burned id after restart");
-    assert!(calls::admit_incoming(&store, &own(), &peer, 401, Some(&body(401, &mine))).await.is_ok(), "our paid offer still rings");
+    assert!(
+        calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &theirs)))
+            .await
+            .is_err(),
+        "burned id after restart"
+    );
+    assert!(
+        calls::admit_incoming(&store, &own(), &peer, 401, Some(&body(401, &mine)))
+            .await
+            .is_ok(),
+        "our paid offer still rings"
+    );
 }
 
 /// Codex P1/P2: recovery settles what a crash left, from the operation journal.
@@ -365,21 +690,39 @@ async fn call_state_survives_a_restart() {
 async fn recovery_commits_paid_releases_unpaid_and_keeps_ambiguous() {
     let store = SqliteStorage::in_memory().await.unwrap();
     let peer = NodeId::from_bytes([87; 32]);
-    for (n, state) in [(1, Some("acked")), (2, Some("prepared")), (3, Some("payment_unknown")), (4, None)] {
+    for (n, state) in [
+        (1, Some("acked")),
+        (2, Some("prepared")),
+        (3, Some("payment_unknown")),
+        (4, None),
+    ] {
         let op = format!("00000000-0000-4000-8000-00000000000{n}");
-        calls::reserve_outgoing(&store, &own(), &peer, 400, &body(400, &id(n)), &op, "h").await.unwrap();
+        calls::reserve_outgoing(&store, &own(), &peer, 400, &body(400, &id(n)), &op, "h")
+            .await
+            .unwrap();
         if let Some(state) = state {
-            let mut row = konsensus_storage::OutboxOperation::prepared(op.clone(), peer.to_hex(), 400, "h".into());
+            let mut row = konsensus_storage::OutboxOperation::prepared(
+                op.clone(),
+                peer.to_hex(),
+                400,
+                "h".into(),
+            );
             assert!(store.insert_outbox_operation(&row).await.unwrap());
             row.state = state.into();
             assert!(store.update_outbox_operation(&row).await.unwrap());
         }
     }
     assert_eq!(calls::recover(&store).await.unwrap(), (1, 2));
-    assert_eq!(store.call_get(&peer, &id(1)).await.unwrap().unwrap().phase, Phase::Ringing);
+    assert_eq!(
+        store.call_get(&peer, &id(1)).await.unwrap().unwrap().phase,
+        Phase::Ringing
+    );
     assert!(store.call_get(&peer, &id(2)).await.unwrap().is_none());
     let kept = store.call_get(&peer, &id(3)).await.unwrap().unwrap();
-    assert_eq!((kept.phase, kept.pending.map(|p| p.kind)), (Phase::Reserved, Some(400)));
+    assert_eq!(
+        (kept.phase, kept.pending.map(|p| p.kind)),
+        (Phase::Reserved, Some(400))
+    );
     assert!(store.call_get(&peer, &id(4)).await.unwrap().is_none());
     // The kept one resolves when its same-operation retry finds it paid.
     let _ = CallSignal::parse(400, &body(400, &id(3))).unwrap();
@@ -394,18 +737,27 @@ async fn recovery_never_commits_a_call_under_another_requests_journal_row() {
     let store = SqliteStorage::in_memory().await.unwrap();
     let peer = NodeId::from_bytes([73; 32]);
     let op = "00000000-0000-4000-8000-0000000000a1".to_string();
-    calls::reserve_outgoing(&store, &own(), &peer, 400, &body(400, &id(1)), &op, "h").await.unwrap();
-    let mut chat = konsensus_storage::OutboxOperation::prepared(op.clone(), peer.to_hex(), 1, "h".into());
+    calls::reserve_outgoing(&store, &own(), &peer, 400, &body(400, &id(1)), &op, "h")
+        .await
+        .unwrap();
+    let mut chat =
+        konsensus_storage::OutboxOperation::prepared(op.clone(), peer.to_hex(), 1, "h".into());
     assert!(store.insert_outbox_operation(&chat).await.unwrap());
     chat.state = "acked".into();
     assert!(store.update_outbox_operation(&chat).await.unwrap());
     assert_eq!(calls::recover(&store).await.unwrap(), (0, 1));
-    assert!(store.call_get(&peer, &id(1)).await.unwrap().is_none(), "released, not ringing");
+    assert!(
+        store.call_get(&peer, &id(1)).await.unwrap().is_none(),
+        "released, not ringing"
+    );
     // Same for another recipient under the same payload hash and kind.
     let other = NodeId::from_bytes([72; 32]);
     let op2 = "00000000-0000-4000-8000-0000000000a2".to_string();
-    calls::reserve_outgoing(&store, &own(), &peer, 400, &body(400, &id(2)), &op2, "h").await.unwrap();
-    let mut elsewhere = konsensus_storage::OutboxOperation::prepared(op2.clone(), other.to_hex(), 400, "h".into());
+    calls::reserve_outgoing(&store, &own(), &peer, 400, &body(400, &id(2)), &op2, "h")
+        .await
+        .unwrap();
+    let mut elsewhere =
+        konsensus_storage::OutboxOperation::prepared(op2.clone(), other.to_hex(), 400, "h".into());
     assert!(store.insert_outbox_operation(&elsewhere).await.unwrap());
     elsewhere.state = "acked".into();
     assert!(store.update_outbox_operation(&elsewhere).await.unwrap());
@@ -422,15 +774,33 @@ async fn unknown_call_signals_never_evict_burned_ids() {
     let now = now_ms();
     for i in 0..MAX_BURNED_PER_PEER as usize {
         let ended = now - BURN_MIN_MS - 60_000 * (MAX_BURNED_PER_PEER - i as u64);
-        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None };
+        let entry = CallEntry {
+            side: Side::Callee,
+            phase: Phase::Ended,
+            deadline_ms: ended + TOMBSTONE_MS,
+            pending: None,
+        };
         store.call_put(&peer, &id(i), &entry).await.unwrap();
     }
     for kind in [401, 402, 403] {
-        assert!(calls::admit_incoming(&store, &own(), &peer, kind, Some(&body(kind, &id(9_000 + kind as usize)))).await.is_err());
+        assert!(calls::admit_incoming(
+            &store,
+            &own(),
+            &peer,
+            kind,
+            Some(&body(kind, &id(9_000 + kind as usize)))
+        )
+        .await
+        .is_err());
     }
-    assert!(store.call_get(&peer, &id(0)).await.unwrap().is_some(), "the oldest burned id is still there");
+    assert!(
+        store.call_get(&peer, &id(0)).await.unwrap().is_some(),
+        "the oldest burned id is still there"
+    );
     // An offer does make room, evicting exactly the oldest.
-    calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(9_999)))).await.unwrap();
+    calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(9_999))))
+        .await
+        .unwrap();
     assert!(store.call_get(&peer, &id(0)).await.unwrap().is_none());
     assert!(store.call_get(&peer, &id(1)).await.unwrap().is_some());
 }

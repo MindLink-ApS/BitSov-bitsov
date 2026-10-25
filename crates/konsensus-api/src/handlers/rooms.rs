@@ -1,6 +1,6 @@
 //! Room management endpoints.
 
-use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::auth::scoped::{Admin, Read, ScopedAuth};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -13,8 +13,8 @@ use konsensus_storage::Room;
 
 use crate::audit::events;
 use crate::error::ApiError;
-use crate::state::AppState;
 use crate::handlers::list_diagnostics::ListDiagnostics;
+use crate::state::AppState;
 
 /// Request to create a room.
 #[derive(Deserialize)]

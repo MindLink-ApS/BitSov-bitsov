@@ -159,9 +159,14 @@ pub(crate) struct Operation {
     execution_id: String,
 }
 impl Operation {
-    pub(crate) fn reservation_link(&self, readmission: bool) -> crate::spend_budget::OperationReservationLink {
+    pub(crate) fn reservation_link(
+        &self,
+        readmission: bool,
+    ) -> crate::spend_budget::OperationReservationLink {
         crate::spend_budget::OperationReservationLink {
-            operation_id: self.id.clone(), execution_id: self.execution_id.clone(), readmission,
+            operation_id: self.id.clone(),
+            execution_id: self.execution_id.clone(),
+            readmission,
         }
     }
     async fn load(&self) -> Result<OutboxOperation, ApiError> {
@@ -240,14 +245,28 @@ impl Operation {
         }
         if data.admission_pending {
             if data.admission_is_readmission {
-                let prior = if op.readmission_msat == 0 { Some(0) } else { data.readmission_fee_paid_msat };
-                data.readmission_fee_paid_msat = prior.and_then(|a| crate::handlers::payments::fee_paid_msat(&self.state.lightning_backend, details).and_then(|b| a.checked_add(b)));
+                let prior = if op.readmission_msat == 0 {
+                    Some(0)
+                } else {
+                    data.readmission_fee_paid_msat
+                };
+                data.readmission_fee_paid_msat = prior.and_then(|a| {
+                    crate::handlers::payments::fee_paid_msat(&self.state.lightning_backend, details)
+                        .and_then(|b| a.checked_add(b))
+                });
                 op.readmission_msat = op
                     .readmission_msat
                     .saturating_add(details.amount_msat as i64);
             } else {
-                let prior = if data.admission_msat == 0 { Some(0) } else { data.admission_fee_paid_msat };
-                data.admission_fee_paid_msat = prior.and_then(|a| crate::handlers::payments::fee_paid_msat(&self.state.lightning_backend, details).and_then(|b| a.checked_add(b)));
+                let prior = if data.admission_msat == 0 {
+                    Some(0)
+                } else {
+                    data.admission_fee_paid_msat
+                };
+                data.admission_fee_paid_msat = prior.and_then(|a| {
+                    crate::handlers::payments::fee_paid_msat(&self.state.lightning_backend, details)
+                        .and_then(|b| a.checked_add(b))
+                });
                 data.admission_msat = data.admission_msat.saturating_add(details.amount_msat);
                 data.budget_admission_msat = data
                     .budget_admission_msat
@@ -259,7 +278,13 @@ impl Operation {
         }
         if data.admission_is_readmission {
             if let Some(reservation) = data.admission_reservation.clone() {
-                queue_resolution(&mut data, reservation, details.fee_msat.and_then(|fee| details.amount_msat.checked_add(fee)));
+                queue_resolution(
+                    &mut data,
+                    reservation,
+                    details
+                        .fee_msat
+                        .and_then(|fee| details.amount_msat.checked_add(fee)),
+                );
             }
         }
         data.admission_pending = false;
@@ -431,19 +456,39 @@ async fn materialize(
 
 /// Sum only proven component fees. This is independent of budget reconciliation.
 fn reported_fee_paid_msat(backend: &str, op: &OutboxOperation, data: &Recovery) -> Option<u64> {
-    if backend != "ldk" || !data.ldk_fee_evidence || data.admission_pending { return None; }
-    if op.recovery_compacted { return data.compacted_fee_paid_msat; }
+    if backend != "ldk" || !data.ldk_fee_evidence || data.admission_pending {
+        return None;
+    }
+    if op.recovery_compacted {
+        return data.compacted_fee_paid_msat;
+    }
     let details = data.settlement.as_ref()?;
     if !settlement_matches(op, data, details)
         || u64::try_from(op.settled_msat).ok() != Some(details.amount_msat)
-    { return None; }
+    {
+        return None;
+    }
     let message_fee = crate::handlers::payments::fee_paid_msat(backend, details)?;
-    let admission_fee = if data.admission_msat > 0 { data.admission_fee_paid_msat? } else { 0 };
-    let readmission_fee = if op.readmission_msat > 0 { data.readmission_fee_paid_msat? } else { 0 };
-    message_fee.checked_add(admission_fee)?.checked_add(readmission_fee)
+    let admission_fee = if data.admission_msat > 0 {
+        data.admission_fee_paid_msat?
+    } else {
+        0
+    };
+    let readmission_fee = if op.readmission_msat > 0 {
+        data.readmission_fee_paid_msat?
+    } else {
+        0
+    };
+    message_fee
+        .checked_add(admission_fee)?
+        .checked_add(readmission_fee)
 }
 
-fn response(backend: &str, op: &OutboxOperation, delivered: bool) -> Result<ComposeResponse, ApiError> {
+fn response(
+    backend: &str,
+    op: &OutboxOperation,
+    delivered: bool,
+) -> Result<ComposeResponse, ApiError> {
     let data = recovery(op)?;
     Ok(ComposeResponse {
         operation_id: Some(op.operation_id.clone()),
@@ -525,19 +570,39 @@ pub(super) async fn compose_call(
     // signal is refused before any reservation. A retry of an operation that
     // already paid is answered from the journal, without reserving.
     let request_hash = request_digest(&peer, &req)?;
-    let journal = state.storage.get_outbox_operation(&id).await.map_err(storage)?;
+    let journal = state
+        .storage
+        .get_outbox_operation(&id)
+        .await
+        .map_err(storage)?;
     if let Some(op) = journal.as_ref().filter(|op| op.state == "abandoned") {
-        return Err(contextual(ApiError::OperationConflict("operation_abandoned"), op));
+        return Err(contextual(
+            ApiError::OperationConflict("operation_abandoned"),
+            op,
+        ));
     }
-    if let Some(op) = journal.as_ref().filter(|op| op.request_hash != request_hash) {
+    if let Some(op) = journal
+        .as_ref()
+        .filter(|op| op.request_hash != request_hash)
+    {
         return Err(mismatch(op));
     }
     let paid = journal.as_ref().is_some_and(|op| {
-        konsensus_core::payloads::call::settlement(Some(&op.state)) == konsensus_core::payloads::call::Settlement::Paid
+        konsensus_core::payloads::call::settlement(Some(&op.state))
+            == konsensus_core::payloads::call::Settlement::Paid
     });
     let plaintext = req.plaintext.clone();
     if !paid {
-        crate::calls::reserve_outgoing(state.storage.as_ref(), state.identity.node_id(), &peer, req.kind, &plaintext, &id, &request_hash).await?;
+        crate::calls::reserve_outgoing(
+            state.storage.as_ref(),
+            state.identity.node_id(),
+            &peer,
+            req.kind,
+            &plaintext,
+            &id,
+            &request_hash,
+        )
+        .await?;
     }
     let result = compose_locked(
         auth,
@@ -547,8 +612,16 @@ pub(super) async fn compose_call(
         peer,
         id.clone(),
         super::compose::ComposePolicy::default(),
-    ).await;
-    crate::calls::resolve_outgoing(state.storage.as_ref(), &peer, &plaintext, &id, &request_hash).await;
+    )
+    .await;
+    crate::calls::resolve_outgoing(
+        state.storage.as_ref(),
+        &peer,
+        &plaintext,
+        &id,
+        &request_hash,
+    )
+    .await;
     result
 }
 
@@ -592,7 +665,10 @@ async fn compose_locked(
         // Missing-row tombstones intentionally have no request hash. Refuse
         // them before mismatch checks or any recovery/re-payment work.
         if op.state == "abandoned" {
-            return Err(contextual(ApiError::OperationConflict("operation_abandoned"), &op));
+            return Err(contextual(
+                ApiError::OperationConflict("operation_abandoned"),
+                &op,
+            ));
         }
         if op.request_hash != digest {
             return Err(mismatch(&op));
@@ -602,10 +678,7 @@ async fn compose_locked(
         // Reopen those only; genuine terminal rejects stay failed_paid.
         // Compaction strips recovery evidence (dispatched/envelope_ready) but is
         // payload retention, not re-payment authorization — never reopen compacted.
-        if op.state == "failed_paid"
-            && !op.recovery_compacted
-            && incomplete_settled_recovery(&op)
-        {
+        if op.state == "failed_paid" && !op.recovery_compacted && incomplete_settled_recovery(&op) {
             op.state = "payment_unknown".into();
             save(&state, &mut op).await?;
         }
@@ -661,8 +734,15 @@ async fn compose_locked(
         execution_id,
     };
     let wait = req.wait_ack_ms;
-    let result =
-        super::compose::compose_peer(auth, state.clone(), req, references, operation.clone(), policy).await;
+    let result = super::compose::compose_peer(
+        auth,
+        state.clone(),
+        req,
+        references,
+        operation.clone(),
+        policy,
+    )
+    .await;
     match result {
         Ok(result) => wait_response(&state, &id, wait, result.0.delivered).await,
         Err(error) => {
@@ -798,19 +878,43 @@ pub(super) async fn abandon_operation(
     let _guard = lock(&state, &id).await?;
     let mut op = OutboxOperation::prepared(id.clone(), String::new(), 0, String::new());
     op.state = "abandoned".into();
-    encode(&mut op, &Recovery { caller: caller(&auth), ..Default::default() })?;
-    if state.storage.insert_outbox_operation(&op).await.map_err(storage)? {
-        crate::calls::release_abandoned(state.storage.as_ref(), &id).await.map_err(storage)?;
-        return Ok((StatusCode::OK, Json(response(&state.lightning_backend, &op, false)?)));
+    encode(
+        &mut op,
+        &Recovery {
+            caller: caller(&auth),
+            ..Default::default()
+        },
+    )?;
+    if state
+        .storage
+        .insert_outbox_operation(&op)
+        .await
+        .map_err(storage)?
+    {
+        crate::calls::release_abandoned(state.storage.as_ref(), &id)
+            .await
+            .map_err(storage)?;
+        return Ok((
+            StatusCode::OK,
+            Json(response(&state.lightning_backend, &op, false)?),
+        ));
     }
-    op = state.storage.get_outbox_operation(&id).await.map_err(storage)?
+    op = state
+        .storage
+        .get_outbox_operation(&id)
+        .await
+        .map_err(storage)?
         .ok_or_else(|| storage("missing operation"))?;
     let mut data = recovery(&op)?;
     if caller(&auth).is_some() && caller(&auth) != data.caller {
-        return Err(ApiError::Forbidden("operation belongs to another caller".into()));
+        return Err(ApiError::Forbidden(
+            "operation belongs to another caller".into(),
+        ));
     }
     if op.state == "abandoned" {
-        crate::calls::release_abandoned(state.storage.as_ref(), &id).await.map_err(storage)?;
+        crate::calls::release_abandoned(state.storage.as_ref(), &id)
+            .await
+            .map_err(storage)?;
     }
     if matches!(op.state.as_str(), "prepared" | "released")
         && proven_unpaid(&state, &op, &data).await
@@ -821,18 +925,37 @@ pub(super) async fn abandon_operation(
         op.state = "abandoned".into();
         encode(&mut op, &data)?;
         op.updated_at = chrono::Utc::now().timestamp_millis();
-        if state.storage.update_outbox_operation(&op).await.map_err(storage)? {
-            crate::calls::release_abandoned(state.storage.as_ref(), &id).await.map_err(storage)?;
-            return Ok((StatusCode::OK, Json(response(&state.lightning_backend, &op, false)?)));
+        if state
+            .storage
+            .update_outbox_operation(&op)
+            .await
+            .map_err(storage)?
+        {
+            crate::calls::release_abandoned(state.storage.as_ref(), &id)
+                .await
+                .map_err(storage)?;
+            return Ok((
+                StatusCode::OK,
+                Json(response(&state.lightning_backend, &op, false)?),
+            ));
         }
         // A different process may have claimed the row. Its current receipt
         // must keep the caller's spending fence in place.
-        op = state.storage.get_outbox_operation(&id).await.map_err(storage)?
+        op = state
+            .storage
+            .get_outbox_operation(&id)
+            .await
+            .map_err(storage)?
             .ok_or_else(|| storage("missing operation"))?;
     }
-    Ok((StatusCode::CONFLICT, Json(response(
-        &state.lightning_backend, &op, op.last_sent_at.is_some() || op.state == "acked",
-    )?)))
+    Ok((
+        StatusCode::CONFLICT,
+        Json(response(
+            &state.lightning_backend,
+            &op,
+            op.last_sent_at.is_some() || op.state == "acked",
+        )?),
+    ))
 }
 
 pub(super) async fn get_operation(
@@ -861,16 +984,27 @@ pub(super) async fn get_operation(
 /// Checkpoint the original operation before another compose clears its peer
 /// journal. A failed/ambiguous SQL write leaves the false dispatch marker intact.
 pub(super) async fn record_undispatched_admission(
-    state: &AppState, peer: &NodeId, link: &crate::spend_budget::OperationReservationLink,
+    state: &AppState,
+    peer: &NodeId,
+    link: &crate::spend_budget::OperationReservationLink,
     reservation: Option<&Reservation>,
 ) -> Result<(), ApiError> {
-    let Some(mut op) = state.storage.get_outbox_operation(&link.operation_id).await.map_err(storage)? else { return Ok(()); };
+    let Some(mut op) = state
+        .storage
+        .get_outbox_operation(&link.operation_id)
+        .await
+        .map_err(storage)?
+    else {
+        return Ok(());
+    };
     let mut data = recovery(&op)?;
     if op.recipient != peer.to_hex() || data.execution_id.as_deref() != Some(&link.execution_id) {
         return Ok(());
     }
     if data.dispatched {
-        return Err(ApiError::PaymentUnresolved("cannot undo admission after message dispatch".into()));
+        return Err(ApiError::PaymentUnresolved(
+            "cannot undo admission after message dispatch".into(),
+        ));
     }
     // Fence even an admission_started UPDATE still queued in the SQL worker.
     // Its fields may not be visible yet, but its old version must never commit
@@ -893,13 +1027,19 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
     recover_budget(state, op).await?;
     let mut data = recovery(op)?;
     // Settlement evidence is monotonic even while proof retrieval is incomplete.
-    if let Some(details) = data.settlement.as_ref().filter(|d| settlement_matches(op, &data, d)) {
+    if let Some(details) = data
+        .settlement
+        .as_ref()
+        .filter(|d| settlement_matches(op, &data, d))
+    {
         op.settled_msat = i64::try_from(details.amount_msat).map_err(storage)?;
     }
     if data.admission_pending && !data.dispatched {
         let peer = NodeId::from_hex(&op.recipient).map_err(storage)?;
         if let Some(hash) = op.admission_payment_hash.clone() {
-            if super::admission_journal::load(state, &peer)?.is_some_and(|a| a.payment_hash == hash && !a.dispatch_started) {
+            if super::admission_journal::load(state, &peer)?
+                .is_some_and(|a| a.payment_hash == hash && !a.dispatch_started)
+            {
                 data.admission_pending = false;
                 if let Some(reservation) = data.admission_reservation.take() {
                     queue_resolution(&mut data, reservation, Some(0));
@@ -940,22 +1080,49 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
                 let admission_reservation = data.admission_reservation.clone();
                 if data.admission_is_readmission {
                     if principal > 0 {
-                        let prior = if op.readmission_msat == 0 { Some(0) } else { data.readmission_fee_paid_msat };
-                        data.readmission_fee_paid_msat = prior.and_then(|a| crate::handlers::payments::fee_paid_msat(&state.lightning_backend, &details).and_then(|b| a.checked_add(b)));
+                        let prior = if op.readmission_msat == 0 {
+                            Some(0)
+                        } else {
+                            data.readmission_fee_paid_msat
+                        };
+                        data.readmission_fee_paid_msat = prior.and_then(|a| {
+                            crate::handlers::payments::fee_paid_msat(
+                                &state.lightning_backend,
+                                &details,
+                            )
+                            .and_then(|b| a.checked_add(b))
+                        });
                     }
                     op.readmission_msat = op.readmission_msat.saturating_add(principal as i64);
                 } else {
                     if principal > 0 {
-                        let prior = if data.admission_msat == 0 { Some(0) } else { data.admission_fee_paid_msat };
-                        data.admission_fee_paid_msat = prior.and_then(|a| crate::handlers::payments::fee_paid_msat(&state.lightning_backend, &details).and_then(|b| a.checked_add(b)));
+                        let prior = if data.admission_msat == 0 {
+                            Some(0)
+                        } else {
+                            data.admission_fee_paid_msat
+                        };
+                        data.admission_fee_paid_msat = prior.and_then(|a| {
+                            crate::handlers::payments::fee_paid_msat(
+                                &state.lightning_backend,
+                                &details,
+                            )
+                            .and_then(|b| a.checked_add(b))
+                        });
                     }
                     data.admission_msat = data.admission_msat.saturating_add(principal);
-                    data.budget_admission_msat = data.budget_admission_msat.saturating_add(principal);
-                    data.admission_fee_msat = data.admission_fee_msat.and_then(|prior| fee.and_then(|f| prior.checked_add(f)));
+                    data.budget_admission_msat =
+                        data.budget_admission_msat.saturating_add(principal);
+                    data.admission_fee_msat = data
+                        .admission_fee_msat
+                        .and_then(|prior| fee.and_then(|f| prior.checked_add(f)));
                 }
                 if data.admission_is_readmission {
                     if let Some(reservation) = admission_reservation {
-                        queue_resolution(&mut data, reservation, fee.and_then(|f| principal.checked_add(f)));
+                        queue_resolution(
+                            &mut data,
+                            reservation,
+                            fee.and_then(|f| principal.checked_add(f)),
+                        );
                     }
                 }
                 queue_message_resolution(&mut data, 0, Some(0));
@@ -1016,7 +1183,7 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
             Some(hash) => {
                 ldk_fee_evidence = state.lightning_backend == "ldk";
                 state.lightning.get_payment_status(hash).await.ok()
-            },
+            }
             None => None,
         },
     };
@@ -1101,16 +1268,26 @@ fn settlement_preimage(details: &PaymentDetails) -> Option<[u8; 32]> {
 }
 
 fn queue_resolution(data: &mut Recovery, reservation: Reservation, actual_msat: Option<u64>) {
-    if let Some(existing) = data.budget_resolutions.iter_mut().find(|r| r.reservation.id == reservation.id && r.reservation.op_id == reservation.op_id) {
-        if existing.actual_msat.is_none() { existing.actual_msat = actual_msat; }
+    if let Some(existing) = data
+        .budget_resolutions
+        .iter_mut()
+        .find(|r| r.reservation.id == reservation.id && r.reservation.op_id == reservation.op_id)
+    {
+        if existing.actual_msat.is_none() {
+            existing.actual_msat = actual_msat;
+        }
     } else {
-        data.budget_resolutions.push(BudgetResolution { reservation, actual_msat });
+        data.budget_resolutions.push(BudgetResolution {
+            reservation,
+            actual_msat,
+        });
     }
 }
 
 fn queue_message_resolution(data: &mut Recovery, principal: u64, fee: Option<u64>) {
     if let Some(reservation) = data.reservation.clone() {
-        let total = fee.and_then(|fee| principal.checked_add(fee))
+        let total = fee
+            .and_then(|fee| principal.checked_add(fee))
             .and_then(|v| v.checked_add(data.budget_admission_msat))
             .and_then(|v| data.admission_fee_msat.and_then(|fee| v.checked_add(fee)));
         queue_resolution(data, reservation, total);
@@ -1118,16 +1295,24 @@ fn queue_message_resolution(data: &mut Recovery, principal: u64, fee: Option<u64
 }
 
 async fn drain_resolutions(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
-    let Some(service) = &state.pairing else { return Ok(()); };
+    let Some(service) = &state.pairing else {
+        return Ok(());
+    };
     let mut data = recovery(op)?;
     let before = data.budget_resolutions.len();
     for resolution in &data.budget_resolutions {
         if let Some(actual) = resolution.actual_msat {
-            service.try_resolve_spend(&resolution.reservation, &op.recipient, actual).map_err(storage)?;
-            if data.reservation.as_ref().is_some_and(|r| r.id == resolution.reservation.id && r.op_id == resolution.reservation.op_id) {
+            service
+                .try_resolve_spend(&resolution.reservation, &op.recipient, actual)
+                .map_err(storage)?;
+            if data.reservation.as_ref().is_some_and(|r| {
+                r.id == resolution.reservation.id && r.op_id == resolution.reservation.op_id
+            }) {
                 data.reservation = None;
             }
-            if data.admission_reservation.as_ref().is_some_and(|r| r.id == resolution.reservation.id && r.op_id == resolution.reservation.op_id) {
+            if data.admission_reservation.as_ref().is_some_and(|r| {
+                r.id == resolution.reservation.id && r.op_id == resolution.reservation.op_id
+            }) {
                 data.admission_reservation = None;
             }
         }
@@ -1170,9 +1355,11 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
     // exists. Its later tombstone is outside list_recoverable_operations, so
     // use pending reservations as durable cleanup intents too.
     match state.storage.call_pending().await {
-        Ok(pending) => ids.extend(pending.into_iter().filter_map(|(_, _, entry)| {
-            entry.pending.map(|p| p.operation_id)
-        })),
+        Ok(pending) => ids.extend(
+            pending
+                .into_iter()
+                .filter_map(|(_, _, entry)| entry.pending.map(|p| p.operation_id)),
+        ),
         Err(error) => tracing::warn!(%error, "call reservation cleanup deferred"),
     }
     // Never let this listing hold up recovery of paid or unresolved rows.
@@ -1195,7 +1382,9 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             // Ledger links can union abandoned IDs back in after the SQL
             // exclusion. A cancelled debit may never have reached the row.
             if op.state == "abandoned" {
-                crate::calls::release_abandoned(state.storage.as_ref(), &id).await.map_err(storage)?;
+                crate::calls::release_abandoned(state.storage.as_ref(), &id)
+                    .await
+                    .map_err(storage)?;
                 if let Some(linked) = links.get(&id) {
                     let mut data = recovery(&op)?;
                     if proven_unpaid(state, &op, &data).await {
@@ -1272,7 +1461,9 @@ async fn proven_unpaid(state: &AppState, op: &OutboxOperation, data: &Recovery) 
             || a.envelope.is_some()
             || a.settled_at_unix.is_some()
             || a.readmission.as_ref().is_some_and(|r| r.reported)
-            || a.operation.as_ref().is_some_and(|l| l.operation_id != op.operation_id)
+            || a.operation
+                .as_ref()
+                .is_some_and(|l| l.operation_id != op.operation_id)
         {
             return false;
         }
@@ -1416,7 +1607,10 @@ async fn compact_terminal_operations(
             if op.accounting_pending
                 || op.recovery_compacted
                 || op.updated_at >= cutoff
-                || !matches!(op.state.as_str(), "acked" | "failed_paid" | "released" | "abandoned")
+                || !matches!(
+                    op.state.as_str(),
+                    "acked" | "failed_paid" | "released" | "abandoned"
+                )
             {
                 return Ok(());
             }
@@ -1427,7 +1621,8 @@ async fn compact_terminal_operations(
             if op.accounting_pending {
                 return save(state, &mut op).await;
             }
-            let compacted_fee_paid_msat = reported_fee_paid_msat(&state.lightning_backend, &op, &data);
+            let compacted_fee_paid_msat =
+                reported_fee_paid_msat(&state.lightning_backend, &op, &data);
             let receipt = Recovery {
                 ldk_fee_evidence: data.ldk_fee_evidence,
                 compacted_fee_paid_msat,
@@ -1448,7 +1643,6 @@ async fn compact_terminal_operations(
     Ok(())
 }
 
-
 fn settlement_matches(op: &OutboxOperation, data: &Recovery, details: &PaymentDetails) -> bool {
     details.status == PaymentStatus::Settled
         && details.direction == PaymentDirection::Outgoing
@@ -1457,21 +1651,34 @@ fn settlement_matches(op: &OutboxOperation, data: &Recovery, details: &PaymentDe
 }
 
 async fn recover_budget(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
-    if !op.accounting_pending { return Ok(()); }
+    if !op.accounting_pending {
+        return Ok(());
+    }
     let mut data = recovery(op)?;
     let before = op.recovery.clone();
     let was_pending = op.accounting_pending;
-    if let Some(details) = data.settlement.clone().filter(|d| settlement_matches(op, &data, d)) {
+    if let Some(details) = data
+        .settlement
+        .clone()
+        .filter(|d| settlement_matches(op, &data, d))
+    {
         queue_message_resolution(&mut data, details.amount_msat, details.fee_msat);
     } else if op.state == "released"
         || (!data.dispatched && !data.admission_pending && !data.envelope_ready)
-        || (data.envelope_ready && !data.dispatched && data.expected_msat == 0
-            && data.draft.as_ref().is_some_and(|env| env.payment_proof.amount_msat == 0))
+        || (data.envelope_ready
+            && !data.dispatched
+            && data.expected_msat == 0
+            && data
+                .draft
+                .as_ref()
+                .is_some_and(|env| env.payment_proof.amount_msat == 0))
     {
         queue_message_resolution(&mut data, 0, Some(0));
     }
     encode(op, &data)?;
-    if op.recovery != before || op.accounting_pending != was_pending { save(state, op).await?; }
+    if op.recovery != before || op.accounting_pending != was_pending {
+        save(state, op).await?;
+    }
     drain_resolutions(state, op).await
 }
 
@@ -1515,10 +1722,7 @@ fn paces() -> std::sync::MutexGuard<'static, HashMap<String, Pace>> {
 /// Drop pacing for operations that are no longer recoverable.
 fn prune_paces(state: &AppState, live: &std::collections::BTreeSet<String>) {
     let prefix = pace_prefix(state);
-    paces().retain(|key, _| {
-        key.strip_prefix(&prefix)
-            .is_none_or(|id| live.contains(id))
-    });
+    paces().retain(|key, _| key.strip_prefix(&prefix).is_none_or(|id| live.contains(id)));
 }
 
 /// Exponential delay capped at [`RESEND_CAP`], with deterministic
@@ -1578,7 +1782,14 @@ async fn recover_paid(state: &AppState, op: &mut OutboxOperation) -> Result<(), 
         } else if link == Link::Offline {
             // Nothing is sent while offline; remember it so the next
             // connection counts as a reconnect.
-            paces.insert(key, Pace { failures: 0, due: now, link });
+            paces.insert(
+                key,
+                Pace {
+                    failures: 0,
+                    due: now,
+                    link,
+                },
+            );
             return Ok(());
         }
     }
@@ -1587,13 +1798,16 @@ async fn recover_paid(state: &AppState, op: &mut OutboxOperation) -> Result<(), 
     if matches!(result, Ok(true)) {
         paces.remove(&key);
     } else {
-        let pace = paces.entry(key).or_insert(Pace { failures: 0, due: now, link });
+        let pace = paces.entry(key).or_insert(Pace {
+            failures: 0,
+            due: now,
+            link,
+        });
         pace.failures = pace.failures.saturating_add(1);
         pace.due = now + resend_delay(&op.operation_id, pace.failures);
         pace.link = link;
     }
     result.map(|_| ())
-
 }
 
 /// Early #113 builds terminalized settled-without-proof / missing-draft as
@@ -1613,7 +1827,8 @@ mod actual_fee_tests {
     use serde_json::{json, Value};
 
     fn receipt(fee: Option<u64>) -> (OutboxOperation, Recovery) {
-        let mut op = OutboxOperation::prepared("fee-test".into(), "peer".into(), 1, "request".into());
+        let mut op =
+            OutboxOperation::prepared("fee-test".into(), "peer".into(), 1, "request".into());
         op.payment_hash = Some("ab".repeat(32));
         op.settled_msat = 1000;
         op.state = "paid".into();
@@ -1621,9 +1836,14 @@ mod actual_fee_tests {
             expected_msat: 1000,
             ldk_fee_evidence: true,
             settlement: Some(PaymentDetails {
-                payment_hash: "ab".repeat(32), preimage: Some("cd".repeat(32)),
-                amount_msat: 1000, status: PaymentStatus::Settled,
-                direction: PaymentDirection::Outgoing, timestamp: 0, memo: None, fee_msat: fee,
+                payment_hash: "ab".repeat(32),
+                preimage: Some("cd".repeat(32)),
+                amount_msat: 1000,
+                status: PaymentStatus::Settled,
+                direction: PaymentDirection::Outgoing,
+                timestamp: 0,
+                memo: None,
+                fee_msat: fee,
             }),
             fee_ceiling_msat: 5000,
             ..Default::default()
@@ -1654,10 +1874,14 @@ mod actual_fee_tests {
         data.admission_fee_msat = Some(0);
         assert_eq!(wire("ldk", op.clone(), data.clone())["fee_paid_msat"], 450);
         data.readmission_fee_paid_msat = None;
-        assert!(wire("ldk", op.clone(), data.clone()).get("fee_paid_msat").is_none());
+        assert!(wire("ldk", op.clone(), data.clone())
+            .get("fee_paid_msat")
+            .is_none());
         op.readmission_msat = 0;
         data.admission_fee_paid_msat = None;
-        assert!(wire("ldk", op.clone(), data.clone()).get("fee_paid_msat").is_none());
+        assert!(wire("ldk", op.clone(), data.clone())
+            .get("fee_paid_msat")
+            .is_none());
         data.admission_fee_paid_msat = Some(u64::MAX);
         assert!(wire("ldk", op, data).get("fee_paid_msat").is_none());
     }
@@ -1672,7 +1896,12 @@ mod actual_fee_tests {
         let (mut checkpoint, data) = receipt(Some(400));
         checkpoint.settled_msat = 0;
         assert!(wire("ldk", checkpoint, data).get("fee_paid_msat").is_none());
-        for status in [PaymentStatus::Pending, PaymentStatus::InFlight, PaymentStatus::Failed, PaymentStatus::Expired] {
+        for status in [
+            PaymentStatus::Pending,
+            PaymentStatus::InFlight,
+            PaymentStatus::Failed,
+            PaymentStatus::Expired,
+        ] {
             let (op, mut data) = receipt(Some(0));
             data.settlement.as_mut().unwrap().status = status;
             assert!(wire("ldk", op, data).get("fee_paid_msat").is_none());
@@ -1699,8 +1928,15 @@ mod actual_fee_tests {
         let (mut op, data) = receipt(Some(400));
         let fee = reported_fee_paid_msat("ldk", &op, &data);
         op.recovery_compacted = true;
-        let compacted = Recovery { ldk_fee_evidence: true, compacted_fee_paid_msat: fee, fee_ceiling_msat: 5000, ..Default::default() };
+        let compacted = Recovery {
+            ldk_fee_evidence: true,
+            compacted_fee_paid_msat: fee,
+            fee_ceiling_msat: 5000,
+            ..Default::default()
+        };
         assert_eq!(wire("ldk", op.clone(), compacted)["fee_paid_msat"], 400);
-        assert!(wire("ldk", op, Recovery::default()).get("fee_paid_msat").is_none());
+        assert!(wire("ldk", op, Recovery::default())
+            .get("fee_paid_msat")
+            .is_none());
     }
 }

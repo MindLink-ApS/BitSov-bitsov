@@ -165,10 +165,7 @@ impl<S: Storage> EncryptedStorage<S> {
     }
 
     /// Encrypt an optional string field.
-    fn encrypt_opt_string(
-        &self,
-        opt: &Option<String>,
-    ) -> Result<Option<String>, StorageError> {
+    fn encrypt_opt_string(&self, opt: &Option<String>) -> Result<Option<String>, StorageError> {
         match opt {
             Some(s) => Ok(Some(self.encrypt_string(s)?)),
             None => Ok(None),
@@ -176,10 +173,7 @@ impl<S: Storage> EncryptedStorage<S> {
     }
 
     /// Decrypt an optional hex-encoded encrypted string field.
-    fn decrypt_opt_string(
-        &self,
-        opt: &Option<String>,
-    ) -> Result<Option<String>, StorageError> {
+    fn decrypt_opt_string(&self, opt: &Option<String>) -> Result<Option<String>, StorageError> {
         match opt {
             Some(s) => Ok(Some(self.decrypt_string(s)?)),
             None => Ok(None),
@@ -365,10 +359,14 @@ impl<S: Storage> EncryptedStorage<S> {
 
     fn record_list_health<T>(&self, result: &crate::StorageList<T>) {
         let mut health = self.read_health.lock().unwrap_or_else(|e| e.into_inner());
-        health.storage_unreadable_rows = health.storage_unreadable_rows.saturating_add(result.unreadable_count);
+        health.storage_unreadable_rows = health
+            .storage_unreadable_rows
+            .saturating_add(result.unreadable_count);
         if result.storage_key_mismatch() && !health.storage_key_mismatch {
             health.storage_key_mismatch = true;
-            tracing::error!("storage_key_mismatch: at least half of a storage list could not be read");
+            tracing::error!(
+                "storage_key_mismatch: at least half of a storage list could not be read"
+            );
         }
     }
 
@@ -399,7 +397,10 @@ impl<S: Storage> EncryptedStorage<S> {
                 let at = position(&row);
                 match decrypt(&row) {
                     Ok(item) => {
-                        result.readable_cursors.push(crate::ListCursor { timestamp: at.timestamp.to_string(), id: at.id.clone() });
+                        result.readable_cursors.push(crate::ListCursor {
+                            timestamp: at.timestamp.to_string(),
+                            id: at.id.clone(),
+                        });
                         result.items.push(item);
                     }
                     Err(_) => {
@@ -409,22 +410,31 @@ impl<S: Storage> EncryptedStorage<S> {
                 }
                 cursor = Some(at);
                 scanned += 1;
-                if result.items.len() == limit as usize { break; }
+                if result.items.len() == limit as usize {
+                    break;
+                }
             }
-            if exhausted { break; }
+            if exhausted {
+                break;
+            }
         }
         // Even an exhausted scan must let clients advance past unreadable rows.
         // Only a subsequent empty scan without omissions is unambiguous exhaustion.
-        if result.unreadable_count > 0 || (scanned == budget && result.items.len() < limit as usize) {
+        if result.unreadable_count > 0 || (scanned == budget && result.items.len() < limit as usize)
+        {
             result.continuation = cursor.map(|at| crate::ListCursor {
-                timestamp: at.timestamp.to_string(), id: at.id,
+                timestamp: at.timestamp.to_string(),
+                id: at.id,
             });
         }
         self.record_list_health(&result);
         Ok(result)
     }
 
-    fn decrypt_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<crate::OutboxOperation, StorageError> {
+    fn decrypt_outbox_operation(
+        &self,
+        op: &crate::OutboxOperation,
+    ) -> Result<crate::OutboxOperation, StorageError> {
         let mut op = op.clone();
         // Empty recovery is valid for existing compacted tombstones.
         if !op.recovery.is_empty() {
@@ -441,19 +451,30 @@ impl<S: Storage> EncryptedStorage<S> {
 
 #[async_trait]
 impl<S: Storage> Storage for EncryptedStorage<S> {
-    async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
+    async fn starter_request_get(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         self.inner.starter_request_get(id).await
     }
 
-    async fn starter_request_current(&self) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
+    async fn starter_request_current(
+        &self,
+    ) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         self.inner.starter_request_current().await
     }
 
-    async fn starter_request_create(&self, r: &crate::starter_request::StarterRequest) -> Result<(crate::starter_request::StarterRequest, bool), StorageError> {
+    async fn starter_request_create(
+        &self,
+        r: &crate::starter_request::StarterRequest,
+    ) -> Result<(crate::starter_request::StarterRequest, bool), StorageError> {
         self.inner.starter_request_create(r).await
     }
 
-    async fn starter_request_adopt(&self, r: &crate::starter_request::StarterRequest) -> Result<crate::starter_request::StarterRequest, StorageError> {
+    async fn starter_request_adopt(
+        &self,
+        r: &crate::starter_request::StarterRequest,
+    ) -> Result<crate::starter_request::StarterRequest, StorageError> {
         self.inner.starter_request_adopt(r).await
     }
 
@@ -461,14 +482,20 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.starter_request_rearm(id).await
     }
 
-    async fn starter_request_save(&self, r: &crate::starter_request::StarterRequest) -> Result<(), StorageError> {
+    async fn starter_request_save(
+        &self,
+        r: &crate::starter_request::StarterRequest,
+    ) -> Result<(), StorageError> {
         self.inner.starter_request_save(r).await
     }
 
-    async fn starter_request_retry(&self, id: &str, now: i64) -> Result<crate::starter_request::StarterRequest, StorageError> {
+    async fn starter_request_retry(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<crate::starter_request::StarterRequest, StorageError> {
         self.inner.starter_request_retry(id, now).await
     }
-
 
     fn storage_read_health(&self) -> crate::StorageReadHealth {
         *self.read_health.lock().unwrap_or_else(|e| e.into_inner())
@@ -478,17 +505,30 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.record_outbox_sent(id, peer).await
     }
 
-    async fn commit_outbox_envelope(&self, op: &crate::OutboxOperation, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
-        let mut encrypted = op.clone(); encrypted.recovery = self.encrypt(&op.recovery)?;
-        self.inner.commit_outbox_envelope(&encrypted, &self.encrypt_envelope(envelope)?).await
+    async fn commit_outbox_envelope(
+        &self,
+        op: &crate::OutboxOperation,
+        envelope: &UkmEnvelope,
+    ) -> Result<bool, StorageError> {
+        let mut encrypted = op.clone();
+        encrypted.recovery = self.encrypt(&op.recovery)?;
+        self.inner
+            .commit_outbox_envelope(&encrypted, &self.encrypt_envelope(envelope)?)
+            .await
     }
 
-    async fn insert_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
+    async fn insert_outbox_operation(
+        &self,
+        op: &crate::OutboxOperation,
+    ) -> Result<bool, StorageError> {
         let mut encrypted = op.clone();
         encrypted.recovery = self.encrypt(&op.recovery)?;
         self.inner.insert_outbox_operation(&encrypted).await
     }
-    async fn update_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
+    async fn update_outbox_operation(
+        &self,
+        op: &crate::OutboxOperation,
+    ) -> Result<bool, StorageError> {
         let mut encrypted = op.clone();
         encrypted.recovery = self.encrypt(&op.recovery)?;
         self.inner.update_outbox_operation(&encrypted).await
@@ -520,55 +560,118 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     async fn starter_counters(&self) -> Result<crate::starter::StarterCounters, StorageError> {
         self.inner.starter_counters().await
     }
-    async fn insert_channel_open_operation(&self, op: &crate::ChannelOpenOperation) -> Result<bool, StorageError> {
+    async fn insert_channel_open_operation(
+        &self,
+        op: &crate::ChannelOpenOperation,
+    ) -> Result<bool, StorageError> {
         let mut encrypted = op.clone();
         encrypted.request = self.encrypt(&op.request)?;
         encrypted.result = op.result.as_deref().map(|r| self.encrypt(r)).transpose()?;
         self.inner.insert_channel_open_operation(&encrypted).await
     }
-    async fn get_channel_open_operation(&self, id: &str) -> Result<Option<crate::ChannelOpenOperation>, StorageError> {
-        let Some(mut op) = self.inner.get_channel_open_operation(id).await? else { return Ok(None) };
+    async fn get_channel_open_operation(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::ChannelOpenOperation>, StorageError> {
+        let Some(mut op) = self.inner.get_channel_open_operation(id).await? else {
+            return Ok(None);
+        };
         op.request = self.decrypt(&op.request)?;
         op.result = op.result.as_deref().map(|r| self.decrypt(r)).transpose()?;
         Ok(Some(op))
     }
-    async fn resolve_channel_open_operation(&self, id: &str, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
+    async fn resolve_channel_open_operation(
+        &self,
+        id: &str,
+        state: &str,
+        result: Option<&[u8]>,
+        last_error: Option<&str>,
+    ) -> Result<bool, StorageError> {
         let result = result.map(|r| self.encrypt(r)).transpose()?;
-        self.inner.resolve_channel_open_operation(id, state, result.as_deref(), last_error).await
+        self.inner
+            .resolve_channel_open_operation(id, state, result.as_deref(), last_error)
+            .await
     }
     async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
         self.inner.delete_pending_channel_open_operation(id).await
     }
-    async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
+    async fn get_outbox_operation(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::OutboxOperation>, StorageError> {
         let mut op = self.inner.get_outbox_operation(id).await?;
-        if let Some(op) = &mut op { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
+        if let Some(op) = &mut op {
+            if !op.recovery.is_empty() {
+                op.recovery = self.decrypt(&op.recovery)?;
+            }
+        }
         Ok(op)
     }
-    async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        Ok(self.list_recoverable_operations_with_diagnostics().await?.items)
+    async fn list_recoverable_operations(
+        &self,
+    ) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        Ok(self
+            .list_recoverable_operations_with_diagnostics()
+            .await?
+            .items)
     }
 
-    async fn list_recoverable_operations_with_diagnostics(&self) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
+    async fn list_recoverable_operations_with_diagnostics(
+        &self,
+    ) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
         let rows = self.inner.list_recoverable_operations().await?;
-        Ok(self.decrypt_list(rows, |row| self.decrypt_outbox_operation(row), |row| row.operation_id.to_string()))
+        Ok(self.decrypt_list(
+            rows,
+            |row| self.decrypt_outbox_operation(row),
+            |row| row.operation_id.to_string(),
+        ))
     }
 
-    async fn list_failed_prepared_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        Ok(self.list_failed_prepared_operations_with_diagnostics().await?.items)
+    async fn list_failed_prepared_operations(
+        &self,
+    ) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        Ok(self
+            .list_failed_prepared_operations_with_diagnostics()
+            .await?
+            .items)
     }
 
-    async fn list_failed_prepared_operations_with_diagnostics(&self) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
+    async fn list_failed_prepared_operations_with_diagnostics(
+        &self,
+    ) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
         let rows = self.inner.list_failed_prepared_operations().await?;
-        Ok(self.decrypt_list(rows, |row| self.decrypt_outbox_operation(row), |row| row.operation_id.to_string()))
+        Ok(self.decrypt_list(
+            rows,
+            |row| self.decrypt_outbox_operation(row),
+            |row| row.operation_id.to_string(),
+        ))
     }
 
-    async fn list_compactable_operations(&self, before_ms: i64, limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        Ok(self.list_compactable_operations_with_diagnostics(before_ms, limit).await?.items)
+    async fn list_compactable_operations(
+        &self,
+        before_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        Ok(self
+            .list_compactable_operations_with_diagnostics(before_ms, limit)
+            .await?
+            .items)
     }
 
-    async fn list_compactable_operations_with_diagnostics(&self, before_ms: i64, limit: u32) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
-        let rows = self.inner.list_compactable_operations(before_ms, limit).await?;
-        Ok(self.decrypt_list(rows, |row| self.decrypt_outbox_operation(row), |row| row.operation_id.to_string()))
+    async fn list_compactable_operations_with_diagnostics(
+        &self,
+        before_ms: i64,
+        limit: u32,
+    ) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
+        let rows = self
+            .inner
+            .list_compactable_operations(before_ms, limit)
+            .await?;
+        Ok(self.decrypt_list(
+            rows,
+            |row| self.decrypt_outbox_operation(row),
+            |row| row.operation_id.to_string(),
+        ))
     }
 
     async fn store_message(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
@@ -576,21 +679,45 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.store_message(&encrypted).await
     }
 
-    async fn record_delivery_prices(&self, sender: &NodeId, prices: &[(String, u64)], excluded_kinds: &[u16], issued_at: u64, expires_at: u64) -> Result<(), StorageError> {
-        self.inner.record_delivery_prices(sender, prices, excluded_kinds, issued_at, expires_at).await
+    async fn record_delivery_prices(
+        &self,
+        sender: &NodeId,
+        prices: &[(String, u64)],
+        excluded_kinds: &[u16],
+        issued_at: u64,
+        expires_at: u64,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .record_delivery_prices(sender, prices, excluded_kinds, issued_at, expires_at)
+            .await
     }
 
-    async fn delivery_price_floor(&self, envelope: &UkmEnvelope, paid_at: u64, now: u64) -> Result<Option<u64>, StorageError> {
-        self.inner.delivery_price_floor(envelope, paid_at, now).await
+    async fn delivery_price_floor(
+        &self,
+        envelope: &UkmEnvelope,
+        paid_at: u64,
+        now: u64,
+    ) -> Result<Option<u64>, StorageError> {
+        self.inner
+            .delivery_price_floor(envelope, paid_at, now)
+            .await
     }
 
-    async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+    async fn is_paid_envelope_accepted(
+        &self,
+        envelope: &UkmEnvelope,
+    ) -> Result<bool, StorageError> {
         // Receipt matching uses immutable metadata, never randomized at-rest ciphertext.
         self.inner.is_paid_envelope_accepted(envelope).await
     }
 
-    async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
-        self.inner.accept_paid_envelope(&self.encrypt_envelope(envelope)?).await
+    async fn accept_paid_envelope(
+        &self,
+        envelope: &UkmEnvelope,
+    ) -> Result<crate::PaidAcceptance, StorageError> {
+        self.inner
+            .accept_paid_envelope(&self.encrypt_envelope(envelope)?)
+            .await
     }
 
     async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
@@ -601,20 +728,47 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.mark_pending_sent(id, peer).await
     }
 
-    async fn is_pending_dispatched(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+    async fn is_pending_dispatched(
+        &self,
+        id: &MessageId,
+        peer: &NodeId,
+        sender: &NodeId,
+    ) -> Result<bool, StorageError> {
         self.inner.is_pending_dispatched(id, peer, sender).await
     }
 
-    async fn reject_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, reason: &str, terminal: bool) -> Result<bool, StorageError> {
-        self.inner.reject_pending(id, peer, sender, reason, terminal).await
+    async fn reject_pending(
+        &self,
+        id: &MessageId,
+        peer: &NodeId,
+        sender: &NodeId,
+        reason: &str,
+        terminal: bool,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .reject_pending(id, peer, sender, reason, terminal)
+            .await
     }
 
-    async fn acknowledge_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+    async fn acknowledge_pending(
+        &self,
+        id: &MessageId,
+        peer: &NodeId,
+        sender: &NodeId,
+    ) -> Result<bool, StorageError> {
         self.inner.acknowledge_pending(id, peer, sender).await
     }
 
-    async fn acknowledge_pending_payment(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, hash: &[u8; 32]) -> Result<bool, StorageError> {
-        self.inner.acknowledge_pending_payment(id, peer, sender, hash).await
+    async fn acknowledge_pending_payment(
+        &self,
+        id: &MessageId,
+        peer: &NodeId,
+        sender: &NodeId,
+        hash: &[u8; 32],
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .acknowledge_pending_payment(id, peer, sender, hash)
+            .await
     }
 
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
@@ -629,29 +783,70 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         }
     }
 
-    async fn message_page(&self, query: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<Vec<UkmEnvelope>, StorageError> {
-        Ok(self.message_page_with_diagnostics(query, limit, before, cursor).await?.items)
+    async fn message_page(
+        &self,
+        query: &crate::MessageListQuery<'_>,
+        limit: u32,
+        before: Option<u64>,
+        cursor: Option<&crate::ListCursor<u64>>,
+    ) -> Result<Vec<UkmEnvelope>, StorageError> {
+        Ok(self
+            .message_page_with_diagnostics(query, limit, before, cursor)
+            .await?
+            .items)
     }
 
-    async fn message_page_with_diagnostics(&self, query: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
-        self.refill(limit, cursor.cloned(),
-            |batch, at| async move { self.inner.message_page(query, batch, before, at.as_ref()).await },
-            |row: &UkmEnvelope| crate::ListCursor { timestamp: row.timestamp, id: row.id.to_hex() },
+    async fn message_page_with_diagnostics(
+        &self,
+        query: &crate::MessageListQuery<'_>,
+        limit: u32,
+        before: Option<u64>,
+        cursor: Option<&crate::ListCursor<u64>>,
+    ) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        self.refill(
+            limit,
+            cursor.cloned(),
+            |batch, at| async move {
+                self.inner
+                    .message_page(query, batch, before, at.as_ref())
+                    .await
+            },
+            |row: &UkmEnvelope| crate::ListCursor {
+                timestamp: row.timestamp,
+                id: row.id.to_hex(),
+            },
             |row| self.decrypt_envelope(row),
-        ).await
+        )
+        .await
     }
 
-    async fn file_page(&self, limit: u32, cursor: Option<&crate::ListCursor<String>>) -> Result<Vec<crate::FileListRow>, StorageError> {
+    async fn file_page(
+        &self,
+        limit: u32,
+        cursor: Option<&crate::ListCursor<String>>,
+    ) -> Result<Vec<crate::FileListRow>, StorageError> {
         let rows = self.file_page_with_diagnostics(limit, cursor).await?;
-        Ok(rows.items.into_iter().zip(rows.readable_cursors).map(|(metadata, cursor)| crate::FileListRow { metadata, cursor }).collect())
+        Ok(rows
+            .items
+            .into_iter()
+            .zip(rows.readable_cursors)
+            .map(|(metadata, cursor)| crate::FileListRow { metadata, cursor })
+            .collect())
     }
 
-    async fn file_page_with_diagnostics(&self, limit: u32, cursor: Option<&crate::ListCursor<String>>) -> Result<crate::StorageList<FileMetadata>, StorageError> {
-        self.refill(limit, cursor.cloned(),
+    async fn file_page_with_diagnostics(
+        &self,
+        limit: u32,
+        cursor: Option<&crate::ListCursor<String>>,
+    ) -> Result<crate::StorageList<FileMetadata>, StorageError> {
+        self.refill(
+            limit,
+            cursor.cloned(),
             |batch, at| async move { self.inner.file_page(batch, at.as_ref()).await },
             |row: &crate::FileListRow| row.cursor.clone(),
             |row| self.decrypt_file_metadata(&row.metadata),
-        ).await
+        )
+        .await
     }
 
     async fn get_messages_for_recipient(
@@ -660,11 +855,25 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         limit: u32,
         before_timestamp: Option<u64>,
     ) -> Result<Vec<UkmEnvelope>, StorageError> {
-        Ok(self.get_messages_for_recipient_with_diagnostics(recipient, limit, before_timestamp).await?.items)
+        Ok(self
+            .get_messages_for_recipient_with_diagnostics(recipient, limit, before_timestamp)
+            .await?
+            .items)
     }
 
-    async fn get_messages_for_recipient_with_diagnostics(&self, recipient: &Recipient, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
-        self.message_page_with_diagnostics(&crate::MessageListQuery::Recipient(recipient), limit, before_timestamp, None).await
+    async fn get_messages_for_recipient_with_diagnostics(
+        &self,
+        recipient: &Recipient,
+        limit: u32,
+        before_timestamp: Option<u64>,
+    ) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        self.message_page_with_diagnostics(
+            &crate::MessageListQuery::Recipient(recipient),
+            limit,
+            before_timestamp,
+            None,
+        )
+        .await
     }
 
     async fn get_conversation_messages(
@@ -675,11 +884,37 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         limit: u32,
         before_timestamp: Option<u64>,
     ) -> Result<Vec<UkmEnvelope>, StorageError> {
-        Ok(self.get_conversation_messages_with_diagnostics(my_node_id, peer_or_room_id, is_room, limit, before_timestamp).await?.items)
+        Ok(self
+            .get_conversation_messages_with_diagnostics(
+                my_node_id,
+                peer_or_room_id,
+                is_room,
+                limit,
+                before_timestamp,
+            )
+            .await?
+            .items)
     }
 
-    async fn get_conversation_messages_with_diagnostics(&self, my_node_id: &str, peer_or_room_id: &str, is_room: bool, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
-        self.message_page_with_diagnostics(&crate::MessageListQuery::Conversation { me: my_node_id, peer: peer_or_room_id, is_room }, limit, before_timestamp, None).await
+    async fn get_conversation_messages_with_diagnostics(
+        &self,
+        my_node_id: &str,
+        peer_or_room_id: &str,
+        is_room: bool,
+        limit: u32,
+        before_timestamp: Option<u64>,
+    ) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        self.message_page_with_diagnostics(
+            &crate::MessageListQuery::Conversation {
+                me: my_node_id,
+                peer: peer_or_room_id,
+                is_room,
+            },
+            limit,
+            before_timestamp,
+            None,
+        )
+        .await
     }
 
     async fn get_node_messages_of_kind(
@@ -689,11 +924,29 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         limit: u32,
         before_timestamp: Option<u64>,
     ) -> Result<Vec<UkmEnvelope>, StorageError> {
-        Ok(self.get_node_messages_of_kind_with_diagnostics(my_node_id, kind, limit, before_timestamp).await?.items)
+        Ok(self
+            .get_node_messages_of_kind_with_diagnostics(my_node_id, kind, limit, before_timestamp)
+            .await?
+            .items)
     }
 
-    async fn get_node_messages_of_kind_with_diagnostics(&self, my_node_id: &str, kind: u16, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
-        self.message_page_with_diagnostics(&crate::MessageListQuery::NodeKind { me: my_node_id, kind }, limit, before_timestamp, None).await
+    async fn get_node_messages_of_kind_with_diagnostics(
+        &self,
+        my_node_id: &str,
+        kind: u16,
+        limit: u32,
+        before_timestamp: Option<u64>,
+    ) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        self.message_page_with_diagnostics(
+            &crate::MessageListQuery::NodeKind {
+                me: my_node_id,
+                kind,
+            },
+            limit,
+            before_timestamp,
+            None,
+        )
+        .await
     }
 
     async fn delete_message(&self, id: &MessageId) -> Result<bool, StorageError> {
@@ -794,7 +1047,11 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn list_peers_with_diagnostics(&self) -> Result<crate::StorageList<Peer>, StorageError> {
         let rows = self.inner.list_peers().await?;
-        Ok(self.decrypt_list(rows, |row| self.decrypt_peer(row), |row| row.node_id.to_string()))
+        Ok(self.decrypt_list(
+            rows,
+            |row| self.decrypt_peer(row),
+            |row| row.node_id.to_string(),
+        ))
     }
 
     async fn delete_peer(&self, id: &NodeId) -> Result<bool, StorageError> {
@@ -803,9 +1060,15 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     // Nonce operations pass through unchanged
     async fn store_paid_nonce(
-        &self, nonce: &Nonce, payment_hash: &[u8; 32], sender: &NodeId, message_id: &MessageId,
+        &self,
+        nonce: &Nonce,
+        payment_hash: &[u8; 32],
+        sender: &NodeId,
+        message_id: &MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, StorageError> {
-        self.inner.store_paid_nonce(nonce, payment_hash, sender, message_id).await
+        self.inner
+            .store_paid_nonce(nonce, payment_hash, sender, message_id)
+            .await
     }
 
     async fn store_nonce(&self, nonce: &Nonce, sender: &NodeId) -> Result<bool, StorageError> {
@@ -828,7 +1091,9 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         payment_hash: &[u8; 32],
         request: konsensus_core::web_reply::OutstandingWebRequest,
     ) -> Result<(), StorageError> {
-        self.inner.record_outgoing_web_request(payment_hash, request).await
+        self.inner
+            .record_outgoing_web_request(payment_hash, request)
+            .await
     }
 
     async fn take_outstanding_web_request(
@@ -838,35 +1103,77 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.take_outstanding_web_request(payment_hash).await
     }
 
-    async fn sweep_outstanding_web_requests(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
+    async fn sweep_outstanding_web_requests(
+        &self,
+        now_ms: u64,
+        max: u32,
+    ) -> Result<u64, StorageError> {
         self.inner.sweep_outstanding_web_requests(now_ms, max).await
     }
 
-    async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+    async fn call_get(
+        &self,
+        peer: &konsensus_core::NodeId,
+        call_id: &str,
+    ) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
         self.inner.call_get(peer, call_id).await
     }
 
-    async fn call_open_by_peer(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+    async fn call_open_by_peer(
+        &self,
+        peer: &konsensus_core::NodeId,
+        now_ms: u64,
+    ) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         self.inner.call_open_by_peer(peer, now_ms).await
     }
 
-    async fn call_put(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+    async fn call_put(
+        &self,
+        peer: &konsensus_core::NodeId,
+        call_id: &str,
+        entry: &konsensus_core::payloads::call::CallEntry,
+    ) -> Result<(), StorageError> {
         self.inner.call_put(peer, call_id, entry).await
     }
 
-    async fn call_delete(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(), StorageError> {
+    async fn call_delete(
+        &self,
+        peer: &konsensus_core::NodeId,
+        call_id: &str,
+    ) -> Result<(), StorageError> {
         self.inner.call_delete(peer, call_id).await
     }
 
-    async fn call_counts(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
+    async fn call_counts(
+        &self,
+        peer: &konsensus_core::NodeId,
+        now_ms: u64,
+    ) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
         self.inner.call_counts(peer, now_ms).await
     }
 
-    async fn call_evict_burned(&self, peer: Option<&konsensus_core::NodeId>, replay_until_at_most: u64, now_ms: u64, max: u64) -> Result<u64, StorageError> {
-        self.inner.call_evict_burned(peer, replay_until_at_most, now_ms, max).await
+    async fn call_evict_burned(
+        &self,
+        peer: Option<&konsensus_core::NodeId>,
+        replay_until_at_most: u64,
+        now_ms: u64,
+        max: u64,
+    ) -> Result<u64, StorageError> {
+        self.inner
+            .call_evict_burned(peer, replay_until_at_most, now_ms, max)
+            .await
     }
 
-    async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+    async fn call_pending(
+        &self,
+    ) -> Result<
+        Vec<(
+            konsensus_core::NodeId,
+            String,
+            konsensus_core::payloads::call::CallEntry,
+        )>,
+        StorageError,
+    > {
         self.inner.call_pending().await
     }
 
@@ -874,11 +1181,18 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_sweep(now_ms, max).await
     }
 
-    async fn reject_accepted_envelope(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
+    async fn reject_accepted_envelope(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+    ) -> Result<(), StorageError> {
         self.inner.reject_accepted_envelope(envelope).await
     }
 
-    async fn call_admission_hold(&self, envelope: &konsensus_core::UkmEnvelope, now_ms: u64) -> Result<bool, StorageError> {
+    async fn call_admission_hold(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
         self.inner.call_admission_hold(envelope, now_ms).await
     }
 
@@ -905,18 +1219,11 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     // Session operations pass through — session blobs are encrypted
     // with AES-256-GCM by the SessionManager (domain-separated key)
     // before reaching storage. No double-encryption needed.
-    async fn store_session(
-        &self,
-        peer_id: &NodeId,
-        state_blob: &[u8],
-    ) -> Result<(), StorageError> {
+    async fn store_session(&self, peer_id: &NodeId, state_blob: &[u8]) -> Result<(), StorageError> {
         self.inner.store_session(peer_id, state_blob).await
     }
 
-    async fn load_session(
-        &self,
-        peer_id: &NodeId,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
+    async fn load_session(&self, peer_id: &NodeId) -> Result<Option<Vec<u8>>, StorageError> {
         self.inner.load_session(peer_id).await
     }
 
@@ -935,7 +1242,9 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         message_id: &MessageId,
         recipient: &NodeId,
     ) -> Result<(), StorageError> {
-        self.inner.queue_pending_delivery(message_id, recipient).await
+        self.inner
+            .queue_pending_delivery(message_id, recipient)
+            .await
     }
 
     async fn get_pending_for_peer(
@@ -950,7 +1259,9 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         message_id: &MessageId,
         recipient: &NodeId,
     ) -> Result<(), StorageError> {
-        self.inner.remove_pending_delivery(message_id, recipient).await
+        self.inner
+            .remove_pending_delivery(message_id, recipient)
+            .await
     }
 
     async fn increment_pending_attempts(
@@ -958,7 +1269,9 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         message_id: &MessageId,
         recipient: &NodeId,
     ) -> Result<(), StorageError> {
-        self.inner.increment_pending_attempts(message_id, recipient).await
+        self.inner
+            .increment_pending_attempts(message_id, recipient)
+            .await
     }
 
     async fn get_pending_peers(&self) -> Result<Vec<NodeId>, StorageError> {
@@ -1002,7 +1315,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         Ok(self.list_files_with_diagnostics(limit).await?.items)
     }
 
-    async fn list_files_with_diagnostics(&self, limit: u32) -> Result<crate::StorageList<FileMetadata>, StorageError> {
+    async fn list_files_with_diagnostics(
+        &self,
+        limit: u32,
+    ) -> Result<crate::StorageList<FileMetadata>, StorageError> {
         self.file_page_with_diagnostics(limit, None).await
     }
 
@@ -1022,18 +1338,13 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
             .await
     }
 
-    async fn get_message_plaintext(
-        &self,
-        id: &MessageId,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
+    async fn get_message_plaintext(&self, id: &MessageId) -> Result<Option<Vec<u8>>, StorageError> {
         self.inner.get_message_plaintext(id).await
     }
 
     // ── Invites (pass-through — invite rows contain signed protocol data) ─
 
-    async fn invite_schema_capabilities(
-        &self,
-    ) -> Result<InviteSchemaCapabilities, StorageError> {
+    async fn invite_schema_capabilities(&self) -> Result<InviteSchemaCapabilities, StorageError> {
         self.inner.invite_schema_capabilities().await
     }
 
@@ -1084,7 +1395,9 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         &self,
         invitee_pubkey: &[u8; 32],
     ) -> Result<Option<InviteIssuedRecord>, StorageError> {
-        self.inner.find_pending_invite_for_invitee(invitee_pubkey).await
+        self.inner
+            .find_pending_invite_for_invitee(invitee_pubkey)
+            .await
     }
 
     async fn mark_invite_accepted(
@@ -1143,10 +1456,7 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
             .await
     }
 
-    async fn add_accepted_invite(
-        &self,
-        record: &AcceptedInviteRecord,
-    ) -> Result<(), StorageError> {
+    async fn add_accepted_invite(&self, record: &AcceptedInviteRecord) -> Result<(), StorageError> {
         self.inner.add_accepted_invite(record).await
     }
 
@@ -1181,7 +1491,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.store_calendar_event(record).await
     }
 
-    async fn get_calendar_event(&self, id: &str) -> Result<Option<CalendarEventRecord>, StorageError> {
+    async fn get_calendar_event(
+        &self,
+        id: &str,
+    ) -> Result<Option<CalendarEventRecord>, StorageError> {
         self.inner.get_calendar_event(id).await
     }
 
@@ -1191,7 +1504,9 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         to_ms: u64,
         limit: u32,
     ) -> Result<Vec<CalendarEventRecord>, StorageError> {
-        self.inner.list_calendar_events_in_range(from_ms, to_ms, limit).await
+        self.inner
+            .list_calendar_events_in_range(from_ms, to_ms, limit)
+            .await
     }
 
     async fn list_recurring_master_events(&self) -> Result<Vec<CalendarEventRecord>, StorageError> {
@@ -1285,10 +1600,15 @@ impl<S: Storage + konsensus_core::gate::NonceStore> konsensus_core::gate::NonceS
     for EncryptedStorage<S>
 {
     async fn check_and_store_paid(
-        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
-        sender: &konsensus_core::NodeId, message_id: &konsensus_core::MessageId,
+        &self,
+        nonce: &konsensus_core::Nonce,
+        payment_hash: &[u8; 32],
+        sender: &konsensus_core::NodeId,
+        message_id: &konsensus_core::MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.check_and_store_paid(nonce, payment_hash, sender, message_id).await
+        self.inner
+            .check_and_store_paid(nonce, payment_hash, sender, message_id)
+            .await
     }
 
     async fn check_and_store(

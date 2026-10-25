@@ -20,8 +20,7 @@ use konsensus_core::types::{NodeId, PaymentProof, Recipient, Signature};
 
 const MNEMONIC_SERVER: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-const MNEMONIC_BROWSER: &str =
-    "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+const MNEMONIC_BROWSER: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
 
 fn make_identity(mnemonic: &str) -> Arc<NodeIdentity> {
     Arc::new(NodeIdentity::from_mnemonic(mnemonic, "").expect("valid mnemonic"))
@@ -137,7 +136,9 @@ async fn sovereign_browser_page_request_response() {
     let deserialized_resp: PageResponse =
         serde_json::from_str(&page_response_json).expect("deserialize response");
     assert_eq!(deserialized_resp.status, PageStatus::Ok);
-    assert!(deserialized_resp.body.contains("Welcome to My Sovereign Page"));
+    assert!(deserialized_resp
+        .body
+        .contains("Welcome to My Sovereign Page"));
 
     // --- Test 6: PageRequest can be transported as UKM envelope payload ---
     // Verify that the JSON payload fits in a UKM ciphertext field

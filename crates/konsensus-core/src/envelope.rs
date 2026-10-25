@@ -120,11 +120,19 @@ pub struct UkmEnvelope {
 impl UkmEnvelope {
     /// Renew only the signed wrapper for an already-paid retry after four minutes.
     /// The ciphertext, nonce, ID, references and payment proof never change.
-    pub fn refresh_for_resend(&mut self, identity: &crate::identity::NodeIdentity, now_ms: u64) -> Result<bool, CoreError> {
+    pub fn refresh_for_resend(
+        &mut self,
+        identity: &crate::identity::NodeIdentity,
+        now_ms: u64,
+    ) -> Result<bool, CoreError> {
         if self.sender != *identity.node_id() {
-            return Err(CoreError::EnvelopeValidation("cannot re-sign another sender's envelope".into()));
+            return Err(CoreError::EnvelopeValidation(
+                "cannot re-sign another sender's envelope".into(),
+            ));
         }
-        if now_ms.saturating_sub(self.timestamp) <= 240_000 { return Ok(false); }
+        if now_ms.saturating_sub(self.timestamp) <= 240_000 {
+            return Ok(false);
+        }
         self.timestamp = now_ms;
         self.signature = Signature::from_ed25519(&identity.sign(&self.signable_bytes()));
         Ok(true)
@@ -318,10 +326,11 @@ mod tests {
         let proof = make_valid_proof();
 
         let nonce = Nonce::from_bytes([5u8; 24]);
-        let envelope = UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, ciphertext.clone(), proof)
-            .nonce(nonce)
-            .timestamp(1_700_000_000_000)
-            .build();
+        let envelope =
+            UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, ciphertext.clone(), proof)
+                .nonce(nonce)
+                .timestamp(1_700_000_000_000)
+                .build();
 
         let expected_id = MessageId::compute(&ciphertext, &nonce);
         assert_eq!(envelope.id, expected_id);
@@ -333,9 +342,10 @@ mod tests {
         let recipient = Recipient::Room(RoomId::new());
         let proof = make_valid_proof();
 
-        let envelope = UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"data".to_vec(), proof)
-            .timestamp(1_700_000_000_000)
-            .build();
+        let envelope =
+            UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"data".to_vec(), proof)
+                .timestamp(1_700_000_000_000)
+                .build();
 
         assert!(envelope.validate().is_ok());
     }
@@ -352,7 +362,10 @@ mod tests {
                 .timestamp(1_700_000_000_000)
                 .references(refs)
                 .build();
-        assert!(envelope.validate().is_err(), "over-cap references must be rejected");
+        assert!(
+            envelope.validate().is_err(),
+            "over-cap references must be rejected"
+        );
 
         // Exactly at the cap is accepted.
         envelope.references = vec![MessageId::from_bytes([7u8; 32]); MAX_MESSAGE_REFERENCES];
@@ -406,10 +419,9 @@ mod tests {
 
         // Empty ciphertext — the builder will compute a valid ID for empty data,
         // but validate should still reject it.
-        let envelope =
-            UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, vec![], proof)
-                .timestamp(1_700_000_000_000)
-                .build();
+        let envelope = UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, vec![], proof)
+            .timestamp(1_700_000_000_000)
+            .build();
 
         let err = envelope.validate().unwrap_err();
         assert!(err.to_string().contains("ciphertext must not be empty"));
@@ -436,9 +448,10 @@ mod tests {
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
         let proof = make_valid_proof();
 
-        let envelope = UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"test".to_vec(), proof)
-            .timestamp(1_700_000_000_000)
-            .build();
+        let envelope =
+            UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"test".to_vec(), proof)
+                .timestamp(1_700_000_000_000)
+                .build();
 
         let json = serde_json::to_string(&envelope).unwrap();
         let deserialized: UkmEnvelope = serde_json::from_str(&json).unwrap();
@@ -525,16 +538,18 @@ mod tests {
         let proof = make_valid_proof();
 
         let env1 = UkmEnvelopeBuilder::new(
-            KIND_CHAT, sender, recipient, b"data".to_vec(), proof.clone(),
+            KIND_CHAT,
+            sender,
+            recipient,
+            b"data".to_vec(),
+            proof.clone(),
         )
         .timestamp(1_000_000_000_000)
         .build();
 
-        let env2 = UkmEnvelopeBuilder::new(
-            KIND_CHAT, sender, recipient, b"data".to_vec(), proof,
-        )
-        .timestamp(2_000_000_000_000)
-        .build();
+        let env2 = UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"data".to_vec(), proof)
+            .timestamp(2_000_000_000_000)
+            .build();
 
         assert_ne!(env1.signable_bytes(), env2.signable_bytes());
     }
@@ -546,19 +561,15 @@ mod tests {
         let proof = make_valid_proof();
         let nonce = Nonce::from_bytes([5u8; 24]);
 
-        let env1 = UkmEnvelopeBuilder::new(
-            0, sender, recipient, b"data".to_vec(), proof.clone(),
-        )
-        .timestamp(1_700_000_000_000)
-        .nonce(nonce)
-        .build();
+        let env1 = UkmEnvelopeBuilder::new(0, sender, recipient, b"data".to_vec(), proof.clone())
+            .timestamp(1_700_000_000_000)
+            .nonce(nonce)
+            .build();
 
-        let env2 = UkmEnvelopeBuilder::new(
-            100, sender, recipient, b"data".to_vec(), proof,
-        )
-        .timestamp(1_700_000_000_000)
-        .nonce(nonce)
-        .build();
+        let env2 = UkmEnvelopeBuilder::new(100, sender, recipient, b"data".to_vec(), proof)
+            .timestamp(1_700_000_000_000)
+            .nonce(nonce)
+            .build();
 
         assert_ne!(env1.signable_bytes(), env2.signable_bytes());
     }
@@ -571,11 +582,9 @@ mod tests {
 
         // 1 MiB of ciphertext
         let big_ct = vec![0xABu8; 1024 * 1024];
-        let envelope = UkmEnvelopeBuilder::new(
-            KIND_CHAT, sender, recipient, big_ct.clone(), proof,
-        )
-        .timestamp(1_700_000_000_000)
-        .build();
+        let envelope = UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, big_ct.clone(), proof)
+            .timestamp(1_700_000_000_000)
+            .build();
 
         assert!(envelope.validate().is_ok());
         assert_eq!(envelope.ciphertext.len(), 1024 * 1024);
@@ -592,11 +601,10 @@ mod tests {
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
         let proof = make_valid_proof();
 
-        let envelope = UkmEnvelopeBuilder::new(
-            u16::MAX, sender, recipient, b"data".to_vec(), proof,
-        )
-        .timestamp(1_700_000_000_000)
-        .build();
+        let envelope =
+            UkmEnvelopeBuilder::new(u16::MAX, sender, recipient, b"data".to_vec(), proof)
+                .timestamp(1_700_000_000_000)
+                .build();
 
         assert_eq!(envelope.kind, u16::MAX);
         assert!(envelope.validate().is_ok());
@@ -631,19 +639,15 @@ mod tests {
         let hash2: [u8; 32] = Sha256::digest(preimage2).into();
         let proof2 = PaymentProof::new(hash2, preimage2, 10);
 
-        let env1 = UkmEnvelopeBuilder::new(
-            KIND_CHAT, sender, recipient, b"data".to_vec(), proof1,
-        )
-        .timestamp(1_700_000_000_000)
-        .nonce(nonce)
-        .build();
+        let env1 = UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"data".to_vec(), proof1)
+            .timestamp(1_700_000_000_000)
+            .nonce(nonce)
+            .build();
 
-        let env2 = UkmEnvelopeBuilder::new(
-            KIND_CHAT, sender, recipient, b"data".to_vec(), proof2,
-        )
-        .timestamp(1_700_000_000_000)
-        .nonce(nonce)
-        .build();
+        let env2 = UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"data".to_vec(), proof2)
+            .timestamp(1_700_000_000_000)
+            .nonce(nonce)
+            .build();
 
         // Different payment proofs must produce different signable bytes
         assert_ne!(env1.signable_bytes(), env2.signable_bytes());
@@ -660,19 +664,17 @@ mod tests {
         let proof_10 = PaymentProof::new(hash, preimage, 10);
         let proof_99 = PaymentProof::new(hash, preimage, 99);
 
-        let env1 = UkmEnvelopeBuilder::new(
-            KIND_CHAT, sender, recipient, b"data".to_vec(), proof_10,
-        )
-        .timestamp(1_700_000_000_000)
-        .nonce(nonce)
-        .build();
+        let env1 =
+            UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"data".to_vec(), proof_10)
+                .timestamp(1_700_000_000_000)
+                .nonce(nonce)
+                .build();
 
-        let env2 = UkmEnvelopeBuilder::new(
-            KIND_CHAT, sender, recipient, b"data".to_vec(), proof_99,
-        )
-        .timestamp(1_700_000_000_000)
-        .nonce(nonce)
-        .build();
+        let env2 =
+            UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"data".to_vec(), proof_99)
+                .timestamp(1_700_000_000_000)
+                .nonce(nonce)
+                .build();
 
         // Different amounts must produce different signable bytes
         assert_ne!(env1.signable_bytes(), env2.signable_bytes());

@@ -94,7 +94,11 @@ fn hub_only() -> ChannelPeers {
 async fn guarded(
     backend: Arc<OpenRecorder>,
     channel_peers: ChannelPeers,
-) -> (tempfile::TempDir, Arc<RecoveringLightning>, Arc<GuardedLightning>) {
+) -> (
+    tempfile::TempDir,
+    Arc<RecoveringLightning>,
+    Arc<GuardedLightning>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let recovering = Arc::new(
         RecoveringLightning::new(
@@ -120,7 +124,10 @@ async fn guarded(
     (dir, recovering, provider)
 }
 
-async fn open_over_api(channel_peers: ChannelPeers, peer: &str) -> (StatusCode, serde_json::Value, Vec<String>) {
+async fn open_over_api(
+    channel_peers: ChannelPeers,
+    peer: &str,
+) -> (StatusCode, serde_json::Value, Vec<String>) {
     let backend = Arc::new(OpenRecorder::default());
     let (_dir, recovering, provider) = guarded(backend.clone(), channel_peers).await;
     let state = test_state_with_lightning(provider);
@@ -139,8 +146,14 @@ async fn open_over_api(channel_peers: ChannelPeers, peer: &str) -> (StatusCode, 
         .unwrap();
     recovering.shutdown().await.unwrap();
     let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap(), backend.opened())
+    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap(),
+        backend.opened(),
+    )
 }
 
 #[tokio::test]
@@ -159,7 +172,10 @@ async fn hub_only_api_open_to_another_peer_is_refused_before_the_backend() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["code"], HUB_ONLY_WHILE_LOCKABLE);
     assert_eq!(body["retry_allowed"], false);
-    assert!(opened.is_empty(), "refused open reached the backend: {opened:?}");
+    assert!(
+        opened.is_empty(),
+        "refused open reached the backend: {opened:?}"
+    );
 }
 
 #[tokio::test]
@@ -285,14 +301,24 @@ fn hub_only_policy_is_the_configured_liquidity_providers() {
         ))
         .unwrap()
     };
-    assert_eq!(ChannelPeers::hub_only(&ldk("")).unwrap().allowlist(), Some(vec![HUB.to_string()]));
+    assert_eq!(
+        ChannelPeers::hub_only(&ldk("")).unwrap().allowlist(),
+        Some(vec![HUB.to_string()])
+    );
     assert_eq!(ChannelPeers::Any.allowlist(), None);
-    let error = ChannelPeers::hub_only(&ldk("[lsps2_service]\nenabled = true\nrequire_token = 't'"))
-        .unwrap_err();
-    assert!(error.to_string().starts_with(HUB_ONLY_WHILE_LOCKABLE), "{error}");
+    let error =
+        ChannelPeers::hub_only(&ldk("[lsps2_service]\nenabled = true\nrequire_token = 't'"))
+            .unwrap_err();
+    assert!(
+        error.to_string().starts_with(HUB_ONLY_WHILE_LOCKABLE),
+        "{error}"
+    );
     // Backends without a configured hub refuse every peer.
     let mock: crate::config::LightningConfig = toml::from_str("backend = 'mock'").unwrap();
-    assert_eq!(ChannelPeers::hub_only(&mock).unwrap().allowlist(), Some(vec![]));
+    assert_eq!(
+        ChannelPeers::hub_only(&mock).unwrap().allowlist(),
+        Some(vec![])
+    );
 }
 
 #[test]

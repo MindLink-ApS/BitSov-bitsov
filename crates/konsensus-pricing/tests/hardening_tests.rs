@@ -38,7 +38,10 @@ fn static_config_default_serde_roundtrip() {
     assert_eq!(deserialized.file_ref_msat, config.file_ref_msat);
     assert_eq!(deserialized.control_msat, config.control_msat);
     assert_eq!(deserialized.collaboration_msat, config.collaboration_msat);
-    assert_eq!(deserialized.realtime_signal_msat, config.realtime_signal_msat);
+    assert_eq!(
+        deserialized.realtime_signal_msat,
+        config.realtime_signal_msat
+    );
     assert_eq!(deserialized.app_ext_msat, config.app_ext_msat);
     assert_eq!(deserialized.web_content_msat, config.web_content_msat);
 }
@@ -294,14 +297,29 @@ async fn build_price_table_with_custom_config() {
 
 #[test]
 fn category_to_string_all_categories() {
-    assert_eq!(category_to_string(KindCategory::Communication), "communication");
-    assert_eq!(category_to_string(KindCategory::StructuredData), "structured_data");
+    assert_eq!(
+        category_to_string(KindCategory::Communication),
+        "communication"
+    );
+    assert_eq!(
+        category_to_string(KindCategory::StructuredData),
+        "structured_data"
+    );
     assert_eq!(category_to_string(KindCategory::FilesMedia), "files_media");
-    assert_eq!(category_to_string(KindCategory::Collaboration), "collaboration");
-    assert_eq!(category_to_string(KindCategory::RealTimeSignaling), "realtime_signaling");
+    assert_eq!(
+        category_to_string(KindCategory::Collaboration),
+        "collaboration"
+    );
+    assert_eq!(
+        category_to_string(KindCategory::RealTimeSignaling),
+        "realtime_signaling"
+    );
     assert_eq!(category_to_string(KindCategory::WebContent), "web_content");
     assert_eq!(category_to_string(KindCategory::Control), "control");
-    assert_eq!(category_to_string(KindCategory::AppExtension), "app_extension");
+    assert_eq!(
+        category_to_string(KindCategory::AppExtension),
+        "app_extension"
+    );
     assert_eq!(category_to_string(KindCategory::Unknown), "unknown");
 }
 
@@ -354,7 +372,9 @@ async fn peer_price_cache_many_peers() {
     for i in 0..50u8 {
         let mut prices = HashMap::new();
         prices.insert("communication".to_string(), i as u64 * 10);
-        cache.update(test_node_id(i), prices, 886_000, 144, 0.0).await;
+        cache
+            .update(test_node_id(i), prices, 886_000, 144, 0.0)
+            .await;
     }
 
     assert_eq!(cache.len().await, 50);

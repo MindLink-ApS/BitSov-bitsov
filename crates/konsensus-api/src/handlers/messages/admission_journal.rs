@@ -128,7 +128,8 @@ pub(super) fn clear(state: &AppState, peer: &NodeId) -> Result<(), ApiError> {
 pub(super) fn clear_failed(state: &AppState, peer: &NodeId) -> Result<(), ApiError> {
     if let Some(attempt) = load(state, peer)? {
         if !attempt.message_may_have_dispatched {
-            if let (Some(service), Some(original)) = (&state.pairing, &attempt.original_reservation) {
+            if let (Some(service), Some(original)) = (&state.pairing, &attempt.original_reservation)
+            {
                 service.resolve_spend(original, &peer.to_hex(), 0);
             }
         }
@@ -136,15 +137,24 @@ pub(super) fn clear_failed(state: &AppState, peer: &NodeId) -> Result<(), ApiErr
     clear(state, peer)
 }
 
-
 /// Remove only the exact known-undispatched guard, restoring any earlier record.
 /// Persisted intent makes cancellation/process death during the async operation
 /// write recoverable too; a legacy or possibly-dispatched attempt is untouched.
-pub(super) fn undo_undispatched(state: &AppState, peer: &NodeId, hash: &str) -> Result<bool, ApiError> {
-    let Some(attempt) = load(state, peer)? else { return Ok(false); };
-    if attempt.payment_hash != hash || attempt.dispatch_started { return Ok(false); }
+pub(super) fn undo_undispatched(
+    state: &AppState,
+    peer: &NodeId,
+    hash: &str,
+) -> Result<bool, ApiError> {
+    let Some(attempt) = load(state, peer)? else {
+        return Ok(false);
+    };
+    if attempt.payment_hash != hash || attempt.dispatch_started {
+        return Ok(false);
+    }
     if let (Some(service), Some(original)) = (&state.pairing, &attempt.original_reservation) {
-        service.try_resolve_spend(original, &peer.to_hex(), 0).map_err(error)?;
+        service
+            .try_resolve_spend(original, &peer.to_hex(), 0)
+            .map_err(error)?;
     }
     match attempt.previous_attempt {
         Some(previous) => save(state, peer, &previous)?,
@@ -154,7 +164,11 @@ pub(super) fn undo_undispatched(state: &AppState, peer: &NodeId, hash: &str) -> 
 }
 
 /// Checkpoint positive non-dispatch before any cancellable operation-store await.
-pub(super) fn mark_undispatched(state: &AppState, peer: &NodeId, hash: &str) -> Result<(), ApiError> {
+pub(super) fn mark_undispatched(
+    state: &AppState,
+    peer: &NodeId,
+    hash: &str,
+) -> Result<(), ApiError> {
     if let Some(mut attempt) = load(state, peer)? {
         if attempt.payment_hash == hash {
             attempt.dispatch_started = false;
@@ -219,10 +233,7 @@ mod relative_config_tests {
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             assert!(data_dir.is_absolute());
-            assert_eq!(
-                data_dir.canonicalize()?,
-                tmp.path().canonicalize()?
-            );
+            assert_eq!(data_dir.canonicalize()?, tmp.path().canonicalize()?);
 
             let peer = NodeId::from_bytes([9; 32]);
             let dir = data_dir.join("admission-attempts");

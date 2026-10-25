@@ -233,7 +233,10 @@ impl FrontDoorCard {
         Self::issue_with_key(identity.ed25519_signing_key(), fields)
     }
 
-    pub fn issue_with_key(key: &SigningKey, fields: FrontDoorFields) -> Result<Self, FrontDoorError> {
+    pub fn issue_with_key(
+        key: &SigningKey,
+        fields: FrontDoorFields,
+    ) -> Result<Self, FrontDoorError> {
         let endpoint = fields.endpoint.trim().to_string();
         let reach = reach_of_endpoint(&endpoint)?;
         let mut card = Self {
@@ -313,7 +316,8 @@ impl FrontDoorCard {
     }
 
     fn ensure_size(&self) -> Result<(), FrontDoorError> {
-        let encoded = serde_json::to_vec(self).map_err(|e| FrontDoorError::Malformed(e.to_string()))?;
+        let encoded =
+            serde_json::to_vec(self).map_err(|e| FrontDoorError::Malformed(e.to_string()))?;
         if encoded.len() > MAX_CARD_BYTES {
             return Err(FrontDoorError::TooLarge(encoded.len()));
         }
@@ -337,7 +341,9 @@ impl FrontDoorCard {
         if self.expires_at <= self.issued_at || self.expires_at - self.issued_at > LIFETIME_SECS {
             return Err(FrontDoorError::LifetimeTooLong);
         }
-        if self.profile.display_name.is_empty() || self.profile.display_name.len() > MAX_DISPLAY_NAME {
+        if self.profile.display_name.is_empty()
+            || self.profile.display_name.len() > MAX_DISPLAY_NAME
+        {
             return Err(FrontDoorError::FieldTooLong("display_name"));
         }
         if self.profile.tagline.len() > MAX_TAGLINE {
@@ -447,7 +453,8 @@ impl FrontDoorCard {
     /// `bitsov://front-door#<base64url(JSON)>` for QR / share.
     pub fn to_link(&self) -> Result<String, FrontDoorError> {
         self.ensure_size()?;
-        let json = serde_json::to_vec(self).map_err(|e| FrontDoorError::Malformed(e.to_string()))?;
+        let json =
+            serde_json::to_vec(self).map_err(|e| FrontDoorError::Malformed(e.to_string()))?;
         if json.len() > MAX_CARD_BYTES {
             return Err(FrontDoorError::TooLarge(json.len()));
         }
@@ -490,7 +497,8 @@ impl FrontDoorCard {
 }
 
 fn reach_of_endpoint(endpoint: &str) -> Result<Reach, FrontDoorError> {
-    crate::introduction::reach_of(endpoint).map_err(|e| FrontDoorError::InvalidEndpoint(e.to_string()))
+    crate::introduction::reach_of(endpoint)
+        .map_err(|e| FrontDoorError::InvalidEndpoint(e.to_string()))
 }
 
 fn decode_fixed<const N: usize>(hex_str: &str) -> Option<[u8; N]> {

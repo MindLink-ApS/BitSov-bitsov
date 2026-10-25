@@ -124,7 +124,10 @@ async fn realtime_signaling_uses_payment_gate_price() {
     assert_eq!(engine.get_price_msat(KIND_ICE_CANDIDATE).await.unwrap(), 59);
     // The call offer's own base (call_msat 10 000) takes the same multiplier.
     assert!(engine.get_price_msat(KIND_CALL_INVITE).await.unwrap() > 10_000);
-    assert_eq!(engine.category_price_overrides(), Some(vec![konsensus_core::kind::KIND_LONGFORM, KIND_CALL_INVITE]));
+    assert_eq!(
+        engine.category_price_overrides(),
+        Some(vec![konsensus_core::kind::KIND_LONGFORM, KIND_CALL_INVITE])
+    );
 }
 
 #[tokio::test]

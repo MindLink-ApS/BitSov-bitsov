@@ -33,7 +33,7 @@ use uuid::Uuid;
 use konsensus_core::types::NodeId;
 use konsensus_core::{HostingContractState, OperatorHostingContract, OperatorHostingPayment};
 
-use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::auth::scoped::{Admin, Read, ScopedAuth};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -241,7 +241,10 @@ mod tests {
         assert!(!hosting_flag_enabled(Some("0")), "0 must be OFF");
         assert!(!hosting_flag_enabled(Some("false")), "false must be OFF");
         assert!(!hosting_flag_enabled(Some("no")), "no must be OFF");
-        assert!(!hosting_flag_enabled(Some("enabled")), "arbitrary must be OFF");
+        assert!(
+            !hosting_flag_enabled(Some("enabled")),
+            "arbitrary must be OFF"
+        );
         // Opt IN only on the accepted truthy tokens.
         for on in ["1", "true", "TRUE", "yes", "YES"] {
             assert!(hosting_flag_enabled(Some(on)), "{on} must enable hosting");

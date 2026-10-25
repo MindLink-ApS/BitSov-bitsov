@@ -18,12 +18,17 @@ pub(crate) const WEB_REQUEST_SWEEP_MAX: u32 = 10_000;
 
 /// Remove paid web requests whose reply window has closed (#129 R2). An
 /// expired entry can never bind a reply, so this only reclaims space.
-pub(crate) async fn sweep_outstanding_web_requests(storage: &dyn konsensus_storage::Storage) -> u64 {
+pub(crate) async fn sweep_outstanding_web_requests(
+    storage: &dyn konsensus_storage::Storage,
+) -> u64 {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    match storage.sweep_outstanding_web_requests(now_ms, WEB_REQUEST_SWEEP_MAX).await {
+    match storage
+        .sweep_outstanding_web_requests(now_ms, WEB_REQUEST_SWEEP_MAX)
+        .await
+    {
         Ok(removed) => {
             if removed > 0 {
                 debug!(removed, "swept expired outstanding web requests");
@@ -48,7 +53,7 @@ pub(crate) async fn run_nonce_cleanup(
 ) {
     let cleanup_interval = std::time::Duration::from_secs(300); // every 5 minutes
     let max_nonce_age_secs: u64 = 3600; // 1 hour
-    // Expired paid web requests (#129 R2): once at startup, then every tick.
+                                        // Expired paid web requests (#129 R2): once at startup, then every tick.
     sweep_outstanding_web_requests(storage.as_ref()).await;
     loop {
         tokio::select! {
@@ -205,7 +210,11 @@ pub(crate) async fn run_pending_cleanup(
 /// Spawns the send_timestamps cleanup task — periodically removes stale entries
 /// for messages that were never acked.
 pub(crate) async fn run_timestamps_cleanup(
-    send_timestamps: Arc<tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>>>,
+    send_timestamps: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>,
+        >,
+    >,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let cleanup_interval = std::time::Duration::from_secs(60);
@@ -406,7 +415,9 @@ pub(crate) async fn run_price_refresh(
 /// that are no longer connected. Without this, the map grows unbounded over
 /// the node's lifetime as unique peers connect and disconnect.
 pub(crate) async fn run_peer_ln_pubkeys_cleanup(
-    peer_ln_pubkeys: Arc<tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::NodeId, String>>>,
+    peer_ln_pubkeys: Arc<
+        tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::NodeId, String>>,
+    >,
     transport: Arc<NoiseTransport>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -439,7 +450,14 @@ pub(crate) async fn run_peer_ln_pubkeys_cleanup(
 /// longer than the configured TTL. Prevents unbounded map growth from leaked
 /// entries when the normal success/timeout cleanup paths are bypassed.
 pub(crate) async fn run_invoice_requests_cleanup(
-    invoice_requests: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
+    invoice_requests: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>,
+            >,
+        >,
+    >,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let cleanup_interval = std::time::Duration::from_secs(60); // every 60 seconds
@@ -464,7 +482,6 @@ pub(crate) async fn run_invoice_requests_cleanup(
         }
     }
 }
-
 
 /// Write one snapshot row per supported currency for the given UTC date.
 ///
@@ -537,9 +554,8 @@ pub(crate) async fn run_fiat_rate_snapshot(
     // Seconds remaining in the current UTC day.
     fn secs_until_midnight() -> u64 {
         let now = chrono::Utc::now();
-        let elapsed = u64::from(now.hour()) * 3600
-            + u64::from(now.minute()) * 60
-            + u64::from(now.second());
+        let elapsed =
+            u64::from(now.hour()) * 3600 + u64::from(now.minute()) * 60 + u64::from(now.second());
         86_400u64.saturating_sub(elapsed)
     }
 
@@ -562,12 +578,7 @@ pub(crate) async fn run_fiat_rate_snapshot(
     // 24-hour loop.
     loop {
         let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let (ok, failed) = take_fiat_snapshot(
-            storage.as_ref(),
-            provider.as_ref(),
-            &date,
-        )
-        .await;
+        let (ok, failed) = take_fiat_snapshot(storage.as_ref(), provider.as_ref(), &date).await;
 
         info!(
             date = %date,

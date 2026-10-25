@@ -221,10 +221,7 @@ mod tests {
 
     #[test]
     fn nested_tags_stripped() {
-        assert_eq!(
-            strip_html_tags("<div><p>nested</p></div>"),
-            "nested"
-        );
+        assert_eq!(strip_html_tags("<div><p>nested</p></div>"), "nested");
     }
 
     #[test]
@@ -245,8 +242,7 @@ mod tests {
 
     #[test]
     fn extract_multiple_links() {
-        let links =
-            extract_markdown_links("[a](bitsov://x) and [b](bitsov://y)");
+        let links = extract_markdown_links("[a](bitsov://x) and [b](bitsov://y)");
         assert_eq!(links, vec!["bitsov://x", "bitsov://y"]);
     }
 

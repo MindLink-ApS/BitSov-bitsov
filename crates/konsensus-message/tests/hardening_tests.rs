@@ -78,7 +78,10 @@ fn encode_decode_roundtrip_session_ack() {
 #[test]
 fn encode_decode_roundtrip_message_ack() {
     let id = MessageId::from_bytes([0xBB; 32]);
-    let frame = Frame::MessageAck { id, duplicate: false };
+    let frame = Frame::MessageAck {
+        id,
+        duplicate: false,
+    };
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {
@@ -193,9 +196,7 @@ fn encode_decode_roundtrip_peer_exchange_response() {
         label: Some("test-node".to_string()),
         tier: SovereigntyTier::T2,
     };
-    let frame = Frame::PeerExchangeResponse {
-        peers: vec![entry],
-    };
+    let frame = Frame::PeerExchangeResponse { peers: vec![entry] };
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {

@@ -331,8 +331,8 @@ async fn worker(
     let (auto, _) = mpsc::channel(8);
     let handle = tokio::spawn(crate::session_handler::run(
         crate::session_handler::SessionHandlerDeps {
-        content_server: None,
-        front_door: Default::default(),
+            content_server: None,
+            front_door: Default::default(),
             min_admission_cost_msat: 0,
             privacy: f.policy.clone(),
             peer_exchange_floor: 2500,
@@ -362,7 +362,7 @@ async fn worker(
             ws_delivery_tx: delivery,
             pending_tx: pending,
             starter_hub_tx: None,
-        starter_newcomer_tx: None,
+            starter_newcomer_tx: None,
             auto_channel_tx: auto,
             shutdown_rx,
         },

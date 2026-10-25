@@ -11,7 +11,7 @@
 //! invitee's pubkey. Until then, share invite links only over
 //! confidential channels.
 
-use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::auth::scoped::{Admin, Read, ScopedAuth};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -175,8 +175,7 @@ fn invite_capabilities_response(
         invite_v2_ready: runtime_v2_ready && storage_v2_ready,
         addr_column: storage_caps.addr_column,
         max_fee_rate_sat_per_vb_column: storage_caps.max_fee_rate_sat_per_vb_column,
-        channel_open_intent_expiry_unix_column: storage_caps
-            .channel_open_intent_expiry_unix_column,
+        channel_open_intent_expiry_unix_column: storage_caps.channel_open_intent_expiry_unix_column,
     }
 }
 
@@ -331,7 +330,9 @@ async fn issue_invite(
         .parse::<u16>()
         .map_err(|_| ApiError::BadRequest("addr port must be a valid u16".into()))?;
     if port == 0 {
-        return Err(ApiError::BadRequest("addr port must be greater than zero".into()));
+        return Err(ApiError::BadRequest(
+            "addr port must be greater than zero".into(),
+        ));
     }
     let max_fee_rate_sat_per_vb = req
         .max_fee_rate_sat_per_vb
@@ -594,7 +595,9 @@ async fn accept_invite(
             .unwrap_or(true);
     if should_update_onboarding {
         let scoped_onboarding = OnboardingStateRecord {
-            invite_id: previous_onboarding.as_ref().and_then(|record| record.invite_id),
+            invite_id: previous_onboarding
+                .as_ref()
+                .and_then(|record| record.invite_id),
             inviter_pubkey: Some(invite.inviter_pubkey),
             inviter_ln_pubkey: None,
             current_step: "connecting".to_string(),

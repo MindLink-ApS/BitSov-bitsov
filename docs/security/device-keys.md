@@ -175,7 +175,7 @@ Console recovery and revocation remain available even for the last key.
 
 | Route | Who | Effect |
 |---|---|---|
-| `GET /api/v1/pair/device-keys` | paired | `{node, client_id, owner_control, local_owner_device, owner_device_count, device_approvals, device_keys}`. `node` and `client_id` are part of every message the device signs |
+| `GET /api/v1/pair/device-keys` | paired | `{node, client_id, epoch, owner_control, local_owner_device, owner_device_count, device_approvals, device_keys}`. `node`, `client_id` and `epoch` are what a relation intent signs; registration proofs sign `node` and `client_id` |
 | `POST /api/v1/pair/device-key` | paired | `{public_key, name, proof}`. Creates a *pending* registration and nothing else |
 | `POST /api/v1/pair/device-key/{op}/delegate` | local mode, approver paired token + enrolled device signature | approves the exact pending tuple |
 | `GET/DELETE /api/v1/pair/device-key/{op}` | paired, own | status (`pending/registered/expired/lost/absent`) / cancel |
@@ -191,8 +191,14 @@ node's own state, never from the request body:
 
 ```
 bitsov-device-register-v1\nnode:{node}\nclient:{client_id}\npublic_key:{hex}
-bitsov-relation-intent-v1\nnode:{node}\nclient:{client_id}\ndevice:{key_id}\npeer:{peer}\nlevel:{level}\nbudget_msat:{b}\nper_act_max_msat:{p}\nwindow_secs:{w}\nissued_at:{t}\nnonce:{n}
+bitsov-relation-intent-v2\nnode:{node}\nclient:{client_id}\nepoch:{epoch}\ndevice:{key_id}\npeer:{peer}\nlevel:{level}\nbudget_msat:{b}\nper_act_max_msat:{p}\nwindow_secs:{w}\nissued_at:{t}\nnonce:{n}
 ```
+
+`epoch` is the pairing epoch on the caller's token (`GET /api/v1/pair/device-keys` returns the same value). The node rebuilds these bytes itself; a body field cannot substitute a different epoch. `GET /api/v1/status` advertises `relation_intent_v2`.
+
+`bitsov-relation-intent-v1` omitted `epoch`. It is not accepted. Delegation v1/v2 and ticket v1/v2 keep an older domain only for a different operation that is fully bound by its own bytes. Accepting v1 during a transition would leave the cross-epoch replay open until the transition ended. A device holding a v1 signature signs the v2 bytes again. The acceptance window stays ±300 seconds.
+
+Re-approving the same public key without an epoch bump does not change the signed epoch, so this binding does not cover that case.
 
 Signatures are ECDSA P-256/SHA-256, DER encoded, which is what CryptoKit's
 `derRepresentation` produces. Verification uses `ring`, which rejects points
@@ -312,7 +318,7 @@ An intent is refused, and nothing is written, when any of these holds:
   `--password-fd <n> --local-owner-device`;
 - the key is unknown, revoked, belongs to another client, or was registered
   at an older epoch;
-- the signature does not verify for this node and this client;
+- the signature does not verify for this node, this client and this pairing epoch;
 - `issued_at` is more than 5 minutes from the node's clock;
 - the nonce was already used (nonces are kept durably for an hour);
 - the level is not 1 (Contact; Knock arrives with first contact, step 4);

@@ -54,8 +54,13 @@ impl ChainVisibility {
         } else if let Some(server) = &self.electrum {
             server.tx_visible(&txid).await.map_err(|e| e.to_string())
         } else {
-            let txid = txid.parse().map_err(|_| "invalid transaction id".to_owned())?;
-            self.node.funding_present(txid).await.map_err(|e| e.to_string())
+            let txid = txid
+                .parse()
+                .map_err(|_| "invalid transaction id".to_owned())?;
+            self.node
+                .funding_present(txid)
+                .await
+                .map_err(|e| e.to_string())
         }
     }
 }
@@ -465,11 +470,18 @@ mod tests {
     #[tokio::test]
     async fn reconciliation_without_chain_source_keeps_reservations() {
         let (_dir, node) = restarted_reservations();
-        let chain = ChainVisibility { node: node.clone(), bitcoind: None, electrum: None };
+        let chain = ChainVisibility {
+            node: node.clone(),
+            bitcoind: None,
+            electrum: None,
+        };
         let mut cursor = None;
         reconcile_local_spends(&node, &chain, &mut cursor).await;
         assert_eq!(node.local_spend_reservations().len(), 3);
-        assert!(node.local_spend_reservations().iter().all(|row| row.last_seen_at.is_none()));
+        assert!(node
+            .local_spend_reservations()
+            .iter()
+            .all(|row| row.last_seen_at.is_none()));
     }
 
     #[tokio::test(start_paused = true)]

@@ -49,16 +49,26 @@ pub struct RoutingFeePolicy {
 }
 impl Default for RoutingFeePolicy {
     fn default() -> Self {
-        Self { minimum_msat: 5_000, proportional_millionths: 10_000, maximum_msat: 10_000 }
+        Self {
+            minimum_msat: 5_000,
+            proportional_millionths: 10_000,
+            maximum_msat: 10_000,
+        }
     }
 }
 impl RoutingFeePolicy {
     /// A caller may tighten, never widen, ordinary routing authority.
     pub fn ceiling(&self, principal: u64, caller: Option<u64>) -> u64 {
-        if principal == 0 { return 0; }
-        let proportional = (u128::from(principal) * u128::from(self.proportional_millionths) / 1_000_000)
+        if principal == 0 {
+            return 0;
+        }
+        let proportional = (u128::from(principal) * u128::from(self.proportional_millionths)
+            / 1_000_000)
             .min(u128::from(u64::MAX)) as u64;
-        proportional.max(self.minimum_msat).min(self.maximum_msat).min(caller.unwrap_or(u64::MAX))
+        proportional
+            .max(self.minimum_msat)
+            .min(self.maximum_msat)
+            .min(caller.unwrap_or(u64::MAX))
     }
 }
 
@@ -238,18 +248,34 @@ impl ChannelInfo {
     /// Verify locally negotiated starter terms. The durable initial push is
     /// commitment evidence, unlike today's balance (which may already be spent).
     /// LDK cannot spend this balance until the channel's commitment is ready.
-    pub fn verifies_starter(&self, hub: &str, capacity_sats: u64, push_sats: u64,
-        channel_id: Option<&str>, funding_txid: Option<&str>) -> bool {
-        capacity_sats > 0 && capacity_sats <= 200_000
-            && push_sats > 0 && push_sats <= capacity_sats / 2
+    pub fn verifies_starter(
+        &self,
+        hub: &str,
+        capacity_sats: u64,
+        push_sats: u64,
+        channel_id: Option<&str>,
+        funding_txid: Option<&str>,
+    ) -> bool {
+        capacity_sats > 0
+            && capacity_sats <= 200_000
+            && push_sats > 0
+            && push_sats <= capacity_sats / 2
             && self.peer_pubkey.eq_ignore_ascii_case(hub)
-            && self.is_outbound == Some(false) && self.is_announced == Some(false)
-            && self.is_channel_ready == Some(true) && self.active
+            && self.is_outbound == Some(false)
+            && self.is_announced == Some(false)
+            && self.is_channel_ready == Some(true)
+            && self.active
             && self.capacity_msat == capacity_sats * 1000
-            && self.initial_push_msat.is_some_and(|push| push >= push_sats * 1000)
+            && self
+                .initial_push_msat
+                .is_some_and(|push| push >= push_sats * 1000)
             && channel_id.is_none_or(|id| id == self.channel_id)
-            && funding_txid.is_none_or(|txid| self.funding_txo.as_deref()
-                .and_then(|outpoint| outpoint.split_once(':')).is_some_and(|(id,_)| id == txid))
+            && funding_txid.is_none_or(|txid| {
+                self.funding_txo
+                    .as_deref()
+                    .and_then(|outpoint| outpoint.split_once(':'))
+                    .is_some_and(|(id, _)| id == txid)
+            })
     }
 }
 
@@ -510,53 +536,87 @@ pub trait LightningProvider: Send + Sync {
     }
 
     /// Local safety state; unsupported backends return None. Never initiates I/O.
-    fn offline_chain_state(&self) -> Option<crate::offline_safety::OfflineChainState> { None }
+    fn offline_chain_state(&self) -> Option<crate::offline_safety::OfflineChainState> {
+        None
+    }
 
     /// Shared node-local report, populated by the unlocked node's heartbeat task.
-    fn offline_safety(&self) -> Option<crate::offline_safety::SharedOfflineSafety> { None }
+    fn offline_safety(&self) -> Option<crate::offline_safety::SharedOfflineSafety> {
+        None
+    }
 
     /// Local diagnostics only. None means no observed failure, not proof of sync.
-    fn chain_sync_status(&self) -> Option<ChainSyncStatus> { None }
+    fn chain_sync_status(&self) -> Option<ChainSyncStatus> {
+        None
+    }
 
     /// Supplied by the node's admission wrapper; bare providers have no disk policy.
-    fn disk_status(&self) -> Option<DiskStatus> { None }
+    fn disk_status(&self) -> Option<DiskStatus> {
+        None
+    }
 
     /// Safe to perform money operations, distinct from sufficient liquidity.
-    async fn money_ready(&self) -> bool { self.is_available().await }
+    async fn money_ready(&self) -> bool {
+        self.is_available().await
+    }
 
     async fn readiness(&self) -> LightningReadiness {
         let money_ready = self.money_ready().await;
-        LightningReadiness { money_ready, state: if money_ready { "ready" } else { "offline" }.into(),
-            retry_attempt: 0, retry_after_secs: None, events: Vec::new() }
+        LightningReadiness {
+            money_ready,
+            state: if money_ready { "ready" } else { "offline" }.into(),
+            retry_attempt: 0,
+            retry_after_secs: None,
+            events: Vec::new(),
+        }
     }
 
     /// Whether LSPS2 funding is explicitly enabled on this backend.
-    fn liquidity_info(&self) -> super::liquidity::LiquidityInfo { Default::default() }
+    fn liquidity_info(&self) -> super::liquidity::LiquidityInfo {
+        Default::default()
+    }
 
     /// Negotiate a private funding invoice, bounded by the caller's fee ceiling.
-    async fn quote_liquidity(&self, _owner: &str, _gross_msat: u64, _max_fee_msat: u64)
-        -> Result<super::liquidity::LiquidityQuote, LightningError> {
+    async fn quote_liquidity(
+        &self,
+        _owner: &str,
+        _gross_msat: u64,
+        _max_fee_msat: u64,
+    ) -> Result<super::liquidity::LiquidityQuote, LightningError> {
         Err(LightningError::Backend("LSPS2 liquidity disabled".into()))
     }
 
     /// Read immutable terms before reserving fee authority.
-    fn liquidity_quote(&self, _owner: &str, _id: &str)
-        -> Result<super::liquidity::LiquidityQuote, LightningError> {
-        Err(LightningError::Backend("liquidity quote unavailable".into()))
+    fn liquidity_quote(
+        &self,
+        _owner: &str,
+        _id: &str,
+    ) -> Result<super::liquidity::LiquidityQuote, LightningError> {
+        Err(LightningError::Backend(
+            "liquidity quote unavailable".into(),
+        ))
     }
 
     /// Consume exactly once and publish the prepared invoice. Implementations
     /// must not spawn work that publishes after this future is dropped.
     async fn accept_liquidity(&self, _owner: &str, _id: &str) -> Result<Invoice, LightningError> {
-        Err(LightningError::PaymentNotDispatched("liquidity quote unavailable".into()))
+        Err(LightningError::PaymentNotDispatched(
+            "liquidity quote unavailable".into(),
+        ))
     }
 
     /// Durable funding-purpose exclusion, checked on EVERY admission attempt.
-    async fn is_funding_payment(&self, _hash: &str) -> Result<bool, LightningError> { Ok(false) }
+    async fn is_funding_payment(&self, _hash: &str) -> Result<bool, LightningError> {
+        Ok(false)
+    }
 
     /// Actual settled JIT net and fee, read from the backend's durable payment store.
-    async fn liquidity_receipt(&self, _hash: &str)
-        -> Result<Option<super::liquidity::LiquidityReceipt>, LightningError> { Ok(None) }
+    async fn liquidity_receipt(
+        &self,
+        _hash: &str,
+    ) -> Result<Option<super::liquidity::LiquidityReceipt>, LightningError> {
+        Ok(None)
+    }
 
     /// Create an invoice for receiving a payment.
     ///
@@ -583,13 +643,21 @@ pub trait LightningProvider: Send + Sync {
     }
 
     /// The policy used by ordinary outgoing payments and pre-dispatch budgets.
-    fn routing_fee_policy(&self) -> RoutingFeePolicy { RoutingFeePolicy::default() }
+    fn routing_fee_policy(&self) -> RoutingFeePolicy {
+        RoutingFeePolicy::default()
+    }
 
     /// Send with a routing ceiling enforced before dispatch; unsupported backends refuse.
     async fn keysend_with_fee_limit(
-        &self, _dest: &str, _amount: u64, _memo: Option<&str>, _max_fee_msat: u64,
+        &self,
+        _dest: &str,
+        _amount: u64,
+        _memo: Option<&str>,
+        _max_fee_msat: u64,
     ) -> Result<PaymentDetails, LightningError> {
-        Err(LightningError::PaymentNotDispatched("backend cannot enforce keysend routing fee limit".into()))
+        Err(LightningError::PaymentNotDispatched(
+            "backend cannot enforce keysend routing fee limit".into(),
+        ))
     }
 
     /// Pay a BOLT11 invoice.
@@ -604,9 +672,13 @@ pub trait LightningProvider: Send + Sync {
     /// Unsupported backends fail closed; never use unbounded pay_invoice as
     /// a fallback or discover an overspend only after it has occurred.
     async fn pay_invoice_with_fee_limit(
-        &self, _bolt11: &str, _max_fee_msat: u64,
+        &self,
+        _bolt11: &str,
+        _max_fee_msat: u64,
     ) -> Result<PaymentDetails, LightningError> {
-        Err(LightningError::PaymentNotDispatched("backend cannot enforce routing fee limit".into()))
+        Err(LightningError::PaymentNotDispatched(
+            "backend cannot enforce routing fee limit".into(),
+        ))
     }
 
     /// Check the status of a payment by its payment hash.
@@ -943,8 +1015,12 @@ pub trait LightningProvider: Send + Sync {
 
     /// Detailed result for callers that need to distinguish funding visibility.
     async fn open_channel_with_status(
-        &self, peer_pubkey: &str, peer_addr: &str, amount_sats: u64,
-        announce: bool, fee_rate_sat_per_vb: Option<f32>,
+        &self,
+        peer_pubkey: &str,
+        peer_addr: &str,
+        amount_sats: u64,
+        announce: bool,
+        fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<ChannelOpenResult, LightningError> {
         let channel_id = self
             .open_channel(
@@ -1004,7 +1080,9 @@ pub trait LightningProvider: Send + Sync {
 
     /// Explicit abandonment, exposed only to an authenticated owner.
     async fn release_local_spend(&self, _txid: &str) -> Result<(), LightningError> {
-        Err(LightningError::Backend("local spend release not supported".into()))
+        Err(LightningError::Backend(
+            "local spend release not supported".into(),
+        ))
     }
 
     /// Close a Lightning channel by user channel ID.
@@ -1098,12 +1176,24 @@ mod routing_fee_policy_tests {
     #[test]
     fn default_policy_bounds_small_large_and_overflowing_inputs() {
         let p = RoutingFeePolicy::default();
-        for (amount, expected) in [(0,0), (1,5000), (1000,5000), (100_000,5000), (500_000,5000), (1_000_000,10000), (u64::MAX,10000)] {
+        for (amount, expected) in [
+            (0, 0),
+            (1, 5000),
+            (1000, 5000),
+            (100_000, 5000),
+            (500_000, 5000),
+            (1_000_000, 10000),
+            (u64::MAX, 10000),
+        ] {
             assert_eq!(p.ceiling(amount, None), expected);
             assert_eq!(p.ceiling(amount, Some(0)), 0);
             assert_eq!(p.ceiling(amount, Some(u64::MAX)), expected);
         }
-        let p = RoutingFeePolicy { minimum_msat: 300, proportional_millionths: u64::MAX, maximum_msat: 700 };
+        let p = RoutingFeePolicy {
+            minimum_msat: 300,
+            proportional_millionths: u64::MAX,
+            maximum_msat: 700,
+        };
         assert_eq!(p.ceiling(u64::MAX, None), 700);
         assert_eq!(p.ceiling(u64::MAX, Some(500)), 500);
     }
@@ -1114,10 +1204,16 @@ mod chain_rate_limit_tests {
     use super::*;
     #[test]
     fn owner_status_serializes_rate_limited_kind() {
-        let status = ChainSyncStatus::Stalled { since: 123, last_error_kind: ChainSyncErrorKind::RateLimited };
-        assert_eq!(serde_json::to_value(status).unwrap(), serde_json::json!({
-            "state": "stalled", "since": 123, "last_error_kind": "rate_limited"
-        }));
+        let status = ChainSyncStatus::Stalled {
+            since: 123,
+            last_error_kind: ChainSyncErrorKind::RateLimited,
+        };
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!({
+                "state": "stalled", "since": 123, "last_error_kind": "rate_limited"
+            })
+        );
     }
 }
 

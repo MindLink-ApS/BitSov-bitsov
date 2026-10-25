@@ -110,7 +110,10 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], SponsorError> {
-        let s = self.b.get(self.at..self.at + n).ok_or_else(|| SponsorError::Malformed("truncated".into()))?;
+        let s = self
+            .b
+            .get(self.at..self.at + n)
+            .ok_or_else(|| SponsorError::Malformed("truncated".into()))?;
         self.at += n;
         Ok(s)
     }
@@ -124,15 +127,26 @@ impl<'a> Reader<'a> {
         Ok(u64::from_be_bytes(self.fixed::<8>()?))
     }
     fn text(&mut self, n: usize) -> Result<String, SponsorError> {
-        String::from_utf8(self.take(n)?.to_vec()).map_err(|_| SponsorError::Malformed("not UTF-8".into()))
+        String::from_utf8(self.take(n)?.to_vec())
+            .map_err(|_| SponsorError::Malformed("not UTF-8".into()))
     }
     fn done(&self) -> Result<(), SponsorError> {
-        if self.at == self.b.len() { Ok(()) } else { Err(SponsorError::Malformed("trailing bytes".into())) }
+        if self.at == self.b.len() {
+            Ok(())
+        } else {
+            Err(SponsorError::Malformed("trailing bytes".into()))
+        }
     }
 }
 
 fn check_network(network: &str) -> Result<(), SponsorError> {
-    if NETWORKS.contains(&network) { Ok(()) } else { Err(SponsorError::Malformed(format!("unknown network {network:?}"))) }
+    if NETWORKS.contains(&network) {
+        Ok(())
+    } else {
+        Err(SponsorError::Malformed(format!(
+            "unknown network {network:?}"
+        )))
+    }
 }
 
 // ---- the offer ----------------------------------------------------------------
@@ -170,7 +184,13 @@ impl SponsorOffer {
         *blake3::hash(&signed).as_bytes()
     }
 
-    pub fn sign(key: &SigningKey, network: &str, intro_id: [u8; 16], gift_msat: u64, expires_at: u64) -> Result<Self, SponsorError> {
+    pub fn sign(
+        key: &SigningKey,
+        network: &str,
+        intro_id: [u8; 16],
+        gift_msat: u64,
+        expires_at: u64,
+    ) -> Result<Self, SponsorError> {
         check_network(network)?;
         if gift_msat == 0 || gift_msat > MAX_KIT_MSAT {
             return Err(SponsorError::Amount);
@@ -191,7 +211,10 @@ impl SponsorOffer {
     pub fn verify(&self, now_unix: u64, network: &str) -> Result<(), SponsorError> {
         check_network(&self.network)?;
         if self.network != network {
-            return Err(SponsorError::WrongNetwork { got: self.network.clone(), want: network.into() });
+            return Err(SponsorError::WrongNetwork {
+                got: self.network.clone(),
+                want: network.into(),
+            });
         }
         if self.gift_msat == 0 || self.gift_msat > MAX_KIT_MSAT {
             return Err(SponsorError::Amount);
@@ -243,7 +266,9 @@ pub fn split_introduction_link(text: &str) -> (String, Option<String>) {
     }
     match text.rsplit_once(OFFER_SEPARATOR) {
         // Only split inside the fragment: a card link has no '.' of its own.
-        Some((card, offer)) if !offer.contains('#') && !offer.is_empty() => (card.to_string(), Some(offer.to_string())),
+        Some((card, offer)) if !offer.contains('#') && !offer.is_empty() => {
+            (card.to_string(), Some(offer.to_string()))
+        }
         _ => (text.to_string(), None),
     }
 }
@@ -330,7 +355,10 @@ impl FundingRequest {
     pub fn verify(&self, now_unix: u64, network: &str) -> Result<(), SponsorError> {
         check_network(&self.network)?;
         if self.network != network {
-            return Err(SponsorError::WrongNetwork { got: self.network.clone(), want: network.into() });
+            return Err(SponsorError::WrongNetwork {
+                got: self.network.clone(),
+                want: network.into(),
+            });
         }
         if self.amount_msat == 0 || self.amount_msat > MAX_KIT_MSAT {
             return Err(SponsorError::Amount);
@@ -339,7 +367,9 @@ impl FundingRequest {
             return Err(SponsorError::Expired(self.expires_at));
         }
         if self.newcomer == self.sponsor {
-            return Err(SponsorError::Malformed("a node cannot sponsor itself".into()));
+            return Err(SponsorError::Malformed(
+                "a node cannot sponsor itself".into(),
+            ));
         }
         verify_sig(&self.newcomer, &self.digest(), &self.sig)
     }
@@ -378,19 +408,40 @@ impl FundingRequest {
         let bolt11 = r.text(len)?;
         let sig = r.fixed()?;
         r.done()?;
-        Ok(Self { network, intro_id, sponsor, newcomer, newcomer_ln, amount_msat, payment_hash, expires_at, bolt11, sig })
+        Ok(Self {
+            network,
+            intro_id,
+            sponsor,
+            newcomer,
+            newcomer_ln,
+            amount_msat,
+            payment_hash,
+            expires_at,
+            bolt11,
+            sig,
+        })
     }
 
     /// The six digits both people compare in person before the sponsor pays.
     pub fn comparison_code(&self) -> String {
-        comparison_code(&self.intro_id, &self.sponsor, &self.newcomer, &self.payment_hash)
+        comparison_code(
+            &self.intro_id,
+            &self.sponsor,
+            &self.newcomer,
+            &self.payment_hash,
+        )
     }
 }
 
 /// Six digits from the kit, both keys and the invoice hash. They supplement
 /// the signatures (a copied QR shows a different code); they are never the
 /// only authorization.
-pub fn comparison_code(intro_id: &[u8; 16], sponsor: &[u8; 32], newcomer: &[u8; 32], payment_hash: &[u8; 32]) -> String {
+pub fn comparison_code(
+    intro_id: &[u8; 16],
+    sponsor: &[u8; 32],
+    newcomer: &[u8; 32],
+    payment_hash: &[u8; 32],
+) -> String {
     let mut h = blake3::Hasher::new();
     h.update(CODE_DOMAIN_V1);
     h.update(intro_id);
@@ -418,7 +469,16 @@ mod tests {
         SponsorOffer::sign(&sponsor(), "regtest", [9; 16], 20_000_000, NOW + 600).unwrap()
     }
     fn request() -> FundingRequest {
-        FundingRequest::sign(&newcomer(), &offer(), [2; 33], 20_000_000, [7; 32], NOW + 300, "lnbcrt200u1ptest".into()).unwrap()
+        FundingRequest::sign(
+            &newcomer(),
+            &offer(),
+            [2; 33],
+            20_000_000,
+            [7; 32],
+            NOW + 300,
+            "lnbcrt200u1ptest".into(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -452,12 +512,27 @@ mod tests {
 
     #[test]
     fn offer_bounds() {
-        assert_eq!(SponsorOffer::sign(&sponsor(), "regtest", [9; 16], MAX_KIT_MSAT + 1, NOW + 600), Err(SponsorError::Amount));
-        assert_eq!(SponsorOffer::sign(&sponsor(), "regtest", [9; 16], 0, NOW + 600), Err(SponsorError::Amount));
-        assert_eq!(offer().verify(NOW + 600, "regtest"), Err(SponsorError::Expired(NOW + 600)));
-        assert!(matches!(offer().verify(NOW, "bitcoin"), Err(SponsorError::WrongNetwork { .. })));
+        assert_eq!(
+            SponsorOffer::sign(&sponsor(), "regtest", [9; 16], MAX_KIT_MSAT + 1, NOW + 600),
+            Err(SponsorError::Amount)
+        );
+        assert_eq!(
+            SponsorOffer::sign(&sponsor(), "regtest", [9; 16], 0, NOW + 600),
+            Err(SponsorError::Amount)
+        );
+        assert_eq!(
+            offer().verify(NOW + 600, "regtest"),
+            Err(SponsorError::Expired(NOW + 600))
+        );
+        assert!(matches!(
+            offer().verify(NOW, "bitcoin"),
+            Err(SponsorError::WrongNetwork { .. })
+        ));
         let long = SponsorOffer::sign(&sponsor(), "regtest", [9; 16], 1000, NOW + 3600).unwrap();
-        assert_eq!(long.verify(NOW, "regtest"), Err(SponsorError::LifetimeTooLong));
+        assert_eq!(
+            long.verify(NOW, "regtest"),
+            Err(SponsorError::LifetimeTooLong)
+        );
     }
 
     #[test]
@@ -489,14 +564,25 @@ mod tests {
         for (i, t) in tamper.iter().enumerate() {
             let mut bad = r.clone();
             t(&mut bad);
-            assert!(bad.verify(NOW, "regtest").is_err(), "request tamper {i} verified");
+            assert!(
+                bad.verify(NOW, "regtest").is_err(),
+                "request tamper {i} verified"
+            );
         }
     }
 
     #[test]
     fn request_bounds() {
         assert_eq!(
-            FundingRequest::sign(&newcomer(), &offer(), [2; 33], 20_000_001, [7; 32], NOW + 300, "ln".into()),
+            FundingRequest::sign(
+                &newcomer(),
+                &offer(),
+                [2; 33],
+                20_000_001,
+                [7; 32],
+                NOW + 300,
+                "ln".into()
+            ),
             Err(SponsorError::Amount),
             "never more than the offer"
         );
@@ -504,7 +590,10 @@ mod tests {
         own.newcomer = own.sponsor;
         assert!(own.verify(NOW, "regtest").is_err());
         assert!(FundingRequest::parse(&"A".repeat(MAX_ENCODED_LEN + 1)).is_err());
-        assert!(FundingRequest::parse(&format!("{}AA", request().to_link())).is_err(), "trailing bytes");
+        assert!(
+            FundingRequest::parse(&format!("{}AA", request().to_link())).is_err(),
+            "trailing bytes"
+        );
     }
 
     #[test]
@@ -525,7 +614,10 @@ mod tests {
     fn introduction_links_split_into_card_and_offer() {
         let o = offer().encode();
         let (card, got) = split_introduction_link(&format!("bitsov://introduce#AQdy.{o}"));
-        assert_eq!((card.as_str(), got.as_deref()), ("bitsov://introduce#AQdy", Some(o.as_str())));
+        assert_eq!(
+            (card.as_str(), got.as_deref()),
+            ("bitsov://introduce#AQdy", Some(o.as_str()))
+        );
         let (card, got) = split_introduction_link("bitsov://introduce#AQdy");
         assert_eq!((card.as_str(), got), ("bitsov://introduce#AQdy", None));
         let (card, got) = split_introduction_link("{\"v\":1}");

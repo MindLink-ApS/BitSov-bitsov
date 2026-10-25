@@ -67,9 +67,7 @@ impl PeerEndorseList {
         if self.endorsements.len() > MAX_ENDORSEMENTS {
             return false;
         }
-        self.endorsements
-            .iter()
-            .all(|e| e.note.len() <= MAX_NOTE)
+        self.endorsements.iter().all(|e| e.note.len() <= MAX_NOTE)
     }
 }
 

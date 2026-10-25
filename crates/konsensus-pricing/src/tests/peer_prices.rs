@@ -63,14 +63,8 @@ fn category_string_mapping() {
         category_to_string(KindCategory::Communication),
         "communication"
     );
-    assert_eq!(
-        category_to_string(KindCategory::FilesMedia),
-        "files_media"
-    );
-    assert_eq!(
-        category_to_string(KindCategory::Control),
-        "control"
-    );
+    assert_eq!(category_to_string(KindCategory::FilesMedia), "files_media");
+    assert_eq!(category_to_string(KindCategory::Control), "control");
 }
 
 #[tokio::test]
@@ -116,7 +110,9 @@ async fn staleness_zero_valid_blocks_never_stale_by_height() {
 
     // Even far in the future, not stale by block height
     assert_eq!(
-        cache.get_fresh_peer_price(&peer, 0, 1_000_000, max_age).await,
+        cache
+            .get_fresh_peer_price(&peer, 0, 1_000_000, max_age)
+            .await,
         Some(10)
     );
 }
@@ -193,9 +189,7 @@ async fn update_kind_price_updates_existing_entry() {
     cache.update(peer, prices, 886_000, 144, 0.0).await;
 
     // Update just the communication price via PriceResponse
-    cache
-        .update_kind_price(peer, 0, 25, 886_050)
-        .await;
+    cache.update_kind_price(peer, 0, 25, 886_050).await;
 
     // Communication should be updated
     assert_eq!(cache.get_peer_price(&peer, 0).await, Some(25));
@@ -212,9 +206,7 @@ async fn update_kind_price_creates_new_entry() {
     let peer = test_node_id(1);
 
     // No existing entry — PriceResponse creates one
-    cache
-        .update_kind_price(peer, 0, 15, 886_000)
-        .await;
+    cache.update_kind_price(peer, 0, 15, 886_000).await;
 
     assert_eq!(cache.get_peer_price(&peer, 0).await, Some(15));
     assert_eq!(cache.len().await, 1);
@@ -375,8 +367,8 @@ fn no_single_discount_path_falls_below_floor() {
         0.1,
         0.25,
         0.5,
-        0.9, // clamped to MAX_TRUST_DISCOUNT
-        1.0, // clamped
+        0.9,   // clamped to MAX_TRUST_DISCOUNT
+        1.0,   // clamped
         100.0, // clamped
         f64::NAN,
         f64::INFINITY,
@@ -400,7 +392,10 @@ fn no_single_discount_path_falls_below_floor() {
 fn discount_applied_once_equals_half_at_max() {
     // A correct single application at the maximum discount equals the floor.
     assert_eq!(apply_trust_discount(1000, MAX_TRUST_DISCOUNT), 500);
-    assert_eq!(apply_trust_discount(1000, MAX_TRUST_DISCOUNT), trust_discount_floor_msat(1000));
+    assert_eq!(
+        apply_trust_discount(1000, MAX_TRUST_DISCOUNT),
+        trust_discount_floor_msat(1000)
+    );
 }
 
 #[test]
@@ -449,7 +444,9 @@ async fn bundled_getter_applies_discount_exactly_once() {
     let mut prices = HashMap::new();
     prices.insert("communication".to_string(), 4000);
     // Maximum trust discount.
-    cache.update(peer, prices, 886_000, 144, MAX_TRUST_DISCOUNT).await;
+    cache
+        .update(peer, prices, 886_000, 144, MAX_TRUST_DISCOUNT)
+        .await;
 
     let max_age = std::time::Duration::from_secs(86400);
 
@@ -478,7 +475,9 @@ async fn bundled_getter_stale_table_returns_none() {
 
     let mut prices = HashMap::new();
     prices.insert("communication".to_string(), 1000);
-    cache.update(peer, prices, 886_000, 144, MAX_TRUST_DISCOUNT).await;
+    cache
+        .update(peer, prices, 886_000, 144, MAX_TRUST_DISCOUNT)
+        .await;
 
     let max_age = std::time::Duration::from_secs(86400);
 
@@ -581,17 +580,17 @@ async fn peer_exchange_cache_applies_advertised_admission_floor() {
     cache
         .update(
             peer,
-            HashMap::from([
-                ("control".into(), 1000),
-                (ADMISSION_FLOOR_KEY.into(), 2000),
-            ]),
+            HashMap::from([("control".into(), 1000), (ADMISSION_FLOOR_KEY.into(), 2000)]),
             1,
             10,
             0.5,
         )
         .await;
     let kind = konsensus_core::kind::KIND_PEER_EXCHANGE;
-    assert_eq!(cache.get_discounted_peer_price(&peer, kind).await, Some(2000));
+    assert_eq!(
+        cache.get_discounted_peer_price(&peer, kind).await,
+        Some(2000)
+    );
     assert_eq!(
         cache
             .get_fresh_discounted_peer_price(&peer, kind, 1, std::time::Duration::from_secs(60))
@@ -608,22 +607,64 @@ async fn issue204_zero_height_cannot_build_a_price_table() {
         ..Default::default()
     });
     let table = build_full_price_table(&pricing, &chain).await;
-    assert!(matches!(table, Err(konsensus_core::traits::lightning::LightningError::NotReady)));
+    assert!(matches!(
+        table,
+        Err(konsensus_core::traits::lightning::LightningError::NotReady)
+    ));
 }
 
 #[tokio::test]
 async fn issue204_bad_updates_preserve_cached_good_price_and_age() {
     let cache = PeerPriceCache::new();
     let peer = NodeId::from_bytes([204; 32]);
-    cache.update(peer, HashMap::from([("communication".into(), 2000)]), 850_000, 144, 0.25).await;
+    cache
+        .update(
+            peer,
+            HashMap::from([("communication".into(), 2000)]),
+            850_000,
+            144,
+            0.25,
+        )
+        .await;
     let original = cache.get_peer_entry(&peer).await.unwrap();
     for bad_height in [0, 800_000] {
-        cache.update(peer, HashMap::from([("communication".into(), 9000)]), bad_height, 72, 0.0).await;
+        cache
+            .update(
+                peer,
+                HashMap::from([("communication".into(), 9000)]),
+                bad_height,
+                72,
+                0.0,
+            )
+            .await;
         cache.update_kind_price(peer, 1, 8000, bad_height).await;
-        assert_eq!(cache.get_fresh_discounted_peer_price(&peer, 1, 850_010, std::time::Duration::from_secs(3600)).await, Some(1500));
-        assert_eq!(cache.get_peer_entry(&peer).await.unwrap().received_at, original.received_at);
+        assert_eq!(
+            cache
+                .get_fresh_discounted_peer_price(
+                    &peer,
+                    1,
+                    850_010,
+                    std::time::Duration::from_secs(3600)
+                )
+                .await,
+            Some(1500)
+        );
+        assert_eq!(
+            cache.get_peer_entry(&peer).await.unwrap().received_at,
+            original.received_at
+        );
     }
-    assert_eq!(cache.get_fresh_discounted_peer_price(&peer, 1, 850_145, std::time::Duration::from_secs(3600)).await, None);
+    assert_eq!(
+        cache
+            .get_fresh_discounted_peer_price(
+                &peer,
+                1,
+                850_145,
+                std::time::Duration::from_secs(3600)
+            )
+            .await,
+        None
+    );
 }
 
 #[tokio::test]
@@ -631,17 +672,32 @@ async fn issue204_all_endpoints_down_refuses_price_table() {
     let pricing = crate::StaticPricingEngine::new(crate::StaticPricingConfig::default());
     // Unsupported schemes fail immediately, without opening sockets.
     let chain = konsensus_chain::EsploraProvider::with_fallbacks(
-        konsensus_chain::EsploraConfig::custom("unsupported://primary".into(), konsensus_core::traits::chain::TrustLevel::ServerTrust),
+        konsensus_chain::EsploraConfig::custom(
+            "unsupported://primary".into(),
+            konsensus_core::traits::chain::TrustLevel::ServerTrust,
+        ),
         vec!["unsupported://fallback".into()],
-    ).unwrap();
-    assert!(matches!(build_full_price_table(&pricing, &chain).await, Err(konsensus_core::traits::lightning::LightningError::NotReady)));
+    )
+    .unwrap();
+    assert!(matches!(
+        build_full_price_table(&pricing, &chain).await,
+        Err(konsensus_core::traits::lightning::LightningError::NotReady)
+    ));
 }
 
 #[tokio::test]
 async fn issue204_zero_height_never_becomes_an_unlimited_cached_price() {
     let cache = PeerPriceCache::new();
     let peer = test_node_id(204);
-    cache.update(peer, HashMap::from([("communication".into(), 1000)]), 0, 0, 0.0).await;
+    cache
+        .update(
+            peer,
+            HashMap::from([("communication".into(), 1000)]),
+            0,
+            0,
+            0.0,
+        )
+        .await;
     cache.update_kind_price(peer, 1, 1000, 0).await;
     assert!(cache.get_peer_entry(&peer).await.is_none());
     assert!(cache.kind_answered_at(&peer, 1).await.is_none());
@@ -653,26 +709,69 @@ async fn issue204_stale_updates_cannot_displace_valid_prices_but_rollbacks_recov
     let peer = test_node_id(205);
     let prices = || HashMap::from([("communication".into(), 2000)]);
     cache.update(peer, prices(), 850_000, 144, 0.0).await;
-    assert_eq!(cache.get_fresh_peer_price(&peer, 1, 850_100, std::time::Duration::from_secs(3600)).await, Some(2000));
-    cache.update(peer, HashMap::from([("communication".into(), 9000)]), 850_010, 36, 0.0).await;
-    assert_eq!(cache.get_fresh_peer_price(&peer, 1, 850_100, std::time::Duration::from_secs(3600)).await, Some(2000));
+    assert_eq!(
+        cache
+            .get_fresh_peer_price(&peer, 1, 850_100, std::time::Duration::from_secs(3600))
+            .await,
+        Some(2000)
+    );
+    cache
+        .update(
+            peer,
+            HashMap::from([("communication".into(), 9000)]),
+            850_010,
+            36,
+            0.0,
+        )
+        .await;
+    assert_eq!(
+        cache
+            .get_fresh_peer_price(&peer, 1, 850_100, std::time::Duration::from_secs(3600))
+            .await,
+        Some(2000)
+    );
     // A fresh table at a lower tip after a short rollback is usable.
     cache.update(peer, prices(), 849_999, 144, 0.0).await;
-    assert_eq!(cache.get_peer_entry(&peer).await.unwrap().block_height, 849_999);
-    cache.entries.write().await.get_mut(&peer).unwrap().received_at = Instant::now() - std::time::Duration::from_secs(3601);
+    assert_eq!(
+        cache.get_peer_entry(&peer).await.unwrap().block_height,
+        849_999
+    );
+    cache
+        .entries
+        .write()
+        .await
+        .get_mut(&peer)
+        .unwrap()
+        .received_at = Instant::now() - std::time::Duration::from_secs(3601);
     cache.update_kind_price(peer, 1, 3000, 849_998).await;
     assert!(cache.kind_answered_at(&peer, 1).await.is_some());
-    assert_eq!(cache.get_fresh_peer_price(&peer, 1, 850_000, std::time::Duration::from_secs(3600)).await, Some(3000));
+    assert_eq!(
+        cache
+            .get_fresh_peer_price(&peer, 1, 850_000, std::time::Duration::from_secs(3600))
+            .await,
+        Some(3000)
+    );
 }
 
 #[tokio::test]
 async fn issue204_stale_kind_response_without_prior_table_is_not_a_fresh_answer() {
     let cache = PeerPriceCache::new();
     let peer = test_node_id(206);
-    assert!(cache.get_fresh_peer_price(&peer, 1, 850_000, std::time::Duration::from_secs(3600)).await.is_none());
+    assert!(cache
+        .get_fresh_peer_price(&peer, 1, 850_000, std::time::Duration::from_secs(3600))
+        .await
+        .is_none());
     cache.update_kind_price(peer, 1, 9000, 800_000).await;
-    assert!(cache.get_fresh_peer_price(&peer, 1, 850_000, std::time::Duration::from_secs(3600)).await.is_none());
+    assert!(cache
+        .get_fresh_peer_price(&peer, 1, 850_000, std::time::Duration::from_secs(3600))
+        .await
+        .is_none());
     assert!(cache.kind_answered_at(&peer, 1).await.is_none());
     cache.update_kind_price(peer, 1, 2000, 850_000).await;
-    assert_eq!(cache.get_fresh_peer_price(&peer, 1, 850_000, std::time::Duration::from_secs(3600)).await, Some(2000));
+    assert_eq!(
+        cache
+            .get_fresh_peer_price(&peer, 1, 850_000, std::time::Duration::from_secs(3600))
+            .await,
+        Some(2000)
+    );
 }

@@ -68,9 +68,7 @@ impl SessionStore for InMemorySessionStore {
         Ok(())
     }
 
-    async fn list_sessions(
-        &self,
-    ) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.data.lock().await.keys().copied().collect())
     }
 }
@@ -102,9 +100,7 @@ impl SessionStore for FailingSessionStore {
         Err("delete failed".into())
     }
 
-    async fn list_sessions(
-        &self,
-    ) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
         Err("list failed".into())
     }
 }
@@ -160,7 +156,8 @@ fn seed_with_all_zeros_produces_valid_identity() {
     let id = NodeIdentity::from_seed(&seed).expect("all-zero seed must produce valid identity");
     // Verify identity can sign and verify (keys are functional)
     let sig = id.sign(b"test");
-    id.verify(b"test", &sig).expect("zero-seed identity must produce valid signatures");
+    id.verify(b"test", &sig)
+        .expect("zero-seed identity must produce valid signatures");
 }
 
 #[test]
@@ -168,7 +165,8 @@ fn seed_with_all_ones_produces_valid_identity() {
     let seed_zeros = [0u8; 64];
     let seed_ones = [0xFF; 64];
     let id_zeros = NodeIdentity::from_seed(&seed_zeros).unwrap();
-    let id_ones = NodeIdentity::from_seed(&seed_ones).expect("all-ones seed must produce valid identity");
+    let id_ones =
+        NodeIdentity::from_seed(&seed_ones).expect("all-ones seed must produce valid identity");
     // Different seeds must produce different node IDs
     assert_ne!(id_zeros.node_id(), id_ones.node_id());
 }
@@ -195,7 +193,8 @@ fn seed_length_0_rejected() {
 fn sign_empty_message() {
     let id = NodeIdentity::from_mnemonic(MNEMONIC_A, "").unwrap();
     let sig = id.sign(b"");
-    id.verify(b"", &sig).expect("empty message signature must verify");
+    id.verify(b"", &sig)
+        .expect("empty message signature must verify");
     // Signature for empty message must NOT verify against non-empty message
     assert!(id.verify(b"x", &sig).is_err());
 }
@@ -205,7 +204,8 @@ fn sign_large_message() {
     let id = NodeIdentity::from_mnemonic(MNEMONIC_A, "").unwrap();
     let large = vec![0x42; 1024 * 1024]; // 1 MB
     let sig = id.sign(&large);
-    id.verify(&large, &sig).expect("large message signature must verify");
+    id.verify(&large, &sig)
+        .expect("large message signature must verify");
     // Verify the signature is deterministic (Ed25519 is deterministic)
     let sig2 = id.sign(&large);
     assert_eq!(sig.to_bytes(), sig2.to_bytes());
@@ -223,7 +223,8 @@ fn verify_with_corrupted_signature() {
     let err = id.verify(b"test message", &corrupted);
     assert!(err.is_err(), "corrupted signature must fail verification");
     // Original signature must still verify
-    id.verify(b"test message", &sig).expect("original signature must still verify");
+    id.verify(b"test message", &sig)
+        .expect("original signature must still verify");
 }
 
 #[test]
@@ -237,7 +238,10 @@ fn verify_with_flipped_last_byte_signature() {
     let bad_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
     let err = id.verify(b"test", &bad_sig);
-    assert!(err.is_err(), "flipped-last-byte signature must fail verification");
+    assert!(
+        err.is_err(),
+        "flipped-last-byte signature must fail verification"
+    );
     // Different message must also fail with the original good signature
     assert!(id.verify(b"wrong", &sig).is_err());
 }
@@ -328,7 +332,10 @@ async fn full_session_lifecycle_with_store() {
     assert!(bob.can_send(alice_id.node_id()).await);
 
     // Bidirectional messaging
-    let msg = bob.encrypt(alice_id.node_id(), b"hello alice").await.unwrap();
+    let msg = bob
+        .encrypt(alice_id.node_id(), b"hello alice")
+        .await
+        .unwrap();
     let decrypted = alice.decrypt(bob_id.node_id(), &msg).await.unwrap();
     assert_eq!(decrypted, b"hello alice");
 
@@ -386,9 +393,7 @@ async fn duplicate_session_initiation_rejected() {
         .unwrap();
 
     // Second initiation fails — session already exists
-    let result = alice
-        .initiate_session(bob_id.node_id(), &bob_bundle)
-        .await;
+    let result = alice.initiate_session(bob_id.node_id(), &bob_bundle).await;
     assert!(matches!(result, Err(SessionError::SessionExists(_))));
 }
 
@@ -607,7 +612,8 @@ fn make_ratchet_pair() -> (DoubleRatchet, DoubleRatchet) {
     let shared_secret = [42u8; 32];
     let ad = b"alice||bob".to_vec();
     let bob_spk = SignedPreKey::generate();
-    let alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).expect("test setup");
+    let alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone())
+        .expect("test setup");
     let bob = DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
     (alice, bob)
 }
@@ -656,7 +662,10 @@ fn double_decrypt_same_message_fails() {
 
     // Second decrypt should fail (message key consumed)
     let err = bob.decrypt(&msg).unwrap_err();
-    assert!(matches!(err, konsensus_crypto::double_ratchet::RatchetError::DecryptionFailed(_)));
+    assert!(matches!(
+        err,
+        konsensus_crypto::double_ratchet::RatchetError::DecryptionFailed(_)
+    ));
 }
 
 #[test]

@@ -84,9 +84,13 @@ impl ChannelPeers {
 
     fn check(&self, peer_pubkey: &str) -> Result<(), LightningError> {
         match self {
-            Self::HubOnly(hubs) if !hubs.iter().any(|hub| hub.eq_ignore_ascii_case(peer_pubkey)) => {
+            Self::HubOnly(hubs)
+                if !hubs.iter().any(|hub| hub.eq_ignore_ascii_case(peer_pubkey)) =>
+            {
                 tracing::warn!(peer = %peer_pubkey, code = HUB_ONLY_WHILE_LOCKABLE, "refused channel open to a non-hub peer");
-                Err(LightningError::PaymentNotDispatched(HUB_ONLY_WHILE_LOCKABLE.into()))
+                Err(LightningError::PaymentNotDispatched(
+                    HUB_ONLY_WHILE_LOCKABLE.into(),
+                ))
             }
             _ => Ok(()),
         }

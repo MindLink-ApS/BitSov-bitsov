@@ -906,10 +906,9 @@ impl LightningConfig {
                 ("advertised_address", advertised_address),
                 ("listening_address", listening_address),
             ] {
-                if address
-                    .as_ref()
-                    .is_some_and(|address| address.len() > konsensus_message::wire::MAX_LN_ADDR_BYTES)
-                {
+                if address.as_ref().is_some_and(|address| {
+                    address.len() > konsensus_message::wire::MAX_LN_ADDR_BYTES
+                }) {
                     anyhow::bail!(
                         "Lightning address lightning.{field} exceeds the wire limit of {} UTF-8 bytes",
                         konsensus_message::wire::MAX_LN_ADDR_BYTES
@@ -1682,11 +1681,16 @@ impl NodeConfig {
         Ok(())
     }
 
-    pub(crate) fn starter_settings(&self) -> konsensus_api::handlers::starter_channel::StarterSettings {
+    pub(crate) fn starter_settings(
+        &self,
+    ) -> konsensus_api::handlers::starter_channel::StarterSettings {
         let mut settings = konsensus_api::handlers::starter_channel::StarterSettings {
             config: self.starter.clone(),
             network: self.lightning.bitcoin_network().unwrap_or_default(),
-            hub_whitelisted: self.peers.iter().any(|p| p.node_id == self.starter.hub_node_id),
+            hub_whitelisted: self
+                .peers
+                .iter()
+                .any(|p| p.node_id == self.starter.hub_node_id),
             ..Default::default()
         };
         if let LightningConfig::Ldk { liquidity, .. } = &self.lightning {
@@ -1702,9 +1706,18 @@ impl NodeConfig {
     pub(crate) fn validate_starter_hub(&self, lockable: bool) -> anyhow::Result<()> {
         let network = self.lightning.bitcoin_network();
         self.starter
-            .validate(network.as_deref(), matches!(self.lightning, LightningConfig::Ldk { .. }))
+            .validate(
+                network.as_deref(),
+                matches!(self.lightning, LightningConfig::Ldk { .. }),
+            )
             .map_err(anyhow::Error::msg)?;
-        self.starter_hub.validate(network.as_deref(), self.lightning.channel_capacity_limits().map(|l| l.max_channel_capacity_sats), lockable)
+        self.starter_hub.validate(
+            network.as_deref(),
+            self.lightning
+                .channel_capacity_limits()
+                .map(|l| l.max_channel_capacity_sats),
+            lockable,
+        )
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {

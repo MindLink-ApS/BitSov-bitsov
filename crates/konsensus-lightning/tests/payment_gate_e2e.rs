@@ -53,7 +53,10 @@ async fn mock_cross_instance_payment_proof() {
     assert_eq!(payment.direction, PaymentDirection::Outgoing);
     assert_eq!(payment.status, PaymentStatus::Settled);
     assert_eq!(payment.amount_msat, amount_msat);
-    assert!(payment.preimage.is_some(), "settled payment must have preimage");
+    assert!(
+        payment.preimage.is_some(),
+        "settled payment must have preimage"
+    );
 
     // ── Cryptographic proof: SHA256(preimage) == payment_hash ────────────
     // This is the fundamental invariant the payment gate checks.

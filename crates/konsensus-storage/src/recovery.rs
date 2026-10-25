@@ -102,16 +102,10 @@ pub trait RecoveryStore: Send + Sync {
     /// greater** than the stored value (or the row does not yet exist).
     ///
     /// Returns `true` if the row was inserted or updated.
-    async fn upsert_recovery_scheme(
-        &self,
-        scheme: &RecoveryScheme,
-    ) -> Result<bool, StorageError>;
+    async fn upsert_recovery_scheme(&self, scheme: &RecoveryScheme) -> Result<bool, StorageError>;
 
     /// Retrieve a recovery scheme by ID.
-    async fn get_recovery_scheme(
-        &self,
-        id: &str,
-    ) -> Result<Option<RecoveryScheme>, StorageError>;
+    async fn get_recovery_scheme(&self, id: &str) -> Result<Option<RecoveryScheme>, StorageError>;
 
     /// List all recovery schemes, ordered by `created_at ASC`.
     async fn list_recovery_schemes(&self) -> Result<Vec<RecoveryScheme>, StorageError>;
@@ -190,10 +184,7 @@ impl SqliteRecoveryStore {
 
 #[async_trait]
 impl RecoveryStore for SqliteRecoveryStore {
-    async fn upsert_recovery_scheme(
-        &self,
-        scheme: &RecoveryScheme,
-    ) -> Result<bool, StorageError> {
+    async fn upsert_recovery_scheme(&self, scheme: &RecoveryScheme) -> Result<bool, StorageError> {
         let threshold = scheme.threshold as i64;
         let total_shares = scheme.total_shares as i64;
 
@@ -222,10 +213,7 @@ impl RecoveryStore for SqliteRecoveryStore {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn get_recovery_scheme(
-        &self,
-        id: &str,
-    ) -> Result<Option<RecoveryScheme>, StorageError> {
+    async fn get_recovery_scheme(&self, id: &str) -> Result<Option<RecoveryScheme>, StorageError> {
         let row: Option<(String, String, i64, i64, String, String, String)> = sqlx::query_as(
             "SELECT id, scheme_type, threshold, total_shares, metadata_json, created_at, updated_at
              FROM recovery_schemes WHERE id = ?1",
@@ -260,7 +248,15 @@ impl RecoveryStore for SqliteRecoveryStore {
         Ok(rows
             .into_iter()
             .map(
-                |(id, scheme_type, threshold, total_shares, metadata_json, created_at, updated_at)| {
+                |(
+                    id,
+                    scheme_type,
+                    threshold,
+                    total_shares,
+                    metadata_json,
+                    created_at,
+                    updated_at,
+                )| {
                     RecoveryScheme {
                         id,
                         scheme_type,
@@ -329,7 +325,15 @@ impl RecoveryStore for SqliteRecoveryStore {
         .await?;
 
         Ok(row.map(
-            |(id, scheme_id, trustee_node_id, share_index, shard_commitment, delivered_at, created_at)| {
+            |(
+                id,
+                scheme_id,
+                trustee_node_id,
+                share_index,
+                shard_commitment,
+                delivered_at,
+                created_at,
+            )| {
                 RecoveryTrustee {
                     id,
                     scheme_id,
@@ -368,7 +372,15 @@ impl RecoveryStore for SqliteRecoveryStore {
         Ok(rows
             .into_iter()
             .map(
-                |(id, scheme_id, trustee_node_id, share_index, shard_commitment, delivered_at, created_at)| {
+                |(
+                    id,
+                    scheme_id,
+                    trustee_node_id,
+                    share_index,
+                    shard_commitment,
+                    delivered_at,
+                    created_at,
+                )| {
                     RecoveryTrustee {
                         id,
                         scheme_id,
@@ -388,12 +400,11 @@ impl RecoveryStore for SqliteRecoveryStore {
         id: &str,
         delivered_at: &str,
     ) -> Result<bool, StorageError> {
-        let result =
-            sqlx::query("UPDATE recovery_trustees SET delivered_at = ?2 WHERE id = ?1")
-                .bind(id)
-                .bind(delivered_at)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query("UPDATE recovery_trustees SET delivered_at = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(delivered_at)
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -441,7 +452,14 @@ impl RecoveryStore for SqliteRecoveryStore {
         .await?;
 
         Ok(row.map(
-            |(id, owner_node_id, share_index, shard_ciphertext, scheme_metadata_json, received_at)| {
+            |(
+                id,
+                owner_node_id,
+                share_index,
+                shard_ciphertext,
+                scheme_metadata_json,
+                received_at,
+            )| {
                 RecoveryShard {
                     id,
                     owner_node_id,
@@ -471,7 +489,14 @@ impl RecoveryStore for SqliteRecoveryStore {
         Ok(rows
             .into_iter()
             .map(
-                |(id, owner_node_id, share_index, shard_ciphertext, scheme_metadata_json, received_at)| {
+                |(
+                    id,
+                    owner_node_id,
+                    share_index,
+                    shard_ciphertext,
+                    scheme_metadata_json,
+                    received_at,
+                )| {
                     RecoveryShard {
                         id,
                         owner_node_id,
@@ -518,10 +543,7 @@ impl PostgresRecoveryStore {
 
 #[async_trait]
 impl RecoveryStore for PostgresRecoveryStore {
-    async fn upsert_recovery_scheme(
-        &self,
-        scheme: &RecoveryScheme,
-    ) -> Result<bool, StorageError> {
+    async fn upsert_recovery_scheme(&self, scheme: &RecoveryScheme) -> Result<bool, StorageError> {
         let threshold = scheme.threshold as i32;
         let total_shares = scheme.total_shares as i32;
 
@@ -550,10 +572,7 @@ impl RecoveryStore for PostgresRecoveryStore {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn get_recovery_scheme(
-        &self,
-        id: &str,
-    ) -> Result<Option<RecoveryScheme>, StorageError> {
+    async fn get_recovery_scheme(&self, id: &str) -> Result<Option<RecoveryScheme>, StorageError> {
         let row: Option<(String, String, i32, i32, String, String, String)> = sqlx::query_as(
             "SELECT id, scheme_type, threshold, total_shares, metadata_json, created_at, updated_at
              FROM recovery_schemes WHERE id = $1",
@@ -588,7 +607,15 @@ impl RecoveryStore for PostgresRecoveryStore {
         Ok(rows
             .into_iter()
             .map(
-                |(id, scheme_type, threshold, total_shares, metadata_json, created_at, updated_at)| {
+                |(
+                    id,
+                    scheme_type,
+                    threshold,
+                    total_shares,
+                    metadata_json,
+                    created_at,
+                    updated_at,
+                )| {
                     RecoveryScheme {
                         id,
                         scheme_type,
@@ -657,7 +684,15 @@ impl RecoveryStore for PostgresRecoveryStore {
         .await?;
 
         Ok(row.map(
-            |(id, scheme_id, trustee_node_id, share_index, shard_commitment, delivered_at, created_at)| {
+            |(
+                id,
+                scheme_id,
+                trustee_node_id,
+                share_index,
+                shard_commitment,
+                delivered_at,
+                created_at,
+            )| {
                 RecoveryTrustee {
                     id,
                     scheme_id,
@@ -696,7 +731,15 @@ impl RecoveryStore for PostgresRecoveryStore {
         Ok(rows
             .into_iter()
             .map(
-                |(id, scheme_id, trustee_node_id, share_index, shard_commitment, delivered_at, created_at)| {
+                |(
+                    id,
+                    scheme_id,
+                    trustee_node_id,
+                    share_index,
+                    shard_commitment,
+                    delivered_at,
+                    created_at,
+                )| {
                     RecoveryTrustee {
                         id,
                         scheme_id,
@@ -716,12 +759,11 @@ impl RecoveryStore for PostgresRecoveryStore {
         id: &str,
         delivered_at: &str,
     ) -> Result<bool, StorageError> {
-        let result =
-            sqlx::query("UPDATE recovery_trustees SET delivered_at = $2 WHERE id = $1")
-                .bind(id)
-                .bind(delivered_at)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query("UPDATE recovery_trustees SET delivered_at = $2 WHERE id = $1")
+            .bind(id)
+            .bind(delivered_at)
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -769,7 +811,14 @@ impl RecoveryStore for PostgresRecoveryStore {
         .await?;
 
         Ok(row.map(
-            |(id, owner_node_id, share_index, shard_ciphertext, scheme_metadata_json, received_at)| {
+            |(
+                id,
+                owner_node_id,
+                share_index,
+                shard_ciphertext,
+                scheme_metadata_json,
+                received_at,
+            )| {
                 RecoveryShard {
                     id,
                     owner_node_id,
@@ -799,7 +848,14 @@ impl RecoveryStore for PostgresRecoveryStore {
         Ok(rows
             .into_iter()
             .map(
-                |(id, owner_node_id, share_index, shard_ciphertext, scheme_metadata_json, received_at)| {
+                |(
+                    id,
+                    owner_node_id,
+                    share_index,
+                    shard_ciphertext,
+                    scheme_metadata_json,
+                    received_at,
+                )| {
                     RecoveryShard {
                         id,
                         owner_node_id,
@@ -887,17 +943,11 @@ impl<S: RecoveryStore> EncryptedRecoveryStore<S> {
 impl<S: RecoveryStore> RecoveryStore for EncryptedRecoveryStore<S> {
     // Schemes pass through unchanged — no sensitive binary payloads.
 
-    async fn upsert_recovery_scheme(
-        &self,
-        scheme: &RecoveryScheme,
-    ) -> Result<bool, StorageError> {
+    async fn upsert_recovery_scheme(&self, scheme: &RecoveryScheme) -> Result<bool, StorageError> {
         self.inner.upsert_recovery_scheme(scheme).await
     }
 
-    async fn get_recovery_scheme(
-        &self,
-        id: &str,
-    ) -> Result<Option<RecoveryScheme>, StorageError> {
+    async fn get_recovery_scheme(&self, id: &str) -> Result<Option<RecoveryScheme>, StorageError> {
         self.inner.get_recovery_scheme(id).await
     }
 
@@ -1119,8 +1169,12 @@ mod tests {
     #[tokio::test]
     async fn test_scheme_list_and_delete() {
         let repo = make_repo().await;
-        repo.upsert_recovery_scheme(&make_scheme("s1", "2026-01-01T00:00:00.000Z")).await.unwrap();
-        repo.upsert_recovery_scheme(&make_scheme("s2", "2026-02-01T00:00:00.000Z")).await.unwrap();
+        repo.upsert_recovery_scheme(&make_scheme("s1", "2026-01-01T00:00:00.000Z"))
+            .await
+            .unwrap();
+        repo.upsert_recovery_scheme(&make_scheme("s2", "2026-02-01T00:00:00.000Z"))
+            .await
+            .unwrap();
         let all = repo.list_recovery_schemes().await.unwrap();
         assert_eq!(all.len(), 2);
         let deleted = repo.delete_recovery_scheme("s1").await.unwrap();
@@ -1135,7 +1189,9 @@ mod tests {
     #[tokio::test]
     async fn test_trustee_upsert_and_get() {
         let repo = make_repo().await;
-        repo.upsert_recovery_scheme(&make_scheme("s1", "2026-01-01T00:00:00.000Z")).await.unwrap();
+        repo.upsert_recovery_scheme(&make_scheme("s1", "2026-01-01T00:00:00.000Z"))
+            .await
+            .unwrap();
         let trustee = make_trustee("t1", "s1", 1);
         repo.upsert_trustee(&trustee).await.unwrap();
         let got = repo.get_trustee("t1").await.unwrap().unwrap();
@@ -1147,10 +1203,18 @@ mod tests {
     #[tokio::test]
     async fn test_trustee_list_for_scheme() {
         let repo = make_repo().await;
-        repo.upsert_recovery_scheme(&make_scheme("s1", "2026-01-01T00:00:00.000Z")).await.unwrap();
-        repo.upsert_trustee(&make_trustee("t1", "s1", 1)).await.unwrap();
-        repo.upsert_trustee(&make_trustee("t2", "s1", 2)).await.unwrap();
-        repo.upsert_trustee(&make_trustee("t3", "s1", 3)).await.unwrap();
+        repo.upsert_recovery_scheme(&make_scheme("s1", "2026-01-01T00:00:00.000Z"))
+            .await
+            .unwrap();
+        repo.upsert_trustee(&make_trustee("t1", "s1", 1))
+            .await
+            .unwrap();
+        repo.upsert_trustee(&make_trustee("t2", "s1", 2))
+            .await
+            .unwrap();
+        repo.upsert_trustee(&make_trustee("t3", "s1", 3))
+            .await
+            .unwrap();
         let trustees = repo.list_trustees_for_scheme("s1").await.unwrap();
         assert_eq!(trustees.len(), 3);
         assert_eq!(trustees[0].share_index, 1);
@@ -1160,19 +1224,33 @@ mod tests {
     #[tokio::test]
     async fn test_trustee_mark_delivered() {
         let repo = make_repo().await;
-        repo.upsert_recovery_scheme(&make_scheme("s1", "2026-01-01T00:00:00.000Z")).await.unwrap();
-        repo.upsert_trustee(&make_trustee("t1", "s1", 1)).await.unwrap();
-        let updated = repo.mark_trustee_delivered("t1", "2026-04-21T12:00:00.000Z").await.unwrap();
+        repo.upsert_recovery_scheme(&make_scheme("s1", "2026-01-01T00:00:00.000Z"))
+            .await
+            .unwrap();
+        repo.upsert_trustee(&make_trustee("t1", "s1", 1))
+            .await
+            .unwrap();
+        let updated = repo
+            .mark_trustee_delivered("t1", "2026-04-21T12:00:00.000Z")
+            .await
+            .unwrap();
         assert!(updated);
         let got = repo.get_trustee("t1").await.unwrap().unwrap();
-        assert_eq!(got.delivered_at.as_deref(), Some("2026-04-21T12:00:00.000Z"));
+        assert_eq!(
+            got.delivered_at.as_deref(),
+            Some("2026-04-21T12:00:00.000Z")
+        );
     }
 
     #[tokio::test]
     async fn test_trustee_delete() {
         let repo = make_repo().await;
-        repo.upsert_recovery_scheme(&make_scheme("s1", "2026-01-01T00:00:00.000Z")).await.unwrap();
-        repo.upsert_trustee(&make_trustee("t1", "s1", 1)).await.unwrap();
+        repo.upsert_recovery_scheme(&make_scheme("s1", "2026-01-01T00:00:00.000Z"))
+            .await
+            .unwrap();
+        repo.upsert_trustee(&make_trustee("t1", "s1", 1))
+            .await
+            .unwrap();
         let deleted = repo.delete_trustee("t1").await.unwrap();
         assert!(deleted);
         assert!(repo.get_trustee("t1").await.unwrap().is_none());
@@ -1194,7 +1272,9 @@ mod tests {
     #[tokio::test]
     async fn test_shard_replace_on_conflict() {
         let repo = make_repo().await;
-        repo.store_shard(&make_shard("sh1", "owner", 1)).await.unwrap();
+        repo.store_shard(&make_shard("sh1", "owner", 1))
+            .await
+            .unwrap();
         let updated = RecoveryShard {
             id: "sh2".into(),
             shard_ciphertext: vec![0xca, 0xfe],
@@ -1209,9 +1289,15 @@ mod tests {
     #[tokio::test]
     async fn test_shard_list_for_owner() {
         let repo = make_repo().await;
-        repo.store_shard(&make_shard("sh1", "alice", 1)).await.unwrap();
-        repo.store_shard(&make_shard("sh2", "alice", 2)).await.unwrap();
-        repo.store_shard(&make_shard("sh3", "bob", 1)).await.unwrap();
+        repo.store_shard(&make_shard("sh1", "alice", 1))
+            .await
+            .unwrap();
+        repo.store_shard(&make_shard("sh2", "alice", 2))
+            .await
+            .unwrap();
+        repo.store_shard(&make_shard("sh3", "bob", 1))
+            .await
+            .unwrap();
         let alice_shards = repo.list_shards_for_owner("alice").await.unwrap();
         assert_eq!(alice_shards.len(), 2);
         assert_eq!(alice_shards[0].share_index, 1);
@@ -1223,7 +1309,9 @@ mod tests {
     #[tokio::test]
     async fn test_shard_delete_by_id() {
         let repo = make_repo().await;
-        repo.store_shard(&make_shard("sh1", "alice", 1)).await.unwrap();
+        repo.store_shard(&make_shard("sh1", "alice", 1))
+            .await
+            .unwrap();
         let deleted = repo.delete_shard("sh1").await.unwrap();
         assert!(deleted);
         assert!(repo.get_shard("sh1").await.unwrap().is_none());
@@ -1234,9 +1322,15 @@ mod tests {
     #[tokio::test]
     async fn test_shard_delete_all_for_owner() {
         let repo = make_repo().await;
-        repo.store_shard(&make_shard("sh1", "alice", 1)).await.unwrap();
-        repo.store_shard(&make_shard("sh2", "alice", 2)).await.unwrap();
-        repo.store_shard(&make_shard("sh3", "bob", 1)).await.unwrap();
+        repo.store_shard(&make_shard("sh1", "alice", 1))
+            .await
+            .unwrap();
+        repo.store_shard(&make_shard("sh2", "alice", 2))
+            .await
+            .unwrap();
+        repo.store_shard(&make_shard("sh3", "bob", 1))
+            .await
+            .unwrap();
         let n = repo.delete_shards_for_owner("alice").await.unwrap();
         assert_eq!(n, 2);
         let remaining = repo.list_shards_for_owner("alice").await.unwrap();

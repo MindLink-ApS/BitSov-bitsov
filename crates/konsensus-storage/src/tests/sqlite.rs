@@ -1,6 +1,6 @@
 use super::*;
-use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_core::kind::KIND_CHAT;
+use konsensus_core::UkmEnvelopeBuilder;
 use sha2::{Digest, Sha256};
 
 fn make_proof() -> PaymentProof {
@@ -22,8 +22,8 @@ fn make_envelope(sender: NodeId, recipient: Recipient) -> UkmEnvelope {
 }
 
 #[tokio::test]
-async fn sqlite_invite_schema_capabilities_reports_v2_columns()
--> Result<(), Box<dyn std::error::Error>> {
+async fn sqlite_invite_schema_capabilities_reports_v2_columns(
+) -> Result<(), Box<dyn std::error::Error>> {
     let db = SqliteStorage::in_memory().await?;
     let caps = db.invite_schema_capabilities().await?;
 
@@ -641,8 +641,8 @@ async fn clear_pending_for_peer_removes_all() -> Result<(), Box<dyn std::error::
 }
 
 #[tokio::test]
-async fn cleanup_stale_pending_stalls_high_attempt_entries()
--> Result<(), Box<dyn std::error::Error>> {
+async fn cleanup_stale_pending_stalls_high_attempt_entries(
+) -> Result<(), Box<dyn std::error::Error>> {
     let db = SqliteStorage::in_memory().await?;
     let sender = NodeId::from_bytes([1u8; 32]);
     let peer = NodeId::from_bytes([2u8; 32]);
@@ -903,8 +903,8 @@ async fn plaintext_cache_returns_none_for_uncached() -> Result<(), Box<dyn std::
 }
 
 #[tokio::test]
-async fn plaintext_cache_returns_none_for_nonexistent_message()
--> Result<(), Box<dyn std::error::Error>> {
+async fn plaintext_cache_returns_none_for_nonexistent_message(
+) -> Result<(), Box<dyn std::error::Error>> {
     let db = SqliteStorage::in_memory().await?;
     let id = MessageId::from_bytes([0u8; 32]);
 
@@ -1598,7 +1598,10 @@ fn hard4_sqlite_select_consts_have_no_limit() {
     for (name, sql) in [
         ("PENDING_FOR_PEER_SELECT", PENDING_FOR_PEER_SELECT),
         ("INVITES_ISSUED_SELECT", INVITES_ISSUED_SELECT),
-        ("RECURRING_MASTER_EVENTS_SELECT", RECURRING_MASTER_EVENTS_SELECT),
+        (
+            "RECURRING_MASTER_EVENTS_SELECT",
+            RECURRING_MASTER_EVENTS_SELECT,
+        ),
         (
             "CALENDAR_EXCEPTIONS_IN_RANGE_SELECT",
             CALENDAR_EXCEPTIONS_IN_RANGE_SELECT,
@@ -1642,9 +1645,17 @@ fn embedded_migrations_match_migrations_dir() {
         let version: i64 = version.parse().unwrap();
         assert_eq!(m.version, version, "{name}: version");
         let contents = std::fs::read_to_string(path).unwrap();
-        assert_eq!(m.sql.as_ref(), contents.as_str(), "{name}: SQL bytes differ");
+        assert_eq!(
+            m.sql.as_ref(),
+            contents.as_str(),
+            "{name}: SQL bytes differ"
+        );
         let expected_desc = rest.trim_end_matches(".sql").replace('_', " ");
-        assert_eq!(m.description.as_ref(), expected_desc.as_str(), "{name}: description");
+        assert_eq!(
+            m.description.as_ref(),
+            expected_desc.as_str(),
+            "{name}: description"
+        );
     }
 }
 
@@ -1681,8 +1692,8 @@ async fn embedded_migrations_apply_and_are_idempotent() -> Result<(), Box<dyn st
 /// Genome #57 compatibility: a database migrated by the FILE source (what rc4/rc5 did on
 /// the build host) must be accepted by the EMBEDDED source without a checksum mismatch.
 #[tokio::test]
-async fn db_migrated_from_files_is_accepted_by_embedded_source()
--> Result<(), Box<dyn std::error::Error>> {
+async fn db_migrated_from_files_is_accepted_by_embedded_source(
+) -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"));
     let path = std::env::temp_dir().join(format!(
         "konsensus-migration-parity-{}.db",

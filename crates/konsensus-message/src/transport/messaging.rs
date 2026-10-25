@@ -10,13 +10,11 @@ use konsensus_core::types::NodeId;
 
 use crate::wire::{sanitized_peer_reason, Frame, WireError};
 
-use super::{
-    write_noise_message, read_noise_message,
-    ControlEvent, Connection,
-    FRAME_BAN_DURATION, INVALID_FRAME_BUDGET, INVALID_FRAME_WINDOW,
-    MEMORY_BUDGET_WINDOW, PEER_MEMORY_BUDGET,
-};
 use super::NoiseTransport;
+use super::{
+    read_noise_message, write_noise_message, Connection, ControlEvent, FRAME_BAN_DURATION,
+    INVALID_FRAME_BUDGET, INVALID_FRAME_WINDOW, MEMORY_BUDGET_WINDOW, PEER_MEMORY_BUDGET,
+};
 
 /// What a connection must hold for [`NoiseTransport::send_raw_frame_on`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,11 +32,7 @@ impl NoiseTransport {
     ///
     /// Used by the session handler to send PrekeyOffer, SessionInit,
     /// SessionAck, MessageAck, and MessageReject frames.
-    pub async fn send_frame(
-        &self,
-        peer: &NodeId,
-        frame: &Frame,
-    ) -> Result<(), TransportError> {
+    pub async fn send_frame(&self, peer: &NodeId, frame: &Frame) -> Result<(), TransportError> {
         // Clone the Arc so we can drop the RwLock read guard before doing
         // network I/O.  Holding the read guard across write_noise_message()
         // would block peer-map mutations (connect / disconnect) for the
@@ -164,18 +158,24 @@ impl NoiseTransport {
                 .get(peer)
                 .filter(|conn| conn.connected_at == since)
                 .map(Arc::clone)
-                .ok_or_else(|| TransportError::NotConnected(format!(
-                    "{}: connection generation replaced or gone", peer.to_hex()
-                )))?
+                .ok_or_else(|| {
+                    TransportError::NotConnected(format!(
+                        "{}: connection generation replaced or gone",
+                        peer.to_hex()
+                    ))
+                })?
         };
         let mut state = conn.lock().await;
         let holds = match standing {
-            Standing::AdmissionPaid => conn.admission_paid.load(std::sync::atomic::Ordering::Acquire),
+            Standing::AdmissionPaid => conn
+                .admission_paid
+                .load(std::sync::atomic::Ordering::Acquire),
             Standing::Privileged => state.privileged,
         };
         if conn.is_closed() || !holds {
             return Err(TransportError::NotConnected(format!(
-                "{}: connection closed or not {standing:?}", peer.to_hex()
+                "{}: connection closed or not {standing:?}",
+                peer.to_hex()
             )));
         }
         let encrypted = state
@@ -274,7 +274,11 @@ impl NoiseTransport {
         };
         let mut eligible = Vec::with_capacity(conns.len());
         for (id, conn) in conns {
-            if conn.admission_paid.load(std::sync::atomic::Ordering::Acquire) || conn.lock().await.privileged {
+            if conn
+                .admission_paid
+                .load(std::sync::atomic::Ordering::Acquire)
+                || conn.lock().await.privileged
+            {
                 eligible.push(id);
             }
         }
@@ -320,442 +324,506 @@ pub(super) fn spawn_reader_task(
     ctx: super::TransportCtx,
 ) {
     tokio::spawn(async move {
-        let super::TransportCtx { peers, banned_peers, incoming_tx, control_tx, mut shutdown, .. } = ctx;
-        if *shutdown.borrow() { conn.remove(&peer_id, &peers).await; return; }
+        let super::TransportCtx {
+            peers,
+            banned_peers,
+            incoming_tx,
+            control_tx,
+            mut shutdown,
+            ..
+        } = ctx;
+        if *shutdown.borrow() {
+            conn.remove(&peer_id, &peers).await;
+            return;
+        }
         // Keep the read future alive across ping ticks: cancelling/restarting a
         // partial length-prefixed read would corrupt framing and reset its deadline.
         let read_frames = async {
-        loop {
-            // Read the next encrypted message
-            let encrypted = match read_noise_message(&mut reader).await {
-                Ok(data) => data,
-                Err(e) => {
-                    debug!(peer = %peer_id, error = %e, "peer reader error, disconnecting");
-                    break;
-                }
-            };
-
-            // Decrypt
-            let decrypted = {
-                let mut conn = conn.lock().await;
-                match conn.noise.decrypt(&encrypted) {
+            loop {
+                // Read the next encrypted message
+                let encrypted = match read_noise_message(&mut reader).await {
                     Ok(data) => data,
                     Err(e) => {
-                        warn!(peer = %peer_id, error = %e, "decryption failed, disconnecting");
+                        debug!(peer = %peer_id, error = %e, "peer reader error, disconnecting");
                         break;
                     }
-                }
-            };
+                };
 
-            // Track per-peer memory usage — prevents a single peer from
-            // exhausting node memory by sending many large frames.
-            {
-                let mut conn = conn.lock().await;
-                let now = Instant::now();
-                if now.duration_since(conn.memory_budget_window_start) >= MEMORY_BUDGET_WINDOW {
-                    conn.bytes_received = 0;
-                    conn.memory_budget_window_start = now;
-                }
-                conn.bytes_received += encrypted.len() as u64;
-                if conn.bytes_received > PEER_MEMORY_BUDGET {
-                    warn!(
-                        peer = %peer_id,
-                        bytes = conn.bytes_received,
-                        budget = PEER_MEMORY_BUDGET,
-                        "per-connection memory budget exceeded — disconnecting and banning peer"
-                    );
-                    drop(conn);
-                    banned_peers.write().await.insert(
-                        peer_id,
-                        Instant::now() + FRAME_BAN_DURATION,
-                    );
-                    break;
-                }
-            }
-
-            // Parse frame — track invalid frames for validation budget
-            let frame = match Frame::from_bytes(&decrypted) {
-                Ok(f) => f,
-                Err(e) => {
-                    let should_ban = {
-                        let mut conn = conn.lock().await;
-                        let now = Instant::now();
-
-                        // Decay-only leaky bucket. Drain tokens for the real time
-                        // elapsed since the last update, then add one for this bad
-                        // frame. The level is sticky — valid frames never touch it —
-                        // so interleaving cheap valid frames cannot refill the
-                        // bad-frame allowance (the reset-on-valid bypass).
-                        let leak_per_sec =
-                            INVALID_FRAME_BUDGET as f64 / INVALID_FRAME_WINDOW.as_secs_f64();
-                        let elapsed = now
-                            .duration_since(conn.invalid_frame_last_leak)
-                            .as_secs_f64();
-                        conn.invalid_frame_level =
-                            (conn.invalid_frame_level - leak_per_sec * elapsed).max(0.0);
-                        conn.invalid_frame_last_leak = now;
-
-                        conn.invalid_frame_level += 1.0;
-                        let level = conn.invalid_frame_level;
-
-                        let should_ban = level > INVALID_FRAME_BUDGET as f64;
-                        warn_invalid_frame(&peer_id, level, should_ban, &e);
-                        should_ban
-                    };
-
-                    if should_ban {
-                        // Add to ban list
-                        banned_peers.write().await.insert(
-                            peer_id,
-                            Instant::now() + FRAME_BAN_DURATION,
-                        );
-                        break;
-                    }
-                    continue;
-                }
-            };
-
-            // Valid frame received — record liveness for keepalive. We deliberately
-            // do NOT drain the invalid-frame leaky bucket here: that bucket is
-            // decay-only and falls solely with elapsed real time. Resetting it on a
-            // valid frame would let an attacker interleave one cheap valid frame
-            // between bursts of garbage to keep the bad-frame allowance topped up
-            // forever (the reset-on-valid bypass this fix closes).
-            //
-            // M1b: snapshot `privileged` under the SAME lock so the dangerous
-            // ControlEvent variants below carry the connection's CURRENT privilege.
-            // promote_to_privileged flips this flag; reading it per frame means a
-            // promotion is honoured on the very next frame. In Whitelist mode this
-            // is always `true`, so every stamped arm behaves byte-identically.
-            //
-            // BUG-PSI: `bought` also admits the frames of a peer whose admission
-            // WE settled on this connection (`admission_paid`, set before our
-            // proof goes out): the replies that complete the act we paid for —
-            // its session handshake, acks/rejects of our messages and its prices.
-            // Every other frame (peer exchange, Lightning info, gossip, price
-            // queries, invoice requests) keeps plain `privileged`.
-            let (privileged, bought, source_ip) = {
-                let mut state = conn.lock().await;
-                state.last_recv = Instant::now();
-                let paid = conn.admission_paid.load(std::sync::atomic::Ordering::Acquire);
-                (state.privileged, state.privileged || paid, state.source_ip)
-            };
-
-            // Handle frame
-            match frame {
-                Frame::Message(envelope) => {
-                    debug!(peer = %peer_id, msg_id = %envelope.id, "received envelope");
-                    if incoming_tx.send(*envelope).await.is_err() {
-                        debug!(peer = %peer_id, "incoming channel closed, stopping reader");
-                        break;
-                    }
-                }
-                Frame::Ping { nonce } => {
-                    debug!(peer = %peer_id, "received ping, sending pong");
-                    let pong = Frame::Pong { nonce };
+                // Decrypt
+                let decrypted = {
                     let mut conn = conn.lock().await;
-                    if let Ok(bytes) = pong.to_bytes() {
-                        if let Ok(encrypted) = conn.noise.encrypt(&bytes) {
-                            if let Err(e) = write_noise_message(&mut conn.writer, &encrypted).await {
-                                warn!(peer = %peer_id, error = %e, "failed to send pong reply");
+                    match conn.noise.decrypt(&encrypted) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            warn!(peer = %peer_id, error = %e, "decryption failed, disconnecting");
+                            break;
+                        }
+                    }
+                };
+
+                // Track per-peer memory usage — prevents a single peer from
+                // exhausting node memory by sending many large frames.
+                {
+                    let mut conn = conn.lock().await;
+                    let now = Instant::now();
+                    if now.duration_since(conn.memory_budget_window_start) >= MEMORY_BUDGET_WINDOW {
+                        conn.bytes_received = 0;
+                        conn.memory_budget_window_start = now;
+                    }
+                    conn.bytes_received += encrypted.len() as u64;
+                    if conn.bytes_received > PEER_MEMORY_BUDGET {
+                        warn!(
+                            peer = %peer_id,
+                            bytes = conn.bytes_received,
+                            budget = PEER_MEMORY_BUDGET,
+                            "per-connection memory budget exceeded — disconnecting and banning peer"
+                        );
+                        drop(conn);
+                        banned_peers
+                            .write()
+                            .await
+                            .insert(peer_id, Instant::now() + FRAME_BAN_DURATION);
+                        break;
+                    }
+                }
+
+                // Parse frame — track invalid frames for validation budget
+                let frame = match Frame::from_bytes(&decrypted) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let should_ban = {
+                            let mut conn = conn.lock().await;
+                            let now = Instant::now();
+
+                            // Decay-only leaky bucket. Drain tokens for the real time
+                            // elapsed since the last update, then add one for this bad
+                            // frame. The level is sticky — valid frames never touch it —
+                            // so interleaving cheap valid frames cannot refill the
+                            // bad-frame allowance (the reset-on-valid bypass).
+                            let leak_per_sec =
+                                INVALID_FRAME_BUDGET as f64 / INVALID_FRAME_WINDOW.as_secs_f64();
+                            let elapsed = now
+                                .duration_since(conn.invalid_frame_last_leak)
+                                .as_secs_f64();
+                            conn.invalid_frame_level =
+                                (conn.invalid_frame_level - leak_per_sec * elapsed).max(0.0);
+                            conn.invalid_frame_last_leak = now;
+
+                            conn.invalid_frame_level += 1.0;
+                            let level = conn.invalid_frame_level;
+
+                            let should_ban = level > INVALID_FRAME_BUDGET as f64;
+                            warn_invalid_frame(&peer_id, level, should_ban, &e);
+                            should_ban
+                        };
+
+                        if should_ban {
+                            // Add to ban list
+                            banned_peers
+                                .write()
+                                .await
+                                .insert(peer_id, Instant::now() + FRAME_BAN_DURATION);
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                // Valid frame received — record liveness for keepalive. We deliberately
+                // do NOT drain the invalid-frame leaky bucket here: that bucket is
+                // decay-only and falls solely with elapsed real time. Resetting it on a
+                // valid frame would let an attacker interleave one cheap valid frame
+                // between bursts of garbage to keep the bad-frame allowance topped up
+                // forever (the reset-on-valid bypass this fix closes).
+                //
+                // M1b: snapshot `privileged` under the SAME lock so the dangerous
+                // ControlEvent variants below carry the connection's CURRENT privilege.
+                // promote_to_privileged flips this flag; reading it per frame means a
+                // promotion is honoured on the very next frame. In Whitelist mode this
+                // is always `true`, so every stamped arm behaves byte-identically.
+                //
+                // BUG-PSI: `bought` also admits the frames of a peer whose admission
+                // WE settled on this connection (`admission_paid`, set before our
+                // proof goes out): the replies that complete the act we paid for —
+                // its session handshake, acks/rejects of our messages and its prices.
+                // Every other frame (peer exchange, Lightning info, gossip, price
+                // queries, invoice requests) keeps plain `privileged`.
+                let (privileged, bought, source_ip) = {
+                    let mut state = conn.lock().await;
+                    state.last_recv = Instant::now();
+                    let paid = conn
+                        .admission_paid
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    (state.privileged, state.privileged || paid, state.source_ip)
+                };
+
+                // Handle frame
+                match frame {
+                    Frame::Message(envelope) => {
+                        debug!(peer = %peer_id, msg_id = %envelope.id, "received envelope");
+                        if incoming_tx.send(*envelope).await.is_err() {
+                            debug!(peer = %peer_id, "incoming channel closed, stopping reader");
+                            break;
+                        }
+                    }
+                    Frame::Ping { nonce } => {
+                        debug!(peer = %peer_id, "received ping, sending pong");
+                        let pong = Frame::Pong { nonce };
+                        let mut conn = conn.lock().await;
+                        if let Ok(bytes) = pong.to_bytes() {
+                            if let Ok(encrypted) = conn.noise.encrypt(&bytes) {
+                                if let Err(e) =
+                                    write_noise_message(&mut conn.writer, &encrypted).await
+                                {
+                                    warn!(peer = %peer_id, error = %e, "failed to send pong reply");
+                                }
                             }
                         }
                     }
-                }
-                Frame::Pong { nonce } => {
-                    debug!(peer = %peer_id, %nonce, "received pong");
-                    // Valid inbound traffic satisfies the connection read deadline.
-                    let mut state = conn.lock().await;
-                    if state.pending_ping == Some(nonce) { state.pending_ping = None; }
-                }
-                Frame::Disconnect { reason } => {
-                    info!(peer = %peer_id, reason = %sanitized_peer_reason(&reason), "peer disconnected gracefully");
-                    break;
-                }
-                Frame::MessageAck { id, duplicate } => {
-                    debug!(peer = %peer_id, msg_id = %id, "received message ack");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::MessageAcked {
-                            duplicate,
-                            peer_id,
-                            message_id: id,
-                            privileged: bought,
-                        })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send MessageAcked control event");
+                    Frame::Pong { nonce } => {
+                        debug!(peer = %peer_id, %nonce, "received pong");
+                        // Valid inbound traffic satisfies the connection read deadline.
+                        let mut state = conn.lock().await;
+                        if state.pending_ping == Some(nonce) {
+                            state.pending_ping = None;
+                        }
                     }
-                }
-                Frame::MessageReject { id, reason } => {
-                    warn!(peer = %peer_id, msg_id = %id, reason = %sanitized_peer_reason(&reason), "message rejected by peer");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::MessageRejected {
-                            peer_id,
-                            message_id: id,
-                            reason,
-                            privileged: bought,
-                        })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send MessageRejected control event");
+                    Frame::Disconnect { reason } => {
+                        info!(peer = %peer_id, reason = %sanitized_peer_reason(&reason), "peer disconnected gracefully");
+                        break;
                     }
-                }
-                Frame::PrekeyOffer { bundle } => {
-                    debug!(peer = %peer_id, "received prekey offer");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::PrekeyOffer {
-                            peer_id,
-                            bundle,
-                            privileged: bought,
-                        })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send PrekeyOffer control event");
+                    Frame::MessageAck { id, duplicate } => {
+                        debug!(peer = %peer_id, msg_id = %id, "received message ack");
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::MessageAcked {
+                                duplicate,
+                                peer_id,
+                                message_id: id,
+                                privileged: bought,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send MessageAcked control event");
+                        }
                     }
-                }
-                Frame::SessionInit { init_data } => {
-                    debug!(peer = %peer_id, "received session init");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::SessionInit {
-                            peer_id,
-                            init_data,
-                            privileged: bought,
-                        })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send SessionInit control event");
+                    Frame::MessageReject { id, reason } => {
+                        warn!(peer = %peer_id, msg_id = %id, reason = %sanitized_peer_reason(&reason), "message rejected by peer");
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::MessageRejected {
+                                peer_id,
+                                message_id: id,
+                                reason,
+                                privileged: bought,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send MessageRejected control event");
+                        }
                     }
-                }
-                Frame::SessionAck => {
-                    debug!(peer = %peer_id, "received session ack");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::SessionAck { peer_id, privileged: bought })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send SessionAck control event");
+                    Frame::PrekeyOffer { bundle } => {
+                        debug!(peer = %peer_id, "received prekey offer");
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::PrekeyOffer {
+                                peer_id,
+                                bundle,
+                                privileged: bought,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send PrekeyOffer control event");
+                        }
                     }
-                }
-                Frame::RatchetInit { payload } => {
-                    debug!(peer = %peer_id, "received ratchet init");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::RatchetInit {
-                            peer_id,
-                            payload,
-                            privileged: bought,
-                        })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send RatchetInit control event");
+                    Frame::SessionInit { init_data } => {
+                        debug!(peer = %peer_id, "received session init");
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::SessionInit {
+                                peer_id,
+                                init_data,
+                                privileged: bought,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send SessionInit control event");
+                        }
                     }
-                }
-                Frame::RequestInvoice { request_id, amount_msat, purpose } => {
-                    debug!(
-                        peer = %peer_id,
-                        %request_id,
+                    Frame::SessionAck => {
+                        debug!(peer = %peer_id, "received session ack");
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::SessionAck {
+                                peer_id,
+                                privileged: bought,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send SessionAck control event");
+                        }
+                    }
+                    Frame::RatchetInit { payload } => {
+                        debug!(peer = %peer_id, "received ratchet init");
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::RatchetInit {
+                                peer_id,
+                                payload,
+                                privileged: bought,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send RatchetInit control event");
+                        }
+                    }
+                    Frame::RequestInvoice {
+                        request_id,
                         amount_msat,
-                        %purpose,
-                        "received invoice request"
-                    );
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::InvoiceRequested {
-                            source_ip,
-                            peer_id,
-                            request_id,
+                        purpose,
+                    } => {
+                        debug!(
+                            peer = %peer_id,
+                            %request_id,
                             amount_msat,
-                            purpose,
-                            privileged,
-                        })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send InvoiceRequested control event");
+                            %purpose,
+                            "received invoice request"
+                        );
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::InvoiceRequested {
+                                source_ip,
+                                peer_id,
+                                request_id,
+                                amount_msat,
+                                purpose,
+                                privileged,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send InvoiceRequested control event");
+                        }
                     }
-                }
-                Frame::InvoiceResponse { request_id, bolt11, payment_hash } => {
-                    debug!(
-                        peer = %peer_id,
-                        %request_id,
-                        "received invoice response"
-                    );
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::InvoiceResponseReceived {
-                            peer_id,
-                            request_id,
-                            bolt11,
-                            payment_hash,
-                        })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send InvoiceResponseReceived control event");
+                    Frame::InvoiceResponse {
+                        request_id,
+                        bolt11,
+                        payment_hash,
+                    } => {
+                        debug!(
+                            peer = %peer_id,
+                            %request_id,
+                            "received invoice response"
+                        );
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::InvoiceResponseReceived {
+                                peer_id,
+                                request_id,
+                                bolt11,
+                                payment_hash,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send InvoiceResponseReceived control event");
+                        }
                     }
-                }
-                Frame::InvoiceError { request_id, reason } => {
-                    debug!(
-                        peer = %peer_id,
-                        %request_id,
-                        reason = %sanitized_peer_reason(&reason),
-                        "received invoice error"
-                    );
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::InvoiceErrorReceived {
-                            peer_id,
-                            request_id,
-                            reason,
-                            privileged,
-                        })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send InvoiceErrorReceived control event");
+                    Frame::InvoiceError { request_id, reason } => {
+                        debug!(
+                            peer = %peer_id,
+                            %request_id,
+                            reason = %sanitized_peer_reason(&reason),
+                            "received invoice error"
+                        );
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::InvoiceErrorReceived {
+                                peer_id,
+                                request_id,
+                                reason,
+                                privileged,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send InvoiceErrorReceived control event");
+                        }
                     }
-                }
-                frame @ Frame::StarterRequest { .. } => {
-                    let _ = control_tx.send(ControlEvent::StarterRequestReceived { peer_id, frame, privileged }).await;
-                }
-                frame @ Frame::StarterStatus { .. } => {
-                    let _ = control_tx.send(ControlEvent::StarterStatusReceived { peer_id, frame, privileged }).await;
-                }
-                Frame::LightningInfo { ln_pubkey, ln_addr } => {
-                    debug!(peer = %peer_id, "received Lightning info for keysend");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::LightningInfoReceived {
-                            peer_id,
-                            ln_pubkey,
-                            ln_addr,
-                            privileged,
-                        })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send LightningInfoReceived control event");
+                    frame @ Frame::StarterRequest { .. } => {
+                        let _ = control_tx
+                            .send(ControlEvent::StarterRequestReceived {
+                                peer_id,
+                                frame,
+                                privileged,
+                            })
+                            .await;
                     }
-                }
-                Frame::PriceTable { prices, block_height, valid_blocks, trust_discount } => {
-                    debug!(
-                        peer = %peer_id,
-                        categories = prices.len(),
+                    frame @ Frame::StarterStatus { .. } => {
+                        let _ = control_tx
+                            .send(ControlEvent::StarterStatusReceived {
+                                peer_id,
+                                frame,
+                                privileged,
+                            })
+                            .await;
+                    }
+                    Frame::LightningInfo { ln_pubkey, ln_addr } => {
+                        debug!(peer = %peer_id, "received Lightning info for keysend");
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::LightningInfoReceived {
+                                peer_id,
+                                ln_pubkey,
+                                ln_addr,
+                                privileged,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send LightningInfoReceived control event");
+                        }
+                    }
+                    Frame::PriceTable {
+                        prices,
                         block_height,
+                        valid_blocks,
                         trust_discount,
-                        "received price table"
-                    );
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::PriceTableReceived {
-                            peer_id,
-                            prices,
+                    } => {
+                        debug!(
+                            peer = %peer_id,
+                            categories = prices.len(),
                             block_height,
-                            valid_blocks,
                             trust_discount,
-                            privileged: bought,
-                        })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send PriceTableReceived control event");
+                            "received price table"
+                        );
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::PriceTableReceived {
+                                peer_id,
+                                prices,
+                                block_height,
+                                valid_blocks,
+                                trust_discount,
+                                privileged: bought,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send PriceTableReceived control event");
+                        }
                     }
-                }
-                Frame::PriceQuery { kind } => {
-                    debug!(peer = %peer_id, kind, "received price query");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::PriceQueryReceived {
-                            peer_id,
-                            kind,
-                            privileged,
-                        })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send PriceQueryReceived control event");
+                    Frame::PriceQuery { kind } => {
+                        debug!(peer = %peer_id, kind, "received price query");
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::PriceQueryReceived {
+                                peer_id,
+                                kind,
+                                privileged,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send PriceQueryReceived control event");
+                        }
                     }
-                }
-                Frame::PriceResponse { kind, price_msat, block_height } => {
-                    debug!(
-                        peer = %peer_id,
+                    Frame::PriceResponse {
                         kind,
                         price_msat,
                         block_height,
-                        "received price response"
-                    );
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::PriceResponseReceived {
-                            peer_id,
+                    } => {
+                        debug!(
+                            peer = %peer_id,
                             kind,
                             price_msat,
                             block_height,
-                            privileged: bought,
-                        })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send PriceResponseReceived control event");
+                            "received price response"
+                        );
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::PriceResponseReceived {
+                                peer_id,
+                                kind,
+                                price_msat,
+                                block_height,
+                                privileged: bought,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send PriceResponseReceived control event");
+                        }
                     }
-                }
-                frame @ (Frame::PorchQuoteRequest { .. } | Frame::PorchQuoteResponse { .. }) => {
-                    let _ = control_tx.send(ControlEvent::PorchQuote {
-                        peer_id, frame: Box::new(frame), privileged, source_ip,
-                    }).await;
-                }
-                frame @ (Frame::PeerExchangeQuoteRequest
+                    frame
+                    @ (Frame::PorchQuoteRequest { .. } | Frame::PorchQuoteResponse { .. }) => {
+                        let _ = control_tx
+                            .send(ControlEvent::PorchQuote {
+                                peer_id,
+                                frame: Box::new(frame),
+                                privileged,
+                                source_ip,
+                            })
+                            .await;
+                    }
+                    frame @ (Frame::PeerExchangeQuoteRequest
                     | Frame::PeerExchangeQuote { .. }
                     | Frame::PeerExchangePaidRequest { .. }
                     | Frame::PeerExchangeRefused { .. }) => {
-                    if let Err(e) = control_tx.send(ControlEvent::PeerExchangeAct {
-                        peer_id, frame: Box::new(frame),
-                    }).await {
-                        warn!(peer = %peer_id, error = %e, "failed to route peer exchange act");
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::PeerExchangeAct {
+                                peer_id,
+                                frame: Box::new(frame),
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to route peer exchange act");
+                        }
                     }
-                }
-                Frame::PeerExchangeRequest => {
-                    debug!(peer = %peer_id, "received peer exchange request");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::PeerExchangeRequested { peer_id, privileged })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send PeerExchangeRequested control event");
+                    Frame::PeerExchangeRequest => {
+                        debug!(peer = %peer_id, "received peer exchange request");
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::PeerExchangeRequested {
+                                peer_id,
+                                privileged,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send PeerExchangeRequested control event");
+                        }
                     }
-                }
-                Frame::PeerExchangeResponse { peers } => {
-                    let count = peers.len();
-                    // Cap at 50 entries to prevent abuse
-                    let peers: Vec<_> = peers.into_iter().take(50).collect();
-                    debug!(peer = %peer_id, count, "received peer exchange response");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::PeerExchangeReceived { peer_id, peers, privileged })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send PeerExchangeReceived control event");
+                    Frame::PeerExchangeResponse { peers } => {
+                        let count = peers.len();
+                        // Cap at 50 entries to prevent abuse
+                        let peers: Vec<_> = peers.into_iter().take(50).collect();
+                        debug!(peer = %peer_id, count, "received peer exchange response");
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::PeerExchangeReceived {
+                                peer_id,
+                                peers,
+                                privileged,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send PeerExchangeReceived control event");
+                        }
                     }
-                }
-                Frame::Gossip(envelope) => {
-                    debug!(
-                        peer = %peer_id,
-                        sender = %envelope.sender,
-                        msg_id = %envelope.id,
-                        kind = envelope.kind,
-                        "received gossip message"
-                    );
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::GossipReceived {
-                            from_peer: peer_id,
-                            envelope,
-                            privileged,
-                        })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send GossipReceived control event");
+                    Frame::Gossip(envelope) => {
+                        debug!(
+                            peer = %peer_id,
+                            sender = %envelope.sender,
+                            msg_id = %envelope.id,
+                            kind = envelope.kind,
+                            "received gossip message"
+                        );
+                        if let Err(e) = control_tx
+                            .send(ControlEvent::GossipReceived {
+                                from_peer: peer_id,
+                                envelope,
+                                privileged,
+                            })
+                            .await
+                        {
+                            warn!(peer = %peer_id, error = %e, "failed to send GossipReceived control event");
+                        }
                     }
-                }
-                Frame::CallOffer { session_id, .. } => {
-                    warn!(peer = %peer_id, %session_id, "rejected legacy unpaid call offer frame; use paid UKM realtime kind");
-                }
-                Frame::CallAnswer { session_id, .. } => {
-                    warn!(peer = %peer_id, %session_id, "rejected legacy unpaid call answer frame; use paid UKM realtime kind");
-                }
-                Frame::IceCandidate { session_id, .. } => {
-                    warn!(peer = %peer_id, %session_id, "rejected legacy unpaid ICE candidate frame; use paid UKM realtime kind");
-                }
-                Frame::CallEnd { session_id, .. } => {
-                    warn!(peer = %peer_id, %session_id, "rejected legacy unpaid call end frame; use paid UKM realtime kind");
-                }
-                _ => {
-                    warn!(peer = %peer_id, "unexpected frame type in reader loop");
+                    Frame::CallOffer { session_id, .. } => {
+                        warn!(peer = %peer_id, %session_id, "rejected legacy unpaid call offer frame; use paid UKM realtime kind");
+                    }
+                    Frame::CallAnswer { session_id, .. } => {
+                        warn!(peer = %peer_id, %session_id, "rejected legacy unpaid call answer frame; use paid UKM realtime kind");
+                    }
+                    Frame::IceCandidate { session_id, .. } => {
+                        warn!(peer = %peer_id, %session_id, "rejected legacy unpaid ICE candidate frame; use paid UKM realtime kind");
+                    }
+                    Frame::CallEnd { session_id, .. } => {
+                        warn!(peer = %peer_id, %session_id, "rejected legacy unpaid call end frame; use paid UKM realtime kind");
+                    }
+                    _ => {
+                        warn!(peer = %peer_id, "unexpected frame type in reader loop");
+                    }
                 }
             }
-        }
-
         };
         tokio::select! {
             _ = read_frames => {},
@@ -779,14 +847,21 @@ async fn connection_keepalive(conn: &Connection) {
         // Local writer contention is not evidence that the peer is dead. The
         // reader still owns its independent 30-second inbound deadline.
         let mut state = conn.lock().await;
-        if conn.is_closed() { return; }
+        if conn.is_closed() {
+            return;
+        }
         state.pending_ping = Some(nonce);
         let sent = tokio::time::timeout(super::READ_TIMEOUT, async {
             let bytes = Frame::Ping { nonce }.to_bytes().ok()?;
             let encrypted = state.noise.encrypt(&bytes).ok()?;
-            write_noise_message(&mut state.writer, &encrypted).await.ok()
-        }).await;
-        if !matches!(sent, Ok(Some(()))) { return; }
+            write_noise_message(&mut state.writer, &encrypted)
+                .await
+                .ok()
+        })
+        .await;
+        if !matches!(sent, Ok(Some(()))) {
+            return;
+        }
     }
 }
 
@@ -809,8 +884,12 @@ mod warning_tests {
 
     struct Capture(Arc<Mutex<Vec<String>>>);
     impl Subscriber for Capture {
-        fn enabled(&self, _: &Metadata<'_>) -> bool { true }
-        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id { span::Id::from_u64(1) }
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
         fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
         fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
         fn enter(&self, _: &span::Id) {}
@@ -818,8 +897,14 @@ mod warning_tests {
         fn event(&self, event: &Event<'_>) {
             struct Fields<'a>(&'a mut Vec<String>);
             impl tracing::field::Visit for Fields<'_> {
-                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                    if field.name() == "error" { self.0.push(format!("{value:?}")); }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "error" {
+                        self.0.push(format!("{value:?}"));
+                    }
                 }
             }
             event.record(&mut Fields(&mut self.0.lock().unwrap()));
@@ -828,7 +913,10 @@ mod warning_tests {
 
     #[test]
     fn peer_log_reasons_strip_controls_and_truncate_on_utf8_boundaries() {
-        assert_eq!(sanitized_peer_reason("bye\n\r\t\0\x1b[31m\u{85}\u{2028}\u{2029}ok"), "bye[31mok");
+        assert_eq!(
+            sanitized_peer_reason("bye\n\r\t\0\x1b[31m\u{85}\u{2028}\u{2029}ok"),
+            "bye[31mok"
+        );
         assert_eq!(sanitized_peer_reason("normal reason"), "normal reason");
         let safe = sanitized_peer_reason(&format!("x{}", "💥".repeat(1024)));
         assert_eq!(safe.len(), 1021);
@@ -843,8 +931,14 @@ mod warning_tests {
             WireError::Serialization(hostile.clone()),
             WireError::InvalidFrame(hostile.clone()),
             WireError::Io(std::io::Error::other(hostile)),
-            WireError::FrameTooLarge { size: usize::MAX, max: 0 },
-            WireError::IncompleteFrame { expected: usize::MAX, got: 0 },
+            WireError::FrameTooLarge {
+                size: usize::MAX,
+                max: 0,
+            },
+            WireError::IncompleteFrame {
+                expected: usize::MAX,
+                got: 0,
+            },
         ];
         tracing::subscriber::with_default(Capture(captured.clone()), || {
             for error in &errors {

@@ -170,12 +170,18 @@ pub fn first_contact_prices(chat_price_msat: u64, min_admission_cost_msat: u64) 
 
 impl Introduction {
     /// Sign `fields` with `identity`. Refuses fields that would not verify.
-    pub fn issue(identity: &NodeIdentity, fields: IntroductionFields) -> Result<Self, IntroductionError> {
+    pub fn issue(
+        identity: &NodeIdentity,
+        fields: IntroductionFields,
+    ) -> Result<Self, IntroductionError> {
         Self::issue_with_key(identity.ed25519_signing_key(), fields)
     }
 
     /// As [`Introduction::issue`], from a bare signing key (test vectors).
-    pub fn issue_with_key(key: &SigningKey, fields: IntroductionFields) -> Result<Self, IntroductionError> {
+    pub fn issue_with_key(
+        key: &SigningKey,
+        fields: IntroductionFields,
+    ) -> Result<Self, IntroductionError> {
         let endpoint = fields.endpoint.trim().to_string();
         let reach = reach_of(&endpoint)?;
         let mut card = Self {
@@ -219,7 +225,13 @@ impl Introduction {
         out.push(self.endpoint.len() as u8);
         out.extend_from_slice(self.endpoint.as_bytes());
         out.push(self.reach.tag());
-        for n in [self.admission_msat, self.message_msat, self.price_epoch, self.issued_at, self.expires_at] {
+        for n in [
+            self.admission_msat,
+            self.message_msat,
+            self.price_epoch,
+            self.issued_at,
+            self.expires_at,
+        ] {
             out.extend_from_slice(&n.to_be_bytes());
         }
         out.extend_from_slice(&intro_id);
@@ -253,7 +265,10 @@ impl Introduction {
     pub fn verify(&self, now_unix: u64, network: &str) -> Result<(), IntroductionError> {
         self.check_shape()?;
         if self.network != network {
-            return Err(IntroductionError::WrongNetwork { card: self.network.clone(), ours: network.into() });
+            return Err(IntroductionError::WrongNetwork {
+                card: self.network.clone(),
+                ours: network.into(),
+            });
         }
         if self.issued_at > now_unix.saturating_add(MAX_SKEW_SECS) {
             return Err(IntroductionError::NotYetValid);
@@ -274,7 +289,10 @@ impl Introduction {
         let mut bytes = self.canonical_bytes().expect("well-formed introduction");
         bytes.drain(..DOMAIN_V1.len());
         bytes.extend_from_slice(&decode_fixed::<64>(&self.sig).unwrap_or([0; 64]));
-        format!("{LINK_PREFIX}{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+        format!(
+            "{LINK_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        )
     }
 
     /// Inverse of the link payload: the canonical fields then the signature.
@@ -286,7 +304,10 @@ impl Introduction {
             at += n;
             Ok(s)
         };
-        let utf8 = |s: &[u8]| String::from_utf8(s.to_vec()).map_err(|_| IntroductionError::Malformed("not UTF-8".into()));
+        let utf8 = |s: &[u8]| {
+            String::from_utf8(s.to_vec())
+                .map_err(|_| IntroductionError::Malformed("not UTF-8".into()))
+        };
         let u64_at = |s: &[u8]| u64::from_be_bytes(s.try_into().expect("8 bytes"));
         let v = take(1)?[0];
         let n = take(1)?[0] as usize;
@@ -309,7 +330,20 @@ impl Introduction {
         if at != b.len() {
             return Err(IntroductionError::Malformed("trailing bytes".into()));
         }
-        Ok(Self { v, network, node_id, endpoint, reach, admission_msat, message_msat, price_epoch, issued_at, expires_at, intro_id, sig })
+        Ok(Self {
+            v,
+            network,
+            node_id,
+            endpoint,
+            reach,
+            admission_msat,
+            message_msat,
+            price_epoch,
+            issued_at,
+            expires_at,
+            intro_id,
+            sig,
+        })
     }
 
     /// Parse a scanned or pasted introduction: the link, its bare fragment,
@@ -320,11 +354,16 @@ impl Introduction {
         }
         let text = text.trim();
         if text.starts_with('{') {
-            return crate::wire_json::from_str(text).map_err(|e| IntroductionError::Malformed(e.to_string()));
+            return crate::wire_json::from_str(text)
+                .map_err(|e| IntroductionError::Malformed(e.to_string()));
         }
         let payload = match text.split_once('#') {
             Some((prefix, frag)) if format!("{prefix}#") == LINK_PREFIX => frag,
-            Some(_) => return Err(IntroductionError::Malformed("not a bitsov://introduce link".into())),
+            Some(_) => {
+                return Err(IntroductionError::Malformed(
+                    "not a bitsov://introduce link".into(),
+                ))
+            }
             None => text,
         };
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -351,7 +390,9 @@ pub fn split_endpoint(endpoint: &str) -> Result<(String, u16), IntroductionError
     if endpoint.contains(|c: char| c.is_whitespace() || "/@?#\\".contains(c)) {
         return Err(bad("must be host:port, not a URL"));
     }
-    let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| bad("missing port"))?;
+    let (host, port) = endpoint
+        .rsplit_once(':')
+        .ok_or_else(|| bad("missing port"))?;
     if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
         return Err(bad("bad port"));
     }
@@ -360,7 +401,8 @@ pub fn split_endpoint(endpoint: &str) -> Result<(String, u16), IntroductionError
         return Err(bad("bad port"));
     }
     let host = if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        v6.parse::<Ipv6Addr>().map_err(|_| bad("bad IPv6 literal"))?;
+        v6.parse::<Ipv6Addr>()
+            .map_err(|_| bad("bad IPv6 literal"))?;
         v6.to_string()
     } else {
         if host.parse::<Ipv4Addr>().is_err() {
@@ -390,7 +432,8 @@ pub fn reach_of(endpoint: &str) -> Result<Reach, IntroductionError> {
         return Ok(Reach::Local);
     }
     match host.parse::<IpAddr>() {
-        Ok(ip) => ip_reach(ip).ok_or_else(|| IntroductionError::InvalidEndpoint(format!("{ip} is never dialable"))),
+        Ok(ip) => ip_reach(ip)
+            .ok_or_else(|| IntroductionError::InvalidEndpoint(format!("{ip} is never dialable"))),
         Err(_) => Ok(Reach::Public),
     }
 }
@@ -407,8 +450,13 @@ pub fn ip_reach(ip: IpAddr) -> Option<Reach> {
     match ip {
         IpAddr::V4(v4) => {
             let [a, b, c, _] = v4.octets();
-            if v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() || v4.is_link_local()
-                || v4.is_documentation() || a == 0 || a >= 240
+            if v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_link_local()
+                || v4.is_documentation()
+                || a == 0
+                || a >= 240
                 || (a == 192 && b == 0 && c == 0)
                 || (a == 198 && (b == 18 || b == 19))
             {
@@ -421,7 +469,11 @@ pub fn ip_reach(ip: IpAddr) -> Option<Reach> {
         }
         IpAddr::V6(v6) => {
             let seg = v6.segments();
-            if v6.is_unspecified() || v6.is_multicast() || (seg[0] & 0xffc0) == 0xfe80 || seg[0] == 0x2001 && seg[1] == 0x0db8 {
+            if v6.is_unspecified()
+                || v6.is_multicast()
+                || (seg[0] & 0xffc0) == 0xfe80
+                || seg[0] == 0x2001 && seg[1] == 0x0db8
+            {
                 None
             } else if v6.is_loopback() || (seg[0] & 0xfe00) == 0xfc00 {
                 Some(Reach::Local)
@@ -488,7 +540,10 @@ mod tests {
     #[test]
     fn test_vector_is_stable() {
         let c = card();
-        assert_eq!(c.node_id, "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c");
+        assert_eq!(
+            c.node_id,
+            "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+        );
         assert_eq!(c.reach, Reach::Public);
         assert_eq!(c.expires_at, NOW + 600);
         assert_eq!(hex::encode(c.digest().unwrap()), VECTOR_DIGEST);
@@ -514,29 +569,49 @@ mod tests {
             |c| c.issued_at -= 1,
             |c| c.expires_at -= 1,
             |c| c.intro_id = hex::encode([0xac; 16]),
-            |c| c.node_id = hex::encode(SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes()),
+            |c| {
+                c.node_id = hex::encode(SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes())
+            },
         ];
         for (i, t) in tamper.iter().enumerate() {
             let mut bad = c.clone();
             t(&mut bad);
             let now_net = bad.network.clone();
-            assert!(bad.verify(NOW, &now_net).is_err(), "tamper {i} still verified");
+            assert!(
+                bad.verify(NOW, &now_net).is_err(),
+                "tamper {i} still verified"
+            );
         }
     }
 
     #[test]
     fn expiry_network_and_version_are_enforced() {
         let c = card();
-        assert_eq!(c.verify(NOW + 600, "regtest"), Err(IntroductionError::Expired(NOW + 600)));
+        assert_eq!(
+            c.verify(NOW + 600, "regtest"),
+            Err(IntroductionError::Expired(NOW + 600))
+        );
         assert!(c.verify(NOW + 599, "regtest").is_ok());
-        assert!(matches!(c.verify(NOW, "bitcoin"), Err(IntroductionError::WrongNetwork { .. })));
-        assert_eq!(c.verify(NOW - 61, "regtest"), Err(IntroductionError::NotYetValid));
+        assert!(matches!(
+            c.verify(NOW, "bitcoin"),
+            Err(IntroductionError::WrongNetwork { .. })
+        ));
+        assert_eq!(
+            c.verify(NOW - 61, "regtest"),
+            Err(IntroductionError::NotYetValid)
+        );
         let mut v2 = c.clone();
         v2.v = 2;
-        assert_eq!(v2.verify(NOW, "regtest"), Err(IntroductionError::UnsupportedVersion(2)));
+        assert_eq!(
+            v2.verify(NOW, "regtest"),
+            Err(IntroductionError::UnsupportedVersion(2))
+        );
         let mut long = c.clone();
         long.expires_at = long.issued_at + 601;
-        assert_eq!(long.verify(NOW, "regtest"), Err(IntroductionError::LifetimeTooLong));
+        assert_eq!(
+            long.verify(NOW, "regtest"),
+            Err(IntroductionError::LifetimeTooLong)
+        );
     }
 
     #[test]
@@ -544,38 +619,73 @@ mod tests {
         let c = card();
         let link = c.to_link();
         assert!(link.len() < 300, "QR-sized: {}", link.len());
-        let longest = Introduction::issue_with_key(&key(), fields(&format!("{}.example:9000", "a".repeat(60)))).unwrap();
+        let longest = Introduction::issue_with_key(
+            &key(),
+            fields(&format!("{}.example:9000", "a".repeat(60))),
+        )
+        .unwrap();
         assert!(longest.to_link().len() < 400);
         let mut truncated = link.clone();
         truncated.truncate(link.len() - 4);
         assert!(Introduction::parse(&truncated).is_err());
         let frag = link.strip_prefix(LINK_PREFIX).unwrap();
         assert_eq!(Introduction::parse(frag).unwrap(), c);
-        assert_eq!(Introduction::parse(&serde_json::to_string(&c).unwrap()).unwrap(), c);
+        assert_eq!(
+            Introduction::parse(&serde_json::to_string(&c).unwrap()).unwrap(),
+            c
+        );
         assert_eq!(Introduction::parse(&format!("  {link}\n")).unwrap(), c);
-        assert!(matches!(Introduction::parse(&"A".repeat(MAX_ENCODED_LEN + 1)), Err(IntroductionError::TooLarge(_))));
+        assert!(matches!(
+            Introduction::parse(&"A".repeat(MAX_ENCODED_LEN + 1)),
+            Err(IntroductionError::TooLarge(_))
+        ));
         assert!(Introduction::parse(&format!("https://evil.example/#{frag}")).is_err());
         let mut extra = serde_json::to_value(&c).unwrap();
         extra["grant"] = "admin".into();
-        assert!(Introduction::parse(&extra.to_string()).is_err(), "unknown fields are refused");
+        assert!(
+            Introduction::parse(&extra.to_string()).is_err(),
+            "unknown fields are refused"
+        );
     }
 
     #[test]
     fn endpoints_are_peer_addresses_not_urls() {
         for bad in [
-            "http://node.example.org:9000", "user@node.example.org:9000", "node.example.org",
-            "node.example.org:0", "node.example.org:9000/admin", "[::1", "0.0.0.0:9000",
-            "169.254.169.254:80", "[fe80::1]:9000", "224.0.0.1:9000", "-bad.example:1", "",
+            "http://node.example.org:9000",
+            "user@node.example.org:9000",
+            "node.example.org",
+            "node.example.org:0",
+            "node.example.org:9000/admin",
+            "[::1",
+            "0.0.0.0:9000",
+            "169.254.169.254:80",
+            "[fe80::1]:9000",
+            "224.0.0.1:9000",
+            "-bad.example:1",
+            "",
         ] {
-            assert!(Introduction::issue_with_key(&key(), fields(bad)).is_err(), "{bad} accepted");
+            assert!(
+                Introduction::issue_with_key(&key(), fields(bad)).is_err(),
+                "{bad} accepted"
+            );
         }
         for (ok, reach) in [
-            ("node.example.org:9000", Reach::Public), ("203.0.114.9:9000", Reach::Public),
-            ("[2606:4700::1]:9000", Reach::Public), ("127.0.0.1:9000", Reach::Local),
-            ("192.168.1.20:9000", Reach::Local), ("[fd00::2]:9000", Reach::Local),
-            ("localhost:9000", Reach::Local), ("100.100.1.1:9000", Reach::Local),
+            ("node.example.org:9000", Reach::Public),
+            ("203.0.114.9:9000", Reach::Public),
+            ("[2606:4700::1]:9000", Reach::Public),
+            ("127.0.0.1:9000", Reach::Local),
+            ("192.168.1.20:9000", Reach::Local),
+            ("[fd00::2]:9000", Reach::Local),
+            ("localhost:9000", Reach::Local),
+            ("100.100.1.1:9000", Reach::Local),
         ] {
-            assert_eq!(Introduction::issue_with_key(&key(), fields(ok)).unwrap().reach, reach, "{ok}");
+            assert_eq!(
+                Introduction::issue_with_key(&key(), fields(ok))
+                    .unwrap()
+                    .reach,
+                reach,
+                "{ok}"
+            );
         }
     }
 
@@ -585,7 +695,10 @@ mod tests {
         assert_eq!(c.reach, Reach::Local);
         c.reach = Reach::Public;
         c.sig = hex::encode(key().sign(&c.digest().unwrap()).to_bytes());
-        assert_eq!(c.verify(NOW, "regtest"), Err(IntroductionError::ReachMismatch("public")));
+        assert_eq!(
+            c.verify(NOW, "regtest"),
+            Err(IntroductionError::ReachMismatch("public"))
+        );
     }
 
     #[test]
@@ -593,7 +706,10 @@ mod tests {
         let mut c = card();
         c.endpoint = "169.254.169.254:80".into();
         c.sig = hex::encode(key().sign(&c.digest().unwrap()).to_bytes());
-        assert!(matches!(c.verify(NOW, "regtest"), Err(IntroductionError::InvalidEndpoint(_))));
+        assert!(matches!(
+            c.verify(NOW, "regtest"),
+            Err(IntroductionError::InvalidEndpoint(_))
+        ));
     }
 
     #[test]
@@ -605,7 +721,14 @@ mod tests {
         assert!(!dial_allowed(Reach::Public, ip("::ffff:192.168.0.1")));
         assert!(dial_allowed(Reach::Local, ip("192.168.0.1")));
         assert!(dial_allowed(Reach::Local, ip("8.8.8.8")));
-        for never in ["169.254.169.254", "0.0.0.0", "255.255.255.255", "fe80::1", "::", "::ffff:169.254.169.254"] {
+        for never in [
+            "169.254.169.254",
+            "0.0.0.0",
+            "255.255.255.255",
+            "fe80::1",
+            "::",
+            "::ffff:169.254.169.254",
+        ] {
             assert!(!dial_allowed(Reach::Local, ip(never)), "{never}");
         }
     }
@@ -636,7 +759,10 @@ mod tests {
                 c.expires_at = NOW + 1;
             }
             let parsed = Introduction::parse(&c.to_link()).unwrap();
-            assert_eq!(parsed.verify(NOW, "regtest"), Err(IntroductionError::InvalidSignature));
+            assert_eq!(
+                parsed.verify(NOW, "regtest"),
+                Err(IntroductionError::InvalidSignature)
+            );
         }
     }
 
@@ -646,7 +772,8 @@ mod tests {
         let mut sig = decode_fixed::<64>(&c.sig).unwrap();
         // Add the Ed25519 group order to S: the group equation is unchanged,
         // but the signature's scalar encoding is no longer canonical.
-        let order = hex::decode("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010").unwrap();
+        let order = hex::decode("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010")
+            .unwrap();
         let mut carry = 0u16;
         for (s, l) in sig[32..].iter_mut().zip(order) {
             let sum = u16::from(*s) + u16::from(l) + carry;
@@ -654,29 +781,48 @@ mod tests {
             carry = sum >> 8;
         }
         c.sig = hex::encode(sig);
-        assert_eq!(c.verify(NOW, "regtest"), Err(IntroductionError::InvalidSignature));
+        assert_eq!(
+            c.verify(NOW, "regtest"),
+            Err(IntroductionError::InvalidSignature)
+        );
         // Noncanonical encoding of the identity point (y = p + 1) as R.
         sig = decode_fixed::<64>(&card().sig).unwrap();
         sig[..32].fill(0xff);
         sig[0] = 0xee;
         sig[31] = 0x7f;
         c.sig = hex::encode(sig);
-        assert_eq!(c.verify(NOW, "regtest"), Err(IntroductionError::InvalidSignature));
+        assert_eq!(
+            c.verify(NOW, "regtest"),
+            Err(IntroductionError::InvalidSignature)
+        );
     }
 
     #[test]
     fn parse_bounds_include_surrounding_whitespace() {
         let padded = format!("{}{}", " ".repeat(MAX_ENCODED_LEN), card().to_link());
-        assert!(matches!(Introduction::parse(&padded), Err(IntroductionError::TooLarge(_))));
+        assert!(matches!(
+            Introduction::parse(&padded),
+            Err(IntroductionError::TooLarge(_))
+        ));
     }
 
     #[test]
     fn endpoint_port_and_ipv6_transition_ranges_fail_closed() {
-        for endpoint in ["node.example:0", "node.example:65536", "node.example:+9000", "node.example:-1"] {
+        for endpoint in [
+            "node.example:0",
+            "node.example:65536",
+            "node.example:+9000",
+            "node.example:-1",
+        ] {
             assert!(split_endpoint(endpoint).is_err(), "{endpoint}");
         }
         assert_eq!(split_endpoint("node.example:65535").unwrap().1, 65535);
-        for ip in ["::127.0.0.1", "64:ff9b::7f00:1", "2002:7f00:1::1", "fec0::1"] {
+        for ip in [
+            "::127.0.0.1",
+            "64:ff9b::7f00:1",
+            "2002:7f00:1::1",
+            "fec0::1",
+        ] {
             assert!(!dial_allowed(Reach::Public, ip.parse().unwrap()), "{ip}");
         }
     }

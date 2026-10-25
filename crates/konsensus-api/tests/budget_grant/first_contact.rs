@@ -1,7 +1,12 @@
 use super::*;
 use konsensus_lightning::shared_mock::SharedMockProvider;
 
-type FirstContactFixture = (Fx, Arc<SharedMockProvider>, Arc<SharedMockProvider>, Arc<AtomicUsize>);
+type FirstContactFixture = (
+    Fx,
+    Arc<SharedMockProvider>,
+    Arc<SharedMockProvider>,
+    Arc<AtomicUsize>,
+);
 
 async fn stranger(establish: bool) -> FirstContactFixture {
     let mut fx = fixture().await;
@@ -19,20 +24,37 @@ async fn stranger(establish: bool) -> FirstContactFixture {
     let transport = ConnectedStubTransport::new(vec![peer], fx.state.invoice_requests.clone())
         .with_invoice_responder(move |request_id, _| {
             count.fetch_add(1, Ordering::SeqCst);
-            let invoice = futures::executor::block_on(recipient.create_invoice(2000,
-                &format!("konsensus:{request_id}:message=2000"), 55)).unwrap();
+            let invoice = futures::executor::block_on(recipient.create_invoice(
+                2000,
+                &format!("konsensus:{request_id}:message=2000"),
+                55,
+            ))
+            .unwrap();
             if let Some(identity) = handshake.lock().unwrap().take() {
                 let recipient = recipient.clone();
                 let session = session.clone();
                 tokio::spawn(async move {
-                    while recipient.get_balance_msat().await.unwrap() == 0 { tokio::task::yield_now().await; }
+                    while recipient.get_balance_msat().await.unwrap() == 0 {
+                        tokio::task::yield_now().await;
+                    }
                     let target_session = konsensus_crypto::SessionManager::new(Arc::new(identity));
-                    session.initiate_session(&peer, &target_session.prekey_bundle().await).await.unwrap();
+                    session
+                        .initiate_session(&peer, &target_session.prekey_bundle().await)
+                        .await
+                        .unwrap();
                 });
             }
-            Some(konsensus_api::state::InvoiceResponseData { recipient: peer, bolt11: invoice.bolt11, payment_hash: invoice.payment_hash })
+            Some(konsensus_api::state::InvoiceResponseData {
+                recipient: peer,
+                bolt11: invoice.bolt11,
+                payment_hash: invoice.payment_hash,
+            })
         });
-    fx.state = Arc::new(AppState { lightning: sender.clone(), transport: Arc::new(transport), ..(*fx.state).clone() });
+    fx.state = Arc::new(AppState {
+        lightning: sender.clone(),
+        transport: Arc::new(transport),
+        ..(*fx.state).clone()
+    });
     (fx, sender, target, requests)
 }
 
@@ -85,21 +107,47 @@ async fn both_legs_resolve_one_aggregate_reservation() {
     assert_eq!(sender.get_balance_msat().await.unwrap(), 96_000);
     fx.restart();
     assert_eq!(fx.used(), 4000);
-    assert!(fx.service.snapshot().grants[0].budget.as_ref().unwrap().pending.is_empty());
+    assert!(fx.service.snapshot().grants[0]
+        .budget
+        .as_ref()
+        .unwrap()
+        .pending
+        .is_empty());
 }
 
 fn journal(fx: &Fx, reservation: &konsensus_api::spend_budget::Reservation, hash: &str) {
     let dir = fx.tmp.path().join("admission-attempts");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join(fx.peer.to_hex()), serde_json::to_vec(&json!({
-        "payment_hash": hash, "amount_msat": 2000, "quote":[0,2000], "envelope":null,
-        "original_reservation": reservation, "message_may_have_dispatched":false
-    })).unwrap()).unwrap();
+    std::fs::write(
+        dir.join(fx.peer.to_hex()),
+        serde_json::to_vec(&json!({
+            "payment_hash": hash, "amount_msat": 2000, "quote":[0,2000], "envelope":null,
+            "original_reservation": reservation, "message_may_have_dispatched":false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 fn reserve(fx: &Fx, amount: u64) -> konsensus_api::spend_budget::Reservation {
-    let epoch = fx.service.snapshot().clients.iter().find(|c| c.client_id == fx.client_id).unwrap().epoch;
-    fx.service.reserve_spend(&fx.client_id, epoch, vec![Charge { recipient:fx.peer.to_hex(), amount_msat:amount }]).unwrap()
+    let epoch = fx
+        .service
+        .snapshot()
+        .clients
+        .iter()
+        .find(|c| c.client_id == fx.client_id)
+        .unwrap()
+        .epoch;
+    fx.service
+        .reserve_spend(
+            &fx.client_id,
+            epoch,
+            vec![Charge {
+                recipient: fx.peer.to_hex(),
+                amount_msat: amount,
+            }],
+        )
+        .unwrap()
 }
 
 #[tokio::test]
@@ -112,8 +160,15 @@ async fn unknown_prior_attempt_does_not_charge_polling_retries() {
         fx.restart();
         let (status, body) = send(&fx, &token, 4000).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-        assert!(body["error"].as_str().unwrap().contains("outcome unknown"), "{body}");
-        assert_eq!(fx.used(), 6000, "only the original unknown attempt remains reserved");
+        assert!(
+            body["error"].as_str().unwrap().contains("outcome unknown"),
+            "{body}"
+        );
+        assert_eq!(
+            fx.used(),
+            6000,
+            "only the original unknown attempt remains reserved"
+        );
     }
     assert_eq!(requests.load(Ordering::SeqCst), 0);
     assert_eq!(sender.get_balance_msat().await.unwrap(), 100_000);
@@ -142,7 +197,10 @@ async fn settled_prior_attempt_reconciles_original_once_across_restart() {
 async fn revoking_grant_while_admission_quote_is_pending_prevents_payment() {
     let (mut fx, sender, target, _) = stranger(false).await;
     fx.state = Arc::new(AppState {
-        transport: Arc::new(ConnectedStubTransport::new(vec![fx.peer], fx.state.invoice_requests.clone())),
+        transport: Arc::new(ConnectedStubTransport::new(
+            vec![fx.peer],
+            fx.state.invoice_requests.clone(),
+        )),
         ..(*fx.state).clone()
     });
     let token = fx.grant(None, GrantTerms::new(10_000)).await;
@@ -162,11 +220,26 @@ async fn revoking_grant_while_admission_quote_is_pending_prevents_payment() {
             drop(pending);
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
-    assert_eq!(fx.used(), 4000, "aggregate must already be durably reserved");
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        fx.used(),
+        4000,
+        "aggregate must already be durably reserved"
+    );
     fx.service.revoke_grants(Some(&fx.client_id)).unwrap();
-    let invoice = target.create_invoice(2000, &format!("konsensus:{id}:message=2000"), 55).await.unwrap();
-    response.send(Ok(konsensus_api::state::InvoiceResponseData { recipient:peer, bolt11:invoice.bolt11, payment_hash:invoice.payment_hash })).unwrap();
+    let invoice = target
+        .create_invoice(2000, &format!("konsensus:{id}:message=2000"), 55)
+        .await
+        .unwrap();
+    response
+        .send(Ok(konsensus_api::state::InvoiceResponseData {
+            recipient: peer,
+            bolt11: invoice.bolt11,
+            payment_hash: invoice.payment_hash,
+        }))
+        .unwrap();
     let (status, body) = request.await.unwrap();
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "budget_exceeded");
@@ -178,7 +251,10 @@ async fn old_admission_never_charges_replacement_grant() {
     let (mut fx, sender, target, requests) = stranger(false).await;
     fx.grant(None, GrantTerms::new(10_000)).await;
     let original = reserve(&fx, 6000);
-    let invoice = target.create_invoice(2000, "prior grant", 55).await.unwrap();
+    let invoice = target
+        .create_invoice(2000, "prior grant", 55)
+        .await
+        .unwrap();
     sender.pay_invoice(&invoice.bolt11).await.unwrap();
     journal(&fx, &original, &invoice.payment_hash);
     let token = fx.grant(None, GrantTerms::new(20_000)).await;
@@ -186,7 +262,11 @@ async fn old_admission_never_charges_replacement_grant() {
     let (status, body) = send(&fx, &token, 4000).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["amount_msat"], 0);
-    assert_eq!(fx.used(), 0, "a new grant cannot inherit the old admission debit");
+    assert_eq!(
+        fx.used(),
+        0,
+        "a new grant cannot inherit the old admission debit"
+    );
     assert_eq!(requests.load(Ordering::SeqCst), 0);
     assert_eq!(sender.get_balance_msat().await.unwrap(), 98_000);
 }
@@ -196,10 +276,17 @@ async fn unknown_second_leg_keeps_original_aggregate_reserved_after_restart() {
     let (mut fx, sender, target, requests) = stranger(false).await;
     let token = fx.grant(None, GrantTerms::new(20_000)).await;
     let original = reserve(&fx, 6000);
-    let invoice = target.create_invoice(2000, "before cancellation", 55).await.unwrap();
+    let invoice = target
+        .create_invoice(2000, "before cancellation", 55)
+        .await
+        .unwrap();
     sender.pay_invoice(&invoice.bolt11).await.unwrap();
     journal(&fx, &original, &invoice.payment_hash);
-    let path = fx.tmp.path().join("admission-attempts").join(fx.peer.to_hex());
+    let path = fx
+        .tmp
+        .path()
+        .join("admission-attempts")
+        .join(fx.peer.to_hex());
     let mut attempt: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     // Models cancellation after the durable message-dispatch marker: knowing
     // admission settled cannot establish the outcome of the second payment.
@@ -212,7 +299,6 @@ async fn unknown_second_leg_keeps_original_aggregate_reserved_after_restart() {
     assert_eq!(requests.load(Ordering::SeqCst), 0);
     assert_eq!(sender.get_balance_msat().await.unwrap(), 98_000);
 }
-
 
 async fn prior_admission_refusal_emits_membrane_event(refuse_budget: bool) {
     let (mut fx, sender, target, _) = stranger(false).await;
@@ -298,54 +384,103 @@ async fn prior_admission_budget_refusal_emits_membrane_event_without_new_payment
 // A failed operation journal must not create an unpaid admission guard.
 #[tokio::test]
 async fn failed_admission_operation_journal_does_not_poison_unpaid_retry() {
-    use konsensus_storage::Storage;
     use konsensus_storage::SqliteStorage;
+    use konsensus_storage::Storage;
     for mode in ["failed_write", "committed_write", "other_operation"] {
-    let (mut fx, sender, _target, requests) = stranger(true).await;
-    let db = Arc::new(SqliteStorage::open(fx.tmp.path().join("review113.db").to_str().unwrap()).await.unwrap());
-    fx.state = Arc::new(AppState { storage: db.clone(), ..(*fx.state).clone() });
-    let token = fx.grant(None, GrantTerms::new(20_000)).await;
-    let id = uuid::Uuid::new_v4().to_string();
-    let mut request = json!({"operation_id":id,"recipient":fx.peer.to_hex(),"kind":0,"plaintext":"operation write failure","max_total_msat":6000,"wait_ack_ms":0});
-    sqlx::raw_sql("CREATE TRIGGER review113_crash BEFORE UPDATE ON outbox_operations WHEN NEW.admission_payment_hash IS NOT NULL BEGIN SELECT RAISE(ABORT, 'review113 admission journal failure'); END").execute(db.pool()).await.unwrap();
-    confirm(&fx, &token, 6000).await;
-    let first = fx.call("POST", "/api/v1/messages/compose", Some(request.clone()), Some(&token)).await;
-    assert_eq!(first.0, StatusCode::INTERNAL_SERVER_ERROR, "{first:?}");
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
-    assert_eq!(sender.get_balance_msat().await.unwrap(), 100_000, "no Lightning dispatch occurred");
-    assert_eq!(fx.used(), 0, "known unpaid reservation released");
-    let op = db.get_outbox_operation(&id).await.unwrap().unwrap();
-    assert_eq!(op.state, "released");
-    assert!(op.admission_payment_hash.is_none());
-    sqlx::raw_sql("DROP TRIGGER review113_crash").execute(db.pool()).await.unwrap();
-    // False dispatch marker survives both failed and committed SQL writes.
-    // In other_operation mode the prior fields are not yet visible: cleanup
-    // must still fence the old version against a late cancelled SQL update.
-    let stale = op.clone();
-    if mode == "committed_write" {
-        let journal: Value = serde_json::from_slice(&std::fs::read(fx.tmp.path().join("admission-attempts").join(fx.peer.to_hex())).unwrap()).unwrap();
-        assert_eq!(journal["dispatch_started"], false);
-        let mut op = op;
-        let mut data: Value = serde_json::from_slice(&op.recovery).unwrap();
-        data["admission_pending"] = true.into();
-        data["admission_expected_msat"] = journal["amount_msat"].clone();
-        data["admission_reservation"] = journal["original_reservation"].clone();
-        op.admission_payment_hash = Some(journal["payment_hash"].as_str().unwrap().into());
-        op.recovery = serde_json::to_vec(&data).unwrap();
-        op.state = "payment_unknown".into();
-        assert!(db.update_outbox_operation(&op).await.unwrap());
-        fx.restart();
-    }
-    if mode == "other_operation" { request["operation_id"] = uuid::Uuid::new_v4().to_string().into(); }
-    confirm(&fx, &token, 6000).await;
-    let retry = fx.call("POST", "/api/v1/messages/compose", Some(request), Some(&token)).await;
-    assert_eq!(retry.0, StatusCode::OK, "known undispatched admission must recover after its failed write: {retry:?}");
-    assert_eq!(sender.get_balance_msat().await.unwrap(), 96_000);
-    assert_eq!(fx.used(), 4000);
-    if mode == "other_operation" {
-        assert!(!db.update_outbox_operation(&stale).await.unwrap(), "late cancelled SQL writer must be fenced");
-        assert_eq!(db.get_outbox_operation(&id).await.unwrap().unwrap().state, "prepared");
-    }
+        let (mut fx, sender, _target, requests) = stranger(true).await;
+        let db = Arc::new(
+            SqliteStorage::open(fx.tmp.path().join("review113.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        fx.state = Arc::new(AppState {
+            storage: db.clone(),
+            ..(*fx.state).clone()
+        });
+        let token = fx.grant(None, GrantTerms::new(20_000)).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut request = json!({"operation_id":id,"recipient":fx.peer.to_hex(),"kind":0,"plaintext":"operation write failure","max_total_msat":6000,"wait_ack_ms":0});
+        sqlx::raw_sql("CREATE TRIGGER review113_crash BEFORE UPDATE ON outbox_operations WHEN NEW.admission_payment_hash IS NOT NULL BEGIN SELECT RAISE(ABORT, 'review113 admission journal failure'); END").execute(db.pool()).await.unwrap();
+        confirm(&fx, &token, 6000).await;
+        let first = fx
+            .call(
+                "POST",
+                "/api/v1/messages/compose",
+                Some(request.clone()),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(first.0, StatusCode::INTERNAL_SERVER_ERROR, "{first:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            sender.get_balance_msat().await.unwrap(),
+            100_000,
+            "no Lightning dispatch occurred"
+        );
+        assert_eq!(fx.used(), 0, "known unpaid reservation released");
+        let op = db.get_outbox_operation(&id).await.unwrap().unwrap();
+        assert_eq!(op.state, "released");
+        assert!(op.admission_payment_hash.is_none());
+        sqlx::raw_sql("DROP TRIGGER review113_crash")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // False dispatch marker survives both failed and committed SQL writes.
+        // In other_operation mode the prior fields are not yet visible: cleanup
+        // must still fence the old version against a late cancelled SQL update.
+        let stale = op.clone();
+        if mode == "committed_write" {
+            let journal: Value = serde_json::from_slice(
+                &std::fs::read(
+                    fx.tmp
+                        .path()
+                        .join("admission-attempts")
+                        .join(fx.peer.to_hex()),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(journal["dispatch_started"], false);
+            let mut op = op;
+            let mut data: Value = serde_json::from_slice(&op.recovery).unwrap();
+            data["admission_pending"] = true.into();
+            data["admission_expected_msat"] = journal["amount_msat"].clone();
+            data["admission_reservation"] = journal["original_reservation"].clone();
+            op.admission_payment_hash = Some(journal["payment_hash"].as_str().unwrap().into());
+            op.recovery = serde_json::to_vec(&data).unwrap();
+            op.state = "payment_unknown".into();
+            assert!(db.update_outbox_operation(&op).await.unwrap());
+            fx.restart();
+        }
+        if mode == "other_operation" {
+            request["operation_id"] = uuid::Uuid::new_v4().to_string().into();
+        }
+        confirm(&fx, &token, 6000).await;
+        let retry = fx
+            .call(
+                "POST",
+                "/api/v1/messages/compose",
+                Some(request),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(
+            retry.0,
+            StatusCode::OK,
+            "known undispatched admission must recover after its failed write: {retry:?}"
+        );
+        assert_eq!(sender.get_balance_msat().await.unwrap(), 96_000);
+        assert_eq!(fx.used(), 4000);
+        if mode == "other_operation" {
+            assert!(
+                !db.update_outbox_operation(&stale).await.unwrap(),
+                "late cancelled SQL writer must be fenced"
+            );
+            assert_eq!(
+                db.get_outbox_operation(&id).await.unwrap().unwrap().state,
+                "prepared"
+            );
+        }
     }
 }
 
@@ -364,12 +499,20 @@ impl LightningProvider for RefusingLeg {
     async fn pay_invoice(&self, _: &str) -> Result<PaymentDetails, LightningError> {
         panic!("uncapped payment")
     }
-    async fn pay_invoice_with_fee_limit(&self, b: &str, fee: u64) -> Result<PaymentDetails, LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        b: &str,
+        fee: u64,
+    ) -> Result<PaymentDetails, LightningError> {
         if self.calls.fetch_add(1, Ordering::SeqCst) == self.leg {
             return if self.unknown {
-                Err(LightningError::Backend("not dispatched (untrusted backend text)".into()))
+                Err(LightningError::Backend(
+                    "not dispatched (untrusted backend text)".into(),
+                ))
             } else {
-                Err(LightningError::PaymentNotDispatched("route exceeds fee ceiling".into()))
+                Err(LightningError::PaymentNotDispatched(
+                    "route exceeds fee ceiling".into(),
+                ))
             };
         }
         self.inner.pay_invoice_with_fee_limit(b, fee).await
@@ -377,18 +520,38 @@ impl LightningProvider for RefusingLeg {
     async fn get_payment_status(&self, h: &str) -> Result<PaymentDetails, LightningError> {
         self.inner.get_payment_status(h).await
     }
-    async fn get_balance_msat(&self) -> Result<u64, LightningError> { self.inner.get_balance_msat().await }
-    async fn is_available(&self) -> bool { true }
+    async fn get_balance_msat(&self) -> Result<u64, LightningError> {
+        self.inner.get_balance_msat().await
+    }
+    async fn is_available(&self) -> bool {
+        true
+    }
 }
 
 #[tokio::test]
 async fn first_contact_non_dispatch_preserves_partial_settlement_and_unknown_holds() {
-    for (leg, unknown, expected_used) in [(0, false, 0), (0, true, 6000), (1, false, 2000), (1, true, 6000)] {
+    for (leg, unknown, expected_used) in [
+        (0, false, 0),
+        (0, true, 6000),
+        (1, false, 2000),
+        (1, true, 6000),
+    ] {
         let (mut fx, sender, _, _) = stranger(leg == 1).await;
-        let wallet = Arc::new(RefusingLeg { inner: sender, calls: AtomicUsize::new(0), leg, unknown });
+        let wallet = Arc::new(RefusingLeg {
+            inner: sender,
+            calls: AtomicUsize::new(0),
+            leg,
+            unknown,
+        });
         fx.state = Arc::new(AppState {
             lightning: wallet.clone(),
-            storage: Arc::new(konsensus_storage::SqliteStorage::open(fx.tmp.path().join("outbox.db").to_str().unwrap()).await.unwrap()),
+            storage: Arc::new(
+                konsensus_storage::SqliteStorage::open(
+                    fx.tmp.path().join("outbox.db").to_str().unwrap(),
+                )
+                .await
+                .unwrap(),
+            ),
             ..(*fx.state).clone()
         });
         let token = fx.grant(None, GrantTerms::new(10000)).await;
@@ -399,12 +562,19 @@ async fn first_contact_non_dispatch_preserves_partial_settlement_and_unknown_hol
             assert_eq!(body["state"], "released");
         } else {
             assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-            assert_ne!(body["code"], "not_dispatched", "a paid admission or unknown leg prevents an aggregate non-dispatch claim");
+            assert_ne!(
+                body["code"], "not_dispatched",
+                "a paid admission or unknown leg prevents an aggregate non-dispatch claim"
+            );
         }
         assert_eq!(fx.used(), expected_used, "{body}");
         for _ in 0..2 {
             super::not_dispatched::recover(&mut fx).await;
-            assert_eq!(fx.used(), expected_used, "recovery must retain paid admissions and unknown attempts");
+            assert_eq!(
+                fx.used(),
+                expected_used,
+                "recovery must retain paid admissions and unknown attempts"
+            );
         }
         assert_eq!(wallet.calls.load(Ordering::SeqCst), leg + 1);
     }

@@ -17,8 +17,8 @@
 //! | Homeostatic scaling | Overloaded nodes self-protect | Global weight reduction on overload |
 //! | Critical period | New nodes learn fast | Boosted learning rate initially |
 
-mod weight;
 mod table;
+mod weight;
 
+pub use table::{PeerScore, RoutingConfig, RoutingDecision, RoutingTable};
 pub use weight::SynapticWeight;
-pub use table::{RoutingTable, RoutingDecision, PeerScore, RoutingConfig};

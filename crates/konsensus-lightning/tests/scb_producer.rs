@@ -19,6 +19,10 @@ fn scb_export_reads_persisted_monitor_store_bytes() {
         .expect("export scb");
 
     let blob = fs::read(&scb_path).expect("read scb");
-    assert!(blob.windows("monitor-state".len()).any(|w| w == b"monitor-state"));
-    assert!(blob.windows("monitor-update".len()).any(|w| w == b"monitor-update"));
+    assert!(blob
+        .windows("monitor-state".len())
+        .any(|w| w == b"monitor-state"));
+    assert!(blob
+        .windows("monitor-update".len())
+        .any(|w| w == b"monitor-update"));
 }

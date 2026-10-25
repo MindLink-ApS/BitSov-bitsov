@@ -1,7 +1,7 @@
 //! Message query and management endpoints — list, get, get plaintext, and delete.
 
-use konsensus_storage::MessageListQuery;
 use crate::handlers::list_diagnostics::message_cursor;
+use konsensus_storage::MessageListQuery;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -13,11 +13,11 @@ use konsensus_core::payloads::room::{RoomBinding, RoomChat};
 use konsensus_core::types::{MessageId, NodeId, Recipient};
 
 use crate::audit::events;
-use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::auth::scoped::{Admin, Read, ScopedAuth};
 use crate::error::ApiError;
 use crate::freshness::DataFreshness;
-use crate::state::AppState;
 use crate::handlers::list_diagnostics::ListDiagnostics;
+use crate::state::AppState;
 
 /// Maximum allowed limit for list queries.
 pub(super) const MAX_LIST_LIMIT: u32 = 1000;
@@ -112,7 +112,10 @@ impl MessageResponse {
             return None;
         }
         let chat = RoomChat::parse(plaintext).ok()??;
-        let (from, to) = (NodeId::from_hex(&self.sender).ok()?, NodeId::from_hex(&self.recipient).ok()?);
+        let (from, to) = (
+            NodeId::from_hex(&self.sender).ok()?,
+            NodeId::from_hex(&self.recipient).ok()?,
+        );
         chat.room.check(&from, &to).ok()?;
         Some(chat)
     }
@@ -141,7 +144,11 @@ impl MessageResponse {
     }
 
     /// Attach cached plaintext by decrypting the at-rest encrypted blob.
-    pub(super) fn with_cached_plaintext(mut self, encrypted: Option<Vec<u8>>, cipher: Option<&konsensus_crypto::PlaintextCacheCipher>) -> Self {
+    pub(super) fn with_cached_plaintext(
+        mut self,
+        encrypted: Option<Vec<u8>>,
+        cipher: Option<&konsensus_crypto::PlaintextCacheCipher>,
+    ) -> Self {
         if let (Some(enc), Some(c)) = (encrypted, cipher) {
             match c.decrypt(&enc) {
                 Ok(bytes) => {
@@ -185,7 +192,9 @@ pub(super) async fn get_message(
         .unwrap_or(None);
 
     let cipher = state.plaintext_cipher.as_deref();
-    Ok(Json(MessageResponse::from_envelope(&envelope).with_cached_plaintext(cached, cipher)))
+    Ok(Json(
+        MessageResponse::from_envelope(&envelope).with_cached_plaintext(cached, cipher),
+    ))
 }
 
 /// `GET /api/v1/messages/:id/plaintext` — get decrypted plaintext for a message.
@@ -260,15 +269,30 @@ pub(super) async fn list_messages(
     let limit = clamp_limit(params.limit);
     let cursor = message_cursor(params.before, params.before_id.as_deref())?;
     let scan_cursor = message_cursor(params.scan_before, params.scan_before_id.as_deref())?;
-    let before = if cursor.is_some() { None } else { params.before };
+    let before = if cursor.is_some() {
+        None
+    } else {
+        params.before
+    };
     if let Some(room) = &params.room {
         if !konsensus_core::payloads::room::is_room_id(room) {
-            return Err(ApiError::BadRequest("invalid room: expected a 64-char lowercase hex room id".into()));
+            return Err(ApiError::BadRequest(
+                "invalid room: expected a 64-char lowercase hex room id".into(),
+            ));
         }
         if params.peer.is_some() {
             return Err(ApiError::BadRequest("room and peer are exclusive".into()));
         }
-        let (diagnostics, messages) = room_thread(&state, &my_node_hex, room, limit, params.before, params.scan_before, scan_cursor.as_ref()).await?;
+        let (diagnostics, messages) = room_thread(
+            &state,
+            &my_node_hex,
+            room,
+            limit,
+            params.before,
+            params.scan_before,
+            scan_cursor.as_ref(),
+        )
+        .await?;
         return Ok((store_read, diagnostics, Json(messages)));
     }
 
@@ -291,8 +315,14 @@ pub(super) async fn list_messages(
         state
             .storage
             .message_page_with_diagnostics(
-                &MessageListQuery::Conversation { me: &my_node_hex, peer: peer_id, is_room },
-                limit, before, cursor.as_ref(),
+                &MessageListQuery::Conversation {
+                    me: &my_node_hex,
+                    peer: peer_id,
+                    is_room,
+                },
+                limit,
+                before,
+                cursor.as_ref(),
             )
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
@@ -300,7 +330,12 @@ pub(super) async fn list_messages(
         let recipient = Recipient::Node(*state.identity.node_id());
         state
             .storage
-            .message_page_with_diagnostics(&MessageListQuery::Recipient(&recipient), limit, before, cursor.as_ref())
+            .message_page_with_diagnostics(
+                &MessageListQuery::Recipient(&recipient),
+                limit,
+                before,
+                cursor.as_ref(),
+            )
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
     };
@@ -333,34 +368,70 @@ pub(super) async fn list_messages(
 /// is placed at its newest copy's timestamp, ordered newest first (ties by
 /// id); `before` and `limit` then apply to entries, so a page never repeats
 /// or splits a message.
-async fn room_thread(state: &AppState, me: &str, room_id: &str, limit: u32, before: Option<u64>, scan_before: Option<u64>, cursor: Option<&konsensus_storage::ListCursor<u64>>) -> Result<(ListDiagnostics, Vec<MessageResponse>), ApiError> {
+async fn room_thread(
+    state: &AppState,
+    me: &str,
+    room_id: &str,
+    limit: u32,
+    before: Option<u64>,
+    scan_before: Option<u64>,
+    cursor: Option<&konsensus_storage::ListCursor<u64>>,
+) -> Result<(ListDiagnostics, Vec<MessageResponse>), ApiError> {
     let messages = state
         .storage
-        .message_page_with_diagnostics(&MessageListQuery::NodeKind { me, kind: konsensus_core::kind::KIND_CHAT }, MAX_SEARCH_SCAN, if cursor.is_some() { None } else { scan_before }, cursor)
+        .message_page_with_diagnostics(
+            &MessageListQuery::NodeKind {
+                me,
+                kind: konsensus_core::kind::KIND_CHAT,
+            },
+            MAX_SEARCH_SCAN,
+            if cursor.is_some() { None } else { scan_before },
+            cursor,
+        )
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
     let mut diagnostics = ListDiagnostics::from(&messages);
     // Room source checkpoints use scan_before, never the logical before cursor.
     diagnostics.next_before = None;
-    let Some(cipher) = state.plaintext_cipher.as_deref() else { return Ok((diagnostics, Vec::new())) };
+    let Some(cipher) = state.plaintext_cipher.as_deref() else {
+        return Ok((diagnostics, Vec::new()));
+    };
     let mut thread: Vec<MessageResponse> = Vec::new();
     // Our room message id -> its entry in `thread`.
     let mut sent: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for env in &messages.items {
-        let cached = state.storage.get_message_plaintext(&env.id).await.unwrap_or(None);
-        let mut resp = MessageResponse::from_envelope(env).with_cached_plaintext(cached, Some(cipher));
+        let cached = state
+            .storage
+            .get_message_plaintext(&env.id)
+            .await
+            .unwrap_or(None);
+        let mut resp =
+            MessageResponse::from_envelope(env).with_cached_plaintext(cached, Some(cipher));
         if resp.room.as_ref().is_none_or(|room| room.id != room_id) {
             continue;
         }
         if resp.sender == me {
-            let copy = RoomCopy { recipient: resp.recipient.clone(), id: resp.id.clone(), payment_amount_msat: resp.payment_amount_msat };
+            let copy = RoomCopy {
+                recipient: resp.recipient.clone(),
+                id: resp.id.clone(),
+                payment_amount_msat: resp.payment_amount_msat,
+            };
             let msg = resp.room_msg.clone().unwrap_or_default();
             if let Some(&at) = sent.get(&msg) {
                 let entry = &mut thread[at];
-                entry.payment_amount_msat = entry.payment_amount_msat.saturating_add(copy.payment_amount_msat);
-                if resp.timestamp > entry.timestamp || (resp.timestamp == entry.timestamp && resp.id > entry.id) {
+                entry.payment_amount_msat = entry
+                    .payment_amount_msat
+                    .saturating_add(copy.payment_amount_msat);
+                if resp.timestamp > entry.timestamp
+                    || (resp.timestamp == entry.timestamp && resp.id > entry.id)
+                {
                     // The newest copy represents the entry.
-                    (entry.id, entry.timestamp, entry.ciphertext, entry.payment_hash) = (resp.id, resp.timestamp, resp.ciphertext, resp.payment_hash);
+                    (
+                        entry.id,
+                        entry.timestamp,
+                        entry.ciphertext,
+                        entry.payment_hash,
+                    ) = (resp.id, resp.timestamp, resp.ciphertext, resp.payment_hash);
                 }
                 entry.copies.push(copy);
                 continue;
@@ -431,7 +502,11 @@ fn search_snippet(text: &str, needle_lower: &str, ctx: usize) -> String {
             let take = ctx * 2 + needle_lower.chars().count();
             let body: String = text.chars().skip(start).take(take).collect();
             let prefix = if start > 0 { "\u{2026}" } else { "" };
-            let suffix = if text.chars().count() > start + take { "\u{2026}" } else { "" };
+            let suffix = if text.chars().count() > start + take {
+                "\u{2026}"
+            } else {
+                ""
+            };
             format!("{prefix}{body}{suffix}")
         }
         None => text.chars().take(ctx * 2).collect(),
@@ -454,7 +529,9 @@ pub(super) async fn search_messages(
 ) -> Result<(ListDiagnostics, Json<Vec<SearchResult>>), ApiError> {
     let needle = params.q.trim();
     if needle.is_empty() {
-        return Err(ApiError::BadRequest("search query 'q' must not be empty".into()));
+        return Err(ApiError::BadRequest(
+            "search query 'q' must not be empty".into(),
+        ));
     }
     let needle_lower = needle.to_lowercase();
 
@@ -464,7 +541,11 @@ pub(super) async fn search_messages(
 
     let my_node_hex = state.identity.node_id().to_hex();
     let cursor = message_cursor(params.before, params.before_id.as_deref())?;
-    let before = if cursor.is_some() { None } else { params.before };
+    let before = if cursor.is_some() {
+        None
+    } else {
+        params.before
+    };
 
     // Load the most-recent messages to scan (bounded). Mirrors list_messages.
     let messages = if let Some(ref peer_id) = params.peer {
@@ -482,14 +563,28 @@ pub(super) async fn search_messages(
         };
         state
             .storage
-            .message_page_with_diagnostics(&MessageListQuery::Conversation { me: &my_node_hex, peer: peer_id, is_room }, MAX_SEARCH_SCAN, before, cursor.as_ref())
+            .message_page_with_diagnostics(
+                &MessageListQuery::Conversation {
+                    me: &my_node_hex,
+                    peer: peer_id,
+                    is_room,
+                },
+                MAX_SEARCH_SCAN,
+                before,
+                cursor.as_ref(),
+            )
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
     } else {
         let recipient = Recipient::Node(*state.identity.node_id());
         state
             .storage
-            .message_page_with_diagnostics(&MessageListQuery::Recipient(&recipient), MAX_SEARCH_SCAN, before, cursor.as_ref())
+            .message_page_with_diagnostics(
+                &MessageListQuery::Recipient(&recipient),
+                MAX_SEARCH_SCAN,
+                before,
+                cursor.as_ref(),
+            )
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
     };
@@ -499,9 +594,13 @@ pub(super) async fn search_messages(
     let mut results = Vec::new();
     for env in &messages.items {
         if results.len() >= limit {
-            diagnostics.next_before = results.last().map(|last: &SearchResult| konsensus_storage::ListCursor {
-                timestamp: last.timestamp.to_string(), id: last.id.clone(),
-            });
+            diagnostics.next_before =
+                results
+                    .last()
+                    .map(|last: &SearchResult| konsensus_storage::ListCursor {
+                        timestamp: last.timestamp.to_string(),
+                        id: last.id.clone(),
+                    });
             break;
         }
         let encrypted = match state.storage.get_message_plaintext(&env.id).await {
@@ -568,7 +667,10 @@ mod search_snippet_tests {
     fn snippet_wraps_match_with_ellipses() {
         let text = "the quick brown fox jumps over the lazy dog and keeps going for a while";
         let s = super::search_snippet(text, "brown fox", 5);
-        assert!(s.contains("brown fox"), "snippet must contain the match: {s}");
+        assert!(
+            s.contains("brown fox"),
+            "snippet must contain the match: {s}"
+        );
         // Match is mid-text, so both ends are elided.
         assert!(s.starts_with('\u{2026}'), "expected leading ellipsis: {s}");
     }
@@ -576,14 +678,20 @@ mod search_snippet_tests {
     #[test]
     fn snippet_at_start_has_no_leading_ellipsis() {
         let s = search_snippet("hello world this is a message", "hello", 20);
-        assert!(s.starts_with("hello"), "no leading ellipsis when match is at start: {s}");
+        assert!(
+            s.starts_with("hello"),
+            "no leading ellipsis when match is at start: {s}"
+        );
     }
 
     #[test]
     fn snippet_case_insensitive_positioning() {
         // Needle is already lowercased by the caller; text has mixed case.
         let s = search_snippet("Meeting about the QUARTERLY budget review", "quarterly", 4);
-        assert!(s.to_lowercase().contains("quarterly"), "matches case-insensitively: {s}");
+        assert!(
+            s.to_lowercase().contains("quarterly"),
+            "matches case-insensitively: {s}"
+        );
         // Original casing is preserved in the returned snippet.
         assert!(s.contains("QUARTERLY"), "preserves original casing: {s}");
     }

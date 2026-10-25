@@ -18,9 +18,7 @@
 //!    crate's primitive we depend on still behaves as documented).
 
 use ed25519_dalek::Signer;
-use konsensus_crypto::{
-    x3dh::{initiate, respond, OneTimePreKey, PrekeyBundle, SignedPreKey},
-};
+use konsensus_crypto::x3dh::{initiate, respond, OneTimePreKey, PrekeyBundle, SignedPreKey};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 

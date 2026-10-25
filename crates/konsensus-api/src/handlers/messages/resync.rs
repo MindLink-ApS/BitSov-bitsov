@@ -4,16 +4,16 @@
 //! a time window at 50% `RESYNC_DISCOUNT`) and fulfill (broadcasts stored
 //! messages via WebSocket so the frontend can restore conversation history).
 
-use crate::auth::scoped::{ScopedAuth, Admin};
-use std::sync::Arc;
+use crate::audit::events;
+use crate::auth::scoped::{Admin, ScopedAuth};
+use crate::error::ApiError;
+use crate::handlers::list_diagnostics::ListDiagnostics;
+use crate::state::AppState;
 use axum::extract::State;
 use axum::Json;
-use serde::{Deserialize, Serialize};
 use konsensus_core::types::{MessageId, NodeId};
-use crate::audit::events;
-use crate::error::ApiError;
-use crate::state::AppState;
-use crate::handlers::list_diagnostics::ListDiagnostics;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 const MAX_FULFILL_IDS: usize = 500;
 const MAX_DISCOVERY_LIMIT: u32 = 1000;
@@ -21,8 +21,17 @@ const MAX_DISCOVERY_LIMIT: u32 = 1000;
 #[derive(Deserialize)]
 #[serde(tag = "phase", rename_all = "lowercase")]
 pub enum ResyncRequest {
-    Discover { peer_id: String, from_ms: u64, to_ms: u64, before: Option<u64>, before_id: Option<String> },
-    Fulfill  { peer_id: String, message_ids: Vec<String> },
+    Discover {
+        peer_id: String,
+        from_ms: u64,
+        to_ms: u64,
+        before: Option<u64>,
+        before_id: Option<String>,
+    },
+    Fulfill {
+        peer_id: String,
+        message_ids: Vec<String>,
+    },
 }
 
 #[derive(Serialize)]
@@ -60,15 +69,35 @@ pub(super) async fn resync_messages(
     Json(req): Json<ResyncRequest>,
 ) -> Result<(ListDiagnostics, Json<serde_json::Value>), ApiError> {
     match req {
-        ResyncRequest::Discover { peer_id, from_ms, to_ms, before, before_id } => {
-            let (diagnostics, r) = discover(&state, peer_id, from_ms, to_ms, before, before_id).await?;
-            Ok((diagnostics, Json(serde_json::to_value(r)
-                .map_err(|e| ApiError::Internal(format!("serialization error: {e}")))?)))
+        ResyncRequest::Discover {
+            peer_id,
+            from_ms,
+            to_ms,
+            before,
+            before_id,
+        } => {
+            let (diagnostics, r) =
+                discover(&state, peer_id, from_ms, to_ms, before, before_id).await?;
+            Ok((
+                diagnostics,
+                Json(
+                    serde_json::to_value(r)
+                        .map_err(|e| ApiError::Internal(format!("serialization error: {e}")))?,
+                ),
+            ))
         }
-        ResyncRequest::Fulfill { peer_id, message_ids } => {
+        ResyncRequest::Fulfill {
+            peer_id,
+            message_ids,
+        } => {
             let r = fulfill(&state, peer_id, message_ids).await?;
-            Ok((ListDiagnostics::default(), Json(serde_json::to_value(r)
-                .map_err(|e| ApiError::Internal(format!("serialization error: {e}")))?)))
+            Ok((
+                ListDiagnostics::default(),
+                Json(
+                    serde_json::to_value(r)
+                        .map_err(|e| ApiError::Internal(format!("serialization error: {e}")))?,
+                ),
+            ))
         }
     }
 }
@@ -89,26 +118,45 @@ async fn discover(
 
     let cursor = crate::handlers::list_diagnostics::message_cursor(before, before_id.as_deref())?;
     let upper = to_ms.saturating_add(1);
-    let upper = if cursor.is_some() { upper } else { before.map_or(upper, |b| b.min(upper)) };
+    let upper = if cursor.is_some() {
+        upper
+    } else {
+        before.map_or(upper, |b| b.min(upper))
+    };
     let my_node_hex = state.identity.node_id().to_hex();
     let envelopes = state
         .storage
         .message_page_with_diagnostics(
-            &konsensus_storage::MessageListQuery::Conversation { me: &my_node_hex, peer: &peer_id, is_room: false },
-            MAX_DISCOVERY_LIMIT, Some(upper), cursor.as_ref(),
+            &konsensus_storage::MessageListQuery::Conversation {
+                me: &my_node_hex,
+                peer: &peer_id,
+                is_room: false,
+            },
+            MAX_DISCOVERY_LIMIT,
+            Some(upper),
+            cursor.as_ref(),
         )
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 
     let diagnostics = (&envelopes).into();
-    let in_window: Vec<_> = envelopes.items.into_iter().filter(|env| env.timestamp >= from_ms).collect();
+    let in_window: Vec<_> = envelopes
+        .items
+        .into_iter()
+        .filter(|env| env.timestamp >= from_ms)
+        .collect();
 
     let mut entries = Vec::with_capacity(in_window.len());
     let mut estimated_total: u64 = 0;
     for env in &in_window {
         let base_msat = state.pricing.get_price_msat(env.kind).await.unwrap_or(1);
         let fee_msat = konsensus_pricing::apply_resync_discount(base_msat);
-        let plaintext_available = state.storage.get_message_plaintext(&env.id).await.unwrap_or(None).is_some();
+        let plaintext_available = state
+            .storage
+            .get_message_plaintext(&env.id)
+            .await
+            .unwrap_or(None)
+            .is_some();
         entries.push(ResyncEntry {
             id: env.id.to_hex(),
             kind: env.kind,
@@ -125,7 +173,18 @@ async fn discover(
         Some(serde_json::json!({"action":"resync_discover","peer_id":peer_id,"from_ms":from_ms,"to_ms":to_ms,"found":total_count})));
     tracing::info!(peer = %peer_id, from_ms, to_ms, found = total_count, estimated_msat = estimated_total, "resync discovery complete");
 
-    Ok((diagnostics, ResyncDiscoverResponse { phase: "discover", peer_id, messages: entries, total_count, estimated_total_msat: estimated_total, from_ms, to_ms }))
+    Ok((
+        diagnostics,
+        ResyncDiscoverResponse {
+            phase: "discover",
+            peer_id,
+            messages: entries,
+            total_count,
+            estimated_total_msat: estimated_total,
+            from_ms,
+            to_ms,
+        },
+    ))
 }
 
 async fn fulfill(
@@ -137,46 +196,72 @@ async fn fulfill(
         return Err(ApiError::BadRequest("message_ids must not be empty".into()));
     }
     if message_id_strs.len() > MAX_FULFILL_IDS {
-        return Err(ApiError::BadRequest(format!("too many message_ids: {} (max {MAX_FULFILL_IDS})", message_id_strs.len())));
+        return Err(ApiError::BadRequest(format!(
+            "too many message_ids: {} (max {MAX_FULFILL_IDS})",
+            message_id_strs.len()
+        )));
     }
     NodeId::from_hex(&peer_id)
         .map_err(|e| ApiError::BadRequest(format!("invalid peer_id: {e}")))?;
 
     let mut ids: Vec<MessageId> = Vec::with_capacity(message_id_strs.len());
     for id_str in &message_id_strs {
-        ids.push(MessageId::from_hex(id_str)
-            .map_err(|e| ApiError::BadRequest(format!("invalid message_id {id_str}: {e}")))?);
+        ids.push(
+            MessageId::from_hex(id_str)
+                .map_err(|e| ApiError::BadRequest(format!("invalid message_id {id_str}: {e}")))?,
+        );
     }
 
     let cipher = state.plaintext_cipher.as_deref();
-    let (mut resynced, mut failed, mut plaintext_count, mut total_msat) = (0usize, 0usize, 0usize, 0u64);
+    let (mut resynced, mut failed, mut plaintext_count, mut total_msat) =
+        (0usize, 0usize, 0usize, 0u64);
 
     for id in &ids {
         let envelope = match state.storage.get_message(id).await {
             Ok(Some(env)) => env,
-            Ok(None) => { tracing::warn!(msg_id = %id.to_hex(), "resync: message not found"); failed += 1; continue; }
-            Err(e)    => { tracing::warn!(msg_id = %id.to_hex(), error = %e, "resync: storage error"); failed += 1; continue; }
+            Ok(None) => {
+                tracing::warn!(msg_id = %id.to_hex(), "resync: message not found");
+                failed += 1;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(msg_id = %id.to_hex(), error = %e, "resync: storage error");
+                failed += 1;
+                continue;
+            }
         };
 
         let plaintext = if let Some(c) = cipher {
             match state.storage.get_message_plaintext(id).await {
                 Ok(Some(enc)) => match c.decrypt(&enc) {
                     Ok(bytes) => match String::from_utf8(bytes) {
-                        Ok(text) => { plaintext_count += 1; Some(text) }
-                        Err(_)   => None,
+                        Ok(text) => {
+                            plaintext_count += 1;
+                            Some(text)
+                        }
+                        Err(_) => None,
                     },
                     Err(_) => None,
                 },
                 _ => None,
             }
-        } else { None };
+        } else {
+            None
+        };
 
-        let ws_msg = Arc::new(crate::state::WsMessage { envelope: envelope.clone(), plaintext });
+        let ws_msg = Arc::new(crate::state::WsMessage {
+            envelope: envelope.clone(),
+            plaintext,
+        });
         if let Err(e) = state.ws_broadcast.send(ws_msg) {
             tracing::debug!(msg_id = %id.to_hex(), error = %e, "resync: no WS clients connected");
         }
 
-        let base_msat = state.pricing.get_price_msat(envelope.kind).await.unwrap_or(1);
+        let base_msat = state
+            .pricing
+            .get_price_msat(envelope.kind)
+            .await
+            .unwrap_or(1);
         total_msat = total_msat.saturating_add(konsensus_pricing::apply_resync_discount(base_msat));
         resynced += 1;
     }
@@ -185,17 +270,31 @@ async fn fulfill(
         Some(serde_json::json!({"action":"resync_fulfill","peer_id":peer_id,"requested":ids.len(),"resynced":resynced,"failed":failed})));
     tracing::info!(peer = %peer_id, resynced, failed, plaintext_count, total_msat, "resync fulfillment complete");
 
-    Ok(ResyncFulfillResponse { phase: "fulfill", resynced_count: resynced, failed_count: failed, plaintext_count, total_msat })
+    Ok(ResyncFulfillResponse {
+        phase: "fulfill",
+        resynced_count: resynced,
+        failed_count: failed,
+        plaintext_count,
+        total_msat,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn resync_discount_is_half_price()        { assert_eq!(konsensus_pricing::apply_resync_discount(10), 5); }
+    fn resync_discount_is_half_price() {
+        assert_eq!(konsensus_pricing::apply_resync_discount(10), 5);
+    }
     #[test]
-    fn resync_discount_minimum_one_msat()     { assert_eq!(konsensus_pricing::apply_resync_discount(1),  1); }
+    fn resync_discount_minimum_one_msat() {
+        assert_eq!(konsensus_pricing::apply_resync_discount(1), 1);
+    }
     #[test]
-    fn resync_discount_rounds_up()            { assert_eq!(konsensus_pricing::apply_resync_discount(3),  2); }
+    fn resync_discount_rounds_up() {
+        assert_eq!(konsensus_pricing::apply_resync_discount(3), 2);
+    }
     #[test]
-    fn resync_discount_zero_clamps_to_one()   { assert_eq!(konsensus_pricing::apply_resync_discount(0),  1); }
+    fn resync_discount_zero_clamps_to_one() {
+        assert_eq!(konsensus_pricing::apply_resync_discount(0), 1);
+    }
 }

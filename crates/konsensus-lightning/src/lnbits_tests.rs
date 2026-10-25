@@ -31,7 +31,10 @@ mod tests {
     /// Build a mock LNbits server.
     fn mock_router(state: SharedState) -> Router {
         Router::new()
-            .route("/api/v1/payments", get(handle_list_payments).post(handle_payment))
+            .route(
+                "/api/v1/payments",
+                get(handle_list_payments).post(handle_payment),
+            )
             .route("/api/v1/payments/:hash", get(handle_payment_check))
             .route("/api/v1/wallet", get(handle_wallet))
             .with_state(state)
@@ -40,13 +43,19 @@ mod tests {
     /// Build a mock server that always returns 401.
     fn mock_auth_reject_router() -> Router {
         Router::new()
-            .route("/api/v1/payments", get(handle_auth_reject).post(handle_auth_reject))
+            .route(
+                "/api/v1/payments",
+                get(handle_auth_reject).post(handle_auth_reject),
+            )
             .route("/api/v1/payments/:hash", get(handle_auth_reject))
             .route("/api/v1/wallet", get(handle_auth_reject))
     }
 
     async fn handle_auth_reject() -> impl IntoResponse {
-        (StatusCode::UNAUTHORIZED, Json(json!({ "detail": "Invalid API key" })))
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "detail": "Invalid API key" })),
+        )
     }
 
     async fn handle_payment(
@@ -83,10 +92,7 @@ mod tests {
         } else {
             // Create invoice
             let amount = body.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
-            let memo = body
-                .get("memo")
-                .and_then(|v| v.as_str())
-                .unwrap_or("test");
+            let memo = body.get("memo").and_then(|v| v.as_str()).unwrap_or("test");
             let hash = format!("inv_hash_{amount}");
             let bolt11 = format!("lnbc{amount}n1test_bolt11_string");
 
@@ -129,7 +135,10 @@ mod tests {
         let s = state.lock().await;
         match s.payments.get(&hash) {
             Some(payment) => (StatusCode::OK, Json(payment.clone())),
-            None => (StatusCode::NOT_FOUND, Json(json!({ "detail": "not found" }))),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "detail": "not found" })),
+            ),
         }
     }
 
@@ -235,10 +244,7 @@ mod tests {
         let addr = start_mock_server(state).await;
         let provider = make_provider(addr);
 
-        let details = provider
-            .pay_invoice("lnbc10n1test_bolt11")
-            .await
-            .unwrap();
+        let details = provider.pay_invoice("lnbc10n1test_bolt11").await.unwrap();
 
         assert_eq!(details.payment_hash, "outgoing_hash_abc123");
         assert_eq!(details.status, PaymentStatus::InFlight);
@@ -291,10 +297,7 @@ mod tests {
         let addr = start_mock_server(state).await;
         let provider = make_provider(addr);
 
-        let details = provider
-            .get_payment_status("settled_hash")
-            .await
-            .unwrap();
+        let details = provider.get_payment_status("settled_hash").await.unwrap();
 
         assert_eq!(details.status, PaymentStatus::Settled);
         assert!(details.preimage.is_some());
@@ -456,7 +459,10 @@ mod tests {
         let err = result.unwrap_err();
         // Auth errors should be LightningError::Auth, not Backend
         assert!(
-            matches!(err, konsensus_core::traits::lightning::LightningError::Auth(_)),
+            matches!(
+                err,
+                konsensus_core::traits::lightning::LightningError::Auth(_)
+            ),
             "expected Auth error, got: {err:?}"
         );
     }
@@ -470,7 +476,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, konsensus_core::traits::lightning::LightningError::Auth(_)),
+            matches!(
+                err,
+                konsensus_core::traits::lightning::LightningError::Auth(_)
+            ),
             "expected Auth error, got: {err:?}"
         );
     }
@@ -511,7 +520,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, konsensus_core::traits::lightning::LightningError::Connection(_)),
+            matches!(
+                err,
+                konsensus_core::traits::lightning::LightningError::Connection(_)
+            ),
             "expected Connection error, got: {err:?}"
         );
     }
@@ -538,10 +550,7 @@ mod tests {
         let addr = start_mock_server(state).await;
         let provider = make_provider(addr);
 
-        let details = provider
-            .get_payment_status("expired_hash")
-            .await
-            .unwrap();
+        let details = provider.get_payment_status("expired_hash").await.unwrap();
 
         assert_eq!(details.status, PaymentStatus::Expired);
     }
@@ -595,7 +604,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, konsensus_core::traits::lightning::LightningError::Backend(_)),
+            matches!(
+                err,
+                konsensus_core::traits::lightning::LightningError::Backend(_)
+            ),
             "expected Backend error for malformed JSON, got: {err:?}"
         );
     }
@@ -609,7 +621,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, konsensus_core::traits::lightning::LightningError::Backend(_)),
+            matches!(
+                err,
+                konsensus_core::traits::lightning::LightningError::Backend(_)
+            ),
             "expected Backend error, got: {err:?}"
         );
     }
@@ -623,7 +638,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, konsensus_core::traits::lightning::LightningError::Backend(_)),
+            matches!(
+                err,
+                konsensus_core::traits::lightning::LightningError::Backend(_)
+            ),
             "expected Backend error, got: {err:?}"
         );
     }
@@ -637,7 +655,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, konsensus_core::traits::lightning::LightningError::Backend(_)),
+            matches!(
+                err,
+                konsensus_core::traits::lightning::LightningError::Backend(_)
+            ),
             "expected Backend error, got: {err:?}"
         );
     }
@@ -651,7 +672,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, konsensus_core::traits::lightning::LightningError::Backend(_)),
+            matches!(
+                err,
+                konsensus_core::traits::lightning::LightningError::Backend(_)
+            ),
             "expected Backend error, got: {err:?}"
         );
     }
@@ -691,7 +715,10 @@ mod tests {
         let err = result.unwrap_err();
         // 5xx is not 401/403, so should be Backend not Auth
         assert!(
-            matches!(err, konsensus_core::traits::lightning::LightningError::Backend(_)),
+            matches!(
+                err,
+                konsensus_core::traits::lightning::LightningError::Backend(_)
+            ),
             "expected Backend error for 500, got: {err:?}"
         );
     }
@@ -705,7 +732,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, konsensus_core::traits::lightning::LightningError::Backend(_)),
+            matches!(
+                err,
+                konsensus_core::traits::lightning::LightningError::Backend(_)
+            ),
             "expected Backend error for 500, got: {err:?}"
         );
     }
@@ -719,7 +749,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, konsensus_core::traits::lightning::LightningError::Backend(_)),
+            matches!(
+                err,
+                konsensus_core::traits::lightning::LightningError::Backend(_)
+            ),
             "expected Backend error for 500, got: {err:?}"
         );
     }
@@ -854,10 +887,7 @@ mod tests {
         let addr = start_mock_server(state).await;
         let provider = make_provider(addr);
 
-        let details = provider
-            .get_payment_status("incoming_test")
-            .await
-            .unwrap();
+        let details = provider.get_payment_status("incoming_test").await.unwrap();
         assert_eq!(details.direction, PaymentDirection::Incoming);
         assert_eq!(details.amount_msat, 75000);
     }
@@ -1155,7 +1185,10 @@ mod tests {
     /// Mock LNbits with VoidWallet funding source — invoices work, payments fail.
     fn mock_voidwallet_router() -> Router {
         async fn wallet_ok() -> impl IntoResponse {
-            (StatusCode::OK, Json(json!({ "name": "test", "balance": 100000 })))
+            (
+                StatusCode::OK,
+                Json(json!({ "name": "test", "balance": 100000 })),
+            )
         }
         async fn payments_handler(Json(body): Json<Value>) -> impl IntoResponse {
             let is_outgoing = body.get("out").and_then(|v| v.as_bool()).unwrap_or(false);

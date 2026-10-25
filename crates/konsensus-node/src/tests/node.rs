@@ -495,16 +495,16 @@ async fn offline_fee_barrier_preserves_local_identity_and_storage() {
     // STATE_GENERATION.lock. Only the node under test owns the state lease.
     let mnemonic = std::fs::read_to_string(&config.identity.mnemonic_file).unwrap();
     let expected = *NodeIdentity::from_mnemonic(mnemonic.trim(), &config.identity.passphrase)
-        .unwrap().node_id();
+        .unwrap()
+        .node_id();
     config.backup.scb_dir = dir.path().join("backups").to_string_lossy().into_owned();
     // A private unavailable Esplora endpoint, rather than assuming port 1 is
     // closed on every host. Binding before spawn makes readiness deterministic.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
     let unavailable = tokio::spawn(async move {
-        let app = axum::Router::new().fallback(|| async {
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
-        });
+        let app =
+            axum::Router::new().fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE });
         axum::serve(listener, app).await.unwrap();
     });
     config.lightning = LightningConfig::Ldk {

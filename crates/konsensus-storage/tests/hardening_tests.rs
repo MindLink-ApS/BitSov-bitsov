@@ -19,7 +19,12 @@ fn make_proof(amount_msat: u64) -> PaymentProof {
     PaymentProof::new(hash, preimage, amount_msat)
 }
 
-fn make_envelope(kind: u16, sender_seed: u8, recipient_seed: u8, ts: u64) -> konsensus_core::UkmEnvelope {
+fn make_envelope(
+    kind: u16,
+    sender_seed: u8,
+    recipient_seed: u8,
+    ts: u64,
+) -> konsensus_core::UkmEnvelope {
     let sender = make_node_id(sender_seed);
     let recipient = Recipient::Node(make_node_id(recipient_seed));
     let proof = make_proof(100);
@@ -420,9 +425,7 @@ async fn delete_nonexistent_session_returns_false() {
 async fn list_sessions_returns_all_peer_ids() {
     let db = setup().await;
     for i in 0..3u8 {
-        db.store_session(&make_node_id(i), &[i; 16])
-            .await
-            .unwrap();
+        db.store_session(&make_node_id(i), &[i; 16]).await.unwrap();
     }
     let sessions = db.list_sessions().await.unwrap();
     assert_eq!(sessions.len(), 3);
@@ -475,8 +478,12 @@ async fn queue_pending_is_idempotent() {
     db.store_message(&env).await.unwrap();
     let recipient = make_node_id(2);
 
-    db.queue_pending_delivery(&env.id, &recipient).await.unwrap();
-    db.queue_pending_delivery(&env.id, &recipient).await.unwrap(); // no error
+    db.queue_pending_delivery(&env.id, &recipient)
+        .await
+        .unwrap();
+    db.queue_pending_delivery(&env.id, &recipient)
+        .await
+        .unwrap(); // no error
     assert_eq!(db.get_pending_for_peer(&recipient).await.unwrap().len(), 1);
 }
 
@@ -487,9 +494,17 @@ async fn remove_pending_delivery_works() {
     db.store_message(&env).await.unwrap();
     let recipient = make_node_id(2);
 
-    db.queue_pending_delivery(&env.id, &recipient).await.unwrap();
-    db.remove_pending_delivery(&env.id, &recipient).await.unwrap();
-    assert!(db.get_pending_for_peer(&recipient).await.unwrap().is_empty());
+    db.queue_pending_delivery(&env.id, &recipient)
+        .await
+        .unwrap();
+    db.remove_pending_delivery(&env.id, &recipient)
+        .await
+        .unwrap();
+    assert!(db
+        .get_pending_for_peer(&recipient)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -499,9 +514,15 @@ async fn increment_pending_attempts() {
     db.store_message(&env).await.unwrap();
     let recipient = make_node_id(2);
 
-    db.queue_pending_delivery(&env.id, &recipient).await.unwrap();
-    db.increment_pending_attempts(&env.id, &recipient).await.unwrap();
-    db.increment_pending_attempts(&env.id, &recipient).await.unwrap();
+    db.queue_pending_delivery(&env.id, &recipient)
+        .await
+        .unwrap();
+    db.increment_pending_attempts(&env.id, &recipient)
+        .await
+        .unwrap();
+    db.increment_pending_attempts(&env.id, &recipient)
+        .await
+        .unwrap();
 
     let pending = db.get_pending_for_peer(&recipient).await.unwrap();
     assert_eq!(pending[0].1, 2); // 2 attempts
@@ -534,9 +555,15 @@ async fn get_pending_peers_returns_distinct() {
     for env in [&env1, &env2, &env3] {
         db.store_message(env).await.unwrap();
     }
-    db.queue_pending_delivery(&env1.id, &make_node_id(10)).await.unwrap();
-    db.queue_pending_delivery(&env2.id, &make_node_id(10)).await.unwrap();
-    db.queue_pending_delivery(&env3.id, &make_node_id(11)).await.unwrap();
+    db.queue_pending_delivery(&env1.id, &make_node_id(10))
+        .await
+        .unwrap();
+    db.queue_pending_delivery(&env2.id, &make_node_id(10))
+        .await
+        .unwrap();
+    db.queue_pending_delivery(&env3.id, &make_node_id(11))
+        .await
+        .unwrap();
 
     let peers = db.get_pending_peers().await.unwrap();
     assert_eq!(peers.len(), 2);
@@ -550,12 +577,18 @@ async fn clear_pending_for_peer_removes_all() {
     for ts in [1_000u64, 2_000, 3_000] {
         let env = make_envelope(0, 1, 10, ts);
         db.store_message(&env).await.unwrap();
-        db.queue_pending_delivery(&env.id, &recipient).await.unwrap();
+        db.queue_pending_delivery(&env.id, &recipient)
+            .await
+            .unwrap();
     }
 
     let cleared = db.clear_pending_for_peer(&recipient).await.unwrap();
     assert_eq!(cleared, 3);
-    assert!(db.get_pending_for_peer(&recipient).await.unwrap().is_empty());
+    assert!(db
+        .get_pending_for_peer(&recipient)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -565,11 +598,15 @@ async fn cleanup_stale_pending_stalls_high_attempt_entries() {
     db.store_message(&env).await.unwrap();
     let recipient = make_node_id(2);
 
-    db.queue_pending_delivery(&env.id, &recipient).await.unwrap();
+    db.queue_pending_delivery(&env.id, &recipient)
+        .await
+        .unwrap();
 
     // Increment to 5 attempts
     for _ in 0..5 {
-        db.increment_pending_attempts(&env.id, &recipient).await.unwrap();
+        db.increment_pending_attempts(&env.id, &recipient)
+            .await
+            .unwrap();
     }
 
     // Cleanup with max_attempts=3 should stall this entry
@@ -586,8 +623,12 @@ async fn cleanup_stale_pending_keeps_low_attempt_entries() {
     db.store_message(&env).await.unwrap();
     let recipient = make_node_id(2);
 
-    db.queue_pending_delivery(&env.id, &recipient).await.unwrap();
-    db.increment_pending_attempts(&env.id, &recipient).await.unwrap();
+    db.queue_pending_delivery(&env.id, &recipient)
+        .await
+        .unwrap();
+    db.increment_pending_attempts(&env.id, &recipient)
+        .await
+        .unwrap();
 
     // Cleanup with max_attempts=5 should keep this (only 1 attempt)
     let removed = db.cleanup_stale_pending(5).await.unwrap();
@@ -699,7 +740,9 @@ async fn store_and_get_message_plaintext() {
     db.store_message(&env).await.unwrap();
 
     let encrypted_pt = b"aes-gcm-encrypted-plaintext".to_vec();
-    db.store_message_plaintext(&env.id, &encrypted_pt).await.unwrap();
+    db.store_message_plaintext(&env.id, &encrypted_pt)
+        .await
+        .unwrap();
 
     let loaded = db.get_message_plaintext(&env.id).await.unwrap().unwrap();
     assert_eq!(loaded, encrypted_pt);
@@ -751,7 +794,9 @@ async fn pending_delivery_survives_message_retrieval() {
     let env = make_envelope(0, 1, 2, 1_000);
     db.store_message(&env).await.unwrap();
     let recipient = make_node_id(2);
-    db.queue_pending_delivery(&env.id, &recipient).await.unwrap();
+    db.queue_pending_delivery(&env.id, &recipient)
+        .await
+        .unwrap();
 
     // Reading the message should not affect pending queue
     let _ = db.get_message(&env.id).await.unwrap();
@@ -781,7 +826,9 @@ async fn delete_message_cascades_to_pending_deliveries() {
     db.store_message(&env).await.unwrap();
     let recipient = make_node_id(2);
 
-    db.queue_pending_delivery(&env.id, &recipient).await.unwrap();
+    db.queue_pending_delivery(&env.id, &recipient)
+        .await
+        .unwrap();
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 1);
 
     // Deleting the message should also remove the pending delivery

@@ -15,8 +15,7 @@ use konsensus_core::types::NodeId;
 use crate::wire::{Capability, Frame, SovereigntyTier};
 
 use super::{
-    write_noise_message, read_noise_message,
-    ReachabilityMode, TransportConfig, SharedWhitelist,
+    read_noise_message, write_noise_message, ReachabilityMode, SharedWhitelist, TransportConfig,
     HANDSHAKE_TIMEOUT,
 };
 
@@ -286,7 +285,10 @@ pub(super) async fn perform_federation_handshake_initiator(
             // Verify protocol version
             if version != config.version {
                 let disconnect = Frame::Disconnect {
-                    reason: format!("version mismatch: expected {}, got {version}", config.version),
+                    reason: format!(
+                        "version mismatch: expected {}, got {version}",
+                        config.version
+                    ),
                 };
                 if let Err(e) = send_encrypted_frame(&mut writer, &mut noise, &disconnect).await {
                     warn!(error = %e, "failed to send disconnect frame on version mismatch");
@@ -317,9 +319,10 @@ pub(super) async fn perform_federation_handshake_initiator(
             info!(peer = %node_id, tier = ?tier, "federation handshake complete (initiator)");
             Ok((node_id, tier, capabilities, reader, writer, noise))
         }
-        Frame::Disconnect { reason } => {
-            Err(TransportError::Rejected(format!("peer disconnected: {}", crate::wire::sanitized_peer_reason(&reason))))
-        }
+        Frame::Disconnect { reason } => Err(TransportError::Rejected(format!(
+            "peer disconnected: {}",
+            crate::wire::sanitized_peer_reason(&reason)
+        ))),
         other => Err(TransportError::WireProtocol(format!(
             "expected HelloAck, got {:?}",
             std::mem::discriminant(&other)
@@ -419,11 +422,20 @@ pub(super) async fn perform_federation_handshake_responder(
             send_encrypted_frame(&mut writer, &mut noise, &ack).await?;
 
             info!(peer = %node_id, tier = ?tier, privileged, "federation handshake complete (responder)");
-            Ok((node_id, tier, capabilities, reader, writer, noise, privileged))
+            Ok((
+                node_id,
+                tier,
+                capabilities,
+                reader,
+                writer,
+                noise,
+                privileged,
+            ))
         }
-        Frame::Disconnect { reason } => {
-            Err(TransportError::Rejected(format!("peer disconnected: {}", crate::wire::sanitized_peer_reason(&reason))))
-        }
+        Frame::Disconnect { reason } => Err(TransportError::Rejected(format!(
+            "peer disconnected: {}",
+            crate::wire::sanitized_peer_reason(&reason)
+        ))),
         other => Err(TransportError::WireProtocol(format!(
             "expected Hello, got {:?}",
             std::mem::discriminant(&other)
@@ -444,16 +456,17 @@ pub(super) async fn connect_to_peer(
     use std::sync::Arc;
     use std::time::Instant;
 
-
-    use super::{PeerConnection, spawn_reader_task};
     use super::ControlEvent;
+    use super::{spawn_reader_task, PeerConnection};
 
     // Explicit dials and reconnect tasks share a single in-flight handshake per
     // NodeId. Recheck after acquiring the lock so the losing caller reuses it.
     let dial = {
         let mut locks = ctx.dial_locks.lock().unwrap();
         locks.retain(|_, lock| lock.strong_count() > 0);
-        let dial = locks.get(peer).and_then(std::sync::Weak::upgrade)
+        let dial = locks
+            .get(peer)
+            .and_then(std::sync::Weak::upgrade)
             .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
         locks.insert(*peer, Arc::downgrade(&dial));
         dial
@@ -462,7 +475,9 @@ pub(super) async fn connect_to_peer(
     if *ctx.shutdown.borrow() {
         return Err(TransportError::Other("transport shut down".into()));
     }
-    if ctx.peers.read().await.contains_key(peer) { return Ok(()); }
+    if ctx.peers.read().await.contains_key(peer) {
+        return Ok(());
+    }
 
     let stream = tokio::net::TcpStream::connect(addr)
         .await
@@ -486,20 +501,17 @@ pub(super) async fn connect_to_peer(
         ))
     })??;
 
-    let (peer_node_id, tier, capabilities, reader, mut writer, mut noise) =
-        tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            perform_federation_handshake_initiator(
-                reader, writer, noise, &ctx.identity, &ctx.config,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            TransportError::NoiseError(format!(
-                "initiator federation handshake timed out after {}s to {addr}",
-                HANDSHAKE_TIMEOUT.as_secs()
-            ))
-        })??;
+    let (peer_node_id, tier, capabilities, reader, mut writer, mut noise) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        perform_federation_handshake_initiator(reader, writer, noise, &ctx.identity, &ctx.config),
+    )
+    .await
+    .map_err(|_| {
+        TransportError::NoiseError(format!(
+            "initiator federation handshake timed out after {}s to {addr}",
+            HANDSHAKE_TIMEOUT.as_secs()
+        ))
+    })??;
 
     // Verify the peer is who we expect
     if &peer_node_id != peer {
@@ -531,33 +543,36 @@ pub(super) async fn connect_to_peer(
     };
 
     let now = Instant::now();
-    let conn = super::Connection::new(PeerConnection {
-        advertised_trust_discount: None,
-        source_ip: addr.ip(),
-        privileged,
-        noise,
-        writer,
-        tier,
-        capabilities,
-        connected_at: now,
-        last_recv: now,
-        pending_ping: None,
-        invalid_frame_level: 0.0,
-        invalid_frame_last_leak: now,
-        bytes_received: 0,
-        memory_budget_window_start: now,
-    }, peer_node_id, Arc::clone(&ctx.peers), true)?;
+    let conn = super::Connection::new(
+        PeerConnection {
+            advertised_trust_discount: None,
+            source_ip: addr.ip(),
+            privileged,
+            noise,
+            writer,
+            tier,
+            capabilities,
+            connected_at: now,
+            last_recv: now,
+            pending_ping: None,
+            invalid_frame_level: 0.0,
+            invalid_frame_last_leak: now,
+            bytes_received: 0,
+            memory_budget_window_start: now,
+        },
+        peer_node_id,
+        Arc::clone(&ctx.peers),
+        true,
+    )?;
 
-    if !conn.register(ctx.identity.node_id(), &peer_node_id, &ctx.peers).await {
+    if !conn
+        .register(ctx.identity.node_id(), &peer_node_id, &ctx.peers)
+        .await
+    {
         return Ok(());
     }
 
-    spawn_reader_task(
-        peer_node_id,
-        reader,
-        Arc::clone(&conn),
-        ctx.clone(),
-    );
+    spawn_reader_task(peer_node_id, reader, Arc::clone(&conn), ctx.clone());
 
     // Notify application layer of new peer connection. M1b: carry the privilege
     // tag (computed above from our own whitelist) so the session handler does NOT
@@ -585,20 +600,33 @@ mod diagnostic_tests {
     async fn handshake_decode_errors_use_fixed_categories() {
         let mut sender = NoiseSession::initiator(&[11; 32]).unwrap();
         let mut receiver = NoiseSession::responder(&[22; 32]).unwrap();
-        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
-        sender.read_handshake(&receiver.write_handshake(&[]).unwrap()).unwrap();
-        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
+        receiver
+            .read_handshake(&sender.write_handshake(&[]).unwrap())
+            .unwrap();
+        sender
+            .read_handshake(&receiver.write_handshake(&[]).unwrap())
+            .unwrap();
+        receiver
+            .read_handshake(&sender.write_handshake(&[]).unwrap())
+            .unwrap();
         assert!(sender.try_finish_handshake().unwrap());
         assert!(receiver.try_finish_handshake().unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (client, accepted) = tokio::join!(
-            tokio::net::TcpStream::connect(listener.local_addr().unwrap()), listener.accept()
+            tokio::net::TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
         );
         let (_reader, mut writer) = client.unwrap().into_split();
         let (mut reader, _writer) = accepted.unwrap().0.into_split();
-        let encrypted = sender.encrypt(br#"{"Ping":{"nonce":"PEER_SECRET\n\u001b"}}"#).unwrap();
+        let encrypted = sender
+            .encrypt(br#"{"Ping":{"nonce":"PEER_SECRET\n\u001b"}}"#)
+            .unwrap();
         write_noise_message(&mut writer, &encrypted).await.unwrap();
-        let error = recv_encrypted_frame(&mut reader, &mut receiver).await.unwrap_err();
-        assert!(matches!(error, TransportError::WireProtocol(ref text) if text == "serialization error"));
+        let error = recv_encrypted_frame(&mut reader, &mut receiver)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, TransportError::WireProtocol(ref text) if text == "serialization error")
+        );
     }
 }

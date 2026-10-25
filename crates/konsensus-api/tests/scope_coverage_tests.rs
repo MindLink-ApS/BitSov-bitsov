@@ -309,7 +309,12 @@ fn self_authenticating_endpoints_also_check_scope() {
 /// enough — a paired caller would then spend unmetered.
 #[test]
 fn every_metered_handler_debits_before_it_pays() {
-    const PAYS: &[&str] = &["create_payment_proof(", "create_metered_payment_proof(", ".pay_invoice(", ".keysend("];
+    const PAYS: &[&str] = &[
+        "create_payment_proof(",
+        "create_metered_payment_proof(",
+        ".pay_invoice(",
+        ".keysend(",
+    ];
     let mut bad = Vec::new();
     let mut seen = 0;
     for (file, src) in all_sources() {
@@ -333,13 +338,20 @@ fn every_metered_handler_debits_before_it_pays() {
                 .unwrap_or("<unknown>")
                 .trim()
                 .to_string();
-            match [".debit(", ".debit_operation("].iter().filter_map(|call| body.find(call)).min() {
+            match [".debit(", ".debit_operation("]
+                .iter()
+                .filter_map(|call| body.find(call))
+                .min()
+            {
                 Some(debit) if debit < first_pay => {}
                 _ => bad.push(format!("{file}: {name}")),
             }
         }
     }
-    assert!(seen >= 5, "expected the metered paid handlers, found {seen}");
+    assert!(
+        seen >= 5,
+        "expected the metered paid handlers, found {seen}"
+    );
     assert!(
         bad.is_empty(),
         "{} metered handler(s) can pay without debiting the grant first:\n  {}",
@@ -358,7 +370,10 @@ fn unmetered_spend_routes_refuse_paired_callers() {
         "ScopedAuth<Spend> no longer refuses paired callers"
     );
     let metered = std::fs::read_to_string(src_dir().join("metered.rs")).expect("read metered.rs");
-    assert!(metered.contains("user.has(Scope::Spend)"), "MeteredSpend must demand spend");
+    assert!(
+        metered.contains("user.has(Scope::Spend)"),
+        "MeteredSpend must demand spend"
+    );
 }
 
 /// `front_door` must reach exactly one handler: publishing the node's own
@@ -372,14 +387,26 @@ fn front_door_scope_reaches_only_the_front_door_publish_route() {
             continue;
         }
         for (n, line) in src.lines().enumerate() {
-            if line.contains("ScopedAuth<FrontDoorWrite>") || line.contains("Scope::FrontDoor") && !line.trim_start().starts_with("//") {
+            if line.contains("ScopedAuth<FrontDoorWrite>")
+                || line.contains("Scope::FrontDoor") && !line.trim_start().starts_with("//")
+            {
                 uses.push(format!("{file}:{}: {}", n + 1, line.trim()));
             }
         }
     }
-    let handlers: Vec<_> = uses.iter().filter(|u| u.contains("ScopedAuth<FrontDoorWrite>")).collect();
-    assert_eq!(handlers.len(), 1, "exactly one handler may accept front_door: {handlers:#?}");
-    assert!(handlers[0].contains("handlers/front_door.rs"), "{handlers:#?}");
+    let handlers: Vec<_> = uses
+        .iter()
+        .filter(|u| u.contains("ScopedAuth<FrontDoorWrite>"))
+        .collect();
+    assert_eq!(
+        handlers.len(),
+        1,
+        "exactly one handler may accept front_door: {handlers:#?}"
+    );
+    assert!(
+        handlers[0].contains("handlers/front_door.rs"),
+        "{handlers:#?}"
+    );
     let sig = signature_of(
         &std::fs::read_to_string(handlers_dir().join("front_door.rs")).unwrap(),
         "put_front_door",
@@ -387,7 +414,13 @@ fn front_door_scope_reaches_only_the_front_door_publish_route() {
     .expect("put_front_door");
     assert!(sig.contains("ScopedAuth<FrontDoorWrite>"), "{sig}");
     // Elsewhere the scope appears only where grants are stored and checked.
-    for u in uses.iter().filter(|u| !u.contains("ScopedAuth<FrontDoorWrite>")) {
-        assert!(u.contains("src/pairing.rs") || u.contains("src/control.rs"), "unexpected front_door use: {u}");
+    for u in uses
+        .iter()
+        .filter(|u| !u.contains("ScopedAuth<FrontDoorWrite>"))
+    {
+        assert!(
+            u.contains("src/pairing.rs") || u.contains("src/control.rs"),
+            "unexpected front_door use: {u}"
+        );
     }
 }

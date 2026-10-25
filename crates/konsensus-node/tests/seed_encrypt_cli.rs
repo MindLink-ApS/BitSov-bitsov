@@ -28,7 +28,6 @@ fn detach(cmd: &mut std::process::Command) {
     }
 }
 
-
 fn init() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let ok = bin()
@@ -63,7 +62,10 @@ fn without_a_terminal_for_the_password_nothing_changes() {
         .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("failed to read the password from the terminal"), "failed for the right reason: {stderr}");
+    assert!(
+        stderr.contains("failed to read the password from the terminal"),
+        "failed for the right reason: {stderr}"
+    );
     assert_eq!(snapshot(dir.path()), before);
 }
 
@@ -99,5 +101,8 @@ fn a_password_file_others_can_read_is_refused_before_start() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("chmod 600"), "{stderr}");
-    assert!(stderr.contains("other OS users only"), "the owner is told what the file does not protect: {stderr}");
+    assert!(
+        stderr.contains("other OS users only"),
+        "the owner is told what the file does not protect: {stderr}"
+    );
 }

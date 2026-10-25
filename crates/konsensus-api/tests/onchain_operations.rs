@@ -285,7 +285,10 @@ async fn terminal_and_uncertain_outcomes_survive_restart_without_redispatch() {
 async fn disconnected_client_does_not_cancel_outcome_recording() {
     let wallet = Wallet::new(Outcome::Sent, true);
     let (started, proceed, calls, dropped) = (
-        wallet.started.clone(), wallet.proceed.clone(), wallet.calls.clone(), wallet.dropped.clone(),
+        wallet.started.clone(),
+        wallet.proceed.clone(),
+        wallet.calls.clone(),
+        wallet.dropped.clone(),
     );
     // The router and detached task are the only owners of this provider.
     let (dir, app, auth) = setup(wallet).await;
@@ -309,11 +312,20 @@ async fn disconnected_client_does_not_cancel_outcome_recording() {
     tokio::time::timeout(std::time::Duration::from_secs(30), dropped.notified())
         .await
         .expect("wallet still retained 30s after disconnect; detached outcome writer or AppState owner did not finish");
-    let db = Arc::new(SqliteStorage::open(dir.path().join("operations.db").to_str().unwrap())
-        .await.unwrap());
-    let operation = db.get_channel_open_operation(&format!("send-onchain:{ID}"))
-        .await.unwrap().expect("dispatch inserted its durable operation");
-    assert!(operation.result.is_some(), "disconnect cancelled outcome recording");
+    let db = Arc::new(
+        SqliteStorage::open(dir.path().join("operations.db").to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    let operation = db
+        .get_channel_open_operation(&format!("send-onchain:{ID}"))
+        .await
+        .unwrap()
+        .expect("dispatch inserted its durable operation");
+    assert!(
+        operation.result.is_some(),
+        "disconnect cancelled outcome recording"
+    );
     // Reconstruct the API from durable state; replay must not touch a wallet.
     let replay_wallet = Wallet::new(Outcome::Sent, false);
     let state = common::test_state_with_lightning_and_storage(replay_wallet.clone(), db);
@@ -473,7 +485,11 @@ async fn proven_refusal_releases_id_for_retry_after_restart() {
 async fn refusal_release_failure_keeps_pending_row_and_never_resends() {
     for (outcome, expected, code) in [
         (Outcome::Refused, StatusCode::BAD_REQUEST, "not_dispatched"),
-        (Outcome::NotReady, StatusCode::SERVICE_UNAVAILABLE, "not_ready"),
+        (
+            Outcome::NotReady,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_ready",
+        ),
     ] {
         let wallet = Wallet::new(outcome, false);
         let dir = tempfile::tempdir().unwrap();

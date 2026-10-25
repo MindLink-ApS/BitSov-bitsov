@@ -115,7 +115,11 @@ async fn write_racing_delete(operation: &str, fail: bool) {
         } else {
             assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }
-        let expected: &[&str] = if operation == "import" { &[] } else { &["unwhitelist"] };
+        let expected: &[&str] = if operation == "import" {
+            &[]
+        } else {
+            &["unwhitelist"]
+        };
         assert_eq!(
             transport.calls.lock().unwrap().as_slice(),
             expected,

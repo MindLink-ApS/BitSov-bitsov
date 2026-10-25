@@ -23,19 +23,47 @@ type Route = (&'static str, &'static str, &'static str); // method, uri, body
 
 /// Moving value. Must be refused a loopback token.
 const SPEND_ROUTES: &[Route] = &[
-    ("POST", "/api/v1/payments/release-local-spend", r#"{"txid":"abababababababababababababababababababababababababababababababab"}"#),
+    (
+        "POST",
+        "/api/v1/payments/release-local-spend",
+        r#"{"txid":"abababababababababababababababababababababababababababababababab"}"#,
+    ),
     ("POST", "/api/v1/payments/pay", r#"{"invoice":"lnbc1"}"#),
-    ("POST", "/api/v1/payments/keysend", r#"{"node_id":"ab","amount_msat":1000}"#),
-    ("POST", "/api/v1/payments/send-onchain", r#"{"address":"bc1q","amount_sat":1000}"#),
-    ("POST", "/api/v1/payments/open-channel", r#"{"node_id":"ab","amount_sat":20000}"#),
-    ("POST", "/api/v1/payments/close-channel", r#"{"channel_id":"ab"}"#),
+    (
+        "POST",
+        "/api/v1/payments/keysend",
+        r#"{"node_id":"ab","amount_msat":1000}"#,
+    ),
+    (
+        "POST",
+        "/api/v1/payments/send-onchain",
+        r#"{"address":"bc1q","amount_sat":1000}"#,
+    ),
+    (
+        "POST",
+        "/api/v1/payments/open-channel",
+        r#"{"node_id":"ab","amount_sat":20000}"#,
+    ),
+    (
+        "POST",
+        "/api/v1/payments/close-channel",
+        r#"{"channel_id":"ab"}"#,
+    ),
 ];
 
 /// Paid messaging is spending: under "payment IS the connection" a send settles a payment,
 /// so it must not be reachable with a token that cannot spend.
 const PAID_MESSAGE_ROUTES: &[Route] = &[
-    ("POST", "/api/v1/messages", r#"{"recipient":"ab","content":"hi"}"#),
-    ("POST", "/api/v1/messages/compose", r#"{"recipient":"ab","subject":"s","body":"b"}"#),
+    (
+        "POST",
+        "/api/v1/messages",
+        r#"{"recipient":"ab","content":"hi"}"#,
+    ),
+    (
+        "POST",
+        "/api/v1/messages/compose",
+        r#"{"recipient":"ab","subject":"s","body":"b"}"#,
+    ),
 ];
 
 /// Key material and identity replacement — the operations that must never follow from
@@ -111,7 +139,12 @@ async fn assert_all_forbidden(routes: &[Route], token: &str, why: &str) {
 #[tokio::test]
 async fn loopback_token_cannot_spend() {
     let (secret, node_id) = creds();
-    assert_all_forbidden(SPEND_ROUTES, &loopback_token(&secret, &node_id), "moves value").await;
+    assert_all_forbidden(
+        SPEND_ROUTES,
+        &loopback_token(&secret, &node_id),
+        "moves value",
+    )
+    .await;
 }
 
 #[tokio::test]

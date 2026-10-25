@@ -295,7 +295,11 @@ impl DoubleRatchet {
         // Check if we have a skipped key for this message
         let skip_key = (message.header.dh_public, message.header.message_number);
         if let Some((message_key, _seq)) = self.skipped_keys.remove(&skip_key) {
-            return aead_decrypt(&message_key, &message.ciphertext, &self.aead_ad(&message.header));
+            return aead_decrypt(
+                &message_key,
+                &message.ciphertext,
+                &self.aead_ad(&message.header),
+            );
         }
 
         let remote_pub = PublicKey::from(message.header.dh_public);
@@ -328,7 +332,11 @@ impl DoubleRatchet {
         self.receiving_chain = Some(next_chain);
         self.recv_count += 1;
 
-        aead_decrypt(&message_key, &message.ciphertext, &self.aead_ad(&message.header))
+        aead_decrypt(
+            &message_key,
+            &message.ciphertext,
+            &self.aead_ad(&message.header),
+        )
     }
 
     /// Get our current DH ratchet public key.
@@ -599,8 +607,7 @@ impl DoubleRatchet {
 fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> Result<[u8; 32], RatchetError> {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(key)
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
         .map_err(|e| RatchetError::CryptoPrimitive(e.to_string()))?;
     mac.update(data);
     let result = mac.finalize().into_bytes();
@@ -629,7 +636,10 @@ fn aead_encrypt(key: &[u8; 32], plaintext: &[u8], ad: &[u8]) -> Result<Vec<u8>, 
     let nonce_bytes = derive_nonce(key, ad)?;
     let nonce = AesNonce::from_slice(&nonce_bytes);
 
-    let payload = aes_gcm::aead::Payload { msg: plaintext, aad: ad };
+    let payload = aes_gcm::aead::Payload {
+        msg: plaintext,
+        aad: ad,
+    };
     cipher
         .encrypt(nonce, payload)
         .map_err(|e| RatchetError::EncryptionError(e.to_string()))
@@ -641,7 +651,10 @@ fn aead_decrypt(key: &[u8; 32], ciphertext: &[u8], ad: &[u8]) -> Result<Vec<u8>,
     let nonce_bytes = derive_nonce(key, ad)?;
     let nonce = AesNonce::from_slice(&nonce_bytes);
 
-    let payload = aes_gcm::aead::Payload { msg: ciphertext, aad: ad };
+    let payload = aes_gcm::aead::Payload {
+        msg: ciphertext,
+        aad: ad,
+    };
     cipher
         .decrypt(nonce, payload)
         .map_err(|e| RatchetError::DecryptionFailed(e.to_string()))

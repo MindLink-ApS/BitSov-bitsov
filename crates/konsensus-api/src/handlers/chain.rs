@@ -9,7 +9,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 
-use crate::auth::scoped::{ScopedAuth, Read};
+use crate::auth::scoped::{Read, ScopedAuth};
 use crate::state::AppState;
 
 /// Chain status response — block height, fee rates, halving data.
@@ -88,7 +88,11 @@ async fn chain_status(
         fee_rate_medium: fee_medium,
         fee_rate_slow: fee_slow,
         available,
-        error: if errors.is_empty() { None } else { Some(errors.join("; ")) },
+        error: if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        },
     })
 }
 

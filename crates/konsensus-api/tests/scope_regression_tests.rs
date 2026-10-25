@@ -23,7 +23,12 @@ use tower::ServiceExt;
 
 fn token(scopes: Vec<Scope>) -> String {
     let state = test_state();
-    auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, scopes).unwrap()
+    auth::create_token(
+        &state.identity.node_id().to_hex(),
+        &state.jwt_secret,
+        scopes,
+    )
+    .unwrap()
 }
 
 /// Exactly what `POST /auth/local` mints.
@@ -68,12 +73,16 @@ async fn loopback_token_can_start_full_tier_funding() {
         "the shipped app's funding start must not require admin"
     );
 
-    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["current_step"], "funding");
     assert_eq!(json["funding_amount_sats_required"], 50000);
     assert!(
-        json["funding_address"].as_str().is_some_and(|a| !a.is_empty()),
+        json["funding_address"]
+            .as_str()
+            .is_some_and(|a| !a.is_empty()),
         "funding start must return a funding address, got {json}"
     );
 
@@ -83,7 +92,9 @@ async fn loopback_token_can_start_full_tier_funding() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["current_step"], "funding");
     assert_eq!(json["funding_amount_sats_required"], 50000);
@@ -141,9 +152,12 @@ async fn ws_handshake_status(query: &str, protocol_header: Option<&str>) -> u16 
     let addr = listener.local_addr().unwrap();
     let app = konsensus_api::build_router_for_addr(test_state(), addr);
     let server = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -190,8 +204,7 @@ async fn ws_upgrade_requires_read_scope_via_query() {
 #[tokio::test]
 async fn ws_upgrade_requires_read_scope_via_subprotocol() {
     let tok = token(vec![Scope::Receive]);
-    let status =
-        ws_handshake_status("", Some(&format!("bitsov.v1, bitsov.jwt.{tok}"))).await;
+    let status = ws_handshake_status("", Some(&format!("bitsov.v1, bitsov.jwt.{tok}"))).await;
     assert_eq!(status, 403);
 }
 

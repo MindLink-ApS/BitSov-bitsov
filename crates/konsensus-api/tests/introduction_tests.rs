@@ -41,9 +41,15 @@ impl MessageTransport for Recorder {
     }
     async fn connect(&self, peer: &NodeId, addr: &str) -> Result<(), TransportError> {
         if self.closed {
-            return Err(TransportError::Rejected(format!("peer {} not in whitelist", peer.to_hex())));
+            return Err(TransportError::Rejected(format!(
+                "peer {} not in whitelist",
+                peer.to_hex()
+            )));
         }
-        self.connects.lock().unwrap().push((*peer, addr.to_string()));
+        self.connects
+            .lock()
+            .unwrap()
+            .push((*peer, addr.to_string()));
         Ok(())
     }
     async fn disconnect(&self, _: &NodeId) -> Result<(), TransportError> {
@@ -69,30 +75,62 @@ fn settings(endpoint: Option<&str>) -> IntroductionSettings {
 
 fn state_with(transport: Arc<Recorder>, intro: IntroductionSettings) -> Arc<AppState> {
     let base = test_state();
-    Arc::new(AppState { transport, introduction: intro, ..(*base).clone() })
+    Arc::new(AppState {
+        transport,
+        introduction: intro,
+        ..(*base).clone()
+    })
 }
 
 fn bearer(state: &AppState, scopes: Vec<auth::Scope>) -> String {
-    let token = auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, scopes).unwrap();
+    let token = auth::create_token(
+        &state.identity.node_id().to_hex(),
+        &state.jwt_secret,
+        scopes,
+    )
+    .unwrap();
     format!("Bearer {token}")
 }
 
-async fn call(state: &Arc<AppState>, method: &str, path: &str, bearer: String, body: Option<Value>) -> (StatusCode, Value, Option<String>) {
+async fn call(
+    state: &Arc<AppState>,
+    method: &str,
+    path: &str,
+    bearer: String,
+    body: Option<Value>,
+) -> (StatusCode, Value, Option<String>) {
     let req = Request::builder()
         .method(method)
         .uri(path)
         .header("authorization", bearer)
         .header("content-type", "application/json");
-    let body = body.map(|b| Body::from(b.to_string())).unwrap_or_else(Body::empty);
-    let response = test_router(state.clone()).oneshot(req.body(body).unwrap()).await.unwrap();
+    let body = body
+        .map(|b| Body::from(b.to_string()))
+        .unwrap_or_else(Body::empty);
+    let response = test_router(state.clone())
+        .oneshot(req.body(body).unwrap())
+        .await
+        .unwrap();
     let status = response.status();
-    let cache = response.headers().get("cache-control").map(|v| v.to_str().unwrap().to_string());
-    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(json!({ "raw": String::from_utf8_lossy(&bytes) })), cache)
+    let cache = response
+        .headers()
+        .get("cache-control")
+        .map(|v| v.to_str().unwrap().to_string());
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(json!({ "raw": String::from_utf8_lossy(&bytes) })),
+        cache,
+    )
 }
 
 fn now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 /// A stranger's card, as their node would sign it.
@@ -116,22 +154,40 @@ fn stranger_card(endpoint: &str, network: &str, issued_at: u64) -> Introduction 
 #[tokio::test]
 async fn read_scope_gets_a_signed_card_of_this_node() {
     let state = state_with(Arc::default(), settings(Some("node.example.org:9000")));
-    let (status, body, cache) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
+    let (status, body, cache) = call(
+        &state,
+        "GET",
+        "/api/v1/introduction",
+        bearer(&state, vec![auth::Scope::Read]),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(cache.as_deref(), Some("no-store"));
     let card: Introduction = serde_json::from_value(body["card"].clone()).unwrap();
-    card.verify(now(), "regtest").expect("the node's own card verifies");
+    card.verify(now(), "regtest")
+        .expect("the node's own card verifies");
     assert_eq!(card.node().unwrap(), *state.identity.node_id());
     assert_eq!(card.endpoint, "node.example.org:9000");
     assert_eq!(card.reach, Reach::Public);
     // StubPricing charges 10 msat per chat: the card shows what the stateless quote would.
-    assert_eq!((card.admission_msat, card.message_msat), first_contact_prices(10, 0));
+    assert_eq!(
+        (card.admission_msat, card.message_msat),
+        first_contact_prices(10, 0)
+    );
     assert!(card.expires_at - card.issued_at <= 600);
     let link = body["link"].as_str().unwrap();
     assert!(link.starts_with("bitsov://introduce#"));
     assert_eq!(Introduction::parse(link).unwrap(), card);
     // Fresh id per card: nothing is a durable credential.
-    let (_, again, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
+    let (_, again, _) = call(
+        &state,
+        "GET",
+        "/api/v1/introduction",
+        bearer(&state, vec![auth::Scope::Read]),
+        None,
+    )
+    .await;
     assert_ne!(again["card"]["intro_id"], body["card"]["intro_id"]);
 }
 
@@ -147,7 +203,10 @@ async fn introduction_responses_point_at_front_door_as_profile_successor() {
     let response = test_router(state).oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers().get("deprecation").and_then(|v| v.to_str().ok()),
+        response
+            .headers()
+            .get("deprecation")
+            .and_then(|v| v.to_str().ok()),
         Some("true")
     );
     assert!(
@@ -163,12 +222,33 @@ async fn introduction_responses_point_at_front_door_as_profile_successor() {
 #[tokio::test]
 async fn no_card_without_a_dialable_endpoint_or_network() {
     let state = state_with(Arc::default(), settings(None));
-    let (status, body, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
+    let (status, body, _) = call(
+        &state,
+        "GET",
+        "/api/v1/introduction",
+        bearer(&state, vec![auth::Scope::Read]),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert!(body.to_string().contains("introduction_unavailable: no_dialable_endpoint"), "{body}");
+    assert!(
+        body.to_string()
+            .contains("introduction_unavailable: no_dialable_endpoint"),
+        "{body}"
+    );
 
-    let state = state_with(Arc::default(), IntroductionSettings::fixed(None, Some("a.example:1")));
-    let (status, _, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
+    let state = state_with(
+        Arc::default(),
+        IntroductionSettings::fixed(None, Some("a.example:1")),
+    );
+    let (status, _, _) = call(
+        &state,
+        "GET",
+        "/api/v1/introduction",
+        bearer(&state, vec![auth::Scope::Read]),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
 }
 
@@ -176,7 +256,12 @@ async fn no_card_without_a_dialable_endpoint_or_network() {
 async fn introduction_routes_need_a_token_and_read_is_enough() {
     let state = state_with(Arc::default(), settings(Some("node.example.org:9000")));
     let resp = test_router(state.clone())
-        .oneshot(Request::builder().uri("/api/v1/introduction").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/introduction")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -184,11 +269,27 @@ async fn introduction_routes_need_a_token_and_read_is_enough() {
     let open = |bearer: String| {
         let state = state.clone();
         let body = json!({ "card": card.to_link(), "allow_local": true });
-        async move { call(&state, "POST", "/api/v1/introduction/open", bearer, Some(body)).await.0 }
+        async move {
+            call(
+                &state,
+                "POST",
+                "/api/v1/introduction/open",
+                bearer,
+                Some(body),
+            )
+            .await
+            .0
+        }
     };
     // A paired app holds read + receive before any budget: that is enough to dial.
-    assert_eq!(open(bearer(&state, vec![auth::Scope::Read])).await, StatusCode::OK);
-    assert_eq!(open(bearer(&state, vec![auth::Scope::Receive])).await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        open(bearer(&state, vec![auth::Scope::Read])).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        open(bearer(&state, vec![auth::Scope::Receive])).await,
+        StatusCode::FORBIDDEN
+    );
 }
 
 #[tokio::test]
@@ -196,17 +297,31 @@ async fn open_dials_unprivileged_and_admits_nothing() {
     let transport = Arc::new(Recorder::default());
     let state = state_with(transport.clone(), settings(Some("node.example.org:9000")));
     let card = stranger_card("127.0.0.1:9735", "regtest", now());
-    let (status, body, _) = call(&state, "POST", "/api/v1/introduction/open", bearer(&state, vec![auth::Scope::Read]),
-        Some(json!({ "card": card.to_link(), "allow_local": true }))).await;
+    let (status, body, _) = call(
+        &state,
+        "POST",
+        "/api/v1/introduction/open",
+        bearer(&state, vec![auth::Scope::Read]),
+        Some(json!({ "card": card.to_link(), "allow_local": true })),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["node_id"], card.node_id);
     assert_eq!(body["dialed"], "127.0.0.1:9735");
-    assert_eq!(*transport.connects.lock().unwrap(), vec![(card.node().unwrap(), "127.0.0.1:9735".to_string())]);
+    assert_eq!(
+        *transport.connects.lock().unwrap(),
+        vec![(card.node().unwrap(), "127.0.0.1:9735".to_string())]
+    );
     // Never admission: no whitelist entry, no supervision, no stored peer or registry entry.
     assert!(transport.whitelisted.lock().unwrap().is_empty());
     assert!(transport.supervised.lock().unwrap().is_empty());
     assert!(state.storage.list_peers().await.unwrap().is_empty());
-    assert!(state.peer_registry.read().await.get(&card.node().unwrap()).is_none());
+    assert!(state
+        .peer_registry
+        .read()
+        .await
+        .get(&card.node().unwrap())
+        .is_none());
 }
 
 #[tokio::test]
@@ -221,10 +336,19 @@ async fn open_refuses_bad_cards_before_dialing() {
     let other_net = stranger_card("127.0.0.1:9735", "signet", now());
     let mut swapped = stranger_card("127.0.0.1:9735", "regtest", now());
     swapped.endpoint = "127.0.0.1:9999".into();
-    let own = Introduction::issue(&state.identity, IntroductionFields {
-        network: "regtest".into(), endpoint: "127.0.0.1:9000".into(), admission_msat: 1000,
-        message_msat: 1000, price_epoch: 0, issued_at: now(), intro_id: [1; 16],
-    }).unwrap();
+    let own = Introduction::issue(
+        &state.identity,
+        IntroductionFields {
+            network: "regtest".into(),
+            endpoint: "127.0.0.1:9000".into(),
+            admission_msat: 1000,
+            message_msat: 1000,
+            price_epoch: 0,
+            issued_at: now(),
+            intro_id: [1; 16],
+        },
+    )
+    .unwrap();
 
     for (name, text) in [
         ("tampered price", tampered.to_link()),
@@ -235,22 +359,47 @@ async fn open_refuses_bad_cards_before_dialing() {
         ("garbage", "bitsov://introduce#not-a-card".into()),
         ("oversize", "A".repeat(4096)),
     ] {
-        let (status, body, _) = call(&state, "POST", "/api/v1/introduction/open", spend(), Some(json!({ "card": text }))).await;
+        let (status, body, _) = call(
+            &state,
+            "POST",
+            "/api/v1/introduction/open",
+            spend(),
+            Some(json!({ "card": text })),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {body}");
-        assert!(body.to_string().contains("introduction_invalid"), "{name}: {body}");
+        assert!(
+            body.to_string().contains("introduction_invalid"),
+            "{name}: {body}"
+        );
     }
-    assert!(transport.connects.lock().unwrap().is_empty(), "nothing was dialed");
+    assert!(
+        transport.connects.lock().unwrap().is_empty(),
+        "nothing was dialed"
+    );
 }
 
 #[tokio::test]
 async fn a_closed_mesh_node_refuses_rather_than_whitelisting() {
-    let transport = Arc::new(Recorder { closed: true, ..Default::default() });
+    let transport = Arc::new(Recorder {
+        closed: true,
+        ..Default::default()
+    });
     let state = state_with(transport.clone(), settings(Some("node.example.org:9000")));
     let card = stranger_card("127.0.0.1:9735", "regtest", now());
-    let (status, body, _) = call(&state, "POST", "/api/v1/introduction/open", bearer(&state, vec![auth::Scope::Read]),
-        Some(json!({ "card": card.to_link(), "allow_local": true }))).await;
+    let (status, body, _) = call(
+        &state,
+        "POST",
+        "/api/v1/introduction/open",
+        bearer(&state, vec![auth::Scope::Read]),
+        Some(json!({ "card": card.to_link(), "allow_local": true })),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body.to_string().contains("introduction_closed_mesh"), "{body}");
+    assert!(
+        body.to_string().contains("introduction_closed_mesh"),
+        "{body}"
+    );
     assert!(transport.whitelisted.lock().unwrap().is_empty());
 }
 
@@ -259,7 +408,14 @@ async fn status_advertises_introduction_v1() {
     let state = state_with(Arc::default(), settings(None));
     let (status, body, _) = call(&state, "GET", "/api/v1/status", auth_header(&state), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body["api_capabilities"].as_array().unwrap().iter().any(|c| c == "introduction_v1"), "{body}");
+    assert!(
+        body["api_capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "introduction_v1"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -268,8 +424,14 @@ async fn verify_is_read_only_and_never_dials_or_stores() {
     let state = state_with(transport.clone(), settings(Some("node.example.org:9000")));
     // A nonexistent DNS name also verifies: verification must never resolve it.
     let card = stranger_card("unresolved.invalid:9000", "regtest", now());
-    let (status, body, cache) = call(&state, "POST", "/api/v1/introduction/verify",
-        bearer(&state, vec![auth::Scope::Read]), Some(json!({"card": card.to_link()}))).await;
+    let (status, body, cache) = call(
+        &state,
+        "POST",
+        "/api/v1/introduction/verify",
+        bearer(&state, vec![auth::Scope::Read]),
+        Some(json!({"card": card.to_link()})),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(cache.as_deref(), Some("no-store"));
     assert_eq!(body["card"]["node_id"], card.node_id);
@@ -277,9 +439,20 @@ async fn verify_is_read_only_and_never_dials_or_stores() {
     assert!(transport.whitelisted.lock().unwrap().is_empty());
     assert!(transport.supervised.lock().unwrap().is_empty());
     assert!(state.storage.list_peers().await.unwrap().is_empty());
-    assert!(state.peer_registry.read().await.get(&card.node().unwrap()).is_none());
-    let (status, _, _) = call(&state, "POST", "/api/v1/introduction/verify",
-        bearer(&state, vec![auth::Scope::Receive]), Some(json!({"card": card.to_link()}))).await;
+    assert!(state
+        .peer_registry
+        .read()
+        .await
+        .get(&card.node().unwrap())
+        .is_none());
+    let (status, _, _) = call(
+        &state,
+        "POST",
+        "/api/v1/introduction/verify",
+        bearer(&state, vec![auth::Scope::Receive]),
+        Some(json!({"card": card.to_link()})),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
@@ -287,13 +460,30 @@ async fn verify_is_read_only_and_never_dials_or_stores() {
 async fn local_dial_requires_reader_consent() {
     let transport = Arc::new(Recorder::default());
     let state = state_with(transport.clone(), settings(Some("node.example.org:9000")));
-    for endpoint in ["127.0.0.1:9735", "10.0.0.1:9000", "[::1]:9000", "[::ffff:192.168.1.1]:9000"] {
+    for endpoint in [
+        "127.0.0.1:9735",
+        "10.0.0.1:9000",
+        "[::1]:9000",
+        "[::ffff:192.168.1.1]:9000",
+    ] {
         let card = stranger_card(endpoint, "regtest", now());
-        for body in [json!({"card": card.to_link()}), json!({"card": card.to_link(), "allow_local": false})] {
-            let (status, response, _) = call(&state, "POST", "/api/v1/introduction/open",
-                bearer(&state, vec![auth::Scope::Read]), Some(body)).await;
+        for body in [
+            json!({"card": card.to_link()}),
+            json!({"card": card.to_link(), "allow_local": false}),
+        ] {
+            let (status, response, _) = call(
+                &state,
+                "POST",
+                "/api/v1/introduction/open",
+                bearer(&state, vec![auth::Scope::Read]),
+                Some(body),
+            )
+            .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {response}");
-            assert!(response.to_string().contains("local_consent_required"), "{response}");
+            assert!(
+                response.to_string().contains("local_consent_required"),
+                "{response}"
+            );
             assert!(transport.connects.lock().unwrap().is_empty());
         }
     }
@@ -320,11 +510,22 @@ async fn forged_weak_key_and_malformed_endpoints_never_dial() {
     let mut tampered = stranger_card("127.0.0.1:9735", "regtest", now());
     tampered.message_msat += 1;
     inputs.push(tampered.to_link());
-    for endpoint in ["127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:+9000", "user@127.0.0.1:9000",
-        "169.254.169.254:80", "[fe80::1]:9000", "http://127.0.0.1:9000", "127.0.0.1:9000/admin"] {
+    for endpoint in [
+        "127.0.0.1:0",
+        "127.0.0.1:65536",
+        "127.0.0.1:+9000",
+        "user@127.0.0.1:9000",
+        "169.254.169.254:80",
+        "[fe80::1]:9000",
+        "http://127.0.0.1:9000",
+        "127.0.0.1:9000/admin",
+    ] {
         let mut card = stranger_card("127.0.0.1:9735", "regtest", now());
         card.endpoint = endpoint.into();
-        card.sig = hex::encode(key.sign(blake3::hash(&card.canonical_bytes().unwrap()).as_bytes()).to_bytes());
+        card.sig = hex::encode(
+            key.sign(blake3::hash(&card.canonical_bytes().unwrap()).as_bytes())
+                .to_bytes(),
+        );
         inputs.push(card.to_link());
     }
     let mut too_long = stranger_card("127.0.0.1:9735", "regtest", now());
@@ -332,9 +533,19 @@ async fn forged_weak_key_and_malformed_endpoints_never_dial() {
     inputs.push(serde_json::to_string(&too_long).unwrap());
     for input in inputs {
         for route in ["/api/v1/introduction/verify", "/api/v1/introduction/open"] {
-            let body = if route.ends_with("/open") { json!({"card": input, "allow_local": true}) } else { json!({"card": input}) };
-            let (status, response, _) = call(&state, "POST", route,
-                bearer(&state, vec![auth::Scope::Read]), Some(body)).await;
+            let body = if route.ends_with("/open") {
+                json!({"card": input, "allow_local": true})
+            } else {
+                json!({"card": input})
+            };
+            let (status, response, _) = call(
+                &state,
+                "POST",
+                route,
+                bearer(&state, vec![auth::Scope::Read]),
+                Some(body),
+            )
+            .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {response}");
         }
     }
@@ -348,26 +559,66 @@ async fn paired_read_client_can_verify_and_explicitly_open_without_a_spend_grant
     let dir = tempfile::tempdir().unwrap();
     let transport = Arc::new(Recorder::default());
     let base = state_with(transport.clone(), settings(Some("node.example.org:9000")));
-    let service = Arc::new(PairingService::open(
-        dir.path(), identity_fingerprint(&base.identity.node_id().to_hex()), false,
-    ).unwrap().without_stdout_code());
+    let service = Arc::new(
+        PairingService::open(
+            dir.path(),
+            identity_fingerprint(&base.identity.node_id().to_hex()),
+            false,
+        )
+        .unwrap()
+        .without_stdout_code(),
+    );
     let key = ed25519_dalek::SigningKey::from_bytes(&[53; 32]);
     let public = hex::encode(key.verifying_key().to_bytes());
-    let request = service.request_pairing("introduction reader", &public).unwrap();
-    let challenge = std::fs::read(service.dir().join(format!("challenge-{}", request.pair_id))).unwrap();
-    let proof = key.sign(&PairingService::proof_message(&request.pair_id, &public, &challenge));
-    let client = service.confirm_pairing(&request.pair_id, &hex::encode(proof.to_bytes()),
-        vec![auth::Scope::Read, auth::Scope::Receive]).unwrap();
-    let token = auth::create_paired_token(&base.identity.node_id().to_hex(), &base.jwt_secret,
-        client.scopes, &client.client_id, client.epoch, &service.bound_fingerprint()).unwrap();
-    let state = Arc::new(AppState { pairing: Some(service), ..(*base).clone() });
+    let request = service
+        .request_pairing("introduction reader", &public)
+        .unwrap();
+    let challenge =
+        std::fs::read(service.dir().join(format!("challenge-{}", request.pair_id))).unwrap();
+    let proof = key.sign(&PairingService::proof_message(
+        &request.pair_id,
+        &public,
+        &challenge,
+    ));
+    let client = service
+        .confirm_pairing(
+            &request.pair_id,
+            &hex::encode(proof.to_bytes()),
+            vec![auth::Scope::Read, auth::Scope::Receive],
+        )
+        .unwrap();
+    let token = auth::create_paired_token(
+        &base.identity.node_id().to_hex(),
+        &base.jwt_secret,
+        client.scopes,
+        &client.client_id,
+        client.epoch,
+        &service.bound_fingerprint(),
+    )
+    .unwrap();
+    let state = Arc::new(AppState {
+        pairing: Some(service),
+        ..(*base).clone()
+    });
     let card = stranger_card("127.0.0.1:9735", "regtest", now());
-    let (status, body, _) = call(&state, "POST", "/api/v1/introduction/verify",
-        format!("Bearer {token}"), Some(json!({"card": card.to_link()}))).await;
+    let (status, body, _) = call(
+        &state,
+        "POST",
+        "/api/v1/introduction/verify",
+        format!("Bearer {token}"),
+        Some(json!({"card": card.to_link()})),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(transport.connects.lock().unwrap().is_empty());
-    let (status, body, _) = call(&state, "POST", "/api/v1/introduction/open",
-        format!("Bearer {token}"), Some(json!({"card": card.to_link(), "allow_local": true}))).await;
+    let (status, body, _) = call(
+        &state,
+        "POST",
+        "/api/v1/introduction/open",
+        format!("Bearer {token}"),
+        Some(json!({"card": card.to_link(), "allow_local": true})),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(transport.connects.lock().unwrap().len(), 1);
     assert!(transport.whitelisted.lock().unwrap().is_empty());
@@ -375,7 +626,14 @@ async fn paired_read_client_can_verify_and_explicitly_open_without_a_spend_grant
 }
 
 async fn card_endpoint_or_error(state: &Arc<AppState>) -> Result<String, String> {
-    let (status, body, _) = call(state, "GET", "/api/v1/introduction", bearer(state, vec![auth::Scope::Read]), None).await;
+    let (status, body, _) = call(
+        state,
+        "GET",
+        "/api/v1/introduction",
+        bearer(state, vec![auth::Scope::Read]),
+        None,
+    )
+    .await;
     match status {
         StatusCode::OK => Ok(body["card"]["endpoint"].as_str().unwrap().to_string()),
         _ => Err(body.to_string()),
@@ -387,15 +645,24 @@ async fn discovered_endpoint_is_used_and_failures_carry_a_reason_code() {
     let intro = IntroductionSettings::fixed(Some("regtest"), None);
     let state = state_with(Arc::default(), intro.clone());
     let err = card_endpoint_or_error(&state).await.unwrap_err();
-    assert!(err.contains("introduction_unavailable: no_dialable_endpoint"), "{err}");
+    assert!(
+        err.contains("introduction_unavailable: no_dialable_endpoint"),
+        "{err}"
+    );
 
     intro.set_discovered(PeerEndpointView::missing("stun_unreachable"));
     let err = card_endpoint_or_error(&state).await.unwrap_err();
-    assert!(err.contains("introduction_unavailable: stun_unreachable"), "{err}");
+    assert!(
+        err.contains("introduction_unavailable: stun_unreachable"),
+        "{err}"
+    );
 
     // The settings share the lock, so the running node's discovery shows up.
     intro.set_discovered(PeerEndpointView::found("93.184.216.34:9000".into(), "stun"));
-    assert_eq!(card_endpoint_or_error(&state).await.unwrap(), "93.184.216.34:9000");
+    assert_eq!(
+        card_endpoint_or_error(&state).await.unwrap(),
+        "93.184.216.34:9000"
+    );
 }
 
 #[tokio::test]
@@ -406,11 +673,17 @@ async fn a_configured_endpoint_is_never_replaced_by_discovery() {
     let view = intro.endpoint_view();
     assert_eq!((view.source, view.reason), (Some("advertised"), None));
     let state = state_with(Arc::default(), intro);
-    assert_eq!(card_endpoint_or_error(&state).await.unwrap(), "node.example.org:9000");
+    assert_eq!(
+        card_endpoint_or_error(&state).await.unwrap(),
+        "node.example.org:9000"
+    );
 }
 
 #[test]
 fn endpoint_view_names_the_reason_when_nothing_is_known() {
     let view = IntroductionSettings::default().endpoint_view();
-    assert_eq!((view.endpoint, view.source, view.reason), (None, None, Some("no_dialable_endpoint")));
+    assert_eq!(
+        (view.endpoint, view.source, view.reason),
+        (None, None, Some("no_dialable_endpoint"))
+    );
 }

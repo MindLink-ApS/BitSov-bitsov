@@ -121,7 +121,10 @@ async fn relay_storage_price() {
         .await
         .unwrap();
     assert_eq!(storage, 100);
-    assert!(storage > 0, "relay storage is a paid service — must be non-zero");
+    assert!(
+        storage > 0,
+        "relay storage is a paid service — must be non-zero"
+    );
 }
 
 #[tokio::test]
@@ -176,13 +179,24 @@ async fn custom_config() {
     // A call offer is the per-call admission (call_msat); the rest of the
     // call's signalling keeps the realtime category price.
     assert_eq!(e.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 10_000);
-    assert_eq!(e.get_price_msat(konsensus_core::kind::KIND_CALL_ANSWER).await.unwrap(), 90);
-    assert_eq!(e.category_price_overrides(), Some(vec![KIND_LONGFORM, KIND_CALL_INVITE]));
+    assert_eq!(
+        e.get_price_msat(konsensus_core::kind::KIND_CALL_ANSWER)
+            .await
+            .unwrap(),
+        90
+    );
+    assert_eq!(
+        e.category_price_overrides(),
+        Some(vec![KIND_LONGFORM, KIND_CALL_INVITE])
+    );
 }
 
 #[tokio::test]
 async fn call_offer_uses_call_msat_and_is_advertised_per_kind() {
-    let e = StaticPricingEngine::new(StaticPricingConfig { call_msat: 25_000, ..Default::default() });
+    let e = StaticPricingEngine::new(StaticPricingConfig {
+        call_msat: 25_000,
+        ..Default::default()
+    });
     assert_eq!(e.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 25_000);
     for k in [401, 402, 403] {
         assert_eq!(e.get_price_msat(k).await.unwrap(), 50);
@@ -191,8 +205,13 @@ async fn call_offer_uses_call_msat_and_is_advertised_per_kind() {
     assert_eq!(table["realtime_signaling"], 50);
     assert_eq!(table["kind:400"], 25_000);
     // No override, no per-kind entry.
-    let same = StaticPricingEngine::new(StaticPricingConfig { call_msat: 50, ..Default::default() });
-    assert!(!crate::peer_prices::build_price_table(&same).await.contains_key("kind:400"));
+    let same = StaticPricingEngine::new(StaticPricingConfig {
+        call_msat: 50,
+        ..Default::default()
+    });
+    assert!(!crate::peer_prices::build_price_table(&same)
+        .await
+        .contains_key("kind:400"));
     assert_eq!(same.category_price_overrides(), Some(vec![KIND_LONGFORM]));
 }
 

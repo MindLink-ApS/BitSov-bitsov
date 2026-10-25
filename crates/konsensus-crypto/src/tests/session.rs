@@ -1,12 +1,10 @@
 use super::*;
 
-const TEST_MNEMONIC_A: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon \
+const TEST_MNEMONIC_A: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon art";
 
-const TEST_MNEMONIC_B: &str =
-    "zoo zoo zoo zoo zoo zoo zoo zoo \
+const TEST_MNEMONIC_B: &str = "zoo zoo zoo zoo zoo zoo zoo zoo \
      zoo zoo zoo zoo zoo zoo zoo zoo \
      zoo zoo zoo zoo zoo zoo zoo vote";
 
@@ -198,10 +196,10 @@ async fn one_time_prekey_consumed() {
     let opk_id = bundle.one_time_prekey_id.unwrap();
 
     // Initiate session (consumes OPK)
-    let init_data = mgr_a.initiate_session(
-        &NodeId::from_hex(&bundle.node_id).unwrap(),
-        &bundle,
-    ).await.unwrap();
+    let init_data = mgr_a
+        .initiate_session(&NodeId::from_hex(&bundle.node_id).unwrap(), &bundle)
+        .await
+        .unwrap();
 
     // Accept session (should consume the OPK on Bob's side)
     mgr_b.accept_session(&node_a, &init_data).await.unwrap();
@@ -231,7 +229,10 @@ impl super::SessionStore for MemorySessionStore {
         peer_id: &NodeId,
         state_json: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.data.write().await.insert(*peer_id, state_json.to_vec());
+        self.data
+            .write()
+            .await
+            .insert(*peer_id, state_json.to_vec());
         Ok(())
     }
     async fn load_session(
@@ -247,9 +248,7 @@ impl super::SessionStore for MemorySessionStore {
         self.data.write().await.remove(peer_id);
         Ok(())
     }
-    async fn list_sessions(
-        &self,
-    ) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.data.read().await.keys().copied().collect())
     }
 }
@@ -275,9 +274,15 @@ async fn session_persistence_and_restore() {
 
     // Exchange some messages to advance the ratchet
     let msg1 = mgr_a.encrypt(&node_b, b"hello from A").await.unwrap();
-    assert_eq!(mgr_b.decrypt(&node_a, &msg1).await.unwrap(), b"hello from A");
+    assert_eq!(
+        mgr_b.decrypt(&node_a, &msg1).await.unwrap(),
+        b"hello from A"
+    );
     let msg2 = mgr_b.encrypt(&node_a, b"hello from B").await.unwrap();
-    assert_eq!(mgr_a.decrypt(&node_b, &msg2).await.unwrap(), b"hello from B");
+    assert_eq!(
+        mgr_a.decrypt(&node_b, &msg2).await.unwrap(),
+        b"hello from B"
+    );
 
     // Verify sessions were persisted
     assert!(store_a.data.read().await.contains_key(&node_b));
@@ -301,10 +306,16 @@ async fn session_persistence_and_restore() {
 
     // Verify restored sessions can continue communicating
     let msg3 = mgr_a2.encrypt(&node_b, b"after restart A").await.unwrap();
-    assert_eq!(mgr_b2.decrypt(&node_a, &msg3).await.unwrap(), b"after restart A");
+    assert_eq!(
+        mgr_b2.decrypt(&node_a, &msg3).await.unwrap(),
+        b"after restart A"
+    );
 
     let msg4 = mgr_b2.encrypt(&node_a, b"after restart B").await.unwrap();
-    assert_eq!(mgr_a2.decrypt(&node_b, &msg4).await.unwrap(), b"after restart B");
+    assert_eq!(
+        mgr_a2.decrypt(&node_b, &msg4).await.unwrap(),
+        b"after restart B"
+    );
 }
 
 #[tokio::test]
@@ -370,7 +381,10 @@ async fn session_stored_encrypted_not_plaintext() {
     );
 
     // It should start with a 12-byte nonce + AES-GCM ciphertext
-    assert!(stored_blob.len() > 12, "encrypted blob must contain nonce + ciphertext");
+    assert!(
+        stored_blob.len() > 12,
+        "encrypted blob must contain nonce + ciphertext"
+    );
 }
 
 #[tokio::test]
@@ -408,8 +422,10 @@ async fn restore_migrates_plaintext_to_encrypted() {
     {
         let data = store.data.read().await;
         let blob = data.get(&node_b).unwrap();
-        assert!(serde_json::from_slice::<serde_json::Value>(blob).is_ok(),
-            "should be plaintext JSON before migration");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(blob).is_ok(),
+            "should be plaintext JSON before migration"
+        );
     }
 
     // Phase 2: Create new manager with store and restore.
@@ -502,9 +518,7 @@ fn ratchet_message_from_bytes_under_minimum_header() {
                     "error for {size}-byte payload should mention 'too short', got: {msg}"
                 );
             }
-            other => panic!(
-                "expected InvalidPeerData for {size}-byte payload, got: {other:?}"
-            ),
+            other => panic!("expected InvalidPeerData for {size}-byte payload, got: {other:?}"),
         }
     }
 }
@@ -521,10 +535,7 @@ fn ratchet_message_from_bytes_exactly_minimum_header() {
     assert_eq!(bytes.len(), 40);
 
     let result = ratchet_message_from_bytes(&bytes);
-    assert!(
-        result.is_ok(),
-        "exactly 40 bytes should parse successfully"
-    );
+    assert!(result.is_ok(), "exactly 40 bytes should parse successfully");
     let msg = result.unwrap();
     assert_eq!(msg.header.dh_public, [7u8; 32]);
     assert_eq!(msg.header.previous_chain_length, 3);

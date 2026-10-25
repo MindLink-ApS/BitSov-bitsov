@@ -346,8 +346,17 @@ async fn failed_prepared_listing_selects_only_prepared_rows_with_an_error() {
         assert!(encrypted.insert_outbox_operation(&op).await.unwrap());
     }
     let listed = encrypted.list_failed_prepared_operations().await.unwrap();
-    assert_eq!(listed.iter().map(|op| op.operation_id.as_str()).collect::<Vec<_>>(), ["stuck"]);
-    assert_eq!(listed[0].recovery, b"{\"dispatched\":false}", "recovery is decrypted");
+    assert_eq!(
+        listed
+            .iter()
+            .map(|op| op.operation_id.as_str())
+            .collect::<Vec<_>>(),
+        ["stuck"]
+    );
+    assert_eq!(
+        listed[0].recovery, b"{\"dispatched\":false}",
+        "recovery is decrypted"
+    );
 }
 
 #[tokio::test]

@@ -171,18 +171,18 @@ pub enum KindCategory {
 impl KindCategory {
     /// Canonical category key in authenticated price tables.
     pub fn price_table_key(self) -> &'static str {
-    match self {
-        Self::Communication => "communication",
-        Self::StructuredData => "structured_data",
-        Self::FilesMedia => "files_media",
-        Self::Collaboration => "collaboration",
-        Self::RealTimeSignaling => "realtime_signaling",
-        Self::WebContent => "web_content",
-        Self::Storage => "relay_storage",
-        Self::Control => "control",
-        Self::AppExtension => "app_extension",
-        Self::Unknown => "unknown",
-    }
+        match self {
+            Self::Communication => "communication",
+            Self::StructuredData => "structured_data",
+            Self::FilesMedia => "files_media",
+            Self::Collaboration => "collaboration",
+            Self::RealTimeSignaling => "realtime_signaling",
+            Self::WebContent => "web_content",
+            Self::Storage => "relay_storage",
+            Self::Control => "control",
+            Self::AppExtension => "app_extension",
+            Self::Unknown => "unknown",
+        }
     }
 
     /// Classify a kind value into its category.
@@ -208,18 +208,51 @@ mod tests {
 
     #[test]
     fn kind_category_classification() {
-        assert_eq!(KindCategory::from_kind(KIND_CHAT), KindCategory::Communication);
-        assert_eq!(KindCategory::from_kind(KIND_LONGFORM), KindCategory::Communication);
-        assert_eq!(KindCategory::from_kind(KIND_REPLY), KindCategory::Communication);
-        assert_eq!(KindCategory::from_kind(KIND_CALENDAR_EVENT), KindCategory::StructuredData);
-        assert_eq!(KindCategory::from_kind(KIND_FILE_REF), KindCategory::FilesMedia);
-        assert_eq!(KindCategory::from_kind(KIND_CRDT_OP), KindCategory::Collaboration);
-        assert_eq!(KindCategory::from_kind(KIND_CALL_INVITE), KindCategory::RealTimeSignaling);
+        assert_eq!(
+            KindCategory::from_kind(KIND_CHAT),
+            KindCategory::Communication
+        );
+        assert_eq!(
+            KindCategory::from_kind(KIND_LONGFORM),
+            KindCategory::Communication
+        );
+        assert_eq!(
+            KindCategory::from_kind(KIND_REPLY),
+            KindCategory::Communication
+        );
+        assert_eq!(
+            KindCategory::from_kind(KIND_CALENDAR_EVENT),
+            KindCategory::StructuredData
+        );
+        assert_eq!(
+            KindCategory::from_kind(KIND_FILE_REF),
+            KindCategory::FilesMedia
+        );
+        assert_eq!(
+            KindCategory::from_kind(KIND_CRDT_OP),
+            KindCategory::Collaboration
+        );
+        assert_eq!(
+            KindCategory::from_kind(KIND_CALL_INVITE),
+            KindCategory::RealTimeSignaling
+        );
         assert_eq!(KindCategory::from_kind(KIND_TYPING), KindCategory::Control);
-        assert_eq!(KindCategory::from_kind(KIND_MLS_WELCOME), KindCategory::Control);
-        assert_eq!(KindCategory::from_kind(KIND_PAGE_REQUEST), KindCategory::WebContent);
-        assert_eq!(KindCategory::from_kind(KIND_PAGE_RESPONSE), KindCategory::WebContent);
-        assert_eq!(KindCategory::from_kind(KIND_WEB_MANIFEST), KindCategory::WebContent);
+        assert_eq!(
+            KindCategory::from_kind(KIND_MLS_WELCOME),
+            KindCategory::Control
+        );
+        assert_eq!(
+            KindCategory::from_kind(KIND_PAGE_REQUEST),
+            KindCategory::WebContent
+        );
+        assert_eq!(
+            KindCategory::from_kind(KIND_PAGE_RESPONSE),
+            KindCategory::WebContent
+        );
+        assert_eq!(
+            KindCategory::from_kind(KIND_WEB_MANIFEST),
+            KindCategory::WebContent
+        );
         assert_eq!(KindCategory::from_kind(1000), KindCategory::AppExtension);
         assert_eq!(KindCategory::from_kind(600), KindCategory::Storage);
     }
@@ -386,10 +419,16 @@ mod tests {
 
         // Collaboration: 300-399
         assert_eq!(KindCategory::from_kind(399), KindCategory::Collaboration);
-        assert_eq!(KindCategory::from_kind(400), KindCategory::RealTimeSignaling);
+        assert_eq!(
+            KindCategory::from_kind(400),
+            KindCategory::RealTimeSignaling
+        );
 
         // RealTimeSignaling: 400-499
-        assert_eq!(KindCategory::from_kind(499), KindCategory::RealTimeSignaling);
+        assert_eq!(
+            KindCategory::from_kind(499),
+            KindCategory::RealTimeSignaling
+        );
         assert_eq!(KindCategory::from_kind(500), KindCategory::WebContent);
 
         // WebContent: 500-599
@@ -413,27 +452,56 @@ mod tests {
     #[test]
     fn no_duplicate_kind_constants() {
         let all_kinds: Vec<u16> = vec![
-            KIND_CHAT, KIND_LONGFORM, KIND_REPLY, KIND_REACTION, KIND_EDIT,
-            KIND_DELETE, KIND_FORWARD,
-            KIND_CALENDAR_EVENT, KIND_RSVP, KIND_CONTACT, KIND_PROFILE, KIND_CALENDAR_UPDATE,
-            KIND_FILE_REF, KIND_INLINE_IMAGE, KIND_VOICE_MEMO,
-            KIND_CRDT_OP, KIND_DOC_SNAPSHOT,
-            KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE, KIND_WEB_MANIFEST,
-            KIND_PEER_ENDORSE, KIND_CONTENT_ANNOUNCE, KIND_TOPIC_SUBSCRIBE, KIND_TOPIC_UNSUBSCRIBE,
-            KIND_CALL_INVITE, KIND_CALL_ANSWER, KIND_ICE_CANDIDATE, KIND_CALL_HANGUP,
-            KIND_TYPING, KIND_READ_RECEIPT, KIND_PRESENCE,
-            KIND_ROOM_CREATE, KIND_ROOM_INVITE, KIND_ROOM_JOIN, KIND_ROOM_LEAVE, KIND_ROOM_UPDATE,
-            KIND_KEY_EXCHANGE, KIND_MLS_WELCOME, KIND_MLS_COMMIT, KIND_MLS_PROPOSAL,
-            KIND_RELAY_REGISTER, KIND_RELAY_DEPOSIT, KIND_RELAY_ACK, KIND_RELAY_DRAIN,
+            KIND_CHAT,
+            KIND_LONGFORM,
+            KIND_REPLY,
+            KIND_REACTION,
+            KIND_EDIT,
+            KIND_DELETE,
+            KIND_FORWARD,
+            KIND_CALENDAR_EVENT,
+            KIND_RSVP,
+            KIND_CONTACT,
+            KIND_PROFILE,
+            KIND_CALENDAR_UPDATE,
+            KIND_FILE_REF,
+            KIND_INLINE_IMAGE,
+            KIND_VOICE_MEMO,
+            KIND_CRDT_OP,
+            KIND_DOC_SNAPSHOT,
+            KIND_PAGE_REQUEST,
+            KIND_PAGE_RESPONSE,
+            KIND_WEB_MANIFEST,
+            KIND_PEER_ENDORSE,
+            KIND_CONTENT_ANNOUNCE,
+            KIND_TOPIC_SUBSCRIBE,
+            KIND_TOPIC_UNSUBSCRIBE,
+            KIND_CALL_INVITE,
+            KIND_CALL_ANSWER,
+            KIND_ICE_CANDIDATE,
+            KIND_CALL_HANGUP,
+            KIND_TYPING,
+            KIND_READ_RECEIPT,
+            KIND_PRESENCE,
+            KIND_ROOM_CREATE,
+            KIND_ROOM_INVITE,
+            KIND_ROOM_JOIN,
+            KIND_ROOM_LEAVE,
+            KIND_ROOM_UPDATE,
+            KIND_KEY_EXCHANGE,
+            KIND_MLS_WELCOME,
+            KIND_MLS_COMMIT,
+            KIND_MLS_PROPOSAL,
+            KIND_RELAY_REGISTER,
+            KIND_RELAY_DEPOSIT,
+            KIND_RELAY_ACK,
+            KIND_RELAY_DRAIN,
             KIND_RELAY_UNREGISTER,
             KIND_APP_EXT_START,
         ];
         let mut seen = std::collections::HashSet::new();
         for kind in &all_kinds {
-            assert!(
-                seen.insert(kind),
-                "duplicate KIND constant: {kind}"
-            );
+            assert!(seen.insert(kind), "duplicate KIND constant: {kind}");
         }
     }
 
@@ -459,8 +527,11 @@ mod tests {
         }
         // The five control operations are distinct.
         let distinct: std::collections::HashSet<u16> = [
-            KIND_RELAY_REGISTER, KIND_RELAY_DEPOSIT, KIND_RELAY_ACK,
-            KIND_RELAY_DRAIN, KIND_RELAY_UNREGISTER,
+            KIND_RELAY_REGISTER,
+            KIND_RELAY_DEPOSIT,
+            KIND_RELAY_ACK,
+            KIND_RELAY_DRAIN,
+            KIND_RELAY_UNREGISTER,
         ]
         .into_iter()
         .collect();

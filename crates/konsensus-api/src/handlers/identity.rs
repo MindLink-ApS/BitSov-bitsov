@@ -1,6 +1,6 @@
 //! Identity endpoints — node identity information and recovery.
 
-use crate::auth::scoped::{ScopedAuth, Identity, Read};
+use crate::auth::scoped::{Identity, Read, ScopedAuth};
 use std::sync::Arc;
 use std::time::Instant;
 

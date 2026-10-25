@@ -29,8 +29,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 // One valid BIP-39 mnemonic; passphrase differentiates node identities.
 // ---------------------------------------------------------------------------
 
-const TEST_MNEMONIC: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon \
+const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon art";
 
@@ -98,8 +97,7 @@ fn noise_xx_wrong_static_key_rejected_by_application() {
     // -- Attack path: Alice is tricked into connecting to an IMPOSTOR --
     {
         let mut alice_session = NoiseSession::initiator(alice.x25519_secret_bytes()).unwrap();
-        let mut impostor_session =
-            NoiseSession::responder(impostor.x25519_secret_bytes()).unwrap();
+        let mut impostor_session = NoiseSession::responder(impostor.x25519_secret_bytes()).unwrap();
         complete_noise_handshake(&mut alice_session, &mut impostor_session);
 
         let remote = alice_session.remote_static_key().unwrap();
@@ -263,7 +261,10 @@ fn federation_signed_message_nonce_enables_replay_detection() {
     let mut seen_nonces = std::collections::HashSet::new();
 
     // First occurrence: fresh nonce accepted.
-    assert!(!seen_nonces.contains(&msg1.nonce), "nonce should not yet be in store");
+    assert!(
+        !seen_nonces.contains(&msg1.nonce),
+        "nonce should not yet be in store"
+    );
     seen_nonces.insert(msg1.nonce);
 
     // Replay: same nonce detected.
@@ -273,7 +274,10 @@ fn federation_signed_message_nonce_enables_replay_detection() {
     );
 
     // Second distinct message: not a replay.
-    assert!(!seen_nonces.contains(&msg2.nonce), "different message nonce must not be flagged");
+    assert!(
+        !seen_nonces.contains(&msg2.nonce),
+        "different message nonce must not be flagged"
+    );
 }
 
 // =============================================================================
@@ -309,7 +313,10 @@ fn x3dh_mitm_on_signed_prekey_rejected() {
         };
 
         let result = x3dh::initiate(&alice_secret, &alice_public, &authentic_bundle);
-        assert!(result.is_ok(), "authentic bundle must succeed X3DH initiation");
+        assert!(
+            result.is_ok(),
+            "authentic bundle must succeed X3DH initiation"
+        );
     }
 
     // -- Attack path: MITM substitutes attacker's signed_prekey --
@@ -323,7 +330,7 @@ fn x3dh_mitm_on_signed_prekey_rejected() {
         let tampered_bundle = PrekeyBundle {
             identity_key: *bob.x25519_public(),
             signed_prekey: attacker_spk.public, // MITM substitution
-            signed_prekey_sig: bob_spk_sig,      // Bob's sig over a *different* key
+            signed_prekey_sig: bob_spk_sig,     // Bob's sig over a *different* key
             identity_verifying_key: *bob.ed25519_verifying_key(),
             one_time_prekey: None,
             one_time_prekey_id: None,
@@ -357,9 +364,9 @@ fn x3dh_mitm_with_attacker_self_signed_prekey_rejected() {
     let attacker_sig = attacker_signing.sign(attacker_spk.public.as_bytes());
 
     let tampered_bundle = PrekeyBundle {
-        identity_key: *bob.x25519_public(),               // Bob's real identity key
-        signed_prekey: attacker_spk.public,                // Attacker's SPK
-        signed_prekey_sig: attacker_sig,                   // Attacker's own signature
+        identity_key: *bob.x25519_public(), // Bob's real identity key
+        signed_prekey: attacker_spk.public, // Attacker's SPK
+        signed_prekey_sig: attacker_sig,    // Attacker's own signature
         identity_verifying_key: *bob.ed25519_verifying_key(), // Bob's real Ed25519 pubkey
         one_time_prekey: None,
         one_time_prekey_id: None,

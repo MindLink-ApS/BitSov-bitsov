@@ -90,7 +90,11 @@ pub struct ChainView {
 pub trait ChainProvider: Send + Sync {
     /// Honest default for test/external providers that do not identify themselves.
     fn chain_view(&self) -> ChainView {
-        ChainView { backend: "unknown", trust_level: "unknown", host: None }
+        ChainView {
+            backend: "unknown",
+            trust_level: "unknown",
+            host: None,
+        }
     }
 
     /// The trust level of this chain data source.
@@ -112,11 +116,8 @@ pub trait ChainProvider: Send + Sync {
     async fn estimate_fee(&self, target_blocks: u32) -> Result<FeeEstimate, ChainError>;
 
     /// Check whether a transaction is confirmed (has at least `min_confirmations`).
-    async fn is_tx_confirmed(
-        &self,
-        txid: &str,
-        min_confirmations: u32,
-    ) -> Result<bool, ChainError>;
+    async fn is_tx_confirmed(&self, txid: &str, min_confirmations: u32)
+        -> Result<bool, ChainError>;
 
     /// Check whether the chain backend is connected and synced.
     async fn is_synced(&self) -> bool;

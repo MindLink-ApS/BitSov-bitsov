@@ -34,7 +34,9 @@ async fn onboarding_state_full_start_returns_funding_fields() {
 
     let res_state = common::test_router(state).oneshot(req_state).await.unwrap();
     assert_eq!(res_state.status(), StatusCode::OK);
-    let body_state = axum::body::to_bytes(res_state.into_body(), 4096).await.unwrap();
+    let body_state = axum::body::to_bytes(res_state.into_body(), 4096)
+        .await
+        .unwrap();
     let state_json: serde_json::Value = serde_json::from_slice(&body_state).unwrap();
     assert_eq!(state_json["current_step"], "funding");
 }

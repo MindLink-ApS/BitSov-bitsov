@@ -47,8 +47,15 @@ pub struct ListCursor<T> {
 /// Existing message-list scopes, shared by raw keyset reads and readable scans.
 pub enum MessageListQuery<'a> {
     Recipient(&'a konsensus_core::Recipient),
-    Conversation { me: &'a str, peer: &'a str, is_room: bool },
-    NodeKind { me: &'a str, kind: u16 },
+    Conversation {
+        me: &'a str,
+        peer: &'a str,
+        is_room: bool,
+    },
+    NodeKind {
+        me: &'a str,
+        kind: u16,
+    },
 }
 
 /// Bound decryption work even for an entirely unreadable history.
@@ -66,7 +73,10 @@ pub struct FileListRow {
 
 impl From<crate::FileMetadata> for FileListRow {
     fn from(metadata: crate::FileMetadata) -> Self {
-        let cursor = ListCursor { timestamp: metadata.created_at.clone(), id: metadata.id.clone() };
+        let cursor = ListCursor {
+            timestamp: metadata.created_at.clone(),
+            id: metadata.id.clone(),
+        };
         Self { metadata, cursor }
     }
 }

@@ -8,13 +8,10 @@ fn basic_encrypt_decrypt() {
 
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Alice sends a message
     let msg = alice.encrypt(b"Hello Bob!").unwrap();
@@ -29,13 +26,10 @@ fn bidirectional_messages() {
 
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Alice → Bob
     let msg1 = alice.encrypt(b"Hello").unwrap();
@@ -61,13 +55,10 @@ fn multiple_messages_same_direction() {
 
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Alice sends multiple messages before Bob replies
     let msg1 = alice.encrypt(b"msg 1").unwrap();
@@ -87,13 +78,10 @@ fn out_of_order_delivery() {
 
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Alice sends 3 messages
     let msg1 = alice.encrypt(b"first").unwrap();
@@ -113,13 +101,10 @@ fn forward_secrecy_via_ratchet() {
 
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Exchange messages to advance the ratchet
     let msg1 = alice.encrypt(b"hello").unwrap();
@@ -144,13 +129,10 @@ fn tampered_ciphertext_rejected() {
 
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     let mut msg = alice.encrypt(b"secret").unwrap();
 
@@ -168,8 +150,7 @@ fn different_shared_secrets_cant_decrypt() {
 
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice =
-        DoubleRatchet::init_sender(&[1u8; 32], &bob_spk.public, ad.clone()).unwrap();
+    let mut alice = DoubleRatchet::init_sender(&[1u8; 32], &bob_spk.public, ad.clone()).unwrap();
     let mut bob = DoubleRatchet::init_receiver(
         &[2u8; 32], // Different secret!
         bob_spk.secret(),
@@ -219,13 +200,10 @@ fn export_import_state_roundtrip() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Exchange a few messages to advance the ratchet
     let msg1 = alice.encrypt(b"hello").unwrap();
@@ -263,13 +241,10 @@ fn export_import_with_skipped_keys() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Alice sends 3 messages
     let msg1 = alice.encrypt(b"first").unwrap();
@@ -299,13 +274,10 @@ fn many_round_trips() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // 50 round trips
     for i in 0..50u32 {
@@ -327,12 +299,7 @@ fn export_import_state_with_none_chains() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let bob = DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Bob hasn't received any message yet — sending chain is None
     assert!(!bob.can_send());
@@ -354,13 +321,10 @@ fn export_import_preserves_empty_skipped_keys() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Exchange messages in order — no skipped keys
     let msg1 = alice.encrypt(b"hello").unwrap();
@@ -384,13 +348,10 @@ fn skip_too_many_messages_rejected() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Alice sends MAX_SKIP + 2 messages, bob tries to receive only the last
     let mut last_msg = None;
@@ -409,13 +370,10 @@ fn encrypt_empty_plaintext() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     let msg = alice.encrypt(b"").unwrap();
     let plaintext = bob.decrypt(&msg).unwrap();
@@ -428,13 +386,10 @@ fn encrypt_large_plaintext() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // 1 MiB plaintext
     let big = vec![0xABu8; 1024 * 1024];
@@ -449,13 +404,10 @@ fn replay_same_message_fails() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     let msg = alice.encrypt(b"no replays").unwrap();
     assert_eq!(bob.decrypt(&msg).unwrap(), b"no replays");
@@ -470,12 +422,7 @@ fn can_send_false_for_receiver_before_first_message() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let bob = DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Receiver can't send before first DH ratchet step
     assert!(!bob.can_send());
@@ -502,17 +449,16 @@ fn skipped_key_eviction_uses_insertion_order() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Alice sends messages 0..5. Bob only decrypts message 4, creating
     // skipped keys for messages 0, 1, 2, 3 (inserted in order: seq 0,1,2,3).
-    let msgs: Vec<_> = (0..5).map(|i| alice.encrypt(format!("msg{i}").as_bytes()).unwrap()).collect();
+    let msgs: Vec<_> = (0..5)
+        .map(|i| alice.encrypt(format!("msg{i}").as_bytes()).unwrap())
+        .collect();
     bob.decrypt(&msgs[4]).unwrap(); // Skip 0,1,2,3
 
     // Verify skipped keys exist for 0,1,2,3
@@ -544,7 +490,7 @@ fn skipped_key_eviction_preserves_recent_low_numbered_keys() {
 
     ratchet.skipped_keys.insert((fake_pub, 100), (key_a, 0)); // oldest insertion
     ratchet.skipped_keys.insert((fake_pub, 50), (key_b, 1));
-    ratchet.skipped_keys.insert((fake_pub, 1), (key_c, 2));   // newest insertion
+    ratchet.skipped_keys.insert((fake_pub, 1), (key_c, 2)); // newest insertion
     ratchet.skipped_key_seq = 3;
 
     // Simulate eviction by reducing the cap temporarily.
@@ -577,7 +523,10 @@ fn debug_impl_redacts_ratchet_state() {
     let state = alice.export_state();
     let debug_str = format!("{:?}", state);
 
-    assert!(debug_str.contains("[REDACTED]"), "RatchetState Debug must redact secrets");
+    assert!(
+        debug_str.contains("[REDACTED]"),
+        "RatchetState Debug must redact secrets"
+    );
     // Root key must not appear in debug output
     let root_hex = hex::encode(state.root_key);
     assert!(
@@ -595,7 +544,10 @@ fn debug_impl_redacts_skipped_key() {
     };
     let debug_str = format!("{:?}", sk);
 
-    assert!(debug_str.contains("[REDACTED]"), "SkippedKey Debug must redact message_key");
+    assert!(
+        debug_str.contains("[REDACTED]"),
+        "SkippedKey Debug must redact message_key"
+    );
     let key_hex = hex::encode(sk.message_key);
     assert!(
         !debug_str.contains(&key_hex),
@@ -639,13 +591,10 @@ fn heavy_interleaved_conversation() {
     let ad = b"heavy-test".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // 100 round trips: Alice sends, Bob decrypts, Bob sends, Alice decrypts
     for i in 0u32..100 {
@@ -689,13 +638,10 @@ fn export_import_preserves_bidirectional_communication() {
     let ad = b"persist-test".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Exchange some messages to advance ratchet state
     for i in 0..5 {
@@ -729,11 +675,8 @@ fn ratchet_message_different_ad_fails_decrypt() {
     let shared_secret = [42u8; 32];
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(
-        &shared_secret,
-        &bob_spk.public,
-        b"ad-one".to_vec(),
-    ).unwrap();
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, b"ad-one".to_vec()).unwrap();
     let mut bob = DoubleRatchet::init_receiver(
         &shared_secret,
         bob_spk.secret(),
@@ -744,7 +687,10 @@ fn ratchet_message_different_ad_fails_decrypt() {
     let enc = alice.encrypt(b"test").unwrap();
     let result = bob.decrypt(&enc);
     assert!(result.is_err(), "Decryption with different AD must fail");
-    assert!(matches!(result.unwrap_err(), RatchetError::DecryptionFailed(_)));
+    assert!(matches!(
+        result.unwrap_err(),
+        RatchetError::DecryptionFailed(_)
+    ));
 }
 
 #[test]
@@ -768,15 +714,14 @@ fn receiver_encrypt_before_first_message_fails() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Bob hasn't received any message yet — sending chain is None
-    assert!(!bob.can_send(), "receiver should not be 'initialized' for sending yet");
+    assert!(
+        !bob.can_send(),
+        "receiver should not be 'initialized' for sending yet"
+    );
     let result = bob.encrypt(b"too early");
     assert!(
         matches!(result, Err(RatchetError::NotInitialized)),
@@ -791,22 +736,25 @@ fn receiver_can_encrypt_after_first_decrypt() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // Alice sends first message, Bob decrypts — this triggers DH ratchet
     let msg1 = alice.encrypt(b"hello").unwrap();
     bob.decrypt(&msg1).unwrap();
 
     // Now Bob should be able to encrypt
-    assert!(bob.can_send(), "receiver should be initialized after first decrypt");
+    assert!(
+        bob.can_send(),
+        "receiver should be initialized after first decrypt"
+    );
     let reply = bob.encrypt(b"reply");
-    assert!(reply.is_ok(), "receiver should be able to encrypt after first decrypt");
+    assert!(
+        reply.is_ok(),
+        "receiver should be able to encrypt after first decrypt"
+    );
 
     // Alice can decrypt Bob's reply
     let plaintext = alice.decrypt(&reply.unwrap()).unwrap();
@@ -821,13 +769,10 @@ fn rapid_dh_ratchet_alternation() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     // 50 rapid alternations: alice→bob, bob→alice, alice→bob, ...
     for i in 0u32..50 {
@@ -851,17 +796,17 @@ fn tampered_header_message_number_rejected() {
     let ad = b"alice||bob".to_vec();
     let bob_spk = x3dh::SignedPreKey::generate();
 
-    let mut alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
-    let mut bob = DoubleRatchet::init_receiver(
-        &shared_secret,
-        bob_spk.secret(),
-        &bob_spk.public,
-        ad,
-    );
+    let mut alice =
+        DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let mut bob =
+        DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
 
     let mut msg = alice.encrypt(b"original").unwrap();
     // Tamper with the message number
     msg.header.message_number = msg.header.message_number.wrapping_add(5);
     let result = bob.decrypt(&msg);
-    assert!(result.is_err(), "tampered message_number should cause decryption failure");
+    assert!(
+        result.is_err(),
+        "tampered message_number should cause decryption failure"
+    );
 }

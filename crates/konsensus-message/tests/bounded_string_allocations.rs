@@ -309,7 +309,6 @@ fn starter_lightning_porch_and_quote_hooks_reject_without_large_allocations() {
     }
 }
 
-
 #[test]
 fn global_string_ceiling_rejects_every_schema_position_before_allocation() {
     use konsensus_message::wire::{MAX_BOLT11_BYTES, MAX_FRAME_BYTES};
@@ -318,27 +317,62 @@ fn global_string_ceiling_rejects_every_schema_position_before_allocation() {
         ("u16", r#"{"PriceQuery":{"kind":"PAYLOAD"}}"#),
         ("u8", r#"{"StarterRequest":{"v":"PAYLOAD"}}"#),
         ("u32", r#"{"PriceTable":{"valid_blocks":"PAYLOAD"}}"#),
-        ("bool", r#"{"PorchQuoteResponse":{"admission_required":"PAYLOAD"}}"#),
+        (
+            "bool",
+            r#"{"PorchQuoteResponse":{"admission_required":"PAYLOAD"}}"#,
+        ),
         ("f64", r#"{"PriceTable":{"trust_discount":"PAYLOAD"}}"#),
-        ("optional u64", r#"{"StarterStatus":{"capacity_sats":"PAYLOAD"}}"#),
+        (
+            "optional u64",
+            r#"{"StarterStatus":{"capacity_sats":"PAYLOAD"}}"#,
+        ),
         ("hello version", r#"{"Hello":{"version":"PAYLOAD"}}"#),
-        ("price value", r#"{"PriceTable":{"prices":{"chat":"PAYLOAD"}}}"#),
-        ("quote expiry", r#"{"PeerExchangeQuote":{"quote":{"expires_at":"PAYLOAD"}}}"#),
+        (
+            "price value",
+            r#"{"PriceTable":{"prices":{"chat":"PAYLOAD"}}}"#,
+        ),
+        (
+            "quote expiry",
+            r#"{"PeerExchangeQuote":{"quote":{"expires_at":"PAYLOAD"}}}"#,
+        ),
         ("timestamp", r#"{"Message":{"timestamp":"PAYLOAD"}}"#),
         ("kind", r#"{"Message":{"kind":"PAYLOAD"}}"#),
-        ("amount", r#"{"Message":{"payment_proof":{"amount_msat":"PAYLOAD"}}}"#),
+        (
+            "amount",
+            r#"{"Message":{"payment_proof":{"amount_msat":"PAYLOAD"}}}"#,
+        ),
         ("unit content", r#"{"SessionAck":"PAYLOAD"}"#),
-        ("recipient unit", r#"{"Message":{"recipient":{"Broadcast":"PAYLOAD"}}}"#),
+        (
+            "recipient unit",
+            r#"{"Message":{"recipient":{"Broadcast":"PAYLOAD"}}}"#,
+        ),
         ("tier content", r#"{"Hello":{"tier":{"T1":"PAYLOAD"}}}"#),
         ("struct body", r#"{"Ping":"PAYLOAD"}"#),
         ("envelope body", r#"{"Message":"PAYLOAD"}"#),
-        ("nested struct body", r#"{"PeerExchangeQuote":{"quote":"PAYLOAD"}}"#),
-        ("unknown key", r#"{"Disconnect":{"reason":"bye","PAYLOAD":1}}"#),
-        ("ignored value", r#"{"Disconnect":{"reason":"bye","future":"PAYLOAD"}}"#),
+        (
+            "nested struct body",
+            r#"{"PeerExchangeQuote":{"quote":"PAYLOAD"}}"#,
+        ),
+        (
+            "unknown key",
+            r#"{"Disconnect":{"reason":"bye","PAYLOAD":1}}"#,
+        ),
+        (
+            "ignored value",
+            r#"{"Disconnect":{"reason":"bye","future":"PAYLOAD"}}"#,
+        ),
     ];
     let mut failures = Vec::new();
     for size in [6 * MAX_BOLT11_BYTES + 1, MAX_FRAME_BYTES - 1024] {
-        for prefix in ["", r"\n", r"\u0061", r"\ud83d\ude00", r#"\"\\{}[]"#, "é", "💥"] {
+        for prefix in [
+            "",
+            r"\n",
+            r"\u0061",
+            r"\ud83d\ude00",
+            r#"\"\\{}[]"#,
+            "é",
+            "💥",
+        ] {
             let value = format!("{prefix}{}", "x".repeat(size - prefix.len()));
             for (label, pattern) in patterns {
                 let json = pattern.replace("PAYLOAD", &value);
@@ -357,7 +391,10 @@ fn global_string_ceiling_rejects_every_schema_position_before_allocation() {
             }
         }
     }
-    assert!(failures.is_empty(), "global string ceiling failures: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "global string ceiling failures: {failures:?}"
+    );
 }
 
 #[test]
@@ -374,15 +411,26 @@ fn global_string_ceiling_preserves_exact_raw_boundary_and_maximum_escaped_fields
         }
     }
     for (variant, field, limit, other) in [
-        ("InvoiceResponse", "bolt11", MAX_BOLT11_BYTES, r#""request_id":"id","payment_hash":"00""#),
+        (
+            "InvoiceResponse",
+            "bolt11",
+            MAX_BOLT11_BYTES,
+            r#""request_id":"id","payment_hash":"00""#,
+        ),
         ("CallOffer", "sdp", MAX_SDP_BYTES, r#""session_id":"id""#),
     ] {
-        let json = format!(r#"{{"{variant}":{{{other},"{field}":"{}"}}}}"#, r"\u0078".repeat(limit));
+        let json = format!(
+            r#"{{"{variant}":{{{other},"{field}":"{}"}}}}"#,
+            r"\u0078".repeat(limit)
+        );
         Frame::from_bytes(json.as_bytes()).unwrap();
     }
     // Reset between tokens; escaped quotes/backslashes cannot hide a boundary.
-    let json = format!(r#"{{"Disconnect":{{"reason":"bye","a":"{}","b":"{}"}}}}"#,
-        r#"\"\\{}[]"#.repeat(32 * 1024), "x".repeat(cap));
+    let json = format!(
+        r#"{{"Disconnect":{{"reason":"bye","a":"{}","b":"{}"}}}}"#,
+        r#"\"\\{}[]"#.repeat(32 * 1024),
+        "x".repeat(cap)
+    );
     Frame::from_bytes(json.as_bytes()).unwrap();
 }
 
