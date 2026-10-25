@@ -10,7 +10,7 @@ also live on the corresponding GitHub pre-release pages.
   response, so a client can confirm the network during remote-owner first run
   before any identity exists. The field is absent when the lightning backend
   does not state a network; no other field, route or authentication rule of the
-  bootstrap router changes.
+  bootstrap router changes (#443).
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'
   scripts instead of all 2000 derived scripts. Before each focused sweep preview,
