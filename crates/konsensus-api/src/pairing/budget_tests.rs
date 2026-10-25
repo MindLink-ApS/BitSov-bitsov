@@ -684,6 +684,12 @@ fn console_first_contact_and_readmission_share_six_sat_call_cap() {
         service.grant_first_contact(&client, "grant", &recipient, 7_000, None),
         Err(BudgetRefusal::PerCall { max_msat: 6_000 })
     ));
+    // Nightly run 40155311812: the three-node quote was 2_001 + 2_001 plus two
+    // default 5_000 msat fee floors. That 14_002 msat all-in call is over the cap.
+    assert!(matches!(
+        service.grant_first_contact(&client, "grant", &recipient, 14_002, None),
+        Err(BudgetRefusal::PerCall { max_msat: 6_000 })
+    ));
     service
         .grant_first_contact(&client, "grant", &recipient, 6_000, None)
         .unwrap();

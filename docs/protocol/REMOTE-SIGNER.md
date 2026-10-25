@@ -5,7 +5,7 @@ ship now. The signer protocol (§3 to §5) is not built; every **GAP** marks
 that. It extends `ACCOUNT-LAYER.md` §7.
 
 Doctrine this must not break (genesis `01_Core_Module_and_Concept.md` §1.2,
-`BITSOV-NORTHSTAR.md`):
+an internal design note):
 
 - **The node is the sovereign identity.** A cloud VM may give a node
   reachability and uptime. It must not become the owner.
