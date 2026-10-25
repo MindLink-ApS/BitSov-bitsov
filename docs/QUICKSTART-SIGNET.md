@@ -27,17 +27,20 @@ energy and admission, never identity.
 
 ## 1. Build from source
 
-Rust is the only build dependency. `Cargo.toml` sets the minimum at **1.89**
-and the release build pins **1.91.1** (`scripts/release-toolchain`); use that
-exact version for a build that matches the release. CI and a plain `cargo`
-in the checkout use the exact version pinned in `rust-toolchain.toml`, and this
-guide was run on stable 1.97.0, so a newer stable also works.
+Rust, installed through rustup, is the only build dependency. The checkout
+pins the exact compiler in `rust-toolchain.toml` (**1.99.1** today, with
+clippy and rustfmt); rustup installs it on first use inside the checkout, and
+CI builds on the same version. See [the toolchain pin](ci/RUST-TOOLCHAIN.md)
+for how that relates to the minimum supported version (`rust-version` 1.89 in
+`Cargo.toml`) and to the release-binary toolchain (**1.91.1** in
+`scripts/release-toolchain`; use `cargo +1.91.1` only to reproduce a release
+build). This guide was run on stable 1.97.0 before the pin landed.
 
 ```sh
-rustup toolchain install 1.91.1
 git clone https://github.com/MindLink-ApS/BitSov-bitsov.git
 cd BitSov-bitsov
-cargo +1.91.1 build --release -p konsensus-node
+rustc --version   # rustup installs the pinned toolchain the first time
+cargo build --release -p konsensus-node
 ./target/release/konsensus --version
 ```
 
@@ -317,7 +320,7 @@ signet-specific steps are marked.
 
 | Step | Ran as written | Notes |
 | --- | --- | --- |
-| 1. Build | yes | `cargo build -p konsensus-node`; the 1.91.1 pin itself was not installed in the session |
+| 1. Build | yes | `cargo build -p konsensus-node` on stable 1.97.0, before `rust-toolchain.toml` (1.99.1) landed on main; neither pinned version was installed in the session |
 | 2. `init --tier full`, config edit | yes | Fresh config confirmed to contain `network = "bitcoin"` and mainnet URLs; after the edit the node starts, logs `network=signet`, and reports `money_ready: false` because the Esplora servers were unreachable from the session |
 | 3. `start --owner-control` | yes | Signet config above, and two mock nodes on loopback ports |
 | 4. Owner token, `status` | yes | `docs/ops/owner-token.sh` on both nodes |
