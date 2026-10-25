@@ -4029,3 +4029,249 @@ async fn session_decode_logs_do_not_echo_peer_json() {
         vec!["invalid wire JSON", "invalid wire JSON"],
     );
 }
+
+// ── Validate before replace ─────────────────────────────────────────
+
+/// Two identities with an established, bidirectional E2EE session, returned
+/// as (initiator, its manager, responder, its manager): the initiator has the
+/// lower NodeId, so it is the side `handle_prekey_offer` acts on.
+async fn established_pair() -> (
+    Arc<NodeIdentity>,
+    SessionManager,
+    Arc<NodeIdentity>,
+    SessionManager,
+) {
+    let a = identity_from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    );
+    let b = identity_from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
+    let (low, high) = if a.node_id().as_bytes() < b.node_id().as_bytes() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let low_mgr = SessionManager::new(Arc::clone(&low));
+    let high_mgr = SessionManager::new(Arc::clone(&high));
+    let init = low_mgr
+        .initiate_session(high.node_id(), &high_mgr.prekey_bundle().await)
+        .await
+        .unwrap();
+    high_mgr.accept_session(low.node_id(), &init).await.unwrap();
+    // The responder's sending chain needs the initiator's first message.
+    let first = low_mgr
+        .encrypt(high.node_id(), b"ratchet-init")
+        .await
+        .unwrap();
+    high_mgr.decrypt(low.node_id(), &first).await.unwrap();
+    (low, low_mgr, high, high_mgr)
+}
+
+/// A send and a receive in each direction still succeed.
+async fn assert_session_works(
+    low: &NodeIdentity,
+    low_mgr: &SessionManager,
+    high: &NodeIdentity,
+    high_mgr: &SessionManager,
+    label: &str,
+) {
+    let msg = low_mgr
+        .encrypt(high.node_id(), label.as_bytes())
+        .await
+        .expect(label);
+    assert_eq!(
+        high_mgr.decrypt(low.node_id(), &msg).await.expect(label),
+        label.as_bytes()
+    );
+    let reply = high_mgr
+        .encrypt(low.node_id(), b"reply")
+        .await
+        .expect(label);
+    assert_eq!(
+        low_mgr.decrypt(high.node_id(), &reply).await.expect(label),
+        b"reply"
+    );
+}
+
+/// A malformed, forged or misattributed PrekeyOffer leaves the working
+/// session untouched (a send and a receive still succeed afterwards); a
+/// genuine re-offer still re-keys.
+#[tokio::test]
+async fn malformed_prekey_offer_leaves_the_working_session_alone() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+    let mut negotiations = std::collections::HashMap::new();
+
+    let genuine = high_mgr.prekey_bundle().await;
+    let mut forged = genuine.clone();
+    forged.signed_prekey_sig = hex::encode([0u8; 64]);
+    let mut malformed = genuine.clone();
+    malformed.signed_prekey = hex::encode([7u8; 31]);
+    let mut no_prekey_id = genuine.clone();
+    no_prekey_id.one_time_prekey = Some("zz".into());
+    let stranger = identity_from_mnemonic(
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+    );
+    let strangers = SessionManager::new(Arc::clone(&stranger))
+        .prekey_bundle()
+        .await;
+    let offers = [
+        ("not a bundle", serde_json::json!("not a bundle")),
+        ("forged signature", serde_json::to_value(&forged).unwrap()),
+        ("malformed key", serde_json::to_value(&malformed).unwrap()),
+        (
+            "malformed one-time prekey",
+            serde_json::to_value(&no_prekey_id).unwrap(),
+        ),
+        (
+            "a valid bundle of another node",
+            serde_json::to_value(&strangers).unwrap(),
+        ),
+    ];
+    for (label, offer) in offers {
+        handle_prekey_offer(
+            high.node_id(),
+            offer,
+            *low.node_id(),
+            &low_mgr,
+            &storage,
+            &transport,
+            &audit,
+            &mut negotiations,
+        )
+        .await;
+        assert!(
+            negotiations.is_empty(),
+            "{label}: a refused offer is no negotiation"
+        );
+        assert_session_works(&low, &low_mgr, &high, &high_mgr, label).await;
+    }
+
+    // A genuine re-offer (the peer restarted with fresh keys) still re-keys.
+    let restarted = SessionManager::new(Arc::clone(&high));
+    let offer = serde_json::to_value(restarted.prekey_bundle().await).unwrap();
+    handle_prekey_offer(
+        high.node_id(),
+        offer,
+        *low.node_id(),
+        &low_mgr,
+        &storage,
+        &transport,
+        &audit,
+        &mut negotiations,
+    )
+    .await;
+    assert!(
+        negotiations.contains_key(high.node_id()),
+        "a valid offer is a negotiation"
+    );
+    assert!(low_mgr.can_send(high.node_id()).await);
+    let msg = low_mgr
+        .encrypt(high.node_id(), b"after the re-key")
+        .await
+        .unwrap();
+    assert!(
+        high_mgr.decrypt(low.node_id(), &msg).await.is_err(),
+        "the previous session was replaced by the valid offer"
+    );
+}
+
+/// A malformed SessionInit, or one naming a one-time pre-key this node does
+/// not hold, leaves the working session untouched (a send and a receive still
+/// succeed afterwards) and consumes no pre-key; a genuine re-initiation still
+/// re-keys.
+#[tokio::test]
+async fn malformed_session_init_leaves_the_working_session_alone() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+    let mut negotiations = std::collections::HashMap::new();
+
+    let held = high_mgr.prekey_bundle().await.one_time_prekey_id.unwrap();
+    let key = hex::encode([2u8; 32]);
+    let inits = [
+        ("not an init", serde_json::json!("not an init")),
+        (
+            "malformed key",
+            serde_json::json!({
+                "identity_key": "zz", "ephemeral_key": key, "one_time_prekey_id": held, "ratchet_key": key,
+            }),
+        ),
+        (
+            "unknown one-time prekey",
+            serde_json::json!({
+                "identity_key": key, "ephemeral_key": key, "one_time_prekey_id": u32::MAX, "ratchet_key": key,
+            }),
+        ),
+    ];
+    for (label, init) in inits {
+        handle_session_init(
+            low.node_id(),
+            init,
+            &high_mgr,
+            &storage,
+            &transport,
+            &audit,
+            &mut negotiations,
+        )
+        .await;
+        assert!(
+            negotiations.is_empty(),
+            "{label}: a refused init is no negotiation"
+        );
+        assert_session_works(&low, &low_mgr, &high, &high_mgr, label).await;
+    }
+    assert_eq!(
+        high_mgr.prekey_bundle().await.one_time_prekey_id,
+        Some(held),
+        "a refused init consumes no one-time pre-key"
+    );
+
+    // A genuine re-initiation (the peer restarted) still re-keys.
+    let restarted = SessionManager::new(Arc::clone(&low));
+    let init = restarted
+        .initiate_session(high.node_id(), &high_mgr.prekey_bundle().await)
+        .await
+        .unwrap();
+    handle_session_init(
+        low.node_id(),
+        serde_json::to_value(&init).unwrap(),
+        &high_mgr,
+        &storage,
+        &transport,
+        &audit,
+        &mut negotiations,
+    )
+    .await;
+    assert!(
+        negotiations.contains_key(low.node_id()),
+        "a valid init is a negotiation"
+    );
+    let msg = restarted
+        .encrypt(high.node_id(), b"after the re-key")
+        .await
+        .unwrap();
+    assert_eq!(
+        high_mgr.decrypt(low.node_id(), &msg).await.unwrap(),
+        b"after the re-key"
+    );
+}
+
+/// The receipt refusals are terminal for the sender: a resend of the same
+/// bytes could never be read, so nothing is resent.
+#[test]
+fn receipt_refusals_are_terminal_for_the_sender() {
+    use crate::msg_handler::ReceiptRefusal;
+    for refusal in [
+        ReceiptRefusal::Undecryptable("x"),
+        ReceiptRefusal::NotPersisted("x"),
+        ReceiptRefusal::FileCorrupted("x"),
+    ] {
+        assert!(terminal_paid_rejection(&refusal.to_string()), "{refusal}");
+    }
+    assert!(!terminal_paid_rejection("storage error"));
+}

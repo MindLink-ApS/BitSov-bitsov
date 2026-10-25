@@ -5,6 +5,18 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Validate a peer's `PrekeyOffer` or `SessionInit` in full (key formats, the
+  node id the bundle names, the signed pre-key signature, a one-time pre-key
+  this node holds) before touching the session it replaces; the working
+  session stays usable until a new one is fully derived, and the swap is one
+  atomic write. A malformed or forged offer no longer erases a good session.
+- Never acknowledge a paid message as delivered when its plaintext cannot be
+  produced and kept: an undecryptable chat (no session, not a ratchet message,
+  or a failed decryption), a plaintext or file that could not be stored, and a
+  file that fails its integrity check are withdrawn and refused with a typed
+  `MessageReject` (`undecryptable:`, `not_persisted:`, `file_corrupted:`),
+  which the sender records as terminal `failed_paid`. A damaged file is never
+  listed, stored or shown to the app as received.
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'
   scripts instead of all 2000 derived scripts. Before each focused sweep preview,

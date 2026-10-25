@@ -348,11 +348,11 @@ async fn process_file_valid_stores_file() {
 
     let result = process_file_message(&bytes, &sender, &envelope, &storage, &audit).await;
 
-    assert_eq!(result, Some("[file: test.txt]".to_string()));
+    assert_eq!(result, Ok("[file: test.txt]".to_string()));
 }
 
 #[tokio::test]
-async fn process_file_hash_mismatch_discards_data() {
+async fn process_file_hash_mismatch_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
@@ -380,12 +380,18 @@ async fn process_file_hash_mismatch_discards_data() {
 
     let result = process_file_message(&bytes, &sender, &envelope, &storage, &audit).await;
 
-    // Returns filename (for display) but does NOT store the file (hash mismatch)
-    assert_eq!(result, Some("[file: corrupt.txt]".to_string()));
+    // A hash mismatch is a damaged file: refused, never stored, never shown.
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::FileCorrupted(
+            "the file data does not match its hash"
+        ))
+    );
+    assert!(storage.list_files(10).await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn process_file_invalid_json_returns_none() {
+async fn process_file_invalid_json_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
@@ -401,11 +407,14 @@ async fn process_file_invalid_json_returns_none() {
     let sender = *alice.node_id();
 
     let result = process_file_message(bytes, &sender, &envelope, &storage, &audit).await;
-    assert_eq!(result, None);
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::FileCorrupted("the payload is not a file"))
+    );
 }
 
 #[tokio::test]
-async fn process_file_invalid_base64_returns_filename() {
+async fn process_file_invalid_base64_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
@@ -430,14 +439,17 @@ async fn process_file_invalid_base64_returns_filename() {
 
     let result = process_file_message(&bytes, &sender, &envelope, &storage, &audit).await;
 
-    // Invalid base64 returns filename (graceful degradation)
-    assert_eq!(result, Some("[file: broken.bin]".to_string()));
+    // Undecodable data is a damaged file: refused, not reported as arrived.
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::FileCorrupted("the file data is not base64"))
+    );
 }
 
 // ── decrypt_and_process tests ───────────────────────────────────────
 
 #[tokio::test]
-async fn decrypt_no_session_returns_none() {
+async fn decrypt_no_session_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let session_mgr = SessionManager::new(Arc::clone(&bob));
@@ -474,11 +486,17 @@ async fn decrypt_no_session_returns_none() {
     )
     .await;
 
-    assert!(result.is_none(), "no session should return None");
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::Undecryptable(
+            "no E2EE session with the sender"
+        )),
+        "a paid message with no session to read it is refused, not acknowledged"
+    );
 }
 
 #[tokio::test]
-async fn decrypt_invalid_ratchet_message_returns_none() {
+async fn decrypt_invalid_ratchet_message_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let bob_mgr = SessionManager::new(Arc::clone(&bob));
@@ -520,9 +538,12 @@ async fn decrypt_invalid_ratchet_message_returns_none() {
     )
     .await;
 
-    assert!(
-        result.is_none(),
-        "invalid ratchet message should return None"
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::Undecryptable(
+            "ciphertext is not a ratchet message"
+        )),
+        "a paid message that is not a ratchet message is refused, not acknowledged"
     );
 }
 
@@ -575,7 +596,7 @@ async fn decrypt_valid_message_returns_plaintext_and_caches() {
     )
     .await;
 
-    assert_eq!(result, Some("Hello from Alice!".to_string()));
+    assert_eq!(result, Ok(Some("Hello from Alice!".to_string())));
     // Verify plaintext was cached in storage
     assert!(storage.has_plaintext(&envelope.id));
 }
@@ -641,7 +662,7 @@ async fn decrypt_file_ref_stores_and_returns_label() {
     )
     .await;
 
-    assert_eq!(result, Some("[file: report.pdf]".to_string()));
+    assert_eq!(result, Ok(Some("[file: report.pdf]".to_string())));
     assert_eq!(storage.file_count(), 1);
 }
 
@@ -1023,8 +1044,13 @@ async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
     )
     .await;
 
-    // Decryption failed → returns None
-    assert!(result.is_none());
+    // Decryption failed → refused, never acknowledged as delivered
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::Undecryptable(
+            "the session could not decrypt the ciphertext"
+        ))
+    );
     // Session should be removed for re-negotiation
     assert!(!bob_mgr.has_session(alice.node_id()).await);
 }
@@ -1081,7 +1107,11 @@ async fn decrypt_non_utf8_returns_none() {
     .await;
 
     // Non-UTF8 for a chat message returns None
-    assert!(result.is_none());
+    assert_eq!(
+        result,
+        Ok(None),
+        "kept, but not text: nothing to show, still delivered"
+    );
 }
 
 // ── HARD-11: registry read guard released before the gate await ──────
@@ -3346,4 +3376,335 @@ async fn porch_card_repricing_failure_returns_correlated_error() {
         !response.body.contains("page_msat"),
         "never serve the stale price"
     );
+}
+
+// ── Honest receipts: refuse what cannot be read or kept ─────────────
+
+/// Bob's live receive loop (`run`) behind a PriceOpen Noise transport, an
+/// in-memory SQLite store and a mock wallet, with Alice connected and holding
+/// an E2EE session with Bob (`sessions_a` with Bob's manager).
+struct ReceiveLoop {
+    alice: Arc<NodeIdentity>,
+    bob: Arc<NodeIdentity>,
+    source: Arc<NoiseTransport>,
+    target: Arc<NoiseTransport>,
+    db: Arc<konsensus_storage::SqliteStorage>,
+    wallet: Arc<konsensus_lightning::MockLightningProvider>,
+    sessions_a: SessionManager,
+    sessions_b: Arc<SessionManager>,
+    audit_path: std::path::PathBuf,
+    ws_rx: broadcast::Receiver<Arc<WsMessage>>,
+    shutdown: watch::Sender<bool>,
+    worker: tokio::task::JoinHandle<()>,
+    _dir: tempfile::TempDir,
+}
+
+async fn receive_loop() -> ReceiveLoop {
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let transport = |id| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    assert!(matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ));
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let sessions_b = Arc::new(SessionManager::new(bob.clone()));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let audit_path = dir.path().join("audit.jsonl");
+    let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, ws_rx) = broadcast::channel(8);
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(),
+        transport_ack: target.clone(),
+        storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        })),
+        pricing: Arc::new(MutableDeliveryPrice(std::sync::atomic::AtomicU64::new(
+            1_000,
+        ))),
+        lightning: wallet.clone(),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b.clone(),
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None,
+        front_door: Default::default(),
+        routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(),
+        plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx,
+        audit_log: audit,
+        admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None,
+        shutdown_rx,
+    }));
+    ReceiveLoop {
+        alice,
+        bob,
+        source,
+        target,
+        db,
+        wallet,
+        sessions_a,
+        sessions_b,
+        audit_path,
+        ws_rx,
+        shutdown,
+        worker,
+        _dir: dir,
+    }
+}
+
+impl ReceiveLoop {
+    /// A signed envelope from Alice to Bob paid with a fresh settled keysend.
+    async fn paid_envelope(&self, kind: u16, ciphertext: Vec<u8>) -> konsensus_core::UkmEnvelope {
+        let hash = self.wallet.inject_inbound_keysend(1_000, None).await;
+        let payment = self.wallet.get_payment_status(&hash).await.unwrap();
+        let proof = PaymentProof::new(
+            hex::decode(&hash).unwrap().try_into().unwrap(),
+            hex::decode(payment.preimage.unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            1_000,
+        );
+        let mut env = UkmEnvelopeBuilder::new(
+            kind,
+            *self.alice.node_id(),
+            Recipient::Node(*self.bob.node_id()),
+            ciphertext,
+            proof,
+        )
+        .build();
+        env.signature = Signature::from_ed25519(&self.alice.sign(&env.signable_bytes()));
+        env
+    }
+
+    /// Alice's ciphertext for Bob under their session.
+    async fn ciphertext(&self, plaintext: &[u8]) -> Vec<u8> {
+        konsensus_crypto::ratchet_message_to_bytes(
+            &self
+                .sessions_a
+                .encrypt(self.bob.node_id(), plaintext)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// Send `env` and return Bob's delivery verdict: an ACK or a reject.
+    async fn verdict(&self, env: &konsensus_core::UkmEnvelope) -> konsensus_message::ControlEvent {
+        use konsensus_message::ControlEvent;
+        self.source.send(self.bob.node_id(), env).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                // Prekey offers and the like are not delivery verdicts.
+                if let event @ (ControlEvent::MessageAcked { .. }
+                | ControlEvent::MessageRejected { .. }) =
+                    self.source.recv_control().await.unwrap()
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("Bob answers every paid envelope")
+    }
+
+    /// The receipt state Bob keeps for `env`'s payment: 1 accepted, -1
+    /// application-rejected (the payment stays burned), None unknown.
+    async fn receipt_state(&self, env: &konsensus_core::UkmEnvelope) -> Option<i32> {
+        sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE message_id = ?")
+            .bind(env.id.to_hex())
+            .fetch_optional(self.db.pool())
+            .await
+            .unwrap()
+    }
+
+    fn audit_log(&self) -> String {
+        std::fs::read_to_string(&self.audit_path).unwrap_or_default()
+    }
+
+    async fn stop(self) {
+        self.shutdown.send(true).unwrap();
+        self.worker.await.unwrap();
+        self.source.shutdown();
+        self.target.shutdown();
+    }
+}
+
+fn file_payload(filename: &str, sent: &[u8], received: &[u8]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "filename": filename,
+        "mime_type": "application/octet-stream",
+        "size_bytes": received.len(),
+        "blake3_hash": blake3::hash(sent).to_hex().to_string(),
+        "data_b64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, received),
+    }))
+    .unwrap()
+}
+
+/// A paid chat Bob cannot decrypt is refused with a typed reject, withdrawn
+/// (its payment stays burned) and never shown to the app; it is never
+/// acknowledged as delivered, and a resend of the same bytes is refused too.
+#[tokio::test]
+async fn undecryptable_paid_chat_is_refused_not_acknowledged() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+
+    // Alice's ciphertext comes from a session Bob never had.
+    let stale_a = SessionManager::new(net.alice.clone());
+    let stale_b = SessionManager::new(net.bob.clone());
+    establish_sessions(&stale_a, &stale_b, &net.alice, &net.bob).await;
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+        &stale_a
+            .encrypt(net.bob.node_id(), b"unreadable")
+            .await
+            .unwrap(),
+    );
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext)
+        .await;
+
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason == "undecryptable: the session could not decrypt the ciphertext"),
+        "expected a typed reject, got {verdict:?}"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "withdrawn from history"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        net.receipt_state(&env).await,
+        Some(-1),
+        "the payment stays burned, application-rejected"
+    );
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it");
+    assert!(
+        net.audit_log().contains("message.rejected"),
+        "{}",
+        net.audit_log()
+    );
+    assert!(
+        !net.sessions_b.has_session(net.alice.node_id()).await,
+        "the unreadable session is dropped for re-negotiation, as before"
+    );
+
+    // The sender treats the reason as terminal and resends nothing. Even a
+    // resend of the same bytes is refused as a reused proof, never acknowledged.
+    let again = net.verdict(&env).await;
+    assert!(
+        matches!(&again, ControlEvent::MessageRejected { reason, .. }
+            if reason.starts_with("payment proof already used:")),
+        "a resend is refused, not acknowledged: {again:?}"
+    );
+    assert!(net.ws_rx.try_recv().is_err());
+    assert!(net.db.get_message(&env.id).await.unwrap().is_none());
+    net.stop().await;
+}
+
+/// A received file that fails its integrity check is reported failed to the
+/// app (never listed, never stored, audited) and to the sender (a typed
+/// reject, never a delivered ACK); the session stays usable for the next file.
+#[tokio::test]
+async fn corrupted_file_is_failed_to_the_app_and_the_sender() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+
+    let damaged = net
+        .ciphertext(&file_payload(
+            "damaged.bin",
+            b"the bytes that were sent",
+            b"the bytes that arrived",
+        ))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, damaged)
+        .await;
+
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason == "file_corrupted: the file data does not match its hash"),
+        "expected a typed reject, got {verdict:?}"
+    );
+    assert!(
+        net.db.list_files(10).await.unwrap().is_empty(),
+        "never stored"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "never listed as received"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        net.receipt_state(&env).await,
+        Some(-1),
+        "the payment stays burned, application-rejected"
+    );
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it arrive");
+    let audit = net.audit_log();
+    assert!(
+        audit.contains("file.integrity_failed") && audit.contains("message.rejected"),
+        "{audit}"
+    );
+
+    // An intact file after it is received as usual: the session was not harmed.
+    let intact = net
+        .ciphertext(&file_payload("intact.bin", b"intact", b"intact"))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, intact)
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageAcked {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(net.db.list_files(10).await.unwrap().len(), 1);
+    assert_eq!(net.receipt_state(&env).await, Some(1));
+    let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.plaintext.as_deref(), Some("[file: intact.bin]"));
+    net.stop().await;
 }

@@ -207,6 +207,55 @@ async fn offer_prekey_after_promotion(
     }
 }
 
+/// The fixed, non-empty payload of a first-contact admission proof (see the
+/// compose handler): a paid envelope that carries no readable content and is
+/// sent before, or outside, any E2EE session. It is acknowledged as received,
+/// never read.
+const ADMISSION_ENVELOPE_MARKER: &[u8] = b"konsensus:admission:v1";
+
+/// Why a paid envelope that passed the gate and was stored is refused instead
+/// of acknowledged as delivered: this node could not produce its plaintext and
+/// keep it. The envelope is withdrawn (`reject_accepted_envelope`), so history
+/// and resync never show it and a resend of the same bytes is refused as a
+/// reused proof; the payment hash and nonce stay burned. The sender gets a
+/// `MessageReject` whose reason starts with [`ReceiptRefusal::code`], which
+/// its delivery tracking treats as terminal for that envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReceiptRefusal {
+    /// No session with the sender, not a ratchet message, or the ratchet
+    /// refused the ciphertext.
+    Undecryptable(&'static str),
+    /// Decrypted, but the plaintext (or the file it carries) was not kept.
+    NotPersisted(&'static str),
+    /// A file whose payload is damaged or whose hash does not match its data.
+    FileCorrupted(&'static str),
+}
+
+impl ReceiptRefusal {
+    /// Stable code, the first word of the `MessageReject` reason.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            ReceiptRefusal::Undecryptable(_) => "undecryptable",
+            ReceiptRefusal::NotPersisted(_) => "not_persisted",
+            ReceiptRefusal::FileCorrupted(_) => "file_corrupted",
+        }
+    }
+
+    fn detail(&self) -> &'static str {
+        match self {
+            ReceiptRefusal::Undecryptable(d)
+            | ReceiptRefusal::NotPersisted(d)
+            | ReceiptRefusal::FileCorrupted(d) => d,
+        }
+    }
+}
+
+impl std::fmt::Display for ReceiptRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code(), self.detail())
+    }
+}
+
 /// Runs the incoming message handler loop.
 ///
 /// Receives envelopes from the transport, validates them through the payment gate,
@@ -560,8 +609,13 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             }
                         }
 
-                        // Attempt to decrypt ciphertext via Double Ratchet session
-                        let plaintext = decrypt_and_process(
+                        // Attempt to decrypt ciphertext via Double Ratchet session.
+                        // A paid envelope whose plaintext cannot be produced and
+                        // kept is never acknowledged as delivered: it is withdrawn
+                        // (the payment hash and nonce stay burned) and the sender
+                        // gets a typed `MessageReject`. If the withdrawal fails, a
+                        // held chat stays hidden until the sweep.
+                        let plaintext = match decrypt_and_process(
                             &envelope,
                             &sender,
                             &session_mgr_for_recv,
@@ -576,7 +630,25 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             &audit_for_recv,
                             &gate_for_recv,
                             trust_discount,
-                        ).await;
+                        ).await {
+                            Ok(plaintext) => plaintext,
+                            Err(refusal) => {
+                                warn!(sender = %sender, kind = envelope.kind, msg_id = %msg_id, reason = %refusal, "paid message not readable or not kept; refused, not acknowledged");
+                                if let Err(e) = storage_for_recv.reject_accepted_envelope(&envelope).await {
+                                    error!(msg_id = %msg_id, error = %e, "failed to withdraw a refused message; a held chat stays hidden until the sweep");
+                                }
+                                audit_for_recv.record(
+                                    konsensus_api::audit::events::MESSAGE_REJECTED,
+                                    &sender.to_hex(),
+                                    Some(serde_json::json!({ "reason": refusal.code(), "kind": envelope.kind, "message_id": msg_id.to_hex() })),
+                                );
+                                let reject = Frame::MessageReject { id: msg_id, reason: refusal.to_string() };
+                                if let Err(e) = transport_for_ack.send_frame(&sender, &reject).await {
+                                    warn!(peer = %sender, error = %e, "failed to send MessageReject");
+                                }
+                                continue;
+                            }
+                        };
 
                         // 1:1 calls: the gate made this envelope paid and single-use;
                         // the call registry makes the offer single-use per call id and
@@ -688,8 +760,12 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
 
 /// Decrypts an incoming envelope and processes special message kinds (files, web content).
 ///
-/// Returns the plaintext string if decryption succeeded, or None if no session exists
-/// or decryption failed (triggers session re-negotiation).
+/// Returns the plaintext string when it was produced and kept (`Ok(None)` when
+/// it was kept but is not UTF-8 text, or for an admission proof, which carries
+/// none). Returns a [`ReceiptRefusal`] when no plaintext could be produced
+/// (no session, not a ratchet message, or a failed decryption, which also
+/// triggers session re-negotiation) or kept; the caller then withdraws the
+/// envelope and refuses it instead of acknowledging delivery.
 #[allow(clippy::too_many_arguments)]
 async fn decrypt_and_process(
     envelope: &konsensus_core::UkmEnvelope,
@@ -706,17 +782,28 @@ async fn decrypt_and_process(
     audit: &Arc<AuditLog>,
     gate: &PaymentGate,
     trust_discount: f64,
-) -> Option<String> {
+) -> Result<Option<String>, ReceiptRefusal> {
+    // A first-contact admission proof carries nothing to read; it is
+    // acknowledged as received whether or not a session exists yet.
+    if envelope.ciphertext == ADMISSION_ENVELOPE_MARKER {
+        debug!(sender = %sender, "admission proof envelope; nothing to decrypt");
+        return Ok(None);
+    }
+
     if !session_mgr.has_session(sender).await {
         debug!(sender = %sender, "no E2EE session, cannot decrypt");
-        return None;
+        return Err(ReceiptRefusal::Undecryptable(
+            "no E2EE session with the sender",
+        ));
     }
 
     let ratchet_msg = match konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext) {
         Ok(msg) => msg,
         Err(e) => {
             debug!(sender = %sender, error = %e, "ciphertext is not a valid ratchet message");
-            return None;
+            return Err(ReceiptRefusal::Undecryptable(
+                "ciphertext is not a ratchet message",
+            ));
         }
     };
 
@@ -741,11 +828,14 @@ async fn decrypt_and_process(
                     warn!(peer = %sender, error = %e, "failed to send PrekeyOffer for re-negotiation");
                 }
             }
-            return None;
+            return Err(ReceiptRefusal::Undecryptable(
+                "the session could not decrypt the ciphertext",
+            ));
         }
     };
 
-    // Cache decrypted plaintext (encrypted at rest) for API access
+    // Cache decrypted plaintext (encrypted at rest) for API access. A paid
+    // message this node cannot keep is not delivered.
     match plaintext_cipher.encrypt(&bytes) {
         Ok(encrypted) => {
             if let Err(e) = storage
@@ -753,17 +843,26 @@ async fn decrypt_and_process(
                 .await
             {
                 warn!(msg_id = %envelope.id, error = %e, "failed to cache plaintext");
+                return Err(ReceiptRefusal::NotPersisted(
+                    "the plaintext could not be stored",
+                ));
             }
         }
         Err(e) => {
             warn!(msg_id = %envelope.id, error = %e, "failed to encrypt plaintext for cache");
+            return Err(ReceiptRefusal::NotPersisted(
+                "the plaintext could not be stored",
+            ));
         }
     }
 
     // Route based on message kind
     if envelope.kind == konsensus_core::kind::KIND_FILE_REF {
-        process_file_message(&bytes, sender, envelope, storage, audit).await
-    } else if envelope.kind == konsensus_core::kind::KIND_CALENDAR_EVENT
+        return process_file_message(&bytes, sender, envelope, storage, audit)
+            .await
+            .map(Some);
+    }
+    let plaintext = if envelope.kind == konsensus_core::kind::KIND_CALENDAR_EVENT
         || envelope.kind == konsensus_core::kind::KIND_CALENDAR_UPDATE
     {
         process_calendar_event(&bytes, sender, envelope, storage).await
@@ -844,22 +943,27 @@ async fn decrypt_and_process(
                 None
             }
         }
-    }
+    };
+    Ok(plaintext)
 }
 
 /// Process an incoming file transfer message (KIND_FILE_REF).
+///
+/// A file is received only once its data has been decoded, has matched its
+/// hash and has been stored; otherwise it is refused and never surfaced to
+/// the app as arrived.
 async fn process_file_message(
     bytes: &[u8],
     sender: &konsensus_core::types::NodeId,
     envelope: &konsensus_core::UkmEnvelope,
     storage: &Arc<dyn konsensus_storage::Storage>,
     audit: &Arc<AuditLog>,
-) -> Option<String> {
+) -> Result<String, ReceiptRefusal> {
     let payload = match konsensus_api::handlers::files::FilePayload::from_wire_bytes(bytes) {
         Ok(p) => p,
         Err(e) => {
             debug!(sender = %sender, error = %e, "KIND_FILE_REF payload not valid JSON");
-            return None;
+            return Err(ReceiptRefusal::FileCorrupted("the payload is not a file"));
         }
     };
 
@@ -870,7 +974,7 @@ async fn process_file_message(
         Ok(data) => data,
         Err(e) => {
             warn!(sender = %sender, error = %e, "failed to decode base64 file data");
-            return Some(format!("[file: {}]", payload.filename));
+            return Err(ReceiptRefusal::FileCorrupted("the file data is not base64"));
         }
     };
 
@@ -893,7 +997,9 @@ async fn process_file_message(
                 "message_id": envelope.id.to_hex(),
             })),
         );
-        return Some(format!("[file: {}]", payload.filename));
+        return Err(ReceiptRefusal::FileCorrupted(
+            "the file data does not match its hash",
+        ));
     }
 
     let file = konsensus_storage::FileRecord {
@@ -910,27 +1016,27 @@ async fn process_file_message(
     let file_id = file.id.clone();
     if let Err(e) = storage.store_file(&file).await {
         error!(error = %e, "failed to store received file");
-    } else {
-        info!(
-            sender = %sender,
-            file_id = %file_id,
-            filename = %payload.filename,
-            size = payload.size_bytes,
-            "stored received file"
-        );
-        audit.record(
-            konsensus_api::audit::events::FILE_RECEIVED,
-            &sender.to_hex(),
-            Some(serde_json::json!({
-                "file_id": file_id,
-                "filename": payload.filename,
-                "size_bytes": payload.size_bytes,
-                "message_id": envelope.id.to_hex(),
-            })),
-        );
+        return Err(ReceiptRefusal::NotPersisted("the file could not be stored"));
     }
+    info!(
+        sender = %sender,
+        file_id = %file_id,
+        filename = %payload.filename,
+        size = payload.size_bytes,
+        "stored received file"
+    );
+    audit.record(
+        konsensus_api::audit::events::FILE_RECEIVED,
+        &sender.to_hex(),
+        Some(serde_json::json!({
+            "file_id": file_id,
+            "filename": payload.filename,
+            "size_bytes": payload.size_bytes,
+            "message_id": envelope.id.to_hex(),
+        })),
+    );
 
-    Some(format!("[file: {}]", payload.filename))
+    Ok(format!("[file: {}]", payload.filename))
 }
 
 /// Process an incoming calendar event (KIND_CALENDAR_EVENT or KIND_CALENDAR_UPDATE).
