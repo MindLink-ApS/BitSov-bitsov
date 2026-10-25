@@ -42,6 +42,8 @@ def evaluate(head_sha, branch, labels, files, comments, authors=""):
                 if author.strip()} if authors.strip() else None)
     latest = {}
     for comment in comments:
+        if comment.get("author_association") not in ("OWNER", "MEMBER", "COLLABORATOR"):
+            continue
         if allowed is not None and comment["user"]["login"].casefold() not in allowed:
             continue
         lines = (comment.get("body") or "").splitlines()
@@ -125,6 +127,7 @@ def run_gate(event_name, event, repository, authors="", *, api=github_api):
     # Clear any previous success before API reads; errors leave this pending.
     post(sha, "pending", f"computing review gate on {sha[:7]}")
     files = api(f"{endpoint}/files?per_page=100", paginate=True)
+    # Keep full comment objects, including GitHub's author_association.
     comments = api(f"{root}/issues/{number}/comments?per_page=100", paginate=True)
     current = api(endpoint)
     if (current["head"]["sha"] != sha or current["head"]["ref"] != pr["head"]["ref"]

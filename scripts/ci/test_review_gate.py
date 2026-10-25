@@ -13,11 +13,12 @@ STALE = "b" * 40
 
 
 def verdict(vendor, outcome="PASS", sha=HEAD, *, number=1, author="reviewer",
-            updated=None):
+            association="MEMBER", updated=None):
     return {
         "id": number,
         "body": f"{vendor}-VERDICT {outcome} {sha}\nReview details follow.",
         "user": {"login": author},
+        "author_association": association,
         "created_at": f"2026-10-25T00:00:{number:02d}Z",
         "updated_at": updated or f"2026-10-25T00:00:{number:02d}Z",
     }
@@ -153,6 +154,41 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(self.check_gate(comments, authors="bob")[0], "pending")
         self.assertEqual(self.check_gate(comments)[0], "failure")
 
+    def test_trusted_author_associations_count_with_or_without_allowlist(self):
+        for association in ["OWNER", "MEMBER", "COLLABORATOR"]:
+            for authors in ["", "reviewer"]:
+                with self.subTest(association=association, authors=authors):
+                    comments = [verdict("CODEX", association=association),
+                                verdict("CURSOR", association=association)]
+                    self.assertEqual(self.check_gate(comments, authors=authors)[0], "success")
+
+    def test_outsider_pass_is_ignored_with_or_without_allowlist(self):
+        for association in ["NONE", "CONTRIBUTOR", "FIRST_TIMER",
+                            "FIRST_TIME_CONTRIBUTOR", "MANNEQUIN", None, "UNKNOWN"]:
+            for authors in ["", "reviewer, outsider"]:
+                with self.subTest(association=association, authors=authors):
+                    comments = [verdict("CURSOR"),
+                                verdict("CODEX", author="outsider", association=association)]
+                    self.assertEqual(self.check_gate(comments, authors=authors)[0], "pending")
+
+    def test_outsider_fail_does_not_block_with_or_without_allowlist(self):
+        for association in ["NONE", "CONTRIBUTOR", "FIRST_TIMER",
+                            "FIRST_TIME_CONTRIBUTOR", "MANNEQUIN", None, "UNKNOWN"]:
+            for authors in ["", "reviewer, outsider"]:
+                with self.subTest(association=association, authors=authors):
+                    comments = [verdict("CODEX"), verdict("CURSOR"),
+                                verdict("CODEX", "FAIL", number=2, author="outsider",
+                                        association=association)]
+                    self.assertEqual(self.check_gate(comments, authors=authors)[0], "success")
+
+    def test_missing_author_association_is_ignored(self):
+        for authors in ["", "reviewer"]:
+            with self.subTest(authors=authors):
+                comment = verdict("CODEX")
+                del comment["author_association"]
+                self.assertEqual(self.check_gate([comment, verdict("CURSOR")],
+                                                 authors=authors)[0], "pending")
+
     def test_only_exact_first_line_verdicts_count(self):
         for body in [f"Preface\nCODEX-VERDICT PASS {HEAD}",
                      f"CODEX-VERDICT PASS {HEAD[:7]}",
@@ -212,6 +248,19 @@ class FakeAPI:
 
 
 class APITests(unittest.TestCase):
+    def test_comment_author_association_survives_pagination(self):
+        pages = [[verdict("CURSOR", association="COLLABORATOR")],
+                 [verdict("CODEX", author="outsider", association="NONE")]]
+        response = subprocess.CompletedProcess([], 0, stdout=json.dumps(pages))
+        with patch("scripts.ci.review_gate.subprocess.run", return_value=response):
+            comments = github_api("repos/o/r/issues/7/comments?per_page=100", paginate=True)
+        state, _ = evaluate(HEAD, "feature/topic", ["builder:claude"], ["src/lib.rs"],
+                            comments)
+        self.assertEqual(state, "pending")
+        state, _ = evaluate(HEAD, "feature/topic", ["builder:claude"], ["README.md"],
+                            comments)
+        self.assertEqual(state, "success")
+
     def test_github_api_reads_all_pages(self):
         def gh(command, **kwargs):
             self.assertEqual(command, ["gh", "api", "--method", "GET", "repos/o/r/files",

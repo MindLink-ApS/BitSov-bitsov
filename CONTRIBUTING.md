@@ -49,10 +49,12 @@ PRs must include CODEX, or CLAUDE when CODEX built the PR; these are PRs labeled
 `crates/konsensus-crypto/`, or with paths containing `spend_budget`, `pairing`,
 `invoice`, or `session`. The docs-only exception applies first.
 
-The optional repository variable `REVIEW_GATE_AUTHORS` restricts verdicts to
-comma-separated GitHub logins; unset means all authors count. Vendor tags rely
-on honest attribution until per-vendor GitHub Apps exist. The workflow uses
-only trusted default-branch code and becomes active after merging to `main`.
+Only comments with an `author_association` of OWNER, MEMBER, or COLLABORATOR count.
+The optional repository variable `REVIEW_GATE_AUTHORS` further restricts verdicts
+to comma-separated GitHub logins. Vendor tags rely on honest attribution until
+per-vendor GitHub Apps exist. The workflow loads gate scripts from the trusted
+default branch and becomes active after merging to `main`.
+On same-repo branches the workflow YAML comes from the PR head, so this is an honest-system gate for collaborators.
 Fork PR runs have read-only tokens; post or edit a PR comment after head/label
 changes to recompute their status from `main`. Merge-queue groups report success
 because review is enforced on the PR before enqueue. Making `review-gate`
