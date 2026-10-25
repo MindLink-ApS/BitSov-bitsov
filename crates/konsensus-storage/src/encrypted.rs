@@ -536,9 +536,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         let result = result.map(|r| self.encrypt(r)).transpose()?;
         self.inner.resolve_channel_open_operation(id, state, result.as_deref(), last_error).await
     }
-    async fn finalize_channel_open_operation(&self, id: &str, result: &[u8], last_error: Option<&str>) -> Result<bool, StorageError> {
-        let result = self.encrypt(result)?;
-        self.inner.finalize_channel_open_operation(id, &result, last_error).await
+    async fn record_channel_open_outcome(&self, expected: &crate::ChannelOpenOperation, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
+        // The fence reads only unencrypted columns (id, request hash, time, state).
+        let result = result.map(|r| self.encrypt(r)).transpose()?;
+        self.inner.record_channel_open_outcome(expected, state, result.as_deref(), last_error).await
     }
     async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
         self.inner.delete_pending_channel_open_operation(id).await

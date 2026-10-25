@@ -209,13 +209,17 @@ pub trait Storage: Send + Sync {
     async fn delete_pending_channel_open_operation(&self, _id: &str) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("channel open operations".into()))
     }
-    /// Move an `uncertain` record to `opened` once a later backend read proves
-    /// its final outcome. `opened` records are never rewritten; false writes
-    /// nothing.
-    async fn finalize_channel_open_operation(
+    /// Fenced outcome write (direct payments): move the row to `state` only
+    /// while it is still the row `expected` describes, with the same request
+    /// binding (`request_hash`), insertion time (`created_at`) and current
+    /// `state`. A row deleted and re-inserted under the same id, or already
+    /// finalized by another writer, is left untouched; false writes nothing and
+    /// the caller re-reads the authoritative row. `opened` is never rewritten.
+    async fn record_channel_open_outcome(
         &self,
-        _id: &str,
-        _result: &[u8],
+        _expected: &crate::ChannelOpenOperation,
+        _state: &str,
+        _result: Option<&[u8]>,
         _last_error: Option<&str>,
     ) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("channel open operations".into()))

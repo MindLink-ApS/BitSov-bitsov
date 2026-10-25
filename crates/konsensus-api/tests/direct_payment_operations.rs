@@ -47,6 +47,14 @@ struct Wallet {
     dispatches: AtomicUsize,
     /// Outgoing payments the backend knows: hash → (amount, preimage).
     outgoing: Mutex<HashMap<String, (u64, String)>>,
+    /// Test gates: while armed, a dispatch (or the next status read) signals
+    /// that it was entered and parks until the test releases it.
+    gate_dispatch: std::sync::atomic::AtomicBool,
+    dispatch_entered: tokio::sync::Notify,
+    dispatch_gate: tokio::sync::Semaphore,
+    gate_status: std::sync::atomic::AtomicBool,
+    status_entered: tokio::sync::Notify,
+    status_gate: tokio::sync::Semaphore,
 }
 
 impl Wallet {
@@ -55,6 +63,12 @@ impl Wallet {
             mode: Mutex::new(mode),
             dispatches: AtomicUsize::new(0),
             outgoing: Mutex::new(HashMap::new()),
+            gate_dispatch: std::sync::atomic::AtomicBool::new(false),
+            dispatch_entered: tokio::sync::Notify::new(),
+            dispatch_gate: tokio::sync::Semaphore::new(0),
+            gate_status: std::sync::atomic::AtomicBool::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_gate: tokio::sync::Semaphore::new(0),
         })
     }
     fn set(&self, mode: Mode) {
@@ -85,6 +99,10 @@ impl Wallet {
         preimage: String,
     ) -> Result<PaymentDetails, LightningError> {
         self.dispatches.fetch_add(1, Ordering::SeqCst);
+        if self.gate_dispatch.load(Ordering::SeqCst) {
+            self.dispatch_entered.notify_one();
+            self.dispatch_gate.acquire().await.unwrap().forget();
+        }
         tokio::task::yield_now().await;
         let mode = self.mode();
         if mode == Mode::Refused {
@@ -159,6 +177,10 @@ impl LightningProvider for Wallet {
         self.dispatch(hash, amount, hex::encode(preimage)).await
     }
     async fn get_payment_status(&self, hash: &str) -> Result<PaymentDetails, LightningError> {
+        if self.gate_status.swap(false, Ordering::SeqCst) {
+            self.status_entered.notify_one();
+            self.status_gate.acquire().await.unwrap().forget();
+        }
         let known = self.outgoing.lock().unwrap().get(hash).cloned();
         let Some((amount, preimage)) = known else {
             return Err(LightningError::PaymentNotFound(hash.into()));
@@ -544,4 +566,104 @@ async fn status_advertises_direct_payment_operations() {
             .contains(&json!("direct_payment_operations_v1")),
         "{body}"
     );
+}
+
+/// A replay that read a pending row, then waited on the backend, must not
+/// attach its result to a row that was freed by a refusal and re-created for
+/// another request under the same id. The unpaid replacement never becomes
+/// "settled", and its own outcome still gets recorded.
+#[tokio::test]
+async fn stale_replay_cannot_finalize_a_reused_id_with_another_requests_receipt() {
+    let wallet = Wallet::new(Mode::Settle);
+    let state = test_state_with_lightning(wallet.clone());
+    let first = create_test_bolt11(1000);
+    let replacement = create_test_bolt11_with_hash(1000, [0xdd; 32]);
+    // The backend knows `first` as settled from an earlier, unrelated operation.
+    let (status, paid) = post(&state, "pay", pay_body("earlier", &first)).await;
+    assert_eq!(status, StatusCode::OK, "{paid}");
+
+    // A: pay `first` under "reuse"; parks inside the backend before it is refused.
+    wallet.set(Mode::Refused);
+    wallet.gate_dispatch.store(true, Ordering::SeqCst);
+    let a = tokio::spawn({
+        let state = state.clone();
+        let first = first.clone();
+        async move { post(&state, "pay", pay_body("reuse", &first)).await }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wallet.dispatch_entered.notified(),
+    )
+    .await
+    .unwrap();
+    // B: a retry of A reads the pending row, then parks in its status read.
+    wallet.gate_status.store(true, Ordering::SeqCst);
+    let b = tokio::spawn({
+        let state = state.clone();
+        let first = first.clone();
+        async move { post(&state, "pay", pay_body("reuse", &first)).await }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wallet.status_entered.notified(),
+    )
+    .await
+    .unwrap();
+    // A is refused before dispatch: the id is freed.
+    wallet.dispatch_gate.add_permits(1);
+    let (status, body) = a.await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "not_dispatched");
+    // C: "reuse" now names a different invoice; its row is pending while B is
+    // still waiting on the backend.
+    let c = tokio::spawn({
+        let state = state.clone();
+        let replacement = replacement.clone();
+        async move { post(&state, "pay", pay_body("reuse", &replacement)).await }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wallet.dispatch_entered.notified(),
+    )
+    .await
+    .unwrap();
+    // B learns `first` settled (the backend reports the earlier payment), but
+    // the row it read is gone: no write, no 200.
+    wallet.set(Mode::Settle);
+    wallet.status_gate.add_permits(1);
+    let (status, body) = b.await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_ne!(body["status"], "settled", "{body}");
+    let row = state
+        .storage
+        .get_channel_open_operation("pay:reuse")
+        .await
+        .unwrap()
+        .expect("C's pending row");
+    assert_eq!(row.state, "pending", "{row:?}");
+    assert!(row.result.is_none(), "{row:?}");
+    // C is refused too: the unpaid replacement is never settled, and the id is free.
+    wallet.set(Mode::Refused);
+    wallet.dispatch_gate.add_permits(1);
+    let (status, body) = c.await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(state
+        .storage
+        .get_channel_open_operation("pay:reuse")
+        .await
+        .unwrap()
+        .is_none());
+    wallet.gate_dispatch.store(false, Ordering::SeqCst);
+    // A retry of C pays its own invoice and records its own receipt.
+    wallet.set(Mode::Settle);
+    let (status, body) = post(&state, "pay", pay_body("reuse", &replacement)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_settled(&body, "pay", "reuse");
+    assert_ne!(body["payment_hash"], paid["payment_hash"], "{body}");
+    assert!(body.get("replayed").is_none(), "{body}");
+    let (status, again) = post(&state, "pay", pay_body("reuse", &replacement)).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["payment_hash"], body["payment_hash"]);
+    assert_eq!(again["replayed"], true);
+    assert_eq!(wallet.dispatches(), 4);
 }

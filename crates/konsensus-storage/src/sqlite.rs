@@ -742,9 +742,13 @@ impl Storage for SqliteStorage {
             .bind(id)
             .execute(&self.pool).await?.rows_affected() == 1)
     }
-    async fn finalize_channel_open_operation(&self, id: &str, result: &[u8], last_error: Option<&str>) -> Result<bool, StorageError> {
-        let changed = sqlx::query("UPDATE channel_open_operations SET state = 'opened', result = ?, last_error = ?, updated_at = ? WHERE operation_id = ? AND state = 'uncertain'")
-            .bind(result).bind(last_error).bind(chrono::Utc::now().timestamp_millis()).bind(id)
+    async fn record_channel_open_outcome(&self, expected: &crate::ChannelOpenOperation, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
+        if expected.state == crate::channel_open::CHANNEL_OPEN_OPENED {
+            return Ok(false);
+        }
+        let changed = sqlx::query("UPDATE channel_open_operations SET state = ?, result = ?, last_error = ?, updated_at = ? WHERE operation_id = ? AND request_hash = ? AND created_at = ? AND state = ?")
+            .bind(state).bind(result).bind(last_error).bind(chrono::Utc::now().timestamp_millis())
+            .bind(&expected.operation_id).bind(&expected.request_hash).bind(expected.created_at).bind(&expected.state)
             .execute(&self.pool).await?.rows_affected();
         Ok(changed == 1)
     }

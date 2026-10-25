@@ -7,7 +7,7 @@
 //! Direct Lightning payments use `pay:<request_id>` and `keysend:<request_id>`
 //! keys: `opened` holds a final receipt (settled or failed), `uncertain` holds
 //! an in-flight snapshot or an ambiguous error until a later backend read
-//! finalizes it through `finalize_channel_open_operation`.
+//! finalizes it through the fenced `record_channel_open_outcome`.
 
 /// Dispatch is in flight, or the process stopped before the outcome was recorded.
 pub const CHANNEL_OPEN_PENDING: &str = "pending";

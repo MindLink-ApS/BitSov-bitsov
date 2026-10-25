@@ -55,9 +55,12 @@ A repeat never dispatches. What it answers depends on what is recorded:
 | in flight (hash known) | the backend is read by hash: settled → `200` (and the record is finalized); failed → `502`; otherwise `202 in_flight` |
 | ambiguous error, or the first attempt not yet recorded | `202 in_flight`, with `last_error` when one was recorded; for an invoice the backend is read by hash as above |
 
-A settled or failed record is final and immutable. An in-flight or ambiguous
-record is finalized only from what the backend reports for the **outgoing**
-payment under that hash; an incoming record under the same hash (a
+A settled or failed record is final and immutable. Every outcome write is
+fenced on the row it was derived from (request binding, insertion time and
+state): a retry whose row was freed by a refusal and re-created for another
+request under the same id writes nothing and answers `409`. An in-flight or
+ambiguous record is finalized only from what the backend reports for the
+**outgoing** payment under that hash; an incoming record under the same hash (a
 self-payment's invoice) is never taken as settlement. Elapsed time and a
 missing backend record are never evidence of non-dispatch: a keysend whose
 backend reply was lost before a hash was recorded stays `202` under its id.

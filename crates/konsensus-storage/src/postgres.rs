@@ -854,9 +854,13 @@ impl Storage for PostgresStorage {
             .bind(id)
             .execute(&self.pool).await?.rows_affected() == 1)
     }
-    async fn finalize_channel_open_operation(&self, id: &str, result: &[u8], last_error: Option<&str>) -> Result<bool, StorageError> {
-        let changed = sqlx::query("UPDATE channel_open_operations SET state = 'opened', result = $1, last_error = $2, updated_at = $3 WHERE operation_id = $4 AND state = 'uncertain'")
-            .bind(result).bind(last_error).bind(chrono::Utc::now().timestamp_millis()).bind(id)
+    async fn record_channel_open_outcome(&self, expected: &crate::ChannelOpenOperation, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
+        if expected.state == crate::channel_open::CHANNEL_OPEN_OPENED {
+            return Ok(false);
+        }
+        let changed = sqlx::query("UPDATE channel_open_operations SET state = $1, result = $2, last_error = $3, updated_at = $4 WHERE operation_id = $5 AND request_hash = $6 AND created_at = $7 AND state = $8")
+            .bind(state).bind(result).bind(last_error).bind(chrono::Utc::now().timestamp_millis())
+            .bind(&expected.operation_id).bind(&expected.request_hash).bind(expected.created_at).bind(&expected.state)
             .execute(&self.pool).await?.rows_affected();
         Ok(changed == 1)
     }

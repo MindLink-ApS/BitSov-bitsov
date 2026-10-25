@@ -20,6 +20,9 @@
 //! Recovery only reads: a later request under the same id re-reads the
 //! backend by payment hash and finalizes the record from what it reports.
 //! Elapsed time or a missing backend record never counts as non-dispatch.
+//! Every outcome write is fenced on the row it was derived from (request
+//! binding, insertion time and state): a refusal that freed the id and a new
+//! request that reused it can never receive an earlier request's receipt.
 
 use super::fee_paid_msat;
 use crate::handlers::messages::{SettlementPoll, SettlementUpdates};
@@ -52,6 +55,10 @@ pub const STATUS_IN_FLIGHT: &str = "in_flight";
 /// `202 in_flight`. A routed HTLC settles in a few hundred milliseconds on a
 /// warm node; a longer wait would only block the client, never change truth.
 const SETTLE_WAIT: Duration = Duration::from_secs(3);
+
+/// Bound on one backend status read, so a stalled provider still yields a
+/// timely answer (`202 in_flight`) instead of hanging the request.
+const STATUS_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 const IN_FLIGHT_MESSAGE: &str = "Not settled yet. Repeat this request with the same request_id to learn the outcome, or poll GET /api/v1/payments/{payment_hash}. Nothing is dispatched again under this request_id.";
 
@@ -273,8 +280,7 @@ where
             // Polled, then lost authority: the backend may have sent. Unknown.
             record(
                 state,
-                &ident.key,
-                CHANNEL_OPEN_PENDING,
+                &pending,
                 CHANNEL_OPEN_UNCERTAIN,
                 None,
                 Some(error.to_string()),
@@ -292,8 +298,7 @@ where
             tracing::warn!(operation_id = %ident.key, %error, "direct payment outcome uncertain; a retry will not dispatch");
             record(
                 state,
-                &ident.key,
-                CHANNEL_OPEN_PENDING,
+                &pending,
                 CHANNEL_OPEN_UNCERTAIN,
                 None,
                 Some(error.to_string()),
@@ -304,7 +309,7 @@ where
         Ok(Ok(details)) => {
             let details = settle_briefly(state, updates, details).await;
             super::resolve_payment(guard, &op.recipient, &Ok(details.clone()));
-            conclude(state, &ident, &op, CHANNEL_OPEN_PENDING, details, false).await
+            conclude(state, &ident, &op, &pending, details, false).await
         }
     }
 }
@@ -344,7 +349,7 @@ async fn replay(
     };
     if !template.payment_hash.is_empty() {
         if let Some(details) = terminal_outgoing(state, &template.payment_hash).await {
-            return conclude(state, ident, op, &row.state, details, true).await;
+            return conclude(state, ident, op, &row, details, true).await;
         }
     }
     let mut body = template;
@@ -357,13 +362,16 @@ async fn replay(
     Ok((StatusCode::ACCEPTED, Json(value)))
 }
 
-/// Report `details` and record it. `from` is the row's current state:
-/// `pending` after a fresh dispatch, `uncertain` when a replay found truth.
+/// Report `details` and record it against `expected`: the row this request
+/// inserted (`pending`, fresh dispatch) or the row a replay read before it
+/// asked the backend. A replay whose row changed underneath it answers from
+/// the authoritative row instead; it never attaches its result to another
+/// request's binding.
 async fn conclude(
     state: &Arc<AppState>,
     ident: &Ident,
     op: &Dispatch,
-    from: &str,
+    expected: &ChannelOpenOperation,
     details: PaymentDetails,
     replayed: bool,
 ) -> Response {
@@ -372,19 +380,11 @@ async fn conclude(
         DirectPaymentResponse::in_flight(ident, op),
         &details,
     );
-    match details.status {
+    let (fenced, response) = match details.status {
         PaymentStatus::Settled => {
             let receipt = serde_json::to_vec(&Receipt::Settled(body.clone())).map_err(storage)?;
-            record(
-                state,
-                &ident.key,
-                from,
-                CHANNEL_OPEN_OPENED,
-                Some(receipt),
-                None,
-            )
-            .await;
-            Ok((StatusCode::OK, Json(view(body, replayed)?)))
+            let fenced = record(state, expected, CHANNEL_OPEN_OPENED, Some(receipt), None).await;
+            (fenced, Ok((StatusCode::OK, Json(view(body, replayed)?))))
         }
         PaymentStatus::Failed | PaymentStatus::Expired => {
             let error = failure_text(ident.route);
@@ -393,34 +393,65 @@ async fn conclude(
                 max_routing_fee_msat: op.max_routing_fee_msat,
             })
             .map_err(storage)?;
-            record(
+            let fenced = record(
                 state,
-                &ident.key,
-                from,
+                expected,
                 CHANNEL_OPEN_OPENED,
                 Some(receipt),
                 Some(error.clone()),
             )
             .await;
-            Err(ApiError::Lightning(error).with_routing_fee(op.max_routing_fee_msat))
+            (
+                fenced,
+                Err(ApiError::Lightning(error).with_routing_fee(op.max_routing_fee_msat)),
+            )
         }
         PaymentStatus::Pending | PaymentStatus::InFlight => {
-            if from == CHANNEL_OPEN_PENDING {
+            let fenced = if expected.state == CHANNEL_OPEN_PENDING {
                 let receipt =
                     serde_json::to_vec(&Receipt::InFlight(body.clone())).map_err(storage)?;
-                record(
-                    state,
-                    &ident.key,
-                    from,
-                    CHANNEL_OPEN_UNCERTAIN,
-                    Some(receipt),
-                    None,
-                )
-                .await;
-            }
-            Ok((StatusCode::ACCEPTED, Json(view(body, replayed)?)))
+                record(state, expected, CHANNEL_OPEN_UNCERTAIN, Some(receipt), None).await
+            } else {
+                true
+            };
+            (
+                fenced,
+                Ok((StatusCode::ACCEPTED, Json(view(body, replayed)?))),
+            )
         }
+    };
+    if fenced || !replayed {
+        // A fresh dispatch answers from its own backend result even when a
+        // concurrent replay of the same binding recorded it first.
+        return response;
     }
+    reread(state, ident, op, expected).await
+}
+
+/// After a replay lost its fence: the row it read was finalized by another
+/// writer, or deleted and re-created under the same id for another request.
+/// Only the former may be answered, and only from the authoritative row.
+async fn reread(
+    state: &Arc<AppState>,
+    ident: &Ident,
+    op: &Dispatch,
+    expected: &ChannelOpenOperation,
+) -> Response {
+    let changed = || ApiError::Conflict("operation changed concurrently; retry".into());
+    let current = state
+        .storage
+        .get_channel_open_operation(&ident.key)
+        .await
+        .map_err(storage)?
+        .ok_or_else(changed)?;
+    if current.request_hash != expected.request_hash
+        || current.created_at != expected.created_at
+        || current.state != CHANNEL_OPEN_OPENED
+    {
+        return Err(changed());
+    }
+    let hash = current.request_hash.clone();
+    Box::pin(replay(state, current, ident, op, &hash)).await
 }
 
 /// Give a dispatched payment a short window to settle. Returns the latest
@@ -433,14 +464,20 @@ async fn settle_briefly(
     if is_terminal(&initial) || initial.payment_hash.is_empty() {
         return initial;
     }
+    let started = tokio::time::Instant::now();
     let mut poll = SettlementPoll::new(updates, &initial.payment_hash).with_deadline(SETTLE_WAIT);
     let mut latest = initial;
     loop {
         poll.wait().await;
-        if let Ok(details) = state
-            .lightning
-            .get_payment_status(&latest.payment_hash)
-            .await
+        // The window bounds the read too: a stalled provider yields a timely 202.
+        let remaining = SETTLE_WAIT
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(50));
+        if let Ok(Ok(details)) = tokio::time::timeout(
+            remaining,
+            state.lightning.get_payment_status(&latest.payment_hash),
+        )
+        .await
         {
             if details.direction == PaymentDirection::Outgoing {
                 latest = details;
@@ -456,11 +493,13 @@ async fn settle_briefly(
 /// incoming record under the same hash (a self-payment's invoice, or someone
 /// else paying it) is not proof that this payment settled.
 async fn terminal_outgoing(state: &AppState, payment_hash: &str) -> Option<PaymentDetails> {
-    let details = state
-        .lightning
-        .get_payment_status(payment_hash)
-        .await
-        .ok()?;
+    let details = tokio::time::timeout(
+        STATUS_READ_TIMEOUT,
+        state.lightning.get_payment_status(payment_hash),
+    )
+    .await
+    .ok()?
+    .ok()?;
     (details.direction == PaymentDirection::Outgoing && is_terminal(&details)).then_some(details)
 }
 
@@ -476,86 +515,75 @@ async fn release(state: &AppState, key: &str) {
     }
 }
 
-/// Record an outcome: `pending → to` (fresh dispatch) or `uncertain → opened`
-/// (a replay found the backend's final word). Retried off the request's
-/// lifetime on storage errors; a lost CAS never overwrites a final receipt.
+/// Record an outcome against `expected`, the row this result was derived
+/// from. Returns false when the fence did not match (the row was finalized by
+/// another writer, or deleted and re-created for another request); nothing is
+/// written then. Storage errors are retried off the request's lifetime with
+/// the same fence, so a late retry can never land on a replacement row.
 async fn record(
     state: &Arc<AppState>,
-    key: &str,
-    from: &str,
+    expected: &ChannelOpenOperation,
     to: &'static str,
     receipt: Option<Vec<u8>>,
     last_error: Option<String>,
-) {
-    let from_pending = from == CHANNEL_OPEN_PENDING;
-    if write(
+) -> bool {
+    if let Some(fenced) = write(
         state,
-        key,
-        from_pending,
+        expected,
         to,
         receipt.as_deref(),
         last_error.as_deref(),
     )
     .await
     {
-        return;
+        return fenced;
     }
     let state = Arc::clone(state);
-    let key = key.to_owned();
+    let expected = expected.clone();
     tokio::spawn(async move {
         for delay_ms in [100, 500, 1_000, 5_000, 30_000] {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             if write(
                 &state,
-                &key,
-                from_pending,
+                &expected,
                 to,
                 receipt.as_deref(),
                 last_error.as_deref(),
             )
             .await
+            .is_some()
             {
                 return;
             }
         }
-        tracing::error!(operation_id = %key, "direct payment outcome persistence retries exhausted; the backend record stays the truth");
+        tracing::error!(operation_id = %expected.operation_id, "direct payment outcome persistence retries exhausted; the backend record stays the truth");
     });
+    // Unknown until the retry lands; the caller answers from backend truth.
+    true
 }
 
-// True means no further write is needed.
+// Some(true): written. Some(false): the fence did not match, nothing written.
+// None: storage error, retry.
 async fn write(
     state: &AppState,
-    key: &str,
-    from_pending: bool,
+    expected: &ChannelOpenOperation,
     to: &str,
     receipt: Option<&[u8]>,
     last_error: Option<&str>,
-) -> bool {
-    let result = if from_pending {
-        state
-            .storage
-            .resolve_channel_open_operation(key, to, receipt, last_error)
-            .await
-    } else {
-        match receipt {
-            Some(receipt) => {
-                state
-                    .storage
-                    .finalize_channel_open_operation(key, receipt, last_error)
-                    .await
-            }
-            None => return true,
-        }
-    };
-    match result {
-        Ok(true) => true,
+) -> Option<bool> {
+    match state
+        .storage
+        .record_channel_open_outcome(expected, to, receipt, last_error)
+        .await
+    {
+        Ok(true) => Some(true),
         Ok(false) => {
-            tracing::warn!(operation_id = %key, "direct payment operation changed before outcome recording");
-            true
+            tracing::warn!(operation_id = %expected.operation_id, "direct payment operation changed before outcome recording");
+            Some(false)
         }
         Err(error) => {
-            tracing::warn!(operation_id = %key, %error, "direct payment outcome not recorded; retrying persistence");
-            false
+            tracing::warn!(operation_id = %expected.operation_id, %error, "direct payment outcome not recorded; retrying persistence");
+            None
         }
     }
 }
