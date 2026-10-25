@@ -32,6 +32,8 @@
 //!   `NodeOffline` UI can detect a reachable but un-tokened node. Identity,
 //!   peer IDs, wallet balance, and LN pubkey are owner-only at `/api/v1/status`.
 //! - `GET  /api/v1/status` — owner-only full node status (behind `AuthUser`).
+//! - `GET  /api/v1/owner/claim-code` — authenticated, and additionally bound to
+//!   a loopback source and an owner actor; absent from the remote router.
 //! - `GET  /api/v1/preflight` and `GET /livez` — cheap operator liveness
 //!   probes mounted only when `AppState::operator_probes_enabled` is true.
 //!   They do not query Lightning, chain, storage, peers, or user state.
@@ -246,7 +248,26 @@ fn build_router_with_options(
         ))
     } else {
         // Prometheus scrape endpoint — unauthenticated, restrict via network ACL.
-        router.route("/metrics", get(metrics_handler))
+        router
+            .route("/metrics", get(metrics_handler))
+            // Owner-local only: never mounted behind the tunnel (`remote` above).
+            // Every response of the route, refusals included, is `no-store`.
+            .merge(
+                Router::new()
+                    .route(
+                        "/api/v1/owner/claim-code",
+                        get(handlers::owner_claim_code::show),
+                    )
+                    .layer(middleware::map_response(
+                        |mut response: axum::response::Response| async move {
+                            response.headers_mut().insert(
+                                header::CACHE_CONTROL,
+                                HeaderValue::from_static("no-store"),
+                            );
+                            response
+                        },
+                    )),
+            )
     };
     router
         .layer(middleware::from_fn_with_state(
@@ -393,7 +414,10 @@ mod tests {
     #[test]
     fn cors_rejects_wildcard_and_null_origin() {
         let origins = parse_cors_allowed_origins("*, null, NULL, http://localhost:1420");
-        assert_eq!(origins, vec![HeaderValue::from_static("http://localhost:1420")]);
+        assert_eq!(
+            origins,
+            vec![HeaderValue::from_static("http://localhost:1420")]
+        );
     }
 
     #[test]

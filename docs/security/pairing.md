@@ -596,7 +596,45 @@ an owner console (the data-directory owner on Unix); output goes directly to
 that console, including when stdout is redirected. Missing, malformed or
 symlinked claim files fail closed; a malformed file is never silently replaced.
 Keep the code with the box. Disk access to this file defeats this additional
-physical-origin check.
+physical-origin check. The one HTTP path is the owner-authenticated, loopback-only
+display route below; it exists only on a live node, never during SETUP.
+
+### Owner claim-code display
+
+`GET /api/v1/owner/claim-code` lets the app show the code to the owner while a
+new device is asking for it, so first-run setup needs no terminal. It is mounted
+only on the owner-local API router (`build_router`), never on the remote tunnel
+router, the bootstrap router, the LAN box page or any peer surface. The handler
+additionally refuses any request that carries a tunnel identity and any source
+that is not loopback, so a bridged or LAN request is refused even if a future
+deployment mounted the route elsewhere.
+
+Callers must hold a live token (`read`) and be either a local console session
+(a token without a pairing binding: `POST /api/v1/auth/local` or the node-key
+challenge) or a paired client that holds an enrolled owner device key for its
+current epoch (the same chain `pair/ticket` and `/delegate` verify). A plain
+read/receive pairing, a provisional enrollment, a bootstrap token or a retired
+key is refused with `403 owner_device_required`; a tunnel or LAN source with
+`403 owner_console_only`. Reads are limited to five per minute per actor (the
+console session or the pairing) with `429`; refused requests do not consume
+the budget of another actor.
+
+The response is JSON, always `Cache-Control: no-store`, including refusals:
+
+| `state` | Meaning | Extra fields |
+|---|---|---|
+| `open` | A claim-bound (SAS v1) enrollment is waiting for the code | `code` (18 characters), `expires_at` (Unix seconds; the pending enrollment's deadline), `device_name` (the enrolling device's own label; proves nothing) |
+| `claimed` | The box is claimed and no claim-bound enrollment is pending | none |
+| `closed` | Three SAS mismatches closed claim-bound enrollment until restart | none |
+| `unavailable` | No valid claim-code file (a pre-N3 box, or a damaged file) | none |
+
+The code is returned only in `open`, so an idle owner session cannot be used to
+harvest it; the new device must start its enrollment first. The handler never
+writes the code, its commitment, the nonce or the digest to tracing; the HTTP
+trace span records only the method and path, and the audit record
+`owner.claim_code_viewed` carries the actor and `state` only. Displaying the
+code adds no authority: the device still has to finish the SAS v1 ceremony and
+obtain the owner's delegation or console approval.
 
 Existing initialized boxes without a claim code retain their console enrollment
 flow; this release does not migrate their identity or provision a code remotely.
@@ -763,12 +801,16 @@ frames or base URLs. Device labels enter the DOM as text, not HTML.
 POST `/setup/start` rotates the five-minute, one-use bootstrap ticket. Its QR
 and text are returned only after Start setup. GET `/setup/state` shows the
 claimed label and four SAS words. POST `/setup/approve` accepts exactly
-`{ceremony_id, sas_digest}`: under the same transition lock as finalize, it
-checks the current pending ceremony and all 32 digest bytes using
-`subtle::ConstantTimeEq`, then sets only `box_approved`. It does not sign,
-install a device, write a seed, commit identity or grant scopes (I1).
-No page response contains the claim code, claim commitment, seed, backup words
-or password (I2). The app must compare SAS before sending its password.
+`{ceremony_id, words}`: under the same transition lock as finalize, it checks
+the current pending ceremony and that the four submitted words equal the words
+of the pending digest (compared with `subtle::ConstantTimeEq`), then sets only
+`box_approved`. It does not sign, install a device, write a seed, commit
+identity or grant scopes (I1). No page response contains the claim code, claim
+commitment, box nonce, the SAS digest, seed, backup words or password (I2): the
+digest is the finalize proof derived from the claim commitment, so the page
+publishes only the 44-bit word projection the owner compares. A LAN party that
+starts and approves a ceremony therefore still cannot finalize it without the
+physical code. The app must compare SAS before sending its password.
 
 POST `/setup/cancel` (“Words differ / Not me”) invalidates the shared ticket,
 revokes the bootstrap pairing and discards the pending ceremony, pre-commit
@@ -785,8 +827,9 @@ rotation, CLI replacement, consumption and revocation cannot leave two valid
 tickets. CLI imports cannot replace a claim or reopen an expired window.
 Other daemon modes retain the existing protected-file ticket authority.
 
-An attacker on the LAN can still claim and approve an **empty** box (T1); the
-page identifies the claim and the owner's app cannot pair until it is cancelled.
+An attacker on the LAN can still claim and approve an **empty** box (T1), but
+cannot finalize it without the claim code; the page identifies the claim and
+the owner's app cannot pair until it is cancelled.
 A fake appliance is not authenticated by DNS or Host validation: the separate
 physical claim code and the owner's word comparison remain necessary (T2).
 One use, short ticket lifetime and cancellation limit photographed-QR abuse
