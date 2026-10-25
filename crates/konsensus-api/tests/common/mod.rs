@@ -169,21 +169,37 @@ impl Storage for MemStorage {
         Ok(true)
     }
 
-
-    async fn store_calendar_event(&self, event: &konsensus_storage::calendar::CalendarEventRecord) -> Result<(), StorageError> {
-        self.calendar.lock().unwrap().insert(event.id.clone(), event.clone());
+    async fn store_calendar_event(
+        &self,
+        event: &konsensus_storage::calendar::CalendarEventRecord,
+    ) -> Result<(), StorageError> {
+        self.calendar
+            .lock()
+            .unwrap()
+            .insert(event.id.clone(), event.clone());
         Ok(())
     }
-    async fn get_calendar_event(&self, id: &str) -> Result<Option<konsensus_storage::calendar::CalendarEventRecord>, StorageError> {
+    async fn get_calendar_event(
+        &self,
+        id: &str,
+    ) -> Result<Option<konsensus_storage::calendar::CalendarEventRecord>, StorageError> {
         Ok(self.calendar.lock().unwrap().get(id).cloned())
     }
 
     async fn list_calendar_events_in_range(
-        &self, from_ms: u64, to_ms: u64, limit: u32,
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+        limit: u32,
     ) -> Result<Vec<konsensus_storage::calendar::CalendarEventRecord>, StorageError> {
-        let mut events: Vec<_> = self.calendar.lock().unwrap().values()
+        let mut events: Vec<_> = self
+            .calendar
+            .lock()
+            .unwrap()
+            .values()
             .filter(|event| event.start_ms < to_ms && event.end_ms > from_ms)
-            .cloned().collect();
+            .cloned()
+            .collect();
         events.sort_by_key(|event| event.start_ms);
         events.truncate(limit as usize);
         Ok(events)
@@ -261,9 +277,16 @@ impl Storage for MemStorage {
         before_timestamp: Option<u64>,
     ) -> Result<Vec<UkmEnvelope>, StorageError> {
         let before = before_timestamp.unwrap_or(u64::MAX);
-        let mut result: Vec<_> = self.messages.lock().unwrap().values()
+        let mut result: Vec<_> = self
+            .messages
+            .lock()
+            .unwrap()
+            .values()
             .filter(|env| env.kind == kind && env.timestamp < before)
-            .filter(|env| matches!(&env.recipient, Recipient::Node(n) if n.to_hex() == my_node_id) || env.sender.to_hex() == my_node_id)
+            .filter(|env| {
+                matches!(&env.recipient, Recipient::Node(n) if n.to_hex() == my_node_id)
+                    || env.sender.to_hex() == my_node_id
+            })
             .filter(|env| matches!(env.recipient, Recipient::Node(_)))
             .cloned()
             .collect();
@@ -401,8 +424,13 @@ impl Storage for MemStorage {
 
     // This general route fixture accepts replay keys; the real SQLite and gate
     // suites exercise atomic replay rejection and rollback.
-    async fn store_paid_nonce(&self, _nonce: &Nonce, _hash: &[u8; 32], _sender: &NodeId, _message: &MessageId)
-        -> Result<konsensus_core::gate::PaidReplay, StorageError> {
+    async fn store_paid_nonce(
+        &self,
+        _nonce: &Nonce,
+        _hash: &[u8; 32],
+        _sender: &NodeId,
+        _message: &MessageId,
+    ) -> Result<konsensus_core::gate::PaidReplay, StorageError> {
         Ok(konsensus_core::gate::PaidReplay::Accepted)
     }
 
@@ -449,7 +477,9 @@ impl Storage for MemStorage {
         Ok(Vec::new())
     }
 
-    async fn mark_pending_sent(&self, _: &MessageId, _: &NodeId) -> Result<(), StorageError> { Ok(()) }
+    async fn mark_pending_sent(&self, _: &MessageId, _: &NodeId) -> Result<(), StorageError> {
+        Ok(())
+    }
     async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
         let mut messages = self.messages.lock().unwrap();
         if let Some(stored) = messages.get_mut(&envelope.id.to_hex()) {
@@ -720,11 +750,27 @@ pub struct StubLightning;
 
 #[async_trait]
 impl LightningProvider for StubLightning {
-    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        invoice: &str,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.pay_invoice(invoice).await
     }
 
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn keysend_with_fee_limit(
+        &self,
+        dest: &str,
+        amount: u64,
+        memo: Option<&str>,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.keysend(dest, amount, memo).await
     }
 
@@ -747,9 +793,13 @@ impl LightningProvider for StubLightning {
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
         let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().ok();
         Ok(PaymentDetails {
-            payment_hash: invoice.as_ref().map_or("bb".repeat(32), |i| i.payment_hash().to_string()),
+            payment_hash: invoice
+                .as_ref()
+                .map_or("bb".repeat(32), |i| i.payment_hash().to_string()),
             preimage: Some("cc".repeat(32)),
-            amount_msat: invoice.and_then(|i| i.amount_milli_satoshis()).unwrap_or(1000),
+            amount_msat: invoice
+                .and_then(|i| i.amount_milli_satoshis())
+                .unwrap_or(1000),
             status: PaymentStatus::Settled,
             direction: PaymentDirection::Outgoing,
             timestamp: 1_700_000_000,
@@ -854,7 +904,12 @@ impl LightningProvider for StubLightning {
                 "stub cannot enforce a per-channel funding fee rate".into(),
             ));
         }
-        Ok(if announce { "stub-announced-channel-id" } else { "stub-channel-id" }.into())
+        Ok(if announce {
+            "stub-announced-channel-id"
+        } else {
+            "stub-channel-id"
+        }
+        .into())
     }
 
     async fn close_channel(
@@ -1027,6 +1082,7 @@ pub fn test_state() -> Arc<AppState> {
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1093,6 +1149,7 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1147,6 +1204,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1211,6 +1269,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1265,6 +1324,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1310,7 +1370,14 @@ pub struct ConnectedStubTransport {
     pub invoice_responder: Option<Box<InvoiceResponder>>,
     /// Shared reference to the invoice_requests map so the transport can
     /// fulfill pending requests (simulating the peer responding).
-    pub invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
+    pub invoice_requests: Arc<
+        tokio::sync::Mutex<
+            HashMap<
+                String,
+                tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>,
+            >,
+        >,
+    >,
     /// One live connection per peer, established when the stub was built.
     pub since: Option<std::time::Instant>,
     /// Every raw control frame sent (e.g. `PriceQuery`), in order.
@@ -1323,7 +1390,14 @@ pub struct ConnectedStubTransport {
 impl ConnectedStubTransport {
     pub fn new(
         connected_peers: Vec<NodeId>,
-        invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
+        invoice_requests: Arc<
+            tokio::sync::Mutex<
+                HashMap<
+                    String,
+                    tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>,
+                >,
+            >,
+        >,
     ) -> Self {
         Self {
             connected: std::sync::Mutex::new(connected_peers.into_iter().collect()),
@@ -1338,7 +1412,10 @@ impl ConnectedStubTransport {
 
     /// `peer` advertised `capabilities` in its Hello (e.g. `Custom("room_binding_v1")`).
     pub fn advertise(&self, peer: NodeId, capabilities: &[&str]) {
-        self.peer_capabilities.lock().unwrap().insert(peer, capabilities.iter().map(|c| c.to_string()).collect());
+        self.peer_capabilities
+            .lock()
+            .unwrap()
+            .insert(peer, capabilities.iter().map(|c| c.to_string()).collect());
     }
 
     pub fn with_invoice_responder(
@@ -1383,7 +1460,8 @@ impl MessageTransport for ConnectedStubTransport {
     }
 
     async fn connected_since(&self, peer: &NodeId) -> Option<std::time::Instant> {
-        self.since.filter(|_| self.connected.lock().unwrap().contains(peer))
+        self.since
+            .filter(|_| self.connected.lock().unwrap().contains(peer))
     }
 
     async fn peer_info(&self, peer: &NodeId) -> Option<konsensus_core::traits::ConnectedPeerInfo> {
@@ -1391,7 +1469,10 @@ impl MessageTransport for ConnectedStubTransport {
             return None;
         }
         let capabilities = self.peer_capabilities.lock().unwrap().get(peer)?.clone();
-        Some(konsensus_core::traits::ConnectedPeerInfo { tier: "T1".into(), capabilities })
+        Some(konsensus_core::traits::ConnectedPeerInfo {
+            tier: "T1".into(),
+            capabilities,
+        })
     }
 
     async fn connected_peers(&self) -> Vec<NodeId> {
@@ -1526,6 +1607,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1648,11 +1730,27 @@ impl CountingLightning {
 
 #[async_trait]
 impl LightningProvider for CountingLightning {
-    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        invoice: &str,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.pay_invoice(invoice).await
     }
 
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn keysend_with_fee_limit(
+        &self,
+        dest: &str,
+        amount: u64,
+        memo: Option<&str>,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.keysend(dest, amount, memo).await
     }
 
@@ -1770,6 +1868,7 @@ pub fn test_state_with_lightning_and_storage(
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),

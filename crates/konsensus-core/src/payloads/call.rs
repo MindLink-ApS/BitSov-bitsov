@@ -35,6 +35,8 @@ pub const CALL_SIGNAL_VERSION: u8 = 1;
 pub const MAX_SDP_BYTES: usize = 16 * 1024;
 /// Largest single ICE candidate line.
 pub const MAX_CANDIDATE_BYTES: usize = 1024;
+/// How long a callee waits for a paired device to take an invite.
+pub const DEVICE_WAIT_MS: u64 = 15_000;
 /// How long an unanswered offer rings.
 pub const RING_TIMEOUT_MS: u64 = 60_000;
 /// Longest a call stays live without a hangup.
@@ -246,6 +248,8 @@ impl Side {
 pub enum Phase {
     /// Our offer is reserved but not yet paid: nobody has been rung.
     Reserved,
+    /// An incoming offer has not yet reached one of our devices.
+    AwaitingDevice,
     Ringing,
     Live,
     Ended,
@@ -253,11 +257,12 @@ pub enum Phase {
 
 impl Phase {
     pub fn as_str(self) -> &'static str {
-        match self { Phase::Reserved => "reserved", Phase::Ringing => "ringing", Phase::Live => "live", Phase::Ended => "ended" }
+        match self { Phase::Reserved => "reserved", Phase::AwaitingDevice => "awaiting_device", Phase::Ringing => "ringing", Phase::Live => "live", Phase::Ended => "ended" }
     }
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "reserved" => Some(Phase::Reserved),
+            "awaiting_device" => Some(Phase::AwaitingDevice),
             "ringing" => Some(Phase::Ringing),
             "live" => Some(Phase::Live),
             "ended" => Some(Phase::Ended),
@@ -320,8 +325,21 @@ impl CallEntry {
         }
     }
 
+    /// First device delivery anchors only the callee's ring deadline. Age the
+    /// row first so late delivery can never revive an expired call.
+    pub fn device_fetched(self, now_ms: u64) -> Option<Self> {
+        self.at(now_ms).map(|e| match (e.side, e.phase) {
+            (Side::Callee, Phase::AwaitingDevice) => Self {
+                phase: Phase::Ringing,
+                deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS),
+                ..e
+            },
+            _ => e,
+        })
+    }
+
     fn open(&self) -> bool {
-        matches!(self.phase, Phase::Ringing | Phase::Live)
+        matches!(self.phase, Phase::AwaitingDevice | Phase::Ringing | Phase::Live)
     }
 }
 
@@ -368,7 +386,7 @@ pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> CallEntry {
     match (p.kind, cleared.phase) {
         (KIND_CALL_INVITE, Phase::Reserved) => CallEntry { phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), ..cleared },
         (KIND_CALL_ANSWER, Phase::Ringing) => CallEntry { phase: Phase::Live, deadline_ms: now_ms.saturating_add(MAX_CALL_MS), ..cleared },
-        (KIND_CALL_HANGUP, Phase::Ringing | Phase::Live | Phase::Reserved) => {
+        (KIND_CALL_HANGUP, Phase::AwaitingDevice | Phase::Ringing | Phase::Live | Phase::Reserved) => {
             CallEntry { phase: Phase::Ended, deadline_ms: now_ms.saturating_add(TOMBSTONE_MS), ..cleared }
         }
         _ => cleared,
@@ -390,14 +408,14 @@ pub fn release(entry: CallEntry, operation_id: &str) -> Option<CallEntry> {
 pub fn receive(entry: Option<CallEntry>, kind: u16, now_ms: u64) -> Result<CallEntry, CallRefusal> {
     match kind {
         KIND_CALL_INVITE => match entry {
-            None => Ok(CallEntry { side: Side::Callee, phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: None }),
+            None => Ok(CallEntry { side: Side::Callee, phase: Phase::AwaitingDevice, deadline_ms: now_ms.saturating_add(DEVICE_WAIT_MS), pending: None }),
             Some(_) => Err(CallRefusal::Replayed),
         },
         KIND_CALL_ANSWER => {
             let e = entry.ok_or(CallRefusal::UnknownCall)?;
             match (e.phase, e.side) {
                 // A reserved offer was never paid: nobody can answer it.
-                (Phase::Reserved | Phase::Ended, _) => Err(CallRefusal::UnknownCall),
+                (Phase::Reserved | Phase::AwaitingDevice | Phase::Ended, _) => Err(CallRefusal::UnknownCall),
                 (Phase::Ringing, Side::Caller) => Ok(CallEntry { phase: Phase::Live, deadline_ms: now_ms.saturating_add(MAX_CALL_MS), ..e }),
                 (Phase::Ringing, Side::Callee) => Err(CallRefusal::WrongSide),
                 (Phase::Live, _) => Err(CallRefusal::NotRinging),
@@ -472,6 +490,49 @@ mod tests {
     use super::*;
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn an_unfetched_invite_ends_after_fifteen_seconds_without_ringing() {
+        let entry = receive(None, 400, 1_000).unwrap();
+        assert_eq!(entry.phase.as_str(), "awaiting_device");
+        assert_eq!(entry.deadline_ms, 16_000);
+        assert_eq!(entry.clone().at(15_999).unwrap().phase.as_str(), "awaiting_device");
+        assert_eq!(entry.at(16_000).unwrap().phase, Phase::Ended);
+    }
+
+    #[test]
+    fn first_device_gets_sixty_seconds_and_second_device_does_not_reset_it() {
+        let entry = receive(None, 400, 1_000).unwrap().device_fetched(11_000).unwrap();
+        assert_eq!((entry.phase, entry.deadline_ms), (Phase::Ringing, 71_000));
+        assert_eq!(entry.clone().device_fetched(15_000), Some(entry.clone()));
+        assert_eq!(entry.clone().at(70_999).unwrap().phase, Phase::Ringing);
+        assert_eq!(entry.at(71_000).unwrap().phase, Phase::Ended);
+    }
+
+    #[test]
+    fn late_device_fetch_never_revives_an_awaiting_row() {
+        for now in [16_000, 16_001, 16_000 + TOMBSTONE_MS + 1] {
+            let entry = receive(None, 400, 1_000).unwrap().device_fetched(now);
+            assert!(entry.is_none_or(|e| e.phase == Phase::Ended));
+        }
+    }
+
+    #[test]
+    fn awaiting_device_accepts_paid_ice_and_hangup() {
+        let entry = receive(None, 400, 1_000).unwrap();
+        assert_eq!(receive(Some(entry.clone()), 402, 2_000).unwrap(), entry);
+        assert_eq!(receive(Some(entry.clone()), 403, 2_000).unwrap().phase, Phase::Ended);
+        assert!(reserve(Some(entry.clone()), 402, "ice", "h", 2_000).is_ok());
+        let pending = reserve(Some(entry), 403, "hangup", "h", 2_000).unwrap();
+        assert_eq!(commit(pending, "hangup", 2_001).phase, Phase::Ended);
+    }
+
+    #[test]
+    fn caller_deadline_still_starts_at_payment() {
+        let entry = commit(reserve(None, 400, "offer", "h", 1_000).unwrap(), "offer", 2_000);
+        assert_eq!((entry.phase, entry.deadline_ms), (Phase::Ringing, 62_000));
+        assert_eq!(entry.clone().device_fetched(11_000), Some(entry));
+    }
 
     #[test]
     fn each_kind_carries_only_its_own_fields() {
@@ -561,7 +622,7 @@ mod tests {
 
     #[test]
     fn our_answer_and_hangup_change_state_only_when_paid() {
-        let ringing = receive(None, 400, 0).unwrap();
+        let ringing = receive(None, 400, 0).unwrap().device_fetched(0).unwrap();
         assert_eq!(reserve(Some(ringing.clone()), 401, "a", "h", 1).unwrap().phase, Phase::Ringing, "reserved, not yet live");
         let pending = reserve(Some(ringing.clone()), 401, "a", "h", 1).unwrap();
         // A second signal while the answer is being paid waits.
@@ -596,7 +657,7 @@ mod tests {
         assert!(ended.clone().at(2 + TOMBSTONE_MS - 1).is_some());
         assert!(ended.at(2 + TOMBSTONE_MS).is_none());
         // Unanswered: stops ringing at the deadline, id stays burned a day after.
-        let r = receive(None, 400, 0).unwrap();
+        let r = receive(None, 400, 0).unwrap().device_fetched(0).unwrap();
         let late = r.at(RING_TIMEOUT_MS).unwrap();
         assert_eq!((late.phase, late.deadline_ms), (Phase::Ended, RING_TIMEOUT_MS + TOMBSTONE_MS));
         assert_eq!(receive(Some(late.clone()), 401, RING_TIMEOUT_MS), Err(CallRefusal::UnknownCall));

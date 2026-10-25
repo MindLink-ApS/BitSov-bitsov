@@ -146,6 +146,9 @@ pub struct AppState {
     ///
     /// Separate from `ws_broadcast` to avoid changing the existing message
     /// format. The frontend distinguishes these events by the `type` field.
+    /// Callee invite waits, shared by receive, paired fetch and stream delivery.
+    pub call_devices: Arc<crate::calls::devices::Devices>,
+
     pub ws_delivery_broadcast: broadcast::Sender<Arc<WsDeliveryStatus>>,
 
     /// Per-IP rate limiter.

@@ -842,6 +842,18 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.sweep_outstanding_web_requests(now_ms, max).await
     }
 
+    async fn call_invite_outcome(&self, envelope: &UkmEnvelope) -> Result<Option<crate::CallInviteOutcome>, StorageError> {
+        self.inner.call_invite_outcome(envelope).await
+    }
+
+    async fn call_invite_set_outcome(&self, id: &MessageId, peer: &konsensus_core::NodeId, outcome: crate::CallInviteOutcome) -> Result<(), StorageError> {
+        self.inner.call_invite_set_outcome(id, peer, outcome).await
+    }
+
+    async fn call_invite_recover(&self, max: u32) -> Result<u64, StorageError> {
+        self.inner.call_invite_recover(max).await
+    }
+
     async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
         self.inner.call_get(peer, call_id).await
     }
@@ -870,6 +882,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_pending().await
     }
 
+    async fn call_awaiting(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        self.inner.call_awaiting().await
+    }
+
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
         self.inner.call_sweep(now_ms, max).await
     }
@@ -880,6 +896,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn call_admission_hold(&self, envelope: &konsensus_core::UkmEnvelope, now_ms: u64) -> Result<bool, StorageError> {
         self.inner.call_admission_hold(envelope, now_ms).await
+    }
+
+    async fn call_admission_rehold(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
+        self.inner.call_admission_rehold(envelope).await
     }
 
     async fn call_admission_release(&self, id: &MessageId) -> Result<(), StorageError> {

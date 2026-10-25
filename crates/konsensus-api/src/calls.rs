@@ -13,6 +13,8 @@
 //! Read-modify-write is serialised by one process-wide async lock; the
 //! backing store is one node's database.
 
+pub mod devices;
+
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -37,7 +39,7 @@ fn lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -96,16 +98,20 @@ pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind:
     signal.check_leg(peer, own)?;
     let _g = lock().lock().await;
     let now = now_ms();
+    admit_locked(store, peer, kind, &signal, now, now).await?;
+    Ok(signal)
+}
+
+async fn admit_locked(store: Store<'_>, peer: &NodeId, kind: u16, signal: &CallSignal, now: u64, arrived: u64) -> Result<(), CallRefusal> {
     let unavailable = |_| CallRefusal::Invalid("call state unavailable");
     let entry = current(store, peer, &signal.call_id, now).await.map_err(unavailable)?;
-    // Only an offer opens a new call id; an unknown-id answer/ICE/hangup is
-    // refused below and must never make room by evicting a burned id (Fable R2).
     if entry.is_none() && kind == konsensus_core::kind::KIND_CALL_INVITE {
         room(store, peer, now).await?;
     }
-    let next = rules::receive(entry, kind, now)?;
+    let transition_time = if kind == konsensus_core::kind::KIND_CALL_INVITE { arrived } else { now };
+    let next = rules::receive(entry, kind, transition_time)?;
     write(store, peer, &signal.call_id, Some(&next)).await.map_err(unavailable)?;
-    Ok(signal)
+    Ok(())
 }
 
 fn refused(e: CallRefusal, new_operation: bool) -> ApiError {
@@ -299,6 +305,7 @@ pub(crate) async fn release_abandoned(store: Store<'_>, operation_id: &str) -> R
 /// operation journal. Ambiguous ones stay for a same-operation retry. Run
 /// before the receive loop and the outbox resend start.
 pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_storage::StorageError> {
+    recover_devices(store).await?;
     let (mut committed, mut released) = (0, 0);
     for (peer, call_id, entry) in store.call_pending().await? {
         let Some(p) = entry.pending.clone() else { continue };
@@ -316,6 +323,25 @@ pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_stora
         }
     }
     Ok((committed, released))
+}
+
+/// Startup prerequisite before serving devices or receiving peer messages.
+/// A failure must prevent startup: volatile bindings cannot recover pending
+/// receipt outcomes by an ordinary same-operation retry.
+pub async fn recover_devices(store: Store<'_>) -> Result<(), konsensus_storage::StorageError> {
+    while store.call_invite_recover(10_000).await? != 0 {}
+    // Device bindings are intentionally volatile. On restart, fail closed
+    // rather than attach a historical envelope to an awaiting call id.
+    let _guard = lock().lock().await;
+    loop {
+        let rows = store.call_awaiting().await?;
+        if rows.is_empty() { break; }
+        for (peer, id, row) in rows {
+            let ended = CallEntry { phase: rules::Phase::Ended, deadline_ms: row.deadline_ms.saturating_add(rules::TOMBSTONE_MS), ..row };
+            store.call_put(&peer, &id, &ended).await?;
+        }
+    }
+    Ok(())
 }
 
 /// How long an incoming signal may stay held by a live handler before the

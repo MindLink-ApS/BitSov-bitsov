@@ -1639,6 +1639,9 @@ async fn start_node_services<'a>(
         _ => None,
     };
 
+    konsensus_api::calls::recover_devices(node.storage().as_ref()).await
+        .context("incoming call device recovery failed")?;
+
     let api_state = Arc::new(konsensus_api::AppState {
         starter: config.starter_settings(),
         identity: Arc::clone(node.identity()),
@@ -1663,6 +1666,7 @@ async fn start_node_services<'a>(
         sensitive_identity_routes_enabled: config.tier.is_self_hosted(),
         has_identity_passphrase: !config.identity.passphrase.is_empty(),
         ws_broadcast: ws_tx.clone(),
+        call_devices: Default::default(),
         ws_delivery_broadcast: ws_delivery_tx.clone(),
         rate_limiter,
         mnemonic_reveal_limiter: Arc::new(
@@ -1895,6 +1899,7 @@ async fn start_node_services<'a>(
         plaintext_cipher: Arc::new(konsensus_crypto::PlaintextCacheCipher::new(
             node.identity().aes_key(),
         )),
+        call_devices: api_state.call_devices.clone(),
         ws_tx,
         audit_log: Arc::clone(&audit_log),
         // M1a: wire the configured admission mode into the receive-path gate carrier.
@@ -2073,6 +2078,7 @@ async fn start_node_services<'a>(
     let send_timestamps_for_cleanup = Arc::clone(&api_state.send_timestamps);
     let peer_ln_pubkeys_for_cleanup = Arc::clone(&api_state.peer_ln_pubkeys);
     let invoice_requests_for_cleanup = Arc::clone(&api_state.invoice_requests);
+    let call_devices_for_cleanup = Arc::clone(&api_state.call_devices);
 
     let api_handle = tokio::spawn(async move {
         if let Err(e) = konsensus_api::serve(api_addr, api_state, shutdown_rx_api).await {
@@ -2082,6 +2088,13 @@ async fn start_node_services<'a>(
     });
 
     // ── Housekeeping tasks ──────────────────────────────────────────────
+
+    let call_cleanup_handle = tokio::spawn(housekeeping::run_call_cleanup(
+        Arc::clone(node.storage()),
+        call_devices_for_cleanup,
+        Arc::clone(node.transport()),
+        node.shutdown_rx(),
+    ));
 
     let nonce_cleanup_handle = tokio::spawn(housekeeping::run_nonce_cleanup(
         Arc::clone(node.storage()),
@@ -2221,6 +2234,9 @@ async fn start_node_services<'a>(
         }
         if let Err(e) = offline_safety_handle.await {
             warn!(error = %e, "offline safety task panicked");
+        }
+        if let Err(e) = call_cleanup_handle.await {
+            warn!(error = %e, "call cleanup task failed");
         }
         if let Err(e) = nonce_cleanup_handle.await {
             warn!(error = %e, "nonce cleanup task panicked");

@@ -162,9 +162,18 @@ impl MessageResponse {
     }
 }
 
+/// Inspection by an owner token or an internal reader is not device receipt.
+async fn device_fetched(auth: &ScopedAuth<Read>, state: &AppState, envelope: &konsensus_core::UkmEnvelope) -> Result<(), ApiError> {
+    if auth.pairing.is_some() && auth.node_id == state.identity.node_id().to_hex() {
+        state.call_devices.fetched(state.storage.as_ref(), envelope, crate::calls::now_ms).await
+            .map_err(|e| ApiError::Storage(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// `GET /api/v1/messages/:id` — get a specific message.
 pub(super) async fn get_message(
-    _auth: ScopedAuth<Read>,
+    auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(id_hex): Path<String>,
 ) -> Result<Json<MessageResponse>, ApiError> {
@@ -185,6 +194,7 @@ pub(super) async fn get_message(
         .unwrap_or(None);
 
     let cipher = state.plaintext_cipher.as_deref();
+    device_fetched(&auth, &state, &envelope).await?;
     Ok(Json(MessageResponse::from_envelope(&envelope).with_cached_plaintext(cached, cipher)))
 }
 
@@ -195,7 +205,7 @@ pub(super) async fn get_message(
 /// derived key. Returns 404 if no cached plaintext exists (e.g., the message
 /// could not be decrypted on receive, or predates the plaintext cache).
 pub(super) async fn get_message_plaintext(
-    _auth: ScopedAuth<Read>,
+    auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(id_hex): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -235,6 +245,9 @@ pub(super) async fn get_message_plaintext(
         }
     };
 
+    if let Some(envelope) = state.storage.get_message(&id).await.map_err(|e| ApiError::Storage(e.to_string()))? {
+        device_fetched(&auth, &state, &envelope).await?;
+    }
     Ok(Json(content))
 }
 
@@ -251,7 +264,7 @@ pub(super) async fn get_message_plaintext(
 /// `BitSov-Data-As-Of` is the time the message store was read for this
 /// response (the store is local and authoritative, so normally "now").
 pub(super) async fn list_messages(
-    _auth: ScopedAuth<Read>,
+    auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListMessagesQuery>,
 ) -> Result<(DataFreshness, ListDiagnostics, Json<Vec<MessageResponse>>), ApiError> {
@@ -318,6 +331,7 @@ pub(super) async fn list_messages(
                 .unwrap_or(None);
             resp = resp.with_cached_plaintext(cached, cipher);
         }
+        device_fetched(&auth, &state, env).await?;
         responses.push(resp);
     }
 
