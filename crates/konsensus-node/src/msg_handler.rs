@@ -338,7 +338,17 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
 
                         if gate_result.is_ok() && !is_relay_control {
                             use konsensus_storage::PaidAcceptance;
-                            match storage_for_recv.accept_paid_envelope(&envelope).await {
+                            let acceptance = storage_for_recv.accept_paid_envelope(&envelope).await;
+                            // Burned replay keys: decide, fail closed, what the resend
+                            // is told BEFORE the gate's payment-reuse reason can be
+                            // produced (the sender reads that one as a legacy ACK).
+                            let burned_reply = match &acceptance {
+                                Ok(PaidAcceptance::NonceReused | PaidAcceptance::PaymentReused) => {
+                                    burned_replay_reply(storage_for_recv.as_ref(), &envelope).await
+                                }
+                                _ => None,
+                            };
+                            match acceptance {
                                 // A web reply the gate accepted is bound to OUR paid
                                 // request: the sender paid nothing, so it is no admission.
                                 Ok(PaidAcceptance::Accepted) if konsensus_core::is_web_service_reply(&envelope) => {}
@@ -364,19 +374,18 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     continue;
                                 }
                                 Ok(PaidAcceptance::NonceReused | PaidAcceptance::PaymentReused)
-                                    if storage_for_recv.is_application_rejected(&envelope).await.unwrap_or(false) =>
+                                    if burned_reply.is_some() =>
                                 {
                                     // A resend of a paid envelope this node accepted and
                                     // then refused at the application (a withdrawn call
                                     // signal, room chat or calendar payload, or one the
-                                    // hold sweep withdrew). The proof is burned, so the
-                                    // answer is a terminal application rejection: a
-                                    // payment-reuse reason here would be read by the
-                                    // sender's legacy-ACK compatibility path as delivered.
+                                    // hold sweep withdrew), or one whose withdrawal
+                                    // status could not be read. Neither may fall through
+                                    // to the payment-reuse reason below.
                                     if call_hold {
                                         let _ = storage_for_recv.call_admission_release(&msg_id).await;
                                     }
-                                    let reject = Frame::MessageReject { id: msg_id, reason: application_rejected_reason() };
+                                    let reject = Frame::MessageReject { id: msg_id, reason: burned_reply.unwrap_or_default() };
                                     if let Err(e) = transport_for_ack.send_frame(&sender, &reject).await {
                                         warn!(peer = %sender, error = %e, "failed to send MessageReject");
                                     }
@@ -625,10 +634,12 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         };
 
                         // Calendar: the payload passed the inbound caps (or there was no
-                        // session to decrypt it); lift the hold before the app sees it.
+                        // session to decrypt it); lift the hold before the app sees it,
+                        // whether this attempt placed it or inherited it from an earlier
+                        // attempt whose acceptance rolled back and whose cleanup failed.
                         // If that write fails the envelope stays held and the sweep
                         // withdraws it: fail closed, the peer gets a reject, not an ACK.
-                        if call_hold && is_calendar_kind(envelope.kind) {
+                        if is_calendar_kind(envelope.kind) {
                             if let Err(e) = storage_for_recv.call_admission_release(&msg_id).await {
                                 error!(msg_id = %msg_id, error = %e, "admitted calendar payload could not be released; withheld");
                                 let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
@@ -949,6 +960,27 @@ pub(crate) const APPLICATION_REJECTED_PREFIX: &str = "application_rejected:";
 
 pub(crate) fn application_rejected_reason() -> String {
     format!("{APPLICATION_REJECTED_PREFIX} the recipient withdrew this message; it will not be delivered")
+}
+
+/// What a resend whose replay keys are already burned is told, before the
+/// gate's payment-reuse reason is considered. `Some` for an envelope this node
+/// withdrew at the application (terminal `application_rejected:`) and, fail
+/// closed, for a withdrawal status that could not be read (`storage error`,
+/// transient): neither may fall through to `payment proof already used`, which
+/// the sender's legacy-ACK compatibility path records as delivered. `None`
+/// only for a genuine reuse whose status read succeeded.
+pub(crate) async fn burned_replay_reply(
+    storage: &dyn konsensus_storage::Storage,
+    envelope: &konsensus_core::UkmEnvelope,
+) -> Option<String> {
+    match storage.is_application_rejected(envelope).await {
+        Ok(true) => Some(application_rejected_reason()),
+        Ok(false) => None,
+        Err(e) => {
+            error!(msg_id = %envelope.id, error = %e, "withdrawal status unreadable; replay answered as storage error, not as payment reuse");
+            Some("storage error".into())
+        }
+    }
 }
 
 /// The `MessageReject` reason for a refused calendar payload: the stable code,

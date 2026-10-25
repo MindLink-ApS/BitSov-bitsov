@@ -19,6 +19,10 @@ struct TestStorage {
     /// Calendar records the inbound path asked to store (counter, not timing).
     calendar_events: Mutex<Vec<konsensus_storage::CalendarEventRecord>>,
     rsvps: Mutex<Vec<konsensus_storage::RsvpRecord>>,
+    /// Message ids whose receipt is application-rejected.
+    application_rejected: Mutex<std::collections::HashSet<String>>,
+    /// Make `is_application_rejected` fail, as a backend read error would.
+    fail_rejected_lookup: std::sync::atomic::AtomicBool,
 }
 
 impl TestStorage {
@@ -29,6 +33,8 @@ impl TestStorage {
             plaintexts: Mutex::new(HashMap::new()),
             calendar_events: Mutex::new(Vec::new()),
             rsvps: Mutex::new(Vec::new()),
+            application_rejected: Mutex::new(std::collections::HashSet::new()),
+            fail_rejected_lookup: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -262,6 +268,24 @@ impl Storage for TestStorage {
     async fn store_rsvp(&self, record: &konsensus_storage::RsvpRecord) -> Result<(), StorageError> {
         self.rsvps.lock().unwrap().push(record.clone());
         Ok(())
+    }
+    async fn is_application_rejected(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+    ) -> Result<bool, StorageError> {
+        if self
+            .fail_rejected_lookup
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError::Unsupported(
+                "injected receipt read failure".into(),
+            ));
+        }
+        Ok(self
+            .application_rejected
+            .lock()
+            .unwrap()
+            .contains(&envelope.id.to_hex()))
     }
 }
 
@@ -3837,8 +3861,106 @@ async fn over_cap_calendar_invite_is_refused_withdrawn_and_terminal_for_the_send
     source.send(bob.node_id(), &ok).await.unwrap();
     assert_eq!(outcome(source.clone()).await, Ok(true));
 
+    // Inherited hold: the acceptance rolls back and the hold cleanup fails, so
+    // the hold outlives the attempt. The retry does not place a hold of its
+    // own, yet the admitted invite must be released before it is published and
+    // acknowledged, and the sweep must leave it alone afterwards.
+    sqlx::raw_sql("CREATE TRIGGER fail_message BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TRIGGER fail_release BEFORE DELETE ON call_admission_hold BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let retried = invite(calendar_json("retry me", 1, serde_json::Value::Null)).await;
+    source.send(bob.node_id(), &retried).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("storage error".into()));
+    assert!(
+        db.call_admission_held(&retried.id).await.unwrap(),
+        "the hold outlives the failed attempt"
+    );
+    hidden(retried.clone()).await;
+    assert!(ws_rx.try_recv().is_err());
+    sqlx::raw_sql("DROP TRIGGER fail_message")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql("DROP TRIGGER fail_release")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    source.send(bob.node_id(), &retried).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    assert!(
+        !db.call_admission_held(&retried.id).await.unwrap(),
+        "an inherited hold must be released before the ACK"
+    );
+    assert!(db.get_message(&retried.id).await.unwrap().is_some());
+    assert_eq!(receipt_accepted(retried.clone()).await, 1);
+    let shown = tokio::time::timeout(Duration::from_secs(5), ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.envelope.id, retried.id);
+    assert_eq!(
+        konsensus_api::calls::withdraw_held(db.as_ref(), true)
+            .await
+            .unwrap(),
+        0,
+        "nothing is left held, so the sweep cannot withdraw an acknowledged invite"
+    );
+    assert!(db.get_message(&retried.id).await.unwrap().is_some());
+    assert_eq!(receipt_accepted(retried.clone()).await, 1);
+    source.send(bob.node_id(), &retried).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(true));
+
     shutdown.send(true).unwrap();
     worker.await.unwrap();
     source.shutdown();
     target.shutdown();
+}
+
+/// A resend whose replay keys are burned is answered, before any payment-reuse
+/// reason, from the receipt's withdrawal status: withdrawn is the terminal
+/// application rejection; an unreadable status fails closed to `storage error`
+/// (transient on the sender, never a delivery); only a readable, genuine reuse
+/// falls through. Neither reply parses as the sender's legacy-ACK exceptions.
+#[tokio::test]
+async fn burned_replay_reply_fails_closed_when_the_withdrawal_status_is_unreadable() {
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let storage = TestStorage::new();
+    let env = make_envelope(
+        alice.as_ref(),
+        *bob.node_id(),
+        konsensus_core::kind::KIND_CALENDAR_EVENT,
+        b"ciphertext".to_vec(),
+    );
+
+    // Genuine reuse with a readable status: no override, the gate's reason stands.
+    assert_eq!(burned_replay_reply(&storage, &env).await, None);
+
+    // Withdrawn at the application: terminal for the sender.
+    storage
+        .application_rejected
+        .lock()
+        .unwrap()
+        .insert(env.id.to_hex());
+    let reply = burned_replay_reply(&storage, &env).await.unwrap();
+    assert!(reply.starts_with(APPLICATION_REJECTED_PREFIX));
+    assert!(crate::session_handler::terminal_paid_rejection(&reply));
+
+    // The status read fails (a lost refusal whose receipt cannot be read now):
+    // fail closed to a transient storage error, never the payment-reuse reason.
+    storage
+        .fail_rejected_lookup
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let reply = burned_replay_reply(&storage, &env).await.unwrap();
+    assert_eq!(reply, "storage error");
+    assert!(!crate::session_handler::terminal_paid_rejection(&reply));
+    for reason in [reply.as_str(), &application_rejected_reason()] {
+        assert!(!reason.starts_with("payment proof already used: "));
+        assert_ne!(reason, "replay detected: nonce already used");
+    }
 }
