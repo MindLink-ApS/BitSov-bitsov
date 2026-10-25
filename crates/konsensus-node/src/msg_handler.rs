@@ -236,7 +236,7 @@ async fn duplicate_call_invite_should_ack(
         warn!(peer = %sender, "call invite resend has no binding; not acknowledging");
         return false;
     };
-    let class = match konsensus_api::calls::conclude_unfetched(storage, sender, &call_id, konsensus_api::calls::now_ms()).await {
+    let class = match konsensus_api::calls::conclude_unfetched(storage, sender, &call_id, &msg_id, konsensus_api::calls::now_ms()).await {
         Ok(class) => Ok(class),
         Err(e) => {
             warn!(peer = %sender, error = %e, "call invite resend not classified; not acknowledging");
@@ -276,7 +276,7 @@ fn arm_device_grace(
 ) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(konsensus_core::payloads::call::DEVICE_RING_GRACE_MS)).await;
-        match konsensus_api::calls::conclude_unfetched(storage.as_ref(), &peer, &call_id, konsensus_api::calls::now_ms()).await {
+        match konsensus_api::calls::conclude_unfetched(storage.as_ref(), &peer, &call_id, &message_id, konsensus_api::calls::now_ms()).await {
             Ok(konsensus_api::calls::Unfetched::BecameNotReachable) => {
                 let transport = transport as Arc<dyn MessageTransport>;
                 konsensus_api::calls::notify_caller(transport, &peer, message_id, konsensus_api::calls::CallerNotice::NotReachable);
@@ -674,7 +674,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // caller's ringing ack wait until a paired device has it.
                         let mut device_ring: Option<String> = None;
                         if konsensus_api::calls::is_call_kind(envelope.kind) {
-                            let admitted = konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref()).await;
+                            let admitted = konsensus_api::calls::admit_incoming_id(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref(), Some(msg_id)).await;
                             // Admitted: lift the hold before the app sees it. If that
                             // write fails the signal stays held and is withdrawn by the
                             // sweep: fail closed, the peer gets a reject, not an ACK.

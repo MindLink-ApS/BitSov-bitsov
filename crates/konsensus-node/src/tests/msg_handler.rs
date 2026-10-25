@@ -2972,6 +2972,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
         db.as_ref(),
         alice.node_id(),
         &id,
+        &env.id,
         konsensus_api::calls::now_ms(),
     )
     .await

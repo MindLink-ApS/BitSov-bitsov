@@ -96,6 +96,19 @@ async fn room(store: Store<'_>, peer: &NodeId, now: u64) -> Result<(), CallRefus
 /// withdraws the stored message). A meeting leg must come from the earlier
 /// participant of its roster.
 pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind: u16, plaintext: Option<&str>) -> Result<CallSignal, CallRefusal> {
+    admit_incoming_id(store, own, peer, kind, plaintext, None).await
+}
+
+/// [`admit_incoming`], recording `invite_id` as the only message that can
+/// start this invite's ring clock. Pass it for every incoming invite.
+pub async fn admit_incoming_id(
+    store: Store<'_>,
+    own: &NodeId,
+    peer: &NodeId,
+    kind: u16,
+    plaintext: Option<&str>,
+    invite_id: Option<MessageId>,
+) -> Result<CallSignal, CallRefusal> {
     let signal = CallSignal::parse(kind, plaintext.ok_or(CallRefusal::Invalid("undecryptable"))?)?;
     signal.check_leg(peer, own)?;
     let _g = lock().lock().await;
@@ -107,9 +120,51 @@ pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind:
     if entry.is_none() && kind == konsensus_core::kind::KIND_CALL_INVITE {
         room(store, peer, now).await?;
     }
-    let next = rules::receive(entry, kind, now)?;
+    let mut next = rules::receive(entry, kind, now)?;
+    if kind == konsensus_core::kind::KIND_CALL_INVITE {
+        if let Some(id) = invite_id {
+            next.invite_message_id = Some(id);
+        }
+    }
     write(store, peer, &signal.call_id, Some(&next)).await.map_err(unavailable)?;
     Ok(signal)
+}
+
+/// Durable outcomes stored on the invite binding. They outlive `call_state`.
+pub const INVITE_PENDING: &str = "pending";
+pub const INVITE_FETCHED: &str = "fetched";
+pub const INVITE_UNREACHABLE: &str = "unreachable";
+
+/// A receipt counts for this row when the row names that message, or when the
+/// row predates message binding (`None`). A different message — an older
+/// invite whose call id was reused — does not.
+fn receipt_matches(stored: Option<MessageId>, receipt: &MessageId) -> bool {
+    stored.is_none_or(|id| id == *receipt)
+}
+
+async fn durable_outcome(store: Store<'_>, receipt: &MessageId) -> Result<Option<String>, konsensus_storage::StorageError> {
+    match store.call_invite_outcome(receipt).await {
+        Ok(outcome) => Ok(outcome),
+        Err(konsensus_storage::StorageError::Unsupported(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn from_durable_outcome(outcome: Option<&str>) -> Unfetched {
+    match outcome {
+        Some(INVITE_UNREACHABLE) => Unfetched::AlreadyNotReachable,
+        Some(INVITE_FETCHED) => Unfetched::Other,
+        // Pending, absent, or unrecognised: no proof a device fetched it.
+        _ => Unfetched::Unrecorded,
+    }
+}
+
+async fn remember_invite_outcome(store: Store<'_>, receipt: &MessageId, outcome: &str) {
+    if let Err(e) = store.record_call_invite_outcome(receipt, outcome).await {
+        if !matches!(e, konsensus_storage::StorageError::Unsupported(_)) {
+            tracing::warn!(error = %e, "call invite outcome not recorded");
+        }
+    }
 }
 
 /// What a paired device's fetch of an incoming invite did.
@@ -129,14 +184,27 @@ pub enum DeviceTook {
 ///
 /// The first call starts the ring clock at `now_ms` and is the signal to send
 /// the ringing acknowledgement. A second device does not move the deadline.
-pub async fn note_device_has_invite(store: Store<'_>, peer: &NodeId, call_id: &str, now_ms: u64) -> Result<DeviceTook, konsensus_storage::StorageError> {
+/// `receipt` must be the current invite's message id; an older retained invite
+/// for a reused call id does not start the new clock. The check and the write
+/// share the call-state lock.
+pub async fn note_device_has_invite(
+    store: Store<'_>,
+    peer: &NodeId,
+    call_id: &str,
+    receipt: &MessageId,
+    now_ms: u64,
+) -> Result<DeviceTook, konsensus_storage::StorageError> {
     let _g = lock().lock().await;
     let Some(raw) = store.call_get(peer, call_id).await? else {
         return Ok(DeviceTook::Ignored);
     };
+    if !receipt_matches(raw.invite_message_id, receipt) {
+        return Ok(DeviceTook::Ignored);
+    }
     if raw.phase == Phase::AwaitingDevice && raw.deadline_ms <= now_ms {
         if let Some(missed) = raw.at(now_ms) {
             write(store, peer, call_id, Some(&missed)).await?;
+            remember_invite_outcome(store, receipt, INVITE_UNREACHABLE).await;
         }
         return Ok(DeviceTook::NotReachable);
     }
@@ -147,10 +215,14 @@ pub async fn note_device_has_invite(store: Store<'_>, peer: &NodeId, call_id: &s
         DeviceFetch::Started(next) => {
             let deadline_ms = next.deadline_ms;
             write(store, peer, call_id, Some(&next)).await?;
+            remember_invite_outcome(store, receipt, INVITE_FETCHED).await;
             Ok(DeviceTook::Started { deadline_ms })
         }
         DeviceFetch::Unchanged(entry) => Ok(DeviceTook::Already { deadline_ms: entry.deadline_ms }),
-        DeviceFetch::NotWaiting(entry) if entry.phase == Phase::Unreachable => Ok(DeviceTook::NotReachable),
+        DeviceFetch::NotWaiting(entry) if entry.phase == Phase::Unreachable => {
+            remember_invite_outcome(store, receipt, INVITE_UNREACHABLE).await;
+            Ok(DeviceTook::NotReachable)
+        }
         DeviceFetch::NotWaiting(_) => Ok(DeviceTook::Ignored),
     }
 }
@@ -166,20 +238,42 @@ pub enum Unfetched {
     BecameNotReachable,
     /// Already told (or already stored) as not reachable.
     AlreadyNotReachable,
-    /// No such invite, or it ended some other way.
+    /// No such invite, or it ended some other way. Also a swept row whose
+    /// durable outcome says a device did fetch the invite.
     Other,
+    /// The call row is gone and nothing durable says a device fetched it or
+    /// that it was already not reachable. Do not acknowledge success.
+    Unrecorded,
 }
 
 /// If `call_id` is still waiting for a device at `now_ms` and the grace has
 /// elapsed, burn it as not reachable. The ring clock is not started.
-pub async fn conclude_unfetched(store: Store<'_>, peer: &NodeId, call_id: &str, now_ms: u64) -> Result<Unfetched, konsensus_storage::StorageError> {
+///
+/// `receipt` is the resent invite's message id. It is applied only when it is
+/// the current row's invite. A missing row, or a row for a newer invite,
+/// follows the durable outcome of `receipt` and does not acknowledge success
+/// when that outcome is missing.
+pub async fn conclude_unfetched(
+    store: Store<'_>,
+    peer: &NodeId,
+    call_id: &str,
+    receipt: &MessageId,
+    now_ms: u64,
+) -> Result<Unfetched, konsensus_storage::StorageError> {
     let _g = lock().lock().await;
+    let outcome = durable_outcome(store, receipt).await?;
     let Some(raw) = store.call_get(peer, call_id).await? else {
-        return Ok(Unfetched::Other);
+        return Ok(from_durable_outcome(outcome.as_deref()));
     };
+    if !receipt_matches(raw.invite_message_id, receipt) {
+        return Ok(from_durable_outcome(outcome.as_deref()));
+    }
     match raw.phase {
         Phase::Ringing | Phase::Live => Ok(Unfetched::Ringing { deadline_ms: raw.deadline_ms }),
-        Phase::Unreachable => Ok(Unfetched::AlreadyNotReachable),
+        Phase::Unreachable => {
+            remember_invite_outcome(store, receipt, INVITE_UNREACHABLE).await;
+            Ok(Unfetched::AlreadyNotReachable)
+        }
         Phase::AwaitingDevice if now_ms < raw.deadline_ms => Ok(Unfetched::Waiting { until_ms: raw.deadline_ms }),
         Phase::AwaitingDevice => {
             let Some(missed) = raw.at(now_ms) else {
@@ -189,6 +283,7 @@ pub async fn conclude_unfetched(store: Store<'_>, peer: &NodeId, call_id: &str, 
                 return Ok(Unfetched::Other);
             }
             write(store, peer, call_id, Some(&missed)).await?;
+            remember_invite_outcome(store, receipt, INVITE_UNREACHABLE).await;
             Ok(Unfetched::BecameNotReachable)
         }
         Phase::Reserved | Phase::Ended => Ok(Unfetched::Other),
@@ -198,7 +293,18 @@ pub async fn conclude_unfetched(store: Store<'_>, peer: &NodeId, call_id: &str, 
 /// How many ring notices may be writing to peers at once. Past this, a notice
 /// is dropped instead of waiting: a stalled caller must not block the caller
 /// of [`notify_caller`], and must not pile up unbounded tasks.
-const NOTICE_IN_FLIGHT: usize = 32;
+pub const NOTICE_IN_FLIGHT: usize = 32;
+
+/// How long one notice may spend acquiring the peer connection lock and
+/// writing the socket. The permit is released when this elapses, so a stalled
+/// caller cannot hold a slot until process exit.
+pub const NOTICE_SEND_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Permits still free for [`notify_caller`]. Tests use this to show a stalled
+/// write gives its slot back at [`NOTICE_SEND_DEADLINE`].
+pub fn notice_permits_available() -> usize {
+    notice_permits().available_permits()
+}
 
 fn notice_permits() -> &'static Semaphore {
     static PERMITS: OnceLock<Semaphore> = OnceLock::new();
@@ -209,9 +315,10 @@ fn notice_permits() -> &'static Semaphore {
 /// `duplicate` is set only when repeating an acknowledgement of an invite
 /// that already rang.
 ///
-/// Returns as soon as the notice is queued. The peer lock and the socket
-/// write run on a bounded background task, so a stalled caller cannot block
-/// an inbox read or the receive loop.
+/// Returns as soon as the notice is queued. The peer connection lock and the
+/// socket write run on a bounded background task, so a stalled caller cannot
+/// block an inbox read or the receive loop. The task holds its permit only
+/// until [`NOTICE_SEND_DEADLINE`], which covers both the lock and the write.
 pub fn notify_caller(transport: Arc<dyn MessageTransport>, peer: &NodeId, id: MessageId, notice: CallerNotice) {
     let frame = match notice {
         CallerNotice::Ringing { duplicate } => konsensus_message::Frame::MessageAck { id, duplicate },
@@ -231,8 +338,13 @@ pub fn notify_caller(transport: Arc<dyn MessageTransport>, peer: &NodeId, id: Me
     let peer = *peer;
     tokio::spawn(async move {
         let _permit = permit;
-        if let Err(e) = transport.send_raw_frame(&peer, &bytes).await {
-            tracing::warn!(peer = %peer, error = %e, "call notice not sent");
+        // The deadline starts before send_raw_frame, so it covers the
+        // connection-lock wait and the socket write inside that call.
+        let send = transport.send_raw_frame(&peer, &bytes);
+        match tokio::time::timeout(NOTICE_SEND_DEADLINE, send).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(peer = %peer, error = %e, "call notice not sent"),
+            Err(_) => tracing::warn!(peer = %peer, "call notice deadline elapsed before the peer write finished"),
         }
     });
 }
@@ -255,7 +367,7 @@ pub async fn deliver_invite_to_device(state: &AppState, sender_hex: &str, messag
     let Ok(peer) = NodeId::from_hex(sender_hex) else { return };
     let Ok(id) = MessageId::from_hex(message_id_hex) else { return };
     let Ok(signal) = CallSignal::parse(konsensus_core::kind::KIND_CALL_INVITE, plaintext) else { return };
-    match note_device_has_invite(state.storage.as_ref(), &peer, &signal.call_id, now_ms()).await {
+    match note_device_has_invite(state.storage.as_ref(), &peer, &signal.call_id, &id, now_ms()).await {
         Ok(DeviceTook::Started { .. }) => notify_caller(Arc::clone(&state.transport), &peer, id, CallerNotice::Ringing { duplicate: false }),
         Ok(DeviceTook::NotReachable) => notify_caller(Arc::clone(&state.transport), &peer, id, CallerNotice::NotReachable),
         Ok(DeviceTook::Already { .. } | DeviceTook::Ignored) => {}
@@ -291,13 +403,14 @@ pub enum InviteRetry {
     NotReachable,
 }
 
-/// Classify a resend. A storage failure is [`InviteRetry::Hold`]: a success
-/// ack without proof of device receipt would stop the sender's retries.
+/// Classify a resend. A storage failure, or a missing call row with no durable
+/// proof a device fetched the invite, is [`InviteRetry::Hold`]: a success ack
+/// without that proof would stop the sender's retries.
 pub fn invite_retry_decision(class: Result<Unfetched, ()>) -> InviteRetry {
     match class {
         Ok(Unfetched::Ringing { .. } | Unfetched::Other) => InviteRetry::Ack,
         Ok(Unfetched::BecameNotReachable | Unfetched::AlreadyNotReachable) => InviteRetry::NotReachable,
-        Ok(Unfetched::Waiting { .. }) | Err(()) => InviteRetry::Hold,
+        Ok(Unfetched::Waiting { .. } | Unfetched::Unrecorded) | Err(()) => InviteRetry::Hold,
     }
 }
 

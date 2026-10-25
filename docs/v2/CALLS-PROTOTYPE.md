@@ -36,20 +36,26 @@ live calls and reservations. Pure rules: `konsensus_core::payloads::call`.
 |---|---|---|
 | 400 offer | the id was never used with that peer (or its replay protection ended) | awaiting a paired device (`awaiting_device`) for 15 s (`DEVICE_RING_GRACE_MS`); ringing for 60 s only once a device fetches that invite |
 | 401 answer | ringing, and sent by the callee | live, 4 h cap |
-| 402 ICE | ringing or live | — |
+| 402 ICE | ringing or live; an incoming candidate is also kept while awaiting a device. The caller cannot pay for one until ringing is confirmed | — |
 | 403 hangup | awaiting a device, ringing, or live | ended; id burned for 24 h |
 
 **Ringing starts when a device has the invite.** The callee's node admits a paid
 offer without starting the 60 s ring clock and without acknowledging it as
 ringing. The clock starts, and the caller is sent the ringing acknowledgement,
 only when one of the callee's paired devices fetches or receives that invite:
-the device WebSocket stream for the call, or a device read of that invite
-(`GET /api/v1/messages`, its plaintext, or a resync fulfill). A second device
-fetching the same invite does not restart the clock. If no device does so
-within 15 s, the caller is answered `not reachable` (a terminal delivery
-rejection with that exact reason). That is not a no-answer: a no-answer is a
-ring that ran its 60 s, measured from the device fetch, and then ended. Who
-may call, and what a call costs, are unchanged.
+a successful write of the invite on that device's WebSocket, or a device read
+(`GET /api/v1/messages` or its plaintext). A resync fulfill only queues the
+broadcast. With no connected device it does not start the clock or acknowledge
+ringing; the HTTP response is counts. A second device fetching the same invite
+does not restart the clock. The call row stores that invite's message id, so a
+fetch of an older invite after the call id is reused does not start the new
+clock. The invite binding keeps a durable outcome (`pending`, `fetched`, or
+`unreachable`) that outlives the call row: a swept invite is not acknowledged
+as delivered. If no device fetches the invite within 15 s, the caller is
+answered `not reachable` (a terminal delivery rejection with that exact
+reason). That is not a no-answer: a no-answer is a ring that ran its 60 s,
+measured from the device fetch, and then ended. Who may call, and what a call
+costs, are unchanged.
 
 **Our own signals are transactional.** Compose *reserves* the signal under its
 operation id (generated if absent) before any quote or payment; a reserved

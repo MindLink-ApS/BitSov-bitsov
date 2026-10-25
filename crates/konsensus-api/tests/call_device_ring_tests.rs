@@ -6,7 +6,7 @@ use konsensus_api::calls::{self, DeviceTook, Unfetched};
 use konsensus_core::payloads::call::{
     Phase, DEVICE_RING_GRACE_MS, NOT_REACHABLE, RING_TIMEOUT_MS, TOMBSTONE_MS,
 };
-use konsensus_core::NodeId;
+use konsensus_core::{MessageId, NodeId};
 use konsensus_storage::{SqliteStorage, Storage};
 
 fn offer(id: &str) -> String {
@@ -19,6 +19,11 @@ fn id(n: usize) -> String {
 
 fn own() -> NodeId {
     NodeId::from_bytes([0xee; 32])
+}
+
+/// Rows admitted without a message id accept any receipt.
+fn receipt() -> MessageId {
+    MessageId::from_bytes([0; 32])
 }
 
 async fn admitted(store: &SqliteStorage, n: usize) -> (NodeId, String, u64) {
@@ -47,7 +52,7 @@ async fn invite_with_no_device_is_not_reachable_and_the_ring_clock_never_starts(
     let early = grace_end - 1;
 
     assert_eq!(
-        calls::conclude_unfetched(&store, &peer, &call, early)
+        calls::conclude_unfetched(&store, &peer, &call, &receipt(), early)
             .await
             .unwrap(),
         Unfetched::Waiting {
@@ -69,7 +74,7 @@ async fn invite_with_no_device_is_not_reachable_and_the_ring_clock_never_starts(
     );
 
     assert_eq!(
-        calls::conclude_unfetched(&store, &peer, &call, grace_end)
+        calls::conclude_unfetched(&store, &peer, &call, &receipt(), grace_end)
             .await
             .unwrap(),
         Unfetched::BecameNotReachable,
@@ -85,7 +90,7 @@ async fn invite_with_no_device_is_not_reachable_and_the_ring_clock_never_starts(
     assert_eq!(NOT_REACHABLE, "not reachable");
 
     assert_eq!(
-        calls::note_device_has_invite(&store, &peer, &call, grace_end)
+        calls::note_device_has_invite(&store, &peer, &call, &receipt(), grace_end)
             .await
             .unwrap(),
         DeviceTook::NotReachable,
@@ -95,7 +100,7 @@ async fn invite_with_no_device_is_not_reachable_and_the_ring_clock_never_starts(
         Phase::Ringing
     );
     assert_eq!(
-        calls::conclude_unfetched(&store, &peer, &call, grace_end + 1)
+        calls::conclude_unfetched(&store, &peer, &call, &receipt(), grace_end + 1)
             .await
             .unwrap(),
         Unfetched::AlreadyNotReachable,
@@ -131,7 +136,7 @@ async fn a_device_fetch_starts_the_ring_clock_at_fetch_time() {
     let fetch_at = invited_at + 4_000;
     assert!(fetch_at < grace_end);
 
-    match calls::note_device_has_invite(&store, &peer, &call, fetch_at)
+    match calls::note_device_has_invite(&store, &peer, &call, &receipt(), fetch_at)
         .await
         .unwrap()
     {
@@ -161,7 +166,7 @@ async fn a_device_fetch_starts_the_ring_clock_at_fetch_time() {
     );
 
     assert_eq!(
-        calls::conclude_unfetched(&store, &peer, &call, grace_end)
+        calls::conclude_unfetched(&store, &peer, &call, &receipt(), grace_end)
             .await
             .unwrap(),
         Unfetched::Ringing {
@@ -183,7 +188,7 @@ async fn a_second_device_fetch_does_not_restart_the_ring_clock() {
     let second_at = first_at + 10_000;
     assert!(second_at < grace_end);
 
-    let started = calls::note_device_has_invite(&store, &peer, &call, first_at)
+    let started = calls::note_device_has_invite(&store, &peer, &call, &receipt(), first_at)
         .await
         .unwrap();
     assert_eq!(
@@ -193,7 +198,7 @@ async fn a_second_device_fetch_does_not_restart_the_ring_clock() {
         }
     );
 
-    let again = calls::note_device_has_invite(&store, &peer, &call, second_at)
+    let again = calls::note_device_has_invite(&store, &peer, &call, &receipt(), second_at)
         .await
         .unwrap();
     assert_eq!(
@@ -288,6 +293,11 @@ async fn invite_retry_holds_the_ack_when_classification_fails() {
         calls::invite_retry_decision(Ok(calls::Unfetched::BecameNotReachable)),
         calls::InviteRetry::NotReachable
     );
+    assert_eq!(
+        calls::invite_retry_decision(Ok(calls::Unfetched::Unrecorded)),
+        calls::InviteRetry::Hold,
+        "a missing call row with no durable outcome is not a success ack"
+    );
 
     let store = SqliteStorage::in_memory().await.unwrap();
     let peer = NodeId::from_bytes([9; 32]);
@@ -302,7 +312,7 @@ async fn invite_retry_holds_the_ack_when_classification_fails() {
         .execute(store.pool())
         .await
         .unwrap();
-    assert!(calls::conclude_unfetched(&store, &peer, &call, 1)
+    assert!(calls::conclude_unfetched(&store, &peer, &call, &receipt(), 1)
         .await
         .is_err());
     assert_eq!(
@@ -367,10 +377,17 @@ impl konsensus_core::traits::transport::MessageTransport for StallTransport {
     }
 }
 
+fn notice_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Finding 4: a ring notice returns while the caller socket write is still
 /// blocked, so an inbox read is not stuck on that peer.
 #[tokio::test]
 async fn ring_notice_does_not_block_on_a_stalled_caller() {
+    let _gate = notice_gate().lock().await;
+    let permits_before = calls::notice_permits_available();
     let started = std::sync::Arc::new(tokio::sync::Notify::new());
     let release = std::sync::Arc::new(tokio::sync::Notify::new());
     let sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -403,4 +420,286 @@ async fn ring_notice_does_not_block_on_a_stalled_caller() {
     })
     .await
     .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while calls::notice_permits_available() < permits_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+struct HangTransport {
+    entered: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl konsensus_core::traits::transport::MessageTransport for HangTransport {
+    async fn send(
+        &self,
+        _peer: &NodeId,
+        _envelope: &konsensus_core::UkmEnvelope,
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        Ok(())
+    }
+
+    async fn recv(&self) -> Result<konsensus_core::UkmEnvelope, konsensus_core::traits::transport::TransportError> {
+        std::future::pending().await
+    }
+
+    async fn connect(
+        &self,
+        _peer: &NodeId,
+        _addr: &str,
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        Ok(())
+    }
+
+    async fn disconnect(
+        &self,
+        _peer: &NodeId,
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        Ok(())
+    }
+
+    async fn is_connected(&self, _peer: &NodeId) -> bool {
+        false
+    }
+
+    async fn connected_peers(&self) -> Vec<NodeId> {
+        Vec::new()
+    }
+
+    async fn send_raw_frame(
+        &self,
+        _peer: &NodeId,
+        _frame_bytes: &[u8],
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+struct CountTransport {
+    sent: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl konsensus_core::traits::transport::MessageTransport for CountTransport {
+    async fn send(
+        &self,
+        _peer: &NodeId,
+        _envelope: &konsensus_core::UkmEnvelope,
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        Ok(())
+    }
+
+    async fn recv(&self) -> Result<konsensus_core::UkmEnvelope, konsensus_core::traits::transport::TransportError> {
+        std::future::pending().await
+    }
+
+    async fn connect(
+        &self,
+        _peer: &NodeId,
+        _addr: &str,
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        Ok(())
+    }
+
+    async fn disconnect(
+        &self,
+        _peer: &NodeId,
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        Ok(())
+    }
+
+    async fn is_connected(&self, _peer: &NodeId) -> bool {
+        false
+    }
+
+    async fn connected_peers(&self) -> Vec<NodeId> {
+        Vec::new()
+    }
+
+    async fn send_raw_frame(
+        &self,
+        _peer: &NodeId,
+        _frame_bytes: &[u8],
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A stalled connection lock or socket write holds a notice permit only until
+/// the deadline. Once every slot is taken, a further notice is dropped; after
+/// the deadline those slots are free and a later notice is sent.
+#[tokio::test]
+async fn stalled_notice_write_releases_its_permit_when_the_deadline_elapses() {
+    let _gate = notice_gate().lock().await;
+    let hang = std::sync::Arc::new(HangTransport {
+        entered: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let transport = std::sync::Arc::clone(&hang) as std::sync::Arc<dyn konsensus_core::traits::transport::MessageTransport>;
+    let peer = NodeId::from_bytes([7; 32]);
+    let id = MessageId::from_bytes([8; 32]);
+    for _ in 0..calls::NOTICE_IN_FLIGHT {
+        calls::notify_caller(
+            std::sync::Arc::clone(&transport),
+            &peer,
+            id,
+            calls::CallerNotice::Ringing { duplicate: false },
+        );
+    }
+    assert_eq!(calls::notice_permits_available(), 0, "every notice slot is held");
+    let dropped = std::sync::Arc::new(CountTransport {
+        sent: std::sync::atomic::AtomicUsize::new(0),
+    });
+    calls::notify_caller(
+        std::sync::Arc::clone(&dropped) as _,
+        &peer,
+        id,
+        calls::CallerNotice::NotReachable,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dropped.sent.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a notice past the permit cap is not written while the slots are stalled"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while hang.entered.load(std::sync::atomic::Ordering::SeqCst) < calls::NOTICE_IN_FLIGHT {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("each stalled notice is inside the peer write, which includes the connection lock");
+    tokio::time::timeout(
+        calls::NOTICE_SEND_DEADLINE + std::time::Duration::from_secs(2),
+        async {
+            while calls::notice_permits_available() < calls::NOTICE_IN_FLIGHT {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await
+    .expect("stalled lock and socket writes release their permits at the deadline");
+    let later = std::sync::Arc::new(CountTransport {
+        sent: std::sync::atomic::AtomicUsize::new(0),
+    });
+    calls::notify_caller(
+        std::sync::Arc::clone(&later) as _,
+        &NodeId::from_bytes([9; 32]),
+        id,
+        calls::CallerNotice::Ringing { duplicate: false },
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while later.sent.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a notice for another caller is sent once the deadline frees a permit");
+}
+
+/// After an unreachable invite's row is swept, resending the retained paid
+/// invite is not a success ack. With no durable outcome at all, the resend
+/// fails closed and is held.
+#[tokio::test]
+async fn swept_unreachable_invite_is_not_acked_when_no_device_fetched_it() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([0x42; 32]);
+    let call = id(11);
+    let msg = MessageId::from_bytes([4; 32]);
+    calls::admit_incoming_id(&store, &own(), &peer, 400, Some(&offer(&call)), Some(msg))
+        .await
+        .unwrap();
+    store.bind_call_invite(&msg, &peer, &call).await.unwrap();
+    assert_eq!(
+        store.call_invite_outcome(&msg).await.unwrap().as_deref(),
+        Some(calls::INVITE_PENDING)
+    );
+    let grace_end = store.call_get(&peer, &call).await.unwrap().unwrap().deadline_ms;
+    assert_eq!(
+        calls::conclude_unfetched(&store, &peer, &call, &msg, grace_end)
+            .await
+            .unwrap(),
+        Unfetched::BecameNotReachable,
+    );
+    assert_eq!(
+        store.call_invite_outcome(&msg).await.unwrap().as_deref(),
+        Some(calls::INVITE_UNREACHABLE)
+    );
+    store.call_delete(&peer, &call).await.unwrap();
+    assert!(store.call_get(&peer, &call).await.unwrap().is_none());
+    let class = calls::conclude_unfetched(&store, &peer, &call, &msg, grace_end + 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        calls::invite_retry_decision(Ok(class)),
+        calls::InviteRetry::NotReachable,
+        "the swept row still remembers that no device fetched the invite"
+    );
+
+    let unknown = MessageId::from_bytes([5; 32]);
+    let missing = calls::conclude_unfetched(&store, &peer, &call, &unknown, grace_end + 1)
+        .await
+        .unwrap();
+    assert_eq!(missing, Unfetched::Unrecorded);
+    assert_eq!(
+        calls::invite_retry_decision(Ok(missing)),
+        calls::InviteRetry::Hold,
+        "a missing call row with no durable outcome fails closed"
+    );
+}
+
+/// Fetching an older retained invite after the call id is reused must not
+/// start the newer invite's ring clock. Only the current invite's message id
+/// is a receipt.
+#[tokio::test]
+async fn historical_invite_fetch_after_call_id_reuse_does_not_start_the_new_ring() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([0x42; 32]);
+    let call = id(12);
+    let old_id = MessageId::from_bytes([1; 32]);
+    let new_id = MessageId::from_bytes([2; 32]);
+    calls::admit_incoming_id(&store, &own(), &peer, 400, Some(&offer(&call)), Some(old_id))
+        .await
+        .unwrap();
+    let grace_end = store.call_get(&peer, &call).await.unwrap().unwrap().deadline_ms;
+    assert_eq!(
+        calls::conclude_unfetched(&store, &peer, &call, &old_id, grace_end)
+            .await
+            .unwrap(),
+        Unfetched::BecameNotReachable,
+    );
+    store.call_delete(&peer, &call).await.unwrap();
+
+    calls::admit_incoming_id(&store, &own(), &peer, 400, Some(&offer(&call)), Some(new_id))
+        .await
+        .unwrap();
+    let before = store.call_get(&peer, &call).await.unwrap().unwrap();
+    assert_eq!(before.phase, Phase::AwaitingDevice);
+    assert_eq!(before.invite_message_id, Some(new_id));
+    let fetch_at = before.deadline_ms - DEVICE_RING_GRACE_MS + 1_000;
+    assert!(fetch_at < before.deadline_ms);
+
+    assert_eq!(
+        calls::note_device_has_invite(&store, &peer, &call, &old_id, fetch_at)
+            .await
+            .unwrap(),
+        DeviceTook::Ignored,
+    );
+    let still = store.call_get(&peer, &call).await.unwrap().unwrap();
+    assert_eq!(still.phase, Phase::AwaitingDevice);
+    assert_eq!(still.deadline_ms, before.deadline_ms);
+    assert!(!still.ring_anchored);
+
+    match calls::note_device_has_invite(&store, &peer, &call, &new_id, fetch_at)
+        .await
+        .unwrap()
+    {
+        DeviceTook::Started { deadline_ms } => assert_eq!(deadline_ms, fetch_at + RING_TIMEOUT_MS),
+        other => panic!("the current invite's fetch starts the clock, got {other:?}"),
+    }
 }

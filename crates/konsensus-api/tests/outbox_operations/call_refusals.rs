@@ -23,6 +23,7 @@ fn ringing() -> CallEntry {
         deadline_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap() + 60_000,
         pending: None,
         ring_anchored: false,
+        invite_message_id: None,
     }
 }
 

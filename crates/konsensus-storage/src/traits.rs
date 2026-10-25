@@ -1184,4 +1184,16 @@ pub trait Storage: Send + Sync {
     async fn call_invite_binding(&self, _id: &MessageId) -> Result<Option<(konsensus_core::NodeId, String)>, StorageError> {
         Err(StorageError::Unsupported("call invite binding".into()))
     }
+
+    /// Durable delivery outcome for this invite message (`pending`, `fetched`,
+    /// or `unreachable`). It outlives the call row, so a resend after the row
+    /// is swept is not a success acknowledgement.
+    async fn call_invite_outcome(&self, _id: &MessageId) -> Result<Option<String>, StorageError> {
+        Err(StorageError::Unsupported("call invite outcome".into()))
+    }
+
+    /// Advance a pending outcome to `outcome`. A terminal outcome is left stored.
+    async fn record_call_invite_outcome(&self, _id: &MessageId, _outcome: &str) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call invite outcome".into()))
+    }
 }

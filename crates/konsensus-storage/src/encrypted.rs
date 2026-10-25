@@ -902,6 +902,14 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_invite_binding(id).await
     }
 
+    async fn call_invite_outcome(&self, id: &MessageId) -> Result<Option<String>, StorageError> {
+        self.inner.call_invite_outcome(id).await
+    }
+
+    async fn record_call_invite_outcome(&self, id: &MessageId, outcome: &str) -> Result<(), StorageError> {
+        self.inner.record_call_invite_outcome(id, outcome).await
+    }
+
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
         self.inner.has_nonce(nonce).await
     }

@@ -54,6 +54,7 @@ fn entry(phase: Phase, side: Side, deadline_ms: u64, op: Option<&str>) -> CallEn
             request_hash: "hash".into(),
         }),
         ring_anchored: false,
+        invite_message_id: None,
     }
 }
 

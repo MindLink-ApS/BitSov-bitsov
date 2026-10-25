@@ -19,7 +19,10 @@
 //!   safety cap (grace + 60 s), not the ring clock. If no device fetches
 //!   the invite, the caller is told [`NOT_REACHABLE`] — not a ring timeout;
 //! - an answer (401) is accepted only from the callee, while it rings;
-//! - ICE (402) only for a ringing or live call; hangup (403) also while the
+//! - ICE (402) is kept while the invite is still waiting for a device, and
+//!   for a ringing or live call. The caller does not pay for a candidate
+//!   until its own ring is confirmed (the ringing acknowledgement, or the
+//!   call already being live). Hangup (403) is also accepted while the
 //!   invite is still waiting for a device;
 //! - our own signals are **reserved** under their operation id before any
 //!   payment and **committed** only once the payment settled. A definite
@@ -37,7 +40,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::kind::{KIND_CALL_ANSWER, KIND_CALL_HANGUP, KIND_CALL_INVITE, KIND_ICE_CANDIDATE};
-use crate::types::NodeId;
+use crate::types::{MessageId, NodeId};
 
 /// Payload schema version.
 pub const CALL_SIGNAL_VERSION: u8 = 1;
@@ -336,6 +339,11 @@ pub struct CallEntry {
     /// the caller's first ringing acknowledgement. A paid invite can already
     /// be [`Phase::Ringing`] and still be unanchored.
     pub ring_anchored: bool,
+    /// Message id of the invite this row admits. A device receipt counts only
+    /// when it is this message, so a reused call id cannot be rung by an
+    /// older retained invite. `None` on rows written before the binding, and
+    /// on the caller's own offer (the callee's row is the one that rings).
+    pub invite_message_id: Option<MessageId>,
 }
 
 impl CallEntry {
@@ -381,7 +389,7 @@ pub fn reserve(entry: Option<CallEntry>, kind: u16, operation_id: &str, request_
     let mine = |e: &CallEntry| e.pending.as_ref().is_some_and(|p| p.is(operation_id, request_hash) && p.kind == kind);
     match kind {
         KIND_CALL_INVITE => match entry {
-            None => Ok(CallEntry { side: Side::Caller, phase: Phase::Reserved, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: Some(pending), ring_anchored: false }),
+            None => Ok(CallEntry { side: Side::Caller, phase: Phase::Reserved, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: Some(pending), ring_anchored: false, invite_message_id: None }),
             Some(e) if e.phase == Phase::Reserved && mine(&e) => Ok(e),
             Some(_) => Err(CallRefusal::Replayed),
         },
@@ -399,6 +407,11 @@ pub fn reserve(entry: Option<CallEntry>, kind: u16, operation_id: &str, request_
                 // The caller can cancel during the device grace; that is not a ring.
                 KIND_CALL_HANGUP if e.phase == Phase::AwaitingDevice => Ok(CallEntry { pending: Some(pending), ..e }),
                 _ if !e.open() => Err(CallRefusal::UnknownCall),
+                // No payment until a device has the invite. An unanchored
+                // caller is only inside the grace-plus-ring safety cap; ICE
+                // paid then is deleted by a callee still in AwaitingDevice.
+                // A live call has already been answered, so candidates proceed.
+                KIND_ICE_CANDIDATE if e.phase != Phase::Live && e.side == Side::Caller && !e.ring_anchored => Err(CallRefusal::NotRinging),
                 // ICE changes nothing once paid: no reservation needed.
                 KIND_ICE_CANDIDATE => Ok(e),
                 _ => Ok(CallEntry { pending: Some(pending), ..e }),
@@ -456,6 +469,7 @@ pub fn receive(entry: Option<CallEntry>, kind: u16, now_ms: u64) -> Result<CallE
                 deadline_ms: now_ms.saturating_add(DEVICE_RING_GRACE_MS),
                 pending: None,
                 ring_anchored: false,
+                invite_message_id: None,
             }),
             Some(_) => Err(CallRefusal::Replayed),
         },
@@ -471,7 +485,10 @@ pub fn receive(entry: Option<CallEntry>, kind: u16, now_ms: u64) -> Result<CallE
                 (Phase::Live, _) => Err(CallRefusal::NotRinging),
             }
         }
-        KIND_ICE_CANDIDATE => entry.filter(|e| e.open()).ok_or(CallRefusal::UnknownCall),
+        // Kept during device grace so a candidate the caller already paid for
+        // is still there when a device fetches the invite. Ended, unreachable,
+        // and unknown calls still refuse it.
+        KIND_ICE_CANDIDATE => entry.filter(|e| e.open() || e.phase == Phase::AwaitingDevice).ok_or(CallRefusal::UnknownCall),
         KIND_CALL_HANGUP => {
             let e = entry.filter(|e| e.open() || e.phase == Phase::AwaitingDevice).ok_or(CallRefusal::UnknownCall)?;
             // Their hangup wins; a signal of ours still being paid keeps its
@@ -851,5 +868,38 @@ mod tests {
         for s in ["paying", "payment_unknown", "something_new"] {
             assert_eq!(settlement(Some(s)), Settlement::Ambiguous);
         }
+    }
+
+    /// The caller must not pay for ICE while the callee is still waiting for
+    /// a device. Those candidates are kept if they arrive anyway, and the
+    /// caller may reserve one once the ringing acknowledgement anchors the clock.
+    #[test]
+    fn caller_ice_is_refused_before_payment_until_ringing_is_confirmed() {
+        let paid_at = 1_000u64;
+        let caller = commit(reserve(None, KIND_CALL_INVITE, "op", "h", paid_at).unwrap(), "op", paid_at);
+        assert_eq!(caller.phase, Phase::Ringing);
+        assert!(!caller.ring_anchored, "payment has not confirmed that a device is ringing");
+        assert_eq!(
+            reserve(Some(caller.clone()), KIND_ICE_CANDIDATE, "ice", "h", paid_at),
+            Err(CallRefusal::NotRinging),
+            "refusing here is before any payment"
+        );
+        let waiting = receive(None, KIND_CALL_INVITE, paid_at).unwrap();
+        assert_eq!(waiting.phase, Phase::AwaitingDevice);
+        let kept = receive(Some(waiting.clone()), KIND_ICE_CANDIDATE, paid_at + 1).unwrap();
+        assert_eq!(kept, waiting, "a candidate during grace is kept, not deleted");
+
+        let anchored = match note_ringing_ack(caller, paid_at + 1_000) {
+            RingAck::Started(entry) => entry,
+            other => panic!("the ringing ack confirms the ring, got {other:?}"),
+        };
+        assert!(reserve(Some(anchored), KIND_ICE_CANDIDATE, "ice", "h", paid_at).is_ok());
+
+        let callee = match note_device_fetch(waiting, paid_at + 1_000) {
+            DeviceFetch::Started(entry) => entry,
+            other => panic!("device fetch starts the callee ring, got {other:?}"),
+        };
+        assert!(reserve(Some(callee.clone()), KIND_ICE_CANDIDATE, "ice", "h", paid_at).is_ok());
+        assert!(receive(Some(callee), KIND_ICE_CANDIDATE, paid_at + 1_001).is_ok());
     }
 }

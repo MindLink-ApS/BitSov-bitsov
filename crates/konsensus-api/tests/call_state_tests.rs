@@ -113,7 +113,7 @@ async fn a_meeting_leg_out_of_roster_order_is_refused_before_reservation_or_paym
     calls::admit_incoming(store, &me, &host, 400, Some(&meeting_offer(&right, &[&host, &me, &later]))).await.unwrap();
     // Admitted, not ringing, until a paired device fetches the invite.
     assert_eq!(store.call_get(&host, &right).await.unwrap().unwrap().phase, Phase::AwaitingDevice);
-    calls::note_device_has_invite(store, &host, &right, now_ms()).await.unwrap();
+    calls::note_device_has_invite(store, &host, &right, &konsensus_core::MessageId::from_bytes([0; 32]), now_ms()).await.unwrap();
     // From here it is an ordinary call: answer, then hangup.
     assert_eq!(store.call_get(&host, &right).await.unwrap().unwrap().phase, Phase::Ringing);
     calls::admit_incoming(store, &me, &host, 403, Some(&body(403, &right))).await.unwrap();
@@ -130,7 +130,7 @@ async fn an_unpaid_answer_leaves_the_call_ringing_and_retryable() {
     let call = id(0x8400);
     calls::admit_incoming(state.storage.as_ref(), &own(), &peer, 400, Some(&body(400, &call))).await.unwrap();
     // The callee's device has the invite, so the call is ringing and an answer can be reserved.
-    calls::note_device_has_invite(state.storage.as_ref(), &peer, &call, now_ms()).await.unwrap();
+    calls::note_device_has_invite(state.storage.as_ref(), &peer, &call, &konsensus_core::MessageId::from_bytes([0; 32]), now_ms()).await.unwrap();
     let op = uuid::Uuid::new_v4().to_string();
     let first = compose(&state, &op, &peer, 401, &body(401, &call)).await;
     println!("answer: {first}");
@@ -184,7 +184,7 @@ async fn burned_ids_older_than_the_minimum_make_room_oldest_first() {
     // 255 calls that ended more than BURN_MIN_MS ago (oldest = id 0) ...
     for i in 0..MAX_BURNED_PER_PEER as usize - 1 {
         let ended = now - BURN_MIN_MS - 60_000 * (MAX_BURNED_PER_PEER - i as u64);
-        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None, ring_anchored: false };
+        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None, ring_anchored: false, invite_message_id: None };
         store.call_put(&peer, &id(i), &entry).await.unwrap();
     }
     // ... and one that just ended.
@@ -345,6 +345,66 @@ async fn a_refused_signal_is_not_delivered_by_resync_or_counted_accepted() {
     assert!(ws.try_recv().is_err(), "refused signal must not reach WS");
 }
 
+/// Resync must not start the ring clock or acknowledge the invite unless a
+/// paired device's socket write succeeds. An internal broadcast subscriber is
+/// not that device, and the HTTP body is only counts.
+#[tokio::test]
+async fn resync_with_no_connected_device_does_not_start_ringing() {
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let mut state = sqlite_state(wallet).await;
+    let cipher = Arc::new(konsensus_crypto::plaintext_cache::PlaintextCacheCipher::new(&[9; 32]));
+    Arc::get_mut(&mut state).unwrap().plaintext_cipher = Some(cipher.clone());
+    let peer = NodeId::from_bytes([0x44; 32]);
+    let call = id(0x4400);
+    let text = body(400, &call);
+    let env = UkmEnvelopeBuilder::new(
+        400,
+        peer,
+        Recipient::Node(*state.identity.node_id()),
+        vec![1],
+        PaymentProof::new([4; 32], [5; 32], 10_000),
+    )
+    .build();
+    assert!(matches!(
+        state.storage.accept_paid_envelope(&env).await.unwrap(),
+        konsensus_storage::PaidAcceptance::Accepted
+    ));
+    state
+        .storage
+        .store_message_plaintext(&env.id, &cipher.encrypt(text.as_bytes()).unwrap())
+        .await
+        .unwrap();
+    calls::admit_incoming_id(state.storage.as_ref(), &own(), &peer, 400, Some(&text), Some(env.id))
+        .await
+        .unwrap();
+    state.storage.bind_call_invite(&env.id, &peer, &call).await.unwrap();
+    let before = state.storage.call_get(&peer, &call).await.unwrap().unwrap();
+    assert_eq!(before.phase, Phase::AwaitingDevice);
+
+    let mut watcher = state.ws_broadcast.subscribe();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/messages/resync")
+        .header("authorization", common::auth_header(&state))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"phase": "fulfill", "peer_id": peer.to_hex(), "message_ids": [env.id.to_hex()]}).to_string(),
+        ))
+        .unwrap();
+    let response = common::test_router(Arc::clone(&state)).oneshot(req).await.unwrap();
+    assert!(response.status().is_success(), "{}", response.status());
+    let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["resynced_count"], 1, "the HTTP body is only counts: {body}");
+    let broadcast = watcher.try_recv().unwrap();
+    assert_eq!(broadcast.envelope.id, env.id, "an internal subscriber is not a device socket");
+
+    let after = state.storage.call_get(&peer, &call).await.unwrap().unwrap();
+    assert_eq!(after.phase, Phase::AwaitingDevice);
+    assert_eq!(after.deadline_ms, before.deadline_ms);
+    assert!(!after.ring_anchored, "resync did not start the ring clock");
+}
+
 /// Codex P2: a restart keeps burned ids and live calls.
 #[tokio::test]
 async fn call_state_survives_a_restart() {
@@ -427,7 +487,7 @@ async fn unknown_call_signals_never_evict_burned_ids() {
     let now = now_ms();
     for i in 0..MAX_BURNED_PER_PEER as usize {
         let ended = now - BURN_MIN_MS - 60_000 * (MAX_BURNED_PER_PEER - i as u64);
-        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None, ring_anchored: false };
+        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None, ring_anchored: false, invite_message_id: None };
         store.call_put(&peer, &id(i), &entry).await.unwrap();
     }
     for kind in [401, 402, 403] {

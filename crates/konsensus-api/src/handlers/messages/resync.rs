@@ -171,11 +171,10 @@ async fn fulfill(
             }
         } else { None };
 
-        if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE {
-            if let Some(text) = plaintext.as_deref() {
-                crate::calls::deliver_invite_to_device(state, &envelope.sender.to_hex(), &envelope.id.to_hex(), text).await;
-            }
-        }
+        // Ringing starts only after a paired device's socket write succeeds
+        // (`ws`). This response is counts; a broadcast with no device, or an
+        // internal subscriber, is not that write. Calling deliver here would
+        // acknowledge the invite before any device had it.
         let ws_msg = Arc::new(crate::state::WsMessage { envelope: envelope.clone(), plaintext });
         if let Err(e) = state.ws_broadcast.send(ws_msg) {
             tracing::debug!(msg_id = %id.to_hex(), error = %e, "resync: no WS clients connected");
