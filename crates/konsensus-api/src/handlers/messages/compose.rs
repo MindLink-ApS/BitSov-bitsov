@@ -866,6 +866,14 @@ async fn try_keysend(
 
 /// Refuse a keysend whose destination is not the contact's verified Lightning
 /// key. Fixed reasons; no payment is dispatched.
+///
+/// This is the authorization point for the destination: the binding is read
+/// under the map lock and compared with the exact string handed to the
+/// backend. The lock is not held across dispatch (the backend call awaits the
+/// network). A rotation or removal that lands after this point does not
+/// change the destination of the payment already authorized; it governs the
+/// next payment. Every destination that reaches the backend is therefore one
+/// the contact's identity signed at the moment it was authorized.
 async fn require_verified_keysend_destination(
     state: &AppState,
     peer_id: &NodeId,

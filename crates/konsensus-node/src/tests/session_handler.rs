@@ -295,11 +295,23 @@ async fn lightning_info_rotation_with_new_signature_updates_binding() {
         PeerLightningKey::Verified(pk2.into())
     );
 
-    // The old signature does not move the binding back to the old key.
+    // The old signature does not vouch for the new key (mismatch).
     handle_lightning_info_received(&peer_id, pk2, &sig1, &pubkeys).await;
     assert_eq!(
         pubkeys.lock().await[&peer_id],
         PeerLightningKey::Verified(pk2.into())
+    );
+
+    // Policy: the latest announcement that verifies wins. A complete earlier
+    // announcement (old key with its own signature) is still a key this
+    // identity signed, so it is accepted again. Announcements only travel
+    // over the peer's own authenticated session, so this is the peer moving
+    // back, not a third party rolling it back; the binding carries no
+    // freshness and claims none.
+    handle_lightning_info_received(&peer_id, pk1, &sig1, &pubkeys).await;
+    assert_eq!(
+        pubkeys.lock().await[&peer_id],
+        PeerLightningKey::Verified(pk1.into())
     );
 }
 

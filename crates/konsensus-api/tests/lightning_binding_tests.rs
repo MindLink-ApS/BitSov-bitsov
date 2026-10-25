@@ -18,10 +18,18 @@ use konsensus_lightning::{MockLightningProvider, RecoveringLightning};
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
-/// The stock mock, recording every keysend destination.
+type PeerLnKeys = Arc<
+    tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::NodeId, PeerLightningKey>>,
+>;
+
+/// The stock mock, recording every keysend destination. It can also rewrite a
+/// peer's binding while a keysend is in flight, to model a rotation that
+/// lands between the destination check and the backend call.
 struct RecordingLightning {
     backend: MockLightningProvider,
     keysend_destinations: Mutex<Vec<String>>,
+    rotate_during_keysend:
+        Mutex<Option<(PeerLnKeys, konsensus_core::types::NodeId, PeerLightningKey)>>,
 }
 
 impl RecordingLightning {
@@ -29,7 +37,19 @@ impl RecordingLightning {
         Self {
             backend: MockLightningProvider::new(),
             keysend_destinations: Mutex::new(Vec::new()),
+            rotate_during_keysend: Mutex::new(None),
         }
+    }
+
+    /// Arm the next keysend to replace `peer`'s binding with `next` after the
+    /// destination has been authorized and before the backend sees it.
+    fn rotate_during_next_keysend(
+        &self,
+        map: PeerLnKeys,
+        peer: konsensus_core::types::NodeId,
+        next: PeerLightningKey,
+    ) {
+        *self.rotate_during_keysend.lock().unwrap() = Some((map, peer, next));
     }
 
     fn destinations(&self) -> Vec<String> {
@@ -77,6 +97,10 @@ impl LightningProvider for RecordingLightning {
             .lock()
             .unwrap()
             .push(destination.to_owned());
+        let rotation = self.rotate_during_keysend.lock().unwrap().take();
+        if let Some((map, peer, next)) = rotation {
+            map.lock().await.insert(peer, next);
+        }
         self.backend
             .keysend_with_fee_limit(destination, amount, memo, cap)
             .await
@@ -226,6 +250,68 @@ async fn rotated_binding_moves_keysend_to_the_new_key() {
         .unwrap();
 
     assert_eq!(fx.backend.destinations(), vec![ln_key("02"), ln_key("03")]);
+    fx.lightning.shutdown().await.unwrap();
+}
+
+/// The destination is authorized immediately before dispatch. A rotation that
+/// lands while the backend call is in flight does not redirect that payment;
+/// it was authorized to a key the identity signed, and the next payment
+/// follows the new binding.
+#[tokio::test]
+async fn rotation_during_dispatch_pays_the_key_that_was_authorized() {
+    let fx = fixture().await;
+    fx.state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(fx.peer, PeerLightningKey::Verified(ln_key("02")));
+    fx.backend.rotate_during_next_keysend(
+        fx.state.peer_ln_pubkeys.clone(),
+        fx.peer,
+        PeerLightningKey::Verified(ln_key("03")),
+    );
+
+    create_payment_proof(&fx.state, 2_000, &fx.peer)
+        .await
+        .unwrap();
+    create_payment_proof(&fx.state, 2_000, &fx.peer)
+        .await
+        .unwrap();
+
+    assert_eq!(fx.backend.destinations(), vec![ln_key("02"), ln_key("03")]);
+    assert_eq!(fx.backend.payments().await, 2);
+    fx.lightning.shutdown().await.unwrap();
+}
+
+/// A removal that lands while the backend call is in flight does not cancel
+/// the authorized payment either; the next payment is refused.
+#[tokio::test]
+async fn removal_during_dispatch_refuses_only_the_next_payment() {
+    let fx = fixture().await;
+    fx.state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(fx.peer, PeerLightningKey::Verified(ln_key("02")));
+    fx.backend.rotate_during_next_keysend(
+        fx.state.peer_ln_pubkeys.clone(),
+        fx.peer,
+        PeerLightningKey::Unsigned,
+    );
+
+    create_payment_proof(&fx.state, 2_000, &fx.peer)
+        .await
+        .unwrap();
+    let err = create_payment_proof(&fx.state, 2_000, &fx.peer)
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains(REASON_CONTACT_MUST_UPDATE),
+        "{err}"
+    );
+    assert_eq!(fx.backend.destinations(), vec![ln_key("02")]);
+    assert_eq!(fx.backend.payments().await, 1);
     fx.lightning.shutdown().await.unwrap();
 }
 
