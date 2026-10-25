@@ -683,10 +683,13 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // The plaintext is produced and kept (a file stored): lift
                         // the hold now, except for a call signal or a candidate
                         // room chat, whose admission checks below lift their own.
-                        // If that write fails the envelope stays held and the
-                        // sweep withdraws it: fail closed, a reject, not an ACK.
-                        if call_hold
-                            && !konsensus_api::calls::is_call_kind(envelope.kind)
+                        // Released whether or not this attempt placed the hold: a
+                        // retry can inherit one left by an earlier attempt whose
+                        // acceptance rolled back and whose cleanup failed, and an
+                        // acknowledged message must never stay hidden. If the
+                        // write fails the envelope stays held and the sweep
+                        // withdraws it: fail closed, a reject, not an ACK.
+                        if !konsensus_api::calls::is_call_kind(envelope.kind)
                             && !konsensus_api::room_binding::is_candidate(envelope.kind)
                         {
                             if let Err(e) = storage_for_recv.call_admission_release(&msg_id).await {
@@ -748,9 +751,11 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // withdrawn (the payment hash and nonce stay burned) and
                         // never shown; if the withdrawal fails it stays held until
                         // the sweep. Anything else is released before the app sees
-                        // it; if that write fails it stays held: fail closed.
+                        // it (whether or not this attempt placed the hold: a retry
+                        // can inherit one); if that write fails it stays held:
+                        // fail closed.
                         let room = konsensus_api::room_binding::admit_incoming(identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref());
-                        if room.is_ok() && call_hold && konsensus_api::room_binding::is_candidate(envelope.kind) {
+                        if room.is_ok() && konsensus_api::room_binding::is_candidate(envelope.kind) {
                             if let Err(e) = storage_for_recv.call_admission_release(&msg_id).await {
                                 error!(msg_id = %msg_id, error = %e, "admitted chat could not be released; withheld");
                                 let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };

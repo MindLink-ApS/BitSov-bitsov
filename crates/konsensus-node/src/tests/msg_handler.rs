@@ -4166,3 +4166,89 @@ async fn corrupted_file_with_failed_withdrawal_stays_hidden() {
     assert_eq!(net.receipt_state(&env).await, Some(-1));
     net.stop().await;
 }
+
+/// A hold inherited from an earlier attempt (its paid acceptance rolled back
+/// and its hold cleanup failed) is released before the successful retry is
+/// published and acknowledged, so the acknowledged message is never hidden
+/// and the sweep leaves it alone. Checked for a chat and for a long-form
+/// message, the two release paths.
+#[tokio::test]
+async fn inherited_hold_is_released_before_a_retry_is_acknowledged() {
+    use konsensus_message::ControlEvent;
+    for kind in [
+        konsensus_core::kind::KIND_CHAT,
+        konsensus_core::kind::KIND_LONGFORM,
+    ] {
+        let mut net = receive_loop().await;
+        sqlx::query("CREATE TRIGGER fail_message BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+            .execute(net.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER fail_release BEFORE DELETE ON call_admission_hold BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+            .execute(net.db.pool())
+            .await
+            .unwrap();
+
+        let env = net
+            .paid_envelope(kind, net.ciphertext(b"retried").await)
+            .await;
+        assert!(matches!(
+            net.verdict(&env).await,
+            ControlEvent::MessageRejected { reason, .. } if reason == "storage error"
+        ));
+        assert!(
+            net.db.call_admission_held(&env.id).await.unwrap(),
+            "the hold outlived the failed attempt"
+        );
+        assert!(net.ws_rx.try_recv().is_err());
+
+        // The store recovers; the sender retries the same bytes.
+        sqlx::query("DROP TRIGGER fail_message")
+            .execute(net.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER fail_release")
+            .execute(net.db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            net.verdict(&env).await,
+            ControlEvent::MessageAcked {
+                duplicate: false,
+                ..
+            }
+        ));
+        assert!(
+            !net.db.call_admission_held(&env.id).await.unwrap(),
+            "kind {kind}: released before the ACK"
+        );
+        let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shown.plaintext.as_deref(), Some("retried"));
+        assert_eq!(
+            net.db.get_message(&env.id).await.unwrap().map(|m| m.id),
+            Some(env.id),
+            "visible in history"
+        );
+        assert_eq!(
+            net.db.call_admission_withdraw(u64::MAX).await.unwrap(),
+            0,
+            "nothing for the sweep"
+        );
+        assert_eq!(net.receipt_state(&env).await, Some(1));
+        assert!(
+            net.db.get_message(&env.id).await.unwrap().is_some(),
+            "kept after the sweep"
+        );
+        assert!(matches!(
+            net.verdict(&env).await,
+            ControlEvent::MessageAcked {
+                duplicate: true,
+                ..
+            }
+        ));
+        net.stop().await;
+    }
+}
