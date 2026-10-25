@@ -1,0 +1,57 @@
+name: Review gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  issue_comment:
+    types: [created, edited]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  statuses: write
+  pull-requests: read
+  issues: read
+  contents: read
+
+concurrency:
+  # Both PR and issue_comment events for a PR share the same group.
+  group: review-gate-${{ github.event.pull_request.number || github.event.issue.number || github.event.merge_group.head_sha || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # Reserve review-gate for the commit status; a same-named job check would
+  # also have to pass if the owner later requires that status in a ruleset.
+  compute-review-gate:
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      REVIEW_GATE_AUTHORS: ${{ vars.REVIEW_GATE_AUTHORS }}
+      TRUSTED_BRANCH: ${{ github.event.repository.default_branch }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      # No checkout and no actions: only API reads of trusted default-branch
+      # code, plus commit-status writes. Never fetch scripts from a PR ref.
+      # issue_comment runs this workflow from main. These files must be merged
+      # to main before the gate can run, including on its own initial PR.
+      # Fork pull_request tokens are read-only; a PR comment runs from main
+      # with statuses:write and can publish the gate for the fork's head.
+      - name: Load trusted gate and tests through the API
+        run: |
+          python3 -c 'from pathlib import Path; Path("scripts/ci").mkdir(parents=True, exist_ok=True)'
+          trusted_sha=$(gh api --method GET "repos/$GH_REPO/commits/$TRUSTED_BRANCH" --jq .sha)
+          [[ "$trusted_sha" =~ ^[0-9a-f]{40}$ ]]
+          for path in scripts/ci/review_gate.py scripts/ci/test_review_gate.py; do
+            gh api --method GET "repos/$GH_REPO/contents/$path" -f "ref=$trusted_sha" --jq .content |
+              python3 -c 'import base64, pathlib, sys; pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(sys.stdin.read()))' "$path"
+          done
+      - name: Test review gate
+        run: python3 -m unittest scripts/ci/test_review_gate.py
+      - name: Compute review-gate commit status
+        run: python3 scripts/ci/review_gate.py
