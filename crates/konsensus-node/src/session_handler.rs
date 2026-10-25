@@ -1619,6 +1619,8 @@ async fn handle_invoice_requested(
         }
         return;
     }
+    // Empty and below-floor requests are refused before pricing or the wallet.
+    // A price-ceiling miss or a failed create_invoice keeps the rate slot.
     let mut rollback_rate = || invoices.rollback_issue(peer_id);
     if amount_msat == 0 {
         rollback_rate();
@@ -1656,7 +1658,6 @@ async fn handle_invoice_requested(
     {
         Ok(Ok(ceiling)) => ceiling,
         _ => {
-            rollback_rate();
             if refusals.permit(source_ip, tokio::time::Instant::now()) {
                 send_invoice_refusal(
                     transport,
@@ -1702,7 +1703,6 @@ async fn handle_invoice_requested(
             }
         }
         Err(e) => {
-            rollback_rate();
             warn!(
                 peer = %peer_id, %request_id, error = %e,
                 "failed to create invoice for peer request — sending error to peer"

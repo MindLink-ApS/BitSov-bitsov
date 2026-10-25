@@ -98,7 +98,7 @@ impl PeerInvoiceBook {
         Ok(())
     }
 
-    /// Undo a rate-slot reservation when invoice creation never commits a row.
+    /// Undo a rate-slot reservation refused before pricing or the wallet.
     pub(crate) fn rollback_issue(&mut self, peer: &NodeId) {
         if let Some((_, count)) = self.rates.get_mut(peer) {
             if *count > 0 {
@@ -147,6 +147,16 @@ impl PeerInvoiceBook {
     }
 }
 
+/// `u64::MAX` is an unknown deadline. Replace it with a finite one so the
+/// row ages out of the cap and the sweep can forget it.
+fn finite_imported_expiry(expires_at: u64, now_unix: u64) -> u64 {
+    if expires_at == u64::MAX {
+        now_unix.saturating_add(u64::from(INVOICE_EXPIRY_SECS))
+    } else {
+        expires_at
+    }
+}
+
 pub(crate) struct Reconciliation {
     ready: bool,
     imported: Vec<(String, u64)>,
@@ -174,6 +184,12 @@ pub(crate) async fn reconcile(
         let Ok(imported) = lightning.pending_invoice_expiries().await else {
             return;
         };
+        // An unknown deadline must not stay open. Give it the service-invoice
+        // window from this sweep; a later sweep does not extend that row.
+        let imported: Vec<(String, u64)> = imported
+            .into_iter()
+            .map(|(hash, expires_at)| (hash, finite_imported_expiry(expires_at, now_unix)))
+            .collect();
         for (hash, expires_at) in &imported {
             before.insert(hash.clone());
             snapshot.note_unattributed(hash.clone(), *expires_at);
@@ -340,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_rate_reservation_rolls_back_on_refusal_paths() {
+    fn failed_rate_reservation_counts_on_refusal_paths() {
         let mut book = PeerInvoiceBook {
             reconciled: true,
             ..Default::default()
@@ -350,9 +366,9 @@ mod tests {
         let unix = 1_000u64;
         for _ in 0..PEER_RATE_BURST {
             book.try_issue(&peer, now, unix).unwrap();
-            book.rollback_issue(&peer);
         }
-        assert!(book.try_issue(&peer, now, unix).is_ok());
+        assert_eq!(book.try_issue(&peer, now, unix), Err(InvoiceLimit::Rate));
+        assert_eq!(book.try_issue(&peer, now + RATE_WINDOW, unix), Ok(()));
     }
 
     #[tokio::test]

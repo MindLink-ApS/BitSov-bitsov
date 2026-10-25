@@ -1827,7 +1827,7 @@ async fn invoice_persistence_failure_refuses_and_removes_unpublished_invoice() {
 }
 
 #[tokio::test]
-async fn review_regression_invoice_restart_preserves_unknown_expiry_and_discards_orphan_rows() {
+async fn invoice_restart_assigns_legacy_lifetime_when_expiry_is_missing() {
     let dir = tempfile::tempdir().unwrap();
     let mut builder = ldk_node::Builder::new();
     builder.set_network(bitcoin::Network::Regtest);
@@ -1836,31 +1836,35 @@ async fn review_regression_invoice_restart_preserves_unknown_expiry_and_discards
     let node = Arc::new(builder.build().unwrap());
     let provider = LdkProvider::from_node(node.clone());
     let invoice = provider
-        .create_invoice(1000, "sponsor upgrade", 7_200)
+        .create_invoice(1000, "legacy upgrade", 7_200)
         .await
         .unwrap();
     drop(provider);
     drop(node);
-    let node = builder.build().unwrap();
+    let node = Arc::new(builder.build().unwrap());
     let path = dir.path().join("expiry.tsv");
-    // Simulate a legacy truncated sidecar: unrelated valid line and partial hash.
+    // Unrelated committed row and a truncated line. The live invoice has no row.
     std::fs::write(&path, format!("{} 10\npartial", "ff".repeat(32))).unwrap();
     let map = reconcile_invoice_expiries(&node, load_invoice_expiries(&path).unwrap());
     assert_eq!(map.len(), 1);
+    let updated_at = node
+        .list_payments()
+        .into_iter()
+        .find_map(|payment| {
+            payment_hash_from_kind(&payment.kind)
+                .filter(|hash| hex::encode(hash.0) == invoice.payment_hash)
+                .map(|_| payment.latest_update_timestamp)
+        })
+        .unwrap();
+    let expires_at = updated_at + super::LEGACY_SERVICE_INVOICE_EXPIRY_SECS;
+    assert_eq!(map[&invoice.payment_hash], expires_at);
     store_invoice_expiries(&path, &map).unwrap();
     assert_eq!(load_invoice_expiries(&path).unwrap(), map);
-    let provider = LdkProvider::from_node(Arc::new(node));
+    let provider = LdkProvider::from_node(node);
     *provider.invoice_expiries.lock().unwrap() = map;
     assert_eq!(
         provider
-            .purge_expired_pending_invoices(invoice.created_at + 121)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        provider
-            .purge_expired_pending_invoices(invoice.created_at + 3_601)
+            .purge_expired_pending_invoices(expires_at - 1)
             .await
             .unwrap(),
         0
@@ -1873,23 +1877,103 @@ async fn review_regression_invoice_restart_preserves_unknown_expiry_and_discards
             .status,
         PaymentStatus::Pending
     );
+    assert_eq!(
+        provider
+            .purge_expired_pending_invoices(expires_at)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        provider.get_payment_status(&invoice.payment_hash).await,
+        Err(LightningError::PaymentNotFound(_))
+    ));
 }
 
 #[test]
 fn review_regression_legacy_orphan_expiry_guess_is_never_shortened() {
     let timestamp = 1_700_000_000u64;
     let legacy = timestamp.saturating_add(u64::from(u32::MAX));
-    assert_eq!(super::migrate_service_invoice_expiry(Some(legacy)), legacy);
+    assert_eq!(
+        super::migrate_service_invoice_expiry(Some(legacy), timestamp),
+        legacy
+    );
 }
 
 #[test]
-fn missing_invoice_expiry_is_not_due_at_a_guessed_deadline() {
+fn missing_invoice_expiry_uses_the_legacy_one_hour_lifetime() {
     let created = 1_700_000_000u64;
-    let expires = super::migrate_service_invoice_expiry(None);
-    // Sponsor and owner invoices may outlive the old peer path's one-hour
-    // default. Neither guessed deadline may trigger wallet cancellation.
-    assert!(created + 120 < expires);
-    assert!(created + 7_200 < expires);
+    let expires = super::migrate_service_invoice_expiry(None, created);
+    assert_eq!(expires, created + super::LEGACY_SERVICE_INVOICE_EXPIRY_SECS);
+    assert_eq!(
+        super::migrate_service_invoice_expiry(Some(u64::MAX), created),
+        created + super::LEGACY_SERVICE_INVOICE_EXPIRY_SECS
+    );
+}
+
+#[tokio::test]
+async fn legacy_pending_invoices_without_stored_expiry_age_out_and_accept_new_invoices() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ldk_node::Builder::new();
+    builder.set_network(bitcoin::Network::Regtest);
+    builder.set_entropy_seed_bytes([46; 64]);
+    builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+    let node = Arc::new(builder.build().unwrap());
+    let provider = LdkProvider::from_node(node.clone());
+    let count = 33usize;
+    for i in 0..count {
+        provider
+            .create_invoice(1_000, &format!("legacy pending {i}"), 3_600)
+            .await
+            .unwrap();
+    }
+    drop(provider);
+    drop(node);
+    let node = Arc::new(builder.build().unwrap());
+    let map = reconcile_invoice_expiries(&node, std::collections::HashMap::new());
+    assert_eq!(map.len(), count);
+    let mut deadline = 0u64;
+    for payment in node.list_payments() {
+        if payment.direction != ldk_node::payment::PaymentDirection::Inbound
+            || payment.status != LdkPaymentStatus::Pending
+        {
+            continue;
+        }
+        let Some(hash) = payment_hash_from_kind(&payment.kind) else {
+            continue;
+        };
+        let hash = hex::encode(hash.0);
+        let expires_at = map[&hash];
+        assert_eq!(
+            expires_at,
+            payment
+                .latest_update_timestamp
+                .saturating_add(super::LEGACY_SERVICE_INVOICE_EXPIRY_SECS)
+        );
+        deadline = deadline.max(expires_at);
+    }
+    let provider = LdkProvider::from_node(node);
+    *provider.invoice_expiries.lock().unwrap() = map;
+    assert_eq!(
+        provider
+            .purge_expired_pending_invoices(deadline.saturating_sub(1))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(provider.list_payments(100).await.unwrap().len(), count);
+    assert_eq!(
+        provider
+            .purge_expired_pending_invoices(deadline)
+            .await
+            .unwrap(),
+        u32::try_from(count).unwrap()
+    );
+    assert!(provider.list_payments(100).await.unwrap().is_empty());
+    provider
+        .create_invoice(1_000, "after sweep", 120)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

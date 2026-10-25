@@ -1155,9 +1155,7 @@ impl LdkProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.iter()
-            .filter(|(_, expires_at)| {
-                **expires_at != UNKNOWN_INVOICE_EXPIRY && **expires_at <= now_unix
-            })
+            .filter(|(_, expires_at)| **expires_at <= now_unix)
             .map(|(hash, _)| hash.clone())
             .collect()
     }
@@ -2687,18 +2685,21 @@ fn load_invoice_expiries(
     Ok(map)
 }
 
-/// LDK PaymentDetails does not retain BOLT11 expiry. Missing metadata must
-/// never become an inferred cancellation deadline. Keep such invoices until
-/// the wallet reports a terminal status; the sentinel still accounts for their
-/// outstanding slots after restart.
-const UNKNOWN_INVOICE_EXPIRY: u64 = u64::MAX;
+/// Previous peer-invoice lifetime. LDK does not retain BOLT11 expiry on a
+/// payment. A pending invoice with no sidecar row, or with an unknown
+/// deadline, uses its last update time plus this window and then ages out.
+const LEGACY_SERVICE_INVOICE_EXPIRY_SECS: u64 = 3600;
 
-fn migrate_service_invoice_expiry(recorded: Option<u64>) -> u64 {
-    recorded.unwrap_or(UNKNOWN_INVOICE_EXPIRY)
+fn migrate_service_invoice_expiry(recorded: Option<u64>, updated_at: u64) -> u64 {
+    match recorded {
+        Some(expires_at) if expires_at < u64::MAX => expires_at,
+        _ => updated_at.saturating_add(LEGACY_SERVICE_INVOICE_EXPIRY_SECS),
+    }
 }
 
-/// Repair the sidecar against durable wallet state without guessing expiry.
-/// Preserve saved BOLT11 deadlines exactly, including long legacy estimates.
+/// Repair the sidecar against durable wallet state.
+/// A saved deadline is kept. A missing deadline uses the payment timestamp
+/// plus the previous one-hour lifetime.
 fn reconcile_invoice_expiries(
     node: &ldk_node::Node,
     mut recorded: std::collections::HashMap<String, u64>,
@@ -2719,7 +2720,10 @@ fn reconcile_invoice_expiries(
                 }
                 _ => return None,
             };
-            let expires_at = migrate_service_invoice_expiry(recorded.remove(&hash));
+            let expires_at = migrate_service_invoice_expiry(
+                recorded.remove(&hash),
+                payment.latest_update_timestamp,
+            );
             Some((hash, expires_at))
         })
         .collect()
