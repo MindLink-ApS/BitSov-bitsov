@@ -2926,10 +2926,25 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(ws_rx.try_recv().is_err());
 
-    // Paid at Bob's call_msat (10 000 msat default): rings Bob's app once.
+    // Paid at Bob's call_msat (10 000 msat default). The broadcast subscriber
+    // is not a paired device: the invite waits, and the ringing ack is sent
+    // only once a device fetch is recorded.
     let env = signal(400, 10_000, offer.clone()).await;
     source.send(bob.node_id(), &env).await.unwrap();
-    assert_eq!(outcome(source.clone()).await, Ok(false));
+    let waiting = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(entry) = db.call_get(alice.node_id(), &id).await.unwrap() {
+                break entry;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        waiting.phase,
+        konsensus_core::payloads::call::Phase::AwaitingDevice
+    );
     let rung = tokio::time::timeout(Duration::from_secs(5), ws_rx.recv())
         .await
         .unwrap()
@@ -2938,6 +2953,41 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
         (rung.envelope.kind, rung.plaintext.as_deref()),
         (400, Some(offer.as_str()))
     );
+    let acked_early = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match source.recv_control().await.unwrap() {
+                ControlEvent::MessageAcked { .. } | ControlEvent::MessageRejected { .. } => {
+                    break true
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        acked_early.is_err(),
+        "a broadcast subscriber does not start ringing"
+    );
+    let fetched = konsensus_api::calls::note_device_has_invite(
+        db.as_ref(),
+        alice.node_id(),
+        &id,
+        konsensus_api::calls::now_ms(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        fetched,
+        konsensus_api::calls::DeviceTook::Started { .. }
+    ));
+    let transport = target.clone() as Arc<dyn konsensus_core::traits::transport::MessageTransport>;
+    konsensus_api::calls::notify_caller(
+        transport,
+        alice.node_id(),
+        env.id,
+        konsensus_api::calls::CallerNotice::Ringing { duplicate: false },
+    );
+    assert_eq!(outcome(source.clone()).await, Ok(false));
     // Now a paid peer: an underpaid offer for another call is refused openly.
     let under = format!(
         r#"{{"v":1,"call_id":"{:032x}","media":"video","sdp":"v=0"}}"#,
@@ -3030,6 +3080,274 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     worker.await.unwrap();
     source.shutdown();
     target.shutdown();
+}
+
+struct CallLeg {
+    source: Arc<NoiseTransport>,
+    target: Arc<NoiseTransport>,
+    db: Arc<konsensus_storage::SqliteStorage>,
+    alice: Arc<NodeIdentity>,
+    bob: Arc<NodeIdentity>,
+    wallet: Arc<konsensus_lightning::MockLightningProvider>,
+    sessions_a: SessionManager,
+    ws_rx: broadcast::Receiver<Arc<WsMessage>>,
+    browse_rx: broadcast::Receiver<Arc<WsMessage>>,
+    shutdown: watch::Sender<bool>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl CallLeg {
+    async fn paid_invite(&self, body: String) -> konsensus_core::UkmEnvelope {
+        let msat = 10_000;
+        let hash = self.wallet.inject_inbound_keysend(msat, None).await;
+        let payment = self.wallet.get_payment_status(&hash).await.unwrap();
+        let proof = PaymentProof::new(
+            hex::decode(&hash).unwrap().try_into().unwrap(),
+            hex::decode(payment.preimage.unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            msat,
+        );
+        let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+            &self
+                .sessions_a
+                .encrypt(self.bob.node_id(), body.as_bytes())
+                .await
+                .unwrap(),
+        );
+        let mut env = UkmEnvelopeBuilder::new(
+            400,
+            *self.alice.node_id(),
+            Recipient::Node(*self.bob.node_id()),
+            ciphertext,
+            proof,
+        )
+        .build();
+        env.signature = Signature::from_ed25519(&self.alice.sign(&env.signable_bytes()));
+        env
+    }
+
+    async fn no_ring_notice(&self) {
+        use konsensus_message::ControlEvent;
+        use std::time::Duration;
+        let noticed = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                match self.source.recv_control().await.unwrap() {
+                    ControlEvent::MessageAcked { .. } | ControlEvent::MessageRejected { .. } => {
+                        break true
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            noticed.is_err(),
+            "no confirmed device receipt, so the invite is not acknowledged"
+        );
+    }
+
+    async fn shutdown(self) {
+        self.shutdown.send(true).unwrap();
+        self.worker.await.unwrap();
+        self.source.shutdown();
+        self.target.shutdown();
+    }
+}
+
+async fn call_leg() -> CallLeg {
+    use konsensus_message::{ReachabilityMode, TransportConfig};
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let transport = |id| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    while !matches!(
+        source.recv_control().await.unwrap(),
+        konsensus_message::ControlEvent::PeerConnected { .. }
+    ) {}
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let sessions_b = Arc::new(SessionManager::new(bob.clone()));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, ws_rx) = broadcast::channel(16);
+    let browse_rx = ws_tx.subscribe();
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> =
+        Arc::new(konsensus_pricing::StaticPricingEngine::new(Default::default()));
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(),
+        transport_ack: target.clone(),
+        storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        })),
+        pricing,
+        lightning: wallet.clone(),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b,
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None,
+        front_door: Default::default(),
+        routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(),
+        plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx,
+        audit_log: make_audit_log(),
+        admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None,
+        shutdown_rx,
+    }));
+    CallLeg {
+        source,
+        target,
+        db,
+        alice,
+        bob,
+        wallet,
+        sessions_a,
+        ws_rx,
+        browse_rx,
+        shutdown,
+        worker,
+    }
+}
+
+/// Finding 1: a broadcast subscriber (the browse waiter uses this same
+/// channel) is not a paired device. Enqueue success must not start ringing
+/// or skip the grace timer.
+#[tokio::test]
+async fn internal_only_subscriber_does_not_start_ringing() {
+    use konsensus_core::payloads::call::{Phase, DEVICE_RING_GRACE_MS};
+    use std::time::Duration;
+    let mut leg = call_leg().await;
+    let id = format!("{:032x}", rand::random::<u128>());
+    let offer = format!(r#"{{"v":1,"call_id":"{id}","media":"audio","sdp":"v=0"}}"#);
+    let env = leg.paid_invite(offer.clone()).await;
+    leg.source.send(leg.bob.node_id(), &env).await.unwrap();
+    let waiting = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(entry) = leg.db.call_get(leg.alice.node_id(), &id).await.unwrap() {
+                break entry;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(waiting.phase, Phase::AwaitingDevice);
+    assert!(!waiting.ring_anchored);
+    let now = konsensus_api::calls::now_ms();
+    assert!(
+        waiting.deadline_ms <= now + DEVICE_RING_GRACE_MS,
+        "ringing stays on the grace timer until a device fetch"
+    );
+    assert!(waiting.deadline_ms + 5_000 >= now + DEVICE_RING_GRACE_MS);
+    let app = tokio::time::timeout(Duration::from_secs(5), leg.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let browse = tokio::time::timeout(Duration::from_secs(5), leg.browse_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(app.plaintext.as_deref(), Some(offer.as_str()));
+    assert_eq!(browse.envelope.id, app.envelope.id);
+    leg.no_ring_notice().await;
+    let still = leg.db.call_get(leg.alice.node_id(), &id).await.unwrap().unwrap();
+    assert_eq!(still.phase, Phase::AwaitingDevice);
+    assert_eq!(still.deadline_ms, waiting.deadline_ms, "the grace timer stays armed");
+    leg.shutdown().await;
+}
+
+/// Finding 3: a resend is not a success ack when the plaintext cache is gone
+/// or call-state classification fails. The message-to-call binding is what
+/// makes the waiting invite classifiable; without proof, the sender retries.
+#[tokio::test]
+async fn duplicate_invite_is_not_acked_when_classification_fails() {
+    use konsensus_core::payloads::call::Phase;
+    use std::time::Duration;
+    let mut leg = call_leg().await;
+    let id = format!("{:032x}", rand::random::<u128>());
+    let offer = format!(r#"{{"v":1,"call_id":"{id}","media":"audio","sdp":"v=0"}}"#);
+    let env = leg.paid_invite(offer).await;
+    leg.source.send(leg.bob.node_id(), &env).await.unwrap();
+    let waiting = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(entry) = leg.db.call_get(leg.alice.node_id(), &id).await.unwrap() {
+                break entry;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(waiting.phase, Phase::AwaitingDevice);
+    let _ = tokio::time::timeout(Duration::from_secs(5), leg.ws_rx.recv()).await;
+    leg.no_ring_notice().await;
+
+    let now = konsensus_api::calls::now_ms();
+    sqlx::query("UPDATE call_state SET deadline_ms = ? WHERE call_id = ?")
+        .bind(i64::try_from(now + 3_600_000).unwrap())
+        .bind(&id)
+        .execute(leg.db.pool())
+        .await
+        .unwrap();
+    let (peer, call) = leg.db.call_invite_binding(&env.id).await.unwrap().unwrap();
+    assert_eq!((peer, call), (*leg.alice.node_id(), id.clone()));
+
+    sqlx::query("UPDATE messages SET plaintext_enc = NULL WHERE id = ?")
+        .bind(env.id.to_hex())
+        .execute(leg.db.pool())
+        .await
+        .unwrap();
+    assert!(leg.db.get_message_plaintext(&env.id).await.unwrap().is_none());
+    leg.source.send(leg.bob.node_id(), &env).await.unwrap();
+    leg.no_ring_notice().await;
+    assert_eq!(
+        leg.db
+            .call_get(leg.alice.node_id(), &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        Phase::AwaitingDevice,
+    );
+
+    sqlx::query("DROP TABLE call_state")
+        .execute(leg.db.pool())
+        .await
+        .unwrap();
+    leg.source.send(leg.bob.node_id(), &env).await.unwrap();
+    leg.no_ring_notice().await;
+
+    sqlx::query("DELETE FROM call_invite_binding WHERE message_id = ?")
+        .bind(env.id.to_hex())
+        .execute(leg.db.pool())
+        .await
+        .unwrap();
+    leg.source.send(leg.bob.node_id(), &env).await.unwrap();
+    leg.no_ring_notice().await;
+    leg.shutdown().await;
 }
 
 /// Rooms (#155): every incoming chat is held (invisible to history,

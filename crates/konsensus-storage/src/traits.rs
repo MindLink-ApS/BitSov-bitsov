@@ -1173,4 +1173,15 @@ pub trait Storage: Send + Sync {
     async fn call_admission_withdraw(&self, _held_before_ms: u64) -> Result<u64, StorageError> {
         Ok(0)
     }
+
+    /// Remember that `id` is the invite for `(peer, call_id)`. A later resend
+    /// classifies the call from this row when the plaintext cache is gone.
+    async fn bind_call_invite(&self, _id: &MessageId, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call invite binding".into()))
+    }
+
+    /// The peer and call id bound to this invite message, if one was stored.
+    async fn call_invite_binding(&self, _id: &MessageId) -> Result<Option<(konsensus_core::NodeId, String)>, StorageError> {
+        Err(StorageError::Unsupported("call invite binding".into()))
+    }
 }

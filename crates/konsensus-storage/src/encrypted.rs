@@ -894,6 +894,14 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_admission_withdraw(held_before_ms).await
     }
 
+    async fn bind_call_invite(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(), StorageError> {
+        self.inner.bind_call_invite(id, peer, call_id).await
+    }
+
+    async fn call_invite_binding(&self, id: &MessageId) -> Result<Option<(konsensus_core::NodeId, String)>, StorageError> {
+        self.inner.call_invite_binding(id).await
+    }
+
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
         self.inner.has_nonce(nonce).await
     }

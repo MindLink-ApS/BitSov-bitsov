@@ -444,6 +444,7 @@ impl PostgresStorage {
     (30, "channel open operations", include_str!("../migrations/postgres/030_channel_open_operations.sql")),
     (31, "starter requests", include_str!("../migrations/postgres/031_starter_requests.sql")),
     (32, "starter queries", include_str!("../migrations/postgres/032_starter_queries.sql")),
+    (33, "call invite binding", include_str!("../migrations/033_call_invite_binding.sql")),
         ]
     }
 
@@ -1680,35 +1681,36 @@ impl Storage for PostgresStorage {
     }
 
     async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
-        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash FROM call_state WHERE peer = $1 AND call_id = $2")
+        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, ring_anchored FROM call_state WHERE peer = $1 AND call_id = $2")
             .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
         row.map(call_entry_from_row).transpose()
     }
 
     async fn call_open_by_peer(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
-        let rows: Vec<(String, String, String, i64, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
-            "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash FROM call_state \
+        let rows: Vec<(String, String, String, i64, Option<String>, Option<i64>, Option<String>, i64)> = sqlx::query_as(
+            "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, ring_anchored FROM call_state \
              WHERE peer = $1 AND (pending_operation_id IS NOT NULL OR (phase <> 'ended' AND phase <> 'unreachable' AND deadline_ms > $2)) \
              ORDER BY CASE WHEN pending_operation_id IS NOT NULL THEN 0 ELSE 1 END, call_id LIMIT $3")
             .bind(peer.to_hex()).bind(now)
             .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS_PER_PEER as i64)
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(id, side, phase, deadline, op, kind, hash)| {
-            Ok((id, call_entry_from_row((side, phase, deadline, op, kind, hash))?))
+        rows.into_iter().map(|(id, side, phase, deadline, op, kind, hash, anchored)| {
+            Ok((id, call_entry_from_row((side, phase, deadline, op, kind, hash, anchored))?))
         }).collect()
     }
 
     async fn call_put(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
         let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
-        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash")
+        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, ring_anchored) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, ring_anchored = excluded.ring_anchored")
             .bind(peer.to_hex()).bind(call_id)
             .bind(entry.side.as_str()).bind(entry.phase.as_str())
             .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
             .bind(entry.pending.as_ref().map(|p| p.operation_id.clone()))
             .bind(entry.pending.as_ref().map(|p| i64::from(p.kind)))
             .bind(entry.pending.as_ref().map(|p| p.request_hash.clone()))
+            .bind(i64::from(entry.ring_anchored))
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -1749,12 +1751,12 @@ impl Storage for PostgresStorage {
     }
 
     async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
-            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash FROM call_state WHERE pending_operation_id IS NOT NULL")
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, i64)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, ring_anchored FROM call_state WHERE pending_operation_id IS NOT NULL")
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash)| {
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, anchored)| {
             let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
-            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash))?))
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, anchored))?))
         }).collect()
     }
 
@@ -1809,6 +1811,22 @@ impl Storage for PostgresStorage {
             .bind(before).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(done.rows_affected())
+    }
+
+    async fn bind_call_invite(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(), StorageError> {
+        sqlx::query("INSERT INTO call_invite_binding (message_id, peer, call_id) VALUES ($1, $2, $3) ON CONFLICT(message_id) DO UPDATE SET peer = excluded.peer, call_id = excluded.call_id")
+            .bind(id.to_hex()).bind(peer.to_hex()).bind(call_id)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn call_invite_binding(&self, id: &MessageId) -> Result<Option<(konsensus_core::NodeId, String)>, StorageError> {
+        let row: Option<(String, String)> = sqlx::query_as("SELECT peer, call_id FROM call_invite_binding WHERE message_id = $1")
+            .bind(id.to_hex()).fetch_optional(&self.pool).await?;
+        row.map(|(peer, call_id)| {
+            let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call invite binding: bad peer".into()))?;
+            Ok((peer, call_id))
+        }).transpose()
     }
 
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
@@ -3746,11 +3764,11 @@ fn outstanding_from_row(
     })
 }
 
-/// `(side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash)` of `call_state`.
-type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>);
+/// `(side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, ring_anchored)` of `call_state`.
+type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>, i64);
 
 /// A stored call row. A corrupt row is an error, never a call.
-fn call_entry_from_row((side, phase, deadline, op, kind, hash): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
+fn call_entry_from_row((side, phase, deadline, op, kind, hash, anchored): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
     use konsensus_core::payloads::call::{CallEntry, Pending, Phase, Side};
     let bad = |what: &str| StorageError::Conversion(format!("call state: bad {what}"));
     let pending = match (op, kind) {
@@ -3763,5 +3781,6 @@ fn call_entry_from_row((side, phase, deadline, op, kind, hash): CallRow) -> Resu
         phase: Phase::parse(&phase).ok_or_else(|| bad("phase"))?,
         deadline_ms: u64::try_from(deadline).map_err(|_| bad("deadline"))?,
         pending,
+        ring_anchored: anchored != 0,
     })
 }

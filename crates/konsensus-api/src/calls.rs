@@ -14,8 +14,10 @@
 //! backing store is one node's database.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use tokio::sync::Semaphore;
 
 use konsensus_core::payloads::call::{self as rules, CallEntry, CallRefusal, CallSignal, DeviceFetch, Phase, Settlement};
 use konsensus_core::traits::transport::MessageTransport;
@@ -193,10 +195,24 @@ pub async fn conclude_unfetched(store: Store<'_>, peer: &NodeId, call_id: &str, 
     }
 }
 
+/// How many ring notices may be writing to peers at once. Past this, a notice
+/// is dropped instead of waiting: a stalled caller must not block the caller
+/// of [`notify_caller`], and must not pile up unbounded tasks.
+const NOTICE_IN_FLIGHT: usize = 32;
+
+fn notice_permits() -> &'static Semaphore {
+    static PERMITS: OnceLock<Semaphore> = OnceLock::new();
+    PERMITS.get_or_init(|| Semaphore::new(NOTICE_IN_FLIGHT))
+}
+
 /// Tell the caller the invite is ringing, or that no device can be reached.
 /// `duplicate` is set only when repeating an acknowledgement of an invite
 /// that already rang.
-pub async fn notify_caller(transport: &dyn MessageTransport, peer: &NodeId, id: MessageId, notice: CallerNotice) {
+///
+/// Returns as soon as the notice is queued. The peer lock and the socket
+/// write run on a bounded background task, so a stalled caller cannot block
+/// an inbox read or the receive loop.
+pub fn notify_caller(transport: Arc<dyn MessageTransport>, peer: &NodeId, id: MessageId, notice: CallerNotice) {
     let frame = match notice {
         CallerNotice::Ringing { duplicate } => konsensus_message::Frame::MessageAck { id, duplicate },
         CallerNotice::NotReachable => konsensus_message::Frame::MessageReject { id, reason: rules::NOT_REACHABLE.into() },
@@ -208,9 +224,17 @@ pub async fn notify_caller(transport: &dyn MessageTransport, peer: &NodeId, id: 
             return;
         }
     };
-    if let Err(e) = transport.send_raw_frame(peer, &bytes).await {
-        tracing::warn!(peer = %peer, error = %e, "call notice not sent");
-    }
+    let Ok(permit) = notice_permits().try_acquire() else {
+        tracing::warn!(peer = %peer, "call notice not queued; delivery is bounded");
+        return;
+    };
+    let peer = *peer;
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Err(e) = transport.send_raw_frame(&peer, &bytes).await {
+            tracing::warn!(peer = %peer, error = %e, "call notice not sent");
+        }
+    });
 }
 
 /// The caller-facing result of an invite's device grace.
@@ -232,10 +256,48 @@ pub async fn deliver_invite_to_device(state: &AppState, sender_hex: &str, messag
     let Ok(id) = MessageId::from_hex(message_id_hex) else { return };
     let Ok(signal) = CallSignal::parse(konsensus_core::kind::KIND_CALL_INVITE, plaintext) else { return };
     match note_device_has_invite(state.storage.as_ref(), &peer, &signal.call_id, now_ms()).await {
-        Ok(DeviceTook::Started { .. }) => notify_caller(state.transport.as_ref(), &peer, id, CallerNotice::Ringing { duplicate: false }).await,
-        Ok(DeviceTook::NotReachable) => notify_caller(state.transport.as_ref(), &peer, id, CallerNotice::NotReachable).await,
+        Ok(DeviceTook::Started { .. }) => notify_caller(Arc::clone(&state.transport), &peer, id, CallerNotice::Ringing { duplicate: false }),
+        Ok(DeviceTook::NotReachable) => notify_caller(Arc::clone(&state.transport), &peer, id, CallerNotice::NotReachable),
         Ok(DeviceTook::Already { .. } | DeviceTook::Ignored) => {}
         Err(e) => tracing::warn!(peer = %peer, error = %e, "device invite fetch not recorded"),
+    }
+}
+
+/// The caller's first ringing acknowledgement anchors its 60 s clock.
+/// Returns whether this ack was the one that anchored it.
+pub async fn note_caller_ringing(store: Store<'_>, peer: &NodeId, call_id: &str) -> Result<bool, konsensus_storage::StorageError> {
+    let _g = lock().lock().await;
+    let now = now_ms();
+    let Some(raw) = store.call_get(peer, call_id).await? else { return Ok(false) };
+    let Some(entry) = raw.at(now) else { return Ok(false) };
+    match rules::note_ringing_ack(entry, now) {
+        rules::RingAck::Started(next) => {
+            write(store, peer, call_id, Some(&next)).await?;
+            Ok(true)
+        }
+        rules::RingAck::Unchanged(_) | rules::RingAck::Ignored => Ok(false),
+    }
+}
+
+/// How a resend of an accepted invite should be answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteRetry {
+    /// A device already has the invite, or this row is not waiting on one.
+    Ack,
+    /// Still inside the grace window, or the resend could not be classified.
+    /// Do not acknowledge: the sender keeps retrying.
+    Hold,
+    /// No device fetched it. Tell the caller, and do not acknowledge success.
+    NotReachable,
+}
+
+/// Classify a resend. A storage failure is [`InviteRetry::Hold`]: a success
+/// ack without proof of device receipt would stop the sender's retries.
+pub fn invite_retry_decision(class: Result<Unfetched, ()>) -> InviteRetry {
+    match class {
+        Ok(Unfetched::Ringing { .. } | Unfetched::Other) => InviteRetry::Ack,
+        Ok(Unfetched::BecameNotReachable | Unfetched::AlreadyNotReachable) => InviteRetry::NotReachable,
+        Ok(Unfetched::Waiting { .. }) | Err(()) => InviteRetry::Hold,
     }
 }
 

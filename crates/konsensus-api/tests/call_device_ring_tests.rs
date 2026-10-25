@@ -208,3 +208,199 @@ async fn a_second_device_fetch_does_not_restart_the_ring_clock() {
     assert_eq!(stored.phase, Phase::Ringing);
     assert_eq!(stored.deadline_ms, first_at + RING_TIMEOUT_MS);
 }
+
+/// Finding 2: a paid invite stays ringing under a grace-plus-60 s safety cap.
+/// The caller's 60 s clock is stored when the ringing ack arrives, and a later
+/// reservation does not drop that anchor.
+#[tokio::test]
+async fn caller_ring_deadline_anchors_at_the_ringing_ack() {
+    use konsensus_core::payloads::call::{commit, release, reserve, Phase};
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([0x42; 32]);
+    let call = id(7);
+    let paid_at = calls::now_ms();
+    let caller = commit(
+        reserve(None, 400, "op", "h", paid_at).unwrap(),
+        "op",
+        paid_at,
+    );
+    assert_eq!(caller.phase, Phase::Ringing);
+    assert!(!caller.ring_anchored);
+    assert_eq!(
+        caller.deadline_ms,
+        paid_at + DEVICE_RING_GRACE_MS + RING_TIMEOUT_MS
+    );
+    store.call_put(&peer, &call, &caller).await.unwrap();
+    let loaded = store.call_get(&peer, &call).await.unwrap().unwrap();
+    assert!(!loaded.ring_anchored);
+    assert_eq!(loaded.deadline_ms, caller.deadline_ms);
+
+    let anchored_at = calls::now_ms();
+    assert!(calls::note_caller_ringing(&store, &peer, &call).await.unwrap());
+    let stored = store.call_get(&peer, &call).await.unwrap().unwrap();
+    assert!(stored.ring_anchored);
+    assert!(stored.deadline_ms >= anchored_at + RING_TIMEOUT_MS);
+    assert!(stored.deadline_ms <= calls::now_ms() + RING_TIMEOUT_MS);
+
+    let reserved = reserve(
+        Some(stored.clone()),
+        konsensus_core::kind::KIND_CALL_HANGUP,
+        "hang",
+        "h2",
+        calls::now_ms(),
+    )
+    .unwrap();
+    assert!(reserved.ring_anchored);
+    assert_eq!(reserved.deadline_ms, stored.deadline_ms);
+    store.call_put(&peer, &call, &reserved).await.unwrap();
+    let roundtrip = store.call_get(&peer, &call).await.unwrap().unwrap();
+    assert!(roundtrip.ring_anchored);
+    assert!(roundtrip.pending.is_some());
+    assert_eq!(roundtrip.deadline_ms, stored.deadline_ms);
+    let released = release(roundtrip, "hang").unwrap();
+    store.call_put(&peer, &call, &released).await.unwrap();
+
+    assert!(!calls::note_caller_ringing(&store, &peer, &call)
+        .await
+        .unwrap());
+    let again = store.call_get(&peer, &call).await.unwrap().unwrap();
+    assert!(again.ring_anchored);
+    assert_eq!(again.deadline_ms, stored.deadline_ms);
+}
+
+/// Finding 3: classification failure is not a success ack. A missing call row
+/// is a storage error, and that error holds the retry.
+#[tokio::test]
+async fn invite_retry_holds_the_ack_when_classification_fails() {
+    assert_eq!(
+        calls::invite_retry_decision(Err(())),
+        calls::InviteRetry::Hold
+    );
+    assert_eq!(
+        calls::invite_retry_decision(Ok(calls::Unfetched::Waiting { until_ms: 1 })),
+        calls::InviteRetry::Hold
+    );
+    assert!(matches!(
+        calls::invite_retry_decision(Ok(calls::Unfetched::Ringing { deadline_ms: 1 })),
+        calls::InviteRetry::Ack
+    ));
+    assert_eq!(
+        calls::invite_retry_decision(Ok(calls::Unfetched::BecameNotReachable)),
+        calls::InviteRetry::NotReachable
+    );
+
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([9; 32]);
+    let msg = konsensus_core::MessageId::from_bytes([3; 32]);
+    let call = id(8);
+    store.bind_call_invite(&msg, &peer, &call).await.unwrap();
+    assert_eq!(
+        store.call_invite_binding(&msg).await.unwrap(),
+        Some((peer, call.clone()))
+    );
+    sqlx::query("DROP TABLE call_state")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert!(calls::conclude_unfetched(&store, &peer, &call, 1)
+        .await
+        .is_err());
+    assert_eq!(
+        calls::invite_retry_decision(Err(())),
+        calls::InviteRetry::Hold
+    );
+}
+
+struct StallTransport {
+    started: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+    sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl konsensus_core::traits::transport::MessageTransport for StallTransport {
+    async fn send(
+        &self,
+        _peer: &NodeId,
+        _envelope: &konsensus_core::UkmEnvelope,
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        Ok(())
+    }
+
+    async fn recv(&self) -> Result<konsensus_core::UkmEnvelope, konsensus_core::traits::transport::TransportError> {
+        std::future::pending().await
+    }
+
+    async fn connect(
+        &self,
+        _peer: &NodeId,
+        _addr: &str,
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        Ok(())
+    }
+
+    async fn disconnect(
+        &self,
+        _peer: &NodeId,
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        Ok(())
+    }
+
+    async fn is_connected(&self, _peer: &NodeId) -> bool {
+        false
+    }
+
+    async fn connected_peers(&self) -> Vec<NodeId> {
+        Vec::new()
+    }
+
+    async fn send_raw_frame(
+        &self,
+        _peer: &NodeId,
+        _frame_bytes: &[u8],
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        self.sent
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Finding 4: a ring notice returns while the caller socket write is still
+/// blocked, so an inbox read is not stuck on that peer.
+#[tokio::test]
+async fn ring_notice_does_not_block_on_a_stalled_caller() {
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let transport = std::sync::Arc::new(StallTransport {
+        started: std::sync::Arc::clone(&started),
+        release: std::sync::Arc::clone(&release),
+        sent: std::sync::Arc::clone(&sent),
+    }) as std::sync::Arc<dyn konsensus_core::traits::transport::MessageTransport>;
+    let began = std::time::Instant::now();
+    calls::notify_caller(
+        transport,
+        &NodeId::from_bytes([1; 32]),
+        konsensus_core::MessageId::from_bytes([2; 32]),
+        calls::CallerNotice::Ringing { duplicate: false },
+    );
+    assert!(began.elapsed() < std::time::Duration::from_millis(200));
+    assert!(!sent.load(std::sync::atomic::Ordering::SeqCst));
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    assert!(
+        !sent.load(std::sync::atomic::Ordering::SeqCst),
+        "the socket write is still blocked"
+    );
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !sent.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}

@@ -1177,6 +1177,16 @@ async fn handle_message_acked(
     )) {
         tracing::debug!(error = %e, "no WebSocket clients for delivery status");
     }
+
+    // The callee's ringing ack is this delivery. Anchor our 60 s clock to it
+    // once; a duplicate ack does not move the deadline.
+    if let Ok(Some((bound, call_id))) = storage.call_invite_binding(message_id).await {
+        if bound == *peer_id {
+            if let Err(e) = konsensus_api::calls::note_caller_ringing(storage.as_ref(), peer_id, &call_id).await {
+                warn!(peer = %peer_id, error = %e, "caller ring deadline not anchored");
+            }
+        }
+    }
 }
 
 async fn handle_message_rejected(

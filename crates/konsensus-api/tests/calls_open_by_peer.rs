@@ -53,6 +53,7 @@ fn entry(phase: Phase, side: Side, deadline_ms: u64, op: Option<&str>) -> CallEn
             kind: 400,
             request_hash: "hash".into(),
         }),
+        ring_anchored: false,
     }
 }
 

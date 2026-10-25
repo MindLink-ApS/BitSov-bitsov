@@ -11,9 +11,13 @@
 //!   replay deadline passes (24 h after the call ends);
 //! - an incoming offer does not ring yet. It waits
 //!   [`DEVICE_RING_GRACE_MS`] for one of the callee's paired devices to
-//!   fetch that invite. The 60 s ring clock and the caller's ringing
-//!   acknowledgement start at that fetch, once. If no device fetches it,
-//!   the caller is told [`NOT_REACHABLE`] — not a ring timeout (no answer);
+//!   fetch that invite. The callee's 60 s ring clock starts at that fetch.
+//!   The caller's 60 s clock starts when the ringing acknowledgement of
+//!   that fetch arrives, so the two deadlines are the same instant and a
+//!   fetch 10 s after payment cannot expire the caller while the callee
+//!   is still ringing. Until that ack the caller's deadline is only a
+//!   safety cap (grace + 60 s), not the ring clock. If no device fetches
+//!   the invite, the caller is told [`NOT_REACHABLE`] — not a ring timeout;
 //! - an answer (401) is accepted only from the callee, while it rings;
 //! - ICE (402) only for a ringing or live call; hangup (403) also while the
 //!   invite is still waiting for a device;
@@ -322,8 +326,16 @@ pub struct CallEntry {
     pub side: Side,
     pub phase: Phase,
     /// End of ringing / live, or of the replay tombstone once ended.
+    ///
+    /// On the caller, this is the ring deadline only once [`Self::ring_anchored`]
+    /// is set. Before the ringing acknowledgement it is a safety cap of
+    /// grace plus [`RING_TIMEOUT_MS`], measured from payment.
     pub deadline_ms: u64,
     pub pending: Option<Pending>,
+    /// The 60 s ring clock has been anchored: the callee's device fetch, or
+    /// the caller's first ringing acknowledgement. A paid invite can already
+    /// be [`Phase::Ringing`] and still be unanchored.
+    pub ring_anchored: bool,
 }
 
 impl CallEntry {
@@ -369,7 +381,7 @@ pub fn reserve(entry: Option<CallEntry>, kind: u16, operation_id: &str, request_
     let mine = |e: &CallEntry| e.pending.as_ref().is_some_and(|p| p.is(operation_id, request_hash) && p.kind == kind);
     match kind {
         KIND_CALL_INVITE => match entry {
-            None => Ok(CallEntry { side: Side::Caller, phase: Phase::Reserved, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: Some(pending) }),
+            None => Ok(CallEntry { side: Side::Caller, phase: Phase::Reserved, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: Some(pending), ring_anchored: false }),
             Some(e) if e.phase == Phase::Reserved && mine(&e) => Ok(e),
             Some(_) => Err(CallRefusal::Replayed),
         },
@@ -404,7 +416,14 @@ pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> CallEntry {
     };
     let cleared = CallEntry { pending: None, ..entry };
     match (p.kind, cleared.phase) {
-        (KIND_CALL_INVITE, Phase::Reserved) => CallEntry { phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), ..cleared },
+        // Paid, but the 60 s clock waits for the callee's ringing ack.
+        // The safety cap keeps an answer admissible until that ack can arrive.
+        (KIND_CALL_INVITE, Phase::Reserved) => CallEntry {
+            phase: Phase::Ringing,
+            deadline_ms: now_ms.saturating_add(DEVICE_RING_GRACE_MS).saturating_add(RING_TIMEOUT_MS),
+            ring_anchored: false,
+            ..cleared
+        },
         (KIND_CALL_ANSWER, Phase::Ringing) => CallEntry { phase: Phase::Live, deadline_ms: now_ms.saturating_add(MAX_CALL_MS), ..cleared },
         (KIND_CALL_HANGUP, Phase::Ringing | Phase::Live | Phase::Reserved | Phase::AwaitingDevice) => {
             CallEntry { phase: Phase::Ended, deadline_ms: now_ms.saturating_add(TOMBSTONE_MS), ..cleared }
@@ -436,6 +455,7 @@ pub fn receive(entry: Option<CallEntry>, kind: u16, now_ms: u64) -> Result<CallE
                 phase: Phase::AwaitingDevice,
                 deadline_ms: now_ms.saturating_add(DEVICE_RING_GRACE_MS),
                 pending: None,
+                ring_anchored: false,
             }),
             Some(_) => Err(CallRefusal::Replayed),
         },
@@ -484,10 +504,41 @@ pub fn note_device_fetch(entry: CallEntry, now_ms: u64) -> DeviceFetch {
         Phase::AwaitingDevice if entry.deadline_ms > now_ms => DeviceFetch::Started(CallEntry {
             phase: Phase::Ringing,
             deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS),
+            ring_anchored: true,
             ..entry
         }),
         Phase::Ringing | Phase::Live => DeviceFetch::Unchanged(entry),
         Phase::Reserved | Phase::AwaitingDevice | Phase::Ended | Phase::Unreachable => DeviceFetch::NotWaiting(entry),
+    }
+}
+
+/// What the caller's first ringing acknowledgement did to the ring clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RingAck {
+    /// This ack anchored the 60 s clock at `now_ms`.
+    Started(CallEntry),
+    /// The clock was already anchored. It is not restarted.
+    Unchanged(CallEntry),
+    /// Not a caller invite waiting for its ringing acknowledgement.
+    Ignored,
+}
+
+/// Anchor the caller's 60 s ring clock to the first ringing acknowledgement.
+///
+/// The callee sends that ack at the device fetch and starts its own clock
+/// then. Applying this at the same `now_ms` stores the same deadline. A later
+/// ack does not move it. Payment time is not the anchor: until this runs, a
+/// paid invite's deadline is only the grace-plus-ring safety cap.
+pub fn note_ringing_ack(entry: CallEntry, now_ms: u64) -> RingAck {
+    match (entry.side, entry.phase, entry.ring_anchored) {
+        (Side::Caller, Phase::Ringing, false) => RingAck::Started(CallEntry {
+            deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS),
+            ring_anchored: true,
+            ..entry
+        }),
+        (Side::Caller, Phase::Ringing, true) => RingAck::Unchanged(entry),
+        (Side::Caller, Phase::Reserved | Phase::AwaitingDevice | Phase::Live | Phase::Ended | Phase::Unreachable, _)
+        | (Side::Callee, _, _) => RingAck::Ignored,
     }
 }
 
@@ -718,6 +769,38 @@ mod tests {
         assert_eq!(ringing.clone().at(fetch_at + RING_TIMEOUT_MS - 1).unwrap().phase, Phase::Ringing);
         let no_answer = ringing.at(fetch_at + RING_TIMEOUT_MS).unwrap();
         assert_eq!((no_answer.phase, no_answer.deadline_ms), (Phase::Ended, fetch_at + RING_TIMEOUT_MS + TOMBSTONE_MS));
+    }
+
+    #[test]
+    fn caller_and_callee_ring_deadlines_agree_at_the_ringing_ack() {
+        let paid_at = 1_000u64;
+        let fetch_at = paid_at + 10_000;
+        let answer_at = paid_at + 65_000;
+        let caller = commit(reserve(None, 400, "op", "h", paid_at).unwrap(), "op", paid_at);
+        assert_eq!(caller.phase, Phase::Ringing);
+        assert!(!caller.ring_anchored, "payment does not start the caller's 60 s clock");
+        assert_eq!(caller.deadline_ms, paid_at + DEVICE_RING_GRACE_MS + RING_TIMEOUT_MS);
+        assert!(answer_at < caller.deadline_ms, "the safety cap still covers a fetch-delayed answer");
+        assert!(paid_at + RING_TIMEOUT_MS < answer_at, "a payment-anchored 60 s clock would already have ended");
+
+        let callee = match note_device_fetch(receive(None, 400, paid_at).unwrap(), fetch_at) {
+            DeviceFetch::Started(entry) => entry,
+            other => panic!("fetch starts the callee clock, got {other:?}"),
+        };
+        assert_eq!(callee.deadline_ms, fetch_at + RING_TIMEOUT_MS);
+        let caller = match note_ringing_ack(caller, fetch_at) {
+            RingAck::Started(entry) => entry,
+            other => panic!("the ringing ack anchors the caller, got {other:?}"),
+        };
+        assert!(caller.ring_anchored);
+        assert_eq!(caller.deadline_ms, callee.deadline_ms, "caller and callee ring until the same instant");
+        assert_eq!(callee.clone().at(answer_at).unwrap().phase, Phase::Ringing);
+        assert_eq!(receive(Some(caller.clone()), 401, answer_at).unwrap().phase, Phase::Live);
+
+        match note_ringing_ack(caller, fetch_at + 5_000) {
+            RingAck::Unchanged(again) => assert_eq!(again.deadline_ms, fetch_at + RING_TIMEOUT_MS),
+            other => panic!("a second ack must not restart the clock, got {other:?}"),
+        }
     }
 
     #[test]

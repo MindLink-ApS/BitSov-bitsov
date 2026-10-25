@@ -3677,6 +3677,13 @@ pub(super) async fn compose_peer(
             // Paid: publish the call transition before the envelope goes out.
             let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
             crate::calls::commit_outgoing(state.storage.as_ref(), &peer_id, &req.plaintext, &operation.id, &request_hash).await;
+            if req.kind == konsensus_core::kind::KIND_CALL_INVITE {
+                if let Ok(signal) = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext) {
+                    if let Err(e) = state.storage.bind_call_invite(&envelope.id, &peer_id, &signal.call_id).await {
+                        tracing::warn!(msg_id = %envelope.id, error = %e, "call invite binding not stored");
+                    }
+                }
+            }
         }
 
         if let Some(expected) = konsensus_core::expected_reply_kind(req.kind) {

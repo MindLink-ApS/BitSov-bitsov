@@ -17,6 +17,8 @@ use axum::Router;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+use konsensus_core::kind::KIND_CALL_INVITE;
+
 use crate::auth;
 use crate::state::AppState;
 
@@ -132,6 +134,19 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
                                 if socket.send(Message::Text(json)).await.is_err() {
                                     debug!("WebSocket client disconnected");
                                     break;
+                                }
+                                // The bytes reached an authorized paired device.
+                                // Broadcast enqueue alone is not that delivery.
+                                if ws_msg.envelope.kind == KIND_CALL_INVITE {
+                                    if let Some(text) = ws_msg.plaintext.as_deref() {
+                                        crate::calls::deliver_invite_to_device(
+                                            &state,
+                                            &ws_msg.envelope.sender.to_hex(),
+                                            &ws_msg.envelope.id.to_hex(),
+                                            text,
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
                             Err(e) => {
