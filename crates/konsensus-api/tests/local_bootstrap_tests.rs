@@ -2033,3 +2033,161 @@ async fn sas_boot_window_cannot_be_reopened_after_expiry() {
     .await;
     assert_eq!(status, StatusCode::GONE);
 }
+
+// ─── Network advertisement (remote-owner setup safety) ────────────────────
+
+fn keys(value: &Value) -> Vec<&str> {
+    let mut keys: Vec<_> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+fn plain_state(dir: &std::path::Path, network: Option<&str>) -> Arc<BootstrapState> {
+    let pairing = Arc::new(
+        PairingService::open(dir, String::new(), false)
+            .unwrap()
+            .without_stdout_code(),
+    );
+    Arc::new(
+        BootstrapState::new(DataDirLayout::new(dir), pairing)
+            .with_network(network.map(str::to_owned)),
+    )
+}
+
+#[tokio::test]
+async fn bootstrap_state_reports_each_configured_network_and_nothing_else() {
+    for network in ["bitcoin", "testnet", "signet", "regtest"] {
+        let dir = tempfile::tempdir().unwrap();
+        let state = plain_state(dir.path(), Some(network));
+        let (status, response) =
+            call(&state, "", "GET", "/api/v1/bootstrap/state", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["network"], network, "{response}");
+        assert_eq!(
+            keys(&response),
+            [
+                "can_create",
+                "can_restore",
+                "local_owner",
+                "network",
+                "state"
+            ],
+            "only the network name is added: {response}"
+        );
+        assert_eq!(
+            keys(&response["local_owner"]),
+            ["available", "enroll_device", "pending"],
+            "{response}"
+        );
+        assert_eq!(response["state"], "bootstrap");
+        assert_eq!(response["can_create"], true);
+        assert_eq!(response["can_restore"], true);
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_state_omits_network_when_the_node_states_none_or_an_unknown_name() {
+    // `None` (LND/LNbits say nothing) and non-canonical text (an operator's
+    // free-form backend setting) both stay off the unauthenticated surface.
+    for network in [
+        None,
+        Some("mainnet"),
+        Some("Signet"),
+        Some("my custom chain"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let state = plain_state(dir.path(), network);
+        let (status, response) =
+            call(&state, "", "GET", "/api/v1/bootstrap/state", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(response.get("network").is_none(), "{network:?}: {response}");
+        assert_eq!(
+            keys(&response),
+            ["can_create", "can_restore", "local_owner", "state"],
+            "{response}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn remote_first_run_state_reports_network_with_the_same_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let pairing = Arc::new(
+        PairingService::open(dir.path(), String::new(), false)
+            .unwrap()
+            .without_stdout_code(),
+    );
+    let tunnel = Arc::new(konsensus_api::rate_limit::RemoteTunnelClients::default());
+    let state = Arc::new(
+        BootstrapState::new(DataDirLayout::new(dir.path()), pairing)
+            .with_remote_owner(bootstrap::RemoteOwner {
+                hooks: Box::new(|password| Ok(remote_hooks(password))),
+                tunnel,
+            })
+            .with_network(Some("signet".into())),
+    );
+    let (status, response) = call(&state, "", "GET", "/api/v1/bootstrap/state", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["network"], "signet", "{response}");
+    assert_eq!(response["can_restore"], false);
+    assert_eq!(response["local_owner"]["tunnel_password"], true);
+    assert_eq!(
+        keys(&response),
+        [
+            "can_create",
+            "can_restore",
+            "local_owner",
+            "network",
+            "state"
+        ],
+        "{response}"
+    );
+    assert_eq!(
+        keys(&response["local_owner"]),
+        ["available", "enroll_device", "pending", "tunnel_password"],
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn network_field_adds_no_routes_and_changes_no_auth() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = plain_state(dir.path(), Some("signet"));
+    // No new read-only surface: the network travels only in bootstrap/state.
+    for path in [
+        "/status",
+        "/api/v1/status",
+        "/api/v1/network",
+        "/api/v1/bootstrap/network",
+        "/api/v1/health",
+    ] {
+        let (status, _) = call(&state, "", "GET", path, json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path} must stay unrouted");
+    }
+    // The state route stays unauthenticated and ignores a bogus bearer token.
+    let (status, response) = call(
+        &state,
+        "not-a-token",
+        "GET",
+        "/api/v1/bootstrap/state",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["network"], "signet");
+    // Protected routes still require a bootstrap token.
+    for (method, path) in [
+        ("POST", "/api/v1/identity/create"),
+        ("POST", "/api/v1/identity/restore"),
+    ] {
+        let (status, _) = call(&state, "", method, path, json!({})).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}");
+    }
+    let (status, _) = call(&state, "", "GET", "/livez", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+}

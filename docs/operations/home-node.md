@@ -592,9 +592,12 @@ The physical claim code comes only from the sticker or trusted local console.
 
 1. Click **Start setup**. The page shows a QR, link and copyable text for a
    five-minute, one-use bootstrap ticket. Clicking again rotates it.
-2. The app pins the box key, pairs, commits its device key and password hash,
-   and shows the recovery phrase and backup check. Only one client can claim
-   the box. The page shows the claimed device; it hides the ticket.
+2. The app pins the box key, pairs, reads the box's configured Bitcoin network
+   from `GET /api/v1/bootstrap/state` (`network`: `bitcoin`, `testnet`,
+   `signet` or `regtest`) and refuses to continue if it is not the network the
+   app expects. It then commits its device key and password hash, and shows
+   the recovery phrase and backup check. Only one client can claim the box.
+   The page shows the claimed device; it hides the ticket.
 3. Compare the four SAS words in the app and page. Click **Approve** on the
    page, then finish the backup check and device proof in the app. The app
    sends its password only over the pinned Noise tunnel. Finalize before box
