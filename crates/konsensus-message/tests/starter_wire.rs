@@ -147,16 +147,19 @@ fn starter_and_lightning_info_strings_reject_one_byte_past_the_cap() {
     let info = Frame::LightningInfo {
         ln_pubkey: "k".repeat(MAX_LN_PUBKEY_BYTES),
         ln_addr: Some("a".repeat(MAX_LN_ADDR_BYTES - ":9735".len()) + ":9735"),
+        identity_sig: vec![],
     };
     assert!(decodes(&info));
     let over_key = Frame::LightningInfo {
         ln_pubkey: "k".repeat(MAX_LN_PUBKEY_BYTES + 1),
         ln_addr: None,
+        identity_sig: vec![],
     };
     assert!(!decodes(&over_key));
     let over_addr = Frame::LightningInfo {
         ln_pubkey: pubkey,
         ln_addr: Some("a".repeat(MAX_LN_ADDR_BYTES + 1)),
+        identity_sig: vec![],
     };
     assert!(!decodes(&over_addr));
 }
@@ -177,6 +180,7 @@ fn starter_status_null_strings_and_lightning_info_without_addr_still_decode() {
     let info = Frame::LightningInfo {
         ln_pubkey: "02".repeat(33),
         ln_addr: None,
+        identity_sig: vec![],
     };
     let decoded = Frame::from_bytes(&info.to_bytes().unwrap()).unwrap();
     assert!(matches!(
@@ -227,7 +231,8 @@ fn lightning_address_accepts_maximum_dns_hostname_and_five_digit_port() {
     assert_eq!(addr.len(), 259);
     assert!(decodes(&Frame::LightningInfo {
         ln_pubkey: "02".repeat(33),
-        ln_addr: Some(addr)
+        ln_addr: Some(addr),
+        identity_sig: vec![],
     }));
 }
 

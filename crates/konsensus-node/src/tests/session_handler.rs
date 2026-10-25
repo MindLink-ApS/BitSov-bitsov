@@ -108,81 +108,211 @@ async fn progress_event_persisted_and_replayable() {
     assert_eq!(state.current_step, "waiting_for_inviter_channel");
 }
 
+type PeerLnKeys =
+    Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, PeerLightningKey>>>;
+
+fn empty_peer_ln_keys() -> PeerLnKeys {
+    Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn signing_peer() -> (NodeIdentity, NodeId) {
+    let (_, identity) = NodeIdentity::generate().unwrap();
+    let id = *identity.node_id();
+    (identity, id)
+}
+
 #[tokio::test]
-async fn lightning_info_stores_valid_pubkey() {
-    let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+async fn lightning_info_stores_identity_signed_pubkey() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
 
-    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &pubkeys).await;
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
 
+    assert_eq!(verified.as_deref(), Some(valid_ln_pubkey().as_str()));
     let map = pubkeys.lock().await;
-    assert!(map.contains_key(&peer_id));
-    assert_eq!(map[&peer_id], valid_ln_pubkey());
+    assert_eq!(map[&peer_id], PeerLightningKey::Verified(valid_ln_pubkey()));
+}
+
+#[tokio::test]
+async fn lightning_info_unsigned_is_recorded_but_never_verified() {
+    // An older peer advertises its key without a signature: the entry says so
+    // and the key is not handed to the inviter record or auto-channel opener.
+    let peer_id = test_peer_id();
+    let pubkeys = empty_peer_ln_keys();
+
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &[], &pubkeys).await;
+
+    assert!(verified.is_none());
+    assert_eq!(pubkeys.lock().await[&peer_id], PeerLightningKey::Unsigned);
+}
+
+#[tokio::test]
+async fn lightning_info_unsigned_replaces_earlier_verified_binding() {
+    // A peer that stops signing (downgrade) is no longer paid at the old key.
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &[], &pubkeys).await;
+
+    assert_eq!(pubkeys.lock().await[&peer_id], PeerLightningKey::Unsigned);
+}
+
+#[tokio::test]
+async fn lightning_info_rejects_tampered_signature() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let mut sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    sig[3] ^= 0x80;
+
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    assert!(verified.is_none());
+    assert!(pubkeys.lock().await.is_empty(), "a bad signature stores nothing");
+}
+
+#[tokio::test]
+async fn lightning_info_rejects_signature_for_a_different_key() {
+    // A valid signature over one key does not vouch for another (mismatch).
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let other = "03abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
+    let sig = lightning_binding::sign(&identity, other).unwrap();
+
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    assert!(verified.is_none());
+    assert!(pubkeys.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn lightning_info_rejects_signature_by_another_identity() {
+    // Signed by someone who is not the connected peer.
+    let (other_identity, _) = signing_peer();
+    let peer_id = test_peer_id();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&other_identity, &valid_ln_pubkey()).unwrap();
+
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    assert!(verified.is_none());
+    assert!(pubkeys.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn lightning_info_bad_signature_keeps_previous_binding() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    let other = "03abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
+    let mut bad = lightning_binding::sign(&identity, other).unwrap();
+    bad[0] ^= 0x01;
+    handle_lightning_info_received(&peer_id, other, &bad, &pubkeys).await;
+
+    assert_eq!(
+        pubkeys.lock().await[&peer_id],
+        PeerLightningKey::Verified(valid_ln_pubkey())
+    );
 }
 
 #[tokio::test]
 async fn lightning_info_rejects_short_pubkey() {
-    let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
 
-    handle_lightning_info_received(&peer_id, "02abcdef", &pubkeys).await;
+    handle_lightning_info_received(&peer_id, "02abcdef", &sig, &pubkeys).await;
 
     assert!(pubkeys.lock().await.is_empty());
 }
 
 #[tokio::test]
 async fn lightning_info_rejects_wrong_prefix() {
-    let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
 
     // Starts with 04 (uncompressed) — invalid.
     let bad_pk = "04abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
-    handle_lightning_info_received(&peer_id, bad_pk, &pubkeys).await;
+    handle_lightning_info_received(&peer_id, bad_pk, &sig, &pubkeys).await;
 
     assert!(pubkeys.lock().await.is_empty());
 }
 
 #[tokio::test]
 async fn lightning_info_rejects_invalid_hex() {
-    let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
 
     // Correct length but contains non-hex character 'zz'.
     let bad_pk = "02abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456zzab";
-    handle_lightning_info_received(&peer_id, bad_pk, &pubkeys).await;
+    handle_lightning_info_received(&peer_id, bad_pk, &sig, &pubkeys).await;
 
     assert!(pubkeys.lock().await.is_empty());
 }
 
 #[tokio::test]
-async fn lightning_info_updates_on_reconnect() {
+async fn lightning_info_malformed_unsigned_key_records_nothing() {
+    // Legacy peers get the Unsigned marker only for a well-formed key.
     let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+    let pubkeys = empty_peer_ln_keys();
+
+    handle_lightning_info_received(&peer_id, "02abcdef", &[], &pubkeys).await;
+
+    assert!(pubkeys.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn lightning_info_rotation_with_new_signature_updates_binding() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
 
     let pk1 = "02abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
     let pk2 = "03abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
 
-    handle_lightning_info_received(&peer_id, pk1, &pubkeys).await;
-    assert_eq!(pubkeys.lock().await[&peer_id], pk1);
+    let sig1 = lightning_binding::sign(&identity, pk1).unwrap();
+    handle_lightning_info_received(&peer_id, pk1, &sig1, &pubkeys).await;
+    assert_eq!(
+        pubkeys.lock().await[&peer_id],
+        PeerLightningKey::Verified(pk1.into())
+    );
 
-    // Peer reconnects with new Lightning node — pubkey is updated.
-    handle_lightning_info_received(&peer_id, pk2, &pubkeys).await;
-    assert_eq!(pubkeys.lock().await[&peer_id], pk2);
+    // Peer moves to a new Lightning node and signs the new key: binding follows.
+    let sig2 = lightning_binding::sign(&identity, pk2).unwrap();
+    handle_lightning_info_received(&peer_id, pk2, &sig2, &pubkeys).await;
+    assert_eq!(
+        pubkeys.lock().await[&peer_id],
+        PeerLightningKey::Verified(pk2.into())
+    );
+
+    // The old signature does not move the binding back to the old key.
+    handle_lightning_info_received(&peer_id, pk2, &sig1, &pubkeys).await;
+    assert_eq!(
+        pubkeys.lock().await[&peer_id],
+        PeerLightningKey::Verified(pk2.into())
+    );
+}
+
+#[tokio::test]
+async fn lightning_info_stores_canonical_lowercase_key() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let upper = valid_ln_pubkey().to_ascii_uppercase();
+    let sig = lightning_binding::sign(&identity, &upper).unwrap();
+
+    let verified = handle_lightning_info_received(&peer_id, &upper, &sig, &pubkeys).await;
+
+    assert_eq!(verified.as_deref(), Some(valid_ln_pubkey().as_str()));
 }
 
 // ── Invoice response handler tests ──────────────────────────
@@ -2206,6 +2336,7 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                     peer_id,
                     ln_pubkey: "private-ln-key".into(),
                     ln_addr: Some("192.0.2.123:9735".into()),
+                    identity_sig: vec![],
                     privileged,
                 },
                 ControlEvent::PeerExchangeRequested {
@@ -3017,6 +3148,7 @@ async fn recovery_announces_lightning_once_only_to_privileged_connected_peers() 
     let mut was_ready = false;
     refresh_recovered_lightning(
         &mut was_ready,
+        b.as_ref(),
         &target,
         &lightning,
         &None,
@@ -3029,11 +3161,21 @@ async fn recovery_announces_lightning_once_only_to_privileged_connected_peers() 
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        matches!(event, ControlEvent::LightningInfoReceived { ln_pubkey, .. } if ln_pubkey == expected)
-    );
+    match event {
+        ControlEvent::LightningInfoReceived {
+            ln_pubkey,
+            identity_sig,
+            ..
+        } => {
+            assert_eq!(ln_pubkey, expected);
+            // The announcement is bound to our identity so the peer can pay it.
+            lightning_binding::verify(b.node_id(), &ln_pubkey, &identity_sig).unwrap();
+        }
+        other => panic!("expected LightningInfoReceived, got {other:?}"),
+    }
     refresh_recovered_lightning(
         &mut was_ready,
+        b.as_ref(),
         &target,
         &lightning,
         &None,

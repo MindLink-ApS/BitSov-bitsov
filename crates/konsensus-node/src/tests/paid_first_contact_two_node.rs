@@ -373,7 +373,9 @@ struct Node {
     wallet: Arc<SharedMockProvider>,
     routing: Arc<konsensus_routing::RoutingTable>,
     peer_prices: Arc<konsensus_pricing::PeerPriceCache>,
-    peer_ln_pubkeys: Arc<tokio::sync::Mutex<HashMap<NodeId, String>>>,
+    peer_ln_pubkeys: Arc<
+        tokio::sync::Mutex<HashMap<NodeId, konsensus_core::lightning_binding::PeerLightningKey>>,
+    >,
     router: axum::Router,
     auth: String,
     front_door: konsensus_api::handlers::front_door::FrontDoorStore,
@@ -1077,7 +1079,18 @@ async fn m8_paid_payee_gets_no_peer_exchange_lightning_or_gossip() {
         envelope
     };
     net.payee.transport.send_frame(&payer, &Frame::PeerExchangeRequest).await.unwrap();
-    net.payee.transport.send_frame(&payer, &Frame::LightningInfo { ln_pubkey: "02".repeat(33), ln_addr: None }).await.unwrap();
+    net.payee
+        .transport
+        .send_frame(
+            &payer,
+            &Frame::LightningInfo {
+                ln_pubkey: "02".repeat(33),
+                ln_addr: None,
+                identity_sig: vec![],
+            },
+        )
+        .await
+        .unwrap();
     net.payee.transport.send_frame(&payer, &Frame::Gossip(Box::new(gossip))).await.unwrap();
     wait_until("the payer dropped all three", Duration::from_secs(5), || async {
         let after = net.payer.refused();

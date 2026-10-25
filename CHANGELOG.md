@@ -5,6 +5,14 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Pay a contact by keysend only at a Lightning key their identity signed. A
+  `LightningInfo` announcement now carries an Ed25519 signature by the node's
+  identity key over a domain-separated binding of its Lightning pubkey; the
+  receiver verifies it and stores only verified bindings. Message payments
+  refuse, before any dispatch, when a contact has no verified binding or the
+  destination differs from it. A contact on an older version that advertises
+  an unsigned key is refused with the fixed reason "contact must update"; the
+  payment never falls back to an invoice to the unbound node.
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'
   scripts instead of all 2000 derived scripts. Before each focused sweep preview,

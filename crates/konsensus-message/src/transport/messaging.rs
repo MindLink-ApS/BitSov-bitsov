@@ -613,13 +613,22 @@ pub(super) fn spawn_reader_task(
                 frame @ Frame::StarterStatus { .. } => {
                     let _ = control_tx.send(ControlEvent::StarterStatusReceived { peer_id, frame, privileged }).await;
                 }
-                Frame::LightningInfo { ln_pubkey, ln_addr } => {
-                    debug!(peer = %peer_id, "received Lightning info for keysend");
+                Frame::LightningInfo {
+                    ln_pubkey,
+                    ln_addr,
+                    identity_sig,
+                } => {
+                    debug!(
+                        peer = %peer_id,
+                        signed = !identity_sig.is_empty(),
+                        "received Lightning info for keysend"
+                    );
                     if let Err(e) = control_tx
                         .send(ControlEvent::LightningInfoReceived {
                             peer_id,
                             ln_pubkey,
                             ln_addr,
+                            identity_sig,
                             privileged,
                         })
                         .await
