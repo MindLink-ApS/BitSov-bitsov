@@ -272,6 +272,11 @@ pub struct AppState {
     /// reported to the owner in `/status`. `None`: not running (default).
     pub stun_port: Option<u16>,
 
+    /// Validated `[network] stun_server` as `host:port` (no `stun:` prefix),
+    /// used for `/status` `stun_url` when the node's own responder has no
+    /// dialable public host. `None` when unset or invalid at config load.
+    pub configured_stun_server: Option<String>,
+
     /// Where the seed lives, reported to the owner in `/status`
     /// (`docs/protocol/REMOTE-SIGNER.md` §2).
     pub custody_mode: crate::custody::CustodyMode,
