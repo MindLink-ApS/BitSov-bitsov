@@ -826,7 +826,12 @@ async fn try_keysend(
         }
         state
             .lightning
-            .keysend_with_fee_limit(&destination, amount_msat, Some("konsensus message"), fee_limit)
+            .keysend_with_fee_limit(
+                &destination,
+                amount_msat,
+                Some("konsensus message"),
+                fee_limit,
+            )
             .await
     };
     let details = match debit.dispatch_message(state, None, amount_msat, dispatch).await? {
@@ -931,9 +936,13 @@ fn keysend_destination_allowed(
 /// The fixed binding reason carried by a not-dispatched keysend that the
 /// authorization point refused, if that is what it was.
 fn binding_refusal_reason(reason: &str) -> Option<&'static str> {
-    [REASON_DESTINATION_MISMATCH, REASON_CONTACT_MUST_UPDATE, REASON_NO_BINDING]
-        .into_iter()
-        .find(|fixed| *fixed == reason)
+    [
+        REASON_DESTINATION_MISMATCH,
+        REASON_CONTACT_MUST_UPDATE,
+        REASON_NO_BINDING,
+    ]
+    .into_iter()
+    .find(|fixed| *fixed == reason)
 }
 
 #[cfg(test)]
@@ -950,7 +959,11 @@ mod keysend_destination_tests {
 
     #[test]
     fn binding_refusals_are_recognized_in_not_dispatched_reasons() {
-        for fixed in [REASON_DESTINATION_MISMATCH, REASON_CONTACT_MUST_UPDATE, REASON_NO_BINDING] {
+        for fixed in [
+            REASON_DESTINATION_MISMATCH,
+            REASON_CONTACT_MUST_UPDATE,
+            REASON_NO_BINDING,
+        ] {
             assert_eq!(binding_refusal_reason(fixed), Some(fixed));
         }
         assert_eq!(binding_refusal_reason("no route"), None);
