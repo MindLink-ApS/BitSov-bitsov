@@ -6,7 +6,7 @@ Status: conceptual anchor, 1 Oct 2026, revision 2. It argues *why* the system is
 
 Read it before touching BitSov. Order of authority: whitepaper (WP) → `CHARTER.md` (and `OPERATOR_SOVEREIGNTY_CHARTER.md`, once it is in-tree) → this doc → specs (`docs/protocol/`, `docs/v2/`, in-tree ADRs) → code. A lower layer may add detail; it may never contradict a higher one.
 When two layers disagree, or a task needs what §5 refuses: stop, write the conflict down (PR or issue), and flag it. Do not build around it.
-Paths without a prefix are in this repo. Paths marked **external** are not in this tree: WP = `Konsensus_v02/docs/v2/whitepaper/BitSov_Whitepaper_DRAFT.tex`; V/BIO = `Konsensus_v02/docs/vision/`; OSC = `Konsensus_v02/docs/v2/OPERATOR_SOVEREIGNTY_CHARTER.md`; ADR-032/034/036 = `Konsensus_v02/docs/v2/`; NS, DEC, RL and `research/` = `MindLink-Private/pm/`. Status words BUILT / PROPOSAL / RESERVED were checked against `origin/main` a1c1b74 with `git grep`; app-side claims could not be checked here (no app source in this tree).
+Paths without a prefix are in this repo. Paths marked **external** are not in this tree: WP = `Konsensus_v02/docs/v2/whitepaper/BitSov_Whitepaper_DRAFT.tex`; V/BIO = `Konsensus_v02/docs/vision/`; OSC = `Konsensus_v02/docs/v2/OPERATOR_SOVEREIGNTY_CHARTER.md`; ADR-032/034/036 = `Konsensus_v02/docs/v2/`. NS, DEC and RL each refer to an internal design note. Status words BUILT / PROPOSAL / RESERVED were checked against `origin/main` a1c1b74 with `git grep`; app-side claims could not be checked here (no app source in this tree).
 
 ## 1. First premises
 
@@ -72,7 +72,7 @@ Each item: Decision → Why → Rejected → Spec → Biology → Status.
 - Status: BUILT (`level` in RelationIntent; `SynapticWeight` discount in `konsensus-pricing`). Close/Anchored rails and automatic ladder movement: PROPOSAL.
 
 ### 3.4 Transport and relay (store-and-forward)
-- Decision: one envelope format (UKM) over Noise; the `kind` is the receptor. A ciphertext-only relay tier exists in code and ships when an operator enables it (register, deposit, drain, unregister are paid operations); it is off by default, not advertised by default, and its policy is `RelayPolicy::inert_default()` (7-day TTL cap, quotas). The privacy design it needs before promotion (padding, multi-relay fan-out, 24 h retention ceiling, no FCM/APNS in core) is a proposal. An operator may refuse by peer identity, never by content, and a user exits with identity, channels and history intact.
+- Decision: one envelope format (UKM) over Noise; the `kind` is the receptor. A ciphertext-only relay tier exists in code but is not shipped as a service: it runs only when an operator enables it (register, deposit, drain, unregister are paid operations), it is off by default, not advertised by default, and its policy is `RelayPolicy::inert_default()` (7-day TTL cap, quotas). The privacy design it needs before promotion (padding, multi-relay fan-out, 24 h retention ceiling, no FCM/APNS in core) is a proposal. An operator may refuse by peer identity, never by content, and a user exits with identity, channels and history intact.
 - Why: P6, P7, P8. A relay leaks twelve metadata classes, the social graph loudest, so the tier stays unpromoted until those mitigations exist.
 - Rejected: legacy protocols in core (bridges live edge-only); a full Sphinx mixnet (latency); the operator as the user's only LN hop; contractual rather than cryptographic prohibitions.
 - Spec: `docs/v2/UNIFIED_PROTOCOL.md`; `docs/v2/RELAY_PROTOCOL.md`; `docs/v2/THREAT_MODEL_TIER2_RELAY.md`; external OSC §3-4.

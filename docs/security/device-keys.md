@@ -1,7 +1,6 @@
 # Paired device keys and signed relation intents
 
-Relation ladder, Before-Mexico steps 1–3. Direction:
-`MindLink-Private/pm/projects/bitsov/research/RELATION-LADDER-AND-DEVICE-KEYS.md`.
+Relation ladder, Before-Mexico steps 1–3. Direction: an internal design note.
 
 ## What changes for the owner
 
@@ -218,6 +217,22 @@ for older records and is informational; it grants no authority.
 
 In local mode, `apply_relation_intent` clears the budgets on all other grants
 for that client, including console grants.
+
+New and renewed relation grants have a per-call ceiling of 6,000 msat (6 sats),
+including fan-out and routing fees, without reducing the total budget. A lower
+signed per-act limit still applies. Owner-device `spend_grant` budget approvals
+are also messaging grants: the node narrows their proposed per-call limit to
+6,000 msat before presenting the terms for signature. `GET /api/v1/pair/grant`
+and `konsensus pair-status` expose the effective non-payment `per_call_max_msat`.
+Quotes over this ceiling are refused before payment with a fixed explanation
+and an info log carrying `reason="per_call"`.
+
+Invoice payments and keysend cannot draw from either messaging grant class;
+they require separate explicit owner authority. Console payment budgets retain
+the owner's chosen limits. No stored schema or existing signed terms are
+rewritten: every non-payment reservation uses the lesser of the stored limit
+and 6,000 msat, including console grants and existing live grants on their
+first request after upgrade. Renewal is not required.
 
 A relation grant is the client's one budget grant, marked `recipients_only`:
 

@@ -213,7 +213,7 @@ impl Stranger {
 #[tokio::test(start_paused = true)]
 async fn confirmed_first_contact_pays_both_legs_and_debits_the_budget_once() {
     let s = stranger(2000).await;
-    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
+    let token = s.fx.grant(None, GrantTerms::new(9_000)).await;
     let (status, grant) = s.confirm(&token, &s.peer, 4000).await;
     assert_eq!(status, StatusCode::OK, "{grant}");
     assert_eq!(grant["recipient"], s.peer.to_hex());
@@ -230,11 +230,11 @@ async fn confirmed_first_contact_pays_both_legs_and_debits_the_budget_once() {
         s.fx.service.take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex()),
         None
     );
-    // The next confirmation must fit what is left of the budget (6,000 msat).
+    // The next confirmation must fit what is left of the budget (5,000 msat).
     let other = NodeId::from_hex(&"cd".repeat(32)).unwrap();
-    let (status, body) = s.confirm(&token, &other, 6_001).await;
+    let (status, body) = s.confirm(&token, &other, 5_001).await;
     assert_budget_exceeded(status, &body, "total");
-    let (status, _) = s.confirm(&token, &other, 6_000).await;
+    let (status, _) = s.confirm(&token, &other, 5_000).await;
     assert_eq!(status, StatusCode::OK);
 }
 

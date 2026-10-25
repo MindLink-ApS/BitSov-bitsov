@@ -618,3 +618,126 @@ fn failure_slots_bound_fanout_and_pause_stops_queued_dispatch() {
     service.resolve_spend(&queued, &"bb".repeat(32), 500);
     assert!(service.grant_views()[0].breakers.paused);
 }
+
+#[test]
+fn legacy_relation_cap_applies_on_first_reservation_without_rewriting_terms() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let recipient = "aa".repeat(32);
+    {
+        let mut inner = service.lock();
+        let budget = inner.file.grants[0].budget.as_mut().unwrap();
+        *budget = GrantBudget::relations();
+        budget.open_envelope(
+            &recipient,
+            200_000,
+            20_000,
+            chrono::Utc::now().timestamp() + 600,
+        );
+        // The pre-upgrade relation format used the aggregate budget as its cap.
+        budget.per_call_max_msat = budget.budget_msat;
+        service.persist(&mut inner.file).unwrap();
+    }
+    drop(service);
+    let service = PairingService::open(dir.path(), "identity".into(), true).unwrap();
+    let stored_cap = service.snapshot().grants[0]
+        .budget
+        .as_ref()
+        .unwrap()
+        .per_call_max_msat;
+    assert_eq!(
+        stored_cap, 200_000,
+        "opening a legacy grant must not rewrite its terms"
+    );
+    let charge = |amount_msat| {
+        vec![Charge {
+            recipient: recipient.clone(),
+            amount_msat,
+        }]
+    };
+    assert!(matches!(
+        service.reserve_spend(&client, 1, charge(7_000)),
+        Err(BudgetRefusal::PerCall { max_msat: 6_000 })
+    ));
+    assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 0);
+    assert_eq!(
+        service.grant_view_for(&client).unwrap().per_call_max_msat,
+        6_000
+    );
+    service.reserve_spend(&client, 1, charge(6_000)).unwrap();
+    let stored = service.reload_from_disk().unwrap().grants[0]
+        .budget
+        .clone()
+        .unwrap();
+    assert_eq!(stored.per_call_max_msat, stored_cap);
+    assert_eq!(stored.used_msat, 6_000);
+}
+
+#[test]
+fn console_first_contact_and_readmission_share_six_sat_call_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let recipient = "aa".repeat(32);
+    assert!(matches!(
+        service.grant_first_contact(&client, "grant", &recipient, 7_000, None),
+        Err(BudgetRefusal::PerCall { max_msat: 6_000 })
+    ));
+    // Nightly run 40155311812: the three-node quote was 2_001 + 2_001 plus two
+    // default 5_000 msat fee floors. That 14_002 msat all-in call is over the cap.
+    assert!(matches!(
+        service.grant_first_contact(&client, "grant", &recipient, 14_002, None),
+        Err(BudgetRefusal::PerCall { max_msat: 6_000 })
+    ));
+    service
+        .grant_first_contact(&client, "grant", &recipient, 6_000, None)
+        .unwrap();
+    let parent = service
+        .reserve_spend(
+            &client,
+            1,
+            vec![Charge {
+                recipient: recipient.clone(),
+                amount_msat: 4_000,
+            }],
+        )
+        .unwrap();
+    // Both the message repricing and admission must fit the original call.
+    assert!(matches!(
+        service.reserve_quoted_readmission(&parent, &recipient, 5_000, 2_000, 4_000, None),
+        Err(BudgetRefusal::PerCall { max_msat: 6_000 })
+    ));
+    assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 4_000);
+    let (total, _) = service
+        .reserve_quoted_readmission(&parent, &recipient, 4_000, 2_000, 4_000, None)
+        .unwrap();
+    assert_eq!(total, 6_000);
+    assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 6_000);
+}
+
+#[test]
+fn console_fanout_cap_checks_the_whole_call_before_any_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let charges = |amount_msat| {
+        vec![
+            Charge {
+                recipient: "aa".repeat(32),
+                amount_msat,
+            },
+            Charge {
+                recipient: "bb".repeat(32),
+                amount_msat,
+            },
+        ]
+    };
+    assert!(matches!(
+        service.reserve_spend(&client, 1, charges(3_500)),
+        Err(BudgetRefusal::PerCall { max_msat: 6_000 })
+    ));
+    assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 0);
+    service.reserve_spend(&client, 1, charges(3_000)).unwrap();
+    assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 6_000);
+}

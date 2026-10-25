@@ -56,12 +56,25 @@ async fn owner_approve(fx: &Fx, cand: &Value) -> (StatusCode, Value) {
 
 // Old versions could dispatch against G1. Seed their durable state so the
 // reconciliation contract remains tested without enabling new paired approval.
-async fn legacy_unknown(fx: &Fx) {
+async fn legacy_unknown(fx: &mut Fx) {
     let path = fx.state.data_dir.as_ref().unwrap().join("sponsor/kits.json");
     let mut ledger: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let epoch = fx.service.snapshot().clients.iter().find(|c| c.client_id == fx.client_id).unwrap().epoch;
     let recipient = ledger["kits"][0]["candidate"]["newcomer_ln"].as_str().unwrap().to_owned();
-    let reservation = fx.service.reserve_spend(&fx.client_id, epoch, vec![Charge { recipient, amount_msat: GIFT }]).unwrap();
+    // Seed the pre-upgrade reservation directly. New non-payment reservations
+    // cannot reproduce a legacy 20-sat hold under the six-sat call ceiling.
+    let mut pairing = fx.service.snapshot();
+    let grant = pairing.grants.iter_mut().find(|g| g.client_id == fx.client_id).unwrap();
+    let reservation = konsensus_api::spend_budget::Reservation {
+        id: uuid::Uuid::new_v4().to_string(),
+        client_id: fx.client_id.clone(),
+        op_id: grant.op_id.clone(),
+        charges: vec![Charge { recipient: recipient.clone(), amount_msat: GIFT }],
+    };
+    let budget = grant.budget.as_mut().unwrap();
+    budget.reserve_at(&reservation.charges, chrono::Utc::now().timestamp()).unwrap();
+    budget.pending.insert(reservation.id.clone(), [(recipient, GIFT)].into_iter().collect());
+    std::fs::write(fx.tmp.path().join("pairing/clients.json"), serde_json::to_vec(&pairing).unwrap()).unwrap();
+    fx.restart();
     ledger["kits"][0]["state"] = json!("unknown");
     ledger["kits"][0]["reserved_msat"] = json!(GIFT + FEE);
     ledger["kits"][0]["fresh_payment_hash"] = json!(true);
@@ -134,7 +147,7 @@ async fn an_owner_payment_failure_closes_the_kit_without_debiting_a_grant() {
 #[tokio::test]
 async fn regression_definitive_reconcile_releases_grant_hold_after_restart() {
     let (mut fx, _token, cand) = kit(50_000).await;
-    legacy_unknown(&fx).await;
+    legacy_unknown(&mut fx).await;
     assert_eq!(fx.used(), GIFT);
     fx.restart();
     fx.wallet.set(FAILED);

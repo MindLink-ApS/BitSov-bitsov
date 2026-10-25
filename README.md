@@ -1,10 +1,12 @@
 # BitSov
 
+[![CI](https://github.com/MindLink-ApS/BitSov-bitsov/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MindLink-ApS/BitSov-bitsov/actions/workflows/ci.yml)
+
 A sovereign mesh network where every user is a node whose identity comes from its own user-held keys, and Bitcoin/Lightning pays for communication admission.
 
 BitSov is a decentralized, privacy-respecting, Bitcoin-backed substrate where the node, not a platform account, owns the relationship. Today it carries messaging, scheduling, and collaboration; calls and file-sharing are on the roadmap.
 
-**Status:** BitSov is in closed beta with signet test nodes. Paid admission was proven on mainnet on 1 July 2026.
+**Status:** BitSov is in closed beta with signet test nodes. Paid admission follows the [2026-07-01 keystone](docs/v2/F1-CAPPED-FIRST-CONTACT.md#stranger-payment-preparation-and-the-whitepaper-floor): the target re-prices and the requester pays the target's invoice. That is the mechanism, not scale. Location privacy, the relay and scale have **not** shipped; mainnet is not supported in this beta.
 
 Node IDs and public keys are the protocol identity layer. IP addresses and DNS names are reachability hints, not identity or admission authority. Nodes may learn those hints through invites, QR codes, manual entry, relays, or other out-of-band discovery, but communication remains governed by the node identity, encryption state, and payment/admission policy.
 
@@ -21,6 +23,8 @@ Node IDs and public keys are the protocol identity layer. IP addresses and DNS n
 ### Developer Preview: Build the CLI from Source
 
 The public protocol/core repository is source-first until the signed release is published. Signed binaries and desktop app packages are release artifacts; they are published only after the final launch go/no-go.
+
+Verifying a release: artifacts are signed with the release key described under [Reporting a Vulnerability in `SECURITY.md`](SECURITY.md#reporting-a-vulnerability); the release policy has the [pinned build recipe](docs/ops/RELEASE_POLICY.md#reproducibility-inputs) and the [independent rebuild gate](docs/ops/RELEASE_POLICY.md#independent-rebuild-gate-h3), and the per-release checklists live under [`docs/releases/`](docs/releases/).
 
 ```bash
 # Prerequisite: Rust 1.89+
@@ -57,7 +61,7 @@ See the [CLN configuration reference](docs/CLN.md).
 | Tier | Setup | Identity | Lightning | Storage |
 |------|-------|----------|-----------|---------|
 | **Relay** | Paired remote access | User-held keys | User-authorized payments | Relay-held ciphertext |
-| **Light** | Download binary | Local mnemonic | User-selected Lightning | Local SQLite |
+| **Light** | Build from source (signed binaries after the launch go/no-go) | Local mnemonic | User-selected Lightning | Local SQLite |
 | **Full** | Self-hosted | HSM-ready | Own LDK/LND node | Encrypted SQLite/PostgreSQL |
 
 All tiers use node identity as the canonical endpoint identifier. Reachability hints are secondary.
