@@ -411,7 +411,7 @@ async fn conclude(
         DirectPaymentResponse::in_flight(ident, op),
         &details,
     );
-    let (fenced, response) = match details.status {
+    let (recorded, response) = match details.status {
         PaymentStatus::Settled => {
             let receipt = serde_json::to_vec(&Receipt::Settled(body.clone())).map_err(storage)?;
             let fenced = record(state, expected, CHANNEL_OPEN_OPENED, Some(receipt), None).await;
@@ -438,25 +438,62 @@ async fn conclude(
             )
         }
         PaymentStatus::Pending | PaymentStatus::InFlight => {
-            let fenced = if expected.state == CHANNEL_OPEN_PENDING {
+            let recorded = if expected.state == CHANNEL_OPEN_PENDING {
                 let receipt =
                     serde_json::to_vec(&Receipt::InFlight(body.clone())).map_err(storage)?;
                 record(state, expected, CHANNEL_OPEN_UNCERTAIN, Some(receipt), None).await
             } else {
-                true
+                Recorded::Written
             };
             (
-                fenced,
+                recorded,
                 Ok((StatusCode::ACCEPTED, Json(view(body, replayed)?))),
             )
         }
     };
-    if fenced || !replayed {
-        // A fresh dispatch answers from its own backend result even when a
-        // concurrent replay of the same binding recorded it first.
+    if !replayed {
+        // A fresh dispatch answers from its own backend result: the row is the
+        // one this request inserted, whether or not the write landed first.
         return response;
     }
-    reread(state, ident, op, expected).await
+    match recorded {
+        Recorded::Written => response,
+        // The row this replay read is gone or finalized: only the authoritative
+        // row may answer, and only when it is still the same binding.
+        Recorded::FenceMissed => reread(state, ident, op, expected).await,
+        // The write failed, so the fence proved nothing. Serve the backend's
+        // answer only after the authoritative row shows the same binding; the
+        // receipt itself is persisted by the retry.
+        Recorded::Failed => {
+            same_binding(state, ident, expected).await?;
+            response
+        }
+    }
+}
+
+/// The authoritative row still carries `expected`'s binding (request hash
+/// and insertion time); otherwise the operation changed underneath a replay.
+async fn same_binding(
+    state: &Arc<AppState>,
+    ident: &Ident,
+    expected: &ChannelOpenOperation,
+) -> Result<(), ApiError> {
+    let current = state
+        .storage
+        .get_channel_open_operation(&ident.key)
+        .await
+        .map_err(storage)?;
+    match current {
+        Some(row)
+            if row.request_hash == expected.request_hash
+                && row.created_at == expected.created_at =>
+        {
+            Ok(())
+        }
+        _ => Err(ApiError::Conflict(
+            "operation changed concurrently; retry".into(),
+        )),
+    }
 }
 
 /// After a replay lost its fence: the row it read was finalized by another
@@ -546,19 +583,29 @@ async fn release(state: &AppState, key: &str) {
     }
 }
 
-/// Record an outcome against `expected`, the row this result was derived
-/// from. Returns false when the fence did not match (the row was finalized by
-/// another writer, or deleted and re-created for another request); nothing is
-/// written then. Storage errors are retried off the request's lifetime with
-/// the same fence, so a late retry can never land on a replacement row.
+/// What an outcome write proved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Recorded {
+    /// The fenced update matched `expected` and landed.
+    Written,
+    /// Nothing matched: the row was finalized by another writer, or deleted
+    /// and re-created for another request. Nothing was written.
+    FenceMissed,
+    /// Storage failed; the fence proved nothing. The write is retried off the
+    /// request's lifetime with the same fence, so a late retry can never land
+    /// on a replacement row.
+    Failed,
+}
+
+/// Record an outcome against `expected`, the row this result was derived from.
 async fn record(
     state: &Arc<AppState>,
     expected: &ChannelOpenOperation,
     to: &'static str,
     receipt: Option<Vec<u8>>,
     last_error: Option<String>,
-) -> bool {
-    if let Some(fenced) = write(
+) -> Recorded {
+    match write(
         state,
         expected,
         to,
@@ -567,7 +614,9 @@ async fn record(
     )
     .await
     {
-        return fenced;
+        Some(true) => return Recorded::Written,
+        Some(false) => return Recorded::FenceMissed,
+        None => {}
     }
     let state = Arc::clone(state);
     let expected = expected.clone();
@@ -589,8 +638,7 @@ async fn record(
         }
         tracing::error!(operation_id = %expected.operation_id, "direct payment outcome persistence retries exhausted; the backend record stays the truth");
     });
-    // Unknown until the retry lands; the caller answers from backend truth.
-    true
+    Recorded::Failed
 }
 
 // Some(true): written. Some(false): the fence did not match, nothing written.

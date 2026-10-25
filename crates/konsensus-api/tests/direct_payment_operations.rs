@@ -14,7 +14,7 @@ use konsensus_api::state::AppState;
 use konsensus_core::traits::lightning::{
     Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection, PaymentStatus,
 };
-use konsensus_storage::SqliteStorage;
+use konsensus_storage::{SqliteStorage, Storage};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -583,7 +583,8 @@ async fn status_advertises_direct_payment_operations() {
 #[tokio::test]
 async fn stale_replay_cannot_finalize_a_reused_id_with_another_requests_receipt() {
     let wallet = Wallet::new(Mode::Settle);
-    let state = test_state_with_lightning(wallet.clone());
+    let storage = Arc::new(MemStorage::new());
+    let state = test_state_with_lightning_and_storage(wallet.clone(), storage.clone());
     let first = create_test_bolt11(1000);
     let replacement = create_test_bolt11_with_hash(1000, [0xdd; 32]);
     // The backend knows `first` as settled from an earlier, unrelated operation.
@@ -638,6 +639,9 @@ async fn stale_replay_cannot_finalize_a_reused_id_with_another_requests_receipt(
     // B learns `first` settled (the backend reports the earlier payment), but
     // the row it read is gone: no write, no 200.
     wallet.set(Mode::Settle);
+    // B's outcome write fails outright: a storage error proves nothing about
+    // the fence, so B must still validate the binding before answering.
+    storage.fail_next_outcome_write();
     wallet.status_gate.add_permits(1);
     let (status, body) = b.await.unwrap();
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -674,4 +678,45 @@ async fn stale_replay_cannot_finalize_a_reused_id_with_another_requests_receipt(
     assert_eq!(again["payment_hash"], body["payment_hash"]);
     assert_eq!(again["replayed"], true);
     assert_eq!(wallet.dispatches(), 4);
+}
+
+/// A storage error on a replay's outcome write is not a fence result. The
+/// replay answers from backend truth only after the authoritative row shows
+/// its own binding, and the fenced retry persists the receipt afterwards.
+#[tokio::test]
+async fn outcome_write_failure_on_replay_validates_the_binding_before_answering() {
+    let wallet = Wallet::new(Mode::InFlight);
+    let storage = Arc::new(MemStorage::new());
+    let state = test_state_with_lightning_and_storage(wallet.clone(), storage.clone());
+    let bolt11 = create_test_bolt11(1000);
+    let (status, body) = post(&state, "pay", pay_body("flaky", &bolt11)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(wallet.dispatches(), 1);
+
+    wallet.set(Mode::Settle);
+    storage.fail_next_outcome_write();
+    let (status, body) = post(&state, "pay", pay_body("flaky", &bolt11)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_settled(&body, "pay", "flaky");
+    assert_eq!(body["replayed"], true);
+    assert_eq!(wallet.dispatches(), 1);
+    // The retry lands the same fenced write a moment later.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let row = storage
+            .get_channel_open_operation("pay:owner:flaky")
+            .await
+            .unwrap()
+            .unwrap();
+        if row.state == "opened" {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{row:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    wallet.set(Mode::Refused);
+    let (status, body) = post(&state, "pay", pay_body("flaky", &bolt11)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_settled(&body, "pay", "flaky");
+    assert_eq!(wallet.dispatches(), 1);
 }

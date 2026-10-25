@@ -77,6 +77,7 @@ pub struct MemStorage {
     onboarding_state: Mutex<Option<OnboardingStateRecord>>,
     invite_schema_capabilities: InviteSchemaCapabilities,
     fail_next_whitelist_write: Mutex<bool>,
+    fail_next_outcome_write: Mutex<bool>,
 }
 
 impl MemStorage {
@@ -98,6 +99,7 @@ impl MemStorage {
             onboarding_state: Mutex::new(None),
             invite_schema_capabilities: InviteSchemaCapabilities::v2_ready_default(),
             fail_next_whitelist_write: Mutex::new(false),
+            fail_next_outcome_write: Mutex::new(false),
         }
     }
 
@@ -106,6 +108,11 @@ impl MemStorage {
             invite_schema_capabilities: InviteSchemaCapabilities::not_ready(),
             ..Self::new()
         }
+    }
+
+    /// The next `record_channel_open_outcome` fails with a storage error.
+    pub fn fail_next_outcome_write(&self) {
+        *self.fail_next_outcome_write.lock().unwrap() = true;
     }
 
     pub fn fail_next_whitelist_write(&self) {
@@ -156,6 +163,11 @@ impl Storage for MemStorage {
         result: Option<&[u8]>,
         last_error: Option<&str>,
     ) -> Result<bool, StorageError> {
+        if std::mem::take(&mut *self.fail_next_outcome_write.lock().unwrap()) {
+            return Err(StorageError::Serialization(
+                "injected outcome write failure".into(),
+            ));
+        }
         let mut rows = self.operations.lock().unwrap();
         let Some(op) = rows.get_mut(&expected.operation_id).filter(|op| {
             op.state != "opened"

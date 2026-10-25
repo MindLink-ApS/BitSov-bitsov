@@ -3080,6 +3080,11 @@ async fn request_ids_are_scoped_per_caller_so_clients_never_share_a_receipt() {
         1_000,
         "the first app is debited once, for its own payment"
     );
+    assert_eq!(
+        fx.service.grant_view_for(&second_id).unwrap().used_msat,
+        1_000,
+        "the second app is debited once, for its own payment"
+    );
     // Each caller's retry replays only its own operation.
     for (token, receipt) in [
         (&first, &receipts[0]),
