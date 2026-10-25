@@ -806,23 +806,42 @@ async fn try_keysend(
     peer_id: &NodeId,
     debit: &Debit,
 ) -> Result<KeysendOutcome, ApiError> {
-    // Pay a contact only at the Lightning key their identity signed. The
-    // binding is read again right before dispatch so a rotation or removal
-    // that landed since the caller's lookup cannot send sats to a stale key.
-    // Every refusal here precedes dispatch and settles nothing.
+    // Pay a contact only at the Lightning key their identity signed. Refuse
+    // early, before any journal or budget bookkeeping, when the caller's
+    // destination is not the contact's verified key.
     require_verified_keysend_destination(state, peer_id, ln_pubkey).await?;
     let updates = SettlementUpdates::subscribe(state.lightning.as_ref());
-    let details = match debit.dispatch_message(state, None, amount_msat, state
-        .lightning
-        .keysend_with_fee_limit(ln_pubkey, amount_msat, Some("konsensus message"), debit.fee_limit(state, amount_msat)))
-        .await?
-    {
+    let fee_limit = debit.fee_limit(state, amount_msat);
+    let destination = ln_pubkey.to_owned();
+    // The authorization point proper. `dispatch_message` awaits the journal
+    // and budget bookkeeping before it polls this future, so the binding is
+    // read again here, at the moment the backend is handed the payment. A
+    // rotation or removal that landed during those awaits refuses the
+    // payment instead of paying a key the identity no longer signs; the
+    // refusal is a positive not-dispatched, so the bookkeeping is rolled
+    // back and nothing is paid.
+    let dispatch = async {
+        if let Err(reason) = keysend_destination_reason(state, peer_id, &destination).await {
+            return Err(LightningError::PaymentNotDispatched(reason.to_owned()));
+        }
+        state
+            .lightning
+            .keysend_with_fee_limit(&destination, amount_msat, Some("konsensus message"), fee_limit)
+            .await
+    };
+    let details = match debit.dispatch_message(state, None, amount_msat, dispatch).await? {
         Ok(details) => details,
         Err(LightningError::NotReady) => return Err(ApiError::NotReady),
         Err(LightningError::PaymentNotDispatched(reason)) if reason == "disk_low" => {
             return Err(ApiError::NotDispatched(reason));
         }
         Err(LightningError::PaymentNotDispatched(reason)) => {
+            // A binding refusal never falls back to an invoice: the contact
+            // is paid at their verified key or not at all.
+            if let Some(fixed) = binding_refusal_reason(&reason) {
+                tracing::warn!(peer = %peer_id, reason = fixed, "keysend refused at dispatch: binding changed");
+                return Err(ApiError::PeerNotReady { reason: fixed });
+            }
             tracing::warn!(peer = %peer_id, %reason, "keysend rejected before dispatch");
             return Ok(KeysendOutcome::NotDispatched);
         }
@@ -879,6 +898,18 @@ async fn require_verified_keysend_destination(
     peer_id: &NodeId,
     destination: &str,
 ) -> Result<(), ApiError> {
+    keysend_destination_reason(state, peer_id, destination)
+        .await
+        .map_err(|reason| ApiError::PeerNotReady { reason })
+}
+
+/// Read the contact's current binding and decide whether `destination` may
+/// be paid; the error is the fixed refusal reason.
+async fn keysend_destination_reason(
+    state: &AppState,
+    peer_id: &NodeId,
+    destination: &str,
+) -> Result<(), &'static str> {
     let binding = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
     keysend_destination_allowed(binding.as_ref(), destination)
 }
@@ -888,19 +919,21 @@ async fn require_verified_keysend_destination(
 fn keysend_destination_allowed(
     binding: Option<&PeerLightningKey>,
     destination: &str,
-) -> Result<(), ApiError> {
+) -> Result<(), &'static str> {
     match binding {
         Some(PeerLightningKey::Verified(key)) if key == destination => Ok(()),
-        Some(PeerLightningKey::Verified(_)) => Err(ApiError::PeerNotReady {
-            reason: REASON_DESTINATION_MISMATCH,
-        }),
-        Some(PeerLightningKey::Unsigned) => Err(ApiError::PeerNotReady {
-            reason: REASON_CONTACT_MUST_UPDATE,
-        }),
-        None => Err(ApiError::PeerNotReady {
-            reason: REASON_NO_BINDING,
-        }),
+        Some(PeerLightningKey::Verified(_)) => Err(REASON_DESTINATION_MISMATCH),
+        Some(PeerLightningKey::Unsigned) => Err(REASON_CONTACT_MUST_UPDATE),
+        None => Err(REASON_NO_BINDING),
     }
+}
+
+/// The fixed binding reason carried by a not-dispatched keysend that the
+/// authorization point refused, if that is what it was.
+fn binding_refusal_reason(reason: &str) -> Option<&'static str> {
+    [REASON_DESTINATION_MISMATCH, REASON_CONTACT_MUST_UPDATE, REASON_NO_BINDING]
+        .into_iter()
+        .find(|fixed| *fixed == reason)
 }
 
 #[cfg(test)]
@@ -911,12 +944,17 @@ mod keysend_destination_tests {
         format!("{prefix}{}", "ab".repeat(32))
     }
 
-    fn reason(result: Result<(), ApiError>) -> Option<&'static str> {
-        match result {
-            Ok(()) => None,
-            Err(ApiError::PeerNotReady { reason }) => Some(reason),
-            Err(other) => panic!("unexpected error {other:?}"),
+    fn reason(result: Result<(), &'static str>) -> Option<&'static str> {
+        result.err()
+    }
+
+    #[test]
+    fn binding_refusals_are_recognized_in_not_dispatched_reasons() {
+        for fixed in [REASON_DESTINATION_MISMATCH, REASON_CONTACT_MUST_UPDATE, REASON_NO_BINDING] {
+            assert_eq!(binding_refusal_reason(fixed), Some(fixed));
         }
+        assert_eq!(binding_refusal_reason("no route"), None);
+        assert_eq!(binding_refusal_reason("disk_low"), None);
     }
 
     #[test]

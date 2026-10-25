@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode};
 use futures::stream::BoxStream;
 use konsensus_api::handlers::messages::create_payment_proof;
 use konsensus_api::state::PeerLightningKey;
-use konsensus_core::lightning_binding::REASON_CONTACT_MUST_UPDATE;
+use konsensus_core::lightning_binding::{REASON_CONTACT_MUST_UPDATE, REASON_DESTINATION_MISMATCH};
 use konsensus_core::traits::lightning::{
     Invoice, LightningError, LightningProvider, PaymentDetails,
 };
@@ -30,6 +30,8 @@ struct RecordingLightning {
     keysend_destinations: Mutex<Vec<String>>,
     rotate_during_keysend:
         Mutex<Option<(PeerLnKeys, konsensus_core::types::NodeId, PeerLightningKey)>>,
+    rotate_on_subscribe:
+        Mutex<Option<(PeerLnKeys, konsensus_core::types::NodeId, PeerLightningKey)>>,
 }
 
 impl RecordingLightning {
@@ -38,7 +40,21 @@ impl RecordingLightning {
             backend: MockLightningProvider::new(),
             keysend_destinations: Mutex::new(Vec::new()),
             rotate_during_keysend: Mutex::new(None),
+            rotate_on_subscribe: Mutex::new(None),
         }
+    }
+
+    /// Arm the next settlement subscription to replace `peer`'s binding with
+    /// `next`. `try_keysend` subscribes after its early destination check and
+    /// before the dispatch bookkeeping, so this lands a change exactly in the
+    /// window between the caller's check and the backend call.
+    fn rotate_before_dispatch(
+        &self,
+        map: PeerLnKeys,
+        peer: konsensus_core::types::NodeId,
+        next: PeerLightningKey,
+    ) {
+        *self.rotate_on_subscribe.lock().unwrap() = Some((map, peer, next));
     }
 
     /// Arm the next keysend to replace `peer`'s binding with `next` after the
@@ -107,6 +123,12 @@ impl LightningProvider for RecordingLightning {
     }
 
     fn outgoing_payment_updates(&self) -> Option<BoxStream<'static, String>> {
+        let rotation = self.rotate_on_subscribe.lock().unwrap().take();
+        if let Some((map, peer, next)) = rotation {
+            map.try_lock()
+                .expect("binding map is not locked while subscribing")
+                .insert(peer, next);
+        }
         self.backend.outgoing_payment_updates()
     }
 
@@ -311,6 +333,151 @@ async fn removal_during_dispatch_refuses_only_the_next_payment() {
         "{err}"
     );
     assert_eq!(fx.backend.destinations(), vec![ln_key("02")]);
+    assert_eq!(fx.backend.payments().await, 1);
+    fx.lightning.shutdown().await.unwrap();
+}
+
+/// A rotation that lands between the caller's check and the backend call
+/// (while the dispatch bookkeeping awaits) refuses the payment instead of
+/// paying the key the identity no longer signs. Nothing is dispatched, and the
+/// next payment follows the new binding.
+#[tokio::test]
+async fn rotation_before_dispatch_refuses_and_pays_nothing() {
+    let fx = fixture().await;
+    fx.state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(fx.peer, PeerLightningKey::Verified(ln_key("02")));
+    fx.backend.rotate_before_dispatch(
+        fx.state.peer_ln_pubkeys.clone(),
+        fx.peer,
+        PeerLightningKey::Verified(ln_key("03")),
+    );
+
+    let err = create_payment_proof(&fx.state, 2_000, &fx.peer)
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains(REASON_DESTINATION_MISMATCH),
+        "{err}"
+    );
+    assert!(
+        fx.backend.destinations().is_empty(),
+        "nothing reached the backend"
+    );
+    assert_eq!(fx.backend.payments().await, 0);
+
+    create_payment_proof(&fx.state, 2_000, &fx.peer)
+        .await
+        .unwrap();
+    assert_eq!(fx.backend.destinations(), vec![ln_key("03")]);
+    fx.lightning.shutdown().await.unwrap();
+}
+
+/// The same window, with the binding becoming unsigned: refused with the
+/// update reason, no keysend, no invoice.
+#[tokio::test]
+async fn unsigned_before_dispatch_refuses_and_pays_nothing() {
+    let fx = fixture().await;
+    fx.state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(fx.peer, PeerLightningKey::Verified(ln_key("02")));
+    fx.backend.rotate_before_dispatch(
+        fx.state.peer_ln_pubkeys.clone(),
+        fx.peer,
+        PeerLightningKey::Unsigned,
+    );
+
+    let err = create_payment_proof(&fx.state, 2_000, &fx.peer)
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains(REASON_CONTACT_MUST_UPDATE),
+        "{err}"
+    );
+    assert!(fx.backend.destinations().is_empty());
+    assert_eq!(fx.backend.payments().await, 0);
+    assert!(fx.state.invoice_requests.lock().await.is_empty());
+    fx.lightning.shutdown().await.unwrap();
+}
+
+/// Through a durable operation the dispatch bookkeeping writes the journal
+/// before the backend is polled. A rotation in that window is refused with
+/// the fixed reason, the journal is rolled back to not dispatched, and a
+/// fresh operation pays the new key.
+#[tokio::test]
+async fn rotation_before_dispatch_in_operation_refuses_and_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let db: Arc<dyn konsensus_storage::Storage> = Arc::new(
+        konsensus_storage::SqliteStorage::open(dir.path().join("ops.db").to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    let mut fx = fixture().await;
+    Arc::get_mut(&mut fx.state).unwrap().storage = db;
+    fx.state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(fx.peer, PeerLightningKey::Verified(ln_key("02")));
+    fx.backend.rotate_before_dispatch(
+        fx.state.peer_ln_pubkeys.clone(),
+        fx.peer,
+        PeerLightningKey::Verified(ln_key("03")),
+    );
+    let auth = common::auth_header(&fx.state);
+    let app = common::test_router(Arc::clone(&fx.state));
+    let request = |operation_id: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/messages/compose")
+            .header("authorization", &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "operation_id": operation_id,
+                    "recipient": fx.peer.to_hex(),
+                    "kind": 1,
+                    "plaintext": "hello",
+                    "wait_ack_ms": 0
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    let body = |resp: axum::response::Response| async {
+        serde_json::from_slice::<serde_json::Value>(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    };
+
+    let rotated_op = uuid::Uuid::new_v4().to_string();
+    let fresh_op = uuid::Uuid::new_v4().to_string();
+    let first = app.clone().oneshot(request(&rotated_op)).await.unwrap();
+    let status = first.status();
+    let first = body(first).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{first}");
+    assert_eq!(first["reason"], REASON_DESTINATION_MISMATCH);
+    assert_eq!(first["accepted"], false);
+    assert!(
+        fx.backend.destinations().is_empty(),
+        "nothing reached the backend"
+    );
+    assert_eq!(fx.backend.payments().await, 0);
+
+    let second = app.oneshot(request(&fresh_op)).await.unwrap();
+    let status = second.status();
+    let second = body(second).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(fx.backend.destinations(), vec![ln_key("03")]);
     assert_eq!(fx.backend.payments().await, 1);
     fx.lightning.shutdown().await.unwrap();
 }
