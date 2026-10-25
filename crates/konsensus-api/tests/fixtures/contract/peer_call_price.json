@@ -1,0 +1,9 @@
+{
+  "body": {
+    "offer_msat": 10000,
+    "peer_id": "<hex64>",
+    "signal_msat": 10
+  },
+  "request": "GET /api/v1/pricing/peers/:id/call",
+  "status": 200
+}
