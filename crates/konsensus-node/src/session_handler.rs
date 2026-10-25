@@ -1068,11 +1068,14 @@ fn terminal_paid_rejection(reason: &str) -> bool {
         "payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:",
         "room_binding_invalid:", "room_sender_not_member:", "room_recipient_not_member:",
         // The recipient's gate kept the payment but withdrew the envelope
-        // (`crate::msg_handler::ReceiptRefusal`): a resend of the same bytes
-        // can never be read, and is refused as a reused proof.
+        // (`crate::msg_handler::ReceiptRefusal`, a refused call or room chat):
+        // a resend of the same bytes can never be accepted, and is answered
+        // with the withdrawal again, so a lost refusal is not a delivery.
         "undecryptable:",
         "not_persisted:",
         "file_corrupted:",
+        "message withdrawn",
+        "call signal withdrawn",
     ]
     .iter().any(|prefix| reason.starts_with(prefix))
 }

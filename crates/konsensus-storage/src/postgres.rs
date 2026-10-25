@@ -1079,6 +1079,12 @@ impl Storage for PostgresStorage {
                 tx.rollback().await?;
                 return Ok(PaymentReused);
             }
+            // The same envelope, refused and withdrawn by the application: its
+            // sender is told so again, never that its proof belongs to another.
+            if binding.2 == -1 {
+                tx.rollback().await?;
+                return Ok(Withdrawn);
+            }
             // Receipt metadata is independent of retained message content and
             // excludes only the timestamp/signature wrapper refreshed on retry.
             let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = 1 AND kind = $4 AND recipient_type = $5 AND recipient_id = $6 AND preimage = $7 AND amount_msat = $8 AND nonce = $9 AND references_json = $10")

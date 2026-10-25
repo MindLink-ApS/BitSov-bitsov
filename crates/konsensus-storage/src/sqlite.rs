@@ -971,6 +971,12 @@ impl Storage for SqliteStorage {
                 tx.rollback().await?;
                 return Ok(PaymentReused);
             }
+            // The same envelope, refused and withdrawn by the application: its
+            // sender is told so again, never that its proof belongs to another.
+            if binding.2 == -1 {
+                tx.rollback().await?;
+                return Ok(Withdrawn);
+            }
             // Receipt metadata is independent of retained message content and
             // excludes only the timestamp/signature wrapper refreshed on retry.
             let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = ? AND message_id = ? AND sender = ? AND accepted = 1 AND kind = ? AND recipient_type = ? AND recipient_id = ? AND preimage = ? AND amount_msat = ? AND nonce = ? AND references_json = ?")

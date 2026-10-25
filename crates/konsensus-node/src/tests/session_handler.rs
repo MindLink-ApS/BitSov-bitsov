@@ -4273,5 +4273,96 @@ fn receipt_refusals_are_terminal_for_the_sender() {
     ] {
         assert!(terminal_paid_rejection(&refusal.to_string()), "{refusal}");
     }
+    // The recipient's answer to a resend of a withdrawn envelope.
+    assert!(terminal_paid_rejection("message withdrawn"));
+    assert!(terminal_paid_rejection("call signal withdrawn"));
     assert!(!terminal_paid_rejection("storage error"));
+}
+
+/// The refusal was lost and the flusher resent the same bytes: the recipient
+/// answers `message withdrawn`, which is terminal here (`failed_paid`), and a
+/// stray reused-proof reply afterwards cannot turn it into a delivery.
+#[tokio::test]
+async fn withdrawn_reply_after_a_lost_refusal_is_terminal_not_delivery() {
+    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
+    let mut limits = DeliveryConfirmationBudget::default();
+    let own = make_peer_id(71);
+    let peer = make_peer_id(72);
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    let routing = konsensus_routing::RoutingTable::new(Default::default());
+    let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
+    let (ws, mut updates) = broadcast::channel(16);
+    let dir = tempfile::tempdir().unwrap();
+    let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+    let preimage = [7u8; 32];
+    let hash: [u8; 32] = sha2::Sha256::digest(preimage).into();
+    let env = UkmEnvelopeBuilder::new(
+        konsensus_core::kind::KIND_CHAT,
+        own,
+        Recipient::Node(peer),
+        vec![1],
+        PaymentProof::new(hash, preimage, 1000),
+    )
+    .build();
+    db.store_message(&env).await.unwrap();
+    db.prepare_delivery(&env.id, &peer).await.unwrap();
+
+    handle_delivery_confirmation(
+        &peer,
+        &env.id,
+        Some("message withdrawn"),
+        true,
+        &own,
+        &storage,
+        &timestamps,
+        &routing,
+        &ws,
+        &audit,
+        &mut limits,
+    )
+    .await;
+    let status = updates.try_recv().unwrap();
+    assert_eq!(status.status, "failed_paid");
+    assert_eq!(status.reason.as_deref(), Some("message withdrawn"));
+    let state: String = sqlx::query_as::<_, (String,)>("SELECT state FROM pending_deliveries")
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(state, "failed_paid");
+    assert!(
+        db.get_pending_for_peer(&peer).await.unwrap().is_empty(),
+        "nothing is resent"
+    );
+
+    // A reused-proof reply with the exact payment hash is the legacy delivery
+    // receipt for a live row; a failed row never becomes delivered.
+    handle_delivery_confirmation(
+        &peer,
+        &env.id,
+        Some(&format!(
+            "payment proof already used: {}",
+            hex::encode(hash)
+        )),
+        true,
+        &own,
+        &storage,
+        &timestamps,
+        &routing,
+        &ws,
+        &audit,
+        &mut limits,
+    )
+    .await;
+    assert!(
+        updates.try_recv().is_err(),
+        "no delivery status after a terminal refusal"
+    );
+    let state: String = sqlx::query_as::<_, (String,)>("SELECT state FROM pending_deliveries")
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(state, "failed_paid");
 }

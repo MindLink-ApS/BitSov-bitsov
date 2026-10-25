@@ -16,7 +16,10 @@ also live on the corresponding GitHub pre-release pages.
   file that fails its integrity check are withdrawn and refused with a typed
   `MessageReject` (`undecryptable:`, `not_persisted:`, `file_corrupted:`),
   which the sender records as terminal `failed_paid`. A damaged file is never
-  listed, stored or shown to the app as received.
+  listed, stored or shown to the app as received; files are held like chats
+  until stored. A resend of any withdrawn envelope is answered
+  `message withdrawn` (terminal), never the reused-proof reply, so a lost
+  refusal cannot become a delivery on retry.
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'
   scripts instead of all 2000 derived scripts. Before each focused sweep preview,

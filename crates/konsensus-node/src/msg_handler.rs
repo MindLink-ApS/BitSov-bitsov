@@ -226,10 +226,10 @@ fn is_admission_proof(envelope: &konsensus_core::UkmEnvelope) -> bool {
 /// Why a paid envelope that passed the gate and was stored is refused instead
 /// of acknowledged as delivered: this node could not produce its plaintext and
 /// keep it. The envelope is withdrawn (`reject_accepted_envelope`), so history
-/// and resync never show it and a resend of the same bytes is refused as a
-/// reused proof; the payment hash and nonce stay burned. The sender gets a
-/// `MessageReject` whose reason starts with [`ReceiptRefusal::code`], which
-/// its delivery tracking treats as terminal for that envelope.
+/// and resync never show it and a resend of the same bytes is answered
+/// `message withdrawn`; the payment hash and nonce stay burned. The sender
+/// gets a `MessageReject` whose reason starts with [`ReceiptRefusal::code`],
+/// which its delivery tracking treats as terminal for that envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReceiptRefusal {
     /// No session with the sender, not a ratchet message, or the ratchet
@@ -371,14 +371,17 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             continue;
                         }
 
-                        // A call signal, and a chat (a candidate room chat: its
-                        // binding is only visible after decryption), is held
-                        // (invisible to history, plaintext, resync and duplicate
-                        // ACKs) from before its paid acceptance until its admission
-                        // is final; a hold that outlives this handler is withdrawn
-                        // by the startup/periodic sweep (Codex delta2 #4, #155).
+                        // A call signal, a chat (a candidate room chat: its
+                        // binding is only visible after decryption) and a file
+                        // (received only once decoded, verified and stored) is
+                        // held (invisible to history, plaintext, resync and
+                        // duplicate ACKs) from before its paid acceptance until
+                        // its admission is final; a hold that outlives this
+                        // handler is withdrawn by the startup/periodic sweep
+                        // (Codex delta2 #4, #155).
                         let held_kind = konsensus_api::calls::is_call_kind(envelope.kind)
-                            || konsensus_api::room_binding::is_candidate(envelope.kind);
+                            || konsensus_api::room_binding::is_candidate(envelope.kind)
+                            || envelope.kind == konsensus_core::kind::KIND_FILE_REF;
                         let mut call_hold = false;
                         if gate_result.is_ok() && !is_relay_control && held_kind {
                             match konsensus_api::calls::hold_incoming(storage_for_recv.as_ref(), &envelope).await {
@@ -424,6 +427,24 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     let rejection = konsensus_core::gate::GateRejection::ReplayDetected;
                                     audit_for_recv.membrane().refused(&envelope, &rejection);
                                     gate_result = Err(rejection);
+                                }
+                                Ok(PaidAcceptance::Withdrawn) => {
+                                    // This exact envelope was accepted, then refused and
+                                    // withdrawn (a call, a room chat, a receipt refusal).
+                                    // Its payment stays burned. The sender hears the
+                                    // refusal again, terminal on its side, never the
+                                    // reused-proof reply its legacy receipt path could
+                                    // mistake for a delivery: a lost refusal is not a
+                                    // delivery on retry.
+                                    if call_hold {
+                                        let _ = storage_for_recv.call_admission_release(&msg_id).await;
+                                    }
+                                    let reason = if konsensus_api::calls::is_call_kind(envelope.kind) { "call signal withdrawn" } else { "message withdrawn" };
+                                    let reject = Frame::MessageReject { id: msg_id, reason: reason.into() };
+                                    if let Err(e) = transport_for_ack.send_frame(&sender, &reject).await {
+                                        warn!(peer = %sender, error = %e, "failed to send MessageReject");
+                                    }
+                                    continue;
                                 }
                                 Ok(PaidAcceptance::PaymentReused) => {
                                     let rejection = konsensus_core::gate::GateRejection::PaymentProofReused {
@@ -659,6 +680,18 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 continue;
                             }
                         };
+
+                        // A file is held until it is stored; lift the hold only
+                        // now. If that write fails the file stays held and the
+                        // sweep withdraws it: fail closed, a reject, not an ACK.
+                        if call_hold && envelope.kind == konsensus_core::kind::KIND_FILE_REF {
+                            if let Err(e) = storage_for_recv.call_admission_release(&msg_id).await {
+                                error!(msg_id = %msg_id, error = %e, "stored file could not be released; withheld");
+                                let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                continue;
+                            }
+                        }
 
                         // 1:1 calls: the gate made this envelope paid and single-use;
                         // the call registry makes the offer single-use per call id and

@@ -3622,11 +3622,12 @@ async fn undecryptable_paid_chat_is_refused_not_acknowledged() {
     );
 
     // The sender treats the reason as terminal and resends nothing. Even a
-    // resend of the same bytes is refused as a reused proof, never acknowledged.
+    // resend of the same bytes (the refusal was lost) is answered with the
+    // withdrawal, terminal too, never acknowledged and never the reused-proof
+    // reply the sender's legacy receipt path could take for a delivery.
     let again = net.verdict(&env).await;
     assert!(
-        matches!(&again, ControlEvent::MessageRejected { reason, .. }
-            if reason.starts_with("payment proof already used:")),
+        matches!(&again, ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"),
         "a resend is refused, not acknowledged: {again:?}"
     );
     assert!(net.ws_rx.try_recv().is_err());
@@ -3803,7 +3804,7 @@ async fn plaintext_store_failure_is_refused_not_acknowledged() {
     // The replay keys stay consumed: the same bytes are refused, not acknowledged.
     assert!(matches!(
         net.verdict(&env).await,
-        ControlEvent::MessageRejected { reason, .. } if reason.starts_with("payment proof already used:")
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
     ));
     assert!(net.ws_rx.try_recv().is_err());
 
@@ -3931,5 +3932,76 @@ async fn withdrawal_failure_still_refuses_and_keeps_the_chat_hidden() {
     assert_eq!(net.db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
     assert!(net.db.get_message(&env.id).await.unwrap().is_none());
     assert_eq!(net.receipt_state(&env).await, Some(-1));
+    net.stop().await;
+}
+
+/// A file is held until it is stored. When the file store and then the
+/// withdrawal both fail, the hold keeps the envelope out of history and off
+/// the duplicate-ACK path: a resend is refused as withdrawn, nothing is
+/// published, and the sweep finishes the withdrawal.
+#[tokio::test]
+async fn file_withdrawal_failure_keeps_the_file_hidden_and_refuses_a_resend() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_file BEFORE INSERT ON files BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let intact = net
+        .ciphertext(&file_payload("intact.bin", b"intact", b"intact"))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, intact)
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "not_persisted: the file could not be stored"
+    ));
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+        .bind(env.id.to_hex())
+        .fetch_one(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "the delete was rolled back");
+    assert!(
+        net.db.call_admission_held(&env.id).await.unwrap(),
+        "the hold keeps it hidden"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "hidden from history"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(net.db.list_files(10).await.unwrap().is_empty());
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it arrive");
+
+    // A resend is refused as withdrawn, never acknowledged as a duplicate.
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    sqlx::query("DROP TRIGGER fail_withdraw")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(net.db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
     net.stop().await;
 }
