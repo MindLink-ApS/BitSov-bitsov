@@ -4,6 +4,10 @@
 //! The send-onchain API also uses this ledger with `send-onchain:<UUID>` keys.
 //! For those isolated records, `opened` holds a returned txid and `uncertain`
 //! holds ambiguous outcomes (or legacy refusals); only that API interprets their blobs.
+//! Direct Lightning payments use `pay:<request_id>` and `keysend:<request_id>`
+//! keys: `opened` holds a final receipt (settled or failed), `uncertain` holds
+//! an in-flight snapshot or an ambiguous error until a later backend read
+//! finalizes it through `finalize_channel_open_operation`.
 
 /// Dispatch is in flight, or the process stopped before the outcome was recorded.
 pub const CHANNEL_OPEN_PENDING: &str = "pending";

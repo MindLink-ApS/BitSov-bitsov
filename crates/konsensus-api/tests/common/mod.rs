@@ -62,6 +62,8 @@ pub struct MemStorage {
     pub peer_upsert_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub peer_delete_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     outbox: Mutex<HashMap<String, konsensus_storage::OutboxOperation>>,
+    /// The channel-open / send-onchain / direct-payment operation ledger.
+    operations: Mutex<HashMap<String, konsensus_storage::ChannelOpenOperation>>,
     calendar: Mutex<HashMap<String, konsensus_storage::calendar::CalendarEventRecord>>,
     messages: Mutex<HashMap<String, UkmEnvelope>>,
     /// AES-GCM-encrypted plaintext blobs keyed by message id hex (mirrors prod).
@@ -83,6 +85,7 @@ impl MemStorage {
             peer_upsert_gate: Mutex::new(None),
             peer_delete_gate: Mutex::new(None),
             outbox: Mutex::new(HashMap::new()),
+            operations: Mutex::new(HashMap::new()),
             calendar: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
             message_plaintext: Mutex::new(HashMap::new()),
@@ -112,6 +115,64 @@ impl MemStorage {
 
 #[async_trait]
 impl Storage for MemStorage {
+    async fn insert_channel_open_operation(
+        &self,
+        op: &konsensus_storage::ChannelOpenOperation,
+    ) -> Result<bool, StorageError> {
+        let mut rows = self.operations.lock().unwrap();
+        if rows.contains_key(&op.operation_id) {
+            return Ok(false);
+        }
+        rows.insert(op.operation_id.clone(), op.clone());
+        Ok(true)
+    }
+    async fn get_channel_open_operation(
+        &self,
+        id: &str,
+    ) -> Result<Option<konsensus_storage::ChannelOpenOperation>, StorageError> {
+        Ok(self.operations.lock().unwrap().get(id).cloned())
+    }
+    async fn resolve_channel_open_operation(
+        &self,
+        id: &str,
+        state: &str,
+        result: Option<&[u8]>,
+        last_error: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let mut rows = self.operations.lock().unwrap();
+        let Some(op) = rows.get_mut(id).filter(|op| op.state == "pending") else {
+            return Ok(false);
+        };
+        op.state = state.to_owned();
+        op.result = result.map(<[u8]>::to_vec);
+        op.last_error = last_error.map(str::to_owned);
+        op.updated_at = chrono::Utc::now().timestamp_millis();
+        Ok(true)
+    }
+    async fn finalize_channel_open_operation(
+        &self,
+        id: &str,
+        result: &[u8],
+        last_error: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let mut rows = self.operations.lock().unwrap();
+        let Some(op) = rows.get_mut(id).filter(|op| op.state == "uncertain") else {
+            return Ok(false);
+        };
+        op.state = "opened".into();
+        op.result = Some(result.to_vec());
+        op.last_error = last_error.map(str::to_owned);
+        op.updated_at = chrono::Utc::now().timestamp_millis();
+        Ok(true)
+    }
+    async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
+        let mut rows = self.operations.lock().unwrap();
+        if rows.get(id).is_some_and(|op| op.state == "pending") {
+            rows.remove(id);
+            return Ok(true);
+        }
+        Ok(false)
+    }
     async fn insert_outbox_operation(
         &self,
         op: &konsensus_storage::OutboxOperation,

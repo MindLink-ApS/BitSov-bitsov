@@ -507,7 +507,7 @@ impl Fx {
         self.call(
             "POST",
             "/api/v1/payments/keysend",
-            Some(json!({"dest_pubkey": dest, "amount_msat": amount_msat})),
+            Some(json!({"request_id": rid(), "dest_pubkey": dest, "amount_msat": amount_msat})),
             Some(token),
         )
         .await
@@ -552,6 +552,10 @@ async fn call(
     let json = serde_json::from_slice(&bytes)
         .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&bytes)}));
     (status, json)
+}
+
+fn rid() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn assert_budget_exceeded(status: StatusCode, body: &Value, reason: &str) {
@@ -775,7 +779,7 @@ async fn pay_debits_the_payee_and_refuses_amountless_invoices() {
         .call(
             "POST",
             "/api/v1/payments/pay",
-            Some(json!({"bolt11": amountless_bolt11()})),
+            Some(json!({"request_id": rid(), "bolt11": amountless_bolt11()})),
             Some(&token),
         )
         .await;
@@ -786,7 +790,7 @@ async fn pay_debits_the_payee_and_refuses_amountless_invoices() {
         .call(
             "POST",
             "/api/v1/payments/pay",
-            Some(json!({"bolt11": bolt11})),
+            Some(json!({"request_id": rid(), "bolt11": bolt11})),
             Some(&token),
         )
         .await;
@@ -796,7 +800,7 @@ async fn pay_debits_the_payee_and_refuses_amountless_invoices() {
         .call(
             "POST",
             "/api/v1/payments/pay",
-            Some(json!({"bolt11": create_test_bolt11_with_hash(1_500, [0xdd; 32])})),
+            Some(json!({"request_id": rid(), "bolt11": create_test_bolt11_with_hash(1_500, [0xdd; 32])})),
             Some(&token),
         )
         .await;
@@ -1220,7 +1224,9 @@ async fn concurrent_paid_calls_never_overspend_the_budget() {
                     &state,
                     "POST",
                     "/api/v1/payments/keysend",
-                    Some(json!({"dest_pubkey": OTHER_LN, "amount_msat": 1000})),
+                    Some(
+                        json!({"request_id": rid(), "dest_pubkey": OTHER_LN, "amount_msat": 1000}),
+                    ),
                     Some(&token),
                 )
                 .await
@@ -1340,7 +1346,7 @@ async fn membrane_observes_direct_payment_budget_denials_without_invoice_data() 
         fx.call(
             "POST",
             "/api/v1/payments/pay",
-            Some(json!({"bolt11":invoice})),
+            Some(json!({"request_id": rid(), "bolt11":invoice})),
             Some(&token)
         )
         .await
@@ -1480,12 +1486,12 @@ async fn all_in_reservation_settles_actual_fee_and_holds_unknown_fee() {
     let fx = fixture().await;
     fx.wallet.fee.store(400, Ordering::SeqCst);
     let token = fx.grant(None, GrantTerms::new(2000)).await;
-    let request = json!({"dest_pubkey":PEER_LN,"amount_msat":1000,"max_routing_fee_msat":1000});
+    let request = || json!({"request_id":rid(),"dest_pubkey":PEER_LN,"amount_msat":1000,"max_routing_fee_msat":1000});
     let (status, receipt) = fx
         .call(
             "POST",
             "/api/v1/payments/keysend",
-            Some(request.clone()),
+            Some(request()),
             Some(&token),
         )
         .await;
@@ -1496,7 +1502,7 @@ async fn all_in_reservation_settles_actual_fee_and_holds_unknown_fee() {
         .call(
             "POST",
             "/api/v1/payments/keysend",
-            Some(request.clone()),
+            Some(request()),
             Some(&token),
         )
         .await;
@@ -1509,7 +1515,7 @@ async fn all_in_reservation_settles_actual_fee_and_holds_unknown_fee() {
         .call(
             "POST",
             "/api/v1/payments/keysend",
-            Some(request),
+            Some(request()),
             Some(&token),
         )
         .await;
@@ -1526,7 +1532,8 @@ async fn all_in_invoice_reserves_fee_before_dispatch_and_settles_actual_fee() {
     let fx = fixture().await;
     fx.wallet.fee.store(400, Ordering::SeqCst);
     let invoice = create_test_bolt11(1000);
-    let request = json!({"bolt11":invoice,"max_routing_fee_msat":1000});
+    let request =
+        json!({"request_id":"all-in-invoice","bolt11":invoice,"max_routing_fee_msat":1000});
     let token = fx.grant(None, GrantTerms::new(1999)).await;
     assert_eq!(
         fx.call(
@@ -2278,9 +2285,9 @@ async fn direct_send_fee_refusal_is_not_dispatched_and_releases_budget() {
                     .unwrap()
                 };
                 let request = if route == "pay" {
-                    json!({"bolt11": create_test_bolt11(1000), "max_routing_fee_msat": cap})
+                    json!({"request_id": rid(), "bolt11": create_test_bolt11(1000), "max_routing_fee_msat": cap})
                 } else {
-                    json!({"dest_pubkey": PEER_LN, "amount_msat": 1000, "max_routing_fee_msat": cap})
+                    json!({"request_id": rid(), "dest_pubkey": PEER_LN, "amount_msat": 1000, "max_routing_fee_msat": cap})
                 };
                 let path = format!("/api/v1/payments/{route}");
                 fx.wallet.fee.store(cap + 1, Ordering::SeqCst);
@@ -2341,6 +2348,9 @@ async fn direct_send_fee_refusal_is_not_dispatched_and_releases_budget() {
                     }
                     request["bolt11"] = json!(create_test_bolt11_with_hash(1000, [0xdd; 32]));
                 }
+                // A fresh payment is a fresh request_id: the refused id stays
+                // consumed in the grant, as the retry above showed.
+                request["request_id"] = json!(rid());
                 fx.wallet.fee.store(cap, Ordering::SeqCst);
                 let (status, body) = fx.call("POST", &path, Some(request), Some(&token)).await;
                 assert_eq!(status, StatusCode::OK, "{body}");
@@ -2376,9 +2386,9 @@ async fn direct_send_unknown_keeps_502_and_full_reservation() {
         let token = fx.grant(None, GrantTerms::new(2000)).await;
         fx.wallet.set(UNKNOWN);
         let request = if route == "pay" {
-            json!({"bolt11": create_test_bolt11(1000), "max_routing_fee_msat": 1000})
+            json!({"request_id": rid(), "bolt11": create_test_bolt11(1000), "max_routing_fee_msat": 1000})
         } else {
-            json!({"dest_pubkey": PEER_LN, "amount_msat": 1000, "max_routing_fee_msat": 1000})
+            json!({"request_id": rid(), "dest_pubkey": PEER_LN, "amount_msat": 1000, "max_routing_fee_msat": 1000})
         };
         let (status, body) = fx
             .call(
@@ -2660,26 +2670,54 @@ async fn invoice_retry_storm_dispatches_and_debits_once() {
         fx.call(
             "POST",
             "/api/v1/payments/pay",
-            Some(json!({"bolt11": bolt11})),
+            Some(json!({"request_id": "storm", "bolt11": bolt11})),
             Some(&token),
         )
     });
     let results = futures::future::join_all(requests).await;
-    assert_eq!(
-        results
-            .iter()
-            .filter(|(status, _)| *status == StatusCode::OK)
-            .count(),
-        1
-    );
-    for (status, body) in results
-        .into_iter()
-        .filter(|(status, _)| *status != StatusCode::OK)
-    {
-        assert_budget_exceeded(status, &body, "duplicate_payment");
+    // Every retry of one request_id is the same operation: answered settled
+    // (200) once the backend reported it, or in flight (202) while the first
+    // attempt was still being recorded. Never a second payment, never a refusal.
+    let mut settled = 0;
+    for (status, body) in &results {
+        match *status {
+            StatusCode::OK => {
+                settled += 1;
+                assert_eq!(body["status"], "settled", "{body}");
+            }
+            StatusCode::ACCEPTED => {
+                assert_eq!(body["status"], "in_flight", "{body}");
+                assert_eq!(body["preimage"], "", "{body}");
+            }
+            other => panic!("{other}: {body}"),
+        }
     }
+    assert!(settled >= 1, "{results:?}");
+    let (status, body) = fx
+        .call(
+            "POST",
+            "/api/v1/payments/pay",
+            Some(json!({"request_id": "storm", "bolt11": bolt11})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "settled");
+    assert_eq!(body["replayed"], true);
     assert_eq!(fx.wallet.money(), 1);
     assert_eq!(fx.used(), 1_500);
+    // The same id with a different invoice is a different request: refused.
+    let (status, body) = fx
+        .call(
+            "POST",
+            "/api/v1/payments/pay",
+            Some(json!({"request_id": "storm", "bolt11": create_test_bolt11_with_hash(1_500, [0xdd; 32])})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "operation_mismatch");
+    assert_eq!(fx.wallet.money(), 1);
 }
 
 #[tokio::test]
@@ -2710,7 +2748,7 @@ async fn allowlist_enforces_pay_and_keysend_and_proposals_cannot_widen_it() {
         .call(
             "POST",
             "/api/v1/payments/pay",
-            Some(json!({"bolt11":bolt11})),
+            Some(json!({"request_id": rid(), "bolt11":bolt11})),
             Some(&token),
         )
         .await;
@@ -2725,7 +2763,7 @@ async fn keysend_request_id_is_single_use_even_after_failure() {
     let token = fx.grant(None, GrantTerms::new(100_000)).await;
     fx.wallet.set(FAILED);
     let request = json!({"dest_pubkey":OTHER_LN,"amount_msat":1000,"request_id":"retry-1"});
-    let _ = fx
+    let (status, body) = fx
         .call(
             "POST",
             "/api/v1/payments/keysend",
@@ -2733,9 +2771,13 @@ async fn keysend_request_id_is_single_use_even_after_failure() {
             Some(&token),
         )
         .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"], "keysend payment failed before settlement");
     assert_eq!(fx.wallet.money(), 1);
     assert_eq!(fx.used(), 0);
     fx.wallet.set(SETTLE);
+    // A positive failure is bound to its request_id: the retry repeats the
+    // same error and never dispatches again, even now that the wallet would pay.
     let (status, body) = fx
         .call(
             "POST",
@@ -2744,7 +2786,8 @@ async fn keysend_request_id_is_single_use_even_after_failure() {
             Some(&token),
         )
         .await;
-    assert_budget_exceeded(status, &body, "duplicate_payment");
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"], "keysend payment failed before settlement");
     assert_eq!(fx.wallet.money(), 1);
     assert_eq!(fx.used(), 0);
 }
@@ -2767,16 +2810,44 @@ async fn invoice_hash_and_request_id_remain_consumed_after_unknown_and_restart()
     assert_eq!(fx.wallet.money(), 1);
     fx.restart();
     fx.wallet.set(SETTLE);
-    for request in [
-        json!({"bolt11":bolt11,"request_id":"different-id"}),
-        json!({"bolt11":create_test_bolt11_with_hash(2000, [0xdd;32]),"request_id":"invoice-1"}),
-        json!({"bolt11":bolt11.to_uppercase()}),
-    ] {
-        let (status, body) = fx
-            .call("POST", "/api/v1/payments/pay", Some(request), Some(&token))
-            .await;
-        assert_budget_exceeded(status, &body, "duplicate_payment");
-    }
+    // A new id for the same invoice: the grant still knows the hash.
+    let (status, body) = fx
+        .call(
+            "POST",
+            "/api/v1/payments/pay",
+            Some(json!({"bolt11":bolt11,"request_id":"different-id"})),
+            Some(&token),
+        )
+        .await;
+    assert_budget_exceeded(status, &body, "duplicate_payment");
+    // The same id for another invoice: bound to the first request.
+    let (status, body) = fx
+        .call(
+            "POST",
+            "/api/v1/payments/pay",
+            Some(json!({"bolt11":create_test_bolt11_with_hash(2000, [0xdd;32]),"request_id":"invoice-1"})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "operation_mismatch");
+    // No id at all: refused before anything is looked up.
+    let (status, body) = fx
+        .call(
+            "POST",
+            "/api/v1/payments/pay",
+            Some(json!({"bolt11":bolt11.to_uppercase()})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("request_id is required"),
+        "{body}"
+    );
     assert_eq!(fx.wallet.money(), 1);
     assert_eq!(fx.used(), 1_500);
 }
@@ -2871,10 +2942,15 @@ async fn breakers_refuse_before_backend_and_owner_reset_preserves_dedupe() {
     ));
     fx.restart();
     assert_eq!(fx.used(), used);
+    // The reset restores the breaker, not the right to pay "once" again:
+    // the repeat is answered from its record without a dispatch.
     let (status, response) = fx
         .call("POST", "/api/v1/payments/keysend", Some(body), Some(&token))
         .await;
-    assert_budget_exceeded(status, &response, "duplicate_payment");
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["replayed"], true);
+    assert_eq!(response["status"], "settled");
+    assert_eq!(fx.wallet.money(), 1);
     assert_eq!(fx.keysend(&token, PEER_LN, 1000).await.0, StatusCode::OK);
     assert_eq!(fx.wallet.money(), 2);
     let rows: Vec<Value> = std::fs::read_to_string(fx.state.audit_log.path())

@@ -329,6 +329,7 @@ async fn status(
                 "message_operations_v1",
                 "message_operation_abandon_v1",
                 "channel_open_operations_v1",
+                super::payments::direct::CAPABILITY,
                 super::messages::caps::CAPABILITY,
                 super::messages::caps::QUOTED_READMISSION_CAPABILITY,
                 super::messages::caps::ROOM_CAPABILITY,
@@ -346,7 +347,9 @@ async fn status(
                 konsensus_core::payloads::call::MEETING_CAPABILITY,
                 konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY,
             ];
-            if state.starter.config.enabled { capabilities.push("starter_channel_request_v1"); }
+            if state.starter.config.enabled {
+                capabilities.push("starter_channel_request_v1");
+            }
             if state
                 .pairing
                 .as_ref()

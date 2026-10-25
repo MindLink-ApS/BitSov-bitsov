@@ -742,6 +742,12 @@ impl Storage for SqliteStorage {
             .bind(id)
             .execute(&self.pool).await?.rows_affected() == 1)
     }
+    async fn finalize_channel_open_operation(&self, id: &str, result: &[u8], last_error: Option<&str>) -> Result<bool, StorageError> {
+        let changed = sqlx::query("UPDATE channel_open_operations SET state = 'opened', result = ?, last_error = ?, updated_at = ? WHERE operation_id = ? AND state = 'uncertain'")
+            .bind(result).bind(last_error).bind(chrono::Utc::now().timestamp_millis()).bind(id)
+            .execute(&self.pool).await?.rows_affected();
+        Ok(changed == 1)
+    }
     async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
         Ok(sqlx::query("DELETE FROM channel_open_operations WHERE operation_id = ? AND state = 'pending'")
             .bind(id)
@@ -825,6 +831,13 @@ impl Storage for SqliteStorage {
 
         sqlx::query("INSERT INTO pending_deliveries (message_id, recipient_id) VALUES (?, ?) ON CONFLICT DO NOTHING")
             .bind(envelope.id.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
+        // A paid web request binds its reply in the same transaction as its
+        // envelope: no crash window between "paid and queued" and "reply bindable".
+        if let Some(row) = crate::outstanding_web_request_row(envelope)? {
+            sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
+                .bind(row.payment_hash).bind(row.request_id).bind(row.peer).bind(row.expected_reply_kind).bind(row.expires_at_ms)
+                .execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(true)
     }

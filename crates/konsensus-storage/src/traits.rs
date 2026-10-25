@@ -161,6 +161,9 @@ pub trait Storage: Send + Sync {
     async fn record_outbox_sent(&self, _id: &MessageId, _peer: &NodeId) -> Result<(), StorageError> { Ok(()) }
 
     /// Atomically publish the paid envelope, pending queue entry and operation.
+    /// A paid web request (kind 500/510) also commits its outstanding-reply row
+    /// (`outstanding_web_requests`) in the same transaction: a crash after the
+    /// envelope exists can never leave its reply unbindable.
     /// Uses the same version CAS as update_outbox_operation; false writes nothing.
     async fn commit_outbox_envelope(&self, _op: &crate::OutboxOperation, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
@@ -204,6 +207,17 @@ pub trait Storage: Send + Sync {
     /// Remove a `pending` record after a proven non-dispatch, so the same id
     /// may be retried. Resolved records are never removed.
     async fn delete_pending_channel_open_operation(&self, _id: &str) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("channel open operations".into()))
+    }
+    /// Move an `uncertain` record to `opened` once a later backend read proves
+    /// its final outcome. `opened` records are never rewritten; false writes
+    /// nothing.
+    async fn finalize_channel_open_operation(
+        &self,
+        _id: &str,
+        _result: &[u8],
+        _last_error: Option<&str>,
+    ) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("channel open operations".into()))
     }
     /// Complete recovery authority: never silently truncate unpaid/paid work.

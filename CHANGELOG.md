@@ -5,6 +5,19 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Payment truth on the owner API: `POST /payments/pay` and `/payments/keysend`
+  answer `202 Accepted` with `status: in_flight` (payment hash and operation id,
+  no preimage or fee) until the backend reports a final state, and `200` with
+  `status: settled`, the preimage and the actual fee only once settled; a
+  failure is its proper error. Both routes now require a client `request_id`
+  (`400` without it), recorded in the encrypted operation ledger before any
+  debit or dispatch: a repeat with the same id answers from the record and
+  never pays again, the same id with other parameters is `409
+  operation_mismatch`. Nodes advertise `direct_payment_operations_v1`. A paid
+  web request (kinds 500/510) now commits its outstanding-reply row in the same
+  transaction as its envelope, and every resend restores the row. See
+  [docs/v2/API_PAYMENTS.md](docs/v2/API_PAYMENTS.md) for the status codes and
+  the compatibility notes.
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'
   scripts instead of all 2000 derived scripts. Before each focused sweep preview,
