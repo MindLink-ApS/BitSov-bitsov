@@ -492,9 +492,12 @@ async fn existing_channel_to_peer(
 ) -> Result<bool, LightningError> {
     let channels: Vec<ChannelInfo> = lightning.list_channels().await?;
     // Pending funding and temporarily unusable channels still cover this peer.
+    // Hex case is not identity: LDK prints lowercase, and the peer chooses the
+    // case in LightningInfo. A case-sensitive compare misses that channel and
+    // funds another one.
     Ok(channels
         .iter()
-        .any(|channel| channel.peer_pubkey == ln_pubkey))
+        .any(|channel| channel.peer_pubkey.eq_ignore_ascii_case(ln_pubkey)))
 }
 
 fn validate_host_port(addr: &str) -> Result<(), AutoChannelError> {
@@ -1908,6 +1911,71 @@ mod tests {
         assert!(
             lightning.opens.lock().await.is_empty(),
             "already-open path must not open a NEW channel"
+        );
+        let notices = notifier.notices.lock().await;
+        assert_eq!(notices[0].status, "opened");
+        assert_eq!(notices[0].channel_id.as_deref(), Some("already_open"));
+        drop(notices);
+        let invite = storage.list_invites_issued().await.unwrap().remove(0);
+        assert_eq!(invite.state, InviteState::Accepted);
+    }
+
+    #[tokio::test]
+    async fn already_open_channel_matches_pubkey_regardless_of_hex_case() {
+        // LDK stores the counterparty key in lowercase. A peer can advertise the
+        // same key in uppercase. That must still count as the existing channel:
+        // the balance here is enough to fund a second open, so a case-sensitive
+        // miss would spend.
+        let peer = NodeId::from_bytes([17u8; 32]);
+        let storage = storage_with_invite(peer, 50, Some(50_000), now_unix() + 60).await;
+        let lightning = Arc::new(TestLightning {
+            balance_msat: 1_000_000_000,
+            ..Default::default()
+        });
+        *lightning.channels.lock().await = vec![ChannelInfo {
+            is_outbound: Some(true),
+            is_announced: Some(false),
+            is_channel_ready: Some(true),
+            local_reserve_msat: None,
+            initial_push_msat: None,
+            user_channel_id: None,
+            funding_txo: None,
+            channel_id: "1".to_string(),
+            peer_pubkey: LN_PUBKEY.to_string(),
+            capacity_msat: 50_000_000,
+            local_balance_msat: 25_000_000,
+            remote_balance_msat: 25_000_000,
+            active: true,
+            short_channel_id: Some("100x1x0".to_string()),
+        }];
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (storage_dyn, lightning_dyn, chain_dyn, notifier_dyn) =
+            deps(storage.clone(), lightning.clone(), 5.0, notifier.clone());
+
+        handle_peer_lightning_info(
+            peer,
+            LN_PUBKEY.to_ascii_uppercase(),
+            Some("127.0.0.1:9735".to_string()),
+            storage_dyn,
+            lightning_dyn,
+            chain_dyn,
+            notifier_dyn,
+            SubsidyConfig {
+                enabled: true,
+                max_channel_sats: 50_000,
+                max_total_budget_sats: 100_000_000,
+                max_funding_fee_rate_sat_per_vb: 50,
+                per_peer_max_opens: 1,
+                allowlist: vec![hex::encode(peer.as_bytes())],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            lightning.opens.lock().await.is_empty(),
+            "uppercase Lightning pubkey must not fund a second channel"
         );
         let notices = notifier.notices.lock().await;
         assert_eq!(notices[0].status, "opened");
