@@ -526,7 +526,7 @@ async fn pay_invoice_success() {
     assert!(json["preimage"].is_string());
     assert_eq!(json["status"], "settled");
     assert_eq!(json["request_id"], "pay-success-1");
-    assert_eq!(json["operation_id"], "pay:pay-success-1");
+    assert_eq!(json["operation_id"], "pay:owner:pay-success-1");
     assert!(json.get("replayed").is_none());
 }
 
@@ -1136,7 +1136,7 @@ async fn keysend_success() {
     assert!(json["preimage"].is_string());
     assert!(json["amount_msat"].is_number());
     assert_eq!(json["status"], "settled");
-    assert_eq!(json["operation_id"], "keysend:keysend-success-1");
+    assert_eq!(json["operation_id"], "keysend:owner:keysend-success-1");
 }
 
 #[tokio::test]

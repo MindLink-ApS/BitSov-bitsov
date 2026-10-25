@@ -21,10 +21,14 @@ one `request_id`.
 A missing or malformed `request_id` is `400` with the remedy in `error`;
 nothing is looked up, debited or dispatched. The id is recorded in the node's
 encrypted operation ledger (the same store `open-channel` and `send-onchain`
-use, keyed `pay:<request_id>` / `keysend:<request_id>`) **before** any budget
-debit or backend call. Ids are per route: the same string names different
-operations on `pay` and `keysend`. Within a budget grant the id is also still
-consumed once, as before ([SPEND_BUDGET_GRANTS](../SPEND_BUDGET_GRANTS.md)).
+use, keyed `pay:<caller>:<request_id>` / `keysend:<caller>:<request_id>`)
+**before** any budget debit or backend call. Ids are scoped to the route and
+to the authenticated caller (`owner` for the owner's own key, `client:<id>`
+for a paired client, independent of its pairing epoch): the same string names
+different operations on `pay` and `keysend`, and different operations for
+different callers, so one caller can never read or replay another's receipt.
+Within a budget grant the id is also still consumed once, as before
+([SPEND_BUDGET_GRANTS](../SPEND_BUDGET_GRANTS.md)).
 
 ## Status codes
 
@@ -39,8 +43,8 @@ consumed once, as before ([SPEND_BUDGET_GRANTS](../SPEND_BUDGET_GRANTS.md)).
 
 Every response keeps the pre-existing fields (`payment_hash`, `amount_msat`,
 `preimage`, `max_routing_fee_msat`, `fee_paid_msat`) and adds `status`,
-`request_id`, `operation_id` and, on an answer served from the record,
-`replayed: true`. The `keysend` route's `status` values are now the lowercase
+`request_id`, `operation_id` (`<route>:<caller>:<request_id>`) and, on an
+answer served from the record, `replayed: true`. The `keysend` route's `status` values are now the lowercase
 `settled` / `in_flight` of this table (previously the backend's `Debug` name,
 such as `Settled`).
 

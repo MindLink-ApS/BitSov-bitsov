@@ -2,10 +2,12 @@
 //!
 //! Every request carries a client `request_id` (idempotency key). It is
 //! recorded in the encrypted operation ledger before the budget is debited or
-//! the backend is called (`pay:<id>` / `keysend:<id>` rows of the
-//! `channel_open_operations` store, as send-onchain does), so a retry after a
-//! timeout, a dropped connection or a restart answers from the record and
-//! never dispatches a second payment.
+//! the backend is called (`pay:<caller>:<id>` / `keysend:<caller>:<id>` rows
+//! of the `channel_open_operations` store, as send-onchain does), so a retry
+//! after a timeout, a dropped connection or a restart answers from the record
+//! and never dispatches a second payment. Ids are scoped to the authenticated
+//! caller (`owner`, or a paired client's id): two callers reusing the same
+//! string name two operations, and neither can read the other's receipt.
 //!
 //! Status codes tell the truth about settlement:
 //! - `200` with `status: settled` only once the backend reports the payment
@@ -102,6 +104,31 @@ enum Receipt {
         error: String,
         max_routing_fee_msat: u64,
     },
+}
+
+/// Who a `request_id` belongs to. Part of the ledger key, so operations of
+/// different callers never collide, and part of the request binding.
+pub(super) enum Caller {
+    /// The owner's own key (not metered).
+    Owner,
+    /// A paired client; the pairing epoch is not part of the scope, so a retry
+    /// after a key rotation still finds its operation instead of paying again.
+    Client(String),
+}
+
+impl Caller {
+    pub(super) fn of(auth: &crate::metered::MeteredSpend) -> Self {
+        match &auth.user.pairing {
+            Some(binding) => Self::Client(binding.client_id.clone()),
+            None => Self::Owner,
+        }
+    }
+    fn scope(&self) -> String {
+        match self {
+            Self::Owner => "owner".into(),
+            Self::Client(id) => format!("client:{id}"),
+        }
+    }
 }
 
 /// Everything a route knows about one payment before it is dispatched.
@@ -212,6 +239,7 @@ fn view(mut body: DirectPaymentResponse, replayed: bool) -> Result<Value, ApiErr
 pub(super) async fn run<Fut>(
     state: &Arc<AppState>,
     route: &'static str,
+    caller: Caller,
     request_id: String,
     prepare: impl FnOnce() -> Result<Dispatch, ApiError>,
     debit: impl FnOnce(&Dispatch) -> Result<Option<Debit>, ApiError>,
@@ -220,9 +248,10 @@ pub(super) async fn run<Fut>(
 where
     Fut: Future<Output = Result<PaymentDetails, LightningError>>,
 {
+    let scope = caller.scope();
     let ident = Ident {
         route,
-        key: format!("{route}:{request_id}"),
+        key: format!("{route}:{scope}:{request_id}"),
         request_id,
     };
     // Saved receipts answer even while the wallet is not money-ready.
@@ -234,7 +263,9 @@ where
     if existing.is_none() {
         crate::error::require_money_ready(state).await?;
     }
-    let op = prepare()?;
+    let mut op = prepare()?;
+    // The caller is part of the binding as well as the key.
+    op.fingerprint["caller"] = scope.into();
     let request = serde_json::to_vec(&op.fingerprint).map_err(storage)?;
     let hash = hex::encode(Sha256::digest(&request));
     if let Some(row) = existing {

@@ -414,17 +414,48 @@ impl Fx {
         .await
     }
 
+    /// Pair a second app with its own key; returns its client id and key.
+    fn pair_another(&self, seed: u8) -> (String, SigningKey) {
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        let pubkey = hex::encode(key.verifying_key().to_bytes());
+        // The window closed after the fixture's own pairing; the owner reopens it.
+        self.service
+            .open_pairing_window(std::time::Duration::from_secs(60));
+        let outcome = self.service.request_pairing("second app", &pubkey).unwrap();
+        let challenge = std::fs::read(
+            self.service
+                .dir()
+                .join(format!("challenge-{}", outcome.pair_id)),
+        )
+        .unwrap();
+        let sig = hex::encode(
+            key.sign(&PairingService::proof_message(
+                &outcome.pair_id,
+                &pubkey,
+                &challenge,
+            ))
+            .to_bytes(),
+        );
+        let client = self
+            .service
+            .confirm_pairing(&outcome.pair_id, &sig, pairing::default_pairing_scopes())
+            .unwrap();
+        (client.client_id, key)
+    }
+
     /// A paired token, freshly issued (so it carries whatever grant is live).
     async fn token(&self) -> String {
-        let challenge = self.service.issue_token_challenge(&self.client_id).unwrap();
-        let sig = hex::encode(self.key.sign(challenge.as_bytes()).to_bytes());
+        self.token_as(&self.client_id, &self.key).await
+    }
+
+    async fn token_as(&self, client_id: &str, key: &SigningKey) -> String {
+        let challenge = self.service.issue_token_challenge(client_id).unwrap();
+        let sig = hex::encode(key.sign(challenge.as_bytes()).to_bytes());
         let (status, body) = self
             .call(
                 "POST",
                 "/api/v1/pair/token",
-                Some(
-                    json!({"client_id": self.client_id, "challenge": challenge, "signature": sig}),
-                ),
+                Some(json!({"client_id": client_id, "challenge": challenge, "signature": sig})),
                 None,
             )
             .await;
@@ -435,7 +466,18 @@ impl Fx {
     /// The app asks (optionally proposing a budget); the owner grants `terms`
     /// at the control socket with the console code. Returns a new token.
     async fn grant(&self, proposal: Option<Value>, terms: GrantTerms) -> String {
-        let read = self.token().await;
+        self.grant_as(&self.client_id, &self.key, proposal, terms)
+            .await
+    }
+
+    async fn grant_as(
+        &self,
+        client_id: &str,
+        key: &SigningKey,
+        proposal: Option<Value>,
+        terms: GrantTerms,
+    ) -> String {
+        let read = self.token_as(client_id, key).await;
         let mut body = json!({"scopes": ["spend"]});
         if let Some(p) = proposal {
             body["budget"] = p;
@@ -469,7 +511,7 @@ impl Fx {
             },
         );
         assert!(matches!(resp, ControlResponse::Ok { .. }), "{resp:?}");
-        self.token().await
+        self.token_as(client_id, key).await
     }
 
     async fn call(
@@ -2984,3 +3026,95 @@ async fn confirmed_payment_failures_pause_the_grant_at_the_http_boundary() {
 
 #[path = "budget_grant/messaging_cap.rs"]
 mod messaging_cap;
+
+/// A `request_id` belongs to the caller that used it. Two paired apps, or an
+/// app and the owner, reusing the same string with identical parameters are
+/// two operations: each dispatches and is debited once, and neither can read
+/// the other's receipt.
+#[tokio::test]
+async fn request_ids_are_scoped_per_caller_so_clients_never_share_a_receipt() {
+    let fx = fixture().await;
+    let first = fx.grant(None, GrantTerms::new(100_000)).await;
+    let (second_id, second_key) = fx.pair_another(9);
+    let second = fx
+        .grant_as(&second_id, &second_key, None, GrantTerms::new(100_000))
+        .await;
+    let owner = konsensus_api::auth::create_token(
+        &fx.state.identity.node_id().to_hex(),
+        &fx.state.jwt_secret,
+        Scope::all(),
+    )
+    .unwrap();
+    let body = json!({"request_id": "1", "dest_pubkey": OTHER_LN, "amount_msat": 1000});
+    let mut receipts = Vec::new();
+    for (token, scope) in [
+        (&first, format!("client:{}", fx.client_id)),
+        (&second, format!("client:{second_id}")),
+        (&owner, "owner".to_string()),
+    ] {
+        let (status, receipt) = fx
+            .call(
+                "POST",
+                "/api/v1/payments/keysend",
+                Some(body.clone()),
+                Some(token),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["status"], "settled", "{receipt}");
+        assert!(receipt.get("replayed").is_none(), "{receipt}");
+        assert_eq!(
+            receipt["operation_id"],
+            format!("keysend:{scope}:1"),
+            "{receipt}"
+        );
+        receipts.push(receipt);
+    }
+    assert_eq!(
+        fx.wallet.money(),
+        3,
+        "each caller's request is its own payment"
+    );
+    assert_eq!(
+        fx.used(),
+        1_000,
+        "the first app is debited once, for its own payment"
+    );
+    // Each caller's retry replays only its own operation.
+    for (token, receipt) in [
+        (&first, &receipts[0]),
+        (&second, &receipts[1]),
+        (&owner, &receipts[2]),
+    ] {
+        let (status, again) = fx
+            .call(
+                "POST",
+                "/api/v1/payments/keysend",
+                Some(body.clone()),
+                Some(token),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        assert_eq!(again["replayed"], true, "{again}");
+        assert_eq!(again["operation_id"], receipt["operation_id"]);
+        assert_eq!(again["payment_hash"], receipt["payment_hash"]);
+    }
+    assert_eq!(fx.wallet.money(), 3);
+    // A different app with the same id and other parameters is not a mismatch
+    // of someone else's operation either: it is its own, fresh payment.
+    let (third_id, third_key) = fx.pair_another(11);
+    let third = fx
+        .grant_as(&third_id, &third_key, None, GrantTerms::new(100_000))
+        .await;
+    let (status, receipt) = fx
+        .call(
+            "POST",
+            "/api/v1/payments/keysend",
+            Some(json!({"request_id": "1", "dest_pubkey": OTHER_LN, "amount_msat": 2000})),
+            Some(&third),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["amount_msat"], 2000);
+    assert_eq!(fx.wallet.money(), 4);
+}

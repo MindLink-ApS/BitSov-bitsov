@@ -234,11 +234,11 @@ async fn get_balance(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PayInvoiceRequest {
-    /// Required idempotency key (1–128 printable ASCII bytes, no spaces).
-    /// Recorded before dispatch: a retry with the same id answers from the
-    /// record and never pays again; the same id with other parameters is
-    /// `409 operation_mismatch`. Optional only at the JSON level so a missing
-    /// key is a clear 400, not a parse error.
+    /// Required idempotency key (1–128 printable ASCII bytes, no spaces),
+    /// scoped to the authenticated caller. Recorded before dispatch: a retry
+    /// with the same id answers from the record and never pays again; the same
+    /// id with other parameters is `409 operation_mismatch`. Optional only at
+    /// the JSON level so a missing key is a clear 400, not a parse error.
     #[serde(default)]
     pub request_id: Option<String>,
     #[serde(default)]
@@ -293,6 +293,7 @@ async fn run_pay_invoice(
     direct::run(
         &state,
         "pay",
+        direct::Caller::of(&auth),
         request_id,
         || {
             let (principal, payee) = invoice_terms(&req.bolt11).map_err(|error| {
@@ -434,6 +435,7 @@ async fn run_keysend(
     direct::run(
         &state,
         "keysend",
+        direct::Caller::of(&auth),
         request_id,
         || {
             Ok(direct::Dispatch {

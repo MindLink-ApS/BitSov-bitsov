@@ -241,7 +241,11 @@ fn assert_in_flight(body: &Value, route: &str, id: &str) {
     assert_eq!(body["preimage"], "", "{body}");
     assert!(body.get("fee_paid_msat").is_none(), "{body}");
     assert_eq!(body["request_id"], id, "{body}");
-    assert_eq!(body["operation_id"], format!("{route}:{id}"), "{body}");
+    assert_eq!(
+        body["operation_id"],
+        format!("{route}:owner:{id}"),
+        "{body}"
+    );
     assert!(
         body["message"].as_str().unwrap().contains("Not settled"),
         "{body}"
@@ -254,7 +258,11 @@ fn assert_settled(body: &Value, route: &str, id: &str) {
     assert_eq!(body["payment_hash"].as_str().unwrap().len(), 64, "{body}");
     assert_eq!(body["amount_msat"], 1000, "{body}");
     assert_eq!(body["request_id"], id, "{body}");
-    assert_eq!(body["operation_id"], format!("{route}:{id}"), "{body}");
+    assert_eq!(
+        body["operation_id"],
+        format!("{route}:owner:{id}"),
+        "{body}"
+    );
     assert!(body.get("message").is_none(), "{body}");
 }
 
@@ -313,7 +321,7 @@ async fn in_flight_pay_is_202_until_the_backend_settles_it() {
     assert_eq!(body["replayed"], true);
     let row = state
         .storage
-        .get_channel_open_operation("pay:inflight-pay")
+        .get_channel_open_operation("pay:owner:inflight-pay")
         .await
         .unwrap()
         .unwrap();
@@ -427,7 +435,7 @@ async fn refusal_before_dispatch_frees_the_id_and_a_failure_binds_it() {
     assert_eq!(body["code"], "not_dispatched");
     assert!(state
         .storage
-        .get_channel_open_operation("pay:refused")
+        .get_channel_open_operation("pay:owner:refused")
         .await
         .unwrap()
         .is_none());
@@ -636,7 +644,7 @@ async fn stale_replay_cannot_finalize_a_reused_id_with_another_requests_receipt(
     assert_ne!(body["status"], "settled", "{body}");
     let row = state
         .storage
-        .get_channel_open_operation("pay:reuse")
+        .get_channel_open_operation("pay:owner:reuse")
         .await
         .unwrap()
         .expect("C's pending row");
@@ -649,7 +657,7 @@ async fn stale_replay_cannot_finalize_a_reused_id_with_another_requests_receipt(
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(state
         .storage
-        .get_channel_open_operation("pay:reuse")
+        .get_channel_open_operation("pay:owner:reuse")
         .await
         .unwrap()
         .is_none());
