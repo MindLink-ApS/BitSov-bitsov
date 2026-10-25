@@ -37,8 +37,8 @@ pub fn check_room(prices: &[(konsensus_core::NodeId, u64)], total: Option<u64>, 
     check(sum, total)
 }
 
-/// One authorization covers both first-contact acts. Never reserve/debit them
-/// as separate calls: G1 per-call limits apply to this aggregate.
+/// One approval/reservation covers both first-contact acts. The message also
+/// has its own all-in ceiling, independently of admission.
 pub fn first_contact_total(admission: u64, message: u64, cap: Option<u64>) -> Result<u64, ApiError> {
     let total = admission.checked_add(message).ok_or_else(|| ApiError::PriceCapExceeded("first-contact total overflow".into()))?;
     check(total, cap)?;
@@ -50,14 +50,55 @@ pub fn all_in(state: &crate::state::AppState, principal: u64, caller: Option<u64
     let fee = state.lightning.routing_fee_policy().ceiling(principal, caller);
     principal.checked_add(fee).ok_or_else(|| ApiError::PriceCapExceeded(format!("all-in amount overflow; max_routing_fee_msat={fee}")))
 }
-pub fn check_payment(state: &crate::state::AppState, principal: u64, caller: Option<u64>, cap: Option<u64>) -> Result<u64, ApiError> {
-    let total = all_in(state, principal, caller)?;
-    let fee = total - principal;
-    if cap.is_some_and(|cap| total > cap) {
-        return Err(ApiError::PriceCapExceeded(format!("required {total} msat including max_routing_fee_msat={fee} exceeds the confirmed cap")).with_routing_fee(fee));
-    }
-    Ok(total)
+/// Snapshot of messaging limits used for both reservation and dispatch.
+#[derive(Clone)]
+pub(crate) struct MessageCaps {
+    limit: u64,
+    recipients: std::collections::BTreeMap<String, u64>,
 }
+impl Default for MessageCaps {
+    fn default() -> Self { Self { limit: u64::MAX, recipients: Default::default() } }
+}
+impl MessageCaps {
+    pub(crate) fn for_user(state: &crate::state::AppState, user: &crate::auth::AuthUser) -> Self {
+        let Some(binding) = &user.pairing else { return Self::default(); };
+        let view = state.pairing.as_ref().and_then(|s| s.grant_view_for(&binding.client_id));
+        Self {
+            limit: view.as_ref().map_or(crate::spend_budget::MESSAGING_PER_CALL_MAX_MSAT, |v| v.per_call_max_msat),
+            recipients: view.map_or_else(Default::default, |v| v.per_act_max_by_recipient),
+        }
+    }
+    pub(crate) fn for_reservation(service: &crate::pairing::PairingService, reservation: &crate::spend_budget::Reservation) -> Self {
+        match service.grant_view_for(&reservation.client_id).filter(|v| v.op_id == reservation.op_id) {
+            Some(view) => Self { limit: view.per_call_max_msat, recipients: view.per_act_max_by_recipient },
+            None => Self { limit: 0, recipients: Default::default() },
+        }
+    }
+    pub(crate) fn tighten(&mut self, other: Self) {
+        self.limit = self.limit.min(other.limit);
+        for (peer, limit) in other.recipients {
+            self.recipients.entry(peer).and_modify(|current| *current = (*current).min(limit)).or_insert(limit);
+        }
+    }
+    fn limit(&self, peer: &str) -> u64 {
+        self.limit.min(self.recipients.get(peer).copied().unwrap_or(u64::MAX))
+    }
+    pub(crate) fn fee(&self, state: &crate::state::AppState, peer: &str, price: u64, caller: Option<u64>) -> u64 {
+        state.lightning.routing_fee_policy().ceiling(price, caller)
+            .min(self.limit(peer).saturating_sub(price))
+    }
+    pub(crate) fn all_in(&self, state: &crate::state::AppState, peer: &str, price: u64, caller: Option<u64>) -> Result<u64, ApiError> {
+        let max_msat = self.limit(peer);
+        if price > max_msat {
+            return Err(ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::PerCall { max_msat }));
+        }
+        price.checked_add(self.fee(state, peer, price, caller))
+            .ok_or_else(|| ApiError::PriceCapExceeded("message total overflow".into()))
+    }
+}
+
+pub(crate) const MESSAGE_ROUTE_REFUSAL: &str =
+    "The route cannot fit within the approved message total. The message payment was not dispatched.";
 
 #[cfg(test)]
 mod first_contact_tests {

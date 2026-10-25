@@ -492,8 +492,13 @@ async fn send_file_inner(
         .await
         .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
 
-    let all_in = super::messages::caps::check_payment(&state, super::messages::caps::payable(price_msat), req.max_routing_fee_msat, req.max_total_msat)?;
-    *ceiling.lock().unwrap_or_else(|e| e.into_inner()) = Some(all_in - super::messages::caps::payable(price_msat));
+    let message_caps = super::messages::caps::MessageCaps::for_user(&state, &auth.user);
+    let principal = super::messages::caps::payable(price_msat);
+    let fee = message_caps.fee(&state, &peer_id.to_hex(), principal, req.max_routing_fee_msat);
+    *ceiling.lock().unwrap_or_else(|e| e.into_inner()) = Some(fee);
+    super::messages::caps::check(principal, req.max_total_msat)?;
+    let all_in = message_caps.all_in(&state, &peer_id.to_hex(), principal, req.max_routing_fee_msat)?;
+    super::messages::caps::check(all_in, req.max_total_msat)?;
 
     // Do not retain bytes across pricing awaits: deletion or expiry could
     // otherwise release their quota while this future still owns the blob.
@@ -518,7 +523,7 @@ async fn send_file_inner(
             recipient: peer_key.clone(),
             amount_msat: all_in,
         }],
-    ).map_err(|e| e.with_routing_fee(all_in - super::messages::caps::payable(price_msat)))?.with_fee_limit(req.max_routing_fee_msat);
+    ).map_err(|e| e.with_routing_fee(all_in - super::messages::caps::payable(price_msat)))?.with_fee_limit(req.max_routing_fee_msat).with_message_caps(message_caps);
 
     // Reserve this staged blob through every await. Cap refusals leave it
     // available; an attempted send consumes it even on error/cancellation.
@@ -551,7 +556,7 @@ async fn send_file_inner(
     } else {
         debit.resolve_proof(&peer_key, &paid);
     }
-    let (payment_hash, preimage, amount_msat) = paid.map_err(|e| e.with_routing_fee(debit.fee_limit(&state, super::messages::caps::payable(price_msat)).saturating_add(readmission.fee_ceiling_msat())))?;
+    let (payment_hash, preimage, amount_msat) = paid.map_err(|e| e.with_routing_fee(debit.message_fee_limit(&state, &peer_id.to_hex(), super::messages::caps::payable(price_msat)).saturating_add(readmission.fee_ceiling_msat())))?;
     let proof =
         konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
     let amount_msat = amount_msat.saturating_add(admission.settled_msat);

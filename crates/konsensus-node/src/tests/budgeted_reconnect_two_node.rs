@@ -843,16 +843,17 @@ async fn unknown_admission_keeps_only_its_own_reservation() {
     net.shutdown();
 }
 
-// The grant per-call limit covers admission plus the message.
+// Admission is a separate act; the message keeps its own all-in limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn regression_readmission_respects_aggregate_grant_per_call_limit() {
+async fn readmission_and_message_have_separate_grant_act_limits() {
     let net = two_nodes(|bob| Some(budget(bob, Some(50_000)).per_call(3_000))).await;
     net.connect().await;
     let (status, body) = net.sender.compose(&net.bob_id, "one call").await;
     let paid: u64 = net.sender.paid_out().await.iter().sum();
     println!("compose={status} {body}; total paid={paid}; grant used={}", net.sender.grant().used_msat);
     net.shutdown();
-    assert!(paid <= 3_000, "one compose exceeded the grant per-call maximum: {paid}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(paid, 4_000, "separate admission and message acts");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1030,9 +1031,9 @@ async fn capped_reconnect_readmission_refusal_carries_a_stable_reason() {
         serde_json::json!({"recipient": bob.to_hex()})).await;
     assert_eq!(status, StatusCode::OK, "{quote}");
     assert_eq!((quote["admission_msat"].as_u64(), quote["message_msat"].as_u64(), quote["total_msat"].as_u64()),
-        (Some(2_000), Some(2_000), Some(14_000)), "policy fee ceilings included: {quote}");
+        (Some(2_000), Some(2_000), Some(13_000)), "policy fee ceilings included: {quote}");
     // Same operation id under the quoted total: admission once, message once.
-    let (status, body) = net.sender.post("/api/v1/messages/compose", compose(14_000)).await;
+    let (status, body) = net.sender.post("/api/v1/messages/compose", compose(13_000)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["operation_id"], operation_id.as_str(), "{body}");
     assert_eq!(body["amount_msat"], 2_000, "{body}");
@@ -1044,7 +1045,7 @@ async fn capped_reconnect_readmission_refusal_carries_a_stable_reason() {
     assert_eq!(net.sender.paid_out().await, expected);
     assert_eq!(net.sender.grant().used_msat, used + 4_000);
     // A retry of the same operation id pays nothing more.
-    let (status, again) = net.sender.post("/api/v1/messages/compose", compose(14_000)).await;
+    let (status, again) = net.sender.post("/api/v1/messages/compose", compose(13_000)).await;
     assert_eq!(status, StatusCode::OK, "{again}");
     assert_eq!(again["message_id"], body["message_id"], "{again}");
     assert_eq!(net.sender.paid_out().await, expected);
@@ -1059,17 +1060,17 @@ async fn capped_reconnect_readmission_refusal_carries_a_stable_reason() {
 /// Codex #111 finding 3: a higher fresh message quote must fail the grant
 /// before any admission payment, not after.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn capped_reconnect_refuses_when_quoted_all_in_exceeds_grant_before_pay() {
+async fn capped_reconnect_refuses_when_quoted_message_exceeds_grant_before_pay() {
     // Sender prices locally at 2_000; recipient quotes admission=3_000 and
-    // message=3_000. Cap 6_000 fits the quote; grant per_call 5_000 does not.
-    let net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000)).per_call(5_000)), 3_000).await;
+    // message=3_000. Cap 6_000 fits both acts; the 2_500 message limit does not.
+    let net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000)).per_call(2_500)), 3_000).await;
     net.connect().await;
     let (status, body) = net.sender.compose_capped(&net.bob_id, "higher quote", 6_000).await;
     let paid = net.sender.paid_out().await;
     net.shutdown();
     assert!(
         paid.is_empty(),
-        "quote all-in=6000 grant per_call=5000 must refuse before pay; paid={paid:?}, status={status}, body={body}"
+        "quoted message=3000 grant message cap=2500 must refuse before pay; paid={paid:?}, status={status}, body={body}"
     );
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "budget_exceeded", "{body}");

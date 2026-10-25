@@ -413,6 +413,7 @@ async fn first_contact_is_bounded_and_consumed_once_in_home_and_console_modes() 
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        // Admission approval may exceed the message cap, but not the contact budget.
         let request = |max| json!({"kind":"first_contact","terms":{"recipient":PEER,"max_total_msat":max,"budget_msat":50000}});
         let (status, op) = f
             .call(
@@ -420,7 +421,7 @@ async fn first_contact_is_bounded_and_consumed_once_in_home_and_console_modes() 
                 true,
                 "POST",
                 "/api/v1/pair/approval-request",
-                request(1000),
+                request(10001),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{op}");
@@ -453,7 +454,7 @@ async fn first_contact_is_bounded_and_consumed_once_in_home_and_console_modes() 
                 true,
                 "POST",
                 "/api/v1/pair/approval-request",
-                request(10001),
+                request(50001),
             )
             .await;
         assert_eq!(status, StatusCode::OK);
@@ -513,11 +514,19 @@ async fn approval_message_binds_every_displayed_field_and_rejects_unknown_terms(
     let f = Fixture::new(true);
     let op = f.request(false).await;
     let expected=format!("bitsov-owner-approval-v1\nnode:{}\nkind:spend_grant\nclient:{}\nclient_pubkey:{}\nepoch:{}\ngrant_op:-\nrecipient:-\nmax_total_msat:100000\nbudget_msat:100000\nper_call_max_msat:6000\nwindow_secs:600\nop_id:{}\nnonce:{}\nexpires_at:{}", f.svc.bound_fingerprint(),f.requester.client_id,f.requester.client_pubkey,f.requester.epoch,op["op_id"].as_str().unwrap(),op["nonce"].as_str().unwrap(),op["expires_at"]);
+    let expected = expected + "\nspend_limits:per_act_v1\n  budget:        100 sats in total\n  message:       at most 6 sats all-in\n  room post:     N paid members x their message all-in cap, one total\n  admission:     quoted price + maximum fee, separate from message (100-sat safety ceiling)\n  payment:       at most 6 sats all-in\n  window:        10 min\n  breakers:      10 payments/min, 60 payments/hour; pause after 5 failures; 1000 sats/10 min\n  LSP fees:      not authorized\n  recipients:    any, within the total";
     assert_eq!(op["approval_message"], expected);
+    assert_eq!(op["per_act_limits"], true);
     assert_eq!(op["nonce"].as_str().unwrap().len(), 32);
     let now = chrono::Utc::now().timestamp();
     assert!((299..=300).contains(&(op["expires_at"].as_i64().unwrap() - now)));
-    for extra in ["client_id", "nonce", "breakers", "allow_liquidity_fees"] {
+    for extra in [
+        "client_id",
+        "nonce",
+        "breakers",
+        "allow_liquidity_fees",
+        "per_act_limits",
+    ] {
         let mut terms = json!({"budget_msat":100000,"per_call_max_msat":10000,"window_secs":600});
         terms[extra] = json!(true);
         assert_ne!(

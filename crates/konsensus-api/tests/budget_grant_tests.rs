@@ -54,6 +54,7 @@ const FAILED: u8 = 3;
 #[derive(Default)]
 struct Wallet {
     fee: AtomicU64,
+    ldk_route_refusal: AtomicBool,
     unknown_fee: AtomicBool,
     outgoing: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
     liquidity: std::sync::Mutex<Option<Arc<konsensus_lightning::liquidity::LiquidityClient>>>,
@@ -133,7 +134,11 @@ impl LightningProvider for Wallet {
     > {
         if self.fee.load(Ordering::SeqCst) > _cap {
             return Err(LightningError::PaymentNotDispatched(
-                "route exceeds fee ceiling".into(),
+                if self.ldk_route_refusal.load(Ordering::SeqCst) {
+                    "Failed to send the given payment."
+                } else {
+                    "route exceeds fee ceiling"
+                }.into(),
             ));
         }
         self.keysend(dest, amount, memo).await
@@ -186,7 +191,11 @@ impl LightningProvider for Wallet {
     ) -> Result<PaymentDetails, LightningError> {
         if self.fee.load(Ordering::SeqCst) > _max_fee_msat {
             return Err(LightningError::PaymentNotDispatched(
-                "route exceeds fee ceiling".into(),
+                if self.ldk_route_refusal.load(Ordering::SeqCst) {
+                    "Failed to send the given payment."
+                } else {
+                    "route exceeds fee ceiling"
+                }.into(),
             ));
         }
         let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
@@ -884,10 +893,10 @@ async fn room_fanout_is_one_debited_call_and_refused_members_are_released() {
     }
     let body = json!({"recipient": id, "is_room": true, "kind": 100, "plaintext": "room"});
 
-    // The whole fan-out is one call: 2 × 1000 exceeds a 1999 per-call max,
-    // so no member is paid.
+    // A member price above its all-in cap refuses the entire fan-out
+    // before any member is paid.
     let token = fx
-        .grant(None, GrantTerms::new(10_000).per_call(1_999))
+        .grant(None, GrantTerms::new(10_000).per_call(999))
         .await;
     let (status, err) = fx
         .call(
