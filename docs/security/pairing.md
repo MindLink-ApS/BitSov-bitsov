@@ -406,8 +406,8 @@ and `network`: the configured Bitcoin network name (`bitcoin`, `testnet`,
 `signet` or `regtest`), present only when the lightning backend states one.
 The field is the name alone: no node id, balances, addresses or endpoints. A
 client that requires a particular network, such as a beta app that sets up home
-nodes on signet only, reads it here before pairing and must refuse setup when
-it is absent or differs.
+nodes on signet only, reads it here (directly on the loopback API, or through
+the tunnel once paired) and must refuse setup when it is absent or differs.
 If an interrupted commit requires repair, it returns `state: "refused"` with
 `can_create: false` and `can_restore: false`, including before a restart. It
 does not expose a refusal object, reason, disk-state details, or repair text.
