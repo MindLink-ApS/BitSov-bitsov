@@ -77,6 +77,15 @@ impl FromRequestParts<Arc<AppState>> for MeteredSpend {
 }
 
 impl MeteredSpend {
+    /// Internal authority only for a paid protocol hangup after durable Unpaid
+    /// expiry. Call renewal always requires the app's authenticated spend grant.
+    pub(crate) fn call_timeout(state: &AppState) -> Self {
+        Self {
+            user: AuthUser { node_id: state.identity.node_id().to_hex(), scopes: vec![Scope::Spend], pairing: None },
+            meter: Meter::Owner,
+        }
+    }
+
     /// Only the owner control socket may construct authority without HTTP proof.
     #[cfg(unix)]
     pub(crate) fn owner_control(state: &AppState) -> Self {
@@ -242,6 +251,7 @@ pub struct Debit {
     operation: Option<crate::handlers::messages::operations::Operation>,
     held: Option<(Arc<PairingService>, Reservation)>,
     max_routing_fee_msat: Option<u64>,
+    call_block: Option<(konsensus_core::NodeId, String)>,
     // None means a settled payment's fee is still unknown. Never release that liability.
     fees: std::sync::Mutex<std::collections::BTreeMap<String, Option<u64>>>,
     // Shared by every member of a room fan-out. Reservations consume this
@@ -254,12 +264,45 @@ impl Debit {
         self.operation = Some(operation); self
     }
     pub(crate) fn operation(&self) -> Option<&crate::handlers::messages::operations::Operation> { self.operation.as_ref() }
-    pub(crate) async fn dispatch_message<F>(&self, _state: &AppState, hash: Option<String>, amount: u64, future: F) -> Result<F::Output, ApiError>
+    pub(crate) fn for_call_block(mut self, peer: konsensus_core::NodeId, plaintext: String) -> Self {
+        self.call_block = Some((peer, plaintext));
+        self
+    }
+
+    pub(crate) async fn dispatch_message<F>(&self, state: &AppState, hash: Option<String>, amount: u64, future: F) -> Result<F::Output, ApiError>
     where F: Future<Output=Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>> {
         match &self.operation {
             Some(op) => op.dispatch(self, hash, amount, future).await,
-            None => self.dispatch(future).await,
+            None => self.dispatch_message_payment(state, future).await,
         }
+    }
+
+    /// Called after dispatch intent is durable. Fresh call validation and spend
+    /// authority both remain serialized through the first wallet poll.
+    pub(crate) async fn dispatch_message_payment<F>(&self, state: &AppState, future: F) -> Result<F::Output, ApiError>
+    where F: Future<Output=Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>> {
+        let (mut call_guard, deadline) = if let Some((peer, plaintext)) = &self.call_block {
+            match crate::calls::block_dispatch_guard(state.storage.as_ref(), peer, plaintext).await {
+                Ok((guard, deadline)) => (Some(guard), Some(deadline)),
+                Err(error) => return Ok(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(error.to_string()))),
+            }
+        } else { (None, None) };
+        let mut future = std::pin::pin!(future);
+        let mut polled = false;
+        let guarded = futures::future::poll_fn(|cx| {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64).unwrap_or(u64::MAX);
+            // Recheck after journal awaits, immediately before the first wallet
+            // poll. Once polled, money may be in flight: preserve reconciliation.
+            if !polled && deadline.is_some_and(|until| now > until) {
+                return Poll::Ready(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched("call block expired before payment dispatch".into())));
+            }
+            polled = true;
+            let result = future.as_mut().poll(cx);
+            drop(call_guard.take());
+            result
+        });
+        self.dispatch(guarded).await
     }
 
     pub(crate) fn with_fee_limit(mut self, limit: Option<u64>) -> Self {
@@ -284,12 +327,12 @@ impl Debit {
 
     /// Owner-only paths have no grant to revalidate.
     pub(crate) fn unmetered() -> Self {
-        Self { operation: None, max_routing_fee_msat: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
+        Self { operation: None, max_routing_fee_msat: None, call_block: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
     }
 
     fn reserved(service: Arc<PairingService>, reservation: Reservation) -> Self {
         let total = reservation.charges.iter().map(|c| c.amount_msat).sum();
-        Self { operation: None, max_routing_fee_msat: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
+        Self { operation: None, max_routing_fee_msat: None, call_block: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
     }
 
     /// Whether this debit is held against a budget grant.

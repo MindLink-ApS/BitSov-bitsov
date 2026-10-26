@@ -1,32 +1,11 @@
-//! 1:1 call signalling payloads (kinds 400-403) and the per-call state that
-//! makes an offer single-use.
-//!
-//! Media never touches the node: the two apps open a direct WebRTC path and
-//! only exchange SDP (and optionally trickled ICE) through these paid UKMs.
-//! The payment gate already makes every envelope paid, recipient-bound and
-//! single-use. The call state adds, per `(peer, call_id)`:
-//!
-//! - an offer (400) opens a call exactly once; a second offer with the same
-//!   id — even freshly paid — is a replay and is refused until the id's
-//!   replay deadline passes (24 h after the call ends);
-//! - an answer (401) is accepted only from the callee, while it rings;
-//! - ICE (402) and hangup (403) only for a ringing or live call;
-//! - our own signals are **reserved** under their operation id before any
-//!   payment and **committed** only once the payment settled. A definite
-//!   nonpayment releases the reservation; an ambiguous one keeps it so a retry
-//!   of the same operation recovers without a second charge. A reserved (not
-//!   yet paid) offer does not accept answers.
-//!
-//! These are pure transitions over one [`CallEntry`]; the node stores entries
-//! durably (restart keeps used ids and live calls) and bounds them per peer
-//! and in total, never evicting unexpired replay protection.
-//!
-//! The offer is priced at the recipient's `call_msat`; 401-403 keep the
-//! ordinary realtime signalling price (29 Sep overnight default).
+//! Node-routed call signalling and sequential paid 60-second blocks.
+//! Media travels app → own node → peer node → peer app. Only paid block
+//! settlement admits media; an answer starts a ten-second payment window.
+//! Durable reservations, bounded call ids and replay tombstones survive restarts.
 
 use serde::{Deserialize, Serialize};
 
-use crate::kind::{KIND_CALL_ANSWER, KIND_CALL_HANGUP, KIND_CALL_INVITE, KIND_ICE_CANDIDATE};
+use crate::kind::{KIND_CALL_ANSWER, KIND_CALL_BLOCK, KIND_CALL_HANGUP, KIND_CALL_INVITE, KIND_ICE_CANDIDATE};
 use crate::types::NodeId;
 
 /// Payload schema version.
@@ -37,7 +16,13 @@ pub const MAX_SDP_BYTES: usize = 16 * 1024;
 pub const MAX_CANDIDATE_BYTES: usize = 1024;
 /// How long an unanswered offer rings.
 pub const RING_TIMEOUT_MS: u64 = 60_000;
-/// Longest a call stays live without a hangup.
+/// Length of a paid media interval.
+pub const CALL_BLOCK_MS: u64 = 60_000;
+/// Renewal is due this long before the paid interval ends.
+pub const CALL_BLOCK_LEAD_MS: u64 = 20_000;
+/// Late payment slack, including the initial payment window after answer.
+pub const CALL_BLOCK_GRACE_MS: u64 = 10_000;
+/// Longest continuously paid call.
 pub const MAX_CALL_MS: u64 = 4 * 60 * 60 * 1000;
 /// How long an ended or expired call id stays burned.
 pub const TOMBSTONE_MS: u64 = 24 * 60 * 60 * 1000;
@@ -74,13 +59,19 @@ pub enum CallMedia {
     Video,
 }
 
-/// The JSON inside a 400-403 envelope.
+fn signal_version() -> u8 { CALL_SIGNAL_VERSION }
+
+/// The JSON inside a 400-404 envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CallSignal {
+    #[serde(default = "signal_version")]
     pub v: u8,
     /// 32 lowercase hex characters (16 random bytes), chosen by the caller.
     pub call_id: String,
+    /// 404 only: strictly sequential, starting at zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u32>,
     /// 400 only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<CallMedia>,
@@ -127,6 +118,22 @@ pub enum HangupReason {
     Busy,
     Timeout,
     Failed,
+    Unpaid,
+}
+
+impl HangupReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hangup => "hangup", Self::Declined => "declined", Self::Busy => "busy",
+            Self::Timeout => "timeout", Self::Failed => "failed", Self::Unpaid => "unpaid",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "hangup" => Some(Self::Hangup), "declined" => Some(Self::Declined), "busy" => Some(Self::Busy),
+            "timeout" => Some(Self::Timeout), "failed" => Some(Self::Failed), "unpaid" => Some(Self::Unpaid), _ => None,
+        }
+    }
 }
 
 /// Why a call signal was refused. Nothing here is ever forwarded to the app.
@@ -148,6 +155,10 @@ pub enum CallRefusal {
     Full,
     #[error("another signal for this call is still being paid")]
     InFlight,
+    #[error("call block sequence is duplicated or out of order")]
+    Sequence,
+    #[error("call block is not due yet")]
+    NotDue,
 }
 
 fn is_lower_hex(id: &str, len: usize) -> bool {
@@ -176,13 +187,16 @@ impl Meeting {
 impl CallSignal {
     /// Parse and check the fields `kind` requires, and only those.
     pub fn parse(kind: u16, plaintext: &str) -> Result<Self, CallRefusal> {
-        if !(KIND_CALL_INVITE..=KIND_CALL_HANGUP).contains(&kind) {
+        if !(KIND_CALL_INVITE..=KIND_CALL_BLOCK).contains(&kind) {
             return Err(CallRefusal::NotCallKind);
         }
         if plaintext.len() > MAX_SDP_BYTES + 1024 {
             return Err(CallRefusal::Invalid("payload too large"));
         }
         let s: CallSignal = crate::wire_json::from_str(plaintext).map_err(|_| CallRefusal::Invalid("not a call signal"))?;
+        if kind != KIND_CALL_BLOCK && !crate::wire_json::from_str::<serde_json::Value>(plaintext).is_ok_and(|v| v.get("v").is_some()) {
+            return Err(CallRefusal::Invalid("missing version"));
+        }
         if s.v != CALL_SIGNAL_VERSION {
             return Err(CallRefusal::Invalid("unsupported version"));
         }
@@ -196,7 +210,7 @@ impl CallSignal {
                 && (cand || (s.candidate.is_none() && s.sdp_mid.is_none() && s.sdp_mline_index.is_none()))
                 && (reason || s.reason.is_none())
         };
-        let ok = match kind {
+        let ok = (kind == KIND_CALL_BLOCK || s.seq.is_none()) && match kind {
             KIND_CALL_INVITE => {
                 s.media.is_some() && sdp_ok(&s.sdp) && none_but(true, true, false, false) && s.meeting.as_ref().is_none_or(Meeting::valid)
             }
@@ -206,6 +220,7 @@ impl CallSignal {
                     && s.sdp_mid.as_deref().is_none_or(|m| m.len() <= 64)
                     && none_but(false, false, true, false)
             }
+            KIND_CALL_BLOCK => s.seq.is_some() && none_but(false, false, false, false),
             _ => none_but(false, false, false, true),
         };
         if ok { Ok(s) } else { Err(CallRefusal::Invalid("fields do not match the kind")) }
@@ -293,9 +308,33 @@ pub struct CallEntry {
     /// End of ringing / live, or of the replay tombstone once ended.
     pub deadline_ms: u64,
     pub pending: Option<Pending>,
+    /// Last paid boundary; absent until block zero settles.
+    pub paid_until_ms: Option<u64>,
+    pub next_block_seq: u32,
+    pub end_reason: Option<HangupReason>,
 }
 
 impl CallEntry {
+    /// Media fails closed until a block is paid, and immediately after grace.
+    pub fn media_admitted(&self, now_ms: u64) -> bool {
+        self.phase == Phase::Live && self.paid_until_ms.is_some_and(|until| now_ms <= until.saturating_add(CALL_BLOCK_GRACE_MS))
+    }
+
+    /// The caller schedules this sequence through authenticated compose.
+    pub fn next_block_due_ms(&self) -> Option<u64> {
+        (self.phase == Phase::Live && u64::from(self.next_block_seq) < MAX_CALL_MS / CALL_BLOCK_MS).then(|| {
+            self.paid_until_ms.map_or(self.deadline_ms.saturating_sub(CALL_BLOCK_GRACE_MS), |until| until.saturating_sub(CALL_BLOCK_LEAD_MS))
+        })
+    }
+
+    fn answered(self, now_ms: u64) -> Self {
+        Self { phase: Phase::Live, deadline_ms: now_ms.saturating_add(CALL_BLOCK_GRACE_MS), ..self }
+    }
+
+    fn expired(&self, now_ms: u64) -> bool {
+        if self.phase == Phase::Live { now_ms > self.deadline_ms } else { now_ms >= self.deadline_ms }
+    }
+
     /// Until when this id must stay burned (the row may not be dropped before).
     pub fn replay_until_ms(&self) -> u64 {
         match self.phase {
@@ -312,9 +351,9 @@ impl CallEntry {
         match self.phase {
             Phase::Ended if self.deadline_ms <= now_ms && self.pending.is_none() => None,
             Phase::Ended => Some(self),
-            _ if self.deadline_ms <= now_ms => {
+            _ if self.expired(now_ms) => {
                 let until = self.deadline_ms.saturating_add(TOMBSTONE_MS);
-                (until > now_ms || self.pending.is_some()).then_some(CallEntry { phase: Phase::Ended, deadline_ms: until, ..self })
+                (until > now_ms || self.pending.is_some()).then_some(CallEntry { phase: Phase::Ended, deadline_ms: until, end_reason: Some(if self.phase == Phase::Live { HangupReason::Unpaid } else { HangupReason::Timeout }), ..self })
             }
             _ => Some(self),
         }
@@ -333,7 +372,7 @@ pub fn reserve(entry: Option<CallEntry>, kind: u16, operation_id: &str, request_
     let mine = |e: &CallEntry| e.pending.as_ref().is_some_and(|p| p.is(operation_id, request_hash) && p.kind == kind);
     match kind {
         KIND_CALL_INVITE => match entry {
-            None => Ok(CallEntry { side: Side::Caller, phase: Phase::Reserved, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: Some(pending) }),
+            None => Ok(CallEntry { side: Side::Caller, phase: Phase::Reserved, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: Some(pending), paid_until_ms: None, next_block_seq: 0, end_reason: None }),
             Some(e) if e.phase == Phase::Reserved && mine(&e) => Ok(e),
             Some(_) => Err(CallRefusal::Replayed),
         },
@@ -367,7 +406,8 @@ pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> CallEntry {
     let cleared = CallEntry { pending: None, ..entry };
     match (p.kind, cleared.phase) {
         (KIND_CALL_INVITE, Phase::Reserved) => CallEntry { phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), ..cleared },
-        (KIND_CALL_ANSWER, Phase::Ringing) => CallEntry { phase: Phase::Live, deadline_ms: now_ms.saturating_add(MAX_CALL_MS), ..cleared },
+        (KIND_CALL_ANSWER, Phase::Ringing) => cleared.answered(now_ms),
+        (KIND_CALL_BLOCK, Phase::Live) => apply_block(cleared.clone(), cleared.next_block_seq, now_ms).unwrap_or(cleared),
         (KIND_CALL_HANGUP, Phase::Ringing | Phase::Live | Phase::Reserved) => {
             CallEntry { phase: Phase::Ended, deadline_ms: now_ms.saturating_add(TOMBSTONE_MS), ..cleared }
         }
@@ -390,7 +430,7 @@ pub fn release(entry: CallEntry, operation_id: &str) -> Option<CallEntry> {
 pub fn receive(entry: Option<CallEntry>, kind: u16, now_ms: u64) -> Result<CallEntry, CallRefusal> {
     match kind {
         KIND_CALL_INVITE => match entry {
-            None => Ok(CallEntry { side: Side::Callee, phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: None }),
+            None => Ok(CallEntry { side: Side::Callee, phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None }),
             Some(_) => Err(CallRefusal::Replayed),
         },
         KIND_CALL_ANSWER => {
@@ -398,7 +438,7 @@ pub fn receive(entry: Option<CallEntry>, kind: u16, now_ms: u64) -> Result<CallE
             match (e.phase, e.side) {
                 // A reserved offer was never paid: nobody can answer it.
                 (Phase::Reserved | Phase::Ended, _) => Err(CallRefusal::UnknownCall),
-                (Phase::Ringing, Side::Caller) => Ok(CallEntry { phase: Phase::Live, deadline_ms: now_ms.saturating_add(MAX_CALL_MS), ..e }),
+                (Phase::Ringing, Side::Caller) => Ok(e.answered(now_ms)),
                 (Phase::Ringing, Side::Callee) => Err(CallRefusal::WrongSide),
                 (Phase::Live, _) => Err(CallRefusal::NotRinging),
             }
@@ -412,6 +452,65 @@ pub fn receive(entry: Option<CallEntry>, kind: u16, now_ms: u64) -> Result<CallE
         }
         _ => Err(CallRefusal::NotCallKind),
     }
+}
+
+/// Check one sequential block without granting media or moving money.
+fn check_block(entry: &CallEntry, seq: u32, now_ms: u64) -> Result<(), CallRefusal> {
+    if entry.phase != Phase::Live || entry.expired(now_ms) {
+        return Err(CallRefusal::UnknownCall);
+    }
+    if seq != entry.next_block_seq || u64::from(seq) >= MAX_CALL_MS / CALL_BLOCK_MS {
+        return Err(CallRefusal::Sequence);
+    }
+    if entry.next_block_due_ms().is_none_or(|due| now_ms < due) {
+        return Err(CallRefusal::NotDue);
+    }
+    Ok(())
+}
+
+fn apply_block(entry: CallEntry, seq: u32, now_ms: u64) -> Result<CallEntry, CallRefusal> {
+    check_block(&entry, seq, now_ms)?;
+    let start = entry.paid_until_ms.unwrap_or_else(|| entry.deadline_ms.saturating_sub(CALL_BLOCK_GRACE_MS));
+    let until = start.saturating_add(CALL_BLOCK_MS);
+    Ok(CallEntry { paid_until_ms: Some(until), next_block_seq: seq.saturating_add(1), deadline_ms: until.saturating_add(CALL_BLOCK_GRACE_MS), ..entry })
+}
+
+/// Gate-accepted block, strictly caller → callee. Never revives an expired call.
+pub fn receive_block(entry: Option<CallEntry>, seq: u32, now_ms: u64) -> Result<CallEntry, CallRefusal> {
+    let entry = entry.ok_or(CallRefusal::UnknownCall)?;
+    if entry.side != Side::Callee { return Err(CallRefusal::WrongSide); }
+    apply_block(entry, seq, now_ms)
+}
+
+/// Recheck before a new outgoing charge, including a reconciled failed retry.
+pub fn validate_outgoing_block(entry: &CallEntry, seq: u32, now_ms: u64) -> Result<(), CallRefusal> {
+    if entry.side != Side::Caller { return Err(CallRefusal::WrongSide); }
+    check_block(entry, seq, now_ms)
+}
+
+/// Reserve a caller's block before payment. The request hash binds its seq;
+/// no incoming block is accepted on the caller side while it is pending.
+pub fn reserve_block(entry: Option<CallEntry>, seq: u32, operation_id: &str, request_hash: &str, now_ms: u64) -> Result<CallEntry, CallRefusal> {
+    let entry = entry.ok_or(CallRefusal::UnknownCall)?;
+    if entry.side != Side::Caller { return Err(CallRefusal::WrongSide); }
+    if let Some(pending) = &entry.pending {
+        return if pending.kind == KIND_CALL_BLOCK && pending.is(operation_id, request_hash) { Ok(entry) } else { Err(CallRefusal::InFlight) };
+    }
+    check_block(&entry, seq, now_ms)?;
+    Ok(CallEntry { pending: Some(Pending { operation_id: operation_id.into(), kind: KIND_CALL_BLOCK, request_hash: request_hash.into() }), ..entry })
+}
+
+/// A timer may notify an already ended unpaid call through normal compose.
+/// This never reopens the call or grants media. Existing pending evidence wins.
+pub fn reserve_unpaid_hangup(entry: Option<CallEntry>, operation_id: &str, request_hash: &str) -> Result<CallEntry, CallRefusal> {
+    let entry = entry.ok_or(CallRefusal::UnknownCall)?;
+    if entry.phase != Phase::Ended || entry.end_reason != Some(HangupReason::Unpaid) {
+        return Err(CallRefusal::UnknownCall);
+    }
+    if let Some(pending) = &entry.pending {
+        return if pending.kind == KIND_CALL_HANGUP && pending.is(operation_id, request_hash) { Ok(entry) } else { Err(CallRefusal::InFlight) };
+    }
+    Ok(CallEntry { pending: Some(Pending { operation_id: operation_id.into(), kind: KIND_CALL_HANGUP, request_hash: request_hash.into() }), ..entry })
 }
 
 /// Stored call rows as of one instant, split by what they hold.
@@ -487,7 +586,7 @@ mod tests {
         let big = "a".repeat(MAX_SDP_BYTES + 1);
         assert!(CallSignal::parse(401, &format!(r#"{{"v":1,"call_id":"{ID}","sdp":"{big}"}}"#)).is_err());
         assert_eq!(CallSignal::parse(0, "{}"), Err(CallRefusal::NotCallKind));
-        assert_eq!(CallSignal::parse(404, "{}"), Err(CallRefusal::NotCallKind));
+        assert_eq!(CallSignal::parse(405, "{}"), Err(CallRefusal::NotCallKind));
     }
 
     fn meeting_offer(roster: &[String]) -> String {

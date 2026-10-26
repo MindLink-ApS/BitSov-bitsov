@@ -61,6 +61,8 @@ impl PeerWriteGate {
 pub struct MemStorage {
     pub peer_upsert_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub peer_delete_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub call_block_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    calls: Mutex<HashMap<(NodeId, String), konsensus_core::payloads::call::CallEntry>>,
     outbox: Mutex<HashMap<String, konsensus_storage::OutboxOperation>>,
     calendar: Mutex<HashMap<String, konsensus_storage::calendar::CalendarEventRecord>>,
     messages: Mutex<HashMap<String, UkmEnvelope>>,
@@ -82,6 +84,8 @@ impl MemStorage {
         Self {
             peer_upsert_gate: Mutex::new(None),
             peer_delete_gate: Mutex::new(None),
+            call_block_dispatch_gate: Mutex::new(None),
+            calls: Mutex::new(HashMap::new()),
             outbox: Mutex::new(HashMap::new()),
             calendar: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
@@ -112,6 +116,15 @@ impl MemStorage {
 
 #[async_trait]
 impl Storage for MemStorage {
+    async fn call_get(&self, peer: &NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+        Ok(self.calls.lock().unwrap().get(&(*peer, call_id.to_owned())).cloned())
+    }
+
+    async fn call_put(&self, peer: &NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+        self.calls.lock().unwrap().insert((*peer, call_id.to_owned()), entry.clone());
+        Ok(())
+    }
+
     async fn insert_outbox_operation(
         &self,
         op: &konsensus_storage::OutboxOperation,
@@ -127,6 +140,10 @@ impl Storage for MemStorage {
         &self,
         op: &konsensus_storage::OutboxOperation,
     ) -> Result<bool, StorageError> {
+        let dispatched = op.kind == 404 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
+            .is_ok_and(|data| data["dispatched"] == true);
+        let gate = if dispatched { self.call_block_dispatch_gate.lock().unwrap().take() } else { None };
+        if let Some(gate) = gate { gate.run().await?; }
         let mut rows = self.outbox.lock().unwrap();
         if rows
             .get(&op.operation_id)

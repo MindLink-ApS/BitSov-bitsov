@@ -1133,6 +1133,11 @@ pub trait Storage: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// At most MAX_OPEN_CALLS live rows, including expired ones, oldest first.
+    async fn call_live(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
     /// Drop up to `max` entries whose replay protection ended, with no pending signal.
     async fn call_sweep(&self, _now_ms: u64, _max: u32) -> Result<u64, StorageError> {
         Ok(0)
