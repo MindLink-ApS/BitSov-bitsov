@@ -16,6 +16,9 @@ mod private_forwarding;
 #[cfg(unix)]
 #[path = "regtest/three_node.rs"]
 mod three_node;
+#[cfg(unix)]
+#[path = "regtest/paid_call.rs"]
+mod paid_call;
 
 async fn wait<F, Fut>(label: &str, mut check: F)
 where
