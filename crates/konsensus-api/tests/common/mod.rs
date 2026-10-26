@@ -62,6 +62,7 @@ pub struct MemStorage {
     pub peer_upsert_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub peer_delete_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub call_block_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub call_offer_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     calls: Mutex<HashMap<(NodeId, String), konsensus_core::payloads::call::CallEntry>>,
     outbox: Mutex<HashMap<String, konsensus_storage::OutboxOperation>>,
     calendar: Mutex<HashMap<String, konsensus_storage::calendar::CalendarEventRecord>>,
@@ -85,6 +86,7 @@ impl MemStorage {
             peer_upsert_gate: Mutex::new(None),
             peer_delete_gate: Mutex::new(None),
             call_block_dispatch_gate: Mutex::new(None),
+            call_offer_dispatch_gate: Mutex::new(None),
             calls: Mutex::new(HashMap::new()),
             outbox: Mutex::new(HashMap::new()),
             calendar: Mutex::new(HashMap::new()),
@@ -125,6 +127,37 @@ impl Storage for MemStorage {
         Ok(())
     }
 
+    async fn call_delete(&self, peer: &NodeId, call_id: &str) -> Result<(), StorageError> {
+        self.calls.lock().unwrap().remove(&(*peer, call_id.to_owned()));
+        Ok(())
+    }
+
+    async fn call_counts(&self, peer: &NodeId, now: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
+        use konsensus_core::payloads::call::{CallCounts, Phase};
+        let mut counts = CallCounts::default();
+        for ((p, _), entry) in self.calls.lock().unwrap().iter() {
+            let Some(entry) = entry.clone().at(now) else { continue };
+            if entry.pending.is_some() || entry.phase != Phase::Ended {
+                counts.open_total += 1;
+                counts.open_peer += u64::from(p == peer);
+            } else {
+                counts.burned_total += 1;
+                counts.burned_peer += u64::from(p == peer);
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn call_live(&self) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Ok(self.calls.lock().unwrap().iter().filter(|(_, e)| e.phase != konsensus_core::payloads::call::Phase::Ended)
+            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone())).collect())
+    }
+
+    async fn call_pending(&self) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Ok(self.calls.lock().unwrap().iter().filter(|(_, e)| e.pending.is_some())
+            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone())).collect())
+    }
+
     async fn insert_outbox_operation(
         &self,
         op: &konsensus_storage::OutboxOperation,
@@ -143,6 +176,10 @@ impl Storage for MemStorage {
         let dispatched = op.kind == 404 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
             .is_ok_and(|data| data["dispatched"] == true);
         let gate = if dispatched { self.call_block_dispatch_gate.lock().unwrap().take() } else { None };
+        if let Some(gate) = gate { gate.run().await?; }
+        let offer_dispatched = op.kind == 400 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
+            .is_ok_and(|data| data["dispatched"] == true);
+        let gate = if offer_dispatched { self.call_offer_dispatch_gate.lock().unwrap().take() } else { None };
         if let Some(gate) = gate { gate.run().await?; }
         let mut rows = self.outbox.lock().unwrap();
         if rows

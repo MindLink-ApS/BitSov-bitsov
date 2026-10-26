@@ -60,6 +60,7 @@ use crate::auth::{self, Scope, TokenError};
 
 pub mod approval;
 pub mod console;
+mod call_spend;
 pub mod device;
 pub mod second_device;
 #[cfg(test)]
@@ -755,6 +756,7 @@ struct ReservationAuthority<'a> {
     liquidity: bool,
     before_persist: Option<ReservationJournal<'a>>,
     operation: Option<crate::spend_budget::OperationReservationLink>,
+    call: Option<crate::spend_budget::CallSpendTerms>,
 }
 
 /// Consumed, single-use authorization. Its grant identity survives the handoff
@@ -3299,7 +3301,7 @@ impl PairingService {
         // Purpose, not grant provenance, determines the effective ceiling.
         // Enforce it without changing stored/signed terms, so live grants are
         // covered immediately and explicit payments retain the owner's limit.
-        let purpose_limit = if authority.payment {
+        let purpose_limit = if authority.payment || authority.call.is_some() {
             Ok(())
         } else {
             let max_msat = budget.messaging_per_call_max_msat();
@@ -3333,6 +3335,9 @@ impl PairingService {
         // An empty fanout moves no value and grants no dispatch authority.
         if !recipients.is_empty() {
             budget.pending.insert(id.clone(), recipients);
+            if let Some(terms) = authority.call {
+                budget.call_reservations.insert(id.clone(), crate::spend_budget::CallSpend::new(terms));
+            }
             if let Some(link) = authority.operation {
                 budget.operation_links.insert(id.clone(), link);
             }
@@ -3905,6 +3910,22 @@ impl PairingService {
         clock: impl FnOnce() -> i64,
         action: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefusal> {
+        self.with_call_spend_authority_at(reservation, None, clock, action)
+    }
+
+    pub(crate) fn with_call_spend_authority<T>(
+        &self, reservation: &Reservation, call: Option<(&str, &str)>, action: impl FnOnce() -> T,
+    ) -> Result<T, BudgetRefusal> {
+        match call {
+            None => self.with_spend_authority(reservation, action),
+            Some(call) => self.with_call_spend_authority_at(reservation, Some(call), || chrono::Utc::now().timestamp(), action),
+        }
+    }
+
+    fn with_call_spend_authority_at<T>(
+        &self, reservation: &Reservation, call: Option<(&str, &str)>,
+        clock: impl FnOnce() -> i64, action: impl FnOnce() -> T,
+    ) -> Result<T, BudgetRefusal> {
         let inner = self.lock();
         let now = clock();
         let valid = inner.file.grants.iter().any(|g| {
@@ -3917,6 +3938,8 @@ impl PairingService {
                     b.pending
                         .get(&reservation.id)
                         .is_some_and(|recipients| b.envelopes_live(recipients.keys(), now))
+                        && call.is_none_or(|(peer, id)| b.call_reservations.values().any(|hold|
+                            hold.terms.peer == peer && hold.terms.call_id == id && !hold.closed))
                 })
                 && g.client_id == reservation.client_id
                 && g.identity_fingerprint == inner.identity_fingerprint
@@ -3999,8 +4022,10 @@ impl PairingService {
             budget.pending.remove(&reservation.id);
             budget.operation_links.remove(&reservation.id);
         }
-        budget.resolve(recipient, reserved, actual_msat);
-        budget.record_outcome(reserved, actual_msat, chrono::Utc::now().timestamp());
+        if !budget.resolve_call_draw(&reservation.id, recipient, reserved, actual_msat) {
+            budget.resolve(recipient, reserved, actual_msat);
+            budget.record_outcome(reserved, actual_msat, chrono::Utc::now().timestamp());
+        }
         if let Err(e) = self.persist(&mut inner.file) {
             if let Some(grant) = inner
                 .file

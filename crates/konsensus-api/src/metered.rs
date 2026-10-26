@@ -100,6 +100,24 @@ impl MeteredSpend {
         matches!(self.meter, Meter::Grant { .. })
     }
 
+    pub(crate) fn reserve_call(&self, state: &AppState, terms: crate::spend_budget::CallSpendTerms,
+        capacity: u64) -> Result<(), ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(()) };
+        state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?
+            .reserve_call_spend(client_id, *epoch, terms, capacity).map_err(ApiError::BudgetExceeded)?;
+        Ok(())
+    }
+
+    pub(crate) fn debit_call_block(&self, state: &AppState, signal: &konsensus_core::payloads::call::CallSignal,
+        peer: &str, price: u64, fee: u64, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()) };
+        let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        let reservation = service.draw_call_spend(client_id, *epoch, peer, &signal.call_id,
+            signal.seq.ok_or_else(|| ApiError::BadRequest("missing call block sequence".into()))?,
+            price, fee, operation.reservation_link(false)).map_err(ApiError::BudgetExceeded)?;
+        Ok(Debit::reserved(service.clone(), reservation))
+    }
+
     /// Refuse a payment whose amount cannot be known before it is made.
     /// Only a metered caller is refused; the owner's own key is not.
     pub fn refuse_unpriced(&self, why: &str) -> Result<(), ApiError> {
@@ -252,6 +270,8 @@ pub struct Debit {
     held: Option<(Arc<PairingService>, Reservation)>,
     max_routing_fee_msat: Option<u64>,
     call_block: Option<(konsensus_core::NodeId, String)>,
+    call_offer: Option<(konsensus_core::NodeId, String)>,
+    call_spend: Option<(String, String)>,
     // None means a settled payment's fee is still unknown. Never release that liability.
     fees: std::sync::Mutex<std::collections::BTreeMap<String, Option<u64>>>,
     // Shared by every member of a room fan-out. Reservations consume this
@@ -265,7 +285,16 @@ impl Debit {
     }
     pub(crate) fn operation(&self) -> Option<&crate::handlers::messages::operations::Operation> { self.operation.as_ref() }
     pub(crate) fn for_call_block(mut self, peer: konsensus_core::NodeId, plaintext: String) -> Self {
+        self.call_spend = konsensus_core::wire_json::from_str::<konsensus_core::payloads::call::CallSignal>(&plaintext)
+            .ok().map(|signal| (peer.to_hex(), signal.call_id));
         self.call_block = Some((peer, plaintext));
+        self
+    }
+
+    pub(crate) fn for_call_offer(mut self, peer: konsensus_core::NodeId, plaintext: String) -> Self {
+        self.call_spend = konsensus_core::wire_json::from_str::<konsensus_core::payloads::call::CallSignal>(&plaintext)
+            .ok().map(|signal| (peer.to_hex(), signal.call_id));
+        self.call_offer = Some((peer, plaintext));
         self
     }
 
@@ -283,6 +312,11 @@ impl Debit {
     where F: Future<Output=Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>> {
         let (mut call_guard, deadline) = if let Some((peer, plaintext)) = &self.call_block {
             match crate::calls::block_dispatch_guard(state.storage.as_ref(), peer, plaintext).await {
+                Ok((guard, deadline)) => (Some(guard), Some(deadline)),
+                Err(error) => return Ok(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(error.to_string()))),
+            }
+        } else if let Some((peer, plaintext)) = &self.call_offer {
+            match crate::calls::offer_dispatch_guard(state.storage.as_ref(), peer, plaintext).await {
                 Ok((guard, deadline)) => (Some(guard), Some(deadline)),
                 Err(error) => return Ok(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(error.to_string()))),
             }
@@ -329,12 +363,12 @@ impl Debit {
 
     /// Owner-only paths have no grant to revalidate.
     pub(crate) fn unmetered() -> Self {
-        Self { operation: None, max_routing_fee_msat: None, call_block: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
+        Self { operation: None, max_routing_fee_msat: None, call_block: None, call_offer: None, call_spend: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
     }
 
     fn reserved(service: Arc<PairingService>, reservation: Reservation) -> Self {
         let total = reservation.charges.iter().map(|c| c.amount_msat).sum();
-        Self { operation: None, max_routing_fee_msat: None, call_block: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
+        Self { operation: None, max_routing_fee_msat: None, call_block: None, call_offer: None, call_spend: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
     }
 
     /// Whether this debit is held against a budget grant.
@@ -408,7 +442,7 @@ impl Debit {
         let mut operation = std::pin::pin!(operation);
         let mut polled = false;
         futures::future::poll_fn(|cx| {
-            match service.with_spend_authority(reservation, || {
+            match service.with_call_spend_authority(reservation, self.call_spend.as_ref().map(|(peer, id)| (peer.as_str(), id.as_str())), || {
                 polled = true;
                 operation.as_mut().poll(cx)
             }) {
@@ -438,7 +472,8 @@ impl Debit {
         };
         let mut operation = std::pin::pin!(operation);
         let first = futures::future::poll_fn(|cx| {
-            Poll::Ready(service.with_spend_authority(reservation, || operation.as_mut().poll(cx)))
+            Poll::Ready(service.with_call_spend_authority(reservation,
+                self.call_spend.as_ref().map(|(peer, id)| (peer.as_str(), id.as_str())), || operation.as_mut().poll(cx)))
         })
         .await
         .map_err(ApiError::BudgetExceeded)?;

@@ -1865,6 +1865,13 @@ async fn start_node_services<'a>(
             warn!(error = %e, "call state recovery failed; reservations stay for a same-operation retry")
         }
     }
+    // Release unused call spending after restoring the durable call lifecycle.
+    // Unresolved block payments keep their operation-linked liabilities.
+    if let Err(error) = konsensus_api::calls::reconcile_call_spend(
+        &api_state, chrono::Utc::now().timestamp_millis() as u64,
+    ).await {
+        warn!(%error, "call spend recovery deferred to maintenance");
+    }
     // Incoming call signals still held were never admitted (refusal cleanup
     // failed, or a crash): withdraw them before anything can read them.
     match konsensus_api::calls::withdraw_held(node.storage().as_ref(), true).await {

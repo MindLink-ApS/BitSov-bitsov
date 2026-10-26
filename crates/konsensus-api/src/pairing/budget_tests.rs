@@ -1,5 +1,109 @@
 use super::*;
 
+// A call reserves 240 minutes plus a per-block fee ceiling, once. Splitting
+// that hold into journaled payments must never charge the grant a second time.
+#[test]
+fn call_reservation_draw_release_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 20, 5).unwrap();
+    let hold = service.reserve_call_spend(&client, 1, terms.clone(), 10_000).unwrap();
+    assert_eq!(service.reserve_call_spend(&client, 1, terms, 10_000).unwrap(), hold);
+    let link = crate::spend_budget::OperationReservationLink {
+        operation_id: "block-0".into(), execution_id: "attempt".into(), readmission: false,
+    };
+    let debit = service.draw_call_spend(&client, 1, &peer, "call", 0, 20, 5, link).unwrap();
+    service.try_resolve_spend(&debit, &peer, 22).unwrap();
+    service.try_resolve_spend(&debit, &peer, 22).unwrap();
+    drop(service);
+    let service = PairingService::open(dir.path(), "identity".into(), true).unwrap();
+    let view = service.call_spend_status(&peer, "call").unwrap();
+    assert_eq!((view.reserved_msat, view.spent_msat, view.remaining_msat, view.per_block_msat), (6000, 22, 5978, 20));
+    service.close_call_spend(&hold).unwrap();
+    service.close_call_spend(&hold).unwrap();
+    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert_eq!(budget.used_msat, 22);
+    assert!(budget.pending.is_empty());
+    assert_eq!(budget.breaker_status(chrono::Utc::now().timestamp()).payments_last_hour, 1);
+}
+
+#[test]
+fn call_reservation_caps_liquidity_price_and_unknown_payment() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    let terms = |price| crate::spend_budget::CallSpendTerms::new(&peer, "call", price, 5).unwrap();
+    assert!(service.reserve_call_spend(&client, 1, terms(50), 20_000).is_err());
+    assert!(service.reserve_call_spend(&client, 1, terms(20), 5999).is_err());
+    let hold = service.reserve_call_spend(&client, 1, terms(20), 6000).unwrap();
+    let link = crate::spend_budget::OperationReservationLink {
+        operation_id: "block-0".into(), execution_id: "attempt".into(), readmission: false,
+    };
+    assert!(service.draw_call_spend(&client, 1, &peer, "call", 0, 21, 5, link.clone()).is_err());
+    let debit = service.draw_call_spend(&client, 1, &peer, "call", 0, 20, 5, link.clone()).unwrap();
+    assert!(service.draw_call_spend(&client, 1, &peer, "call", 0, 20, 5, link).is_err());
+    service.close_call_spend(&hold).unwrap();
+    assert_eq!(service.reload_from_disk().unwrap().grants[0].budget.as_ref().unwrap().used_msat, 25);
+    drop(service);
+    let service = PairingService::open(dir.path(), "identity".into(), true).unwrap();
+    service.try_resolve_spend(&debit, &peer, 22).unwrap();
+    service.try_resolve_spend(&debit, &peer, 22).unwrap();
+    service.close_call_spend(&hold).unwrap();
+    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert_eq!(budget.used_msat, 22);
+    assert!(budget.pending.is_empty());
+}
+
+#[test]
+fn concurrent_calls_cannot_reserve_the_same_budget_or_liquidity() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let reserve = |id| {
+            barrier.wait();
+            service.reserve_call_spend(&client, 1,
+                crate::spend_budget::CallSpendTerms::new(&peer, id, 20, 5).unwrap(), 10_000)
+        };
+        let a = scope.spawn(move || reserve("a"));
+        let b = scope.spawn(move || reserve("b"));
+        assert_eq!([a.join().unwrap(), b.join().unwrap()].iter().filter(|r| r.is_ok()).count(), 1);
+    });
+    assert_eq!(service.reload_from_disk().unwrap().grants[0].budget.as_ref().unwrap().used_msat, 6000);
+}
+
+#[test]
+fn seventy_blocks_use_one_breaker_entry_and_cannot_exceed_call_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    let hold = service.reserve_call_spend(&client, 1,
+        crate::spend_budget::CallSpendTerms::new(&peer, "call", 30, 5).unwrap(), 10_000).unwrap();
+    for seq in 0..70 {
+        let link = crate::spend_budget::OperationReservationLink {
+            operation_id: format!("block-{seq}"), execution_id: "attempt".into(), readmission: false,
+        };
+        let debit = service.draw_call_spend(&client, 1, &peer, "call", seq, 30, 5, link).unwrap();
+        service.try_resolve_spend(&debit, &peer, 32).unwrap();
+    }
+    let link = crate::spend_budget::OperationReservationLink {
+        operation_id: "too-late".into(), execution_id: "attempt".into(), readmission: false,
+    };
+    assert!(service.draw_call_spend(&client, 1, &peer, "call", 240, 30, 5, link).is_err());
+    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert_eq!(budget.used_msat, 8400);
+    let status = budget.breaker_status(chrono::Utc::now().timestamp());
+    assert_eq!((status.payments_last_hour, status.unresolved_payments), (1, 1));
+    service.close_call_spend(&hold).unwrap();
+    assert_eq!(service.reload_from_disk().unwrap().grants[0].budget.as_ref().unwrap().used_msat, 2240);
+}
+
 fn first_contact_service(dir: &Path) -> PairingService {
     let service = PairingService::open(dir, "identity".into(), true).unwrap();
     let key = ed25519_dalek::SigningKey::from_bytes(&[12; 32]);

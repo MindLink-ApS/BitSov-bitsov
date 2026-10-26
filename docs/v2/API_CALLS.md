@@ -48,6 +48,13 @@ The bound also applies if the stored data exceeds the admission bound.
 - `op_id`: nullable string, the stored pending signal's operation id, or `null`
   once no operation binding remains in call state. It can refer to an answer
   or hangup rather than an offer. No placeholder strings are returned.
+- `reservation`: present for an outgoing call backed by a paired app's spend
+  grant. Contains `reserved_msat`, `spent_msat`, `remaining_msat`,
+  `per_block_msat`, `per_block_fee_msat`, `released_msat`, and `closed`.
+  `spent_msat` includes settled block principal and known routing fees.
+  `remaining_msat` includes unresolved payment liabilities and excludes released
+  funds. It is an observation, never new payment authority. The original
+  reservation amount and per-block ceilings stay fixed for the call.
 
 Open means an unexpired reserved/ringing/live call **or any call with a pending
 signal**, including calls whose ringing/live deadline and replay tombstone
@@ -64,6 +71,36 @@ compose/admission checks.
 The endpoint reads the durable call state, including paid interval fields from migration 035. It does not request
 prices, pay, dispatch signals, emit call events, sweep rows, or mutate the
 operation journal. See [call protocol and recovery](CALLS-PROTOTYPE.md).
+
+## Paired-app call spending (M6 N3)
+
+Before a caller's offer is dispatched, the node reserves 240 blocks (the
+four-hour maximum) at the callee's current kind-404 price, plus the enforced
+routing-fee ceiling for each block. The existing minimum invoice amount also
+applies. Already-answered calls without a hold may reserve at block zero.
+The total must fit the approved grant's total, per-call, recipient, envelope,
+allowlist and spend-velocity limits. This block bundle counts as one breaker
+entry; the separate ringing fee and other signaling retain their ordinary
+metering. Blocks draw from the bundle without another breaker entry or the
+generic messaging per-payment ceiling.
+
+One active channel's known spendable outbound capacity must cover the hold,
+less all other held call funds. Unknown capacity fails closed. This is a
+conservative local-channel preflight, not a guarantee of remote routing
+liquidity throughout the call. No liquidity purchase is implied.
+`call_liquidity_insufficient` identifies insufficient capacity;
+`call_liquidity_unavailable` identifies a failed capacity query.
+
+The hold and its child debit references are written atomically in the existing
+pairing ledger. Child payments use the existing outbox reconciliation journal.
+Hangup, Unpaid, failure and timeout release unallocated funds once; ambiguous
+payments remain held until their outcome and fees are known. Startup and the
+one-second call maintenance sweep repair interrupted releases. A closed hold
+cannot fund a retried offer; use a new call id. A block price above the reserved
+price ends the call with `call_price_changed`. Later requests may tighten the
+original routing ceiling but cannot widen it; blocks cannot pay re-admission.
+
+This slice adds no SQL migration. Any new migration needs the owner's GO.
 
 ## Contract goldens (app–node)
 

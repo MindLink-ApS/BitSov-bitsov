@@ -53,6 +53,10 @@ const FAILED: u8 = 3;
 /// Counts every money-moving call and settles, loses, refuses or fails it.
 #[derive(Default)]
 struct Wallet {
+    call_capacity: AtomicU64,
+    pause_capacity: AtomicBool,
+    capacity_entered: tokio::sync::Notify,
+    capacity_resume: tokio::sync::Notify,
     fee: AtomicU64,
     unknown_fee: AtomicBool,
     outgoing: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
@@ -121,6 +125,20 @@ impl Wallet {
 
 #[async_trait]
 impl LightningProvider for Wallet {
+    async fn list_channels(&self) -> Result<Vec<konsensus_core::traits::lightning::ChannelInfo>, LightningError> {
+        if self.pause_capacity.load(Ordering::SeqCst) {
+            self.capacity_entered.notify_one();
+            self.capacity_resume.notified().await;
+        }
+        let capacity = self.call_capacity.load(Ordering::SeqCst);
+        Ok(vec![konsensus_core::traits::lightning::ChannelInfo {
+            is_outbound: Some(true), is_announced: Some(false), is_channel_ready: Some(true),
+            local_reserve_msat: Some(0), initial_push_msat: None, channel_id: "test-channel".into(),
+            user_channel_id: None, funding_txo: None, peer_pubkey: PEER_LN.into(),
+            capacity_msat: capacity, local_balance_msat: capacity, outbound_capacity_msat: Some(capacity),
+            remote_balance_msat: 0, active: true, short_channel_id: None,
+        }])
+    }
     async fn keysend_with_fee_limit(
         &self,
         dest: &str,
@@ -2908,3 +2926,6 @@ async fn confirmed_payment_failures_pause_the_grant_at_the_http_boundary() {
 
 #[path = "budget_grant/messaging_cap.rs"]
 mod messaging_cap;
+
+#[path = "budget_grant/calls.rs"]
+mod call_reservations;

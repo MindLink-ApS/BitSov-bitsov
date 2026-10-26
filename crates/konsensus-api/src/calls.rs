@@ -87,6 +87,7 @@ pub async fn expire_calls(store: Store<'_>, now: u64) -> Result<Vec<(NodeId, Str
 pub async fn maintain_calls(state: &std::sync::Arc<AppState>, now: u64) -> Result<(), konsensus_storage::StorageError> {
     use crate::handlers::messages::{compose_for, ComposeRequest};
     let expired = expire_calls(state.storage.as_ref(), now).await?;
+    reconcile_call_spend(state, now).await?;
     // No network wait in the expiry loop and no unbounded task/queue growth.
     static NOTIFICATIONS: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let slots = NOTIFICATIONS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(8)));
@@ -114,6 +115,70 @@ pub async fn maintain_calls(state: &std::sync::Arc<AppState>, now: u64) -> Resul
     Ok(())
 }
 
+/// End-path and restart cleanup. Missing, ended and expired call rows release
+/// the unallocated hold. Child debits stay in the existing outbox recovery
+/// journal until settlement is known. Errors retain liability for the sweep.
+pub async fn reconcile_call_spend(state: &AppState, now: u64) -> Result<(), konsensus_storage::StorageError> {
+    let Some(service) = &state.pairing else { return Ok(()) };
+    let _guard = lock().lock().await;
+    for (reservation, terms) in service.call_spend_holds() {
+        let peer = NodeId::from_hex(&terms.peer).map_err(|e| konsensus_storage::StorageError::Serialization(e.to_string()))?;
+        let entry = state.storage.call_get(&peer, &terms.call_id).await?;
+        if entry.and_then(|e| e.at(now)).is_none_or(|e| e.phase == rules::Phase::Ended) {
+            service.close_call_spend(&reservation).map_err(|e| konsensus_storage::StorageError::Serialization(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn fail_outgoing(state: &AppState, peer: &NodeId, plaintext: &str) -> Result<(), konsensus_storage::StorageError> {
+    let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else { return Ok(()) };
+    let _guard = lock().lock().await;
+    if let Some(mut entry) = state.storage.call_get(peer, &signal.call_id).await? {
+        if entry.phase != rules::Phase::Ended {
+            entry.phase = rules::Phase::Ended;
+            entry.end_reason = Some(rules::HangupReason::Failed);
+            entry.deadline_ms = now_ms().saturating_add(rules::TOMBSTONE_MS);
+            state.storage.call_put(peer, &signal.call_id, &entry).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Reserve before sending the offer; block zero also supports already-answered
+/// calls created before this slice. The call lock orders reservation with expiry.
+pub(crate) async fn ensure_call_spend(auth: &crate::metered::MeteredSpend, state: &AppState,
+    peer: &NodeId, signal: &CallSignal, price: u64, fee: u64) -> Result<(), ApiError> {
+    if !auth.is_metered() { return Ok(()) }
+    // Serialize capacity observations only with other new holds. A remote
+    // wallet RPC must never stall block renewal, incoming media or hangup.
+    static RESERVATIONS: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    let _reservation_guard = RESERVATIONS.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let channels = state.lightning.list_channels().await.map_err(|_| {
+        ApiError::NotDispatched("call outbound liquidity unavailable".into()).with_reason("call_liquidity_unavailable")
+    })?;
+    let _guard = lock().lock().await;
+    let entry = current(state.storage.as_ref(), peer, &signal.call_id, now_ms()).await
+        .map_err(|e| ApiError::Storage(e.to_string()))?
+        .ok_or_else(|| ApiError::BadRequest("call is not live".into()))?;
+    if entry.side != rules::Side::Caller || entry.phase == rules::Phase::Ended {
+        return Err(ApiError::BadRequest("caller reservation requires an open outgoing call".into()));
+    }
+    if state.pairing.as_ref().and_then(|s| s.call_spend_status(&peer.to_hex(), &signal.call_id)).is_some() {
+        return Ok(());
+    }
+    if entry.next_block_seq != 0 {
+        return Err(ApiError::BadRequest("call reservation missing after block zero; start a new call".into()));
+    }
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer.to_hex(), &signal.call_id, price, fee)
+        .map_err(ApiError::BudgetExceeded)?;
+    // One active outbound channel must cover the hold. Do not infer spendable
+    // capacity from wallet balance, channel size, or an unknown provider field.
+    let capacity = channels.iter().filter(|c| c.active)
+        .filter_map(|c| c.outbound_capacity_msat).max().unwrap_or(0);
+    auth.reserve_call(state, terms, capacity)
+}
+
 /// Recovery may resend settled blocks, but a new charge needs a still-payable
 /// interval. Recheck after reconciliation and after asking the callee's price.
 pub(crate) async fn revalidate_outgoing_block(store: Store<'_>, peer: &NodeId, plaintext: &str) -> Result<u64, ApiError> {
@@ -131,6 +196,18 @@ pub(crate) async fn block_dispatch_guard(store: Store<'_>, peer: &NodeId, plaint
         .ok_or_else(|| refused(CallRefusal::UnknownCall, false))?;
     rules::validate_outgoing_block(&entry, signal.seq.ok_or_else(|| refused(CallRefusal::Sequence, false))?, now_ms())
         .map_err(|e| refused(e, false))?;
+    Ok((guard, entry.deadline_ms))
+}
+
+pub(crate) async fn offer_dispatch_guard(store: Store<'_>, peer: &NodeId, plaintext: &str) -> Result<(tokio::sync::MutexGuard<'static, ()>, u64), ApiError> {
+    let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_INVITE, plaintext).map_err(|e| refused(e, false))?;
+    let guard = lock().lock().await;
+    let entry = current(store, peer, &signal.call_id, now_ms()).await
+        .map_err(|_| ApiError::Internal("call state unavailable".into()))?
+        .ok_or_else(|| refused(CallRefusal::UnknownCall, false))?;
+    if entry.side != rules::Side::Caller || !matches!(entry.phase, rules::Phase::Reserved | rules::Phase::Ringing) {
+        return Err(refused(CallRefusal::UnknownCall, false));
+    }
     Ok((guard, entry.deadline_ms))
 }
 

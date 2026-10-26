@@ -537,6 +537,8 @@ pub(super) async fn compose_call(
         konsensus_core::payloads::call::settlement(Some(&op.state)) == konsensus_core::payloads::call::Settlement::Paid
     });
     let plaintext = req.plaintext.clone();
+    let spend_client = auth.user.pairing.as_ref().map(|p| p.client_id.clone());
+    let ends_on_failure = matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK);
     if !paid {
         crate::calls::reserve_outgoing(state.storage.as_ref(), state.identity.node_id(), &peer, req.kind, &plaintext, &id, &request_hash).await?;
     }
@@ -550,6 +552,15 @@ pub(super) async fn compose_call(
         policy,
     ).await;
     crate::calls::resolve_outgoing(state.storage.as_ref(), &peer, &plaintext, &id, &request_hash).await;
+    if result.is_err() && ends_on_failure {
+        if let (Some(client), Some(service), Ok(signal)) = (spend_client, state.pairing.as_ref(),
+            konsensus_core::wire_json::from_str::<konsensus_core::payloads::call::CallSignal>(&plaintext)) {
+            if service.owns_call_spend(&client, &peer.to_hex(), &signal.call_id) {
+                crate::calls::fail_outgoing(&state, &peer, &plaintext).await.map_err(storage)?;
+            }
+        }
+    }
+    crate::calls::reconcile_call_spend(&state, chrono::Utc::now().timestamp_millis() as u64).await.map_err(storage)?;
     result
 }
 
