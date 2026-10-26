@@ -5,6 +5,11 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Callee nodes start the 60 s ring clock and the caller's ringing `MessageAck`
+  only when a paired device fetches or streams a call invite; when no device
+  takes it within 15 s the caller gets a `MessageReject` with reason
+  `call_not_reachable`, and resends or duplicates repeat the same answer
+  without a second charge (#422, slice A).
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'
   scripts instead of all 2000 derived scripts. Before each focused sweep preview,
