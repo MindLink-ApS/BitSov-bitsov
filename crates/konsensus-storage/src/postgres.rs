@@ -3283,6 +3283,78 @@ impl Storage for PostgresStorage {
         Ok(())
     }
 
+    async fn commit_calendar_admission(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+        admission: &crate::CalendarAdmission,
+    ) -> Result<(), StorageError> {
+        let id = envelope.id.to_hex();
+        let mut tx = self.pool.begin().await?;
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = $1 AND sender = $2")
+            .bind(&id).bind(envelope.sender.to_hex()).fetch_one(&mut *tx).await?;
+        if stored != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("accepted envelope {id}")));
+        }
+        match admission {
+            crate::CalendarAdmission::Event(record) => {
+                sqlx::query(
+                    "INSERT INTO calendar_events
+                       (id, message_id, organizer, title, description, start_ms, end_ms, tz,
+                        location, attendees_json, recurrence_json, color, parent_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                     ON CONFLICT(id) DO UPDATE SET
+                       message_id      = EXCLUDED.message_id,
+                       title           = EXCLUDED.title,
+                       description     = EXCLUDED.description,
+                       start_ms        = EXCLUDED.start_ms,
+                       end_ms          = EXCLUDED.end_ms,
+                       tz              = EXCLUDED.tz,
+                       location        = EXCLUDED.location,
+                       attendees_json  = EXCLUDED.attendees_json,
+                       recurrence_json = EXCLUDED.recurrence_json,
+                       color           = EXCLUDED.color,
+                       parent_id       = EXCLUDED.parent_id",
+                )
+                .bind(&record.id)
+                .bind(&record.message_id)
+                .bind(&record.organizer)
+                .bind(&record.title)
+                .bind(&record.description)
+                .bind(record.start_ms as i64)
+                .bind(record.end_ms as i64)
+                .bind(&record.tz)
+                .bind(&record.location)
+                .bind(&record.attendees_json)
+                .bind(&record.recurrence_json)
+                .bind(&record.color)
+                .bind(&record.parent_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            crate::CalendarAdmission::Rsvp(record) => {
+                sqlx::query(
+                    "INSERT INTO calendar_rsvps (id, event_id, responder, response, comment)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT(event_id, responder) DO UPDATE SET
+                       response = EXCLUDED.response,
+                       comment  = EXCLUDED.comment",
+                )
+                .bind(&record.id)
+                .bind(&record.event_id)
+                .bind(&record.responder)
+                .bind(&record.response)
+                .bind(&record.comment)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
+            .bind(&id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn upsert_operator_hosting_contract(
         &self,
         contract: &OperatorHostingContract,

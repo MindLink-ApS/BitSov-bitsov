@@ -608,11 +608,12 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             trust_discount,
                         ).await {
                             Ok(plaintext) => plaintext,
-                            Err(InboundRefusal::HoldNotReleased) => {
-                                // The calendar envelope passed the caps but its hold
-                                // could not be lifted: nothing of it was persisted, it
-                                // stays held and hidden for the sweep, and the sender
-                                // gets a transient reject, not an ACK.
+                            Err(InboundRefusal::NotCommitted) => {
+                                // The calendar envelope passed the caps but its event or
+                                // RSVP and hold release did not commit together: nothing
+                                // of it was persisted, it stays held and hidden for the
+                                // sweep, and the sender gets a transient reject, not an
+                                // ACK.
                                 let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
                                 let _ = transport_for_ack.send_frame(&sender, &reject).await;
                                 continue;
@@ -759,9 +760,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
 /// tells the sender why) or a hold that could not be released (nothing was persisted;
 /// the envelope stays held for the sweep).
 ///
-/// Calendar order: decode under the caps, cache the plaintext, release the admission
-/// hold, and only then persist the event or RSVP. A refusal therefore never follows a
-/// calendar mutation, and a mutation never lands on an envelope that stays held.
+/// Calendar order: decode under the caps, cache the plaintext, then persist the event
+/// or RSVP and release the admission hold in one storage transaction. A refusal
+/// therefore never follows a calendar mutation, a mutation never lands on an envelope
+/// that stays held, and an accepted, unheld envelope always has its mutation.
 #[allow(clippy::too_many_arguments)]
 async fn decrypt_and_process(
     envelope: &konsensus_core::UkmEnvelope,
@@ -856,28 +858,29 @@ async fn decrypt_and_process(
         }
     }
 
-    // The calendar payload passed the caps: lift the admission hold BEFORE the
-    // event or RSVP is persisted, whether this attempt placed the hold or
-    // inherited it from an attempt whose acceptance rolled back and whose cleanup
-    // failed. If the release fails nothing has been written yet: the envelope
-    // stays held and hidden for the sweep and the caller rejects, so a withdrawn
-    // envelope can never leave a calendar change behind.
-    if calendar.is_some() {
-        release_calendar_hold(storage.as_ref(), envelope).await?;
+    // The calendar payload passed the caps: persist its event or RSVP and lift
+    // the admission hold in ONE transaction, whether this attempt placed the hold
+    // or inherited it from an attempt whose acceptance rolled back and whose
+    // cleanup failed. On any failure nothing is written: the envelope stays held
+    // and hidden for the sweep and the caller rejects. A withdrawn envelope can
+    // never leave a calendar change behind, and an accepted, unheld one always
+    // carries its change.
+    if let Some(calendar) = calendar {
+        let (admission, summary) = build_calendar_admission(calendar, sender, envelope);
+        storage
+            .commit_calendar_admission(envelope, &admission)
+            .await
+            .map_err(|e| {
+                error!(sender = %sender, msg_id = %envelope.id, error = %e, "calendar admission did not commit; envelope withheld for the sweep");
+                InboundRefusal::NotCommitted
+            })?;
+        info!(sender = %sender, msg_id = %envelope.id, summary = %summary, "calendar envelope admitted");
+        return Ok(Some(summary));
     }
 
     // Route based on message kind
     let plaintext = if envelope.kind == konsensus_core::kind::KIND_FILE_REF {
         process_file_message(&bytes, sender, envelope, storage, audit).await
-    } else if let Some(calendar) = calendar {
-        match calendar {
-            CalendarInbound::Event(payload) => {
-                process_calendar_event(*payload, sender, envelope, storage).await
-            }
-            CalendarInbound::Rsvp(payload) => {
-                process_rsvp(payload, sender, envelope, storage).await
-            }
-        }
     } else if konsensus_core::is_web_service_reply(envelope) {
         // 510/501 reply bound to our paid request: deliver plaintext to the
         // frontend, never treat it as a fresh manifest/page request (F3).
@@ -963,14 +966,18 @@ pub(crate) enum InboundRefusal {
     /// A calendar payload failed the inbound caps: the caller withdraws the
     /// envelope and tells the sender the typed reason.
     Calendar(CalendarPayloadError),
-    /// A calendar envelope passed the caps but its admission hold could not be
-    /// released. Nothing was persisted; it stays held for the sweep and the
-    /// caller answers with a transient storage error.
-    HoldNotReleased,
+    /// A calendar envelope passed the caps (or could not be decrypted) but its
+    /// admission did not commit: the event or RSVP write and the hold release
+    /// share one transaction and it rolled back, or the bare release of an
+    /// undecryptable envelope failed. Nothing was persisted; it stays held for
+    /// the sweep and the caller answers with a transient storage error.
+    NotCommitted,
 }
 
-/// Lift a calendar envelope's admission hold; a no-op for other kinds. Fails
-/// closed: on a storage error the hold stays and the envelope is not admitted.
+/// Lift a calendar envelope's admission hold without a mutation (there was no
+/// session or the ciphertext could not be decrypted, so the envelope is admitted
+/// as an opaque message); a no-op for other kinds. Fails closed: on a storage
+/// error the hold stays and the envelope is not admitted.
 async fn release_calendar_hold(
     storage: &dyn konsensus_storage::Storage,
     envelope: &konsensus_core::UkmEnvelope,
@@ -980,7 +987,7 @@ async fn release_calendar_hold(
     }
     storage.call_admission_release(&envelope.id).await.map_err(|e| {
         error!(msg_id = %envelope.id, error = %e, "calendar envelope could not be released; withheld for the sweep");
-        InboundRefusal::HoldNotReleased
+        InboundRefusal::NotCommitted
     })
 }
 
@@ -1034,7 +1041,7 @@ pub(crate) fn calendar_reject_reason(refusal: &CalendarPayloadError) -> String {
 }
 
 /// A calendar payload decoded under the inbound caps, ahead of the plaintext cache.
-enum CalendarInbound {
+pub(crate) enum CalendarInbound {
     Event(Box<CalendarEventPayload>),
     Rsvp(RsvpPayload),
 }
@@ -1125,87 +1132,55 @@ async fn process_file_message(
     Some(format!("[file: {}]", payload.filename))
 }
 
-/// Process an incoming calendar event (KIND_CALENDAR_EVENT or KIND_CALENDAR_UPDATE).
-/// The payload was already decoded under the inbound caps; this only builds and
-/// stores the record.
-async fn process_calendar_event(
-    payload: CalendarEventPayload,
+/// Build the storage mutation and the frontend summary for a decoded calendar
+/// payload. Nothing is written here: the caller commits the mutation together
+/// with the hold release.
+pub(crate) fn build_calendar_admission(
+    inbound: CalendarInbound,
     sender: &konsensus_core::types::NodeId,
     envelope: &konsensus_core::UkmEnvelope,
-    storage: &Arc<dyn konsensus_storage::Storage>,
-) -> Option<String> {
-    let attendees_json = serde_json::to_string(&payload.attendees).unwrap_or_else(|_| "[]".into());
-    let recurrence_json = payload
-        .recurrence
-        .as_ref()
-        .and_then(|r| serde_json::to_string(r).ok());
-
-    let record = konsensus_storage::CalendarEventRecord {
-        id: payload.event_id.clone(),
-        message_id: Some(envelope.id.to_hex()),
-        organizer: payload.organizer.clone(),
-        title: payload.title.clone(),
-        description: payload.description.clone(),
-        start_ms: payload.start_ms,
-        end_ms: payload.end_ms,
-        tz: payload.tz.clone(),
-        location: payload.location.clone(),
-        attendees_json,
-        recurrence_json,
-        color: payload.color.clone(),
-        created_at: String::new(),
-        parent_id: None,
-    };
-
-    if let Err(e) = storage.store_calendar_event(&record).await {
-        warn!(
-            sender = %sender,
-            event_id = %payload.event_id,
-            error = %e,
-            "failed to store incoming calendar event"
-        );
-    } else {
-        info!(
-            sender = %sender,
-            event_id = %payload.event_id,
-            title = %payload.title,
-            "stored incoming calendar event"
-        );
+) -> (konsensus_storage::CalendarAdmission, String) {
+    match inbound {
+        CalendarInbound::Event(payload) => {
+            let attendees_json =
+                serde_json::to_string(&payload.attendees).unwrap_or_else(|_| "[]".into());
+            let recurrence_json = payload
+                .recurrence
+                .as_ref()
+                .and_then(|r| serde_json::to_string(r).ok());
+            let summary = format!("[calendar: {}]", payload.title);
+            let record = konsensus_storage::CalendarEventRecord {
+                id: payload.event_id,
+                message_id: Some(envelope.id.to_hex()),
+                organizer: payload.organizer,
+                title: payload.title,
+                description: payload.description,
+                start_ms: payload.start_ms,
+                end_ms: payload.end_ms,
+                tz: payload.tz,
+                location: payload.location,
+                attendees_json,
+                recurrence_json,
+                color: payload.color,
+                created_at: String::new(),
+                parent_id: None,
+            };
+            (konsensus_storage::CalendarAdmission::Event(record), summary)
+        }
+        CalendarInbound::Rsvp(payload) => {
+            let response = format!("{:?}", payload.response).to_lowercase();
+            let summary = format!("[rsvp: {response}]");
+            let record = konsensus_storage::RsvpRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                event_id: payload.event_id,
+                responder: sender.to_hex(),
+                response,
+                comment: payload.comment,
+                created_at: String::new(),
+            };
+            (konsensus_storage::CalendarAdmission::Rsvp(record), summary)
+        }
     }
-
-    Some(format!("[calendar: {}]", payload.title))
-}
-
-/// Process an incoming RSVP (KIND_RSVP). The payload was already decoded under
-/// the inbound caps.
-async fn process_rsvp(
-    payload: RsvpPayload,
-    sender: &konsensus_core::types::NodeId,
-    envelope: &konsensus_core::UkmEnvelope,
-    storage: &Arc<dyn konsensus_storage::Storage>,
-) -> Option<String> {
-    let response_str = format!("{:?}", payload.response).to_lowercase();
-    let record = konsensus_storage::RsvpRecord {
-        id: uuid::Uuid::new_v4().to_string(),
-        event_id: payload.event_id.clone(),
-        responder: sender.to_hex(),
-        response: response_str.clone(),
-        comment: payload.comment.clone(),
-        created_at: String::new(),
-    };
-
-    // Best-effort: the organizer stores the event locally; the attendee may not have it.
-    let _ = storage.store_rsvp(&record).await;
-
-    info!(
-        sender = %sender,
-        event_id = %payload.event_id,
-        response = %response_str,
-        msg_id = %envelope.id,
-        "received RSVP"
-    );
-
-    Some(format!("[rsvp: {}]", response_str))
 }
 
 /// Process an incoming web manifest request (KIND_WEB_MANIFEST).

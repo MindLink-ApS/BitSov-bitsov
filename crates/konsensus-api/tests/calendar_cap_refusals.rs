@@ -250,6 +250,7 @@ async fn over_cap_rsvp_is_refused_before_ratchet_and_payment() {
     assert_eq!(lightning.money(), 0);
     assert_eq!(lightning.invoices(), 0);
 
+    let before = ratchet_sequence(&state, &organizer).await;
     let (_, result) = request(
         &state,
         "POST",
@@ -257,19 +258,32 @@ async fn over_cap_rsvp_is_refused_before_ratchet_and_payment() {
         json!({"response": "accepted", "organizer": organizer.to_hex(), "comment": "see you"}),
     )
     .await;
+    let after = ratchet_sequence(&state, &organizer).await;
     assert!(
         !cap_code(&result),
         "in-cap RSVP refused by the caps: {result}"
     );
     // Past the caps the handler encrypted the RSVP for the organizer, so the
-    // ratchet has advanced exactly once; the stub transport then reports the
-    // organizer offline, which is not a cap refusal.
-    assert!(
-        !ratchet_unused(&state, &organizer).await,
+    // ratchet advanced exactly once between two probes (each probe advances it
+    // by one itself); the stub transport then reports the organizer offline,
+    // which is not a cap refusal.
+    assert_eq!(
+        after - before,
+        2,
         "in-cap RSVP never reached encryption: {result}"
     );
     assert_eq!(
         result["error"].as_str().unwrap_or_default(),
         "Recipient is offline. Message will be queued and sent when they reconnect."
     );
+}
+
+async fn ratchet_sequence(state: &AppState, peer: &konsensus_core::NodeId) -> u32 {
+    state
+        .session_manager
+        .encrypt(peer, b"probe")
+        .await
+        .unwrap()
+        .header
+        .message_number
 }

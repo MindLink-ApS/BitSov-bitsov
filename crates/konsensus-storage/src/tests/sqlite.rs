@@ -1786,3 +1786,125 @@ async fn sqlite_open_refuses_stale_external_migrations_dir() {
     );
     let _ = std::fs::remove_file(db_path);
 }
+
+/// `commit_calendar_admission` writes the event or RSVP and releases the hold
+/// in one transaction: a failed write leaves the hold (and no row), a failed
+/// release leaves no row (and the hold), a success leaves the row (and no
+/// hold), and an envelope that is not stored is refused with nothing written.
+/// The calendar tables are created here because the SQLite migrator does not
+/// create them yet (#409).
+#[tokio::test]
+async fn calendar_admission_commits_mutation_and_hold_release_together() {
+    use crate::{CalendarAdmission, CalendarEventRecord, RsvpRecord};
+    let db = SqliteStorage::in_memory().await.unwrap();
+    for ddl in [
+        "CREATE TABLE calendar_events (id TEXT PRIMARY KEY, message_id TEXT, organizer TEXT NOT NULL, title TEXT NOT NULL, description TEXT, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, tz TEXT NOT NULL, location TEXT, attendees_json TEXT NOT NULL, recurrence_json TEXT, color TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), parent_id TEXT)",
+        "CREATE TABLE calendar_rsvps (id TEXT PRIMARY KEY, event_id TEXT NOT NULL, responder TEXT NOT NULL, response TEXT NOT NULL, comment TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), UNIQUE(event_id, responder))",
+    ] {
+        sqlx::raw_sql(ddl).execute(db.pool()).await.unwrap();
+    }
+    let sender = NodeId::from_bytes([7u8; 32]);
+    let env = make_envelope(sender, Recipient::Node(NodeId::from_bytes([8u8; 32])));
+    let event = |title: &str| {
+        CalendarAdmission::Event(CalendarEventRecord {
+            id: "evt-1".into(),
+            message_id: Some(env.id.to_hex()),
+            organizer: sender.to_hex(),
+            title: title.into(),
+            description: None,
+            start_ms: 1,
+            end_ms: 2,
+            tz: "UTC".into(),
+            location: None,
+            attendees_json: "[]".into(),
+            recurrence_json: None,
+            color: None,
+            created_at: String::new(),
+            parent_id: None,
+        })
+    };
+
+    // Not stored for this sender: refused, nothing written, hold untouched.
+    assert!(db.call_admission_hold(&env, 1).await.unwrap());
+    let err = db
+        .commit_calendar_admission(&env, &event("early"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::NotFound(_)), "{err}");
+    assert!(db.call_admission_held(&env.id).await.unwrap());
+    assert!(db.get_calendar_event("evt-1").await.unwrap().is_none());
+
+    // Stored and held: a failing calendar write rolls the release back too.
+    db.store_message(&env).await.unwrap();
+    sqlx::raw_sql("CREATE TRIGGER fail_calendar BEFORE INSERT ON calendar_events BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(db
+        .commit_calendar_admission(&env, &event("unwritten"))
+        .await
+        .is_err());
+    assert!(
+        db.call_admission_held(&env.id).await.unwrap(),
+        "a failed write must keep the hold"
+    );
+    assert!(db.get_calendar_event("evt-1").await.unwrap().is_none());
+    sqlx::raw_sql("DROP TRIGGER fail_calendar")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // A failing release rolls the calendar write back too.
+    sqlx::raw_sql("CREATE TRIGGER fail_release BEFORE DELETE ON call_admission_hold BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(db
+        .commit_calendar_admission(&env, &event("unreleased"))
+        .await
+        .is_err());
+    assert!(db.call_admission_held(&env.id).await.unwrap());
+    assert!(
+        db.get_calendar_event("evt-1").await.unwrap().is_none(),
+        "a failed release must not leave the write behind"
+    );
+    sqlx::raw_sql("DROP TRIGGER fail_release")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // Both succeed together.
+    db.commit_calendar_admission(&env, &event("written"))
+        .await
+        .unwrap();
+    assert!(!db.call_admission_held(&env.id).await.unwrap());
+    let row = db.get_calendar_event("evt-1").await.unwrap().unwrap();
+    assert_eq!(row.title, "written");
+    assert_eq!(row.message_id.as_deref(), Some(env.id.to_hex().as_str()));
+
+    // RSVPs upsert by (event_id, responder) under the same contract.
+    let rsvp = |response: &str, id: &str| {
+        CalendarAdmission::Rsvp(RsvpRecord {
+            id: id.into(),
+            event_id: "evt-1".into(),
+            responder: sender.to_hex(),
+            response: response.into(),
+            comment: None,
+            created_at: String::new(),
+        })
+    };
+    db.commit_calendar_admission(&env, &rsvp("accepted", "r1"))
+        .await
+        .unwrap();
+    db.commit_calendar_admission(&env, &rsvp("declined", "r2"))
+        .await
+        .unwrap();
+    let (count, response): (i64, String) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(response) FROM calendar_rsvps WHERE event_id = 'evt-1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!((count, response.as_str()), (1, "declined"));
+    assert!(!db.call_admission_held(&env.id).await.unwrap());
+}

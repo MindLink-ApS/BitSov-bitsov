@@ -7,7 +7,7 @@ use konsensus_core::{
     OperatorHostingPayment, Recipient, RoomId, UkmEnvelope,
 };
 
-use crate::calendar::{CalendarEventRecord, RsvpRecord};
+use crate::calendar::{CalendarEventRecord, RsvpRecord, CalendarAdmission};
 use crate::error::StorageError;
 use crate::invites::{
     AcceptedInviteRecord, InviteIssuedRecord, InviteSchemaCapabilities, InviteState,
@@ -871,6 +871,23 @@ pub trait Storage: Send + Sync {
 
     /// Insert or update an RSVP record (upsert by `(event_id, responder)`).
     async fn store_rsvp(&self, _record: &RsvpRecord) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported(
+            "calendar storage not implemented for this backend".into(),
+        ))
+    }
+
+    /// Admit an accepted inbound calendar envelope: in one transaction, check
+    /// that the envelope is stored for this sender, persist its event (upsert
+    /// by id) or RSVP (upsert by `(event_id, responder)`), and release its
+    /// admission hold. Rolls back on any failure, so the envelope either has
+    /// its mutation and is visible, or stays held (hidden, withdrawn by the
+    /// sweep) with no mutation. An envelope that is not stored is refused with
+    /// `NotFound` and nothing is written.
+    async fn commit_calendar_admission(
+        &self,
+        _envelope: &konsensus_core::UkmEnvelope,
+        _admission: &CalendarAdmission,
+    ) -> Result<(), StorageError> {
         Err(StorageError::Unsupported(
             "calendar storage not implemented for this backend".into(),
         ))

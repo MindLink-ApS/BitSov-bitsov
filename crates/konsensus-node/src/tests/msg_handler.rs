@@ -272,6 +272,22 @@ impl Storage for TestStorage {
         self.rsvps.lock().unwrap().push(record.clone());
         Ok(())
     }
+    async fn commit_calendar_admission(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+        admission: &konsensus_storage::CalendarAdmission,
+    ) -> Result<(), StorageError> {
+        match admission {
+            konsensus_storage::CalendarAdmission::Event(record) => {
+                self.calendar_events.lock().unwrap().push(record.clone())
+            }
+            konsensus_storage::CalendarAdmission::Rsvp(record) => {
+                self.rsvps.lock().unwrap().push(record.clone())
+            }
+        }
+        self.holds.lock().unwrap().remove(&envelope.id.to_hex());
+        Ok(())
+    }
     async fn call_admission_hold(
         &self,
         envelope: &konsensus_core::UkmEnvelope,
@@ -4033,6 +4049,66 @@ async fn over_cap_calendar_invite_is_refused_withdrawn_and_terminal_for_the_send
         .unwrap()
         .is_none());
     assert_eq!(rsvp_count().await, 0);
+
+    // The calendar write itself fails after a successful acceptance: the hold
+    // release shares its transaction, so the invite stays held and hidden with
+    // no row. A resend is a replay of a still-held envelope and is refused, not
+    // re-admitted; the sweep withdraws it and the replay after that is
+    // terminal. No accepted, unheld envelope ever lacks its mutation.
+    sqlx::raw_sql("CREATE TRIGGER fail_calendar BEFORE INSERT ON calendar_events BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let unwritten = invite(calendar_json_id(
+        "evt-unwritten",
+        "never written",
+        1,
+        serde_json::Value::Null,
+    ))
+    .await;
+    source.send(bob.node_id(), &unwritten).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("storage error".into()));
+    assert!(db.call_admission_held(&unwritten.id).await.unwrap());
+    hidden(unwritten.clone()).await;
+    assert_eq!(receipt_accepted(unwritten.clone()).await, 1);
+    assert!(db
+        .get_calendar_event("evt-unwritten")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(ws_rx.try_recv().is_err());
+    sqlx::raw_sql("DROP TRIGGER fail_calendar")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    source.send(bob.node_id(), &unwritten).await.unwrap();
+    assert_eq!(
+        outcome(source.clone()).await,
+        Err("message withdrawn".into()),
+        "a held, accepted envelope is never duplicate-acknowledged"
+    );
+    assert!(db
+        .get_calendar_event("evt-unwritten")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        konsensus_api::calls::withdraw_held(db.as_ref(), true)
+            .await
+            .unwrap(),
+        1
+    );
+    hidden(unwritten.clone()).await;
+    assert_eq!(receipt_accepted(unwritten.clone()).await, -1);
+    assert!(db
+        .get_calendar_event("evt-unwritten")
+        .await
+        .unwrap()
+        .is_none());
+    source.send(bob.node_id(), &unwritten).await.unwrap();
+    let again = outcome(source.clone()).await.unwrap_err();
+    assert!(again.starts_with(APPLICATION_REJECTED_PREFIX), "{again}");
+    assert!(ws_rx.try_recv().is_err());
 
     // With the release working, an RSVP is released, persisted and acknowledged.
     let rsvp = paid(

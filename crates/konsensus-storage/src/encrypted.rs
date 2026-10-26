@@ -1231,6 +1231,16 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.store_rsvp(record).await
     }
 
+    async fn commit_calendar_admission(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+        admission: &crate::CalendarAdmission,
+    ) -> Result<(), StorageError> {
+        // Calendar rows stay plaintext (as `store_calendar_event`); the envelope
+        // is matched by id and sender only.
+        self.inner.commit_calendar_admission(envelope, admission).await
+    }
+
     // ── Operator hosting (pass-through — contract state contains no message plaintext) ─
 
     async fn upsert_operator_hosting_contract(
