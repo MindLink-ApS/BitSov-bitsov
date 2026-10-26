@@ -49,7 +49,7 @@ compose refuses `call_price_unknown` before paying.
 ## Paid interval state machine
 
 An offer rings for 60 seconds. A callee's paid answer (401) starts the call's
-clock and a ten-second initial payment window. The answer itself grants no
+clock and a thirty-second initial payment window. The answer itself grants no
 media. On receiving 401 the caller app requests block 0 through its own
 node's authenticated compose endpoint, using its existing spend grant and
 payment caps. The node refuses a block sent by the callee or for an unknown,
@@ -68,13 +68,18 @@ A late payment within ten seconds of the previous boundary extends that
 boundary by exactly 60 seconds; it never buys extra time by moving the
 anchor to its arrival. The grace endpoint is inclusive: media stops when
 `now > paid_until_ms + 10 seconds`. With no block zero, media remains refused
-and the initial window expires ten seconds after answer.
+and the initial window expires thirty seconds after answer. The receiver checks
+block admission before consuming its payment proof and holds that decision
+through acceptance, so crossing a deadline cannot consume a proof and then
+refuse the block.
 
 Calls are capped at 240 blocks (four hours). No payment revives an expired
 or ended call. Expiry changes the durable phase to `ended`, records
 `HangupReason::Unpaid`, and keeps the replay tombstone and any pending
-payment evidence. A one-second maintenance timer ages calls independently
-of connected apps, then attempts a 403 `reason: "unpaid"` through normal paid
+payment evidence. A 403 arriving after local `Unpaid` expiry is admitted
+without changing the tombstone; envelope replay protection still applies.
+A one-second maintenance timer ages calls independently
+of connected apps; only the callee then attempts a 403 `reason: "unpaid"` through normal paid
 compose with at most eight concurrent notifications, a five-second attempt deadline,
 a 1 000 msat total cap, zero routing fees, and no peer re-admission. Excess
 notifications are dropped rather than blocking expiry. The notification

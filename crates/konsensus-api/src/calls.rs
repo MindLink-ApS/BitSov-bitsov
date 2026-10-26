@@ -58,7 +58,7 @@ pub async fn call_media_admitted(store: Store<'_>, peer: &NodeId, call_id: &str,
 }
 
 /// End expired calls durably, retaining pending evidence and tombstones.
-/// The returned bounded list needs a best-effort 403 Unpaid notification.
+/// Only callee entries are returned for a best-effort 403 Unpaid notification.
 pub async fn expire_calls(store: Store<'_>, now: u64) -> Result<Vec<(NodeId, String)>, konsensus_storage::StorageError> {
     let _g = lock().lock().await;
     let mut expired = Vec::new();
@@ -73,7 +73,9 @@ pub async fn expire_calls(store: Store<'_>, now: u64) -> Result<Vec<(NodeId, Str
             ..entry
         });
         store.call_put(&peer, &call_id, &next).await?;
-        expired.push((peer, call_id));
+        if next.side == rules::Side::Callee {
+            expired.push((peer, call_id));
+        }
     }
     Ok(expired)
 }
@@ -166,6 +168,37 @@ async fn room(store: Store<'_>, peer: &NodeId, now: u64) -> Result<(), CallRefus
         return Err(CallRefusal::Full);
     }
     Ok(())
+}
+
+/// A validated incoming block, holding the call lock through paid acceptance.
+/// Dropping it without committing grants no media and changes no call state.
+pub struct IncomingBlock<'a> {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+    store: Store<'a>,
+    peer: NodeId,
+    signal: CallSignal,
+    next: CallEntry,
+}
+
+impl IncomingBlock<'_> {
+    /// Publish only after the envelope's payment proof is accepted. Do not
+    /// recheck time: expiry cannot race the admission decision under this lock.
+    pub async fn commit(self) -> Result<CallSignal, konsensus_storage::StorageError> {
+        self.store.call_put(&self.peer, &self.signal.call_id, &self.next).await?;
+        Ok(self.signal)
+    }
+}
+
+/// Check a payment-validated block before consuming its nonce/payment proof.
+/// Retain the returned guard until acceptance and commit; a late block must
+/// be refused here, never after the gate has consumed its payment proof.
+pub async fn prepare_incoming_block<'a>(store: Store<'a>, peer: &NodeId, plaintext: Option<&str>) -> Result<IncomingBlock<'a>, CallRefusal> {
+    let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, plaintext.ok_or(CallRefusal::Invalid("undecryptable"))?)?;
+    let guard = lock().lock().await;
+    let now = now_ms();
+    let entry = current(store, peer, &signal.call_id, now).await.map_err(|_| CallRefusal::Invalid("call state unavailable"))?;
+    let next = rules::receive_block(entry, signal.seq.ok_or(CallRefusal::Invalid("missing seq"))?, now)?;
+    Ok(IncomingBlock { _guard: guard, store, peer: *peer, signal, next })
 }
 
 /// Admit a signal this node (`own`) received from `peer` (after the payment

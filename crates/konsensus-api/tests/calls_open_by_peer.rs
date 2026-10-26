@@ -119,7 +119,7 @@ async fn open_calls_keep_expired_unresolved_admission_and_isolate_peers_without_
             json!([
                 {"id":"expired", "state":"ended", "direction":"outgoing", "unresolved_paid_admission":true, "created":123456, "op_id":"pending-offer", "paid_until_ms":null, "next_block_seq":0, "next_block_due_ms":null},
                 {"id":"incoming", "state":"ringing", "direction":"incoming", "unresolved_paid_admission":false, "created":null, "op_id":null, "paid_until_ms":null, "next_block_seq":0, "next_block_due_ms":null},
-                {"id":"live", "state":"live", "direction":"outgoing", "unresolved_paid_admission":false, "created":null, "op_id":null, "paid_until_ms":null, "next_block_seq":0, "next_block_due_ms":future - 10_000}
+                {"id":"live", "state":"live", "direction":"outgoing", "unresolved_paid_admission":false, "created":null, "op_id":null, "paid_until_ms":null, "next_block_seq":0, "next_block_due_ms":future - 30_000}
             ])
         );
     }

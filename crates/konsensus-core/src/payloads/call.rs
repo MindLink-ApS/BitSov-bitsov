@@ -1,6 +1,6 @@
 //! Node-routed call signalling and sequential paid 60-second blocks.
 //! Media travels app → own node → peer node → peer app. Only paid block
-//! settlement admits media; an answer starts a ten-second payment window.
+//! settlement admits media; an answer starts a thirty-second payment window.
 //! Durable reservations, bounded call ids and replay tombstones survive restarts.
 
 use serde::{Deserialize, Serialize};
@@ -20,8 +20,10 @@ pub const RING_TIMEOUT_MS: u64 = 60_000;
 pub const CALL_BLOCK_MS: u64 = 60_000;
 /// Renewal is due this long before the paid interval ends.
 pub const CALL_BLOCK_LEAD_MS: u64 = 20_000;
-/// Late payment slack, including the initial payment window after answer.
+/// Late payment slack after a paid interval.
 pub const CALL_BLOCK_GRACE_MS: u64 = 10_000;
+/// Block zero gets the same lead plus grace as a renewal, without media.
+pub const CALL_BLOCK_INITIAL_MS: u64 = CALL_BLOCK_LEAD_MS + CALL_BLOCK_GRACE_MS;
 /// Longest continuously paid call.
 pub const MAX_CALL_MS: u64 = 4 * 60 * 60 * 1000;
 /// How long an ended or expired call id stays burned.
@@ -323,12 +325,12 @@ impl CallEntry {
     /// The caller schedules this sequence through authenticated compose.
     pub fn next_block_due_ms(&self) -> Option<u64> {
         (self.phase == Phase::Live && u64::from(self.next_block_seq) < MAX_CALL_MS / CALL_BLOCK_MS).then(|| {
-            self.paid_until_ms.map_or(self.deadline_ms.saturating_sub(CALL_BLOCK_GRACE_MS), |until| until.saturating_sub(CALL_BLOCK_LEAD_MS))
+            self.paid_until_ms.map_or(self.deadline_ms.saturating_sub(CALL_BLOCK_INITIAL_MS), |until| until.saturating_sub(CALL_BLOCK_LEAD_MS))
         })
     }
 
     fn answered(self, now_ms: u64) -> Self {
-        Self { phase: Phase::Live, deadline_ms: now_ms.saturating_add(CALL_BLOCK_GRACE_MS), ..self }
+        Self { phase: Phase::Live, deadline_ms: now_ms.saturating_add(CALL_BLOCK_INITIAL_MS), ..self }
     }
 
     fn expired(&self, now_ms: u64) -> bool {
@@ -445,6 +447,11 @@ pub fn receive(entry: Option<CallEntry>, kind: u16, now_ms: u64) -> Result<CallE
         }
         KIND_ICE_CANDIDATE => entry.filter(|e| e.open()).ok_or(CallRefusal::UnknownCall),
         KIND_CALL_HANGUP => {
+            if let Some(e) = entry.as_ref().filter(|e| e.phase == Phase::Ended && e.end_reason == Some(HangupReason::Unpaid)) {
+                // The peer's expiry notification may arrive after our timer.
+                // Keep the original tombstone and any pending payment evidence.
+                return Ok(e.clone());
+            }
             let e = entry.filter(|e| e.open()).ok_or(CallRefusal::UnknownCall)?;
             // Their hangup wins; a signal of ours still being paid keeps its
             // mark so its settlement or release is still recorded.
@@ -470,7 +477,7 @@ fn check_block(entry: &CallEntry, seq: u32, now_ms: u64) -> Result<(), CallRefus
 
 fn apply_block(entry: CallEntry, seq: u32, now_ms: u64) -> Result<CallEntry, CallRefusal> {
     check_block(&entry, seq, now_ms)?;
-    let start = entry.paid_until_ms.unwrap_or_else(|| entry.deadline_ms.saturating_sub(CALL_BLOCK_GRACE_MS));
+    let start = entry.paid_until_ms.unwrap_or_else(|| entry.deadline_ms.saturating_sub(CALL_BLOCK_INITIAL_MS));
     let until = start.saturating_add(CALL_BLOCK_MS);
     Ok(CallEntry { paid_until_ms: Some(until), next_block_seq: seq.saturating_add(1), deadline_ms: until.saturating_add(CALL_BLOCK_GRACE_MS), ..entry })
 }

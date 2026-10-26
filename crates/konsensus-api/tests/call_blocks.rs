@@ -9,6 +9,60 @@ use konsensus_storage::{SqliteStorage, Storage};
 const ID: &str = "0123456789abcdef0123456789abcdef";
 
 #[tokio::test]
+async fn block_admission_keeps_its_decision_through_acceptance_and_expiry() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([9; 32]);
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let answered_at = now;
+    let ringing = rules::receive(None, 400, answered_at).unwrap();
+    let pending = rules::reserve(Some(ringing), 401, "answer", "hash", answered_at).unwrap();
+    let entry = rules::commit(pending, "answer", answered_at);
+    let deadline = entry.deadline_ms;
+    store.call_put(&peer, ID, &entry).await.unwrap();
+    let body = format!(r#"{{"v":1,"call_id":"{ID}","seq":0}}"#);
+
+    // Aborting paid acceptance releases the lock without admitting media.
+    let prepared = calls::prepare_incoming_block(&store, &peer, Some(&body)).await.unwrap();
+    assert!(!calls::call_media_admitted(&store, &peer, ID, now).await);
+    drop(prepared);
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(entry));
+
+    let prepared = calls::prepare_incoming_block(&store, &peer, Some(&body)).await.unwrap();
+    let expiry = calls::expire_calls(&store, deadline + 1);
+    tokio::pin!(expiry);
+    assert!(futures::poll!(&mut expiry).is_pending());
+    // The expiry sweep is already checking a time beyond the old deadline.
+    // It must wait for acceptance, then observe the extended paid interval.
+    prepared.commit().await.unwrap();
+    assert!(expiry.await.unwrap().is_empty());
+    let paid = store.call_get(&peer, ID).await.unwrap().unwrap();
+    assert_eq!(paid.paid_until_ms, Some(answered_at + 60_000));
+    assert_eq!(paid.next_block_seq, 1);
+    assert!(paid.media_admitted(deadline + 1));
+}
+
+#[tokio::test]
+async fn expiry_ends_both_sides_but_only_callee_needs_notification() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let caller_peer = NodeId::from_bytes([7; 32]);
+    let callee_peer = NodeId::from_bytes([8; 32]);
+    let ringing = rules::receive(None, 400, 0).unwrap();
+    let pending = rules::reserve(Some(ringing), 401, "answer", "hash", 1_000).unwrap();
+    let callee = rules::commit(pending, "answer", 1_000);
+    let caller = rules::CallEntry { side: rules::Side::Caller, ..callee.clone() };
+    store.call_put(&caller_peer, ID, &caller).await.unwrap();
+    store.call_put(&callee_peer, ID, &callee).await.unwrap();
+    assert_eq!(calls::expire_calls(&store, 31_001).await.unwrap(), vec![(callee_peer, ID.to_owned())]);
+    for peer in [caller_peer, callee_peer] {
+        let ended = store.call_get(&peer, ID).await.unwrap().unwrap();
+        assert_eq!(ended.phase, Phase::Ended);
+        assert_eq!(ended.end_reason, Some(HangupReason::Unpaid));
+        assert!(!ended.media_admitted(31_001));
+    }
+    assert!(calls::expire_calls(&store, 31_002).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn paid_blocks_survive_storage_roundtrip_and_admit_only_the_right_call() {
     let store = SqliteStorage::in_memory().await.unwrap();
     let peer = NodeId::from_bytes([1; 32]);
@@ -90,11 +144,11 @@ async fn unpaid_expiry_notification_cannot_grant_media_even_if_dispatch_fails() 
         1_000,
     );
     state.storage.call_put(&peer, ID, &entry).await.unwrap();
-    calls::maintain_calls(&state, 11_001).await.unwrap();
+    calls::maintain_calls(&state, 31_001).await.unwrap();
     let ended = state.storage.call_get(&peer, ID).await.unwrap().unwrap();
     assert_eq!(ended.phase, Phase::Ended);
     assert_eq!(ended.end_reason, Some(HangupReason::Unpaid));
-    assert!(!calls::call_media_admitted(state.storage.as_ref(), &peer, ID, 11_001).await);
+    assert!(!calls::call_media_admitted(state.storage.as_ref(), &peer, ID, 31_001).await);
 }
 
 #[tokio::test]
@@ -175,11 +229,11 @@ async fn delayed_block_invoice_cannot_charge_after_grace() {
         .unwrap();
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let ringing = rules::commit(
-        rules::reserve(None, 400, "offer", "hash", now - 8_000).unwrap(),
+        rules::reserve(None, 400, "offer", "hash", now - 28_000).unwrap(),
         "offer",
-        now - 8_000,
+        now - 28_000,
     );
-    let answered = rules::receive(Some(ringing), 401, now - 8_000).unwrap();
+    let answered = rules::receive(Some(ringing), 401, now - 28_000).unwrap();
     state.storage.call_put(&peer, ID, &answered).await.unwrap();
     let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
         .header("authorization", common::auth_header(&state)).header("content-type", "application/json")
