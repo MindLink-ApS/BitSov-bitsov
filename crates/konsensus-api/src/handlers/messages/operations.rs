@@ -318,7 +318,7 @@ impl Operation {
         op.state = "paying".into();
         encode(&mut op, &data)?;
         save(&self.state, &mut op).await?;
-        let mut result = debit.dispatch(future).await;
+        let mut result = debit.dispatch_message_payment(&self.state, future).await;
         match &mut result {
             Ok(Ok(details)) => {
                 if details.payment_hash.is_empty() {
@@ -514,6 +514,7 @@ pub(super) async fn compose_call(
     state: Arc<AppState>,
     mut req: ComposeRequest,
     references: Vec<MessageId>,
+    policy: super::compose::ComposePolicy,
 ) -> Result<Json<ComposeResponse>, ApiError> {
     let peer = NodeId::from_hex(&req.recipient)
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
@@ -546,7 +547,7 @@ pub(super) async fn compose_call(
         references,
         peer,
         id.clone(),
-        super::compose::ComposePolicy::default(),
+        policy,
     ).await;
     crate::calls::resolve_outgoing(state.storage.as_ref(), &peer, &plaintext, &id, &request_hash).await;
     result
@@ -633,6 +634,9 @@ async fn compose_locked(
                 ))
             }
         }
+    }
+    if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+        crate::calls::revalidate_outgoing_block(state.storage.as_ref(), &peer, &req.plaintext).await?;
     }
     // The CAS also serializes processes sharing a database. A claimed operation
     // never re-enters the paying handler without positive nonpayment evidence.

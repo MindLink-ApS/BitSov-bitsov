@@ -3439,7 +3439,7 @@ pub(super) async fn compose_message_with_policy(
         // Calls: reserved before any quote or payment and resolved afterwards,
         // under the operation's lock; the paid transition is published at
         // settlement (compose_peer).
-        super::operations::compose_call(auth, state, req, references).await
+        super::operations::compose_call(auth, state, req, references, policy).await
     } else {
         super::operations::compose(auth, state, req, references, policy).await
     }
@@ -3505,9 +3505,12 @@ pub(super) async fn compose_peer(
                 ).with_reason("call_needs_contact"));
             }
             // The offer pays the callee's own call price, asked of it just now.
-            if req.kind == konsensus_core::kind::KIND_CALL_INVITE {
-                price_msat = super::caps::payable(crate::calls::peer_call_price(&state, &peer_id).await?);
+            if matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK) {
+                price_msat = super::caps::payable(crate::calls::peer_call_kind_price(&state, &peer_id, req.kind).await?);
             }
+        }
+        if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+            crate::calls::revalidate_outgoing_block(state.storage.as_ref(), &peer_id, &req.plaintext).await?;
         }
         // G1 × F1 (#85): an aggregate cap alone never lets a budget pay a
         // stranger. A paired caller also needs the owner's one-time
@@ -3533,6 +3536,9 @@ pub(super) async fn compose_peer(
             .map_err(|e| e.with_routing_fee(state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat)))?
             .with_fee_limit(req.max_routing_fee_msat);
         let debit = debit.with_operation(operation.clone());
+        let debit = if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+            debit.for_call_block(peer_id, req.plaintext.clone())
+        } else { debit };
         if let Err(error) = operation.attach_debit(&debit).await {
             // No payment/invoice future has been polled under this debit.
             debit.released(&peer_key);

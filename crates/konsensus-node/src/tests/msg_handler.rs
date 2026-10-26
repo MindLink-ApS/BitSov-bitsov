@@ -2854,7 +2854,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
         lightning: wallet.clone(),
         chain: Arc::new(konsensus_chain::MockChainProvider::new()),
         peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
-        session_manager: sessions_b,
+        session_manager: sessions_b.clone(),
         nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
         content_server: None,
         front_door: Default::default(),
@@ -3026,6 +3026,74 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     source.send(bob.node_id(), &env).await.unwrap();
     assert!(outcome(source.clone()).await.is_err());
     assert!(ws_rx.try_recv().is_err());
+
+    // Block zero may take longer than ten seconds to reach the callee.
+    // The paid interval stays anchored to answer, and the gate remains single-use.
+    use konsensus_core::payloads::call::{self as calls, HangupReason, Phase};
+    let block_id = format!("{:032x}", rand::random::<u128>());
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let answered_at = now - 20_000;
+    let pending = calls::reserve(Some(calls::receive(None, 400, answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
+    let entry = calls::commit(pending, "answer", answered_at);
+    db.call_put(alice.node_id(), &block_id, &entry).await.unwrap();
+    let block = |seq| format!(r#"{{"v":1,"call_id":"{block_id}","seq":{seq}}}"#);
+    let env = signal(404, 10_000, block(0)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    let paid = db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap();
+    assert_eq!(paid.paid_until_ms, Some(answered_at + 60_000));
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(true));
+    assert!(ws_rx.try_recv().is_err());
+
+    // Block zero beyond the initial window is also refused without consuming
+    // either replay key or exposing its plaintext to history.
+    let late_id = format!("{:032x}", rand::random::<u128>());
+    let late_initial = calls::CallEntry { deadline_ms: now - 1, ..entry };
+    db.call_put(alice.node_id(), &late_id, &late_initial).await.unwrap();
+    let env = signal(404, 10_000, format!(r#"{{"v":1,"call_id":"{late_id}","seq":0}}"#)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(outcome(source.clone()).await.is_err());
+    assert!(!db.has_nonce(&env.nonce).await.unwrap());
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    assert!(db.get_message_plaintext(&env.id).await.unwrap().is_none());
+    assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(outcome(source.clone()).await.is_err());
+    assert!(sessions_b.has_session(alice.node_id()).await, "retrying a refused block must not reset the session");
+    assert!(db.store_payment_receipt(&env.payment_proof.payment_hash, alice.node_id(), &env.id).await.unwrap());
+    assert!(ws_rx.try_recv().is_err());
+
+    // An already settled late renewal is refused before either replay key
+    // is consumed. The call remains expired and no message reaches the app.
+    let expired = calls::CallEntry { deadline_ms: now - 1, ..paid };
+    db.call_put(alice.node_id(), &block_id, &expired).await.unwrap();
+    let env = signal(404, 10_000, block(1)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(outcome(source.clone()).await.is_err());
+    assert!(!db.has_nonce(&env.nonce).await.unwrap());
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    assert!(db.get_message_plaintext(&env.id).await.unwrap().is_none());
+    assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
+    assert!(db.store_payment_receipt(&env.payment_proof.payment_hash, alice.node_id(), &env.id).await.unwrap());
+    assert!(ws_rx.try_recv().is_err());
+
+    // The peer can observe the callee's unpaid termination even after its
+    // own timer expired. Replaying that envelope never notifies the app twice.
+    let ended = calls::CallEntry { side: calls::Side::Caller, ..expired.at(now).unwrap() };
+    assert_eq!(ended.end_reason, Some(HangupReason::Unpaid));
+    db.call_put(alice.node_id(), &block_id, &ended).await.unwrap();
+    let env = signal(403, 1_000, format!(r#"{{"v":1,"call_id":"{block_id}","reason":"unpaid"}}"#)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    let notification = ws_rx.recv().await.unwrap();
+    assert_eq!(notification.plaintext.as_deref(), Some(format!(r#"{{"v":1,"call_id":"{block_id}","reason":"unpaid"}}"#).as_str()));
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap(), Some(ended));
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(true));
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap().phase, Phase::Ended);
     shutdown.send(true).unwrap();
     worker.await.unwrap();
     source.shutdown();

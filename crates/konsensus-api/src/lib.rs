@@ -373,6 +373,24 @@ pub async fn serve(
             }
         }
     });
+    // Paid call deadlines are enforced independently of connected apps.
+    let call_state = state.clone();
+    let mut call_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64).unwrap_or(0);
+                    if let Err(error) = calls::maintain_calls(&call_state, now).await {
+                        tracing::warn!(%error, "call expiry maintenance failed");
+                    }
+                },
+                _ = call_shutdown.changed() => break,
+            }
+        }
+    });
     // Recovery only polls recorded payments and queues their encrypted envelopes.
     let operation_state = state.clone();
     let mut operation_shutdown = shutdown_rx.clone();

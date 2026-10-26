@@ -312,6 +312,30 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             continue;
                         }
 
+                        // Validate the block against call state before consuming its
+                        // proof. Keep the call lock through acceptance so a timer or
+                        // hangup cannot turn an admitted payment into a late refusal.
+                        let mut incoming_block = None;
+                        if gate_result.is_ok() && envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+                            // A refusal or storage failure must leave ratchet keys
+                            // available for a retransmission of this paid envelope.
+                            let block_plaintext = match konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext) {
+                                Ok(message) => session_mgr_for_recv.preview_decrypt(&sender, &message).await.ok()
+                                    .and_then(|bytes| String::from_utf8(bytes).ok()),
+                                Err(_) => None,
+                            };
+                            match konsensus_api::calls::prepare_incoming_block(
+                                storage_for_recv.as_ref(), &sender, block_plaintext.as_deref(),
+                            ).await {
+                                Ok(block) => incoming_block = Some(block),
+                                Err(refusal) => {
+                                    let reject = Frame::MessageReject { id: msg_id, reason: refusal.to_string() };
+                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    continue;
+                                }
+                            }
+                        }
+
                         // A call signal, and a chat (a candidate room chat: its
                         // binding is only visible after decryption), is held
                         // (invisible to history, plaintext, resync and duplicate
@@ -325,6 +349,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             match konsensus_api::calls::hold_incoming(storage_for_recv.as_ref(), &envelope).await {
                                 Ok(placed) => call_hold = placed,
                                 Err(e) => {
+                                    drop(incoming_block.take());
                                     // Fail closed: unheld, a refused message could stay visible.
                                     error!(msg_id = %msg_id, error = %e, "incoming message not held; not accepted");
                                     let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
@@ -344,6 +369,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     audit_for_recv.membrane().admitted(&envelope, gate_result.as_ref().expect("validated").0);
                                 }
                                 Ok(PaidAcceptance::AlreadyAccepted) => {
+                                    drop(incoming_block.take());
                                     // A call signal or chat still held was never admitted:
                                     // never acknowledge it as delivered.
                                     if held_kind
@@ -374,6 +400,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     gate_result = Err(rejection);
                                 }
                                 Err(e) => {
+                                    drop(incoming_block.take());
                                     if call_hold {
                                         let _ = storage_for_recv.call_admission_release(&msg_id).await;
                                     }
@@ -387,6 +414,9 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             }
                         }
 
+                        if gate_result.is_err() {
+                            drop(incoming_block.take());
+                        }
                         if call_hold && gate_result.is_err() {
                             // Nothing of ours was stored under this hold.
                             let _ = storage_for_recv.call_admission_release(&msg_id).await;
@@ -489,6 +519,20 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             continue;
                         }
 
+                        let admitted_block = match incoming_block {
+                            Some(block) => match block.commit().await {
+                                Ok(signal) => Some(signal),
+                                Err(e) => {
+                                    error!(msg_id = %msg_id, error = %e, "accepted block state could not be stored; withheld");
+                                    let _ = storage_for_recv.reject_accepted_envelope(&envelope).await;
+                                    let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        };
+
                         // M1b promote-on-paid: the PaymentGate just accepted a
                         // PAID, M2-recipient-bound UKM from `sender`. Flip this
                         // connection to privileged so its subsequent control frames
@@ -583,7 +627,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // accepts answer/ICE/hangup only for a live call with this
                         // sender. A refused signal never reaches the app.
                         if konsensus_api::calls::is_call_kind(envelope.kind) {
-                            let admitted = konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref()).await;
+                            let admitted = match admitted_block {
+                                Some(signal) => Ok(signal),
+                                None => konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref()).await,
+                            };
                             // Admitted: lift the hold before the app sees it. If that
                             // write fails the signal stays held and is withdrawn by the
                             // sweep: fail closed, the peer gets a reject, not an ACK.
