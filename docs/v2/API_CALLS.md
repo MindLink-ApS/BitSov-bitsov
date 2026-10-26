@@ -111,6 +111,7 @@ kept literally.
 | `/body/lightning_node_pubkey` | 66 lower-case hex chars | `<hex66>` |
 | `/body/message_id`, `/body/payment_hash` | 64 lower-case hex chars | `<hex64>` |
 | `/body/uptime_secs` | non-negative integer | `<uint>` |
+| `/body/*/next_block_due_ms` | non-negative integer ≥ 10^12 (Unix milliseconds) | `<unix_ms>` |
 | `/body/*/created` | non-negative integer ≥ 10^12 (Unix milliseconds) | `<unix_ms>` |
 
 ### Regenerating

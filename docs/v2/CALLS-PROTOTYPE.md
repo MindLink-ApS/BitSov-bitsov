@@ -71,13 +71,22 @@ anchor to its arrival. The grace endpoint is inclusive: media stops when
 and the initial window expires thirty seconds after answer. The receiver checks
 block admission before consuming its payment proof and holds that decision
 through acceptance, so crossing a deadline cannot consume a proof and then
-refuse the block.
+refuse the block. Late refusals emit `message.rejected` audit records.
+If the subsequent call-state write fails after paid acceptance, no media is
+granted and the receipt remains stored. A `call.block_commit_failed` audit
+record links its message id to the call id, sequence and amount for operator
+reconciliation; it contains no payment preimage or decrypted payload. This
+records the failure for manual reconciliation, not automatic retry or refund.
 
 Calls are capped at 240 blocks (four hours). No payment revives an expired
 or ended call. Expiry changes the durable phase to `ended`, records
 `HangupReason::Unpaid`, and keeps the replay tombstone and any pending
-payment evidence. A 403 arriving after local `Unpaid` expiry is admitted
-without changing the tombstone; envelope replay protection still applies.
+payment evidence. After local `Unpaid` expiry, the caller admits only one
+403 `reason: "unpaid"` from the callee, without changing the tombstone.
+A durable notice flag suppresses further distinct envelopes as well as
+ordinary envelope replays. Only the callee can reserve that notification;
+a pending retry is idempotent, definite nonpayment releases it, and a paid
+commit keeps the flag consumed across restarts.
 A one-second maintenance timer ages calls independently
 of connected apps; only the callee then attempts a 403 `reason: "unpaid"` through normal paid
 compose with at most eight concurrent notifications, a five-second attempt deadline,
@@ -103,7 +112,8 @@ unpaid timeout notification or outstanding reservation can authorize media.
 ## Persistence, recovery and bounds
 
 `call_state` stores side, phase, effective deadline, replay deadline,
-`paid_until_ms`, next sequence, end reason and any outgoing reservation.
+`paid_until_ms`, next sequence, end reason, the Unpaid notice flag and any outgoing reservation.
+Migration 036 adds the notice flag for SQLite and PostgreSQL.
 Migration 035 adds paid intervals in SQLite and PostgreSQL; versions 033/034
 are reserved by the schema-parity and call-invite changes. Existing live
 rows with no block proof are ended while retaining their entire replay
@@ -117,7 +127,9 @@ the sequence until payment settles. A recovered payment cannot revive an
 expired call. Before every new block charge, including after a failed-payment
 retry and after invoice response, the call is revalidated. After journal
 writes, phase, sequence and deadline are checked again under the call
-transition lock, held through the first wallet poll. Already-dispatched
+transition lock, held through the first wallet poll. A new wallet dispatch
+requires at least five seconds before the local deadline to allow for the
+callee's earlier answer time and payment/delivery latency. Already-dispatched
 payments retain normal settlement recovery, even if they settle after expiry. One operation cannot settle or release another request.
 
 Incoming call envelopes are held before paid acceptance. Only a

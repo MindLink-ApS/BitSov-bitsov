@@ -3,7 +3,7 @@ use konsensus_core::payloads::call::{
 };
 
 fn answered() -> CallEntry {
-    let ringing = calls::receive(None, 400, 0).unwrap();
+    let ringing = calls::receive(None, 400, None, 0).unwrap();
     let pending = calls::reserve(Some(ringing), 401, "answer", "hash", 1_000).unwrap();
     calls::commit(pending, "answer", 1_000)
 }
@@ -47,15 +47,17 @@ fn block_zero_allows_initial_round_trips_without_granting_unpaid_media() {
 
 #[test]
 fn unpaid_hangup_is_admitted_after_local_expiry_without_changing_the_tombstone() {
-    let ended = answered().at(31_001).unwrap();
+    let ended = CallEntry { side: calls::Side::Caller, ..answered().at(31_001).unwrap() };
     assert_eq!(ended.phase, Phase::Ended);
     assert_eq!(ended.end_reason, Some(HangupReason::Unpaid));
-    assert_eq!(calls::receive(Some(ended.clone()), 403, 32_000), Ok(ended.clone()));
-    assert!(calls::receive(Some(ended.clone()), 402, 32_000).is_err());
+    let notified = calls::receive(Some(ended.clone()), 403, Some(HangupReason::Unpaid), 32_000).unwrap();
+    assert_eq!(notified, CallEntry { unpaid_notice_used: true, ..ended.clone() });
+    assert_eq!(calls::receive(Some(notified), 403, Some(HangupReason::Unpaid), 32_001), Err(CallRefusal::UnknownCall));
+    assert!(calls::receive(Some(ended.clone()), 402, None, 32_000).is_err());
     assert!(calls::receive_block(Some(ended.clone()), 0, 32_000).is_err());
     let other_end = CallEntry { end_reason: Some(HangupReason::Hangup), ..ended };
-    assert!(calls::receive(Some(other_end), 403, 32_000).is_err());
-    assert!(calls::receive(None, 403, 32_000).is_err());
+    assert!(calls::receive(Some(other_end), 403, None, 32_000).is_err());
+    assert!(calls::receive(None, 403, None, 32_000).is_err());
 }
 
 #[test]
@@ -67,7 +69,7 @@ fn call_blocks_expiry_ends_unpaid_and_preserves_the_tombstone() {
     assert_eq!(ended.end_reason, Some(HangupReason::Unpaid));
     assert!(!ended.media_admitted(71_001));
     assert_eq!(
-        calls::receive(Some(ended), 400, 71_001),
+        calls::receive(Some(ended), 400, None, 71_001),
         Err(CallRefusal::Replayed)
     );
     let never_paid = answered().at(31_001).unwrap();
@@ -77,20 +79,20 @@ fn call_blocks_expiry_ends_unpaid_and_preserves_the_tombstone() {
 #[test]
 fn call_blocks_refuse_duplicates_gaps_early_unknown_ended_and_wrong_side() {
     assert!(calls::receive_block(None, 0, 1_000).is_err());
-    let ringing = calls::receive(None, 400, 0).unwrap();
+    let ringing = calls::receive(None, 400, None, 0).unwrap();
     assert!(calls::receive_block(Some(ringing), 0, 1_000).is_err());
     let first = calls::receive_block(Some(answered()), 0, 1_000).unwrap();
     for (seq, at) in [(0, 41_000), (2, 41_000), (u32::MAX, 41_000), (1, 40_999)] {
         assert!(calls::receive_block(Some(first.clone()), seq, at).is_err());
     }
-    let ended = calls::receive(Some(first), 403, 2_000).unwrap();
+    let ended = calls::receive(Some(first), 403, None, 2_000).unwrap();
     assert!(calls::receive_block(Some(ended), 1, 41_000).is_err());
     let own = calls::commit(
         calls::reserve(None, 400, "offer", "hash", 0).unwrap(),
         "offer",
         0,
     );
-    let caller = calls::receive(Some(own), 401, 1_000).unwrap();
+    let caller = calls::receive(Some(own), 401, None, 1_000).unwrap();
     assert!(calls::receive_block(Some(caller), 0, 1_000).is_err());
 }
 
@@ -123,7 +125,7 @@ fn call_blocks_outgoing_reservations_settle_once_and_cannot_revive_expiry() {
         "offer",
         0,
     );
-    let entry = calls::receive(Some(own), 401, 1_000).unwrap();
+    let entry = calls::receive(Some(own), 401, None, 1_000).unwrap();
     let pending = calls::reserve_block(Some(entry.clone()), 0, "block", "hash", 1_000).unwrap();
     assert_eq!(calls::release(pending.clone(), "block"), Some(entry));
     let first = calls::commit(pending.clone(), "block", 1_000);
@@ -140,7 +142,14 @@ fn unpaid_hangup_notification_never_reopens_an_ended_call() {
     let ended = calls::commit(pending, "timeout", 31_002);
     assert_eq!(ended.phase, Phase::Ended);
     assert!(!ended.media_admitted(31_002));
+    assert_eq!(calls::reserve_unpaid_hangup(Some(ended), "second", "hash2"), Err(CallRefusal::UnknownCall));
     assert!(calls::reserve_unpaid_hangup(Some(answered()), "timeout", "hash").is_err());
+}
+
+#[test]
+fn unpaid_hangup_cannot_be_reserved_by_the_caller() {
+    let ended = CallEntry { side: calls::Side::Caller, ..answered().at(31_001).unwrap() };
+    assert_eq!(calls::reserve_unpaid_hangup(Some(ended), "timeout", "hash"), Err(CallRefusal::UnknownCall));
 }
 
 #[test]
@@ -162,7 +171,7 @@ fn call_blocks_expired_pending_can_reconcile_but_cannot_pay_again() {
         "offer",
         0,
     );
-    let entry = calls::receive(Some(own), 401, 1_000).unwrap();
+    let entry = calls::receive(Some(own), 401, None, 1_000).unwrap();
     let pending = calls::reserve_block(Some(entry), 0, "block", "hash", 1_000).unwrap();
     assert!(
         calls::reserve_block(Some(pending.clone()), 0, "block", "hash", 31_001).is_ok(),
@@ -173,4 +182,17 @@ fn call_blocks_expired_pending_can_reconcile_but_cannot_pay_again() {
         "positive nonpayment evidence cannot authorize a new expired charge"
     );
     assert!(calls::validate_outgoing_block(&pending, 0, 31_000).is_ok());
+}
+
+#[test]
+fn unpaid_notice_reservation_retries_and_definite_nonpayment_release() {
+    let ended = answered().at(31_001).unwrap();
+    let pending = calls::reserve_unpaid_hangup(Some(ended.clone()), "notice", "hash").unwrap();
+    assert!(pending.unpaid_notice_used);
+    assert_eq!(calls::reserve_unpaid_hangup(Some(pending.clone()), "notice", "hash"), Ok(pending.clone()));
+    assert_eq!(calls::reserve_unpaid_hangup(Some(pending.clone()), "other", "hash"), Err(CallRefusal::InFlight));
+    assert_eq!(calls::release(pending.clone(), "notice"), Some(ended));
+    let committed = calls::commit(pending, "notice", 32_000);
+    assert!(committed.unpaid_notice_used);
+    assert_eq!(calls::release(committed.clone(), "notice"), Some(committed));
 }

@@ -3033,7 +3033,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     let block_id = format!("{:032x}", rand::random::<u128>());
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let answered_at = now - 20_000;
-    let pending = calls::reserve(Some(calls::receive(None, 400, answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
+    let pending = calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
     let entry = calls::commit(pending, "answer", answered_at);
     db.call_put(alice.node_id(), &block_id, &entry).await.unwrap();
     let block = |seq| format!(r#"{{"v":1,"call_id":"{block_id}","seq":{seq}}}"#);
@@ -3065,6 +3065,40 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     assert!(db.store_payment_receipt(&env.payment_proof.payment_hash, alice.node_id(), &env.id).await.unwrap());
     assert!(ws_rx.try_recv().is_err());
 
+    let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    assert!(audit_entries.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).any(|event|
+        event["event"] == konsensus_api::audit::events::MESSAGE_REJECTED
+            && event["detail"]["kind"] == 404
+            && event["detail"]["message_id"] == env.id.to_hex()
+    ), "late block refusal must leave an audit record");
+
+    // A paid block whose call-state write fails leaves explicit evidence for
+    // reconciliation, bound to its retained payment receipt, without media.
+    let failed_id = format!("{:032x}", rand::random::<u128>());
+    let failed_entry = calls::CallEntry { deadline_ms: now + 30_000, ..late_initial.clone() };
+    db.call_put(alice.node_id(), &failed_id, &failed_entry).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_call_commit BEFORE UPDATE ON call_state BEGIN SELECT RAISE(ABORT, 'injected call commit failure'); END")
+        .execute(db.pool()).await.unwrap();
+    let failed = signal(404, 10_000, format!(r#"{{"v":1,"call_id":"{failed_id}","seq":0}}"#)).await;
+    source.send(bob.node_id(), &failed).await.unwrap();
+    assert!(outcome(source.clone()).await.is_err());
+    sqlx::query("DROP TRIGGER fail_call_commit").execute(db.pool()).await.unwrap();
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &failed_id).await.unwrap(), Some(failed_entry));
+    assert!(db.get_message(&failed.id).await.unwrap().is_none());
+    assert!(db.get_message_plaintext(&failed.id).await.unwrap().is_none());
+    let receipt: (String, i64, i32) = sqlx::query_as("SELECT message_id, amount_msat, accepted FROM payment_receipts WHERE payment_hash = ?")
+        .bind(hex::encode(failed.payment_proof.payment_hash)).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(receipt, (failed.id.to_hex(), 10_000, -1));
+    let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    let reconciliation = audit_entries.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["event"] == "call.block_commit_failed" && event["detail"]["message_id"] == failed.id.to_hex())
+        .expect("failed paid block needs a reconciliation record");
+    assert_eq!(reconciliation["detail"]["call_id"], failed_id);
+    assert_eq!(reconciliation["detail"]["seq"], 0);
+    assert_eq!(reconciliation["detail"]["amount_msat"], 10_000);
+    assert_eq!(reconciliation["detail"]["reconciliation_required"], true);
+
     // An already settled late renewal is refused before either replay key
     // is consumed. The call remains expired and no message reaches the app.
     let expired = calls::CallEntry { deadline_ms: now - 1, ..paid };
@@ -3089,11 +3123,16 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     assert_eq!(outcome(source.clone()).await, Ok(false));
     let notification = ws_rx.recv().await.unwrap();
     assert_eq!(notification.plaintext.as_deref(), Some(format!(r#"{{"v":1,"call_id":"{block_id}","reason":"unpaid"}}"#).as_str()));
-    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap(), Some(ended));
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap(), Some(calls::CallEntry { unpaid_notice_used: true, ..ended }));
     source.send(bob.node_id(), &env).await.unwrap();
     assert_eq!(outcome(source.clone()).await, Ok(true));
     assert!(ws_rx.try_recv().is_err());
     assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap().phase, Phase::Ended);
+    let second = signal(403, 1_000, format!(r#"{{"v":1,"call_id":"{block_id}","reason":"unpaid"}}"#)).await;
+    assert_ne!(second.id, env.id);
+    source.send(bob.node_id(), &second).await.unwrap();
+    assert!(outcome(source.clone()).await.is_err());
+    assert!(ws_rx.try_recv().is_err(), "a distinct paid notice must not reach the app twice");
     shutdown.send(true).unwrap();
     worker.await.unwrap();
     source.shutdown();

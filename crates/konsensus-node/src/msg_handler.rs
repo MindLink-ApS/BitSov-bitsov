@@ -329,6 +329,14 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             ).await {
                                 Ok(block) => incoming_block = Some(block),
                                 Err(refusal) => {
+                                    audit_for_recv.record(
+                                        konsensus_api::audit::events::MESSAGE_REJECTED,
+                                        &sender.to_hex(),
+                                        Some(serde_json::json!({
+                                            "reason": refusal.to_string(), "kind": envelope.kind,
+                                            "message_id": msg_id.to_hex(),
+                                        })),
+                                    );
                                     let reject = Frame::MessageReject { id: msg_id, reason: refusal.to_string() };
                                     let _ = transport_for_ack.send_frame(&sender, &reject).await;
                                     continue;
@@ -520,14 +528,32 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         }
 
                         let admitted_block = match incoming_block {
-                            Some(block) => match block.commit().await {
-                                Ok(signal) => Some(signal),
-                                Err(e) => {
-                                    error!(msg_id = %msg_id, error = %e, "accepted block state could not be stored; withheld");
-                                    let _ = storage_for_recv.reject_accepted_envelope(&envelope).await;
-                                    let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
-                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
-                                    continue;
+                            Some(block) => {
+                                let identity = block.signal().clone();
+                                match block.commit().await {
+                                    Ok(signal) => Some(signal),
+                                    Err(e) => {
+                                        error!(msg_id = %msg_id, error = %e, "accepted block state could not be stored; withheld");
+                                        // The receipt retains settlement evidence even when
+                                        // withdrawal removes the message. Link it to the
+                                        // failed service interval for reconciliation; never
+                                        // put a preimage or decrypted payload in the audit.
+                                        audit_for_recv.record(
+                                            konsensus_api::audit::events::CALL_BLOCK_COMMIT_FAILED,
+                                            &sender.to_hex(),
+                                            Some(serde_json::json!({
+                                                "message_id": msg_id.to_hex(),
+                                                "call_id": identity.call_id,
+                                                "seq": identity.seq,
+                                                "amount_msat": envelope.payment_proof.amount_msat,
+                                                "reconciliation_required": true,
+                                            })),
+                                        );
+                                        let _ = storage_for_recv.reject_accepted_envelope(&envelope).await;
+                                        let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                        let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                        continue;
+                                    }
                                 }
                             },
                             None => None,
