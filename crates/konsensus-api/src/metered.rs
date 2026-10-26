@@ -311,7 +311,7 @@ impl Debit {
     pub(crate) async fn dispatch_message_payment<F>(&self, state: &AppState, future: F) -> Result<F::Output, ApiError>
     where F: Future<Output=Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>> {
         let (mut call_guard, deadline) = if let Some((peer, plaintext)) = &self.call_block {
-            match crate::calls::block_dispatch_guard(state.storage.as_ref(), peer, plaintext).await {
+            match crate::calls::block_dispatch_guard(state, peer, plaintext).await {
                 Ok((guard, deadline)) => (Some(guard), Some(deadline)),
                 Err(error) => return Ok(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(error.to_string()))),
             }
@@ -496,8 +496,14 @@ impl Debit {
     /// Nothing was paid to `recipient`: refused before dispatch, or the
     /// payment was confirmed failed.
     pub fn released(&self, recipient: &str) {
+        self.released_with_outcome(recipient, false);
+    }
+
+    pub(crate) fn released_with_outcome(&self, recipient: &str, payment_failed: bool) {
         if let Some((service, reservation)) = &self.held {
-            service.resolve_spend(reservation, recipient, 0);
+            if let Err(error) = service.try_resolve_spend_outcome(reservation, recipient, 0, payment_failed) {
+                tracing::warn!(%error, "spend release deferred; reservation retained");
+            }
         }
     }
 

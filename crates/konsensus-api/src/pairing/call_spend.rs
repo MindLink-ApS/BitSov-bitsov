@@ -3,6 +3,21 @@ use super::*;
 use crate::spend_budget::{CallSpendStatus, CallSpendTerms, OperationReservationLink};
 
 impl PairingService {
+    pub(crate) fn prune_call_spend(&self, now: i64) -> Result<(), PairingError> {
+        let mut inner = self.lock();
+        let before = inner.file.clone();
+        for budget in inner.file.grants.iter_mut().filter_map(|g| g.budget.as_mut()) {
+            budget.prune_call_tombstones(now);
+        }
+        if inner.file.grants.iter().zip(&before.grants).any(|(a, b)| a.budget != b.budget) {
+            if let Err(error) = self.persist(&mut inner.file) {
+                inner.file = before;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     fn call_grant_index(
         &self,
         inner: &Inner,
@@ -42,6 +57,8 @@ impl PairingService {
         terms: CallSpendTerms,
         capacity_msat: u64,
     ) -> Result<Reservation, BudgetRefusal> {
+        self.prune_call_spend(chrono::Utc::now().timestamp())
+            .map_err(|e| BudgetRefusal::Ledger(e.to_string()))?;
         let mut inner = self.lock();
         let idx = self.call_grant_index(&inner, client, epoch)?;
         for (grant_idx, grant) in inner.file.grants.iter().enumerate() {
@@ -77,7 +94,7 @@ impl PairingService {
         if inner.file.grants[idx]
             .budget
             .as_ref()
-            .is_some_and(|b| b.call_reservations.len() >= 1024)
+            .is_some_and(|b| b.call_reservations.values().filter(|c| !c.closed || !c.draws.is_empty()).count() >= 1024)
         {
             return Err(BudgetRefusal::Ledger(
                 "call reservation ledger is full; ask the owner for a new grant".into(),
@@ -133,9 +150,7 @@ impl PairingService {
             .find(|(_, call)| call.terms.peer == peer && call.terms.call_id == call_id)
             .ok_or_else(|| BudgetRefusal::Unpriced("call has no spend reservation".into()))?;
         if call.closed
-            || u64::from(seq)
-                >= konsensus_core::payloads::call::MAX_CALL_MS
-                    / konsensus_core::payloads::call::CALL_BLOCK_MS
+            || seq >= u32::from(call.terms.max_call_minutes)
         {
             return Err(BudgetRefusal::Unpriced(
                 "call reservation is closed or duration cap reached".into(),

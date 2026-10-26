@@ -3999,6 +3999,16 @@ impl PairingService {
         recipient: &str,
         actual_msat: u64,
     ) -> Result<(), PairingError> {
+        self.try_resolve_spend_outcome(reservation, recipient, actual_msat, false)
+    }
+
+    pub(crate) fn try_resolve_spend_outcome(
+        &self,
+        reservation: &Reservation,
+        recipient: &str,
+        actual_msat: u64,
+        payment_failed: bool,
+    ) -> Result<(), PairingError> {
         let mut inner = self.lock();
         let Some(grant) = inner
             .file
@@ -4011,6 +4021,9 @@ impl PairingService {
         let Some(budget) = grant.budget.as_mut() else {
             return Ok(());
         };
+        if budget.call_reservations.contains_key(&reservation.id) {
+            return Err(PairingError::Malformed("a call hold must be closed, not resolved as a payment".into()));
+        }
         let before = budget.clone();
         let Some(recipients) = budget.pending.get_mut(&reservation.id) else {
             return Ok(());
@@ -4022,7 +4035,7 @@ impl PairingService {
             budget.pending.remove(&reservation.id);
             budget.operation_links.remove(&reservation.id);
         }
-        if !budget.resolve_call_draw(&reservation.id, recipient, reserved, actual_msat) {
+        if !budget.resolve_call_draw(&reservation.id, recipient, reserved, actual_msat, payment_failed) {
             budget.resolve(recipient, reserved, actual_msat);
             budget.record_outcome(reserved, actual_msat, chrono::Utc::now().timestamp());
         }

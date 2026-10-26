@@ -81,7 +81,7 @@ async fn open_calls(
         if let Some(entry) = entry.at(now) {
             calls.push(OpenCall {
                 reservation: state.pairing.as_ref().and_then(|s| s.call_spend_status(&peer.to_hex(), &id)),
-                id,
+                id: id.clone(),
                 state: entry.phase.as_str(),
                 direction: match entry.side {
                     Side::Caller => "outgoing",
@@ -91,7 +91,9 @@ async fn open_calls(
                 created,
                 paid_until_ms: entry.paid_until_ms,
                 next_block_seq: entry.next_block_seq,
-                next_block_due_ms: entry.next_block_due_ms(),
+                next_block_due_ms: if entry.side == Side::Caller && entry.next_block_seq >= u32::from(crate::calls::call_max_minutes(&state, &peer, &id)) {
+                    None
+                } else { entry.next_block_due_ms() },
                 op_id: entry.pending.map(|p| p.operation_id),
             });
         }

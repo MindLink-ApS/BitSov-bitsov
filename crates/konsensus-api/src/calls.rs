@@ -72,7 +72,10 @@ pub async fn expire_calls(store: Store<'_>, now: u64) -> Result<Vec<(NodeId, Str
             deadline_ms: entry.deadline_ms.saturating_add(rules::TOMBSTONE_MS),
             ..entry
         });
-        store.call_put(&peer, &call_id, &next).await?;
+        if let Err(error) = store.call_put(&peer, &call_id, &next).await {
+            tracing::warn!(%error, "call expiry deferred");
+            continue;
+        }
         if next.side == rules::Side::Callee {
             expired.push((peer, call_id));
         }
@@ -81,22 +84,56 @@ pub async fn expire_calls(store: Store<'_>, now: u64) -> Result<Vec<(NodeId, Str
 }
 
 
+/// A hold pins the owner's setting for that call, including across restart.
+/// Owner-authorized calls without a grant use the current node setting.
+pub(crate) fn call_max_minutes(state: &AppState, peer: &NodeId, id: &str) -> u16 {
+    state.pairing.as_ref().and_then(|s| s.call_spend_status(&peer.to_hex(), id))
+        .map_or(state.max_call_minutes, |s| s.max_call_minutes)
+}
+
+async fn expire_call_caps(state: &AppState, now: u64) -> Result<Vec<(NodeId, String)>, konsensus_storage::StorageError> {
+    let _guard = lock().lock().await;
+    let mut expired = Vec::new();
+    for (peer, id, mut entry) in state.storage.call_live().await? {
+        if entry.side != rules::Side::Caller || entry.phase != rules::Phase::Live { continue; }
+        let minutes = u32::from(call_max_minutes(state, &peer, &id));
+        let Some(until) = entry.paid_until_ms.filter(|_| entry.next_block_seq >= minutes) else { continue };
+        let until = until.saturating_sub(u64::from(entry.next_block_seq - minutes) * rules::CALL_BLOCK_MS);
+        if now < until { continue; }
+        entry.phase = rules::Phase::Ended;
+        entry.end_reason = Some(rules::HangupReason::DurationCap);
+        entry.deadline_ms = until.saturating_add(rules::TOMBSTONE_MS);
+        match state.storage.call_put(&peer, &id, &entry).await {
+            Ok(()) => expired.push((peer, id)),
+            Err(error) => tracing::warn!(%error, "call duration expiry deferred"),
+        }
+    }
+    Ok(expired)
+}
+
 /// Timer maintenance: expiry is committed before any network operation.
 /// Hangups use the ordinary paid compose path, never re-admit a disconnected
 /// peer, and cannot restore media. A failed notification cannot prolong a call.
 pub async fn maintain_calls(state: &std::sync::Arc<AppState>, now: u64) -> Result<(), konsensus_storage::StorageError> {
     use crate::handlers::messages::{compose_for, ComposeRequest};
-    let expired = expire_calls(state.storage.as_ref(), now).await?;
-    reconcile_call_spend(state, now).await?;
+    let mut expired: Vec<_> = expire_call_caps(state, now).await?.into_iter()
+        .map(|(peer, id)| (peer, id, rules::HangupReason::DurationCap)).collect();
+    match expire_calls(state.storage.as_ref(), now).await {
+        Ok(calls) => expired.extend(calls.into_iter().map(|(peer, id)| (peer, id, rules::HangupReason::Unpaid))),
+        Err(error) => tracing::warn!(%error, "call expiry sweep deferred"),
+    }
+    if let Err(error) = reconcile_call_spend(state, now).await {
+        tracing::warn!(%error, "call spend maintenance deferred");
+    }
     // No network wait in the expiry loop and no unbounded task/queue growth.
     static NOTIFICATIONS: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let slots = NOTIFICATIONS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(8)));
-    for (peer, call_id) in expired {
+    for (peer, call_id, reason) in expired {
         let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
         let state = state.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let plaintext = serde_json::json!({"v": 1, "call_id": call_id, "reason": "unpaid"}).to_string();
+            let plaintext = serde_json::json!({"v": 1, "call_id": call_id, "reason": reason.as_str()}).to_string();
             let request = ComposeRequest {
                 operation_id: Some(uuid::Uuid::new_v4().to_string()), wait_ack_ms: Some(0),
                 max_routing_fee_msat: Some(0), max_total_msat: Some(1_000), max_recipient_msat: None,
@@ -108,7 +145,7 @@ pub async fn maintain_calls(state: &std::sync::Arc<AppState>, now: u64) -> Resul
             let result = tokio::time::timeout(Duration::from_secs(5),
                 compose_for(crate::metered::MeteredSpend::call_timeout(&state), state.clone(), request)).await;
             if !matches!(result, Ok(Ok(_))) {
-                tracing::debug!(%peer, "Unpaid call ended; best-effort hangup notification failed");
+                tracing::debug!(%peer, "call ended; best-effort hangup notification failed");
             }
         });
     }
@@ -121,13 +158,25 @@ pub async fn maintain_calls(state: &std::sync::Arc<AppState>, now: u64) -> Resul
 pub async fn reconcile_call_spend(state: &AppState, now: u64) -> Result<(), konsensus_storage::StorageError> {
     let Some(service) = &state.pairing else { return Ok(()) };
     let _guard = lock().lock().await;
+    let mut first_error = None;
     for (reservation, terms) in service.call_spend_holds() {
-        let peer = NodeId::from_hex(&terms.peer).map_err(|e| konsensus_storage::StorageError::Serialization(e.to_string()))?;
-        let entry = state.storage.call_get(&peer, &terms.call_id).await?;
-        if entry.and_then(|e| e.at(now)).is_none_or(|e| e.phase == rules::Phase::Ended) {
-            service.close_call_spend(&reservation).map_err(|e| konsensus_storage::StorageError::Serialization(e.to_string()))?;
+        let result = async {
+            let peer = NodeId::from_hex(&terms.peer).map_err(|e| konsensus_storage::StorageError::Serialization(e.to_string()))?;
+            let entry = state.storage.call_get(&peer, &terms.call_id).await?;
+            if entry.and_then(|e| e.at(now)).is_none_or(|e| e.phase == rules::Phase::Ended) {
+                service.close_call_spend(&reservation).map_err(|e| konsensus_storage::StorageError::Serialization(e.to_string()))?;
+            }
+            Ok::<_, konsensus_storage::StorageError>(())
+        }.await;
+        if let Err(error) = result {
+            tracing::warn!(%error, "call hold cleanup deferred");
+            first_error.get_or_insert(error);
         }
     }
+    if let Err(error) = service.prune_call_spend((now / 1000).min(i64::MAX as u64) as i64) {
+        first_error.get_or_insert(konsensus_storage::StorageError::Serialization(error.to_string()));
+    }
+    if let Some(error) = first_error { return Err(error); }
     Ok(())
 }
 
@@ -170,7 +219,7 @@ pub(crate) async fn ensure_call_spend(auth: &crate::metered::MeteredSpend, state
     if entry.next_block_seq != 0 {
         return Err(ApiError::BadRequest("call reservation missing after block zero; start a new call".into()));
     }
-    let terms = crate::spend_budget::CallSpendTerms::new(&peer.to_hex(), &signal.call_id, price, fee)
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer.to_hex(), &signal.call_id, price, fee, state.max_call_minutes)
         .map_err(ApiError::BudgetExceeded)?;
     // One active outbound channel must cover the hold. Do not infer spendable
     // capacity from wallet balance, channel size, or an unknown provider field.
@@ -181,19 +230,22 @@ pub(crate) async fn ensure_call_spend(auth: &crate::metered::MeteredSpend, state
 
 /// Recovery may resend settled blocks, but a new charge needs a still-payable
 /// interval. Recheck after reconciliation and after asking the callee's price.
-pub(crate) async fn revalidate_outgoing_block(store: Store<'_>, peer: &NodeId, plaintext: &str) -> Result<u64, ApiError> {
-    let (_guard, deadline) = block_dispatch_guard(store, peer, plaintext).await?;
+pub(crate) async fn revalidate_outgoing_block(state: &AppState, peer: &NodeId, plaintext: &str) -> Result<u64, ApiError> {
+    let (_guard, deadline) = block_dispatch_guard(state, peer, plaintext).await?;
     Ok(deadline)
 }
 
 /// Keep call transitions serialized until the wallet's first poll. The caller
 /// must release this guard after that poll, including when it returns Pending.
-pub(crate) async fn block_dispatch_guard(store: Store<'_>, peer: &NodeId, plaintext: &str) -> Result<(tokio::sync::MutexGuard<'static, ()>, u64), ApiError> {
+pub(crate) async fn block_dispatch_guard(state: &AppState, peer: &NodeId, plaintext: &str) -> Result<(tokio::sync::MutexGuard<'static, ()>, u64), ApiError> {
     let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, plaintext).map_err(|e| refused(e, false))?;
     let guard = lock().lock().await;
-    let entry = store.call_get(peer, &signal.call_id).await
+    let entry = state.storage.call_get(peer, &signal.call_id).await
         .map_err(|_| ApiError::Internal("call state unavailable".into()))?
         .ok_or_else(|| refused(CallRefusal::UnknownCall, false))?;
+    if signal.seq.is_some_and(|seq| seq >= u32::from(call_max_minutes(state, peer, &signal.call_id))) {
+        return Err(ApiError::BadRequest("call duration cap reached".into()).with_reason("call_duration_cap"));
+    }
     rules::validate_outgoing_block(&entry, signal.seq.ok_or_else(|| refused(CallRefusal::Sequence, false))?, now_ms())
         .map_err(|e| refused(e, false))?;
     Ok((guard, entry.deadline_ms))
@@ -381,6 +433,8 @@ pub async fn reserve_outgoing(
         rules::reserve_block(entry.clone(), signal.seq.ok_or_else(|| refused(CallRefusal::Invalid("missing seq")))?, operation_id, request_hash, now)
     } else if kind == konsensus_core::kind::KIND_CALL_HANGUP && signal.reason == Some(rules::HangupReason::Unpaid) {
         rules::reserve_unpaid_hangup(entry.clone(), operation_id, request_hash)
+    } else if kind == konsensus_core::kind::KIND_CALL_HANGUP && signal.reason == Some(rules::HangupReason::DurationCap) {
+        rules::reserve_duration_hangup(entry.clone(), operation_id, request_hash)
     } else {
         rules::reserve(entry.clone(), kind, operation_id, request_hash, now)
     }.map_err(refused)?;
@@ -401,11 +455,24 @@ async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &s
     if !entry.pending.as_ref().is_some_and(|p| p.is(operation_id, request_hash)) {
         return Ok(());
     }
-    let next = match how {
+    // Preserve terminal failure across restart and same-operation retries. A
+    // mere pre-dispatch release has no failed payment evidence and stays live.
+    let failed = if how == Settlement::Unpaid {
+        store.get_outbox_operation(operation_id).await?.is_some_and(|op| {
+            op.recipient == peer.to_hex()
+                && entry.pending.as_ref().is_some_and(|p| i64::from(p.kind) == op.kind)
+                && (request_hash.is_empty() || op.request_hash == request_hash)
+                && crate::handlers::messages::operations::definite_call_payment_failure(&op)
+        })
+    } else { false };
+    let next = if failed && entry.phase != rules::Phase::Ended {
+        Some(CallEntry { phase: rules::Phase::Ended, end_reason: Some(rules::HangupReason::Failed),
+            pending: None, deadline_ms: now.saturating_add(rules::TOMBSTONE_MS), ..entry })
+    } else { match how {
         Settlement::Paid => Some(rules::commit(entry, operation_id, now)),
         Settlement::Unpaid => rules::release(entry, operation_id),
         Settlement::Ambiguous => return Ok(()),
-    };
+    }};
     write(store, peer, call_id, next.as_ref()).await
 }
 
@@ -466,7 +533,8 @@ pub async fn settle_operation(store: Store<'_>, op: &konsensus_storage::OutboxOp
     }
     let Ok(peer) = NodeId::from_hex(&op.recipient) else { return };
     let how = rules::settlement(Some(&op.state));
-    if how == Settlement::Ambiguous || (how == Settlement::Unpaid && !release) {
+    if how == Settlement::Ambiguous || (how == Settlement::Unpaid && !release
+        && !crate::handlers::messages::operations::definite_call_payment_failure(op)) {
         return;
     }
     let pending = match store.call_pending().await {

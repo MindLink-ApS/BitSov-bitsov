@@ -63,6 +63,8 @@ pub struct MemStorage {
     pub peer_delete_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub call_block_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub call_offer_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub fail_call_get_for: Mutex<Option<String>>,
+    pub fail_call_put_for: Mutex<Option<String>>,
     calls: Mutex<HashMap<(NodeId, String), konsensus_core::payloads::call::CallEntry>>,
     outbox: Mutex<HashMap<String, konsensus_storage::OutboxOperation>>,
     calendar: Mutex<HashMap<String, konsensus_storage::calendar::CalendarEventRecord>>,
@@ -87,6 +89,8 @@ impl MemStorage {
             peer_delete_gate: Mutex::new(None),
             call_block_dispatch_gate: Mutex::new(None),
             call_offer_dispatch_gate: Mutex::new(None),
+            fail_call_get_for: Mutex::new(None),
+            fail_call_put_for: Mutex::new(None),
             calls: Mutex::new(HashMap::new()),
             outbox: Mutex::new(HashMap::new()),
             calendar: Mutex::new(HashMap::new()),
@@ -119,10 +123,16 @@ impl MemStorage {
 #[async_trait]
 impl Storage for MemStorage {
     async fn call_get(&self, peer: &NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+        if self.fail_call_get_for.lock().unwrap().as_deref() == Some(call_id) {
+            return Err(StorageError::Serialization("injected call read failure".into()));
+        }
         Ok(self.calls.lock().unwrap().get(&(*peer, call_id.to_owned())).cloned())
     }
 
     async fn call_put(&self, peer: &NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+        if self.fail_call_put_for.lock().unwrap().as_deref() == Some(call_id) {
+            return Err(StorageError::Serialization("injected call write failure".into()));
+        }
         self.calls.lock().unwrap().insert((*peer, call_id.to_owned()), entry.clone());
         Ok(())
     }
@@ -1102,6 +1112,7 @@ pub fn test_state() -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         recovery_dir: None,
@@ -1169,6 +1180,7 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         recovery_dir: None,
@@ -1224,6 +1236,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         recovery_dir: None,
@@ -1289,6 +1302,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         recovery_dir: None,
@@ -1344,6 +1358,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         recovery_dir: None,
@@ -1606,6 +1621,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         recovery_dir: None,
@@ -1851,6 +1867,7 @@ pub fn test_state_with_lightning_and_storage(
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         recovery_dir: None,

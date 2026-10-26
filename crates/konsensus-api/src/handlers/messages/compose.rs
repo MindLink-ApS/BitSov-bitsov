@@ -3510,7 +3510,7 @@ pub(super) async fn compose_peer(
             }
         }
         if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
-            crate::calls::revalidate_outgoing_block(state.storage.as_ref(), &peer_id, &req.plaintext).await?;
+            crate::calls::revalidate_outgoing_block(&state, &peer_id, &req.plaintext).await?;
         }
         if auth.is_metered() && matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK) {
             let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
@@ -3812,6 +3812,7 @@ pub(super) async fn compose_peer(
             Err(ApiError::PaymentUnresolved(_)) if admission.readmission_blocks_message => debit.settled(&peer_key, admission.settled_msat.saturating_sub(admission.readmission_msat)),
             Err(ApiError::PaymentUnresolved(_)) if admission.current_dispatch => {},
             Err(ApiError::PaymentProofUnavailable { amount_msat, .. }) => debit.settled(&peer_key, amount_msat.saturating_sub(admission.readmission_msat)),
+            Err(_) if req.kind == konsensus_core::kind::KIND_CALL_BLOCK => operation.release_call_debit(&debit, &peer_key).await,
             Err(_) => debit.released(&peer_key),
         }
         let message_msat = admission.message_authorized.unwrap_or(price_msat);

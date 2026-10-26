@@ -44,13 +44,13 @@ The bound also applies if the stored data exceeds the admission bound.
   and an answer/hangup timestamp is not the call's creation time.
 - `paid_until_ms`: nullable Unix-millisecond boundary of the last settled 60-second block; null until block zero settles.
 - `next_block_seq`: next required block sequence, starting at zero.
-- `next_block_due_ms`: Unix-millisecond renewal time (20 seconds before the paid boundary), or the answer time for block zero; null when ended or at the four-hour cap.
+- `next_block_due_ms`: Unix-millisecond renewal time (20 seconds before the paid boundary), or the answer time for block zero; null when ended or when all blocks allowed by the duration cap have been paid.
 - `op_id`: nullable string, the stored pending signal's operation id, or `null`
   once no operation binding remains in call state. It can refer to an answer
   or hangup rather than an offer. No placeholder strings are returned.
 - `reservation`: present for an outgoing call backed by a paired app's spend
   grant. Contains `reserved_msat`, `spent_msat`, `remaining_msat`,
-  `per_block_msat`, `per_block_fee_msat`, `released_msat`, and `closed`.
+  `per_block_msat`, `per_block_fee_msat`, `max_call_minutes`, `released_msat`, and `closed`.
   `spent_msat` includes settled block principal and known routing fees.
   `remaining_msat` includes unresolved payment liabilities and excludes released
   funds. It is an observation, never new payment authority. The original
@@ -74,15 +74,39 @@ operation journal. See [call protocol and recovery](CALLS-PROTOTYPE.md).
 
 ## Paired-app call spending (M6 N3)
 
-Before a caller's offer is dispatched, the node reserves 240 blocks (the
-four-hour maximum) at the callee's current kind-404 price, plus the enforced
+The owner sets the outgoing paid-duration cap in node configuration:
+
+```toml
+[calls]
+max_call_minutes = 60
+```
+
+The default is **60 minutes**; only integers from **1 through 240** are accepted.
+Restart the node to apply a config change. A paired-app reservation pins its
+cap when created, so a config change never resizes an existing hold. Holds
+created before this setting existed retain their original 240-minute cap.
+Owner-authorized calls without a grant use the current node setting.
+
+Before a caller's offer is dispatched, the node reserves `max_call_minutes`
+60-second blocks at the callee's current kind-404 price, plus the enforced
 routing-fee ceiling for each block. The existing minimum invoice amount also
 applies. Already-answered calls without a hold may reserve at block zero.
 The total must fit the approved grant's total, per-call, recipient, envelope,
 allowlist and spend-velocity limits. This block bundle counts as one breaker
 entry; the separate ringing fee and other signaling retain their ordinary
 metering. Blocks draw from the bundle without another breaker entry or the
-generic messaging per-payment ceiling.
+generic messaging per-payment ceiling. Thus the per-block limit comes from the
+grant limits divided across the reserved minutes, not the 6-sat messaging cap;
+raising the grant's velocity/total limits or reducing reserved minutes permits
+a higher per-block price.
+
+After the final allowed block, `next_block_due_ms` is null and a new block is
+refused with `reason: "call_duration_cap"`. The one-second maintenance sweep
+ends the call at the final paid boundary, without renewal grace, records
+`duration_cap`, and attempts a paid kind-403 notification with that reason.
+Notification failure cannot extend the call. A peer predating this reason may
+ignore the notification and ends through its ordinary unpaid expiry instead.
+The cap counts paid media intervals from the answer, not ringing time.
 
 One active channel's known spendable outbound capacity must cover the hold,
 less all other held call funds. Unknown capacity fails closed. This is a
@@ -99,6 +123,31 @@ one-second call maintenance sweep repair interrupted releases. A closed hold
 cannot fund a retried offer; use a new call id. A block price above the reserved
 price ends the call with `call_price_changed`. Later requests may tighten the
 original routing ceiling but cannot widen it; blocks cannot pay re-admission.
+
+Validation and transient invoice refusals leave a live call retryable. Definite
+payment failure or a price above the reserved ceiling ends it; ambiguous
+payments remain journaled and the ordinary expiry deadline still applies.
+Declined/unanswered holds with zero settled spend are neutral to the failure
+breaker; confirmed first-block payment failures still count, including a failure
+resolved after hangup. Cleanup errors are logged and retried; they never replace a successful
+compose response or prevent unrelated expiry notifications.
+
+Finished holds become small receipts without paid-block lists. At most 256
+finished receipts per grant are retained, for at most 24 hours after completion;
+oldest receipts are removed first under count pressure. Open holds and unresolved
+child payments are never pruned. Call-row tombstones continue to protect call
+ids after a spend receipt is removed.
+
+**Downgrade:** a pre-#460 binary rejects the ledger's `call_reservations` field.
+Downgrade is unsupported while any hold, unresolved draw, or finished receipt
+remains. End calls, let operation reconciliation finish, then leave the new
+binary running for at least 24 hours after the last hold finishes so maintenance
+can prune the receipts. With no retained calls the field is omitted and the
+ledger has the previous schema again. Remove `calls.max_call_minutes` from the
+config before starting an older binary. Never delete the ledger or edit out
+holds to bypass the restriction: that can discard payment liabilities. Retained
+`duration_cap` reasons in call rows require a binary that recognizes that reason;
+allow those call tombstones to expire as well before downgrading.
 
 This slice adds no SQL migration. Any new migration needs the owner's GO.
 
