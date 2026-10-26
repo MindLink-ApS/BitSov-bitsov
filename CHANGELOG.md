@@ -5,6 +5,12 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Report the node's configured Bitcoin network (`bitcoin`, `testnet`, `signet`
+  or `regtest`) as `network` in the unauthenticated `GET /api/v1/bootstrap/state`
+  response, so a client can confirm the network during remote-owner first run
+  before any identity exists. The field is absent when the lightning backend
+  does not state a network; no other field, route or authentication rule of the
+  bootstrap router changes (#443).
 - Add owner-authenticated claim-code display for app onboarding:
   `GET /api/v1/owner/claim-code` on the owner-local API only (loopback source,
   local console session or enrolled owner device), rate limited, `no-store`,

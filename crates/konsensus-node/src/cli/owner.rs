@@ -1253,6 +1253,7 @@ pub async fn serve_bootstrap_mode(
     );
     let align_path = config_path.to_path_buf();
     let mut state = konsensus_api::bootstrap::BootstrapState::new(layout, pairing)
+        .with_network(config.lightning.bitcoin_network())
         .with_before_marker(move |outcome| {
             align_config_mnemonic(&align_path, &outcome.mnemonic_path)
                 .map_err(|e| konsensus_api::bootstrap::CommitError::Io(e.to_string()))
