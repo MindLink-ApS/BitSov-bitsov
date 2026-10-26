@@ -58,8 +58,8 @@ export PATH="$PWD/target/release:$PATH"
 `init` creates a data directory, a 24-word recovery phrase, and
 `konsensus.toml`. Use the `full` tier: it is the one with embedded Lightning
 (LDK) and a real chain source, which signet needs. Pick a dedicated directory
-owned by you: `init` creates it, or re-uses an empty one, at mode `0700`, and
-writes the recovery phrase owner-only (`0600`). At startup the node chmods a
+owned by you: `init` creates it if needed, sets it to mode `0700`, and writes
+the recovery phrase owner-only (`0600`). At startup the node chmods a
 group- or world-readable `mnemonic.txt` back to `0600` and refuses to start if
 that fails.
 
