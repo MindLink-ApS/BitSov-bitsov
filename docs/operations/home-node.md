@@ -1,5 +1,8 @@
 # Home node: unlock after a restart
 
+For a first developer node on signet without remote unlock, start with the
+[signet quickstart](../QUICKSTART-SIGNET.md) instead.
+
 Run one process, data directory, identity and password per person. Use one
 command throughout setup and later reboots:
 
