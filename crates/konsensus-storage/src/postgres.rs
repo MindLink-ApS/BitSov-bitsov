@@ -1771,12 +1771,8 @@ impl Storage for PostgresStorage {
             .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
         sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE payment_hash = $1 AND message_id = $2")
             .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(&id).execute(&mut *tx).await?;
-        let released = sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
+        sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
             .bind(&id).execute(&mut *tx).await?;
-        if released.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Err(StorageError::NotFound(format!("admission hold for {id}")));
-        }
         tx.commit().await?;
         Ok(())
     }

@@ -1682,12 +1682,8 @@ impl Storage for SqliteStorage {
             .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
         sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE payment_hash = ? AND message_id = ?")
             .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(&id).execute(&mut *tx).await?;
-        let released = sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
+        sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
             .bind(&id).execute(&mut *tx).await?;
-        if released.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Err(StorageError::NotFound(format!("admission hold for {id}")));
-        }
         tx.commit().await?;
         Ok(())
     }
