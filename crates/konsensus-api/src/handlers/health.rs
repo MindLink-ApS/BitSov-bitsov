@@ -385,6 +385,7 @@ async fn status(
                 "message_operations_v1",
                 "message_operation_abandon_v1",
                 "channel_open_operations_v1",
+                super::payments::direct::CAPABILITY,
                 super::messages::caps::CAPABILITY,
                 super::messages::caps::QUOTED_READMISSION_CAPABILITY,
                 super::messages::caps::ROOM_CAPABILITY,

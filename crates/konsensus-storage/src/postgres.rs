@@ -854,6 +854,16 @@ impl Storage for PostgresStorage {
             .bind(id)
             .execute(&self.pool).await?.rows_affected() == 1)
     }
+    async fn record_channel_open_outcome(&self, expected: &crate::ChannelOpenOperation, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
+        if expected.state == crate::channel_open::CHANNEL_OPEN_OPENED {
+            return Ok(false);
+        }
+        let changed = sqlx::query("UPDATE channel_open_operations SET state = $1, result = $2, last_error = $3, updated_at = $4 WHERE operation_id = $5 AND request_hash = $6 AND created_at = $7 AND state = $8")
+            .bind(state).bind(result).bind(last_error).bind(chrono::Utc::now().timestamp_millis())
+            .bind(&expected.operation_id).bind(&expected.request_hash).bind(expected.created_at).bind(&expected.state)
+            .execute(&self.pool).await?.rows_affected();
+        Ok(changed == 1)
+    }
     async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
         Ok(sqlx::query("DELETE FROM channel_open_operations WHERE operation_id = $1 AND state = 'pending'")
             .bind(id)
@@ -933,6 +943,13 @@ impl Storage for PostgresStorage {
 
         sqlx::query("INSERT INTO pending_deliveries (message_id, recipient_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
             .bind(envelope.id.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
+        // A paid web request binds its reply in the same transaction as its
+        // envelope: no crash window between "paid and queued" and "reply bindable".
+        if let Some(row) = crate::outstanding_web_request_row(envelope)? {
+            sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
+                .bind(row.payment_hash).bind(row.request_id).bind(row.peer).bind(row.expected_reply_kind).bind(row.expires_at_ms)
+                .execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(true)
     }
