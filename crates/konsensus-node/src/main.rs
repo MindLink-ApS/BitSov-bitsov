@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod content_server;
 mod contracts;
+mod data_dir_hygiene;
 mod delivery_prices;
 mod endpoints;
 mod guarded_lightning;
@@ -459,6 +460,7 @@ fn cmd_init(
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create directory: {}", dir.display()))?;
     restrict_data_dir(dir)?;
+    data_dir_hygiene::prepare(dir)?;
 
     let config_path = dir.join("konsensus.toml");
     let mnemonic_path = dir.join("mnemonic.txt");
@@ -591,6 +593,8 @@ fn cmd_restore(
         "restore requires an empty directory; never reuse a live store or snapshot"
     );
     let _lease = safety::ensure_generation(dir, safety::STATE_GENERATION)?;
+    // After the emptiness check: the ignore file must not count as prior state.
+    data_dir_hygiene::prepare(dir)?;
 
     let config_path = dir.join("konsensus.toml");
     let mnemonic_path = dir.join("mnemonic.txt");
@@ -1176,6 +1180,10 @@ async fn cmd_start(
     let data_dir = owner_cmd::data_dir_of(config_path);
     if data_dir.is_dir() {
         restrict_data_dir(&data_dir)?;
+        // Best effort on existing nodes: hygiene never blocks startup.
+        if let Err(error) = data_dir_hygiene::prepare(&data_dir) {
+            eprintln!("WARNING: could not write data directory .gitignore: {error:#}");
+        }
     }
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
