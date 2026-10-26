@@ -181,6 +181,7 @@ Console recovery and revocation remain available even for the last key.
 | `DELETE /api/v1/pair/device-keys/{key_id}` | paired, own | retire own key; its envelopes end |
 | `POST /api/v1/pair/relation-intent` | paired + device signature | opens or renews one peer's envelope |
 | `DELETE /api/v1/pair/elevation/{op}` | paired, own | cancel a pending console grant request |
+| `GET /api/v1/owner/claim-code` | loopback only: local console session, or paired token with an enrolled owner device key | `{state}` plus `code`, `expires_at`, `device_name` while a claim-bound (SAS v1) enrollment is pending; `claimed`, `closed` or `unavailable` otherwise. Not on the tunnel router. 5 reads/minute per actor, `no-store`, never logged. See [owner claim-code display](pairing.md#owner-claim-code-display) |
 | control socket `ApproveDeviceKey` | owner | registers the key (short code or full line) |
 | control socket `RevokeDeviceKey` | owner | retires a key |
 

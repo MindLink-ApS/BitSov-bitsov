@@ -59,6 +59,12 @@ list/read/manifest, file download/list, hosting contracts list + ledger, calenda
 `read` includes **message plaintext** (`/messages/:id/plaintext`) and message search. That is
 deliberate and is the main residual exposure of loopback issuance — see the closing section.
 
+`GET /owner/claim-code` requires `read` and, on top of the token, a loopback source and an
+owner actor: a token without a pairing binding (a local console session), or a paired token
+whose pairing holds an enrolled owner device key. A plain paired `read` token is refused. The
+route is mounted on the owner-local router only, never behind the tunnel. See
+[owner claim-code display](pairing.md#owner-claim-code-display).
+
 ### receive
 `GET /payments/funding-address` · `POST /payments/invoice` ·
 `POST /onboarding/start` with `tier: "full"`
