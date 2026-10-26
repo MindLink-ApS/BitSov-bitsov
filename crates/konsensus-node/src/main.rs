@@ -1640,11 +1640,11 @@ async fn start_node_services<'a>(
         _ => None,
     };
 
-    // M6 N2: node-routed call media. Until N1 lands, admission is "the call
-    // is live"; N1 tightens it to paid-until.
+    // M6 N2: node-routed call media, admitted by N1's settled-block
+    // coverage and paid-until grace check.
     let call_media = call_media::CallMediaRouter::new(
         Arc::clone(node.transport()) as Arc<dyn call_media::MediaLink>,
-        Arc::new(call_media::LiveCallAdmission::new(Arc::clone(node.storage()))),
+        Arc::new(call_media::PaidCallAdmission::new(Arc::clone(node.storage()))),
     );
     let call_media_handle = call_media.spawn(node.shutdown_rx());
 

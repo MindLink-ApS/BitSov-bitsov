@@ -981,11 +981,11 @@ impl MessageTransport for NoiseTransport {
     }
 
     async fn is_connected(&self, peer: &NodeId) -> bool {
-        self.peers.read().await.contains_key(peer)
+        self.peers.read().await.get(peer).is_some_and(|conn| !conn.is_closed())
     }
 
     async fn connected_peers(&self) -> Vec<NodeId> {
-        self.peers.read().await.keys().copied().collect()
+        self.peers.read().await.iter().filter_map(|(peer, conn)| (!conn.is_closed()).then_some(*peer)).collect()
     }
 
     async fn request_peer_exchange(&self, peer: &NodeId) -> Result<(), TransportError> {
@@ -4353,6 +4353,57 @@ mod tests {
 mod cancelled_noise_write_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn cancelled_media_send_invalidates_connection_before_signalling_reuse() {
+        let mut sender = NoiseSession::initiator(&[11; 32]).unwrap();
+        let mut receiver = NoiseSession::responder(&[22; 32]).unwrap();
+        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
+        sender.read_handshake(&receiver.write_handshake(&[]).unwrap()).unwrap();
+        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
+        assert!(sender.try_finish_handshake().unwrap());
+        assert!(receiver.try_finish_handshake().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
+        let (_reader, writer) = client.unwrap().into_split();
+        let (mut server, addr) = accepted.unwrap();
+        let identity = Arc::new(NodeIdentity::generate().unwrap().1);
+        let transport = NoiseTransport::new(identity, TransportConfig::default());
+        let peer = NodeId::from_bytes([44; 32]);
+        let now = Instant::now();
+        let conn = Connection::new(PeerConnection {
+            advertised_trust_discount: None, source_ip: addr.ip(), privileged: true,
+            noise: sender, writer, tier: SovereigntyTier::T1, capabilities: vec![],
+            connected_at: now, last_recv: now, pending_ping: None,
+            invalid_frame_level: 0.0, invalid_frame_last_leak: now,
+            bytes_received: 0, memory_budget_window_start: now,
+        }, peer, transport.peers.clone(), true).unwrap();
+        transport.peers.write().await.insert(peer, conn.clone());
+        // Cancellation before encryption must leave the connection usable.
+        let held = conn.lock().await;
+        assert!(tokio::time::timeout(Duration::from_millis(10), transport.send_call_media(&peer, b"waiting"))
+            .await.is_err());
+        assert!(!conn.is_closed());
+        drop(held);
+        // Synthetic large record forces a partial write even on hosts with
+        // large TCP buffers; exercise the actual media-send cancellation path.
+        let bytes = vec![0x5a; 4 * 1024 * 1024];
+        assert!(tokio::time::timeout(Duration::from_millis(30), transport.send_call_media(&peer, &bytes))
+            .await.is_err(), "record must be backpressured");
+        assert!(conn.is_closed(), "cancelled media write must immediately invalidate its connection");
+        assert!(!transport.is_connected(&peer).await);
+        assert!(!transport.connected_peers().await.contains(&peer));
+        let draining = tokio::spawn(async move {
+            let mut wire = Vec::new();
+            server.read_to_end(&mut wire).await.unwrap();
+            wire
+        });
+        assert!(transport.send_frame(&peer, &Frame::SessionAck).await.is_err());
+        let wire = tokio::time::timeout(Duration::from_secs(2), draining).await.unwrap().unwrap();
+        let advertised = u32::from_be_bytes(wire[..4].try_into().unwrap()) as usize;
+        assert!(wire.len() > 4 && wire.len() < advertised + 4, "interrupted record must be partial");
+        transport.shutdown();
+    }
 
     #[tokio::test]
     async fn cancelled_partial_frame_closes_socket_before_next_send() {

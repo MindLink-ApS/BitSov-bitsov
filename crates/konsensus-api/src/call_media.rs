@@ -31,7 +31,7 @@ use axum::routing::get;
 use axum::Router;
 use konsensus_core::types::NodeId;
 use serde::Deserialize;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tracing::{debug, warn};
 
 use crate::auth;
@@ -94,6 +94,7 @@ struct QueueState {
 pub struct MediaQueue {
     state: Mutex<QueueState>,
     notify: Notify,
+    closed: watch::Sender<bool>,
 }
 
 impl MediaQueue {
@@ -106,6 +107,7 @@ impl MediaQueue {
                 dropped: 0,
             }),
             notify: Notify::new(),
+            closed: watch::channel(false).0,
         })
     }
 
@@ -160,8 +162,14 @@ impl MediaQueue {
     /// Stop accepting packets; queued ones can still be popped.
     pub fn close(&self) {
         self.lock().closed = true;
+        self.closed.send_replace(true);
         self.notify.notify_waiters();
         self.notify.notify_one();
+    }
+
+    /// Wait for termination independently of queued packets or socket I/O.
+    pub async fn closed(&self) {
+        let _ = self.closed.subscribe().wait_for(|closed| *closed).await;
     }
 
     pub fn is_closed(&self) -> bool {
@@ -306,7 +314,9 @@ async fn media_handler(
         }
     };
     debug!(node_id = %claims.sub, peer = %peer, "call media socket attached");
-    ws.protocols([crate::ws::WS_PROTOCOL])
+    ws.max_message_size(SEQ_HEADER_BYTES + MAX_MEDIA_PAYLOAD_BYTES)
+        .max_frame_size(SEQ_HEADER_BYTES + MAX_MEDIA_PAYLOAD_BYTES)
+        .protocols([crate::ws::WS_PROTOCOL])
         .on_upgrade(move |socket| handle_media(socket, state, claims, attachment))
         .into_response()
 }
@@ -317,94 +327,116 @@ const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(4
 /// How often the token and pairing are re-checked while the socket is open.
 const AUTH_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Applies to every explicit socket send, including pong, keepalive and close.
+const SOCKET_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+const MAX_SOCKET_MESSAGES_PER_SECOND: u32 = 100;
+const MAX_SOCKET_BYTES_PER_SECOND: usize = 64 * 1024;
+
+struct IngressBudget {
+    start: tokio::time::Instant,
+    messages: u32,
+    bytes: usize,
+}
+
+impl IngressBudget {
+    fn new() -> Self {
+        Self { start: tokio::time::Instant::now(), messages: 0, bytes: 0 }
+    }
+
+    fn admit(&mut self, message: &Message) -> bool {
+        if self.start.elapsed() >= std::time::Duration::from_secs(1) {
+            *self = Self::new();
+        }
+        // Count every message before parsing/copying application payloads.
+        let bytes = match message {
+            Message::Binary(data) | Message::Ping(data) | Message::Pong(data) => data.len(),
+            Message::Text(text) => text.len(),
+            Message::Close(frame) => frame.as_ref().map_or(0, |frame| 2 + frame.reason.len()),
+        };
+        self.messages += 1;
+        self.bytes += bytes;
+        self.messages <= MAX_SOCKET_MESSAGES_PER_SECOND && self.bytes <= MAX_SOCKET_BYTES_PER_SECOND
+    }
+}
+
+async fn socket_send(socket: &mut WebSocket, message: Message) -> bool {
+    matches!(tokio::time::timeout(SOCKET_WRITE_DEADLINE, socket.send(message)).await, Ok(Ok(())))
+}
+
 async fn handle_media(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Claims, attachment: MediaAttachment) {
+    // Keep these futures outside the I/O loop: a pending send cannot suspend
+    // revocation, expiry or route termination. Cancelling socket I/O is safe
+    // here because this socket is dropped, never reused by another handler.
+    let close = tokio::select! {
+        biased;
+        _ = attachment.from_node.closed() => false,
+        _ = attachment.to_node.closed() => false,
+        _ = async {
+            let mut recheck = tokio::time::interval(AUTH_RECHECK_INTERVAL);
+            loop {
+                recheck.tick().await;
+                if !stream_authorized(&state, &claims) { break; }
+            }
+        } => false,
+        close = media_io(&mut socket, &attachment.from_node, &attachment.to_node) => close,
+    };
+    // Release the route before any best-effort close handshake. A write
+    // failure/timeout drops immediately, with no attempt to reuse the socket.
+    drop(attachment);
+    if close {
+        let _ = socket_send(&mut socket, Message::Close(None)).await;
+    }
+}
+
+/// Returns false when a failed/timed-out write requires an immediate drop.
+async fn media_io(socket: &mut WebSocket, from_node: &MediaQueue, to_node: &MediaQueue) -> bool {
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     keepalive.tick().await;
-    let mut recheck = tokio::time::interval(AUTH_RECHECK_INTERVAL);
-    recheck.tick().await;
+    let mut ingress = IngressBudget::new();
     let mut malformed: u64 = 0;
-
     loop {
         tokio::select! {
-            // The peer's packets, to the app.
-            frame = attachment.from_node.pop() => {
-                match frame {
-                    Some(frame) => {
-                        if socket.send(Message::Binary(frame.to_ws_bytes())).await.is_err() {
-                            debug!("call media socket closed by the app");
-                            break;
-                        }
-                    }
-                    None => {
-                        // The router ended the call's media.
-                        let _ = socket.send(Message::Close(None)).await;
-                        break;
-                    }
+            frame = from_node.pop() => {
+                let Some(frame) = frame else { return true };
+                if !socket_send(socket, Message::Binary(frame.to_ws_bytes())).await {
+                    return false;
                 }
             }
-
-            // The app's packets, to the node.
             msg = socket.recv() => {
+                let msg = match msg {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(_)) | None => return false,
+                };
+                if !ingress.admit(&msg) {
+                    debug!("call media socket: ingress budget exhausted");
+                    return true;
+                }
                 match msg {
-                    Some(Ok(Message::Binary(bytes))) => match MediaFrame::from_ws_bytes(&bytes) {
+                    Message::Binary(bytes) => match MediaFrame::from_ws_bytes(&bytes) {
                         Some(frame) => {
-                            if attachment.to_node.push(frame).is_err() {
-                                let _ = socket.send(Message::Close(None)).await;
-                                break;
-                            }
+                            if to_node.push(frame).is_err() { return true; }
                         }
                         None => {
                             malformed += 1;
                             if malformed == 1 {
-                                warn!(len = bytes.len(), "call media socket: malformed or oversize packet dropped (further ones counted only)");
+                                warn!(len = bytes.len(), "call media socket: malformed packet dropped (further ones counted only)");
                             }
                         }
                     },
-                    Some(Ok(Message::Ping(data))) => {
-                        if socket.send(Message::Pong(data)).await.is_err() {
-                            break;
-                        }
+                    Message::Ping(data) => {
+                        if !socket_send(socket, Message::Pong(data)).await { return false; }
                     }
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(val) = konsensus_core::wire_json::from_str::<serde_json::Value>(&text) {
-                            if val.get("type").and_then(|t| t.as_str()) == Some("ping")
-                                && socket.send(Message::Text(r#"{"type":"pong"}"#.to_string())).await.is_err()
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        debug!("call media socket closed");
-                        break;
-                    }
-                    Some(Err(e)) => {
-                        debug!(error = %e, "call media socket error");
-                        break;
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
+                    // This is a binary media protocol. Text consumes the same
+                    // ingress budget but never JSON parsing or a text reply.
+                    Message::Text(_) | Message::Pong(_) => {}
+                    Message::Close(_) => return true,
                 }
             }
-
-            // Revocation, rebinding or expiry closes an open socket.
-            _ = recheck.tick() => {
-                if !stream_authorized(&state, &claims) {
-                    let _ = socket.send(Message::Close(None)).await;
-                    break;
-                }
-            }
-
             _ = keepalive.tick() => {
-                if socket.send(Message::Ping(vec![0x6b, 0x61])).await.is_err() {
-                    break;
-                }
+                if !socket_send(socket, Message::Ping(vec![0x6b, 0x61])).await { return false; }
             }
         }
     }
-    if malformed > 0 {
-        debug!(malformed, "call media socket: malformed packets dropped");
-    }
-    // Dropping the attachment detaches the call from the router.
 }
 
 fn stream_authorized(state: &Arc<AppState>, claims: &auth::Claims) -> bool {

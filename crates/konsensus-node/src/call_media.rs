@@ -23,10 +23,9 @@
 //! flight holds it) and is dropped past that, so audio never queues behind
 //! bulk data for longer than that bound.
 //!
-//! Admission (stub until N1): media is admitted while the `call_state` entry
-//! for `(peer, call_id)` is live, i.e. the call was answered and has not
-//! ended or expired. N1 replaces [`LiveCallAdmission`] with its paid-until
-//! check behind the same trait; nothing here reads prices or blocks.
+//! Admission uses N1's settled-block check: the stored call must be live
+//! and within paid-until plus grace. A per-route timer checks even idle calls
+//! or a stalled peer write, releasing the route when admission ends.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -36,7 +35,6 @@ use async_trait::async_trait;
 use konsensus_api::call_media::{
     AttachRefusal, CallMediaPort, MediaAttachment, MediaFrame, MediaQueue, MEDIA_QUEUE_FRAMES,
 };
-use konsensus_core::payloads::call::Phase;
 use konsensus_core::traits::transport::{MessageTransport, TransportError};
 use konsensus_core::types::NodeId;
 use konsensus_message::wire::{is_call_id, CALL_MEDIA_CAPABILITY, MAX_CALL_MEDIA_BYTES};
@@ -59,36 +57,28 @@ pub const ADMISSION_RECHECK: Duration = Duration::from_secs(1);
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Whether media for `(peer, call_id)` may flow right now. `now_ms` is Unix
-/// milliseconds. N1 supplies the paid-until implementation.
+/// milliseconds. Production uses N1's settled-block admission.
 #[async_trait]
 pub trait CallMediaAdmission: Send + Sync {
     async fn call_media_admitted(&self, peer: &NodeId, call_id: &str, now_ms: u64) -> bool;
 }
 
-/// Admission until N1: the stored call is live (answered, not ended, not
-/// expired). Ringing is not live: nothing flows before the answer.
-pub struct LiveCallAdmission {
+/// Production admission: N1's live call and settled paid-block boundary.
+/// Unknown calls, ringing/ended calls and storage errors all fail closed.
+pub struct PaidCallAdmission {
     storage: Arc<dyn Storage>,
 }
 
-impl LiveCallAdmission {
+impl PaidCallAdmission {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
         Self { storage }
     }
 }
 
 #[async_trait]
-impl CallMediaAdmission for LiveCallAdmission {
+impl CallMediaAdmission for PaidCallAdmission {
     async fn call_media_admitted(&self, peer: &NodeId, call_id: &str, now_ms: u64) -> bool {
-        match self.storage.call_get(peer, call_id).await {
-            Ok(entry) => entry
-                .and_then(|e| e.at(now_ms))
-                .is_some_and(|e| e.phase == Phase::Live),
-            Err(e) => {
-                warn!(peer = %peer, error = %e, "call media: call state unreadable; media not admitted");
-                false
-            }
-        }
+        konsensus_api::calls::call_media_admitted(self.storage.as_ref(), peer, call_id, now_ms).await
     }
 }
 
@@ -140,7 +130,7 @@ pub enum MediaDrop {
     NotCounterparty,
     /// The sending connection is neither privileged nor one we paid on.
     Unprivileged,
-    /// The call is no longer admitted (ended, expired; N1: unpaid).
+    /// The call is no longer admitted (ended, expired or unpaid).
     NotAdmitted,
     /// Over the per-call, per-direction rate cap.
     RateCapped,
@@ -405,31 +395,56 @@ impl CallMediaRouter {
 
     /// The app → peer direction of one call: pop, cap, admit, send.
     async fn pump(self: Arc<Self>, call_id: String, route: Arc<Route>) {
-        let mut cap = RateCap::media(Instant::now());
-        while let Some(frame) = route.from_app.pop().await {
-            let now = Instant::now();
-            if !cap.admit(now, frame.payload.len()) {
-                self.drops.note(MediaDrop::RateCapped, Some(&route.peer), &call_id);
-                continue;
-            }
-            if !self.still_admitted(&route, &call_id).await {
-                self.drops.note(MediaDrop::NotAdmitted, Some(&route.peer), &call_id);
-                self.end_route(&call_id, &route);
-                break;
-            }
-            let bytes = match Frame::call_media(&call_id, frame.seq, frame.payload).and_then(|f| f.to_bytes()) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    self.drops.note(MediaDrop::Encode, Some(&route.peer), &call_id);
+        let forward = async {
+            let mut cap = RateCap::media(Instant::now());
+            while let Some(frame) = route.from_app.pop().await {
+                let now = Instant::now();
+                if !cap.admit(now, frame.payload.len()) {
+                    self.drops.note(MediaDrop::RateCapped, Some(&route.peer), &call_id);
                     continue;
                 }
-            };
-            match self.link.send_call_media(&route.peer, &bytes).await {
-                Ok(()) => {}
-                Err(TransportError::Timeout(_)) => self.drops.note(MediaDrop::PeerBusy, Some(&route.peer), &call_id),
-                Err(_) => self.drops.note(MediaDrop::NotConnected, Some(&route.peer), &call_id),
+                if !self.still_admitted(&route, &call_id).await {
+                    self.drops.note(MediaDrop::NotAdmitted, Some(&route.peer), &call_id);
+                    self.end_route(&call_id, &route);
+                    break;
+                }
+                let bytes = match Frame::call_media(&call_id, frame.seq, frame.payload).and_then(|f| f.to_bytes()) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        self.drops.note(MediaDrop::Encode, Some(&route.peer), &call_id);
+                        continue;
+                    }
+                };
+                match self.link.send_call_media(&route.peer, &bytes).await {
+                    Ok(()) => {}
+                    Err(TransportError::Timeout(_)) => self.drops.note(MediaDrop::PeerBusy, Some(&route.peer), &call_id),
+                    Err(_) => self.drops.note(MediaDrop::NotConnected, Some(&route.peer), &call_id),
+                }
             }
+        };
+        let monitor = async {
+            let mut recheck = tokio::time::interval_at(
+                tokio::time::Instant::now() + ADMISSION_RECHECK,
+                ADMISSION_RECHECK,
+            );
+            recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                recheck.tick().await;
+                // Do not rely on a packet arriving, or on its admission cache:
+                // this timer must also run while the peer writer is stalled.
+                if !self.admission.call_media_admitted(&route.peer, &call_id, now_ms()).await {
+                    self.drops.note(MediaDrop::NotAdmitted, Some(&route.peer), &call_id);
+                    break;
+                }
+                *route.admitted_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = monitor => self.end_route(&call_id, &route),
+            _ = forward => {},
         }
+
     }
 }
 

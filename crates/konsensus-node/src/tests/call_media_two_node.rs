@@ -2,7 +2,7 @@
 //! media socket comes out of node B's owner media socket, and back.
 //!
 //! Real Noise transports on loopback, real call media routers, real SQLite
-//! call state (a live call on both sides), the real API router served on a
+//! call state (a paid live call on both sides), the real API router served on a
 //! loopback port with a paired device holding `spend`, and a plain WebSocket
 //! client. Nothing is stubbed on the media path.
 
@@ -21,7 +21,7 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{CallMediaRouter, LiveCallAdmission, MediaLink};
+use super::{CallMediaRouter, PaidCallAdmission, MediaLink};
 
 const JWT_SECRET: &str = "call-media-two-node-jwt-secret";
 const CALL: &str = "00112233445566778899aabbccddeeff";
@@ -80,7 +80,7 @@ async fn start_node(identity: Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Node
 
     let router = CallMediaRouter::new(
         Arc::clone(&transport) as Arc<dyn MediaLink>,
-        Arc::new(LiveCallAdmission::new(Arc::clone(&storage))),
+        Arc::new(PaidCallAdmission::new(Arc::clone(&storage))),
     );
     router.spawn(shutdown_rx);
 
@@ -181,11 +181,11 @@ impl Node {
         self.transport.listen_addr().unwrap().to_string()
     }
 
-    /// The call with `peer` is live on this node, as an answered call is.
+    /// An answered call with its first 60-second block settled.
     async fn live_call(&self, peer: &NodeId, side: Side) {
         let now = chrono::Utc::now().timestamp_millis() as u64;
         self.storage
-            .call_put(peer, CALL, &CallEntry { side, phase: Phase::Live, deadline_ms: now + 3_600_000, pending: None })
+            .call_put(peer, CALL, &CallEntry { side, phase: Phase::Live, deadline_ms: now + 70_000, pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1, end_reason: None })
             .await
             .unwrap();
     }
@@ -261,7 +261,7 @@ async fn a_packet_into_node_a_s_socket_comes_out_of_node_b_s_socket() {
     })
     .await;
 
-    // Nothing is admitted before the call is live on a node.
+    // Nothing is admitted before a live call has paid block coverage.
     assert_eq!(a.media_socket(&b.id, &a.token).await.err(), Some(403));
 
     a.live_call(&b.id, Side::Caller).await;

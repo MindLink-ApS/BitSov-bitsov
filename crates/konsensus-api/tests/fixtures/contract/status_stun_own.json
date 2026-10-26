@@ -23,7 +23,8 @@
       "lsps2_funding_quotes_v1",
       "sponsor_kit_v1",
       "call_meeting_v1",
-      "room_binding_v1"
+      "room_binding_v1",
+      "call_media_v1"
     ],
     "block_height": 850000,
     "chain_backend": "mock",

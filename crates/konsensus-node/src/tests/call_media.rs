@@ -53,6 +53,8 @@ struct RecordingLink {
     connected: Mutex<HashSet<NodeId>>,
     sent: Mutex<Vec<(NodeId, Vec<u8>)>>,
     busy: std::sync::atomic::AtomicBool,
+    stalled: std::sync::atomic::AtomicBool,
+    sending: tokio::sync::Notify,
     inbound: Mutex<Option<tokio::sync::mpsc::Receiver<CallMediaEvent>>>,
 }
 
@@ -73,6 +75,10 @@ impl MediaLink for RecordingLink {
         self.connected.lock().unwrap().contains(peer)
     }
     async fn send_call_media(&self, peer: &NodeId, frame_bytes: &[u8]) -> Result<(), TransportError> {
+        if self.stalled.load(std::sync::atomic::Ordering::SeqCst) {
+            self.sending.notify_one();
+            return std::future::pending().await;
+        }
         if self.busy.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(TransportError::Timeout("call media writer busy".into()));
         }
@@ -167,11 +173,11 @@ async fn media_stops_once_the_call_is_no_longer_admitted() {
     let attachment = f.router.attach(&peer(), CALL).await.unwrap();
     f.router.inbound(event(peer(), CALL, 1, true)).await.unwrap();
 
-    // Ended (N1: unpaid). The answer is re-read after the recheck window.
+    // Admission is revoked; the timer releases the route without another packet.
     f.admission.revoke(peer(), CALL);
     f.router.inbound(event(peer(), CALL, 2, true)).await.unwrap();
     tokio::time::sleep(super::ADMISSION_RECHECK + Duration::from_millis(100)).await;
-    assert_eq!(f.router.inbound(event(peer(), CALL, 3, true)).await, Err(MediaDrop::NotAdmitted));
+    assert_eq!(f.router.inbound(event(peer(), CALL, 3, true)).await, Err(MediaDrop::UnknownCall));
 
     // The route is gone and the socket sees its queue end after what was queued.
     assert_eq!(f.router.routed_calls(), 0);
@@ -309,4 +315,74 @@ async fn inbound_loop_routes_transport_events_until_shutdown() {
     tokio::time::timeout(Duration::from_secs(3), worker).await.unwrap().unwrap();
     assert_eq!(f.router.routed_calls(), 0);
     assert_eq!(attachment.from_node.pop().await, None, "shutdown ends every route");
+}
+
+#[tokio::test]
+async fn production_admission_requires_paid_live_blocks_and_fails_closed() {
+    use konsensus_core::payloads::call::{CallEntry, Phase, Side};
+    use konsensus_storage::{SqliteStorage, Storage};
+    let store = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let admission = super::PaidCallAdmission::new(store.clone());
+    let live = CallEntry { side: Side::Caller, phase: Phase::Live, deadline_ms: 100_000,
+        pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None };
+    assert!(!admission.call_media_admitted(&peer(), CALL, 1_000).await);
+    store.call_put(&peer(), CALL, &live).await.unwrap();
+    assert!(!admission.call_media_admitted(&peer(), CALL, 1_000).await, "answered is not paid");
+    let paid = CallEntry { paid_until_ms: Some(61_000), next_block_seq: 1, ..live };
+    store.call_put(&peer(), CALL, &paid).await.unwrap();
+    assert!(admission.call_media_admitted(&peer(), CALL, 71_000).await);
+    assert!(!admission.call_media_admitted(&peer(), CALL, 71_001).await);
+    assert!(!admission.call_media_admitted(&stranger(), CALL, 2_000).await);
+    for phase in [Phase::Reserved, Phase::Ringing, Phase::Ended] {
+        store.call_put(&peer(), CALL, &CallEntry { phase, ..paid.clone() }).await.unwrap();
+        assert!(!admission.call_media_admitted(&peer(), CALL, 2_000).await);
+    }
+    sqlx::query("DROP TABLE call_state").execute(store.pool()).await.unwrap();
+    assert!(!admission.call_media_admitted(&peer(), CALL, 2_000).await, "storage errors fail closed");
+}
+
+#[tokio::test]
+async fn idle_route_is_released_without_another_media_packet() {
+    let f = fixture();
+    let attachment = f.router.attach(&peer(), CALL).await.unwrap();
+    f.admission.revoke(peer(), CALL);
+    tokio::time::timeout(Duration::from_millis(1600), async {
+        while f.router.routed_calls() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("idle call was never rechecked");
+    assert!(attachment.from_node.is_closed() && attachment.to_node.is_closed());
+}
+
+#[tokio::test]
+async fn ended_call_releases_even_while_peer_write_is_stalled() {
+    let f = fixture();
+    f.link.stalled.store(true, std::sync::atomic::Ordering::SeqCst);
+    let attachment = f.router.attach(&peer(), CALL).await.unwrap();
+    attachment.to_node.push(MediaFrame { seq: 1, payload: vec![1] }).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), f.link.sending.notified()).await.unwrap();
+    f.admission.revoke(peer(), CALL);
+    tokio::time::timeout(Duration::from_millis(1600), async {
+        while f.router.routed_calls() != 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await.expect("peer write blocked admission recheck");
+    assert!(attachment.from_node.is_closed() && attachment.to_node.is_closed());
+}
+
+#[tokio::test]
+async fn idle_paid_route_expires_after_grace_without_media() {
+    use konsensus_core::payloads::call::{CallEntry, Phase, Side};
+    use konsensus_storage::{SqliteStorage, Storage};
+    let store = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let now = super::now_ms();
+    store.call_put(&peer(), CALL, &CallEntry {
+        side: Side::Caller, phase: Phase::Live, deadline_ms: now + 200,
+        pending: None, paid_until_ms: Some(now - 9_800), next_block_seq: 1, end_reason: None,
+    }).await.unwrap();
+    let f = fixture();
+    let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store)));
+    let attachment = router.attach(&peer(), CALL).await.unwrap();
+    tokio::time::timeout(Duration::from_millis(1600), async {
+        while router.routed_calls() != 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await.expect("paid expiry was not rechecked without media");
+    assert!(attachment.from_node.is_closed() && attachment.to_node.is_closed());
 }

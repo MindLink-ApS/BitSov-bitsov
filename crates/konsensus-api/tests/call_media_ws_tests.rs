@@ -106,8 +106,14 @@ impl Fixture {
 
     /// The upgrade request as a browser sends it; the status it gets.
     async fn upgrade(&self, path: &str, token: Option<&str>) -> StatusCode {
+        self.open(path, token).await.0
+    }
+
+    async fn open(&self, path: &str, token: Option<&str>) -> (StatusCode, tokio::net::TcpStream) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut stream = tokio::net::TcpStream::connect(self.addr).await.unwrap();
+        let tcp = tokio::net::TcpSocket::new_v4().unwrap();
+        tcp.set_recv_buffer_size(1024).unwrap();
+        let mut stream = tcp.connect(self.addr).await.unwrap();
         let protocol = match token {
             Some(token) => format!("Sec-WebSocket-Protocol: bitsov.v1, bitsov.jwt.{token}\r\n"),
             None => String::new(),
@@ -133,7 +139,7 @@ impl Fixture {
         .await
         .unwrap();
         let status: u16 = std::str::from_utf8(&response).unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
-        StatusCode::from_u16(status).unwrap()
+        (StatusCode::from_u16(status).unwrap(), stream)
     }
 }
 
@@ -215,4 +221,171 @@ async fn media_socket_is_not_a_plain_http_route() {
     let status = app.oneshot(request).await.unwrap().status();
     assert!(status.is_client_error(), "{status}");
     assert_ne!(status, StatusCode::OK);
+}
+
+/// Observe the real socket's attachment lifetime, and supply outbound media.
+struct ObservedPort {
+    to_node: Arc<MediaQueue>,
+    from_node: Arc<MediaQueue>,
+    released: Arc<tokio::sync::Notify>,
+}
+impl ObservedPort {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { to_node: MediaQueue::new(32), from_node: MediaQueue::new(32),
+            released: Arc::new(tokio::sync::Notify::new()) })
+    }
+}
+#[async_trait]
+impl CallMediaPort for ObservedPort {
+    async fn attach(&self, peer: &NodeId, _: &str) -> Result<MediaAttachment, AttachRefusal> {
+        let released = self.released.clone();
+        Ok(MediaAttachment::new(*peer, self.to_node.clone(), self.from_node.clone(), move || released.notify_one()))
+    }
+}
+
+fn masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![opcode];
+    if payload.len() < 126 {
+        frame.push(0x80 | payload.len() as u8);
+    } else {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    frame.extend_from_slice(&[0; 4]);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[tokio::test]
+async fn oversize_frame_header_is_rejected_before_the_body_arrives() {
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir().unwrap();
+    let port = ObservedPort::new();
+    let f = fixture(dir.path(), Some(port.clone())).await;
+    let token = f.paired_token(30, vec![Scope::Spend]);
+    let (status, mut socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+    // Declares 4101 bytes, but sends only the header and mask. Waiting for
+    // a body here means the WebSocket framing limit was not installed.
+    socket.write_all(&[0x82, 0xfe, 0x10, 0x05, 0, 0, 0, 0]).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), port.released.notified())
+        .await.expect("oversize frame was buffered instead of rejected");
+    assert!(port.to_node.is_empty());
+}
+
+#[tokio::test]
+async fn fragmented_message_cannot_exceed_the_media_limit() {
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir().unwrap();
+    let port = ObservedPort::new();
+    let f = fixture(dir.path(), Some(port.clone())).await;
+    let token = f.paired_token(31, vec![Scope::Spend]);
+    let (_, mut socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
+    socket.write_all(&masked_frame(0x02, &vec![0; 3000])).await.unwrap();
+    socket.write_all(&masked_frame(0x80, &vec![0; 1101])).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), port.released.notified())
+        .await.expect("fragment reassembly exceeded the media limit");
+    assert!(port.to_node.is_empty());
+}
+
+#[tokio::test]
+async fn text_malformed_and_control_floods_share_the_ingress_budget() {
+    use tokio::io::AsyncWriteExt;
+    for opcode in [0x81, 0x82, 0x89, 0x8a] {
+        let dir = tempfile::tempdir().unwrap();
+        let port = ObservedPort::new();
+        let f = fixture(dir.path(), Some(port.clone())).await;
+        let token = f.paired_token(32, vec![Scope::Spend]);
+        let (_, mut socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
+        // Text is deliberately not JSON. Binary is deliberately too short.
+        let frame = masked_frame(opcode, b"x");
+        socket.write_all(&frame.repeat(101)).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), port.released.notified())
+            .await.unwrap_or_else(|_| panic!("opcode {opcode:x} bypassed the ingress budget"));
+        assert!(port.to_node.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn non_reading_socket_releases_attachment_on_write_timeout() {
+    stalled_socket_releases("timeout").await;
+}
+
+#[tokio::test]
+async fn call_termination_releases_attachment_while_socket_is_stalled() {
+    stalled_socket_releases("ended").await;
+}
+
+#[tokio::test]
+async fn pairing_revocation_releases_attachment_while_socket_is_stalled() {
+    stalled_socket_releases("revoked").await;
+}
+
+async fn stalled_socket_releases(reason: &str) {
+    use konsensus_api::call_media::MediaFrame;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let port = ObservedPort::new();
+    let f = fixture(dir.path(), Some(port.clone())).await;
+    let token = f.paired_token(33, vec![Scope::Spend]);
+    let (_, socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
+    // Keep the client alive but never read. A small TCP receive window plus
+    // sustained bounded-queue production forces the server's send to stall.
+    let output = port.from_node.clone();
+    let producer = tokio::spawn(async move {
+        loop {
+            for seq in 0..32 {
+                if output.push(MediaFrame { seq, payload: vec![0; 4096] }).is_err() { return; }
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    match reason {
+        "ended" => port.from_node.close(),
+        "revoked" => for client in f.service.list_clients() { f.service.revoke(&client.client_id).unwrap(); },
+        _ => {}
+    }
+    // Both termination checks must win before the two-second write deadline.
+    let bound = match reason {
+        "ended" => Duration::from_millis(300),
+        "revoked" => Duration::from_millis(1350),
+        _ => Duration::from_secs(3),
+    };
+    let result = tokio::time::timeout(bound, port.released.notified()).await;
+    producer.abort();
+    result.unwrap_or_else(|_| panic!("{reason}: stalled send prevented attachment release"));
+    assert!(port.to_node.is_closed() && port.from_node.is_closed());
+    drop(socket);
+}
+
+#[tokio::test]
+async fn text_ping_is_ignored_without_a_json_reply() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let port = ObservedPort::new();
+    let f = fixture(dir.path(), Some(port.clone())).await;
+    let token = f.paired_token(34, vec![Scope::Spend]);
+    let (_, mut socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
+    socket.write_all(&masked_frame(0x81, br#"{"type":"ping"}"#)).await.unwrap();
+    let mut byte = [0; 1];
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(100), socket.read(&mut byte)).await.is_err(),
+        "binary media socket must not parse and answer text JSON");
+    assert!(port.to_node.is_empty());
+}
+
+#[tokio::test]
+async fn socket_ingress_byte_budget_counts_before_routing() {
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir().unwrap();
+    let port = ObservedPort::new();
+    let f = fixture(dir.path(), Some(port.clone())).await;
+    let token = f.paired_token(35, vec![Scope::Spend]);
+    let (_, mut socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
+    // Every packet is valid and exactly at the per-message limit; the 16th
+    // crosses 64 KiB including headers, well below the 100-message limit.
+    socket.write_all(&masked_frame(0x82, &vec![0; 4100]).repeat(16)).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), port.released.notified()).await.unwrap();
+    assert_eq!(port.to_node.len(), 15);
+    assert_eq!(port.to_node.try_pop().unwrap().payload.len(), 4096);
 }

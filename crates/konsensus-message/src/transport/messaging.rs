@@ -27,6 +27,22 @@ pub enum Standing {
     Privileged,
 }
 
+/// Encryption consumes a nonce before the first socket await. If the caller
+/// abandons a record, invalidate this exact connection synchronously, while
+/// its write lock is still held, even if the reader has not observed EOF yet.
+struct MediaWriteGuard<'a> {
+    conn: &'a Connection,
+    complete: bool,
+}
+
+impl Drop for MediaWriteGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.conn.close();
+        }
+    }
+}
+
 // ─── impl NoiseTransport — send_frame ────────────────────────────────────────
 
 impl NoiseTransport {
@@ -194,8 +210,8 @@ impl NoiseTransport {
     /// flight would otherwise queue audio behind it for as long as it takes.
     /// Media is instead bounded: a packet that cannot start within the
     /// deadline is dropped and `Timeout` returned, never written late. The
-    /// write itself is small (at most a few KiB) and completes or closes the
-    /// connection like any other Noise record.
+    /// write itself has the same deadline. Cancellation, failure or timeout
+    /// closes and invalidates this connection before the write lock is released.
     ///
     /// [`CALL_MEDIA_WRITE_DEADLINE`]: super::CALL_MEDIA_WRITE_DEADLINE
     pub async fn send_call_media(&self, peer: &NodeId, frame_bytes: &[u8]) -> Result<(), TransportError> {
@@ -213,13 +229,20 @@ impl NoiseTransport {
         if conn.is_closed() {
             return Err(TransportError::NotConnected(peer.to_hex()));
         }
+        let mut guard = MediaWriteGuard { conn: &conn, complete: false };
         let encrypted = state
             .noise
             .encrypt(frame_bytes)
             .map_err(|e| TransportError::NoiseError(e.to_string()))?;
-        write_noise_message(&mut state.writer, &encrypted)
-            .await
-            .map_err(|e| TransportError::Other(e.to_string()))
+        tokio::time::timeout(
+            super::CALL_MEDIA_WRITE_DEADLINE,
+            write_noise_message(&mut state.writer, &encrypted),
+        )
+        .await
+        .map_err(|_| TransportError::Timeout("call media record write stalled; connection closed".into()))?
+        .map_err(|e| TransportError::Other(e.to_string()))?;
+        guard.complete = true;
+        Ok(())
     }
 
     /// M1b promote-on-paid: flip a connection's `privileged` flag to `true`.
