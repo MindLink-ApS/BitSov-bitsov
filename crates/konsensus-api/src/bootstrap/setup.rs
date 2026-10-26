@@ -316,7 +316,6 @@ struct View {
     device_name: Option<String>,
     claimed_at: Option<i64>,
     ceremony_id: Option<String>,
-    sas_digest: Option<String>,
     words: Option<[String; 4]>,
     approved: bool,
 }
@@ -344,7 +343,8 @@ async fn view(
             .map(|s| s.device_name.clone())
             .or_else(|| client.map(|c| c.name)),
         ceremony_id: sas.and(p).map(|p| p.ceremony_id.clone()),
-        sas_digest: sas.map(|s| s.digest.to_hex().to_string()),
+        // The full digest is the finalize proof derived from the claim code;
+        // the page shows only the four comparison words (I2).
         words: sas.map(|s| crate::sas::words(&s.digest).map(str::to_owned)),
         approved: sas.is_some_and(|s| s.box_approved),
     }))
@@ -389,11 +389,12 @@ async fn start(State(page): State<Arc<SetupPage>>) -> Result<Json<Ticket>, Statu
         expires_in: ttl.as_secs(),
     }))
 }
+/// The owner approves the exact words the page showed, never a digest.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Approval {
     ceremony_id: String,
-    sas_digest: String,
+    words: [String; 4],
 }
 async fn approve(
     State(page): State<Arc<SetupPage>>,
@@ -408,8 +409,14 @@ async fn approve(
         .filter(|p| !p.expired() && p.ceremony_id == body.ceremony_id)
         .ok_or(StatusCode::CONFLICT)?;
     let sas = p.sas.as_mut().ok_or(StatusCode::CONFLICT)?;
-    let digest = blake3::Hash::from_hex(&body.sas_digest).map_err(|_| StatusCode::BAD_REQUEST)?;
-    if !bool::from(digest.as_bytes().ct_eq(sas.digest.as_bytes())) {
+    let shown = crate::sas::words(&sas.digest).join(" ");
+    let submitted = body
+        .words
+        .iter()
+        .map(|w| w.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !bool::from(shown.as_bytes().ct_eq(submitted.as_bytes())) {
         return Err(StatusCode::BAD_REQUEST);
     }
     sas.box_approved = true;
