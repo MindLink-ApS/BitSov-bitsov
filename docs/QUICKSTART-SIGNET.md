@@ -6,7 +6,8 @@ block times add waiting where a confirmation is needed, and those waits are
 marked.
 
 **What this is and is not.** BitSov is in closed beta on signet test nodes.
-Paid admission was proven on mainnet on 1 July 2026, but **mainnet is not
+Paid admission follows the [2026-07-01 keystone](v2/F1-CAPPED-FIRST-CONTACT.md)
+(the target re-prices and the requester pays its invoice), and **mainnet is not
 supported for the public beta**: this guide never uses it and nothing here
 funds a mainnet wallet. Signet coins have no value. There is no final signed
 release yet (only pre-release candidates); this guide builds from source. Every
@@ -57,7 +58,8 @@ export PATH="$PWD/target/release:$PATH"
 `init` creates a data directory, a 24-word recovery phrase, and
 `konsensus.toml`. Use the `full` tier: it is the one with embedded Lightning
 (LDK) and a real chain source, which signet needs. Pick a dedicated directory
-owned by you; the node forces it to mode `0700`.
+owned by you and `chmod 700` it yourself: the node restricts only its `pairing/`
+and LDK subdirectories and refuses a group- or world-readable `mnemonic.txt`.
 
 ```sh
 konsensus init --dir ~/bitsov-signet --tier full
@@ -264,8 +266,8 @@ curl -sS -X POST -H "Authorization: Bearer $OWNER_TOKEN" -H 'content-type: appli
 
 `kind: 0` is a chat message. The node encrypts it end to end (X3DH and the
 Double Ratchet), pays the recipient's chat price over the channel, and sends
-it. The default chat price is 10 msat, which Lightning rounds up to its
-1,000 msat minimum; `max_total_msat` caps principal plus routing fee (6,000 msat
+it. The default chat price is 10 msat, which the node raises to its
+1,000 msat invoice minimum; `max_total_msat` caps principal plus routing fee (6,000 msat
 is the smallest cap that fits under the default fee policy; 20,000 leaves room).
 A listed contact pays the message price only; a stranger would pay admission
 as well, which is the first-contact path described in
@@ -298,9 +300,9 @@ by payment, content end to end encrypted.
   for example not enough confirmed on-chain funds or a fee cap below the
   estimate. If the other side refused it, they have no reserve yet: fund the
   acceptor too.
-- **Compose is refused as a first contact (409 `first_contact`)**: the
-  recipient has not listed you, so your node is a stranger to it. They run
-  step 6.
+- **Compose fails with 503 `peer_not_ready`** and the recipient's log shows
+  `not in whitelist`: the recipient has not listed you, so their node refuses
+  your connection. They run step 6.
 - **`open-channel` refused with `HUB_ONLY_WHILE_LOCKABLE`**: the
   `hub_only_channels = false` line from step 2 is missing, or the node was
   started lockable.
