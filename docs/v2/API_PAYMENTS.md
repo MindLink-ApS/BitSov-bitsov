@@ -36,7 +36,7 @@ Within a budget grant the id is also still consumed once, as before
 | --- | --- | --- |
 | `200` | `settled` | The backend reported the payment settled. `preimage` is the proof; `fee_paid_msat` is the actual LDK routing fee (omitted on other backends). Only this response means paid. |
 | `202` | `in_flight` | Dispatched but not final after a short settlement wait (about 3 s), or the first attempt's outcome is not recorded yet. `payment_hash` (empty only for a keysend the backend has not yet identified) and `operation_id` are returned; `preimage` is empty and `fee_paid_msat` absent. Repeat the request with the same `request_id`, or poll `GET /payments/{payment_hash}`. |
-| `400` `not_dispatched` | — | Refused before anything left (fee ceiling, local validation, backend refusal). The id is freed and may be retried. |
+| `400` `not_dispatched` | — | Refused before anything left (fee ceiling, local validation, backend refusal). The ledger frees the id and the owner may retry it; a paired client's grant still holds the id (`409 duplicate_payment`, see [spend budget grants](../SPEND_BUDGET_GRANTS.md)), so it must use a new one. |
 | `409` `operation_mismatch` | — | The same `request_id` with different parameters. Nothing is dispatched; use a new id for a new payment. |
 | `502` | — | A positive backend failure after dispatch (`"… payment failed before settlement"`), or an ambiguous backend error. |
 | `503` `not_ready` | — | The wallet is not money-ready. Saved receipts still answer. |

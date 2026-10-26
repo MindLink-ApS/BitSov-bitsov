@@ -73,7 +73,8 @@ pub struct DirectPaymentResponse {
     pub status: String,
     /// The client's idempotency key, echoed.
     pub request_id: String,
-    /// The durable operation this request is bound to (`pay:<id>` / `keysend:<id>`).
+    /// The durable operation this request is bound to (`pay:<caller>:<id>` /
+    /// `keysend:<caller>:<id>`).
     pub operation_id: String,
     /// Answered from the record of an earlier request; nothing was dispatched.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

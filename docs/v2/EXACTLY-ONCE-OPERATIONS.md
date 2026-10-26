@@ -106,7 +106,7 @@ Tests measure actual SQLite VM steps before/after 20,000 additional terminal row
 
 `POST /api/v1/payments/pay` and `/payments/keysend` require a client
 `request_id`, recorded in the same ledger as channel opens and on-chain sends
-(`pay:<id>` / `keysend:<id>`) before the budget debit and the backend call. A
+(`pay:<caller>:<id>` / `keysend:<caller>:<id>`) before the budget debit and the backend call. A
 repeat answers from the record and never dispatches again; the outcome is
 reported as `202 in_flight` until the backend says settled (`200 settled`) or
 failed. Status codes, replay rules and the compatibility notes are in
