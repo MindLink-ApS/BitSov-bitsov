@@ -127,7 +127,7 @@ async fn recipient_fallback_case(wrong_payee: bool) {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(recipient, intended_key);
+        .insert(recipient, konsensus_api::state::PeerLightningKey::Verified(intended_key));
 
     let result = create_payment_proof(&state, 1000, &recipient).await;
     let a = sender.get_balance_msat().await.unwrap();

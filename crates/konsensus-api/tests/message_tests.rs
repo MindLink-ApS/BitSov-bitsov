@@ -1941,7 +1941,7 @@ async fn compose_happy_path_keysend() {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(peer_id, "02aaaa".repeat(5));
+        .insert(peer_id, konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)));
 
     // Step 4: Compose a message via the HTTP endpoint.
     let auth = auth_header(&state);
@@ -2416,7 +2416,7 @@ async fn compose_keysend_fallback_to_invoice() {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(peer_id, invoice_payee);
+        .insert(peer_id, konsensus_api::state::PeerLightningKey::Verified(invoice_payee));
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2547,7 +2547,7 @@ async fn compose_queues_when_transport_send_fails() {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(peer_id, "02cccc".repeat(5));
+        .insert(peer_id, konsensus_api::state::PeerLightningKey::Verified("02cccc".repeat(5)));
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2661,7 +2661,7 @@ async fn compose_room_delivers_to_all_connected_members() {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(peer_id, "02dddd".repeat(5));
+        .insert(peer_id, konsensus_api::state::PeerLightningKey::Verified("02dddd".repeat(5)));
 
     // Create a room with our node + the peer as members.
     let auth = auth_header(&state);
@@ -2805,7 +2805,7 @@ async fn compose_broadcasts_to_websocket() {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(peer_id, "02eeee".repeat(5));
+        .insert(peer_id, konsensus_api::state::PeerLightningKey::Verified("02eeee".repeat(5)));
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2911,7 +2911,7 @@ async fn compose_records_send_timestamp_for_stdp() {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(peer_id, "02ffff".repeat(5));
+        .insert(peer_id, konsensus_api::state::PeerLightningKey::Verified("02ffff".repeat(5)));
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));

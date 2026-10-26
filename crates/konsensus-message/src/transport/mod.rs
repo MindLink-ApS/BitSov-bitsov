@@ -326,6 +326,11 @@ pub enum ControlEvent {
         ln_pubkey: String,
         /// Dialable Lightning P2P address (`host:port`) for channel opens.
         ln_addr: Option<String>,
+        /// Identity-key signature binding `ln_pubkey` to `peer_id`
+        /// (`konsensus_core::lightning_binding`). Empty from older peers;
+        /// the session handler then records the key as unsigned and the
+        /// payer refuses keysend to it.
+        identity_sig: Vec<u8>,
         /// M1b: privileged tag stamped from `conn.privileged` by the reader.
         /// `false` => the session handler DROPS this frame so a stranger cannot
         /// drive the durable onboarding write or queue an auto-channel open
@@ -2717,7 +2722,7 @@ mod tests {
             (Frame::RequestInvoice { request_id: "r".into(), amount_msat: 1_000, purpose: "konsensus message".into() }, false),
             (Frame::PeerExchangeRequest, false),
             (Frame::PeerExchangeResponse { peers: vec![] }, false),
-            (Frame::LightningInfo { ln_pubkey: "02".repeat(33), ln_addr: None }, false),
+            (Frame::LightningInfo { ln_pubkey: "02".repeat(33), ln_addr: None, identity_sig: vec![] }, false),
             (Frame::Gossip(Box::new(make_test_envelope(payee, payer))), false),
         ]
     }

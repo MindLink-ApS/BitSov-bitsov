@@ -54,7 +54,7 @@ async fn keysend_call_site_subscribes_before_dispatch() {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(peer, format!("02{}", "aa".repeat(32)));
+        .insert(peer, konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "aa".repeat(32))));
 
     // Invoke create_payment_proof -> try_keysend; the test never subscribes.
     let started = Instant::now();
@@ -224,7 +224,7 @@ async fn operation_dispatch_hint_is_consumed(keysend: bool) {
             .peer_ln_pubkeys
             .lock()
             .await
-            .insert(peer, format!("02{}", "aa".repeat(32)));
+            .insert(peer, konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "aa".repeat(32))));
     }
     let invoice = MockLightningProvider::new()
         .create_invoice(1000, "operation message", 60)

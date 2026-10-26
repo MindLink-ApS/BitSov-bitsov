@@ -298,7 +298,7 @@ async fn capped_send_refusal_is_an_outbound_membrane_event() {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(peer, "02aaaa".repeat(5));
+        .insert(peer, konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)));
     let mut rx = state.audit_log.membrane().subscribe();
 
     let response = test_router(state.clone())

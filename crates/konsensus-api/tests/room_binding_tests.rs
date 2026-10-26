@@ -55,7 +55,7 @@ impl Fixture {
         let transport = Arc::new(ConnectedStubTransport::new(members.clone(), Arc::clone(&state.invoice_requests)));
         Arc::get_mut(&mut state).unwrap().transport = transport.clone();
         for (i, member) in members.iter().enumerate() {
-            state.peer_ln_pubkeys.lock().await.insert(*member, format!("02{:02x}", i).repeat(16));
+            state.peer_ln_pubkeys.lock().await.insert(*member, konsensus_api::state::PeerLightningKey::Verified(format!("02{:02x}", i).repeat(16)));
             let prices = HashMap::from([("communication".to_string(), PRICES[i])]);
             state.peer_prices.update(*member, prices, 850_000, 144, 0.0).await;
         }

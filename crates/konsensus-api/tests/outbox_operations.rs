@@ -35,7 +35,7 @@ async fn concurrent_operation_posts_pay_once_and_mismatch_never_pays() {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(peer, format!("02{}", "ab".repeat(32)));
+        .insert(peer, konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "ab".repeat(32))));
     let transport = Arc::new(common::ConnectedStubTransport::new(
         vec![peer],
         state.invoice_requests.clone(),
@@ -238,7 +238,7 @@ impl Fixture {
             .peer_ln_pubkeys
             .lock()
             .await
-            .insert(peer, format!("02{}", "ab".repeat(32)));
+            .insert(peer, konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "ab".repeat(32))));
         let transport = Arc::new(common::ConnectedStubTransport::new(
             vec![peer],
             state.invoice_requests.clone(),

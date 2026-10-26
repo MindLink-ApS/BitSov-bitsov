@@ -335,7 +335,7 @@ async fn fixture() -> Fx {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(peer, PEER_LN.into());
+        .insert(peer, konsensus_api::state::PeerLightningKey::Verified(PEER_LN.into()));
 
     let key = SigningKey::from_bytes(&[7u8; 32]);
     let pubkey = hex::encode(key.verifying_key().to_bytes());

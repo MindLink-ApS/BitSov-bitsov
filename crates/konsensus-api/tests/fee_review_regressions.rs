@@ -57,7 +57,7 @@ async fn paid_file_delivery_error_reports_fee_ceiling() {
     let mut state = test_state_with_lightning(wallet.clone());
     let peer = setup_e2ee_session(&state.session_manager).await;
     Arc::get_mut(&mut state).unwrap().transport = Arc::new(FailingDelivery(peer, false));
-    state.peer_ln_pubkeys.lock().await.insert(peer, format!("02{}", "aa".repeat(32)));
+    state.peer_ln_pubkeys.lock().await.insert(peer, konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "aa".repeat(32))));
     let (status, file) = post(&state, "/api/v1/files", json!({"filename":"review.txt", "mime_type":"text/plain", "data_b64":"aGk="})).await;
     assert_eq!(status, StatusCode::OK, "{file}");
     let path = format!("/api/v1/files/{}/send", file["file_id"].as_str().unwrap());
@@ -75,7 +75,7 @@ async fn file_deadline_preserves_the_authorized_fee_ceiling() {
     let mut state = test_state_with_lightning(wallet.clone());
     let peer = setup_e2ee_session(&state.session_manager).await;
     Arc::get_mut(&mut state).unwrap().transport = Arc::new(FailingDelivery(peer, true));
-    state.peer_ln_pubkeys.lock().await.insert(peer, format!("02{}", "aa".repeat(32)));
+    state.peer_ln_pubkeys.lock().await.insert(peer, konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "aa".repeat(32))));
     let (_, file) = post(&state, "/api/v1/files", json!({"filename":"timeout.txt", "mime_type":"text/plain", "data_b64":"aGk="})).await;
     let path = format!("/api/v1/files/{}/send", file["file_id"].as_str().unwrap());
     let (status, receipt) = post(&state, &path, json!({"recipient":peer.to_hex(), "max_total_msat":2000, "max_routing_fee_msat":1000})).await;
@@ -111,7 +111,7 @@ async fn calendar_fanout_and_rsvp_report_aggregate_authorized_ceiling() {
         "legal winner thank year wave sausage worth useful legal winner thank yellow").await;
     let requests = state.invoice_requests.clone();
     Arc::get_mut(&mut state).unwrap().transport = Arc::new(ConnectedStubTransport::new(vec![peer, other], requests));
-    for id in [peer, other] { state.peer_ln_pubkeys.lock().await.insert(id, format!("02{}", "aa".repeat(32))); }
+    for id in [peer, other] { state.peer_ln_pubkeys.lock().await.insert(id, konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "aa".repeat(32)))); }
     let (status, event) = post(&state, "/api/v1/calendar/events", json!({
         "title":"fee report", "start":1800000000000u64, "end":1800003600000u64,
         "attendees":[peer.to_hex(), other.to_hex()]

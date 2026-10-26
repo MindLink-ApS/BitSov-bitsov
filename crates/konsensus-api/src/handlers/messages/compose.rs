@@ -30,7 +30,10 @@ use crate::audit::events;
 use crate::error::ApiError;
 use crate::handlers::utils::generate_valid_proof;
 use crate::invoice_refusal;
-use crate::state::{AppState, InvoiceRequestOutcome, InvoiceResponseData};
+use crate::state::{AppState, InvoiceRequestOutcome, InvoiceResponseData, PeerLightningKey};
+use konsensus_core::lightning_binding::{
+    REASON_CONTACT_MUST_UPDATE, REASON_DESTINATION_MISMATCH, REASON_NO_BINDING,
+};
 
 /// Request to compose and send a message (node handles encryption + payment).
 ///
@@ -393,12 +396,18 @@ async fn await_message_settlement(state: &AppState, debit: &Debit, updates: Sett
 /// Implements Principle 2 correctly: real economic flow from sender to recipient.
 ///
 /// **Keysend path** (fast, ~0ms round-trip): If the peer's Lightning pubkey is
-/// known (exchanged via `Frame::LightningInfo` after handshake), pushes sats
-/// directly to their node. No invoice request needed.
+/// known and its identity-key signature verified (exchanged via
+/// `Frame::LightningInfo` after handshake), pushes sats directly to that key.
+/// No invoice request needed. Keysend never targets a key the contact's
+/// identity did not sign.
 ///
 /// **Invoice path** (fallback, ~100-200ms round-trip): If the peer has no
 /// Lightning pubkey, or keysend is positively rejected before dispatch, use the
 /// RequestInvoice/InvoiceResponse/pay_invoice flow.
+///
+/// **Refused**: a peer that advertised a Lightning key without an identity
+/// signature (an older version) is paid by neither path. The call fails with
+/// the fixed reason [`REASON_CONTACT_MUST_UPDATE`] and nothing is dispatched.
 ///
 /// Returns (payment_hash, preimage, amount_msat). Never falls back to fake proofs.
 pub async fn create_payment_proof(
@@ -505,7 +514,20 @@ pub(crate) async fn create_metered_payment_proof(
     // Try keysend first — eliminates the invoice round-trip. A caller that
     // forbids re-admission must ask the recipient for an invoice so its live
     // connection gate can refuse before any payment is dispatched.
-    let peer_ln_pubkey = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
+    //
+    // A contact whose Lightning key carries no identity signature runs a
+    // version that does not sign bindings yet. Neither path pays them: keysend
+    // would target an unbound key and the invoice fallback would pay the same
+    // unbound node. Refuse out loud until the contact updates.
+    let peer_ln_pubkey = match state.peer_ln_pubkeys.lock().await.get(peer_id) {
+        Some(PeerLightningKey::Verified(key)) => Some(key.clone()),
+        Some(PeerLightningKey::Unsigned) => {
+            return Err(ApiError::PeerNotReady {
+                reason: REASON_CONTACT_MUST_UPDATE,
+            });
+        }
+        None => None,
+    };
     if !readmission.forbidden {
         if let Some(ln_pubkey) = peer_ln_pubkey {
             match try_keysend(state, &ln_pubkey, payment_amount_msat, peer_id, debit).await {
@@ -784,18 +806,51 @@ async fn try_keysend(
     peer_id: &NodeId,
     debit: &Debit,
 ) -> Result<KeysendOutcome, ApiError> {
+    // Pay a contact only at the Lightning key their identity signed. Refuse
+    // early, before any journal or budget bookkeeping, when the caller's
+    // destination is not the contact's verified key.
+    require_verified_keysend_destination(state, peer_id, ln_pubkey).await?;
     let updates = SettlementUpdates::subscribe(state.lightning.as_ref());
-    let details = match debit.dispatch_message(state, None, amount_msat, state
-        .lightning
-        .keysend_with_fee_limit(ln_pubkey, amount_msat, Some("konsensus message"), debit.fee_limit(state, amount_msat)))
-        .await?
-    {
+    let fee_limit = debit.fee_limit(state, amount_msat);
+    let destination = ln_pubkey.to_owned();
+    // The authorization point proper. `dispatch_message` awaits the journal
+    // and budget bookkeeping before it polls this future, so the binding is
+    // read again here, at the moment the backend is handed the payment. A
+    // rotation or removal that landed during those awaits refuses the
+    // payment instead of paying a key the identity no longer signs; the
+    // refusal is a positive not-dispatched, so the bookkeeping is rolled
+    // back and nothing is paid.
+    let dispatch = async {
+        if let Err(reason) = keysend_destination_reason(state, peer_id, &destination).await {
+            return Err(LightningError::PaymentNotDispatched(reason.to_owned()));
+        }
+        state
+            .lightning
+            .keysend_with_fee_limit(
+                &destination,
+                amount_msat,
+                Some("konsensus message"),
+                fee_limit,
+            )
+            .await
+    };
+    let details = match debit.dispatch_message(state, None, amount_msat, dispatch).await? {
         Ok(details) => details,
         Err(LightningError::NotReady) => return Err(ApiError::NotReady),
         Err(LightningError::PaymentNotDispatched(reason)) if reason == "disk_low" => {
             return Err(ApiError::NotDispatched(reason));
         }
         Err(LightningError::PaymentNotDispatched(reason)) => {
+            // A binding refusal never falls back to an invoice: the contact
+            // is paid at their verified key or not at all.
+            if let Some(fixed) = binding_refusal_reason(&reason) {
+                tracing::warn!(
+                    peer = %peer_id,
+                    reason = fixed,
+                    "keysend refused at dispatch: binding changed"
+                );
+                return Err(ApiError::PeerNotReady { reason: fixed });
+            }
             tracing::warn!(peer = %peer_id, %reason, "keysend rejected before dispatch");
             return Ok(KeysendOutcome::NotDispatched);
         }
@@ -835,6 +890,144 @@ async fn try_keysend(
     );
 
     Ok(KeysendOutcome::Settled((hash_bytes, preimage_bytes, amount_msat)))
+}
+
+/// Refuse a keysend whose destination is not the contact's verified Lightning
+/// key. Fixed reasons; no payment is dispatched.
+///
+/// This is the authorization point for the destination: the binding is read
+/// under the map lock and compared with the exact string handed to the
+/// backend. The lock is not held across dispatch (the backend call awaits the
+/// network). A rotation or removal that lands after this point does not
+/// change the destination of the payment already authorized; it governs the
+/// next payment. Every destination that reaches the backend is therefore one
+/// the contact's identity signed at the moment it was authorized.
+async fn require_verified_keysend_destination(
+    state: &AppState,
+    peer_id: &NodeId,
+    destination: &str,
+) -> Result<(), ApiError> {
+    keysend_destination_reason(state, peer_id, destination)
+        .await
+        .map_err(|reason| ApiError::PeerNotReady { reason })
+}
+
+/// Read the contact's current binding and decide whether `destination` may
+/// be paid; the error is the fixed refusal reason.
+async fn keysend_destination_reason(
+    state: &AppState,
+    peer_id: &NodeId,
+    destination: &str,
+) -> Result<(), &'static str> {
+    let binding = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
+    keysend_destination_allowed(binding.as_ref(), destination)
+}
+
+/// The decision behind [`require_verified_keysend_destination`]: only a
+/// verified binding equal to the destination lets a keysend proceed.
+fn keysend_destination_allowed(
+    binding: Option<&PeerLightningKey>,
+    destination: &str,
+) -> Result<(), &'static str> {
+    match binding {
+        Some(PeerLightningKey::Verified(key)) if key == destination => Ok(()),
+        Some(PeerLightningKey::Verified(_)) => Err(REASON_DESTINATION_MISMATCH),
+        Some(PeerLightningKey::Unsigned) => Err(REASON_CONTACT_MUST_UPDATE),
+        None => Err(REASON_NO_BINDING),
+    }
+}
+
+/// The fixed binding reason carried by a not-dispatched keysend that the
+/// authorization point refused, if that is what it was.
+fn binding_refusal_reason(reason: &str) -> Option<&'static str> {
+    [
+        REASON_DESTINATION_MISMATCH,
+        REASON_CONTACT_MUST_UPDATE,
+        REASON_NO_BINDING,
+    ]
+    .into_iter()
+    .find(|fixed| *fixed == reason)
+}
+
+#[cfg(test)]
+mod keysend_destination_tests {
+    use super::*;
+
+    fn key(prefix: &str) -> String {
+        format!("{prefix}{}", "ab".repeat(32))
+    }
+
+    fn reason(result: Result<(), &'static str>) -> Option<&'static str> {
+        result.err()
+    }
+
+    #[test]
+    fn binding_refusals_are_recognized_in_not_dispatched_reasons() {
+        for fixed in [
+            REASON_DESTINATION_MISMATCH,
+            REASON_CONTACT_MUST_UPDATE,
+            REASON_NO_BINDING,
+        ] {
+            assert_eq!(binding_refusal_reason(fixed), Some(fixed));
+        }
+        assert_eq!(binding_refusal_reason("no route"), None);
+        assert_eq!(binding_refusal_reason("disk_low"), None);
+    }
+
+    #[test]
+    fn verified_binding_matching_destination_is_allowed() {
+        let binding = PeerLightningKey::Verified(key("02"));
+        assert_eq!(
+            reason(keysend_destination_allowed(Some(&binding), &key("02"))),
+            None
+        );
+    }
+
+    #[test]
+    fn verified_binding_for_another_key_refuses_destination() {
+        let binding = PeerLightningKey::Verified(key("02"));
+        assert_eq!(
+            reason(keysend_destination_allowed(Some(&binding), &key("03"))),
+            Some(REASON_DESTINATION_MISMATCH)
+        );
+    }
+
+    #[test]
+    fn unsigned_binding_refuses_with_update_reason() {
+        let binding = PeerLightningKey::Unsigned;
+        assert_eq!(
+            reason(keysend_destination_allowed(Some(&binding), &key("02"))),
+            Some(REASON_CONTACT_MUST_UPDATE)
+        );
+    }
+
+    #[test]
+    fn missing_binding_refuses() {
+        assert_eq!(
+            reason(keysend_destination_allowed(None, &key("02"))),
+            Some(REASON_NO_BINDING)
+        );
+    }
+}
+
+/// An invoice from a contact must be payable to the Lightning key their
+/// identity signed, when one is on record. An unsigned advertisement refuses
+/// the payment; no entry leaves the invoice's own payee as the only check.
+async fn require_invoice_payee_bound(
+    state: &AppState,
+    peer_id: &NodeId,
+    payee: &str,
+    mismatch: &'static str,
+) -> Result<(), ApiError> {
+    let binding = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
+    match binding {
+        Some(PeerLightningKey::Verified(key)) if key == payee => Ok(()),
+        Some(PeerLightningKey::Verified(_)) => Err(ApiError::Lightning(mismatch.into())),
+        Some(PeerLightningKey::Unsigned) => Err(ApiError::PeerNotReady {
+            reason: REASON_CONTACT_MUST_UPDATE,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Create a payment proof via the invoice-request/response round-trip.
@@ -961,13 +1154,13 @@ async fn create_payment_proof_via_invoice(
         return Err(ApiError::Lightning("recipient invoice provenance/hash/expiry mismatch".into()));
     }
 
-    if let Some(expected) = state.peer_ln_pubkeys.lock().await.get(peer_id) {
-        if invoice.recover_payee_pub_key().to_string() != *expected {
-            return Err(ApiError::Lightning(
-                "invoice payee does not match recipient".into(),
-            ));
-        }
-    }
+    require_invoice_payee_bound(
+        state,
+        peer_id,
+        &invoice.recover_payee_pub_key().to_string(),
+        "invoice payee does not match recipient",
+    )
+    .await?;
 
     if promotion_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
         return Err(admission_refusal(peer_id));
@@ -2114,13 +2307,13 @@ async fn validate_admission_invoice(
             "admission invoice hash/expiry mismatch".into(),
         ));
     }
-    if let Some(expected) = state.peer_ln_pubkeys.lock().await.get(peer_id) {
-        if invoice.recover_payee_pub_key().to_string() != *expected {
-            return Err(ApiError::Lightning(
-                "admission invoice payee does not match recipient".into(),
-            ));
-        }
-    }
+    require_invoice_payee_bound(
+        state,
+        peer_id,
+        &invoice.recover_payee_pub_key().to_string(),
+        "admission invoice payee does not match recipient",
+    )
+    .await?;
     let prefix = format!("konsensus:{request_id}:message=");
     let message_price = invoice
         .description()

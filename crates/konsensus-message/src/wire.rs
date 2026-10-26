@@ -1031,6 +1031,16 @@ pub enum Frame {
             deserialize_with = "bounded::limited_opt_string::<_, MAX_LN_ADDR_BYTES>"
         )]
         ln_addr: Option<String>,
+        /// Ed25519 signature by the sender's identity key over the
+        /// domain-separated binding of `ln_pubkey` to that identity
+        /// (`konsensus_core::lightning_binding`). Empty from peers that
+        /// predate signed bindings; a receiver never pays such a key.
+        #[serde(
+            default,
+            deserialize_with = "bounded::key_bytes",
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        identity_sig: Vec<u8>,
     },
 
     /// Price table announcement — a node's current pricing for all kind categories.
@@ -2438,16 +2448,53 @@ mod tests {
         let frame = Frame::LightningInfo {
             ln_pubkey: test_pubkey.clone(),
             ln_addr: Some("127.0.0.1:9735".into()),
+            identity_sig: vec![7u8; 64],
         };
         let bytes = frame.to_bytes().unwrap();
         let decoded = Frame::from_bytes(&bytes).unwrap();
         match decoded {
-            Frame::LightningInfo { ln_pubkey, ln_addr } => {
+            Frame::LightningInfo {
+                ln_pubkey,
+                ln_addr,
+                identity_sig,
+            } => {
                 assert_eq!(ln_pubkey, test_pubkey);
                 assert_eq!(ln_addr.as_deref(), Some("127.0.0.1:9735"));
+                assert_eq!(identity_sig, vec![7u8; 64]);
             }
             _ => panic!("expected LightningInfo frame"),
         }
+    }
+
+    /// A `LightningInfo` from a peer that predates signed bindings carries no
+    /// `identity_sig`; it still decodes, with an empty signature, so the
+    /// receiver can refuse to pay it out loud instead of dropping the peer.
+    #[test]
+    fn frame_lightning_info_without_identity_sig_decodes_as_unsigned() {
+        let legacy = format!(
+            r#"{{"LightningInfo":{{"ln_pubkey":"{}","ln_addr":null}}}}"#,
+            "02".repeat(33)
+        );
+        match Frame::from_bytes(legacy.as_bytes()).unwrap() {
+            Frame::LightningInfo { identity_sig, .. } => assert!(identity_sig.is_empty()),
+            _ => panic!("expected LightningInfo frame"),
+        }
+        // An unsigned frame we send omits the field, so older peers that
+        // reject unknown keys keep decoding it.
+        let unsigned = Frame::LightningInfo {
+            ln_pubkey: "02".repeat(33),
+            ln_addr: None,
+            identity_sig: vec![],
+        };
+        let json = String::from_utf8(unsigned.to_bytes().unwrap()).unwrap();
+        assert!(!json.contains("identity_sig"));
+        // An over-cap signature is refused like any other oversized key field.
+        let oversized = format!(
+            r#"{{"LightningInfo":{{"ln_pubkey":"{}","ln_addr":null,"identity_sig":[{}]}}}}"#,
+            "02".repeat(33),
+            vec!["0"; MAX_KEY_BYTES + 1].join(",")
+        );
+        assert!(Frame::from_bytes(oversized.as_bytes()).is_err());
     }
 
     #[test]

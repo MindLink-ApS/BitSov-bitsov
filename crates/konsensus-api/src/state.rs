@@ -10,6 +10,7 @@ use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
 
 use konsensus_core::gate::PaymentGate;
 use konsensus_core::identity::NodeIdentity;
+pub use konsensus_core::lightning_binding::PeerLightningKey;
 use konsensus_core::traits::chain::ChainProvider;
 use konsensus_core::traits::lightning::LightningProvider;
 use konsensus_core::traits::pricing::PricingEngine;
@@ -218,13 +219,17 @@ pub struct AppState {
     /// Hebbian learning with latency bonus.
     pub send_timestamps: Arc<tokio::sync::Mutex<HashMap<MessageId, Instant>>>,
 
-    /// Lightning pubkeys of connected peers (for keysend payments).
+    /// Lightning keys of connected peers (for keysend payments).
     ///
     /// Populated when a peer sends a `Frame::LightningInfo` after the
-    /// federation handshake. Used by `create_payment_proof()` to attempt
-    /// keysend before falling back to the invoice-request round-trip.
-    /// Key: peer NodeId, Value: compressed Lightning pubkey (hex, 66 chars).
-    pub peer_ln_pubkeys: Arc<tokio::sync::Mutex<HashMap<NodeId, String>>>,
+    /// federation handshake. Only a key whose identity-key signature verified
+    /// is stored as [`PeerLightningKey::Verified`]; a key advertised without
+    /// one (an older peer) is recorded as [`PeerLightningKey::Unsigned`] so
+    /// `create_payment_proof()` refuses to pay that contact with a fixed
+    /// reason instead of paying an unbound destination. Keysend only ever
+    /// targets a verified key; a peer with no entry is paid via the
+    /// invoice-request round-trip.
+    pub peer_ln_pubkeys: Arc<tokio::sync::Mutex<HashMap<NodeId, PeerLightningKey>>>,
 
     /// Lightning backend name (e.g. "lnbits", "mock", "void").
     ///
