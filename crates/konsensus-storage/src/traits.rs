@@ -7,7 +7,7 @@ use konsensus_core::{
     OperatorHostingPayment, Recipient, RoomId, UkmEnvelope,
 };
 
-use crate::calendar::{CalendarEventRecord, RsvpRecord, CalendarAdmission};
+use crate::calendar::{CalendarAdmission, CalendarEventRecord, RsvpRecord};
 use crate::error::StorageError;
 use crate::invites::{
     AcceptedInviteRecord, InviteIssuedRecord, InviteSchemaCapabilities, InviteState,

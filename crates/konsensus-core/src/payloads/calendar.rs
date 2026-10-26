@@ -2,7 +2,6 @@
 //!
 //! These structs are serialized to JSON, E2EE encrypted via Double Ratchet,
 //! and placed in the `ciphertext` field of UKM envelopes.
-
 //!
 //! ## Inbound caps
 //! A peer's calendar payload is bounded before this node copies, stores or
