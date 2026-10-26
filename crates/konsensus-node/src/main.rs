@@ -1713,6 +1713,10 @@ async fn start_node_services<'a>(
             .as_ref()
             .and_then(|s| s.local_addr().ok())
             .map(|a| a.port()),
+        configured_stun_server: config
+            .network
+            .stun_server_addr()
+            .map_err(|e| anyhow::anyhow!(e))?,
         custody_mode: custody_mode(config),
         recovery_dir: matches!(config.lightning, LightningConfig::Ldk { .. }).then(|| {
             config
