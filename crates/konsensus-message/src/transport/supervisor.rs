@@ -175,6 +175,7 @@ impl NoiseTransport {
             incoming_tx: self.incoming_tx.clone(),
             control_tx: self.control_tx.clone(),
             call_media_tx: self.call_media_tx.clone(),
+            media_ingress: Arc::clone(&self.media_ingress),
             cookie_keyring: Arc::clone(&self.cookie_keyring),
             shutdown: self.shutdown.subscribe(),
         };

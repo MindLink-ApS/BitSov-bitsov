@@ -17,6 +17,7 @@ use control_reply::Connection;
 mod cookie;
 mod edge;
 mod handshake;
+mod media_ingress;
 mod messaging;
 mod supervisor;
 
@@ -391,7 +392,8 @@ pub struct CallMediaEvent {
     pub privileged: bool,
 }
 
-/// Hold a connection's queue slot until the router dequeues the frame.
+/// Hold the authenticated identity's queue slot until the router dequeues the
+/// frame, including across disconnects and replacement connections.
 struct QueuedCallMedia {
     event: CallMediaEvent,
     _slot: tokio::sync::OwnedSemaphorePermit,
@@ -675,6 +677,7 @@ struct TransportCtx {
     incoming_tx: mpsc::Sender<UkmEnvelope>,
     control_tx: mpsc::Sender<ControlEvent>,
     call_media_tx: mpsc::Sender<QueuedCallMedia>,
+    media_ingress: Arc<media_ingress::MediaIngress>,
     /// Shared pre-Noise cookie secret, consulted when admission requires a cookie.
     cookie_keyring: Arc<cookie::CookieKeyring>,
 }
@@ -706,6 +709,8 @@ pub struct NoiseTransport {
     /// Call media frames from every reader (consumed by `recv_call_media()`).
     call_media_tx: mpsc::Sender<QueuedCallMedia>,
     call_media_rx: Mutex<mpsc::Receiver<QueuedCallMedia>>,
+    /// Per-identity rate and queue budgets survive all connection generations.
+    media_ingress: Arc<media_ingress::MediaIngress>,
     /// Listener shutdown signal.
     shutdown: tokio::sync::watch::Sender<bool>,
     /// Local reconnect reasons and one worker per known dial endpoint.
@@ -748,6 +753,7 @@ impl NoiseTransport {
             control_rx: Mutex::new(control_rx),
             call_media_tx,
             call_media_rx: Mutex::new(call_media_rx),
+            media_ingress: Arc::new(media_ingress::MediaIngress::default()),
             shutdown,
             supervision: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dial_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -952,6 +958,7 @@ impl MessageTransport for NoiseTransport {
             incoming_tx: self.incoming_tx.clone(),
             control_tx: self.control_tx.clone(),
             call_media_tx: self.call_media_tx.clone(),
+            media_ingress: Arc::clone(&self.media_ingress),
             cookie_keyring: Arc::clone(&self.cookie_keyring),
         };
         handshake::connect_to_peer(peer, &socket_addr, &ctx).await?;

@@ -46,6 +46,93 @@ async fn privileged_media_flood_cannot_fill_the_shared_queue() {
     flood_does_not_block_paid_call(true).await;
 }
 
+#[tokio::test]
+async fn reconnect_with_queued_media_preserves_identity_quota_and_other_paid_media() {
+    const OTHER_CALL: &str = "ffeeddccbbaa99887766554433221100";
+    let receiver = open_transport();
+    let flooder = open_transport();
+    let paid = open_transport();
+    receiver.start_listener().await.unwrap();
+    flooder.start_listener().await.unwrap();
+    let addr = receiver.listen_addr().unwrap().to_string();
+    let receiver_id = receiver.identity.node_id();
+    let flooder_id = flooder.identity.node_id();
+    paid.connect(receiver_id, &addr).await.unwrap();
+    barrier(&paid, &receiver).await;
+    let paid_id = paid.identity.node_id();
+    let since = receiver.connected_since(paid_id).await.unwrap();
+    receiver.mark_admission_paid(paid_id, since).await;
+
+    for generation in 0..3 {
+        // Exercise both accepting and dialing the replacement connection.
+        if generation == 1 {
+            receiver
+                .connect(flooder_id, &flooder.listen_addr().unwrap().to_string())
+                .await
+                .unwrap();
+        } else {
+            flooder.connect(receiver_id, &addr).await.unwrap();
+        }
+        barrier(&flooder, &receiver).await;
+        assert!(receiver.promote_to_privileged(flooder_id).await);
+        for seq in 0..1024 {
+            flooder
+                .send_frame(
+                    receiver_id,
+                    &Frame::call_media(CALL, generation * 1024 + seq, vec![1]).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        barrier(&flooder, &receiver).await;
+        assert_eq!(
+            receiver.call_media_rx.lock().await.len(),
+            64,
+            "reconnect must not add quota while old frames remain queued"
+        );
+        if generation < 2 {
+            flooder.disconnect(receiver_id).await.unwrap();
+            receiver.disconnect(flooder_id).await.unwrap();
+        }
+    }
+
+    paid.send_frame(
+        receiver_id,
+        &Frame::call_media(OTHER_CALL, 42, vec![4, 2]).unwrap(),
+    )
+    .await
+    .unwrap();
+    barrier(&paid, &receiver).await;
+    assert_eq!(receiver.call_media_rx.lock().await.len(), 65);
+    for _ in 0..64 {
+        let event = receiver.recv_call_media().await.unwrap();
+        assert_eq!(event.peer_id, *flooder_id);
+        assert!(event.seq < 1024, "replacement bypassed the old backlog");
+    }
+    let event = receiver.recv_call_media().await.unwrap();
+    assert_eq!(event.peer_id, *paid_id);
+    assert_eq!(event.call_id, OTHER_CALL);
+    assert_eq!(event.data, [4, 2]);
+    assert!(event.privileged);
+
+    // Draining old generations releases quota for the current connection.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    flooder
+        .send_frame(receiver_id, &Frame::call_media(CALL, 4096, vec![8]).unwrap())
+        .await
+        .unwrap();
+    barrier(&flooder, &receiver).await;
+    let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv_call_media())
+        .await
+        .expect("old queue permits must be reusable after dequeue")
+        .unwrap();
+    assert_eq!(event.peer_id, *flooder_id);
+    assert_eq!(event.seq, 4096);
+    receiver.shutdown();
+    flooder.shutdown();
+    paid.shutdown();
+}
+
 async fn flood_does_not_block_paid_call(promote_flooder: bool) {
     let receiver = open_transport();
     let flooder = open_transport();

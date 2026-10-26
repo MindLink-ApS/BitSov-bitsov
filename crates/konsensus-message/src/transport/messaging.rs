@@ -18,34 +18,6 @@ use super::{
 };
 use super::NoiseTransport;
 
-// Allow the router's maximum 64 calls at 100 frames/s each, but only a
-// 64-frame burst and 64 queued frames per connection. A stalled router must
-// never let one connection occupy the entire shared 512-frame channel.
-const MEDIA_FRAMES_PER_SECOND: f64 = 100.0 * 64.0;
-const MEDIA_CONNECTION_QUEUE: usize = 64;
-
-struct MediaRateLimit {
-    tokens: f64,
-    updated: Instant,
-}
-
-impl MediaRateLimit {
-    fn new(now: Instant) -> Self {
-        Self { tokens: MEDIA_CONNECTION_QUEUE as f64, updated: now }
-    }
-
-    fn admit(&mut self, now: Instant) -> bool {
-        self.tokens = (self.tokens + now.duration_since(self.updated).as_secs_f64() * MEDIA_FRAMES_PER_SECOND)
-            .min(MEDIA_CONNECTION_QUEUE as f64);
-        self.updated = now;
-        if self.tokens < 1.0 {
-            return false;
-        }
-        self.tokens -= 1.0;
-        true
-    }
-}
-
 /// What a connection must hold for [`NoiseTransport::send_raw_frame_on`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
@@ -417,10 +389,8 @@ pub(super) fn spawn_reader_task(
     ctx: super::TransportCtx,
 ) {
     tokio::spawn(async move {
-        let super::TransportCtx { peers, banned_peers, incoming_tx, control_tx, call_media_tx, mut shutdown, .. } = ctx;
+        let super::TransportCtx { peers, banned_peers, incoming_tx, control_tx, call_media_tx, media_ingress, mut shutdown, .. } = ctx;
         if *shutdown.borrow() { conn.remove(&peer_id, &peers).await; return; }
-        let mut media_rate = MediaRateLimit::new(Instant::now());
-        let media_slots = Arc::new(tokio::sync::Semaphore::new(MEDIA_CONNECTION_QUEUE));
         // Keep the read future alive across ping ticks: cancelling/restarting a
         // partial length-prefixed read would corrupt framing and reset its deadline.
         let read_frames = async {
@@ -840,10 +810,10 @@ pub(super) fn spawn_reader_task(
                 Frame::CallMedia { call_id, seq, data } => {
                     // Reject strangers and excess traffic before it can
                     // compete with other peers in the shared media channel.
-                    if !bought || !media_rate.admit(Instant::now()) {
+                    if !bought {
                         continue;
                     }
-                    let Ok(slot) = Arc::clone(&media_slots).try_acquire_owned() else {
+                    let Some(slot) = media_ingress.try_acquire(peer_id, Instant::now()) else {
                         continue;
                     };
                     // Never block the reader on media: the router drains its
@@ -918,30 +888,6 @@ fn warn_invalid_frame(peer_id: &NodeId, level: f64, should_ban: bool, error: &Wi
     } else {
         warn!(peer = %peer_id, invalid_level = level, budget = INVALID_FRAME_BUDGET,
             error = error.log_category(), "invalid frame (budget warning)");
-    }
-}
-
-#[cfg(test)]
-mod media_rate_tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[test]
-    fn media_rate_caps_bursts_and_refills_only_with_elapsed_time() {
-        let now = Instant::now();
-        let mut cap = MediaRateLimit::new(now);
-        // One packet for each of 64 calls fits, but a flood at the same
-        // instant cannot buy more tokens by repeatedly trying.
-        for _ in 0..64 { assert!(cap.admit(now)); }
-        for _ in 0..1024 { assert!(!cap.admit(now)); }
-        // 6,400 packets/s restores exactly 32 slots in five milliseconds.
-        let later = now + Duration::from_millis(5);
-        for _ in 0..32 { assert!(cap.admit(later)); }
-        assert!(!cap.admit(later));
-        // Idle time replenishes the burst but cannot accumulate a larger one.
-        let later = now + Duration::from_secs(10);
-        for _ in 0..64 { assert!(cap.admit(later)); }
-        assert!(!cap.admit(later));
     }
 }
 
