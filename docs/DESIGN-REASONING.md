@@ -6,7 +6,7 @@ Status: conceptual anchor, 1 Oct 2026, revision 2. It argues *why* the system is
 
 Read it before touching BitSov. Order of authority: whitepaper (WP) → `CHARTER.md` (and `OPERATOR_SOVEREIGNTY_CHARTER.md`, once it is in-tree) → this doc → specs (`docs/protocol/`, `docs/v2/`, in-tree ADRs) → code. A lower layer may add detail; it may never contradict a higher one.
 When two layers disagree, or a task needs what §5 refuses: stop, write the conflict down (PR or issue), and flag it. Do not build around it.
-Paths without a prefix are in this repo. Paths marked **external** are not in this tree: WP = `Konsensus_v02/docs/v2/whitepaper/BitSov_Whitepaper_DRAFT.tex`; V/BIO = `Konsensus_v02/docs/vision/`; OSC = `Konsensus_v02/docs/v2/OPERATOR_SOVEREIGNTY_CHARTER.md`; ADR-032/034/036 = `Konsensus_v02/docs/v2/`; NS, DEC, RL and `research/` = `MindLink-Private/pm/`. Status words BUILT / PROPOSAL / RESERVED were checked against `origin/main` a1c1b74 with `git grep`; app-side claims could not be checked here (no app source in this tree).
+Paths without a prefix are in this repo. Paths marked **external** are not in this tree: WP = `Konsensus_v02/docs/v2/whitepaper/BitSov_Whitepaper_DRAFT.tex`; V/BIO = `Konsensus_v02/docs/vision/`; OSC = `Konsensus_v02/docs/v2/OPERATOR_SOVEREIGNTY_CHARTER.md`; ADR-032/034/036 = `Konsensus_v02/docs/v2/`. NS, DEC and RL each refer to an internal design note. Status words BUILT / PROPOSAL / RESERVED were checked against `origin/main` a1c1b74 with `git grep`; app-side claims could not be checked here (no app source in this tree).
 
 ## 1. First premises
 
