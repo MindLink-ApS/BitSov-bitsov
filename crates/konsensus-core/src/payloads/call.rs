@@ -314,6 +314,8 @@ pub struct CallEntry {
     pub paid_until_ms: Option<u64>,
     pub next_block_seq: u32,
     pub end_reason: Option<HangupReason>,
+    /// Unpaid notice received (caller) or reserved/sent (callee). Survives restart.
+    pub unpaid_notice_used: bool,
 }
 
 impl CallEntry {
@@ -374,7 +376,7 @@ pub fn reserve(entry: Option<CallEntry>, kind: u16, operation_id: &str, request_
     let mine = |e: &CallEntry| e.pending.as_ref().is_some_and(|p| p.is(operation_id, request_hash) && p.kind == kind);
     match kind {
         KIND_CALL_INVITE => match entry {
-            None => Ok(CallEntry { side: Side::Caller, phase: Phase::Reserved, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: Some(pending), paid_until_ms: None, next_block_seq: 0, end_reason: None }),
+            None => Ok(CallEntry { side: Side::Caller, phase: Phase::Reserved, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: Some(pending), paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false }),
             Some(e) if e.phase == Phase::Reserved && mine(&e) => Ok(e),
             Some(_) => Err(CallRefusal::Replayed),
         },
@@ -423,16 +425,20 @@ pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> CallEntry {
 pub fn release(entry: CallEntry, operation_id: &str) -> Option<CallEntry> {
     match &entry.pending {
         Some(p) if p.operation_id == operation_id && p.kind == KIND_CALL_INVITE && entry.phase == Phase::Reserved => None,
-        Some(p) if p.operation_id == operation_id => Some(CallEntry { pending: None, ..entry }),
+        Some(p) if p.operation_id == operation_id => {
+            let release_notice = p.kind == KIND_CALL_HANGUP && entry.side == Side::Callee
+                && entry.phase == Phase::Ended && entry.end_reason == Some(HangupReason::Unpaid);
+            Some(CallEntry { pending: None, unpaid_notice_used: entry.unpaid_notice_used && !release_notice, ..entry })
+        }
         _ => Some(entry),
     }
 }
 
 /// A signal this node received (paid, gate-accepted). Returns the entry to store.
-pub fn receive(entry: Option<CallEntry>, kind: u16, now_ms: u64) -> Result<CallEntry, CallRefusal> {
+pub fn receive(entry: Option<CallEntry>, kind: u16, reason: Option<HangupReason>, now_ms: u64) -> Result<CallEntry, CallRefusal> {
     match kind {
         KIND_CALL_INVITE => match entry {
-            None => Ok(CallEntry { side: Side::Callee, phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None }),
+            None => Ok(CallEntry { side: Side::Callee, phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false }),
             Some(_) => Err(CallRefusal::Replayed),
         },
         KIND_CALL_ANSWER => {
@@ -447,15 +453,24 @@ pub fn receive(entry: Option<CallEntry>, kind: u16, now_ms: u64) -> Result<CallE
         }
         KIND_ICE_CANDIDATE => entry.filter(|e| e.open()).ok_or(CallRefusal::UnknownCall),
         KIND_CALL_HANGUP => {
-            if let Some(e) = entry.as_ref().filter(|e| e.phase == Phase::Ended && e.end_reason == Some(HangupReason::Unpaid)) {
-                // The peer's expiry notification may arrive after our timer.
-                // Keep the original tombstone and any pending payment evidence.
-                return Ok(e.clone());
+            let e = entry.ok_or(CallRefusal::UnknownCall)?;
+            if reason == Some(HangupReason::Unpaid) && e.side != Side::Caller {
+                return Err(CallRefusal::UnknownCall);
             }
-            let e = entry.filter(|e| e.open()).ok_or(CallRefusal::UnknownCall)?;
+            if e.phase == Phase::Ended {
+                if e.end_reason != Some(HangupReason::Unpaid)
+                    || reason != Some(HangupReason::Unpaid)
+                    || e.unpaid_notice_used
+                {
+                    return Err(CallRefusal::UnknownCall);
+                }
+                // Preserve the tombstone and pending evidence; consume only the notice.
+                return Ok(CallEntry { unpaid_notice_used: true, ..e });
+            }
+            if !e.open() { return Err(CallRefusal::UnknownCall); }
             // Their hangup wins; a signal of ours still being paid keeps its
             // mark so its settlement or release is still recorded.
-            Ok(CallEntry { phase: Phase::Ended, deadline_ms: now_ms.saturating_add(TOMBSTONE_MS), ..e })
+            Ok(CallEntry { phase: Phase::Ended, deadline_ms: now_ms.saturating_add(TOMBSTONE_MS), end_reason: reason, unpaid_notice_used: reason == Some(HangupReason::Unpaid), ..e })
         }
         _ => Err(CallRefusal::NotCallKind),
     }
@@ -511,13 +526,14 @@ pub fn reserve_block(entry: Option<CallEntry>, seq: u32, operation_id: &str, req
 /// This never reopens the call or grants media. Existing pending evidence wins.
 pub fn reserve_unpaid_hangup(entry: Option<CallEntry>, operation_id: &str, request_hash: &str) -> Result<CallEntry, CallRefusal> {
     let entry = entry.ok_or(CallRefusal::UnknownCall)?;
-    if entry.phase != Phase::Ended || entry.end_reason != Some(HangupReason::Unpaid) {
+    if entry.side != Side::Callee || entry.phase != Phase::Ended || entry.end_reason != Some(HangupReason::Unpaid) {
         return Err(CallRefusal::UnknownCall);
     }
     if let Some(pending) = &entry.pending {
         return if pending.kind == KIND_CALL_HANGUP && pending.is(operation_id, request_hash) { Ok(entry) } else { Err(CallRefusal::InFlight) };
     }
-    Ok(CallEntry { pending: Some(Pending { operation_id: operation_id.into(), kind: KIND_CALL_HANGUP, request_hash: request_hash.into() }), ..entry })
+    if entry.unpaid_notice_used { return Err(CallRefusal::UnknownCall); }
+    Ok(CallEntry { unpaid_notice_used: true, pending: Some(Pending { operation_id: operation_id.into(), kind: KIND_CALL_HANGUP, request_hash: request_hash.into() }), ..entry })
 }
 
 /// Stored call rows as of one instant, split by what they hold.
@@ -652,22 +668,22 @@ mod tests {
         assert_eq!(reserve(Some(r.clone()), 400, "op1", "h", 1).unwrap(), r);
         assert_eq!(reserve(Some(r.clone()), 400, "op2", "h", 1), Err(CallRefusal::Replayed));
         // Codex P1: an answer cannot be accepted for an offer that was never paid.
-        assert_eq!(receive(Some(r.clone()), 401, 1), Err(CallRefusal::UnknownCall));
+        assert_eq!(receive(Some(r.clone()), 401, None, 1), Err(CallRefusal::UnknownCall));
         // Definite nonpayment: forgotten, so the same id can be offered again.
         assert_eq!(release(r.clone(), "op1"), None);
         // Paid: now it rings and accepts the callee's answer once.
         let ringing = commit(r, "op1", 5);
         assert_eq!((ringing.phase, ringing.pending.clone()), (Phase::Ringing, None));
-        let live = receive(Some(ringing.clone()), 401, 6).unwrap();
+        let live = receive(Some(ringing.clone()), 401, None, 6).unwrap();
         assert_eq!(live.phase, Phase::Live);
-        assert_eq!(receive(Some(live), 401, 7), Err(CallRefusal::NotRinging));
+        assert_eq!(receive(Some(live), 401, None, 7), Err(CallRefusal::NotRinging));
         // Commit is idempotent and never fails after payment.
         assert_eq!(commit(ringing.clone(), "op1", 9), ringing);
     }
 
     #[test]
     fn our_answer_and_hangup_change_state_only_when_paid() {
-        let ringing = receive(None, 400, 0).unwrap();
+        let ringing = receive(None, 400, None, 0).unwrap();
         assert_eq!(reserve(Some(ringing.clone()), 401, "a", "h", 1).unwrap().phase, Phase::Ringing, "reserved, not yet live");
         let pending = reserve(Some(ringing.clone()), 401, "a", "h", 1).unwrap();
         // A second signal while the answer is being paid waits.
@@ -691,21 +707,21 @@ mod tests {
     #[test]
     fn signals_need_an_open_call_and_ids_stay_burned_until_their_deadline() {
         for k in [401, 402, 403] {
-            assert_eq!(receive(None, k, 0), Err(CallRefusal::UnknownCall));
+            assert_eq!(receive(None, k, None, 0), Err(CallRefusal::UnknownCall));
             assert_eq!(reserve(None, k, "op", "h", 0), Err(CallRefusal::UnknownCall));
         }
-        let ringing = receive(None, 400, 0).unwrap();
-        assert_eq!(receive(Some(ringing.clone()), 400, 1), Err(CallRefusal::Replayed));
-        let ended = receive(Some(ringing), 403, 2).unwrap();
-        assert_eq!(receive(Some(ended.clone()), 402, 3), Err(CallRefusal::UnknownCall));
+        let ringing = receive(None, 400, None, 0).unwrap();
+        assert_eq!(receive(Some(ringing.clone()), 400, None, 1), Err(CallRefusal::Replayed));
+        let ended = receive(Some(ringing), 403, None, 2).unwrap();
+        assert_eq!(receive(Some(ended.clone()), 402, None, 3), Err(CallRefusal::UnknownCall));
         // Burned until the tombstone runs out, then free again.
         assert!(ended.clone().at(2 + TOMBSTONE_MS - 1).is_some());
         assert!(ended.at(2 + TOMBSTONE_MS).is_none());
         // Unanswered: stops ringing at the deadline, id stays burned a day after.
-        let r = receive(None, 400, 0).unwrap();
+        let r = receive(None, 400, None, 0).unwrap();
         let late = r.at(RING_TIMEOUT_MS).unwrap();
         assert_eq!((late.phase, late.deadline_ms), (Phase::Ended, RING_TIMEOUT_MS + TOMBSTONE_MS));
-        assert_eq!(receive(Some(late.clone()), 401, RING_TIMEOUT_MS), Err(CallRefusal::UnknownCall));
+        assert_eq!(receive(Some(late.clone()), 401, None, RING_TIMEOUT_MS), Err(CallRefusal::UnknownCall));
         assert_eq!(late.replay_until_ms(), RING_TIMEOUT_MS + TOMBSTONE_MS);
     }
 
@@ -723,7 +739,7 @@ mod tests {
         assert_eq!(burned_excess(MAX_BURNED_PER_PEER - 1, MAX_BURNED_PER_PEER), 0);
         assert_eq!(burned_excess(MAX_BURNED_PER_PEER, MAX_BURNED_PER_PEER), 1);
         // An id ended at t is evictable only from t + BURN_MIN_MS.
-        let ended = commit(reserve(Some(receive(None, 400, 0).unwrap()), 403, "h", "h", 0).unwrap(), "h", 0);
+        let ended = commit(reserve(Some(receive(None, 400, None, 0).unwrap()), 403, "h", "h", 0).unwrap(), "h", 0);
         assert!(ended.replay_until_ms() > evictable_until(BURN_MIN_MS - 1));
         assert!(ended.replay_until_ms() <= evictable_until(BURN_MIN_MS));
     }

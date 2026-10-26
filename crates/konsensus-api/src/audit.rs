@@ -73,6 +73,9 @@ pub mod events {
     pub const MESSAGE_RECEIVED: &str = "message.received";
     /// Incoming P2P message rejected by payment gate.
     pub const MESSAGE_REJECTED: &str = "message.rejected";
+    /// Payment accepted but the call block could not be committed. The record
+    /// identifies the retained receipt and block for operator reconciliation.
+    pub const CALL_BLOCK_COMMIT_FAILED: &str = "call.block_commit_failed";
     /// Peer added to registry.
     pub const PEER_ADDED: &str = "peer.added";
     /// Peer removed from registry.

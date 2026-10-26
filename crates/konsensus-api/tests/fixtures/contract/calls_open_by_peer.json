@@ -27,9 +27,9 @@
       "direction": "incoming",
       "id": "000000000000000000000000000a11ce",
       "next_block_due_ms": "<unix_ms>",
-      "next_block_seq": 1,
+      "next_block_seq": 0,
       "op_id": null,
-      "paid_until_ms": "<unix_ms>",
+      "paid_until_ms": null,
       "state": "live",
       "unresolved_paid_admission": false
     }

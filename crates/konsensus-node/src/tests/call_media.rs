@@ -324,7 +324,7 @@ async fn production_admission_requires_paid_live_blocks_and_fails_closed() {
     let store = Arc::new(SqliteStorage::in_memory().await.unwrap());
     let admission = super::PaidCallAdmission::new(store.clone());
     let live = CallEntry { side: Side::Caller, phase: Phase::Live, deadline_ms: 100_000,
-        pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None };
+        pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false };
     assert!(!admission.call_media_admitted(&peer(), CALL, 1_000).await);
     store.call_put(&peer(), CALL, &live).await.unwrap();
     assert!(!admission.call_media_admitted(&peer(), CALL, 1_000).await, "answered is not paid");
@@ -376,7 +376,7 @@ async fn idle_paid_route_expires_after_grace_without_media() {
     let now = super::now_ms();
     store.call_put(&peer(), CALL, &CallEntry {
         side: Side::Caller, phase: Phase::Live, deadline_ms: now + 200,
-        pending: None, paid_until_ms: Some(now - 9_800), next_block_seq: 1, end_reason: None,
+        pending: None, paid_until_ms: Some(now - 9_800), next_block_seq: 1, end_reason: None, unpaid_notice_used: false,
     }).await.unwrap();
     let f = fixture();
     let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store)));

@@ -48,7 +48,7 @@ fn entry(phase: Phase, side: Side, deadline_ms: u64, op: Option<&str>) -> CallEn
         phase,
         side,
         deadline_ms,
-        paid_until_ms: None, next_block_seq: 0, end_reason: None,
+        paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false,
         pending: op.map(|op| Pending {
             operation_id: op.into(),
             kind: 400,

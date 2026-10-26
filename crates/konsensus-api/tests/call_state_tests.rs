@@ -179,7 +179,7 @@ async fn burned_ids_older_than_the_minimum_make_room_oldest_first() {
     // 255 calls that ended more than BURN_MIN_MS ago (oldest = id 0) ...
     for i in 0..MAX_BURNED_PER_PEER as usize - 1 {
         let ended = now - BURN_MIN_MS - 60_000 * (MAX_BURNED_PER_PEER - i as u64);
-        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None };
+        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false };
         store.call_put(&peer, &id(i), &entry).await.unwrap();
     }
     // ... and one that just ended.
@@ -422,7 +422,7 @@ async fn unknown_call_signals_never_evict_burned_ids() {
     let now = now_ms();
     for i in 0..MAX_BURNED_PER_PEER as usize {
         let ended = now - BURN_MIN_MS - 60_000 * (MAX_BURNED_PER_PEER - i as u64);
-        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None };
+        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false };
         store.call_put(&peer, &id(i), &entry).await.unwrap();
     }
     for kind in [401, 402, 403] {

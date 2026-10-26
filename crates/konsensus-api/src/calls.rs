@@ -181,6 +181,11 @@ pub struct IncomingBlock<'a> {
 }
 
 impl IncomingBlock<'_> {
+    /// Validated block identity for reconciliation if its paid commit fails.
+    pub fn signal(&self) -> &CallSignal {
+        &self.signal
+    }
+
     /// Publish only after the envelope's payment proof is accepted. Do not
     /// recheck time: expiry cannot race the admission decision under this lock.
     pub async fn commit(self) -> Result<CallSignal, konsensus_storage::StorageError> {
@@ -220,7 +225,7 @@ pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind:
     let next = if kind == konsensus_core::kind::KIND_CALL_BLOCK {
         rules::receive_block(entry, signal.seq.ok_or(CallRefusal::Invalid("missing seq"))?, now)?
     } else {
-        rules::receive(entry, kind, now)?
+        rules::receive(entry, kind, signal.reason, now)?
     };
     write(store, peer, &signal.call_id, Some(&next)).await.map_err(unavailable)?;
     Ok(signal)

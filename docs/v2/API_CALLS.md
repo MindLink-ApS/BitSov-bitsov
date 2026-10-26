@@ -65,49 +65,6 @@ The endpoint reads the durable call state, including paid interval fields from m
 prices, pay, dispatch signals, emit call events, sweep rows, or mutate the
 operation journal. See [call protocol and recovery](CALLS-PROTOTYPE.md).
 
-# Owner media socket (M6 N2)
-
-`GET /api/v1/calls/<call-id>/media?peer=<node-id>` upgrades to the binary
-WebSocket that carries a node-routed call's media between the owner's app and
-its own node. Media flows app → own node → peer node → peer app; apps never
-send media to each other. The JWT is sent as the `bitsov.jwt.<token>`
-subprotocol, as on `/api/v1/ws` (the `?token=` query form is for local tooling).
-
-The socket opens only for a **paired device** (a token with a live pairing
-binding; the owner's own key-proof token gets 403) that holds the `spend`
-scope and whose subject is this node. `call-id` must be the 32-hex call id and
-`peer` the call's counterparty (400 otherwise). The node's call media router
-must admit `(peer, call-id)`: the stored call must be live with a settled
-block, and now must be at or before `paid_until_ms` plus the 10-second grace
-from N1 (#453). Unknown calls and storage errors fail closed. A call
-that is not admitted gets 403, a second socket on the same call 409, a peer
-that is not connected or does not advertise `call_media_v1` 503. Pairing and
-scope are re-checked every second while the socket is open; revocation closes it.
-
-Every binary message is one packet: `seq` (u32, big-endian) followed by the
-codec payload, at most 4096 bytes. Packets from the app are forwarded to the
-peer node as `CallMedia` frames on the existing Noise link; the peer's packets
-arrive on the same socket in the same form. Each direction is capped at 100
-packets and 64 KiB per second; queues are bounded and drop the oldest packet
-rather than block, and a packet that cannot be written to the peer within
-200 ms (a bulk frame holds the writer) is dropped rather than queued. Once
-an encrypted record starts, cancellation, failure or a write timeout closes
-and invalidates that Noise connection before it can be reused.
-
-Admission is rechecked every second even without traffic or during a stalled
-peer write. Losing admission ends the route. Socket authorization and route
-termination remain active while a socket write is stalled; every send and
-close has a two-second deadline. A timeout drops the socket and releases its
-attachment.
-
-WebSocket frames and reassembled messages are limited to 4100 bytes before
-upgrade (4 sequence bytes plus 4096 payload bytes). All incoming messages,
-including text, control and malformed messages, share a 100-message and
-64-KiB per-second ingress budget; exceeding either closes the socket. Text
-is dropped without JSON parsing or application replies. Short binary packets
-are dropped and counted. Oversize frames/messages close the socket at the
-WebSocket framing layer.
-
 ## Contract goldens (app–node)
 
 The responses the app consumes for calls and for the owner-only STUN fields
@@ -129,12 +86,6 @@ on either side fails there and here before it reaches a user.
 | `calls_open_by_peer.json` | `GET /api/v1/calls?peer=<node-id>` | 200 | Three open calls: an `ended` outgoing call with an unresolved paid admission bound to its journal row (`created` set, `op_id` set) first, then a `ringing` outgoing and a `live` incoming call in id order, both with `created` and `op_id` `null`. |
 | `calls_open_by_peer_empty.json` | `GET /api/v1/calls?peer=<node-id>` | 200 | A valid peer with no open calls: `[]`. |
 | `calls_invalid_peer.json` | `GET /api/v1/calls?peer=not-a-node-id` | 400 | `{"error":"invalid peer id","code":400}`: the fixed text, with the generic numeric bad-request `code`. |
-
-The status fixtures include `call_media_v1` in `api_capabilities`. The call
-list fixture includes `paid_until_ms`, `next_block_seq` and
-`next_block_due_ms`: its live incoming call has block zero settled, while
-ringing and ended calls have no paid interval. These fields are shared with
-the app contract consumer.
 
 Each fixture is one envelope:
 
@@ -160,7 +111,8 @@ kept literally.
 | `/body/lightning_node_pubkey` | 66 lower-case hex chars | `<hex66>` |
 | `/body/message_id`, `/body/payment_hash` | 64 lower-case hex chars | `<hex64>` |
 | `/body/uptime_secs` | non-negative integer | `<uint>` |
-| `/body/*/created`, `/body/*/paid_until_ms`, `/body/*/next_block_due_ms` | non-negative integer ≥ 10^12 (Unix milliseconds); `null` stays `null` | `<unix_ms>` |
+| `/body/*/next_block_due_ms` | non-negative integer ≥ 10^12 (Unix milliseconds) | `<unix_ms>` |
+| `/body/*/created` | non-negative integer ≥ 10^12 (Unix milliseconds) | `<unix_ms>` |
 
 ### Regenerating
 

@@ -294,8 +294,10 @@ impl Debit {
                 .map(|d| d.as_millis() as u64).unwrap_or(u64::MAX);
             // Recheck after journal awaits, immediately before the first wallet
             // poll. Once polled, money may be in flight: preserve reconciliation.
-            if !polled && deadline.is_some_and(|until| now > until) {
-                return Poll::Ready(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched("call block expired before payment dispatch".into())));
+            // The caller observes the answer after the callee committed it.
+            // Leave five seconds for that skew and payment/delivery latency.
+            if !polled && deadline.is_some_and(|until| now.saturating_add(5_000) > until) {
+                return Poll::Ready(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched("call block too close to expiry before payment dispatch".into())));
             }
             polled = true;
             let result = future.as_mut().poll(cx);

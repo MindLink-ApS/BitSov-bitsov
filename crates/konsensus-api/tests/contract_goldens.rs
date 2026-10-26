@@ -90,7 +90,6 @@ const MASKS: &[(&str, Mask)] = &[
     ("/body/payment_hash", Mask::Hex(64)),
     // GET /api/v1/calls?peer=
     ("/body/*/created", Mask::UnixMs),
-    ("/body/*/paid_until_ms", Mask::UnixMs),
     ("/body/*/next_block_due_ms", Mask::UnixMs),
     // GET /api/v1/pricing/peers/:id/call
     ("/body/peer_id", Mask::Hex(64)),
@@ -434,13 +433,14 @@ async fn call_invite_and_call_state_match_goldens() {
             &peer,
             &call_id(0xa11ce),
             &CallEntry {
-                paid_until_ms: Some(now + 60_000),
-                next_block_seq: 1,
-                end_reason: None,
                 phase: Phase::Live,
                 side: Side::Callee,
-                deadline_ms: now + 70_000,
+                deadline_ms: in_an_hour,
                 pending: None,
+                paid_until_ms: None,
+                next_block_seq: 0,
+                end_reason: None,
+                unpaid_notice_used: false,
             },
         )
         .await
@@ -460,12 +460,13 @@ async fn call_invite_and_call_state_match_goldens() {
             &peer,
             &call_id(0xdead),
             &CallEntry {
-                paid_until_ms: None,
-                next_block_seq: 0,
-                end_reason: None,
                 phase: Phase::Ended,
                 side: Side::Caller,
                 deadline_ms: in_an_hour,
+                paid_until_ms: None,
+                next_block_seq: 0,
+                end_reason: None,
+                unpaid_notice_used: false,
                 pending: Some(Pending {
                     operation_id: unresolved.into(),
                     kind: 400,

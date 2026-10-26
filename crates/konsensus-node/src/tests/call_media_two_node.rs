@@ -185,7 +185,7 @@ impl Node {
     async fn live_call(&self, peer: &NodeId, side: Side) {
         let now = chrono::Utc::now().timestamp_millis() as u64;
         self.storage
-            .call_put(peer, CALL, &CallEntry { side, phase: Phase::Live, deadline_ms: now + 70_000, pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1, end_reason: None })
+            .call_put(peer, CALL, &CallEntry { side, phase: Phase::Live, deadline_ms: now + 70_000, pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1, end_reason: None, unpaid_notice_used: false })
             .await
             .unwrap();
     }
