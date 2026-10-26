@@ -293,6 +293,21 @@ async fn a_packet_into_node_a_s_socket_comes_out_of_node_b_s_socket() {
     app_a.send(packet(21, b"still here")).await.unwrap();
     assert_eq!(next_binary(&mut app_b).await, [&21u32.to_be_bytes()[..], b"still here"].concat());
 
+    // A replacement Noise connection must resume the paid call on the same
+    // owner sockets, with a fresh cipher and no stale transport generation.
+    let before = a.transport.connected_since(&b.id).await.unwrap();
+    a.transport.disconnect(&b.id).await.unwrap();
+    wait_until("B observed the disconnect", || async { !b.transport.is_connected(&a.id).await }).await;
+    a.transport.connect(&b.id, &b.addr()).await.unwrap();
+    wait_until("both see the replacement", || async {
+        a.transport.is_connected(&b.id).await && b.transport.is_connected(&a.id).await
+    }).await;
+    assert_ne!(a.transport.connected_since(&b.id).await.unwrap(), before);
+    app_a.send(packet(30, b"after reconnect")).await.unwrap();
+    assert_eq!(next_binary(&mut app_b).await, [&30u32.to_be_bytes()[..], b"after reconnect"].concat());
+    app_b.send(packet(31, b"return after reconnect")).await.unwrap();
+    assert_eq!(next_binary(&mut app_a).await, [&31u32.to_be_bytes()[..], b"return after reconnect"].concat());
+
     // The call ends on B: B's socket closes and nothing more arrives on it.
     b.storage.call_delete(&a.id, CALL).await.unwrap();
     tokio::time::sleep(super::ADMISSION_RECHECK + Duration::from_millis(200)).await;

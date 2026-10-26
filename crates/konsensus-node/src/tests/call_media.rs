@@ -128,7 +128,7 @@ async fn frames_for_unknown_calls_or_from_non_counterparties_are_dropped_without
 
     let attachment = f.router.attach(&peer(), CALL).await.unwrap();
     assert_eq!(f.router.inbound(event(peer(), OTHER_CALL, 1, true)).await, Err(MediaDrop::UnknownCall));
-    assert_eq!(f.router.inbound(event(stranger(), CALL, 1, true)).await, Err(MediaDrop::NotCounterparty));
+    assert_eq!(f.router.inbound(event(stranger(), CALL, 1, true)).await, Err(MediaDrop::UnknownCall));
     assert_eq!(f.router.inbound(event(peer(), CALL, 1, false)).await, Err(MediaDrop::Unprivileged));
     let oversize = CallMediaEvent { data: vec![0; MAX_CALL_MEDIA_BYTES + 1], ..event(peer(), CALL, 1, true) };
     assert_eq!(f.router.inbound(oversize).await, Err(MediaDrop::Oversize));
@@ -136,12 +136,38 @@ async fn frames_for_unknown_calls_or_from_non_counterparties_are_dropped_without
     // Dropped means dropped: nothing reached the app, nothing went back.
     assert!(attachment.from_node.try_pop().is_none());
     assert!(f.link.sent.lock().unwrap().is_empty());
-    assert_eq!(f.router.dropped(MediaDrop::UnknownCall), 2);
-    assert_eq!(f.router.dropped(MediaDrop::NotCounterparty), 1);
+    assert_eq!(f.router.dropped(MediaDrop::UnknownCall), 3);
 
     // The counterparty's frame, privileged, is the one that arrives.
     f.router.inbound(event(peer(), CALL, 9, true)).await.unwrap();
     assert_eq!(attachment.from_node.try_pop().unwrap(), MediaFrame { seq: 9, payload: vec![9; 160] });
+}
+
+#[tokio::test]
+async fn same_call_id_routes_independently_for_each_peer() {
+    let f = fixture();
+    f.link.connected.lock().unwrap().insert(stranger());
+    f.admission.admit(stranger(), CALL);
+    let first = f.router.attach(&peer(), CALL).await.unwrap();
+    let second = f.router.attach(&stranger(), CALL).await.expect("distinct peer, distinct route");
+    assert_eq!(f.router.routed_calls(), 2);
+    assert_eq!(f.router.attach(&stranger(), CALL).await.err(), Some(AttachRefusal::AlreadyAttached));
+    f.router.inbound(event(peer(), CALL, 11, true)).await.unwrap();
+    f.router.inbound(event(stranger(), CALL, 22, true)).await.unwrap();
+    assert_eq!(first.from_node.try_pop().unwrap().seq, 11);
+    assert_eq!(second.from_node.try_pop().unwrap().seq, 22);
+    assert!(first.from_node.try_pop().is_none() && second.from_node.try_pop().is_none());
+    drop(first);
+    assert_eq!(f.router.routed_calls(), 1);
+    assert!(!second.from_node.is_closed());
+    f.router.inbound(event(stranger(), CALL, 23, true)).await.unwrap();
+    assert_eq!(second.from_node.try_pop().unwrap().seq, 23);
+    let replacement = f.router.attach(&peer(), CALL).await.unwrap();
+    drop(second);
+    assert_eq!(f.router.routed_calls(), 1);
+    assert!(!replacement.from_node.is_closed());
+    drop(replacement);
+    assert_eq!(f.router.routed_calls(), 0);
 }
 
 #[tokio::test]

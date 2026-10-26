@@ -360,6 +360,24 @@ async fn stalled_socket_releases(reason: &str) {
 }
 
 #[tokio::test]
+async fn websocket_ping_gets_one_automatic_pong_and_media_continues() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let port = ObservedPort::new();
+    let f = fixture(dir.path(), Some(port.clone())).await;
+    let token = f.paired_token(36, vec![Scope::Spend]);
+    let (_, mut socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
+    socket.write_all(&masked_frame(0x89, b"probe")).await.unwrap();
+    let mut pong = [0; 7];
+    tokio::time::timeout(std::time::Duration::from_secs(2), socket.read_exact(&mut pong)).await.unwrap().unwrap();
+    assert_eq!(&pong, b"\x8a\x05probe");
+    port.from_node.push(konsensus_api::call_media::MediaFrame { seq: 9, payload: vec![7] }).unwrap();
+    let mut media = [0; 7];
+    tokio::time::timeout(std::time::Duration::from_secs(2), socket.read_exact(&mut media)).await.unwrap().unwrap();
+    assert_eq!(media, [0x82, 5, 0, 0, 0, 9, 7], "next frame must be media, not a second pong");
+}
+
+#[tokio::test]
 async fn text_ping_is_ignored_without_a_json_reply() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dir = tempfile::tempdir().unwrap();

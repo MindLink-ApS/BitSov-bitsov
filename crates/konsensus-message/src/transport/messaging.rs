@@ -18,6 +18,34 @@ use super::{
 };
 use super::NoiseTransport;
 
+// Allow the router's maximum 64 calls at 100 frames/s each, but only a
+// 64-frame burst and 64 queued frames per connection. A stalled router must
+// never let one connection occupy the entire shared 512-frame channel.
+const MEDIA_FRAMES_PER_SECOND: f64 = 100.0 * 64.0;
+const MEDIA_CONNECTION_QUEUE: usize = 64;
+
+struct MediaRateLimit {
+    tokens: f64,
+    updated: Instant,
+}
+
+impl MediaRateLimit {
+    fn new(now: Instant) -> Self {
+        Self { tokens: MEDIA_CONNECTION_QUEUE as f64, updated: now }
+    }
+
+    fn admit(&mut self, now: Instant) -> bool {
+        self.tokens = (self.tokens + now.duration_since(self.updated).as_secs_f64() * MEDIA_FRAMES_PER_SECOND)
+            .min(MEDIA_CONNECTION_QUEUE as f64);
+        self.updated = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
 /// What a connection must hold for [`NoiseTransport::send_raw_frame_on`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
@@ -32,6 +60,7 @@ pub enum Standing {
 /// its write lock is still held, even if the reader has not observed EOF yet.
 struct MediaWriteGuard<'a> {
     conn: &'a Connection,
+    peer: &'a NodeId,
     complete: bool,
 }
 
@@ -39,6 +68,7 @@ impl Drop for MediaWriteGuard<'_> {
     fn drop(&mut self) {
         if !self.complete {
             self.conn.close();
+            info!(peer = %self.peer, "unfinished media record closed peer connection");
         }
     }
 }
@@ -209,9 +239,11 @@ impl NoiseTransport {
     /// Every frame on a connection shares one writer, so a bulk frame in
     /// flight would otherwise queue audio behind it for as long as it takes.
     /// Media is instead bounded: a packet that cannot start within the
-    /// deadline is dropped and `Timeout` returned, never written late. The
-    /// write itself has the same deadline. Cancellation, failure or timeout
-    /// closes and invalidates this connection before the write lock is released.
+    /// deadline is dropped and `Timeout` returned, never written late. Wait
+    /// for socket readiness within that deadline before consuming a nonce;
+    /// congestion or cancellation here leaves the connection usable. Once
+    /// encrypted, the write has its own deadline: cancellation, failure or
+    /// timeout closes this connection before releasing the write lock.
     ///
     /// [`CALL_MEDIA_WRITE_DEADLINE`]: super::CALL_MEDIA_WRITE_DEADLINE
     pub async fn send_call_media(&self, peer: &NodeId, frame_bytes: &[u8]) -> Result<(), TransportError> {
@@ -223,13 +255,20 @@ impl NoiseTransport {
                     .ok_or_else(|| TransportError::NotConnected(peer.to_hex()))?,
             )
         };
-        let mut state = tokio::time::timeout(super::CALL_MEDIA_WRITE_DEADLINE, conn.lock())
+        let deadline = tokio::time::Instant::now() + super::CALL_MEDIA_WRITE_DEADLINE;
+        let mut state = tokio::time::timeout_at(deadline, conn.lock())
             .await
             .map_err(|_| TransportError::Timeout("call media writer busy".into()))?;
         if conn.is_closed() {
             return Err(TransportError::NotConnected(peer.to_hex()));
         }
-        let mut guard = MediaWriteGuard { conn: &conn, complete: false };
+        tokio::time::timeout_at(deadline, state.writer.writable())
+            .await
+            .map_err(|_| TransportError::Timeout("call media socket not writable".into()))?
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+        // Readiness can race or be a false positive. After encrypting we
+        // must still close on an incomplete record; never reuse its nonce.
+        let mut guard = MediaWriteGuard { conn: &conn, peer, complete: false };
         let encrypted = state
             .noise
             .encrypt(frame_bytes)
@@ -380,6 +419,8 @@ pub(super) fn spawn_reader_task(
     tokio::spawn(async move {
         let super::TransportCtx { peers, banned_peers, incoming_tx, control_tx, call_media_tx, mut shutdown, .. } = ctx;
         if *shutdown.borrow() { conn.remove(&peer_id, &peers).await; return; }
+        let mut media_rate = MediaRateLimit::new(Instant::now());
+        let media_slots = Arc::new(tokio::sync::Semaphore::new(MEDIA_CONNECTION_QUEUE));
         // Keep the read future alive across ping ticks: cancelling/restarting a
         // partial length-prefixed read would corrupt framing and reset its deadline.
         let read_frames = async {
@@ -797,10 +838,21 @@ pub(super) fn spawn_reader_task(
                     }
                 }
                 Frame::CallMedia { call_id, seq, data } => {
+                    // Reject strangers and excess traffic before it can
+                    // compete with other peers in the shared media channel.
+                    if !bought || !media_rate.admit(Instant::now()) {
+                        continue;
+                    }
+                    let Ok(slot) = Arc::clone(&media_slots).try_acquire_owned() else {
+                        continue;
+                    };
                     // Never block the reader on media: the router drains its
                     // own channel; a full one drops the newest packet.
                     if call_media_tx
-                        .try_send(CallMediaEvent { peer_id, call_id, seq, data, privileged: bought })
+                        .try_send(super::QueuedCallMedia {
+                            event: CallMediaEvent { peer_id, call_id, seq, data, privileged: bought },
+                            _slot: slot,
+                        })
                         .is_err()
                     {
                         debug!(peer = %peer_id, "call media channel full; packet dropped");
@@ -866,6 +918,30 @@ fn warn_invalid_frame(peer_id: &NodeId, level: f64, should_ban: bool, error: &Wi
     } else {
         warn!(peer = %peer_id, invalid_level = level, budget = INVALID_FRAME_BUDGET,
             error = error.log_category(), "invalid frame (budget warning)");
+    }
+}
+
+#[cfg(test)]
+mod media_rate_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn media_rate_caps_bursts_and_refills_only_with_elapsed_time() {
+        let now = Instant::now();
+        let mut cap = MediaRateLimit::new(now);
+        // One packet for each of 64 calls fits, but a flood at the same
+        // instant cannot buy more tokens by repeatedly trying.
+        for _ in 0..64 { assert!(cap.admit(now)); }
+        for _ in 0..1024 { assert!(!cap.admit(now)); }
+        // 6,400 packets/s restores exactly 32 slots in five milliseconds.
+        let later = now + Duration::from_millis(5);
+        for _ in 0..32 { assert!(cap.admit(later)); }
+        assert!(!cap.admit(later));
+        // Idle time replenishes the burst but cannot accumulate a larger one.
+        let later = now + Duration::from_secs(10);
+        for _ in 0..64 { assert!(cap.admit(later)); }
+        assert!(!cap.admit(later));
     }
 }
 

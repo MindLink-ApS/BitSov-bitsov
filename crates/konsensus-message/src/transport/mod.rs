@@ -391,6 +391,12 @@ pub struct CallMediaEvent {
     pub privileged: bool,
 }
 
+/// Hold a connection's queue slot until the router dequeues the frame.
+struct QueuedCallMedia {
+    event: CallMediaEvent,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
 /// Media frames a reader may hold for the router before dropping the
 /// newest: at 50 packets per second per direction this is a few hundred
 /// milliseconds across every live call. The reader never blocks on it.
@@ -668,7 +674,7 @@ struct TransportCtx {
     banned_peers: BanMap,
     incoming_tx: mpsc::Sender<UkmEnvelope>,
     control_tx: mpsc::Sender<ControlEvent>,
-    call_media_tx: mpsc::Sender<CallMediaEvent>,
+    call_media_tx: mpsc::Sender<QueuedCallMedia>,
     /// Shared pre-Noise cookie secret, consulted when admission requires a cookie.
     cookie_keyring: Arc<cookie::CookieKeyring>,
 }
@@ -698,8 +704,8 @@ pub struct NoiseTransport {
     /// Receiver for control events (consumed by `recv_control()`).
     control_rx: Mutex<mpsc::Receiver<ControlEvent>>,
     /// Call media frames from every reader (consumed by `recv_call_media()`).
-    call_media_tx: mpsc::Sender<CallMediaEvent>,
-    call_media_rx: Mutex<mpsc::Receiver<CallMediaEvent>>,
+    call_media_tx: mpsc::Sender<QueuedCallMedia>,
+    call_media_rx: Mutex<mpsc::Receiver<QueuedCallMedia>>,
     /// Listener shutdown signal.
     shutdown: tokio::sync::watch::Sender<bool>,
     /// Local reconnect reasons and one worker per known dial endpoint.
@@ -4348,6 +4354,9 @@ mod tests {
         transport_b.shutdown();
     }
 }
+
+#[cfg(test)]
+mod media_tests;
 
 #[cfg(test)]
 mod cancelled_noise_write_tests {

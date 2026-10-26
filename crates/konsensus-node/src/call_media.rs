@@ -124,10 +124,8 @@ fn now_ms() -> u64 {
 /// at a bounded rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MediaDrop {
-    /// No socket is attached to a call with that id.
+    /// No socket is attached to this peer and call id.
     UnknownCall,
-    /// The frame came from a node that is not the call's counterparty.
-    NotCounterparty,
     /// The sending connection is neither privileged nor one we paid on.
     Unprivileged,
     /// The call is no longer admitted (ended, expired or unpaid).
@@ -150,7 +148,6 @@ impl MediaDrop {
     fn as_str(self) -> &'static str {
         match self {
             MediaDrop::UnknownCall => "unknown_call",
-            MediaDrop::NotCounterparty => "not_counterparty",
             MediaDrop::Unprivileged => "unprivileged",
             MediaDrop::NotAdmitted => "not_admitted",
             MediaDrop::RateCapped => "rate_capped",
@@ -272,7 +269,7 @@ impl Route {
 pub struct CallMediaRouter {
     link: Arc<dyn MediaLink>,
     admission: Arc<dyn CallMediaAdmission>,
-    routes: Mutex<HashMap<String, Arc<Route>>>,
+    routes: Mutex<HashMap<(NodeId, String), Arc<Route>>>,
     drops: DropLog,
     me: Weak<Self>,
 }
@@ -310,7 +307,7 @@ impl CallMediaRouter {
         })
     }
 
-    fn routes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Route>>> {
+    fn routes(&self) -> std::sync::MutexGuard<'_, HashMap<(NodeId, String), Arc<Route>>> {
         self.routes.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -334,12 +331,9 @@ impl CallMediaRouter {
             self.drops.note(reason, Some(&peer_id), &call_id);
             Err(reason)
         };
-        let Some(route) = self.routes().get(&call_id).cloned() else {
+        let Some(route) = self.routes().get(&(peer_id, call_id.clone())).cloned() else {
             return refuse(MediaDrop::UnknownCall);
         };
-        if route.peer != peer_id {
-            return refuse(MediaDrop::NotCounterparty);
-        }
         if !privileged {
             return refuse(MediaDrop::Unprivileged);
         }
@@ -380,10 +374,11 @@ impl CallMediaRouter {
 
     /// Stop routing `call_id` if `route` is still its route.
     fn end_route(&self, call_id: &str, route: &Arc<Route>) {
+        let key = (route.peer, call_id.to_string());
         let removed = {
             let mut routes = self.routes();
-            match routes.get(call_id) {
-                Some(current) if Arc::ptr_eq(current, route) => routes.remove(call_id).is_some(),
+            match routes.get(&key) {
+                Some(current) if Arc::ptr_eq(current, route) => routes.remove(&key).is_some(),
                 _ => false,
             }
         };
@@ -470,14 +465,15 @@ impl CallMediaPort for CallMediaRouter {
         });
         {
             let mut routes = self.routes();
-            if routes.contains_key(call_id) {
+            let key = (*peer, call_id.to_string());
+            if routes.contains_key(&key) {
                 return Err(AttachRefusal::AlreadyAttached);
             }
             if routes.len() >= MAX_ROUTED_CALLS {
                 warn!(call_id, max = MAX_ROUTED_CALLS, "call media: too many routed calls");
                 return Err(AttachRefusal::Unavailable);
             }
-            routes.insert(call_id.to_string(), Arc::clone(&route));
+            routes.insert(key, Arc::clone(&route));
         }
         let pump = tokio::spawn(Arc::clone(&me).pump(call_id.to_string(), Arc::clone(&route)));
         *route.pump.lock().unwrap_or_else(|e| e.into_inner()) = Some(pump);

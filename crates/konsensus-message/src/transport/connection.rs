@@ -400,7 +400,7 @@ impl NoiseTransport {
     /// [`recv_control`]: NoiseTransport::recv_control
     pub async fn recv_call_media(&self) -> Option<super::CallMediaEvent> {
         let mut rx = self.call_media_rx.lock().await;
-        rx.recv().await
+        rx.recv().await.map(|queued| queued.event)
     }
 }
 

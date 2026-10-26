@@ -423,9 +423,9 @@ async fn media_io(socket: &mut WebSocket, from_node: &MediaQueue, to_node: &Medi
                             }
                         }
                     },
-                    Message::Ping(data) => {
-                        if !socket_send(socket, Message::Pong(data)).await { return false; }
-                    }
+                    // Tungstenite queues and flushes the automatic pong on
+                    // the next read/write; no explicit response is needed.
+                    Message::Ping(_) => {}
                     // This is a binary media protocol. Text consumes the same
                     // ingress budget but never JSON parsing or a text reply.
                     Message::Text(_) | Message::Pong(_) => {}
