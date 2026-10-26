@@ -1882,7 +1882,29 @@ async fn calendar_admission_commits_mutation_and_hold_release_together() {
     assert_eq!(row.title, "written");
     assert_eq!(row.message_id.as_deref(), Some(env.id.to_hex().as_str()));
 
-    // RSVPs upsert by (event_id, responder) under the same contract.
+    // The hold was consumed: a second admission of the same envelope finds no
+    // hold and writes nothing (the sweep may have withdrawn it meanwhile).
+    let err = db
+        .commit_calendar_admission(&env, &event("twice"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::NotFound(_)), "{err}");
+    assert_eq!(
+        db.get_calendar_event("evt-1").await.unwrap().unwrap().title,
+        "written"
+    );
+
+    // RSVPs upsert by (event_id, responder) under the same contract. The hold
+    // is re-created directly, since `call_admission_hold` never holds a stored
+    // message.
+    let rehold = || async {
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) VALUES (?, ?, 1)")
+            .bind(env.id.to_hex())
+            .bind(sender.to_hex())
+            .execute(db.pool())
+            .await
+            .unwrap();
+    };
     let rsvp = |response: &str, id: &str| {
         CalendarAdmission::Rsvp(RsvpRecord {
             id: id.into(),
@@ -1893,9 +1915,11 @@ async fn calendar_admission_commits_mutation_and_hold_release_together() {
             created_at: String::new(),
         })
     };
+    rehold().await;
     db.commit_calendar_admission(&env, &rsvp("accepted", "r1"))
         .await
         .unwrap();
+    rehold().await;
     db.commit_calendar_admission(&env, &rsvp("declined", "r2"))
         .await
         .unwrap();
@@ -1907,4 +1931,54 @@ async fn calendar_admission_commits_mutation_and_hold_release_together() {
     .unwrap();
     assert_eq!((count, response.as_str()), (1, "declined"));
     assert!(!db.call_admission_held(&env.id).await.unwrap());
+}
+
+/// Restart regression: a calendar envelope accepted and held by a process that
+/// died before its admission committed is withdrawn by the startup sweep after
+/// the database is reopened (message and plaintext gone, receipt
+/// application-rejected, no calendar row), and a replay then reads as
+/// application-rejected. The calendar tables are created here (#409).
+#[tokio::test]
+async fn held_calendar_envelope_is_withdrawn_by_the_startup_sweep_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restart.sqlite");
+    let path = path.to_str().unwrap();
+    let sender = NodeId::from_bytes([7u8; 32]);
+    let env = make_envelope(sender, Recipient::Node(NodeId::from_bytes([8u8; 32])));
+    {
+        let db = SqliteStorage::open(path).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE calendar_events (id TEXT PRIMARY KEY, message_id TEXT, organizer TEXT NOT NULL, title TEXT NOT NULL, description TEXT, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, tz TEXT NOT NULL, location TEXT, attendees_json TEXT NOT NULL, recurrence_json TEXT, color TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), parent_id TEXT)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // Hold, then durable paid acceptance; the process "dies" here, before
+        // `commit_calendar_admission`.
+        assert!(db.call_admission_hold(&env, 1).await.unwrap());
+        assert!(matches!(
+            db.accept_paid_envelope(&env).await.unwrap(),
+            crate::PaidAcceptance::Accepted
+        ));
+        db.store_message_plaintext(&env.id, b"sealed").await.unwrap();
+        db.pool().close().await;
+    }
+    let db = SqliteStorage::open(path).await.unwrap();
+    assert!(db.call_admission_held(&env.id).await.unwrap());
+    assert!(db.get_message(&env.id).await.unwrap().is_none(), "held is hidden");
+    assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
+    assert_eq!(db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    assert!(!db.call_admission_held(&env.id).await.unwrap());
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    assert!(db.get_message_plaintext(&env.id).await.unwrap().is_none());
+    assert!(db.is_application_rejected(&env).await.unwrap());
+    assert!(db.get_calendar_event("evt-1").await.unwrap().is_none());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM calendar_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    // The replay keys stay burned: a resend is a reuse of a withdrawn envelope.
+    assert!(matches!(
+        db.accept_paid_envelope(&env).await.unwrap(),
+        crate::PaidAcceptance::PaymentReused
+    ));
 }

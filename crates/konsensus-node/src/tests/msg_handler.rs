@@ -25,6 +25,11 @@ struct TestStorage {
     fail_rejected_lookup: std::sync::atomic::AtomicBool,
     /// Message ids under an admission hold.
     holds: Mutex<std::collections::HashSet<String>>,
+    /// Message ids whose paid acceptance committed.
+    accepted: Mutex<std::collections::HashSet<String>>,
+    /// Make the next `accept_paid_envelope` commit and then report an error,
+    /// as a backend whose commit response was lost would.
+    fail_accept_once: std::sync::atomic::AtomicBool,
 }
 
 impl TestStorage {
@@ -38,6 +43,8 @@ impl TestStorage {
             application_rejected: Mutex::new(std::collections::HashSet::new()),
             fail_rejected_lookup: std::sync::atomic::AtomicBool::new(false),
             holds: Mutex::new(std::collections::HashSet::new()),
+            accepted: Mutex::new(std::collections::HashSet::new()),
+            fail_accept_once: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -272,11 +279,70 @@ impl Storage for TestStorage {
         self.rsvps.lock().unwrap().push(record.clone());
         Ok(())
     }
+    async fn accept_paid_envelope(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+    ) -> Result<konsensus_storage::PaidAcceptance, StorageError> {
+        use konsensus_storage::PaidAcceptance;
+        let id = envelope.id.to_hex();
+        if self.application_rejected.lock().unwrap().contains(&id) {
+            return Ok(PaidAcceptance::PaymentReused);
+        }
+        if self.accepted.lock().unwrap().contains(&id) {
+            return Ok(PaidAcceptance::AlreadyAccepted);
+        }
+        self.messages
+            .lock()
+            .unwrap()
+            .insert(id.clone(), envelope.clone());
+        self.accepted.lock().unwrap().insert(id);
+        if self
+            .fail_accept_once
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError::Unsupported(
+                "commit response lost after a durable acceptance".into(),
+            ));
+        }
+        Ok(PaidAcceptance::Accepted)
+    }
+    async fn is_paid_envelope_accepted(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+    ) -> Result<bool, StorageError> {
+        let id = envelope.id.to_hex();
+        Ok(self.accepted.lock().unwrap().contains(&id)
+            && !self.holds.lock().unwrap().contains(&id)
+            && !self.application_rejected.lock().unwrap().contains(&id))
+    }
+    async fn reject_accepted_envelope(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+    ) -> Result<(), StorageError> {
+        let id = envelope.id.to_hex();
+        self.messages.lock().unwrap().remove(&id);
+        self.plaintexts.lock().unwrap().remove(&id);
+        self.holds.lock().unwrap().remove(&id);
+        self.application_rejected.lock().unwrap().insert(id);
+        Ok(())
+    }
+    async fn call_admission_withdraw(&self, _held_before_ms: u64) -> Result<u64, StorageError> {
+        let held: Vec<String> = self.holds.lock().unwrap().drain().collect();
+        for id in &held {
+            self.messages.lock().unwrap().remove(id);
+            self.plaintexts.lock().unwrap().remove(id);
+            self.application_rejected.lock().unwrap().insert(id.clone());
+        }
+        Ok(held.len() as u64)
+    }
     async fn commit_calendar_admission(
         &self,
         envelope: &konsensus_core::UkmEnvelope,
         admission: &konsensus_storage::CalendarAdmission,
     ) -> Result<(), StorageError> {
+        if !self.holds.lock().unwrap().contains(&envelope.id.to_hex()) {
+            return Err(StorageError::NotFound("admission hold".into()));
+        }
         match admission {
             konsensus_storage::CalendarAdmission::Event(record) => {
                 self.calendar_events.lock().unwrap().push(record.clone())
@@ -3462,6 +3528,11 @@ async fn deliver_to_bob(
     let envelope = make_envelope(alice.as_ref(), *bob.node_id(), kind, ciphertext);
     let sender = *alice.node_id();
     let storage_dyn: Arc<dyn Storage> = Arc::clone(&storage) as _;
+    // The receive loop holds calendar kinds before paid acceptance; the
+    // admission commit consumes that hold.
+    if is_calendar_kind(kind) {
+        assert!(storage.call_admission_hold(&envelope, 0).await.unwrap());
+    }
 
     let result = decrypt_and_process(
         &envelope,
@@ -4170,4 +4241,183 @@ async fn burned_replay_reply_fails_closed_when_the_withdrawal_status_is_unreadab
         assert!(!reason.starts_with("payment proof already used: "));
         assert_ne!(reason, "replay detected: nonce already used");
     }
+}
+
+/// Receive side over Noise with a storage fixture whose paid acceptance commits
+/// and then reports an error (a lost commit response). The calendar hold placed
+/// before acceptance must survive that error: the envelope stays held and
+/// hidden, its resend is refused rather than duplicate-acknowledged without a
+/// calendar record, the sweep withdraws it, the replay after that is terminal,
+/// and a later invite is admitted normally.
+#[tokio::test]
+async fn uncertain_paid_acceptance_keeps_the_calendar_hold() {
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let transport = |id| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let fixture = Arc::new(TestStorage::new());
+    let storage: Arc<dyn Storage> = fixture.clone();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    while !matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ) {}
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let sessions_b = Arc::new(SessionManager::new(bob.clone()));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, mut ws_rx) = broadcast::channel(16);
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
+        konsensus_pricing::StaticPricingEngine::new(Default::default()),
+    );
+    let price = pricing
+        .get_price_msat(konsensus_core::kind::KIND_CALENDAR_EVENT)
+        .await
+        .unwrap()
+        .max(1_000);
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(),
+        transport_ack: target.clone(),
+        storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        })),
+        pricing,
+        lightning: wallet.clone(),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b,
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None,
+        front_door: Default::default(),
+        routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(),
+        plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx,
+        audit_log: audit,
+        admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None,
+        shutdown_rx,
+    }));
+    let invite = |event_id: &str| {
+        let (wallet, sessions_a, alice, bob) =
+            (wallet.clone(), &sessions_a, alice.clone(), bob.clone());
+        let plaintext = calendar_json_id(event_id, "agenda", 1, serde_json::Value::Null);
+        async move {
+            let hash = wallet.inject_inbound_keysend(price, None).await;
+            let payment = wallet.get_payment_status(&hash).await.unwrap();
+            let proof = PaymentProof::new(
+                hex::decode(&hash).unwrap().try_into().unwrap(),
+                hex::decode(payment.preimage.unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                price,
+            );
+            let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+                &sessions_a.encrypt(bob.node_id(), &plaintext).await.unwrap(),
+            );
+            let mut env = UkmEnvelopeBuilder::new(
+                konsensus_core::kind::KIND_CALENDAR_EVENT,
+                *alice.node_id(),
+                Recipient::Node(*bob.node_id()),
+                ciphertext,
+                proof,
+            )
+            .build();
+            env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+            env
+        }
+    };
+    let outcome = |source: Arc<NoiseTransport>| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source.recv_control().await.unwrap() {
+                    ControlEvent::MessageAcked { duplicate, .. } => break Ok(duplicate),
+                    ControlEvent::MessageRejected { reason, .. } => break Err(reason),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap()
+    };
+
+    // Acceptance commits, the backend reports an error: the hold is kept.
+    fixture
+        .fail_accept_once
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let env = invite("evt-uncertain").await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("storage error".into()));
+    assert!(
+        fixture.call_admission_held(&env.id).await.unwrap(),
+        "an uncertain acceptance must keep the hold"
+    );
+    assert!(fixture.accepted.lock().unwrap().contains(&env.id.to_hex()));
+    assert!(!fixture.is_paid_envelope_accepted(&env).await.unwrap());
+    assert_eq!(fixture.calendar_event_count(), 0);
+    assert!(ws_rx.try_recv().is_err());
+
+    // The sender retries: a replay of a held, accepted envelope is refused,
+    // never duplicate-acknowledged without its calendar record.
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(
+        outcome(source.clone()).await,
+        Err("message withdrawn".into())
+    );
+    assert_eq!(fixture.calendar_event_count(), 0);
+    assert!(ws_rx.try_recv().is_err());
+
+    // The sweep withdraws it; the replay after that is terminal for the sender.
+    assert_eq!(
+        konsensus_api::calls::withdraw_held(fixture.as_ref(), true)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(!fixture.call_admission_held(&env.id).await.unwrap());
+    assert!(fixture.is_application_rejected(&env).await.unwrap());
+    source.send(bob.node_id(), &env).await.unwrap();
+    let again = outcome(source.clone()).await.unwrap_err();
+    assert!(again.starts_with(APPLICATION_REJECTED_PREFIX), "{again}");
+    assert!(crate::session_handler::terminal_paid_rejection(&again));
+    assert_eq!(fixture.calendar_event_count(), 0);
+
+    // A later invite is admitted: committed, released, acknowledged, forwarded.
+    let ok = invite("evt-later").await;
+    source.send(bob.node_id(), &ok).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    assert!(!fixture.call_admission_held(&ok.id).await.unwrap());
+    assert_eq!(fixture.calendar_event_count(), 1);
+    let shown = tokio::time::timeout(Duration::from_secs(5), ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.envelope.id, ok.id);
+
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    source.shutdown();
+    target.shutdown();
 }

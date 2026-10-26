@@ -1682,8 +1682,12 @@ impl Storage for SqliteStorage {
             .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
         sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE payment_hash = ? AND message_id = ?")
             .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(&id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
+        let released = sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
             .bind(&id).execute(&mut *tx).await?;
+        if released.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("admission hold for {id}")));
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -3181,6 +3185,14 @@ impl Storage for SqliteStorage {
     ) -> Result<(), StorageError> {
         let id = envelope.id.to_hex();
         let mut tx = self.pool.begin().await?;
+        // The hold must still be there: a missing hold means the sweep withdrew
+        // the envelope (or it was never held), and nothing may be written for it.
+        let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_admission_hold WHERE message_id = ?")
+            .bind(&id).fetch_one(&mut *tx).await?;
+        if held != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("admission hold for {id}")));
+        }
         let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ? AND sender = ?")
             .bind(&id).bind(envelope.sender.to_hex()).fetch_one(&mut *tx).await?;
         if stored != 1 {
@@ -3240,8 +3252,12 @@ impl Storage for SqliteStorage {
                 .await?;
             }
         }
-        sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
+        let released = sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
             .bind(&id).execute(&mut *tx).await?;
+        if released.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("admission hold for {id}")));
+        }
         tx.commit().await?;
         Ok(())
     }

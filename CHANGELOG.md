@@ -16,9 +16,12 @@ also live on the corresponding GitHub pre-release pages.
   (`failed_paid`) and never retries it. Calendar envelopes are held from
   before paid acceptance until the caps pass, like call signals and room
   chats, and the event or RSVP is written and the hold released in one
-  storage transaction (`commit_calendar_admission`), so a failed withdrawal
+  storage transaction (`commit_calendar_admission`) that requires the hold
+  and, on PostgreSQL, locks it against the hold sweep, so a failed withdrawal
   leaves them hidden for the hold sweep with no calendar change behind and an
-  admitted envelope never lacks its change. A
+  admitted envelope never lacks its change. A held envelope whose paid
+  acceptance returns an error keeps its hold (the acceptance may have
+  committed); a retry re-admits it or the sweep withdraws it. A
   resend of any envelope this node withdrew at the application is answered
   with a terminal `application_rejected:` reason instead of a payment-reuse
   one, which a sender's compatibility path could read as delivered. The owner

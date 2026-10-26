@@ -404,10 +404,14 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     gate_result = Err(rejection);
                                 }
                                 Err(e) => {
-                                    if call_hold {
-                                        let _ = storage_for_recv.call_admission_release(&msg_id).await;
-                                    }
-                                    error!(error = %e, "atomic paid acceptance failed; replay keys rolled back");
+                                    // The hold placed above is KEPT: the acceptance may
+                                    // have committed before the error (a lost commit
+                                    // response), and releasing would expose an accepted
+                                    // envelope that never had its admission, which a
+                                    // replay could then duplicate-acknowledge. Held, it
+                                    // stays hidden; a retry re-admits it (the hold is
+                                    // inherited) or the sweep withdraws it.
+                                    error!(error = %e, held = call_hold, "atomic paid acceptance failed; replay keys rolled back");
                                     audit_for_recv.membrane().refused(&envelope,
                                         &konsensus_core::gate::GateRejection::NonceCheckFailed(e.to_string()));
                                     let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
@@ -696,7 +700,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // the sweep. Anything else is released before the app sees
                         // it; if that write fails it stays held: fail closed.
                         let room = konsensus_api::room_binding::admit_incoming(identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref());
-                        if room.is_ok() && call_hold && konsensus_api::room_binding::is_candidate(envelope.kind) {
+                        // Released whether this attempt placed the hold or inherited it
+                        // from an attempt whose acceptance errored (the hold is kept
+                        // then, see above): an admitted chat must never stay held.
+                        if room.is_ok() && konsensus_api::room_binding::is_candidate(envelope.kind) {
                             if let Err(e) = storage_for_recv.call_admission_release(&msg_id).await {
                                 error!(msg_id = %msg_id, error = %e, "admitted chat could not be released; withheld");
                                 let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
