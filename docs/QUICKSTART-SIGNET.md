@@ -11,9 +11,10 @@ Paid admission follows the [2026-07-01 keystone](v2/F1-CAPPED-FIRST-CONTACT.md)
 supported for the public beta**: this guide never uses it and nothing here
 funds a mainnet wallet. Signet coins have no value. There is no final signed
 release yet (only pre-release candidates); this guide builds from source. Every
-step below was run as written in the session that produced this guide unless it
-is marked **untested in CI**;
-the [appendix](#appendix-what-was-tested) says exactly what ran where.
+step below was run in the session that produced this guide, except the two
+marked **untested in CI**, and some ran under different conditions (a debug
+build on another compiler, mock Lightning instead of a live signet node); the
+[appendix](#appendix-what-was-tested) says exactly what ran how.
 
 You need two nodes to exchange a paid message: yours and a contact's. "Contact"
 below can be a second machine of your own or a second person following the
@@ -95,10 +96,11 @@ esplora_url_fallback = "https://blockstream.info/signet"
 ```
 
 The URLs are the signet endpoints of the same two public Esplora operators
-`init` already wrote; any Esplora-compatible signet server works, including
-your own Bitcoin Core or Electrum server (see [chain source](CHAIN-SOURCE.md)).
-A public Esplora can link the addresses your wallet watches to your IP; that is
-the trade-off of not running your own chain source.
+`init` already wrote; any Esplora-compatible signet server works. Your own
+Bitcoin Core or an Electrum server are different backends, configured as
+described in [chain source](CHAIN-SOURCE.md) instead of these URLs. A public
+Esplora can link the addresses your wallet watches to your IP; that is the
+trade-off of not running your own chain source.
 
 `hub_only_channels = false` is new in this file. By default an embedded LDK
 node opens channels only to a configured hub or LSP, because nothing watches a
@@ -143,24 +145,36 @@ reports `money_ready: false`. Wait for `money_ready: true` before step 5.
 
 ## 4. Pair your terminal with the node (owner token)
 
+In the second terminal, enter the checkout and put the binary on `PATH` again
+(the export from step 1 lives only in the first shell):
+
+```sh
+cd BitSov-bitsov
+export PATH="$PWD/target/release:$PATH"
+```
+
 The HTTP API is loopback only and every owner route needs a bearer token. The
 owner's token comes from signing a challenge with the node's own key, which is
 what `docs/ops/owner-token.sh` does with `konsensus sign-challenge`. Source it
 (do not execute it), with `curl` installed:
 
 ```sh
-cd BitSov-bitsov
 KONSENSUS_CONFIG=~/bitsov-signet/konsensus.toml source docs/ops/owner-token.sh
 ```
 
 It sets `OWNER_TOKEN` in your shell for 24 hours and never writes it to disk.
 A token minted this way carries every scope (read, receive, spend, admin, …):
 it is the owner's key, not a paired app, so it is not metered by a budget
-grant. The commands below use:
+grant. Treat it like a password. In particular, never put it on a command
+line (`curl -H "Authorization: Bearer $OWNER_TOKEN"`): every process on the
+machine can read other processes' arguments. Define this helper once in the
+same shell; it feeds the header to `curl` through stdin (`-H @-`, curl 7.55 or
+newer), so the token never appears in a process list:
 
 ```sh
+api() { printf 'Authorization: Bearer %s\n' "$OWNER_TOKEN" | curl -sS -H @- "$@"; }
 API=http://127.0.0.1:3141/api/v1
-curl -sS -H "Authorization: Bearer $OWNER_TOKEN" $API/status | jq .
+api $API/status | jq .
 ```
 
 Fields to watch in `status`: `node_id`, `money_ready`, `block_height`,
@@ -173,7 +187,7 @@ with the public servers above).
 Ask the node for an on-chain address once `money_ready` is `true`:
 
 ```sh
-curl -sS -H "Authorization: Bearer $OWNER_TOKEN" $API/payments/funding-address | jq .
+api $API/payments/funding-address | jq .
 ```
 
 The response includes `"network": "signet"`; if it says anything else, stop
@@ -187,7 +201,7 @@ an inbound channel. **Wait for one confirmation** (signet blocks are roughly
 ten minutes apart) and check:
 
 ```sh
-curl -sS -H "Authorization: Bearer $OWNER_TOKEN" $API/payments/balance | jq .
+api $API/payments/balance | jq .
 ```
 
 `balance_msat` includes spendable on-chain funds; on LDK the response also
@@ -215,7 +229,7 @@ connection: whoever runs this first sees
 Check from either side; the answer is the list of connected node IDs:
 
 ```sh
-curl -sS -H "Authorization: Bearer $OWNER_TOKEN" $API/peers/connected | jq .
+api $API/peers/connected | jq .
 ```
 
 ## 7. Open a channel to the contact
@@ -226,28 +240,27 @@ contact's `lightning_node_pubkey` (from their `status`) and their LDK address
 (`<ip>:9735`). Preview first with `dry_run`, then open:
 
 ```sh
-curl -sS -X POST -H "Authorization: Bearer $OWNER_TOKEN" -H 'content-type: application/json' \
-  $API/payments/open-channel -d '{
-    "peer_pubkey": "<their lightning_node_pubkey>",
-    "peer_addr": "<their ip>:9735",
-    "amount_sats": 100000,
-    "push_sats": 10000,
-    "funding_priority": "fast",
-    "max_funding_fee_sats": 2000,
-    "dry_run": true
-  }' | jq .
+api -X POST -H 'content-type: application/json' $API/payments/open-channel -d '{
+  "peer_pubkey": "<their lightning_node_pubkey>",
+  "peer_addr": "<their ip>:9735",
+  "amount_sats": 100000,
+  "push_sats": 10000,
+  "funding_priority": "fast",
+  "max_funding_fee_sats": 2000,
+  "dry_run": true
+}' | jq .
 ```
 
-Drop `"dry_run": true` to broadcast. `push_sats` gives the contact a balance so
-they can pay you back; it is their money once the channel is open. The channel
-is private (`announce` defaults to false). The default per-channel cap is
-1,000,000 sats.
+Change `"dry_run": true` to `"dry_run": false` to broadcast. `push_sats` gives
+the contact a balance so they can pay you back; it is their money once the
+channel is open. The channel is private (`announce` defaults to false). The
+default per-channel cap is 1,000,000 sats.
 
 **Wait for the channel to become usable** (the acceptor's required funding
 depth, usually six signet blocks, so around an hour; no deadline is promised):
 
 ```sh
-curl -sS -H "Authorization: Bearer $OWNER_TOKEN" $API/payments/channels | jq .
+api $API/payments/channels | jq .
 ```
 
 Both ends must show the channel ready. [Funding fees](ops/funding-fees.md)
@@ -257,30 +270,29 @@ routing-fee policy used below.
 ## 8. Send a paid message
 
 ```sh
-curl -sS -X POST -H "Authorization: Bearer $OWNER_TOKEN" -H 'content-type: application/json' \
-  $API/messages/compose -d '{
-    "recipient": "<their 64-hex node id>",
-    "kind": 0,
-    "plaintext": "hello from signet",
-    "max_total_msat": 20000
-  }' | jq .
+api -X POST -H 'content-type: application/json' $API/messages/compose -d '{
+  "recipient": "<their 64-hex node id>",
+  "kind": 0,
+  "plaintext": "hello from signet",
+  "max_total_msat": 20000
+}' | jq .
 ```
 
 `kind: 0` is a chat message. The node encrypts it end to end (X3DH and the
 Double Ratchet), pays the recipient's chat price over the channel, and sends
-it. The default chat price is 10 msat, which the node raises to its
-1,000 msat invoice minimum; `max_total_msat` caps principal plus routing fee (6,000 msat
-is the smallest cap that fits under the default fee policy; 20,000 leaves room).
+it. The default chat price is 10 msat, which the node raises to its 1,000 msat
+invoice minimum; `max_total_msat` caps principal plus routing fee (6,000 msat is
+the smallest cap that fits under the default fee policy; 20,000 leaves room).
 A listed contact pays the message price only; a stranger would pay admission
 as well, which is the first-contact path described in
 [capped first contact](v2/F1-CAPPED-FIRST-CONTACT.md).
 
 A successful response has `"state": "acked"`, `"accepted": true`,
 `"delivered": true`, `"amount_msat": 1000` and a `payment_hash`. On the
-contact's node, with their own owner token:
+contact's node, with their own owner token and the same `api` helper:
 
 ```sh
-curl -sS -H "Authorization: Bearer $OWNER_TOKEN" "$API/messages?peer=<your node id>" | jq .
+api "$API/messages?peer=<your node id>" | jq .
 ```
 
 lists the message with its decrypted `plaintext`, and their `payments/balance`
@@ -322,12 +334,12 @@ two local nodes on one machine with the node's mock Lightning backend
 (`shared_mock`, a local settlement ledger with no real funds), and the
 signet-specific steps are marked.
 
-| Step | Ran as written | Notes |
+| Step | Ran | Notes |
 | --- | --- | --- |
-| 1. Build | yes | `cargo build -p konsensus-node` on stable 1.97.0, before `rust-toolchain.toml` (1.99.1) landed on main; neither pinned version was installed in the session |
+| 1. Build | partly | A debug build (`cargo build -p konsensus-node`, not `--release`) on stable 1.97.0, before `rust-toolchain.toml` (1.99.1) landed on main; neither pinned toolchain was installed in the session |
 | 2. `init --tier full`, config edit | yes | Fresh config confirmed to contain `network = "bitcoin"` and mainnet URLs; after the edit the node starts, logs `network=signet`, and reports `money_ready: false` because the Esplora servers were unreachable from the session |
 | 3. `start --owner-control` | yes | Signet config above, and two mock nodes on loopback ports |
-| 4. Owner token, `status` | yes | `docs/ops/owner-token.sh` on both nodes |
+| 4. Owner token, `status` | yes | `docs/ops/owner-token.sh` on both nodes; the `api` helper checked for GET and POST, and `ps` showed no process carrying the token |
 | 5. Faucet, `funding-address`, one confirmation | **untested in CI** | Needs a reachable signet Esplora and a faucet; the route and its `network` field were read from source, and on a mock node it answers 400 as expected |
 | 6. `peer add` both ways, `peers/connected` | yes | First side reports `not reachable yet (… not in whitelist)` until the second side lists it; the contact survived a restart of the node |
 | 7. `open-channel`, `payments/channels` | **untested in CI** | Needs signet funds; request shape, the hub-only default and refusal codes were read from source and [funding fees](ops/funding-fees.md) |
