@@ -9,8 +9,8 @@ returns 403.
 `peer` is required and must decode as a 32-byte hex node id. Missing, duplicate,
 or malformed peer parameters return HTTP 400 with fixed JSON error text:
 `{"error":"invalid peer id","code":400}` (the numeric `code` is the generic
-400 marker every bad request carries). Input is never echoed. A valid
-unknown peer returns `[]`.
+bad-request marker; typed refusals such as `not_dispatched` carry a string
+`code` instead). Input is never echoed. A valid unknown peer returns `[]`.
 
 The response is an array of at most **4** entries (the per-peer open-call
 admission bound), with unresolved reservations first, then call id order.
@@ -65,7 +65,7 @@ The responses the app consumes for calls and for the owner-only STUN fields
 are pinned as JSON fixtures under
 `crates/konsensus-api/tests/fixtures/contract/`, rendered by the live
 handlers with fixed inputs and compared field by field by
-`crates/konsensus-api/tests/contract_goldens.rs`. The app repo consumes the
+`crates/konsensus-api/tests/contract_goldens.rs`. The app repo will consume the
 same fixtures, so a field added, removed, renamed, retyped or made nullable
 on either side fails there and here before it reaches a user.
 
@@ -76,10 +76,10 @@ on either side fails there and here before it reaches a user.
 | `status_stun_absent.json` | `GET /api/v1/status` | 200 | No responder, no dialable host, no configured server: `stun_port`, `stun_url`, `stun_source`, `peer_endpoint` and `peer_endpoint_source` are absent; `peer_endpoint_reason` `no_dialable_endpoint`. |
 | `peer_call_price.json` | `GET /api/v1/pricing/peers/:id/call` | 200 | The callee's live call price: `peer_id`, `offer_msat` (kind 400, asked of the callee), `signal_msat` (kind 401). |
 | `call_invite_accepted.json` | `POST /api/v1/messages/compose` (kind 400, `wait_ack_ms: 0`) | 200 | A paid, dispatched invite: `operation_id` (echoed), `state` `sent`, `accepted` `false` (no acceptance receipt was awaited), `payment_hash`, `retry_allowed`, `max_routing_fee_msat`, `message_id`, `delivered`, `amount_msat`. See [exactly-once operations](EXACTLY-ONCE-OPERATIONS.md). |
-| `call_invite_refused_call_id_used.json` | `POST /api/v1/messages/compose` (kind 400) | 400 | A new operation reusing a call id: `error`, `code` `not_dispatched`, `reason` `call_id_used` (the refusal table above). |
+| `call_invite_refused_call_id_used.json` | `POST /api/v1/messages/compose` (kind 400) | 400 | A new operation reusing a call id: `error`, `code` `not_dispatched`, `reason` `call_id_used` (see the refusal table in [CALLS-PROTOTYPE.md](CALLS-PROTOTYPE.md)). |
 | `calls_open_by_peer.json` | `GET /api/v1/calls?peer=<node-id>` | 200 | Three open calls: an `ended` outgoing call with an unresolved paid admission bound to its journal row (`created` set, `op_id` set) first, then a `ringing` outgoing and a `live` incoming call in id order, both with `created` and `op_id` `null`. |
 | `calls_open_by_peer_empty.json` | `GET /api/v1/calls?peer=<node-id>` | 200 | A valid peer with no open calls: `[]`. |
-| `calls_invalid_peer.json` | `GET /api/v1/calls?peer=not-a-node-id` | 400 | `{"error":"invalid peer id","code":400}`: the fixed text, with the generic numeric `code` every 400 carries. |
+| `calls_invalid_peer.json` | `GET /api/v1/calls?peer=not-a-node-id` | 400 | `{"error":"invalid peer id","code":400}`: the fixed text, with the generic numeric bad-request `code`. |
 
 Each fixture is one envelope:
 
