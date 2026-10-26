@@ -1175,7 +1175,7 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.get_onboarding_state().await
     }
 
-    // ── Calendar (pass-through — calendar metadata queried plaintext for indexing) ─
+    // ── Calendar and fiat (pass-through — queried in SQL, stored plaintext) ─
 
     async fn store_calendar_event(&self, record: &CalendarEventRecord) -> Result<(), StorageError> {
         self.inner.store_calendar_event(record).await
@@ -1224,6 +1224,23 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn store_rsvp(&self, record: &RsvpRecord) -> Result<(), StorageError> {
         self.inner.store_rsvp(record).await
+    }
+
+    async fn store_fiat_rate_snapshot(
+        &self,
+        snapshot: &crate::fiat_snapshots::FiatRateSnapshot,
+    ) -> Result<(), StorageError> {
+        self.inner.store_fiat_rate_snapshot(snapshot).await
+    }
+
+    async fn list_fiat_rate_snapshots(
+        &self,
+        from_date: &str,
+        to_date: &str,
+    ) -> Result<Vec<crate::fiat_snapshots::FiatRateSnapshot>, StorageError> {
+        self.inner
+            .list_fiat_rate_snapshots(from_date, to_date)
+            .await
     }
 
     // ── Operator hosting (pass-through — contract state contains no message plaintext) ─
