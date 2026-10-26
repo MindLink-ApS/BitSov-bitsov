@@ -67,6 +67,15 @@ pub const MAX_RSVP_COMMENT_BYTES: usize = 2 * 1024;
 /// the reader's time window and occurrence budget instead.
 pub const MAX_RECURRENCE_INSTANCES: u64 = 5_000;
 
+/// Latest Unix millisecond timestamp a calendar field may carry: chrono's
+/// `DateTime::<Utc>::MAX_UTC`. Timestamps are `u64` on the wire while the
+/// expander works in `i64` and chrono's range; keeping every `start_ms`,
+/// `end_ms` and `UNTIL` at or below this bound means the estimate here and the
+/// expansion later read the same instants, with no cast wrap or fallback.
+pub fn max_calendar_timestamp_ms() -> u64 {
+    chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp_millis() as u64
+}
+
 /// Why an inbound calendar payload was refused. Carries no peer-controlled
 /// text: every field is a static name or a number, so it is safe to log and to
 /// echo back to the sender.
@@ -87,6 +96,9 @@ pub enum CalendarPayloadError {
     /// The recurrence rule is malformed (`interval` 0 or an unknown `freq`).
     #[error("calendar recurrence is invalid: {0}")]
     RecurrenceInvalid(&'static str),
+    /// A timestamp field lies outside the range the calendar can represent.
+    #[error("calendar field `{field}` is outside the supported timestamp range")]
+    TimestampOutOfRange { field: &'static str },
     /// Not a valid wire JSON document of the expected shape.
     #[error("calendar payload is not valid wire JSON")]
     Malformed,
@@ -96,12 +108,13 @@ impl CalendarPayloadError {
     /// Every refusal code, for the sender's terminal-rejection classifier: a
     /// `MessageReject` whose reason starts with one of these followed by `:`
     /// consumed the payment proof and must never be retried.
-    pub const CODES: [&'static str; 6] = [
+    pub const CODES: [&'static str; 7] = [
         "calendar_too_large",
         "calendar_field_too_long",
         "calendar_too_many_entries",
         "calendar_recurrence_too_large",
         "calendar_recurrence_invalid",
+        "calendar_timestamp_out_of_range",
         "calendar_malformed",
     ];
 
@@ -113,6 +126,7 @@ impl CalendarPayloadError {
             Self::TooManyEntries { .. } => "calendar_too_many_entries",
             Self::RecurrenceTooLarge { .. } => "calendar_recurrence_too_large",
             Self::RecurrenceInvalid(_) => "calendar_recurrence_invalid",
+            Self::TimestampOutOfRange { .. } => "calendar_timestamp_out_of_range",
             Self::Malformed => "calendar_malformed",
         }
     }
@@ -120,7 +134,10 @@ impl CalendarPayloadError {
     /// Whether the refusal is a size or count cap (as opposed to a malformed
     /// document): the sender can shrink the payload and retry.
     pub fn is_cap(&self) -> bool {
-        !matches!(self, Self::Malformed | Self::RecurrenceInvalid(_))
+        !matches!(
+            self,
+            Self::Malformed | Self::RecurrenceInvalid(_) | Self::TimestampOutOfRange { .. }
+        )
     }
 }
 
@@ -358,6 +375,8 @@ impl CalendarEventPayload {
         check_len("organizer", &self.organizer)?;
         check_opt_len("color", self.color.as_deref())?;
         check_list("attendees", &self.attendees)?;
+        check_timestamp("start_ms", self.start_ms)?;
+        check_timestamp("end_ms", self.end_ms)?;
         if let Some(rule) = &self.recurrence {
             rule.validate(self.start_ms)?;
         }
@@ -408,6 +427,10 @@ impl WireRRule {
             "DAILY" | "WEEKLY" | "MONTHLY" | "YEARLY"
         ) {
             return Err(CalendarPayloadError::RecurrenceInvalid("unknown freq"));
+        }
+        check_timestamp("start_ms", start_ms)?;
+        if let Some(until) = self.until {
+            check_timestamp("until", until)?;
         }
         match self.implied_instances(start_ms) {
             Some(estimated) if estimated > MAX_RECURRENCE_INSTANCES => {
@@ -502,6 +525,13 @@ fn check_len(field: &'static str, value: &str) -> Result<(), CalendarPayloadErro
     let max = string_cap(field);
     if value.len() > max {
         return Err(CalendarPayloadError::FieldTooLong { field, max });
+    }
+    Ok(())
+}
+
+fn check_timestamp(field: &'static str, value: u64) -> Result<(), CalendarPayloadError> {
+    if value > max_calendar_timestamp_ms() {
+        return Err(CalendarPayloadError::TimestampOutOfRange { field });
     }
     Ok(())
 }
@@ -924,7 +954,7 @@ mod tests {
         assert_eq!(p.recurrence.unwrap().implied_instances(start), Some(132));
         // A huge interval saturates the period rather than overflowing.
         let p = decode_json(with_recurrence(serde_json::json!({
-            "freq": "YEARLY", "interval": u32::MAX, "until": u64::MAX
+            "freq": "YEARLY", "interval": u32::MAX, "until": max_calendar_timestamp_ms()
         })))
         .unwrap();
         assert!(p.recurrence.unwrap().implied_instances(start).unwrap() <= 2);
@@ -1065,6 +1095,80 @@ mod tests {
         assert_eq!(expanded("UTC"), MAX_RECURRENCE_INSTANCES);
         assert_eq!(expanded("Europe/Copenhagen"), MAX_RECURRENCE_INSTANCES + 1);
         assert!(wire.implied_instances(start).unwrap() >= expanded("Europe/Copenhagen"));
+    }
+
+    /// Timestamps past chrono's range are refused on every field, so the
+    /// unsigned wire values and the signed expander never disagree; the
+    /// boundary itself is admitted, and a bounded series anchored near the
+    /// boundary never expands past the estimate.
+    #[test]
+    fn timestamps_past_the_representable_range_are_refused() {
+        use crate::calendar::{expand_occurrences, CalendarEvent, Freq, RRule};
+        let max = max_calendar_timestamp_ms();
+        assert!(max < i64::MAX as u64);
+        for (field, value) in [("start_ms", max + 1), ("end_ms", max + 1)] {
+            let mut v = serde_json::to_value(sample_event()).unwrap();
+            v[field] = serde_json::json!(value);
+            assert_eq!(
+                decode_json(v),
+                Err(CalendarPayloadError::TimestampOutOfRange { field }),
+                "{field}"
+            );
+        }
+        let err = decode_json(with_recurrence(serde_json::json!({
+            "freq": "DAILY", "until": max + 1
+        })))
+        .unwrap_err();
+        assert_eq!(
+            err,
+            CalendarPayloadError::TimestampOutOfRange { field: "until" }
+        );
+        assert!(!err.is_cap());
+        let mut v = serde_json::to_value(sample_event()).unwrap();
+        v["start_ms"] = serde_json::json!(max - 3_600_000);
+        v["end_ms"] = serde_json::json!(max);
+        assert!(decode_json(v).is_ok(), "the boundary itself is admitted");
+
+        // Anchored under the boundary, weekly with every BYDAY code: the
+        // expander runs out of representable instants and stops, so it yields
+        // no more than the estimate.
+        let start = max - 400 * 7 * MS_PER_DAY;
+        let codes = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
+        let wire = WireRRule {
+            freq: "WEEKLY".into(),
+            interval: 1,
+            until: Some(max),
+            count: None,
+            byday: codes.iter().map(|c| c.to_string()).collect(),
+        };
+        let implied = wire.implied_instances(start).unwrap();
+        let event = CalendarEvent {
+            id: "e".into(),
+            organizer: "o".into(),
+            title: "t".into(),
+            description: None,
+            start,
+            end: start + 3_600_000,
+            tz: "Europe/Copenhagen".into(),
+            location: None,
+            attendees: vec![],
+            recurrence: Some(RRule {
+                freq: Freq::Weekly,
+                interval: 1,
+                until: Some(max),
+                count: None,
+                byday: wire.byday.clone(),
+                bymonthday: vec![],
+            }),
+            color: None,
+            created_at: String::new(),
+            parent_id: None,
+        };
+        let expanded = expand_occurrences(&event, 0, u64::MAX / 2, &[]).len() as u64;
+        assert!(
+            expanded <= implied,
+            "expanded {expanded} > implied {implied}"
+        );
     }
 
     /// Malformed rules are refused with a typed reason instead of being
@@ -1214,6 +1318,10 @@ mod tests {
             (
                 CalendarPayloadError::RecurrenceInvalid("x"),
                 "calendar_recurrence_invalid",
+            ),
+            (
+                CalendarPayloadError::TimestampOutOfRange { field: "until" },
+                "calendar_timestamp_out_of_range",
             ),
             (CalendarPayloadError::Malformed, "calendar_malformed"),
         ];

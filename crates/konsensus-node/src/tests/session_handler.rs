@@ -4056,6 +4056,7 @@ async fn calendar_refusals_are_terminal_and_never_deliver_later() {
             max: 5_000,
         },
         CalendarPayloadError::RecurrenceInvalid("interval must be at least 1"),
+        CalendarPayloadError::TimestampOutOfRange { field: "until" },
         CalendarPayloadError::Malformed,
     ];
     assert_eq!(refusals.len(), CalendarPayloadError::CODES.len());

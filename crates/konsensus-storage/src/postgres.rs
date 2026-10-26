@@ -1048,101 +1048,11 @@ impl Storage for PostgresStorage {
     }
 
     async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
-        use crate::PaidAcceptance::*;
-        let id = envelope.id.to_hex();
-        let kind = i64::from(envelope.kind);
-        let sender = envelope.sender.to_hex();
-        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ts = i64::try_from(envelope.timestamp)
-            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
-        let ciphertext = &envelope.ciphertext;
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
-        let sig = hex::encode(envelope.signature.as_bytes());
-        let nonce = hex::encode(envelope.nonce.as_bytes());
-        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
-        let refs_json =
-            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.accept_paid_envelope_impl(envelope, false).await
+    }
 
-        let mut tx = self.pool.begin().await?;
-        let receipt = sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
-            .bind(&ph).bind(&id).bind(&sender).execute(&mut *tx).await?;
-        let healing = receipt.rows_affected() == 0;
-        if healing {
-            // Serialize legacy healers on the receipt binding (SQLite already
-            // holds the writer lock from the INSERT above).
-            let binding: (String, String, i32) = sqlx::query_as("SELECT message_id, sender, accepted FROM payment_receipts WHERE payment_hash = $1 FOR UPDATE")
-                .bind(&ph).fetch_one(&mut *tx).await?;
-            if binding.0 != id || binding.1 != sender {
-                tx.rollback().await?;
-                return Ok(PaymentReused);
-            }
-            // Receipt metadata is independent of retained message content and
-            // excludes only the timestamp/signature wrapper refreshed on retry.
-            let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = 1 AND kind = $4 AND recipient_type = $5 AND recipient_id = $6 AND preimage = $7 AND amount_msat = $8 AND nonce = $9 AND references_json = $10")
-                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
-                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
-                .fetch_one(&mut *tx).await?;
-            if durable == 1 {
-                tx.rollback().await?;
-                return Ok(AlreadyAccepted);
-            }
-            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = $1 AND r.message_id = $2 AND r.sender = $3 AND m.sender = r.sender AND m.kind = $4 AND m.recipient_type = $5 AND m.recipient_id = $6 AND m.payment_hash = r.payment_hash AND m.preimage = $7 AND m.amount_msat = $8 AND m.nonce = $9 AND m.references_json = $10")
-                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
-                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
-                .fetch_one(&mut *tx).await?;
-            if matched == 1 {
-                sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = $1, recipient_type = $2, recipient_id = $3, preimage = $4, amount_msat = $5, nonce = $6, references_json = $7 WHERE payment_hash = $8")
-                    .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
-                tx.commit().await?;
-                return Ok(AlreadyAccepted);
-            }
-            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = $1")
-                .bind(&id).fetch_one(&mut *tx).await?;
-            if exists != 0 || binding.2 != 0 {
-                tx.rollback().await?;
-                return Ok(PaymentReused);
-            }
-            // Full gate validation precedes this transaction. The receipt
-            // binds this paid identity; repair only its missing message row.
-        }
-        let inserted = sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-            .bind(&nonce).bind(&sender).execute(&mut *tx).await?;
-        if inserted.rows_affected() == 0 {
-            let owner: String = sqlx::query_scalar("SELECT sender FROM nonces WHERE nonce_hex = $1")
-                .bind(&nonce).fetch_one(&mut *tx).await?;
-            if !healing || owner != sender {
-                tx.rollback().await?;
-                return Ok(NonceReused);
-            }
-        }
-        sqlx::query(
-            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
-        )
-        .bind(&id)
-        .bind(kind)
-        .bind(&sender)
-        .bind(rtype)
-        .bind(&rid)
-        .bind(ts)
-        .bind(ciphertext)
-        .bind(&ph)
-        .bind(&pi)
-        .bind(amt)
-        .bind(&sig)
-        .bind(&nonce)
-        .bind(&refs_json)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = $1, recipient_type = $2, recipient_id = $3, preimage = $4, amount_msat = $5, nonce = $6, references_json = $7 WHERE payment_hash = $8")
-            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(Accepted)
+    async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.accept_paid_envelope_impl(envelope, true).await
     }
 
     async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
@@ -1767,6 +1677,9 @@ impl Storage for PostgresStorage {
     async fn reject_accepted_envelope(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
         let id = envelope.id.to_hex();
         let mut tx = self.pool.begin().await?;
+        // Hold-first lock order, shared with the sweep and the calendar admission.
+        sqlx::query_as::<_, (String,)>("SELECT message_id FROM call_admission_hold WHERE message_id = $1 FOR UPDATE")
+            .bind(&id).fetch_optional(&mut *tx).await?;
         sqlx::query("DELETE FROM messages WHERE id = $1 AND sender = $2")
             .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
         sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE payment_hash = $1 AND message_id = $2")
@@ -3795,6 +3708,54 @@ mod migration_recovery_tests {
         assert!(!db.call_admission_held(&env.id).await.unwrap());
         assert_eq!(db.call_admission_withdraw(u64::MAX).await.unwrap(), 0);
 
+        // Held paid acceptance against the sweep: a fresh envelope is held, the
+        // sweep transaction locks that hold, the acceptance blocks on it, and
+        // once the sweep has withdrawn the hold the acceptance is refused with
+        // nothing written. A fresh hold then lets it be accepted.
+        let fresh = konsensus_core::UkmEnvelopeBuilder::new(
+            konsensus_core::kind::KIND_RSVP,
+            sender,
+            konsensus_core::Recipient::Node(NodeId::from_bytes([8u8; 32])),
+            vec![2],
+            {
+                use sha2::Digest;
+                let preimage = [10u8; 32];
+                let hash: [u8; 32] = sha2::Sha256::digest(preimage).into();
+                konsensus_core::PaymentProof::new(hash, preimage, 1_000)
+            },
+        )
+        .build();
+        assert!(db.call_admission_hold(&fresh, 1).await.unwrap());
+        let mut sweep = db.pool.begin().await.unwrap();
+        let locked: Vec<(String, String)> = sqlx::query_as("SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < $1 FOR UPDATE")
+            .bind(i64::MAX).fetch_all(&mut *sweep).await.unwrap();
+        assert_eq!(locked.len(), 1);
+        let acceptance = tokio::spawn({
+            let db = db.clone();
+            let fresh = fresh.clone();
+            async move { db.accept_held_paid_envelope(&fresh).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!acceptance.is_finished(), "held acceptance must wait for the sweep's hold lock");
+        for (message_id, s) in &locked {
+            sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1 AND sender = $2")
+                .bind(message_id).bind(s).execute(&mut *sweep).await.unwrap();
+        }
+        sweep.commit().await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), acceptance)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Err(StorageError::NotFound(_))), "{outcome:?}");
+        assert!(db.get_message(&fresh.id).await.unwrap().is_none());
+        assert!(!db.has_nonce(&fresh.nonce).await.unwrap(), "no replay key burned");
+        assert!(db.call_admission_hold(&fresh, 2).await.unwrap());
+        assert!(matches!(
+            db.accept_held_paid_envelope(&fresh).await.unwrap(),
+            crate::PaidAcceptance::Accepted
+        ));
+        assert!(db.call_admission_held(&fresh.id).await.unwrap());
+
         db.pool.close().await;
         sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
     }
@@ -3966,4 +3927,123 @@ fn call_entry_from_row((side, phase, deadline, op, kind, hash): CallRow) -> Resu
         deadline_ms: u64::try_from(deadline).map_err(|_| bad("deadline"))?,
         pending,
     })
+}
+
+impl PostgresStorage {
+    /// Shared body of `accept_paid_envelope` and `accept_held_paid_envelope`.
+    async fn accept_paid_envelope_impl(&self, envelope: &UkmEnvelope, require_hold: bool) -> Result<crate::PaidAcceptance, StorageError> {
+        use crate::PaidAcceptance::*;
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ts = i64::try_from(envelope.timestamp)
+            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
+        let ciphertext = &envelope.ciphertext;
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let sig = hex::encode(envelope.signature.as_bytes());
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let mut tx = self.pool.begin().await?;
+        // Hold-first lock order, shared with the sweep and the calendar admission.
+        let hold_locked = if require_hold {
+            sqlx::query_as::<_, (String,)>("SELECT message_id FROM call_admission_hold WHERE message_id = $1 FOR UPDATE")
+                .bind(&id).fetch_optional(&mut *tx).await?.is_some()
+        } else {
+            false
+        };
+        let receipt = sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+            .bind(&ph).bind(&id).bind(&sender).execute(&mut *tx).await?;
+        let healing = receipt.rows_affected() == 0;
+        if healing {
+            // Serialize legacy healers on the receipt binding (SQLite already
+            // holds the writer lock from the INSERT above).
+            let binding: (String, String, i32) = sqlx::query_as("SELECT message_id, sender, accepted FROM payment_receipts WHERE payment_hash = $1 FOR UPDATE")
+                .bind(&ph).fetch_one(&mut *tx).await?;
+            if binding.0 != id || binding.1 != sender {
+                tx.rollback().await?;
+                return Ok(PaymentReused);
+            }
+            // Receipt metadata is independent of retained message content and
+            // excludes only the timestamp/signature wrapper refreshed on retry.
+            let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = 1 AND kind = $4 AND recipient_type = $5 AND recipient_id = $6 AND preimage = $7 AND amount_msat = $8 AND nonce = $9 AND references_json = $10")
+                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+                .fetch_one(&mut *tx).await?;
+            if durable == 1 {
+                tx.rollback().await?;
+                return Ok(AlreadyAccepted);
+            }
+            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = $1 AND r.message_id = $2 AND r.sender = $3 AND m.sender = r.sender AND m.kind = $4 AND m.recipient_type = $5 AND m.recipient_id = $6 AND m.payment_hash = r.payment_hash AND m.preimage = $7 AND m.amount_msat = $8 AND m.nonce = $9 AND m.references_json = $10")
+                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+                .fetch_one(&mut *tx).await?;
+            if matched == 1 {
+                sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = $1, recipient_type = $2, recipient_id = $3, preimage = $4, amount_msat = $5, nonce = $6, references_json = $7 WHERE payment_hash = $8")
+                    .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+                tx.commit().await?;
+                return Ok(AlreadyAccepted);
+            }
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = $1")
+                .bind(&id).fetch_one(&mut *tx).await?;
+            if exists != 0 || binding.2 != 0 {
+                tx.rollback().await?;
+                return Ok(PaymentReused);
+            }
+            // Full gate validation precedes this transaction. The receipt
+            // binds this paid identity; repair only its missing message row.
+        }
+        let inserted = sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            .bind(&nonce).bind(&sender).execute(&mut *tx).await?;
+        if inserted.rows_affected() == 0 {
+            let owner: String = sqlx::query_scalar("SELECT sender FROM nonces WHERE nonce_hex = $1")
+                .bind(&nonce).fetch_one(&mut *tx).await?;
+            if !healing || owner != sender {
+                tx.rollback().await?;
+                return Ok(NonceReused);
+            }
+        }
+        // A held kind is accepted fresh only under its admission hold: the hold
+        // sweep may have withdrawn an expired or inherited hold between the hold
+        // and this acceptance, and an unheld acceptance would never be admitted
+        // yet be replay-acknowledged. Checked here, with the hold row locked first (the sweep locks holds first too).
+        if require_hold {
+            let held: i64 = i64::from(hold_locked);
+            if held != 1 {
+                tx.rollback().await?;
+                return Err(StorageError::NotFound(format!("admission hold for {id}")));
+            }
+        }
+        sqlx::query(
+            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(&sender)
+        .bind(rtype)
+        .bind(&rid)
+        .bind(ts)
+        .bind(ciphertext)
+        .bind(&ph)
+        .bind(&pi)
+        .bind(amt)
+        .bind(&sig)
+        .bind(&nonce)
+        .bind(&refs_json)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = $1, recipient_type = $2, recipient_id = $3, preimage = $4, amount_msat = $5, nonce = $6, references_json = $7 WHERE payment_hash = $8")
+            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Accepted)
+    }
 }

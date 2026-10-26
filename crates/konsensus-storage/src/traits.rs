@@ -237,6 +237,20 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("accept_paid_envelope".into()))
     }
 
+    /// Paid acceptance for a kind that is held before acceptance (call
+    /// signals, room chats, calendar). Identical to `accept_paid_envelope`,
+    /// except that a FRESH acceptance requires the envelope's admission hold to
+    /// exist, checked inside the acceptance transaction (hold-first row lock on
+    /// PostgreSQL; under the writer lock on SQLite). A hold the sweep already
+    /// withdrew therefore cannot be followed by an unheld acceptance: the
+    /// acceptance fails with `NotFound` and nothing is written, and the
+    /// sender's retry places a fresh hold. A replay of an already accepted
+    /// envelope needs no hold. Backends with holds must override this; the
+    /// default is for backends without holds.
+    async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<PaidAcceptance, StorageError> {
+        self.accept_paid_envelope(envelope).await
+    }
+
     /// Match immutable acceptance without reserving replay keys or writing messages.
     /// Legacy full-message evidence is backfilled into the receipt before returning.
     async fn is_paid_envelope_accepted(&self, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {

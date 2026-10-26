@@ -306,6 +306,18 @@ impl Storage for TestStorage {
         }
         Ok(PaidAcceptance::Accepted)
     }
+    async fn accept_held_paid_envelope(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+    ) -> Result<konsensus_storage::PaidAcceptance, StorageError> {
+        let id = envelope.id.to_hex();
+        let fresh = !self.accepted.lock().unwrap().contains(&id)
+            && !self.application_rejected.lock().unwrap().contains(&id);
+        if fresh && !self.holds.lock().unwrap().contains(&id) {
+            return Err(StorageError::NotFound("admission hold".into()));
+        }
+        self.accept_paid_envelope(envelope).await
+    }
     async fn is_paid_envelope_accepted(
         &self,
         envelope: &konsensus_core::UkmEnvelope,

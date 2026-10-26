@@ -1982,3 +1982,80 @@ async fn held_calendar_envelope_is_withdrawn_by_the_startup_sweep_after_reopen()
         crate::PaidAcceptance::PaymentReused
     ));
 }
+
+/// Held kinds are accepted under their hold inside the acceptance transaction:
+/// once the sweep has withdrawn the hold, a fresh acceptance is refused with
+/// nothing written (no message, no receipt, no burned nonce), a re-placed hold
+/// lets the retry be accepted and admitted, and a replay of an accepted
+/// envelope needs no hold. The same holds through the encrypted wrapper.
+#[tokio::test]
+async fn held_acceptance_requires_a_live_hold_direct_and_through_the_wrapper() {
+    use crate::{CalendarAdmission, EncryptedStorage, PaidAcceptance, RsvpRecord};
+    let sender = NodeId::from_bytes([7u8; 32]);
+    let recipient = Recipient::Node(NodeId::from_bytes([8u8; 32]));
+
+    // Direct SQLite, with the calendar tables for the admission step (#409).
+    let db = SqliteStorage::in_memory().await.unwrap();
+    sqlx::raw_sql("CREATE TABLE calendar_rsvps (id TEXT PRIMARY KEY, event_id TEXT NOT NULL, responder TEXT NOT NULL, response TEXT NOT NULL, comment TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), UNIQUE(event_id, responder))")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let env = make_envelope(sender, recipient);
+    assert!(db.call_admission_hold(&env, 1).await.unwrap());
+    // The sweep withdraws the (expired) hold before acceptance ran.
+    assert_eq!(db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    let err = db.accept_held_paid_envelope(&env).await.unwrap_err();
+    assert!(matches!(err, StorageError::NotFound(_)), "{err}");
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
+    assert!(!db.has_nonce(&env.nonce).await.unwrap(), "no replay key burned");
+    assert!(!db.is_application_rejected(&env).await.unwrap());
+    // The retry places a fresh hold: accepted, then admitted and released.
+    assert!(db.call_admission_hold(&env, 2).await.unwrap());
+    assert!(matches!(
+        db.accept_held_paid_envelope(&env).await.unwrap(),
+        PaidAcceptance::Accepted
+    ));
+    let rsvp = CalendarAdmission::Rsvp(RsvpRecord {
+        id: "r1".into(),
+        event_id: "evt-1".into(),
+        responder: sender.to_hex(),
+        response: "accepted".into(),
+        comment: None,
+        created_at: String::new(),
+    });
+    db.commit_calendar_admission(&env, &rsvp).await.unwrap();
+    assert!(!db.call_admission_held(&env.id).await.unwrap());
+    assert!(db.is_paid_envelope_accepted(&env).await.unwrap());
+    // A replay of the admitted envelope needs no hold.
+    assert!(matches!(
+        db.accept_held_paid_envelope(&env).await.unwrap(),
+        PaidAcceptance::AlreadyAccepted
+    ));
+    // Through the encrypted wrapper.
+    let wrapped = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[9u8; 32]);
+    let env = make_envelope(sender, recipient);
+    assert!(wrapped.call_admission_hold(&env, 1).await.unwrap());
+    assert_eq!(wrapped.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    let err = wrapped.accept_held_paid_envelope(&env).await.unwrap_err();
+    assert!(matches!(err, StorageError::NotFound(_)), "{err}");
+    assert!(wrapped.get_message(&env.id).await.unwrap().is_none());
+    assert!(!wrapped.is_paid_envelope_accepted(&env).await.unwrap());
+    assert!(!wrapped.has_nonce(&env.nonce).await.unwrap());
+    assert!(wrapped.call_admission_hold(&env, 2).await.unwrap());
+    assert!(matches!(
+        wrapped.accept_held_paid_envelope(&env).await.unwrap(),
+        PaidAcceptance::Accepted
+    ));
+    assert!(wrapped.call_admission_held(&env.id).await.unwrap());
+    assert!(
+        wrapped.get_message(&env.id).await.unwrap().is_none(),
+        "held stays hidden through the wrapper"
+    );
+    wrapped.call_admission_release(&env.id).await.unwrap();
+    assert!(wrapped.get_message(&env.id).await.unwrap().is_some());
+    assert!(matches!(
+        wrapped.accept_held_paid_envelope(&env).await.unwrap(),
+        PaidAcceptance::AlreadyAccepted
+    ));
+}

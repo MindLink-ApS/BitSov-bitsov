@@ -19,9 +19,13 @@ also live on the corresponding GitHub pre-release pages.
   storage transaction (`commit_calendar_admission`) that requires the hold
   and, on PostgreSQL, locks it against the hold sweep, so a failed withdrawal
   leaves them hidden for the hold sweep with no calendar change behind and an
-  admitted envelope never lacks its change. A held envelope whose paid
-  acceptance returns an error keeps its hold (the acceptance may have
-  committed); a retry re-admits it or the sweep withdraws it. A
+  admitted envelope never lacks its change. Held kinds (call signals, room
+  chats, calendar) are accepted under their hold inside the acceptance
+  transaction, so a hold the sweep withdrew cannot be followed by an unheld
+  acceptance. A held envelope whose paid acceptance returns an error keeps
+  its hold (the acceptance may have committed); a retry re-admits it or the
+  sweep withdraws it. Calendar timestamps past the representable range are
+  refused (`calendar_timestamp_out_of_range`). A
   resend of any envelope this node withdrew at the application is answered
   with a terminal `application_rejected:` reason instead of a payment-reuse
   one, which a sender's compatibility path could read as delivered. The owner

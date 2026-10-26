@@ -338,7 +338,15 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
 
                         if gate_result.is_ok() && !is_relay_control {
                             use konsensus_storage::PaidAcceptance;
-                            let acceptance = storage_for_recv.accept_paid_envelope(&envelope).await;
+                            // A held kind is accepted under its hold, inside the
+                            // acceptance transaction: if the sweep withdrew the hold
+                            // in between, nothing is accepted and the sender's retry
+                            // places a fresh hold.
+                            let acceptance = if held_kind {
+                                storage_for_recv.accept_held_paid_envelope(&envelope).await
+                            } else {
+                                storage_for_recv.accept_paid_envelope(&envelope).await
+                            };
                             // Burned replay keys: decide, fail closed, what the resend
                             // is told BEFORE the gate's payment-reuse reason can be
                             // produced (the sender reads that one as a legacy ACK).

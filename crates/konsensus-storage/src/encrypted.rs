@@ -593,6 +593,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.accept_paid_envelope(&self.encrypt_envelope(envelope)?).await
     }
 
+    async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.inner.accept_held_paid_envelope(&self.encrypt_envelope(envelope)?).await
+    }
+
     async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
         self.inner.update_message_wrapper(envelope).await
     }
