@@ -248,6 +248,7 @@ impl NoiseTransport {
             banned_peers: Arc::clone(&self.banned_peers),
             incoming_tx: self.incoming_tx.clone(),
             control_tx: self.control_tx.clone(),
+            call_media_tx: self.call_media_tx.clone(),
             cookie_keyring: Arc::clone(&self.cookie_keyring),
         };
         let mut shutdown_rx = self.shutdown.subscribe();
@@ -390,6 +391,15 @@ impl NoiseTransport {
     /// and delivery confirmations. Blocks until an event is available.
     pub async fn recv_control(&self) -> Option<ControlEvent> {
         let mut rx = self.control_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Receive the next call media frame a peer sent (M6 N2). Consumed by the
+    /// node's call media router, independently of [`recv_control`].
+    ///
+    /// [`recv_control`]: NoiseTransport::recv_control
+    pub async fn recv_call_media(&self) -> Option<super::CallMediaEvent> {
+        let mut rx = self.call_media_rx.lock().await;
         rx.recv().await
     }
 }

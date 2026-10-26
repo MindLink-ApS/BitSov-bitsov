@@ -12,7 +12,7 @@ use crate::wire::{sanitized_peer_reason, Frame, WireError};
 
 use super::{
     write_noise_message, read_noise_message,
-    ControlEvent, Connection,
+    CallMediaEvent, ControlEvent, Connection,
     FRAME_BAN_DURATION, INVALID_FRAME_BUDGET, INVALID_FRAME_WINDOW,
     MEMORY_BUDGET_WINDOW, PEER_MEMORY_BUDGET,
 };
@@ -187,6 +187,41 @@ impl NoiseTransport {
             .map_err(|e| TransportError::Other(e.to_string()))
     }
 
+    /// Write one encoded [`Frame::CallMedia`] to `peer`, waiting at most
+    /// [`CALL_MEDIA_WRITE_DEADLINE`] for the connection's writer (M6 N2).
+    ///
+    /// Every frame on a connection shares one writer, so a bulk frame in
+    /// flight would otherwise queue audio behind it for as long as it takes.
+    /// Media is instead bounded: a packet that cannot start within the
+    /// deadline is dropped and `Timeout` returned, never written late. The
+    /// write itself is small (at most a few KiB) and completes or closes the
+    /// connection like any other Noise record.
+    ///
+    /// [`CALL_MEDIA_WRITE_DEADLINE`]: super::CALL_MEDIA_WRITE_DEADLINE
+    pub async fn send_call_media(&self, peer: &NodeId, frame_bytes: &[u8]) -> Result<(), TransportError> {
+        let conn = {
+            let peers = self.peers.read().await;
+            Arc::clone(
+                peers
+                    .get(peer)
+                    .ok_or_else(|| TransportError::NotConnected(peer.to_hex()))?,
+            )
+        };
+        let mut state = tokio::time::timeout(super::CALL_MEDIA_WRITE_DEADLINE, conn.lock())
+            .await
+            .map_err(|_| TransportError::Timeout("call media writer busy".into()))?;
+        if conn.is_closed() {
+            return Err(TransportError::NotConnected(peer.to_hex()));
+        }
+        let encrypted = state
+            .noise
+            .encrypt(frame_bytes)
+            .map_err(|e| TransportError::NoiseError(e.to_string()))?;
+        write_noise_message(&mut state.writer, &encrypted)
+            .await
+            .map_err(|e| TransportError::Other(e.to_string()))
+    }
+
     /// M1b promote-on-paid: flip a connection's `privileged` flag to `true`.
     ///
     /// Called by the message-plane handler AFTER the PaymentGate accepts a PAID,
@@ -320,7 +355,7 @@ pub(super) fn spawn_reader_task(
     ctx: super::TransportCtx,
 ) {
     tokio::spawn(async move {
-        let super::TransportCtx { peers, banned_peers, incoming_tx, control_tx, mut shutdown, .. } = ctx;
+        let super::TransportCtx { peers, banned_peers, incoming_tx, control_tx, call_media_tx, mut shutdown, .. } = ctx;
         if *shutdown.borrow() { conn.remove(&peer_id, &peers).await; return; }
         // Keep the read future alive across ping ticks: cancelling/restarting a
         // partial length-prefixed read would corrupt framing and reset its deadline.
@@ -736,6 +771,16 @@ pub(super) fn spawn_reader_task(
                         .await
                     {
                         warn!(peer = %peer_id, error = %e, "failed to send GossipReceived control event");
+                    }
+                }
+                Frame::CallMedia { call_id, seq, data } => {
+                    // Never block the reader on media: the router drains its
+                    // own channel; a full one drops the newest packet.
+                    if call_media_tx
+                        .try_send(CallMediaEvent { peer_id, call_id, seq, data, privileged: bought })
+                        .is_err()
+                    {
+                        debug!(peer = %peer_id, "call media channel full; packet dropped");
                     }
                 }
                 Frame::CallOffer { session_id, .. } => {

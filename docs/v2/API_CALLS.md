@@ -57,3 +57,31 @@ compose/admission checks.
 The endpoint uses existing tables without a migration. It does not request
 prices, pay, dispatch signals, emit call events, sweep rows, or mutate the
 operation journal. See [call protocol and recovery](CALLS-PROTOTYPE.md).
+
+# Owner media socket (M6 N2)
+
+`GET /api/v1/calls/<call-id>/media?peer=<node-id>` upgrades to the binary
+WebSocket that carries a node-routed call's media between the owner's app and
+its own node. Media flows app → own node → peer node → peer app; apps never
+send media to each other. The JWT is sent as the `bitsov.jwt.<token>`
+subprotocol, as on `/api/v1/ws` (the `?token=` query form is for local tooling).
+
+The socket opens only for a **paired device** (a token with a live pairing
+binding; the owner's own key-proof token gets 403) that holds the `spend`
+scope and whose subject is this node. `call-id` must be the 32-hex call id and
+`peer` the call's counterparty (400 otherwise). The node's call media router
+must admit `(peer, call-id)`: until N1 lands that means the stored call is
+live (answered, not ended, not expired); N1 tightens it to paid-until. A call
+that is not admitted gets 403, a second socket on the same call 409, a peer
+that is not connected or does not advertise `call_media_v1` 503. Pairing and
+scope are re-checked while the socket is open; revocation closes it.
+
+Every binary message is one packet: `seq` (u32, big-endian) followed by the
+codec payload, at most 4096 bytes. Packets from the app are forwarded to the
+peer node as `CallMedia` frames on the existing Noise link; the peer's packets
+arrive on the same socket in the same form. Each direction is capped at 100
+packets and 64 KiB per second; queues are bounded and drop the oldest packet
+rather than block, and a packet that cannot be written to the peer within
+200 ms (a bulk frame holds the writer) is dropped rather than queued. The
+socket closes when the call stops being admitted. Malformed or oversize app
+packets are dropped and counted; the socket stays open.

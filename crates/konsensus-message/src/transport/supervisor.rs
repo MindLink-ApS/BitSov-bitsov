@@ -174,6 +174,7 @@ impl NoiseTransport {
             banned_peers: Arc::clone(&self.banned_peers),
             incoming_tx: self.incoming_tx.clone(),
             control_tx: self.control_tx.clone(),
+            call_media_tx: self.call_media_tx.clone(),
             cookie_keyring: Arc::clone(&self.cookie_keyring),
             shutdown: self.shutdown.subscribe(),
         };

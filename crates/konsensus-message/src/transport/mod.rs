@@ -376,6 +376,30 @@ pub enum ControlEvent {
     },
 }
 
+/// One [`Frame::CallMedia`] a peer sent us (M6 N2). Media has its own
+/// channel ([`NoiseTransport::recv_call_media`]) so audio never queues
+/// behind control events the session handler is slow to work through.
+#[derive(Debug)]
+pub struct CallMediaEvent {
+    /// The authenticated peer the frame came from.
+    pub peer_id: NodeId,
+    pub call_id: String,
+    pub seq: u32,
+    pub data: Vec<u8>,
+    /// `privileged || admission_paid` on the receiving connection: a
+    /// whitelisted or promoted peer, or one whose admission we settled.
+    pub privileged: bool,
+}
+
+/// Media frames a reader may hold for the router before dropping the
+/// newest: at 50 packets per second per direction this is a few hundred
+/// milliseconds across every live call. The reader never blocks on it.
+const CALL_MEDIA_CHANNEL_CAPACITY: usize = 512;
+
+/// Longest a media frame waits for the connection's writer (a bulk frame
+/// in flight holds it): past this the packet is dropped, never queued.
+pub const CALL_MEDIA_WRITE_DEADLINE: Duration = Duration::from_millis(200);
+
 /// Each connection sends a Ping every ten seconds, on both ends, independent
 /// of reconnect eligibility. Sending never resets the 30-second read deadline.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -644,6 +668,7 @@ struct TransportCtx {
     banned_peers: BanMap,
     incoming_tx: mpsc::Sender<UkmEnvelope>,
     control_tx: mpsc::Sender<ControlEvent>,
+    call_media_tx: mpsc::Sender<CallMediaEvent>,
     /// Shared pre-Noise cookie secret, consulted when admission requires a cookie.
     cookie_keyring: Arc<cookie::CookieKeyring>,
 }
@@ -672,6 +697,9 @@ pub struct NoiseTransport {
     control_tx: mpsc::Sender<ControlEvent>,
     /// Receiver for control events (consumed by `recv_control()`).
     control_rx: Mutex<mpsc::Receiver<ControlEvent>>,
+    /// Call media frames from every reader (consumed by `recv_call_media()`).
+    call_media_tx: mpsc::Sender<CallMediaEvent>,
+    call_media_rx: Mutex<mpsc::Receiver<CallMediaEvent>>,
     /// Listener shutdown signal.
     shutdown: tokio::sync::watch::Sender<bool>,
     /// Local reconnect reasons and one worker per known dial endpoint.
@@ -698,6 +726,7 @@ impl NoiseTransport {
         let initial_whitelist: HashSet<NodeId> = config.whitelist.iter().copied().collect();
         let (incoming_tx, incoming_rx) = mpsc::channel(1024);
         let (control_tx, control_rx) = mpsc::channel(256);
+        let (call_media_tx, call_media_rx) = mpsc::channel(CALL_MEDIA_CHANNEL_CAPACITY);
         let (shutdown, _) = tokio::sync::watch::channel(false);
         let (actual_listen_addr, actual_listen_addr_rx) = tokio::sync::watch::channel(None);
 
@@ -711,6 +740,8 @@ impl NoiseTransport {
             incoming_rx: Mutex::new(incoming_rx),
             control_tx,
             control_rx: Mutex::new(control_rx),
+            call_media_tx,
+            call_media_rx: Mutex::new(call_media_rx),
             shutdown,
             supervision: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dial_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -914,6 +945,7 @@ impl MessageTransport for NoiseTransport {
             banned_peers: Arc::clone(&self.banned_peers),
             incoming_tx: self.incoming_tx.clone(),
             control_tx: self.control_tx.clone(),
+            call_media_tx: self.call_media_tx.clone(),
             cookie_keyring: Arc::clone(&self.cookie_keyring),
         };
         handshake::connect_to_peer(peer, &socket_addr, &ctx).await?;
