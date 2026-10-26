@@ -364,21 +364,29 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     audit_for_recv.membrane().admitted(&envelope, gate_result.as_ref().expect("validated").0);
                                 }
                                 Ok(PaidAcceptance::AlreadyAccepted) => {
-                                    // A call signal or chat still held was never admitted:
-                                    // never acknowledge it as delivered.
-                                    if held_kind
-                                        && storage_for_recv.call_admission_held(&msg_id).await.unwrap_or(true)
-                                    {
-                                        let reason = if konsensus_api::calls::is_call_kind(envelope.kind) { "call signal withdrawn" } else { "message withdrawn" };
-                                        let reject = Frame::MessageReject { id: msg_id, reason: reason.into() };
-                                        let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    // A duplicate ACK needs POSITIVE, durable evidence of
+                                    // admission (receipt accepted and not held), read now,
+                                    // after the acceptance transaction: a still-held
+                                    // envelope was never admitted, one the sweep withdrew
+                                    // meanwhile no longer exists, and an unreadable status
+                                    // is not evidence. The absence of a hold is not proof.
+                                    if matches!(storage_for_recv.is_paid_envelope_accepted(&envelope).await, Ok(true)) {
+                                        // No second promotion, decrypt, application side effect or write.
+                                        let ack = Frame::MessageAck { id: msg_id, duplicate: true };
+                                        if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
+                                            warn!(error = %e, "failed to send duplicate ACK");
+                                        }
                                         continue;
                                     }
-                                    // No second promotion, decrypt, application side effect or write.
-                                    let ack = Frame::MessageAck { id: msg_id, duplicate: true };
-                                    if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
-                                        warn!(error = %e, "failed to send duplicate ACK");
-                                    }
+                                    let reason = if matches!(storage_for_recv.is_application_rejected(&envelope).await, Ok(true)) {
+                                        application_rejected_reason()
+                                    } else if konsensus_api::calls::is_call_kind(envelope.kind) {
+                                        "call signal withdrawn".into()
+                                    } else {
+                                        "message withdrawn".into()
+                                    };
+                                    let reject = Frame::MessageReject { id: msg_id, reason };
+                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
                                     continue;
                                 }
                                 Ok(PaidAcceptance::NonceReused | PaidAcceptance::PaymentReused)
@@ -989,10 +997,12 @@ pub(crate) enum InboundRefusal {
     NotCommitted,
 }
 
-/// Lift a calendar envelope's admission hold without a mutation (there was no
-/// session or the ciphertext could not be decrypted, so the envelope is admitted
-/// as an opaque message); a no-op for other kinds. Fails closed: on a storage
-/// error the hold stays and the envelope is not admitted.
+/// Admit a calendar envelope that could not be decrypted (no session or an
+/// unreadable ciphertext) as an opaque message; a no-op for other kinds. Goes
+/// through the same transaction as a decoded admission with no mutation: the
+/// live hold and the stored sender-bound envelope are required and exactly one
+/// hold is consumed, so an envelope the sweep withdrew meanwhile is refused,
+/// never acknowledged. Fails closed on any storage error.
 async fn release_calendar_hold(
     storage: &dyn konsensus_storage::Storage,
     envelope: &konsensus_core::UkmEnvelope,
@@ -1000,10 +1010,13 @@ async fn release_calendar_hold(
     if !is_calendar_kind(envelope.kind) {
         return Ok(());
     }
-    storage.call_admission_release(&envelope.id).await.map_err(|e| {
-        error!(msg_id = %envelope.id, error = %e, "calendar envelope could not be released; withheld for the sweep");
-        InboundRefusal::NotCommitted
-    })
+    storage
+        .commit_calendar_admission(envelope, &konsensus_storage::CalendarAdmission::Opaque)
+        .await
+        .map_err(|e| {
+            error!(msg_id = %envelope.id, error = %e, "opaque calendar envelope not admitted; withheld for the sweep");
+            InboundRefusal::NotCommitted
+        })
 }
 
 /// Calendar kinds are held from before paid acceptance until their payload has

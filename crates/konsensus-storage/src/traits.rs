@@ -890,10 +890,11 @@ pub trait Storage: Send + Sync {
         ))
     }
 
-    /// Admit an accepted inbound calendar envelope: in one transaction, check
-    /// that the envelope is stored for this sender, persist its event (upsert
-    /// by id) or RSVP (upsert by `(event_id, responder)`), and release its
-    /// admission hold. Rolls back on any failure, so the envelope either has
+    /// Admit an accepted inbound calendar envelope: in one transaction, require
+    /// its live admission hold, check that the envelope is stored for this
+    /// sender, persist its event (upsert by id) or RSVP (upsert by
+    /// `(event_id, responder)`) or nothing (`Opaque`, an undecryptable
+    /// envelope), and consume exactly that one hold. Rolls back on any failure, so the envelope either has
     /// its mutation and is visible, or stays held (hidden, withdrawn by the
     /// sweep) with no mutation. An envelope that is not stored is refused with
     /// `NotFound` and nothing is written.

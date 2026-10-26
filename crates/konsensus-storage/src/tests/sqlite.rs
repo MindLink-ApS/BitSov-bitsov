@@ -2059,3 +2059,90 @@ async fn held_acceptance_requires_a_live_hold_direct_and_through_the_wrapper() {
         PaidAcceptance::AlreadyAccepted
     ));
 }
+
+/// An opaque admission (an undecryptable calendar envelope, no mutation) goes
+/// through the same transaction as a decoded one: it needs the live hold and
+/// the stored sender-bound envelope, consumes exactly that hold, and is refused
+/// with nothing written once the sweep has withdrawn the envelope. Direct and
+/// through the encrypted wrapper.
+#[tokio::test]
+async fn opaque_admission_requires_the_live_hold_direct_and_through_the_wrapper() {
+    use crate::{CalendarAdmission, EncryptedStorage, PaidAcceptance};
+    let sender = NodeId::from_bytes([7u8; 32]);
+    let recipient = Recipient::Node(NodeId::from_bytes([8u8; 32]));
+
+    // Each envelope carries its own payment proof: the first one's stays burned.
+    fn paid(sender: NodeId, recipient: Recipient, preimage: u8) -> UkmEnvelope {
+        let preimage = [preimage; 32];
+        let hash: [u8; 32] = Sha256::digest(preimage).into();
+        UkmEnvelopeBuilder::new(
+            KIND_CHAT,
+            sender,
+            recipient,
+            b"opaque".to_vec(),
+            PaymentProof::new(hash, preimage, 10),
+        )
+        .timestamp(1_700_000_000_000)
+        .build()
+    }
+
+    async fn check(db: &dyn Storage, sender: NodeId, recipient: Recipient) {
+        // Held but never accepted: no stored envelope, refused, hold kept.
+        let env = paid(sender, recipient, 21);
+        assert!(db.call_admission_hold(&env, 1).await.unwrap());
+        let err = db
+            .commit_calendar_admission(&env, &CalendarAdmission::Opaque)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::NotFound(_)), "{err}");
+        assert!(db.call_admission_held(&env.id).await.unwrap());
+        // Accepted under the hold, then the sweep withdraws it before the
+        // opaque admission: refused, the withdrawal stands, nothing is visible.
+        assert!(matches!(
+            db.accept_held_paid_envelope(&env).await.unwrap(),
+            PaidAcceptance::Accepted
+        ));
+        assert_eq!(db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+        let err = db
+            .commit_calendar_admission(&env, &CalendarAdmission::Opaque)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::NotFound(_)), "{err}");
+        assert!(!db.call_admission_held(&env.id).await.unwrap());
+        assert!(db.get_message(&env.id).await.unwrap().is_none());
+        assert!(db.is_application_rejected(&env).await.unwrap());
+        assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
+        assert!(matches!(
+            db.accept_held_paid_envelope(&env).await.unwrap(),
+            PaidAcceptance::PaymentReused | PaidAcceptance::NonceReused
+        ));
+        // Uncontended: the opaque admission consumes the hold and the envelope
+        // becomes visible and durably accepted; a second admission finds no hold.
+        let fresh = paid(sender, recipient, 22);
+        assert!(db.call_admission_hold(&fresh, 1).await.unwrap());
+        assert!(matches!(
+            db.accept_held_paid_envelope(&fresh).await.unwrap(),
+            PaidAcceptance::Accepted
+        ));
+        assert!(db.get_message(&fresh.id).await.unwrap().is_none());
+        db.commit_calendar_admission(&fresh, &CalendarAdmission::Opaque)
+            .await
+            .unwrap();
+        assert!(!db.call_admission_held(&fresh.id).await.unwrap());
+        assert!(db.get_message(&fresh.id).await.unwrap().is_some());
+        assert!(db.is_paid_envelope_accepted(&fresh).await.unwrap());
+        assert!(!db.is_application_rejected(&fresh).await.unwrap());
+        let err = db
+            .commit_calendar_admission(&fresh, &CalendarAdmission::Opaque)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::NotFound(_)), "{err}");
+        assert!(db.get_message(&fresh.id).await.unwrap().is_some());
+        assert_eq!(db.call_admission_withdraw(u64::MAX).await.unwrap(), 0);
+    }
+
+    let db = SqliteStorage::in_memory().await.unwrap();
+    check(&db, sender, recipient).await;
+    let wrapped = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[9u8; 32]);
+    check(&wrapped, sender, recipient).await;
+}

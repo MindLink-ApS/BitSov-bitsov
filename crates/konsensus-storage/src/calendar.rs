@@ -64,4 +64,10 @@ pub enum CalendarAdmission {
     Event(CalendarEventRecord),
     /// An attendee's answer (`KIND_RSVP`).
     Rsvp(RsvpRecord),
+    /// No calendar mutation: the envelope could not be decrypted (no session or
+    /// an unreadable ciphertext) and is admitted as an opaque message. The
+    /// commit still requires the live hold and the stored sender-bound
+    /// envelope and consumes exactly one hold, so an envelope the sweep
+    /// withdrew meanwhile is never acknowledged.
+    Opaque,
 }

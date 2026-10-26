@@ -24,7 +24,12 @@ also live on the corresponding GitHub pre-release pages.
   acceptance transaction, so a hold the sweep withdrew cannot be followed by
   an unheld acceptance. A held envelope whose paid acceptance returns an
   error keeps its hold (the acceptance may have committed); a retry re-admits
-  it or the sweep withdraws it. Calendar timestamps past the representable
+  it or the sweep withdraws it. A calendar envelope that cannot be decrypted
+  is admitted as an opaque message through the same transaction (live hold
+  and stored sender-bound envelope required, one hold consumed), and a resend
+  is acknowledged as a duplicate only on positive evidence of its durable
+  admission, never on the mere absence of a hold, so an envelope the sweep
+  withdrew meanwhile is refused. Calendar timestamps past the representable
   range are refused (`calendar_timestamp_out_of_range`). A
   resend of any envelope this node withdrew at the application is answered
   with a terminal `application_rejected:` reason instead of a payment-reuse

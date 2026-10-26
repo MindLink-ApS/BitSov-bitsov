@@ -3157,6 +3157,7 @@ impl Storage for SqliteStorage {
                 .execute(&mut *tx)
                 .await?;
             }
+            crate::CalendarAdmission::Opaque => {}
         }
         let released = sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
             .bind(&id).execute(&mut *tx).await?;
