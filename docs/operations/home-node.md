@@ -97,8 +97,20 @@ user, starts at boot, and restarts after failures and setup exit 75. The older
 [konsensus.service user unit](konsensus.service) remains available for existing
 installations. Run only one service against a data directory.
 
-On a Linux system with systemd, from the repository root, install the verified
-binary at `/usr/bin/konsensus` and create the account and data directory:
+On a Linux system with systemd, from the repository root, verify the release
+directory and install the Linux binary at `/usr/bin/konsensus`. The verifier
+checks the detached signature's primary-key fingerprint and every hash in
+`SHA256SUMS`. It does not download the key or the binaries. `RELEASE_KEY.asc`
+is the reviewed copy, not a file fetched from `main`.
+
+```sh
+bash scripts/verify-release.sh /path/to/download RELEASE_KEY.asc
+sudo install -m 0755 /path/to/download/bitsov-linux-x86_64 /usr/bin/konsensus
+```
+
+On `aarch64`, install `bitsov-linux-aarch64` in place of `bitsov-linux-x86_64`.
+
+Then create the account and data directory:
 
 ```sh
 sudo useradd --system --user-group --home-dir /var/lib/bitsov --shell /usr/sbin/nologin bitsov

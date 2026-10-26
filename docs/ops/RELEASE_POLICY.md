@@ -258,14 +258,36 @@ build preflight check their respective toolchains. These version records aid
 diagnosis; only the H3 binary hash comparison proves
 a matching host rebuild.
 
+## Verifying a published download
+
+`scripts/verify-release.sh <download-dir> <release-public-key.asc>` checks a
+directory that already contains `SHA256SUMS`, `SHA256SUMS.asc`, and the
+published CLI files. The key file must be the reviewed `RELEASE_KEY.asc`. The
+script reads that file's primary fingerprint and refuses anything other than
+`B299274C200301714DC6F51A7C2D6F8AC842EF6E`. It does not fetch the key, the tag,
+or the binaries, and it imports the key only into a temporary GnuPG home.
+
+A signature counts only when GnuPG reports `[GNUPG:] VALIDSIG` with field 10
+equal to that fingerprint. This is the same predicate as `scripts/release-sign.sh`.
+`SHA256SUMS` must name the five CLI binaries and may also name their `.sha256`,
+`.sbom.spdx.json`, and Darwin `.toolchain.txt` files. Every named file must be
+a regular file in that directory and match its hash. Another file, a nested
+path, or a symlink is refused.
+
+The script does not verify the git tag. Check `git verify-tag` separately
+against the same key. It also does not record whether a target was rebuilt on
+the signing host or accepted with `--accept-unverified-target`.
+
 ## Release-script tests
 
-Run `bash scripts/test-release-sign.sh`. It isolates `HOME`, `GNUPGHOME` and Git
-configuration, generates a disposable signing key, uses a local Git origin and
-simulates GitHub/large Rust builds. A private test copy substitutes only the
-throwaway fingerprint; the production pin stays fixed. Tests must never import,
-list or use real signing keys. Lint with `shellcheck scripts/release-sign.sh
-scripts/release-build.sh scripts/release-macos-toolchain.sh scripts/test-release-sign.sh`.
+Run `bash scripts/test-release-sign.sh` and `bash scripts/test-verify-release.sh`.
+The signer test isolates `HOME`, `GNUPGHOME` and Git configuration, generates a
+disposable signing key, uses a local Git origin and simulates GitHub/large Rust
+builds. A private test copy substitutes only the throwaway fingerprint; the
+production pin stays fixed. Tests must never import, list or use real signing
+keys. Lint with `shellcheck scripts/release-sign.sh scripts/release-build.sh
+scripts/release-macos-toolchain.sh scripts/test-release-sign.sh
+scripts/verify-release.sh scripts/test-verify-release.sh`.
 
 Use the [RC checklist template](../releases/RC_CHECKLIST_TEMPLATE.md) for each new
 release, including rebuild evidence and per-target waiver decisions.
