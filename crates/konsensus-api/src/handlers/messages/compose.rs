@@ -844,7 +844,11 @@ async fn try_keysend(
             // A binding refusal never falls back to an invoice: the contact
             // is paid at their verified key or not at all.
             if let Some(fixed) = binding_refusal_reason(&reason) {
-                tracing::warn!(peer = %peer_id, reason = fixed, "keysend refused at dispatch: binding changed");
+                tracing::warn!(
+                    peer = %peer_id,
+                    reason = fixed,
+                    "keysend refused at dispatch: binding changed"
+                );
                 return Err(ApiError::PeerNotReady { reason: fixed });
             }
             tracing::warn!(peer = %peer_id, %reason, "keysend rejected before dispatch");
