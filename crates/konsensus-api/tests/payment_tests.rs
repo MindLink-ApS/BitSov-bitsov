@@ -339,6 +339,7 @@ async fn pricing_own_chain_aware_reports_mode() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -1372,6 +1373,7 @@ async fn health_lightning_unavailable_shows_null_balance() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -1880,6 +1882,7 @@ async fn chain_status_with_failing_provider() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2001,6 +2004,7 @@ async fn chain_status_partial_failure() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2341,6 +2345,7 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: base.gossip_validator.clone(),
     });

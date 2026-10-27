@@ -1933,6 +1933,7 @@ async fn compose_happy_path_keysend() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2090,6 +2091,7 @@ async fn compose_happy_path_invoice_flow() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2216,6 +2218,7 @@ async fn compose_rejects_invoice_amount_mismatch() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2406,6 +2409,7 @@ async fn compose_keysend_fallback_to_invoice() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2543,6 +2547,7 @@ async fn compose_queues_when_transport_send_fails() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2658,6 +2663,7 @@ async fn compose_room_delivers_to_all_connected_members() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2804,6 +2810,7 @@ async fn compose_broadcasts_to_websocket() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2911,6 +2918,7 @@ async fn compose_records_send_timestamp_for_stdp() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -3017,6 +3025,7 @@ async fn compose_room_all_members_fail_returns_explicit_refusals() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -3186,6 +3195,7 @@ async fn compose_room_rejects_oversized_member_count() {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });

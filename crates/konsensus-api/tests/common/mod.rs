@@ -1249,6 +1249,7 @@ pub fn test_state() -> Arc<AppState> {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1317,6 +1318,7 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1373,6 +1375,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1439,6 +1442,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1495,6 +1499,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1779,6 +1784,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: Some(Arc::new(konsensus_gossip::GossipValidator::new(
             Default::default(),
@@ -2041,6 +2047,7 @@ pub fn test_state_with_lightning_and_storage(
         max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })

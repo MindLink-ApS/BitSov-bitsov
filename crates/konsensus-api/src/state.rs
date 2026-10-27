@@ -283,6 +283,11 @@ pub struct AppState {
     /// Where the seed lives, reported to the owner in `/status`
     /// (`docs/protocol/REMOTE-SIGNER.md` §2).
     pub custody_mode: crate::custody::CustodyMode,
+
+    /// The node's call media router (M6 N2), behind the owner media socket
+    /// `GET /api/v1/calls/:call_id/media`. `None` (tests, or a node without
+    /// a router) makes the socket answer 503 rather than route nothing.
+    pub call_media: Option<Arc<dyn crate::call_media::CallMediaPort>>,
 }
 
 /// Authenticated terminal result of an invoice request.

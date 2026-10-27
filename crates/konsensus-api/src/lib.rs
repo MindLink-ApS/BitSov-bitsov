@@ -54,10 +54,15 @@
 //!   from the `?token=<jwt>` query parameter inside `ws_handler`
 //!   (browsers cannot set `Authorization` on the WS handshake).
 //!   Functionally gated; see `ws.rs`.
+//! - `GET  /api/v1/calls/:call_id/media` — binary media WebSocket (M6 N2).
+//!   Validates the JWT inline like `/ws`, then requires a live pairing
+//!   binding, the `spend` scope, the owner subject and an admitted call.
+//!   Functionally gated; see `call_media.rs`.
 
 pub mod audit;
 pub mod auth;
 pub mod bootstrap;
+pub mod call_media;
 pub mod calls;
 pub mod control;
 pub mod custody;
@@ -240,7 +245,8 @@ fn build_router_with_options(
         .merge(handlers::starter_channel::routes())
         .merge(handlers::organism::routes())
         .merge(handlers::gossip::routes())
-        .merge(ws::routes());
+        .merge(ws::routes())
+        .merge(call_media::routes());
     let router = if remote {
         router.layer(middleware::from_fn_with_state(
             Arc::clone(&state),
