@@ -79,7 +79,9 @@ ghash = { version = "0.5", features = ["zeroize"] }
 polyval = { version = "0.6", features = ["zeroize"] }
 argon2 = { version = "0.5", features = ["zeroize"] }
 snow = "0.9"
-rand = "0.8"
+# Floor at 0.8.6. RUSTSEC-2026-0097 is patched on 0.8 only from 0.8.6;
+# `0.8` still admits 0.8.5. Cargo.lock already selects 0.8.6.
+rand = "0.8.6"
 sha2 = "0.10"
 hkdf = "0.12"
 hmac = "0.12"
