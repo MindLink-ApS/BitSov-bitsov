@@ -159,6 +159,7 @@ async fn start_node(identity: Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Node
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: Some(router as Arc<dyn konsensus_api::call_media::CallMediaPort>),

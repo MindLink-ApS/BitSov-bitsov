@@ -132,19 +132,21 @@ pub enum HangupReason {
     Timeout,
     Failed,
     Unpaid,
+    #[serde(rename = "duration_cap")]
+    DurationCap,
 }
 
 impl HangupReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Hangup => "hangup", Self::Declined => "declined", Self::Busy => "busy",
-            Self::Timeout => "timeout", Self::Failed => "failed", Self::Unpaid => "unpaid",
+            Self::Timeout => "timeout", Self::Failed => "failed", Self::Unpaid => "unpaid", Self::DurationCap => "duration_cap",
         }
     }
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "hangup" => Some(Self::Hangup), "declined" => Some(Self::Declined), "busy" => Some(Self::Busy),
-            "timeout" => Some(Self::Timeout), "failed" => Some(Self::Failed), "unpaid" => Some(Self::Unpaid), _ => None,
+            "timeout" => Some(Self::Timeout), "failed" => Some(Self::Failed), "unpaid" => Some(Self::Unpaid), "duration_cap" => Some(Self::DurationCap), _ => None,
         }
     }
 }
@@ -469,8 +471,10 @@ pub fn release(entry: CallEntry, operation_id: &str) -> Option<CallEntry> {
     match &entry.pending {
         Some(p) if p.operation_id == operation_id && p.kind == KIND_CALL_INVITE && entry.phase == Phase::Reserved => None,
         Some(p) if p.operation_id == operation_id => {
-            let release_notice = p.kind == KIND_CALL_HANGUP && entry.side == Side::Callee
-                && entry.unpaid_notice_used;
+            let release_notice = p.kind == KIND_CALL_HANGUP && entry.unpaid_notice_used
+                && (entry.side == Side::Callee
+                    || (entry.phase == Phase::Ended && entry.side == Side::Caller
+                        && entry.end_reason == Some(HangupReason::DurationCap)));
             Some(CallEntry { pending: None, unpaid_notice_used: entry.unpaid_notice_used && !release_notice, ..entry })
         }
         _ => Some(entry),
@@ -609,8 +613,17 @@ pub fn reserve_block(entry: Option<CallEntry>, seq: u32, operation_id: &str, req
 /// A timer may notify an already ended unpaid call through normal compose.
 /// This never reopens the call or grants media. Existing pending evidence wins.
 pub fn reserve_unpaid_hangup(entry: Option<CallEntry>, operation_id: &str, request_hash: &str) -> Result<CallEntry, CallRefusal> {
+    reserve_end_notice(entry, Side::Callee, HangupReason::Unpaid, operation_id, request_hash)
+}
+
+/// A caller notifies its peer after ending at the owner's paid-duration cap.
+pub fn reserve_duration_hangup(entry: Option<CallEntry>, operation_id: &str, request_hash: &str) -> Result<CallEntry, CallRefusal> {
+    reserve_end_notice(entry, Side::Caller, HangupReason::DurationCap, operation_id, request_hash)
+}
+
+fn reserve_end_notice(entry: Option<CallEntry>, side: Side, reason: HangupReason, operation_id: &str, request_hash: &str) -> Result<CallEntry, CallRefusal> {
     let entry = entry.ok_or(CallRefusal::UnknownCall)?;
-    if entry.side != Side::Callee || entry.phase != Phase::Ended || entry.end_reason != Some(HangupReason::Unpaid) {
+    if entry.side != side || entry.phase != Phase::Ended || entry.end_reason != Some(reason) {
         return Err(CallRefusal::UnknownCall);
     }
     if let Some(pending) = &entry.pending {
@@ -839,5 +852,28 @@ mod tests {
         for s in ["paying", "payment_unknown", "something_new"] {
             assert_eq!(settlement(Some(s)), Settlement::Ambiguous);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod duration_cap_tests {
+    use super::*;
+
+    #[test]
+    fn duration_notice_is_single_use_and_preserves_the_terminal_boundary() {
+        let signal = CallSignal::parse(403, r#"{"v":1,"call_id":"0123456789abcdef0123456789abcdef","reason":"duration_cap"}"#).unwrap();
+        assert_eq!(signal.reason, Some(HangupReason::DurationCap));
+        let caller = commit(reserve(None, 400, "offer", "hash", 0).unwrap(), "offer", 0).unwrap();
+        let ended = CallEntry { phase: Phase::Ended, end_reason: signal.reason,
+            deadline_ms: 60_000 + TOMBSTONE_MS, ..caller };
+        assert!(reserve_duration_hangup(Some(CallEntry { side: Side::Callee, ..ended.clone() }), "notice", "hash").is_err());
+        let pending = reserve_duration_hangup(Some(ended.clone()), "notice", "hash").unwrap();
+        assert_eq!(release(pending.clone(), "notice").unwrap(), ended);
+        let sent = commit(pending, "notice", 65_000).unwrap();
+        assert_eq!(sent.deadline_ms, ended.deadline_ms);
+        assert_eq!(sent.end_reason, ended.end_reason);
+        assert!(!sent.media_admitted(65_000));
+        assert!(reserve_duration_hangup(Some(sent), "again", "hash").is_err());
     }
 }

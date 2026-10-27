@@ -53,8 +53,13 @@ const FAILED: u8 = 3;
 /// Counts every money-moving call and settles, loses, refuses or fails it.
 #[derive(Default)]
 struct Wallet {
+    call_capacity: AtomicU64,
+    pause_capacity: AtomicBool,
+    capacity_entered: tokio::sync::Notify,
+    capacity_resume: tokio::sync::Notify,
     fee: AtomicU64,
     unknown_fee: AtomicBool,
+    recover_preimage: AtomicBool,
     outgoing: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
     liquidity: std::sync::Mutex<Option<Arc<konsensus_lightning::liquidity::LiquidityClient>>>,
     mode: AtomicU8,
@@ -121,6 +126,20 @@ impl Wallet {
 
 #[async_trait]
 impl LightningProvider for Wallet {
+    async fn list_channels(&self) -> Result<Vec<konsensus_core::traits::lightning::ChannelInfo>, LightningError> {
+        if self.pause_capacity.load(Ordering::SeqCst) {
+            self.capacity_entered.notify_one();
+            self.capacity_resume.notified().await;
+        }
+        let capacity = self.call_capacity.load(Ordering::SeqCst);
+        Ok(vec![konsensus_core::traits::lightning::ChannelInfo {
+            is_outbound: Some(true), is_announced: Some(false), is_channel_ready: Some(true),
+            local_reserve_msat: Some(0), initial_push_msat: None, channel_id: "test-channel".into(),
+            user_channel_id: None, funding_txo: None, peer_pubkey: PEER_LN.into(),
+            capacity_msat: capacity, local_balance_msat: capacity, outbound_capacity_msat: Some(capacity),
+            remote_balance_msat: 0, active: true, short_channel_id: None,
+        }])
+    }
     async fn keysend_with_fee_limit(
         &self,
         dest: &str,
@@ -192,6 +211,14 @@ impl LightningProvider for Wallet {
         let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
         let mut paid = self.pay_invoice(bolt11).await?;
         paid.payment_hash = invoice.payment_hash().to_string();
+        if paid.preimage.is_some() {
+            // Invoice fixtures use these preimages; keysend has its own proof.
+            paid.preimage = [0xcc, 0xdd].into_iter().find_map(|byte| {
+                let preimage = [byte; 32];
+                (hex::encode(<sha2::Sha256 as sha2::Digest>::digest(preimage))
+                    == paid.payment_hash).then(|| hex::encode(preimage))
+            });
+        }
         Ok(paid)
     }
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
@@ -214,7 +241,7 @@ impl LightningProvider for Wallet {
         if let Some(amount_msat) = amount {
             return Ok(PaymentDetails {
                 payment_hash: hash.into(),
-                preimage: None,
+                preimage: self.recover_preimage.load(Ordering::SeqCst).then(|| "cc".repeat(32)),
                 amount_msat,
                 status: match self.mode.load(Ordering::SeqCst) {
                     FAILED => PaymentStatus::Failed,
@@ -3027,6 +3054,8 @@ async fn confirmed_payment_failures_pause_the_grant_at_the_http_boundary() {
 #[path = "budget_grant/messaging_cap.rs"]
 mod messaging_cap;
 
+#[path = "budget_grant/calls.rs"]
+mod call_reservations;
 /// A `request_id` belongs to the caller that used it. Two paired apps, or an
 /// app and the owner, reusing the same string with identical parameters are
 /// two operations: each dispatches and is debited once, and neither can read

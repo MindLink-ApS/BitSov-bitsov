@@ -1318,13 +1318,32 @@ pub struct RelayConfig {
 /// request/response only: no TURN, no relay, no auth, no per-caller state). It
 /// tells a caller the public address its request came from, which is all an
 /// app needs to connect directly across a router. Off unless `stun_listen` is set.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CallsConfig {
     /// UDP address for the STUN responder, for example `0.0.0.0:3478`.
     /// `None` (default): no UDP socket is opened.
     #[serde(default)]
     pub stun_listen: Option<SocketAddr>,
+    /// Outgoing paid minutes reserved per call; one minute per block.
+    #[serde(default = "default_max_call_minutes", deserialize_with = "deserialize_max_call_minutes")]
+    pub max_call_minutes: u16,
+}
+
+fn default_max_call_minutes() -> u16 { 60 }
+
+fn deserialize_max_call_minutes<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u16, D::Error> {
+    let value = u16::deserialize(deserializer)?;
+    if !(1..=240).contains(&value) {
+        return Err(serde::de::Error::custom("calls.max_call_minutes must be between 1 and 240"));
+    }
+    Ok(value)
+}
+
+impl Default for CallsConfig {
+    fn default() -> Self {
+        Self { stun_listen: None, max_call_minutes: default_max_call_minutes() }
+    }
 }
 
 /// Storage backend selection.
@@ -1712,6 +1731,7 @@ impl NodeConfig {
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!((1..=240).contains(&self.calls.max_call_minutes), "calls.max_call_minutes must be between 1 and 240");
         self.lightning.validate_address_lengths()?;
         self.validate_starter_hub(false)?;
         self.tower.validate()?;
