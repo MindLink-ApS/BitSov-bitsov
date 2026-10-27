@@ -115,16 +115,18 @@ async fn compose(
     signal: Value,
     cap: u64,
 ) -> (StatusCode, Value) {
-    app.post(
-        "/api/v1/messages/compose",
-        json!({
-            "operation_id": uuid::Uuid::new_v4().to_string(),
-            "recipient": peer.to_hex(), "kind": kind, "plaintext": signal.to_string(),
-            "max_routing_fee_msat": 0, "max_total_msat": cap,
-        }),
-        false,
-    )
-    .await
+    let mut request = json!({
+        "operation_id": uuid::Uuid::new_v4().to_string(),
+        "recipient": peer.to_hex(), "kind": kind, "plaintext": signal.to_string(),
+        "max_routing_fee_msat": 0, "max_total_msat": cap,
+    });
+    if kind == 400 {
+        // Explicit owner consent at both inclusive ceilings, separate from
+        // the offer payment cap and with no direct-channel routing fee.
+        request["max_block_msat"] = json!(PRICE);
+        request["max_hold_msat"] = json!(u64::from(app.state.max_call_minutes) * PRICE);
+    }
+    app.post("/api/v1/messages/compose", request, false).await
 }
 
 async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {

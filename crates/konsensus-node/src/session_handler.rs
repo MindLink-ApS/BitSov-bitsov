@@ -287,13 +287,14 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                     }
 
-                    ControlEvent::MessageAcked { peer_id, message_id, privileged, .. } => {
+                    ControlEvent::MessageAcked { peer_id, message_id, privileged, paid_until_ms, .. } => {
+                        let cipher = konsensus_crypto::PlaintextCacheCipher::new(identity.aes_key());
                         handle_delivery_confirmation(&peer_id, &message_id, None, privileged,
-                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget).await;
+                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget, paid_until_ms.map(|until| (until, &cipher))).await;
                     }
                     ControlEvent::MessageRejected { peer_id, message_id, reason, privileged } => {
                         handle_delivery_confirmation(&peer_id, &message_id, Some(&reason), privileged,
-                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget).await;
+                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget, None).await;
                     }
 
                     ControlEvent::PriceTableReceived { peer_id, prices, block_height, valid_blocks, trust_discount, privileged } => {
@@ -374,6 +375,26 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     }
 
                     ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } => {
+                        if purpose.starts_with(konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX) {
+                            if privileged {
+                                let result = prepare_call_block_invoice(storage.as_ref(), &peer_id, &purpose, amount_msat, &request_id, lightning.as_ref()).await;
+                                match result {
+                                    Ok(invoice) => {
+                                        let _ = transport.send_frame(&peer_id, &Frame::InvoiceResponse {
+                                            request_id, bolt11: invoice.bolt11, payment_hash: invoice.payment_hash,
+                                        }).await;
+                                    },
+                                    Err(reason) => {
+                                        if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
+                                            send_invoice_refusal(&transport, &peer_id, &request_id, reason).await;
+                                        }
+                                    },
+                                }
+                            } else if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
+                                send_invoice_refusal(&transport, &peer_id, &request_id, konsensus_api::invoice_refusal::ADMISSION_REQUIRED).await;
+                            }
+                            continue;
+                        }
                         handle_invoice_requested_gated(
                             &peer_id, &request_id, amount_msat, &purpose, privileged,
                             &pricing, &readiness_height, &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
@@ -1042,6 +1063,7 @@ async fn send_prekey_offer(
 /// Wire reasons are the gate's stable Display prefixes; unknown reasons stay
 /// retryable so older peers and temporary gate failures cannot burn delivery.
 fn terminal_paid_rejection(reason: &str) -> bool {
+    if reason == "call_block_overpayment" { return true; }
     [
         "payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:",
         "room_binding_invalid:", "room_sender_not_member:", "room_recipient_not_member:",
@@ -1085,10 +1107,17 @@ async fn handle_delivery_confirmation(
     routing: &konsensus_routing::RoutingTable, ws: &broadcast::Sender<Arc<WsDeliveryStatus>>,
     audit: &konsensus_api::audit::AuditLog,
     budget: &mut DeliveryConfirmationBudget,
+    paid_until_ms: Option<(u64, &konsensus_crypto::PlaintextCacheCipher)>,
 ) {
     if !budget.allow(peer, privileged, tokio::time::Instant::now()) {
         audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
         return;
+    }
+    if let Some((until, cipher)) = paid_until_ms.filter(|_| rejection.is_none()) {
+        if let Err(e) = konsensus_api::calls::receive_block_grant(storage.as_ref(), cipher, own_id, peer, id, until).await {
+            warn!(error = %e, "call grant not durable; withholding ACK completion for retry");
+            return;
+        }
     }
     let nonce_replay = rejection == Some("replay detected: nonce already used");
     let hash_replay = rejection.and_then(|reason| reason.strip_prefix("payment proof already used: "))
@@ -1985,6 +2014,35 @@ async fn handle_gossip_received(
         total_peers = connected_peers.len(),
         "gossip re-broadcast complete"
     );
+}
+
+
+/// Refuse before touching the wallet and again after asynchronous creation.
+/// No invoice is returned to the caller when the safety margin is exhausted.
+async fn prepare_call_block_invoice(
+    storage: &dyn konsensus_storage::Storage, peer: &NodeId, purpose: &str,
+    amount_msat: u64, request_id: &str, lightning: &dyn LightningProvider,
+) -> Result<konsensus_core::traits::lightning::Invoice, &'static str> {
+    use konsensus_core::payloads::call as calls;
+    const REFUSED: &str = konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE;
+    if lightning.disk_status().is_some_and(|status| status.disk_low) { return Err("disk_low"); }
+    let (call_id, seq) = purpose.strip_prefix(calls::CALL_BLOCK_INVOICE_PREFIX)
+        .and_then(|s| s.split_once(':')).ok_or(REFUSED)?;
+    let seq: u32 = seq.parse().map_err(|_| REFUSED)?;
+    // Parse the bounded schema as well as the numeric sequence.
+    calls::CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK,
+        &serde_json::json!({"call_id": call_id, "seq": seq}).to_string()).map_err(|_| REFUSED)?;
+    let validate = async || {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_millis() as u64;
+        let entry = storage.call_get(peer, call_id).await.map_err(|_| REFUSED)?.ok_or(REFUSED)?;
+        calls::validate_block_invoice(&entry, seq, now).map_err(|_| REFUSED)
+    };
+    validate().await?;
+    let invoice = lightning.create_invoice(amount_msat, &format!("konsensus:{request_id}"),
+        calls::CALL_BLOCK_INVOICE_EXPIRY_SECS).await.map_err(invoice_refusal_reason)?;
+    validate().await?;
+    Ok(invoice)
 }
 
 #[cfg(test)]

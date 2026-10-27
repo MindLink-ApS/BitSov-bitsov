@@ -8,6 +8,7 @@
       "message_operations_v1",
       "message_operation_abandon_v1",
       "channel_open_operations_v1",
+      "direct_payment_operations_v1",
       "paid_send_caps_v1",
       "quoted_readmission_v1",
       "room_terminal_outcomes_v1",

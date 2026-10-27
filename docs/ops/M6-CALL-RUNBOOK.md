@@ -114,10 +114,11 @@ must cover the whole reservation plus setup and fees.
 ## Checks before dialing
 
 1. Record the exact node SHA on each host and the app SHA/build on each device.
-   Check that both nodes include N1 #453, N2 #454 and N3 #460. For this
-   integration branch, `e710bf0` is the merge beneath P1; it is not a substitute
-   for recording the actual running HEAD. Verify both apps use node-routed M6
-   audio with direct WebRTC disabled.
+   Check that both nodes include the merged main commits `03616b2` (N1 #453),
+   `30cc34c` (N2 #454) and `2e5f952` (N3 #460). P1 sits directly on main;
+   these prerequisites do not replace recording the actual running HEAD.
+   Both nodes must support the late-block grant acknowledgement described
+   below. Verify both apps use node-routed M6 audio with direct WebRTC disabled.
 2. On both nodes check `GET /api/v1/status`: expected node identity, real LDK,
    `money_ready: true`, advancing signet chain height. Verify signet in
    `GET /api/v1/payments/funding-address`. Check `peers/connected` and
@@ -133,7 +134,8 @@ must cover the whole reservation plus setup and fees.
    reports **offer/signal** prices, not the block tariff. The compose path
    asks B afresh for kind 404 before reserving/paying. The app must show B's
    payable block price, the cap, the total reservation and fees, and receive
-   explicit price/cap consent before dialing.
+   explicit price/cap consent before dialing. Put the approved ceilings in
+   the offer's `max_block_msat` and `max_hold_msat` fields described below.
 5. Ensure the grant's total, per-call, recipient and rolling spend limits cover
    `max_call_minutes × (block price + enforced per-block routing-fee ceiling)`.
    One active channel must have enough known outbound capacity after other
@@ -158,7 +160,29 @@ token and a stable unique `operation_id` for each action:
 The endpoint is `POST /api/v1/messages/compose`, with `recipient`, `kind`,
 `plaintext` (the JSON encoded as a string), `operation_id`,
 `max_total_msat` and `max_routing_fee_msat`. Caps must match owner consent;
-they must not silently increase on retry. The offer pays for ringing only.
+they must not silently increase on retry. On the kind-400 offer, also supply
+these top-level consent fields (outside the encoded `plaintext`):
+
+- `max_block_msat`: maximum payable price of one 60-second block, excluding
+  routing fees. The node checks the callee's fresh quote, including the
+  existing 1000-msat floor for a nonzero quote below that amount.
+- `max_hold_msat`: maximum entire block reservation, computed as
+  `max_call_minutes × (payable block price + enforced per-block routing-fee ceiling)`.
+  The hold excludes the offer and other signaling payments; `max_total_msat`
+  still caps the offer itself, and `max_routing_fee_msat` bounds routing fees.
+
+For the ten-minute example above with a zero routing-fee ceiling, send
+`max_block_msat: 23001`, `max_hold_msat: 230010`, `max_total_msat: 1000` and
+`max_routing_fee_msat: 0`. A route requiring a fee will be refused under those
+terms. Both consent ceilings are inclusive; zero is a real ceiling. Omitted
+or null fields add no consent limit for compatibility with older clients,
+so this rehearsal must send both explicitly. An excessive quote or hold
+returns HTTP 400, `code: "not_dispatched"`, with respectively
+`call_price_above_consent` or `call_hold_above_consent`, before creating a new
+hold or dispatching payment. A retry cannot resize an existing hold or undo
+an already-paid operation; recover with its original operation ID and terms.
+
+The offer pays for ringing only.
 Answer starts a 30-second block-zero payment window and **does not admit
 media**. Verify both media sockets refuse before block 0 settles.
 
@@ -173,9 +197,44 @@ call. Confirm microphone audio arrives in both directions.
 Observe `GET /api/v1/calls?peer=<other node id>` on A: the reservation appears
 at dial, `next_block_seq` becomes 1 after block 0, and `spent_msat` rises while
 `remaining_msat` falls. Schedule each next 404 at `next_block_due_ms`, normally
-20 seconds before `paid_until_ms`. Blocks buy contiguous 60-second intervals
-anchored to the answer; paying late does not move the anchor. A single call
-hold counts once toward the payment-count breaker, not once per block.
+20 seconds before `paid_until_ms`. On-time blocks, including receipt at the
+inclusive grace endpoint, extend the previous paid boundary by exactly
+60 seconds, starting from each node's recorded answer time. A late-block
+acknowledgement can advance A to B's usable grant; it cannot rewind a newer
+local interval. A single call hold counts once toward the payment-count
+breaker, not once per block.
+
+The late-block policy is **stop early + honour**:
+
+- **Stop early:** B checks the call ID, next sequence and its own clock before
+  issuing and returning a block invoice. With less than 15 seconds remaining
+  before `deadline_ms` (which already includes grace, or the initial
+  30-second block-zero window), it refuses with `call_block_unpayable`.
+  A also checks its independent five-second margin before wallet dispatch.
+  Block invoices have a five-second BOLT11 expiry, but expiry cannot cancel
+  an in-flight HTLC or guarantee that settlement stops then.
+- **Honour:** after grace, media stops and the call becomes `unpaid`. If the
+  expected next paid block reaches B within 60 seconds after that end
+  (inclusive), B reopens the call for a full 60 seconds **from receipt**, with
+  a new grace period. This also applies if the expiry sweep has not yet run.
+  B's acknowledgement carries the granted `paid_until_ms`; A applies it to
+  the matching dispatched block. Duplicate delivery repeats the grant
+  without extending it, and a delayed Unpaid notice cannot end the revived
+  interval. Explicit hangup/decline never resumes.
+- **Reconcile:** a settled block outside that window, or with an
+  unserviceable sequence, buys no media. B consumes the proof once, retains
+  the rejected payment receipt, records `call.block_overpayment`, and sends
+  `call_block_overpayment` to A. Preserve that evidence privately and
+  reconcile the payment; there is no automatic refund. Do not pay again
+  under a new operation ID to hide an uncertain outcome.
+
+An Unpaid call with a pending block keeps its unused reservation during the
+60-second resume window. A settled block still queued for delivery can retain
+the bundle for a usable grant acknowledgement, bounded by 130 seconds after
+A's local Unpaid deadline. After the applicable window only unresolved
+payment liabilities remain held. Recovery charges a settled block once;
+it never recreates a released hold. See the
+[settlement rules](../v2/API_CALLS.md#settlement-and-release) for reconciliation.
 
 For cutoff proof, leave both nodes and media sockets connected and stop only
 the caller app's **404 renewal loop**. Do not send Hangup, close the channel,
@@ -210,11 +269,14 @@ without renewal grace. Restore the rehearsal cap before a five-minute run.
 | `busy` | Callee declined because it cannot take the call. Retry later with fresh consent and a new call ID. |
 | `timeout` | The offer was not answered within its 60-second ringing window. |
 | `failed` | The call failed, including definite payment failure. Inspect the operation receipt before retrying. |
-| `unpaid` (Unpaid in the app) | Block 0 missed its 30-second window, or a renewal missed the final paid boundary plus ten-second grace. Media ends locally even if the notice cannot be paid. |
+| `unpaid` (Unpaid in the app) | Block 0 missed its 30-second window, or a renewal missed the final paid boundary plus ten-second grace. Media ends locally even if the notice cannot be paid; an already-paid next block can revive it under the bounded honour policy above. |
 | `duration_cap` | Caller reached its pinned paid-duration limit. Media ends at the final paid boundary. |
 | `payment_failed` | Client/payment error, not a separate wire hangup enum. A definite failure ends the call; an ambiguous operation stays journaled until reconciled. |
 | `call_price_changed` | B's new block price exceeds the reserved ceiling. Call ends; a new call needs fresh consent. |
 | `call_price_unknown` | No fresh answer from B for the required tariff. Nothing should be paid; check connection/admission/readiness. |
+| `call_price_above_consent` / `call_hold_above_consent` | The offer exceeds an explicit block-price or whole-hold ceiling. No new hold/payment is dispatched; obtain fresh owner consent before changing terms. |
+| `call_block_unpayable` | Too little time remains to issue a new block invoice safely. No new payment is authorized; reconcile any existing operation. |
+| `call_block_overpayment` | A settled block cannot be served. Preserve the payment receipt and audit evidence for reconciliation; do not treat this as nonpayment. |
 | `call_liquidity_insufficient` / `call_liquidity_unavailable` | Capacity is too small or cannot be established. Resolve liquidity/readiness before dialing. |
 | `budget_exceeded` / `price_cap_exceeded` | Approved limits do not cover the request. Inspect the structured reason and ask the owner for appropriate terms. |
 

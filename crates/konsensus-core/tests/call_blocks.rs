@@ -5,7 +5,7 @@ use konsensus_core::payloads::call::{
 fn answered() -> CallEntry {
     let ringing = calls::receive(None, 400, None, 0).unwrap();
     let pending = calls::reserve(Some(ringing), 401, "answer", "hash", 1_000).unwrap();
-    calls::commit(pending, "answer", 1_000)
+    calls::commit(pending, "answer", 1_000).unwrap()
 }
 
 #[test]
@@ -42,7 +42,7 @@ fn block_zero_allows_initial_round_trips_without_granting_unpaid_media() {
     let paid = calls::receive_block(Some(entry.clone()), 0, 31_000).unwrap();
     assert_eq!(paid.paid_until_ms, Some(61_000));
     assert_eq!(paid.next_block_due_ms(), Some(41_000));
-    assert!(calls::receive_block(Some(entry), 0, 31_001).is_err());
+    assert_eq!(calls::receive_block(Some(entry), 0, 31_001).unwrap().paid_until_ms, Some(91_001));
 }
 
 #[test]
@@ -63,7 +63,7 @@ fn unpaid_hangup_is_admitted_after_local_expiry_without_changing_the_tombstone()
 #[test]
 fn call_blocks_expiry_ends_unpaid_and_preserves_the_tombstone() {
     let first = calls::receive_block(Some(answered()), 0, 1_000).unwrap();
-    assert!(calls::receive_block(Some(first.clone()), 1, 71_001).is_err());
+    assert_eq!(calls::receive_block(Some(first.clone()), 1, 71_001).unwrap().paid_until_ms, Some(131_001));
     let ended = first.at(71_001).unwrap();
     assert_eq!(ended.phase, Phase::Ended);
     assert_eq!(ended.end_reason, Some(HangupReason::Unpaid));
@@ -91,7 +91,7 @@ fn call_blocks_refuse_duplicates_gaps_early_unknown_ended_and_wrong_side() {
         calls::reserve(None, 400, "offer", "hash", 0).unwrap(),
         "offer",
         0,
-    );
+    ).unwrap();
     let caller = calls::receive(Some(own), 401, None, 1_000).unwrap();
     assert!(calls::receive_block(Some(caller), 0, 1_000).is_err());
 }
@@ -119,27 +119,27 @@ fn call_blocks_have_strict_bounded_payloads() {
 }
 
 #[test]
-fn call_blocks_outgoing_reservations_settle_once_and_cannot_revive_expiry() {
+fn call_blocks_outgoing_reservations_settle_once_and_honour_late_payment() {
     let own = calls::commit(
         calls::reserve(None, 400, "offer", "hash", 0).unwrap(),
         "offer",
         0,
-    );
+    ).unwrap();
     let entry = calls::receive(Some(own), 401, None, 1_000).unwrap();
     let pending = calls::reserve_block(Some(entry.clone()), 0, "block", "hash", 1_000).unwrap();
     assert_eq!(calls::release(pending.clone(), "block"), Some(entry));
-    let first = calls::commit(pending.clone(), "block", 1_000);
+    let first = calls::commit(pending.clone(), "block", 1_000).unwrap();
     assert_eq!(first.paid_until_ms, Some(61_000));
-    assert_eq!(calls::commit(first.clone(), "block", 2_000), first);
+    assert_eq!(calls::commit(first.clone(), "block", 2_000).unwrap(), first);
     let expired = pending.at(31_001).unwrap();
-    assert_eq!(calls::commit(expired, "block", 31_001).phase, Phase::Ended);
+    assert_eq!(calls::commit(expired, "block", 31_001).unwrap().paid_until_ms, Some(91_001));
 }
 
 #[test]
 fn unpaid_hangup_notification_never_reopens_an_ended_call() {
     let ended = answered().at(31_001).unwrap();
     let pending = calls::reserve_unpaid_hangup(Some(ended), "timeout", "hash").unwrap();
-    let ended = calls::commit(pending, "timeout", 31_002);
+    let ended = calls::commit(pending, "timeout", 31_002).unwrap();
     assert_eq!(ended.phase, Phase::Ended);
     assert!(!ended.media_admitted(31_002));
     assert_eq!(calls::reserve_unpaid_hangup(Some(ended), "second", "hash2"), Err(CallRefusal::UnknownCall));
@@ -170,7 +170,7 @@ fn call_blocks_expired_pending_can_reconcile_but_cannot_pay_again() {
         calls::reserve(None, 400, "offer", "hash", 0).unwrap(),
         "offer",
         0,
-    );
+    ).unwrap();
     let entry = calls::receive(Some(own), 401, None, 1_000).unwrap();
     let pending = calls::reserve_block(Some(entry), 0, "block", "hash", 1_000).unwrap();
     assert!(
@@ -192,7 +192,58 @@ fn unpaid_notice_reservation_retries_and_definite_nonpayment_release() {
     assert_eq!(calls::reserve_unpaid_hangup(Some(pending.clone()), "notice", "hash"), Ok(pending.clone()));
     assert_eq!(calls::reserve_unpaid_hangup(Some(pending.clone()), "other", "hash"), Err(CallRefusal::InFlight));
     assert_eq!(calls::release(pending.clone(), "notice"), Some(ended));
-    let committed = calls::commit(pending, "notice", 32_000);
+    let committed = calls::commit(pending, "notice", 32_000).unwrap();
     assert!(committed.unpaid_notice_used);
     assert_eq!(calls::release(committed.clone(), "notice"), Some(committed));
+}
+
+#[test]
+fn late_block_resumes_at_window_boundary_without_pending_unpaid_notice_ending_it() {
+    let ended = answered().at(31_001).unwrap();
+    let pending = calls::reserve_unpaid_hangup(Some(ended), "notice", "hash").unwrap();
+    let resumed = calls::receive_block(Some(pending), 0, 91_000).unwrap();
+    assert_eq!(resumed.phase, Phase::Live);
+    assert_eq!(resumed.paid_until_ms, Some(151_000));
+    assert_eq!(resumed.next_block_seq, 1);
+    assert!(resumed.media_admitted(150_999));
+    let committed = calls::commit(resumed, "notice", 91_001).unwrap();
+    assert_eq!(committed.phase, Phase::Live);
+    assert_eq!(committed.paid_until_ms, Some(151_000));
+    assert!(committed.pending.is_none());
+}
+
+#[test]
+fn late_block_outside_resume_window_or_wrong_seq_never_grants_media() {
+    let ended = answered().at(31_001).unwrap();
+    assert!(calls::receive_block(Some(ended.clone()), 0, 91_001).is_err());
+    assert!(calls::receive_block(Some(ended.clone()), 1, 32_000).is_err());
+    assert!(calls::receive_block(Some(CallEntry { end_reason: Some(HangupReason::Hangup), ..ended }), 0, 32_000).is_err());
+}
+
+#[test]
+fn block_invoice_cutoff_is_independent_of_settlement_grace() {
+    let live = answered();
+    assert!(calls::validate_block_invoice(&live, 0, 16_000).is_ok());
+    assert!(calls::validate_block_invoice(&live, 0, 16_001).is_err());
+    assert!(calls::validate_block_invoice(&live, 1, 1_000).is_err());
+    assert!(calls::validate_block_invoice(&live.at(31_001).unwrap(), 0, 31_001).is_err());
+}
+
+#[test]
+fn delayed_unpaid_notice_cannot_revoke_a_settled_interval() {
+    let caller = CallEntry { side: calls::Side::Caller, ..answered() };
+    let pending = calls::reserve_block(Some(caller), 0, "block", "hash", 1_000).unwrap();
+    let paid = calls::commit(pending, "block", 32_000).unwrap();
+    assert!(calls::receive(Some(paid), 403, Some(HangupReason::Unpaid), 32_001).is_err());
+}
+
+#[test]
+fn very_late_outgoing_settlement_still_delivers_for_callee_reconciliation() {
+    let caller = CallEntry { side: calls::Side::Caller, ..answered() };
+    let pending = calls::reserve_block(Some(caller), 0, "block", "hash", 1_000).unwrap();
+    let now = 31_000 + calls::TOMBSTONE_MS + 1;
+    let paid = calls::commit(pending.at(now).unwrap(), "block", now).unwrap();
+    assert!(paid.pending.is_none(), "paid envelope can leave for reconciliation");
+    assert_eq!(paid.next_block_seq, 0);
+    assert!(!paid.media_admitted(now));
 }

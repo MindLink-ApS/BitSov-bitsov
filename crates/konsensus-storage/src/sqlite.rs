@@ -702,6 +702,9 @@ impl Storage for SqliteStorage {
     async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = ?").bind(id).fetch_optional(&self.pool).await?)
     }
+    async fn get_outbox_operation_by_message(&self, id: &MessageId) -> Result<Option<crate::OutboxOperation>, StorageError> {
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE message_id = ?").bind(id.to_hex()).fetch_optional(&self.pool).await?)
+    }
     async fn starter_update(&self, update: crate::starter::StarterUpdate, now: Option<i64>) -> Result<crate::starter::StarterOutcome, StorageError> {
         crate::starter::sqlite::update(&self.pool, update, now).await
     }
@@ -743,6 +746,16 @@ impl Storage for SqliteStorage {
             .bind(chrono::Utc::now().timestamp_millis())
             .bind(id)
             .execute(&self.pool).await?.rows_affected() == 1)
+    }
+    async fn record_channel_open_outcome(&self, expected: &crate::ChannelOpenOperation, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
+        if expected.state == crate::channel_open::CHANNEL_OPEN_OPENED {
+            return Ok(false);
+        }
+        let changed = sqlx::query("UPDATE channel_open_operations SET state = ?, result = ?, last_error = ?, updated_at = ? WHERE operation_id = ? AND request_hash = ? AND created_at = ? AND state = ?")
+            .bind(state).bind(result).bind(last_error).bind(chrono::Utc::now().timestamp_millis())
+            .bind(&expected.operation_id).bind(&expected.request_hash).bind(expected.created_at).bind(&expected.state)
+            .execute(&self.pool).await?.rows_affected();
+        Ok(changed == 1)
     }
     async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
         Ok(sqlx::query("DELETE FROM channel_open_operations WHERE operation_id = ? AND state = 'pending'")
@@ -827,6 +840,13 @@ impl Storage for SqliteStorage {
 
         sqlx::query("INSERT INTO pending_deliveries (message_id, recipient_id) VALUES (?, ?) ON CONFLICT DO NOTHING")
             .bind(envelope.id.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
+        // A paid web request binds its reply in the same transaction as its
+        // envelope: no crash window between "paid and queued" and "reply bindable".
+        if let Some(row) = crate::outstanding_web_request_row(envelope)? {
+            sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
+                .bind(row.payment_hash).bind(row.request_id).bind(row.peer).bind(row.expected_reply_kind).bind(row.expires_at_ms)
+                .execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(true)
     }
@@ -900,6 +920,27 @@ impl Storage for SqliteStorage {
             .bind(envelope.sender.to_hex()).bind(format!("kind:{}", envelope.kind)).bind(category).bind(format!("%,{},%", envelope.kind)).bind(paid).bind(paid)
             .fetch_one(&self.pool).await?;
         amount.map(|n| u64::try_from(n).map_err(|_| StorageError::Conversion("negative quoted price".into()))).transpose()
+    }
+
+    async fn is_paid_envelope_rejected(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = ? AND message_id = ? AND sender = ? AND accepted = -1 AND kind = ? AND recipient_type = ? AND recipient_id = ? AND preimage = ? AND amount_msat = ? AND nonce = ? AND references_json = ?")
+            .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+            .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .fetch_one(&self.pool).await?;
+        Ok(durable == 1)
     }
 
     async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
