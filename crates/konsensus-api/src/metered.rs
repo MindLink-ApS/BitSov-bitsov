@@ -298,6 +298,14 @@ impl Debit {
         self
     }
 
+    pub(crate) fn invoice_purpose(&self) -> String {
+        self.call_block.as_ref().and_then(|(_, plaintext)|
+            konsensus_core::payloads::call::CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, plaintext).ok()
+        ).map(|signal| format!("{}{}:{}", konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX,
+            signal.call_id, signal.seq.unwrap_or_default()))
+        .unwrap_or_else(|| "konsensus message".into())
+    }
+
     pub(crate) async fn dispatch_message<F>(&self, state: &AppState, hash: Option<String>, amount: u64, future: F) -> Result<F::Output, ApiError>
     where F: Future<Output=Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>> {
         match &self.operation {

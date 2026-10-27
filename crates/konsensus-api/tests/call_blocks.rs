@@ -16,7 +16,7 @@ async fn unpaid_notice_is_single_use_callee_only_and_reason_checked() {
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let ringing = rules::receive(None, 400, None, now - 31_000).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", now - 31_000).unwrap();
-    let ended = rules::commit(pending, "answer", now - 31_000).at(now).unwrap();
+    let ended = rules::commit(pending, "answer", now - 31_000).unwrap().at(now).unwrap();
     let unpaid = format!(r#"{{"v":1,"call_id":"{ID}","reason":"unpaid"}}"#);
     store.call_put(&peer, ID, &ended).await.unwrap();
     assert!(calls::admit_incoming(&store, &own, &peer, 403, Some(&unpaid)).await.is_err(), "caller cannot send the notice");
@@ -44,7 +44,7 @@ async fn block_admission_keeps_its_decision_through_acceptance_and_expiry() {
     let answered_at = now;
     let ringing = rules::receive(None, 400, None, answered_at).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", answered_at).unwrap();
-    let entry = rules::commit(pending, "answer", answered_at);
+    let entry = rules::commit(pending, "answer", answered_at).unwrap();
     let deadline = entry.deadline_ms;
     store.call_put(&peer, ID, &entry).await.unwrap();
     let body = format!(r#"{{"v":1,"call_id":"{ID}","seq":0}}"#);
@@ -76,7 +76,7 @@ async fn expiry_ends_both_sides_but_only_callee_needs_notification() {
     let callee_peer = NodeId::from_bytes([8; 32]);
     let ringing = rules::receive(None, 400, None, 0).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", 1_000).unwrap();
-    let callee = rules::commit(pending, "answer", 1_000);
+    let callee = rules::commit(pending, "answer", 1_000).unwrap();
     let caller = rules::CallEntry { side: rules::Side::Caller, ..callee.clone() };
     store.call_put(&caller_peer, ID, &caller).await.unwrap();
     store.call_put(&callee_peer, ID, &callee).await.unwrap();
@@ -96,7 +96,7 @@ async fn paid_blocks_survive_storage_roundtrip_and_admit_only_the_right_call() {
     let peer = NodeId::from_bytes([1; 32]);
     let ringing = rules::receive(None, 400, None, 0).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", 1_000).unwrap();
-    let live = rules::commit(pending, "answer", 1_000);
+    let live = rules::commit(pending, "answer", 1_000).unwrap();
     assert!(!live.media_admitted(1_000));
     let paid = rules::receive_block(Some(live), 0, 1_000).unwrap();
     store.call_put(&peer, ID, &paid).await.unwrap();
@@ -115,7 +115,7 @@ async fn paid_blocks_survive_storage_roundtrip_and_admit_only_the_right_call() {
         .await
         .unwrap()
         .is_empty());
-    assert!(rules::receive_block(Some(ended), 1, 71_002).is_err());
+    assert_eq!(rules::receive_block(Some(ended), 1, 71_002).unwrap().paid_until_ms, Some(131_002));
 }
 
 #[tokio::test]
@@ -135,7 +135,7 @@ async fn incoming_block_and_outgoing_block_reservations_use_normal_call_admissio
         .unwrap(),
         "answer",
         now,
-    );
+    ).unwrap();
     store.call_put(&peer, ID, &entry).await.unwrap();
     let body = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
     calls::admit_incoming(&store, &own, &peer, 404, Some(&body))
@@ -170,7 +170,7 @@ async fn unpaid_expiry_notification_cannot_grant_media_even_if_dispatch_fails() 
         .unwrap(),
         "answer",
         1_000,
-    );
+    ).unwrap();
     state.storage.call_put(&peer, ID, &entry).await.unwrap();
     calls::maintain_calls(&state, 31_001).await.unwrap();
     let ended = state.storage.call_get(&peer, ID).await.unwrap().unwrap();
@@ -269,7 +269,7 @@ async fn delayed_block_invoice(answer_age_ms: u64) {
         rules::reserve(None, 400, "offer", "hash", now - answer_age_ms).unwrap(),
         "offer",
         now - answer_age_ms,
-    );
+    ).unwrap();
     let answered = rules::receive(Some(ringing), 401, None, now - answer_age_ms).unwrap();
     state.storage.call_put(&peer, ID, &answered).await.unwrap();
     let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
@@ -324,7 +324,7 @@ async fn grace_endpoint_still_counts_against_call_bounds() {
         .unwrap(),
         "answer",
         1_000,
-    );
+    ).unwrap();
     let paid = rules::receive_block(Some(entry), 0, 1_000).unwrap();
     store.call_put(&peer, ID, &paid).await.unwrap();
     assert_eq!(store.call_counts(&peer, 71_000).await.unwrap().open_peer, 1);
@@ -370,7 +370,7 @@ async fn hangup_during_dispatch_journal_save_does_not_charge_a_block() {
     let target = konsensus_crypto::SessionManager::new(Arc::new(identity));
     state.session_manager.initiate_session(&peer, &target.prekey_bundle().await).await.unwrap();
     let now = chrono::Utc::now().timestamp_millis() as u64;
-    let ringing = rules::commit(rules::reserve(None, 400, "offer", "hash", now).unwrap(), "offer", now);
+    let ringing = rules::commit(rules::reserve(None, 400, "offer", "hash", now).unwrap(), "offer", now).unwrap();
     store.call_put(&peer, ID, &rules::receive(Some(ringing), 401, None, now).unwrap()).await.unwrap();
     let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
         .header("authorization", common::auth_header(&state)).header("content-type", "application/json")
@@ -397,7 +397,7 @@ async fn unpaid_notice_reservation_survives_encrypted_storage_restart() {
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let ringing = rules::receive(None, 400, None, now - 31_000).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", now - 31_000).unwrap();
-    let ended = rules::commit(pending, "answer", now - 31_000).at(now).unwrap();
+    let ended = rules::commit(pending, "answer", now - 31_000).unwrap().at(now).unwrap();
     let body = format!(r#"{{"v":1,"call_id":"{ID}","reason":"unpaid"}}"#);
     {
         let store = EncryptedStorage::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap(), &[7; 32]);
@@ -412,7 +412,7 @@ async fn unpaid_notice_reservation_survives_encrypted_storage_restart() {
         assert_eq!(pending.len(), 1);
         assert!(pending[0].2.unpaid_notice_used);
         calls::reserve_outgoing(&store, &own, &peer, 403, &body, "notice", "hash").await.unwrap();
-        calls::commit_outgoing(&store, &peer, &body, "notice", "hash").await;
+        calls::commit_outgoing(&store, &peer, &body, "notice", "hash").await.unwrap();
     }
     let store = EncryptedStorage::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap(), &[7; 32]);
     assert!(store.call_pending().await.unwrap().is_empty());
@@ -424,4 +424,84 @@ async fn unpaid_notice_reservation_survives_encrypted_storage_restart() {
     let caller = rules::CallEntry { side: rules::Side::Caller, unpaid_notice_used: false, ..ended };
     store.call_put(&peer, ID, &caller).await.unwrap();
     assert!(calls::reserve_outgoing(&store, &own, &peer, 403, &body, "caller", "hash").await.is_err());
+}
+
+#[tokio::test]
+async fn failed_paid_block_commit_preserves_pending_evidence() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([10; 32]);
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let answered_at = now - 31_000;
+    let ringing = rules::commit(
+        rules::reserve(None, 400, "offer", "hash", answered_at).unwrap(),
+        "offer",
+        answered_at,
+    ).unwrap();
+    let answered = rules::receive(Some(ringing), 401, None, answered_at).unwrap();
+    let pending = rules::reserve_block(Some(answered), 0, "block", "hash", answered_at).unwrap();
+    let body = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
+    // Exercise both an unswept Live row and the durable Unpaid tombstone.
+    for entry in [pending.clone(), pending.at(now).unwrap()] {
+        // Explicit hangup is never resumable, even with a settled reservation.
+        let entry = rules::CallEntry { phase: Phase::Ended, end_reason: Some(HangupReason::Hangup), ..entry };
+        store.call_put(&peer, ID, &entry).await.unwrap();
+        assert!(calls::commit_outgoing(&store, &peer, &body, "block", "hash").await.is_err());
+        assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(entry),
+            "a rejected paid transition must retain its pending reconciliation evidence");
+    }
+}
+
+#[tokio::test]
+async fn callee_grant_resumes_caller_after_unpaid_notice_and_is_bound_to_paid_message() {
+    use konsensus_core::{UkmEnvelopeBuilder, Recipient, PaymentProof};
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let own = NodeId::from_bytes([21; 32]);
+    let peer = NodeId::from_bytes([22; 32]);
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let ended = rules::CallEntry { side: rules::Side::Caller, phase: Phase::Ended,
+        deadline_ms: now + rules::TOMBSTONE_MS, paid_until_ms: None, next_block_seq: 0,
+        pending: None, end_reason: Some(HangupReason::Unpaid), unpaid_notice_used: true };
+    store.call_put(&peer, ID, &ended).await.unwrap();
+    let envelope = UkmEnvelopeBuilder::new(404, own, Recipient::Node(peer), vec![], PaymentProof::new([24; 32], [25; 32], 23_000)).build();
+    store.store_message(&envelope).await.unwrap();
+    let mut op = konsensus_storage::OutboxOperation::prepared("block-grant".into(), peer.to_hex(), 404, "request".into());
+    op.state = "sent".into();
+    op.message_id = Some(envelope.id.to_hex());
+    op.recovery = serde_json::to_vec(&serde_json::json!({
+        "call_block": [ID, 0], "dispatched": true, "expected_msat": 23_000,
+        "fee_ceiling_msat": 0, "admission_msat": 0,
+    })).unwrap();
+    store.insert_outbox_operation(&op).await.unwrap();
+    store.queue_pending_delivery(&envelope.id, &peer).await.unwrap();
+    store.mark_pending_sent(&envelope.id, &peer).await.unwrap();
+    // Deliberately no plaintext cache: durable operation binding is enough.
+    calls::receive_block_grant(&store, &konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]), &own, &NodeId::from_bytes([99; 32]), &envelope.id, now + 60_000).await.unwrap();
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(ended));
+    calls::receive_block_grant(&store, &konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]), &own, &peer, &envelope.id, now + 60_000).await.unwrap();
+    let granted = store.call_get(&peer, ID).await.unwrap().unwrap();
+    assert_eq!(granted.phase, Phase::Live);
+    assert_eq!(granted.paid_until_ms, Some(now + 60_000));
+    assert_eq!(granted.next_block_seq, 1);
+    assert!(granted.media_admitted(now + 59_999));
+    calls::receive_block_grant(&store, &konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]), &own, &peer, &envelope.id, now + 60_000).await.unwrap();
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(granted.clone()));
+    // Upgrade recovery: a legacy pending block needs its cached plaintext;
+    // a missing cache must retain the delivery instead of silently ACKing.
+    let mut legacy = store.get_outbox_operation_by_message(&envelope.id).await.unwrap().unwrap();
+    let mut recovery: serde_json::Value = serde_json::from_slice(&legacy.recovery).unwrap();
+    recovery.as_object_mut().unwrap().remove("call_block");
+    legacy.recovery = serde_json::to_vec(&recovery).unwrap();
+    assert!(store.update_outbox_operation(&legacy).await.unwrap());
+    let cipher = konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]);
+    assert!(calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 60_000).await.is_err());
+    assert!(store.is_pending_dispatched(&envelope.id, &peer, &own).await.unwrap());
+    let body = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
+    store.store_message_plaintext(&envelope.id, &cipher.encrypt(body.as_bytes()).unwrap()).await.unwrap();
+    calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 60_000).await.unwrap();
+    let upgraded = store.get_outbox_operation_by_message(&envelope.id).await.unwrap().unwrap();
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&upgraded.recovery).unwrap()["call_block"], serde_json::json!([ID, 0]));
+    let hung_up = rules::CallEntry { phase: Phase::Ended, end_reason: Some(HangupReason::Hangup), ..granted };
+    store.call_put(&peer, ID, &hung_up).await.unwrap();
+    calls::receive_block_grant(&store, &konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]), &own, &peer, &envelope.id, now + 60_000).await.unwrap();
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(hung_up));
 }

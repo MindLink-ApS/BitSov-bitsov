@@ -24,6 +24,14 @@ pub const CALL_BLOCK_LEAD_MS: u64 = 20_000;
 pub const CALL_BLOCK_GRACE_MS: u64 = 10_000;
 /// Block zero gets the same lead plus grace as a renewal, without media.
 pub const CALL_BLOCK_INITIAL_MS: u64 = CALL_BLOCK_LEAD_MS + CALL_BLOCK_GRACE_MS;
+/// Refuse new invoices with less time left (deadline already includes grace).
+pub const CALL_BLOCK_INVOICE_MARGIN_MS: u64 = 15_000;
+/// A settled next block may resume an Unpaid call for this long after its end.
+pub const CALL_BLOCK_RESUME_MS: u64 = 60_000;
+/// Short BOLT11 lifetime; in-flight HTLCs and LDK's inbound buffer can outlive it.
+pub const CALL_BLOCK_INVOICE_EXPIRY_SECS: u32 = 5;
+/// Invoice requests carry the call and sequence so the callee checks its clock.
+pub const CALL_BLOCK_INVOICE_PREFIX: &str = "konsensus:call_block:";
 /// Longest continuously paid call.
 pub const MAX_CALL_MS: u64 = 4 * 60 * 60 * 1000;
 /// How long an ended or expired call id stays burned.
@@ -403,22 +411,42 @@ pub fn reserve(entry: Option<CallEntry>, kind: u16, operation_id: &str, request_
     }
 }
 
-/// The reserved signal's payment settled: publish its transition. Never
-/// fails (money already moved); a call that ended meanwhile stays ended.
-pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> CallEntry {
+/// The reserved signal's payment settled: publish its transition. A refused
+/// paid block is an error; the caller must retain its reconciliation evidence.
+pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> Result<CallEntry, CallRefusal> {
     let Some(p) = entry.pending.clone().filter(|p| p.operation_id == operation_id) else {
-        return entry;
+        return Ok(entry);
     };
     let cleared = CallEntry { pending: None, ..entry };
-    match (p.kind, cleared.phase) {
+    Ok(match (p.kind, cleared.phase) {
         (KIND_CALL_INVITE, Phase::Reserved) => CallEntry { phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), ..cleared },
         (KIND_CALL_ANSWER, Phase::Ringing) => cleared.answered(now_ms),
-        (KIND_CALL_BLOCK, Phase::Live) => apply_block(cleared.clone(), cleared.next_block_seq, now_ms).unwrap_or(cleared),
+        (KIND_CALL_BLOCK, _) => {
+            // The callee decides whether a paid interval can still be served.
+            // Deliver even beyond our local resume window so it can audit an
+            // overpayment; the outgoing journal retains the payment evidence.
+            let unpaid_end = match (cleared.phase, cleared.end_reason) {
+                (Phase::Live, _) => Some(cleared.deadline_ms),
+                (Phase::Ended, Some(HangupReason::Unpaid)) => Some(cleared.deadline_ms.saturating_sub(TOMBSTONE_MS)),
+                _ => None,
+            };
+            if let Some(end) = unpaid_end.filter(|end| cleared.side == Side::Caller
+                && now_ms > end.saturating_add(CALL_BLOCK_RESUME_MS)) {
+                CallEntry { phase: Phase::Ended, end_reason: Some(HangupReason::Unpaid),
+                    deadline_ms: end.saturating_add(TOMBSTONE_MS), ..cleared }
+            } else {
+                apply_block(cleared.clone(), cleared.next_block_seq, now_ms)?
+            }
+        },
+        (KIND_CALL_HANGUP, Phase::Live) if cleared.side == Side::Callee && cleared.unpaid_notice_used => {
+            // A notice reserved before a late block must never end the resumed interval.
+            CallEntry { unpaid_notice_used: false, ..cleared }
+        },
         (KIND_CALL_HANGUP, Phase::Ringing | Phase::Live | Phase::Reserved) => {
             CallEntry { phase: Phase::Ended, deadline_ms: now_ms.saturating_add(TOMBSTONE_MS), ..cleared }
         }
         _ => cleared,
-    }
+    })
 }
 
 /// The reserved signal was definitely not paid: undo the reservation. An
@@ -428,9 +456,10 @@ pub fn release(entry: CallEntry, operation_id: &str) -> Option<CallEntry> {
     match &entry.pending {
         Some(p) if p.operation_id == operation_id && p.kind == KIND_CALL_INVITE && entry.phase == Phase::Reserved => None,
         Some(p) if p.operation_id == operation_id => {
-            let release_notice = p.kind == KIND_CALL_HANGUP && entry.phase == Phase::Ended
-                && matches!((entry.side, entry.end_reason),
-                    (Side::Callee, Some(HangupReason::Unpaid)) | (Side::Caller, Some(HangupReason::DurationCap)));
+            let release_notice = p.kind == KIND_CALL_HANGUP && entry.unpaid_notice_used
+                && (entry.side == Side::Callee
+                    || (entry.phase == Phase::Ended && entry.side == Side::Caller
+                        && entry.end_reason == Some(HangupReason::DurationCap)));
             Some(CallEntry { pending: None, unpaid_notice_used: entry.unpaid_notice_used && !release_notice, ..entry })
         }
         _ => Some(entry),
@@ -471,6 +500,10 @@ pub fn receive(entry: Option<CallEntry>, kind: u16, reason: Option<HangupReason>
                 return Ok(CallEntry { unpaid_notice_used: true, ..e });
             }
             if !e.open() { return Err(CallRefusal::UnknownCall); }
+            if reason == Some(HangupReason::Unpaid) && e.media_admitted(now_ms) {
+                // A delayed notice for an older interval cannot revoke settled service.
+                return Err(CallRefusal::UnknownCall);
+            }
             // Their hangup wins; a signal of ours still being paid keeps its
             // mark so its settlement or release is still recorded.
             Ok(CallEntry { phase: Phase::Ended, deadline_ms: now_ms.saturating_add(TOMBSTONE_MS), end_reason: reason, unpaid_notice_used: reason == Some(HangupReason::Unpaid), ..e })
@@ -494,17 +527,47 @@ fn check_block(entry: &CallEntry, seq: u32, now_ms: u64) -> Result<(), CallRefus
 }
 
 fn apply_block(entry: CallEntry, seq: u32, now_ms: u64) -> Result<CallEntry, CallRefusal> {
-    check_block(&entry, seq, now_ms)?;
-    let start = entry.paid_until_ms.unwrap_or_else(|| entry.deadline_ms.saturating_sub(CALL_BLOCK_INITIAL_MS));
+    if seq != entry.next_block_seq || u64::from(seq) >= MAX_CALL_MS / CALL_BLOCK_MS {
+        return Err(CallRefusal::Sequence);
+    }
+    let end = match (entry.phase, entry.end_reason) {
+        (Phase::Live, _) => entry.deadline_ms,
+        (Phase::Ended, Some(HangupReason::Unpaid)) => entry.deadline_ms.saturating_sub(TOMBSTONE_MS),
+        _ => return Err(CallRefusal::UnknownCall),
+    };
+    let late = now_ms > end;
+    if late && now_ms > end.saturating_add(CALL_BLOCK_RESUME_MS) {
+        return Err(CallRefusal::UnknownCall);
+    }
+    if !late { check_block(&entry, seq, now_ms)?; }
+    let start = if late { now_ms } else {
+        entry.paid_until_ms.unwrap_or_else(|| entry.deadline_ms.saturating_sub(CALL_BLOCK_INITIAL_MS))
+    };
     let until = start.saturating_add(CALL_BLOCK_MS);
-    Ok(CallEntry { paid_until_ms: Some(until), next_block_seq: seq.saturating_add(1), deadline_ms: until.saturating_add(CALL_BLOCK_GRACE_MS), ..entry })
+    // Keep a pending Unpaid notice identifiable until its commit/release.
+    let notice_pending = entry.side == Side::Callee && entry.unpaid_notice_used
+        && entry.pending.as_ref().is_some_and(|p| p.kind == KIND_CALL_HANGUP);
+    Ok(CallEntry { phase: Phase::Live, end_reason: None, unpaid_notice_used: notice_pending,
+        paid_until_ms: Some(until), next_block_seq: seq.saturating_add(1),
+        deadline_ms: until.saturating_add(CALL_BLOCK_GRACE_MS), ..entry })
 }
 
-/// Gate-accepted block, strictly caller → callee. Never revives an expired call.
+/// Gate-accepted block, strictly caller → callee. Honour late settlement within
+/// the bounded Unpaid resume window; refusal requires overpayment accounting.
 pub fn receive_block(entry: Option<CallEntry>, seq: u32, now_ms: u64) -> Result<CallEntry, CallRefusal> {
     let entry = entry.ok_or(CallRefusal::UnknownCall)?;
     if entry.side != Side::Callee { return Err(CallRefusal::WrongSide); }
     apply_block(entry, seq, now_ms)
+}
+
+/// The callee's pre-invoice check never resumes a call or moves money.
+pub fn validate_block_invoice(entry: &CallEntry, seq: u32, now_ms: u64) -> Result<(), CallRefusal> {
+    if entry.side != Side::Callee { return Err(CallRefusal::WrongSide); }
+    check_block(entry, seq, now_ms)?;
+    if now_ms.saturating_add(CALL_BLOCK_INVOICE_MARGIN_MS) > entry.deadline_ms {
+        return Err(CallRefusal::Invalid("call block invoice too close to deadline"));
+    }
+    Ok(())
 }
 
 /// Recheck before a new outgoing charge, including a reconciled failed retry.
@@ -684,13 +747,13 @@ mod tests {
         // Definite nonpayment: forgotten, so the same id can be offered again.
         assert_eq!(release(r.clone(), "op1"), None);
         // Paid: now it rings and accepts the callee's answer once.
-        let ringing = commit(r, "op1", 5);
+        let ringing = commit(r, "op1", 5).unwrap();
         assert_eq!((ringing.phase, ringing.pending.clone()), (Phase::Ringing, None));
         let live = receive(Some(ringing.clone()), 401, None, 6).unwrap();
         assert_eq!(live.phase, Phase::Live);
         assert_eq!(receive(Some(live), 401, None, 7), Err(CallRefusal::NotRinging));
-        // Commit is idempotent and never fails after payment.
-        assert_eq!(commit(ringing.clone(), "op1", 9), ringing);
+        // Repeating an already committed offer is idempotent.
+        assert_eq!(commit(ringing.clone(), "op1", 9).unwrap(), ringing);
     }
 
     #[test]
@@ -704,15 +767,15 @@ mod tests {
         let back = release(pending.clone(), "a").unwrap();
         assert_eq!(back, ringing);
         assert!(reserve(Some(back), 401, "a2", "h", 2).is_ok());
-        let live = commit(pending, "a", 3);
+        let live = commit(pending, "a", 3).unwrap();
         assert_eq!(live.phase, Phase::Live);
         let hang = reserve(Some(live.clone()), 403, "h", "h", 4).unwrap();
         assert_eq!(hang.phase, Phase::Live);
         assert_eq!(release(hang.clone(), "h").unwrap(), live);
-        let ended = commit(hang, "h", 5);
+        let ended = commit(hang, "h", 5).unwrap();
         assert_eq!((ended.phase, ended.deadline_ms), (Phase::Ended, 5 + TOMBSTONE_MS));
         // The caller cannot answer its own call.
-        let own = commit(reserve(None, 400, "o", "h", 0).unwrap(), "o", 0);
+        let own = commit(reserve(None, 400, "o", "h", 0).unwrap(), "o", 0).unwrap();
         assert_eq!(reserve(Some(own), 401, "x", "h", 1), Err(CallRefusal::WrongSide));
     }
 
@@ -751,7 +814,7 @@ mod tests {
         assert_eq!(burned_excess(MAX_BURNED_PER_PEER - 1, MAX_BURNED_PER_PEER), 0);
         assert_eq!(burned_excess(MAX_BURNED_PER_PEER, MAX_BURNED_PER_PEER), 1);
         // An id ended at t is evictable only from t + BURN_MIN_MS.
-        let ended = commit(reserve(Some(receive(None, 400, None, 0).unwrap()), 403, "h", "h", 0).unwrap(), "h", 0);
+        let ended = commit(reserve(Some(receive(None, 400, None, 0).unwrap()), 403, "h", "h", 0).unwrap(), "h", 0).unwrap();
         assert!(ended.replay_until_ms() > evictable_until(BURN_MIN_MS - 1));
         assert!(ended.replay_until_ms() <= evictable_until(BURN_MIN_MS));
     }
@@ -779,13 +842,13 @@ mod duration_cap_tests {
     fn duration_notice_is_single_use_and_preserves_the_terminal_boundary() {
         let signal = CallSignal::parse(403, r#"{"v":1,"call_id":"0123456789abcdef0123456789abcdef","reason":"duration_cap"}"#).unwrap();
         assert_eq!(signal.reason, Some(HangupReason::DurationCap));
-        let caller = commit(reserve(None, 400, "offer", "hash", 0).unwrap(), "offer", 0);
+        let caller = commit(reserve(None, 400, "offer", "hash", 0).unwrap(), "offer", 0).unwrap();
         let ended = CallEntry { phase: Phase::Ended, end_reason: signal.reason,
             deadline_ms: 60_000 + TOMBSTONE_MS, ..caller };
         assert!(reserve_duration_hangup(Some(CallEntry { side: Side::Callee, ..ended.clone() }), "notice", "hash").is_err());
         let pending = reserve_duration_hangup(Some(ended.clone()), "notice", "hash").unwrap();
         assert_eq!(release(pending.clone(), "notice").unwrap(), ended);
-        let sent = commit(pending, "notice", 65_000);
+        let sent = commit(pending, "notice", 65_000).unwrap();
         assert_eq!(sent.deadline_ms, ended.deadline_ms);
         assert_eq!(sent.end_reason, ended.end_reason);
         assert!(!sent.media_admitted(65_000));

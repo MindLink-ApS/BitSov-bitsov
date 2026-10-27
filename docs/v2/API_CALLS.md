@@ -100,6 +100,53 @@ grant limits divided across the reserved minutes, not the 6-sat messaging cap;
 raising the grant's velocity/total limits or reducing reserved minutes permits
 a higher per-block price.
 
+### Caller consent on an offer
+
+`POST /api/v1/messages/compose` accepts two optional top-level integer fields
+for a kind-400 offer, in msat:
+
+- `max_block_msat`: the maximum payable price of one 60-second kind-404 block.
+  The node asks the callee for its current price, rather than trusting its
+  advert. A nonzero quote below 1,000 msat uses the existing 1,000-msat minimum;
+  a zero quote stays free.
+- `max_hold_msat`: the maximum complete block reservation. The node computes
+  `max_call_minutes × (payable block price + per-block routing-fee ceiling)`.
+  `max_routing_fee_msat` bounds that per-block fee under the existing routing
+  policy. This hold excludes the separately metered offer/signaling fees;
+  `max_total_msat` still caps the offer payment itself.
+
+Both limits are inclusive: equality succeeds if the ordinary grant, liquidity,
+and call checks pass. Either field may be omitted independently; an absent or
+null field adds no consent limit, preserving previous clients' behavior. Zero
+is a real ceiling. The checks also apply to owner-authenticated offers when
+supplied, although those calls do not create a paired-app hold. Other kinds
+do not use these offer fields.
+
+For example, with the default 60-minute cap:
+
+```json
+{
+  "operation_id": "9a6b9c52-f45b-400d-8891-080fb382dcad",
+  "recipient": "<callee-node-id>",
+  "kind": 400,
+  "plaintext": "{\"v\":1,\"call_id\":\"0123456789abcdef0123456789abcdef\",\"sdp\":\"<offer>\",\"media\":\"audio\"}",
+  "max_block_msat": 7000,
+  "max_routing_fee_msat": 500,
+  "max_hold_msat": 450000
+}
+```
+
+A price above consent returns HTTP 400 with `code: "not_dispatched"` and
+`reason: "call_price_above_consent"`. An excessive computed hold returns the
+same status/code with `reason: "call_hold_above_consent"`. Both checks precede
+reservation creation, invoice/payment dispatch, and offer delivery: a refused
+new offer creates no hold and spends nothing. A retry with an existing hold
+must also cover its pinned price and original amount; it cannot silently
+resize that hold. Replaying an already-paid operation returns its existing
+receipt without spending again; new limits cannot undo that payment.
+
+### Settlement and release
+
 After the final allowed block, `next_block_due_ms` is null and a new block is
 refused with `reason: "call_duration_cap"`. The one-second maintenance sweep
 ends the call at the final paid boundary, without renewal grace, records
@@ -127,6 +174,26 @@ original routing ceiling but cannot widen it; blocks cannot pay re-admission.
 Validation and transient invoice refusals leave a live call retryable. Definite
 payment failure or a price above the reserved ceiling ends it; ambiguous
 payments remain journaled and the ordinary expiry deadline still applies.
+If an Unpaid call has a pending block, its unused hold stays reserved through
+the 60-second resume window. Settlement inside that window reopens the call
+and draws once from the original reservation. After the window, unused funds
+are released and only unresolved payment liabilities remain held. A later
+settlement is still charged once and delivered for the callee's overpayment
+audit; it does not reopen the call or create another hold. A block invoice
+refused near the deadline spends nothing and returns its unused draw to the
+open hold (or releases it if the hold has closed).
+
+A locally settled block can still be awaiting the callee's delivery grant.
+For that case the node checks the paid delivery queue or durable settlement
+recovery evidence and the call/sequence binding before retaining the unused
+hold. Older rows recover their binding from encrypted plaintext; a settled
+legacy row awaiting materialization conservatively keeps the peer's allowance
+until recovery identifies it. The allowance ends
+at most 130 seconds after the local Unpaid deadline (60 seconds to resume,
+one 60-second granted interval, and 10 seconds of grace). Receipt or terminal
+rejection ends this allowance; it cannot retain a hold indefinitely. This
+lets a delayed usable grant reopen the call with its original reservation.
+
 Declined/unanswered holds with zero settled spend are neutral to the failure
 breaker; confirmed first-block payment failures still count, including a failure
 resolved after hangup. Cleanup errors are logged and retried; they never replace a successful

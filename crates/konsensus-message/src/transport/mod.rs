@@ -120,6 +120,7 @@ pub enum ControlEvent {
 
     /// Peer acknowledged receipt of a message.
     MessageAcked {
+        paid_until_ms: Option<u64>,
         /// Recipient had already durably accepted the paid envelope.
         duplicate: bool,
         /// The peer who acknowledged.
@@ -2007,7 +2008,7 @@ mod tests {
             b"test",
             &konsensus_core::types::Nonce::generate(),
         );
-        let ack = Frame::MessageAck { id: test_id, duplicate: false };
+        let ack = Frame::MessageAck { id: test_id, duplicate: false, paid_until_ms: None };
         transport_b.send_frame(&node_a_id, &ack).await.unwrap();
 
         let event = tokio::time::timeout(
@@ -2701,7 +2702,7 @@ mod tests {
             (Frame::SessionInit { init_data: serde_json::json!({}) }, true),
             (Frame::SessionAck, true),
             (Frame::RatchetInit { payload: vec![1, 2, 3] }, true),
-            (Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([1u8; 32]), duplicate: false }, true),
+            (Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([1u8; 32]), duplicate: false, paid_until_ms: None }, true),
             (Frame::MessageReject { id: konsensus_core::types::MessageId::from_bytes([2u8; 32]), reason: "r".into() }, true),
             (
                 Frame::PriceTable {

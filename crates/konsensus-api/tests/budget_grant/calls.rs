@@ -13,6 +13,18 @@ async fn send_id(fx: &Fx, token: &str, kind: u16, price: u64, seq: u32, call_id:
 }
 
 async fn send_operation(fx: &Fx, token: &str, kind: u16, price: u64, seq: u32, call_id: &str, operation_id: &str) -> (StatusCode, Value) {
+    let body = if kind == 400 {
+        json!({"v": 1, "call_id": call_id, "sdp": "offer", "media": "audio"})
+    } else {
+        json!({"v": 1, "call_id": call_id, "seq": seq})
+    };
+    send_request(fx, token, price, json!({
+        "operation_id": operation_id, "recipient": fx.peer.to_hex(),
+        "kind": kind, "plaintext": body.to_string(), "max_routing_fee_msat": 0, "wait_ack_ms": 0,
+    })).await
+}
+
+async fn send_request(fx: &Fx, token: &str, price: u64, request: Value) -> (StatusCode, Value) {
     let prices = fx.state.peer_prices.clone();
     let peer = fx.peer;
     let quotes = tokio::spawn(async move {
@@ -23,15 +35,7 @@ async fn send_operation(fx: &Fx, token: &str, kind: u16, price: u64, seq: u32, c
             prices.update_kind_price(peer, 403, 0, 850_000).await;
         }
     });
-    let body = if kind == 400 {
-        json!({"v": 1, "call_id": call_id, "sdp": "offer", "media": "audio"})
-    } else {
-        json!({"v": 1, "call_id": call_id, "seq": seq})
-    };
-    let result = fx.call("POST", "/api/v1/messages/compose", Some(json!({
-        "operation_id": operation_id, "recipient": peer.to_hex(),
-        "kind": kind, "plaintext": body.to_string(), "max_routing_fee_msat": 0, "wait_ack_ms": 0,
-    })), Some(token)).await;
+    let result = fx.call("POST", "/api/v1/messages/compose", Some(request), Some(token)).await;
     quotes.abort();
     result
 }
@@ -104,6 +108,10 @@ async fn call_reserves_before_offer_draws_above_message_cap_and_releases_each_en
         answer(&fx).await;
         let (status, body) = send(&fx, &token, 404, 7_000, 0).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        // This end-path case has received its block ACK; delayed grants are
+        // exercised separately and must retain their still-usable reservation.
+        let block_id = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+        fx.state.storage.remove_pending_delivery(&block_id, &fx.peer).await.unwrap();
         let view = fx
             .service
             .call_spend_status(&fx.peer.to_hex(), CALL)
@@ -139,6 +147,14 @@ async fn call_reserves_before_offer_draws_above_message_cap_and_releases_each_en
                 .await
                 .unwrap();
         } else {
+            if reason == HangupReason::Unpaid {
+                // A stale Unpaid notice cannot revoke a paid media interval.
+                let now = chrono::Utc::now().timestamp_millis() as u64;
+                let mut entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+                entry.deadline_ms = now - 1;
+                entry.paid_until_ms = Some(now - konsensus_core::payloads::call::CALL_BLOCK_GRACE_MS - 1);
+                fx.state.storage.call_put(&fx.peer, CALL, &entry).await.unwrap();
+            }
             let hangup = json!({"v":1,"call_id":CALL,"reason":reason.as_str()}).to_string();
             konsensus_api::calls::admit_incoming(
                 fx.state.storage.as_ref(),
@@ -402,7 +418,7 @@ async fn slow_liquidity_query_does_not_block_another_calls_transitions() {
         rules::reserve(Some(entry), 401, "answer", "hash", now).unwrap(),
         "answer",
         now,
-    );
+    ).unwrap();
     fx.state
         .storage
         .call_put(&peer, CALL, &entry)
@@ -508,7 +524,7 @@ async fn broken_hold_cleanup_preserves_paid_response_and_other_expiry_notificati
     let notification_id = "bbbbbbbb222243338444555555555555";
     let ringing = rules::receive(None, 400, None, now - 31_000).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", now - 31_000).unwrap();
-    let live = rules::commit(pending, "answer", now - 31_000);
+    let live = rules::commit(pending, "answer", now - 31_000).unwrap();
     fx.state.storage.call_put(&fx.peer, notification_id, &live).await.unwrap();
     konsensus_api::calls::maintain_calls(&fx.state, now).await.unwrap();
     assert!(fx.service.call_spend_status(&fx.peer.to_hex(), other).unwrap().closed);
@@ -629,3 +645,8 @@ async fn recovered_failure_cannot_repay_when_call_cleanup_write_fails() {
     assert_eq!(fx.state.storage.call_get(&peer, CALL).await.unwrap().unwrap().phase, Phase::Ended);
     assert!(fx.service.call_spend_status(&peer.to_hex(), CALL).unwrap().closed);
 }
+
+#[path = "calls_consent.rs"]
+mod consent;
+#[path = "calls_settlement.rs"]
+mod settlement;
