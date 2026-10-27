@@ -3,6 +3,30 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## Call-block invoice provenance (migration 037)
+
+Migration **037** adds invoice-hash bindings to `(peer, call_id, seq)` on
+SQLite and PostgreSQL. It is additive and idempotent, with no down migration.
+Keep a consistent database backup before upgrading: an older SQLite binary
+that does not know version 037 refuses the upgraded database (`VersionMissing`).
+Returning to that binary requires restoring the pre-upgrade database; do not
+delete migration history or invoice bindings to bypass the check.
+
+## Call reservations (#460)
+
+`[calls] max_call_minutes` defaults to 60 and accepts 1–240. It sizes the
+paired-app block reservation and caps outgoing paid media duration; the cap is
+included in call reservation status. Existing holds keep their original cap
+(240 minutes for holds written before the setting existed).
+
+Pre-#460 binaries cannot parse a ledger while call holds or retained receipts
+exist. Downgrade is unsupported until all calls end, unresolved payments are
+reconciled, and the new binary has pruned the finished receipts and call-row
+tombstones after at least 24 hours. Remove `calls.max_call_minutes` from config
+before using an older binary. Do not remove ledger data to force a downgrade.
+See [call spending and downgrade details](v2/API_CALLS.md#paired-app-call-spending-m6-n3).
+No SQL migration is introduced.
+
 ## rc18 → rc19
 
 rc19 is rc18 (`20c6449e`) plus #330, #332, #333, #334, #335, #337, #339,
@@ -1464,7 +1488,7 @@ selects embedded LDK's chain source; it does not reconfigure an external LND.
 | `[remote_access]` | `listen_addr`, `advertised_endpoint`, `mdns` | Off unless a listener is set; `advertised_endpoint` optionally overrides the first auto-discovered endpoint. `[api] listen_addr` must stay loopback. Optional `mdns` build feature advertises only under `--home`; `mdns = false` opts out. Old apps use `pair-ticket --legacy`. Avoid API/P2P/Lightning TCP port collisions. |
 | `[privacy]` | `peer_exchange = "off"` or `"paid"`, `shareable_peers`, `share_peer_labels` | Off and empty lists. Node-ID allowlists explicitly consent to sharing peers and, separately, their labels. Restart to apply; already issued quotes stay redeemable until expiry. |
 | `[network]` | `advertised_addr`, `stun_server` | Optional; explicit advertised address wins. Discovery uses only owner-set STUN; no default third-party server. |
-| `[calls]` | `stun_listen` | Omitted/off; optional UDP binding responder, no TURN. |
+| `[calls]` | `stun_listen`, `max_call_minutes` | STUN omitted/off; outgoing paid call cap defaults to 60 minutes, bounded 1–240. |
 | `[pricing]` | `call_msat` | New, default `10000`, must be positive; offer kind 400 only. |
 | `[pricing]` / `[web]` | Existing `web_content_msat` / `page_price_msat` | Defaults changed from 50 to 1000 msat before rc8 (#167, #173). Retained `web_content_msat < 1000` is rejected at startup, even if web serving is disabled; raise or remove it. `page_price_msat` is legacy, not a separate charge override. Porch floors still apply to advertised and paid prices. |
 | `[identity]` | `hosted` | Default false; true or cloud tier reports hosted custody. Seed encryption does not turn a hosted node into a remote signer. |

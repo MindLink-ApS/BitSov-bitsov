@@ -507,8 +507,10 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         front_door: front_door.clone(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
         file_staging: Default::default(),
@@ -1158,7 +1160,7 @@ async fn m9_m10_reconnect_needs_readmission_then_acks_count() {
     net.payee.transport.send_frame(&payer, &Frame::PrekeyOffer { bundle }).await.unwrap();
     net.payee
         .transport
-        .send_frame(&payer, &Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([3u8; 32]), duplicate: false })
+        .send_frame(&payer, &Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([3u8; 32]), duplicate: false, paid_until_ms: None })
         .await
         .unwrap();
     wait_until("the payer dropped both", Duration::from_secs(5), || async {

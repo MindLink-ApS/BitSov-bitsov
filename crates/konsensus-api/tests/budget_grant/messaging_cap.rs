@@ -192,7 +192,7 @@ async fn messaging_grants_cannot_pay_invoices_or_keysend() {
             .call(
                 "POST",
                 "/api/v1/payments/pay",
-                Some(json!({"bolt11": create_test_bolt11(1_000)})),
+                Some(json!({"request_id": uuid::Uuid::new_v4().to_string(), "bolt11": create_test_bolt11(1_000)})),
                 Some(&token),
             )
             .await;
@@ -227,7 +227,7 @@ async fn console_grant_caps_messages_but_allows_twenty_sat_payments() {
         .call(
             "POST",
             "/api/v1/payments/pay",
-            Some(json!({"bolt11": create_test_bolt11(20_000)})),
+            Some(json!({"request_id": uuid::Uuid::new_v4().to_string(), "bolt11": create_test_bolt11(20_000)})),
             Some(&token),
         )
         .await;

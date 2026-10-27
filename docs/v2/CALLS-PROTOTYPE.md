@@ -1,259 +1,192 @@
-# 1:1 calls (prototype, regtest)
+# Node-routed calls and paid blocks (M6)
 
-Status: prototype behind no flag; proven on regtest only (29 Sep 2026 overnight
-defaults). Mainnet only after review.
+Calls route media **app → own node → peer node → peer app**. Both media
+paths terminate at the participating nodes. There is no app-to-app media
+path, direct WebRTC bypass, or unpaid media relay. The separate media-frame
+implementation must consult the call admission hook before forwarding frames.
 
-## Shape
+## Signalling and money
 
-- **Media** never touches the node. The two apps open a direct WebRTC path
-  (STUN only; no TURN relay, so no third party carries or bills media).
-- **Signalling** is four paid UKM kinds through the ordinary payment gate:
-  `400` offer, `401` answer, `402` ICE candidate, `403` hangup. Payload:
-  `konsensus_core::payloads::call::CallSignal` (JSON, `v: 1`, `call_id` =
-  32 lowercase hex; offer carries `media` + `sdp`, answer `sdp`, ICE
-  `candidate`, hangup `reason`). Unknown fields are refused.
+All signals use the normal authenticated `POST /api/v1/messages/compose`
+path: encryption, recipient payment, signing, gate verification, durable
+operation recovery, and application admission. Each call is scoped to exactly
+one `(peer, call_id)`. A `call_id` is 32 lowercase hexadecimal characters.
+Signals 400–403 carry `v: 1`; 404 accepts the minimal payload below (and
+optionally `v: 1`). Unknown fields and fields from another kind are refused.
+SDP/ICE fields are retained for signalling compatibility; M6 media uses
+the existing TCP Noise peer link, with no UDP or STUN on the call path.
+Only one node must be reachable; the other dials out and holds the connection.
+The initial media transport is encrypted hop by hop: each owner's own node
+can hear it. App-to-app end-to-end media encryption is a separate milestone.
 
-## Money
-
-- The offer is the **per-call admission**, paid once at the callee's
-  `[pricing] call_msat` (default 10 000 msat; must be > 0). It is advertised
-  as the per-kind price-table entry `kind:400` and the kind is a category
-  override, so a realtime category offer never covers it.
-- Before paying an offer, the caller's node asks the callee now
-  (`PriceQuery {kind: 400}` → `PriceResponse`). It never falls back to its own
-  tariff: no fresh answer, nothing is paid (`call_price_unknown`).
-  `GET /api/v1/pricing/peers/:id/call` exposes the same answer to the app.
-- Answer, ICE and hangup pay `realtime_signal_msat` (the app floors every
-  payment at 1 sat). No per-minute payment for direct media.
-
-## Call state (durable, `call_state`, migration 027)
-
-Per `(peer, call_id)`: side, phase, deadline, replay deadline and any pending
-signal of ours. Stored in the node database, so a restart keeps used ids,
-live calls and reservations. Pure rules: `konsensus_core::payloads::call`.
-
-| Signal | Accepted only when | Effect |
-|---|---|---|
-| 400 offer | the id was never used with that peer (or its replay protection ended) | ringing, 60 s |
-| 401 answer | ringing, and sent by the callee | live, 4 h cap |
-| 402 ICE | ringing or live | — |
-| 403 hangup | ringing or live | ended; id burned for 24 h |
-
-**Our own signals are transactional.** Compose *reserves* the signal under its
-operation id (generated if absent) before any quote or payment; a reserved
-offer rings nobody and accepts no answer. The transition is *committed* right
-after the payment settles, before the envelope is dispatched. After compose
-returns, the operation journal decides: paid → commit, `prepared`/`released`
-(definitely unpaid) → release (an unsent offer is forgotten, so its id is
-free), `paying`/`payment_unknown` → keep, so a retry of the same operation
-recovers without a second charge. At startup, before the receive loop and the
-outbox resend, `calls::recover` applies the same rule to every reservation a
-crash left.
-
-**Incoming signals are held until admitted.** Before its paid acceptance an
-incoming call signal is held (`call_admission_hold`): history, resync and
-duplicate ACKs treat it as absent until its admission is final. Admitted, the
-hold is lifted before the app sees it; refused, message, plaintext, receipt and
-hold are withdrawn in one transaction. A hold that outlives its handler (the
-withdrawal failed, or the node crashed) is withdrawn at startup, before the
-receive loop runs, and by the periodic sweep after 5 minutes: fail closed.
-
-**Incoming refusals are withdrawn.** A paid signal refused by the call rules
-(after the gate and decryption) is answered with `MessageReject`, its message
-row and cached plaintext are deleted, and its receipt is marked
-application-rejected (`accepted = -1`): history, resync and a resend never
-present it as delivered, and its payment hash and nonce stay burned.
-
-**Bounds.** Open calls (reserved, ringing, live, or with a signal of ours
-being paid) are bounded at 4 per peer and 4 096 in total and are never
-evicted; a new call beyond that is refused (`call_busy`). Burned ids (ended
-calls under replay protection) are bounded separately, 256 per peer and 65 536
-in total, so ended calls never block new ones for the whole tombstone: past a
-bound, the oldest ids burned for at least 1 hour make room; an id burned less
-than 1 hour ago is never dropped, and if those alone fill a bound the call is
-refused. Otherwise an id stays burned for 24 h. Expired rows are swept every 5
-minutes (never one with a pending signal).
-
-**One operation, one signal.** Operation ids are canonicalized (lowercase
-UUIDv4) before the reservation, which is bound to the exact request (the
-journal's request hash, kind and recipient). An operation id reused for
-another call id or another payload is refused (`operation_mismatch`) before
-any reservation and never commits or releases the first request's; a retry of an operation
-that already paid is answered from the journal. The background operation
-reconciler and a same-operation retry that finds the payment settled both
-commit the call reservation before any resend, so an offer whose payment resolved later rings the callee
-and accepts the answer.
-
-**Pricing freshness is per kind.** The caller asks the callee (`PriceQuery`
-400) and accepts only a kind-400 answer that arrived after that query; an
-unrelated price update never counts. Queries to one peer are sent at most every
-2 s; concurrent callers share the answer.
-
-**Admission.** A call never pays first-contact admission: a contact without an
-E2EE session is refused (`call_needs_contact`, nothing paid). After a
-reconnect, re-admission follows the existing non-chat rule: an uncapped
-(owner) call re-admits once, reported separately as `readmission_msat`, then
-pays the call (verified on real LDK); a capped (paired app) call refuses
-re-admission before any quote, as files do (#127), and re-admission happens on
-the chat path under the owner's quoted approval. If the callee does not answer
-the price query at all, the call is refused before paying
-(`call_price_unknown`) and its reservation released.
-
-Calls are 1:1: a room compose of 400-403 is refused (`call_room`).
-
-## Open calls by peer
-
-`GET /api/v1/calls?peer=<node-id>` returns the owner's open calls for exactly
-that peer, with `read` scope required and at most 4 entries. A valid unknown
-peer returns `[]`; a missing, duplicate, or malformed peer returns 400 with
-fixed error text `invalid peer id`.
-
-Each entry has `id`, `state` (`reserved`, `ringing`, `live`, or `ended`),
-`direction` (`incoming` or `outgoing`), and boolean
-`unresolved_paid_admission`. A pending signal keeps a call in this view even
-after its deadline and replay tombstone expire; its aged state is `ended`.
-Unresolved reservations sort first, followed by call id order.
-
-`created` and `op_id` are explicitly nullable. `created` is the stored pending
-offer operation's creation time (Unix milliseconds) when the journal binding
-matches; otherwise `null`, because call state stores no creation timestamp.
-`op_id` is the stored pending signal operation id or `null` when that binding
-is no longer retained. Neither field uses placeholder strings or inferred
-timestamps. This view requires no migration.
-
-**The client must fail closed per peer when `unresolved_paid_admission` is
-true:** keep blocking re-admission/new paid admission to that peer even for
-`ended` calls or null metadata. The flag conservatively reflects any retained
-pending signal; expiry alone is not proof of nonpayment. Other peers are
-unaffected. The GET is read-only: no recovery, sweeping, quote, payment,
-dispatch, or call event. See the [API contract](API_CALLS.md) for response
-fields, ordering, authentication, and error details.
-
-## Compose API refusals
-
-For a new operation, `POST /api/v1/messages/compose` checks the call rules
-before creating an operation row, requesting a quote, or attempting payment.
-These refusals remain HTTP **400** and use the existing non-dispatch contract:
+| Kind | Payload fields beyond version and call id | Price at receiver |
+| --- | --- | --- |
+| 400 offer | `media`, `sdp`, optional `meeting` | `call_msat` |
+| 401 answer | `sdp` | `realtime_signal_msat` |
+| 402 transport candidate | `candidate`, optional `sdp_mid`, `sdp_mline_index` | `realtime_signal_msat` |
+| 403 hangup | optional `reason`, including `unpaid` | `realtime_signal_msat` |
+| 404 CALL_BLOCK | `seq` | **callee's `call_block_msat`** |
 
 ```json
-{
-  "error": "call offer replayed: this call id was already used",
-  "code": "not_dispatched",
-  "reason": "call_id_used"
-}
+{"call_id":"0123456789abcdef0123456789abcdef","seq":0}
 ```
 
-| `reason` | Meaning |
-|---|---|
-| `call_id_used` | The offer's call id is already reserved or used. |
-| `call_busy` | The node cannot make room for another call. |
-| `call_signal_in_flight` | Another operation has a pending signal for this call. |
-| `call_signal_invalid` | The signal or meeting leg is invalid. |
-| `call_not_live` | The signal requires a live/ringing call or the correct caller/callee role. |
+The offer fee pays for ringing, not ongoing media or a live admission grant.
+The caller pays every block to the callee. The callee's `[pricing]
+call_block_msat` defaults to 10 000 msat and must be positive. It is a
+per-kind override and appears as `kind:404` in price adverts whenever it
+differs from the realtime category, following `call_msat` / `kind:400`.
+Chain pricing and trust discounts apply through the existing pricing engine
+and gate, including the gate's admission floor.
 
-Clients may use `code: "not_dispatched"` to release their local spend
-reservation and `reason` to explain the refusal. The guarantee applies to
-the refused operation, not another operation holding the call reservation.
-Retries with an existing operation row retain their previous error shape:
-the call rules alone cannot prove that an earlier attempt never dispatched.
-Incoming paid-signal rejections and later payment/dispatch failures do not
-gain this code from the call-rule check.
+Before paying 400 or 404, the caller node asks the recipient for that exact
+kind (`PriceQuery` / `PriceResponse`). Only a fresh answer after that query
+counts; another kind's answer cannot satisfy it. Queries are coalesced per
+peer and kind for two seconds, in a bounded cache. There is **no fallback to
+the caller's tariff** for these payments. Without the callee's answer,
+compose refuses `call_price_unknown` before paying.
 
-## Mesh meetings (up to 4)
+## Paid interval state machine
 
-A meeting is a set of ordinary 1:1 calls ("legs") that share a meeting id and
-a fixed roster. The offer (400) of a leg carries one optional field:
+An offer rings for 60 seconds. A callee's paid answer (401) starts the call's
+clock and a thirty-second initial payment window. The answer itself grants no
+media. On receiving 401 the caller app requests block 0 through its own
+node's authenticated compose endpoint, using its existing spend grant and
+payment caps. The node refuses a block sent by the callee or for an unknown,
+unanswered, or ended call.
 
-```json
-"meeting": {"id": "<32 lowercase hex>", "roster": ["<host node id>", "<invitee>", ...]}
+Block 0 purchases `[answer, answer + 60 seconds]`. Only its settled payment
+admits media. The caller app requests block `k + 1` **20 seconds before**
+block `k` ends, again through compose. `GET /api/v1/calls?peer=…` exposes
+`paid_until_ms`, `next_block_seq`, and `next_block_due_ms` to resume scheduling.
+The node never manufactures caller spend authority for background renewals.
+Stopping the app or losing its spend grant therefore stops renewals.
+
+The owner policy is **stop early + honour** (26 October 2026). Only the
+next sequence is served, beginning at zero. Replays cannot grant it twice.
+New invoice requests carry `konsensus:call_block:<call_id>:<seq>`; the callee
+checks its own call state before issuing an invoice and again before returning
+it. Less than `CALL_BLOCK_INVOICE_MARGIN_MS` (15 seconds) before `deadline_ms`
+is a clear `call_block_unpayable` refusal with no invoice returned and no payment.
+The deadline already includes the 10-second grace (or the 30-second initial
+window). The caller retains its independent 5-second pre-dispatch check.
+
+On-time payments, including the inclusive grace endpoint, extend the previous
+paid boundary by exactly 60 seconds. After grace, expiry records `ended` /
+`Unpaid` and preserves the tombstone and pending financial evidence. If the
+expected next block settles within `CALL_BLOCK_RESUME_MS` (60 seconds,
+inclusive) after that end, the callee reopens the call and grants a full usable
+60 seconds **from receipt**, with a new grace period. An unswept expired Live
+row follows exactly the same rule. Explicit hangup/decline never resumes.
+Calls remain capped at 240 paid blocks (four hours of purchased intervals).
+
+The callee includes optional `paid_until_ms` in its ordinary `MessageAck`.
+The caller binds it to its dispatched outgoing 404 and durable operation's
+recipient, call id and sequence (independent of the plaintext cache),
+and updates the interval before completing delivery, even if it already
+received the single-use Unpaid notice. A failed grant write leaves delivery
+pending for retry. The callee durably stores grant metadata before committing
+the interval. Both peers must run this call-block protocol version. Duplicate delivery repeats the latest grant without extending it;
+older blocks cannot rewind a newer interval. A delayed Unpaid notice cannot
+revoke current paid media, and settlement of a notice reserved before revival
+cannot end the revived call. Notice single-use resets for the new paid interval.
+
+Outside the resume window, or with an unserviceable sequence, the settled
+payment is an **overpayment requiring reconciliation**. The callee consumes its
+proof once, retains an application-rejected payment receipt, writes and syncs a
+`call.block_overpayment` audit containing payment hash, message id, call id,
+sequence, amount and reason, and emits an error log. It sends the terminal
+`call_block_overpayment` rejection to the caller. Audit-write failure is itself
+an error; the retained payment receipt remains financial evidence. No preimage
+or decrypted payload is included. A call-state write failure after acceptance
+retains the existing `call.block_commit_failed` reconciliation path.
+
+Block invoices use a 5-second BOLT11 expiry (`CALL_BLOCK_INVOICE_EXPIRY_SECS`)
+instead of the ordinary one hour. **Residual settlement window:** BOLT11 expiry
+stops conforming payers starting new payments; it cannot cancel an in-flight
+HTLC. The vendored LDK `ln/inbound_payment.rs::calculate_absolute_expiry` adds
+7,200 seconds to the invoice delta against the highest observed block timestamp,
+and verifies against that chain-derived timestamp. Thus the receiver does not
+have a strict five-second wall-clock cutoff, and stale chain timestamps can
+extend the residual further. The bounded honour policy plus durable overpayment
+reconciliation covers this residual; no automatic refund is implemented.
+
+A one-second maintenance timer ages calls independently
+of connected apps; only the callee then attempts a 403 `reason: "unpaid"` through normal paid
+compose with at most eight concurrent notifications, a five-second attempt deadline,
+a 1 000 msat total cap, zero routing fees, and no peer re-admission. Excess
+notifications are dropped rather than blocking expiry. The notification
+is best effort; transport, wallet, or process failure never extends media
+admission. An operation already dispatched retains ordinary journal recovery.
+
+## Media admission interface
+
+The media-frame path calls:
+
+```rust,ignore
+konsensus_api::calls::call_media_admitted(storage, peer, call_id, now_ms).await
 ```
 
-- The roster is 2 to 4 distinct node ids (64 lowercase hex), host first
-  (`MAX_MEETING_PARTICIPANTS`). Only an offer may carry it; unknown fields are
-  refused.
-- **The earlier participant places each leg:** a leg is accepted only if both
-  caller and callee are in the roster and the caller comes first
-  (`CallSignal::check_leg`). So each pair has exactly one payer, and two
-  participants never ring each other. Checked on compose before the
-  reservation (`call_signal_invalid`, nothing reserved or paid) and on
-  receive after the gate (withdrawn like any refused call signal).
-- Everything else is the 1:1 call, unchanged: the leg's offer pays the
-  callee's `call_msat` once, answers and hangups pay the realtime price, the
-  same reservation/commit/release rules, operation ids, per-peer and total
-  bounds. The node keeps no meeting state.
-- Evidence: `payloads::call` tests (roster shape, leg order),
-  `call_state_tests::a_meeting_leg_out_of_roster_order_is_refused_before_reservation_or_payment`,
-  and `regtest_e2e::real_ldk_regtest_meeting` (apps A, B, C and router R on
-  real LDK: legs A→B, A→C, B→C, an out-of-order leg refused before paying,
-  C leaves while A–B stays live, msat-exact per participant).
-- **Capability advert `call_meeting_v1`.** A node that accepts the field
-  advertises `Capability::Custom("call_meeting_v1")` in its federation Hello
-  (a connected peer shows `Custom("call_meeting_v1")` in `GET /api/v1/peers`)
-  and lists `call_meeting_v1` in its own `/status` `api_capabilities`. An
-  older node has `deny_unknown_fields` on the payload, so it would withdraw a
-  meeting leg after it was paid: apps send a leg only to a connected peer
-  with the advert, from a node that lists it. `Custom` is an existing
-  variant, so older nodes still decode the Hello.
-- Rooms (chat, up to 4) follow the same pattern with a binding on ordinary
-  chat and the advert `room_binding_v1`: `docs/protocol/ROOMS.md`.
+Time is Unix milliseconds. The result is true only for a live call with a
+settled block and a paid boundary whose grace has not elapsed. Unknown peer,
+unknown call, ringing, ended, unpaid first block and storage errors all fail
+closed. The pure `CallEntry::media_admitted(now_ms)` uses the same rule. No
+unpaid timeout notification or outstanding reservation can authorize media.
 
-## Own STUN responder (`[calls] stun_listen`, optional)
+## Persistence, recovery and bounds
 
-Direct media across routers needs each app to learn its public address. Rather
-than asking a third-party STUN server, the owner can let their own node answer:
+`call_state` stores side, phase, effective deadline, replay deadline,
+`paid_until_ms`, next sequence, end reason, the Unpaid notice flag and any outgoing reservation.
+Migration 037 adds `call_block_invoices` for SQLite and PostgreSQL. Before
+publishing a short-lived block invoice, the callee durably binds its payment
+hash to the peer, call id and sequence. A generic invoice or keysend cannot
+admit a 404: its settled proof is consumed and audited as an overpayment.
+Bindings survive restarts and are swept after the call's resume window.
+Invoices issued before this upgrade have no binding and likewise become
+an audited overpayment if delivered after the upgrade.
 
-```toml
-[calls]
-stun_listen = "0.0.0.0:3478"   # UDP; omit to keep it off (default)
-```
+Migration 036 adds the notice flag for SQLite and PostgreSQL.
+Migration 035 adds paid intervals in SQLite and PostgreSQL; versions 033/034
+are reserved by the schema-parity and call-invite changes. Existing live
+rows with no block proof are ended while retaining their entire replay
+window. New calls and paid intervals survive restarts.
 
-- **Binding only** (RFC 5389 binding request → success with
-  XOR-MAPPED-ADDRESS). No TURN, no relay, no media, no authentication, no
-  per-call state: it only tells the sender the address its packet came from.
-- **Silent on anything else.** Other methods, responses, bad cookie or length,
-  malformed attributes, comprehension-required attributes (ICE checks,
-  credentials) and a wrong FINGERPRINT get no packet back (not even a 420).
-- **Rate-limited:** 20 answers per source (IPv4 address, IPv6 /64) and 2 000
-  in total per 10 s; the source table is bounded (16 384) and a full table
-  refuses new sources. Answers are ≤ 44 bytes, so it is a poor amplifier.
-- A configured address that cannot be bound fails boot.
-- **STUN URL precedence (owner app, option E):** (1) this node's own
-  `[calls] stun_listen` responder when it has a dialable peer host
-  (`stun_source: own`), then (2) the owner's `[network] stun_server` when set
-  and valid (`stun_source: configured`), then (3) nothing — no default and never
-  a public third-party server. Only the owner-only `GET /api/v1/status` reports
-  `stun_port` (while the responder runs), `stun_url` (`stun:host:port`), and
-  `stun_source`; the public `GET /api/v1/health` reports none of these. The app
-  may *offer* the URL from `/status`; the owner confirms it, it is never switched
-  on automatically.
-- `[network] stun_server = "stun:host:port"` (owner-set, no default) makes the
-  node query a STUN server for its public IP when `advertised_addr` is unset
-  and `listen_addr` is a wildcard. The endpoint is that IP plus the TCP
-  `listen_addr` port; `/status` shows `peer_endpoint`, `peer_endpoint_source`
-  (`advertised`/`listen`/`stun`) and, when missing, `peer_endpoint_reason`
-  (`no_dialable_endpoint`, `stun_pending`, `stun_unreachable`,
-  `stun_invalid_response`). An explicit `advertised_addr` is never replaced.
-  The same setting is also reported as `/status` `stun_url` (with
-  `stun_source: configured`) when this node has no dialable host for its own
-  `[calls] stun_listen` responder — for example, point it at a hub you run with
-  a public address so your home node's app gets a STUN server. That server
-  sees the caller's public IP on each binding request (normal STUN behaviour);
-  STUN only reflects addresses and call media never passes through it.
-- It helps apps that reach the node from outside its network (the owner away
-  from home, or a contact). An app behind the same router as the node would
-  mostly learn its local address (router hairpinning varies).
-- Code: `konsensus-node/src/stun.rs` (tests: RFC 5769 vectors, malformed
-  packets, rate limits, a UDP round trip).
+Outgoing signals reserve under a canonical operation id and exact request
+hash before any quote or payment. Settlement commits before envelope
+publication. Definite nonpayment releases the reservation; ambiguous payment
+keeps it for same-operation recovery. A block reservation does not advance
+the sequence until payment settles. A recovered payment follows the bounded honour policy. Even beyond the caller's local resume window, the paid envelope is delivered for the callee's service or overpayment decision. Before every new block charge, including after a failed-payment
+retry and after invoice response, the call is revalidated. After journal
+writes, phase, sequence and deadline are checked again under the call
+transition lock, held through the first wallet poll. A new wallet dispatch
+requires at least five seconds before the local deadline to allow for the
+callee's earlier answer time and payment/delivery latency. Already-dispatched
+payments retain normal settlement recovery, even if they settle after expiry. One operation cannot settle or release another request.
 
-## Evidence
+Incoming call envelopes are held before paid acceptance. Only a
+payment-gate-accepted, decrypted, valid transition is released to the app.
+Refusals withdraw message and plaintext, mark the receipt application-rejected,
+and retain the burned payment hash and nonce. Startup and periodic sweeps
+withdraw abandoned holds. Freshly paying a duplicate sequence does not buy
+another interval.
 
-- `msg_handler::tests::paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call`
-  (two Noise transports, real receive loop): underpaid, paid, duplicate,
-  replayed id, wrong-side answer, ICE for live/unknown call, hangup.
-- `regtest_e2e::real_ldk_regtest_calls` (real Core + electrs + LDK, A–C–B):
-  live price query, paid offer, local refusals, answer/ICE/hangup both ways,
-  msat-exact channel and budget reconciliation, and a call after reconnect
-  refused before paying with its id released.
-- `konsensus-api/tests/call_state_tests.rs`: the #131 review probes as
-  regressions (unpaid offer/answer, capacity, unrelated price response,
-  refused signal via resync), restart, recovery and price-query rate limit.
+Open calls remain bounded at four per peer and 4 096 globally, including
+unsettled reservations; none are evicted. Burned ids have separate bounds
+of 256 per peer and 65 536 globally. Pressure may evict the oldest ids only
+after at least one hour of replay protection; otherwise tombstones remain
+for 24 hours after ending. Expired tombstones are swept in bounded batches;
+ended caller reservations are released after explicit hangup or the bounded
+Unpaid resume window. The independent outbox journal retains payment evidence
+and drives delivery to the unchanged callee overpayment audit. Callee ACKs
+more than one block beyond the caller's expected boundary are ignored.
+
+Mesh meetings remain sets of ordinary pairwise calls with at most four
+participants. The earlier participant in the fixed roster places and pays
+each leg, including its blocks. The `call_meeting_v1` capability guards
+meeting offers. Every leg uses both nodes for media and the same paid
+admission rule; no meeting-level grant bypasses it.
+
+Calls require an existing E2EE contact. First-contact admission stays on the
+ordinary owner-approved chat path. Existing operation idempotency, budget
+grants, recipient and aggregate caps, routing-fee limits, and reconnect
+admission rules apply to calls as to other paid messages.

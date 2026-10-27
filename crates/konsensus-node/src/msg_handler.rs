@@ -363,12 +363,62 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         )
                         .await;
 
+                        if envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+                            match storage_for_recv.is_paid_envelope_rejected(&envelope).await {
+                                Ok(true) => {
+                                    let reject = Frame::MessageReject { id: msg_id, reason: "call_block_overpayment".into() };
+                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    continue;
+                                },
+                                Err(e) => { error!(error = %e, "cannot read call payment receipt; withholding response"); continue; },
+                                Ok(false) => {},
+                            }
+                        }
+
                         if matches!(gate_result, Ok((_, true))) {
-                            let ack = Frame::MessageAck { id: msg_id, duplicate: true };
+                            let paid_until_ms = if envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+                                match konsensus_api::calls::block_grant(storage_for_recv.as_ref(), &plaintext_cipher, &sender, &msg_id).await {
+                                    Ok(grant) => grant,
+                                    Err(e) => { error!(error = %e, "cannot recover call grant; withholding ACK"); continue; }
+                                }
+                            } else { None };
+                            let ack = Frame::MessageAck { id: msg_id, duplicate: true, paid_until_ms };
                             if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
                                 warn!(error = %e, "failed to send duplicate ACK");
                             }
                             continue;
+                        }
+
+                        // Validate the block against call state before consuming its
+                        // proof. Keep the call lock through acceptance so a timer or
+                        // hangup cannot turn an admitted payment into a late refusal.
+                        let mut incoming_block = None;
+                        if gate_result.is_ok() && envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+                            // A refusal or storage failure must leave ratchet keys
+                            // available for a retransmission of this paid envelope.
+                            let block_plaintext = match konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext) {
+                                Ok(message) => session_mgr_for_recv.preview_decrypt(&sender, &message).await.ok()
+                                    .and_then(|bytes| String::from_utf8(bytes).ok()),
+                                Err(_) => None,
+                            };
+                            match konsensus_api::calls::prepare_incoming_block(
+                                storage_for_recv.as_ref(), &sender, block_plaintext.as_deref(), &envelope.payment_proof.payment_hash,
+                            ).await {
+                                Ok(block) => incoming_block = Some(block),
+                                Err(refusal) => {
+                                    audit_for_recv.record(
+                                        konsensus_api::audit::events::MESSAGE_REJECTED,
+                                        &sender.to_hex(),
+                                        Some(serde_json::json!({
+                                            "reason": refusal.to_string(), "kind": envelope.kind,
+                                            "message_id": msg_id.to_hex(),
+                                        })),
+                                    );
+                                    let reject = Frame::MessageReject { id: msg_id, reason: refusal.to_string() };
+                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    continue;
+                                }
+                            }
                         }
 
                         // Every paid envelope is held (invisible to history,
@@ -386,6 +436,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             match konsensus_api::calls::hold_incoming(storage_for_recv.as_ref(), &envelope).await {
                                 Ok(placed) => call_hold = placed,
                                 Err(e) => {
+                                    drop(incoming_block.take());
                                     // Fail closed: unheld, a refused message could stay visible.
                                     error!(msg_id = %msg_id, error = %e, "incoming message not held; not accepted");
                                     let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
@@ -405,6 +456,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     audit_for_recv.membrane().admitted(&envelope, gate_result.as_ref().expect("validated").0);
                                 }
                                 Ok(PaidAcceptance::AlreadyAccepted) => {
+                                    drop(incoming_block.take());
                                     // An envelope still held was never admitted: never
                                     // acknowledge it as delivered.
                                     if !is_relay_control
@@ -416,7 +468,13 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                         continue;
                                     }
                                     // No second promotion, decrypt, application side effect or write.
-                                    let ack = Frame::MessageAck { id: msg_id, duplicate: true };
+                                    let paid_until_ms = if envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+                                        match konsensus_api::calls::block_grant(storage_for_recv.as_ref(), &plaintext_cipher, &sender, &msg_id).await {
+                                            Ok(grant) => grant,
+                                            Err(e) => { error!(error = %e, "cannot recover call grant; withholding ACK"); continue; }
+                                        }
+                                    } else { None };
+                                    let ack = Frame::MessageAck { id: msg_id, duplicate: true, paid_until_ms };
                                     if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
                                         warn!(error = %e, "failed to send duplicate ACK");
                                     }
@@ -428,6 +486,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     gate_result = Err(rejection);
                                 }
                                 Ok(PaidAcceptance::Withdrawn) => {
+                                    drop(incoming_block.take());
                                     // This exact envelope was accepted, then refused and
                                     // withdrawn (a call, a room chat, a receipt refusal).
                                     // Its payment stays burned. The sender hears the
@@ -453,6 +512,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     gate_result = Err(rejection);
                                 }
                                 Err(e) => {
+                                    drop(incoming_block.take());
                                     if call_hold {
                                         let _ = storage_for_recv.call_admission_release(&msg_id).await;
                                     }
@@ -466,6 +526,9 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             }
                         }
 
+                        if gate_result.is_err() {
+                            drop(incoming_block.take());
+                        }
                         if call_hold && gate_result.is_err() {
                             // Nothing of ours was stored under this hold.
                             let _ = storage_for_recv.call_admission_release(&msg_id).await;
@@ -567,6 +630,72 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             }
                             continue;
                         }
+
+                        let admitted_block = match incoming_block {
+                            Some(block) => {
+                                let identity = block.signal().clone();
+                                if let Some(refusal) = block.refusal() {
+                                    error!(msg_id = %msg_id, reason = %refusal, "PAID CALL BLOCK NOT SERVED: overpayment requires reconciliation");
+                                    let recorded = audit_for_recv.record_durable(
+                                        konsensus_api::audit::events::CALL_BLOCK_OVERPAYMENT,
+                                        &sender.to_hex(), serde_json::json!({
+                                            "message_id": msg_id.to_hex(), "call_id": identity.call_id,
+                                            "seq": identity.seq, "amount_msat": envelope.payment_proof.amount_msat,
+                                            "payment_hash": hex::encode(envelope.payment_proof.payment_hash),
+                                            "reason": refusal.to_string(), "reconciliation_required": true,
+                                        }));
+                                    let audit_failed = recorded.is_err();
+                                    if let Err(e) = recorded {
+                                        error!(msg_id = %msg_id, error = %e, "OVERPAYMENT AUDIT WRITE FAILED; retained payment receipt requires reconciliation");
+                                    }
+                                    drop(block);
+                                    if let Err(e) = storage_for_recv.reject_accepted_envelope(&envelope).await {
+                                        error!(msg_id = %msg_id, error = %e, "overpayment receipt could not be marked rejected");
+                                        if audit_failed {
+                                            error!(msg_id = %msg_id, call_id = %identity.call_id, seq = ?identity.seq,
+                                                amount_msat = envelope.payment_proof.amount_msat,
+                                                payment_hash = %hex::encode(envelope.payment_proof.payment_hash),
+                                                "CRITICAL: OVERPAYMENT AUDIT AND REJECT MARKING BOTH FAILED; manual reconciliation required");
+                                        }
+                                    }
+                                    let reject = Frame::MessageReject { id: msg_id, reason: "call_block_overpayment".into() };
+                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    continue;
+                                }
+                                let committed = async {
+                                    let bytes = serde_json::to_vec(&identity).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+                                    let cached = plaintext_cipher.encrypt(&bytes).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+                                    storage_for_recv.store_message_plaintext(&msg_id, &cached).await?;
+                                    block.commit().await
+                                }.await;
+                                match committed {
+                                    Ok(signal) => Some(signal),
+                                    Err(e) => {
+                                        error!(msg_id = %msg_id, error = %e, "accepted block state could not be stored; withheld");
+                                        // The receipt retains settlement evidence even when
+                                        // withdrawal removes the message. Link it to the
+                                        // failed service interval for reconciliation; never
+                                        // put a preimage or decrypted payload in the audit.
+                                        audit_for_recv.record(
+                                            konsensus_api::audit::events::CALL_BLOCK_COMMIT_FAILED,
+                                            &sender.to_hex(),
+                                            Some(serde_json::json!({
+                                                "message_id": msg_id.to_hex(),
+                                                "call_id": identity.call_id,
+                                                "seq": identity.seq,
+                                                "amount_msat": envelope.payment_proof.amount_msat,
+                                                "reconciliation_required": true,
+                                            })),
+                                        );
+                                        let _ = storage_for_recv.reject_accepted_envelope(&envelope).await;
+                                        let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                        let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                        continue;
+                                    }
+                                }
+                            },
+                            None => None,
+                        };
 
                         // M1b promote-on-paid: the PaymentGate just accepted a
                         // PAID, M2-recipient-bound UKM from `sender`. Flip this
@@ -705,7 +834,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // accepts answer/ICE/hangup only for a live call with this
                         // sender. A refused signal never reaches the app.
                         if konsensus_api::calls::is_call_kind(envelope.kind) {
-                            let admitted = konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref()).await;
+                            let admitted = match admitted_block {
+                                Some(signal) => Ok(signal),
+                                None => konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref()).await,
+                            };
                             // Admitted: lift the hold before the app sees it. If that
                             // write fails the signal stays held and is withdrawn by the
                             // sweep: fail closed, the peer gets a reject, not an ACK.
@@ -780,6 +912,17 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             continue;
                         }
 
+                        let paid_until_ms = if envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+
+                            match konsensus_api::calls::block_grant(storage_for_recv.as_ref(), &plaintext_cipher, &sender, &msg_id).await {
+
+                                Ok(grant) => grant,
+
+                                Err(e) => { error!(error = %e, "cannot recover call grant; withholding ACK"); continue; }
+
+                            }
+
+                        } else { None };
                         // Broadcast to WebSocket clients (with plaintext if decrypted)
                         if let Err(e) = ws_tx_for_recv.send(Arc::new(
                             WsMessage {
@@ -791,7 +934,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         }
 
                         // Send MessageAck back to sender
-                        let ack = Frame::MessageAck { id: msg_id, duplicate: false };
+                        let ack = Frame::MessageAck { id: msg_id, duplicate: false, paid_until_ms };
                         if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
                             warn!(peer = %sender, error = %e, "failed to send MessageAck");
                         }
