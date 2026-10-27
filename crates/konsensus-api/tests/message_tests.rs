@@ -1932,6 +1932,7 @@ async fn compose_happy_path_keysend() {
         stun_port: None,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2088,6 +2089,7 @@ async fn compose_happy_path_invoice_flow() {
         stun_port: None,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2213,6 +2215,7 @@ async fn compose_rejects_invoice_amount_mismatch() {
         stun_port: None,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2402,6 +2405,7 @@ async fn compose_keysend_fallback_to_invoice() {
         stun_port: None,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2538,6 +2542,7 @@ async fn compose_queues_when_transport_send_fails() {
         stun_port: None,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2652,6 +2657,7 @@ async fn compose_room_delivers_to_all_connected_members() {
         stun_port: None,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2797,6 +2803,7 @@ async fn compose_broadcasts_to_websocket() {
         stun_port: None,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2903,6 +2910,7 @@ async fn compose_records_send_timestamp_for_stdp() {
         stun_port: None,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -3008,6 +3016,7 @@ async fn compose_room_all_members_fail_returns_explicit_refusals() {
         stun_port: None,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -3176,6 +3185,7 @@ async fn compose_room_rejects_oversized_member_count() {
         stun_port: None,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });

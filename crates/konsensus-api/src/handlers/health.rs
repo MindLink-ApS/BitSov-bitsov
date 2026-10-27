@@ -402,6 +402,7 @@ async fn status(
                 super::sponsor::CAPABILITY,
                 konsensus_core::payloads::call::MEETING_CAPABILITY,
                 konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY,
+                konsensus_message::wire::CALL_MEDIA_CAPABILITY,
             ];
             if state.starter.config.enabled {
                 capabilities.push("starter_channel_request_v1");

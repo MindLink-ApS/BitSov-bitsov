@@ -34,6 +34,47 @@ fn refusal() -> Frame {
 }
 
 #[tokio::test]
+async fn budgeted_reconnect_redials_closed_generation_before_reader_cleanup() {
+    let (a, b, aid, bid) = pair().await;
+    let addr = b.listen_addr().unwrap().to_string();
+    let old_generation = a.connected_since(&bid).await.unwrap();
+    // Consume the original registrations before waiting for the replacement.
+    assert!(matches!(a.recv_control().await, Some(ControlEvent::PeerConnected { .. })));
+    assert!(matches!(b.recv_control().await, Some(ControlEvent::PeerConnected { .. })));
+
+    // remove() closes the socket before acquiring the map's write lock. Hold
+    // that lock out so the dial observes exactly this real teardown window.
+    // This current-thread test polls the dial before any cleanup task can run.
+    let peers = a.peers.read().await;
+    let old = peers.get(&bid).unwrap().clone();
+    old.close();
+    assert!(!a.is_connected(&bid).await);
+    let reconnect = a.connect(&bid, &addr);
+    tokio::pin!(reconnect);
+    assert!(
+        futures::poll!(&mut reconnect).is_pending(),
+        "connect must dial, not return success for a closed map entry"
+    );
+    drop(peers);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        reconnect.await.unwrap();
+        assert!(matches!(
+            b.recv_control().await,
+            Some(ControlEvent::PeerConnected { peer_id, .. }) if peer_id == aid
+        ));
+    }).await.expect("replacement handshake must complete");
+    assert!(a.is_connected(&bid).await);
+    assert!(b.is_connected(&aid).await);
+    assert_ne!(a.connected_since(&bid).await, Some(old_generation));
+    // A delayed old reader must not remove the replacement it raced with.
+    old.remove(&bid, &a.peers).await;
+    assert!(a.is_connected(&bid).await);
+    a.shutdown();
+    b.shutdown();
+}
+
+#[tokio::test]
 async fn control_reply_backpressure_closes_without_waiting_for_connection_lock() {
     let (a, b, aid, bid) = pair().await;
     let conn = b.peers.read().await.get(&aid).unwrap().clone();
