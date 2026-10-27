@@ -62,31 +62,55 @@ block `k` ends, again through compose. `GET /api/v1/calls?peer=…` exposes
 The node never manufactures caller spend authority for background renewals.
 Stopping the app or losing its spend grant therefore stops renewals.
 
-Only the next sequence is accepted, beginning at zero. Duplicates, replays,
-gaps, excessive sequences and renewals before their due time are refused.
-A late payment within ten seconds of the previous boundary extends that
-boundary by exactly 60 seconds; it never buys extra time by moving the
-anchor to its arrival. The grace endpoint is inclusive: media stops when
-`now > paid_until_ms + 10 seconds`. With no block zero, media remains refused
-and the initial window expires thirty seconds after answer. The receiver checks
-block admission before consuming its payment proof and holds that decision
-through acceptance, so crossing a deadline cannot consume a proof and then
-refuse the block. Late refusals emit `message.rejected` audit records.
-If the subsequent call-state write fails after paid acceptance, no media is
-granted and the receipt remains stored. A `call.block_commit_failed` audit
-record links its message id to the call id, sequence and amount for operator
-reconciliation; it contains no payment preimage or decrypted payload. This
-records the failure for manual reconciliation, not automatic retry or refund.
+The owner policy is **stop early + honour** (26 October 2026). Only the
+next sequence is served, beginning at zero. Replays cannot grant it twice.
+New invoice requests carry `konsensus:call_block:<call_id>:<seq>`; the callee
+checks its own call state before issuing an invoice and again before returning
+it. Less than `CALL_BLOCK_INVOICE_MARGIN_MS` (15 seconds) before `deadline_ms`
+is a clear `call_block_unpayable` refusal with no invoice returned and no payment.
+The deadline already includes the 10-second grace (or the 30-second initial
+window). The caller retains its independent 5-second pre-dispatch check.
 
-Calls are capped at 240 blocks (four hours). No payment revives an expired
-or ended call. Expiry changes the durable phase to `ended`, records
-`HangupReason::Unpaid`, and keeps the replay tombstone and any pending
-payment evidence. After local `Unpaid` expiry, the caller admits only one
-403 `reason: "unpaid"` from the callee, without changing the tombstone.
-A durable notice flag suppresses further distinct envelopes as well as
-ordinary envelope replays. Only the callee can reserve that notification;
-a pending retry is idempotent, definite nonpayment releases it, and a paid
-commit keeps the flag consumed across restarts.
+On-time payments, including the inclusive grace endpoint, extend the previous
+paid boundary by exactly 60 seconds. After grace, expiry records `ended` /
+`Unpaid` and preserves the tombstone and pending financial evidence. If the
+expected next block settles within `CALL_BLOCK_RESUME_MS` (60 seconds,
+inclusive) after that end, the callee reopens the call and grants a full usable
+60 seconds **from receipt**, with a new grace period. An unswept expired Live
+row follows exactly the same rule. Explicit hangup/decline never resumes.
+Calls remain capped at 240 paid blocks (four hours of purchased intervals).
+
+The callee includes optional `paid_until_ms` in its ordinary `MessageAck`.
+The caller binds it to its dispatched outgoing 404 and durable operation's
+recipient, call id and sequence (independent of the plaintext cache),
+and updates the interval before completing delivery, even if it already
+received the single-use Unpaid notice. A failed grant write leaves delivery
+pending for retry. The callee durably stores grant metadata before committing
+the interval. Both peers must run this call-block protocol version. Duplicate delivery repeats the latest grant without extending it;
+older blocks cannot rewind a newer interval. A delayed Unpaid notice cannot
+revoke current paid media, and settlement of a notice reserved before revival
+cannot end the revived call. Notice single-use resets for the new paid interval.
+
+Outside the resume window, or with an unserviceable sequence, the settled
+payment is an **overpayment requiring reconciliation**. The callee consumes its
+proof once, retains an application-rejected payment receipt, writes and syncs a
+`call.block_overpayment` audit containing payment hash, message id, call id,
+sequence, amount and reason, and emits an error log. It sends the terminal
+`call_block_overpayment` rejection to the caller. Audit-write failure is itself
+an error; the retained payment receipt remains financial evidence. No preimage
+or decrypted payload is included. A call-state write failure after acceptance
+retains the existing `call.block_commit_failed` reconciliation path.
+
+Block invoices use a 5-second BOLT11 expiry (`CALL_BLOCK_INVOICE_EXPIRY_SECS`)
+instead of the ordinary one hour. **Residual settlement window:** BOLT11 expiry
+stops conforming payers starting new payments; it cannot cancel an in-flight
+HTLC. The vendored LDK `ln/inbound_payment.rs::calculate_absolute_expiry` adds
+7,200 seconds to the invoice delta against the highest observed block timestamp,
+and verifies against that chain-derived timestamp. Thus the receiver does not
+have a strict five-second wall-clock cutoff, and stale chain timestamps can
+extend the residual further. The bounded honour policy plus durable overpayment
+reconciliation covers this residual; no automatic refund is implemented.
+
 A one-second maintenance timer ages calls independently
 of connected apps; only the callee then attempts a 403 `reason: "unpaid"` through normal paid
 compose with at most eight concurrent notifications, a five-second attempt deadline,
@@ -123,8 +147,7 @@ Outgoing signals reserve under a canonical operation id and exact request
 hash before any quote or payment. Settlement commits before envelope
 publication. Definite nonpayment releases the reservation; ambiguous payment
 keeps it for same-operation recovery. A block reservation does not advance
-the sequence until payment settles. A recovered payment cannot revive an
-expired call. Before every new block charge, including after a failed-payment
+the sequence until payment settles. A recovered payment follows the bounded honour policy. Even beyond the caller's local resume window, the paid envelope is delivered for the callee's service or overpayment decision. Before every new block charge, including after a failed-payment
 retry and after invoice response, the call is revalidated. After journal
 writes, phase, sequence and deadline are checked again under the call
 transition lock, held through the first wallet poll. A new wallet dispatch

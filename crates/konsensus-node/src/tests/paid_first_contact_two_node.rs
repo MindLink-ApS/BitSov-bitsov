@@ -1158,7 +1158,7 @@ async fn m9_m10_reconnect_needs_readmission_then_acks_count() {
     net.payee.transport.send_frame(&payer, &Frame::PrekeyOffer { bundle }).await.unwrap();
     net.payee
         .transport
-        .send_frame(&payer, &Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([3u8; 32]), duplicate: false })
+        .send_frame(&payer, &Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([3u8; 32]), duplicate: false, paid_until_ms: None })
         .await
         .unwrap();
     wait_until("the payer dropped both", Duration::from_secs(5), || async {

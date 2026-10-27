@@ -26,6 +26,9 @@ use std::{
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Recovery {
+    /// Call/sequence binding survives missing plaintext caches and recovery.
+    #[serde(default)]
+    call_block: Option<(String, u32)>,
     caller: Option<String>,
     #[serde(default)]
     execution_id: Option<String>,
@@ -272,9 +275,11 @@ impl Operation {
         expected_msat: u64,
         fee_ceiling: u64,
         admission_msat: u64,
+        call_block: Option<(String, u32)>,
     ) -> Result<(), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
+        data.call_block = call_block;
         op.message_id = Some(draft.id.to_hex());
         data.draft = Some(draft);
         data.expected_msat = expected_msat;
@@ -689,6 +694,34 @@ async fn compose_locked(
     }
 }
 
+/// Upsert the outstanding-reply row of a paid web request (kind 500/510)
+/// before it is (re)sent. Other kinds are untouched.
+pub(crate) async fn restore_outstanding_web_request(
+    state: &AppState,
+    env: &UkmEnvelope,
+) -> Result<(), ApiError> {
+    let Some(expected) = konsensus_core::expected_reply_kind(env.kind) else {
+        return Ok(());
+    };
+    let konsensus_core::Recipient::Node(peer) = env.recipient else {
+        return Err(storage("web request recipient must be a node"));
+    };
+    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    state
+        .storage
+        .record_outgoing_web_request(
+            &env.payment_proof.payment_hash,
+            konsensus_core::OutstandingWebRequest {
+                request_id: env.id,
+                peer,
+                expected_reply_kind: expected,
+                expires_at_ms: now_ms.saturating_add(konsensus_core::OUTSTANDING_TTL_MS),
+            },
+        )
+        .await
+        .map_err(storage)
+}
+
 async fn resend(state: &AppState, op: &OutboxOperation) -> Result<bool, ApiError> {
     let id = MessageId::from_hex(
         op.message_id
@@ -752,6 +785,10 @@ async fn resend(state: &AppState, op: &OutboxOperation) -> Result<bool, ApiError
         }
         return Err(storage(error));
     }
+    // A paid web request is only worth sending while its reply can be bound.
+    // The row was committed with the envelope; a resend restores it if it was
+    // consumed or lost, and extends the reply window from this attempt.
+    restore_outstanding_web_request(state, &env).await?;
     let delivered = state.transport.send(&peer, &env).await.is_ok();
     if delivered {
         state
@@ -1609,6 +1646,17 @@ fn incomplete_settled_recovery(op: &OutboxOperation) -> bool {
         Some("settled payment has no valid proof")
             | Some("settled payment missing encrypted draft")
     )
+}
+
+
+pub(crate) fn call_block_binding(op: &OutboxOperation) -> Result<Option<(String, u32)>, konsensus_storage::StorageError> {
+    recovery(op).map(|r| r.call_block).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
+}
+
+pub(crate) fn bind_legacy_call_block(op: &mut OutboxOperation, binding: (String, u32)) -> Result<(), konsensus_storage::StorageError> {
+    let mut data = recovery(op).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+    data.call_block = Some(binding);
+    encode(op, &data).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
 }
 
 #[cfg(test)]

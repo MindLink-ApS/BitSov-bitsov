@@ -222,10 +222,10 @@ const PAYMENT_POLL_INITIAL: Duration = Duration::from_millis(50);
 /// may settle and emit the terminal hint before the dispatch call returns; a
 /// subscription taken afterwards would never see it. Taken first, the hint is
 /// buffered and ends the first wait at once.
-struct SettlementUpdates(Option<futures::stream::BoxStream<'static, String>>);
+pub(crate) struct SettlementUpdates(Option<futures::stream::BoxStream<'static, String>>);
 
 impl SettlementUpdates {
-    fn subscribe(lightning: &dyn LightningProvider) -> Self {
+    pub(crate) fn subscribe(lightning: &dyn LightningProvider) -> Self {
         Self(lightning.outgoing_payment_updates())
     }
 }
@@ -234,24 +234,33 @@ impl SettlementUpdates {
 /// backoff timer or at the backend's update hint for this payment, whichever
 /// comes first; the caller then re-reads `get_payment_status`, which stays the
 /// only thing it acts on (a hint is never proof of settlement).
-struct SettlementPoll {
+pub(crate) struct SettlementPoll {
     updates: Option<futures::stream::BoxStream<'static, String>>,
     payment_hash: String,
     next: Duration,
     started: tokio::time::Instant,
+    deadline: Duration,
 }
 
 impl SettlementPoll {
-    fn new(updates: SettlementUpdates, payment_hash: &str) -> Self {
+    pub(crate) fn new(updates: SettlementUpdates, payment_hash: &str) -> Self {
         Self {
             updates: updates.0,
             payment_hash: payment_hash.to_owned(),
             next: PAYMENT_POLL_INITIAL,
             started: tokio::time::Instant::now(),
+            deadline: PAYMENT_SETTLE_TIMEOUT,
         }
     }
 
-    async fn wait(&mut self) {
+    /// Give up sooner than the message default. The direct payment routes
+    /// answer `202 in_flight` after this window instead of blocking.
+    pub(crate) fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    pub(crate) async fn wait(&mut self) {
         use futures::StreamExt;
         let delay = self.next;
         self.next = (self.next * 2).min(PAYMENT_POLL_INTERVAL);
@@ -274,8 +283,8 @@ impl SettlementPoll {
         sleep.await;
     }
 
-    fn timed_out(&self) -> bool {
-        self.started.elapsed() >= PAYMENT_SETTLE_TIMEOUT
+    pub(crate) fn timed_out(&self) -> bool {
+        self.started.elapsed() >= self.deadline
     }
 }
 
@@ -581,6 +590,9 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
     match refusal.as_deref() {
         Some(invoice_refusal::ADMISSION_REQUIRED) => admission_refusal(peer_id),
         Some("disk_low") => ApiError::NotDispatched("disk_low".into()),
+        Some(invoice_refusal::CALL_BLOCK_UNPAYABLE) => ApiError::NotDispatched(
+            "callee refused the call block invoice: deadline margin or call sequence; nothing was paid".into()
+        ).with_reason("call_block_unpayable"),
         Some(reason) => ApiError::Lightning(format!(
             "Recipient refused the invoice request: {reason}"
         )),
@@ -873,7 +885,7 @@ async fn create_payment_proof_via_invoice(
     let frame = Frame::RequestInvoice {
         request_id: request_id.clone(),
         amount_msat: invoice_amount_msat,
-        purpose: "konsensus message".into(),
+        purpose: debit.invoice_purpose(),
     };
     let frame_bytes = frame
         .to_bytes()
@@ -3648,7 +3660,12 @@ pub(super) async fn compose_peer(
         ).references(references).build();
         operation.draft(draft, price_msat,
             debit.fee_limit(&state, price_msat).saturating_add(admission.fee_ceiling_msat),
-            admission.settled_msat.saturating_sub(admission.readmission_msat)).await?;
+            admission.settled_msat.saturating_sub(admission.readmission_msat),
+            if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+                let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                Some((signal.call_id, signal.seq.unwrap_or_default()))
+            } else { None }).await?;
 
         // Create payment proof — requests invoice from recipient's wallet (Principle 2).
         if let Some(mut attempt) = super::admission_journal::load(&state, &peer_id)? {
@@ -3678,35 +3695,17 @@ pub(super) async fn compose_peer(
         let proof =
             konsensus_core::PaymentProof::new(payment_hash, preimage_bytes, amount_msat);
 
-        let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
         if crate::calls::is_call_kind(req.kind) {
             // Paid: publish the call transition before the envelope goes out.
             let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
-            crate::calls::commit_outgoing(state.storage.as_ref(), &peer_id, &req.plaintext, &operation.id, &request_hash).await;
+            crate::calls::commit_outgoing(state.storage.as_ref(), &peer_id, &req.plaintext, &operation.id, &request_hash).await
+                .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("paid call transition failed: {e}") })?;
         }
+        let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
 
-        if let Some(expected) = konsensus_core::expected_reply_kind(req.kind) {
-            let Recipient::Node(peer) = envelope.recipient else {
-                return Err(ApiError::BadRequest("web request recipient must be a node".into()));
-            };
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            state
-                .storage
-                .record_outgoing_web_request(
-                    &envelope.payment_proof.payment_hash,
-                    konsensus_core::OutstandingWebRequest {
-                        request_id: envelope.id,
-                        peer,
-                        expected_reply_kind: expected,
-                        expires_at_ms: now_ms.saturating_add(konsensus_core::OUTSTANDING_TTL_MS),
-                    },
-                )
-                .await
-                .map_err(|e| ApiError::Internal(format!("record web request: {e}")))?;
-        }
+        // A paid web request's outstanding-reply row was committed by
+        // `settled_envelope` in the same transaction as the envelope, and every
+        // resend refreshes it (`operations::resend`). Nothing to write here.
 
         // Cache plaintext (encrypted at rest) for API retrieval
         if let Some(ref cipher) = state.plaintext_cipher {
