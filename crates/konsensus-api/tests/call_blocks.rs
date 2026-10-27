@@ -8,6 +8,32 @@ use konsensus_storage::{SqliteStorage, Storage};
 
 const ID: &str = "0123456789abcdef0123456789abcdef";
 
+async fn answer_block_price_query(
+    state: &konsensus_api::state::AppState,
+    transport: &common::ConnectedStubTransport,
+    peer: NodeId,
+) {
+    // Compose may spend longer than 50 ms in storage before asking. A price
+    // injected before its query is correctly rejected as a stale answer.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let queried = transport.raw_frames.lock().unwrap().iter().any(|bytes| {
+                matches!(
+                    konsensus_message::wire::Frame::from_bytes(bytes).unwrap(),
+                    konsensus_message::wire::Frame::PriceQuery { kind: 404 }
+                )
+            });
+            if queried {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("compose must request the block price before the peer answers");
+    state.peer_prices.update_kind_price(peer, 404, 23_000, 850_000).await;
+}
+
 // SQLx must progress on another worker while the invoice responder records
 // the callee's binding. The wallet supports keysend, as a real LN peer does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -70,10 +96,7 @@ async fn known_ln_peer_call_block_uses_bound_invoice_and_is_admitted() {
     let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
         .header("authorization", common::auth_header(&state)).header("content-type", "application/json")
         .body(Body::from(serde_json::json!({"operation_id":uuid::Uuid::new_v4().to_string(),"recipient":peer.to_hex(),"kind":404,"plaintext":plaintext,"wait_ack_ms":0}).to_string())).unwrap();
-    let quote = async {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        state.peer_prices.update_kind_price(peer, 404, 23_000, 850_000).await;
-    };
+    let quote = answer_block_price_query(&state, &transport, peer);
     let (response, ()) = tokio::join!(common::test_router(state.clone()).oneshot(request), quote);
     let response = response.unwrap();
     let status = response.status();
@@ -352,7 +375,7 @@ async fn delayed_block_invoice(answer_age_ms: u64) {
             }),
     );
     let mutable = Arc::get_mut(&mut state).unwrap();
-    mutable.transport = transport;
+    mutable.transport = transport.clone();
     mutable.storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
     let target = konsensus_crypto::SessionManager::new(Arc::new(identity));
     state
@@ -371,13 +394,7 @@ async fn delayed_block_invoice(answer_age_ms: u64) {
     let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
         .header("authorization", common::auth_header(&state)).header("content-type", "application/json")
         .body(Body::from(serde_json::json!({"operation_id":uuid::Uuid::new_v4().to_string(),"recipient":peer.to_hex(),"kind":404,"plaintext":format!(r#"{{"call_id":"{ID}","seq":0}}"#),"wait_ack_ms":0}).to_string())).unwrap();
-    let quote = async {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        state
-            .peer_prices
-            .update_kind_price(peer, 404, 23_000, 850_000)
-            .await;
-    };
+    let quote = answer_block_price_query(&state, &transport, peer);
     let (response, ()) = tokio::join!(common::test_router(state.clone()).oneshot(request), quote);
     let response = response.unwrap();
     let status = response.status();
