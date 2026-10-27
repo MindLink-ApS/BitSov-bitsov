@@ -14,7 +14,7 @@ use std::path::Path;
 /// fee ceilings. This fixture's 2,001 + 2,001 quote plus the production 5,000 msat
 /// floor on each leg is 14,002 msat, which the cap refuses before anything is paid.
 /// Authorize the fee the regtest actually pays so the quote stays at 4,002 msat.
-fn direct_channel_fee_policy() -> RoutingFeePolicy {
+pub(super) fn direct_channel_fee_policy() -> RoutingFeePolicy {
     RoutingFeePolicy {
         minimum_msat: 0,
         proportional_millionths: 0,
@@ -70,7 +70,7 @@ async fn owner(app: &app::App, request: ControlRequest, incident: &str) {
     );
 }
 
-async fn elevate(app: &mut app::App, recipients: &[String]) {
+pub(super) async fn elevate(app: &mut app::App, recipients: &[String]) {
     use std::os::unix::fs::PermissionsExt;
     let scopes = app.refresh_token().await;
     assert_eq!(
@@ -171,7 +171,7 @@ async fn elevate(app: &mut app::App, recipients: &[String]) {
     assert_eq!(app.used(), 0, "{APPROVAL}: granting never spends");
 }
 
-async fn connect(from: &app::App, to: &app::App, incident: &str) {
+pub(super) async fn connect(from: &app::App, to: &app::App, incident: &str) {
     from.transport
         .connect(
             to.state.identity.node_id(),
@@ -319,7 +319,7 @@ async fn approve_contact(
     .await;
 }
 
-async fn list_contact(from: &app::App, to: &app::App, incident: &str) {
+pub(super) async fn list_contact(from: &app::App, to: &app::App, incident: &str) {
     let (status, body) = from
         .post(
             "/api/v1/peers",
@@ -413,6 +413,7 @@ async fn start_app(
         Some(app::Options {
             identity: Arc::new(NodeIdentity::from_mnemonic(&config.mnemonic, "").unwrap()),
             chain_url: chain_url.to_owned(),
+            calls: None,
         }),
     )
     .await
