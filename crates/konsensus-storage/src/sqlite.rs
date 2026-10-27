@@ -623,6 +623,13 @@ const PEERS_SELECT: &str =
 
 #[async_trait]
 impl Storage for SqliteStorage {
+    async fn record_upgrade_rows(&self, table: crate::record_upgrade::RecordTable, after: Option<&str>, limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {
+        crate::record_upgrade::sqlite::rows(&self.pool, table, after, limit).await
+    }
+    async fn record_upgrade_replace(&self, table: crate::record_upgrade::RecordTable, old: &crate::record_upgrade::RecordRow, new: &crate::record_upgrade::RecordRow) -> Result<bool, StorageError> {
+        crate::record_upgrade::sqlite::replace(&self.pool, table, old, new).await
+    }
+
     async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         crate::starter_request::sqlite::get(&self.pool, id).await
     }

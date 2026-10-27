@@ -288,7 +288,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     }
 
                     ControlEvent::MessageAcked { peer_id, message_id, privileged, paid_until_ms, .. } => {
-                        let cipher = konsensus_crypto::PlaintextCacheCipher::new(identity.aes_key());
+                        let cipher = konsensus_crypto::PlaintextCacheCipher::with_policy(identity.aes_key(), session_manager.record_policy());
                         handle_delivery_confirmation(&peer_id, &message_id, None, privileged,
                             identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget, paid_until_ms.map(|until| (until, &cipher))).await;
                     }

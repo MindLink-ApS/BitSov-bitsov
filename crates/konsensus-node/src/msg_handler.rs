@@ -577,7 +577,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 }
                                 let committed = async {
                                     let bytes = serde_json::to_vec(&identity).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
-                                    let cached = plaintext_cipher.encrypt(&bytes).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+                                    let cached = plaintext_cipher.encrypt(&msg_id.to_hex(), &bytes).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
                                     storage_for_recv.store_message_plaintext(&msg_id, &cached).await?;
                                     block.commit().await
                                 }.await;
@@ -881,7 +881,7 @@ async fn decrypt_and_process(
     };
 
     // Cache decrypted plaintext (encrypted at rest) for API access
-    match plaintext_cipher.encrypt(&bytes) {
+    match plaintext_cipher.encrypt(&envelope.id.to_hex(), &bytes) {
         Ok(encrypted) => {
             if let Err(e) = storage
                 .store_message_plaintext(&envelope.id, &encrypted)

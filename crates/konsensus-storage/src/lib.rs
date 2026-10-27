@@ -5,6 +5,7 @@
 pub mod calendar;
 pub mod contacts;
 pub mod encrypted;
+pub mod record_upgrade;
 pub mod error;
 pub mod fiat_snapshots;
 pub mod models;
