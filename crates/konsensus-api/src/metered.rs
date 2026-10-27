@@ -269,6 +269,8 @@ impl Debit {
         self
     }
 
+    pub(crate) fn is_call_block(&self) -> bool { self.call_block.is_some() }
+
     pub(crate) fn invoice_purpose(&self) -> String {
         self.call_block.as_ref().and_then(|(_, plaintext)|
             konsensus_core::payloads::call::CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, plaintext).ok()

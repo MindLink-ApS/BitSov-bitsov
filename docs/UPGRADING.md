@@ -3,6 +3,15 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## Call-block invoice provenance (migration 037)
+
+Migration **037** adds invoice-hash bindings to `(peer, call_id, seq)` on
+SQLite and PostgreSQL. It is additive and idempotent, with no down migration.
+Keep a consistent database backup before upgrading: an older SQLite binary
+that does not know version 037 refuses the upgraded database (`VersionMissing`).
+Returning to that binary requires restoring the pre-upgrade database; do not
+delete migration history or invoice bindings to bypass the check.
+
 ## rc18 → rc19
 
 rc19 is rc18 (`20c6449e`) plus #330, #332, #333, #334, #335, #337, #339,

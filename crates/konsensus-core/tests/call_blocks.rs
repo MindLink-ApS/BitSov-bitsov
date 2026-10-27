@@ -136,6 +136,26 @@ fn call_blocks_outgoing_reservations_settle_once_and_honour_late_payment() {
 }
 
 #[test]
+fn live_block_commit_not_due_retains_the_reservation() {
+    let caller = CallEntry { side: calls::Side::Caller, ..answered() };
+    let first = calls::commit(
+        calls::reserve_block(Some(caller), 0, "first", "hash", 1_000).unwrap(),
+        "first", 1_000,
+    ).unwrap();
+    let pending = calls::reserve_block(Some(first), 1, "renewal", "hash", 41_000).unwrap();
+    // A delayed grant for block zero moves its boundary while block one is
+    // paying. A backwards clock step can make the same reservation NotDue.
+    for (paid_until_ms, deadline_ms, now) in [(Some(91_000), 101_000, 41_001), (Some(61_000), 71_000, 40_999)] {
+        let pending = CallEntry { paid_until_ms, deadline_ms, ..pending.clone() };
+        assert_eq!(calls::commit(pending.clone(), "renewal", now), Err(CallRefusal::NotDue));
+        assert_eq!(calls::reserve_block(Some(pending.clone()), 1, "second-payment", "hash", 71_000), Err(CallRefusal::InFlight));
+        let committed = calls::commit(pending, "renewal", 71_000).unwrap();
+        assert_eq!(committed.next_block_seq, 2);
+        assert!(committed.pending.is_none());
+    }
+}
+
+#[test]
 fn unpaid_hangup_notification_never_reopens_an_ended_call() {
     let ended = answered().at(31_001).unwrap();
     let pending = calls::reserve_unpaid_hangup(Some(ended), "timeout", "hash").unwrap();

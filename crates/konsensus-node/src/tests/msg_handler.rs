@@ -2873,14 +2873,20 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
         let (wallet, sessions_a, alice, bob, db) =
             (wallet.clone(), &sessions_a, alice.clone(), bob.clone(), db.clone());
         async move {
-            let hash = wallet.inject_inbound_keysend(msat, None).await;
-            // These fixtures model block invoices issued before settlement/delivery.
-            if kind == 404 {
+            let hash = if kind == 404 {
+                // Issue and bind a real invoice before paying it. These fixtures
+                // model issuance before the delayed settlement/delivery below.
+                let invoice = wallet.create_invoice(msat, "call block",
+                    konsensus_core::payloads::call::CALL_BLOCK_INVOICE_EXPIRY_SECS).await.unwrap();
                 let block = konsensus_core::payloads::call::CallSignal::parse(404, &body).unwrap();
                 db.record_call_block_invoice(alice.node_id(), &block.call_id, block.seq.unwrap(),
-                    &hex::decode(&hash).unwrap().try_into().unwrap(),
+                    &hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap(),
                     chrono::Utc::now().timestamp_millis() as u64 + 120_000).await.unwrap();
-            }
+                wallet.pay_invoice(&invoice.bolt11).await.unwrap();
+                invoice.payment_hash
+            } else {
+                wallet.inject_inbound_keysend(msat, None).await
+            };
             let payment = wallet.get_payment_status(&hash).await.unwrap();
             let proof = PaymentProof::new(
                 hex::decode(&hash).unwrap().try_into().unwrap(),

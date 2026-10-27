@@ -1817,9 +1817,20 @@ impl Storage for PostgresStorage {
 
     async fn record_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32], retain_until_ms: u64) -> Result<(), StorageError> {
         let until = i64::try_from(retain_until_ms).map_err(|_| StorageError::Conversion("call invoice time overflow".into()))?;
-        sqlx::query("INSERT INTO call_block_invoices (payment_hash, peer, call_id, seq, retain_until_ms) VALUES ($1, $2, $3, $4, $5)")
+        let mut tx = self.pool.begin().await?;
+        // Serialize issuance for this tuple even when it has no rows yet.
+        // The following statement gets a fresh snapshot after the lock wait.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("call_block_invoice:{}:{call_id}:{seq}", peer.to_hex()))
+            .execute(&mut *tx).await?;
+        let inserted = sqlx::query("INSERT INTO call_block_invoices (payment_hash, peer, call_id, seq, retain_until_ms) SELECT $1, $2, $3, $4, $5 WHERE (SELECT COUNT(*) FROM call_block_invoices WHERE peer = $2 AND call_id = $3 AND seq = $4) < $6")
             .bind(hex::encode(payment_hash)).bind(peer.to_hex()).bind(call_id).bind(i64::from(seq)).bind(until)
-            .execute(&self.pool).await?;
+            .bind(i64::from(konsensus_core::payloads::call::MAX_CALL_BLOCK_INVOICES))
+            .execute(&mut *tx).await?;
+        if inserted.rows_affected() == 0 {
+            return Err(StorageError::Conversion("call block invoice capacity reached".into()));
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1834,8 +1845,11 @@ impl Storage for PostgresStorage {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
         // Reclaim legacy caller reservations once no interval can be resumed.
         // The independent outbox operation retains all payment evidence.
-        sqlx::query("UPDATE call_state SET pending_operation_id = NULL, pending_kind = NULL, pending_request_hash = NULL WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE phase = 'ended' AND side = 'caller' AND pending_kind = 404 AND pending_operation_id IS NOT NULL AND (end_reason IS NULL OR end_reason <> 'unpaid' OR deadline_ms - 86400000 + 60000 < $1) ORDER BY deadline_ms LIMIT $2)")
-            .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
+        sqlx::query("UPDATE call_state SET pending_operation_id = NULL, pending_kind = NULL, pending_request_hash = NULL WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE phase = 'ended' AND side = 'caller' AND pending_kind = 404 AND pending_operation_id IS NOT NULL AND (end_reason IS NULL OR end_reason <> 'unpaid' OR deadline_ms - $3 + $4 < $1) ORDER BY deadline_ms LIMIT $2)")
+            .bind(now).bind(i64::from(max))
+            .bind(konsensus_core::payloads::call::TOMBSTONE_MS as i64)
+            .bind(konsensus_core::payloads::call::CALL_BLOCK_RESUME_MS as i64)
+            .execute(&self.pool).await?;
         sqlx::query("DELETE FROM call_block_invoices WHERE payment_hash IN (SELECT payment_hash FROM call_block_invoices WHERE retain_until_ms < $1 ORDER BY retain_until_ms LIMIT $2)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
         let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= $1 AND (pending_operation_id IS NULL OR (phase = 'ended' AND side = 'caller' AND pending_kind = 404)) ORDER BY replay_until_ms LIMIT $2)")

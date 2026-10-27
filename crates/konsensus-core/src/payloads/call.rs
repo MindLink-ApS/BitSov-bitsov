@@ -32,6 +32,9 @@ pub const CALL_BLOCK_RESUME_MS: u64 = 60_000;
 pub const CALL_BLOCK_INVOICE_EXPIRY_SECS: u32 = 5;
 /// Invoice requests carry the call and sequence so the callee checks its clock.
 pub const CALL_BLOCK_INVOICE_PREFIX: &str = "konsensus:call_block:";
+/// Maximum outstanding invoice bindings per peer, call and block sequence.
+/// Refuse further issuance without evicting a hash that may already be paid.
+pub const MAX_CALL_BLOCK_INVOICES: u32 = 8;
 /// Longest continuously paid call.
 pub const MAX_CALL_MS: u64 = 4 * 60 * 60 * 1000;
 /// How long an ended or expired call id stays burned.
@@ -417,7 +420,7 @@ pub fn reserve(entry: Option<CallEntry>, kind: u16, operation_id: &str, request_
 }
 
 /// The reserved signal's payment settled: publish its transition. An unserviceable
-/// caller block clears its reservation; the outbox journal retains payment evidence
+/// ended caller block clears its reservation; the outbox journal retains payment evidence
 /// and delivery still lets the callee grant service or audit an overpayment.
 pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> Result<CallEntry, CallRefusal> {
     let Some(p) = entry.pending.clone().filter(|p| p.operation_id == operation_id) else {
@@ -443,7 +446,7 @@ pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> Result<CallE
             } else {
                 match apply_block(cleared.clone(), cleared.next_block_seq, now_ms) {
                     Ok(next) => next,
-                    Err(_) if cleared.side == Side::Caller => cleared,
+                    Err(_) if cleared.side == Side::Caller && cleared.phase == Phase::Ended => cleared,
                     Err(e) => return Err(e),
                 }
             }

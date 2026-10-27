@@ -8,6 +8,96 @@ use konsensus_storage::{SqliteStorage, Storage};
 
 const ID: &str = "0123456789abcdef0123456789abcdef";
 
+// SQLx must progress on another worker while the invoice responder records
+// the callee's binding. The wallet supports keysend, as a real LN peer does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn known_ln_peer_call_block_uses_bound_invoice_and_is_admitted() {
+    use axum::{body::Body, http::Request};
+    use konsensus_core::traits::lightning::LightningProvider;
+    use konsensus_lightning::MockLightningProvider;
+    use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+    use tower::ServiceExt;
+
+    let payer = Arc::new(MockLightningProvider::new());
+    let payee = Arc::new(MockLightningProvider::new());
+    let initial_balance = payer.get_balance_msat().await.unwrap();
+    let mut state = common::test_state_with_lightning(payer.clone());
+    let (_, identity) = konsensus_core::NodeIdentity::generate().unwrap();
+    let peer = *identity.node_id();
+    let caller_id = *state.identity.node_id();
+    let callee_store = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let invoice_store = callee_store.clone();
+    let invoices = Arc::new(AtomicUsize::new(0));
+    let observed = invoices.clone();
+    // The mock's advertised pubkey is a placeholder; advertise the identity
+    // that actually signs its BOLT11s, as LightningInfo does for a real wallet.
+    let identity_invoice = payee.create_invoice(1_000, "identity", 60).await.unwrap();
+    let ln_pubkey = identity_invoice.bolt11.parse::<lightning_invoice::Bolt11Invoice>()
+        .unwrap().recover_payee_pub_key().to_string();
+    let transport = Arc::new(
+        common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone())
+            .with_invoice_responder(move |_, amount| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let invoice = futures::executor::block_on(async {
+                    let now = chrono::Utc::now().timestamp_millis() as u64;
+                    let entry = invoice_store.call_get(&caller_id, ID).await.unwrap().unwrap();
+                    rules::validate_block_invoice(&entry, 0, now).unwrap();
+                    let invoice = payee.create_invoice(amount, "call block", rules::CALL_BLOCK_INVOICE_EXPIRY_SECS).await.unwrap();
+                    invoice_store.record_call_block_invoice(&caller_id, ID, 0,
+                        &hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap(),
+                        entry.deadline_ms + rules::CALL_BLOCK_RESUME_MS).await.unwrap();
+                    invoice
+                });
+                Some(konsensus_api::state::InvoiceResponseData {
+                    recipient: peer, bolt11: invoice.bolt11, payment_hash: invoice.payment_hash,
+                })
+            }),
+    );
+    let mutable = Arc::get_mut(&mut state).unwrap();
+    mutable.transport = transport.clone();
+    mutable.storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    // LightningInfo fills this map in a money-ready connection.
+    state.peer_ln_pubkeys.lock().await.insert(peer, ln_pubkey);
+    let target = konsensus_crypto::SessionManager::new(Arc::new(identity));
+    state.session_manager.initiate_session(&peer, &target.prekey_bundle().await).await.unwrap();
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let caller = rules::receive(Some(rules::commit(
+        rules::reserve(None, 400, "offer", "hash", now).unwrap(), "offer", now,
+    ).unwrap()), 401, None, now).unwrap();
+    callee_store.call_put(&caller_id, ID, &rules::CallEntry { side: rules::Side::Callee, ..caller.clone() }).await.unwrap();
+    state.storage.call_put(&peer, ID, &caller).await.unwrap();
+    let plaintext = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
+    let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
+        .header("authorization", common::auth_header(&state)).header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"operation_id":uuid::Uuid::new_v4().to_string(),"recipient":peer.to_hex(),"kind":404,"plaintext":plaintext,"wait_ack_ms":0}).to_string())).unwrap();
+    let quote = async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        state.peer_prices.update_kind_price(peer, 404, 23_000, 850_000).await;
+    };
+    let (response, ()) = tokio::join!(common::test_router(state.clone()).oneshot(request), quote);
+    let response = response.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    assert_eq!(status, axum::http::StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(invoices.load(Ordering::SeqCst), 1, "known LN peers must still request the block invoice");
+    let purposes: Vec<_> = transport.raw_frames.lock().unwrap().iter().filter_map(|bytes| {
+        match konsensus_message::wire::Frame::from_bytes(bytes).unwrap() {
+            konsensus_message::wire::Frame::RequestInvoice { purpose, .. } => Some(purpose),
+            _ => None,
+        }
+    }).collect();
+    assert_eq!(purposes, vec![format!("konsensus:call_block:{ID}:0")]);
+    assert_eq!(initial_balance - payer.get_balance_msat().await.unwrap(), 23_000);
+    let envelopes = transport.sent_envelopes.lock().unwrap().clone();
+    let blocks: Vec<_> = envelopes.iter().filter(|(_, envelope)| envelope.kind == 404).collect();
+    assert_eq!(blocks.len(), 1);
+    let hash = &blocks[0].1.payment_proof.payment_hash;
+    assert!(callee_store.has_call_block_invoice(&caller_id, ID, 0, hash).await.unwrap());
+    calls::prepare_incoming_block(callee_store.as_ref(), &caller_id, Some(&plaintext), hash)
+        .await.unwrap().commit().await.unwrap();
+    assert!(calls::call_media_admitted(callee_store.as_ref(), &caller_id, ID, now + 1).await);
+}
+
 #[tokio::test]
 async fn unpaid_notice_is_single_use_callee_only_and_reason_checked() {
     let store = SqliteStorage::in_memory().await.unwrap();
@@ -548,7 +638,8 @@ async fn callee_grant_resumes_caller_after_unpaid_notice_and_is_bound_to_paid_me
     // A peer cannot keep this row open with an unbounded ACK boundary.
     calls::receive_block_grant(&store, &konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]), &own, &peer, &envelope.id, u64::MAX).await.unwrap();
     assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(granted.clone()));
-    calls::receive_block_grant(&store, &konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]), &own, &peer, &envelope.id, now + 120_001).await.unwrap();
+    // Leave room for elapsed test time when checking the wall-clock cap.
+    calls::receive_block_grant(&store, &konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]), &own, &peer, &envelope.id, now + 125_000).await.unwrap();
     assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(granted.clone()));
     calls::receive_block_grant(&store, &konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]), &own, &peer, &envelope.id, now + 120_000).await.unwrap();
     assert_eq!(store.call_get(&peer, ID).await.unwrap().unwrap().paid_until_ms, Some(now + 120_000));
@@ -572,4 +663,99 @@ async fn callee_grant_resumes_caller_after_unpaid_notice_and_is_bound_to_paid_me
     store.call_put(&peer, ID, &hung_up).await.unwrap();
     calls::receive_block_grant(&store, &konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]), &own, &peer, &envelope.id, now + 60_000).await.unwrap();
     assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(hung_up));
+}
+
+#[tokio::test]
+async fn callee_grant_accepts_exact_resume_boundary_for_initial_and_renewal_blocks() {
+    use konsensus_core::{UkmEnvelopeBuilder, Recipient, PaymentProof};
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let own = NodeId::from_bytes([31; 32]);
+    let peer = NodeId::from_bytes([32; 32]);
+    let cipher = konsensus_crypto::PlaintextCacheCipher::new(&[33; 32]);
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    // Block zero: answered + 30s initial + 60s resume + 60s block.
+    // Renewal: previous paid boundary + 10s grace + 60s resume + 60s block.
+    for (seq, previous_paid, deadline, due) in [
+        (0, None, now - 60_000, now - 90_000),
+        (1, Some(now - 70_000), now - 60_000, now - 90_000),
+    ] {
+        let before = rules::CallEntry {
+            side: rules::Side::Caller, phase: Phase::Live, deadline_ms: deadline,
+            paid_until_ms: previous_paid, next_block_seq: seq,
+            pending: None, end_reason: None, unpaid_notice_used: false,
+        };
+        let callee = rules::CallEntry { side: rules::Side::Callee, ..before.clone() };
+        let grant = rules::receive_block(Some(callee), seq, now).unwrap();
+        assert_eq!(grant.paid_until_ms, Some(now + 60_000));
+        let committed = rules::commit(
+            rules::reserve_block(Some(before.clone()), seq, "block", "hash", due).unwrap(),
+            "block", due,
+        ).unwrap();
+        let envelope = UkmEnvelopeBuilder::new(404, own, Recipient::Node(peer), vec![], PaymentProof::new([34; 32], [35; 32], 23_000)).build();
+        store.store_message(&envelope).await.unwrap();
+        let mut op = konsensus_storage::OutboxOperation::prepared(format!("boundary-{seq}"), peer.to_hex(), 404, "request".into());
+        op.state = "sent".into();
+        op.message_id = Some(envelope.id.to_hex());
+        op.recovery = serde_json::to_vec(&serde_json::json!({
+            "call_block": [ID, seq], "dispatched": true, "expected_msat": 23_000,
+            "fee_ceiling_msat": 0, "admission_msat": 0,
+        })).unwrap();
+        store.insert_outbox_operation(&op).await.unwrap();
+        store.queue_pending_delivery(&envelope.id, &peer).await.unwrap();
+        store.mark_pending_sent(&envelope.id, &peer).await.unwrap();
+        // Cover both sides of local commit, with and without the expiry sweep.
+        for row in [before.clone(), before.at(now).unwrap(), committed.clone(), committed.at(now).unwrap()] {
+            store.call_put(&peer, ID, &row).await.unwrap();
+            calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 60_001).await.unwrap();
+            assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(row));
+            calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 60_000).await.unwrap();
+            let accepted = store.call_get(&peer, ID).await.unwrap().unwrap();
+            assert_eq!(accepted.paid_until_ms, Some(now + 60_000), "seq {seq}");
+            assert_eq!(accepted.next_block_seq, seq + 1);
+            assert!(accepted.media_admitted(now + 59_999));
+        }
+    }
+}
+
+#[tokio::test]
+async fn callee_grant_clears_only_its_own_pending_block() {
+    use konsensus_core::{UkmEnvelopeBuilder, Recipient, PaymentProof};
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let own = NodeId::from_bytes([41; 32]);
+    let peer = NodeId::from_bytes([42; 32]);
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let before = rules::CallEntry {
+        side: rules::Side::Caller, phase: Phase::Live, deadline_ms: now + 60_000,
+        paid_until_ms: Some(now + 50_000), next_block_seq: 1,
+        pending: None, end_reason: None, unpaid_notice_used: false,
+    };
+    let pending = rules::reserve_block(Some(before), 1, "block-grant", "request", now + 30_000).unwrap();
+    // Dispatch happened on time, but a backwards clock step makes the local
+    // commit NotDue. Recovery can still deliver the paid envelope to the callee.
+    assert_eq!(rules::commit(pending.clone(), "block-grant", now), Err(rules::CallRefusal::NotDue));
+    store.call_put(&peer, ID, &pending).await.unwrap();
+    let envelope = UkmEnvelopeBuilder::new(404, own, Recipient::Node(peer), vec![], PaymentProof::new([44; 32], [45; 32], 23_000)).build();
+    store.store_message(&envelope).await.unwrap();
+    let mut op = konsensus_storage::OutboxOperation::prepared("block-grant".into(), peer.to_hex(), 404, "request".into());
+    op.state = "sent".into();
+    op.message_id = Some(envelope.id.to_hex());
+    op.recovery = serde_json::to_vec(&serde_json::json!({
+        "call_block": [ID, 1], "dispatched": true, "expected_msat": 23_000,
+        "fee_ceiling_msat": 0, "admission_msat": 0,
+    })).unwrap();
+    store.insert_outbox_operation(&op).await.unwrap();
+    store.queue_pending_delivery(&envelope.id, &peer).await.unwrap();
+    store.mark_pending_sent(&envelope.id, &peer).await.unwrap();
+    let cipher = konsensus_crypto::PlaintextCacheCipher::new(&[43; 32]);
+    calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 110_000).await.unwrap();
+    let granted = store.call_get(&peer, ID).await.unwrap().unwrap();
+    assert_eq!(granted.next_block_seq, 2);
+    assert!(granted.pending.is_none(), "the grant completes its paid reservation");
+    assert_eq!(rules::commit(granted.clone(), "block-grant", now + 90_000).unwrap(), granted,
+        "recovery must not apply an extra block without payment");
+    let renewal = rules::reserve_block(Some(granted), 2, "next-block", "next-request", now + 90_000).unwrap();
+    store.call_put(&peer, ID, &renewal).await.unwrap();
+    calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 110_000).await.unwrap();
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(renewal),
+        "a delayed duplicate grant must preserve the next payment's reservation");
 }

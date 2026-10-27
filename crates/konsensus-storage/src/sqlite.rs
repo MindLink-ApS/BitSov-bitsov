@@ -1728,9 +1728,15 @@ impl Storage for SqliteStorage {
 
     async fn record_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32], retain_until_ms: u64) -> Result<(), StorageError> {
         let until = i64::try_from(retain_until_ms).map_err(|_| StorageError::Conversion("call invoice time overflow".into()))?;
-        sqlx::query("INSERT INTO call_block_invoices (payment_hash, peer, call_id, seq, retain_until_ms) VALUES (?, ?, ?, ?, ?)")
+        // One write statement keeps the count and insertion atomic across connections.
+        let inserted = sqlx::query("INSERT INTO call_block_invoices (payment_hash, peer, call_id, seq, retain_until_ms) SELECT ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM call_block_invoices WHERE peer = ? AND call_id = ? AND seq = ?) < ?")
             .bind(hex::encode(payment_hash)).bind(peer.to_hex()).bind(call_id).bind(i64::from(seq)).bind(until)
+            .bind(peer.to_hex()).bind(call_id).bind(i64::from(seq))
+            .bind(i64::from(konsensus_core::payloads::call::MAX_CALL_BLOCK_INVOICES))
             .execute(&self.pool).await?;
+        if inserted.rows_affected() == 0 {
+            return Err(StorageError::Conversion("call block invoice capacity reached".into()));
+        }
         Ok(())
     }
 
@@ -1745,7 +1751,9 @@ impl Storage for SqliteStorage {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
         // Reclaim legacy caller reservations once no interval can be resumed.
         // The independent outbox operation retains all payment evidence.
-        sqlx::query("UPDATE call_state SET pending_operation_id = NULL, pending_kind = NULL, pending_request_hash = NULL WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE phase = 'ended' AND side = 'caller' AND pending_kind = 404 AND pending_operation_id IS NOT NULL AND (end_reason IS NULL OR end_reason <> 'unpaid' OR deadline_ms - 86400000 + 60000 < ?) ORDER BY deadline_ms LIMIT ?)")
+        sqlx::query("UPDATE call_state SET pending_operation_id = NULL, pending_kind = NULL, pending_request_hash = NULL WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE phase = 'ended' AND side = 'caller' AND pending_kind = 404 AND pending_operation_id IS NOT NULL AND (end_reason IS NULL OR end_reason <> 'unpaid' OR deadline_ms - ? + ? < ?) ORDER BY deadline_ms LIMIT ?)")
+            .bind(konsensus_core::payloads::call::TOMBSTONE_MS as i64)
+            .bind(konsensus_core::payloads::call::CALL_BLOCK_RESUME_MS as i64)
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
         sqlx::query("DELETE FROM call_block_invoices WHERE payment_hash IN (SELECT payment_hash FROM call_block_invoices WHERE retain_until_ms < ? ORDER BY retain_until_ms LIMIT ?)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;

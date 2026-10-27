@@ -511,11 +511,11 @@ pub(crate) async fn create_metered_payment_proof(
     // The payment gate accepts overpayment, so this is safe.
     let payment_amount_msat = price_msat.max(MIN_INVOICE_AMOUNT_MSAT);
 
-    // Try keysend first — eliminates the invoice round-trip. A caller that
-    // forbids re-admission must ask the recipient for an invoice so its live
-    // connection gate can refuse before any payment is dispatched.
+    // Call blocks require the callee's stop-early check and invoice binding.
+    // A caller that forbids re-admission also needs the recipient's invoice
+    // gate to refuse before any payment is dispatched.
     let peer_ln_pubkey = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
-    if !readmission.forbidden {
+    if !debit.is_call_block() && !readmission.forbidden {
         if let Some(ln_pubkey) = peer_ln_pubkey {
             match try_keysend(state, &ln_pubkey, payment_amount_msat, peer_id, debit).await {
                 Ok(KeysendOutcome::Settled(proof)) => return Ok(proof),

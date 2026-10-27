@@ -597,22 +597,32 @@ pub async fn receive_block_grant(store: Store<'_>, cipher: &konsensus_crypto::Pl
         || !(entry.phase == rules::Phase::Live || (entry.phase == rules::Phase::Ended && entry.end_reason == Some(rules::HangupReason::Unpaid))) {
         return Ok(());
     }
-    // The callee may account for delayed settlement, but may not hold our slot
-    // indefinitely. Ignore grants more than one block beyond our expected end.
+    // The callee can receive at the last millisecond of the pre-block resume
+    // window and grant a full block from there. Reconstruct that deadline if
+    // our local commit has already advanced the paid boundary by one block.
     let deadline = if entry.phase == rules::Phase::Ended {
         entry.deadline_ms.saturating_sub(rules::TOMBSTONE_MS)
     } else { entry.deadline_ms };
-    let expected = if entry.next_block_seq == seq {
-        entry.paid_until_ms.unwrap_or_else(|| deadline.saturating_sub(rules::CALL_BLOCK_INITIAL_MS))
-            .saturating_add(rules::CALL_BLOCK_MS)
-    } else { entry.paid_until_ms.unwrap_or(deadline) };
-    let maximum = expected.saturating_add(rules::CALL_BLOCK_MS)
+    let pre_block_end = if entry.next_block_seq == seq {
+        deadline
+    } else {
+        entry.paid_until_ms.unwrap_or_else(|| deadline.saturating_sub(rules::CALL_BLOCK_GRACE_MS))
+            .saturating_sub(rules::CALL_BLOCK_MS)
+            .saturating_add(if seq == 0 { rules::CALL_BLOCK_INITIAL_MS } else { rules::CALL_BLOCK_GRACE_MS })
+    };
+    let maximum = pre_block_end.saturating_add(rules::CALL_BLOCK_RESUME_MS)
+        .saturating_add(rules::CALL_BLOCK_MS)
         .min(now_ms().saturating_add(2 * rules::CALL_BLOCK_MS));
     if paid_until_ms > maximum { return Ok(()); }
     // A repeated receipt is idempotent and cannot move a boundary backwards.
     if entry.paid_until_ms.is_some_and(|until| until > paid_until_ms) { return Ok(()); }
+    // Recovery may deliver a paid block whose local commit was NotDue. Its
+    // grant completes that reservation; retaining it could apply the next
+    // sequence again. An older ACK must leave a pending renewal untouched.
+    let pending = entry.pending.filter(|p| !(p.kind == konsensus_core::kind::KIND_CALL_BLOCK
+        && p.is(&op.operation_id, &op.request_hash)));
     let next = CallEntry { phase: rules::Phase::Live, paid_until_ms: Some(paid_until_ms),
         next_block_seq: seq.saturating_add(1), deadline_ms: paid_until_ms.saturating_add(rules::CALL_BLOCK_GRACE_MS),
-        end_reason: None, unpaid_notice_used: false, ..entry };
+        pending, end_reason: None, unpaid_notice_used: false, ..entry };
     store.call_put(peer, &call_id, &next).await
 }

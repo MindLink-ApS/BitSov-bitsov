@@ -1168,6 +1168,8 @@ pub trait Storage: Send + Sync {
 
     /// Bind an invoice hash to the peer and block before publishing it.
     /// Stored separately from replay receipts; duplicates cannot rebind a hash.
+    /// Refuse past MAX_CALL_BLOCK_INVOICES per (peer, call_id, seq), retaining
+    /// all issued bindings until their retention window has been swept.
     async fn record_call_block_invoice(&self, _peer: &NodeId, _call_id: &str, _seq: u32, _payment_hash: &[u8; 32], _retain_until_ms: u64) -> Result<(), StorageError> {
         Err(StorageError::Unsupported("call block invoice provenance".into()))
     }
