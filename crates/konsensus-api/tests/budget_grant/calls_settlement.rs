@@ -1,5 +1,114 @@
 use super::*;
 use konsensus_core::payloads::call as rules;
+use konsensus_storage::Storage;
+
+// The invoice responder persists the callee binding before publishing its
+// invoice. SQLx needs another worker while this synchronous callback waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bound_block_invoice_draws_once_across_delivery_and_operation_replay() {
+    bound_invoice_accounting(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overpayment_rejection_never_redraws_and_releases_the_unused_hold_once() {
+    bound_invoice_accounting(true).await;
+}
+
+async fn bound_invoice_accounting(overpayment: bool) {
+    let (mut fx, token) = prepared().await;
+    assert_eq!(send(&fx, &token, 400, 7000, 0).await.0, StatusCode::OK);
+    answer(&fx).await;
+    let peer = fx.peer;
+    let caller = *fx.state.identity.node_id();
+    let entry = fx.state.storage.call_get(&peer, CALL).await.unwrap().unwrap();
+    let callee = Arc::new(EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[9; 32]));
+    callee.call_put(&caller, CALL, &rules::CallEntry {
+        side: rules::Side::Callee, ..entry
+    }).await.unwrap();
+    let invoice_store = callee.clone();
+    let transport = Arc::new(ConnectedStubTransport::new(vec![peer], fx.state.invoice_requests.clone())
+        .with_invoice_responder(move |_, amount| {
+            let bolt11 = create_test_bolt11(amount);
+            let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse().unwrap();
+            futures::executor::block_on(async {
+                let entry = invoice_store.call_get(&caller, CALL).await.unwrap().unwrap();
+                rules::validate_block_invoice(&entry, 0, chrono::Utc::now().timestamp_millis() as u64).unwrap();
+                invoice_store.record_call_block_invoice(&caller, CALL, 0,
+                    &hex::decode(invoice.payment_hash().to_string()).unwrap().try_into().unwrap(),
+                    entry.deadline_ms + rules::CALL_BLOCK_RESUME_MS).await.unwrap();
+            });
+            Some(konsensus_api::state::InvoiceResponseData {
+                payment_hash: invoice.payment_hash().to_string(), recipient: peer, bolt11,
+            })
+        }));
+    fx.state = Arc::new(AppState { transport: transport.clone(), ..(*fx.state).clone() });
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let (status, body) = send_operation(&fx, &token, 404, 7000, 0, CALL, &operation_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let envelope = fx.state.storage.get_message(&id).await.unwrap().unwrap();
+    envelope.payment_proof.verify_preimage().unwrap();
+    assert!(callee.has_call_block_invoice(&caller, CALL, 0, &envelope.payment_proof.payment_hash).await.unwrap());
+    let purposes: Vec<_> = transport.raw_frames.lock().unwrap().iter().filter_map(|bytes| {
+        match konsensus_message::wire::Frame::from_bytes(bytes).unwrap() {
+            konsensus_message::wire::Frame::RequestInvoice { purpose, .. } => Some(purpose),
+            _ => None,
+        }
+    }).collect();
+    assert_eq!(purposes, vec![format!("konsensus:call_block:{CALL}:0")]);
+    if overpayment {
+        // The bound invoice was payable when issued, but delivery occurs after
+        // the resume window. The node receive-loop tests cover the durable
+        // audit and emit this terminal rejection for exactly this refusal.
+        let mut entry = callee.call_get(&caller, CALL).await.unwrap().unwrap();
+        entry.deadline_ms = chrono::Utc::now().timestamp_millis() as u64 - rules::CALL_BLOCK_RESUME_MS - 1;
+        callee.call_put(&caller, CALL, &entry).await.unwrap();
+    }
+    let plaintext = json!({"v": 1, "call_id": CALL, "seq": 0}).to_string();
+    let incoming = konsensus_api::calls::prepare_incoming_block(callee.as_ref(), &caller,
+        Some(&plaintext), &envelope.payment_proof.payment_hash).await.unwrap();
+    assert_eq!(incoming.refusal().is_some(), overpayment);
+    if overpayment {
+        drop(incoming);
+        assert!(fx.state.storage.reject_pending(&id, &peer, &caller, "call_block_overpayment", true).await.unwrap());
+        let entry = fx.state.storage.call_get(&peer, CALL).await.unwrap();
+        konsensus_api::calls::receive_block_grant(fx.state.storage.as_ref(),
+            &konsensus_crypto::PlaintextCacheCipher::new(&[7; 32]), &caller, &peer, &id,
+            chrono::Utc::now().timestamp_millis() as u64 + 60_000).await.unwrap();
+        assert_eq!(fx.state.storage.call_get(&peer, CALL).await.unwrap(), entry);
+    } else {
+        incoming.commit().await.unwrap();
+        assert!(konsensus_api::calls::call_media_admitted(callee.as_ref(), &caller, CALL,
+            chrono::Utc::now().timestamp_millis() as u64).await);
+    }
+    for _ in 0..2 {
+        let (status, replay) = send_operation(&fx, &token, 404, 7000, 0, CALL, &operation_id).await;
+        if overpayment { assert_eq!(replay["state"], "failed_paid", "{replay}"); }
+        else { assert_eq!(status, StatusCode::OK, "{replay}"); }
+        assert_ne!(send(&fx, &token, 404, 7000, 0).await.0, StatusCode::OK);
+        konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+        let hold = fx.service.call_spend_status(&peer.to_hex(), CALL).unwrap();
+        assert_eq!((hold.spent_msat, hold.remaining_msat, hold.released_msat), (7000, 413_000, 0));
+        assert_eq!((fx.wallet.money(), fx.wallet.left(), fx.used()), (2, 8000, 421_000));
+    }
+    if !overpayment {
+        assert!(fx.state.storage.acknowledge_pending(&id, &peer, &caller).await.unwrap());
+    }
+    let deadline = fx.state.storage.call_get(&peer, CALL).await.unwrap().unwrap().deadline_ms;
+    // Expiry plus repeated reconciliation must release the unused reservation,
+    // while retaining the settled principal even for an audited overpayment.
+    for _ in 0..2 {
+        konsensus_api::calls::expire_calls(fx.state.storage.as_ref(), deadline + 1).await.unwrap();
+        konsensus_api::calls::reconcile_call_spend(&fx.state, deadline + 1).await.unwrap();
+    }
+    let hold = fx.service.call_spend_status(&peer.to_hex(), CALL).unwrap();
+    assert!(hold.closed);
+    assert_eq!((hold.spent_msat, hold.remaining_msat, hold.released_msat), (7000, 0, 413_000));
+    assert_eq!((fx.wallet.money(), fx.wallet.left(), fx.used()), (2, 8000, 8000));
+    let budget = fx.service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert!(budget.pending.is_empty());
+    assert!(budget.operation_links.is_empty());
+}
 
 #[tokio::test]
 async fn delayed_paid_block_grant_reopens_call_with_its_original_hold() {
@@ -119,6 +228,10 @@ async fn delayed_paid_block_grant_reopens_call_with_its_original_hold() {
             .mark_pending_sent(&id, &fx.peer)
             .await
             .unwrap_or_else(|error| panic!("{variant}: {error}"));
+        // Even the 61-second-old local expiry can receive an honest delayed
+        // grant with 19 seconds left: the callee's original block-zero
+        // deadline + resume window + block. Use 10 seconds, not a fresh full
+        // minute that would exceed N1b's grant ceiling in that case.
         for _ in 0..2 {
             konsensus_api::calls::receive_block_grant(
                 fx.state.storage.as_ref(),
@@ -126,7 +239,7 @@ async fn delayed_paid_block_grant_reopens_call_with_its_original_hold() {
                 fx.state.identity.node_id(),
                 &fx.peer,
                 &id,
-                now + 60_000,
+                now + 10_000,
             )
             .await
             .unwrap();
@@ -370,7 +483,7 @@ async fn late_settlement(resume: bool) {
             .peer_ln_pubkeys
             .lock()
             .await
-            .insert(peer, PEER_LN.into());
+            .insert(peer, invoice_payee());
         assert_eq!(send(&fx, &token, 404, 7000, 1).await.0, StatusCode::OK);
         assert_eq!(
             fx.service

@@ -137,6 +137,14 @@ unpaid timeout notification or outstanding reservation can authorize media.
 
 `call_state` stores side, phase, effective deadline, replay deadline,
 `paid_until_ms`, next sequence, end reason, the Unpaid notice flag and any outgoing reservation.
+Migration 037 adds `call_block_invoices` for SQLite and PostgreSQL. Before
+publishing a short-lived block invoice, the callee durably binds its payment
+hash to the peer, call id and sequence. A generic invoice or keysend cannot
+admit a 404: its settled proof is consumed and audited as an overpayment.
+Bindings survive restarts and are swept after the call's resume window.
+Invoices issued before this upgrade have no binding and likewise become
+an audited overpayment if delivered after the upgrade.
+
 Migration 036 adds the notice flag for SQLite and PostgreSQL.
 Migration 035 adds paid intervals in SQLite and PostgreSQL; versions 033/034
 are reserved by the schema-parity and call-invite changes. Existing live
@@ -167,7 +175,10 @@ unsettled reservations; none are evicted. Burned ids have separate bounds
 of 256 per peer and 65 536 globally. Pressure may evict the oldest ids only
 after at least one hour of replay protection; otherwise tombstones remain
 for 24 hours after ending. Expired tombstones are swept in bounded batches;
-pending payment evidence is never swept as unpaid.
+ended caller reservations are released after explicit hangup or the bounded
+Unpaid resume window. The independent outbox journal retains payment evidence
+and drives delivery to the unchanged callee overpayment audit. Callee ACKs
+more than one block beyond the caller's expected boundary are ignored.
 
 Mesh meetings remain sets of ordinary pairwise calls with at most four
 participants. The earlier participant in the fixed roster places and pays

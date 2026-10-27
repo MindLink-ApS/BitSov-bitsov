@@ -1320,6 +1320,16 @@ async fn invoice_requested_creates_invoice_on_local_wallet() {
 }
 
 #[tokio::test]
+async fn generic_invoice_handler_cannot_issue_block_purpose_invoices() {
+    let lightning: Arc<dyn LightningProvider> = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    handle_invoice_requested(&test_peer_id(), "generic-block", 23_000,
+        "konsensus:call_block:0123456789abcdef0123456789abcdef:0", &lightning,
+        &make_gossip_test_transport(), "127.0.0.1".parse().unwrap(),
+        &mut crate::invoice_refusals::RefusalLimits::default()).await;
+    assert!(lightning.list_payments(10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn invoice_requested_sends_error_on_lightning_failure() {
     use konsensus_core::traits::lightning::{
         Invoice, LightningError, LightningProvider as LP, PaymentDetails,
@@ -4047,6 +4057,14 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
     let issued = prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, "block-ok", &wallet).await.unwrap();
     assert_eq!(issued.expiry_secs, 5);
+    let hash = hex::decode(&issued.payment_hash).unwrap().try_into().unwrap();
+    assert!(storage.has_call_block_invoice(&peer, id, 0, &hash).await.unwrap());
+    assert!(!storage.has_call_block_invoice(&peer, id, 1, &hash).await.unwrap());
+    // An unavailable provenance store withholds the invoice before any payment.
+    sqlx::query("CREATE TRIGGER fail_block_invoice BEFORE INSERT ON call_block_invoices BEGIN SELECT RAISE(FAIL, 'test'); END")
+        .execute(storage.pool()).await.unwrap();
+    assert_eq!(prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, "write-fails", &wallet).await.unwrap_err(),
+        konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
 }
 

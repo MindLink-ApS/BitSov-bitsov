@@ -387,12 +387,17 @@ impl IncomingBlock<'_> {
 /// Check a payment-validated block before consuming its nonce/payment proof.
 /// Retain the guard through acceptance and commit. An unserviceable settled
 /// block still consumes its proof and becomes an audited overpayment.
-pub async fn prepare_incoming_block<'a>(store: Store<'a>, peer: &NodeId, plaintext: Option<&str>) -> Result<IncomingBlock<'a>, CallRefusal> {
+pub async fn prepare_incoming_block<'a>(store: Store<'a>, peer: &NodeId, plaintext: Option<&str>, payment_hash: &[u8; 32]) -> Result<IncomingBlock<'a>, CallRefusal> {
     let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, plaintext.ok_or(CallRefusal::Invalid("undecryptable"))?)?;
     let guard = lock().lock().await;
     let now = now_ms();
     let entry = current(store, peer, &signal.call_id, now).await.map_err(|_| CallRefusal::Invalid("call state unavailable"))?;
-    let next = rules::receive_block(entry, signal.seq.ok_or(CallRefusal::Invalid("missing seq"))?, now);
+    let seq = signal.seq.ok_or(CallRefusal::Invalid("missing seq"))?;
+    let issued = store.has_call_block_invoice(peer, &signal.call_id, seq, payment_hash).await
+        .map_err(|_| CallRefusal::Invalid("call invoice provenance unavailable"))?;
+    let next = if issued { rules::receive_block(entry, seq, now) } else {
+        Err(CallRefusal::Invalid("call block paid through a non-block invoice"))
+    };
     Ok(IncomingBlock { _guard: guard, store, peer: *peer, signal, next })
 }
 
@@ -413,7 +418,7 @@ pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind:
         room(store, peer, now).await?;
     }
     let next = if kind == konsensus_core::kind::KIND_CALL_BLOCK {
-        rules::receive_block(entry, signal.seq.ok_or(CallRefusal::Invalid("missing seq"))?, now)?
+        return Err(CallRefusal::Invalid("call blocks require invoice-bound admission"));
     } else {
         rules::receive(entry, kind, signal.reason, now)?
     };
@@ -539,8 +544,8 @@ async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &s
 }
 
 /// Publish a paid call transition before queuing its envelope. A refused
-/// transition or failed write retains the pending evidence and fails the send;
-/// recovery can retry it without silently treating an ungranted block as sent.
+/// transition on the callee or a failed write fails the send. Ended caller
+/// reservations clear so the paid envelope can reach the callee's audit path.
 pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) -> Result<(), konsensus_storage::StorageError> {
     let signal = konsensus_core::wire_json::from_str::<CallSignal>(plaintext)
         .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
@@ -791,11 +796,33 @@ pub async fn receive_block_grant(store: Store<'_>, cipher: &konsensus_crypto::Pl
         || !(entry.phase == rules::Phase::Live || (entry.phase == rules::Phase::Ended && entry.end_reason == Some(rules::HangupReason::Unpaid))) {
         return Ok(());
     }
+    // The callee can receive at the last millisecond of the pre-block resume
+    // window and grant a full block from there. Reconstruct that deadline if
+    // our local commit has already advanced the paid boundary by one block.
+    let deadline = if entry.phase == rules::Phase::Ended {
+        entry.deadline_ms.saturating_sub(rules::TOMBSTONE_MS)
+    } else { entry.deadline_ms };
+    let pre_block_end = if entry.next_block_seq == seq {
+        deadline
+    } else {
+        entry.paid_until_ms.unwrap_or_else(|| deadline.saturating_sub(rules::CALL_BLOCK_GRACE_MS))
+            .saturating_sub(rules::CALL_BLOCK_MS)
+            .saturating_add(if seq == 0 { rules::CALL_BLOCK_INITIAL_MS } else { rules::CALL_BLOCK_GRACE_MS })
+    };
+    let maximum = pre_block_end.saturating_add(rules::CALL_BLOCK_RESUME_MS)
+        .saturating_add(rules::CALL_BLOCK_MS)
+        .min(now_ms().saturating_add(2 * rules::CALL_BLOCK_MS));
+    if paid_until_ms > maximum { return Ok(()); }
     // A repeated receipt is idempotent and cannot move a boundary backwards.
     if entry.paid_until_ms.is_some_and(|until| until > paid_until_ms) { return Ok(()); }
+    // Recovery may deliver a paid block whose local commit was NotDue. Its
+    // grant completes that reservation; retaining it could apply the next
+    // sequence again. An older ACK must leave a pending renewal untouched.
+    let pending = entry.pending.filter(|p| !(p.kind == konsensus_core::kind::KIND_CALL_BLOCK
+        && p.is(&op.operation_id, &op.request_hash)));
     let next = CallEntry { phase: rules::Phase::Live, paid_until_ms: Some(paid_until_ms),
         next_block_seq: seq.saturating_add(1), deadline_ms: paid_until_ms.saturating_add(rules::CALL_BLOCK_GRACE_MS),
-        end_reason: None, unpaid_notice_used: false, ..entry };
+        pending, end_reason: None, unpaid_notice_used: false, ..entry };
     store.call_put(peer, &call_id, &next).await
 }
 

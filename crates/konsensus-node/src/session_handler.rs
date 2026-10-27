@@ -1433,6 +1433,11 @@ async fn handle_invoice_requested(
         peer = %peer_id, %request_id, amount_msat, %purpose,
         "peer requested invoice — creating on our wallet"
     );
+    // Only the dedicated path may issue call-block-purpose invoices.
+    if purpose.starts_with(konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX) {
+        send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE).await;
+        return;
+    }
     let description = format!("konsensus:{request_id}");
     match lightning.create_invoice(amount_msat, &description, 3600).await {
         Ok(invoice) => {
@@ -2036,11 +2041,17 @@ async fn prepare_call_block_invoice(
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_millis() as u64;
         let entry = storage.call_get(peer, call_id).await.map_err(|_| REFUSED)?.ok_or(REFUSED)?;
-        calls::validate_block_invoice(&entry, seq, now).map_err(|_| REFUSED)
+        calls::validate_block_invoice(&entry, seq, now).map_err(|_| REFUSED)?;
+        Ok::<_, &'static str>(entry.deadline_ms.saturating_add(calls::CALL_BLOCK_RESUME_MS))
     };
     validate().await?;
     let invoice = lightning.create_invoice(amount_msat, &format!("konsensus:{request_id}"),
         calls::CALL_BLOCK_INVOICE_EXPIRY_SECS).await.map_err(invoice_refusal_reason)?;
+    let retain_until = validate().await?;
+    let hash: [u8; 32] = hex::decode(&invoice.payment_hash).map_err(|_| REFUSED)?
+        .try_into().map_err(|_| REFUSED)?;
+    storage.record_call_block_invoice(peer, call_id, seq, &hash, retain_until).await.map_err(|_| REFUSED)?;
+    // Storage can take time too. Never publish after the stop-early margin.
     validate().await?;
     Ok(invoice)
 }
