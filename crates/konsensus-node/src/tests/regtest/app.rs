@@ -333,6 +333,7 @@ impl App {
             stun_port: None,
         configured_stun_server: None,
             custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+            call_media: None,
             recovery_dir: None,
             gossip_validator: None,
             file_staging: Default::default(),

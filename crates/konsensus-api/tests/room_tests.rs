@@ -953,6 +953,7 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
         stun_port: None,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });

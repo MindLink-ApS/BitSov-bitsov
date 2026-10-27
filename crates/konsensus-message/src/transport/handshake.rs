@@ -462,7 +462,13 @@ pub(super) async fn connect_to_peer(
     if *ctx.shutdown.borrow() {
         return Err(TransportError::Other("transport shut down".into()));
     }
-    if ctx.peers.read().await.contains_key(peer) { return Ok(()); }
+    // Teardown closes the socket before asynchronously removing its map entry.
+    // A caller can already observe is_connected == false in that interval;
+    // only a live generation can satisfy this dial. Registration replaces a
+    // closed entry, and the old reader's cleanup cannot remove the replacement.
+    if ctx.peers.read().await.get(peer).is_some_and(|conn| !conn.is_closed()) {
+        return Ok(());
+    }
 
     let stream = tokio::net::TcpStream::connect(addr)
         .await
