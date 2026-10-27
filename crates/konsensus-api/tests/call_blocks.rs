@@ -22,7 +22,9 @@ async fn unpaid_notice_is_single_use_callee_only_and_reason_checked() {
     assert!(calls::admit_incoming(&store, &own, &peer, 403, Some(&unpaid)).await.is_err(), "caller cannot send the notice");
     let ended = rules::CallEntry { side: rules::Side::Caller, ..ended };
     store.call_put(&peer, ID, &ended).await.unwrap();
-    for reason in ["hangup", "timeout", "busy"] {
+    // An explicit hangup is covered by the late-termination regression below;
+    // unrelated reasons still cannot masquerade as the single-use Unpaid notice.
+    for reason in ["timeout", "busy"] {
         let body = format!(r#"{{"v":1,"call_id":"{ID}","reason":"{reason}"}}"#);
         assert!(calls::admit_incoming(&store, &own, &peer, 403, Some(&body)).await.is_err());
         assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(ended.clone()));
@@ -49,13 +51,14 @@ async fn block_admission_keeps_its_decision_through_acceptance_and_expiry() {
     store.call_put(&peer, ID, &entry).await.unwrap();
     let body = format!(r#"{{"v":1,"call_id":"{ID}","seq":0}}"#);
 
+    store.record_call_block_invoice(&peer, ID, 0, &[1; 32], deadline + 60_000).await.unwrap();
     // Aborting paid acceptance releases the lock without admitting media.
-    let prepared = calls::prepare_incoming_block(&store, &peer, Some(&body)).await.unwrap();
+    let prepared = calls::prepare_incoming_block(&store, &peer, Some(&body), &[1; 32]).await.unwrap();
     assert!(!calls::call_media_admitted(&store, &peer, ID, now).await);
     drop(prepared);
     assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(entry));
 
-    let prepared = calls::prepare_incoming_block(&store, &peer, Some(&body)).await.unwrap();
+    let prepared = calls::prepare_incoming_block(&store, &peer, Some(&body), &[1; 32]).await.unwrap();
     let expiry = calls::expire_calls(&store, deadline + 1);
     tokio::pin!(expiry);
     assert!(futures::poll!(&mut expiry).is_pending());
@@ -138,9 +141,12 @@ async fn incoming_block_and_outgoing_block_reservations_use_normal_call_admissio
     ).unwrap();
     store.call_put(&peer, ID, &entry).await.unwrap();
     let body = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
-    calls::admit_incoming(&store, &own, &peer, 404, Some(&body))
-        .await
-        .unwrap();
+    assert!(calls::admit_incoming(&store, &own, &peer, 404, Some(&body)).await.is_err());
+    let unbound = calls::prepare_incoming_block(&store, &peer, Some(&body), &[1; 32]).await.unwrap();
+    assert!(unbound.refusal().is_some());
+    drop(unbound);
+    store.record_call_block_invoice(&peer, ID, 0, &[1; 32], now + 90_000).await.unwrap();
+    calls::prepare_incoming_block(&store, &peer, Some(&body), &[1; 32]).await.unwrap().commit().await.unwrap();
     assert!(calls::call_media_admitted(&store, &peer, ID, now + 1).await);
     assert!(calls::admit_incoming(&store, &own, &peer, 404, Some(&body))
         .await
@@ -427,28 +433,82 @@ async fn unpaid_notice_reservation_survives_encrypted_storage_restart() {
 }
 
 #[tokio::test]
-async fn failed_paid_block_commit_preserves_pending_evidence() {
+async fn remote_hangup_during_block_payment_frees_slots_and_allows_next_call() {
     let store = SqliteStorage::in_memory().await.unwrap();
+    let own = NodeId::from_bytes([11; 32]);
     let peer = NodeId::from_bytes([10; 32]);
     let now = chrono::Utc::now().timestamp_millis() as u64;
-    let answered_at = now - 31_000;
-    let ringing = rules::commit(
-        rules::reserve(None, 400, "offer", "hash", answered_at).unwrap(),
-        "offer",
-        answered_at,
-    ).unwrap();
-    let answered = rules::receive(Some(ringing), 401, None, answered_at).unwrap();
-    let pending = rules::reserve_block(Some(answered), 0, "block", "hash", answered_at).unwrap();
-    let body = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
-    // Exercise both an unswept Live row and the durable Unpaid tombstone.
-    for entry in [pending.clone(), pending.at(now).unwrap()] {
-        // Explicit hangup is never resumable, even with a settled reservation.
-        let entry = rules::CallEntry { phase: Phase::Ended, end_reason: Some(HangupReason::Hangup), ..entry };
-        store.call_put(&peer, ID, &entry).await.unwrap();
-        assert!(calls::commit_outgoing(&store, &peer, &body, "block", "hash").await.is_err());
-        assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(entry),
-            "a rejected paid transition must retain its pending reconciliation evidence");
+    for index in 0..rules::MAX_OPEN_CALLS_PER_PEER {
+        let id = format!("{index:032x}");
+        let ringing = rules::commit(rules::reserve(None, 400, "offer", "hash", now).unwrap(), "offer", now).unwrap();
+        let answered = rules::receive(Some(ringing), 401, None, now).unwrap();
+        let pending = rules::reserve_block(Some(answered), 0, "block", "hash", now).unwrap();
+        store.call_put(&peer, &id, &pending).await.unwrap();
+        let hangup = format!(r#"{{"v":1,"call_id":"{id}","reason":"hangup"}}"#);
+        calls::admit_incoming(&store, &own, &peer, 403, Some(&hangup)).await.unwrap();
+        assert!(store.call_pending().await.unwrap().is_empty());
+        let body = format!(r#"{{"call_id":"{id}","seq":0}}"#);
+        calls::commit_outgoing(&store, &peer, &body, "block", "hash").await.unwrap();
+        let ended = store.call_get(&peer, &id).await.unwrap().unwrap();
+        assert_eq!(ended.phase, Phase::Ended);
+        assert_eq!(ended.end_reason, Some(HangupReason::Hangup));
+        assert!(!ended.media_admitted(now));
     }
+    assert_eq!(store.call_counts(&peer, now).await.unwrap().open_peer, 0);
+    let offer = format!(r#"{{"v":1,"call_id":"{ID}","media":"audio","sdp":"v=0"}}"#);
+    calls::reserve_outgoing(&store, &own, &peer, 400, &offer, "later", "later-hash").await.unwrap();
+    calls::commit_outgoing(&store, &peer, &offer, "later", "later-hash").await.unwrap();
+    let answer = format!(r#"{{"v":1,"call_id":"{ID}","sdp":"v=0"}}"#);
+    calls::admit_incoming(&store, &own, &peer, 401, Some(&answer)).await.unwrap();
+    assert_eq!(store.call_get(&peer, ID).await.unwrap().unwrap().phase, Phase::Live);
+}
+
+#[tokio::test]
+async fn explicit_hangup_after_local_unpaid_expiry_prevents_late_resume() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let own = NodeId::from_bytes([11; 32]);
+    let peer = NodeId::from_bytes([10; 32]);
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let ended = rules::CallEntry { side: rules::Side::Caller, phase: Phase::Ended,
+        deadline_ms: now - 1_000 + rules::TOMBSTONE_MS, paid_until_ms: None, next_block_seq: 0,
+        pending: Some(rules::Pending { operation_id: "block".into(), kind: 404, request_hash: "hash".into() }),
+        end_reason: Some(HangupReason::Unpaid), unpaid_notice_used: true };
+    store.call_put(&peer, ID, &ended).await.unwrap();
+    let hangup = format!(r#"{{"v":1,"call_id":"{ID}","reason":"hangup"}}"#);
+    calls::admit_incoming(&store, &own, &peer, 403, Some(&hangup)).await.unwrap();
+    let body = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
+    calls::commit_outgoing(&store, &peer, &body, "block", "hash").await.unwrap();
+    let actual = store.call_get(&peer, ID).await.unwrap().unwrap();
+    assert_eq!(actual.phase, Phase::Ended);
+    assert_eq!(actual.end_reason, Some(HangupReason::Hangup));
+    assert_eq!(actual.deadline_ms, ended.deadline_ms);
+    assert!(actual.pending.is_none());
+    assert_eq!(store.call_counts(&peer, now).await.unwrap().open_peer, 0);
+}
+
+#[tokio::test]
+async fn legacy_ended_pending_blocks_are_reclaimed_by_settlement_and_sweep() {
+    use konsensus_storage::EncryptedStorage;
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let peer = NodeId::from_bytes([10; 32]);
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let ended = rules::CallEntry { side: rules::Side::Caller, phase: Phase::Ended,
+        deadline_ms: now + rules::TOMBSTONE_MS, paid_until_ms: None, next_block_seq: 0,
+        pending: Some(rules::Pending { operation_id: "block".into(), kind: 404, request_hash: "hash".into() }),
+        end_reason: Some(HangupReason::Hangup), unpaid_notice_used: false };
+    let body = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
+    store.call_put(&peer, ID, &ended).await.unwrap();
+    calls::commit_outgoing(&store, &peer, &body, "block", "hash").await.unwrap();
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(rules::CallEntry { pending: None, ..ended.clone() }));
+    store.call_put(&peer, ID, &ended).await.unwrap();
+    store.call_sweep(now, 100).await.unwrap();
+    assert!(store.call_pending().await.unwrap().is_empty());
+    assert_eq!(store.call_counts(&peer, now).await.unwrap().open_peer, 0);
+    assert!(store.call_get(&peer, ID).await.unwrap().is_some(), "keep replay protection");
+    store.call_put(&peer, ID, &ended).await.unwrap();
+    store.call_sweep(now + 10 * rules::TOMBSTONE_MS, 100).await.unwrap();
+    assert!(store.call_get(&peer, ID).await.unwrap().is_none());
+    assert!(ended.at(now + 10 * rules::TOMBSTONE_MS).is_none());
 }
 
 #[tokio::test]
@@ -485,6 +545,14 @@ async fn callee_grant_resumes_caller_after_unpaid_notice_and_is_bound_to_paid_me
     assert!(granted.media_admitted(now + 59_999));
     calls::receive_block_grant(&store, &konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]), &own, &peer, &envelope.id, now + 60_000).await.unwrap();
     assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(granted.clone()));
+    // A peer cannot keep this row open with an unbounded ACK boundary.
+    calls::receive_block_grant(&store, &konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]), &own, &peer, &envelope.id, u64::MAX).await.unwrap();
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(granted.clone()));
+    calls::receive_block_grant(&store, &konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]), &own, &peer, &envelope.id, now + 120_001).await.unwrap();
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(granted.clone()));
+    calls::receive_block_grant(&store, &konsensus_crypto::PlaintextCacheCipher::new(&[23; 32]), &own, &peer, &envelope.id, now + 120_000).await.unwrap();
+    assert_eq!(store.call_get(&peer, ID).await.unwrap().unwrap().paid_until_ms, Some(now + 120_000));
+    store.call_put(&peer, ID, &granted).await.unwrap();
     // Upgrade recovery: a legacy pending block needs its cached plaintext;
     // a missing cache must retain the delivery instead of silently ACKing.
     let mut legacy = store.get_outbox_operation_by_message(&envelope.id).await.unwrap().unwrap();

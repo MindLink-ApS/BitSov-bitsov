@@ -197,6 +197,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (32, "starter queries", include_str!("../migrations/032_starter_queries.sql")),
     (35, "call blocks", include_str!("../migrations/035_call_blocks.sql")),
     (36, "call unpaid notice", include_str!("../migrations/036_call_unpaid_notice.sql")),
+    (37, "call block invoices", include_str!("../migrations/037_call_block_invoices.sql")),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -1725,9 +1726,30 @@ impl Storage for SqliteStorage {
         }).collect()
     }
 
+    async fn record_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32], retain_until_ms: u64) -> Result<(), StorageError> {
+        let until = i64::try_from(retain_until_ms).map_err(|_| StorageError::Conversion("call invoice time overflow".into()))?;
+        sqlx::query("INSERT INTO call_block_invoices (payment_hash, peer, call_id, seq, retain_until_ms) VALUES (?, ?, ?, ?, ?)")
+            .bind(hex::encode(payment_hash)).bind(peer.to_hex()).bind(call_id).bind(i64::from(seq)).bind(until)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn has_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32]) -> Result<bool, StorageError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_block_invoices WHERE payment_hash = ? AND peer = ? AND call_id = ? AND seq = ?")
+            .bind(hex::encode(payment_hash)).bind(peer.to_hex()).bind(call_id).bind(i64::from(seq))
+            .fetch_one(&self.pool).await?;
+        Ok(count == 1)
+    }
+
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
-        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= ? AND pending_operation_id IS NULL ORDER BY replay_until_ms LIMIT ?)")
+        // Reclaim legacy caller reservations once no interval can be resumed.
+        // The independent outbox operation retains all payment evidence.
+        sqlx::query("UPDATE call_state SET pending_operation_id = NULL, pending_kind = NULL, pending_request_hash = NULL WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE phase = 'ended' AND side = 'caller' AND pending_kind = 404 AND pending_operation_id IS NOT NULL AND (end_reason IS NULL OR end_reason <> 'unpaid' OR deadline_ms - 86400000 + 60000 < ?) ORDER BY deadline_ms LIMIT ?)")
+            .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
+        sqlx::query("DELETE FROM call_block_invoices WHERE payment_hash IN (SELECT payment_hash FROM call_block_invoices WHERE retain_until_ms < ? ORDER BY retain_until_ms LIMIT ?)")
+            .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
+        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= ? AND (pending_operation_id IS NULL OR (phase = 'ended' AND side = 'caller' AND pending_kind = 404)) ORDER BY replay_until_ms LIMIT ?)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
         Ok(done.rows_affected())
     }

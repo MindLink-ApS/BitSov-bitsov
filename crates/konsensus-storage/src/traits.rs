@@ -1166,7 +1166,19 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("call state".into()))
     }
 
-    /// Drop up to `max` entries whose replay protection ended, with no pending signal.
+    /// Bind an invoice hash to the peer and block before publishing it.
+    /// Stored separately from replay receipts; duplicates cannot rebind a hash.
+    async fn record_call_block_invoice(&self, _peer: &NodeId, _call_id: &str, _seq: u32, _payment_hash: &[u8; 32], _retain_until_ms: u64) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call block invoice provenance".into()))
+    }
+
+    /// Only a callee-issued block invoice can admit a 404. Unknown is not valid.
+    async fn has_call_block_invoice(&self, _peer: &NodeId, _call_id: &str, _seq: u32, _payment_hash: &[u8; 32]) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("call block invoice provenance".into()))
+    }
+
+    /// Reclaim stale ended reservations and drop up to `max` expired tombstones.
+    /// Also prune up to `max` invoice bindings past their call's resume window.
     async fn call_sweep(&self, _now_ms: u64, _max: u32) -> Result<u64, StorageError> {
         Ok(0)
     }

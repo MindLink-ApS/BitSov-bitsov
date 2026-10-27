@@ -357,15 +357,22 @@ impl CallEntry {
 
     /// The entry as of `now_ms`: a ringing/live/reserved call past its deadline
     /// is ended (its tombstone runs from the deadline); an expired tombstone is
-    /// gone. A pending payment survives expiry so it can still be settled or
-    /// released.
+    /// gone. Pending caller blocks survive only the bounded Unpaid resume
+    /// window; payment reconciliation lives independently in the outbox journal.
     pub fn at(self, now_ms: u64) -> Option<CallEntry> {
         match self.phase {
-            Phase::Ended if self.deadline_ms <= now_ms && self.pending.is_none() => None,
+            Phase::Ended if self.deadline_ms <= now_ms && (self.pending.is_none()
+                || (self.side == Side::Caller && self.pending.as_ref().is_some_and(|p| p.kind == KIND_CALL_BLOCK))) => None,
+            Phase::Ended if self.side == Side::Caller
+                && self.pending.as_ref().is_some_and(|p| p.kind == KIND_CALL_BLOCK)
+                && (self.end_reason != Some(HangupReason::Unpaid)
+                || now_ms > self.deadline_ms.saturating_sub(TOMBSTONE_MS).saturating_add(CALL_BLOCK_RESUME_MS)) => {
+                Some(CallEntry { pending: None, ..self })
+            }
             Phase::Ended => Some(self),
             _ if self.expired(now_ms) => {
                 let until = self.deadline_ms.saturating_add(TOMBSTONE_MS);
-                (until > now_ms || self.pending.is_some()).then_some(CallEntry { phase: Phase::Ended, deadline_ms: until, end_reason: Some(if self.phase == Phase::Live { HangupReason::Unpaid } else { HangupReason::Timeout }), ..self })
+                CallEntry { phase: Phase::Ended, deadline_ms: until, end_reason: Some(if self.phase == Phase::Live { HangupReason::Unpaid } else { HangupReason::Timeout }), ..self }.at(now_ms)
             }
             _ => Some(self),
         }
@@ -409,8 +416,9 @@ pub fn reserve(entry: Option<CallEntry>, kind: u16, operation_id: &str, request_
     }
 }
 
-/// The reserved signal's payment settled: publish its transition. A refused
-/// paid block is an error; the caller must retain its reconciliation evidence.
+/// The reserved signal's payment settled: publish its transition. An unserviceable
+/// caller block clears its reservation; the outbox journal retains payment evidence
+/// and delivery still lets the callee grant service or audit an overpayment.
 pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> Result<CallEntry, CallRefusal> {
     let Some(p) = entry.pending.clone().filter(|p| p.operation_id == operation_id) else {
         return Ok(entry);
@@ -433,7 +441,11 @@ pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> Result<CallE
                 CallEntry { phase: Phase::Ended, end_reason: Some(HangupReason::Unpaid),
                     deadline_ms: end.saturating_add(TOMBSTONE_MS), ..cleared }
             } else {
-                apply_block(cleared.clone(), cleared.next_block_seq, now_ms)?
+                match apply_block(cleared.clone(), cleared.next_block_seq, now_ms) {
+                    Ok(next) => next,
+                    Err(_) if cleared.side == Side::Caller => cleared,
+                    Err(e) => return Err(e),
+                }
             }
         },
         (KIND_CALL_HANGUP, Phase::Live) if cleared.side == Side::Callee && cleared.unpaid_notice_used => {
@@ -486,6 +498,12 @@ pub fn receive(entry: Option<CallEntry>, kind: u16, reason: Option<HangupReason>
                 return Err(CallRefusal::UnknownCall);
             }
             if e.phase == Phase::Ended {
+                if e.side == Side::Caller && e.end_reason == Some(HangupReason::Unpaid)
+                    && matches!(reason, Some(HangupReason::Hangup | HangupReason::Declined)) {
+                    // Explicit termination also wins after local expiry. Preserve
+                    // replay protection, but never resume on a later settlement.
+                    return Ok(CallEntry { pending: None, end_reason: reason, ..e });
+                }
                 if e.end_reason != Some(HangupReason::Unpaid)
                     || reason != Some(HangupReason::Unpaid)
                     || e.unpaid_notice_used
@@ -500,9 +518,10 @@ pub fn receive(entry: Option<CallEntry>, kind: u16, reason: Option<HangupReason>
                 // A delayed notice for an older interval cannot revoke settled service.
                 return Err(CallRefusal::UnknownCall);
             }
-            // Their hangup wins; a signal of ours still being paid keeps its
-            // mark so its settlement or release is still recorded.
-            Ok(CallEntry { phase: Phase::Ended, deadline_ms: now_ms.saturating_add(TOMBSTONE_MS), end_reason: reason, unpaid_notice_used: reason == Some(HangupReason::Unpaid), ..e })
+            // Explicit hangup wins. Reconciliation and callee overpayment auditing
+            // use the outbox journal, so an unserviceable call need not hold a slot.
+            let pending = if reason == Some(HangupReason::Unpaid) { e.pending.clone() } else { None };
+            Ok(CallEntry { phase: Phase::Ended, pending, deadline_ms: now_ms.saturating_add(TOMBSTONE_MS), end_reason: reason, unpaid_notice_used: reason == Some(HangupReason::Unpaid), ..e })
         }
         _ => Err(CallRefusal::NotCallKind),
     }

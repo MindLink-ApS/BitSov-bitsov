@@ -242,7 +242,11 @@ fn very_late_outgoing_settlement_still_delivers_for_callee_reconciliation() {
     let caller = CallEntry { side: calls::Side::Caller, ..answered() };
     let pending = calls::reserve_block(Some(caller), 0, "block", "hash", 1_000).unwrap();
     let now = 31_000 + calls::TOMBSTONE_MS + 1;
-    let paid = calls::commit(pending.at(now).unwrap(), "block", now).unwrap();
+    // The replay sweep may reclaim the row; the independent outbox journal
+    // still delivers its settled envelope for callee reconciliation.
+    assert!(pending.clone().at(now).is_none());
+    // A commit racing the sweep also clears the reservation without service.
+    let paid = calls::commit(pending, "block", now).unwrap();
     assert!(paid.pending.is_none(), "paid envelope can leave for reconciliation");
     assert_eq!(paid.next_block_seq, 0);
     assert!(!paid.media_admitted(now));
