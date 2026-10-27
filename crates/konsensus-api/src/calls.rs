@@ -177,7 +177,7 @@ pub struct IncomingBlock<'a> {
     store: Store<'a>,
     peer: NodeId,
     signal: CallSignal,
-    next: CallEntry,
+    next: Result<CallEntry, CallRefusal>,
 }
 
 impl IncomingBlock<'_> {
@@ -186,23 +186,26 @@ impl IncomingBlock<'_> {
         &self.signal
     }
 
+    pub fn refusal(&self) -> Option<&CallRefusal> { self.next.as_ref().err() }
+
     /// Publish only after the envelope's payment proof is accepted. Do not
     /// recheck time: expiry cannot race the admission decision under this lock.
     pub async fn commit(self) -> Result<CallSignal, konsensus_storage::StorageError> {
-        self.store.call_put(&self.peer, &self.signal.call_id, &self.next).await?;
+        let next = self.next.map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+        self.store.call_put(&self.peer, &self.signal.call_id, &next).await?;
         Ok(self.signal)
     }
 }
 
 /// Check a payment-validated block before consuming its nonce/payment proof.
-/// Retain the returned guard until acceptance and commit; a late block must
-/// be refused here, never after the gate has consumed its payment proof.
+/// Retain the guard through acceptance and commit. An unserviceable settled
+/// block still consumes its proof and becomes an audited overpayment.
 pub async fn prepare_incoming_block<'a>(store: Store<'a>, peer: &NodeId, plaintext: Option<&str>) -> Result<IncomingBlock<'a>, CallRefusal> {
     let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, plaintext.ok_or(CallRefusal::Invalid("undecryptable"))?)?;
     let guard = lock().lock().await;
     let now = now_ms();
     let entry = current(store, peer, &signal.call_id, now).await.map_err(|_| CallRefusal::Invalid("call state unavailable"))?;
-    let next = rules::receive_block(entry, signal.seq.ok_or(CallRefusal::Invalid("missing seq"))?, now)?;
+    let next = rules::receive_block(entry, signal.seq.ok_or(CallRefusal::Invalid("missing seq"))?, now);
     Ok(IncomingBlock { _guard: guard, store, peer: *peer, signal, next })
 }
 
@@ -325,22 +328,21 @@ async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &s
         return Ok(());
     }
     let next = match how {
-        Settlement::Paid => Some(rules::commit(entry, operation_id, now)),
+        Settlement::Paid => Some(rules::commit(entry, operation_id, now)
+            .map_err(|e| konsensus_storage::StorageError::Conversion(format!("paid call transition refused: {e}")))?),
         Settlement::Unpaid => rules::release(entry, operation_id),
         Settlement::Ambiguous => return Ok(()),
     };
     write(store, peer, call_id, next.as_ref()).await
 }
 
-/// The reserved signal's payment settled: publish its transition before the
-/// envelope goes out, so the peer's reply finds a paid call. Never fails the
-/// send (money already moved): a store error is logged and `resolve` or
-/// `recover` commits later from the operation journal.
-pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) {
-    let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else { return };
-    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, request_hash, Settlement::Paid).await {
-        tracing::warn!(peer = %peer, error = %e, "call commit after settlement failed; recovery will retry");
-    }
+/// Publish a paid call transition before queuing its envelope. A refused
+/// transition or failed write retains the pending evidence and fails the send;
+/// recovery can retry it without silently treating an ungranted block as sent.
+pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) -> Result<(), konsensus_storage::StorageError> {
+    let signal = konsensus_core::wire_json::from_str::<CallSignal>(plaintext)
+        .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+    settle(store, peer, &signal.call_id, operation_id, request_hash, Settlement::Paid).await
 }
 
 /// How the journal says this request's reservation ends. A journal entry of
@@ -542,4 +544,58 @@ pub async fn peer_call_kind_price(state: &AppState, peer: &NodeId, kind: u16) ->
     .map_err(|()| unknown())?;
     let height = state.chain.get_block_height().await.unwrap_or(0);
     state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, PRICE_ANSWER_MAX_AGE).await.ok_or_else(unknown)
+}
+
+/// Repeat the latest grant on duplicate delivery without extending it again.
+/// Older blocks cannot change the already more advanced caller state.
+pub async fn block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextCacheCipher, peer: &NodeId, id: &konsensus_core::MessageId) -> Result<Option<u64>, konsensus_storage::StorageError> {
+    let unavailable = || konsensus_storage::StorageError::Conversion("paid call grant metadata unavailable".into());
+    let cached = store.get_message_plaintext(id).await?.ok_or_else(unavailable)?;
+    let plaintext = cipher.decrypt(&cached).map_err(|_| unavailable())?;
+    let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, std::str::from_utf8(&plaintext).map_err(|_| unavailable())?).map_err(|_| unavailable())?;
+    let entry = store.call_get(peer, &signal.call_id).await?.ok_or_else(unavailable)?;
+    if entry.side != rules::Side::Callee || entry.next_block_seq != signal.seq.ok_or_else(unavailable)?.saturating_add(1)
+        || (entry.phase == rules::Phase::Ended && entry.end_reason != Some(rules::HangupReason::Unpaid)) { return Ok(None); }
+    Ok(entry.paid_until_ms)
+}
+
+/// Only a grant from the recipient of our stored, paid block can adjust its
+/// interval. It cannot open a new call or undo an explicit local/remote hangup.
+pub async fn receive_block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextCacheCipher, own: &NodeId, peer: &NodeId,
+    id: &konsensus_core::MessageId, paid_until_ms: u64,
+) -> Result<(), konsensus_storage::StorageError> {
+    if !store.is_pending_dispatched(id, peer, own).await? { return Ok(()); }
+    let Some(envelope) = store.get_message(id).await? else { return Ok(()) };
+    if envelope.kind != konsensus_core::kind::KIND_CALL_BLOCK || envelope.sender != *own
+        || envelope.recipient != konsensus_core::Recipient::Node(*peer) { return Ok(()); }
+    let mut op = store.get_outbox_operation_by_message(id).await?
+        .ok_or_else(|| konsensus_storage::StorageError::Conversion("paid block operation unavailable".into()))?;
+    let (call_id, seq) = match crate::handlers::messages::operations::call_block_binding(&op)? {
+        Some(binding) => binding,
+        None => {
+            // Pending blocks drafted by an earlier build can recover from their
+            // encrypted cache. Persist the binding before completing this ACK.
+            let unavailable = || konsensus_storage::StorageError::Conversion("legacy paid block binding unavailable".into());
+            let cached = store.get_message_plaintext(id).await?.ok_or_else(unavailable)?;
+            let plaintext = cipher.decrypt(&cached).map_err(|_| unavailable())?;
+            let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK,
+                std::str::from_utf8(&plaintext).map_err(|_| unavailable())?).map_err(|_| unavailable())?;
+            let binding = (signal.call_id, signal.seq.ok_or_else(unavailable)?);
+            crate::handlers::messages::operations::bind_legacy_call_block(&mut op, binding.clone())?;
+            if !store.update_outbox_operation(&op).await? { return Err(unavailable()); }
+            binding
+        },
+    };
+    let _guard = lock().lock().await;
+    let Some(entry) = store.call_get(peer, &call_id).await? else { return Ok(()) };
+    if entry.side != rules::Side::Caller || (entry.next_block_seq != seq && entry.next_block_seq != seq.saturating_add(1))
+        || !(entry.phase == rules::Phase::Live || (entry.phase == rules::Phase::Ended && entry.end_reason == Some(rules::HangupReason::Unpaid))) {
+        return Ok(());
+    }
+    // A repeated receipt is idempotent and cannot move a boundary backwards.
+    if entry.paid_until_ms.is_some_and(|until| until > paid_until_ms) { return Ok(()); }
+    let next = CallEntry { phase: rules::Phase::Live, paid_until_ms: Some(paid_until_ms),
+        next_block_seq: seq.saturating_add(1), deadline_ms: paid_until_ms.saturating_add(rules::CALL_BLOCK_GRACE_MS),
+        end_reason: None, unpaid_notice_used: false, ..entry };
+    store.call_put(peer, &call_id, &next).await
 }

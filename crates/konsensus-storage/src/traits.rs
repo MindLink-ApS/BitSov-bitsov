@@ -161,6 +161,9 @@ pub trait Storage: Send + Sync {
     async fn record_outbox_sent(&self, _id: &MessageId, _peer: &NodeId) -> Result<(), StorageError> { Ok(()) }
 
     /// Atomically publish the paid envelope, pending queue entry and operation.
+    /// A paid web request (kind 500/510) also commits its outstanding-reply row
+    /// (`outstanding_web_requests`) in the same transaction: a crash after the
+    /// envelope exists can never leave its reply unbindable.
     /// Uses the same version CAS as update_outbox_operation; false writes nothing.
     async fn commit_outbox_envelope(&self, _op: &crate::OutboxOperation, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
@@ -174,6 +177,11 @@ pub trait Storage: Send + Sync {
     async fn update_outbox_operation(&self, _op: &crate::OutboxOperation) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
+    /// Durable operation binding used by paid-block delivery confirmations.
+    async fn get_outbox_operation_by_message(&self, _id: &MessageId) -> Result<Option<crate::OutboxOperation>, StorageError> {
+        Err(StorageError::Unsupported("outbox operation by message".into()))
+    }
+
     async fn get_outbox_operation(&self, _id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
@@ -206,6 +214,21 @@ pub trait Storage: Send + Sync {
     async fn delete_pending_channel_open_operation(&self, _id: &str) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("channel open operations".into()))
     }
+    /// Fenced outcome write (direct payments): move the row to `state` only
+    /// while it is still the row `expected` describes, with the same request
+    /// binding (`request_hash`), insertion time (`created_at`) and current
+    /// `state`. A row deleted and re-inserted under the same id, or already
+    /// finalized by another writer, is left untouched; false writes nothing and
+    /// the caller re-reads the authoritative row. `opened` is never rewritten.
+    async fn record_channel_open_outcome(
+        &self,
+        _expected: &crate::ChannelOpenOperation,
+        _state: &str,
+        _result: Option<&[u8]>,
+        _last_error: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("channel open operations".into()))
+    }
     /// Complete recovery authority: never silently truncate unpaid/paid work.
     /// Select unresolved accounting/payment intents and undelivered envelopes
     /// through the recovery index; resolved terminal history is excluded.
@@ -235,6 +258,11 @@ pub trait Storage: Send + Sync {
     /// ciphertext; backends compare the validated ID and immutable metadata.
     async fn accept_paid_envelope(&self, _envelope: &UkmEnvelope) -> Result<PaidAcceptance, StorageError> {
         Err(StorageError::Unsupported("accept_paid_envelope".into()))
+    }
+
+    /// Exact, previously accepted proof subsequently rejected by the application.
+    async fn is_paid_envelope_rejected(&self, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        Ok(false)
     }
 
     /// Match immutable acceptance without reserving replay keys or writing messages.

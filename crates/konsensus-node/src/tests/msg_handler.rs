@@ -3034,7 +3034,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let answered_at = now - 20_000;
     let pending = calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
-    let entry = calls::commit(pending, "answer", answered_at);
+    let entry = calls::commit(pending, "answer", answered_at).unwrap();
     db.call_put(alice.node_id(), &block_id, &entry).await.unwrap();
     let block = |seq| format!(r#"{{"v":1,"call_id":"{block_id}","seq":{seq}}}"#);
     let env = signal(404, 10_000, block(0)).await;
@@ -3047,30 +3047,48 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     assert_eq!(outcome(source.clone()).await, Ok(true));
     assert!(ws_rx.try_recv().is_err());
 
-    // Block zero beyond the initial window is also refused without consuming
-    // either replay key or exposing its plaintext to history.
+    // Outside the resume window the settled block is a durable, terminal
+    // overpayment. Its proof is single-use; the audit survives reopening.
     let late_id = format!("{:032x}", rand::random::<u128>());
-    let late_initial = calls::CallEntry { deadline_ms: now - 1, ..entry };
+    let late_initial = calls::CallEntry { deadline_ms: now - calls::CALL_BLOCK_RESUME_MS - 1, ..entry };
     db.call_put(alice.node_id(), &late_id, &late_initial).await.unwrap();
     let env = signal(404, 10_000, format!(r#"{{"v":1,"call_id":"{late_id}","seq":0}}"#)).await;
     source.send(bob.node_id(), &env).await.unwrap();
-    assert!(outcome(source.clone()).await.is_err());
-    assert!(!db.has_nonce(&env.nonce).await.unwrap());
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert!(db.has_nonce(&env.nonce).await.unwrap());
     assert!(db.get_message(&env.id).await.unwrap().is_none());
     assert!(db.get_message_plaintext(&env.id).await.unwrap().is_none());
     assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
     source.send(bob.node_id(), &env).await.unwrap();
-    assert!(outcome(source.clone()).await.is_err());
-    assert!(sessions_b.has_session(alice.node_id()).await, "retrying a refused block must not reset the session");
-    assert!(db.store_payment_receipt(&env.payment_proof.payment_hash, alice.node_id(), &env.id).await.unwrap());
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert!(!db.store_payment_receipt(&env.payment_proof.payment_hash, alice.node_id(), &env.id).await.unwrap());
     assert!(ws_rx.try_recv().is_err());
-
+    assert!(!konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &late_id, now).await);
     let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
-    assert!(audit_entries.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).any(|event|
-        event["event"] == konsensus_api::audit::events::MESSAGE_REJECTED
-            && event["detail"]["kind"] == 404
-            && event["detail"]["message_id"] == env.id.to_hex()
-    ), "late block refusal must leave an audit record");
+    let events: Vec<serde_json::Value> = audit_entries.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    let overpayment = events.iter().find(|event| event["event"] == "call.block_overpayment"
+        && event["detail"]["message_id"] == env.id.to_hex()).expect("durable overpayment audit");
+    assert_eq!(overpayment["detail"]["call_id"], late_id);
+    assert_eq!(overpayment["detail"]["seq"], 0);
+    assert_eq!(overpayment["detail"]["amount_msat"], 10_000);
+    assert_eq!(overpayment["detail"]["payment_hash"], hex::encode(env.payment_proof.payment_hash));
+    assert_eq!(overpayment["detail"]["reconciliation_required"], true);
+    assert_eq!(events.iter().filter(|event| event["event"] == "call.block_overpayment"
+        && event["detail"]["message_id"] == env.id.to_hex()).count(), 1);
+
+    // An incorrect sequence is also an audited overpayment, never a grant.
+    let wrong_id = format!("{:032x}", rand::random::<u128>());
+    let wrong_entry = calls::CallEntry { deadline_ms: now + 30_000, ..late_initial.clone() };
+    db.call_put(alice.node_id(), &wrong_id, &wrong_entry).await.unwrap();
+    let wrong = signal(404, 10_000, format!(r#"{{"call_id":"{wrong_id}","seq":1}}"#)).await;
+    source.send(bob.node_id(), &wrong).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert!(db.is_paid_envelope_rejected(&wrong).await.unwrap());
+    assert_eq!(db.call_get(alice.node_id(), &wrong_id).await.unwrap(), Some(wrong_entry));
+    let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    assert!(audit_entries.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .any(|event| event["event"] == "call.block_overpayment" && event["detail"]["call_id"] == wrong_id
+            && event["detail"]["seq"] == 1 && event["detail"]["reconciliation_required"] == true));
 
     // A paid block whose call-state write fails leaves explicit evidence for
     // reconciliation, bound to its retained payment receipt, without media.
@@ -3099,19 +3117,30 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     assert_eq!(reconciliation["detail"]["amount_msat"], 10_000);
     assert_eq!(reconciliation["detail"]["reconciliation_required"], true);
 
-    // An already settled late renewal is refused before either replay key
-    // is consumed. The call remains expired and no message reaches the app.
+    // A settled next renewal within the window resumes even after the
+    // callee already emitted its single-use Unpaid notice, and tells the caller.
     let expired = calls::CallEntry { deadline_ms: now - 1, ..paid };
-    db.call_put(alice.node_id(), &block_id, &expired).await.unwrap();
+    let ended = calls::CallEntry { unpaid_notice_used: true, ..expired.clone().at(now).unwrap() };
+    db.call_put(alice.node_id(), &block_id, &ended).await.unwrap();
     let env = signal(404, 10_000, block(1)).await;
     source.send(bob.node_id(), &env).await.unwrap();
-    assert!(outcome(source.clone()).await.is_err());
-    assert!(!db.has_nonce(&env.nonce).await.unwrap());
-    assert!(db.get_message(&env.id).await.unwrap().is_none());
-    assert!(db.get_message_plaintext(&env.id).await.unwrap().is_none());
-    assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
-    assert!(db.store_payment_receipt(&env.payment_proof.payment_hash, alice.node_id(), &env.id).await.unwrap());
-    assert!(ws_rx.try_recv().is_err());
+    let grant = tokio::time::timeout(Duration::from_secs(5), source.recv_control()).await.unwrap().unwrap();
+    let granted_until = match grant {
+        ControlEvent::MessageAcked { message_id, paid_until_ms: Some(paid_until_ms), duplicate: false, .. } => {
+            assert_eq!(message_id, env.id);
+            assert!(paid_until_ms >= now + 60_000);
+            paid_until_ms
+        },
+        other => panic!("expected paid interval confirmation, got {other:?}"),
+    };
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    let resumed = db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap();
+    assert_eq!(resumed.phase, Phase::Live);
+    assert_eq!(resumed.next_block_seq, 2);
+    assert_eq!(resumed.paid_until_ms, Some(granted_until));
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(matches!(source.recv_control().await.unwrap(), ControlEvent::MessageAcked { paid_until_ms: Some(paid_until_ms), duplicate: true, .. } if paid_until_ms == granted_until));
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap(), Some(resumed));
 
     // The peer can observe the callee's unpaid termination even after its
     // own timer expired. Replaying that envelope never notifies the app twice.

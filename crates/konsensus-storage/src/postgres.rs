@@ -814,6 +814,9 @@ impl Storage for PostgresStorage {
     async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = $1").bind(id).fetch_optional(&self.pool).await?)
     }
+    async fn get_outbox_operation_by_message(&self, id: &MessageId) -> Result<Option<crate::OutboxOperation>, StorageError> {
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE message_id = $1").bind(id.to_hex()).fetch_optional(&self.pool).await?)
+    }
     async fn starter_update(&self, update: crate::starter::StarterUpdate, now: Option<i64>) -> Result<crate::starter::StarterOutcome, StorageError> {
         crate::starter::postgres::update(&self.pool, update, now).await
     }
@@ -855,6 +858,16 @@ impl Storage for PostgresStorage {
             .bind(chrono::Utc::now().timestamp_millis())
             .bind(id)
             .execute(&self.pool).await?.rows_affected() == 1)
+    }
+    async fn record_channel_open_outcome(&self, expected: &crate::ChannelOpenOperation, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
+        if expected.state == crate::channel_open::CHANNEL_OPEN_OPENED {
+            return Ok(false);
+        }
+        let changed = sqlx::query("UPDATE channel_open_operations SET state = $1, result = $2, last_error = $3, updated_at = $4 WHERE operation_id = $5 AND request_hash = $6 AND created_at = $7 AND state = $8")
+            .bind(state).bind(result).bind(last_error).bind(chrono::Utc::now().timestamp_millis())
+            .bind(&expected.operation_id).bind(&expected.request_hash).bind(expected.created_at).bind(&expected.state)
+            .execute(&self.pool).await?.rows_affected();
+        Ok(changed == 1)
     }
     async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
         Ok(sqlx::query("DELETE FROM channel_open_operations WHERE operation_id = $1 AND state = 'pending'")
@@ -935,6 +948,13 @@ impl Storage for PostgresStorage {
 
         sqlx::query("INSERT INTO pending_deliveries (message_id, recipient_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
             .bind(envelope.id.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
+        // A paid web request binds its reply in the same transaction as its
+        // envelope: no crash window between "paid and queued" and "reply bindable".
+        if let Some(row) = crate::outstanding_web_request_row(envelope)? {
+            sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
+                .bind(row.payment_hash).bind(row.request_id).bind(row.peer).bind(row.expected_reply_kind).bind(row.expires_at_ms)
+                .execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(true)
     }
@@ -1008,6 +1028,27 @@ impl Storage for PostgresStorage {
             .bind(envelope.sender.to_hex()).bind(format!("kind:{}", envelope.kind)).bind(category).bind(format!("%,{},%", envelope.kind)).bind(paid).bind(paid)
             .fetch_one(&self.pool).await?;
         amount.map(|n| u64::try_from(n).map_err(|_| StorageError::Conversion("negative quoted price".into()))).transpose()
+    }
+
+    async fn is_paid_envelope_rejected(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = -1 AND kind = $4 AND recipient_type = $5 AND recipient_id = $6 AND preimage = $7 AND amount_msat = $8 AND nonce = $9 AND references_json = $10")
+            .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+            .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .fetch_one(&self.pool).await?;
+        Ok(durable == 1)
     }
 
     async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
@@ -3610,7 +3651,7 @@ mod migration_recovery_tests {
         db.call_put(&peer, call_id, &pending).await.unwrap();
         assert_eq!(db.call_pending().await.unwrap(), vec![(peer, call_id.to_owned(), pending.clone())]);
         assert_eq!(db.call_open_by_peer(&peer, 31_001).await.unwrap(), vec![(call_id.to_owned(), pending.clone())]);
-        let ended = calls::commit(pending, "notice", 31_002);
+        let ended = calls::commit(pending, "notice", 31_002).unwrap();
         db.call_put(&peer, call_id, &ended).await.unwrap();
         db.pool.close().await;
         let db = PostgresStorage::connect(&db_url).await.unwrap();
