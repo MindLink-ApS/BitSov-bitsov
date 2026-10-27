@@ -2870,10 +2870,23 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
 
     // Alice pays `msat` to Bob and sends one signal of `kind`.
     let signal = |kind: u16, msat: u64, body: String| {
-        let (wallet, sessions_a, alice, bob) =
-            (wallet.clone(), &sessions_a, alice.clone(), bob.clone());
+        let (wallet, sessions_a, alice, bob, db) =
+            (wallet.clone(), &sessions_a, alice.clone(), bob.clone(), db.clone());
         async move {
-            let hash = wallet.inject_inbound_keysend(msat, None).await;
+            let hash = if kind == 404 {
+                // Issue and bind a real invoice before paying it. These fixtures
+                // model issuance before the delayed settlement/delivery below.
+                let invoice = wallet.create_invoice(msat, "call block",
+                    konsensus_core::payloads::call::CALL_BLOCK_INVOICE_EXPIRY_SECS).await.unwrap();
+                let block = konsensus_core::payloads::call::CallSignal::parse(404, &body).unwrap();
+                db.record_call_block_invoice(alice.node_id(), &block.call_id, block.seq.unwrap(),
+                    &hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap(),
+                    chrono::Utc::now().timestamp_millis() as u64 + 120_000).await.unwrap();
+                wallet.pay_invoice(&invoice.bolt11).await.unwrap();
+                invoice.payment_hash
+            } else {
+                wallet.inject_inbound_keysend(msat, None).await
+            };
             let payment = wallet.get_payment_status(&hash).await.unwrap();
             let proof = PaymentProof::new(
                 hex::decode(&hash).unwrap().try_into().unwrap(),
@@ -3037,6 +3050,25 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     let entry = calls::commit(pending, "answer", answered_at).unwrap();
     db.call_put(alice.node_id(), &block_id, &entry).await.unwrap();
     let block = |seq| format!(r#"{{"v":1,"call_id":"{block_id}","seq":{seq}}}"#);
+    // A generic 3600-second invoice cannot buy call media, even for a valid seq.
+    let invoice = wallet.create_invoice(10_000, "generic", 3600).await.unwrap();
+    let payment = wallet.pay_invoice(&invoice.bolt11).await.unwrap();
+    let mut generic = signal(404, 10_000, block(0)).await;
+    generic.payment_proof = PaymentProof::new(
+        hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap(),
+        hex::decode(payment.preimage.unwrap()).unwrap().try_into().unwrap(), 10_000);
+    generic.signature = Signature::from_ed25519(&alice.sign(&generic.signable_bytes()));
+    source.send(bob.node_id(), &generic).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap(), Some(entry.clone()));
+    assert!(ws_rx.try_recv().is_err());
+    assert!(db.is_paid_envelope_rejected(&generic).await.unwrap());
+    source.send(bob.node_id(), &generic).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    assert!(log.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .any(|event| event["event"] == "call.block_overpayment" && event["detail"]["message_id"] == generic.id.to_hex()));
+
     let env = signal(404, 10_000, block(0)).await;
     source.send(bob.node_id(), &env).await.unwrap();
     assert_eq!(outcome(source.clone()).await, Ok(false));

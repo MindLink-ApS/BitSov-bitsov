@@ -4,6 +4,14 @@ use konsensus_storage::{EncryptedStorage, SqliteStorage};
 
 const CALL: &str = "11111111222243338444555555555555";
 
+fn invoice_payee() -> String {
+    create_test_bolt11(1_000)
+        .parse::<lightning_invoice::Bolt11Invoice>()
+        .unwrap()
+        .recover_payee_pub_key()
+        .to_string()
+}
+
 async fn send(fx: &Fx, token: &str, kind: u16, price: u64, seq: u32) -> (StatusCode, Value) {
     send_id(fx, token, kind, price, seq, CALL).await
 }
@@ -56,17 +64,24 @@ async fn prepared() -> (Fx, String) {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(fx.peer, PEER_LN.into());
+        .insert(fx.peer, invoice_payee());
     // Exercise the production encrypted call storage as well as the pairing file.
     let store = SqliteStorage::open(fx.tmp.path().join("calls.sqlite").to_str().unwrap())
         .await
         .unwrap();
+    let peer = fx.peer;
     fx.state = Arc::new(AppState {
         storage: Arc::new(EncryptedStorage::new(store, &[7; 32])),
         transport: Arc::new(ConnectedStubTransport::new(
             vec![fx.peer],
             fx.state.invoice_requests.clone(),
-        )),
+        ).with_invoice_responder(move |_, amount| {
+            let bolt11 = create_test_bolt11(amount);
+            let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse().unwrap();
+            Some(konsensus_api::state::InvoiceResponseData {
+                payment_hash: invoice.payment_hash().to_string(), recipient: peer, bolt11,
+            })
+        })),
         ..(*fx.state).clone()
     });
     fx.wallet.call_capacity.store(10_000_000, Ordering::SeqCst);
@@ -424,6 +439,8 @@ async fn slow_liquidity_query_does_not_block_another_calls_transitions() {
         .call_put(&peer, CALL, &entry)
         .await
         .unwrap();
+    fx.state.storage.record_call_block_invoice(&peer, CALL, 0, &[1; 32],
+        entry.deadline_ms + rules::CALL_BLOCK_RESUME_MS).await.unwrap();
     let accept_block = async {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -434,13 +451,11 @@ async fn slow_liquidity_query_does_not_block_another_calls_transitions() {
         let plaintext = json!({"call_id": CALL, "seq": 0}).to_string();
         let accepted = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            konsensus_api::calls::admit_incoming(
-                fx.state.storage.as_ref(),
-                fx.state.identity.node_id(),
-                &peer,
-                404,
-                Some(&plaintext),
-            ),
+            async {
+                konsensus_api::calls::prepare_incoming_block(
+                    fx.state.storage.as_ref(), &peer, Some(&plaintext), &[1; 32],
+                ).await.unwrap().commit().await
+            },
         )
         .await;
         fx.wallet.capacity_resume.notify_one();

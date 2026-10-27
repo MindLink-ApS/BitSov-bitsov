@@ -343,7 +343,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 Err(_) => None,
                             };
                             match konsensus_api::calls::prepare_incoming_block(
-                                storage_for_recv.as_ref(), &sender, block_plaintext.as_deref(),
+                                storage_for_recv.as_ref(), &sender, block_plaintext.as_deref(), &envelope.payment_proof.payment_hash,
                             ).await {
                                 Ok(block) => incoming_block = Some(block),
                                 Err(refusal) => {
@@ -564,12 +564,19 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                             "payment_hash": hex::encode(envelope.payment_proof.payment_hash),
                                             "reason": refusal.to_string(), "reconciliation_required": true,
                                         }));
+                                    let audit_failed = recorded.is_err();
                                     if let Err(e) = recorded {
                                         error!(msg_id = %msg_id, error = %e, "OVERPAYMENT AUDIT WRITE FAILED; retained payment receipt requires reconciliation");
                                     }
                                     drop(block);
                                     if let Err(e) = storage_for_recv.reject_accepted_envelope(&envelope).await {
                                         error!(msg_id = %msg_id, error = %e, "overpayment receipt could not be marked rejected");
+                                        if audit_failed {
+                                            error!(msg_id = %msg_id, call_id = %identity.call_id, seq = ?identity.seq,
+                                                amount_msat = envelope.payment_proof.amount_msat,
+                                                payment_hash = %hex::encode(envelope.payment_proof.payment_hash),
+                                                "CRITICAL: OVERPAYMENT AUDIT AND REJECT MARKING BOTH FAILED; manual reconciliation required");
+                                        }
                                     }
                                     let reject = Frame::MessageReject { id: msg_id, reason: "call_block_overpayment".into() };
                                     let _ = transport_for_ack.send_frame(&sender, &reject).await;
