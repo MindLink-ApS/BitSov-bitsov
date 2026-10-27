@@ -59,7 +59,7 @@ impl PeerPriceEntry {
     /// Returns `None` if the kind's category isn't in the peer's table.
     pub fn get_price_for_kind(&self, kind: u16) -> Option<u64> {
         // A per-kind price (the peer's call offer price) wins over its category.
-        if kind == konsensus_core::kind::KIND_CALL_INVITE {
+        if matches!(kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK) {
             if let Some(price) = self.prices.get(&kind_key(kind)) {
                 return Some(*price);
             }
@@ -305,7 +305,7 @@ impl PeerPriceCache {
     ) {
         // A call offer's price is per kind: never overwrite the category the
         // call's answers and ICE are priced at.
-        let category_name = if kind == konsensus_core::kind::KIND_CALL_INVITE {
+        let category_name = if matches!(kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK) {
             kind_key(kind)
         } else {
             category_to_string(KindCategory::from_kind(kind))
@@ -572,15 +572,15 @@ pub async fn build_price_table(
         }
     }
 
-    // The call offer is the per-call admission. When it differs from the
-    // realtime category, peers need it by kind to pay it (and nothing else).
-    let call = konsensus_core::kind::KIND_CALL_INVITE;
-    if pricing.category_price_overrides().is_some_and(|k| k.contains(&call)) {
-        if let Ok(price) = pricing.get_price_msat(call).await {
-            prices.insert(kind_key(call), price);
+    // Call setup and paid blocks have separate per-kind tariffs when they
+    // differ from the realtime category.
+    for call in [konsensus_core::kind::KIND_CALL_INVITE, konsensus_core::kind::KIND_CALL_BLOCK] {
+        if pricing.category_price_overrides().is_some_and(|k| k.contains(&call)) {
+            if let Ok(price) = pricing.get_price_msat(call).await {
+                prices.insert(kind_key(call), price);
+            }
         }
     }
-
     prices
 }
 

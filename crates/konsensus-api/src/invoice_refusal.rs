@@ -26,6 +26,9 @@ pub const ADMISSION_REQUIRED: &str = "konsensus:admission_required";
 /// too recently (the unpaid admission path has source and global limits).
 pub const ADMISSION_RATE_LIMITED: &str = "konsensus:admission_rate_limited";
 
+/// No block invoice was issued: wrong call/sequence or too close to its deadline.
+pub const CALL_BLOCK_UNPAYABLE: &str = "konsensus:call_block_unpayable";
+
 /// Readiness refusals use the existing authenticated InvoiceError frame.
 pub const CHAIN_UNAVAILABLE: &str = "konsensus:not_ready:chain_unavailable";
 pub const NOT_SYNCED: &str = "konsensus:not_ready:not_synced";

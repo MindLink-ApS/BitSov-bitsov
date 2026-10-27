@@ -28,6 +28,9 @@ struct OpenCall {
     unresolved_paid_admission: bool,
     created: Option<i64>,
     op_id: Option<String>,
+    paid_until_ms: Option<u64>,
+    next_block_seq: u32,
+    next_block_due_ms: Option<u64>,
 }
 
 async fn open_calls(
@@ -83,6 +86,9 @@ async fn open_calls(
                 },
                 unresolved_paid_admission: entry.pending.is_some(),
                 created,
+                paid_until_ms: entry.paid_until_ms,
+                next_block_seq: entry.next_block_seq,
+                next_block_due_ms: entry.next_block_due_ms(),
                 op_id: entry.pending.map(|p| p.operation_id),
             });
         }

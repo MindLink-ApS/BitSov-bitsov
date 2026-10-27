@@ -270,7 +270,7 @@ pub(crate) async fn handle_relay_control(
                 )
                 .await
             {
-                Ok(()) => reply(sender, Frame::MessageAck { id, duplicate: false }),
+                Ok(()) => reply(sender, Frame::MessageAck { id, duplicate: false, paid_until_ms: None }),
                 Err(e) => reply(sender, reject(id, format!("relay register: {e:?}"))),
             }
         }
@@ -283,7 +283,7 @@ pub(crate) async fn handle_relay_control(
                 Err(_) => return reply(sender, reject(id, "relay_ack_invalid_body".into())),
             };
             match engine.handle_ack(sender, &body.message_ids).await {
-                Ok(_count) => reply(sender, Frame::MessageAck { id, duplicate: false }),
+                Ok(_count) => reply(sender, Frame::MessageAck { id, duplicate: false, paid_until_ms: None }),
                 Err(e) => reply(sender, reject(id, format!("relay ack: {e:?}"))),
             }
         }
@@ -418,7 +418,7 @@ pub(crate) async fn handle_relay_control(
                 )
                 .await
             {
-                Ok(_seq) => reply(sender, Frame::MessageAck { id, duplicate: false }),
+                Ok(_seq) => reply(sender, Frame::MessageAck { id, duplicate: false, paid_until_ms: None }),
                 Err(e) => reply(sender, reject(id, format!("relay deposit: {e:?}"))),
             }
         }
@@ -457,7 +457,7 @@ pub(crate) async fn handle_relay_control(
             }
             if out.is_empty() {
                 // Nothing deliverable — ack so the drainer knows the drain ran.
-                out.push((sender, Frame::MessageAck { id, duplicate: false }));
+                out.push((sender, Frame::MessageAck { id, duplicate: false, paid_until_ms: None }));
             }
             out
         }
@@ -465,7 +465,7 @@ pub(crate) async fn handle_relay_control(
             // §0: the binding owner is the authenticated sender; revoking its own
             // binding needs no body. Killing the registration trap = revocability.
             match engine.handle_unregister(sender).await {
-                Ok(()) => reply(sender, Frame::MessageAck { id, duplicate: false }),
+                Ok(()) => reply(sender, Frame::MessageAck { id, duplicate: false, paid_until_ms: None }),
                 Err(e) => reply(sender, reject(id, format!("relay unregister: {e:?}"))),
             }
         }

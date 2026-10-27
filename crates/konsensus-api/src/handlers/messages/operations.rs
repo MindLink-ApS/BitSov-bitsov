@@ -26,6 +26,9 @@ use std::{
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Recovery {
+    /// Call/sequence binding survives missing plaintext caches and recovery.
+    #[serde(default)]
+    call_block: Option<(String, u32)>,
     caller: Option<String>,
     #[serde(default)]
     execution_id: Option<String>,
@@ -272,9 +275,11 @@ impl Operation {
         expected_msat: u64,
         fee_ceiling: u64,
         admission_msat: u64,
+        call_block: Option<(String, u32)>,
     ) -> Result<(), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
+        data.call_block = call_block;
         op.message_id = Some(draft.id.to_hex());
         data.draft = Some(draft);
         data.expected_msat = expected_msat;
@@ -318,7 +323,7 @@ impl Operation {
         op.state = "paying".into();
         encode(&mut op, &data)?;
         save(&self.state, &mut op).await?;
-        let mut result = debit.dispatch(future).await;
+        let mut result = debit.dispatch_message_payment(&self.state, future).await;
         match &mut result {
             Ok(Ok(details)) => {
                 if details.payment_hash.is_empty() {
@@ -514,6 +519,7 @@ pub(super) async fn compose_call(
     state: Arc<AppState>,
     mut req: ComposeRequest,
     references: Vec<MessageId>,
+    policy: super::compose::ComposePolicy,
 ) -> Result<Json<ComposeResponse>, ApiError> {
     let peer = NodeId::from_hex(&req.recipient)
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
@@ -546,7 +552,7 @@ pub(super) async fn compose_call(
         references,
         peer,
         id.clone(),
-        super::compose::ComposePolicy::default(),
+        policy,
     ).await;
     crate::calls::resolve_outgoing(state.storage.as_ref(), &peer, &plaintext, &id, &request_hash).await;
     result
@@ -633,6 +639,9 @@ async fn compose_locked(
                 ))
             }
         }
+    }
+    if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+        crate::calls::revalidate_outgoing_block(state.storage.as_ref(), &peer, &req.plaintext).await?;
     }
     // The CAS also serializes processes sharing a database. A claimed operation
     // never re-enters the paying handler without positive nonpayment evidence.
@@ -1637,6 +1646,17 @@ fn incomplete_settled_recovery(op: &OutboxOperation) -> bool {
         Some("settled payment has no valid proof")
             | Some("settled payment missing encrypted draft")
     )
+}
+
+
+pub(crate) fn call_block_binding(op: &OutboxOperation) -> Result<Option<(String, u32)>, konsensus_storage::StorageError> {
+    recovery(op).map(|r| r.call_block).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
+}
+
+pub(crate) fn bind_legacy_call_block(op: &mut OutboxOperation, binding: (String, u32)) -> Result<(), konsensus_storage::StorageError> {
+    let mut data = recovery(op).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+    data.call_block = Some(binding);
+    encode(op, &data).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
 }
 
 #[cfg(test)]

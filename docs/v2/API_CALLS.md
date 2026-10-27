@@ -24,7 +24,10 @@ The bound also applies if the stored data exceeds the admission bound.
     "direction": "outgoing",
     "unresolved_paid_admission": true,
     "created": 1790000000000,
-    "op_id": "9a6b9c52-f45b-400d-8891-080fb382dcad"
+    "op_id": "9a6b9c52-f45b-400d-8891-080fb382dcad",
+    "paid_until_ms": null,
+    "next_block_seq": 0,
+    "next_block_due_ms": null
   }
 ]
 ```
@@ -39,6 +42,9 @@ The bound also applies if the stored data exceeds the admission bound.
   to a matching operation journal entry, this is that operation's stored
   `created_at`. Otherwise it is `null`: `call_state` has no creation timestamp,
   and an answer/hangup timestamp is not the call's creation time.
+- `paid_until_ms`: nullable Unix-millisecond boundary of the last settled 60-second block; null until block zero settles.
+- `next_block_seq`: next required block sequence, starting at zero.
+- `next_block_due_ms`: Unix-millisecond renewal time (20 seconds before the paid boundary), or the answer time for block zero; null when ended or at the four-hour cap.
 - `op_id`: nullable string, the stored pending signal's operation id, or `null`
   once no operation binding remains in call state. It can refer to an answer
   or hangup rather than an offer. No placeholder strings are returned.
@@ -55,7 +61,7 @@ never does so. This blocker applies to the requested peer, not unrelated
 peers. An empty response is a snapshot, not authorization to bypass the normal
 compose/admission checks.
 
-The endpoint uses existing tables without a migration. It does not request
+The endpoint reads the durable call state, including paid interval fields from migration 035. It does not request
 prices, pay, dispatch signals, emit call events, sweep rows, or mutate the
 operation journal. See [call protocol and recovery](CALLS-PROTOTYPE.md).
 
@@ -105,6 +111,7 @@ kept literally.
 | `/body/lightning_node_pubkey` | 66 lower-case hex chars | `<hex66>` |
 | `/body/message_id`, `/body/payment_hash` | 64 lower-case hex chars | `<hex64>` |
 | `/body/uptime_secs` | non-negative integer | `<uint>` |
+| `/body/*/next_block_due_ms` | non-negative integer ≥ 10^12 (Unix milliseconds) | `<unix_ms>` |
 | `/body/*/created` | non-negative integer ≥ 10^12 (Unix milliseconds) | `<unix_ms>` |
 
 ### Regenerating

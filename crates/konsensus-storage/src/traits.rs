@@ -177,6 +177,11 @@ pub trait Storage: Send + Sync {
     async fn update_outbox_operation(&self, _op: &crate::OutboxOperation) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
+    /// Durable operation binding used by paid-block delivery confirmations.
+    async fn get_outbox_operation_by_message(&self, _id: &MessageId) -> Result<Option<crate::OutboxOperation>, StorageError> {
+        Err(StorageError::Unsupported("outbox operation by message".into()))
+    }
+
     async fn get_outbox_operation(&self, _id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
@@ -253,6 +258,11 @@ pub trait Storage: Send + Sync {
     /// ciphertext; backends compare the validated ID and immutable metadata.
     async fn accept_paid_envelope(&self, _envelope: &UkmEnvelope) -> Result<PaidAcceptance, StorageError> {
         Err(StorageError::Unsupported("accept_paid_envelope".into()))
+    }
+
+    /// Exact, previously accepted proof subsequently rejected by the application.
+    async fn is_paid_envelope_rejected(&self, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        Ok(false)
     }
 
     /// Match immutable acceptance without reserving replay keys or writing messages.
@@ -1149,6 +1159,11 @@ pub trait Storage: Send + Sync {
     /// Every entry with a reserved, unsettled signal of ours.
     async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         Ok(Vec::new())
+    }
+
+    /// At most MAX_OPEN_CALLS live rows, including expired ones, oldest first.
+    async fn call_live(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
     }
 
     /// Drop up to `max` entries whose replay protection ended, with no pending signal.
