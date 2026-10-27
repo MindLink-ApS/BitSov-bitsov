@@ -16,5 +16,5 @@ pub mod wire;
 
 pub use offer_limit::EagerOfferLimiter;
 pub use peer::{PeerConfig, PeerEntry, PeerRegistry};
-pub use transport::{DosEdgeConfig, CookieMode, ReachabilityMode, ControlEvent, NoiseTransport, Standing, TransportConfig};
+pub use transport::{CallMediaEvent, DosEdgeConfig, CookieMode, ReachabilityMode, ControlEvent, NoiseTransport, Standing, TransportConfig, CALL_MEDIA_WRITE_DEADLINE};
 pub use wire::{Capability, Frame, PeerExchangeEntry, SovereigntyTier, WireError};

@@ -18,6 +18,18 @@ also live on the corresponding GitHub pre-release pages.
   transaction as its envelope, and every resend restores the row. See
   [docs/v2/API_PAYMENTS.md](docs/v2/API_PAYMENTS.md) for the status codes and
   the compatibility notes.
+- Call-block settlement policy: **stop early + honour** (owner decision,
+  26 October 2026). The callee refuses new invoices inside a 15-second deadline
+  margin; expected late blocks resume an Unpaid call within 60 seconds and buy
+  a fresh 60-second interval. The callee confirms its paid boundary to the caller.
+  Unserviceable settlements retain payment receipts and synced overpayment
+  audits for reconciliation. Block invoices expire after 5 seconds; LDK's
+  inbound expiry buffer and in-flight HTLC residual are documented in
+  `docs/v2/CALLS-PROTOTYPE.md`.
+- Deployment note: migration 035 ends every in-flight live call when upgrading
+  to paid call blocks. Existing calls must be restarted after the upgrade;
+  their replay tombstones are retained and no unpaid media interval is granted.
+
 - Add owner-authenticated claim-code display for app onboarding:
   `GET /api/v1/owner/claim-code` on the owner-local API only (loopback source,
   local console session or enrolled owner device), rate limited, `no-store`,

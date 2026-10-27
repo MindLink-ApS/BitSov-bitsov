@@ -26,6 +26,9 @@ use std::{
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Recovery {
+    /// Call/sequence binding survives missing plaintext caches and recovery.
+    #[serde(default)]
+    call_block: Option<(String, u32)>,
     caller: Option<String>,
     #[serde(default)]
     execution_id: Option<String>,
@@ -68,6 +71,8 @@ struct Recovery {
 #[derive(Clone, Serialize, Deserialize)]
 struct BudgetResolution {
     reservation: Reservation,
+    #[serde(default)]
+    payment_failed: bool,
     // None keeps the full liability when any fee is unknown.
     actual_msat: Option<u64>,
 }
@@ -272,9 +277,11 @@ impl Operation {
         expected_msat: u64,
         fee_ceiling: u64,
         admission_msat: u64,
+        call_block: Option<(String, u32)>,
     ) -> Result<(), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
+        data.call_block = call_block;
         op.message_id = Some(draft.id.to_hex());
         data.draft = Some(draft);
         data.expected_msat = expected_msat;
@@ -318,7 +325,7 @@ impl Operation {
         op.state = "paying".into();
         encode(&mut op, &data)?;
         save(&self.state, &mut op).await?;
-        let mut result = debit.dispatch(future).await;
+        let mut result = debit.dispatch_message_payment(&self.state, future).await;
         match &mut result {
             Ok(Ok(details)) => {
                 if details.payment_hash.is_empty() {
@@ -343,6 +350,13 @@ impl Operation {
         }
         result
     }
+    pub(crate) async fn release_call_debit(&self, debit: &Debit, recipient: &str) {
+        match self.load().await {
+            Ok(op) => debit.released_with_outcome(recipient, definite_call_payment_failure(&op)),
+            Err(error) => tracing::warn!(%error, "call debit release deferred; journal unavailable"),
+        }
+    }
+
     pub(crate) async fn record(&self, details: &PaymentDetails) -> Result<(), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
@@ -514,6 +528,7 @@ pub(super) async fn compose_call(
     state: Arc<AppState>,
     mut req: ComposeRequest,
     references: Vec<MessageId>,
+    policy: super::compose::ComposePolicy,
 ) -> Result<Json<ComposeResponse>, ApiError> {
     let peer = NodeId::from_hex(&req.recipient)
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
@@ -536,7 +551,16 @@ pub(super) async fn compose_call(
         konsensus_core::payloads::call::settlement(Some(&op.state)) == konsensus_core::payloads::call::Settlement::Paid
     });
     let plaintext = req.plaintext.clone();
+    let spend_client = auth.user.pairing.as_ref().map(|p| p.client_id.clone());
+    let ends_on_failure = matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK);
     if !paid {
+        if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+            let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &plaintext)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            if signal.seq.is_some_and(|seq| seq >= u32::from(crate::calls::call_max_minutes(&state, &peer, &signal.call_id))) {
+                return Err(ApiError::BadRequest("call duration cap reached".into()).with_reason("call_duration_cap"));
+            }
+        }
         crate::calls::reserve_outgoing(state.storage.as_ref(), state.identity.node_id(), &peer, req.kind, &plaintext, &id, &request_hash).await?;
     }
     let result = compose_locked(
@@ -546,10 +570,51 @@ pub(super) async fn compose_call(
         references,
         peer,
         id.clone(),
-        super::compose::ComposePolicy::default(),
+        policy,
     ).await;
     crate::calls::resolve_outgoing(state.storage.as_ref(), &peer, &plaintext, &id, &request_hash).await;
+    if ends_on_failure && call_payment_failed(&state, &id, result.as_ref().err()).await {
+        if let (Some(client), Some(service), Ok(signal)) = (spend_client, state.pairing.as_ref(),
+            konsensus_core::wire_json::from_str::<konsensus_core::payloads::call::CallSignal>(&plaintext)) {
+            if service.owns_call_spend(&client, &peer.to_hex(), &signal.call_id) {
+                if let Err(error) = crate::calls::fail_outgoing(&state, &peer, &plaintext).await {
+                    tracing::warn!(%error, "call failure cleanup deferred");
+                }
+            }
+        }
+    }
+    if let Err(error) = crate::calls::reconcile_call_spend(&state, chrono::Utc::now().timestamp_millis() as u64).await {
+        tracing::warn!(%error, "call spend cleanup deferred");
+    }
     result
+}
+
+// Validation and invoice refusals leave a live call retryable. Only terminal
+// payment evidence (or a price above the held ceiling) ends it here; ambiguous
+// outcomes retain their journal and are bounded by ordinary call expiry.
+async fn call_payment_failed(state: &AppState, id: &str, error: Option<&ApiError>) -> bool {
+    fn price_changed(error: &ApiError) -> bool {
+        match error {
+            ApiError::Operation { source, .. } | ApiError::RoutingFee { source, .. }
+                | ApiError::Reasoned { source, .. } => price_changed(source),
+            ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::CallPriceChanged) => true,
+            _ => false,
+        }
+    }
+    let Some(error) = error else { return false };
+    if price_changed(error) { return true; }
+    let Ok(Some(op)) = state.storage.get_outbox_operation(id).await else { return false };
+    definite_call_payment_failure(&op)
+}
+
+pub(crate) fn definite_call_payment_failure(op: &OutboxOperation) -> bool {
+    if !matches!(op.kind, 400 | 404) || op.settled_msat > 0 { return false; }
+    recovery(op).is_ok_and(|data| data.settlement.as_ref().is_some_and(|payment| {
+        payment.direction == PaymentDirection::Outgoing
+            && Some(&payment.payment_hash) == op.payment_hash.as_ref()
+            && payment.amount_msat == data.expected_msat
+            && matches!(payment.status, PaymentStatus::Failed | PaymentStatus::Expired)
+    }))
 }
 
 /// The operation itself; the caller holds its per-operation lock.
@@ -616,6 +681,11 @@ async fn compose_locked(
         // so the callee's immediate answer finds a ringing call (Codex
         // delta2 #3). Never a release here: an unpaid one is paid again below.
         crate::calls::settle_operation(state.storage.as_ref(), &op, false).await;
+        // Call-state cleanup is best effort. Its storage failure must never
+        // turn a confirmed failed call payment into permission to pay again.
+        if definite_call_payment_failure(&op) {
+            return Err(contextual(ApiError::Lightning("call payment failed; start a new call".into()), &op));
+        }
         match op.state.as_str() {
             "acked" => return Ok(Json(response(&state.lightning_backend, &op, true)?)),
             "paid" | "sent" | "rejected_retryable" => {
@@ -633,6 +703,9 @@ async fn compose_locked(
                 ))
             }
         }
+    }
+    if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+        crate::calls::revalidate_outgoing_block(&state, &peer, &req.plaintext).await?;
     }
     // The CAS also serializes processes sharing a database. A claimed operation
     // never re-enters the paying handler without positive nonpayment evidence.
@@ -1133,10 +1206,15 @@ fn settlement_preimage(details: &PaymentDetails) -> Option<[u8; 32]> {
 }
 
 fn queue_resolution(data: &mut Recovery, reservation: Reservation, actual_msat: Option<u64>) {
+    let payment_failed = actual_msat == Some(0) && data.settlement.as_ref().is_some_and(|payment| {
+        payment.direction == PaymentDirection::Outgoing && payment.amount_msat == data.expected_msat
+            && matches!(payment.status, PaymentStatus::Failed | PaymentStatus::Expired)
+    });
     if let Some(existing) = data.budget_resolutions.iter_mut().find(|r| r.reservation.id == reservation.id && r.reservation.op_id == reservation.op_id) {
         if existing.actual_msat.is_none() { existing.actual_msat = actual_msat; }
+        existing.payment_failed |= payment_failed;
     } else {
-        data.budget_resolutions.push(BudgetResolution { reservation, actual_msat });
+        data.budget_resolutions.push(BudgetResolution { reservation, actual_msat, payment_failed });
     }
 }
 
@@ -1155,7 +1233,7 @@ async fn drain_resolutions(state: &AppState, op: &mut OutboxOperation) -> Result
     let before = data.budget_resolutions.len();
     for resolution in &data.budget_resolutions {
         if let Some(actual) = resolution.actual_msat {
-            service.try_resolve_spend(&resolution.reservation, &op.recipient, actual).map_err(storage)?;
+            service.try_resolve_spend_outcome(&resolution.reservation, &op.recipient, actual, resolution.payment_failed).map_err(storage)?;
             if data.reservation.as_ref().is_some_and(|r| r.id == resolution.reservation.id && r.op_id == resolution.reservation.op_id) {
                 data.reservation = None;
             }
@@ -1637,6 +1715,23 @@ fn incomplete_settled_recovery(op: &OutboxOperation) -> bool {
         Some("settled payment has no valid proof")
             | Some("settled payment missing encrypted draft")
     )
+}
+
+
+pub(crate) fn call_block_binding(op: &OutboxOperation) -> Result<Option<(String, u32)>, konsensus_storage::StorageError> {
+    recovery(op).map(|r| r.call_block).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
+}
+
+pub(crate) fn settled_call_block(op: &OutboxOperation) -> Result<bool, konsensus_storage::StorageError> {
+    if op.kind != i64::from(konsensus_core::kind::KIND_CALL_BLOCK) { return Ok(false); }
+    let data = recovery(op).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+    Ok(data.settlement.as_ref().is_some_and(|details| settlement_matches(op, &data, details)))
+}
+
+pub(crate) fn bind_legacy_call_block(op: &mut OutboxOperation, binding: (String, u32)) -> Result<(), konsensus_storage::StorageError> {
+    let mut data = recovery(op).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+    data.call_block = Some(binding);
+    encode(op, &data).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
 }
 
 #[cfg(test)]

@@ -549,6 +549,11 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         if let Some(op) = &mut op { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
         Ok(op)
     }
+    async fn get_outbox_operation_by_message(&self, id: &MessageId) -> Result<Option<crate::OutboxOperation>, StorageError> {
+        let mut op = self.inner.get_outbox_operation_by_message(id).await?;
+        if let Some(op) = &mut op { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
+        Ok(op)
+    }
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Ok(self.list_recoverable_operations_with_diagnostics().await?.items)
     }
@@ -587,6 +592,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn delivery_price_floor(&self, envelope: &UkmEnvelope, paid_at: u64, now: u64) -> Result<Option<u64>, StorageError> {
         self.inner.delivery_price_floor(envelope, paid_at, now).await
+    }
+
+    async fn is_paid_envelope_rejected(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        self.inner.is_paid_envelope_rejected(envelope).await
     }
 
     async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
@@ -873,6 +882,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         self.inner.call_pending().await
+    }
+
+    async fn call_live(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        self.inner.call_live().await
     }
 
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {

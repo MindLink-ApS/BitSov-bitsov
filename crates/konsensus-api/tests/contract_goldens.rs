@@ -90,6 +90,7 @@ const MASKS: &[(&str, Mask)] = &[
     ("/body/payment_hash", Mask::Hex(64)),
     // GET /api/v1/calls?peer=
     ("/body/*/created", Mask::UnixMs),
+    ("/body/*/next_block_due_ms", Mask::UnixMs),
     // GET /api/v1/pricing/peers/:id/call
     ("/body/peer_id", Mask::Hex(64)),
 ];
@@ -302,6 +303,7 @@ async fn status_stun_own_matches_golden() {
 async fn status_stun_absent_matches_golden() {
     let state = Arc::new(AppState {
         stun_port: None,
+        max_call_minutes: 60,
         introduction: IntroductionSettings::fixed(Some("regtest"), None),
         ..(*common::test_state()).clone()
     });
@@ -436,6 +438,10 @@ async fn call_invite_and_call_state_match_goldens() {
                 side: Side::Callee,
                 deadline_ms: in_an_hour,
                 pending: None,
+                paid_until_ms: None,
+                next_block_seq: 0,
+                end_reason: None,
+                unpaid_notice_used: false,
             },
         )
         .await
@@ -458,6 +464,10 @@ async fn call_invite_and_call_state_match_goldens() {
                 phase: Phase::Ended,
                 side: Side::Caller,
                 deadline_ms: in_an_hour,
+                paid_until_ms: None,
+                next_block_seq: 0,
+                end_reason: None,
+                unpaid_notice_used: false,
                 pending: Some(Pending {
                     operation_id: unresolved.into(),
                     kind: 400,

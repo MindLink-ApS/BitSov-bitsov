@@ -73,6 +73,11 @@ pub mod events {
     pub const MESSAGE_RECEIVED: &str = "message.received";
     /// Incoming P2P message rejected by payment gate.
     pub const MESSAGE_REJECTED: &str = "message.rejected";
+    /// Payment accepted but the call block could not be committed. The record
+    /// identifies the retained receipt and block for operator reconciliation.
+    pub const CALL_BLOCK_COMMIT_FAILED: &str = "call.block_commit_failed";
+    /// Settled call block that could not be served; requires reconciliation.
+    pub const CALL_BLOCK_OVERPAYMENT: &str = "call.block_overpayment";
     /// Peer added to registry.
     pub const PEER_ADDED: &str = "peer.added";
     /// Peer removed from registry.
@@ -222,6 +227,17 @@ impl AuditLog {
                 error!(error = %e, "failed to serialize audit entry");
             }
         }
+    }
+
+    /// Financial exceptions must survive restart/power loss, and callers must
+    /// observe a failed write rather than silently discarding the evidence.
+    pub fn record_durable(&self, event: &str, actor: &str, detail: serde_json::Value) -> std::io::Result<()> {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = AuditEntry { seq: self.seq.fetch_add(1, Ordering::Relaxed),
+            timestamp: Utc::now().to_rfc3339(), event, actor, detail: Some(detail) };
+        let json = serde_json::to_string(&entry)?;
+        writeln!(writer, "{json}")?;
+        writer.sync_data()
     }
 
     /// The in-memory membrane log (N2): admission decisions at the payment
