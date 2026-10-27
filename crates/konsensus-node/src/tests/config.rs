@@ -3766,3 +3766,16 @@ fn mnemonic_secure_and_special_files_do_not_attempt_chmod() {
         super::tighten_mnemonic_permissions(path, |_, _| panic!("must not chmod")).unwrap();
     }
 }
+
+#[test]
+fn calls_duration_setting_defaults_and_rejects_out_of_bounds() {
+    let default: crate::config::CallsConfig = toml::from_str("").unwrap();
+    assert_eq!(serde_json::to_value(default).unwrap()["max_call_minutes"], 60);
+    for minutes in [1, 60, 240] {
+        let parsed: crate::config::CallsConfig = toml::from_str(&format!("max_call_minutes = {minutes}")).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap()["max_call_minutes"], minutes);
+    }
+    for minutes in [0, 241, -1] {
+        assert!(toml::from_str::<crate::config::CallsConfig>(&format!("max_call_minutes = {minutes}")).is_err());
+    }
+}
