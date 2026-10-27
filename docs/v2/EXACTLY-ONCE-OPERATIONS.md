@@ -102,6 +102,27 @@ Coordination with #103: compaction does not touch `payment_receipts`, its migrat
 
 Tests measure actual SQLite VM steps before/after 20,000 additional terminal rows, verify excluded encrypted blobs are never decrypted, exercise every state with/without accounting, upgrade a migration-024 database without checksum changes, and verify bounded encrypted retention, duplicate POST responses and #103 receipt binding after compaction/restart. Late unattached links are covered after fencing, a newer execution, and compaction; existing dispatch, settlement, budget-write failure and ACK crash-injection tests remain required.
 
+## Direct payments
+
+`POST /api/v1/payments/pay` and `/payments/keysend` require a client
+`request_id`, recorded in the same ledger as channel opens and on-chain sends
+(`pay:<caller>:<id>` / `keysend:<caller>:<id>`) before the budget debit and the backend call. A
+repeat answers from the record and never dispatches again; the outcome is
+reported as `202 in_flight` until the backend says settled (`200 settled`) or
+failed. Status codes, replay rules and the compatibility notes are in
+[API_PAYMENTS.md](API_PAYMENTS.md).
+
+## Paid web requests (kinds 500/510)
+
+The outstanding-reply row that binds a paid page or manifest request to its
+reply (`outstanding_web_requests`, migration 026) is written by
+`commit_outbox_envelope` in the same transaction as the paid envelope, the
+pending queue row and the `paid` transition. A crash after that commit cannot
+leave an envelope whose reply is unbindable. Every resend of the envelope (an
+operation retry, the recovery loop, or the reconnect flusher) upserts the row
+again, restoring it if the reply window consumed it and extending the window
+from the resend.
+
 ## Channel opens (#331)
 
 `POST /api/v1/payments/open-channel` accepts the same optional UUIDv4 `operation_id` (capability `channel_open_operations_v1`). It is recorded in `channel_open_operations` (migration 030) before dispatch; a retry with the same id and parameters returns the recorded channel (200, `replayed: true`) or its unresolved status (202 `pending`/`outcome_uncertain` with the peer's current channels) and never opens again. Different parameters return `409 operation_mismatch`; a proven non-dispatch frees the id. Omitting it keeps the previous behaviour. See [funding-fees.md](../ops/funding-fees.md#idempotent-opens-with-operation_id-331).

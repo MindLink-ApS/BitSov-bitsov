@@ -12,7 +12,7 @@ use crate::wire::{sanitized_peer_reason, Frame, WireError};
 
 use super::{
     write_noise_message, read_noise_message,
-    ControlEvent, Connection,
+    CallMediaEvent, ControlEvent, Connection,
     FRAME_BAN_DURATION, INVALID_FRAME_BUDGET, INVALID_FRAME_WINDOW,
     MEMORY_BUDGET_WINDOW, PEER_MEMORY_BUDGET,
 };
@@ -25,6 +25,24 @@ pub enum Standing {
     AdmissionPaid,
     /// The peer is privileged on this connection (whitelisted or promoted by its payment).
     Privileged,
+}
+
+/// Encryption consumes a nonce before the first socket await. If the caller
+/// abandons a record, invalidate this exact connection synchronously, while
+/// its write lock is still held, even if the reader has not observed EOF yet.
+struct MediaWriteGuard<'a> {
+    conn: &'a Connection,
+    peer: &'a NodeId,
+    complete: bool,
+}
+
+impl Drop for MediaWriteGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.conn.close();
+            info!(peer = %self.peer, "unfinished media record closed peer connection");
+        }
+    }
 }
 
 // ─── impl NoiseTransport — send_frame ────────────────────────────────────────
@@ -187,6 +205,57 @@ impl NoiseTransport {
             .map_err(|e| TransportError::Other(e.to_string()))
     }
 
+    /// Write one encoded [`Frame::CallMedia`] to `peer`, waiting at most
+    /// [`CALL_MEDIA_WRITE_DEADLINE`] for the connection's writer (M6 N2).
+    ///
+    /// Every frame on a connection shares one writer, so a bulk frame in
+    /// flight would otherwise queue audio behind it for as long as it takes.
+    /// Media is instead bounded: a packet that cannot start within the
+    /// deadline is dropped and `Timeout` returned, never written late. Wait
+    /// for socket readiness within that deadline before consuming a nonce;
+    /// congestion or cancellation here leaves the connection usable. Once
+    /// encrypted, the write has its own deadline: cancellation, failure or
+    /// timeout closes this connection before releasing the write lock.
+    ///
+    /// [`CALL_MEDIA_WRITE_DEADLINE`]: super::CALL_MEDIA_WRITE_DEADLINE
+    pub async fn send_call_media(&self, peer: &NodeId, frame_bytes: &[u8]) -> Result<(), TransportError> {
+        let conn = {
+            let peers = self.peers.read().await;
+            Arc::clone(
+                peers
+                    .get(peer)
+                    .ok_or_else(|| TransportError::NotConnected(peer.to_hex()))?,
+            )
+        };
+        let deadline = tokio::time::Instant::now() + super::CALL_MEDIA_WRITE_DEADLINE;
+        let mut state = tokio::time::timeout_at(deadline, conn.lock())
+            .await
+            .map_err(|_| TransportError::Timeout("call media writer busy".into()))?;
+        if conn.is_closed() {
+            return Err(TransportError::NotConnected(peer.to_hex()));
+        }
+        tokio::time::timeout_at(deadline, state.writer.writable())
+            .await
+            .map_err(|_| TransportError::Timeout("call media socket not writable".into()))?
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+        // Readiness can race or be a false positive. After encrypting we
+        // must still close on an incomplete record; never reuse its nonce.
+        let mut guard = MediaWriteGuard { conn: &conn, peer, complete: false };
+        let encrypted = state
+            .noise
+            .encrypt(frame_bytes)
+            .map_err(|e| TransportError::NoiseError(e.to_string()))?;
+        tokio::time::timeout(
+            super::CALL_MEDIA_WRITE_DEADLINE,
+            write_noise_message(&mut state.writer, &encrypted),
+        )
+        .await
+        .map_err(|_| TransportError::Timeout("call media record write stalled; connection closed".into()))?
+        .map_err(|e| TransportError::Other(e.to_string()))?;
+        guard.complete = true;
+        Ok(())
+    }
+
     /// M1b promote-on-paid: flip a connection's `privileged` flag to `true`.
     ///
     /// Called by the message-plane handler AFTER the PaymentGate accepts a PAID,
@@ -320,7 +389,7 @@ pub(super) fn spawn_reader_task(
     ctx: super::TransportCtx,
 ) {
     tokio::spawn(async move {
-        let super::TransportCtx { peers, banned_peers, incoming_tx, control_tx, mut shutdown, .. } = ctx;
+        let super::TransportCtx { peers, banned_peers, incoming_tx, control_tx, call_media_tx, media_ingress, mut shutdown, .. } = ctx;
         if *shutdown.borrow() { conn.remove(&peer_id, &peers).await; return; }
         // Keep the read future alive across ping ticks: cancelling/restarting a
         // partial length-prefixed read would corrupt framing and reset its deadline.
@@ -472,10 +541,11 @@ pub(super) fn spawn_reader_task(
                     info!(peer = %peer_id, reason = %sanitized_peer_reason(&reason), "peer disconnected gracefully");
                     break;
                 }
-                Frame::MessageAck { id, duplicate } => {
+                Frame::MessageAck { id, duplicate, paid_until_ms } => {
                     debug!(peer = %peer_id, msg_id = %id, "received message ack");
                     if let Err(e) = control_tx
                         .send(ControlEvent::MessageAcked {
+                            paid_until_ms,
                             duplicate,
                             peer_id,
                             message_id: id,
@@ -736,6 +806,27 @@ pub(super) fn spawn_reader_task(
                         .await
                     {
                         warn!(peer = %peer_id, error = %e, "failed to send GossipReceived control event");
+                    }
+                }
+                Frame::CallMedia { call_id, seq, data } => {
+                    // Reject strangers and excess traffic before it can
+                    // compete with other peers in the shared media channel.
+                    if !bought {
+                        continue;
+                    }
+                    let Some(slot) = media_ingress.try_acquire(peer_id, Instant::now()) else {
+                        continue;
+                    };
+                    // Never block the reader on media: the router drains its
+                    // own channel; a full one drops the newest packet.
+                    if call_media_tx
+                        .try_send(super::QueuedCallMedia {
+                            event: CallMediaEvent { peer_id, call_id, seq, data, privileged: bought },
+                            _slot: slot,
+                        })
+                        .is_err()
+                    {
+                        debug!(peer = %peer_id, "call media channel full; packet dropped");
                     }
                 }
                 Frame::CallOffer { session_id, .. } => {

@@ -336,8 +336,10 @@ async fn pricing_own_chain_aware_reports_mode() {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -509,6 +511,7 @@ async fn pay_invoice_success() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
+                "request_id": "pay-success-1",
                 "bolt11": create_test_bolt11(1000)
             })
             .to_string(),
@@ -523,6 +526,10 @@ async fn pay_invoice_success() {
     assert!(json["payment_hash"].is_string());
     assert_eq!(json["amount_msat"], 1000);
     assert!(json["preimage"].is_string());
+    assert_eq!(json["status"], "settled");
+    assert_eq!(json["request_id"], "pay-success-1");
+    assert_eq!(json["operation_id"], "pay:owner:pay-success-1");
+    assert!(json.get("replayed").is_none());
 }
 
 #[tokio::test]
@@ -1114,6 +1121,7 @@ async fn keysend_success() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
+                "request_id": "keysend-success-1",
                 "dest_pubkey": test_dest_pubkey(),
                 "amount_msat": 1000
             })
@@ -1129,7 +1137,8 @@ async fn keysend_success() {
     assert!(json["payment_hash"].is_string());
     assert!(json["preimage"].is_string());
     assert!(json["amount_msat"].is_number());
-    assert!(json["status"].is_string());
+    assert_eq!(json["status"], "settled");
+    assert_eq!(json["operation_id"], "keysend:owner:keysend-success-1");
 }
 
 #[tokio::test]
@@ -1361,8 +1370,10 @@ async fn health_lightning_unavailable_shows_null_balance() {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -1488,7 +1499,7 @@ async fn payments_pay_returns_preimage_and_hash() {
         .header("authorization", &auth)
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({ "bolt11": create_test_bolt11(1000) }).to_string(),
+            serde_json::json!({ "request_id": "pay-proof-1", "bolt11": create_test_bolt11(1000) }).to_string(),
         ))
         .unwrap();
 
@@ -1868,8 +1879,10 @@ async fn chain_status_with_failing_provider() {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -1988,8 +2001,10 @@ async fn chain_status_partial_failure() {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -2327,8 +2342,10 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: base.gossip_validator.clone(),
     });

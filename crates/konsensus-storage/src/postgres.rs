@@ -444,6 +444,9 @@ impl PostgresStorage {
     (30, "channel open operations", include_str!("../migrations/postgres/030_channel_open_operations.sql")),
     (31, "starter requests", include_str!("../migrations/postgres/031_starter_requests.sql")),
     (32, "starter queries", include_str!("../migrations/postgres/032_starter_queries.sql")),
+    (35, "call blocks", include_str!("../migrations/035_call_blocks.sql")),
+    (36, "call unpaid notice", include_str!("../migrations/036_call_unpaid_notice.sql")),
+    (37, "call block invoices", include_str!("../migrations/037_call_block_invoices.sql")),
         ]
     }
 
@@ -812,6 +815,9 @@ impl Storage for PostgresStorage {
     async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = $1").bind(id).fetch_optional(&self.pool).await?)
     }
+    async fn get_outbox_operation_by_message(&self, id: &MessageId) -> Result<Option<crate::OutboxOperation>, StorageError> {
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE message_id = $1").bind(id.to_hex()).fetch_optional(&self.pool).await?)
+    }
     async fn starter_update(&self, update: crate::starter::StarterUpdate, now: Option<i64>) -> Result<crate::starter::StarterOutcome, StorageError> {
         crate::starter::postgres::update(&self.pool, update, now).await
     }
@@ -853,6 +859,16 @@ impl Storage for PostgresStorage {
             .bind(chrono::Utc::now().timestamp_millis())
             .bind(id)
             .execute(&self.pool).await?.rows_affected() == 1)
+    }
+    async fn record_channel_open_outcome(&self, expected: &crate::ChannelOpenOperation, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
+        if expected.state == crate::channel_open::CHANNEL_OPEN_OPENED {
+            return Ok(false);
+        }
+        let changed = sqlx::query("UPDATE channel_open_operations SET state = $1, result = $2, last_error = $3, updated_at = $4 WHERE operation_id = $5 AND request_hash = $6 AND created_at = $7 AND state = $8")
+            .bind(state).bind(result).bind(last_error).bind(chrono::Utc::now().timestamp_millis())
+            .bind(&expected.operation_id).bind(&expected.request_hash).bind(expected.created_at).bind(&expected.state)
+            .execute(&self.pool).await?.rows_affected();
+        Ok(changed == 1)
     }
     async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
         Ok(sqlx::query("DELETE FROM channel_open_operations WHERE operation_id = $1 AND state = 'pending'")
@@ -933,6 +949,13 @@ impl Storage for PostgresStorage {
 
         sqlx::query("INSERT INTO pending_deliveries (message_id, recipient_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
             .bind(envelope.id.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
+        // A paid web request binds its reply in the same transaction as its
+        // envelope: no crash window between "paid and queued" and "reply bindable".
+        if let Some(row) = crate::outstanding_web_request_row(envelope)? {
+            sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
+                .bind(row.payment_hash).bind(row.request_id).bind(row.peer).bind(row.expected_reply_kind).bind(row.expires_at_ms)
+                .execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(true)
     }
@@ -1006,6 +1029,27 @@ impl Storage for PostgresStorage {
             .bind(envelope.sender.to_hex()).bind(format!("kind:{}", envelope.kind)).bind(category).bind(format!("%,{},%", envelope.kind)).bind(paid).bind(paid)
             .fetch_one(&self.pool).await?;
         amount.map(|n| u64::try_from(n).map_err(|_| StorageError::Conversion("negative quoted price".into()))).transpose()
+    }
+
+    async fn is_paid_envelope_rejected(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = -1 AND kind = $4 AND recipient_type = $5 AND recipient_id = $6 AND preimage = $7 AND amount_msat = $8 AND nonce = $9 AND references_json = $10")
+            .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+            .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .fetch_one(&self.pool).await?;
+        Ok(durable == 1)
     }
 
     async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
@@ -1590,35 +1634,39 @@ impl Storage for PostgresStorage {
     }
 
     async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
-        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash FROM call_state WHERE peer = $1 AND call_id = $2")
+        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE peer = $1 AND call_id = $2")
             .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
         row.map(call_entry_from_row).transpose()
     }
 
     async fn call_open_by_peer(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
-        let rows: Vec<(String, String, String, i64, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
-            "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash FROM call_state \
-             WHERE peer = $1 AND (pending_operation_id IS NOT NULL OR (phase <> 'ended' AND deadline_ms > $2)) \
+        let rows: Vec<(String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
+            "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state \
+             WHERE peer = $1 AND (pending_operation_id IS NOT NULL OR (phase <> 'ended' AND (CASE WHEN phase = 'live' THEN deadline_ms >= $2 ELSE deadline_ms > $2 END))) \
              ORDER BY CASE WHEN pending_operation_id IS NOT NULL THEN 0 ELSE 1 END, call_id LIMIT $3")
             .bind(peer.to_hex()).bind(now)
             .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS_PER_PEER as i64)
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(id, side, phase, deadline, op, kind, hash)| {
-            Ok((id, call_entry_from_row((side, phase, deadline, op, kind, hash))?))
+        rows.into_iter().map(|(id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
+            Ok((id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
         }).collect()
     }
 
     async fn call_put(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
         let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
-        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash")
+        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, paid_until_ms = excluded.paid_until_ms, next_block_seq = excluded.next_block_seq, end_reason = excluded.end_reason, unpaid_notice_used = excluded.unpaid_notice_used")
             .bind(peer.to_hex()).bind(call_id)
             .bind(entry.side.as_str()).bind(entry.phase.as_str())
             .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
             .bind(entry.pending.as_ref().map(|p| p.operation_id.clone()))
             .bind(entry.pending.as_ref().map(|p| i64::from(p.kind)))
             .bind(entry.pending.as_ref().map(|p| p.request_hash.clone()))
+            .bind(entry.paid_until_ms.map(ms).transpose()?)
+            .bind(i64::from(entry.next_block_seq))
+            .bind(entry.end_reason.map(|reason| reason.as_str()))
+            .bind(i64::from(entry.unpaid_notice_used))
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -1638,7 +1686,7 @@ impl Storage for PostgresStorage {
                 COALESCE(SUM(CASE WHEN open = 1 THEN 1 ELSE 0 END), 0), \
                 COALESCE(SUM(CASE WHEN open = 0 AND peer = $2 THEN 1 ELSE 0 END), 0), \
                 COALESCE(SUM(CASE WHEN open = 0 THEN 1 ELSE 0 END), 0) \
-             FROM (SELECT peer, CASE WHEN pending_operation_id IS NOT NULL OR (phase <> 'ended' AND deadline_ms > $3) THEN 1 ELSE 0 END AS open \
+             FROM (SELECT peer, CASE WHEN pending_operation_id IS NOT NULL OR (phase <> 'ended' AND (CASE WHEN phase = 'live' THEN deadline_ms >= $3 ELSE deadline_ms > $3 END)) THEN 1 ELSE 0 END AS open \
                    FROM call_state WHERE replay_until_ms > $4 OR pending_operation_id IS NOT NULL) AS rows")
             .bind(peer.to_hex()).bind(peer.to_hex()).bind(now).bind(now).fetch_one(&self.pool).await?;
         let n = |v: i64| u64::try_from(v).unwrap_or(0);
@@ -1658,18 +1706,63 @@ impl Storage for PostgresStorage {
     }
 
     async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
-            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash FROM call_state WHERE pending_operation_id IS NOT NULL")
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE pending_operation_id IS NOT NULL")
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash)| {
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
             let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
-            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash))?))
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
         }).collect()
+    }
+
+    async fn call_live(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE phase = 'live' ORDER BY deadline_ms LIMIT $1")
+            .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS as i64).fetch_all(&self.pool).await?;
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
+            let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
+        }).collect()
+    }
+
+    async fn record_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32], retain_until_ms: u64) -> Result<(), StorageError> {
+        let until = i64::try_from(retain_until_ms).map_err(|_| StorageError::Conversion("call invoice time overflow".into()))?;
+        let mut tx = self.pool.begin().await?;
+        // Serialize issuance for this tuple even when it has no rows yet.
+        // The following statement gets a fresh snapshot after the lock wait.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("call_block_invoice:{}:{call_id}:{seq}", peer.to_hex()))
+            .execute(&mut *tx).await?;
+        let inserted = sqlx::query("INSERT INTO call_block_invoices (payment_hash, peer, call_id, seq, retain_until_ms) SELECT $1, $2, $3, $4, $5 WHERE (SELECT COUNT(*) FROM call_block_invoices WHERE peer = $2 AND call_id = $3 AND seq = $4) < $6")
+            .bind(hex::encode(payment_hash)).bind(peer.to_hex()).bind(call_id).bind(i64::from(seq)).bind(until)
+            .bind(i64::from(konsensus_core::payloads::call::MAX_CALL_BLOCK_INVOICES))
+            .execute(&mut *tx).await?;
+        if inserted.rows_affected() == 0 {
+            return Err(StorageError::Conversion("call block invoice capacity reached".into()));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn has_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32]) -> Result<bool, StorageError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_block_invoices WHERE payment_hash = $1 AND peer = $2 AND call_id = $3 AND seq = $4")
+            .bind(hex::encode(payment_hash)).bind(peer.to_hex()).bind(call_id).bind(i64::from(seq))
+            .fetch_one(&self.pool).await?;
+        Ok(count == 1)
     }
 
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
-        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= $1 AND pending_operation_id IS NULL ORDER BY replay_until_ms LIMIT $2)")
+        // Reclaim legacy caller reservations once no interval can be resumed.
+        // The independent outbox operation retains all payment evidence.
+        sqlx::query("UPDATE call_state SET pending_operation_id = NULL, pending_kind = NULL, pending_request_hash = NULL WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE phase = 'ended' AND side = 'caller' AND pending_kind = 404 AND pending_operation_id IS NOT NULL AND (end_reason IS NULL OR end_reason <> 'unpaid' OR deadline_ms - $3 + $4 < $1) ORDER BY deadline_ms LIMIT $2)")
+            .bind(now).bind(i64::from(max))
+            .bind(konsensus_core::payloads::call::TOMBSTONE_MS as i64)
+            .bind(konsensus_core::payloads::call::CALL_BLOCK_RESUME_MS as i64)
+            .execute(&self.pool).await?;
+        sqlx::query("DELETE FROM call_block_invoices WHERE payment_hash IN (SELECT payment_hash FROM call_block_invoices WHERE retain_until_ms < $1 ORDER BY retain_until_ms LIMIT $2)")
+            .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
+        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= $1 AND (pending_operation_id IS NULL OR (phase = 'ended' AND side = 'caller' AND pending_kind = 404)) ORDER BY replay_until_ms LIMIT $2)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
         Ok(done.rows_affected())
     }
@@ -3577,6 +3670,69 @@ mod accepted_invites_guard {
 mod migration_recovery_tests {
     use super::*;
 
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn call_notice_upgrade_and_all_readers_survive_reconnect() {
+        use konsensus_core::payloads::call::{self as calls, Phase, Side};
+        let url = std::env::var("BITSOV_TEST_POSTGRES_URL").unwrap();
+        let admin = PgPool::connect(&url).await.unwrap();
+        let name = format!("call_notice_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+        let db_url = format!("{}/{name}", url.rsplit_once('/').unwrap().0);
+        let peer = NodeId::from_bytes([8; 32]);
+        let call_id = "0123456789abcdef0123456789abcdef";
+        // Upgrade an existing 035 row; the marker must default to unused.
+        let pool = PgPool::connect(&db_url).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE _konsensus_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .execute(&pool).await.unwrap();
+        for (version, description, sql) in PostgresStorage::pg_migrations().into_iter().filter(|(v, _, _)| *v < 36) {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO _konsensus_migrations VALUES ($1, $2)")
+                .bind(version).bind(description).execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms) VALUES ($1, $2, 'callee', 'live', 31000, 86431000)")
+            .bind(peer.to_hex()).bind(call_id).execute(&pool).await.unwrap();
+        pool.close().await;
+        let db = PostgresStorage::connect(&db_url).await.unwrap();
+        let live = db.call_get(&peer, call_id).await.unwrap().unwrap();
+        assert_eq!((live.side, live.phase, live.unpaid_notice_used), (Side::Callee, Phase::Live, false));
+        assert_eq!(db.call_live().await.unwrap(), vec![(peer, call_id.to_owned(), live.clone())]);
+        assert_eq!(db.call_open_by_peer(&peer, 1_000).await.unwrap(), vec![(call_id.to_owned(), live.clone())]);
+        let pending = calls::reserve_unpaid_hangup(Some(live.at(31_001).unwrap()), "notice", "hash").unwrap();
+        db.call_put(&peer, call_id, &pending).await.unwrap();
+        assert_eq!(db.call_pending().await.unwrap(), vec![(peer, call_id.to_owned(), pending.clone())]);
+        assert_eq!(db.call_open_by_peer(&peer, 31_001).await.unwrap(), vec![(call_id.to_owned(), pending.clone())]);
+        let ended = calls::commit(pending, "notice", 31_002).unwrap();
+        db.call_put(&peer, call_id, &ended).await.unwrap();
+        db.record_call_block_invoice(&peer, call_id, 0, &[3; 32], 90_000).await.unwrap();
+        assert!(db.record_call_block_invoice(&peer, call_id, 1, &[3; 32], 90_000).await.is_err());
+        db.pool.close().await;
+        let db = PostgresStorage::connect(&db_url).await.unwrap();
+        let persisted = db.call_get(&peer, call_id).await.unwrap().unwrap();
+        assert_eq!(persisted, ended);
+        assert!(persisted.unpaid_notice_used);
+        assert!(calls::reserve_unpaid_hangup(Some(persisted), "again", "hash2").is_err());
+        assert!(db.has_call_block_invoice(&peer, call_id, 0, &[3; 32]).await.unwrap());
+        assert!(!db.has_call_block_invoice(&NodeId::from_bytes([9; 32]), call_id, 0, &[3; 32]).await.unwrap());
+        assert!(!db.has_call_block_invoice(&peer, call_id, 1, &[3; 32]).await.unwrap());
+        assert!(!db.has_call_block_invoice(&peer, "different", 0, &[3; 32]).await.unwrap());
+        assert!(!db.has_call_block_invoice(&peer, call_id, 0, &[4; 32]).await.unwrap());
+        let stalled = calls::CallEntry { side: Side::Caller, end_reason: Some(calls::HangupReason::Hangup),
+            pending: Some(calls::Pending { kind: 404, operation_id: "block".into(), request_hash: "hash".into() }), ..ended };
+        db.call_put(&peer, call_id, &stalled).await.unwrap();
+        db.call_sweep(90_001, 1).await.unwrap();
+        assert!(db.call_pending().await.unwrap().is_empty());
+        assert_eq!(db.call_counts(&peer, 90_001).await.unwrap().open_peer, 0);
+        assert!(!db.has_call_block_invoice(&peer, call_id, 0, &[3; 32]).await.unwrap());
+        db.call_put(&peer, call_id, &stalled).await.unwrap();
+        db.call_sweep(stalled.deadline_ms, 1).await.unwrap();
+        assert!(db.call_get(&peer, call_id).await.unwrap().is_none());
+        db.pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+        admin.close().await;
+    }
+
+
     /// #129 R1/R2 on Postgres: the outstanding web request survives a reconnect,
     /// is taken once, and expired rows are swept with a bound.
     #[tokio::test]
@@ -3966,10 +4122,10 @@ fn outstanding_from_row(
 }
 
 /// `(side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash)` of `call_state`.
-type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>);
+type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64);
 
 /// A stored call row. A corrupt row is an error, never a call.
-fn call_entry_from_row((side, phase, deadline, op, kind, hash): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
+fn call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
     use konsensus_core::payloads::call::{CallEntry, Pending, Phase, Side};
     let bad = |what: &str| StorageError::Conversion(format!("call state: bad {what}"));
     let pending = match (op, kind) {
@@ -3981,6 +4137,10 @@ fn call_entry_from_row((side, phase, deadline, op, kind, hash): CallRow) -> Resu
         side: Side::parse(&side).ok_or_else(|| bad("side"))?,
         phase: Phase::parse(&phase).ok_or_else(|| bad("phase"))?,
         deadline_ms: u64::try_from(deadline).map_err(|_| bad("deadline"))?,
+        paid_until_ms: paid.map(|v| u64::try_from(v).map_err(|_| bad("paid until"))).transpose()?,
+        next_block_seq: u32::try_from(seq).map_err(|_| bad("block sequence"))?,
+        end_reason: reason.map(|v| konsensus_core::payloads::call::HangupReason::parse(&v).ok_or_else(|| bad("end reason"))).transpose()?,
+        unpaid_notice_used: match notice { 0 => false, 1 => true, _ => return Err(bad("unpaid notice")) },
         pending,
     })
 }

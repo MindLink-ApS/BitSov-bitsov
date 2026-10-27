@@ -179,7 +179,7 @@ async fn burned_ids_older_than_the_minimum_make_room_oldest_first() {
     // 255 calls that ended more than BURN_MIN_MS ago (oldest = id 0) ...
     for i in 0..MAX_BURNED_PER_PEER as usize - 1 {
         let ended = now - BURN_MIN_MS - 60_000 * (MAX_BURNED_PER_PEER - i as u64);
-        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None };
+        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false };
         store.call_put(&peer, &id(i), &entry).await.unwrap();
     }
     // ... and one that just ended.
@@ -352,7 +352,7 @@ async fn call_state_survives_a_restart() {
         calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &theirs))).await.unwrap();
         calls::admit_incoming(&store, &own(), &peer, 403, Some(&body(403, &theirs))).await.unwrap();
         calls::reserve_outgoing(&store, &own(), &peer, 400, &body(400, &mine), "op-mine", "h").await.unwrap();
-        calls::commit_outgoing(&store, &peer, &body(400, &mine), "op-mine", "h").await;
+        calls::commit_outgoing(&store, &peer, &body(400, &mine), "op-mine", "h").await.unwrap();
         store.pool().close().await;
     }
     let store = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
@@ -422,7 +422,7 @@ async fn unknown_call_signals_never_evict_burned_ids() {
     let now = now_ms();
     for i in 0..MAX_BURNED_PER_PEER as usize {
         let ended = now - BURN_MIN_MS - 60_000 * (MAX_BURNED_PER_PEER - i as u64);
-        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None };
+        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false };
         store.call_put(&peer, &id(i), &entry).await.unwrap();
     }
     for kind in [401, 402, 403] {

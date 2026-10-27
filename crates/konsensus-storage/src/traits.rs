@@ -161,6 +161,9 @@ pub trait Storage: Send + Sync {
     async fn record_outbox_sent(&self, _id: &MessageId, _peer: &NodeId) -> Result<(), StorageError> { Ok(()) }
 
     /// Atomically publish the paid envelope, pending queue entry and operation.
+    /// A paid web request (kind 500/510) also commits its outstanding-reply row
+    /// (`outstanding_web_requests`) in the same transaction: a crash after the
+    /// envelope exists can never leave its reply unbindable.
     /// Uses the same version CAS as update_outbox_operation; false writes nothing.
     async fn commit_outbox_envelope(&self, _op: &crate::OutboxOperation, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
@@ -174,6 +177,11 @@ pub trait Storage: Send + Sync {
     async fn update_outbox_operation(&self, _op: &crate::OutboxOperation) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
+    /// Durable operation binding used by paid-block delivery confirmations.
+    async fn get_outbox_operation_by_message(&self, _id: &MessageId) -> Result<Option<crate::OutboxOperation>, StorageError> {
+        Err(StorageError::Unsupported("outbox operation by message".into()))
+    }
+
     async fn get_outbox_operation(&self, _id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
@@ -204,6 +212,21 @@ pub trait Storage: Send + Sync {
     /// Remove a `pending` record after a proven non-dispatch, so the same id
     /// may be retried. Resolved records are never removed.
     async fn delete_pending_channel_open_operation(&self, _id: &str) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("channel open operations".into()))
+    }
+    /// Fenced outcome write (direct payments): move the row to `state` only
+    /// while it is still the row `expected` describes, with the same request
+    /// binding (`request_hash`), insertion time (`created_at`) and current
+    /// `state`. A row deleted and re-inserted under the same id, or already
+    /// finalized by another writer, is left untouched; false writes nothing and
+    /// the caller re-reads the authoritative row. `opened` is never rewritten.
+    async fn record_channel_open_outcome(
+        &self,
+        _expected: &crate::ChannelOpenOperation,
+        _state: &str,
+        _result: Option<&[u8]>,
+        _last_error: Option<&str>,
+    ) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("channel open operations".into()))
     }
     /// Complete recovery authority: never silently truncate unpaid/paid work.
@@ -249,6 +272,11 @@ pub trait Storage: Send + Sync {
     /// default is for backends without holds.
     async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<PaidAcceptance, StorageError> {
         self.accept_paid_envelope(envelope).await
+    }
+
+    /// Exact, previously accepted proof subsequently rejected by the application.
+    async fn is_paid_envelope_rejected(&self, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        Ok(false)
     }
 
     /// Match immutable acceptance without reserving replay keys or writing messages.
@@ -1165,7 +1193,26 @@ pub trait Storage: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Drop up to `max` entries whose replay protection ended, with no pending signal.
+    /// At most MAX_OPEN_CALLS live rows, including expired ones, oldest first.
+    async fn call_live(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
+    /// Bind an invoice hash to the peer and block before publishing it.
+    /// Stored separately from replay receipts; duplicates cannot rebind a hash.
+    /// Refuse past MAX_CALL_BLOCK_INVOICES per (peer, call_id, seq), retaining
+    /// all issued bindings until their retention window has been swept.
+    async fn record_call_block_invoice(&self, _peer: &NodeId, _call_id: &str, _seq: u32, _payment_hash: &[u8; 32], _retain_until_ms: u64) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call block invoice provenance".into()))
+    }
+
+    /// Only a callee-issued block invoice can admit a 404. Unknown is not valid.
+    async fn has_call_block_invoice(&self, _peer: &NodeId, _call_id: &str, _seq: u32, _payment_hash: &[u8; 32]) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("call block invoice provenance".into()))
+    }
+
+    /// Reclaim stale ended reservations and drop up to `max` expired tombstones.
+    /// Also prune up to `max` invoice bindings past their call's resume window.
     async fn call_sweep(&self, _now_ms: u64, _max: u32) -> Result<u64, StorageError> {
         Ok(0)
     }

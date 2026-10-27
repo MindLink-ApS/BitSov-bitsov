@@ -536,11 +536,21 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         let result = result.map(|r| self.encrypt(r)).transpose()?;
         self.inner.resolve_channel_open_operation(id, state, result.as_deref(), last_error).await
     }
+    async fn record_channel_open_outcome(&self, expected: &crate::ChannelOpenOperation, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
+        // The fence reads only unencrypted columns (id, request hash, time, state).
+        let result = result.map(|r| self.encrypt(r)).transpose()?;
+        self.inner.record_channel_open_outcome(expected, state, result.as_deref(), last_error).await
+    }
     async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
         self.inner.delete_pending_channel_open_operation(id).await
     }
     async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
         let mut op = self.inner.get_outbox_operation(id).await?;
+        if let Some(op) = &mut op { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
+        Ok(op)
+    }
+    async fn get_outbox_operation_by_message(&self, id: &MessageId) -> Result<Option<crate::OutboxOperation>, StorageError> {
+        let mut op = self.inner.get_outbox_operation_by_message(id).await?;
         if let Some(op) = &mut op { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
         Ok(op)
     }
@@ -582,6 +592,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn delivery_price_floor(&self, envelope: &UkmEnvelope, paid_at: u64, now: u64) -> Result<Option<u64>, StorageError> {
         self.inner.delivery_price_floor(envelope, paid_at, now).await
+    }
+
+    async fn is_paid_envelope_rejected(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        self.inner.is_paid_envelope_rejected(envelope).await
     }
 
     async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
@@ -872,6 +886,19 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         self.inner.call_pending().await
+    }
+
+    async fn call_live(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        self.inner.call_live().await
+    }
+
+    async fn record_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32], retain_until_ms: u64) -> Result<(), StorageError> {
+        // Routing/payment metadata only, like call_state; no payload or preimage.
+        self.inner.record_call_block_invoice(peer, call_id, seq, payment_hash, retain_until_ms).await
+    }
+
+    async fn has_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32]) -> Result<bool, StorageError> {
+        self.inner.has_call_block_invoice(peer, call_id, seq, payment_hash).await
     }
 
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
