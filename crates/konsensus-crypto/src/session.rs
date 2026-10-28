@@ -772,6 +772,23 @@ impl SessionManager {
             .is_some_and(|session| session.ratchet.has_consumed(header))
     }
 
+    /// Inspect a payment-validated payload before application admission without
+    /// consuming ratchet keys or persisting session changes. Once accepted, the
+    /// caller must use `decrypt` to advance the real session normally.
+    pub async fn preview_decrypt(
+        &self,
+        peer_id: &NodeId,
+        message: &RatchetMessage,
+    ) -> Result<Vec<u8>, SessionError> {
+        let mut preview = {
+            let sessions = self.sessions.read().await;
+            let session = sessions.get(peer_id).ok_or(SessionError::NoSession(*peer_id))?;
+            DoubleRatchet::from_state(&session.ratchet.export_state())
+        };
+        // Both the snapshot and disposable ratchet zeroize their secrets on drop.
+        Ok(preview.decrypt(message)?)
+    }
+
     /// Decrypt a ciphertext message from a peer.
     ///
     /// Uses the Double Ratchet to derive the message key and decrypt.

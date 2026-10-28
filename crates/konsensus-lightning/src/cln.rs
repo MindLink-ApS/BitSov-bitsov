@@ -702,6 +702,7 @@ impl LightningProvider for ClnProvider {
                     peer_pubkey: required(ch.peer_id)?,
                     capacity_msat: capacity,
                     local_balance_msat: local,
+                    outbound_capacity_msat: ch.spendable_msat.map(|v| v.0),
                     remote_balance_msat: capacity
                         .checked_sub(local)
                         .ok_or_else(|| error("CLN channel balances are inconsistent"))?,

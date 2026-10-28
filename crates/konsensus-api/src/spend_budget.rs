@@ -41,6 +41,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
+mod calls;
+pub use calls::{CallSpend, CallSpendStatus, CallSpendTerms};
+
 /// Capability advertised on `/api/v1/status` once this node meters grants.
 pub const CAPABILITY: &str = "spend_budget_grant_v1";
 
@@ -369,6 +372,9 @@ pub struct GrantBudget {
     /// Written atomically with the debit, before async operation attachment.
     #[serde(default)]
     pub operation_links: BTreeMap<String, OperationReservationLink>,
+    /// Call-sized holds and child payment identities, committed with the debit.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub call_reservations: BTreeMap<String, CallSpend>,
     /// A relation grant (device-signed `RelationIntent`s): only recipients
     /// with a live envelope may be paid. Everyone else is refused, rather than
     /// falling through to the total as in an owner console grant.
@@ -412,6 +418,7 @@ impl GrantBudget {
             used_by_recipient: BTreeMap::new(),
             pending: BTreeMap::new(),
             operation_links: BTreeMap::new(),
+            call_reservations: BTreeMap::new(),
             recipients_only: false,
             per_act_max_by_recipient: BTreeMap::new(),
             recipient_expires_at: BTreeMap::new(),
@@ -593,10 +600,14 @@ impl GrantBudget {
             consecutive_failures: self.breaker_state.consecutive_failures,
             unresolved_payments: self
                 .pending
-                .values()
+                .iter()
+                .filter(|(id, _)| !self.call_reservations.contains_key(*id)
+                    && !self.call_reservations.values().any(|call| call.draws.contains_key(*id)))
+                .map(|(_, recipients)| recipients)
                 .flat_map(|r| r.values())
                 .filter(|v| **v > 0)
-                .count() as u64,
+                .count() as u64 + self.call_reservations.values()
+                    .filter(|call| !call.outcome_recorded && call.terms.reserved_msat > 0).count() as u64,
             paused: self.breaker_state.paused,
         };
         for (at, bucket) in &self.breaker_state.buckets {
@@ -849,6 +860,10 @@ impl Reservation {
 /// Why a debit was refused. Nothing was reserved and nothing was dispatched.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BudgetRefusal {
+    #[error("call reservation requires {required_msat} msat but outbound liquidity has {available_msat} msat available; nothing was dispatched")]
+    CallLiquidity { required_msat: u64, available_msat: u64 },
+    #[error("call block price or routing fee exceeds the reserved ceiling; nothing was dispatched")]
+    CallPriceChanged,
     #[error("grant paused after consecutive failures; owner console reset required")]
     GrantPaused,
     #[error(
@@ -909,6 +924,8 @@ impl BudgetRefusal {
     /// Stable machine-readable reason, returned alongside `budget_exceeded`.
     pub fn reason(&self) -> &'static str {
         match self {
+            BudgetRefusal::CallLiquidity { .. } => "call_liquidity_insufficient",
+            BudgetRefusal::CallPriceChanged => "call_price_changed",
             BudgetRefusal::GrantPaused => "grant_paused",
             BudgetRefusal::FailuresPending => "failure_limit_pending",
             BudgetRefusal::RateLimitMinute => "rate_limit_minute",

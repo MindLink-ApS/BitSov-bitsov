@@ -78,6 +78,29 @@ async fn encrypt_decrypt_roundtrip() {
 }
 
 #[tokio::test]
+async fn preview_decrypt_preserves_session_for_retries_and_normal_decryption() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_a = *id_a.node_id();
+    let node_b = *id_b.node_id();
+    let mgr_a = SessionManager::new(id_a);
+    let mgr_b = SessionManager::new(id_b);
+    let init = mgr_a.initiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+    let message = mgr_a.encrypt(&node_b, b"block zero").await.unwrap();
+    let mut corrupt = message.clone();
+    corrupt.ciphertext[0] ^= 1;
+    assert!(mgr_b.preview_decrypt(&node_a, &corrupt).await.is_err());
+    for _ in 0..2 {
+        assert_eq!(mgr_b.preview_decrypt(&node_a, &message).await.unwrap(), b"block zero");
+    }
+    assert_eq!(mgr_b.decrypt(&node_a, &message).await.unwrap(), b"block zero");
+    assert!(mgr_b.preview_decrypt(&node_a, &message).await.is_err());
+    let next = mgr_a.encrypt(&node_b, b"next signal").await.unwrap();
+    assert_eq!(mgr_b.decrypt(&node_a, &next).await.unwrap(), b"next signal");
+}
+
+#[tokio::test]
 async fn bidirectional_messages() {
     let id_a = make_identity(TEST_MNEMONIC_A);
     let id_b = make_identity(TEST_MNEMONIC_B);
