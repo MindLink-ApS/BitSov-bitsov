@@ -236,6 +236,10 @@ pub struct ChannelInfo {
     pub capacity_msat: u64,
     /// Local balance in millisatoshis.
     pub local_balance_msat: u64,
+    /// Known spendable outbound capacity after reserves and pending HTLCs.
+    /// Unknown providers must leave this absent, never substitute total balance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_capacity_msat: Option<u64>,
     /// Remote balance in millisatoshis.
     pub remote_balance_msat: u64,
     /// Whether the channel is active (can route payments).

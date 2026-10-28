@@ -217,6 +217,25 @@ struct LndChannel {
     remote_balance: Option<String>,
     active: Option<bool>,
     chan_id: Option<String>,
+    local_constraints: Option<LndChannelConstraints>,
+    local_chan_reserve_sat: Option<String>,
+    unsettled_balance: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LndChannelConstraints {
+    chan_reserve_sat: Option<String>,
+}
+
+impl LndChannel {
+    fn outbound_capacity_msat(&self) -> Option<u64> {
+        let local = self.local_balance.as_ref()?.parse::<u64>().ok()?;
+        let reserve = self.local_constraints.as_ref().and_then(|c| c.chan_reserve_sat.as_ref())
+            .or(self.local_chan_reserve_sat.as_ref())?.parse::<u64>().ok()?;
+        // Conservative: retain all unsettled value, even incoming HTLCs.
+        let unsettled = self.unsettled_balance.as_ref()?.parse::<u64>().ok()?;
+        local.saturating_sub(reserve).saturating_sub(unsettled).checked_mul(1000)
+    }
 }
 
 /// Response from GET /v1/getinfo.
@@ -1144,6 +1163,7 @@ impl LightningProvider for LndProvider {
             .unwrap_or_default()
             .into_iter()
             .map(|ch| -> Result<ChannelInfo, LightningError> {
+                let outbound_capacity_msat = ch.outbound_capacity_msat();
                 let capacity_sat = ch.capacity.as_deref().map(Self::parse_u64).unwrap_or(0);
                 let local_sat = ch
                     .local_balance
@@ -1169,6 +1189,7 @@ impl LightningProvider for LndProvider {
                     peer_pubkey: ch.remote_pubkey.unwrap_or_default(),
                     capacity_msat: Self::scale_sats(capacity_sat)?,
                     local_balance_msat: Self::scale_sats(local_sat)?,
+                    outbound_capacity_msat,
                     remote_balance_msat: Self::scale_sats(remote_sat)?,
                     active: ch.active.unwrap_or(false),
                     short_channel_id: ch.chan_id,

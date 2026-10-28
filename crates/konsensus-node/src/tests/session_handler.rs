@@ -1325,6 +1325,18 @@ async fn invoice_requested_creates_invoice_on_local_wallet() {
 }
 
 #[tokio::test]
+async fn generic_invoice_handler_cannot_issue_block_purpose_invoices() {
+    let lightning: Arc<dyn LightningProvider> = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    handle_invoice_requested(&test_peer_id(), "generic-block", 23_000,
+        "konsensus:call_block:0123456789abcdef0123456789abcdef:0", &admission_pricing(),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(), &lightning,
+        &make_gossip_test_transport(), "127.0.0.1".parse().unwrap(),
+        &mut crate::invoice_refusals::RefusalLimits::default(), 0,
+        &mut ready_invoice_book().await).await;
+    assert!(lightning.list_payments(10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn invoice_requested_sends_error_on_lightning_failure() {
     use konsensus_core::traits::lightning::{
         Invoice, LightningError, LightningProvider as LP, PaymentDetails,
@@ -2698,6 +2710,7 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                     privileged,
                 },
                 ControlEvent::MessageAcked {
+                    paid_until_ms: None,
                     duplicate: false,
                     peer_id,
                     message_id,
@@ -2854,8 +2867,7 @@ async fn delivery_receipts_only_advance_matching_sent_rows_and_never_unpaid_weig
             &routing,
             &ws,
             &audit,
-            &mut limits,
-        )
+            &mut limits, None)
         .await;
     }
     assert!(
@@ -2875,7 +2887,7 @@ async fn delivery_receipts_only_advance_matching_sent_rows_and_never_unpaid_weig
         &ws,
         &audit,
         &mut limits,
-    )
+     None)
     .await;
     handle_delivery_confirmation(
         &peer,
@@ -2889,7 +2901,7 @@ async fn delivery_receipts_only_advance_matching_sent_rows_and_never_unpaid_weig
         &ws,
         &audit,
         &mut limits,
-    )
+     None)
     .await;
     assert!(updates.try_recv().is_err());
     handle_delivery_confirmation(
@@ -2904,7 +2916,7 @@ async fn delivery_receipts_only_advance_matching_sent_rows_and_never_unpaid_weig
         &ws,
         &audit,
         &mut limits,
-    )
+     None)
     .await;
     assert_eq!(updates.try_recv().unwrap().status, "rejected");
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 1);
@@ -2920,7 +2932,7 @@ async fn delivery_receipts_only_advance_matching_sent_rows_and_never_unpaid_weig
         &ws,
         &audit,
         &mut limits,
-    )
+     None)
     .await;
     assert_eq!(updates.try_recv().unwrap().status, "delivered");
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
@@ -2936,7 +2948,7 @@ async fn delivery_receipts_only_advance_matching_sent_rows_and_never_unpaid_weig
         &ws,
         &audit,
         &mut limits,
-    )
+     None)
     .await;
     assert!(
         updates.try_recv().is_err(),
@@ -2957,7 +2969,7 @@ async fn delivery_receipts_only_advance_matching_sent_rows_and_never_unpaid_weig
         &ws,
         &audit,
         &mut limits,
-    )
+     None)
     .await;
     assert_eq!(updates.try_recv().unwrap().status, "delivered");
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
@@ -3009,8 +3021,7 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
             &routing,
             &ws,
             &audit,
-            &mut limits,
-        )
+            &mut limits, None)
         .await;
         let terminal = !matches!(
             reason,
@@ -3046,8 +3057,7 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
             &routing,
             &ws,
             &audit,
-            &mut limits,
-        )
+            &mut limits, None)
         .await;
         assert!(updates.try_recv().is_err(), "one rejection per dispatch");
         if terminal {
@@ -3085,7 +3095,7 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
                 &ws,
                 &audit,
                 &mut limits,
-            )
+             None)
             .await;
             let retry: i64 = sqlx::query_scalar("SELECT retry_after_ms FROM pending_deliveries")
                 .fetch_one(db.pool())
@@ -3140,8 +3150,7 @@ async fn unpaid_confirmation_flood_is_bounded_before_storage_even_across_peer_ch
             &routing,
             &ws,
             &audit,
-            &mut limits,
-        )
+            &mut limits, None)
         .await;
     }
     handle_delivery_confirmation(
@@ -3156,7 +3165,7 @@ async fn unpaid_confirmation_flood_is_bounded_before_storage_even_across_peer_ch
         &ws,
         &audit,
         &mut limits,
-    )
+     None)
     .await;
     assert_eq!(
         db.count_pending_deliveries().await.unwrap(),
@@ -3197,7 +3206,7 @@ async fn unpaid_confirmation_flood_is_bounded_before_storage_even_across_peer_ch
         &ws,
         &audit,
         &mut limits,
-    )
+     None)
     .await;
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
     assert_eq!(updates.try_recv().unwrap().status, "delivered");
@@ -3292,8 +3301,7 @@ async fn legacy_lost_ack_recovers_after_nonce_expiry_and_sender_restart() {
             &routing,
             &ws,
             &audit,
-            &mut budget,
-        )
+            &mut budget, None)
         .await;
         if case == "exact" {
             assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
@@ -3483,7 +3491,7 @@ async fn accepted_chain_price_rise_and_delayed_ack_never_fail_paid() {
         &ws,
         &audit,
         &mut budget,
-    )
+     None)
     .await;
     assert_eq!(updates.try_recv().unwrap().status, "delivered");
     assert_eq!(sender.count_pending_deliveries().await.unwrap(), 0);
@@ -3500,7 +3508,7 @@ async fn accepted_chain_price_rise_and_delayed_ack_never_fail_paid() {
         &ws,
         &audit,
         &mut budget,
-    )
+     None)
     .await;
     assert!(updates.try_recv().is_err());
     assert_eq!(sender.count_pending_deliveries().await.unwrap(), 0);
@@ -5545,4 +5553,83 @@ async fn review_regression_expiry_retries_run_before_slow_status_scan() {
     let result = crate::peer_invoices::reconcile(book.clone(), wallet.clone(), now).await;
     book.apply_reconciliation(result);
     assert!(wallet.inner.list_payments(500).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn call_block_invoice_near_deadline_is_refused_without_payment() {
+    use konsensus_core::payloads::call as calls;
+    let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let ringing = calls::receive(None, 400, None, now - 16_000).unwrap();
+    let pending = calls::reserve(Some(ringing), 401, "answer", "hash", now - 16_000).unwrap();
+    let live = calls::commit(pending, "answer", now - 16_000).unwrap();
+    storage.call_put(&peer, id, &live).await.unwrap();
+    let wallet = konsensus_lightning::MockLightningProvider::new();
+    let balance = wallet.get_balance_msat().await.unwrap();
+    let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
+    let refused = prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, "block", &wallet).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
+    assert!(wallet.list_payments(10).await.unwrap().is_empty(), "no invoice or payment should be created");
+    assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
+    storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
+    let issued = prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, "block-ok", &wallet).await.unwrap();
+    assert_eq!(issued.expiry_secs, 5);
+    let hash = hex::decode(&issued.payment_hash).unwrap().try_into().unwrap();
+    assert!(storage.has_call_block_invoice(&peer, id, 0, &hash).await.unwrap());
+    assert!(!storage.has_call_block_invoice(&peer, id, 1, &hash).await.unwrap());
+    // An unavailable provenance store withholds the invoice before any payment.
+    sqlx::query("CREATE TRIGGER fail_block_invoice BEFORE INSERT ON call_block_invoices BEGIN SELECT RAISE(FAIL, 'test'); END")
+        .execute(storage.pool()).await.unwrap();
+    assert_eq!(prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, "write-fails", &wallet).await.unwrap_err(),
+        konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
+    assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
+}
+
+#[tokio::test]
+async fn call_block_ack_storage_failure_retains_delivery_until_grant_is_durable() {
+    use konsensus_core::{payloads::call as calls, PaymentProof, Recipient, UkmEnvelopeBuilder};
+    let own = make_peer_id(71);
+    let peer = make_peer_id(72);
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    let ended = calls::CallEntry { side: calls::Side::Caller, phase: calls::Phase::Ended,
+        deadline_ms: now + calls::TOMBSTONE_MS, pending: None, paid_until_ms: None,
+        next_block_seq: 0, end_reason: Some(calls::HangupReason::Unpaid), unpaid_notice_used: true };
+    db.call_put(&peer, id, &ended).await.unwrap();
+    let envelope = UkmEnvelopeBuilder::new(404, own, Recipient::Node(peer), vec![1],
+        PaymentProof::new([2; 32], [3; 32], 23_000)).build();
+    db.store_message(&envelope).await.unwrap();
+    let mut op = konsensus_storage::OutboxOperation::prepared("grant-ack".into(), peer.to_hex(), 404, "request".into());
+    op.state = "sent".into();
+    op.message_id = Some(envelope.id.to_hex());
+    op.recovery = serde_json::to_vec(&serde_json::json!({"call_block": [id, 0], "dispatched": true,
+        "expected_msat": 23_000, "fee_ceiling_msat": 0, "admission_msat": 0})).unwrap();
+    db.insert_outbox_operation(&op).await.unwrap();
+    db.queue_pending_delivery(&envelope.id, &peer).await.unwrap();
+    db.mark_pending_sent(&envelope.id, &peer).await.unwrap();
+    let routing = konsensus_routing::RoutingTable::new(Default::default());
+    let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
+    let (ws, mut updates) = broadcast::channel(16);
+    let dir = tempfile::tempdir().unwrap();
+    let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+    let mut limits = DeliveryConfirmationBudget::default();
+    sqlx::query("CREATE TRIGGER fail_grant BEFORE UPDATE ON call_state BEGIN SELECT RAISE(ABORT, 'injected grant failure'); END")
+        .execute(db.pool()).await.unwrap();
+    handle_delivery_confirmation(&peer, &envelope.id, None, true, &own, &storage,
+        &timestamps, &routing, &ws, &audit, &mut limits, Some((now + 60_000, &konsensus_crypto::PlaintextCacheCipher::new(&[1; 32])))).await;
+    assert!(db.is_pending_dispatched(&envelope.id, &peer, &own).await.unwrap());
+    assert_eq!(db.call_get(&peer, id).await.unwrap(), Some(ended));
+    assert!(updates.try_recv().is_err());
+    sqlx::query("DROP TRIGGER fail_grant").execute(db.pool()).await.unwrap();
+    handle_delivery_confirmation(&peer, &envelope.id, None, true, &own, &storage,
+        &timestamps, &routing, &ws, &audit, &mut limits, Some((now + 60_000, &konsensus_crypto::PlaintextCacheCipher::new(&[1; 32])))).await;
+    assert!(!db.is_pending_dispatched(&envelope.id, &peer, &own).await.unwrap());
+    let paid = db.call_get(&peer, id).await.unwrap().unwrap();
+    assert_eq!(paid.phase, calls::Phase::Live);
+    assert_eq!(paid.paid_until_ms, Some(now + 60_000));
+    assert!(updates.try_recv().is_ok());
 }

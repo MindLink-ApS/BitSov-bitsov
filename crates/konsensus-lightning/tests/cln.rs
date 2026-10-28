@@ -650,6 +650,7 @@ async fn balances_and_channels_preserve_units_and_unknown_categories() {
         (10000, 6000, 4000)
     );
     assert!(channels[0].active);
+    assert_eq!(channels[0].outbound_capacity_msat, Some(4500));
     assert!(!channels[1].active);
     assert!(!channels[2].active);
     server.route(

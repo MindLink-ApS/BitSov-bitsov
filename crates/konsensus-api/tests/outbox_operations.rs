@@ -88,6 +88,92 @@ async fn concurrent_operation_posts_pay_once_and_mismatch_never_pays() {
     assert_eq!(wallet.list_payments(100).await.unwrap().len(), 1);
 }
 
+/// A paid web request (kind 510) commits its outstanding-reply row with the
+/// envelope, and a retry of the same operation restores the row after it was
+/// consumed, without paying again.
+#[tokio::test]
+async fn paid_web_request_reply_row_is_committed_and_restored_on_resend() {
+    use konsensus_core::kind::KIND_WEB_MANIFEST;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStorage::open(dir.path().join("web.db").to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let mut state = common::test_state_with_lightning(wallet.clone());
+    let (_, identity) = NodeIdentity::generate().unwrap();
+    let peer = *identity.node_id();
+    let target = konsensus_crypto::SessionManager::new(Arc::new(identity));
+    state
+        .session_manager
+        .initiate_session(&peer, &target.prekey_bundle().await)
+        .await
+        .unwrap();
+    state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(peer, format!("02{}", "ab".repeat(32)));
+    let transport = Arc::new(common::ConnectedStubTransport::new(
+        vec![peer],
+        state.invoice_requests.clone(),
+    ));
+    let mutable = Arc::get_mut(&mut state).unwrap();
+    mutable.storage = db.clone();
+    mutable.transport = transport;
+    let token = common::auth_header(&state);
+    let app = common::test_router(state.clone());
+    let id = uuid::Uuid::new_v4().to_string();
+    let request = || {
+        Request::builder().method("POST").uri("/api/v1/messages/compose")
+        .header("authorization", &token).header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"operation_id":id,"recipient":peer.to_hex(),"kind":KIND_WEB_MANIFEST,"plaintext":"manifest please","wait_ack_ms":0}).to_string())).unwrap()
+    };
+    let json = |r: axum::response::Response| async {
+        serde_json::from_slice::<serde_json::Value>(
+            &axum::body::to_bytes(r.into_body(), 8192).await.unwrap(),
+        )
+        .unwrap()
+    };
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json(response).await;
+    let hash: [u8; 32] = hex::decode(body["payment_hash"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let message_id =
+        konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let outstanding = db
+        .take_outstanding_web_request(&hash)
+        .await
+        .unwrap()
+        .expect("reply row committed with the envelope");
+    assert_eq!(outstanding.request_id, message_id);
+    assert_eq!(outstanding.peer, peer);
+    assert_eq!(outstanding.expected_reply_kind, KIND_WEB_MANIFEST);
+    assert!(
+        db.take_outstanding_web_request(&hash).await.unwrap().is_none(),
+        "taken once"
+    );
+    // The retry resends the stored envelope without paying and restores the binding.
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let replay = json(response).await;
+    assert_eq!(replay["message_id"], body["message_id"]);
+    assert_eq!(replay["payment_hash"], body["payment_hash"]);
+    assert_eq!(wallet.list_payments(100).await.unwrap().len(), 1);
+    let restored = db
+        .take_outstanding_web_request(&hash)
+        .await
+        .unwrap()
+        .expect("reply row restored by the resend");
+    assert_eq!(restored.request_id, message_id);
+    assert_eq!(restored.peer, peer);
+    assert_eq!(restored.expected_reply_kind, KIND_WEB_MANIFEST);
+}
+
 use konsensus_api::state::AppState;
 use konsensus_core::{
     traits::lightning::{Invoice, LightningError, PaymentDetails, PaymentStatus},

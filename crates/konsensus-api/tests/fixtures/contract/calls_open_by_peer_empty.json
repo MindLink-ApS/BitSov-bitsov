@@ -1,0 +1,5 @@
+{
+  "body": [],
+  "request": "GET /api/v1/calls?peer=<node-id>",
+  "status": 200
+}

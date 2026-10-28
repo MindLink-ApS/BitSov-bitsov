@@ -44,7 +44,8 @@ pub fn initialize(dir: &Path) -> Result<()> {
     }
     Ok(())
 }
-/// Explicit owner-console recovery; never stdout, an HTTP route or a socket.
+/// Explicit owner-console recovery; never stdout or a socket. The only HTTP
+/// path is the live node's loopback-only owner route (`/api/v1/owner/claim-code`).
 pub fn show(config: &Path) -> Result<()> {
     let dir = crate::owner_cmd::data_dir_of(config);
     check_owner(&dir)?;

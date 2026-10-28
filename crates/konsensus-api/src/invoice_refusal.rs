@@ -37,6 +37,9 @@ pub const INVOICE_UNAVAILABLE: &str = "konsensus:invoice_unavailable";
 /// The request is refused; the amount is not raised to the floor.
 pub const BELOW_ADMISSION_FLOOR: &str = "konsensus:below_admission_floor";
 
+/// No block invoice was issued: wrong call/sequence or too close to its deadline.
+pub const CALL_BLOCK_UNPAYABLE: &str = "konsensus:call_block_unpayable";
+
 /// Readiness refusals use the existing authenticated InvoiceError frame.
 pub const CHAIN_UNAVAILABLE: &str = "konsensus:not_ready:chain_unavailable";
 pub const NOT_SYNCED: &str = "konsensus:not_ready:not_synced";
