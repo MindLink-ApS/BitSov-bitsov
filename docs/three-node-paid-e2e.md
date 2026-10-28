@@ -8,6 +8,12 @@ network privacy, production scale, or app UI correctness.
 
 ## Run locally or in CI
 
+The same manual/nightly workflow also runs the M6 two-node paid-call scenarios.
+`scripts/regress/two_node_paid_call_e2e.sh` reuses the fixture and supervisor
+below, with real 60-second blocks, owner media sockets, Unpaid cutoff,
+reservation release and a one-minute duration cap. See the
+[M6 call runbook](ops/M6-CALL-RUNBOOK.md) for signet operation and proof capture.
+
 ```sh
 CARGO_TARGET_DIR=/tmp/bitsov-three-node-target \
 BITCOIND_EXE=/path/to/bitcoind ELECTRS_EXE=/path/to/electrs \

@@ -1999,8 +1999,9 @@ async fn status_reports_stun_port_only_when_listening() {
         ),
         ..(*test_state()).clone()
     });
-    assert_eq!(get(&public, "/api/v1/status", true).await["stun_url"], "stun:node.example.org:3478");
     let status = get(&public, "/api/v1/status", true).await;
+    assert_eq!(status["stun_url"], "stun:node.example.org:3478");
+    assert_eq!(status["stun_source"], "own");
     assert_eq!(status["peer_endpoint"], "node.example.org:9000");
     assert_eq!(status["peer_endpoint_source"], "advertised");
     assert!(status.get("peer_endpoint_reason").is_none());
@@ -2017,17 +2018,58 @@ async fn status_reports_stun_port_only_when_listening() {
     assert_eq!((status["peer_endpoint"].as_str(), status["peer_endpoint_source"].as_str()), (Some("93.184.216.34:9000"), Some("stun")));
 }
 
-#[test]
-fn stun_url_uses_the_dialable_host_only() {
-    use konsensus_api::handlers::health::stun_url;
-    assert_eq!(stun_url(Some("203.0.113.5:9000"), Some(3478)).as_deref(), Some("stun:203.0.113.5:3478"));
-    assert_eq!(stun_url(Some("[2001:db8::1]:9000"), Some(3478)).as_deref(), Some("stun:[2001:db8::1]:3478"));
-    assert_eq!(stun_url(Some(" node.example.org:9000 "), Some(1)).as_deref(), Some("stun:node.example.org:1"));
-    for bad in ["127.0.0.1:9000", "[::1]:9000", "0.0.0.0:9000", "localhost:9000", "nohost", ":9000", "a b:1", "user@h:1", "2001:db8::1:9000"] {
-        assert_eq!(stun_url(Some(bad), Some(3478)), None, "{bad}");
+/// `/status` `stun_url` falls back to `[network] stun_server` when the node's own
+/// responder has no dialable host; own responder + public host always wins.
+#[tokio::test]
+async fn status_reports_configured_stun_server_when_own_has_no_url() {
+    async fn get(state: &Arc<AppState>, uri: &str, auth: bool) -> serde_json::Value {
+        let mut req = Request::builder().uri(uri);
+        if auth {
+            req = req.header("authorization", auth_header(state));
+        }
+        let resp = build_router(Arc::clone(state)).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap()).unwrap()
     }
-    assert_eq!(stun_url(None, Some(3478)), None);
-    assert_eq!(stun_url(Some("203.0.113.5:9000"), None), None);
+    let configured = Arc::new(AppState {
+        stun_port: Some(3478),
+        configured_stun_server: Some("hub.example.org:3478".into()),
+        ..(*test_state()).clone()
+    });
+    let status = get(&configured, "/api/v1/status", true).await;
+    assert_eq!(status["stun_url"], "stun:hub.example.org:3478");
+    assert_eq!(status["stun_source"], "configured");
+    assert!(status.get("peer_endpoint").is_none());
+    let health = get(&configured, "/api/v1/health", false).await;
+    assert!(
+        health.get("stun_url").is_none()
+            && health.get("stun_source").is_none()
+            && health.get("stun_port").is_none(),
+        "public /health must not expose configured STUN"
+    );
+
+    let own_wins = Arc::new(AppState {
+        stun_port: Some(3478),
+        configured_stun_server: Some("hub.example.org:3478".into()),
+        introduction: konsensus_api::handlers::introduction::IntroductionSettings::fixed(
+            None,
+            Some("node.example.org:9000"),
+        ),
+        ..(*test_state()).clone()
+    });
+    let status = get(&own_wins, "/api/v1/status", true).await;
+    assert_eq!(status["stun_url"], "stun:node.example.org:3478");
+    assert_eq!(status["stun_source"], "own");
+
+    let neither = Arc::new(AppState {
+        configured_stun_server: None,
+        ..(*test_state()).clone()
+    });
+    let status = get(&neither, "/api/v1/status", true).await;
+    assert!(status.get("stun_url").is_none());
+    assert!(status.get("stun_source").is_none());
+    let health = get(&neither, "/api/v1/health", false).await;
+    assert!(health.get("stun_url").is_none() && health.get("stun_source").is_none());
 }
 
 /// `custody_mode` (REMOTE-SIGNER.md §2) is owner-only: the owner's `/status`

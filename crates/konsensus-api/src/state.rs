@@ -273,9 +273,22 @@ pub struct AppState {
     /// reported to the owner in `/status`. `None`: not running (default).
     pub stun_port: Option<u16>,
 
+    /// Owner-configured cap for outgoing calls (1..=240, default 60).
+    pub max_call_minutes: u16,
+
+    /// Validated `[network] stun_server` as `host:port` (no `stun:` prefix),
+    /// used for `/status` `stun_url` when the node's own responder has no
+    /// dialable public host. `None` when unset or invalid at config load.
+    pub configured_stun_server: Option<String>,
+
     /// Where the seed lives, reported to the owner in `/status`
     /// (`docs/protocol/REMOTE-SIGNER.md` §2).
     pub custody_mode: crate::custody::CustodyMode,
+
+    /// The node's call media router (M6 N2), behind the owner media socket
+    /// `GET /api/v1/calls/:call_id/media`. `None` (tests, or a node without
+    /// a router) makes the socket answer 503 rather than route nothing.
+    pub call_media: Option<Arc<dyn crate::call_media::CallMediaPort>>,
 }
 
 /// Authenticated terminal result of an invoice request.

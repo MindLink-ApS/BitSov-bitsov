@@ -10,6 +10,38 @@ also live on the corresponding GitHub pre-release pages.
   requests at either cap without evicting an existing ceremony.
 - Limit local sign-in challenges per source, rate-limit issuance, and apply
   the local token route's Host and Origin admission to challenge issuance.
+- Payment truth on the owner API: `POST /payments/pay` and `/payments/keysend`
+  answer `202 Accepted` with `status: in_flight` (payment hash and operation id,
+  no preimage or fee) until the backend reports a final state, and `200` with
+  `status: settled`, the preimage and the actual fee only once settled; a
+  failure is its proper error. Both routes now require a client `request_id`
+  (`400` without it), recorded in the encrypted operation ledger before any
+  debit or dispatch: a repeat with the same id answers from the record and
+  never pays again, the same id with other parameters is `409
+  operation_mismatch`. Nodes advertise `direct_payment_operations_v1`. A paid
+  web request (kinds 500/510) now commits its outstanding-reply row in the same
+  transaction as its envelope, and every resend restores the row. See
+  [docs/v2/API_PAYMENTS.md](docs/v2/API_PAYMENTS.md) for the status codes and
+  the compatibility notes.
+- Call-block settlement policy: **stop early + honour** (owner decision,
+  26 October 2026). The callee refuses new invoices inside a 15-second deadline
+  margin; expected late blocks resume an Unpaid call within 60 seconds and buy
+  a fresh 60-second interval. The callee confirms its paid boundary to the caller.
+  Unserviceable settlements retain payment receipts and synced overpayment
+  audits for reconciliation. Block invoices expire after 5 seconds; LDK's
+  inbound expiry buffer and in-flight HTLC residual are documented in
+  `docs/v2/CALLS-PROTOTYPE.md`.
+- Deployment note: migration 035 ends every in-flight live call when upgrading
+  to paid call blocks. Existing calls must be restarted after the upgrade;
+  their replay tombstones are retained and no unpaid media interval is granted.
+
+- Add owner-authenticated claim-code display for app onboarding:
+  `GET /api/v1/owner/claim-code` on the owner-local API only (loopback source,
+  local console session or enrolled owner device), rate limited, `no-store`,
+  never logged, returning the code only while a claim-bound enrollment is
+  pending and a clear `claimed`/`closed`/`unavailable` state otherwise. The LAN
+  box page no longer publishes the SAS digest (the finalize proof derived from
+  the claim code); `/setup/approve` now takes the four compared words.
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'
   scripts instead of all 2000 derived scripts. Before each focused sweep preview,

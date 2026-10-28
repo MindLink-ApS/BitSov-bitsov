@@ -716,14 +716,43 @@ async fn approval_only_sets_flag_for_exact_pending_digest_and_status_hides_secre
         }),
     });
     let (cookie, csrf) = session(&page).await;
-    for (id, hash, expected) in [
-        ("other", digest.to_hex().to_string(), StatusCode::CONFLICT),
-        ("ceremony", "00".repeat(32), StatusCode::BAD_REQUEST),
+    let words = crate::sas::words(&digest).map(str::to_owned);
+    let mut wrong = words.clone();
+    wrong[3] = if wrong[3] == "zoo" {
+        "zone".into()
+    } else {
+        "zoo".into()
+    };
+    // Malformed bodies come from a second LAN source so the per-source POST
+    // budget of the real approval attempts below is untouched. The former
+    // digest body is refused: the page never learns the digest.
+    for body in [
+        serde_json::json!({"ceremony_id":"ceremony","words":["a","b"]}),
+        serde_json::json!({"ceremony_id":"ceremony","sas_digest":digest.to_hex().to_string()}),
+    ] {
+        assert_eq!(
+            request(
+                &page,
+                "POST",
+                "/setup/approve",
+                "192.168.1.3:1",
+                "bitsov.local:8080",
+                Some((&cookie, &csrf)),
+                body
+            )
+            .await
+            .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+    for (id, body, expected) in [
+        ("other", serde_json::json!(words), StatusCode::CONFLICT),
         (
             "ceremony",
-            digest.to_hex().to_string(),
-            StatusCode::NO_CONTENT,
+            serde_json::json!(wrong),
+            StatusCode::BAD_REQUEST,
         ),
+        ("ceremony", serde_json::json!(words), StatusCode::NO_CONTENT),
     ] {
         assert_eq!(
             request(
@@ -733,11 +762,12 @@ async fn approval_only_sets_flag_for_exact_pending_digest_and_status_hides_secre
                 "192.168.1.2:1",
                 "bitsov.local:8080",
                 Some((&cookie, &csrf)),
-                serde_json::json!({"ceremony_id":id,"sas_digest":hash})
+                serde_json::json!({"ceremony_id":id,"words":body})
             )
             .await
             .status(),
-            expected
+            expected,
+            "{id} {body}"
         );
     }
     assert!(
@@ -791,13 +821,136 @@ async fn approval_only_sets_flag_for_exact_pending_digest_and_status_hides_secre
             "192.168.1.2:1",
             "bitsov.local:8080",
             Some((&cookie, &csrf)),
-            serde_json::json!({"ceremony_id":"ceremony","sas_digest":digest.to_hex().to_string()})
+            serde_json::json!({"ceremony_id":"ceremony","words":words})
         )
         .await
         .status(),
         StatusCode::CONFLICT
     );
 }
+#[tokio::test]
+async fn setup_page_exposes_nothing_claim_related_without_owner_auth() {
+    let (dir, bootstrap, page) = fixture();
+    let (claim, created) = crate::sas::initialize(dir.path()).unwrap();
+    assert!(created);
+    let mut code = Vec::new();
+    claim.write_local(&mut code).unwrap();
+    let code = String::from_utf8(code).unwrap();
+    let commitment = claim.commitment();
+    let binding = crate::sas::NoiseBinding {
+        handshake_hash: [1; 32],
+        box_public_key: [2; 32],
+        client_static: [3; 32],
+    };
+    let mut device = [4; 65];
+    device[0] = 4;
+    let nonce = [5; 16];
+    let digest = crate::sas::digest(&binding, &device, &nonce, &commitment);
+    *bootstrap.pending.lock().unwrap() = Some(super::super::PendingIdentity {
+        ceremony_id: "ceremony".into(),
+        mnemonic: zeroize::Zeroizing::new("secret recovery phrase".into()),
+        node_id: "pending-id".into(),
+        fingerprint: "pending-fp".into(),
+        client_id: "client".into(),
+        created_at: tokio::time::Instant::now(),
+        backup_check: [0, 1, 2],
+        failed_backup_attempts: 0,
+        password_commitment: None,
+        sas: Some(super::super::PendingSas {
+            device_key: device,
+            device_name: "phone".into(),
+            binding,
+            digest,
+            box_approved: false,
+        }),
+    });
+    let secrets = [
+        code.as_str().to_owned(),
+        hex::encode(commitment),
+        digest.to_hex().to_string(),
+        hex::encode(nonce),
+        "secret recovery phrase".into(),
+    ];
+    // Every LAN-reachable response, with and without a page session.
+    let (cookie, csrf) = session(&page).await;
+    for (method, path, with_session, body) in [
+        ("GET", "/", false, serde_json::json!({})),
+        ("GET", "/setup/state", false, serde_json::json!({})),
+        ("GET", "/setup/state", true, serde_json::json!({})),
+        ("POST", "/setup/start", true, serde_json::json!({})),
+        (
+            "POST",
+            "/setup/approve",
+            true,
+            serde_json::json!({"ceremony_id":"ceremony","words":["a","b","c","d"]}),
+        ),
+        (
+            "POST",
+            "/setup/approve",
+            false,
+            serde_json::json!({"ceremony_id":"ceremony","words":["a","b","c","d"]}),
+        ),
+    ] {
+        let response = request(
+            &page,
+            method,
+            path,
+            "192.168.1.2:1",
+            "bitsov.local:8080",
+            with_session.then_some((cookie.as_str(), csrf.as_str())),
+            body,
+        )
+        .await;
+        let status = response.status();
+        let headers = format!("{:?}", response.headers());
+        let text = String::from_utf8_lossy(&to_bytes(response.into_body(), 100000).await.unwrap())
+            .into_owned();
+        for secret in &secrets {
+            assert!(
+                !text.contains(secret.as_str()) && !headers.contains(secret.as_str()),
+                "{method} {path} session={with_session} ({status}) leaked claim material: {text}"
+            );
+        }
+        if path == "/setup/state" && !with_session {
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        if path == "/setup/state" && with_session {
+            assert_eq!(status, StatusCode::OK);
+            let view: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(view.get("sas_digest").is_none(), "{view}");
+            assert_eq!(view["state"], "claimed");
+            assert_eq!(view["words"], serde_json::json!(crate::sas::words(&digest)));
+        }
+    }
+    assert!(
+        !bootstrap
+            .pending
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .sas
+            .as_ref()
+            .unwrap()
+            .box_approved
+    );
+    // Only the words the owner compared approve the ceremony.
+    assert_eq!(
+        request(
+            &page,
+            "POST",
+            "/setup/approve",
+            "192.168.1.2:1",
+            "bitsov.local:8080",
+            Some((&cookie, &csrf)),
+            serde_json::json!({"ceremony_id":"ceremony","words":crate::sas::words(&digest)})
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
 #[test]
 fn private_address_policy() {
     for ip in [
