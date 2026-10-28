@@ -54,6 +54,13 @@ also live on the corresponding GitHub pre-release pages.
   until the sweep. A resend of any withdrawn envelope is answered
   `message withdrawn` (terminal), never the reused-proof reply, so a lost
   refusal cannot become a delivery on retry.
+- A paid call block's grant and the release of its admission hold are now one
+  storage transaction (SQLite and PostgreSQL). A committed block can no longer
+  be left held after its grant, where a restart or the sweep would withdraw it
+  and mark its payment rejected while the callee kept the interval and the
+  caller never got the grant ACK. If the release fails, the grant rolls back
+  with it and the block is refused with a reconciliation record. A committed
+  grant is acknowledged with the boundary it committed, and a retry replays it.
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'
   scripts instead of all 2000 derived scripts. Before each focused sweep preview,

@@ -1146,6 +1146,16 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("call state".into()))
     }
 
+    /// Commit a paid call block: insert or replace `(peer, call_id)` AND
+    /// release the admission hold on its message `id`, in ONE transaction.
+    /// A granted interval is durable exactly when its message is admitted:
+    /// no failure can leave a committed grant behind a hold that the sweep
+    /// would later withdraw (marking a paid, granted block rejected). If the
+    /// release fails, the grant is rolled back with it.
+    async fn call_commit_admitted(&self, _peer: &konsensus_core::NodeId, _call_id: &str, _entry: &konsensus_core::payloads::call::CallEntry, _id: &MessageId) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
     /// Forget `(peer, call_id)` (an offer that was never paid).
     async fn call_delete(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<(), StorageError> {
         Err(StorageError::Unsupported("call state".into()))

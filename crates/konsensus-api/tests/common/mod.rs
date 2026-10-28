@@ -147,6 +147,11 @@ impl Storage for MemStorage {
         Ok(())
     }
 
+    /// No admission holds in memory: the grant alone, with the same fault hook.
+    async fn call_commit_admitted(&self, peer: &NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry, _id: &MessageId) -> Result<(), StorageError> {
+        self.call_put(peer, call_id, entry).await
+    }
+
     async fn call_delete(&self, peer: &NodeId, call_id: &str) -> Result<(), StorageError> {
         self.calls.lock().unwrap().remove(&(*peer, call_id.to_owned()));
         Ok(())

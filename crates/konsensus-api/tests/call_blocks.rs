@@ -117,7 +117,7 @@ async fn known_ln_peer_call_block_uses_bound_invoice_and_is_admitted() {
     let hash = &blocks[0].1.payment_proof.payment_hash;
     assert!(callee_store.has_call_block_invoice(&caller_id, ID, 0, hash).await.unwrap());
     calls::prepare_incoming_block(callee_store.as_ref(), &caller_id, Some(&plaintext), hash)
-        .await.unwrap().commit().await.unwrap();
+        .await.unwrap().commit(&konsensus_core::MessageId::from_bytes([0; 32])).await.unwrap();
     assert!(calls::call_media_admitted(callee_store.as_ref(), &caller_id, ID, now + 1).await);
 }
 
@@ -177,7 +177,7 @@ async fn block_admission_keeps_its_decision_through_acceptance_and_expiry() {
     assert!(futures::poll!(&mut expiry).is_pending());
     // The expiry sweep is already checking a time beyond the old deadline.
     // It must wait for acceptance, then observe the extended paid interval.
-    prepared.commit().await.unwrap();
+    prepared.commit(&konsensus_core::MessageId::from_bytes([0; 32])).await.unwrap();
     assert!(expiry.await.unwrap().is_empty());
     let paid = store.call_get(&peer, ID).await.unwrap().unwrap();
     assert_eq!(paid.paid_until_ms, Some(answered_at + 60_000));
@@ -259,7 +259,7 @@ async fn incoming_block_and_outgoing_block_reservations_use_normal_call_admissio
     assert!(unbound.refusal().is_some());
     drop(unbound);
     store.record_call_block_invoice(&peer, ID, 0, &[1; 32], now + 90_000).await.unwrap();
-    calls::prepare_incoming_block(&store, &peer, Some(&body), &[1; 32]).await.unwrap().commit().await.unwrap();
+    calls::prepare_incoming_block(&store, &peer, Some(&body), &[1; 32]).await.unwrap().commit(&konsensus_core::MessageId::from_bytes([0; 32])).await.unwrap();
     assert!(calls::call_media_admitted(&store, &peer, ID, now + 1).await);
     assert!(calls::admit_incoming(&store, &own, &peer, 404, Some(&body))
         .await

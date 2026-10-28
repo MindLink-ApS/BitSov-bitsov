@@ -631,6 +631,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             continue;
                         }
 
+                        // A committed block's grant: its call state and the release
+                        // of its hold were written in one transaction, so from here
+                        // on it is admitted for good and only the ACK remains.
+                        let mut committed_until = None;
                         let admitted_block = match incoming_block {
                             Some(block) => {
                                 let identity = block.signal().clone();
@@ -666,10 +670,13 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     let bytes = serde_json::to_vec(&identity).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
                                     let cached = plaintext_cipher.encrypt(&bytes).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
                                     storage_for_recv.store_message_plaintext(&msg_id, &cached).await?;
-                                    block.commit().await
+                                    block.commit(&msg_id).await
                                 }.await;
                                 match committed {
-                                    Ok(signal) => Some(signal),
+                                    Ok((signal, paid_until_ms)) => {
+                                        committed_until = paid_until_ms;
+                                        Some(signal)
+                                    }
                                     Err(e) => {
                                         error!(msg_id = %msg_id, error = %e, "accepted block state could not be stored; withheld");
                                         // The receipt retains settlement evidence even when
@@ -776,12 +783,13 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // held chat stays hidden until the sweep.
                         //
                         // A committed call block is the exception: its grant is
-                        // already durable and its metadata was cached before the
-                        // commit, so no second plaintext write is made, and a
-                        // later refusal never withdraws it. Withdrawing would keep
-                        // the caller's settled debit as failed while the interval
-                        // stays granted here; the ratchet still advances and the
-                        // grant is acknowledged (and replayed) as usual.
+                        // already durable, its hold already released with it, and
+                        // its metadata was cached before the commit, so no second
+                        // plaintext write is made, and a later refusal never
+                        // withdraws it. Withdrawing would keep the caller's
+                        // settled debit as failed while the interval stays
+                        // granted here; the ratchet still advances and the grant
+                        // is acknowledged (and replayed) as usual.
                         let committed_block = admitted_block.is_some();
                         let plaintext = match decrypt_and_process(
                             &envelope,
@@ -855,7 +863,11 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             // Admitted: lift the hold before the app sees it. If that
                             // write fails the signal stays held and is withdrawn by the
                             // sweep: fail closed, the peer gets a reject, not an ACK.
+                            // A committed block's hold was lifted in its commit
+                            // transaction: nothing is left that could withhold its
+                            // grant ACK or let the sweep withdraw it (Codex P1).
                             let admitted = match admitted {
+                                Ok(signal) if committed_block => Ok(signal),
                                 Ok(signal) => match storage_for_recv.call_admission_release(&msg_id).await {
                                     Ok(()) => Ok(signal),
                                     Err(e) => {
@@ -926,17 +938,11 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             continue;
                         }
 
-                        let paid_until_ms = if envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
-
-                            match konsensus_api::calls::block_grant(storage_for_recv.as_ref(), &plaintext_cipher, &sender, &msg_id).await {
-
-                                Ok(grant) => grant,
-
-                                Err(e) => { error!(error = %e, "cannot recover call grant; withholding ACK"); continue; }
-
-                            }
-
-                        } else { None };
+                        // A committed block is acknowledged with the boundary it
+                        // just committed, never re-read: no storage read can
+                        // withhold the ACK of a durable grant. A duplicate
+                        // replays the same boundary from storage.
+                        let paid_until_ms = if committed_block { committed_until } else { None };
                         // Broadcast to WebSocket clients (with plaintext if decrypted)
                         if let Err(e) = ws_tx_for_recv.send(Arc::new(
                             WsMessage {

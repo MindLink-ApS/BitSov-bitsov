@@ -2890,12 +2890,12 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     let sessions_b = Arc::new(SessionManager::new(bob.clone()));
     establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
     let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-    let (shutdown, shutdown_rx) = watch::channel(false);
     let (ws_tx, mut ws_rx) = broadcast::channel(16);
     let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
         konsensus_pricing::StaticPricingEngine::new(Default::default()),
     );
-    let worker = tokio::spawn(run(MsgHandlerDeps {
+    // The receive loop over Bob's durable store; started again for a restart.
+    let start = |shutdown_rx| tokio::spawn(run(MsgHandlerDeps {
         transport: target.clone(),
         transport_ack: target.clone(),
         storage: storage.clone(),
@@ -2903,23 +2903,25 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
             verify_lightning_settlement: true,
             ..Default::default()
         })),
-        pricing,
+        pricing: pricing.clone(),
         lightning: wallet.clone(),
         chain: Arc::new(konsensus_chain::MockChainProvider::new()),
         peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
         session_manager: sessions_b.clone(),
-        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage.clone())),
         content_server: None,
         front_door: Default::default(),
         routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
-        ws_tx,
-        audit_log: audit,
+        ws_tx: ws_tx.clone(),
+        audit_log: audit.clone(),
         admission_mode: ReachabilityMode::PriceOpen,
         relay_engine: None,
         shutdown_rx,
     }));
+    let (mut shutdown, shutdown_rx) = watch::channel(false);
+    let mut worker = start(shutdown_rx);
 
     // Alice pays `msat` to Bob and sends one signal of `kind`.
     let signal = |kind: u16, msat: u64, body: String| {
@@ -3356,6 +3358,109 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
             || event["event"] == "call.block_overpayment")
             && (event["detail"]["message_id"] == env0.id.to_hex() || event["detail"]["message_id"] == env1.id.to_hex())));
     sqlx::query("DROP TRIGGER fail_second_plaintext").execute(db.pool()).await.unwrap();
+
+    // Codex P1 (#441): a failing hold release can no longer strand a committed
+    // grant behind a hold that recovery withdraws. The grant and the release
+    // are one transaction: under the fault the grant rolls back with the
+    // release (no interval, a refusal, a reconciliation record), and a block
+    // that did commit has no hold left, so neither restart recovery nor a
+    // retry under the same fault can withdraw it; a retry re-ACKs the same
+    // boundary and never grants twice.
+    let receipts = |env: &konsensus_core::UkmEnvelope| {
+        let (pool, hash) = (db.pool().clone(), hex::encode(env.payment_proof.payment_hash));
+        async move {
+            sqlx::query_as::<_, (String, i32)>("SELECT message_id, accepted FROM payment_receipts WHERE payment_hash = ?")
+                .bind(hash).fetch_all(&pool).await.unwrap()
+        }
+    };
+    let audited = |id: MessageId| -> Vec<String> {
+        std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap().lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["detail"]["message_id"] == id.to_hex())
+            .map(|event| event["event"].as_str().unwrap().to_owned()).collect()
+    };
+    let fail_release = "CREATE TRIGGER fail_release BEFORE DELETE ON call_admission_hold BEGIN SELECT RAISE(ABORT, 'injected hold release failure'); END";
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let answered_at = now - 20_000;
+    let answered = || calls::commit(calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()),
+        401, "answer", "hash", answered_at).unwrap(), "answer", answered_at).unwrap();
+
+    // The release fails: the grant rolls back with it and the block is refused.
+    let stranded_id = format!("{:032x}", rand::random::<u128>());
+    let stranded_entry = answered();
+    db.call_put(alice.node_id(), &stranded_id, &stranded_entry).await.unwrap();
+    sqlx::query(fail_release).execute(db.pool()).await.unwrap();
+    let stranded = signal(404, 10_000, format!(r#"{{"v":1,"call_id":"{stranded_id}","seq":0}}"#)).await;
+    source.send(bob.node_id(), &stranded).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), stranded.id).await, Err("storage error".into()));
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &stranded_id).await.unwrap(), Some(stranded_entry.clone()),
+        "a grant must never be committed without the release of its hold");
+    assert!(!konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &stranded_id, now).await);
+    assert!(db.call_admission_held(&stranded.id).await.unwrap(), "its withdrawal failed too: it stays hidden");
+    // Still held: a retry is refused, never acknowledged or granted.
+    source.send(bob.node_id(), &stranded).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), stranded.id).await, Err("call signal withdrawn".into()));
+    assert_eq!(db.call_get(alice.node_id(), &stranded_id).await.unwrap(), Some(stranded_entry.clone()));
+    sqlx::query("DROP TRIGGER fail_release").execute(db.pool()).await.unwrap();
+
+    // A block that commits is admitted in the same transaction: no hold remains.
+    let kept_id = format!("{:032x}", rand::random::<u128>());
+    db.call_put(alice.node_id(), &kept_id, &answered()).await.unwrap();
+    let caller_entry = calls::CallEntry { side: calls::Side::Caller, next_block_seq: 1, ..answered() };
+    caller_db.call_put(bob.node_id(), &kept_id, &caller_entry).await.unwrap();
+    let kept = signal(404, 10_000, format!(r#"{{"v":1,"call_id":"{kept_id}","seq":0}}"#)).await;
+    journal_dispatched_block(&caller_db, &kept, &kept_id, 0).await;
+    source.send(bob.node_id(), &kept).await.unwrap();
+    let kept_until = match grant_outcome(source.clone(), kept.id).await {
+        Ok((false, Some(until))) => until,
+        other => panic!("a committed block must be granted: {other:?}"),
+    };
+    assert_eq!(kept_until, answered_at + 60_000);
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    assert!(!db.call_admission_held(&kept.id).await.unwrap());
+    let callee_kept = db.call_get(alice.node_id(), &kept_id).await.unwrap().unwrap();
+    assert_eq!((callee_kept.phase, callee_kept.next_block_seq, callee_kept.paid_until_ms), (Phase::Live, 1, Some(kept_until)));
+
+    // That ACK is lost and Bob restarts: startup recovery withdraws only the
+    // stranded block. The release fault is back for everything that follows.
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    assert_eq!(konsensus_api::calls::withdraw_held(db.as_ref(), true).await.unwrap(), 1);
+    sqlx::query(fail_release).execute(db.pool()).await.unwrap();
+    let (restarted, shutdown_rx) = watch::channel(false);
+    shutdown = restarted;
+    worker = start(shutdown_rx);
+
+    // The stranded block: withdrawn, never granted, refused on retry, and its
+    // settled payment is on record for reconciliation.
+    assert_eq!(receipts(&stranded).await, vec![(stranded.id.to_hex(), -1)]);
+    assert!(db.get_message(&stranded.id).await.unwrap().is_none());
+    source.send(bob.node_id(), &stranded).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), stranded.id).await, Err("call_block_overpayment".into()));
+    assert_eq!(db.call_get(alice.node_id(), &stranded_id).await.unwrap(), Some(stranded_entry));
+    assert!(audited(stranded.id).contains(&"call.block_commit_failed".to_owned()));
+
+    // The committed block survived recovery; the retry re-ACKs the same
+    // boundary without a second grant, and the caller's media gate opens.
+    assert!(db.get_message(&kept.id).await.unwrap().is_some(), "not withdrawn");
+    assert_eq!(receipts(&kept).await, vec![(kept.id.to_hex(), 1)]);
+    assert!(!konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &kept_id, now).await);
+    source.send(bob.node_id(), &kept).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), kept.id).await, Ok((true, Some(kept_until))));
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &kept_id).await.unwrap(), Some(callee_kept));
+    for _ in 0..2 {
+        konsensus_api::calls::receive_block_grant(&caller_db, &caller_cipher, alice.node_id(), bob.node_id(), &kept.id, kept_until).await.unwrap();
+    }
+    let caller_kept = caller_db.call_get(bob.node_id(), &kept_id).await.unwrap().unwrap();
+    assert_eq!((caller_kept.phase, caller_kept.next_block_seq, caller_kept.paid_until_ms), (Phase::Live, 1, Some(kept_until)));
+    let at = chrono::Utc::now().timestamp_millis() as u64;
+    assert!(konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &kept_id, at).await);
+    assert!(konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &kept_id, at).await);
+    assert_eq!(receipts(&kept).await, vec![(kept.id.to_hex(), 1)]);
+    assert!(audited(kept.id).is_empty(), "no withdrawal, overpayment or reconciliation for a kept grant");
+    sqlx::query("DROP TRIGGER fail_release").execute(db.pool()).await.unwrap();
     shutdown.send(true).unwrap();
     worker.await.unwrap();
     source.shutdown();
