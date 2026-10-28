@@ -1466,6 +1466,13 @@ pub struct ApiConfig {
     #[serde(default = "default_api_addr")]
     pub listen_addr: SocketAddr,
 
+    /// Explicit opt-in to bind the owner API to a non-loopback address
+    /// (`0.0.0.0`, a LAN IP). The API is plaintext HTTP, so `validate`
+    /// refuses such a bind unless this is set. It never lifts the
+    /// loopback requirement of `[remote_access]`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_public_api: bool,
+
     /// JWT secret for API authentication. If not set, a random secret
     /// is generated at startup (tokens won't survive restarts).
     pub jwt_secret: Option<String>,
@@ -1495,6 +1502,7 @@ impl std::fmt::Debug for ApiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiConfig")
             .field("listen_addr", &self.listen_addr)
+            .field("allow_public_api", &self.allow_public_api)
             .field("jwt_secret", &"<redacted>")
             .field("rate_limit_rps", &self.rate_limit_rps)
             .field("cors_enabled", &self.cors_enabled)
@@ -1508,6 +1516,7 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             listen_addr: default_api_addr(),
+            allow_public_api: false,
             jwt_secret: None,
             rate_limit_rps: default_rate_limit(),
             cors_enabled: true,
@@ -1805,6 +1814,16 @@ impl NodeConfig {
             anyhow::bail!(
                 "[remote_access].advertised_endpoint requires listen_addr; omit both to keep \
                  remote access closed"
+            );
+        }
+
+        // The owner API is plaintext HTTP: a wildcard or LAN bind needs an
+        // explicit opt-in so it never happens by a stray edit.
+        if !self.api.listen_addr.ip().is_loopback() && !self.api.allow_public_api {
+            anyhow::bail!(
+                "[api].listen_addr ({}) is not loopback; the owner API is plaintext HTTP. \
+                 Use 127.0.0.1, or set [api].allow_public_api = true to expose it on purpose",
+                self.api.listen_addr
             );
         }
 

@@ -84,6 +84,98 @@ fn remote_access_requires_loopback_api_but_allows_auto_endpoints() {
 }
 
 #[test]
+fn non_loopback_api_requires_explicit_opt_in() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    assert!(!config.api.allow_public_api);
+    for loopback in ["127.0.0.1:3141", "[::1]:3141"] {
+        config.api.listen_addr = loopback.parse().unwrap();
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("{loopback} should be accepted: {error}"));
+    }
+
+    for public in [
+        "0.0.0.0:3141",
+        "[::]:3141",
+        "192.168.1.20:3141",
+        "10.0.0.2:3141",
+    ] {
+        config.api.listen_addr = public.parse().unwrap();
+        config.api.allow_public_api = false;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("not loopback") && error.contains("allow_public_api"),
+            "{public}: {error}"
+        );
+
+        config.api.allow_public_api = true;
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("{public} with opt-in: {error}"));
+    }
+}
+
+#[test]
+fn allow_public_api_does_not_lift_remote_access_loopback_rule() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    config.remote_access.listen_addr = Some("0.0.0.0:18443".parse().unwrap());
+    config
+        .validate()
+        .expect("remote access works with no extra flag");
+
+    config.api.listen_addr = "0.0.0.0:18080".parse().unwrap();
+    config.api.allow_public_api = true;
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("must be loopback"), "{error}");
+}
+
+#[test]
+fn allow_public_api_parses_from_toml_and_defaults_off() {
+    let base = r#"
+[identity]
+mnemonic_file = "/var/konsensus/mnemonic.txt"
+
+[network]
+listen_addr = "0.0.0.0:9735"
+
+[lightning]
+backend = "lnbits"
+api_url = "http://localhost:5000"
+admin_key = "test-key"
+
+[chain]
+backend = "esplora"
+
+[storage]
+backend = "sqlite"
+"#;
+    let config: NodeConfig = toml::from_str(base).unwrap();
+    assert!(config.api.listen_addr.ip().is_loopback());
+    assert!(!config.api.allow_public_api);
+    // Off stays unwritten, so a saved config still loads on older binaries.
+    let saved = toml::to_string(&config).unwrap();
+    assert!(!saved.contains("allow_public_api"), "{saved}");
+
+    let config: NodeConfig = toml::from_str(&format!(
+        "{base}\n[api]\nlisten_addr = \"0.0.0.0:3141\"\nallow_public_api = true\n"
+    ))
+    .unwrap();
+    assert!(config.api.allow_public_api);
+    assert!(config.api.listen_addr.ip().is_unspecified());
+    let saved = toml::to_string(&config).unwrap();
+    let reloaded: NodeConfig = toml::from_str(&saved).unwrap();
+    assert!(reloaded.api.allow_public_api);
+}
+
+#[test]
 fn hosted_by_is_bounded_trimmed_and_printable() {
     let mut config = NodeConfig::default_for_tier(
         NodeTier::Light,
@@ -1539,6 +1631,7 @@ fn validate_same_port_different_specific_ips_ok() {
     // Two distinct specific IPs on same port should not collide
     config.network.listen_addr = "10.0.0.1:3141".parse().unwrap();
     config.api.listen_addr = "10.0.0.2:3141".parse().unwrap();
+    config.api.allow_public_api = true;
     assert!(config.validate().is_ok());
 }
 
@@ -3355,6 +3448,7 @@ fn identity_and_api_debug_redact_secrets() {
         &[
             "jwt_secret",
             "listen_addr",
+            "allow_public_api",
             "rate_limit_rps",
             "audit_log_path",
         ],
