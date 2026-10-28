@@ -774,6 +774,15 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // (the payment hash and nonce stay burned) and the sender
                         // gets a typed `MessageReject`. If the withdrawal fails, a
                         // held chat stays hidden until the sweep.
+                        //
+                        // A committed call block is the exception: its grant is
+                        // already durable and its metadata was cached before the
+                        // commit, so no second plaintext write is made, and a
+                        // later refusal never withdraws it. Withdrawing would keep
+                        // the caller's settled debit as failed while the interval
+                        // stays granted here; the ratchet still advances and the
+                        // grant is acknowledged (and replayed) as usual.
+                        let committed_block = admitted_block.is_some();
                         let plaintext = match decrypt_and_process(
                             &envelope,
                             &sender,
@@ -789,8 +798,13 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             &audit_for_recv,
                             &gate_for_recv,
                             trust_discount,
+                            !committed_block,
                         ).await {
                             Ok(plaintext) => plaintext,
+                            Err(refusal) if committed_block => {
+                                error!(sender = %sender, msg_id = %msg_id, reason = %refusal, "committed call block: post-commit refusal ignored; the durable grant stands and is acknowledged");
+                                None
+                            }
                             Err(refusal) => {
                                 warn!(sender = %sender, kind = envelope.kind, msg_id = %msg_id, reason = %refusal, "paid message not readable or not kept; refused, not acknowledged");
                                 if let Err(e) = storage_for_recv.reject_accepted_envelope(&envelope).await {
@@ -977,6 +991,7 @@ async fn decrypt_and_process(
     audit: &Arc<AuditLog>,
     gate: &PaymentGate,
     trust_discount: f64,
+    cache_plaintext: bool,
 ) -> Result<Option<String>, ReceiptRefusal> {
     // A first-contact admission proof carries nothing to read; it is
     // acknowledged as received whether or not a session exists yet.
@@ -1030,24 +1045,27 @@ async fn decrypt_and_process(
     };
 
     // Cache decrypted plaintext (encrypted at rest) for API access. A paid
-    // message this node cannot keep is not delivered.
-    match plaintext_cipher.encrypt(&bytes) {
-        Ok(encrypted) => {
-            if let Err(e) = storage
-                .store_message_plaintext(&envelope.id, &encrypted)
-                .await
-            {
-                warn!(msg_id = %envelope.id, error = %e, "failed to cache plaintext");
+    // message this node cannot keep is not delivered. A committed call block
+    // (`cache_plaintext == false`) already cached its metadata before commit.
+    if cache_plaintext {
+        match plaintext_cipher.encrypt(&bytes) {
+            Ok(encrypted) => {
+                if let Err(e) = storage
+                    .store_message_plaintext(&envelope.id, &encrypted)
+                    .await
+                {
+                    warn!(msg_id = %envelope.id, error = %e, "failed to cache plaintext");
+                    return Err(ReceiptRefusal::NotPersisted(
+                        "the plaintext could not be stored",
+                    ));
+                }
+            }
+            Err(e) => {
+                warn!(msg_id = %envelope.id, error = %e, "failed to encrypt plaintext for cache");
                 return Err(ReceiptRefusal::NotPersisted(
                     "the plaintext could not be stored",
                 ));
             }
-        }
-        Err(e) => {
-            warn!(msg_id = %envelope.id, error = %e, "failed to encrypt plaintext for cache");
-            return Err(ReceiptRefusal::NotPersisted(
-                "the plaintext could not be stored",
-            ));
         }
     }
 

@@ -483,6 +483,7 @@ async fn decrypt_no_session_is_refused() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
     )
     .await;
 
@@ -535,6 +536,7 @@ async fn decrypt_invalid_ratchet_message_is_refused() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
     )
     .await;
 
@@ -593,6 +595,7 @@ async fn decrypt_valid_message_returns_plaintext_and_caches() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
     )
     .await;
 
@@ -659,6 +662,7 @@ async fn decrypt_file_ref_stores_and_returns_label() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
     )
     .await;
 
@@ -1041,6 +1045,7 @@ async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
     )
     .await;
 
@@ -1103,6 +1108,7 @@ async fn decrypt_non_utf8_returns_none() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
     )
     .await;
 
@@ -2827,6 +2833,23 @@ async fn kind_offer_publication_serializes_discount_and_fails_closed() {
     target.shutdown();
 }
 
+/// The caller's journal of a settled, dispatched paid block, as compose
+/// leaves it before the callee's grant ACK arrives.
+async fn journal_dispatched_block(store: &konsensus_storage::SqliteStorage, env: &konsensus_core::UkmEnvelope, call_id: &str, seq: u32) {
+    let Recipient::Node(peer) = env.recipient else { panic!("a block goes to one node") };
+    store.store_message(env).await.unwrap();
+    let mut op = konsensus_storage::OutboxOperation::prepared(format!("block-{call_id}-{seq}"), peer.to_hex(), 404, format!("request-{seq}"));
+    op.state = "sent".into();
+    op.message_id = Some(env.id.to_hex());
+    op.recovery = serde_json::to_vec(&serde_json::json!({
+        "call_block": [call_id, seq], "dispatched": true, "expected_msat": env.payment_proof.amount_msat,
+        "fee_ceiling_msat": 0, "admission_msat": 0,
+    })).unwrap();
+    store.insert_outbox_operation(&op).await.unwrap();
+    store.queue_pending_delivery(&env.id, &peer).await.unwrap();
+    store.mark_pending_sent(&env.id, &peer).await.unwrap();
+}
+
 /// 1:1 call signalling (kinds 400-403) end to end over Noise, through the
 /// real receive loop: the offer is admitted only when paid at the recipient's
 /// `call_msat`, once per call id; answer/ICE/hangup reach the app only for a
@@ -3224,6 +3247,115 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     source.send(bob.node_id(), &second).await.unwrap();
     assert!(outcome(source.clone()).await.is_err());
     assert!(ws_rx.try_recv().is_err(), "a distinct paid notice must not reach the app twice");
+
+    // A committed block is never withdrawn by a failure of the generic
+    // (second) plaintext write: its interval is granted, so the sender gets
+    // the normal grant ACK and the caller reconciles to paid. The fault hits
+    // ONLY that write: the metadata write before commit finds the fresh row's
+    // cache empty, any later write would find it set and abort.
+    sqlx::query("CREATE TRIGGER fail_second_plaintext BEFORE UPDATE OF plaintext_enc ON messages WHEN OLD.plaintext_enc IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected second plaintext write failure'); END")
+        .execute(db.pool()).await.unwrap();
+    let grant_outcome = |source: Arc<NoiseTransport>, id: MessageId| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source.recv_control().await.unwrap() {
+                    ControlEvent::MessageAcked { message_id, duplicate, paid_until_ms, .. } if message_id == id => break Ok((duplicate, paid_until_ms)),
+                    ControlEvent::MessageRejected { message_id, reason, .. } if message_id == id => break Err(reason),
+                    _ => {}
+                }
+            }
+        }).await.unwrap()
+    };
+    let caller_db = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let caller_cipher = PlaintextCacheCipher::new(alice.aes_key());
+    let fault_id = format!("{:032x}", rand::random::<u128>());
+    let fault_block = |seq: u32| format!(r#"{{"v":1,"call_id":"{fault_id}","seq":{seq}}}"#);
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let answered_at = now - 20_000;
+    let pending = calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
+    let fault_entry = calls::commit(pending, "answer", answered_at).unwrap();
+    db.call_put(alice.node_id(), &fault_id, &fault_entry).await.unwrap();
+
+    // Delayed block zero. The caller advanced its sequence when it settled.
+    let caller_entry = calls::CallEntry { side: calls::Side::Caller, next_block_seq: 1, ..fault_entry.clone() };
+    caller_db.call_put(bob.node_id(), &fault_id, &caller_entry).await.unwrap();
+    assert!(!konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &fault_id, now).await);
+    let env0 = signal(404, 10_000, fault_block(0)).await;
+    journal_dispatched_block(&caller_db, &env0, &fault_id, 0).await;
+    source.send(bob.node_id(), &env0).await.unwrap();
+    let granted0 = match grant_outcome(source.clone(), env0.id).await {
+        Ok((false, Some(until))) => until,
+        other => panic!("a committed block must be granted, not withdrawn: {other:?}"),
+    };
+    assert_eq!(granted0, answered_at + 60_000);
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    let callee0 = db.call_get(alice.node_id(), &fault_id).await.unwrap().unwrap();
+    assert_eq!((callee0.phase, callee0.next_block_seq, callee0.paid_until_ms), (Phase::Live, 1, Some(granted0)));
+    assert!(db.get_message(&env0.id).await.unwrap().is_some(), "not withdrawn");
+    assert!(db.is_paid_envelope_accepted(&env0).await.unwrap());
+    assert!(!db.is_paid_envelope_rejected(&env0).await.unwrap());
+    // Duplicate: the same durable grant is replayed, never extended.
+    source.send(bob.node_id(), &env0).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), env0.id).await, Ok((true, Some(granted0))));
+    assert_eq!(db.call_get(alice.node_id(), &fault_id).await.unwrap(), Some(callee0.clone()));
+    assert!(ws_rx.try_recv().is_err());
+    // The caller applies the ACK (and its duplicate) and is paid to the same boundary.
+    for _ in 0..2 {
+        konsensus_api::calls::receive_block_grant(&caller_db, &caller_cipher, alice.node_id(), bob.node_id(), &env0.id, granted0).await.unwrap();
+    }
+    let caller0 = caller_db.call_get(bob.node_id(), &fault_id).await.unwrap().unwrap();
+    assert_eq!((caller0.phase, caller0.next_block_seq, caller0.paid_until_ms), (Phase::Live, 1, Some(granted0)));
+    let at = chrono::Utc::now().timestamp_millis() as u64;
+    assert!(konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &fault_id, at).await);
+    assert!(konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &fault_id, at).await);
+
+    // Resumed renewal after both timers expired: only the grant ACK reopens
+    // the caller, so it must survive the same second-write failure.
+    let expired = calls::CallEntry { deadline_ms: now - 1, ..callee0 };
+    let callee_ended = calls::CallEntry { unpaid_notice_used: true, ..expired.clone().at(now).unwrap() };
+    db.call_put(alice.node_id(), &fault_id, &callee_ended).await.unwrap();
+    let caller_ended = calls::CallEntry { side: calls::Side::Caller, next_block_seq: 2, ..expired }.at(now).unwrap();
+    assert_eq!((caller_ended.phase, caller_ended.end_reason), (Phase::Ended, Some(HangupReason::Unpaid)));
+    caller_db.call_put(bob.node_id(), &fault_id, &caller_ended).await.unwrap();
+    let env1 = signal(404, 10_000, fault_block(1)).await;
+    journal_dispatched_block(&caller_db, &env1, &fault_id, 1).await;
+    source.send(bob.node_id(), &env1).await.unwrap();
+    let granted1 = match grant_outcome(source.clone(), env1.id).await {
+        Ok((false, Some(until))) => until,
+        other => panic!("a committed resume must be granted, not withdrawn: {other:?}"),
+    };
+    assert!(granted1 >= now + 60_000);
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    let callee1 = db.call_get(alice.node_id(), &fault_id).await.unwrap().unwrap();
+    assert_eq!((callee1.phase, callee1.next_block_seq, callee1.paid_until_ms), (Phase::Live, 2, Some(granted1)));
+    assert!(db.get_message(&env1.id).await.unwrap().is_some(), "not withdrawn");
+    assert!(!db.is_paid_envelope_rejected(&env1).await.unwrap());
+    source.send(bob.node_id(), &env1).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), env1.id).await, Ok((true, Some(granted1))));
+    assert_eq!(db.call_get(alice.node_id(), &fault_id).await.unwrap(), Some(callee1));
+    assert!(ws_rx.try_recv().is_err());
+    assert!(!konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &fault_id, now).await);
+    for _ in 0..2 {
+        konsensus_api::calls::receive_block_grant(&caller_db, &caller_cipher, alice.node_id(), bob.node_id(), &env1.id, granted1).await.unwrap();
+    }
+    let caller1 = caller_db.call_get(bob.node_id(), &fault_id).await.unwrap().unwrap();
+    assert_eq!((caller1.phase, caller1.next_block_seq, caller1.paid_until_ms), (Phase::Live, 2, Some(granted1)));
+    let at = chrono::Utc::now().timestamp_millis() as u64;
+    assert!(konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &fault_id, at).await);
+    assert!(konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &fault_id, at).await);
+
+    // One payment each, kept accepted; no withdrawal and no reconciliation event.
+    for env in [&env0, &env1] {
+        let receipts: Vec<(String, i32)> = sqlx::query_as("SELECT message_id, accepted FROM payment_receipts WHERE payment_hash = ?")
+            .bind(hex::encode(env.payment_proof.payment_hash)).fetch_all(db.pool()).await.unwrap();
+        assert_eq!(receipts, vec![(env.id.to_hex(), 1)]);
+    }
+    let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    assert!(!audit_entries.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .any(|event| (event["event"] == "message.rejected" || event["event"] == "call.block_commit_failed"
+            || event["event"] == "call.block_overpayment")
+            && (event["detail"]["message_id"] == env0.id.to_hex() || event["detail"]["message_id"] == env1.id.to_hex())));
+    sqlx::query("DROP TRIGGER fail_second_plaintext").execute(db.pool()).await.unwrap();
     shutdown.send(true).unwrap();
     worker.await.unwrap();
     source.shutdown();
