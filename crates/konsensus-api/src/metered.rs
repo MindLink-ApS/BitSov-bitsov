@@ -291,6 +291,8 @@ impl Debit {
         self
     }
 
+    pub(crate) fn is_call_block(&self) -> bool { self.call_block.is_some() }
+
     pub(crate) fn for_call_offer(mut self, peer: konsensus_core::NodeId, plaintext: String) -> Self {
         self.call_spend = konsensus_core::wire_json::from_str::<konsensus_core::payloads::call::CallSignal>(&plaintext)
             .ok().map(|signal| (peer.to_hex(), signal.call_id));

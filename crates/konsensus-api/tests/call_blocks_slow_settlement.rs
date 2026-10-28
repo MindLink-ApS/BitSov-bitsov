@@ -45,10 +45,12 @@ impl konsensus_core::traits::lightning::LightningProvider for LateBlockWallet {
         let delay = self.settle_at_ms.load(Ordering::SeqCst).saturating_sub(now);
         let wallet = self.inner.clone();
         let invoice = invoice.to_owned();
-        // Like LDK/LND, settlement may outlive cancellation of the dispatch future.
+        // Dispatch before the short invoice expires; expose its settled proof
+        // only after the call deadline, even if the dispatch future is cancelled.
         tokio::spawn(async move {
+            let payment = wallet.pay_invoice_with_fee_limit(&invoice, cap).await;
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            wallet.pay_invoice_with_fee_limit(&invoice, cap).await
+            payment
         })
         .await
         .unwrap()
@@ -60,7 +62,13 @@ impl konsensus_core::traits::lightning::LightningProvider for LateBlockWallet {
         konsensus_core::traits::lightning::PaymentDetails,
         konsensus_core::traits::lightning::LightningError,
     > {
-        self.inner.get_payment_status(hash).await
+        let mut payment = self.inner.get_payment_status(hash).await?;
+        if self.polled.load(std::sync::atomic::Ordering::SeqCst)
+            && (chrono::Utc::now().timestamp_millis() as u64) < self.settle_at_ms.load(std::sync::atomic::Ordering::SeqCst) {
+            payment.status = konsensus_core::traits::lightning::PaymentStatus::InFlight;
+            payment.preimage = None;
+        }
+        Ok(payment)
     }
     async fn get_balance_msat(
         &self,
@@ -72,7 +80,9 @@ impl konsensus_core::traits::lightning::LightningProvider for LateBlockWallet {
     }
 }
 
-#[tokio::test]
+// The synchronous invoice responder waits for SQLx; another runtime worker
+// must keep the database driver progressing while it records provenance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settlement_after_first_poll_never_charges_an_ungranted_interval() {
     use axum::{body::Body, http::Request};
     use konsensus_core::traits::lightning::LightningProvider;
@@ -95,12 +105,22 @@ async fn settlement_after_first_poll_never_charges_an_ungranted_interval() {
     let (_, identity) = konsensus_core::NodeIdentity::generate().unwrap();
     let peer = *identity.node_id();
     let invoices = payee.clone();
+    let callee_store = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let invoice_store = callee_store.clone();
+    let caller_id = *state.identity.node_id();
     let transport = Arc::new(
         common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone())
             .with_invoice_responder(move |_, amount| {
-                let invoice =
-                    futures::executor::block_on(invoices.create_invoice(amount, "call block", 60))
-                        .unwrap();
+                let invoice = futures::executor::block_on(async {
+                    let now = chrono::Utc::now().timestamp_millis() as u64;
+                    let call = invoice_store.call_get(&caller_id, ID).await.unwrap().unwrap();
+                    rules::validate_block_invoice(&call, 0, now).unwrap();
+                    let invoice = invoices.create_invoice(amount, "call block", 5).await.unwrap();
+                    invoice_store.record_call_block_invoice(&caller_id, ID, 0,
+                        &hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap(),
+                        call.deadline_ms + rules::CALL_BLOCK_RESUME_MS).await.unwrap();
+                    invoice
+                });
                 Some(konsensus_api::state::InvoiceResponseData {
                     recipient: peer,
                     bolt11: invoice.bolt11,
@@ -126,7 +146,6 @@ async fn settlement_after_first_poll_never_charges_an_ungranted_interval() {
     )
     .unwrap();
     let caller = rules::receive(Some(ringing), 401, None, answered_at).unwrap();
-    let callee_store = SqliteStorage::in_memory().await.unwrap();
     let callee = rules::CallEntry {
         side: rules::Side::Callee,
         ..caller.clone()
@@ -159,23 +178,18 @@ async fn settlement_after_first_poll_never_charges_an_ungranted_interval() {
         .saturating_sub(chrono::Utc::now().timestamp_millis() as u64);
     tokio::time::sleep(std::time::Duration::from_millis(remaining + 100)).await;
     let charged = 100_000 - payer.get_balance_msat().await.unwrap();
-    calls::expire_calls(&callee_store, chrono::Utc::now().timestamp_millis() as u64).await.unwrap();
+    calls::expire_calls(callee_store.as_ref(), chrono::Utc::now().timestamp_millis() as u64).await.unwrap();
     let ended = callee_store.call_get(state.identity.node_id(), ID).await.unwrap().unwrap();
     assert_eq!(ended.phase, rules::Phase::Ended);
     let notice = rules::reserve_unpaid_hangup(Some(ended), "unpaid-notice", "hash").unwrap();
     callee_store.call_put(state.identity.node_id(), ID, &notice).await.unwrap();
-    let admitted = calls::admit_incoming(
-        &callee_store,
-        &peer,
-        state.identity.node_id(),
-        404,
-        Some(&plaintext),
-    )
-    .await
-    .is_ok();
+    let received = payee.list_payments(1).await.unwrap();
+    let hash = hex::decode(&received[0].payment_hash).unwrap().try_into().unwrap();
+    let admitted = calls::prepare_incoming_block(callee_store.as_ref(), state.identity.node_id(),
+        Some(&plaintext), &hash).await.unwrap().commit().await.is_ok();
     let granted = admitted
         && calls::call_media_admitted(
-            &callee_store,
+            callee_store.as_ref(),
             state.identity.node_id(),
             ID,
             chrono::Utc::now().timestamp_millis() as u64,
