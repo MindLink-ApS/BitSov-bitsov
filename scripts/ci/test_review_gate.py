@@ -1,6 +1,7 @@
 """Regression tests for the model-free review gate (no network required)."""
 
 import json
+from pathlib import Path
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -8,6 +9,7 @@ from unittest.mock import patch
 from scripts.ci.review_gate import evaluate, github_api, run_gate
 
 
+WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/review-gate.yml"
 HEAD = "a" * 40
 STALE = "b" * 40
 
@@ -135,11 +137,20 @@ class EvaluationTests(unittest.TestCase):
                             verdict("GROK", old, number=2)]
                 self.assertEqual(self.check_gate(comments)[0], expected)
 
-    def test_edited_comment_is_the_newest_verdict(self):
-        comments = [verdict("GROK", "FAIL", number=1,
-                            updated="2026-10-25T01:00:00Z"),
-                    verdict("COMPOSER", number=2), verdict("CODEX")]
+    def test_editing_an_old_verdict_does_not_revive_it(self):
+        # Red team: a typo edit of an old PASS used to beat a later FAIL.
+        comments = [verdict("CODEX", number=1, updated="2026-10-26T00:00:00Z"),
+                    verdict("CODEX", "FAIL", number=5), verdict("CURSOR")]
         self.assertEqual(self.check_gate(comments)[0], "failure")
+        comments = [verdict("GROK", "FAIL", number=1, updated="2026-10-26T00:00:00Z"),
+                    verdict("COMPOSER", number=2), verdict("CODEX")]
+        self.assertEqual(self.check_gate(comments)[0], "success")
+
+    def test_comment_id_breaks_same_second_ties(self):
+        first = verdict("CODEX", number=7)
+        second = verdict("CODEX", "FAIL", number=8)
+        second["created_at"] = first["created_at"]
+        self.assertEqual(self.check_gate([second, first, verdict("CURSOR")])[0], "failure")
 
     def test_newer_stale_fail_does_not_replace_current_pass(self):
         comments = [verdict("CODEX"), verdict("CODEX", "FAIL", STALE, number=2),
@@ -162,43 +173,125 @@ class EvaluationTests(unittest.TestCase):
                                 verdict("CURSOR", association=association)]
                     self.assertEqual(self.check_gate(comments, authors=authors)[0], "success")
 
-    def test_outsider_pass_is_ignored_with_or_without_allowlist(self):
+    def test_outsider_pass_is_ignored_unless_allowlisted(self):
         for association in ["NONE", "CONTRIBUTOR", "FIRST_TIMER",
                             "FIRST_TIME_CONTRIBUTOR", "MANNEQUIN", None, "UNKNOWN"]:
-            for authors in ["", "reviewer, outsider"]:
+            for authors in ["", "reviewer"]:
                 with self.subTest(association=association, authors=authors):
                     comments = [verdict("CURSOR"),
                                 verdict("CODEX", author="outsider", association=association)]
                     self.assertEqual(self.check_gate(comments, authors=authors)[0], "pending")
 
-    def test_outsider_fail_does_not_block_with_or_without_allowlist(self):
+    def test_outsider_fail_does_not_block_unless_allowlisted(self):
         for association in ["NONE", "CONTRIBUTOR", "FIRST_TIMER",
                             "FIRST_TIME_CONTRIBUTOR", "MANNEQUIN", None, "UNKNOWN"]:
-            for authors in ["", "reviewer, outsider"]:
+            for authors in ["", "reviewer"]:
                 with self.subTest(association=association, authors=authors):
                     comments = [verdict("CODEX"), verdict("CURSOR"),
                                 verdict("CODEX", "FAIL", number=2, author="outsider",
                                         association=association)]
                     self.assertEqual(self.check_gate(comments, authors=authors)[0], "success")
 
-    def test_missing_author_association_is_ignored(self):
-        for authors in ["", "reviewer"]:
-            with self.subTest(authors=authors):
-                comment = verdict("CODEX")
-                del comment["author_association"]
-                self.assertEqual(self.check_gate([comment, verdict("CURSOR")],
-                                                 authors=authors)[0], "pending")
+    def test_allowlisted_login_counts_regardless_of_association(self):
+        # The real Cursor reviewer posts as cursor[bot] with association NONE.
+        for association in ["NONE", None, "CONTRIBUTOR"]:
+            with self.subTest(association=association):
+                bot_fail = verdict("GROK", "FAIL", number=2, author="cursor[bot]",
+                                   association=association)
+                comments = [verdict("CODEX", author="owner", association="OWNER"),
+                            bot_fail]
+                self.assertEqual(self.check_gate(comments, authors="owner, Cursor[bot]")[0],
+                                 "failure")
+                self.assertEqual(self.check_gate(comments)[0], "pending")
 
-    def test_only_exact_first_line_verdicts_count(self):
-        for body in [f"Preface\nCODEX-VERDICT PASS {HEAD}",
-                     f"CODEX-VERDICT PASS {HEAD[:7]}",
-                     f"CODEX-VERDICT PASS {HEAD} extra", "",
+    def test_allowlist_excludes_trusted_associations_not_listed(self):
+        comments = [verdict("CODEX", author="member", association="MEMBER"),
+                    verdict("CURSOR", author="owner", association="OWNER", number=2)]
+        self.assertEqual(self.check_gate(comments, authors="owner")[0], "pending")
+
+    def test_allowlist_without_entries_behaves_as_unset(self):
+        comments = [verdict("CODEX"), verdict("CURSOR", number=2)]
+        outsider = [verdict("CODEX", association="NONE"), verdict("CURSOR", number=2)]
+        for authors in ["", " ", ",", " , ,", "\t,\n"]:
+            with self.subTest(authors=authors):
+                self.assertEqual(self.check_gate(comments, authors=authors)[0], "success")
+                self.assertEqual(self.check_gate(outsider, authors=authors)[0], "pending")
+
+    def test_comment_without_user_is_skipped(self):
+        for user in [None, {}, {"login": None}, "ghost"]:
+            for authors in ["", "reviewer"]:
+                with self.subTest(user=user, authors=authors):
+                    ghost = verdict("CODEX", "FAIL", number=3)
+                    ghost["user"] = user
+                    comments = [ghost, verdict("CODEX"), verdict("CURSOR", number=2)]
+                    self.assertEqual(self.check_gate(comments, authors=authors)[0], "success")
+        ghost = verdict("CODEX")
+        del ghost["user"]
+        self.assertEqual(self.check_gate([ghost, verdict("CURSOR")])[0], "pending")
+
+    def test_missing_author_association_is_ignored_without_allowlist(self):
+        comment = verdict("CODEX")
+        del comment["author_association"]
+        self.assertEqual(self.check_gate([comment, verdict("CURSOR")])[0], "pending")
+        self.assertEqual(self.check_gate([comment, verdict("CURSOR")],
+                                         authors="reviewer")[0], "success")
+
+    def test_verdict_line_may_appear_anywhere(self):
+        for body in [
+            f"_Relayed by Atlas from the NOVA Codex terminal_\n\nCODEX-VERDICT PASS {HEAD}",
+            f"Preface\nCODEX-VERDICT PASS {HEAD}\nDetails.",
+            f"CODEX-VERDICT PASS {HEAD} ",
+            f"  CODEX-VERDICT PASS {HEAD}\t",
+            f"CODEX-VERDICT PASS {HEAD}\r\nDetails.",
+            f"```\ncode\n```\nCODEX-VERDICT PASS {HEAD}",
+        ]:
+            with self.subTest(body=body):
+                comment = verdict("CODEX")
+                comment["body"] = body
+                self.assertEqual(self.check_gate([comment, verdict("CURSOR")])[0], "success")
+
+    def test_only_exact_verdict_lines_count(self):
+        for body in [f"CODEX-VERDICT PASS {HEAD[:7]}",
+                     f"CODEX-VERDICT PASS {HEAD} extra", "", None,
+                     f"CODEX-VERDICT PASS {HEAD}0",
+                     f"CODEX-VERDICT  PASS {HEAD}",
+                     f"codex-VERDICT PASS {HEAD}",
+                     f"\uff23ODEX-VERDICT PASS {HEAD}",
                      f"OTHER-VERDICT PASS {HEAD}",
-                     f"> CODEX-VERDICT PASS {HEAD}"]:
+                     f"> CODEX-VERDICT PASS {HEAD}",
+                     f"Relayed:\n> CODEX-VERDICT PASS {HEAD}",
+                     f"**CODEX-VERDICT PASS {HEAD}**",
+                     f"`CODEX-VERDICT PASS {HEAD}`",
+                     f"Composer review: **VERDICT: PASS** {HEAD}",
+                     f"```\nCODEX-VERDICT PASS {HEAD}\n```",
+                     f"```\nCODEX-VERDICT PASS {HEAD}",
+                     f"~~~text\nCODEX-VERDICT PASS {HEAD}\n~~~",
+                     f"````\n```\nCODEX-VERDICT PASS {HEAD}\n````",
+                     f"Text\n\n    CODEX-VERDICT PASS {HEAD}",
+                     f"\tCODEX-VERDICT PASS {HEAD}",
+                     f"CODEX-VERDICT PASS {HEAD}\u2028junk",
+                     f"CODEX-VERDICT PASS {HEAD}\x85junk",
+                     f"junk\u2029CODEX-VERDICT PASS {HEAD}",
+                     f"```\r\nCODEX-VERDICT PASS {HEAD}\r\n```\r\n"]:
             with self.subTest(body=body):
                 comment = verdict("CODEX")
                 comment["body"] = body
                 self.assertEqual(self.check_gate([comment, verdict("CURSOR")])[0], "pending")
+
+    def test_conflicting_verdicts_in_one_comment_fail_closed(self):
+        for body in [f"CODEX-VERDICT PASS {HEAD}\nCODEX-VERDICT FAIL {HEAD}",
+                     f"CODEX-VERDICT FAIL {HEAD}\nCODEX-VERDICT PASS {HEAD}"]:
+            with self.subTest(body=body):
+                comment = verdict("CODEX")
+                comment["body"] = body
+                self.assertEqual(self.check_gate([comment, verdict("CURSOR", number=2)])[0],
+                                 "failure")
+
+    def test_one_comment_can_carry_several_families(self):
+        comment = verdict("CODEX")
+        comment["body"] = (f"Relay\nCODEX-VERDICT PASS {HEAD}\n"
+                           f"CODEX-VERDICT FAIL {STALE}\nCURSOR-VERDICT PASS {HEAD}")
+        self.assertEqual(self.check_gate([comment])[0], "success")
 
     def test_uppercase_hex_sha_counts(self):
         self.assertEqual(self.check_gate([verdict("CODEX", sha=HEAD.upper()),
@@ -214,6 +307,32 @@ class EvaluationTests(unittest.TestCase):
                 self.assertEqual(state, "pending")
                 self.assertIn("needs CODEX PASS on aaaaaaa", description)
 
+    def test_config_scripts_and_rule_files_are_not_docs_only(self):
+        # Red team: semgrep rules, ops scripts and the rule itself passed with
+        # one PASS, even when labelled money/security.
+        for paths in [["docs/qa/semgrep-rules.yml"], ["docs/ops/owner-token.sh"],
+                      ["docs/ops/deploy.yaml"], ["docs/config/node.toml"],
+                      ["docs/OPS/RUN.SH"], ["CONTRIBUTING.md"],
+                      [".github/CONTRIBUTING.md"], ["docs/CONTRIBUTING.md"],
+                      ["CODEOWNERS"], [".github/CODEOWNERS"], ["docs/CODEOWNERS"],
+                      [".github/workflows/notes.md"], [".github/PULL_REQUEST_TEMPLATE.md"],
+                      ["README.md", "docs/qa/semgrep-rules.yml"]]:
+            with self.subTest(paths=paths):
+                state, description = self.check_gate([verdict("CURSOR")], files=paths)
+                self.assertEqual(state, "pending")
+                self.assertNotIn("1 non-builder PASS", description)
+        state, _ = self.check_gate([verdict("CURSOR")], labels=["money", "security"],
+                                   files=["CONTRIBUTING.md",
+                                          "crates/konsensus-lightning/README.md"])
+        self.assertEqual(state, "pending")
+
+    def test_plain_docs_still_get_docs_exception(self):
+        for paths in [["docs/guide.md"], ["docs/diagram.svg"], ["docs/notes.txt"],
+                      ["README.md", "crates/x/README.md"]]:
+            with self.subTest(paths=paths):
+                self.assertEqual(self.check_gate([verdict("CURSOR")], files=paths)[0],
+                                 "success")
+
     def test_empty_file_list_does_not_get_docs_exception(self):
         self.assertEqual(self.check_gate([verdict("CODEX")], files=[])[0], "pending")
 
@@ -221,8 +340,10 @@ class EvaluationTests(unittest.TestCase):
 class FakeAPI:
     """Small API boundary double; all gate decisions use the real evaluator."""
 
-    def __init__(self, *, second_head=HEAD, changed_files=1, files=None):
+    def __init__(self, *, second_head=HEAD, changed_files=1, files=None, comments=None):
         self.second_head = second_head
+        self.comments = (comments if comments is not None
+                         else [verdict("CODEX"), verdict("CURSOR")])
         self.changed_files = changed_files
         self.files = files if files is not None else [{"filename": "src/lib.rs"}]
         self.statuses = []
@@ -243,7 +364,7 @@ class FakeAPI:
         if endpoint == "repos/owner/repo/pulls/7/files?per_page=100":
             return self.files
         if endpoint == "repos/owner/repo/issues/7/comments?per_page=100":
-            return [verdict("CODEX"), verdict("CURSOR")]
+            return self.comments
         raise AssertionError(f"Unexpected API request: {endpoint}")
 
 
@@ -308,6 +429,27 @@ class APITests(unittest.TestCase):
         run_gate("issue_comment", {"issue": {"number": 7, "pull_request": {}}},
                  "owner/repo", api=api)
         self.assertEqual(api.statuses[-1][1]["state"], "success")
+
+    def test_deleted_pass_comment_recomputes_to_pending(self):
+        # The workflow also runs on issue_comment "deleted"; the payload has the
+        # same issue shape, and the re-read comment list no longer has the PASS.
+        api = FakeAPI(comments=[verdict("CURSOR")])
+        run_gate("issue_comment", {"action": "deleted",
+                                   "issue": {"number": 7, "pull_request": {}},
+                                   "comment": {"id": 1}}, "owner/repo", api=api)
+        self.assertEqual(api.statuses[-1][1]["state"], "pending")
+
+    def test_comment_list_with_null_user_does_not_crash(self):
+        ghost = verdict("CODEX", "FAIL", number=3)
+        ghost["user"] = None
+        api = FakeAPI(comments=[ghost, verdict("CODEX"), verdict("CURSOR", number=2)])
+        run_gate("pull_request", {"number": 7}, "owner/repo", api=api)
+        self.assertEqual(api.statuses[-1][1]["state"], "success")
+
+    @unittest.skipUnless(WORKFLOW.exists(), "workflow file is not loaded in CI")
+    def test_workflow_reacts_to_deleted_comments(self):
+        text = WORKFLOW.read_text()
+        self.assertIn("types: [created, edited, deleted]", text)
 
     def test_regular_issue_comment_is_ignored(self):
         api = FakeAPI()

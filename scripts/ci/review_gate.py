@@ -18,6 +18,73 @@ VERDICT = re.compile(
 )
 MONEY_DIRS = ("crates/konsensus-lightning/", "crates/konsensus-crypto/")
 MONEY_TERMS = ("spend_budget", "pairing", "invoice", "session")
+TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+# Executable or configuration files under docs/ and the files that define the
+# review rules themselves are never "docs-only", whatever their extension.
+NOT_DOCS_SUFFIXES = (".sh", ".yml", ".yaml", ".toml")
+NOT_DOCS_NAMES = ("contributing.md", "codeowners")
+
+
+def parse_allowlist(authors):
+    """Return the casefolded login allowlist, or None when it has no entries.
+
+    An allowlist made only of blanks or commas (for example ",") is treated
+    exactly like an unset variable.
+    """
+    allowed = {author.strip().casefold() for author in (authors or "").split(",")}
+    allowed.discard("")
+    return allowed or None
+
+
+def is_trusted_author(comment, allowed):
+    """Allowlisted logins count whatever their association (cursor[bot] is NONE);
+    without an allowlist only OWNER/MEMBER/COLLABORATOR count."""
+    user = comment.get("user")
+    login = user.get("login") if isinstance(user, dict) else None
+    if not isinstance(login, str) or not login:
+        return False
+    if allowed is not None:
+        return login.casefold() in allowed
+    return comment.get("author_association") in TRUSTED_ASSOCIATIONS
+
+
+def verdict_lines(body):
+    """Yield verdict matches from lines outside fenced or indented code.
+
+    Each line must be exactly the verdict after stripping surrounding spaces,
+    tabs and CR; quotes, bold and any other decoration do not match.
+    """
+    fence = None
+    # Split on "\n" only: GitHub does not break lines at U+2028, U+0085, etc.
+    for line in (body or "").split("\n"):
+        opener = FENCE.match(line)
+        if fence is None:
+            if opener:
+                fence = opener[1]
+                continue
+        else:
+            # A fence closes only with the same character, at least as long.
+            closer = line.strip(" \t\r")
+            if (opener and closer == opener[1] and closer[0] == fence[0]
+                    and len(closer) >= len(fence)):
+                fence = None
+            continue
+        indent = len(line) - len(line.lstrip(" \t"))
+        if "\t" in line[:indent] or indent >= 4:
+            continue  # Indented code block.
+        match = VERDICT.fullmatch(line.strip(" \t\r"))
+        if match:
+            yield match
+
+
+def is_docs_path(path):
+    """Inclusion stays case-sensitive; exclusions match in any case."""
+    lowered = path.casefold()
+    if (lowered.startswith(".github/") or lowered.endswith(NOT_DOCS_SUFFIXES)
+            or lowered.rsplit("/", 1)[-1] in NOT_DOCS_NAMES):
+        return False
+    return path.endswith(".md") or path.startswith("docs/")
 
 
 def evaluate(head_sha, branch, labels, files, comments, authors=""):
@@ -38,23 +105,25 @@ def evaluate(head_sha, branch, labels, files, comments, authors=""):
 
     # This is an honest-system gate until per-vendor GitHub Apps exist:
     # an allowed author can claim any vendor; the tag does not prove provenance.
-    allowed = ({author.strip().casefold() for author in authors.split(",")
-                if author.strip()} if authors.strip() else None)
+    allowed = parse_allowlist(authors)
     latest = {}
     for comment in comments:
-        if comment.get("author_association") not in ("OWNER", "MEMBER", "COLLABORATOR"):
+        if not is_trusted_author(comment, allowed):
             continue
-        if allowed is not None and comment["user"]["login"].casefold() not in allowed:
-            continue
-        lines = (comment.get("body") or "").splitlines()
-        match = VERDICT.fullmatch(lines[0]) if lines else None
-        if not match or match[3].lower() != head_sha.lower():
-            continue
-        family = FAMILIES[match[1]]
-        # Edits count as new verdicts; IDs break ties within the same second.
-        order = (comment.get("updated_at") or comment["created_at"], comment["id"])
-        if family not in latest or order > latest[family][0]:
-            latest[family] = (order, match[2])
+        outcomes = {}
+        for match in verdict_lines(comment.get("body")):
+            if match[3].lower() != head_sha.lower():
+                continue
+            family = FAMILIES[match[1]]
+            # Conflicting verdicts for one family in one comment fail closed.
+            if outcomes.get(family) != "FAIL":
+                outcomes[family] = match[2]
+        # Order by posting time, never by edit time: editing an old verdict
+        # must not revive it over a newer one. IDs break same-second ties.
+        order = (comment["created_at"], comment["id"])
+        for family, outcome in outcomes.items():
+            if family not in latest or order > latest[family][0]:
+                latest[family] = (order, outcome)
 
     failures = sorted(family for family, (_, outcome) in latest.items()
                       if family != builder and outcome == "FAIL")
@@ -65,8 +134,7 @@ def evaluate(head_sha, branch, labels, files, comments, authors=""):
     others = set(FAMILIES.values()) - {builder}
 
     # Follow the rule's docs-only exception before money/security classification.
-    docs_only = bool(files) and all(path.endswith(".md") or path.startswith("docs/")
-                                    for path in files)
+    docs_only = bool(files) and all(is_docs_path(path) for path in files)
     if docs_only:
         if passes:
             return "success", f"docs-only: non-builder PASS on {short_sha}"
