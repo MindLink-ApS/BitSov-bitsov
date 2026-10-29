@@ -104,6 +104,116 @@ class ComputationTests(FixtureCase):
         ]]
         self.assertEqual(self.state()["open_prs"][0]["verdicts"], {})
 
+    def comment(self, body, number=100, *, created="2026-10-25T10:00:00Z", updated=None,
+                login="reviewer", association="MEMBER"):
+        entry = {"id": number, "created_at": created, "body": body,
+                 "user": {"login": login}, "author_association": association}
+        if updated:
+            entry["updated_at"] = updated
+        return entry
+
+    def head_only(self, comments, authors=""):
+        pr = self.data["pulls"][0]
+        pr["reviews"] = []
+        pr["comments"] = comments
+        return hs.compute_state(self.data, self.now, authors)
+
+    def isolated_first(self, comments, authors=""):
+        self.data["pulls"] = [self.data["pulls"][0]]
+        return self.head_only(comments, authors)["first_verdict_7d"]
+
+    def test_drive_by_accounts_cannot_set_first_or_head_verdicts(self):
+        # Red team: association NONE, invented vendor and short SHA used to count.
+        head = "a" * 40
+        for association in ["NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", None]:
+            with self.subTest(association=association):
+                comments = [self.comment(f"CODEX-VERDICT PASS {head}", 1,
+                                         created="2026-10-25T01:00:00Z",
+                                         login="drive-by", association=association),
+                            self.comment(f"CODEX-VERDICT FAIL {head}", 2,
+                                         created="2026-10-25T02:00:00Z")]
+                state = self.head_only(comments)
+                self.assertEqual(state["open_prs"][0]["verdicts"]["openai"]["result"], "FAIL")
+                self.assertEqual(self.isolated_first(comments),
+                                 {"passed": 0, "total": 1, "pass_rate": 0.0})
+                self.setUp()
+
+    def test_spammed_closed_prs_from_outsiders_do_not_move_the_rate(self):
+        spam = [{"number": 1000 + n, "title": "spam", "state": "closed", "merged_at": None,
+                 "comments": [self.comment("CODEX-VERDICT PASS " + "1" * 40, n,
+                                           login="drive-by", association="NONE")],
+                 "reviews": []} for n in range(50)]
+        self.data["pulls"] += spam
+        self.assertEqual(self.state()["first_verdict_7d"],
+                         {"passed": 2, "total": 3, "pass_rate": 0.6667})
+
+    def test_unknown_vendors_and_short_shas_never_count(self):
+        head = "a" * 40
+        for body in [f"LGTM-VERDICT PASS {head}", f"CUSTOM-VERDICT PASS {head}",
+                     "CODEX-VERDICT PASS 0000000", "CODEX-VERDICT PASS " + "a" * 39,
+                     "CODEX-VERDICT PASS " + "a" * 12, f"CODEX-VERDICT PASS {head}0",
+                     f"CODEX-VERDICT PASS {head} extra", f"CODEX-VERDICT  PASS {head}",
+                     f"**CODEX-VERDICT PASS {head}**", f"    CODEX-VERDICT PASS {head}",
+                     f"CODEX-VERDICT PASS {head}\u2028junk"]:
+            with self.subTest(body=body):
+                self.setUp()
+                self.assertEqual(self.head_only([self.comment(body)])["open_prs"][0]["verdicts"], {})
+                self.setUp()
+                self.assertEqual(self.isolated_first([self.comment(body)])["total"], 0)
+
+    def test_verdict_line_anywhere_with_trailing_space_counts(self):
+        body = "_Relayed by Atlas from the NOVA Codex terminal_\n\nCODEX-VERDICT PASS " + "a" * 40 + " "
+        self.assertEqual(self.head_only([self.comment(body)])["open_prs"][0]["verdicts"]
+                         ["openai"]["result"], "PASS")
+
+    def test_allowlist_matches_review_gate_rule(self):
+        head = "a" * 40
+        bot = self.comment(f"GROK-VERDICT FAIL {head}", 1, login="cursor[bot]",
+                           association="NONE")
+        member = self.comment(f"CODEX-VERDICT PASS {head}", 2, login="member",
+                              association="MEMBER")
+        # Allowlisted bot counts despite NONE; unlisted MEMBER does not.
+        verdicts = self.head_only([bot, member], "owner, Cursor[bot]")["open_prs"][0]["verdicts"]
+        self.assertEqual(set(verdicts), {"cursor"})
+        self.assertEqual(verdicts["cursor"]["result"], "FAIL")
+        # Unset, or no non-blank entries: OWNER/MEMBER/COLLABORATOR only.
+        for authors in ["", ",", " , "]:
+            with self.subTest(authors=authors):
+                verdicts = self.head_only([bot, member], authors)["open_prs"][0]["verdicts"]
+                self.assertEqual(set(verdicts), {"openai"})
+
+    def test_comments_without_user_are_skipped(self):
+        for user in [None, {}, {"login": None}, "ghost"]:
+            for authors in ["", "reviewer"]:
+                with self.subTest(user=user, authors=authors):
+                    entry = self.comment("CODEX-VERDICT PASS " + "a" * 40)
+                    entry["user"] = user
+                    self.assertEqual(self.head_only([entry], authors)["open_prs"][0]["verdicts"], {})
+
+    def test_cursor_family_matches_review_gate(self):
+        for vendor in ["GROK", "COMPOSER", "CURSOR"]:
+            with self.subTest(vendor=vendor):
+                comment = self.comment(f"{vendor}-VERDICT PASS " + "a" * 40)
+                self.assertEqual(set(self.head_only([comment])["open_prs"][0]["verdicts"]),
+                                 {"cursor"})
+
+    def test_edited_comments_are_ignored_for_first_verdict_only(self):
+        # Red team: editing a first FAIL into PASS used to count as a PASS.
+        head = "a" * 40
+        edited = self.comment(f"CODEX-VERDICT PASS {head}", 1, created="2026-10-25T00:00:00Z",
+                              updated="2026-10-25T11:00:00Z")
+        self.assertEqual(self.isolated_first([edited]), {"passed": 0, "total": 0, "pass_rate": None})
+        self.setUp()
+        later = self.comment(f"CLAUDE-VERDICT FAIL {head}", 2, created="2026-10-25T01:00:00Z",
+                             updated="2026-10-25T01:00:00Z")
+        self.assertEqual(self.isolated_first([edited, later]),
+                         {"passed": 0, "total": 1, "pass_rate": 0.0})
+        self.setUp()
+        # The head verdict still reflects the current body, ordered by posting time.
+        verdicts = self.head_only([edited])["open_prs"][0]["verdicts"]
+        self.assertEqual(verdicts["openai"]["result"], "PASS")
+        self.assertNotIn("edited", verdicts["openai"])
+
     def test_builder_slash_and_hyphen_conventions(self):
         for label in ["builder/codex", "builder-fable"]:
             with self.subTest(label=label):
@@ -135,11 +245,61 @@ class RenderingTests(FixtureCase):
         self.assertIn("Open: 0", body)
         self.assertIn("n/a", body)
 
-    def test_oversized_report_fails_before_publication(self):
+    def test_long_titles_are_truncated_not_fatal(self):
         state = self.state()
         state["open_prs"][0]["title"] = "x" * 66000
-        with self.assertRaisesRegex(ValueError, "issue body"):
-            hs.render_markdown(state)
+        body = hs.render_markdown(state)
+        self.assertLessEqual(len(body), hs.BODY_LIMIT)
+        self.assertIn("x" * 119 + "\u2026", body)
+        self.assertNotIn("x" * 121, body)
+        self.data["pulls"][0]["title"] = "y" * 256
+        self.assertEqual(len(self.state()["open_prs"][0]["title"]), 120)
+
+    def many_open_prs(self, count, title):
+        template = self.data["pulls"][1]
+        self.data["pulls"] = [dict(template, number=n, title=title) for n in range(1, count + 1)]
+        return self.state()
+
+    def test_many_open_prs_drop_oldest_rows_instead_of_failing(self):
+        # Red team: 60 open fork PRs with 256-character titles stopped the job.
+        for title in ["_" * 256, "a" * 256, "@" * 256]:
+            with self.subTest(title=title[:3]):
+                state = self.many_open_prs(400, title)
+                body = hs.render_markdown(state)
+                self.assertLessEqual(len(body), hs.BODY_LIMIT)
+                data = json.loads(body.split("```json\n", 1)[1].rsplit("```", 1)[0])
+                omitted = data["open_prs_omitted"]
+                self.assertGreater(omitted, 0)
+                self.assertIn(f"\u2026 {omitted} more open PRs", body)
+                self.assertIn("Open: 400", body)
+                shown = [pr["number"] for pr in data["open_prs"]]
+                self.assertEqual(shown, list(range(omitted + 1, 401)))
+                self.assertNotIn(f"| #{omitted} |", body)
+                self.assertIn(f"| #{omitted + 1} |", body)
+                # Only as many rows as needed are dropped (one row is < 2,000 chars).
+                self.assertGreater(len(body), hs.BODY_LIMIT - 2000)
+
+    def test_report_that_fits_has_no_more_line(self):
+        state = self.many_open_prs(50, "_" * 256)
+        body = hs.render_markdown(state)
+        self.assertNotIn("more open PRs", body)
+        self.assertNotIn("open_prs_omitted", body)
+
+    def test_issue_references_links_and_bidi_controls_are_neutralized(self):
+        title = ("@octocat #1 MindLink-ApS/other#5 GH-7 gh-8 https://evil.example/login "
+                 "www.evil.example \u202e\u2066\u2067\u2068\u2069\u202a\u200f end")
+        self.data["pulls"] = [dict(self.data["pulls"][1], number=7, title=title)]
+        body = hs.render_markdown(self.state())
+        row = next(line for line in body.splitlines() if line.startswith("| #7 |"))
+        for raw in ["#1", "#5", "GH-7", "gh-8", "https://", "www.", "@octocat",
+                    "\u202e", "\u2066", "\u2067", "\u2068", "\u2069", "\u202a", "\u200f"]:
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, row)
+        self.assertIn("#\u200b1", row)
+        self.assertIn("other#\u200b5", row)
+        self.assertIn("end", row)
+        for char in "\u202e\u2066\u2069":
+            self.assertNotIn(char, body)
 
 
 class GitHubBoundaryTests(unittest.TestCase):

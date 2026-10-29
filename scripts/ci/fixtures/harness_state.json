@@ -8,14 +8,14 @@
       "draft": false, "labels": [{"name": "security"}, {"name": "builder:claude"}],
       "head": {"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, "mergeable_state": "behind",
       "comments": [
-        {"id": 3, "created_at": "2026-10-25T08:00:00Z", "body": "CODEX-VERDICT FAIL aaaaaaaaaaaa"},
-        {"id": 1, "created_at": "2026-10-24T10:00:00Z", "body": "CODEX-VERDICT FAIL bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
-        {"id": 2, "created_at": "2026-10-25T07:00:00Z", "body": "CLAUDE-VERDICT FAIL aaaaaaa"},
-        {"id": 4, "created_at": "2026-10-25T10:00:00Z", "body": "FABLE-VERDICT PASS aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nReview"},
-        {"id": 5, "created_at": "2026-10-25T11:00:00Z", "body": "Example CODEX-VERDICT PASS aaaaaaa; not a verdict line\n> CODEX-VERDICT PASS aaaaaaa\n```\nCODEX-VERDICT PASS aaaaaaa\n```"}
+        {"id": 3, "user": {"login": "reviewer"}, "author_association": "MEMBER", "created_at": "2026-10-25T08:00:00Z", "body": "CODEX-VERDICT FAIL aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"id": 1, "user": {"login": "reviewer"}, "author_association": "MEMBER", "created_at": "2026-10-24T10:00:00Z", "body": "CODEX-VERDICT FAIL bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+        {"id": 2, "user": {"login": "reviewer"}, "author_association": "MEMBER", "created_at": "2026-10-25T07:00:00Z", "body": "CLAUDE-VERDICT FAIL aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"id": 4, "user": {"login": "reviewer"}, "author_association": "MEMBER", "created_at": "2026-10-25T10:00:00Z", "body": "FABLE-VERDICT PASS aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nReview"},
+        {"id": 5, "user": {"login": "reviewer"}, "author_association": "MEMBER", "created_at": "2026-10-25T11:00:00Z", "body": "Example CODEX-VERDICT PASS aaaaaaa; not a verdict line\n> CODEX-VERDICT PASS aaaaaaa\n```\nCODEX-VERDICT PASS aaaaaaa\n```"}
       ],
       "reviews": [
-        {"id": 6, "submitted_at": "2026-10-25T09:00:00Z", "body": "CODEX-VERDICT PASS AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
+        {"id": 6, "user": {"login": "reviewer"}, "author_association": "MEMBER", "submitted_at": "2026-10-25T09:00:00Z", "body": "CODEX-VERDICT PASS AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
       ],
       "statuses": [
         {"id": 1, "context": "review-gate", "state": "failure", "updated_at": "2026-10-25T08:00:00Z"},
@@ -38,20 +38,20 @@
     {
       "number": 12, "title": "Merged today", "state": "closed", "created_at": "2026-10-20T00:00:00Z",
       "merged_at": "2026-10-24T12:00:00Z", "comments": [
-        {"id": 7, "created_at": "2026-10-22T10:00:00Z", "body": "GEMINI-VERDICT PASS bbbbbbb"}
+        {"id": 7, "user": {"login": "reviewer"}, "author_association": "MEMBER", "created_at": "2026-10-22T10:00:00Z", "body": "GEMINI-VERDICT PASS bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
       ], "reviews": []
     },
     {
       "number": 13, "title": "Merged at seven-day boundary", "state": "closed", "created_at": "2026-10-10T00:00:00Z",
       "merged_at": "2026-10-18T12:00:00Z", "comments": [
-        {"id": 8, "created_at": "2026-10-18T12:00:00Z", "body": "CUSTOM-VERDICT PASS ddddddd"}
+        {"id": 8, "user": {"login": "reviewer"}, "author_association": "MEMBER", "created_at": "2026-10-18T12:00:00Z", "body": "SONNET-VERDICT PASS dddddddddddddddddddddddddddddddddddddddd"}
       ], "reviews": []
     },
     {
       "number": 14, "title": "Closed unmerged", "state": "closed", "merged_at": null,
       "comments": [
-        {"id": 9, "created_at": "2026-10-18T11:59:59Z", "body": "CODEX-VERDICT FAIL eeeeeee"},
-        {"id": 10, "created_at": "2026-10-24T10:00:00Z", "body": "CODEX-VERDICT PASS eeeeeee"}
+        {"id": 9, "user": {"login": "reviewer"}, "author_association": "MEMBER", "created_at": "2026-10-18T11:59:59Z", "body": "CODEX-VERDICT FAIL eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+        {"id": 10, "user": {"login": "reviewer"}, "author_association": "MEMBER", "created_at": "2026-10-24T10:00:00Z", "body": "CODEX-VERDICT PASS eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
       ], "reviews": []
     },
     {

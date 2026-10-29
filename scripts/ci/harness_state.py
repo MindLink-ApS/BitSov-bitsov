@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
 """Public GitHub factory dashboard. Runtime dependencies: gh and Python stdlib.
 
+Verdicts follow the review gate (scripts/ci/review_gate.py): a line that is
+exactly `<VENDOR>-VERDICT PASS|FAIL <40-hex sha>` (surrounding spaces/tabs
+allowed) anywhere outside quotes and fenced or indented code, from a login in
+REVIEW_GATE_AUTHORS when it has any entries (whatever its author_association),
+else from an OWNER/MEMBER/COLLABORATOR. Only known vendors count:
+CLAUDE/FABLE/OPUS/SONNET/ANTHROPIC are Anthropic; CODEX/OPENAI are OpenAI;
+GEMINI/GOOGLE are Google; GROK/COMPOSER/CURSOR are the gate's Cursor family;
+XAI is xAI.
+
 First-verdict rate: one earliest verdict per PR (any vendor/head), whose posting
 falls in the rolling seven-day window, including open, merged and closed PRs.
-Current-head verdicts accept 7..40 hex SHA prefixes and use posting time, not edit
-time. CLAUDE/FABLE/OPUS/SONNET are Anthropic; CODEX is OpenAI; GEMINI is Google.
+The body as originally posted is not available, so comments that were edited
+(updated_at differs from created_at) are ignored for this metric only; the
+earliest unedited verdict counts instead. Review bodies carry no edit time and
+always count. Current-head verdicts use posting time, not edit time.
 CI aggregates latest head checks/statuses, excluding review-gate and review/*.
+Titles are cut to 120 characters; if the body would still exceed 65,000
+characters, the oldest open-PR rows are dropped and counted in a "more" line.
 The E2E result is the newest completed main run, even while another is running.
 No local factory files, model calls, PR checkout, or comment writes are used.
 """
@@ -28,22 +41,47 @@ FAMILIES = {
     "CODEX": "openai", "OPENAI": "openai",
     "CLAUDE": "anthropic", "FABLE": "anthropic", "ANTHROPIC": "anthropic",
     "OPUS": "anthropic", "SONNET": "anthropic",
-    "GEMINI": "google", "GOOGLE": "google", "GROK": "xai", "XAI": "xai",
+    "GEMINI": "google", "GOOGLE": "google",
+    # The review gate treats GROK/COMPOSER/CURSOR as one CURSOR family.
+    "GROK": "cursor", "COMPOSER": "cursor", "CURSOR": "cursor", "XAI": "xai",
 }
 VERDICT = re.compile(
-    r"^([A-Z][A-Z0-9_-]*)-VERDICT[ \t]+(PASS|FAIL)[ \t]+"
-    r"([0-9a-fA-F]{7,40})(?=$|[ \t])"
+    "(" + "|".join(sorted(FAMILIES)) + r")-VERDICT (PASS|FAIL) ([0-9a-fA-F]{40})"
 )
+TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+TITLE_LIMIT = 120
+BODY_LIMIT = 65000
+# Bidirectional embedding/override/isolate controls and directional marks.
+BIDI = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 
 def timestamp(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def parse_allowlist(authors):
+    """Casefolded logins, or None when the list has no non-blank entries."""
+    allowed = {author.strip().casefold() for author in (authors or "").split(",")}
+    allowed.discard("")
+    return allowed or None
+
+
+def is_trusted_author(entry, allowed):
+    """Same rule as the review gate; entries without a user never count."""
+    user = entry.get("user")
+    login = user.get("login") if isinstance(user, dict) else None
+    if not isinstance(login, str) or not login:
+        return False
+    if allowed is not None:
+        return login.casefold() in allowed
+    return entry.get("author_association") in TRUSTED_ASSOCIATIONS
+
+
 def prose_lines(body):
     """Ignore fenced examples; anchored parsers also reject block quotes."""
     fence = None
-    for line in (body or "").splitlines():
+    # GitHub breaks lines only at "\n"; never split at U+2028 or U+0085.
+    for line in (body or "").replace("\r\n", "\n").split("\n"):
         marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
         if marker:
             token = marker[1]
@@ -56,18 +94,23 @@ def prose_lines(body):
             yield line
 
 
-def verdicts(pr):
+def verdicts(pr, allowed=None):
     found = []
     for entry in pr.get("comments", []) + pr.get("reviews", []):
         posted = entry.get("submitted_at") or entry.get("created_at")
-        if not posted:
+        if not posted or not is_trusted_author(entry, allowed):
             continue  # Pending review drafts are not published verdicts.
+        edited = entry.get("updated_at") not in (None, entry.get("created_at"))
         for line in prose_lines(entry.get("body")):
-            match = VERDICT.match(line)
+            indent = len(line) - len(line.lstrip(" \t"))
+            if "\t" in line[:indent] or indent >= 4:
+                continue  # Indented code block.
+            match = VERDICT.fullmatch(line.strip(" \t\r"))
             if match:
                 vendor, result, sha = match.groups()
                 found.append({"vendor": vendor, "result": result, "sha": sha.lower(),
-                              "created_at": posted, "id": entry.get("id", 0)})
+                              "created_at": posted, "id": entry.get("id", 0),
+                              "edited": edited})
     return sorted(found, key=lambda v: (timestamp(v["created_at"]), v["id"]))
 
 
@@ -107,14 +150,21 @@ def head_status(pr):
     return rollup(gate), rollup(ci)
 
 
-def compute_state(data, now):
+def short_title(title):
+    title = str(title)
+    return title if len(title) <= TITLE_LIMIT else title[:TITLE_LIMIT - 1] + "\u2026"
+
+
+def compute_state(data, now, authors=""):
     cutoff = now - timedelta(days=7)
+    allowed = parse_allowlist(authors)
     open_prs, first = [], []
     merges = {"last_24h": 0, "last_7d": 0}
     for pr in data["pulls"]:
-        recorded = [v for v in verdicts(pr) if timestamp(v["created_at"]) <= now]
-        if recorded and timestamp(recorded[0]["created_at"]) >= cutoff:
-            first.append(recorded[0]["result"])
+        recorded = [v for v in verdicts(pr, allowed) if timestamp(v["created_at"]) <= now]
+        unedited = [v for v in recorded if not v["edited"]]
+        if unedited and timestamp(unedited[0]["created_at"]) >= cutoff:
+            first.append(unedited[0]["result"])
         merged = pr.get("merged_at")
         if merged:
             age = now - timestamp(merged)
@@ -125,16 +175,17 @@ def compute_state(data, now):
         sha = pr["head"]["sha"].lower()
         current = {}
         for verdict in recorded:
-            if sha.startswith(verdict["sha"]):
-                family = FAMILIES.get(verdict["vendor"], verdict["vendor"].lower())
-                current[family] = {k: v for k, v in verdict.items() if k != "id"}
+            if verdict["sha"] == sha:
+                family = FAMILIES[verdict["vendor"]]
+                current[family] = {k: v for k, v in verdict.items()
+                                   if k not in ("id", "edited")}
         labels = sorted(label["name"] for label in pr["labels"])
         builder = next((label for label in labels if re.match(r"^builder[:/-]", label, re.I)), None)
         merge_state = (pr.get("mergeable_state") or "unknown").upper()
         known = merge_state != "UNKNOWN"
         gate, ci = head_status(pr)
         open_prs.append({
-            "number": pr["number"], "title": pr["title"], "head_sha": sha,
+            "number": pr["number"], "title": short_title(pr["title"]), "head_sha": sha,
             "age_hours": round(max(0, (now - timestamp(pr["created_at"])).total_seconds() / 3600), 2),
             "draft": pr["draft"], "labels": labels, "builder_label": builder,
             "verdicts": dict(sorted(current.items())), "review_gate": gate, "ci": ci,
@@ -161,10 +212,20 @@ def compute_state(data, now):
     }
 
 
+def neutralize(text):
+    """Drop bidi controls and break issue references and autolinks."""
+    text = BIDI.sub("", str(text))
+    # "#1", "owner/repo#5" and "GH-7" would add timeline cross-references.
+    text = re.sub(r"#(?=\d)", "#\u200b", text)
+    text = re.sub(r"(?i)\b(gh)-(?=\d)", "\\1-\u200b", text)
+    text = re.sub(r"(?i)(?<=[a-z])://", ":\u200b//", text)
+    return re.sub(r"(?i)\bwww\.", "www\u200b.", text)
+
+
 def cell(value):
     # GitHub decodes entities before its mention filter. Break the username
     # with a zero-width space as well, so an issue edit cannot ping people.
-    text = html.escape(str(value), quote=False).replace("@", "&#64;\u200b")
+    text = html.escape(neutralize(value), quote=False).replace("@", "&#64;\u200b")
     text = re.sub(r"([\\`*_\[\]|()])", r"\\\1", text)
     return " ".join(text.split())
 
@@ -176,7 +237,10 @@ def render_markdown(state):
     median = f"{median:.1f} h" if median is not None else "n/a"
     e2e = state["three_node_paid_e2e"]
     checklist = state["checklist_428"]
-    lines = [
+    # Titles are already cut in compute_state; repeat it for any other caller.
+    state = dict(state, open_prs=[dict(pr, title=short_title(pr["title"]))
+                                  for pr in state["open_prs"]])
+    header = [
         f'**Open: {len(state["open_prs"])} · Median age: {median} · '
         f'Merged 24h/7d: {state["merges"]["last_24h"]}/{state["merges"]["last_7d"]} · '
         f'First-verdict PASS 7d: {percent} ({rate["passed"]}/{rate["total"]}) · '
@@ -185,23 +249,46 @@ def render_markdown(state):
         "| PR | Title | Age (h) | Draft | Labels | Builder | Head verdicts | review-gate | CI | Merge state |",
         "| --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- |",
     ]
+    rows = []
     for pr in state["open_prs"]:
         votes = "; ".join(f'{family}: {v["result"]} {v["sha"][:12]}' for family, v in pr["verdicts"].items())
-        values = [f'#{pr["number"]}', pr["title"], f'{pr["age_hours"]:.2f}',
+        values = [pr["title"], f'{pr["age_hours"]:.2f}',
                   "yes" if pr["draft"] else "no", ", ".join(pr["labels"]) or "—",
                   pr["builder_label"] or "—", votes or "missing", pr["review_gate"], pr["ci"], pr["mergeable_state"]]
-        lines.append("| " + " | ".join(cell(v) for v in values) + " |")
-    lines += ["", f'Updated {state["generated_at"]}. First verdict = earliest per PR, any vendor/head; '
-              "window is its posting time. CI excludes review contexts; E2E = latest completed main run.", ""]
-    # Escape HTML/mentions/backticks even in JSON; json.loads still recovers the
-    # exact same data. Repo-controlled text never becomes executable Markdown.
-    encoded = json.dumps(state, ensure_ascii=True, separators=(",", ":"))
-    for char in "<>&@`":
-        encoded = encoded.replace(char, f"\\u{ord(char):04x}")
-    lines += ["```json", encoded, "```", ""]
-    body = "\n".join(lines)
-    if len(body) > 65536:
-        raise ValueError("report exceeds the GitHub issue body limit (65536 characters)")
+        rows.append(f'| #{int(pr["number"])} | ' + " | ".join(cell(v) for v in values) + " |")
+    footer = ["", f'Updated {state["generated_at"]}. First verdict = earliest unedited verdict per PR, '
+              "any vendor/head; window is its posting time. CI excludes review contexts; "
+              "E2E = latest completed main run.", ""]
+
+    def build(omitted):
+        # Rows are sorted by PR number, so the oldest PRs are dropped first.
+        shown = dict(state, open_prs=state["open_prs"][omitted:])
+        more = []
+        if omitted:
+            shown["open_prs_omitted"] = omitted
+            more = ["", f"\u2026 {omitted} more open PRs (oldest) not shown to fit "
+                    "GitHub's issue body limit."]
+        # Escape HTML/mentions/backticks even in JSON; json.loads still recovers
+        # the exact same data. Repo-controlled text never becomes executable Markdown.
+        encoded = json.dumps(shown, ensure_ascii=True, separators=(",", ":"))
+        for char in "<>&@`":
+            encoded = encoded.replace(char, f"\\u{ord(char):04x}")
+        return "\n".join(header + rows[omitted:] + more + footer
+                         + ["```json", encoded, "```", ""])
+
+    body = build(0)
+    if len(body) > BODY_LIMIT:
+        # The size shrinks as rows are dropped: binary-search the fewest drops.
+        low, high = 1, len(rows)
+        while low < high:
+            middle = (low + high) // 2
+            if len(build(middle)) <= BODY_LIMIT:
+                high = middle
+            else:
+                low = middle + 1
+        body = build(low)
+    if len(body) > BODY_LIMIT:
+        raise ValueError("report exceeds the GitHub issue body limit even without PR rows")
     return body
 
 
@@ -319,7 +406,8 @@ def main():
         parser.error("--repo or GITHUB_REPOSITORY is required")
     api = GitHub(args.repo)
     now = datetime.now(timezone.utc)
-    body = render_markdown(compute_state(collect(api, now), now))
+    authors = os.environ.get("REVIEW_GATE_AUTHORS", "")
+    body = render_markdown(compute_state(collect(api, now), now, authors))
     if args.dry_run:
         print(body, end="")
     else:

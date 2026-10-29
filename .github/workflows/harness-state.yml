@@ -23,6 +23,8 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      # Same verdict-author allowlist as the review gate (#434).
+      REVIEW_GATE_AUTHORS: ${{ vars.REVIEW_GATE_AUTHORS }}
     steps:
       - name: Fetch the reporter from the workflow commit and publish
         shell: bash
