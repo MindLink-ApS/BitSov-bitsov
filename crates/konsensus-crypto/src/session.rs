@@ -152,6 +152,24 @@ pub trait SessionStore: Send + Sync {
 /// recovery caps so a full map can never block session setup.
 pub const RATCHET_INIT_RETENTION_KEY: &str = "ratchet-init";
 
+/// Key prefix of receive receipts. They prove a peer's message was consumed and
+/// outlive a session replacement; retained ciphertext is tied to its ratchet.
+pub const RECEIVE_RECEIPT_PREFIX: &str = "received:";
+
+/// The receipts a replacement session must keep from the one it replaces.
+fn carried_receipts(previous: Option<&PeerSession>) -> HashMap<String, Vec<u8>> {
+    previous
+        .map(|session| {
+            session
+                .recovery_data
+                .iter()
+                .filter(|(key, _)| key.starts_with(RECEIVE_RECEIPT_PREFIX))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Most recovery entries (receive receipts and retained replies) per session.
 pub const MAX_RECOVERY_ENTRIES: usize = 256;
 
@@ -217,6 +235,9 @@ pub struct SessionManager {
     next_opk_id: RwLock<u32>,
     /// Active sessions keyed by peer NodeId.
     sessions: RwLock<HashMap<NodeId, PeerSession>>,
+    /// Receive receipts of removed sessions, carried into that peer's next
+    /// session so committed receives stay provable across a replacement.
+    removed_receipts: RwLock<HashMap<NodeId, HashMap<String, Vec<u8>>>>,
     /// Optional persistent session store.
     store: Option<Arc<dyn SessionStore>>,
     /// AES-256-GCM cipher for encrypting session state at rest.
@@ -251,6 +272,7 @@ impl SessionManager {
             one_time_prekeys: RwLock::new(otpks),
             next_opk_id: RwLock::new(10),
             sessions: RwLock::new(HashMap::new()),
+            removed_receipts: RwLock::new(HashMap::new()),
             store: None,
             session_cipher,
         }
@@ -278,6 +300,7 @@ impl SessionManager {
             one_time_prekeys: RwLock::new(otpks),
             next_opk_id: RwLock::new(10),
             sessions: RwLock::new(HashMap::new()),
+            removed_receipts: RwLock::new(HashMap::new()),
             store: Some(store),
             session_cipher,
         }
@@ -589,14 +612,16 @@ impl SessionManager {
 
         let ratchet_key = *ratchet.public_key().as_bytes();
 
-        // Store session
-        self.sessions.write().await.insert(
-            *peer_id,
-            PeerSession {
-                ratchet,
-                recovery_data: HashMap::new(),
-            },
-        );
+        // Store session. Receive receipts survive the replacement, so a request
+        // whose receive was already committed can still be resolved.
+        {
+            let mut sessions = self.sessions.write().await;
+            let mut recovery_data = carried_receipts(sessions.get(peer_id));
+            if let Some(stashed) = self.removed_receipts.write().await.remove(peer_id) {
+                recovery_data.extend(stashed);
+            }
+            sessions.insert(*peer_id, PeerSession { ratchet, recovery_data });
+        }
 
         // Persist to storage. No message ciphertext exists yet; a later send
         // saves the advanced ratchet before returning ciphertext.
@@ -663,14 +688,16 @@ impl SessionManager {
             shared_secret.associated_data.clone(),
         );
 
-        // Store session
-        self.sessions.write().await.insert(
-            *peer_id,
-            PeerSession {
-                ratchet,
-                recovery_data: HashMap::new(),
-            },
-        );
+        // Store session. Receive receipts survive the replacement, so a request
+        // whose receive was already committed can still be resolved.
+        {
+            let mut sessions = self.sessions.write().await;
+            let mut recovery_data = carried_receipts(sessions.get(peer_id));
+            if let Some(stashed) = self.removed_receipts.write().await.remove(peer_id) {
+                recovery_data.extend(stashed);
+            }
+            sessions.insert(*peer_id, PeerSession { ratchet, recovery_data });
+        }
 
         // Persist to storage. No message ciphertext exists yet; a later send
         // saves the advanced ratchet before returning ciphertext.
@@ -947,7 +974,12 @@ impl SessionManager {
 
     /// Remove a session with a peer (e.g., on disconnect or key rotation).
     pub async fn remove_session(&self, peer_id: &NodeId) -> bool {
-        let removed = self.sessions.write().await.remove(peer_id).is_some();
+        let removed = self.sessions.write().await.remove(peer_id);
+        let receipts = carried_receipts(removed.as_ref());
+        if !receipts.is_empty() {
+            self.removed_receipts.write().await.entry(*peer_id).or_default().extend(receipts);
+        }
+        let removed = removed.is_some();
         if removed {
             if let Some(store) = &self.store {
                 if let Err(e) = store.delete_session(peer_id).await {

@@ -1385,3 +1385,44 @@ async fn recovery_retention_is_capped_without_evicting_pending_evidence() {
         b"held back"
     );
 }
+
+/// Codex P2 on #406: replacing a session keeps receive receipts (so a request
+/// whose receive was committed can still be resolved) but drops ciphertext
+/// retained under the old ratchet.
+#[tokio::test]
+async fn session_replacement_keeps_receive_receipts_only() {
+    let alice = make_identity(TEST_MNEMONIC_A);
+    let bob = make_identity(TEST_MNEMONIC_B);
+    let sender = SessionManager::new(alice.clone());
+    let receiver = SessionManager::new(bob.clone());
+    let init = sender
+        .initiate_session(bob.node_id(), &receiver.prekey_bundle().await)
+        .await
+        .unwrap();
+    receiver.accept_session(alice.node_id(), &init).await.unwrap();
+    let request = sender.encrypt(bob.node_id(), b"request").await.unwrap();
+    let receipt = format!("{RECEIVE_RECEIPT_PREFIX}abc");
+    receiver
+        .decrypt_with_recovery(alice.node_id(), &request, Some(&receipt), |_| async { Ok(()) })
+        .await
+        .unwrap();
+    receiver
+        .encrypt_retained(alice.node_id(), "web-reply:abc", b"reply", |m| Ok(ratchet_message_to_bytes(m)))
+        .await
+        .unwrap();
+
+    // The session goes stale and is removed; the peer re-initiates and Bob
+    // accepts a replacement session, as the node does.
+    assert!(receiver.remove_session(alice.node_id()).await);
+    let fresh = SessionManager::new(alice.clone());
+    let init = fresh
+        .initiate_session(bob.node_id(), &receiver.prekey_bundle().await)
+        .await
+        .unwrap();
+    receiver.accept_session(alice.node_id(), &init).await.unwrap();
+    assert_eq!(
+        receiver.recovery_data(alice.node_id(), &receipt).await.as_deref(),
+        Some(request.header.to_bytes().as_slice())
+    );
+    assert!(receiver.recovery_data(alice.node_id(), "web-reply:abc").await.is_none());
+}

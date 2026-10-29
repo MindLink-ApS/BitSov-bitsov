@@ -1087,7 +1087,7 @@ fn uses_pending_plaintext(envelope: &konsensus_core::UkmEnvelope) -> bool {
 }
 
 fn receive_retention_key(envelope: &konsensus_core::UkmEnvelope) -> String {
-    format!("received:{}", envelope.id)
+    format!("{}{}", konsensus_crypto::RECEIVE_RECEIPT_PREFIX, envelope.id)
 }
 
 async fn receive_was_committed(
