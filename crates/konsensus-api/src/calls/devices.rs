@@ -330,26 +330,21 @@ impl Devices {
                             reason: NOT_REACHABLE.into(),
                         },
                     ));
-                } else if let Some(row) = row.filter(|e| e.side == Side::Callee) {
-                    if !invite.waiting && matches!(row.phase, Phase::Ringing | Phase::Live) {
-                        if row.deadline_ms > now_ms {
-                            if let Some(tracked) = self
-                                .invites
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .get_mut(&id)
-                            {
-                                tracked.deadline_ms = row.deadline_ms;
-                            }
-                            return Ok(());
-                        }
-                        if let Some(ended) = row.at(now_ms) {
-                            store
-                                .call_put(&invite.peer, &invite.call_id, &ended)
-                                .await?;
-                        }
+                } else if let Some(row) = row.filter(|e| e.side == Side::Callee && e.phase == Phase::Ringing && e.deadline_ms > now_ms) {
+                    // Still ringing: keep the binding so another device can stream it.
+                    if let Some(tracked) = self
+                        .invites
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_mut(&id)
+                    {
+                        tracked.deadline_ms = row.deadline_ms;
                     }
+                    return Ok(());
                 }
+                // Answered, ended or rung out: the wait is over. Never write the
+                // row here; live expiry and its Unpaid notice belong to
+                // `expire_calls`, and reads age an unanswered row to ended.
                 self.invites
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())

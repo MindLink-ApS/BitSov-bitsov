@@ -4115,3 +4115,11 @@ async fn call_block_ack_storage_failure_retains_delivery_until_grant_is_durable(
     assert_eq!(paid.paid_until_ms, Some(now + 60_000));
     assert!(updates.try_recv().is_ok());
 }
+
+#[test]
+fn not_reachable_invite_is_a_terminal_paid_rejection() {
+    // A refused device wait is final: resending the paid invite only repeats it.
+    assert!(terminal_paid_rejection(konsensus_api::calls::devices::NOT_REACHABLE));
+    assert!(terminal_paid_rejection("call_block_overpayment"));
+    assert!(!terminal_paid_rejection("storage error"));
+}

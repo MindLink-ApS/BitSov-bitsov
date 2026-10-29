@@ -1063,7 +1063,7 @@ async fn send_prekey_offer(
 /// Wire reasons are the gate's stable Display prefixes; unknown reasons stay
 /// retryable so older peers and temporary gate failures cannot burn delivery.
 fn terminal_paid_rejection(reason: &str) -> bool {
-    if reason == "call_block_overpayment" { return true; }
+    if matches!(reason, "call_block_overpayment" | konsensus_api::calls::devices::NOT_REACHABLE) { return true; }
     [
         "payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:",
         "room_binding_invalid:", "room_sender_not_member:", "room_recipient_not_member:",

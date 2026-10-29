@@ -662,3 +662,35 @@ async fn pending_device_receipts_are_withdrawn_before_outbound_recovery_can_fail
         Some(konsensus_storage::CallInviteOutcome::NotReachable)
     );
 }
+
+#[tokio::test]
+async fn device_sweep_leaves_live_expiry_and_its_unpaid_notice_to_expire_calls() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let devices = Devices::default();
+    let (env, text) = invite(9);
+    db.accept_paid_envelope(&env).await.unwrap();
+    devices
+        .admit(&db, &own(), &env, Some(&text), 1_000, || 1_000)
+        .await
+        .unwrap();
+    devices.fetched(&db, &env, || 11_000).await.unwrap();
+    assert_eq!(devices.sweep(&db, 11_100).await.unwrap().len(), 1, "ringing ack");
+    // Answered and paid until 40 s; its grace ends at 50 s.
+    let ringing = db.call_get(&env.sender, CALL).await.unwrap().unwrap();
+    let live = konsensus_core::payloads::call::CallEntry {
+        phase: Phase::Live,
+        deadline_ms: 50_000,
+        paid_until_ms: Some(40_000),
+        next_block_seq: 1,
+        ..ringing
+    };
+    db.call_put(&env.sender, CALL, &live).await.unwrap();
+    // Past the paid deadline and the old ring deadline: the device sweep must
+    // not end the row, or the callee would never send its Unpaid hangup.
+    assert!(devices.sweep(&db, 71_000).await.unwrap().is_empty());
+    assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap(), live);
+    assert_eq!(
+        konsensus_api::calls::expire_calls(&db, 71_000).await.unwrap(),
+        vec![(env.sender, CALL.to_owned())]
+    );
+}
