@@ -148,6 +148,31 @@ pub trait SessionStore: Send + Sync {
     async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+/// Retention key for the session's ratchet-init frame. It is exempt from the
+/// recovery caps so a full map can never block session setup.
+pub const RATCHET_INIT_RETENTION_KEY: &str = "ratchet-init";
+
+/// Most recovery entries (receive receipts and retained replies) per session.
+pub const MAX_RECOVERY_ENTRIES: usize = 256;
+
+/// Most recovery bytes (keys plus values) per session.
+pub const MAX_RECOVERY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Room for one more recovery entry? Existing entries are never evicted: a
+/// full session refuses new work (backpressure) until replies complete.
+fn recovery_has_room(data: &HashMap<String, Vec<u8>>, key: &str, value_len: usize) -> bool {
+    if key == RATCHET_INIT_RETENTION_KEY || data.contains_key(key) {
+        return true;
+    }
+    let counted = data.iter().filter(|(k, _)| k.as_str() != RATCHET_INIT_RETENTION_KEY);
+    let (entries, used) = counted.fold((0, 0), |(n, bytes), (k, v)| (n + 1, bytes + k.len() + v.len()));
+    entries < MAX_RECOVERY_ENTRIES && used + key.len() + value_len <= MAX_RECOVERY_BYTES
+}
+
+fn recovery_full() -> SessionError {
+    SessionError::Persist("session recovery retention is full; retry after pending replies complete".into())
+}
+
 /// An active E2EE session with a peer.
 #[derive(Clone)]
 struct PeerSession {
@@ -722,6 +747,9 @@ impl SessionManager {
         let mut trial = session.clone();
         let message = trial.ratchet.encrypt(plaintext)?;
         let wire = encode(&message)?;
+        if !recovery_has_room(&trial.recovery_data, retention_key, wire.len()) {
+            return Err(recovery_full());
+        }
         trial
             .recovery_data
             .insert(retention_key.to_owned(), wire.clone());
@@ -853,6 +881,12 @@ impl SessionManager {
             let session = sessions
                 .get_mut(peer_id)
                 .ok_or(SessionError::NoSession(*peer_id))?;
+            // Refuse before any side effect, so the message stays retriable.
+            if let Some(key) = receipt_key {
+                if !recovery_has_room(&session.recovery_data, key, message.header.to_bytes().len()) {
+                    return Err(recovery_full());
+                }
+            }
             let mut trial = session.clone();
             let plaintext = trial.ratchet.decrypt(message)?;
             (plaintext, trial)

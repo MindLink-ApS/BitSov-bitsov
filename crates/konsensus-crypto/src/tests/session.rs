@@ -1311,3 +1311,77 @@ async fn decrypt_persist_failure_leaves_session_able_to_retry() {
     assert!(matches!(err, SessionError::Ratchet(_)));
     assert_ne!(ratchet_state_json(&mgr_b, &node_a).await, state_before);
 }
+
+/// Codex P2 on #406: recovery data is bounded per session. A full session
+/// refuses new receipts and retained replies (backpressure) without evicting
+/// unfinished evidence or advancing the ratchet; clearing one makes room again.
+#[tokio::test]
+async fn recovery_retention_is_capped_without_evicting_pending_evidence() {
+    let alice = make_identity(TEST_MNEMONIC_A);
+    let bob = make_identity(TEST_MNEMONIC_B);
+    let sender = SessionManager::new(alice.clone());
+    let receiver = SessionManager::new(bob.clone());
+    let init = sender
+        .initiate_session(bob.node_id(), &receiver.prekey_bundle().await)
+        .await
+        .unwrap();
+    receiver.accept_session(alice.node_id(), &init).await.unwrap();
+    let encode = |msg: &RatchetMessage| Ok(ratchet_message_to_bytes(msg));
+    for n in 0..MAX_RECOVERY_ENTRIES {
+        sender
+            .encrypt_retained(bob.node_id(), &format!("reply-{n}"), b"r", encode)
+            .await
+            .unwrap();
+    }
+    let before = peek_send(&sender, bob.node_id()).await;
+    assert!(matches!(
+        sender.encrypt_retained(bob.node_id(), "reply-new", b"r", encode).await,
+        Err(SessionError::Persist(_))
+    ));
+    assert!(peek_send(&sender, bob.node_id()).await == before, "refusal advanced the ratchet");
+    // Existing evidence is kept and still returned; ratchet-init is exempt.
+    assert!(sender.recovery_data(bob.node_id(), "reply-0").await.is_some());
+    sender
+        .encrypt_retained(bob.node_id(), "reply-0", b"ignored", |_| panic!("re-encoded"))
+        .await
+        .unwrap();
+    sender
+        .encrypt_retained(bob.node_id(), RATCHET_INIT_RETENTION_KEY, b"ratchet-init", encode)
+        .await
+        .unwrap();
+    // Completing one reply frees a slot.
+    sender.clear_recovery_data(bob.node_id(), "reply-0").await.unwrap();
+    sender
+        .encrypt_retained(bob.node_id(), "reply-new", b"r", encode)
+        .await
+        .unwrap();
+
+    // Receive receipts obey the same cap before any side effect.
+    for n in 0..MAX_RECOVERY_ENTRIES {
+        let msg = sender.encrypt(bob.node_id(), b"req").await.unwrap();
+        receiver
+            .decrypt_with_recovery(alice.node_id(), &msg, Some(&format!("rx-{n}")), |_| async { Ok(()) })
+            .await
+            .unwrap();
+    }
+    let msg = sender.encrypt(bob.node_id(), b"held back").await.unwrap();
+    let mut side_effect = false;
+    assert!(matches!(
+        receiver
+            .decrypt_with_recovery(alice.node_id(), &msg, Some("rx-new"), |_| {
+                side_effect = true;
+                async { Ok(()) }
+            })
+            .await,
+        Err(SessionError::Persist(_))
+    ));
+    assert!(!side_effect, "before_commit ran for a refused receipt");
+    receiver.clear_recovery_data(alice.node_id(), "rx-0").await.unwrap();
+    assert_eq!(
+        receiver
+            .decrypt_with_recovery(alice.node_id(), &msg, Some("rx-new"), |_| async { Ok(()) })
+            .await
+            .unwrap(),
+        b"held back"
+    );
+}

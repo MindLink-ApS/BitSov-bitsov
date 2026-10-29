@@ -966,7 +966,7 @@ async fn handle_session_ack(
     // is not built and nothing is sent. A save failure leaves the session in
     // place so a later attempt can send; other failures still drop it.
     match session_manager
-        .encrypt_retained(peer_id, "ratchet-init", b"ratchet-init", |message| {
+        .encrypt_retained(peer_id, konsensus_crypto::RATCHET_INIT_RETENTION_KEY, b"ratchet-init", |message| {
             Ok(konsensus_crypto::ratchet_message_to_bytes(message))
         })
         .await
@@ -1013,7 +1013,7 @@ async fn retry_ratchet_init(
     pending: &mut PendingRatchetInits,
 ) -> bool {
     if !pending.contains_key(peer_id) {
-        if let Some(payload) = session_manager.recovery_data(peer_id, "ratchet-init").await {
+        if let Some(payload) = session_manager.recovery_data(peer_id, konsensus_crypto::RATCHET_INIT_RETENTION_KEY).await {
             if let Ok(message) = konsensus_crypto::ratchet_message_from_bytes(&payload) {
                 pending.insert(
                     *peer_id,
@@ -1033,7 +1033,7 @@ async fn retry_ratchet_init(
         {
             pending.remove(peer_id);
             let _ = session_manager
-                .clear_recovery_data(peer_id, "ratchet-init")
+                .clear_recovery_data(peer_id, konsensus_crypto::RATCHET_INIT_RETENTION_KEY)
                 .await;
             return false;
         }
@@ -1041,7 +1041,7 @@ async fn retry_ratchet_init(
             Ok(()) => {
                 pending.remove(peer_id);
                 if let Err(error) = session_manager
-                    .clear_recovery_data(peer_id, "ratchet-init")
+                    .clear_recovery_data(peer_id, konsensus_crypto::RATCHET_INIT_RETENTION_KEY)
                     .await
                 {
                     warn!(peer = %peer_id, %error, "sent RatchetInit recovery data could not be cleared");
