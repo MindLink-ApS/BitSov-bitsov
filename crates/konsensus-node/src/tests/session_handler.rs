@@ -1303,7 +1303,7 @@ async fn invoice_requested_creates_invoice_on_local_wallet() {
     handle_invoice_requested(
         &peer_id,
         "req-inv-1",
-        25_000,
+        1_000,
         "konsensus message",
         &admission_pricing(),
         &crate::session_handler::ConfiguredPriceCeilingCache::new(),
@@ -1372,7 +1372,7 @@ async fn invoice_requested_sends_error_on_lightning_failure() {
     handle_invoice_requested(
         &peer_id,
         "req-inv-fail",
-        25_000,
+        1_000,
         "konsensus message",
         &admission_pricing(),
         &crate::session_handler::ConfiguredPriceCeilingCache::new(),
@@ -4870,7 +4870,12 @@ async fn invoice_reconciliation_timeout_retains_completed_observations() {
     );
     let result = crate::peer_invoices::reconcile(book.clone(), lightning, 0).await;
     book.apply_reconciliation(result);
-    assert!(book.try_issue(&peer, std::time::Instant::now(), 0).is_ok());
+    // The closed invoice released the peer slot; the unswept backlog (over
+    // MAX_RETAINED_ROWS) still stops node-wide issuance until it drains.
+    assert_eq!(
+        book.try_issue(&peer, std::time::Instant::now(), 0),
+        Err(crate::peer_invoices::InvoiceLimit::Global)
+    );
 }
 
 /// Pricing failures and cancellation are external inputs; the cache and invoice
@@ -5051,7 +5056,7 @@ async fn review_regression_service_invoice_tracks_price_changes_with_one_cache()
 }
 
 #[tokio::test]
-async fn legacy_pending_invoices_release_the_cap_and_serve_a_new_request() {
+async fn unknown_deadline_wallet_invoices_neither_hold_the_cap_nor_are_deleted() {
     use std::sync::Mutex;
 
     struct LegacyPending {
@@ -5150,7 +5155,7 @@ async fn legacy_pending_invoices_release_the_cap_and_serve_a_new_request() {
         handle_invoice_requested_gated(
             peer,
             request_id,
-            25_000,
+            1_000,
             "konsensus message",
             true,
             pricing,
@@ -5181,45 +5186,27 @@ async fn legacy_pending_invoices_release_the_cap_and_serve_a_new_request() {
         &peer,
     )
     .await;
-    assert!(
-        lightning.list_payments(10).await.unwrap().is_empty(),
-        "legacy pending invoices still hold the node-wide cap"
+    // Codex P1 on #403: invoices with an unknown deadline may be owner
+    // invoices. They neither hold the service cap nor get deleted.
+    assert_eq!(
+        lightning.list_payments(10).await.unwrap().len(),
+        1,
+        "unknown-deadline wallet invoices must not hold the node-wide service cap"
     );
-
-    // A later sweep must not push the unknown deadline further out.
-    book.apply_reconciliation(
-        crate::peer_invoices::reconcile(book.clone(), lightning.clone(), started + 60).await,
-    );
-    issue(
-        &mut book,
-        "still-full",
-        &pricing,
-        &lightning,
-        &transport,
-        &peer,
-    )
-    .await;
-    assert!(lightning.list_payments(10).await.unwrap().is_empty());
-
+    let unknown = crate::peer_invoices::GLOBAL_OUTSTANDING_CAP + 1;
     book.apply_reconciliation(
         crate::peer_invoices::reconcile(
             book.clone(),
             lightning.clone(),
-            started + u64::from(crate::peer_invoices::INVOICE_EXPIRY_SECS),
+            started + 30 * 24 * 3600,
         )
         .await,
     );
-    assert!(wallet.pending.lock().expect("pending invoices").is_empty());
-    issue(
-        &mut book,
-        "after-sweep",
-        &pricing,
-        &lightning,
-        &transport,
-        &peer,
-    )
-    .await;
-    assert_eq!(lightning.list_payments(10).await.unwrap().len(), 1);
+    assert_eq!(
+        wallet.pending.lock().expect("pending invoices").len(),
+        unknown,
+        "an unknown-deadline invoice was deleted"
+    );
 }
 
 #[tokio::test]
@@ -5330,7 +5317,7 @@ async fn failed_price_lookup_and_invoice_creation_count_toward_the_rate_limit() 
         handle_invoice_requested_gated(
             who,
             request_id,
-            25_000,
+            1_000,
             "konsensus message",
             true,
             pricing,
@@ -5405,9 +5392,11 @@ async fn failed_price_lookup_and_invoice_creation_count_toward_the_rate_limit() 
         )
         .await;
     }
+    // An ambiguous (non-InvoiceCreation) failure may have left an invoice, so
+    // it holds the peer's slot: creation stops at the outstanding cap.
     assert_eq!(
         creates.calls.load(Ordering::SeqCst),
-        crate::peer_invoices::PEER_RATE_BURST
+        crate::peer_invoices::PEER_OUTSTANDING_CAP
     );
     request(
         &mut book,
@@ -5421,7 +5410,7 @@ async fn failed_price_lookup_and_invoice_creation_count_toward_the_rate_limit() 
     .await;
     assert_eq!(
         creates.calls.load(Ordering::SeqCst),
-        crate::peer_invoices::PEER_RATE_BURST
+        crate::peer_invoices::PEER_OUTSTANDING_CAP
     );
     request(
         &mut book,
@@ -5435,7 +5424,7 @@ async fn failed_price_lookup_and_invoice_creation_count_toward_the_rate_limit() 
     .await;
     assert_eq!(
         creates.calls.load(Ordering::SeqCst),
-        crate::peer_invoices::PEER_RATE_BURST + 1
+        crate::peer_invoices::PEER_OUTSTANDING_CAP + 1
     );
 }
 
