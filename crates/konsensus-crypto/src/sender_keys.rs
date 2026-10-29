@@ -84,6 +84,11 @@ pub enum SenderKeyError {
 /// Maximum number of skipped message keys to store per sender.
 const MAX_SKIP: u32 = 256;
 
+/// Maximum skipped message keys stored across all senders of one group
+/// session, matching the 1:1 Double Ratchet's total cap. The oldest-inserted
+/// keys are evicted (and zeroized) first.
+const MAX_TOTAL_SKIPPED_KEYS: usize = 2000;
+
 /// AEAD framing version for group ciphertexts.
 ///
 /// Version 1 is the original framing: AES-256-GCM with **no** associated data
@@ -283,8 +288,15 @@ struct ReceiverSenderKey {
     signing_key: ed25519_dalek::VerifyingKey,
     /// Generation counter (must match incoming messages).
     generation: u32,
-    /// Skipped message keys: message_number → message_key.
-    skipped_keys: HashMap<u32, [u8; 32]>,
+    /// Skipped message keys: message_number → (message_key, insertion seq).
+    skipped_keys: HashMap<u32, ([u8; 32], u64)>,
+}
+
+/// Zeroize and drop every skipped key.
+fn clear_skipped(skipped: &mut HashMap<u32, ([u8; 32], u64)>) {
+    for (_, (mut key, _)) in skipped.drain() {
+        key.zeroize();
+    }
 }
 
 /// A group session managing sender keys for all members.
@@ -302,6 +314,9 @@ pub struct GroupSession {
     our_sender_key: SenderKeyState,
     /// Receiver-side sender keys for other members.
     member_keys: HashMap<NodeId, ReceiverSenderKey>,
+    /// Next insertion sequence for a skipped key, shared by all members so
+    /// eviction is oldest-first across the whole session.
+    skipped_key_seq: u64,
 }
 
 impl GroupSession {
@@ -316,6 +331,7 @@ impl GroupSession {
             our_node_id,
             our_sender_key: SenderKeyState::generate(),
             member_keys: HashMap::new(),
+            skipped_key_seq: 0,
         }
     }
 
@@ -361,7 +377,7 @@ impl GroupSession {
             entry.chain_index = 0;
             entry.signing_key = verifying_key;
             entry.generation = dist.generation;
-            entry.skipped_keys.clear();
+            clear_skipped(&mut entry.skipped_keys);
         }
 
         Ok(())
@@ -418,8 +434,10 @@ impl GroupSession {
         let aad = build_aad(&group_id, sender, message.generation, message.message_number);
 
         // Check for skipped key
-        if let Some(message_key) = entry.skipped_keys.remove(&message.message_number) {
-            return aead_decrypt(&message_key, &message.ciphertext, &aad);
+        if let Some((mut message_key, _)) = entry.skipped_keys.remove(&message.message_number) {
+            let plaintext = aead_decrypt(&message_key, &message.ciphertext, &aad);
+            message_key.zeroize();
+            return plaintext;
         }
 
         // Message is behind our chain — can't go backwards
@@ -439,7 +457,10 @@ impl GroupSession {
         let mut chain_key = entry.chain_key;
         for i in entry.chain_index..message.message_number {
             let (next_chain, msg_key) = ratchet_chain_key(&chain_key);
-            entry.skipped_keys.insert(i, msg_key);
+            entry
+                .skipped_keys
+                .insert(i, (msg_key, self.skipped_key_seq));
+            self.skipped_key_seq += 1;
             chain_key = next_chain;
         }
 
@@ -448,7 +469,47 @@ impl GroupSession {
         entry.chain_key = next_chain;
         entry.chain_index = message.message_number + 1;
 
-        aead_decrypt(&message_key, &message.ciphertext, &aad)
+        let plaintext = aead_decrypt(&message_key, &message.ciphertext, &aad);
+        self.evict_excess_skipped_keys();
+        plaintext
+    }
+
+    /// Total skipped keys held across all senders.
+    fn skipped_key_count(&self) -> usize {
+        self.member_keys
+            .values()
+            .map(|m| m.skipped_keys.len())
+            .sum()
+    }
+
+    /// Evict the oldest-inserted skipped keys, across all senders, until the
+    /// session holds at most [`MAX_TOTAL_SKIPPED_KEYS`]. Runs only over the cap.
+    fn evict_excess_skipped_keys(&mut self) {
+        let excess = self
+            .skipped_key_count()
+            .saturating_sub(MAX_TOTAL_SKIPPED_KEYS);
+        if excess == 0 {
+            return;
+        }
+        let mut oldest: Vec<(u64, NodeId, u32)> = self
+            .member_keys
+            .iter()
+            .flat_map(|(node, m)| {
+                m.skipped_keys
+                    .iter()
+                    .map(move |(n, (_, seq))| (*seq, *node, *n))
+            })
+            .collect();
+        oldest.select_nth_unstable_by_key(excess - 1, |(seq, _, _)| *seq);
+        for (_, node, number) in oldest.into_iter().take(excess) {
+            if let Some((mut key, _)) = self
+                .member_keys
+                .get_mut(&node)
+                .and_then(|m| m.skipped_keys.remove(&number))
+            {
+                key.zeroize();
+            }
+        }
     }
 
     /// Remove a member from the group.
@@ -457,7 +518,9 @@ impl GroupSession {
     /// The caller must redistribute our new `SenderKeyDistribution` to
     /// all remaining members.
     pub fn remove_member(&mut self, node_id: &NodeId) -> SenderKeyDistribution {
-        self.member_keys.remove(node_id);
+        if let Some(mut removed) = self.member_keys.remove(node_id) {
+            clear_skipped(&mut removed.skipped_keys);
+        }
         self.our_sender_key.rotate();
         self.our_distribution()
     }
