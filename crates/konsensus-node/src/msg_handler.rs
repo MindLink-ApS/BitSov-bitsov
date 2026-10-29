@@ -478,6 +478,20 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                         continue;
                                     }
                                 }
+                                Ok(PaidAcceptance::NonceReused | PaidAcceptance::PaymentReused)
+                                    if storage_for_recv.is_paid_envelope_rejected(&envelope).await.unwrap_or(false) =>
+                                {
+                                    // This exact envelope was accepted, then withdrawn
+                                    // (refused, or swept while held). Say so terminally;
+                                    // "payment proof already used" would read as delivered.
+                                    drop(incoming_block.take());
+                                    if call_hold {
+                                        let _ = storage_for_recv.call_admission_release(&msg_id).await;
+                                    }
+                                    let reason = if konsensus_api::calls::is_call_kind(envelope.kind) { "call signal withdrawn" } else { "message withdrawn" };
+                                    let _ = transport_for_ack.send_frame(&sender, &Frame::MessageReject { id: msg_id, reason: reason.into() }).await;
+                                    continue;
+                                }
                                 Ok(PaidAcceptance::NonceReused) => {
                                     let rejection = konsensus_core::gate::GateRejection::ReplayDetected;
                                     audit_for_recv.membrane().refused(&envelope, &rejection);

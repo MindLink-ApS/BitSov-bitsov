@@ -4682,3 +4682,195 @@ async fn committed_call_block_with_unsaved_ratchet_recovers_its_grant_on_retry()
     source.shutdown();
     target.shutdown();
 }
+
+/// Codex P2 on #406: a chat left held by an unsaved ratchet and then withdrawn
+/// by the sweep must not be reported as delivered on a later retry.
+#[tokio::test]
+async fn swept_unsaved_chat_retry_is_withdrawn_not_reported_delivered() {
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let transport = |id| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    while !matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ) {}
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let session_store = FlakySessionStore::new();
+    let sessions_b = Arc::new(SessionManager::with_store(
+        bob.clone(),
+        session_store.clone(),
+    ));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let blob_before = session_store.blob(alice.node_id()).await;
+    assert!(blob_before.is_some(), "accepted session was not stored");
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, mut ws_rx) = broadcast::channel(16);
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
+        konsensus_pricing::StaticPricingEngine::new(Default::default()),
+    );
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(),
+        transport_ack: target.clone(),
+        storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        })),
+        pricing,
+        lightning: wallet.clone(),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b,
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None,
+        front_door: Default::default(),
+        routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(),
+        plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx,
+        audit_log: audit,
+        admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None,
+        shutdown_rx,
+    }));
+
+    let body = "retry me";
+    let msat = 10_000;
+    let hash = wallet.inject_inbound_keysend(msat, None).await;
+    let payment = wallet.get_payment_status(&hash).await.unwrap();
+    let proof = PaymentProof::new(
+        hex::decode(&hash).unwrap().try_into().unwrap(),
+        hex::decode(payment.preimage.unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        msat,
+    );
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+        &sessions_a
+            .encrypt(bob.node_id(), body.as_bytes())
+            .await
+            .unwrap(),
+    );
+    let mut env = UkmEnvelopeBuilder::new(
+        konsensus_core::kind::KIND_CHAT,
+        *alice.node_id(),
+        Recipient::Node(*bob.node_id()),
+        ciphertext,
+        proof,
+    )
+    .build();
+    env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+
+    let outcome = |source: Arc<NoiseTransport>| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source.recv_control().await.unwrap() {
+                    ControlEvent::MessageAcked { duplicate, .. } => break Ok(duplicate),
+                    ControlEvent::MessageRejected { reason, .. } => break Err(reason),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap()
+    };
+
+    // First delivery: the tag matches and the session save fails. No ack, the
+    // chat stays held, and the stored ratchet blob is unchanged.
+    let failed_before = session_store.failed_saves.load(Ordering::SeqCst);
+    session_store.fail_saves.store(true, Ordering::SeqCst);
+    source.send(bob.node_id(), &env).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let row: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+            .bind(env.id.to_hex())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let plain_missing: i64 = sqlx::query_scalar(
+            "SELECT CASE WHEN plaintext_enc IS NULL THEN 1 ELSE 0 END FROM messages WHERE id = ?",
+        )
+        .bind(env.id.to_hex())
+        .fetch_optional(db.pool())
+        .await
+        .unwrap()
+        .unwrap_or(0);
+        if row == 1
+            && plain_missing == 0
+            && db.call_admission_held(&env.id).await.unwrap()
+            && session_store.failed_saves.load(Ordering::SeqCst) > failed_before
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "unsaved chat was not held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let silent = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match source.recv_control().await.unwrap() {
+                ControlEvent::MessageAcked { duplicate, .. } => {
+                    panic!("unsaved chat was acknowledged (duplicate={duplicate})")
+                }
+                ControlEvent::MessageRejected { reason, .. } => {
+                    panic!("unsaved chat was rejected: {reason}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(silent.is_err(), "unsaved chat produced a terminal frame");
+    assert!(ws_rx.try_recv().is_err(), "unsaved chat was delivered");
+    assert!(
+        db.get_message(&env.id).await.unwrap().is_none(),
+        "held chat visible"
+    );
+    assert!(
+        !db.is_paid_envelope_accepted(&env).await.unwrap(),
+        "held chat would be duplicate-acked instead of decrypted again"
+    );
+    assert_eq!(session_store.blob(alice.node_id()).await, blob_before);
+
+    // The sweep withdraws the abandoned hold: message gone, receipt rejected.
+    konsensus_api::calls::withdraw_held(db.as_ref(), true).await.unwrap();
+    assert!(db.is_paid_envelope_rejected(&env).await.unwrap());
+    // A retry must be a terminal withdrawal, not "payment proof already used"
+    // (which the sender's compatibility path counts as delivered).
+    session_store.fail_saves.store(false, Ordering::SeqCst);
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("message withdrawn".to_string()));
+    assert!(ws_rx.try_recv().is_err(), "withdrawn chat was delivered");
+    assert!(!db.call_admission_held(&env.id).await.unwrap());
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    source.shutdown();
+    target.shutdown();
+}
