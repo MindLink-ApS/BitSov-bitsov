@@ -23,6 +23,10 @@ pub const AUTH_CHALLENGE_MAX_LIVE: usize = 128;
 /// challenge. Another source's challenge is left in place.
 pub const AUTH_CHALLENGE_MAX_PER_SOURCE: usize = 8;
 
+/// Sources with a live rate-limit bucket. A new source is refused once this
+/// many are tracked, so rotating source addresses cannot grow the map.
+pub const AUTH_CHALLENGE_MAX_SOURCES: usize = 1024;
+
 /// Challenge issuances accepted from one source per minute.
 pub const AUTH_CHALLENGE_RATE_PER_MINUTE: u32 = 30;
 
@@ -74,8 +78,7 @@ impl AuthChallenges {
         challenge: String,
         expires_at: Instant,
     ) -> Result<(), ApiError> {
-        self.rate.cleanup();
-        if !self.rate.check_key(source) {
+        if !self.rate.check_key_capped(source, AUTH_CHALLENGE_MAX_SOURCES) {
             return Err(ApiError::TooManyRequests(
                 "auth challenge rate limit exceeded".into(),
             ));
@@ -147,4 +150,31 @@ pub fn peer_source(ip: IpAddr) -> String {
 /// Tunnel clients are keyed by the authenticated pairing, not the loopback bridge.
 pub fn pairing_source(client_id: &str) -> String {
     format!("pairing:{client_id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rotating_sources_cannot_grow_rate_buckets_past_the_cap() {
+        let pool = AuthChallenges::new();
+        let expires = Instant::now() + Duration::from_secs(60);
+        // Fill every shared slot: 16 sources x 8 challenges.
+        for source in 0..16 {
+            for n in 0..AUTH_CHALLENGE_MAX_PER_SOURCE {
+                pool.insert(&format!("s{source}"), format!("c{source}-{n}"), expires)
+                    .await
+                    .unwrap();
+            }
+        }
+        // Rotating new sources are all refused and the bucket map stays bounded.
+        for source in 0..2000 {
+            assert!(pool.insert(&format!("rot{source}"), format!("r{source}"), expires).await.is_err());
+        }
+        assert!(pool.rate.tracked_keys() <= AUTH_CHALLENGE_MAX_SOURCES);
+        // A known source keeps its own slots: it replaces its oldest challenge.
+        pool.insert("s0", "c0-new".into(), expires).await.unwrap();
+        pool.consume("c0-new").await.unwrap();
+    }
 }

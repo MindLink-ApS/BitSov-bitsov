@@ -1575,7 +1575,11 @@ impl PairingService {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in stale {
-                self.remove_pending_locked(&mut inner, &id)?;
+                // A failed unlink keeps that reservation counted for a later
+                // retry; it must not block requests within the remaining quota.
+                if let Err(error) = self.remove_pending_locked(&mut inner, &id) {
+                    tracing::warn!(pair_id = %id, %error, "expired pairing challenge not removed; still reserved");
+                }
             }
             let source = client_pubkey_hex.to_ascii_lowercase();
             let own_count = inner

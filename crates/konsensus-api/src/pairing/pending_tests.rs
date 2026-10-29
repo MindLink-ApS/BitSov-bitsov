@@ -101,14 +101,14 @@ fn failed_challenge_cleanup_keeps_reservation_until_removal_can_retry() {
     for pending in service.lock().pending.values_mut() {
         pending.expires_at = Instant::now() - Duration::from_secs(1);
     }
-    assert!(matches!(
-        service.request_pairing("client", &public),
-        Err(PairingError::Io(_))
-    ));
-    assert_eq!(service.lock().pending.len(), 1);
-    std::fs::remove_dir(failed_path).unwrap();
+    // The stuck cleanup stays reserved but no longer blocks other requests.
     service.request_pairing("client", &public).unwrap();
-    assert_eq!(service.lock().pending.len(), 1);
+    assert_eq!(service.lock().pending.len(), 2);
+    std::fs::remove_dir(failed_path).unwrap();
+    // The next sweep retries and removes it.
+    service.request_pairing("client", &public).unwrap();
+    assert_eq!(service.lock().pending.len(), 2);
+    assert!(service.lock().pending.values().all(|p| p.expires_at > Instant::now()));
 }
 
 #[test]
