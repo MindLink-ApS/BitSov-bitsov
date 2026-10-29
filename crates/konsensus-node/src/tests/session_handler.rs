@@ -2443,6 +2443,7 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
         "insufficient payment: required 2000 msat, got 1000 msat",
         "recipient mismatch: envelope addressed to a, this node is b",
         "invalid signature: bad signature",
+        "call_not_reachable", // Unknown to the unchanged caller: generic rejection.
         "storage error",
         "lightning verification failed: offline",
     ] {
@@ -2481,7 +2482,7 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
         .await;
         let terminal = !matches!(
             reason,
-            "storage error" | "lightning verification failed: offline"
+            "call_not_reachable" | "storage error" | "lightning verification failed: offline"
         );
         assert_eq!(
             updates.try_recv().unwrap().status,

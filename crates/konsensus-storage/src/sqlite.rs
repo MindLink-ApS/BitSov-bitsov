@@ -944,6 +944,49 @@ impl Storage for SqliteStorage {
         Ok(durable == 1)
     }
 
+    async fn call_invite_outcome(&self, envelope: &UkmEnvelope) -> Result<Option<crate::CallInviteOutcome>, StorageError> {
+        if envelope.kind != konsensus_core::kind::KIND_CALL_INVITE { return Ok(None); }
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let value: Option<i32> = sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE (accepted <> 1 OR message_id NOT IN (SELECT message_id FROM call_admission_hold)) AND payment_hash = ? AND message_id = ? AND sender = ? AND kind = ? AND recipient_type = ? AND recipient_id = ? AND preimage = ? AND amount_msat = ? AND nonce = ? AND references_json = ?")
+            .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+            .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .fetch_optional(&self.pool).await?;
+        Ok(value.and_then(crate::CallInviteOutcome::from_stored))
+    }
+
+    async fn call_invite_set_outcome(&self, id: &MessageId, peer: &NodeId, outcome: crate::CallInviteOutcome) -> Result<(), StorageError> {
+        sqlx::query("UPDATE payment_receipts SET accepted = ? WHERE message_id = ? AND sender = ? AND kind = 400 AND accepted IN (1, -2)")
+            .bind(outcome.stored()).bind(id.to_hex()).bind(peer.to_hex()).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn call_invite_recover(&self, max: u32) -> Result<u64, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        // Holds make a partial/failed startup cleanup invisible to readers.
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT message_id, sender, 0 FROM payment_receipts WHERE kind = 400 AND accepted = -2 ORDER BY message_id LIMIT ? ON CONFLICT DO NOTHING")
+            .bind(i64::from(max)).execute(&mut *tx).await?;
+        let done = sqlx::query("UPDATE payment_receipts SET accepted = -3 WHERE kind = 400 AND accepted = -2 AND message_id IN (SELECT message_id FROM call_admission_hold)")
+            .execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM messages WHERE id IN (SELECT r.message_id FROM payment_receipts r JOIN call_admission_hold h ON h.message_id = r.message_id WHERE r.kind = 400 AND r.accepted = -3)")
+            .execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM call_admission_hold WHERE message_id IN (SELECT r.message_id FROM payment_receipts r JOIN call_admission_hold h ON h.message_id = r.message_id WHERE r.kind = 400 AND r.accepted = -3)")
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(done.rows_affected())
+    }
+
     async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
         let id = envelope.id.to_hex();
         let kind = i64::from(envelope.kind);
@@ -963,7 +1006,7 @@ impl Storage for SqliteStorage {
             .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
             .fetch_one(&self.pool).await?;
         if durable == 1 { return Ok(true); }
-        let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.message_id NOT IN (SELECT message_id FROM call_admission_hold) AND r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
+        let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.accepted IN (0, 1) AND r.message_id NOT IN (SELECT message_id FROM call_admission_hold) AND r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
             .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
             .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
             .fetch_one(&self.pool).await?;
@@ -1025,7 +1068,7 @@ impl Storage for SqliteStorage {
                 tx.rollback().await?;
                 return Ok(AlreadyAccepted);
             }
-            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
+            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.accepted IN (0, 1) AND r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
                 .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
                 .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
                 .fetch_one(&mut *tx).await?;
@@ -1747,6 +1790,16 @@ impl Storage for SqliteStorage {
         Ok(count == 1)
     }
 
+    async fn call_awaiting(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE side = 'callee' AND phase = 'awaiting_device' ORDER BY peer, call_id LIMIT ?")
+            .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS as i64).fetch_all(&self.pool).await?;
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
+            let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
+        }).collect()
+    }
+
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
         // Reclaim legacy caller reservations once no interval can be resumed.
@@ -1767,7 +1820,7 @@ impl Storage for SqliteStorage {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM messages WHERE id = ? AND sender = ?")
             .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
-        sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE payment_hash = ? AND message_id = ?")
+        sqlx::query("UPDATE payment_receipts SET accepted = CASE WHEN accepted IN (-2, -3) THEN -3 ELSE -1 END WHERE payment_hash = ? AND message_id = ?")
             .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(&id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
             .bind(&id).execute(&mut *tx).await?;
@@ -1781,6 +1834,12 @@ impl Storage for SqliteStorage {
         let done = sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id = ?) ON CONFLICT DO NOTHING")
             .bind(&id).bind(envelope.sender.to_hex()).bind(now).bind(&id).execute(&self.pool).await?;
         Ok(done.rows_affected() == 1)
+    }
+
+    async fn call_admission_rehold(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT id, sender, 0 FROM messages WHERE id = ? AND sender = ? ON CONFLICT DO NOTHING")
+            .bind(envelope.id.to_hex()).bind(envelope.sender.to_hex()).execute(&self.pool).await?;
+        Ok(())
     }
 
     async fn call_admission_release(&self, id: &MessageId) -> Result<(), StorageError> {
@@ -1798,7 +1857,7 @@ impl Storage for SqliteStorage {
     async fn call_admission_withdraw(&self, held_before_ms: u64) -> Result<u64, StorageError> {
         let before = i64::try_from(held_before_ms).unwrap_or(i64::MAX);
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE (message_id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < ?)")
+        sqlx::query("UPDATE payment_receipts SET accepted = CASE WHEN accepted IN (-2, -3) THEN -3 ELSE -1 END WHERE (message_id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < ?)")
             .bind(before).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM messages WHERE (id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < ?)")
             .bind(before).execute(&mut *tx).await?;

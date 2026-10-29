@@ -29,6 +29,11 @@ also live on the corresponding GitHub pre-release pages.
 - Deployment note: migration 035 ends every in-flight live call when upgrading
   to paid call blocks. Existing calls must be restarted after the upgrade;
   their replay tombstones are retained and no unpaid media interval is granted.
+- Callee nodes start the 60 s ring clock and the caller's ringing `MessageAck`
+  only when a paired device fetches or streams a call invite; when no device
+  takes it within 15 s the caller gets a `MessageReject` with reason
+  `call_not_reachable`, and resends or duplicates repeat the same answer
+  without a second charge (#422).
 
 - Add owner-authenticated claim-code display for app onboarding:
   `GET /api/v1/owner/claim-code` on the owner-local API only (loopback source,

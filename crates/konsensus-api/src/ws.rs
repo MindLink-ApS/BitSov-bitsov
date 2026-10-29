@@ -126,11 +126,23 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
                 match result {
                     Ok(ws_msg) => {
                         if !stream_authorized(&state, &claims) { break; }
+                        if ws_msg.envelope.sender != *state.identity.node_id() {
+                            match state.call_devices.deliverable(state.storage.as_ref(), &ws_msg.envelope, ws_msg.plaintext.as_deref(), crate::calls::now_ms).await {
+                                Ok(true) => {},
+                                Ok(false) => continue,
+                                Err(e) => { warn!(error = %e, "call state unavailable for device stream"); break; }
+                            }
+                        }
                         // Serialize WsMessage to JSON for the client
                         match serde_json::to_string(ws_msg.as_ref()) {
                             Ok(json) => {
-                                if socket.send(Message::Text(json)).await.is_err() {
+                                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2), socket.send(Message::Text(json))).await, Ok(Ok(()))) {
                                     debug!("WebSocket client disconnected");
+                                    break;
+                                }
+                                if !stream_authorized(&state, &claims) { break; }
+                                if let Err(e) = state.call_devices.fetched(state.storage.as_ref(), &ws_msg.envelope, crate::calls::now_ms).await {
+                                    warn!(error = %e, "could not record call device delivery");
                                     break;
                                 }
                             }

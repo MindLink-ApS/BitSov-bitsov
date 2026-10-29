@@ -47,6 +47,7 @@ pub(crate) struct MsgHandlerDeps {
     pub identity: Arc<NodeIdentity>,
     pub plaintext_cipher: Arc<PlaintextCacheCipher>,
     pub ws_tx: broadcast::Sender<Arc<WsMessage>>,
+    pub call_devices: Arc<konsensus_api::calls::devices::Devices>,
     pub audit_log: Arc<AuditLog>,
     /// Operator-selectable admission mode. In `Whitelist` (default) the receive-path
     /// gate still passes `Some(&whitelist)` (Step-2 membership enforced); in
@@ -207,8 +208,49 @@ async fn offer_prekey_after_promotion(
     }
 }
 
-/// Runs the incoming message handler loop.
-///
+/// Receipt lookup used only by the receive gate. The gate authenticates the
+/// envelope and recipient before this lookup; a pending/refused device wait
+/// reuses its exact paid receipt without another price or settlement check.
+struct InviteReceipts<'a>(&'a dyn konsensus_storage::Storage);
+
+#[async_trait::async_trait]
+impl konsensus_core::gate::NonceStore for InviteReceipts<'_> {
+    async fn is_paid_envelope_accepted(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if self.0.call_invite_outcome(envelope).await?.is_some() { return Ok(true); }
+        Ok(self.0.is_paid_envelope_accepted(envelope).await?)
+    }
+
+    async fn delivery_price_floor(&self, envelope: &konsensus_core::UkmEnvelope, paid_at: u64, now: u64) -> Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.0.delivery_price_floor(envelope, paid_at, now).await?)
+    }
+
+    async fn take_outstanding_web_request(&self, hash: &[u8; 32]) -> Result<Option<konsensus_core::web_reply::OutstandingWebRequest>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.0.take_outstanding_web_request(hash).await?)
+    }
+
+    async fn check_and_store(&self, _: &konsensus_core::Nonce, _: &konsensus_core::NodeId) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err("receive receipt lookup does not consume replay keys".into())
+    }
+}
+
+/// Both duplicate paths use the original durable device outcome, even after
+/// withdrawal, content retention, call expiry, or a process restart.
+async fn duplicate_reply(
+    storage: &dyn konsensus_storage::Storage,
+    envelope: &konsensus_core::UkmEnvelope,
+    paid_until_ms: Option<u64>,
+) -> Option<Frame> {
+    if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE {
+        match storage.call_invite_outcome(envelope).await {
+            Ok(Some(konsensus_storage::CallInviteOutcome::Fetched)) => {},
+            Ok(Some(konsensus_storage::CallInviteOutcome::NotReachable)) => return Some(Frame::MessageReject { id: envelope.id, reason: konsensus_api::calls::devices::NOT_REACHABLE.into() }),
+            Ok(Some(konsensus_storage::CallInviteOutcome::Pending)) | Ok(None) => return None,
+            Err(e) => { warn!(error = %e, "call receipt unavailable for duplicate invite"); return None; }
+        }
+    }
+    Some(Frame::MessageAck { id: envelope.id, duplicate: true, paid_until_ms })
+}
+
 /// Receives envelopes from the transport, validates them through the payment gate,
 /// stores them, decrypts if possible, and broadcasts to WebSocket clients.
 pub(crate) async fn run(deps: MsgHandlerDeps) {
@@ -229,6 +271,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
         identity: identity_for_recv,
         plaintext_cipher,
         ws_tx: ws_tx_for_recv,
+        call_devices,
         audit_log: audit_for_recv,
         admission_mode: admission_mode_for_recv,
         relay_engine: relay_engine_for_recv,
@@ -265,8 +308,17 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                     Ok(envelope) => {
                         // PRINCIPLE 2: Every incoming message MUST pass the payment gate.
                         // Fail-closed: any verification failure = message rejected.
+                        let arrived_ms = konsensus_api::calls::now_ms();
                         let sender = envelope.sender;
                         let msg_id = envelope.id;
+                        if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE {
+                            match call_devices.sweep(storage_for_recv.as_ref(), arrived_ms).await {
+                                Ok(notices) => for (peer, frame) in notices {
+                                    let _ = transport_for_ack.enqueue_control_frame(&peer, &frame).await;
+                                },
+                                Err(e) => warn!(error = %e, "call device sweep failed"),
+                            }
+                        }
 
                         // Compute plasticity trust discount from sender's synaptic weight.
                         // Trusted peers (high weight) get lower required payment.
@@ -285,12 +337,14 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         let is_relay_control = relay_engine_for_recv.is_some()
                             && konsensus_core::kind::KindCategory::from_kind(envelope.kind)
                                 == konsensus_core::kind::KindCategory::Storage;
+                        let invite_receipts = InviteReceipts(storage_for_recv.as_ref());
+                        let receipts: &dyn konsensus_core::gate::NonceStore = if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE { &invite_receipts } else { nonce_adapter.as_ref() };
                         let mut gate_result = whitelist_then_verify(
                             &envelope,
                             audit_for_recv.membrane(),
                             peer_registry_for_recv.as_ref(),
                             gate_for_recv.as_ref(),
-                            nonce_adapter.as_ref(),
+                            receipts,
                             pricing_for_recv.as_ref(),
                             Some(verify_lightning.as_ref()),
                             trust_discount,
@@ -323,9 +377,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     Err(e) => { error!(error = %e, "cannot recover call grant; withholding ACK"); continue; }
                                 }
                             } else { None };
-                            let ack = Frame::MessageAck { id: msg_id, duplicate: true, paid_until_ms };
-                            if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
-                                warn!(error = %e, "failed to send duplicate ACK");
+                            if let Some(reply) = duplicate_reply(storage_for_recv.as_ref(), &envelope, paid_until_ms).await {
+                                if let Err(e) = transport_for_ack.send_frame(&sender, &reply).await {
+                                    warn!(error = %e, "failed to send duplicate reply");
+                                }
                             }
                             continue;
                         }
@@ -413,9 +468,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                             Err(e) => { error!(error = %e, "cannot recover call grant; withholding ACK"); continue; }
                                         }
                                     } else { None };
-                                    let ack = Frame::MessageAck { id: msg_id, duplicate: true, paid_until_ms };
-                                    if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
-                                        warn!(error = %e, "failed to send duplicate ACK");
+                                    if let Some(reply) = duplicate_reply(storage_for_recv.as_ref(), &envelope, paid_until_ms).await {
+                                        if let Err(e) = transport_for_ack.send_frame(&sender, &reply).await {
+                                            warn!(error = %e, "failed to send duplicate reply");
+                                        }
                                     }
                                     continue;
                                 }
@@ -712,14 +768,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // sender. A refused signal never reaches the app.
                         if konsensus_api::calls::is_call_kind(envelope.kind) {
                             let admitted = match admitted_block {
-                                Some(signal) => Ok(signal),
-                                None => konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref()).await,
-                            };
-                            // Admitted: lift the hold before the app sees it. If that
-                            // write fails the signal stays held and is withdrawn by the
-                            // sweep: fail closed, the peer gets a reject, not an ACK.
-                            let admitted = match admitted {
-                                Ok(signal) => match storage_for_recv.call_admission_release(&msg_id).await {
+                                // Admitted block: lift the hold before the app sees it. If
+                                // that write fails the signal stays held and is withdrawn by
+                                // the sweep: fail closed, the peer gets a reject, not an ACK.
+                                Some(signal) => match storage_for_recv.call_admission_release(&msg_id).await {
                                     Ok(()) => Ok(signal),
                                     Err(e) => {
                                         error!(msg_id = %msg_id, error = %e, "admitted call signal could not be released; withheld");
@@ -728,7 +780,9 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                         continue;
                                     }
                                 },
-                                Err(refusal) => Err(refusal),
+                                // Other signals: the device registry releases the hold under
+                                // the call lock, so expiry cannot be undone by a late release.
+                                None => call_devices.admit(storage_for_recv.as_ref(), identity_for_recv.node_id(), &envelope, plaintext.as_deref(), arrived_ms, konsensus_api::calls::now_ms).await,
                             };
                             if let Err(refusal) = admitted {
                                 warn!(sender = %sender, kind = envelope.kind, reason = %refusal, "call signal refused; not forwarded");
@@ -798,6 +852,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             }
 
                         } else { None };
+                        let wait_for_device = envelope.kind == konsensus_core::kind::KIND_CALL_INVITE;
                         // Broadcast to WebSocket clients (with plaintext if decrypted)
                         if let Err(e) = ws_tx_for_recv.send(Arc::new(
                             WsMessage {
@@ -808,6 +863,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             debug!(error = %e, "no WebSocket clients connected for incoming message broadcast");
                         }
 
+                        // The call cleanup writer sends the invite outcome after
+                        // device delivery or the 15-second wait, without stalling
+                        // this receive loop or a paired device's request.
+                        if wait_for_device { continue; }
                         // Send MessageAck back to sender
                         let ack = Frame::MessageAck { id: msg_id, duplicate: false, paid_until_ms };
                         if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {

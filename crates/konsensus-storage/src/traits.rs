@@ -19,9 +19,38 @@ use crate::reactions::ReactionRecord;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaidAcceptance { Accepted, AlreadyAccepted, NonceReused, PaymentReused }
 
+/// Device-delivery outcome stored in the existing immutable payment receipt.
+/// Negative values cannot be mistaken for ordinary paid acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallInviteOutcome { Pending, Fetched, NotReachable }
+
+impl CallInviteOutcome {
+    pub(crate) fn stored(self) -> i32 {
+        match self { Self::Pending => -2, Self::Fetched => 1, Self::NotReachable => -3 }
+    }
+    pub(crate) fn from_stored(value: i32) -> Option<Self> {
+        match value { -2 => Some(Self::Pending), 1 => Some(Self::Fetched), -3 => Some(Self::NotReachable), _ => None }
+    }
+}
+
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
+    /// Exact immutable receipt binding; timestamp/signature renewal is allowed.
+    async fn call_invite_outcome(&self, _envelope: &UkmEnvelope) -> Result<Option<CallInviteOutcome>, StorageError> {
+        Ok(None)
+    }
+
+    /// Update an existing paid invite's outcome without inserting replay keys.
+    async fn call_invite_set_outcome(&self, _id: &MessageId, _peer: &NodeId, _outcome: CallInviteOutcome) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call invite outcome".into()))
+    }
+
+    /// Startup: withdraw at most `max` pending device waits, retaining refusals.
+    async fn call_invite_recover(&self, _max: u32) -> Result<u64, StorageError> {
+        Ok(0)
+    }
+
     async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         let _ = id;
         Err(StorageError::Unsupported("starter newcomer".into()))
@@ -1179,6 +1208,12 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("call block invoice provenance".into()))
     }
 
+    /// Awaiting-device rows for startup recovery, bounded by call admission.
+    /// Returns raw rows, including expired ones; recovery ends them all.
+    async fn call_awaiting(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Ok(Vec::new())
+    }
+
     /// Reclaim stale ended reservations and drop up to `max` expired tombstones.
     /// Also prune up to `max` invoice bindings past their call's resume window.
     async fn call_sweep(&self, _now_ms: u64, _max: u32) -> Result<u64, StorageError> {
@@ -1200,6 +1235,12 @@ pub trait Storage: Send + Sync {
     /// Hold `envelope` before its paid acceptance, unless a message with its
     /// id is already stored. Returns whether this call placed the hold.
     async fn call_admission_hold(&self, _envelope: &konsensus_core::UkmEnvelope, _now_ms: u64) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("call admission hold".into()))
+    }
+
+    /// Hide an already-stored refused invite durably before physical cleanup.
+    /// Reuses the admission hold and makes it eligible for the existing sweep.
+    async fn call_admission_rehold(&self, _envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
         Err(StorageError::Unsupported("call admission hold".into()))
     }
 
