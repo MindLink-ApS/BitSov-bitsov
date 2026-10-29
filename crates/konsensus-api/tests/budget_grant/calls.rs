@@ -428,7 +428,7 @@ async fn slow_liquidity_query_does_not_block_another_calls_transitions() {
     fx.wallet.pause_capacity.store(true, Ordering::SeqCst);
     let peer = NodeId::from_bytes([8; 32]);
     let now = chrono::Utc::now().timestamp_millis() as u64;
-    let entry = rules::receive(None, 400, None, now).unwrap();
+    let entry = rules::receive(None, 400, None, now).unwrap().device_fetched(now).unwrap();
     let entry = rules::commit(
         rules::reserve(Some(entry), 401, "answer", "hash", now).unwrap(),
         "answer",
@@ -537,7 +537,7 @@ async fn broken_hold_cleanup_preserves_paid_response_and_other_expiry_notificati
     fx.state.storage.call_put(&fx.peer, other, &ended).await.unwrap();
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let notification_id = "bbbbbbbb222243338444555555555555";
-    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap();
+    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap().device_fetched(now - 31_000).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", now - 31_000).unwrap();
     let live = rules::commit(pending, "answer", now - 31_000).unwrap();
     fx.state.storage.call_put(&fx.peer, notification_id, &live).await.unwrap();

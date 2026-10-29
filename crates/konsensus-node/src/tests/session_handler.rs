@@ -2443,7 +2443,7 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
         "insufficient payment: required 2000 msat, got 1000 msat",
         "recipient mismatch: envelope addressed to a, this node is b",
         "invalid signature: bad signature",
-        "call_not_reachable", // Unknown to the unchanged caller: generic rejection.
+        "call_not_reachable", // A refused device wait is final; resends only repeat it.
         "storage error",
         "lightning verification failed: offline",
     ] {
@@ -2482,7 +2482,7 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
         .await;
         let terminal = !matches!(
             reason,
-            "call_not_reachable" | "storage error" | "lightning verification failed: offline"
+            "storage error" | "lightning verification failed: offline"
         );
         assert_eq!(
             updates.try_recv().unwrap().status,
@@ -4044,7 +4044,7 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     let peer = test_peer_id();
     let id = "0123456789abcdef0123456789abcdef";
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-    let ringing = calls::receive(None, 400, None, now - 16_000).unwrap();
+    let ringing = calls::receive(None, 400, None, now - 16_000).unwrap().device_fetched(now - 16_000).unwrap();
     let pending = calls::reserve(Some(ringing), 401, "answer", "hash", now - 16_000).unwrap();
     let live = calls::commit(pending, "answer", now - 16_000).unwrap();
     storage.call_put(&peer, id, &live).await.unwrap();

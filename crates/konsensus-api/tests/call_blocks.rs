@@ -127,7 +127,7 @@ async fn unpaid_notice_is_single_use_callee_only_and_reason_checked() {
     let own = NodeId::from_bytes([1; 32]);
     let peer = NodeId::from_bytes([2; 32]);
     let now = chrono::Utc::now().timestamp_millis() as u64;
-    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap();
+    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap().device_fetched(now - 31_000).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", now - 31_000).unwrap();
     let ended = rules::commit(pending, "answer", now - 31_000).unwrap().at(now).unwrap();
     let unpaid = format!(r#"{{"v":1,"call_id":"{ID}","reason":"unpaid"}}"#);
@@ -157,7 +157,7 @@ async fn block_admission_keeps_its_decision_through_acceptance_and_expiry() {
     let peer = NodeId::from_bytes([9; 32]);
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let answered_at = now;
-    let ringing = rules::receive(None, 400, None, answered_at).unwrap();
+    let ringing = rules::receive(None, 400, None, answered_at).unwrap().device_fetched(answered_at).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", answered_at).unwrap();
     let entry = rules::commit(pending, "answer", answered_at).unwrap();
     let deadline = entry.deadline_ms;
@@ -190,7 +190,7 @@ async fn expiry_ends_both_sides_but_only_callee_needs_notification() {
     let store = SqliteStorage::in_memory().await.unwrap();
     let caller_peer = NodeId::from_bytes([7; 32]);
     let callee_peer = NodeId::from_bytes([8; 32]);
-    let ringing = rules::receive(None, 400, None, 0).unwrap();
+    let ringing = rules::receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", 1_000).unwrap();
     let callee = rules::commit(pending, "answer", 1_000).unwrap();
     let caller = rules::CallEntry { side: rules::Side::Caller, ..callee.clone() };
@@ -210,7 +210,7 @@ async fn expiry_ends_both_sides_but_only_callee_needs_notification() {
 async fn paid_blocks_survive_storage_roundtrip_and_admit_only_the_right_call() {
     let store = SqliteStorage::in_memory().await.unwrap();
     let peer = NodeId::from_bytes([1; 32]);
-    let ringing = rules::receive(None, 400, None, 0).unwrap();
+    let ringing = rules::receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", 1_000).unwrap();
     let live = rules::commit(pending, "answer", 1_000).unwrap();
     assert!(!live.media_admitted(1_000));
@@ -242,7 +242,7 @@ async fn incoming_block_and_outgoing_block_reservations_use_normal_call_admissio
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let entry = rules::commit(
         rules::reserve(
-            Some(rules::receive(None, 400, None, now).unwrap()),
+            Some(rules::receive(None, 400, None, now).unwrap().device_fetched(now).unwrap()),
             401,
             "answer",
             "hash",
@@ -280,7 +280,7 @@ async fn unpaid_expiry_notification_cannot_grant_media_even_if_dispatch_fails() 
     let peer = NodeId::from_bytes([3; 32]);
     let entry = rules::commit(
         rules::reserve(
-            Some(rules::receive(None, 400, None, 0).unwrap()),
+            Some(rules::receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap()),
             401,
             "answer",
             "hash",
@@ -428,7 +428,7 @@ async fn grace_endpoint_still_counts_against_call_bounds() {
     let peer = NodeId::from_bytes([6; 32]);
     let entry = rules::commit(
         rules::reserve(
-            Some(rules::receive(None, 400, None, 0).unwrap()),
+            Some(rules::receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap()),
             401,
             "answer",
             "hash",
@@ -508,7 +508,7 @@ async fn unpaid_notice_reservation_survives_encrypted_storage_restart() {
     let own = NodeId::from_bytes([1; 32]);
     let peer = NodeId::from_bytes([2; 32]);
     let now = chrono::Utc::now().timestamp_millis() as u64;
-    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap();
+    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap().device_fetched(now - 31_000).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", now - 31_000).unwrap();
     let ended = rules::commit(pending, "answer", now - 31_000).unwrap().at(now).unwrap();
     let body = format!(r#"{{"v":1,"call_id":"{ID}","reason":"unpaid"}}"#);

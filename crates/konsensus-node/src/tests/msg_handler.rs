@@ -3059,7 +3059,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     let block_id = format!("{:032x}", rand::random::<u128>());
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let answered_at = now - 20_000;
-    let pending = calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
+    let pending = calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap().device_fetched(answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
     let entry = calls::commit(pending, "answer", answered_at).unwrap();
     db.call_put(alice.node_id(), &block_id, &entry).await.unwrap();
     let block = |seq| format!(r#"{{"v":1,"call_id":"{block_id}","seq":{seq}}}"#);
