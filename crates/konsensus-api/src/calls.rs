@@ -761,6 +761,13 @@ pub async fn block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextC
     let cached = store.get_message_plaintext(id).await?.ok_or_else(unavailable)?;
     let plaintext = cipher.decrypt(&cached).map_err(|_| unavailable())?;
     let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, std::str::from_utf8(&plaintext).map_err(|_| unavailable())?).map_err(|_| unavailable())?;
+    committed_block_grant(store, peer, &signal).await
+}
+
+/// The grant already recorded for this exact block, if it was committed.
+/// Works while the message is still held, from the block's own signal.
+pub async fn committed_block_grant(store: Store<'_>, peer: &NodeId, signal: &CallSignal) -> Result<Option<u64>, konsensus_storage::StorageError> {
+    let unavailable = || konsensus_storage::StorageError::Conversion("paid call grant metadata unavailable".into());
     let entry = store.call_get(peer, &signal.call_id).await?.ok_or_else(unavailable)?;
     if entry.side != rules::Side::Callee || entry.next_block_seq != signal.seq.ok_or_else(unavailable)?.saturating_add(1)
         || (entry.phase == rules::Phase::Ended && entry.end_reason != Some(rules::HangupReason::Unpaid)) { return Ok(None); }

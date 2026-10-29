@@ -4532,3 +4532,153 @@ async fn recovered_message_case(kind: u16, failure: RecoveryFailure) {
     source.shutdown();
     target.shutdown();
 }
+
+/// Codex P1 on #406: a call block commits its interval before decrypt, and the
+/// ratchet save then fails. The retry must recover the committed grant (not
+/// refuse the block as an overpayment), release the hold, and ACK with
+/// `paid_until_ms` without applying the block a second time.
+#[tokio::test]
+async fn committed_call_block_with_unsaved_ratchet_recovers_its_grant_on_retry() {
+    use konsensus_core::payloads::call::{self as calls};
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let transport = |id| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    while !matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ) {}
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let session_store = FlakySessionStore::new();
+    let sessions_b = Arc::new(SessionManager::with_store(bob.clone(), session_store.clone()));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, mut ws_rx) = broadcast::channel(16);
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
+        konsensus_pricing::StaticPricingEngine::new(Default::default()),
+    );
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(),
+        transport_ack: target.clone(),
+        storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        })),
+        pricing,
+        lightning: wallet.clone(),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b,
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None,
+        front_door: Default::default(),
+        routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(),
+        plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx,
+        audit_log: audit,
+        admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None,
+        shutdown_rx,
+    }));
+
+    // A live call answered 20 s ago; block 0 is due.
+    let block_id = format!("{:032x}", rand::random::<u128>());
+    let answered_at = chrono::Utc::now().timestamp_millis() as u64 - 20_000;
+    let ringing = calls::receive(None, 400, None, answered_at).unwrap();
+    let pending = calls::reserve(Some(ringing), 401, "answer", "hash", answered_at).unwrap();
+    db.call_put(alice.node_id(), &block_id, &calls::commit(pending, "answer", answered_at).unwrap())
+        .await
+        .unwrap();
+
+    // Block 0, paid through a bound block invoice.
+    let body = format!(r#"{{"v":1,"call_id":"{block_id}","seq":0}}"#);
+    let invoice = wallet
+        .create_invoice(10_000, "call block", calls::CALL_BLOCK_INVOICE_EXPIRY_SECS)
+        .await
+        .unwrap();
+    let hash: [u8; 32] = hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap();
+    db.record_call_block_invoice(alice.node_id(), &block_id, 0, &hash,
+        chrono::Utc::now().timestamp_millis() as u64 + 120_000).await.unwrap();
+    let paid = wallet.pay_invoice(&invoice.bolt11).await.unwrap();
+    let proof = PaymentProof::new(hash, hex::decode(paid.preimage.unwrap()).unwrap().try_into().unwrap(), 10_000);
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+        &sessions_a.encrypt(bob.node_id(), body.as_bytes()).await.unwrap(),
+    );
+    let mut env = UkmEnvelopeBuilder::new(404, *alice.node_id(), Recipient::Node(*bob.node_id()), ciphertext, proof).build();
+    env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+
+    let outcome = |source: Arc<NoiseTransport>| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source.recv_control().await.unwrap() {
+                    ControlEvent::MessageAcked { duplicate, paid_until_ms, .. } => break Ok((duplicate, paid_until_ms)),
+                    ControlEvent::MessageRejected { reason, .. } => break Err(reason),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap()
+    };
+
+    // First delivery: the block commits, then the ratchet save fails. No ACK.
+    session_store.fail_saves.store(true, Ordering::SeqCst);
+    source.send(bob.node_id(), &env).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap();
+        if row.next_block_seq == 1 && session_store.failed_saves.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "block was not committed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let committed = db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap();
+    assert_eq!(committed.paid_until_ms, Some(answered_at + 60_000));
+    assert!(db.call_admission_held(&env.id).await.unwrap(), "unsaved block must stay held");
+    assert!(ws_rx.try_recv().is_err());
+
+    // Retry with saves working: delivered with its grant, applied only once.
+    session_store.fail_saves.store(false, Ordering::SeqCst);
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok((false, Some(answered_at + 60_000))));
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap(), committed);
+    assert!(!db.call_admission_held(&env.id).await.unwrap());
+    assert!(!db.is_paid_envelope_rejected(&env).await.unwrap());
+
+    // A later duplicate keeps the same grant and is never an overpayment.
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok((true, Some(answered_at + 60_000))));
+    assert!(ws_rx.try_recv().is_err());
+
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    source.shutdown();
+    target.shutdown();
+}

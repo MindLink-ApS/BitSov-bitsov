@@ -840,6 +840,22 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         if konsensus_api::calls::is_call_kind(envelope.kind) {
                             let admitted = match admitted_block {
                                 Some(signal) => Ok(signal),
+                                // A block committed on an earlier attempt whose ratchet
+                                // save then failed: finish delivery from its recorded
+                                // grant. Never apply it again or refuse it as unpaid.
+                                None if held_duplicate && envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK => {
+                                    match konsensus_core::payloads::call::CallSignal::parse(envelope.kind, plaintext.as_deref().unwrap_or_default()) {
+                                        Ok(signal) => match konsensus_api::calls::committed_block_grant(storage_for_recv.as_ref(), &sender, &signal).await {
+                                            Ok(Some(_)) => Ok(signal),
+                                            Ok(None) => konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref()).await,
+                                            Err(e) => {
+                                                error!(msg_id = %msg_id, error = %e, "cannot recover committed call grant; withholding response");
+                                                continue;
+                                            }
+                                        },
+                                        Err(refusal) => Err(refusal),
+                                    }
+                                }
                                 None => konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref()).await,
                             };
                             // Admitted: lift the hold before the app sees it. If that
