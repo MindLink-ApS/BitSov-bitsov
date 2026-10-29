@@ -238,7 +238,10 @@ async fn open_calls_accept_uppercase_peer_ids_and_return_the_same_call() {
                 "direction": "outgoing",
                 "unresolved_paid_admission": false,
                 "created": null,
-                "op_id": null
+                "op_id": null,
+                "next_block_due_ms": null,
+                "next_block_seq": 0,
+                "paid_until_ms": null
             }])
         );
     }
