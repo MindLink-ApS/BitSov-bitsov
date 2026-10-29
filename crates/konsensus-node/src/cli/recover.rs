@@ -73,6 +73,20 @@ fn chain(config: &ChainConfig) -> Result<Box<dyn RecoveryChain>> {
     })
 }
 
+/// Esplora costs at least one HTTP request per scanned script. A seed-only
+/// pass scans every derived script until it finds hub close outputs. Only
+/// unconfirmed-close polls stay narrowed; full-scan bursts still occur before
+/// previews, when focus disappears, and after sweep confirmation. A backup
+/// index bounds every pass to its active channels instead.
+fn esplora_request_warning(scripts: usize, backup: bool) -> String {
+    let bound = if backup {
+        format!("at least {scripts} HTTP requests per 30-second pass (one per active backup channel script)")
+    } else {
+        format!("at least {scripts} HTTP requests per 30-second pass until a hub close output is found; unconfirmed-close polls use a few requests per discovered output, but a full scan of all {scripts} scripts runs if the focus disappears, before a sweep preview (including uneconomic focused sweeps), and after a sweep confirms; the rate limit must cover these full-scan bursts")
+    };
+    format!("Esplora recovery can cost {bound} and reveals these scripts to the configured service; rate limits apply.")
+}
+
 pub async fn run(args: RecoverArgs) -> Result<()> {
     let config = NodeConfig::load(&args.config)?;
     let LightningConfig::Ldk {
@@ -165,7 +179,10 @@ pub async fn run(args: RecoverArgs) -> Result<()> {
     println!("Recover node {} on {} to {} at {} sat/vB. {} public scripts. Backups provide historical hints only, never current balances.", plan.node_id, plan.network, plan.destination, plan.fee_rate_sat_vb, scripts.len());
     println!("The old node must be gone. The hub must be reachable and is trusted to close its latest state. In-flight HTLCs may be lost. Recovery never broadcasts a funding spend. A seed-only scan cannot prove that all old channels have closed; keep the seed for late closes.");
     if matches!(config.chain, ChainConfig::Esplora { .. }) {
-        println!("Esplora recovery can cost at least {} HTTP requests per scan and reveals these scripts to the configured service; rate limits apply.", scripts.len());
+        println!(
+            "{}",
+            esplora_request_warning(scripts.len(), index.is_some())
+        );
     }
     // No chain source or LDK construction in preview, including a resumed job.
     if !args.confirm {
@@ -297,6 +314,37 @@ pub async fn run(args: RecoverArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    #[test]
+    fn esplora_warning_states_the_seed_only_and_backup_read_bounds() {
+        let seed_only = super::esplora_request_warning(2000, false);
+        assert!(seed_only.contains(
+            "at least 2000 HTTP requests per 30-second pass until a hub close output is found"
+        ));
+        assert!(
+            seed_only.contains("unconfirmed-close polls use a few requests per discovered output")
+        );
+        for reason in [
+            "focus disappears",
+            "before a sweep preview",
+            "after a sweep confirms",
+        ] {
+            assert!(
+                seed_only.contains(reason),
+                "missing full-scan reason: {reason}"
+            );
+        }
+        assert!(seed_only.contains("full scan of all 2000 scripts"));
+        assert!(seed_only.contains("rate limit must cover these full-scan bursts"));
+        let backup = super::esplora_request_warning(3, true);
+        assert!(backup.contains(
+            "at least 3 HTTP requests per 30-second pass (one per active backup channel script)"
+        ));
+        assert!(!backup.contains("until a hub close"));
+        for warning in [seed_only, backup] {
+            assert!(warning
+                .contains("reveals these scripts to the configured service; rate limits apply."));
+        }
+    }
     #[test]
     fn recover_preview_defaults_and_rejects_remote_consent() {
         let crate::cli::Command::Recover(args) =

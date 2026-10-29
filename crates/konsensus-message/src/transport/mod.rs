@@ -17,6 +17,7 @@ use control_reply::Connection;
 mod cookie;
 mod edge;
 mod handshake;
+mod media_ingress;
 mod messaging;
 mod supervisor;
 
@@ -120,6 +121,7 @@ pub enum ControlEvent {
 
     /// Peer acknowledged receipt of a message.
     MessageAcked {
+        paid_until_ms: Option<u64>,
         /// Recipient had already durably accepted the paid envelope.
         duplicate: bool,
         /// The peer who acknowledged.
@@ -375,6 +377,37 @@ pub enum ControlEvent {
         reason: String,
     },
 }
+
+/// One [`Frame::CallMedia`] a peer sent us (M6 N2). Media has its own
+/// channel ([`NoiseTransport::recv_call_media`]) so audio never queues
+/// behind control events the session handler is slow to work through.
+#[derive(Debug)]
+pub struct CallMediaEvent {
+    /// The authenticated peer the frame came from.
+    pub peer_id: NodeId,
+    pub call_id: String,
+    pub seq: u32,
+    pub data: Vec<u8>,
+    /// `privileged || admission_paid` on the receiving connection: a
+    /// whitelisted or promoted peer, or one whose admission we settled.
+    pub privileged: bool,
+}
+
+/// Hold the authenticated identity's queue slot until the router dequeues the
+/// frame, including across disconnects and replacement connections.
+struct QueuedCallMedia {
+    event: CallMediaEvent,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Media frames a reader may hold for the router before dropping the
+/// newest: at 50 packets per second per direction this is a few hundred
+/// milliseconds across every live call. The reader never blocks on it.
+const CALL_MEDIA_CHANNEL_CAPACITY: usize = 512;
+
+/// Longest a media frame waits for the connection's writer (a bulk frame
+/// in flight holds it): past this the packet is dropped, never queued.
+pub const CALL_MEDIA_WRITE_DEADLINE: Duration = Duration::from_millis(200);
 
 /// Each connection sends a Ping every ten seconds, on both ends, independent
 /// of reconnect eligibility. Sending never resets the 30-second read deadline.
@@ -644,6 +677,8 @@ struct TransportCtx {
     banned_peers: BanMap,
     incoming_tx: mpsc::Sender<UkmEnvelope>,
     control_tx: mpsc::Sender<ControlEvent>,
+    call_media_tx: mpsc::Sender<QueuedCallMedia>,
+    media_ingress: Arc<media_ingress::MediaIngress>,
     /// Shared pre-Noise cookie secret, consulted when admission requires a cookie.
     cookie_keyring: Arc<cookie::CookieKeyring>,
 }
@@ -672,6 +707,11 @@ pub struct NoiseTransport {
     control_tx: mpsc::Sender<ControlEvent>,
     /// Receiver for control events (consumed by `recv_control()`).
     control_rx: Mutex<mpsc::Receiver<ControlEvent>>,
+    /// Call media frames from every reader (consumed by `recv_call_media()`).
+    call_media_tx: mpsc::Sender<QueuedCallMedia>,
+    call_media_rx: Mutex<mpsc::Receiver<QueuedCallMedia>>,
+    /// Per-identity rate and queue budgets survive all connection generations.
+    media_ingress: Arc<media_ingress::MediaIngress>,
     /// Listener shutdown signal.
     shutdown: tokio::sync::watch::Sender<bool>,
     /// Local reconnect reasons and one worker per known dial endpoint.
@@ -698,6 +738,7 @@ impl NoiseTransport {
         let initial_whitelist: HashSet<NodeId> = config.whitelist.iter().copied().collect();
         let (incoming_tx, incoming_rx) = mpsc::channel(1024);
         let (control_tx, control_rx) = mpsc::channel(256);
+        let (call_media_tx, call_media_rx) = mpsc::channel(CALL_MEDIA_CHANNEL_CAPACITY);
         let (shutdown, _) = tokio::sync::watch::channel(false);
         let (actual_listen_addr, actual_listen_addr_rx) = tokio::sync::watch::channel(None);
 
@@ -711,6 +752,9 @@ impl NoiseTransport {
             incoming_rx: Mutex::new(incoming_rx),
             control_tx,
             control_rx: Mutex::new(control_rx),
+            call_media_tx,
+            call_media_rx: Mutex::new(call_media_rx),
+            media_ingress: Arc::new(media_ingress::MediaIngress::default()),
             shutdown,
             supervision: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dial_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -914,6 +958,8 @@ impl MessageTransport for NoiseTransport {
             banned_peers: Arc::clone(&self.banned_peers),
             incoming_tx: self.incoming_tx.clone(),
             control_tx: self.control_tx.clone(),
+            call_media_tx: self.call_media_tx.clone(),
+            media_ingress: Arc::clone(&self.media_ingress),
             cookie_keyring: Arc::clone(&self.cookie_keyring),
         };
         handshake::connect_to_peer(peer, &socket_addr, &ctx).await?;
@@ -949,11 +995,11 @@ impl MessageTransport for NoiseTransport {
     }
 
     async fn is_connected(&self, peer: &NodeId) -> bool {
-        self.peers.read().await.contains_key(peer)
+        self.peers.read().await.get(peer).is_some_and(|conn| !conn.is_closed())
     }
 
     async fn connected_peers(&self) -> Vec<NodeId> {
-        self.peers.read().await.keys().copied().collect()
+        self.peers.read().await.iter().filter_map(|(peer, conn)| (!conn.is_closed()).then_some(*peer)).collect()
     }
 
     async fn request_peer_exchange(&self, peer: &NodeId) -> Result<(), TransportError> {
@@ -2007,7 +2053,7 @@ mod tests {
             b"test",
             &konsensus_core::types::Nonce::generate(),
         );
-        let ack = Frame::MessageAck { id: test_id, duplicate: false };
+        let ack = Frame::MessageAck { id: test_id, duplicate: false, paid_until_ms: None };
         transport_b.send_frame(&node_a_id, &ack).await.unwrap();
 
         let event = tokio::time::timeout(
@@ -2701,7 +2747,7 @@ mod tests {
             (Frame::SessionInit { init_data: serde_json::json!({}) }, true),
             (Frame::SessionAck, true),
             (Frame::RatchetInit { payload: vec![1, 2, 3] }, true),
-            (Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([1u8; 32]), duplicate: false }, true),
+            (Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([1u8; 32]), duplicate: false, paid_until_ms: None }, true),
             (Frame::MessageReject { id: konsensus_core::types::MessageId::from_bytes([2u8; 32]), reason: "r".into() }, true),
             (
                 Frame::PriceTable {
@@ -4318,9 +4364,63 @@ mod tests {
 }
 
 #[cfg(test)]
+mod media_tests;
+
+#[cfg(test)]
 mod cancelled_noise_write_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn cancelled_media_send_invalidates_connection_before_signalling_reuse() {
+        let mut sender = NoiseSession::initiator(&[11; 32]).unwrap();
+        let mut receiver = NoiseSession::responder(&[22; 32]).unwrap();
+        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
+        sender.read_handshake(&receiver.write_handshake(&[]).unwrap()).unwrap();
+        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
+        assert!(sender.try_finish_handshake().unwrap());
+        assert!(receiver.try_finish_handshake().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
+        let (_reader, writer) = client.unwrap().into_split();
+        let (mut server, addr) = accepted.unwrap();
+        let identity = Arc::new(NodeIdentity::generate().unwrap().1);
+        let transport = NoiseTransport::new(identity, TransportConfig::default());
+        let peer = NodeId::from_bytes([44; 32]);
+        let now = Instant::now();
+        let conn = Connection::new(PeerConnection {
+            advertised_trust_discount: None, source_ip: addr.ip(), privileged: true,
+            noise: sender, writer, tier: SovereigntyTier::T1, capabilities: vec![],
+            connected_at: now, last_recv: now, pending_ping: None,
+            invalid_frame_level: 0.0, invalid_frame_last_leak: now,
+            bytes_received: 0, memory_budget_window_start: now,
+        }, peer, transport.peers.clone(), true).unwrap();
+        transport.peers.write().await.insert(peer, conn.clone());
+        // Cancellation before encryption must leave the connection usable.
+        let held = conn.lock().await;
+        assert!(tokio::time::timeout(Duration::from_millis(10), transport.send_call_media(&peer, b"waiting"))
+            .await.is_err());
+        assert!(!conn.is_closed());
+        drop(held);
+        // Synthetic large record forces a partial write even on hosts with
+        // large TCP buffers; exercise the actual media-send cancellation path.
+        let bytes = vec![0x5a; 4 * 1024 * 1024];
+        assert!(tokio::time::timeout(Duration::from_millis(30), transport.send_call_media(&peer, &bytes))
+            .await.is_err(), "record must be backpressured");
+        assert!(conn.is_closed(), "cancelled media write must immediately invalidate its connection");
+        assert!(!transport.is_connected(&peer).await);
+        assert!(!transport.connected_peers().await.contains(&peer));
+        let draining = tokio::spawn(async move {
+            let mut wire = Vec::new();
+            server.read_to_end(&mut wire).await.unwrap();
+            wire
+        });
+        assert!(transport.send_frame(&peer, &Frame::SessionAck).await.is_err());
+        let wire = tokio::time::timeout(Duration::from_secs(2), draining).await.unwrap().unwrap();
+        let advertised = u32::from_be_bytes(wire[..4].try_into().unwrap()) as usize;
+        assert!(wire.len() > 4 && wire.len() < advertised + 4, "interrupted record must be partial");
+        transport.shutdown();
+    }
 
     #[tokio::test]
     async fn cancelled_partial_frame_closes_socket_before_next_send() {

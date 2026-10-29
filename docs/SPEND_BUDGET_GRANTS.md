@@ -10,6 +10,14 @@ store is now version 8. Older nodes refuse to open it rather than ignore
 allowlists, payment deduplication, circuit breakers, device-reset limits or
 envelope identities; existing version 2–7 grants remain readable.
 
+Every non-payment call (messages, room fan-out, first contact, re-admission,
+files and porch pages) is limited to `min(per_call_max_msat, 6_000)` msat,
+including routing fees. This applies at reservation time to every grant type,
+including console grants and existing live grants, without migration or changes
+to signed terms. The grant view and `pair-status` report this effective limit.
+Explicit invoice payments and keysend retain the console grant's owner-approved
+per-call limit; messaging-only grants cannot fund them.
+
 ## Owner flow (one command per budget window)
 
 1. The app asks: `POST /api/v1/pair/elevation-request` with
@@ -80,16 +88,21 @@ add a payee to the allowlist. Refusals are HTTP 409 with `code: budget_exceeded`
 and `reason: payee_not_allowed`; nothing is dispatched.
 
 Within each grant, `/payments/pay` automatically deduplicates by the invoice's
-payment hash. Both `/payments/pay` and `/payments/keysend` also accept an
-optional `request_id` (1–128 printable ASCII bytes, without spaces). Reuse the
-same ID on retries; IDs are shared between these two routes within a grant.
-Keysend requests without an ID retain their legacy behavior: two otherwise
-identical keysend calls are separate payments.
+payment hash. Both `/payments/pay` and `/payments/keysend` require a
+`request_id` (1–128 printable ASCII bytes, without spaces); a request without
+one is HTTP 400 before anything is looked up or debited. Reuse the same ID on
+retries. The ID is recorded in the node's operation ledger before the budget
+debit, so a repeat with the same ID and parameters is answered from that
+record (`replayed: true`, or `202 in_flight` while the outcome is not final)
+without another debit or backend call; the same ID with other parameters is
+`409 operation_mismatch`. See [docs/v2/API_PAYMENTS.md](v2/API_PAYMENTS.md).
 
-The node atomically persists these identifiers with the reservation before
-dispatch. A concurrent or later duplicate receives HTTP 409,
-`code: budget_exceeded`, `reason: duplicate_payment`, without another debit or
-backend call. This is duplicate refusal, not replay of the original response.
+Within the grant the node still atomically persists the ID and the invoice
+hash with the reservation before dispatch. A payment of the same invoice under
+a new ID, or a new payment reusing an ID the grant already consumed (for
+example after a refusal before dispatch freed it in the ledger), receives HTTP
+409, `code: budget_exceeded`, `reason: duplicate_payment`, without another
+debit or backend call.
 For an invoice, read `/payments/:hash` for payment status. Reusing an ID with
 changed parameters is also refused. IDs remain consumed after settlement,
 confirmed failure, cancellation, unknown outcomes and restart, until the grant

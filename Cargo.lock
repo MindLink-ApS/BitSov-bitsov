@@ -2293,6 +2293,7 @@ name = "konsensus-message"
 version = "0.3.0-rc20"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "bytes",
  "ed25519-dalek",
  "futures",
@@ -2375,6 +2376,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "tower",
  "tracing",
