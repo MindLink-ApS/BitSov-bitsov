@@ -596,6 +596,9 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
     match refusal.as_deref() {
         Some(invoice_refusal::ADMISSION_REQUIRED) => admission_refusal(peer_id),
         Some("disk_low") => ApiError::NotDispatched("disk_low".into()),
+        Some(invoice_refusal::PRICE_CHANGED) => ApiError::NotDispatched(
+            "recipient lowered its prices since they were quoted; refresh its prices and retry; nothing was paid".into()
+        ).with_reason("price_changed"),
         Some(invoice_refusal::CALL_BLOCK_UNPAYABLE) => ApiError::NotDispatched(
             "callee refused the call block invoice: deadline margin or call sequence; nothing was paid".into()
         ).with_reason("call_block_unpayable"),

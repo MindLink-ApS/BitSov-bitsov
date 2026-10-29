@@ -30,6 +30,10 @@ pub(crate) const RECONCILIATION_BUDGET: Duration = Duration::from_secs(2);
 const STATUS_BUDGET: Duration = Duration::from_millis(100);
 
 const MAX_RATE_PEERS: usize = 1024;
+/// Rows the book may retain, including expired ones whose wallet deletion has
+/// not succeeded yet. Issuance stops at this bound so a cleanup backlog
+/// cannot grow while the wallet keeps failing deletes or status checks.
+pub(crate) const MAX_RETAINED_ROWS: usize = 2 * GLOBAL_OUTSTANDING_CAP;
 
 /// Why a service invoice was refused. Callers answer with [`INVOICE_LIMITED`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +59,9 @@ struct Row {
     peer: Option<NodeId>,
     hash: String,
     expires_at: u64,
+    /// A creation attempt whose outcome is unknown: no hash, but it may have
+    /// left a wallet invoice. It holds both caps until it expires.
+    unconfirmed: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -81,7 +88,9 @@ impl PeerInvoiceBook {
         if self.outstanding(Some(peer), now_unix) >= PEER_OUTSTANDING_CAP {
             return Err(InvoiceLimit::PeerOutstanding);
         }
-        if self.outstanding(None, now_unix) >= GLOBAL_OUTSTANDING_CAP {
+        if self.outstanding(None, now_unix) >= GLOBAL_OUTSTANDING_CAP
+            || self.rows.len() >= MAX_RETAINED_ROWS
+        {
             return Err(InvoiceLimit::Global);
         }
         if !self.rates.contains_key(peer) && self.rates.len() >= MAX_RATE_PEERS {
@@ -112,6 +121,18 @@ impl PeerInvoiceBook {
             peer: Some(peer),
             hash,
             expires_at,
+            unconfirmed: false,
+        });
+    }
+
+    /// Keep a slot for a creation attempt that may have left an invoice in the
+    /// wallet. It counts toward the peer and global caps until `expires_at`.
+    pub(crate) fn hold_unconfirmed(&mut self, peer: NodeId, request_id: &str, expires_at: u64) {
+        self.rows.push(Row {
+            peer: Some(peer),
+            hash: format!("unconfirmed:{request_id}"),
+            expires_at,
+            unconfirmed: true,
         });
     }
 
@@ -124,6 +145,7 @@ impl PeerInvoiceBook {
             peer: None,
             hash,
             expires_at,
+            unconfirmed: false,
         });
     }
 
@@ -147,14 +169,10 @@ impl PeerInvoiceBook {
     }
 }
 
-/// `u64::MAX` is an unknown deadline. Replace it with a finite one so the
-/// row ages out of the cap and the sweep can forget it.
-fn finite_imported_expiry(expires_at: u64, now_unix: u64) -> u64 {
-    if expires_at == u64::MAX {
-        now_unix.saturating_add(u64::from(INVOICE_EXPIRY_SECS))
-    } else {
-        expires_at
-    }
+/// `u64::MAX` is an unknown deadline: nothing proves the invoice is one of
+/// ours (an owner invoice may run for days). It is neither counted nor purged.
+fn is_unknown_expiry(expires_at: u64) -> bool {
+    expires_at == u64::MAX
 }
 
 pub(crate) struct Reconciliation {
@@ -184,11 +202,11 @@ pub(crate) async fn reconcile(
         let Ok(imported) = lightning.pending_invoice_expiries().await else {
             return;
         };
-        // An unknown deadline must not stay open. Give it the service-invoice
-        // window from this sweep; a later sweep does not extend that row.
+        // Never infer service provenance for an invoice with no known deadline:
+        // deleting it could destroy a valid owner invoice.
         let imported: Vec<(String, u64)> = imported
             .into_iter()
-            .map(|(hash, expires_at)| (hash, finite_imported_expiry(expires_at, now_unix)))
+            .filter(|(_, expires_at)| !is_unknown_expiry(*expires_at))
             .collect();
         for (hash, expires_at) in &imported {
             before.insert(hash.clone());
@@ -217,10 +235,14 @@ pub(crate) async fn purge_expired_peer_invoices(
     // Deletion verifies that each wallet record is still pending. Give expiry
     // retries the sweep budget before status reads, which can otherwise starve
     // all deletes once a large backlog accumulates during a wallet outage.
+    // An expired unconfirmed hold has no wallet record of its own to delete;
+    // any invoice it created is imported (or known) under its real hash.
+    book.rows
+        .retain(|row| !(row.unconfirmed && now_unix >= row.expires_at));
     let expired: Vec<String> = book
         .rows
         .iter()
-        .filter(|row| now_unix >= row.expires_at)
+        .filter(|row| !row.unconfirmed && now_unix >= row.expires_at)
         .map(|row| row.hash.clone())
         .collect();
     use futures::{stream, StreamExt};
@@ -255,6 +277,7 @@ async fn release_closed_rows(book: &mut PeerInvoiceBook, lightning: &dyn Lightni
     let mut statuses = stream::iter(
         book.rows
             .iter()
+            .filter(|row| !row.unconfirmed)
             .map(|row| row.hash.clone())
             .collect::<Vec<_>>()
             .into_iter()
@@ -485,6 +508,70 @@ mod tests {
         book.apply_reconciliation(result);
         assert!(book.try_issue(&peer(1), Instant::now(), 0).is_ok());
         assert!(book.rows.iter().any(|row| row.hash == "bb".repeat(32)));
+    }
+
+    #[test]
+    fn unconfirmed_creation_holds_the_peer_slot_until_it_expires() {
+        let mut book = PeerInvoiceBook { reconciled: true, ..Default::default() };
+        let now = Instant::now();
+        let unix = 10_000u64;
+        let p = peer(3);
+        for i in 0..PEER_OUTSTANDING_CAP {
+            book.try_issue(&p, now, unix).unwrap();
+            book.hold_unconfirmed(p, &format!("req{i}"), unix + 120);
+        }
+        // Ambiguous failures still count: no fifth invoice for this peer.
+        assert_eq!(book.try_issue(&p, now, unix), Err(InvoiceLimit::PeerOutstanding));
+        assert_eq!(book.outstanding(None, unix), PEER_OUTSTANDING_CAP);
+        assert_eq!(book.try_issue(&p, now + RATE_WINDOW, unix + 120), Ok(()));
+    }
+
+    #[test]
+    fn retained_cleanup_backlog_stops_issuance() {
+        let mut book = PeerInvoiceBook { reconciled: true, ..Default::default() };
+        let unix = 20_000u64;
+        // Expired rows whose wallet deletion keeps failing are retained.
+        for i in 0..MAX_RETAINED_ROWS {
+            book.note_unattributed(format!("stuck{i}"), unix - 1);
+        }
+        assert_eq!(book.outstanding(None, unix), 0);
+        assert_eq!(book.try_issue(&peer(4), Instant::now(), unix), Err(InvoiceLimit::Global));
+    }
+
+    #[tokio::test]
+    async fn unknown_deadline_imports_are_never_counted_or_purged() {
+        use konsensus_core::traits::lightning::{Invoice, LightningError, PaymentDetails};
+        struct Unknown(std::sync::Mutex<usize>);
+        #[async_trait::async_trait]
+        impl LightningProvider for Unknown {
+            async fn receive_invoice_capable(&self) -> bool { true }
+            async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+                Ok(vec![("ee".repeat(32), u64::MAX)])
+            }
+            async fn forget_pending_invoice(&self, _: &str) -> Result<bool, LightningError> {
+                *self.0.lock().unwrap() += 1;
+                Ok(true)
+            }
+            async fn create_invoice(&self, _: u64, _: &str, _: u32) -> Result<Invoice, LightningError> {
+                Err(LightningError::Backend("unused".into()))
+            }
+            async fn pay_invoice(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+                Err(LightningError::Backend("unused".into()))
+            }
+            async fn get_payment_status(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+                Err(LightningError::PaymentNotFound("missing".into()))
+            }
+            async fn get_balance_msat(&self) -> Result<u64, LightningError> { Ok(0) }
+            async fn is_available(&self) -> bool { true }
+        }
+        let wallet = Arc::new(Unknown(std::sync::Mutex::new(0)));
+        let lightning: Arc<dyn LightningProvider> = wallet.clone();
+        let mut book = PeerInvoiceBook::default();
+        // Far in the future: an unknown-deadline owner invoice is still kept.
+        let result = reconcile(book.clone(), lightning, u64::MAX - 1).await;
+        book.apply_reconciliation(result);
+        assert!(book.rows.is_empty());
+        assert_eq!(*wallet.0.lock().unwrap(), 0, "an unknown-deadline invoice was deleted");
     }
 
     #[test]

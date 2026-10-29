@@ -1396,7 +1396,7 @@ fn admission_pricing() -> Arc<dyn konsensus_core::traits::pricing::PricingEngine
 }
 
 #[tokio::test]
-async fn privileged_invoice_amount_is_clamped_to_configured_price() {
+async fn privileged_invoice_above_configured_price_is_refused_not_clamped() {
     let peer_id = test_peer_id();
     let transport = make_gossip_test_transport();
     let lightning: Arc<dyn LightningProvider> =
@@ -1454,7 +1454,9 @@ async fn privileged_invoice_amount_is_clamped_to_configured_price() {
         .map(|payment| payment.amount_msat)
         .collect();
     amounts.sort_unstable();
-    assert_eq!(amounts, vec![ceiling - 1, ceiling]);
+    // Over the ceiling: refused (PRICE_CHANGED), never a reduced invoice the
+    // sender would reject anyway.
+    assert_eq!(amounts, vec![ceiling - 1]);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1880,8 +1882,8 @@ async fn below_admission_floor_service_invoice_is_refused_and_releases_its_rate_
 
     handle_invoice_requested_gated(
         &peer,
-        "clamped-under-floor",
-        ceiling.saturating_mul(2),
+        "at-raised-floor",
+        ceiling.saturating_add(1),
         "konsensus message",
         true,
         &pricing,

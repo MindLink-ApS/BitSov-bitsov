@@ -414,6 +414,13 @@ impl LndProvider {
         if !response.status().is_success() {
             return Err(self.handle_error(response, "cancel_invoice").await);
         }
+        self.delete_canceled_invoice(payment_hash).await?;
+        Ok(true)
+    }
+
+    /// DeleteCanceledInvoice. Tracking is cleared only after LND confirms the
+    /// delete, so a failed delete is retried by a later sweep.
+    async fn delete_canceled_invoice(&self, payment_hash: &str) -> Result<(), LightningError> {
         let delete_url = self.api_url(&format!("/v1/invoices?invoice_hash={payment_hash}"));
         let delete = self
             .client
@@ -423,14 +430,10 @@ impl LndProvider {
             .await
             .map_err(|e| LightningError::Connection(e.to_string()))?;
         if !delete.status().is_success() {
-            debug!(
-                payment_hash,
-                status = %delete.status(),
-                "LND canceled invoice but delete-canceled failed"
-            );
+            return Err(self.handle_error(delete, "delete_canceled_invoice").await);
         }
         self.clear_invoice_expiry(payment_hash);
-        Ok(true)
+        Ok(())
     }
 
     async fn list_pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
@@ -704,6 +707,12 @@ impl LightningProvider for LndProvider {
             Ok(details) if details.direction == PaymentDirection::Incoming => {
                 if details.status == PaymentStatus::Pending {
                     return self.cancel_open_invoice(payment_hash).await;
+                }
+                // LND cancels an expired invoice by itself; it still has to be
+                // deleted. A settled invoice stays in the wallet.
+                if matches!(details.status, PaymentStatus::Failed | PaymentStatus::Expired) {
+                    self.delete_canceled_invoice(payment_hash).await?;
+                    return Ok(true);
                 }
                 self.clear_invoice_expiry(payment_hash);
                 Ok(false)

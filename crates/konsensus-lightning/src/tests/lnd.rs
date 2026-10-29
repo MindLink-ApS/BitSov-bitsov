@@ -1559,3 +1559,65 @@ async fn lnd_peer_invoice_hooks_cancel_and_inventory() {
 
     handle.abort();
 }
+
+/// Codex P2 on #403: LND cancels expired invoices by itself; cleanup must still
+/// delete them, and a failed DELETE is an error (tracking kept for a retry),
+/// not a silent success.
+#[tokio::test]
+async fn lnd_cleanup_deletes_canceled_invoices_and_reports_failed_deletes() {
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Store {
+        payment_hash: String,
+        delete_ok: bool,
+        deletes: usize,
+    }
+
+    async fn mock_lookup(
+        Path(hash): Path<String>,
+        State(store): State<Arc<Mutex<Store>>>,
+    ) -> Json<serde_json::Value> {
+        if hash != store.lock().unwrap().payment_hash {
+            return Json(serde_json::json!({}));
+        }
+        // Already canceled by LND after expiry.
+        Json(serde_json::json!({ "state": "CANCELED", "value_msat": "1000", "creation_date": "1000" }))
+    }
+
+    async fn mock_delete(State(store): State<Arc<Mutex<Store>>>) -> (StatusCode, Json<serde_json::Value>) {
+        let mut store = store.lock().unwrap();
+        store.deletes += 1;
+        if store.delete_ok {
+            (StatusCode::OK, Json(serde_json::json!({})))
+        } else {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "message": "delete failed" })))
+        }
+    }
+
+    let payment_hash = "cd".repeat(32);
+    let store = Arc::new(Mutex::new(Store { payment_hash: payment_hash.clone(), delete_ok: false, deletes: 0 }));
+    let app = Router::new()
+        .route("/v1/getinfo", get(mock_getinfo))
+        .route("/v1/invoices", post(mock_addinvoice).delete(mock_delete))
+        .route("/v1/invoice/:hash", get(mock_lookup))
+        .with_state(store.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let provider = test_provider(addr);
+
+    // A failed delete is reported, not treated as cleaned up.
+    assert!(provider.forget_pending_invoice(&payment_hash).await.is_err());
+    assert_eq!(store.lock().unwrap().deletes, 1);
+    // Once LND accepts the delete, the canceled invoice is removed.
+    store.lock().unwrap().delete_ok = true;
+    assert!(provider.forget_pending_invoice(&payment_hash).await.unwrap());
+    assert_eq!(store.lock().unwrap().deletes, 2);
+
+    handle.abort();
+}

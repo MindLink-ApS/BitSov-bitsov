@@ -2685,21 +2685,18 @@ fn load_invoice_expiries(
     Ok(map)
 }
 
-/// Previous peer-invoice lifetime. LDK does not retain BOLT11 expiry on a
-/// payment. A pending invoice with no sidecar row, or with an unknown
-/// deadline, uses its last update time plus this window and then ages out.
-const LEGACY_SERVICE_INVOICE_EXPIRY_SECS: u64 = 3600;
+/// Deadline of a pending invoice with no usable sidecar row. LDK does not keep
+/// a BOLT11's expiry, and nothing proves such an invoice is a short-lived
+/// service invoice (an owner invoice may run for days), so it is never guessed.
+pub(crate) const UNKNOWN_INVOICE_EXPIRY: u64 = u64::MAX;
 
-fn migrate_service_invoice_expiry(recorded: Option<u64>, updated_at: u64) -> u64 {
-    match recorded {
-        Some(expires_at) if expires_at < u64::MAX => expires_at,
-        _ => updated_at.saturating_add(LEGACY_SERVICE_INVOICE_EXPIRY_SECS),
-    }
+fn migrate_service_invoice_expiry(recorded: Option<u64>, _updated_at: u64) -> u64 {
+    recorded.unwrap_or(UNKNOWN_INVOICE_EXPIRY)
 }
 
 /// Repair the sidecar against durable wallet state.
-/// A saved deadline is kept. A missing deadline uses the payment timestamp
-/// plus the previous one-hour lifetime.
+/// A saved deadline is kept. A missing one is recorded as unknown, which no
+/// sweep ever treats as expired.
 fn reconcile_invoice_expiries(
     node: &ldk_node::Node,
     mut recorded: std::collections::HashMap<String, u64>,

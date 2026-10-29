@@ -37,6 +37,11 @@ pub const INVOICE_UNAVAILABLE: &str = "konsensus:invoice_unavailable";
 /// The request is refused; the amount is not raised to the floor.
 pub const BELOW_ADMISSION_FLOOR: &str = "konsensus:below_admission_floor";
 
+/// The requested amount is above every price this node now charges (its
+/// tariff was lowered). Nothing was issued; the sender should refresh this
+/// peer's prices and ask again rather than pay a different amount.
+pub const PRICE_CHANGED: &str = "konsensus:price_changed";
+
 /// No block invoice was issued: wrong call/sequence or too close to its deadline.
 pub const CALL_BLOCK_UNPAYABLE: &str = "konsensus:call_block_unpayable";
 

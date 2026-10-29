@@ -1706,7 +1706,14 @@ async fn handle_invoice_requested(
     };
     // Match the prices advertised to payers and enforced by the payment gate.
     let ceiling = konsensus_core::gate::price_with_floor_msat(ceiling, min_admission_cost_msat);
-    let amount_msat = amount_msat.min(ceiling);
+    // Never return a silently reduced invoice: the sender rejects any amount
+    // other than the one it asked for. Tell it to re-quote instead.
+    if amount_msat > ceiling {
+        if refusals.permit(source_ip, tokio::time::Instant::now()) {
+            send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::PRICE_CHANGED).await;
+        }
+        return;
+    }
     info!(
         peer = %peer_id, %request_id, amount_msat, %purpose,
         "peer requested invoice — creating on our wallet"
@@ -1737,6 +1744,15 @@ async fn handle_invoice_requested(
             }
         }
         Err(e) => {
+            // Only a definite creation failure proves no invoice exists. Any
+            // other error may have left one in the wallet: keep its slot.
+            if !matches!(e, konsensus_core::traits::lightning::LightningError::InvoiceCreation(_)) {
+                invoices.hold_unconfirmed(
+                    *peer_id,
+                    request_id,
+                    now_unix.saturating_add(u64::from(crate::peer_invoices::INVOICE_EXPIRY_SECS)),
+                );
+            }
             warn!(
                 peer = %peer_id, %request_id, error = %e,
                 "failed to create invoice for peer request — sending error to peer"
