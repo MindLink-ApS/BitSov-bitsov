@@ -21,7 +21,7 @@ concurrency:
 jobs:
   paid-regtest:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 70
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -41,9 +41,12 @@ jobs:
       ELECTRS_SHA256: '865e26a96e8df77df01d96f2f569dcf9622fc87a8d99a9b8fe30861a4db9ddf1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Read Rust toolchain pin
+        id: rust-toolchain
+        run: echo "channel=$(bash scripts/rust-toolchain-channel.sh)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (upstream has no semver tags)
         with:
-          toolchain: stable
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: three-node-${{ hashFiles('Cargo.lock') }}
@@ -84,6 +87,19 @@ jobs:
         run: cargo fetch --locked
       - name: Runner lifecycle tests
         run: python3 scripts/regress/test_regtest_e2e_runner.py -v
+      - name: M6 two-node paid call (real 60-second blocks)
+        shell: bash
+        env:
+          REGTEST_TIMEOUT_SECONDS: '1200'
+        run: |
+          set -euo pipefail
+          # Exit 77 is a failure here: a compiled/skipped call is not proof.
+          {
+            git log -1 --format='M6 NODE SHA %H'
+            scripts/regress/two_node_paid_call_e2e.sh
+          } 2>&1 | tee paid-call.log
+          grep -q '^M6 CALL PASS reason=unpaid paid_blocks=3 ' paid-call.log
+          grep -q '^M6 CALL PASS reason=duration_cap paid_blocks=1 ' paid-call.log
       - name: Production private hub forwarding (#225)
         shell: bash
         env:
@@ -119,4 +135,5 @@ jobs:
           path: |
             regtest.log
             private-forwarding.log
+            paid-call.log
           if-no-files-found: ignore

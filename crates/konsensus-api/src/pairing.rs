@@ -60,6 +60,7 @@ use crate::auth::{self, Scope, TokenError};
 
 pub mod approval;
 pub mod console;
+mod call_spend;
 pub mod device;
 pub mod second_device;
 #[cfg(test)]
@@ -282,6 +283,39 @@ pub enum PairingError {
     Io(String),
 }
 
+/// Internal refusal classification. Keep the original error for existing callers
+/// and HTTP mappings; only the fixed reason is suitable for refusal logs.
+#[derive(Debug)]
+pub(crate) struct PairingRefusal {
+    pub error: PairingError,
+    pub reason: &'static str,
+}
+
+impl PairingRefusal {
+    pub(crate) fn new(error: PairingError, reason: &'static str) -> Self {
+        Self { error, reason }
+    }
+}
+
+impl From<PairingError> for PairingRefusal {
+    fn from(error: PairingError) -> Self {
+        let reason = match &error {
+            PairingError::BadProof => "bad_signature",
+            PairingError::Expired => "stale_or_future",
+            PairingError::NotGrantable(_) => "unknown_or_revoked_key",
+            PairingError::PairingInvalid(_) => "invalid_pairing",
+            PairingError::UnknownClient => "unknown_client",
+            PairingError::OwnerChannelUnavailable => "owner_channel_off",
+            PairingError::DeviceApprovalsDisabled(_) => "device_approvals_disabled",
+            PairingError::Malformed(_) => "malformed",
+            PairingError::TooManyPending => "rate_limited",
+            PairingError::Io(_) => "storage_error",
+            _ => "pairing_refused",
+        };
+        Self::new(error, reason)
+    }
+}
+
 impl From<io::Error> for PairingError {
     fn from(e: io::Error) -> Self {
         PairingError::Io(e.to_string())
@@ -351,6 +385,12 @@ pub struct SpendGrant {
 }
 
 impl SpendGrant {
+    /// Existing signed provenance distinguishes messaging authority from
+    /// explicit console payment approvals; no stored schema change is needed.
+    fn is_messaging(&self) -> bool {
+        self.owner_approval.is_some() || self.budget.as_ref().is_some_and(|b| b.recipients_only)
+    }
+
     /// Whether this grant can authorise anything at `now`: metered, unexpired,
     /// and no longer-lived than the 24-hour cap (a hand-edited expiry is not
     /// an extension).
@@ -711,10 +751,12 @@ type ReservationJournal<'a> = Box<dyn FnOnce(&Reservation) -> Result<(), BudgetR
 #[derive(Default)]
 struct ReservationAuthority<'a> {
     payment_ids: Vec<String>,
+    payment: bool,
     expected_op_id: Option<&'a str>,
     liquidity: bool,
     before_persist: Option<ReservationJournal<'a>>,
     operation: Option<crate::spend_budget::OperationReservationLink>,
+    call: Option<crate::spend_budget::CallSpendTerms>,
 }
 
 /// Consumed, single-use authorization. Its grant identity survives the handoff
@@ -2161,12 +2203,24 @@ impl PairingService {
         fingerprint: &str,
         scopes: &[Scope],
     ) -> Result<(), PairingError> {
+        self.verify_token_binding_with_reason(client_id, epoch, fingerprint, scopes)
+            .map_err(|refusal| refusal.error)
+    }
+
+    pub(crate) fn verify_token_binding_with_reason(
+        &self,
+        client_id: &str,
+        epoch: u64,
+        fingerprint: &str,
+        scopes: &[Scope],
+    ) -> Result<(), PairingRefusal> {
         let inner = self.lock();
         let now_unix = chrono::Utc::now().timestamp();
         if inner.identity_fingerprint != fingerprint {
             return Err(PairingError::PairingInvalid(
                 "token was issued against a different identity".into(),
-            ));
+            )
+            .into());
         }
         let record = inner
             .file
@@ -2175,24 +2229,30 @@ impl PairingService {
             .find(|c| c.client_id == client_id)
             .ok_or(PairingError::UnknownClient)?;
         if record.scopes.is_empty() {
-            self.provisional_locked(&inner, &record.client_id)?;
+            self.provisional_locked(&inner, &record.client_id)
+                .map_err(|error| PairingRefusal::new(error, "provisional_session"))?;
         }
         if record.epoch != epoch {
-            return Err(PairingError::PairingInvalid(
-                "pairing epoch has been bumped — the token is revoked".into(),
+            return Err(PairingRefusal::new(
+                PairingError::PairingInvalid(
+                    "pairing epoch has been bumped — the token is revoked".into(),
+                ),
+                "wrong_epoch",
             ));
         }
         if record.identity_fingerprint != fingerprint {
             return Err(PairingError::PairingInvalid(
                 "pairing is bound to a different identity".into(),
-            ));
+            )
+            .into());
         }
         let permitted = self.effective_scopes(&inner, record, now_unix);
         if let Some(extra) = scopes.iter().find(|s| !permitted.contains(s)) {
             return Err(PairingError::PairingInvalid(format!(
                 "token claims scope `{}` the pairing does not hold in this deployment",
                 extra.as_str()
-            )));
+            ))
+            .into());
         }
         Ok(())
     }
@@ -3152,6 +3212,7 @@ impl PairingService {
             charges,
             ReservationAuthority {
                 payment_ids,
+                payment: true,
                 ..Default::default()
             },
             || chrono::Utc::now().timestamp(),
@@ -3193,6 +3254,11 @@ impl PairingService {
         }) else {
             return Err(BudgetRefusal::NoGrant);
         };
+        // Check purpose under the same lock as the debit, even for a keysend
+        // without a hash or request ID. Recipient matching is not authority.
+        if authority.payment && inner.file.grants[idx].is_messaging() {
+            return Err(BudgetRefusal::MessagingGrant);
+        }
         if authority.liquidity
             && !inner.file.grants[idx]
                 .budget
@@ -3232,7 +3298,24 @@ impl PairingService {
                 "too many unresolved reservations".into(),
             ));
         }
-        if let Err(refusal) = budget.reserve_at(&charges, now) {
+        // Purpose, not grant provenance, determines the effective ceiling.
+        // Enforce it without changing stored/signed terms, so live grants are
+        // covered immediately and explicit payments retain the owner's limit.
+        let purpose_limit = if authority.payment || authority.call.is_some() {
+            Ok(())
+        } else {
+            let max_msat = budget.messaging_per_call_max_msat();
+            charges
+                .iter()
+                .try_fold(0u64, |total, charge| {
+                    total
+                        .checked_add(charge.amount_msat)
+                        .filter(|total| *total <= max_msat)
+                        .ok_or(BudgetRefusal::PerCall { max_msat })
+                })
+                .map(|_| ())
+        };
+        if let Err(refusal) = purpose_limit.and_then(|()| budget.reserve_at(&charges, now)) {
             if budget.record_breaker_refusal(&refusal, now) {
                 if let Err(e) = self.persist(&mut inner.file) {
                     if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
@@ -3252,6 +3335,9 @@ impl PairingService {
         // An empty fanout moves no value and grants no dispatch authority.
         if !recipients.is_empty() {
             budget.pending.insert(id.clone(), recipients);
+            if let Some(terms) = authority.call {
+                budget.call_reservations.insert(id.clone(), crate::spend_budget::CallSpend::new(terms));
+            }
             if let Some(link) = authority.operation {
                 budget.operation_links.insert(id.clone(), link);
             }
@@ -3367,10 +3453,9 @@ impl PairingService {
         };
         let epoch = grant.epoch;
         let budget = grant.budget.as_ref().ok_or(BudgetRefusal::NoGrant)?;
-        if max_total_msat > budget.per_call_max_msat {
-            return Err(BudgetRefusal::PerCall {
-                max_msat: budget.per_call_max_msat,
-            });
+        let max_msat = budget.messaging_per_call_max_msat();
+        if max_total_msat > max_msat {
+            return Err(BudgetRefusal::PerCall { max_msat });
         }
         if max_total_msat > budget.remaining_msat() {
             return Err(BudgetRefusal::Total {
@@ -3643,7 +3728,7 @@ impl PairingService {
             return Err(BudgetRefusal::NoGrant);
         };
         let message_top_up = quoted_message_all_in.saturating_sub(old_message);
-        let max_msat = budget.per_call_max_msat;
+        let max_msat = budget.messaging_per_call_max_msat();
         let need = message_top_up
             .checked_add(admission_all_in)
             .ok_or(BudgetRefusal::PerCall { max_msat })?;
@@ -3825,6 +3910,22 @@ impl PairingService {
         clock: impl FnOnce() -> i64,
         action: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefusal> {
+        self.with_call_spend_authority_at(reservation, None, clock, action)
+    }
+
+    pub(crate) fn with_call_spend_authority<T>(
+        &self, reservation: &Reservation, call: Option<(&str, &str)>, action: impl FnOnce() -> T,
+    ) -> Result<T, BudgetRefusal> {
+        match call {
+            None => self.with_spend_authority(reservation, action),
+            Some(call) => self.with_call_spend_authority_at(reservation, Some(call), || chrono::Utc::now().timestamp(), action),
+        }
+    }
+
+    fn with_call_spend_authority_at<T>(
+        &self, reservation: &Reservation, call: Option<(&str, &str)>,
+        clock: impl FnOnce() -> i64, action: impl FnOnce() -> T,
+    ) -> Result<T, BudgetRefusal> {
         let inner = self.lock();
         let now = clock();
         let valid = inner.file.grants.iter().any(|g| {
@@ -3837,6 +3938,8 @@ impl PairingService {
                     b.pending
                         .get(&reservation.id)
                         .is_some_and(|recipients| b.envelopes_live(recipients.keys(), now))
+                        && call.is_none_or(|(peer, id)| b.call_reservations.values().any(|hold|
+                            hold.terms.peer == peer && hold.terms.call_id == id && !hold.closed))
                 })
                 && g.client_id == reservation.client_id
                 && g.identity_fingerprint == inner.identity_fingerprint
@@ -3896,6 +3999,16 @@ impl PairingService {
         recipient: &str,
         actual_msat: u64,
     ) -> Result<(), PairingError> {
+        self.try_resolve_spend_outcome(reservation, recipient, actual_msat, false)
+    }
+
+    pub(crate) fn try_resolve_spend_outcome(
+        &self,
+        reservation: &Reservation,
+        recipient: &str,
+        actual_msat: u64,
+        payment_failed: bool,
+    ) -> Result<(), PairingError> {
         let mut inner = self.lock();
         let Some(grant) = inner
             .file
@@ -3908,6 +4021,9 @@ impl PairingService {
         let Some(budget) = grant.budget.as_mut() else {
             return Ok(());
         };
+        if budget.call_reservations.contains_key(&reservation.id) {
+            return Err(PairingError::Malformed("a call hold must be closed, not resolved as a payment".into()));
+        }
         let before = budget.clone();
         let Some(recipients) = budget.pending.get_mut(&reservation.id) else {
             return Ok(());
@@ -3919,8 +4035,10 @@ impl PairingService {
             budget.pending.remove(&reservation.id);
             budget.operation_links.remove(&reservation.id);
         }
-        budget.resolve(recipient, reserved, actual_msat);
-        budget.record_outcome(reserved, actual_msat, chrono::Utc::now().timestamp());
+        if !budget.resolve_call_draw(&reservation.id, recipient, reserved, actual_msat, payment_failed) {
+            budget.resolve(recipient, reserved, actual_msat);
+            budget.record_outcome(reserved, actual_msat, chrono::Utc::now().timestamp());
+        }
         if let Err(e) = self.persist(&mut inner.file) {
             if let Some(grant) = inner
                 .file
@@ -4140,7 +4258,7 @@ fn grant_view(g: &SpendGrant) -> Option<GrantView> {
         budget_msat: b.budget_msat,
         used_msat: b.used_msat,
         remaining_msat: b.remaining_msat(),
-        per_call_max_msat: b.per_call_max_msat,
+        per_call_max_msat: b.messaging_per_call_max_msat(),
         per_recipient_msat: b.per_recipient_msat.clone(),
         used_by_recipient: b.used_by_recipient.clone(),
         recipients_only: b.recipients_only,

@@ -86,8 +86,7 @@ impl OwnerConsole {
     fn confirmation(&self, label: &str) -> String {
         let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
         text.lines()
-            .filter(|line| line.starts_with(&format!("{label} CODE ")))
-            .next_back()
+            .rfind(|line| line.starts_with(&format!("{label} CODE ")))
             .unwrap_or_else(|| panic!("owner console has no confirmation for {label}"))
             .to_owned()
     }
@@ -211,7 +210,10 @@ async fn start_sender(
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
+        configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
         file_staging: Default::default(),
@@ -337,8 +339,8 @@ impl Sender {
     }
 }
 
-/// Node B: the `price_open` recipient. Returns its membrane and the plaintexts
-/// it delivers, in order.
+/// Node B: the `price_open` recipient. Returns its membrane, delivered
+/// plaintexts and peer-registration events, each in order.
 #[allow(clippy::too_many_arguments)]
 async fn start_recipient(
     dir: &std::path::Path,
@@ -349,10 +351,17 @@ async fn start_recipient(
     recipient_msat: u64,
     refuse_message: Arc<std::sync::atomic::AtomicBool>,
     refuse_admission_quote: Arc<std::sync::atomic::AtomicBool>,
-) -> (Arc<konsensus_api::audit::AuditLog>, mpsc::UnboundedReceiver<String>) {
+) -> (
+    Arc<konsensus_api::audit::AuditLog>,
+    mpsc::UnboundedReceiver<String>,
+    mpsc::UnboundedReceiver<NodeId>,
+) {
     let audit = audit_log(dir);
     let lightning: Arc<dyn LightningProvider> = wallet;
     let pricing = pricing_at(recipient_msat);
+    // Subscribe before spawning or dialing. The control-plane consumer forwards
+    // registrations here so a fast handshake cannot outrun the test's wait.
+    let (connected_tx, connected_rx) = mpsc::unbounded_channel();
 
     // B's control plane: invoice requests, through the real privilege and quote gates.
     {
@@ -367,6 +376,9 @@ async fn start_recipient(
         tokio::spawn(async move {
             let mut last_refusal = crate::invoice_refusals::RefusalLimits::default();
             while let Some(event) = transport.recv_control().await {
+                if let ControlEvent::PeerConnected { peer_id, .. } = &event {
+                    connected_tx.send(*peer_id).unwrap();
+                }
                 if let ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } = event {
                     if purpose.starts_with("konsensus:admission")
                         && refuse_admission_quote.load(std::sync::atomic::Ordering::Acquire)
@@ -431,7 +443,7 @@ async fn start_recipient(
             }
         });
     }
-    (audit, delivered_rx)
+    (audit, delivered_rx, connected_rx)
 }
 
 async fn wait_until<F, Fut>(what: &str, mut check: F)
@@ -465,6 +477,7 @@ struct TwoNodes {
     refuse_admission_quote: Arc<std::sync::atomic::AtomicBool>,
     audit_b: Arc<konsensus_api::audit::AuditLog>,
     delivered: mpsc::UnboundedReceiver<String>,
+    connected_b: mpsc::UnboundedReceiver<NodeId>,
     _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
 }
 
@@ -517,7 +530,7 @@ async fn two_nodes_with_outcome(
     let sender = start_sender(dir_a.path(), &alice, &transport_a, &sessions_a, wallet_a, grant, admission_failure).await;
     let refuse_message = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let refuse_admission_quote = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (audit_b, delivered) = start_recipient(
+    let (audit_b, delivered, connected_b) = start_recipient(
         dir_b.path(), &bob, &transport_b, &sessions_b, wallet_b, recipient_msat,
         Arc::clone(&refuse_message), Arc::clone(&refuse_admission_quote),
     ).await;
@@ -533,22 +546,41 @@ async fn two_nodes_with_outcome(
         refuse_admission_quote,
         audit_b,
         delivered,
+        connected_b,
         _dirs: (dir_a, dir_b, ledger),
     }
 }
 
 impl TwoNodes {
-    async fn connect(&self) {
+    async fn connect(&mut self) {
         self.transport_a.connect(&self.bob_id, &self.addr_b).await.unwrap();
-        wait_until("B sees A", || self.transport_b.is_connected(&self.alice_id)).await;
+        // connect() completes A's handshake; B publishes PeerConnected only
+        // after registering its reader. Consume one event per connection.
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            self.connected_b.recv(),
+        ).await.expect("transport made no progress waiting for B's PeerConnected");
+        assert_eq!(connected, Some(self.alice_id));
+        assert!(self.transport_b.is_connected(&self.alice_id).await);
         assert!(!privileged_on(&self.transport_b, &self.alice_id).await, "a new connection starts unpaid");
     }
 
     /// B drops the connection and A dials again: B holds A as unpaid again
     /// (doctrine: no durable admission object).
-    async fn drop_and_reconnect(&self) {
+    async fn drop_and_reconnect(&mut self) {
+        let previous = self.transport_a.connected_since(&self.bob_id).await.unwrap();
         self.transport_b.disconnect(&self.alice_id).await.unwrap();
-        wait_until("A sees the drop", || async { !self.transport_a.is_connected(&self.bob_id).await }).await;
+        self.finish_reconnect(previous).await;
+    }
+
+    async fn finish_reconnect(&mut self, previous: std::time::Instant) {
+        // Quote/operation interest can let the supervisor redial before this
+        // observer runs. The old generation's retirement is durable; a sampled
+        // disconnected state is not. connect() reuses a supervised replacement.
+        wait_until("A retires the old connection", || async {
+            !self.transport_a.is_connected(&self.bob_id).await
+                || self.transport_a.connected_since(&self.bob_id).await != Some(previous)
+        }).await;
         self.connect().await;
     }
 
@@ -581,6 +613,26 @@ impl TwoNodes {
 }
 
 // ── The regressions ─────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconnect_barrier_accepts_an_already_supervised_replacement() {
+    let mut net = two_nodes(|_| None).await;
+    net.connect().await;
+    let previous_a = net.transport_a.connected_since(&net.bob_id).await.unwrap();
+    let previous_b = net.transport_b.connected_since(&net.alice_id).await.unwrap();
+    // Keep the real supervisor interested, as an in-flight operation or cached
+    // quote does, and force it to reconnect before our drop observer runs.
+    let _operation = net.transport_a.retain_peer(&net.bob_id).await.unwrap();
+    net.transport_b.disconnect(&net.alice_id).await.unwrap();
+    wait_until("supervisor replaces both generations", || async {
+        net.transport_a.connected_since(&net.bob_id).await.is_some_and(|now| now != previous_a)
+            && net.transport_b.connected_since(&net.alice_id).await.is_some_and(|now| now != previous_b)
+    }).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), net.finish_reconnect(previous_a))
+        .await.expect("a delayed observer must accept the completed reconnect");
+    net.send_delivered("after the supervised reconnect").await;
+    net.shutdown();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
@@ -667,6 +719,17 @@ async fn budgeted_contact_is_readmitted_from_the_budget_without_a_prompt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_contact_without_a_budget_needs_the_one_time_confirmation_once() {
     let mut net = two_nodes(|bob| Some(budget(bob, None))).await;
+    // The quote endpoint uses the wallet policy (no caller fee override).
+    // Keep both 2-sat legs plus their 20% ceilings inside the six-sat cap.
+    let mut state = (*net.sender.state).clone();
+    state.lightning = Arc::new(RepricingFeeProvider {
+        wallet: Arc::clone(&net.sender.wallet),
+        dispatched_limits: std::sync::Mutex::new(Vec::new()),
+        lose_message_response: false,
+    });
+    net.sender.state = Arc::new(state);
+    net.sender.router = konsensus_api::build_router(Arc::clone(&net.sender.state))
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50_000))));
     let bob = net.bob_id;
     net.connect().await;
 
@@ -685,7 +748,7 @@ async fn a_contact_without_a_budget_needs_the_one_time_confirmation_once() {
         .post("/api/v1/messages/first-contact/quote", serde_json::json!({ "recipient": bob.to_hex() }))
         .await;
     assert_eq!(status, StatusCode::OK, "{quote}");
-    assert_eq!(quote["total_msat"], 14_000, "{quote}");
+    assert_eq!(quote["total_msat"], 4_800, "{quote}");
     let (status, grant) = net
         .sender
         .owner_confirm(
@@ -731,20 +794,20 @@ async fn failed_message_after_readmission_charges_admission_only_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_quote_is_reserved_into_the_grant_before_admission_pay() {
-    // Sender prices locally at 2_000; recipient quotes admission=7_000 and
-    // message=7_000. Both must be reserved against the grant before any pay
+    // Sender prices locally at 2_000; recipient quotes admission=3_000 and
+    // message=3_000. Both must be reserved against the grant before any pay
     // (Codex #111 finding 3) — previously admission paid then message refused.
-    let net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000))), 7_000).await;
+    let mut net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000))), 3_000).await;
     let bob = net.bob_id;
     net.connect().await;
     let (status, body) = net.sender.compose(&bob, "higher recipient price").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["amount_msat"], 7_000, "{body}");
-    assert_eq!(body["readmission_msat"], 7_000, "{body}");
-    assert_eq!(net.sender.paid_out().await, vec![7_000, 7_000]);
+    assert_eq!(body["amount_msat"], 3_000, "{body}");
+    assert_eq!(body["readmission_msat"], 3_000, "{body}");
+    assert_eq!(net.sender.paid_out().await, vec![3_000, 3_000]);
     let grant = net.sender.grant();
-    assert_eq!(grant.used_msat, 14_000);
-    assert_eq!(grant.used_by_recipient.get(&bob.to_hex()), Some(&14_000));
+    assert_eq!(grant.used_msat, 6_000);
+    assert_eq!(grant.used_by_recipient.get(&bob.to_hex()), Some(&6_000));
     net.shutdown();
 }
 
@@ -807,7 +870,7 @@ impl LightningProvider for UnsettledAdmission {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_admission_releases_the_undispatched_message_reservation() {
-    let net = two_nodes_with_outcome(|bob| Some(budget(bob, Some(50_000))), 2_000, Some(AdmissionFailure::Failed)).await;
+    let mut net = two_nodes_with_outcome(|bob| Some(budget(bob, Some(50_000))), 2_000, Some(AdmissionFailure::Failed)).await;
     let bob = net.bob_id;
     net.connect().await;
     let (status, body) = net.sender.compose(&bob, "admission failed").await;
@@ -821,7 +884,7 @@ async fn failed_admission_releases_the_undispatched_message_reservation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_admission_keeps_only_its_own_reservation() {
-    let net = two_nodes_with_outcome(|bob| Some(budget(bob, Some(50_000))), 2_000, Some(AdmissionFailure::Unknown)).await;
+    let mut net = two_nodes_with_outcome(|bob| Some(budget(bob, Some(50_000))), 2_000, Some(AdmissionFailure::Unknown)).await;
     let bob = net.bob_id;
     net.connect().await;
     let (status, body) = net.sender.compose(&bob, "admission unknown").await;
@@ -836,7 +899,7 @@ async fn unknown_admission_keeps_only_its_own_reservation() {
 // The grant per-call limit covers admission plus the message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn regression_readmission_respects_aggregate_grant_per_call_limit() {
-    let net = two_nodes(|bob| Some(budget(bob, Some(50_000)).per_call(3_000))).await;
+    let mut net = two_nodes(|bob| Some(budget(bob, Some(50_000)).per_call(3_000))).await;
     net.connect().await;
     let (status, body) = net.sender.compose(&net.bob_id, "one call").await;
     let paid: u64 = net.sender.paid_out().await.iter().sum();
@@ -847,7 +910,7 @@ async fn regression_readmission_respects_aggregate_grant_per_call_limit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn regression_recovered_admission_emits_one_n2_event() {
-    let net = two_nodes_with_outcome(|bob| Some(budget(bob, Some(50_000))), 2_000,
+    let mut net = two_nodes_with_outcome(|bob| Some(budget(bob, Some(50_000))), 2_000,
         Some(AdmissionFailure::SettledResponseLost)).await;
     net.connect().await;
     let (status, body) = net.sender.compose(&net.bob_id, "lost response").await;
@@ -969,7 +1032,7 @@ async fn capped_reconnect_no_double_pay_on_retry_or_flap() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn capped_paired_send_cannot_add_unquoted_reconnection_debit() {
-    let net = two_nodes(|bob| Some(budget(bob, Some(50_000)))).await;
+    let mut net = two_nodes(|bob| Some(budget(bob, Some(50_000)))).await;
     let bob = net.bob_id;
     net.connect().await;
     // Cap covers the message only (zero fee); re-admission quote does not fit.
@@ -1052,7 +1115,7 @@ async fn capped_reconnect_readmission_refusal_carries_a_stable_reason() {
 async fn capped_reconnect_refuses_when_quoted_all_in_exceeds_grant_before_pay() {
     // Sender prices locally at 2_000; recipient quotes admission=3_000 and
     // message=3_000. Cap 6_000 fits the quote; grant per_call 5_000 does not.
-    let net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000)).per_call(5_000)), 3_000).await;
+    let mut net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000)).per_call(5_000)), 3_000).await;
     net.connect().await;
     let (status, body) = net.sender.compose_capped(&net.bob_id, "higher quote", 6_000).await;
     let paid = net.sender.paid_out().await;
@@ -1069,7 +1132,7 @@ async fn capped_reconnect_refuses_when_quoted_all_in_exceeds_grant_before_pay() 
 /// must not be paid after reconnect when the replacement refuses fresh quotes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn capped_reconnect_rejects_quote_from_prior_connection_generation() {
-    let net = two_nodes(|_| None).await;
+    let mut net = two_nodes(|_| None).await;
     net.connect().await;
     let (status, body) = net
         .sender
@@ -1094,8 +1157,8 @@ async fn capped_reconnect_rejects_quote_from_prior_connection_generation() {
     );
 }
 
-/// #111 review finding 2: a wallet whose routing ceiling is one principal's
-/// worth, recording every ceiling a dispatch was authorized with.
+/// #111 review finding 2: a wallet whose routing ceiling is 20% of the
+/// principal, recording every ceiling a dispatch was authorized with.
 struct RepricingFeeProvider {
     wallet: Arc<SharedMockProvider>,
     dispatched_limits: std::sync::Mutex<Vec<u64>>,
@@ -1108,7 +1171,7 @@ impl LightningProvider for RepricingFeeProvider {
     fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy {
         konsensus_core::traits::lightning::RoutingFeePolicy {
             minimum_msat: 0,
-            proportional_millionths: 1_000_000,
+            proportional_millionths: 200_000,
             maximum_msat: 10_000,
         }
     }
@@ -1160,12 +1223,12 @@ impl LightningProvider for RepricingFeeProvider {
 /// ones actually given to the wallet, never the stale local price's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repriced_readmission_reports_the_fee_ceilings_it_authorized() {
-    // The sender's cached/local message price is 2,000. The peer quotes 3,000
-    // admission + 3,000 message. The policy allows one principal's worth of
-    // routing fees per dispatch, so the actual authorized sum is 6,000.
+    // The sender's cached/local message price is 2,000. The peer quotes 2,500
+    // admission + 2,500 message. The policy allows 20% routing fees
+    // per dispatch: 500 + 500 msat, within the 6,000-msat all-in call cap.
     let mut net = two_nodes_with_price(
         |bob| Some(budget(bob, Some(50_000))),
-        3_000,
+        2_500,
     ).await;
     let provider = Arc::new(RepricingFeeProvider {
         wallet: Arc::clone(&net.sender.wallet),
@@ -1186,7 +1249,7 @@ async fn repriced_readmission_reports_the_fee_ceilings_it_authorized() {
             "recipient": net.bob_id.to_hex(),
             "kind": konsensus_core::kind::KIND_CHAT,
             "plaintext": "fresh price must update the reported fee allowance",
-            "max_total_msat": 12_000
+            "max_total_msat": 6_000
         }),
     ).await;
     let paid = net.sender.paid_out().await;
@@ -1195,9 +1258,9 @@ async fn repriced_readmission_reports_the_fee_ceilings_it_authorized() {
     net.shutdown();
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(paid, vec![3_000, 3_000], "{body}");
-    assert_eq!(limits, vec![3_000, 3_000], "{body}");
-    assert_eq!(grant_used, 6_000, "mock actual routing fee is zero");
+    assert_eq!(paid, vec![2_500, 2_500], "{body}");
+    assert_eq!(limits, vec![500, 500], "{body}");
+    assert_eq!(grant_used, 5_000, "mock actual routing fee is zero");
     assert_eq!(
         body["max_routing_fee_msat"],
         serde_json::json!(limits.iter().sum::<u64>()),
@@ -1209,7 +1272,7 @@ async fn repriced_readmission_reports_the_fee_ceilings_it_authorized() {
 /// reports the ceilings given to the wallet (admission + fresh message price).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repriced_readmission_error_reports_the_fee_ceilings_it_authorized() {
-    let mut net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000))), 3_000).await;
+    let mut net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000))), 2_500).await;
     let provider = Arc::new(RepricingFeeProvider {
         wallet: Arc::clone(&net.sender.wallet),
         dispatched_limits: std::sync::Mutex::new(Vec::new()),
@@ -1227,13 +1290,13 @@ async fn repriced_readmission_error_reports_the_fee_ceilings_it_authorized() {
             "recipient": net.bob_id.to_hex(),
             "kind": konsensus_core::kind::KIND_CHAT,
             "plaintext": "fresh price, unknown outcome",
-            "max_total_msat": 12_000
+            "max_total_msat": 6_000
         }),
     ).await;
     let limits = provider.dispatched_limits.lock().unwrap().clone();
     net.shutdown();
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["state"], "payment_unknown", "{body}");
-    assert_eq!(limits, vec![3_000, 3_000], "{body}");
-    assert_eq!(body["max_routing_fee_msat"], serde_json::json!(6_000), "{body}");
+    assert_eq!(limits, vec![500, 500], "{body}");
+    assert_eq!(body["max_routing_fee_msat"], serde_json::json!(1_000), "{body}");
 }

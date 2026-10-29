@@ -16,6 +16,9 @@ mod private_forwarding;
 #[cfg(unix)]
 #[path = "regtest/three_node.rs"]
 mod three_node;
+#[cfg(unix)]
+#[path = "regtest/paid_call.rs"]
+mod paid_call;
 
 async fn wait<F, Fut>(label: &str, mut check: F)
 where
@@ -366,7 +369,7 @@ async fn real_ldk_regtest_e2e() {
     let (status, body) = alice
         .post(
             "/api/v1/payments/pay",
-            json!({"bolt11": over.bolt11, "max_routing_fee_msat": fee_b - 1}),
+            json!({"request_id": "regtest-over-ceiling", "bolt11": over.bolt11, "max_routing_fee_msat": fee_b - 1}),
             false,
         )
         .await;
@@ -400,17 +403,42 @@ async fn real_ldk_regtest_e2e() {
     let (status, body) = alice
         .post(
             "/api/v1/payments/pay",
-            json!({"bolt11": capped.bolt11, "max_routing_fee_msat": fee_b}),
+            json!({"request_id": "regtest-fee-capped", "bolt11": capped.bolt11, "max_routing_fee_msat": fee_b}),
             false,
         )
         .await;
-    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    // Dispatched: `200 settled` once the backend reports it, `202 in_flight`
+    // while the HTLC is still out. Never a preimage before settlement.
+    assert!(
+        status == axum::http::StatusCode::OK || status == axum::http::StatusCode::ACCEPTED,
+        "{status}: {body}"
+    );
+    if status == axum::http::StatusCode::ACCEPTED {
+        assert_eq!(body["status"], "in_flight", "{body}");
+        assert_eq!(body["preimage"], "", "{body}");
+    } else {
+        assert_eq!(body["status"], "settled", "{body}");
+    }
     println!(
         "fee-capped pay response: {body}; A used {} msat",
         alice.used()
     );
     settle(&a, &capped.payment_hash).await;
     settle(&b, &capped.payment_hash).await;
+    // The same request_id now answers settled from the record or the backend,
+    // with the proof, and dispatches nothing again.
+    let (status, replay) = alice
+        .post(
+            "/api/v1/payments/pay",
+            json!({"request_id": "regtest-fee-capped", "bolt11": capped.bolt11, "max_routing_fee_msat": fee_b}),
+            false,
+        )
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{replay}");
+    assert_eq!(replay["status"], "settled", "{replay}");
+    assert_eq!(replay["replayed"], true, "{replay}");
+    assert_eq!(replay["payment_hash"], capped.payment_hash, "{replay}");
+    assert_eq!(replay["preimage"].as_str().map(str::len), Some(64), "{replay}");
     steps.pass("fee-capped payment (cap == C's fee) settled");
 
     // Reconciliation, msat-exact, from real LDK payment records and channels.
@@ -1705,7 +1733,7 @@ async fn real_ldk_predispatch_refusal() {
         .post(
             "/api/v1/payments/pay",
             json!({
-                "bolt11": invoice.bolt11, "max_routing_fee_msat": 37
+                "request_id": "regtest-no-route", "bolt11": invoice.bolt11, "max_routing_fee_msat": 37
             }),
             false,
         )
@@ -2295,7 +2323,7 @@ async fn mexico_demo_rehearsal() {
     let (status, body) = alice
         .post(
             "/api/v1/payments/pay",
-            json!({"bolt11": over.bolt11, "max_routing_fee_msat": fee_b - 1}),
+            json!({"request_id": "regtest-over-ceiling", "bolt11": over.bolt11, "max_routing_fee_msat": fee_b - 1}),
             false,
         )
         .await;

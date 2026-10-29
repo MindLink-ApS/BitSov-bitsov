@@ -85,9 +85,12 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      - name: Read Rust toolchain pin
+        id: rust-toolchain
+        run: echo "channel=$(bash scripts/rust-toolchain-channel.sh)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (upstream has no semver tags)
         with:
-          toolchain: stable
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
 
       # Cache compiled dependencies as well as downloads. rust-cache includes
       # Cargo.lock, the compiler, and the runner platform in its cache key.

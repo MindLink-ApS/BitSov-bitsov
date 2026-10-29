@@ -19,7 +19,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use super::{Inner, PairingError, PairingService, SpendGrant, ELEVATION_TTL_SECS};
+use super::{Inner, PairingError, PairingRefusal, PairingService, SpendGrant, ELEVATION_TTL_SECS};
 use crate::auth::Scope;
 use crate::spend_budget::{GrantBudget, GrantView, MAX_SPEND_GRANT_TTL_SECS};
 
@@ -153,6 +153,20 @@ impl std::fmt::Debug for DeviceSas {
         f.write_str("DeviceSas([REDACTED])")
     }
 }
+/// What an owner-authenticated claim-code display may show. Carries no secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimWindow {
+    /// A claim-bound enrollment awaits the code until `expires_at` (Unix seconds).
+    Open {
+        expires_at: i64,
+        device_name: String,
+    },
+    /// The box is claimed and no claim-bound enrollment is pending.
+    Claimed,
+    /// Three SAS mismatches closed claim-bound enrollment until restart.
+    Closed,
+}
+
 impl PendingDeviceKey {
     pub(super) fn sas_ttl_secs(&self) -> i64 {
         if self.sas_version == Some(2) {
@@ -314,7 +328,10 @@ pub fn registration_message(node: &str, client_id: &str, public_key_hex: &str) -
 
 /// Exact bytes a device signs for a relation intent. `node` and `client_id`
 /// come from the node's own state and the caller's token, never the body, so
-/// a signature cannot be replayed to another node or pairing.
+/// a signature cannot be replayed to another node or pairing. V1 has no epoch
+/// field: the server checks the key record against the token epoch. Re-approving
+/// the same public key in a new epoch can accept an unused intent still within
+/// the clock window.
 pub fn intent_message(node: &str, client_id: &str, intent: &RelationIntent) -> String {
     format!(
         "bitsov-relation-intent-v1\nnode:{node}\nclient:{client_id}\ndevice:{}\npeer:{}\nlevel:{}\n\
@@ -1252,29 +1269,45 @@ impl PairingService {
         intent: &RelationIntent,
         signature_hex: &str,
     ) -> Result<RelationIntentOutcome, PairingError> {
+        self.apply_relation_intent_with_reason(client_id, epoch, intent, signature_hex)
+            .map_err(|refusal| refusal.error)
+    }
+
+    pub(crate) fn apply_relation_intent_with_reason(
+        &self,
+        client_id: &str,
+        epoch: u64,
+        intent: &RelationIntent,
+        signature_hex: &str,
+    ) -> Result<RelationIntentOutcome, PairingRefusal> {
         if !self.owner_control_enabled && !self.local_owner_device {
-            return Err(PairingError::OwnerChannelUnavailable);
+            return Err(PairingError::OwnerChannelUnavailable.into());
         }
         self.device_authority()?;
         let peer = intent.peer.to_ascii_lowercase();
         if !is_hex(&peer, 64) || peer != intent.peer {
-            return Err(PairingError::Malformed(
-                "peer must be a lowercase 64-hex node id".into(),
-            ));
+            return Err(
+                PairingError::Malformed("peer must be a lowercase 64-hex node id".into()).into(),
+            );
         }
         if !is_hex(&intent.nonce, 32) {
             return Err(PairingError::Malformed(
                 "nonce must be 16 random bytes, lowercase hex".into(),
-            ));
+            )
+            .into());
         }
         if intent.level != LEVEL_CONTACT {
-            return Err(PairingError::NotGrantable(
-                "only Contact (level 1) envelopes are signed yet".into(),
+            return Err(PairingRefusal::new(
+                PairingError::NotGrantable(
+                    "only Contact (level 1) envelopes are signed yet".into(),
+                ),
+                "cap_exceeded",
             ));
         }
         if !(RELATION_MIN_WINDOW_SECS..=RELATION_MAX_WINDOW_SECS).contains(&intent.window_secs) {
-            return Err(PairingError::Malformed(
-                "window must be between 1 minute and 24 hours".into(),
+            return Err(PairingRefusal::new(
+                PairingError::Malformed("window must be between 1 minute and 24 hours".into()),
+                "cap_exceeded",
             ));
         }
         if intent.budget_msat == 0
@@ -1282,8 +1315,11 @@ impl PairingService {
             || intent.per_act_max_msat == 0
             || intent.per_act_max_msat > intent.budget_msat
         {
-            return Err(PairingError::Malformed(
-                "budget must be 1 msat to 100,000 sats, and per act at most the budget".into(),
+            return Err(PairingRefusal::new(
+                PairingError::Malformed(
+                    "budget must be 1 msat to 100,000 sats, and per act at most the budget".into(),
+                ),
+                "cap_exceeded",
             ));
         }
 
@@ -1291,7 +1327,12 @@ impl PairingService {
         // signature check. Phase 3, under the lock again: re-check and write.
         let (node, key) = {
             let inner = self.lock();
-            let key = self.intent_key(&inner, client_id, epoch, &intent.device_key_id)?;
+            let key = self
+                .intent_key(&inner, client_id, epoch, &intent.device_key_id)
+                .map_err(|error| match error {
+                    PairingError::PairingInvalid(_) => PairingRefusal::new(error, "wrong_epoch"),
+                    _ => error.into(),
+                })?;
             (inner.identity_fingerprint.clone(), key)
         };
         let raw = parse_public_key(&key.public_key)?;
@@ -1305,13 +1346,22 @@ impl PairingService {
         let now = chrono::Utc::now().timestamp();
         if (i128::from(now) - i128::from(intent.issued_at)).abs() > i128::from(INTENT_MAX_SKEW_SECS)
         {
-            return Err(PairingError::Expired);
+            return Err(PairingError::Expired.into());
         }
         if inner.identity_fingerprint != node
-            || self.intent_key(&inner, client_id, epoch, &intent.device_key_id)? != key
+            || self
+                .intent_key(&inner, client_id, epoch, &intent.device_key_id)
+                .map_err(|error| match error {
+                    PairingError::PairingInvalid(_) => PairingRefusal::new(error, "wrong_epoch"),
+                    _ => error.into(),
+                })?
+                != key
         {
-            return Err(PairingError::NotGrantable(
-                "the device key changed while checking; sign again".into(),
+            return Err(PairingRefusal::new(
+                PairingError::NotGrantable(
+                    "the device key changed while checking; sign again".into(),
+                ),
+                "key_changed",
             ));
         }
         // A device intent must not reset a console grant's breakers, including
@@ -1323,9 +1373,9 @@ impl PairingService {
                 && g.is_live(now)
                 && g.budget.as_ref().is_some_and(|b| !b.recipients_only)
         }) {
-            return Err(PairingError::Malformed(
+            return Err(PairingRefusal::new(PairingError::Malformed(
                 "a live console grant must be revoked through the owner console before opening a relation grant".into(),
-            ));
+            ), "console_grant_live"));
         }
         let before = (inner.file.grants.clone(), inner.file.intent_nonces.clone());
 
@@ -1335,7 +1385,10 @@ impl PairingService {
             .intent_nonces
             .retain(|_, (_, at)| *at > now - 3600 - INTENT_MAX_SKEW_SECS);
         if inner.file.intent_nonces.contains_key(&nonce_key) {
-            return Err(PairingError::BadProof);
+            return Err(PairingRefusal::new(
+                PairingError::BadProof,
+                "replayed_nonce",
+            ));
         }
         let recent = inner
             .file
@@ -1344,7 +1397,7 @@ impl PairingService {
             .filter(|(c, at)| c == client_id && *at > now - 3600)
             .count();
         if recent >= RELATION_INTENTS_PER_HOUR {
-            return Err(PairingError::TooManyPending);
+            return Err(PairingError::TooManyPending.into());
         }
 
         let expires = now + intent.window_secs;
@@ -1409,7 +1462,7 @@ impl PairingService {
         if let Err(e) = self.persist(&mut inner.file) {
             // Never leave authority live in memory that the disk did not take.
             (inner.file.grants, inner.file.intent_nonces) = before;
-            return Err(e);
+            return Err(e.into());
         }
         tracing::info!(
             client_id,
@@ -1424,6 +1477,57 @@ impl PairingService {
             envelope_id,
             grant: view,
         })
+    }
+
+    /// An enrolled owner device: any registered key of this pairing at its
+    /// current epoch whose owner approval still verifies. A plain read/receive
+    /// pairing, a provisional enrollment or a retired key has no such key.
+    pub fn owner_device_for(&self, client_id: &str, epoch: u64) -> Result<DeviceKey, PairingError> {
+        let inner = self.lock();
+        let key_ids: Vec<String> = inner
+            .file
+            .device_keys
+            .iter()
+            .filter(|k| k.client_id == client_id && k.epoch == epoch)
+            .map(|k| k.key_id.clone())
+            .collect();
+        let mut refusal =
+            PairingError::NotGrantable("no enrolled owner device for this pairing".into());
+        for key_id in key_ids {
+            match self.intent_key(&inner, client_id, epoch, &key_id) {
+                Ok(key) => return Ok(key),
+                Err(e) => refusal = e,
+            }
+        }
+        Err(refusal)
+    }
+
+    /// Whether a claim-bound (SAS v1) enrollment is waiting for the box claim
+    /// code. Owner-only callers use this to decide whether to display the code;
+    /// it never returns the code, its commitment, the nonce or the digest.
+    pub fn claim_window(&self) -> ClaimWindow {
+        let inner = self.lock();
+        if inner.sas_failures >= 3 {
+            return ClaimWindow::Closed;
+        }
+        let now = chrono::Utc::now().timestamp();
+        inner
+            .file
+            .pending_device_keys
+            .iter()
+            .filter(|op| op.sas_version == Some(1) && op.expires_at > now)
+            .find_map(|op| {
+                let sas = op.sas.as_ref().filter(|s| !s.confirmed)?;
+                let remaining = op.sas_ttl_secs().saturating_sub(
+                    i64::try_from(sas.created_at.elapsed().as_secs()).unwrap_or(i64::MAX),
+                );
+                let expires_at = op.expires_at.min(now.saturating_add(remaining));
+                (expires_at > now).then(|| ClaimWindow::Open {
+                    expires_at,
+                    device_name: op.name.clone(),
+                })
+            })
+            .unwrap_or(ClaimWindow::Claimed)
     }
 
     /// The registered key an intent names, for this client at its current

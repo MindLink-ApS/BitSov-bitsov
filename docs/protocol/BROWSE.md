@@ -205,7 +205,10 @@ senders that send paid envelopes directly still receive the existing bound
   and `references` names the request id. The requester's gate accepts a reply
   only against its own outstanding paid request: same peer, expected kind,
   within 5 minutes. The gate then consumes that request. A reply never mints a
-  payment.
+  payment. The requester records the outstanding request in the same database
+  transaction that commits the paid request envelope, and restores it on every
+  resend, so no crash or resend can leave a paid request whose reply is
+  unbindable.
 - **A bound reply admits nothing.** The requester paid; the replying node did
   not. The requester's node therefore does not promote the replying
   connection to privileged, and does not count the reply as an admission.

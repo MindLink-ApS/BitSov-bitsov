@@ -177,7 +177,7 @@ async fn custom_config() {
     // call's signalling keeps the realtime category price.
     assert_eq!(e.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 10_000);
     assert_eq!(e.get_price_msat(konsensus_core::kind::KIND_CALL_ANSWER).await.unwrap(), 90);
-    assert_eq!(e.category_price_overrides(), Some(vec![KIND_LONGFORM, KIND_CALL_INVITE]));
+    assert_eq!(e.category_price_overrides(), Some(vec![KIND_LONGFORM, KIND_CALL_INVITE, KIND_CALL_BLOCK]));
 }
 
 #[tokio::test]
@@ -193,7 +193,7 @@ async fn call_offer_uses_call_msat_and_is_advertised_per_kind() {
     // No override, no per-kind entry.
     let same = StaticPricingEngine::new(StaticPricingConfig { call_msat: 50, ..Default::default() });
     assert!(!crate::peer_prices::build_price_table(&same).await.contains_key("kind:400"));
-    assert_eq!(same.category_price_overrides(), Some(vec![KIND_LONGFORM]));
+    assert_eq!(same.category_price_overrides(), Some(vec![KIND_LONGFORM, KIND_CALL_BLOCK]));
 }
 
 #[test]
@@ -218,4 +218,20 @@ fn deny_unknown_fields_rejects_typos() {
         err.contains("unknown field"),
         "error should mention unknown field: {err}"
     );
+}
+
+#[tokio::test]
+async fn call_block_uses_receiver_tariff_and_advertises_kind_override() {
+    let callee = StaticPricingEngine::new(serde_json::from_value(serde_json::json!({
+        "chat_msat": 10, "longform_msat": 50, "calendar_msat": 25,
+        "file_ref_msat": 100, "control_msat": 1, "call_block_msat": 23_000
+    })).unwrap());
+    assert_eq!(callee.get_price_msat(404).await.unwrap(), 23_000);
+    assert!(callee.category_price_overrides().unwrap().contains(&404));
+    let table = crate::peer_prices::build_price_table(&callee).await;
+    assert_eq!(table.get("kind:404"), Some(&23_000));
+    let cache = crate::peer_prices::PeerPriceCache::new();
+    let peer = konsensus_core::NodeId::from_bytes([7; 32]);
+    cache.update_kind_price(peer, 404, 23_000, 100).await;
+    assert_eq!(cache.get_peer_price(&peer, 404).await, Some(23_000));
 }

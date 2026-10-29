@@ -145,6 +145,23 @@ async fn flush_peer(
             warn!(error = %e, "cannot persist dispatch intent");
             continue;
         }
+        // A paid web request (500/510) is only sent while its reply can be
+        // bound: restore the outstanding row a crash or reply consumed.
+        if let Some(expected) = konsensus_core::expected_reply_kind(envelope.kind) {
+            let outstanding = konsensus_core::OutstandingWebRequest {
+                request_id: envelope.id,
+                peer: *peer_id,
+                expected_reply_kind: expected,
+                expires_at_ms: now_ms.saturating_add(konsensus_core::OUTSTANDING_TTL_MS),
+            };
+            if let Err(e) = storage
+                .record_outgoing_web_request(&envelope.payment_proof.payment_hash, outstanding)
+                .await
+            {
+                warn!(error = %e, msg_id = %message_id, "cannot restore web request reply binding; not sending");
+                continue;
+            }
+        }
         // Record before send: ACK can arrive before the write returns.
         send_timestamps.lock().await.insert(*message_id, std::time::Instant::now());
         match transport.send(peer_id, &envelope).await {

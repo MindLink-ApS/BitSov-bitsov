@@ -46,6 +46,12 @@ pub struct ComposeRequest {
     pub wait_ack_ms: Option<u64>,
     #[serde(default)]
     pub max_routing_fee_msat: Option<u64>,
+    /// Kind-400 consent ceiling for a payable 60-second block.
+    #[serde(default)]
+    pub max_block_msat: Option<u64>,
+    /// Kind-400 consent ceiling for the complete block hold, including fees.
+    #[serde(default)]
+    pub max_hold_msat: Option<u64>,
     #[serde(default)]
     pub max_total_msat: Option<u64>,
     #[serde(default)]
@@ -222,10 +228,10 @@ const PAYMENT_POLL_INITIAL: Duration = Duration::from_millis(50);
 /// may settle and emit the terminal hint before the dispatch call returns; a
 /// subscription taken afterwards would never see it. Taken first, the hint is
 /// buffered and ends the first wait at once.
-struct SettlementUpdates(Option<futures::stream::BoxStream<'static, String>>);
+pub(crate) struct SettlementUpdates(Option<futures::stream::BoxStream<'static, String>>);
 
 impl SettlementUpdates {
-    fn subscribe(lightning: &dyn LightningProvider) -> Self {
+    pub(crate) fn subscribe(lightning: &dyn LightningProvider) -> Self {
         Self(lightning.outgoing_payment_updates())
     }
 }
@@ -234,24 +240,33 @@ impl SettlementUpdates {
 /// backoff timer or at the backend's update hint for this payment, whichever
 /// comes first; the caller then re-reads `get_payment_status`, which stays the
 /// only thing it acts on (a hint is never proof of settlement).
-struct SettlementPoll {
+pub(crate) struct SettlementPoll {
     updates: Option<futures::stream::BoxStream<'static, String>>,
     payment_hash: String,
     next: Duration,
     started: tokio::time::Instant,
+    deadline: Duration,
 }
 
 impl SettlementPoll {
-    fn new(updates: SettlementUpdates, payment_hash: &str) -> Self {
+    pub(crate) fn new(updates: SettlementUpdates, payment_hash: &str) -> Self {
         Self {
             updates: updates.0,
             payment_hash: payment_hash.to_owned(),
             next: PAYMENT_POLL_INITIAL,
             started: tokio::time::Instant::now(),
+            deadline: PAYMENT_SETTLE_TIMEOUT,
         }
     }
 
-    async fn wait(&mut self) {
+    /// Give up sooner than the message default. The direct payment routes
+    /// answer `202 in_flight` after this window instead of blocking.
+    pub(crate) fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    pub(crate) async fn wait(&mut self) {
         use futures::StreamExt;
         let delay = self.next;
         self.next = (self.next * 2).min(PAYMENT_POLL_INTERVAL);
@@ -274,8 +289,8 @@ impl SettlementPoll {
         sleep.await;
     }
 
-    fn timed_out(&self) -> bool {
-        self.started.elapsed() >= PAYMENT_SETTLE_TIMEOUT
+    pub(crate) fn timed_out(&self) -> bool {
+        self.started.elapsed() >= self.deadline
     }
 }
 
@@ -502,11 +517,11 @@ pub(crate) async fn create_metered_payment_proof(
     // The payment gate accepts overpayment, so this is safe.
     let payment_amount_msat = price_msat.max(MIN_INVOICE_AMOUNT_MSAT);
 
-    // Try keysend first — eliminates the invoice round-trip. A caller that
-    // forbids re-admission must ask the recipient for an invoice so its live
-    // connection gate can refuse before any payment is dispatched.
+    // Call blocks require the callee's stop-early check and invoice binding.
+    // A caller that forbids re-admission also needs the recipient's invoice
+    // gate to refuse before any payment is dispatched.
     let peer_ln_pubkey = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
-    if !readmission.forbidden {
+    if !debit.is_call_block() && !readmission.forbidden {
         if let Some(ln_pubkey) = peer_ln_pubkey {
             match try_keysend(state, &ln_pubkey, payment_amount_msat, peer_id, debit).await {
                 Ok(KeysendOutcome::Settled(proof)) => return Ok(proof),
@@ -581,6 +596,9 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
     match refusal.as_deref() {
         Some(invoice_refusal::ADMISSION_REQUIRED) => admission_refusal(peer_id),
         Some("disk_low") => ApiError::NotDispatched("disk_low".into()),
+        Some(invoice_refusal::CALL_BLOCK_UNPAYABLE) => ApiError::NotDispatched(
+            "callee refused the call block invoice: deadline margin or call sequence; nothing was paid".into()
+        ).with_reason("call_block_unpayable"),
         Some(reason) => ApiError::Lightning(format!(
             "Recipient refused the invoice request: {reason}"
         )),
@@ -873,7 +891,7 @@ async fn create_payment_proof_via_invoice(
     let frame = Frame::RequestInvoice {
         request_id: request_id.clone(),
         amount_msat: invoice_amount_msat,
-        purpose: "konsensus message".into(),
+        purpose: debit.invoice_purpose(),
     };
     let frame_bytes = frame
         .to_bytes()
@@ -3439,14 +3457,14 @@ pub(super) async fn compose_message_with_policy(
         // Calls: reserved before any quote or payment and resolved afterwards,
         // under the operation's lock; the paid transition is published at
         // settlement (compose_peer).
-        super::operations::compose_call(auth, state, req, references).await
+        super::operations::compose_call(auth, state, req, references, policy).await
     } else {
         super::operations::compose(auth, state, req, references, policy).await
     }
 }
 
 pub(super) async fn compose_peer(
-    auth: MeteredSpend, state: Arc<AppState>, req: ComposeRequest,
+    auth: MeteredSpend, state: Arc<AppState>, mut req: ComposeRequest,
     references: Vec<MessageId>, operation: super::operations::Operation,
     policy: ComposePolicy,
 ) -> Result<Json<ComposeResponse>, ApiError> {
@@ -3505,8 +3523,59 @@ pub(super) async fn compose_peer(
                 ).with_reason("call_needs_contact"));
             }
             // The offer pays the callee's own call price, asked of it just now.
-            if req.kind == konsensus_core::kind::KIND_CALL_INVITE {
-                price_msat = super::caps::payable(crate::calls::peer_call_price(&state, &peer_id).await?);
+            if matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK) {
+                price_msat = super::caps::payable(crate::calls::peer_call_kind_price(&state, &peer_id, req.kind).await?);
+            }
+        }
+        if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+            crate::calls::revalidate_outgoing_block(&state, &peer_id, &req.plaintext).await?;
+        }
+        let offer_consent = req.kind == konsensus_core::kind::KIND_CALL_INVITE
+            && (req.max_block_msat.is_some() || req.max_hold_msat.is_some());
+        if (auth.is_metered() && matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK)) || offer_consent {
+            let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            let existing = state.pairing.as_ref().and_then(|s| s.call_spend_status(&peer_id.to_hex(), &signal.call_id));
+            if existing.as_ref().is_some_and(|hold| hold.closed) {
+                return Err(ApiError::BadRequest("call reservation is closed; start a new call".into())
+                    .with_reason("call_reservation_closed"));
+            }
+            if existing.is_none() || offer_consent {
+                let block_price = if req.kind == konsensus_core::kind::KIND_CALL_BLOCK { price_msat }
+                    else { super::caps::payable(crate::calls::peer_call_kind_price(&state, &peer_id, konsensus_core::kind::KIND_CALL_BLOCK).await?) };
+                let fee = state.lightning.routing_fee_policy().ceiling(block_price, req.max_routing_fee_msat);
+                let minutes = crate::calls::call_max_minutes(&state, &peer_id, &signal.call_id);
+                // Check before any ledger reservation or offer payment. A retry
+                // cannot consent to less than either the live price or a hold
+                // already pinned by this call's earlier attempt.
+                if offer_consent {
+                    let price = block_price.max(existing.as_ref().map_or(0, |hold| hold.per_block_msat));
+                    if req.max_block_msat.is_some_and(|cap| price > cap) {
+                        return Err(ApiError::NotDispatched("call block price exceeds caller consent; nothing was paid".into())
+                            .with_reason("call_price_above_consent"));
+                    }
+                    // Widen before comparing: even a u64 quote whose bundle
+                    // overflows must produce the caller's typed consent refusal.
+                    let hold = ((u128::from(block_price) + u128::from(fee)) * u128::from(minutes))
+                        .max(u128::from(existing.as_ref().map_or(0, |hold| hold.reserved_msat)));
+                    if req.max_hold_msat.is_some_and(|cap| hold > u128::from(cap)) {
+                        return Err(ApiError::NotDispatched("call reservation exceeds caller consent; nothing was paid".into())
+                            .with_reason("call_hold_above_consent"));
+                    }
+                }
+                if existing.is_none() {
+                    let terms = crate::spend_budget::CallSpendTerms::new(&peer_id.to_hex(), &signal.call_id, block_price, fee, minutes)
+                        .map_err(ApiError::BudgetExceeded)?;
+                    crate::calls::ensure_call_spend(&auth, &state, &peer_id, &signal, terms).await?;
+                }
+            }
+            if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+                let hold = state.pairing.as_ref().and_then(|s| s.call_spend_status(&peer_id.to_hex(), &signal.call_id))
+                    .ok_or_else(|| ApiError::BadRequest("call reservation unavailable".into()))?;
+                if price_msat > hold.per_block_msat {
+                    return Err(ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::CallPriceChanged));
+                }
+                req.max_routing_fee_msat = Some(req.max_routing_fee_msat.unwrap_or(u64::MAX).min(hold.per_block_fee_msat));
             }
         }
         // G1 × F1 (#85): an aggregate cap alone never lets a budget pay a
@@ -3526,13 +3595,23 @@ pub(super) async fn compose_peer(
 
         // Reject budget limits before advancing the ratchet or requesting an invoice.
         let peer_key = peer_id.to_hex();
-        let debit = auth.debit_operation(&state, vec![Charge {
+        let debit = if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+            let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            auth.debit_call_block(&state, &signal, &peer_key, price_msat,
+                state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat), &operation)
+        } else { auth.debit_operation(&state, vec![Charge {
             recipient: peer_key.clone(),
             amount_msat: if first_contact { cap.unwrap_or(ADMISSION_MAX_MSAT) } else { super::caps::all_in(&state, price_msat, req.max_routing_fee_msat)? },
-        }], confirmation, cap, &operation)
+        }], confirmation, cap, &operation) }
             .map_err(|e| e.with_routing_fee(state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat)))?
             .with_fee_limit(req.max_routing_fee_msat);
         let debit = debit.with_operation(operation.clone());
+        let debit = if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+            debit.for_call_block(peer_id, req.plaintext.clone())
+        } else if req.kind == konsensus_core::kind::KIND_CALL_INVITE && auth.is_metered() {
+            debit.for_call_offer(peer_id, req.plaintext.clone())
+        } else { debit };
         if let Err(error) = operation.attach_debit(&debit).await {
             // No payment/invoice future has been polled under this debit.
             debit.released(&peer_key);
@@ -3642,7 +3721,12 @@ pub(super) async fn compose_peer(
         ).references(references).build();
         operation.draft(draft, price_msat,
             debit.fee_limit(&state, price_msat).saturating_add(admission.fee_ceiling_msat),
-            admission.settled_msat.saturating_sub(admission.readmission_msat)).await?;
+            admission.settled_msat.saturating_sub(admission.readmission_msat),
+            if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+                let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                Some((signal.call_id, signal.seq.unwrap_or_default()))
+            } else { None }).await?;
 
         // Create payment proof — requests invoice from recipient's wallet (Principle 2).
         if let Some(mut attempt) = super::admission_journal::load(&state, &peer_id)? {
@@ -3654,7 +3738,7 @@ pub(super) async fn compose_peer(
         admission.current_dispatch = true;
         // Quoted capped re-admission is priced only for single-recipient chat.
         // Other kinds keep Some(0) refuse-before-quote when a cap is present.
-        let readmission_cap = if !policy.allow_readmission {
+        let readmission_cap = if !policy.allow_readmission || req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
             Some(0)
         } else if req.kind == konsensus_core::kind::KIND_CHAT {
             cap
@@ -3672,35 +3756,17 @@ pub(super) async fn compose_peer(
         let proof =
             konsensus_core::PaymentProof::new(payment_hash, preimage_bytes, amount_msat);
 
-        let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
         if crate::calls::is_call_kind(req.kind) {
             // Paid: publish the call transition before the envelope goes out.
             let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
-            crate::calls::commit_outgoing(state.storage.as_ref(), &peer_id, &req.plaintext, &operation.id, &request_hash).await;
+            crate::calls::commit_outgoing(state.storage.as_ref(), &peer_id, &req.plaintext, &operation.id, &request_hash).await
+                .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("paid call transition failed: {e}") })?;
         }
+        let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
 
-        if let Some(expected) = konsensus_core::expected_reply_kind(req.kind) {
-            let Recipient::Node(peer) = envelope.recipient else {
-                return Err(ApiError::BadRequest("web request recipient must be a node".into()));
-            };
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            state
-                .storage
-                .record_outgoing_web_request(
-                    &envelope.payment_proof.payment_hash,
-                    konsensus_core::OutstandingWebRequest {
-                        request_id: envelope.id,
-                        peer,
-                        expected_reply_kind: expected,
-                        expires_at_ms: now_ms.saturating_add(konsensus_core::OUTSTANDING_TTL_MS),
-                    },
-                )
-                .await
-                .map_err(|e| ApiError::Internal(format!("record web request: {e}")))?;
-        }
+        // A paid web request's outstanding-reply row was committed by
+        // `settled_envelope` in the same transaction as the envelope, and every
+        // resend refreshes it (`operations::resend`). Nothing to write here.
 
         // Cache plaintext (encrypted at rest) for API retrieval
         if let Some(ref cipher) = state.plaintext_cipher {
@@ -3776,6 +3842,7 @@ pub(super) async fn compose_peer(
             Err(ApiError::PaymentUnresolved(_)) if admission.readmission_blocks_message => debit.settled(&peer_key, admission.settled_msat.saturating_sub(admission.readmission_msat)),
             Err(ApiError::PaymentUnresolved(_)) if admission.current_dispatch => {},
             Err(ApiError::PaymentProofUnavailable { amount_msat, .. }) => debit.settled(&peer_key, amount_msat.saturating_sub(admission.readmission_msat)),
+            Err(_) if req.kind == konsensus_core::kind::KIND_CALL_BLOCK => operation.release_call_debit(&debit, &peer_key).await,
             Err(_) => debit.released(&peer_key),
         }
         let message_msat = admission.message_authorized.unwrap_or(price_msat);

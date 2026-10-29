@@ -566,6 +566,7 @@ auto_connect = false
     assert_eq!(config.pricing.control_msat, 1);
     assert_eq!(config.pricing.realtime_signal_msat, 50);
     assert_eq!(config.pricing.call_msat, 10_000);
+    assert_eq!(config.pricing.call_block_msat, 10_000);
     assert_eq!(config.payment_gate.verify_lightning_settlement, Some(true));
     assert_eq!(config.peers.len(), 2);
     assert_eq!(config.peers[0].label.as_deref(), Some("Alice"));
@@ -1496,6 +1497,20 @@ fn validate_zero_call_pricing_rejected() {
     );
     config.peers.clear();
     config.pricing.call_msat = 0;
+    let err = config.validate().unwrap_err();
+    assert!(err.to_string().contains("pricing"), "got: {err}");
+}
+
+#[test]
+fn validate_zero_call_block_pricing_rejected() {
+    let mnemonic = tempfile::NamedTempFile::new().unwrap();
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        mnemonic.path().to_path_buf(),
+        mnemonic.path().parent().unwrap(),
+    );
+    config.peers.clear();
+    config.pricing.call_block_msat = 0;
     let err = config.validate().unwrap_err();
     assert!(err.to_string().contains("pricing"), "got: {err}");
 }
@@ -3749,5 +3764,18 @@ fn mnemonic_secure_and_special_files_do_not_attempt_chmod() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     for path in [path.as_path(), Path::new("/dev/null")] {
         super::tighten_mnemonic_permissions(path, |_, _| panic!("must not chmod")).unwrap();
+    }
+}
+
+#[test]
+fn calls_duration_setting_defaults_and_rejects_out_of_bounds() {
+    let default: crate::config::CallsConfig = toml::from_str("").unwrap();
+    assert_eq!(serde_json::to_value(default).unwrap()["max_call_minutes"], 60);
+    for minutes in [1, 60, 240] {
+        let parsed: crate::config::CallsConfig = toml::from_str(&format!("max_call_minutes = {minutes}")).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap()["max_call_minutes"], minutes);
+    }
+    for minutes in [0, 241, -1] {
+        assert!(toml::from_str::<crate::config::CallsConfig>(&format!("max_call_minutes = {minutes}")).is_err());
     }
 }

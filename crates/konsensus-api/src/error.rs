@@ -6,6 +6,16 @@ use axum::Json;
 use serde::Serialize;
 use thiserror::Error;
 
+/// A fixed log-only classification, never part of the HTTP headers or body.
+#[derive(Clone, Copy)]
+pub(crate) struct RefusalReason(pub &'static str);
+
+pub(crate) fn refusal_response(response: impl IntoResponse, reason: &'static str) -> Response {
+    let mut response = response.into_response();
+    response.extensions_mut().insert(RefusalReason(reason));
+    response
+}
+
 /// API errors — converted to appropriate HTTP status codes.
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -199,6 +209,14 @@ impl ApiError {
             }));
         }
         if let ApiError::BudgetExceeded(refusal) = &self {
+            if matches!(
+                refusal,
+                crate::spend_budget::BudgetRefusal::PerCall { .. }
+                    | crate::spend_budget::BudgetRefusal::MessagingGrant
+            )
+            {
+                tracing::info!(reason = refusal.reason(), "grant spend refused");
+            }
             let remaining = match refusal {
                 crate::spend_budget::BudgetRefusal::Total { remaining_msat }
                 | crate::spend_budget::BudgetRefusal::Recipient { remaining_msat, .. } => {

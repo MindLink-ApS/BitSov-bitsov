@@ -1,11 +1,11 @@
-use bitcoin::{absolute, transaction, Amount, OutPoint, Transaction, TxIn, TxOut};
+use bitcoin::{absolute, transaction, Amount, FeeRate, OutPoint, Transaction, TxIn, TxOut};
 use konsensus_chain::recovery::{ChainTransaction, RecoveryChain};
 use konsensus_core::traits::chain::ChainError;
 use konsensus_lightning::{
     move_home::Plan,
     recover::{self, Job, Progress},
 };
-use konsensus_recovery::{FoundOutput, RecoveryKeys, RecoveryScript, Scanner};
+use konsensus_recovery::{FoundOutput, RecoveryError, RecoveryKeys, RecoveryScript, Scanner};
 use std::sync::Mutex;
 
 struct Chain {
@@ -13,12 +13,27 @@ struct Chain {
     outputs: Mutex<Vec<FoundOutput>>,
     transactions: Mutex<Vec<ChainTransaction>>,
     sent: Mutex<Vec<Transaction>>,
+    /// Number of scripts requested by each `scan` call, in order.
+    scanned: Mutex<Vec<usize>>,
 }
 #[async_trait::async_trait]
 impl Scanner for Chain {
     type Error = ChainError;
-    async fn scan(&self, _: &[RecoveryScript]) -> Result<Vec<FoundOutput>, ChainError> {
-        Ok(self.outputs.lock().unwrap().clone())
+    async fn scan(&self, scripts: &[RecoveryScript]) -> Result<Vec<FoundOutput>, ChainError> {
+        self.scanned.lock().unwrap().push(scripts.len());
+        // Like a real chain source, only outputs on the requested scripts are visible.
+        Ok(self
+            .outputs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| {
+                scripts
+                    .iter()
+                    .any(|s| s.script_pubkey == o.txout.script_pubkey)
+            })
+            .cloned()
+            .collect())
     }
 }
 #[async_trait::async_trait]
@@ -115,6 +130,7 @@ fn fixture() -> (tempfile::TempDir, RecoveryKeys, Chain, Plan) {
             confirmations: 1,
         }]),
         sent: Mutex::new(vec![]),
+        scanned: Mutex::new(vec![]),
     };
     let plan = Plan::new(
         "node".into(),
@@ -388,4 +404,369 @@ fn verification_resumes_only_its_designated_new_store() {
     assert!(resumed.begin_verification("another hub".into()).is_err());
     std::fs::remove_file(dir.path().join("RECOVERY_STORE")).unwrap();
     assert!(Job::load_or_begin(dir.path(), plan, vec![]).is_err());
+}
+
+#[tokio::test]
+async fn seed_only_passes_poll_discovered_scripts_until_the_sweep_confirms() {
+    let (dir, keys, chain, plan) = fixture();
+    let mut job = Job::load_or_begin(dir.path(), plan.clone(), vec![]).unwrap();
+    chain.outputs.lock().unwrap()[0].confirmations = 0;
+    // First pass: every derived script, hub close still unconfirmed.
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[2000]);
+    // Later passes poll only the discovered output's script.
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+    chain.outputs.lock().unwrap()[0].confirmations = 1;
+    let Progress::SweepPreview { sweep, inputs } =
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap()
+    else {
+        panic!("preview");
+    };
+    assert_eq!(
+        chain.scanned.lock().unwrap().as_slice(),
+        &[2000, 1, 1, 2000]
+    );
+    assert_eq!(inputs.len(), 1);
+    job.approve(&chain, sweep, inputs).await.unwrap();
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::Confirming { .. }
+    ));
+    // Broadcasting and confirming never scan the key space.
+    assert_eq!(
+        chain.scanned.lock().unwrap().as_slice(),
+        &[2000, 1, 1, 2000]
+    );
+    chain
+        .transactions
+        .lock()
+        .unwrap()
+        .last_mut()
+        .unwrap()
+        .confirmations = 6;
+    // Once the sweep confirms, the next pass scans everything again so a late
+    // hub close on another channel is not stranded by the narrowed focus.
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::SelfTest
+    ));
+    let scanned = chain.scanned.lock().unwrap().clone();
+    assert_eq!(scanned.last(), Some(&2000), "{scanned:?}");
+    assert_eq!(scanned.iter().filter(|n| **n == 2000).count(), 3);
+}
+
+#[tokio::test]
+async fn narrowed_pass_that_finds_nothing_falls_back_to_a_full_scan() {
+    let (dir, keys, chain, plan) = fixture();
+    let mut job = Job::load_or_begin(dir.path(), plan.clone(), vec![]).unwrap();
+    chain.outputs.lock().unwrap()[0].confirmations = 0;
+    let unconfirmed = chain.outputs.lock().unwrap().clone();
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+    // The unconfirmed close is evicted before it confirms: the narrowed pass
+    // finds nothing and rescans every script within the same pass, so no
+    // decision is ever taken on a stale focus.
+    chain.outputs.lock().unwrap().clear();
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[2000, 1, 2000]);
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+    assert_eq!(
+        chain.scanned.lock().unwrap().as_slice(),
+        &[2000, 1, 2000, 2000]
+    );
+    // A restart always begins with a full pass: the focus is never persisted.
+    *chain.outputs.lock().unwrap() = unconfirmed;
+    job.advance(&chain, &keys, keys.scripts()).await.unwrap();
+    assert_eq!(
+        chain.scanned.lock().unwrap().as_slice(),
+        &[2000, 1, 2000, 2000, 2000]
+    );
+    drop(job);
+    let mut job = Job::load_or_begin(dir.path(), plan, vec![]).unwrap();
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+    assert_eq!(chain.scanned.lock().unwrap().last(), Some(&2000));
+}
+
+#[tokio::test]
+async fn vanished_multi_script_focus_can_refocus_and_preview_a_later_close() {
+    let (dir, keys, chain, plan) = fixture();
+    let mut job = Job::load_or_begin(dir.path(), plan.clone(), vec![]).unwrap();
+    let mut original_close = chain.transactions.lock().unwrap()[0].transaction.clone();
+    original_close.output.push(TxOut {
+        value: Amount::from_sat(40_000),
+        script_pubkey: keys.scripts()[2].script_pubkey.clone(),
+    });
+    chain.transactions.lock().unwrap()[0] = ChainTransaction {
+        transaction: original_close.clone(),
+        confirmations: 0,
+    };
+    *chain.outputs.lock().unwrap() = original_close
+        .output
+        .iter()
+        .enumerate()
+        .map(|(vout, txout)| FoundOutput {
+            outpoint: OutPoint {
+                txid: original_close.compute_txid(),
+                vout: vout as u32,
+            },
+            txout: txout.clone(),
+            confirmations: 0,
+        })
+        .collect();
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+
+    // Both focused scripts disappear. The same pass must discover a new close
+    // elsewhere, then retain that new focus while it remains unconfirmed.
+    let mut later_close = original_close;
+    later_close.output = vec![TxOut {
+        value: Amount::from_sat(50_000),
+        script_pubkey: keys.scripts()[0].script_pubkey.clone(),
+    }];
+    let mut later_output = FoundOutput {
+        outpoint: OutPoint {
+            txid: later_close.compute_txid(),
+            vout: 0,
+        },
+        txout: later_close.output[0].clone(),
+        confirmations: 0,
+    };
+    chain.transactions.lock().unwrap().push(ChainTransaction {
+        transaction: later_close,
+        confirmations: 0,
+    });
+    *chain.outputs.lock().unwrap() = vec![later_output.clone()];
+    for _ in 0..2 {
+        assert!(matches!(
+            job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+            Progress::WaitingForHub
+        ));
+    }
+    assert_eq!(
+        chain.scanned.lock().unwrap().as_slice(),
+        &[2000, 2, 2000, 1]
+    );
+
+    // Once confirmed, the owned focus must still trigger the second full-scan
+    // check and preserve the output used to build the preview.
+    later_output.confirmations = 1;
+    *chain.outputs.lock().unwrap() = vec![later_output.clone()];
+    chain
+        .transactions
+        .lock()
+        .unwrap()
+        .last_mut()
+        .unwrap()
+        .confirmations = 1;
+    let Progress::SweepPreview { sweep, inputs } =
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap()
+    else {
+        panic!("later close preview");
+    };
+    assert_eq!(inputs, vec![later_output.clone()]);
+    assert_eq!(
+        sweep.tx().unwrap().input[0].previous_output,
+        later_output.outpoint
+    );
+    assert_eq!(sweep.validate(&plan).unwrap(), 50_000 - sweep.fee_sats);
+    assert_eq!(
+        chain.scanned.lock().unwrap().as_slice(),
+        &[2000, 2, 2000, 1, 1, 2000]
+    );
+    assert!(chain.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn viable_focused_sweep_includes_a_later_dust_close_before_preview() {
+    let (dir, keys, chain, plan) = fixture();
+    let mut job = Job::load_or_begin(dir.path(), plan.clone(), vec![]).unwrap();
+    chain.outputs.lock().unwrap()[0].confirmations = 0;
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+
+    // While the 90,000-sat focused close was unconfirmed, another script closed.
+    // Its 600 sats cannot pay for a separate sweep at the frozen 2 sat/vB rate.
+    let mut later_close = chain.transactions.lock().unwrap()[0].transaction.clone();
+    later_close.output[0] = TxOut {
+        value: Amount::from_sat(600),
+        script_pubkey: keys.scripts()[0].script_pubkey.clone(),
+    };
+    let later_output = FoundOutput {
+        outpoint: OutPoint {
+            txid: later_close.compute_txid(),
+            vout: 0,
+        },
+        txout: later_close.output[0].clone(),
+        confirmations: 1,
+    };
+    assert_eq!(
+        keys.build_sweep(
+            std::slice::from_ref(&later_output),
+            plan.address().unwrap().script_pubkey(),
+            FeeRate::from_sat_per_vb(2).unwrap(),
+        )
+        .unwrap_err(),
+        RecoveryError::DustOutput
+    );
+    chain.transactions.lock().unwrap().push(ChainTransaction {
+        transaction: later_close,
+        confirmations: 1,
+    });
+    chain.outputs.lock().unwrap()[0].confirmations = 1;
+    chain.outputs.lock().unwrap().push(later_output);
+    let all_outputs = chain.outputs.lock().unwrap().clone();
+
+    let Progress::SweepPreview { sweep, inputs } =
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap()
+    else {
+        panic!("combined preview");
+    };
+    assert_eq!(inputs, all_outputs);
+    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[2000, 1, 2000]);
+    assert_eq!(sweep.tx().unwrap().input.len(), 2);
+    assert_eq!(sweep.validate(&plan).unwrap(), 90_600 - sweep.fee_sats);
+    assert!(chain.sent.lock().unwrap().is_empty());
+    job.approve(&chain, sweep, inputs).await.unwrap();
+    drop(job);
+
+    let mut job = Job::load_or_begin(dir.path(), plan, vec![]).unwrap();
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::Confirming { .. }
+    ));
+    assert!(chain.outputs.lock().unwrap().is_empty());
+    chain
+        .transactions
+        .lock()
+        .unwrap()
+        .last_mut()
+        .unwrap()
+        .confirmations = 6;
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::SelfTest
+    ));
+    job.finish(&chain, "tested".into()).await.unwrap();
+    assert!(recover::ensure_normal_start(dir.path()).is_ok());
+}
+
+#[tokio::test]
+async fn focused_dust_sweep_rescans_for_a_later_confirmed_close() {
+    focused_uneconomic_sweep_rescans(600, RecoveryError::DustOutput).await;
+}
+
+#[tokio::test]
+async fn focused_insufficient_sweep_rescans_for_a_later_confirmed_close() {
+    focused_uneconomic_sweep_rescans(100, RecoveryError::InsufficientFunds).await;
+}
+
+async fn focused_uneconomic_sweep_rescans(value: u64, expected: RecoveryError) {
+    let (dir, keys, chain, plan) = fixture();
+    let later_outputs = chain.outputs.lock().unwrap().clone();
+    let mut small_close = chain.transactions.lock().unwrap()[0].transaction.clone();
+    small_close.output[0] = TxOut {
+        value: Amount::from_sat(value),
+        script_pubkey: keys.scripts()[0].script_pubkey.clone(),
+    };
+    let mut small_output = FoundOutput {
+        outpoint: OutPoint {
+            txid: small_close.compute_txid(),
+            vout: 0,
+        },
+        txout: small_close.output[0].clone(),
+        confirmations: 0,
+    };
+    chain.transactions.lock().unwrap().push(ChainTransaction {
+        transaction: small_close,
+        confirmations: 0,
+    });
+    *chain.outputs.lock().unwrap() = vec![small_output.clone()];
+    let mut job = Job::load_or_begin(dir.path(), plan.clone(), vec![]).unwrap();
+    assert!(matches!(
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap(),
+        Progress::WaitingForHub
+    ));
+    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[2000]);
+
+    // The small output confirms alongside a 90,000-sat close on another script.
+    // At 2 sat/vB to P2PKH, only the combined inputs produce a viable sweep.
+    small_output.confirmations = 1;
+    chain
+        .transactions
+        .lock()
+        .unwrap()
+        .last_mut()
+        .unwrap()
+        .confirmations = 1;
+    let destination = plan.address().unwrap().script_pubkey();
+    assert!(destination.is_p2pkh());
+    let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
+    assert_eq!(plan.fee_rate_sat_vb, 2);
+    assert_eq!(
+        keys.build_sweep(
+            std::slice::from_ref(&small_output),
+            destination.clone(),
+            fee_rate,
+        )
+        .unwrap_err(),
+        expected
+    );
+    let mut all_outputs = vec![small_output];
+    all_outputs.extend(later_outputs);
+    let full_sweep = keys
+        .build_sweep(&all_outputs, destination, fee_rate)
+        .unwrap();
+    *chain.outputs.lock().unwrap() = all_outputs.clone();
+
+    let Progress::SweepPreview { sweep, inputs } =
+        job.advance(&chain, &keys, keys.scripts()).await.unwrap()
+    else {
+        panic!("preview after full-scan fallback");
+    };
+    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[2000, 1, 2000]);
+    assert_eq!(inputs, all_outputs);
+    assert_eq!(sweep.tx().unwrap(), full_sweep.transaction);
+    assert_eq!(
+        sweep.validate(&plan).unwrap(),
+        value + 90_000 - sweep.fee_sats
+    );
+    assert!(chain.sent.lock().unwrap().is_empty());
+    job.approve(&chain, sweep, inputs).await.unwrap();
+}
+
+#[tokio::test]
+async fn backup_index_keeps_scanning_every_active_channel_script() {
+    let (dir, keys, chain, plan) = fixture();
+    // Three active channels in the backup; only one has closed so far.
+    let active = &keys.scripts()[..3];
+    let mut job = Job::load_or_begin(dir.path(), plan, vec![OutPoint::null()]).unwrap();
+    chain.outputs.lock().unwrap()[0].confirmations = 0;
+    for _ in 0..3 {
+        assert!(matches!(
+            job.advance(&chain, &keys, active).await.unwrap(),
+            Progress::WaitingForHub
+        ));
+    }
+    assert_eq!(chain.scanned.lock().unwrap().as_slice(), &[3, 3, 3]);
 }
