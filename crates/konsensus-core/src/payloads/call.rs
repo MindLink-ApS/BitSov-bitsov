@@ -18,6 +18,29 @@ pub const MAX_CANDIDATE_BYTES: usize = 1024;
 pub const DEVICE_WAIT_MS: u64 = 15_000;
 /// How long an unanswered offer rings.
 pub const RING_TIMEOUT_MS: u64 = 60_000;
+/// Oldest offer (by its envelope timestamp, on the callee's clock) a callee
+/// still rings: covers payment, routing and resend delay.
+pub const INVITE_MAX_AGE_MS: u64 = 30_000;
+/// Clock difference between two nodes the call timing tolerates.
+pub const CALL_CLOCK_SKEW_MS: u64 = 15_000;
+/// Allowance for the callee's answer to reach the caller.
+pub const ANSWER_TRANSIT_MS: u64 = 15_000;
+/// The caller's answer window from payment. A callee rings an offer only if
+/// it arrives within [`INVITE_MAX_AGE_MS`] of the offer's timestamp (taken no
+/// later than payment), waits at most [`DEVICE_WAIT_MS`] for a device, then
+/// rings for [`RING_TIMEOUT_MS`]; its last answer still needs transit and may
+/// be off by the clock skew. So every answer the callee may send in its window
+/// reaches the caller inside this one.
+pub const CALLER_ANSWER_WINDOW_MS: u64 =
+    INVITE_MAX_AGE_MS + CALL_CLOCK_SKEW_MS + DEVICE_WAIT_MS + RING_TIMEOUT_MS + ANSWER_TRANSIT_MS;
+
+/// Whether a callee may still ring an offer stamped `offer_ms` that arrived at
+/// `arrived_ms` (callee clock): not older than [`INVITE_MAX_AGE_MS`], and not
+/// from further in the future than the tolerated skew.
+pub fn invite_fresh(offer_ms: u64, arrived_ms: u64) -> bool {
+    arrived_ms <= offer_ms.saturating_add(INVITE_MAX_AGE_MS)
+        && offer_ms <= arrived_ms.saturating_add(CALL_CLOCK_SKEW_MS)
+}
 /// Length of a paid media interval.
 pub const CALL_BLOCK_MS: u64 = 60_000;
 /// Renewal is due this long before the paid interval ends.
@@ -176,6 +199,9 @@ pub enum CallRefusal {
     Sequence,
     #[error("call block is not due yet")]
     NotDue,
+    /// The callee cannot ring this offer inside the caller's answer window.
+    #[error("call_not_reachable")]
+    NotReachable,
 }
 
 fn is_lower_hex(id: &str, len: usize) -> bool {
@@ -448,9 +474,9 @@ pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> Result<CallE
     };
     let cleared = CallEntry { pending: None, ..entry };
     Ok(match (p.kind, cleared.phase) {
-        // The callee may wait DEVICE_WAIT_MS for a device before its own ring
-        // clock starts; outlast it so a late but in-time answer is accepted.
-        (KIND_CALL_INVITE, Phase::Reserved) => CallEntry { phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(DEVICE_WAIT_MS + RING_TIMEOUT_MS), ..cleared },
+        // Outlast every answer the callee may send inside its own window,
+        // including routing, its device wait, transit and clock skew.
+        (KIND_CALL_INVITE, Phase::Reserved) => CallEntry { phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(CALLER_ANSWER_WINDOW_MS), ..cleared },
         (KIND_CALL_ANSWER, Phase::Ringing) => cleared.answered(now_ms),
         (KIND_CALL_BLOCK, _) => {
             // The callee decides whether a paid interval can still be served.
@@ -751,12 +777,36 @@ mod tests {
     #[test]
     fn caller_deadline_starts_at_payment_and_outlasts_the_device_wait() {
         let entry = commit(reserve(None, 400, "offer", "h", 1_000).unwrap(), "offer", 2_000).unwrap();
-        assert_eq!((entry.phase, entry.deadline_ms), (Phase::Ringing, 2_000 + DEVICE_WAIT_MS + RING_TIMEOUT_MS));
+        assert_eq!((entry.phase, entry.deadline_ms), (Phase::Ringing, 2_000 + CALLER_ANSWER_WINDOW_MS));
         assert_eq!(entry.clone().device_fetched(11_000), Some(entry.clone()));
-        // A callee device fetching at the last moment answers just inside its
-        // own 60 s; the caller is still ringing and accepts the answer.
-        let answer_at = 2_000 + DEVICE_WAIT_MS - 1 + RING_TIMEOUT_MS - 1;
-        assert_eq!(receive(Some(entry.at(answer_at).unwrap()), 401, None, answer_at).unwrap().phase, Phase::Live);
+    }
+
+    /// Two nodes, worst case: the offer is stamped before payment, arrives as
+    /// late as the callee accepts on a callee clock running behind by the full
+    /// skew, a device takes it at the end of the wait, and the callee answers
+    /// at the end of its ring window. The answer, after transit, still finds
+    /// the caller ringing; one the callee could not send in time is refused.
+    #[test]
+    fn caller_window_covers_every_answer_inside_the_callee_window() {
+        let offer_ms = 1_000;
+        let paid_ms = offer_ms; // the offer is stamped no later than payment
+        let caller = commit(reserve(None, 400, "offer", "h", offer_ms).unwrap(), "offer", paid_ms).unwrap();
+        // Real time = caller clock; the callee's clock is behind by the skew.
+        let skew = CALL_CLOCK_SKEW_MS;
+        let arrived_local = offer_ms + INVITE_MAX_AGE_MS;
+        assert!(invite_fresh(offer_ms, arrived_local));
+        assert!(!invite_fresh(offer_ms, arrived_local + 1), "an older offer is refused");
+        assert!(!invite_fresh(arrived_local + skew + 1, arrived_local), "a future offer beyond the skew is refused");
+        let callee = receive(None, 400, None, arrived_local).unwrap();
+        let fetched_local = callee.deadline_ms - 1;
+        let ringing = callee.device_fetched(fetched_local).unwrap();
+        let answered_local = ringing.deadline_ms - 1;
+        assert_eq!(ringing.clone().at(answered_local).unwrap().phase, Phase::Ringing, "callee may still answer");
+        let answer_reaches_caller = answered_local + skew + ANSWER_TRANSIT_MS;
+        let live = receive(Some(caller.clone().at(answer_reaches_caller).unwrap()), 401, None, answer_reaches_caller).unwrap();
+        assert_eq!(live.phase, Phase::Live);
+        // Tight, not unbounded: only the two "last moment" milliseconds spare.
+        assert_eq!(caller.deadline_ms - answer_reaches_caller, 2);
     }
 
     #[test]

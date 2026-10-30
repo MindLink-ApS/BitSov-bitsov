@@ -755,3 +755,20 @@ async fn delayed_operation_refusal_still_ends_its_current_call() {
     let ended = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
     assert_eq!((ended.phase, ended.end_reason), (Phase::Ended, Some(HangupReason::Timeout)));
 }
+
+#[tokio::test]
+async fn refusal_of_an_intact_older_operation_cannot_end_a_newer_offer() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    assert_eq!(fx.state.storage.call_offer(&fx.peer, CALL).await.unwrap(), Some(offer));
+    // A distinct, newer operation reuses the call id and binds its own offer;
+    // the older operation stays intact and still names its own offer.
+    let newer = konsensus_core::MessageId::from_hex(&"cd".repeat(32)).unwrap();
+    fx.state.storage.call_offer_bind(&fx.peer, CALL, &newer).await.unwrap();
+    assert!(!konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    assert_eq!(fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap().phase, Phase::Ringing);
+}

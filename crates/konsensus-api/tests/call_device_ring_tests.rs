@@ -13,6 +13,10 @@ fn own() -> NodeId {
     NodeId::from_bytes([201; 32])
 }
 fn invite(seed: u8) -> (UkmEnvelope, String) {
+    invite_at(seed, 1_000)
+}
+/// An offer stamped at `offer_ms`: callees ring only fresh offers.
+fn invite_at(seed: u8, offer_ms: u64) -> (UkmEnvelope, String) {
     (
         UkmEnvelopeBuilder::new(
             400,
@@ -21,6 +25,7 @@ fn invite(seed: u8) -> (UkmEnvelope, String) {
             vec![seed],
             PaymentProof::new([seed; 32], [seed; 32], 10_000),
         )
+        .timestamp(offer_ms)
         .build(),
         format!(r#"{{"v":1,"call_id":"{CALL}","media":"audio","sdp":"v=0"}}"#),
     )
@@ -71,7 +76,7 @@ async fn device_delivery_starts_once_and_historical_fetch_cannot_ring_a_new_call
     );
     assert!(devices.sweep(&db, 16_100).await.unwrap().is_empty());
     assert_eq!(row.at(71_000).unwrap().phase, Phase::Ended);
-    let (new, text) = invite(3);
+    let (new, text) = invite_at(3, 71_000 + TOMBSTONE_MS + 1);
     db.accept_paid_envelope(&new).await.unwrap();
     devices
         .admit(
@@ -201,7 +206,7 @@ async fn stored_invite(
     state: &konsensus_api::AppState,
     db: &SqliteStorage,
 ) -> (UkmEnvelope, String) {
-    let (mut env, text) = invite(6);
+    let (mut env, text) = invite_at(6, konsensus_api::calls::now_ms());
     env.recipient = Recipient::Node(*state.identity.node_id());
     db.accept_paid_envelope(&env).await.unwrap();
     db.store_message_plaintext(
@@ -577,7 +582,7 @@ async fn failed_rehold_cannot_be_lost_when_a_call_id_becomes_reusable() {
     assert!(devices.sweep(&db, 16_000).await.unwrap().is_empty());
     let after_gc = 16_000 + TOMBSTONE_MS + 1;
     db.call_sweep(after_gc, 10_000).await.unwrap();
-    let (new, text) = invite(17);
+    let (new, text) = invite_at(17, 16_000 + TOMBSTONE_MS + 1);
     devices
         .admit(&db, &own(), &new, Some(&text), after_gc, || after_gc)
         .await
@@ -612,7 +617,7 @@ async fn old_wait_cannot_borrow_device_delivery_from_a_reused_call_id() {
     assert!(devices.sweep(&db, 16_000).await.unwrap().is_empty());
     let after_gc = 16_000 + TOMBSTONE_MS + 1;
     db.call_sweep(after_gc, 10_000).await.unwrap();
-    let (new, text) = invite(19);
+    let (new, text) = invite_at(19, 16_000 + TOMBSTONE_MS + 1);
     db.accept_paid_envelope(&new).await.unwrap();
     devices
         .admit(&db, &own(), &new, Some(&text), after_gc, || after_gc)
@@ -1049,4 +1054,26 @@ async fn late_cancellation_prevents_retained_delivery_from_ringing() {
         assert!(devices.fetched(&db, &env, || 16_300).await.is_ok());
         assert_ne!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::Ringing);
     }
+}
+
+/// A callee rings only offers it can ring inside the caller's answer window:
+/// one older than the routing allowance, or stamped further ahead than the
+/// tolerated skew, is refused as not reachable before any state is written.
+#[tokio::test]
+async fn stale_or_future_offer_is_refused_as_not_reachable() {
+    use konsensus_core::payloads::call::{CallRefusal, CALL_CLOCK_SKEW_MS, INVITE_MAX_AGE_MS};
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let devices = Devices::default();
+    for (seed, offer_ms, arrived) in [(27, 1_000, 1_000 + INVITE_MAX_AGE_MS + 1), (28, 100_000 + CALL_CLOCK_SKEW_MS + 1, 100_000)] {
+        let (env, text) = invite_at(seed, offer_ms);
+        db.accept_paid_envelope(&env).await.unwrap();
+        let refused = devices.admit(&db, &own(), &env, Some(&text), arrived, || arrived).await.unwrap_err();
+        assert_eq!(refused, CallRefusal::NotReachable);
+        assert_eq!(refused.to_string(), konsensus_api::calls::devices::NOT_REACHABLE);
+        assert!(db.call_get(&env.sender, CALL).await.unwrap().is_none());
+    }
+    // At the edge it still rings.
+    let (env, text) = invite_at(29, 1_000);
+    db.accept_paid_envelope(&env).await.unwrap();
+    devices.admit(&db, &own(), &env, Some(&text), 1_000 + INVITE_MAX_AGE_MS, || 1_000 + INVITE_MAX_AGE_MS).await.unwrap();
 }

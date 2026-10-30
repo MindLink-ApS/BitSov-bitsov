@@ -285,6 +285,13 @@ impl Operation {
     ) -> Result<(), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
+        if let Some(call_id) = call_invite.as_deref() {
+            // Bind the call row to this exact offer before the operation names
+            // it, so only a refusal of the current offer can end the call
+            // (Codex FAIL on #472). A failed bind leaves the draft unrecorded.
+            let peer = NodeId::from_hex(&op.recipient).map_err(storage)?;
+            self.state.storage.call_offer_bind(&peer, call_id, &draft.id).await.map_err(storage)?;
+        }
         data.call_block = call_block;
         data.call_invite = call_invite;
         op.message_id = Some(draft.id.to_hex());

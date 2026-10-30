@@ -198,6 +198,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (35, "call blocks", include_str!("../migrations/035_call_blocks.sql")),
     (36, "call unpaid notice", include_str!("../migrations/036_call_unpaid_notice.sql")),
     (37, "call block invoices", include_str!("../migrations/037_call_block_invoices.sql")),
+    (38, "call offer binding", include_str!("../migrations/038_call_offer_binding.sql")),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -1717,6 +1718,21 @@ impl Storage for SqliteStorage {
             return Ok(false);
         }
         Err(StorageError::Conversion("call invite receipt not pending".into()))
+    }
+
+    async fn call_offer_bind(&self, peer: &konsensus_core::NodeId, call_id: &str, offer: &MessageId) -> Result<(), StorageError> {
+        let bound = sqlx::query("UPDATE call_state SET offer_id = ? WHERE peer = ? AND call_id = ? AND side = 'caller'")
+            .bind(offer.to_hex()).bind(peer.to_hex()).bind(call_id).execute(&self.pool).await?;
+        if bound.rows_affected() != 1 {
+            return Err(StorageError::Conversion("no caller call row to bind its offer to".into()));
+        }
+        Ok(())
+    }
+
+    async fn call_offer(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<MessageId>, StorageError> {
+        let offer: Option<Option<String>> = sqlx::query_scalar("SELECT offer_id FROM call_state WHERE peer = ? AND call_id = ?")
+            .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
+        offer.flatten().map(|hex| MessageId::from_hex(&hex).map_err(|e| StorageError::Conversion(e.to_string()))).transpose()
     }
 
     async fn call_invite_expire(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, deadline_ms: u64) -> Result<crate::CallInviteExpiry, StorageError> {

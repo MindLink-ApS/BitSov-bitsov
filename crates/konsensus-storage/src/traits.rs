@@ -64,6 +64,16 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("call invite delivery".into()))
     }
 
+    /// Record `offer` as the caller's current paid offer for this call row.
+    async fn call_offer_bind(&self, _peer: &NodeId, _call_id: &str, _offer: &MessageId) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call offer binding".into()))
+    }
+
+    /// The caller's current paid offer for this call row, if bound.
+    async fn call_offer(&self, _peer: &NodeId, _call_id: &str) -> Result<Option<MessageId>, StorageError> {
+        Ok(None)
+    }
+
     /// Expire a device wait atomically against delivery: only while the
     /// invite's receipt is still pending (or already not reachable, on a
     /// retry) mark it not reachable, re-hold the envelope and end the

@@ -451,6 +451,7 @@ fn refused(e: CallRefusal, new_operation: bool) -> ApiError {
     let reason = match e {
         CallRefusal::Replayed => "call_id_used",
         CallRefusal::Full => "call_busy",
+        CallRefusal::NotReachable => "call_not_reachable",
         CallRefusal::InFlight => "call_signal_in_flight",
         CallRefusal::Invalid(_) | CallRefusal::NotCallKind => "call_signal_invalid",
         _ => "call_not_live",
@@ -892,6 +893,11 @@ pub async fn end_unreachable_invite(store: Store<'_>, own: &NodeId, peer: &NodeI
     // A pending cancellation keeps its reservation mark (its own commit or
     // release still resolves it) but cannot keep an unreachable call ringing.
     if entry.side != rules::Side::Caller || entry.phase != rules::Phase::Ringing {
+        return Ok(false);
+    }
+    // The ringing lifecycle must be this offer's: a reused call id rebinds
+    // its row to the newer offer, so an older offer's refusal stops here.
+    if store.call_offer(peer, &call_id).await? != Some(*id) {
         return Ok(false);
     }
     let ended = CallEntry { phase: rules::Phase::Ended, end_reason: Some(rules::HangupReason::Timeout),

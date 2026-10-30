@@ -87,6 +87,13 @@ impl Devices {
         let _guard = super::lock().lock().await;
         let now_ms = clock();
         let unavailable = |_| CallRefusal::Invalid("call state unavailable");
+        if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE
+            && !rules::invite_fresh(envelope.timestamp, arrived_ms)
+        {
+            // Too old (or too far ahead) to ring inside the caller's answer
+            // window: refuse it as not reachable, so the caller ends the call.
+            return Err(CallRefusal::NotReachable);
+        }
         if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE {
             // The registry shares the existing open-call bound. Ended calls
             // may have freed slots since the last sweep. A failed durable hold
