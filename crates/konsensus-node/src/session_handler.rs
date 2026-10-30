@@ -1684,12 +1684,16 @@ async fn handle_invoice_requested(
         }
         return;
     }
-    let ceiling = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        price_ceiling.get(pricing.clone()),
-    )
-    .await
-    {
+    // A request naming its service is priced locally for that kind; only a
+    // legacy request falls back to this node's highest configured price.
+    let service_kind = konsensus_core::gate::parse_service_invoice_purpose(purpose);
+    let lookup = async {
+        match service_kind {
+            Some(kind) => pricing.get_price_msat(kind).await.map_err(|_| "konsensus:price_unavailable"),
+            None => price_ceiling.get(pricing.clone()).await,
+        }
+    };
+    let ceiling = match tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await {
         Ok(Ok(ceiling)) => ceiling,
         _ => {
             if refusals.permit(source_ip, tokio::time::Instant::now()) {

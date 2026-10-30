@@ -1395,6 +1395,63 @@ fn admission_pricing() -> Arc<dyn konsensus_core::traits::pricing::PricingEngine
     ))
 }
 
+/// A request naming its service (#403) is priced locally for that kind: an
+/// amount above this node's price for the kind is refused even when it is
+/// under the node's highest price, which a legacy request is still held to.
+#[tokio::test]
+async fn service_invoice_is_priced_for_its_own_kind() {
+    use konsensus_core::gate::{price_with_floor_msat, service_invoice_purpose};
+    use konsensus_core::kind::KIND_CHAT;
+    let peer_id = test_peer_id();
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+    let ceiling = configured_price_ceiling(pricing.as_ref()).await.unwrap();
+    let chat = price_with_floor_msat(pricing.get_price_msat(KIND_CHAT).await.unwrap(), 0);
+    assert!(chat < ceiling, "fixture needs a kind priced below the node's highest price");
+    let mut invoices = ready_invoice_book().await;
+    let service = service_invoice_purpose(KIND_CHAT);
+    for (request_id, amount, purpose) in [
+        ("svc-over", chat + 1, service.as_str()),
+        ("svc-exact", chat, service.as_str()),
+        ("legacy-over-kind", chat + 1, "konsensus message"),
+        ("svc-unknown-kind", chat, "konsensus:service:"),
+    ] {
+        handle_invoice_requested_gated(
+            &peer_id,
+            request_id,
+            amount,
+            purpose,
+            true,
+            &pricing,
+            &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            &crate::session_handler::ConfiguredPriceCeilingCache::new(),
+            &lightning,
+            &transport,
+            &test_peer_id(),
+            "127.0.0.1".parse().unwrap(),
+            &mut crate::admission_quotes::AdmissionQuotes::default(),
+            &konsensus_api::membrane::Membrane::with_capacity(8),
+            &mut crate::invoice_refusals::RefusalLimits::default(),
+            0,
+            &mut invoices,
+        )
+        .await;
+    }
+    let mut amounts: Vec<u64> = lightning
+        .list_payments(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|payment| payment.amount_msat)
+        .collect();
+    amounts.sort_unstable();
+    // svc-over refused; svc-exact issued; the legacy request keeps the node-wide
+    // ceiling; a malformed service purpose is a legacy request.
+    assert_eq!(amounts, vec![chat, chat, chat + 1]);
+}
+
 #[tokio::test]
 async fn privileged_invoice_above_configured_price_is_refused_not_clamped() {
     let peer_id = test_peer_id();

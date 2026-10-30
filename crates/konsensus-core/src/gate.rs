@@ -34,6 +34,26 @@ pub fn price_with_floor_msat(discounted: u64, min_admission_cost_msat: u64) -> u
     discounted.max(min_admission_cost_msat).max(1_000)
 }
 
+/// Invoice-request purpose naming the service (message kind) being paid for,
+/// so the recipient prices it locally rather than trusting the requested
+/// amount against its highest price. Older recipients treat it as a generic
+/// message invoice.
+pub const SERVICE_INVOICE_PREFIX: &str = "konsensus:service:";
+
+/// The purpose a sender puts on an invoice request for a message of `kind`.
+pub fn service_invoice_purpose(kind: u16) -> String {
+    format!("{SERVICE_INVOICE_PREFIX}{kind}")
+}
+
+/// The kind a service invoice request names. `None` for any other purpose,
+/// including a malformed service purpose.
+pub fn parse_service_invoice_purpose(purpose: &str) -> Option<u16> {
+    let kind = purpose.strip_prefix(SERVICE_INVOICE_PREFIX)?;
+    (!kind.is_empty() && kind.bytes().all(|b| b.is_ascii_digit()) && kind.len() <= 5)
+        .then(|| kind.parse().ok())
+        .flatten()
+}
+
 /// Why the gate rejected a message.
 ///
 /// Every variant is a hard rejection — the message MUST NOT be accepted.
@@ -3377,6 +3397,15 @@ mod tests {
     /// The cost floor is applied AFTER the plasticity trust discount, so even a
     /// maximally-trusted peer (50% discount) cannot pay below cost. base=10,000,
     /// discount=0.5 → discounted=5,000; floor=8,000 → required=8,000.
+    #[test]
+    fn service_invoice_purpose_round_trips_and_rejects_malformed() {
+        assert_eq!(parse_service_invoice_purpose(&service_invoice_purpose(1)), Some(1));
+        assert_eq!(parse_service_invoice_purpose(&service_invoice_purpose(u16::MAX)), Some(u16::MAX));
+        for bad in ["konsensus message", "konsensus:service:", "konsensus:service:-1", "konsensus:service:70000", "konsensus:service:1x", "konsensus:service:+1", "konsensus:service:000001"] {
+            assert_eq!(parse_service_invoice_purpose(bad), None, "{bad}");
+        }
+    }
+
     #[tokio::test]
     async fn cost_floor_cannot_be_undercut_by_trust_discount() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
