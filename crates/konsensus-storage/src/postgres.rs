@@ -3713,7 +3713,7 @@ mod migration_recovery_tests {
         db.call_sweep(stalled.deadline_ms, 1).await.unwrap();
         assert!(db.call_get(&peer, call_id).await.unwrap().is_none());
         db.pool.close().await;
-        sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+        sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
         admin.close().await;
     }
 
@@ -3749,7 +3749,7 @@ mod migration_recovery_tests {
         assert_eq!(db.take_outstanding_web_request(&[1; 32]).await.unwrap(), Some(row(1, 10_000)));
         assert_eq!(db.take_outstanding_web_request(&[1; 32]).await.unwrap(), None);
         db.pool.close().await;
-        sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+        sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
     }
 
     // This test creates and removes its own databases on a disposable server.
@@ -3779,7 +3779,7 @@ mod migration_recovery_tests {
                 sqlx::raw_sql("DROP TRIGGER interrupt_upgrade ON _konsensus_migrations; DROP FUNCTION interrupt_upgrade()").execute(&db.pool).await.unwrap();
                 if columns != 0 {
                     db.pool.close().await;
-                    sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+                    sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
                     panic!("interrupted migration committed {columns} columns without its version record");
                 }
             } else {
@@ -3881,7 +3881,7 @@ mod migration_recovery_tests {
                 assert_eq!(db.accept_paid_envelope(&changed).await.unwrap(), crate::PaidAcceptance::PaymentReused);
             }
             db.pool.close().await;
-            sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+            sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
             result.unwrap();
         }
         admin.close().await;
