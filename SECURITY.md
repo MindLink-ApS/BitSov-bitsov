@@ -1,5 +1,9 @@
 # Security Policy — BitSov
 
+**Preferred reporting channel:** use GitHub's **Security → Report a vulnerability**
+for this repository: [Report a vulnerability privately](https://github.com/MindLink-ApS/BitSov-bitsov/security/advisories/new).
+Email with PGP encryption remains available as described below.
+
 BitSov is a sovereign mesh network where users hold their own cryptographic identity and funds. A vulnerability in BitSov is not just a software bug — it may compromise a user's Bitcoin keys, Lightning channels, or private communications. We take security reports seriously and respond quickly.
 
 ---
@@ -8,12 +12,12 @@ BitSov is a sovereign mesh network where users hold their own cryptographic iden
 
 | Component | Supported |
 |-----------|-----------|
-| `konsensus-node` CLI/binary and exported protocol crates (latest `main`) | Yes |
+| `konsensus-node` CLI/binary and exported protocol crates (latest `rc`) | Yes |
 | Public node API, CLI, and protocol documents in this repository | Yes |
 | Public reference app, hosted relay/service code, website, and commercial operations | Separate policy |
 | All earlier tagged releases | No — upgrade to latest |
 
-We do not backport security patches. Users should always run the latest build.
+Only the latest release candidate (`rc`) is supported. We do not backport security patches. Users should always run the latest `rc`.
 
 The Daily Security Scan scopes OSV to the root `Cargo.lock`, which resolves all release dependencies (no frontend ships here); vendored crates' standalone lockfiles are not release build inputs, and any future release-input lockfiles must be added explicitly.
 

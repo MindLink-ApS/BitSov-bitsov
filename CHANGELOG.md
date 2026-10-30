@@ -5,6 +5,8 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+## [0.3.0-rc20] — 2026-10-31 (prep; not tagged yet)
+
 - Payment truth on the owner API: `POST /payments/pay` and `/payments/keysend`
   answer `202 Accepted` with `status: in_flight` (payment hash and operation id,
   no preimage or fee) until the backend reports a final state, and `200` with

@@ -6,7 +6,8 @@ node's durable call state. It requires a valid owner-subject bearer token with
 invalid authentication returns 401; a different subject or missing scope
 returns 403.
 
-`peer` is required and must decode as a 32-byte hex node id. Missing, duplicate,
+`peer` is required and must decode as a 32-byte hex node id; uppercase and
+lowercase hex are accepted. Missing, duplicate,
 or malformed peer parameters return HTTP 400 with fixed JSON error text:
 `{"error":"invalid peer id","code":400}` (the numeric `code` is the generic
 bad-request marker; typed refusals such as `not_dispatched` carry a string
@@ -59,6 +60,12 @@ The bound also applies if the stored data exceeds the admission bound.
 Open means an unexpired reserved/ringing/live call **or any call with a pending
 signal**, including calls whose ringing/live deadline and replay tombstone
 have expired. Ended/expired calls without a pending signal are omitted.
+
+An offer committed as paid remains an open outgoing call (initially `ringing`)
+with `unresolved_paid_admission=false`: its pending reservation has been cleared,
+but the call is still open. Clients must not pay for a second offer to that peer
+while this outgoing call remains open. A false flag does not mean a new offer
+is safe to pay for.
 
 **The client must fail closed per peer when `unresolved_paid_admission` is
 true:** keep blocking re-admission/new paid admission to that peer, even if
