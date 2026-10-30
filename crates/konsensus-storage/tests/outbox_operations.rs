@@ -346,8 +346,17 @@ async fn failed_prepared_listing_selects_only_prepared_rows_with_an_error() {
         assert!(encrypted.insert_outbox_operation(&op).await.unwrap());
     }
     let listed = encrypted.list_failed_prepared_operations().await.unwrap();
-    assert_eq!(listed.iter().map(|op| op.operation_id.as_str()).collect::<Vec<_>>(), ["stuck"]);
-    assert_eq!(listed[0].recovery, b"{\"dispatched\":false}", "recovery is decrypted");
+    assert_eq!(
+        listed
+            .iter()
+            .map(|op| op.operation_id.as_str())
+            .collect::<Vec<_>>(),
+        ["stuck"]
+    );
+    assert_eq!(
+        listed[0].recovery, b"{\"dispatched\":false}",
+        "recovery is decrypted"
+    );
 }
 
 #[tokio::test]
@@ -437,4 +446,101 @@ async fn migration_029_preserves_receipts_versions_and_opaque_recovery() {
         db.get_outbox_operation("unused").await.unwrap(),
         Some(abandoned)
     );
+}
+
+/// A paid web request (kind 500/510) commits its outstanding-reply row in the
+/// paid-envelope transaction: a failure writing the row commits nothing, and a
+/// successful commit leaves the row bound to the envelope's request id.
+#[tokio::test]
+async fn paid_web_request_commit_binds_its_reply_in_the_same_transaction() {
+    use konsensus_core::{
+        kind::{KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE},
+        NodeIdentity, PaymentProof, Recipient, UkmEnvelopeBuilder,
+    };
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let (_, sender) = NodeIdentity::generate().unwrap();
+    let (_, peer) = NodeIdentity::generate().unwrap();
+    let preimage = [7u8; 32];
+    let hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(preimage).into();
+    let env = UkmEnvelopeBuilder::new(
+        KIND_PAGE_REQUEST,
+        *sender.node_id(),
+        Recipient::Node(*peer.node_id()),
+        vec![1],
+        PaymentProof::new(hash, preimage, 50),
+    )
+    .build();
+    let mut op = OutboxOperation::prepared(
+        "web".into(),
+        peer.node_id().to_hex(),
+        KIND_PAGE_REQUEST,
+        "digest".into(),
+    );
+    op.state = "paying".into();
+    op.message_id = Some(env.id.to_hex());
+    db.insert_outbox_operation(&op).await.unwrap();
+    op.state = "paid".into();
+
+    // The reply row cannot be written: the envelope and queue entry are not
+    // committed either, and the operation is still paying.
+    sqlx::raw_sql("CREATE TRIGGER fail_reply BEFORE INSERT ON outstanding_web_requests BEGIN SELECT RAISE(ABORT, 'injected reply-row failure'); END")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(db.commit_outbox_envelope(&op, &env).await.is_err());
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
+    assert_eq!(
+        db.get_outbox_operation("web").await.unwrap().unwrap().state,
+        "paying"
+    );
+    assert!(db
+        .take_outstanding_web_request(&hash)
+        .await
+        .unwrap()
+        .is_none());
+    sqlx::raw_sql("DROP TRIGGER fail_reply")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    assert!(db.commit_outbox_envelope(&op, &env).await.unwrap());
+    assert!(db.get_message(&env.id).await.unwrap().is_some());
+    assert_eq!(db.count_pending_deliveries().await.unwrap(), 1);
+    let outstanding = db
+        .take_outstanding_web_request(&hash)
+        .await
+        .unwrap()
+        .expect("reply row committed with the envelope");
+    assert_eq!(outstanding.request_id, env.id);
+    assert_eq!(outstanding.peer, *peer.node_id());
+    assert_eq!(outstanding.expected_reply_kind, KIND_PAGE_RESPONSE);
+    assert!(outstanding.expires_at_ms > chrono::Utc::now().timestamp_millis() as u64);
+    // Taken once.
+    assert!(db
+        .take_outstanding_web_request(&hash)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Other kinds commit no reply row.
+    let chat = UkmEnvelopeBuilder::new(
+        1,
+        *sender.node_id(),
+        Recipient::Node(*peer.node_id()),
+        vec![2],
+        PaymentProof::new([3; 32], [3; 32], 50),
+    )
+    .build();
+    let mut op = OutboxOperation::prepared("chat".into(), peer.node_id().to_hex(), 1, "d".into());
+    op.state = "paying".into();
+    op.message_id = Some(chat.id.to_hex());
+    db.insert_outbox_operation(&op).await.unwrap();
+    op.state = "paid".into();
+    assert!(db.commit_outbox_envelope(&op, &chat).await.unwrap());
+    assert!(db
+        .take_outstanding_web_request(&[3; 32])
+        .await
+        .unwrap()
+        .is_none());
 }

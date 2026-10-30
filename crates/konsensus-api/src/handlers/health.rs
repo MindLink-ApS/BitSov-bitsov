@@ -86,11 +86,15 @@ pub struct HealthResponse {
     /// server for calls, never switch to it by itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stun_port: Option<u16>,
-    /// `stun:host:port` for that responder at this node's dialable peer host
-    /// (`[network] advertised_addr`); omitted when the responder is off or the
-    /// node knows no reachable host (wildcard bind, loopback).
+    /// `stun:host:port` for ICE: this node's own STUN responder when it has a
+    /// dialable peer host, else the owner's `[network] stun_server` when set and
+    /// valid; omitted when neither applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stun_url: Option<String>,
+    /// `own` (local responder + dialable host), `configured` (`[network] stun_server`),
+    /// or omitted when no `stun_url` is reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stun_source: Option<&'static str>,
     /// Dialable `host:port` this node signs into introductions and front-door
     /// cards; omitted when none is known (see `peer_endpoint_reason`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,6 +136,53 @@ pub fn stun_url(endpoint: Option<&str>, stun_port: Option<u16>) -> Option<String
         }
     }
     Some(format!("stun:{host}:{port}"))
+}
+
+/// `stun:host:port` from a validated `[network] stun_server` (`host:port`).
+/// Rejects `stuns:`, `stun:`-prefixed, and malformed values so they are never
+/// reported on `/status`.
+pub fn configured_stun_url(host_port: &str) -> Option<String> {
+    let raw = host_port.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("stuns:") || lower.starts_with("stun:") {
+        return None;
+    }
+    let (host, port) = raw.rsplit_once(':')?;
+    let _: u16 = port.parse().ok().filter(|p| *p != 0)?;
+    let host_ok = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => {
+            !host.is_empty()
+                && host.len() <= 253
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        }
+    };
+    if !host_ok {
+        return None;
+    }
+    Some(format!("stun:{raw}"))
+}
+
+/// Resolve `stun_url` and `stun_source` for owner `/status`.
+pub fn stun_status(
+    endpoint: Option<&str>,
+    stun_port: Option<u16>,
+    configured_stun_server: Option<&str>,
+) -> (Option<String>, Option<&'static str>) {
+    if let Some(url) = stun_url(endpoint, stun_port) {
+        return (Some(url), Some("own"));
+    }
+    if let Some(addr) = configured_stun_server {
+        if let Some(url) = configured_stun_url(addr) {
+            return (Some(url), Some("configured"));
+        }
+    }
+    (None, None)
 }
 
 /// Public (unauthenticated) health response.
@@ -304,6 +355,11 @@ async fn status(
     let disk = state.lightning.disk_status();
     let chain_sync = state.lightning.chain_sync_status();
     let storage_health = state.storage.storage_read_health();
+    let (stun_url, stun_source) = stun_status(
+        peer.endpoint.as_deref(),
+        state.stun_port,
+        state.configured_stun_server.as_deref(),
+    );
     Ok(Json(HealthResponse {
         network: state.introduction.network.clone(),
         recovery,
@@ -329,6 +385,7 @@ async fn status(
                 "message_operations_v1",
                 "message_operation_abandon_v1",
                 "channel_open_operations_v1",
+                super::payments::direct::CAPABILITY,
                 super::messages::caps::CAPABILITY,
                 super::messages::caps::QUOTED_READMISSION_CAPABILITY,
                 super::messages::caps::ROOM_CAPABILITY,
@@ -345,8 +402,11 @@ async fn status(
                 super::sponsor::CAPABILITY,
                 konsensus_core::payloads::call::MEETING_CAPABILITY,
                 konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY,
+                konsensus_message::wire::CALL_MEDIA_CAPABILITY,
             ];
-            if state.starter.config.enabled { capabilities.push("starter_channel_request_v1"); }
+            if state.starter.config.enabled {
+                capabilities.push("starter_channel_request_v1");
+            }
             if state
                 .pairing
                 .as_ref()
@@ -374,7 +434,8 @@ async fn status(
         chain_sync,
         block_height,
         stun_port: state.stun_port,
-        stun_url: stun_url(peer.endpoint.as_deref(), state.stun_port),
+        stun_url,
+        stun_source,
         peer_endpoint: peer.endpoint,
         peer_endpoint_source: peer.source.map(String::from),
         peer_endpoint_reason: peer.reason.map(String::from),
@@ -447,4 +508,96 @@ async fn tower_status(
         coverage_scope: "to_local_only",
         status,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{configured_stun_url, stun_status, stun_url};
+
+    #[test]
+    fn stun_status_own_responder_wins() {
+        let (url, source) = stun_status(
+            Some("node.example.org:9000"),
+            Some(3478),
+            Some("hub.example:3478"),
+        );
+        assert_eq!(url.as_deref(), Some("stun:node.example.org:3478"));
+        assert_eq!(source, Some("own"));
+    }
+
+    #[test]
+    fn stun_status_configured_when_no_dialable_own_host() {
+        let (url, source) = stun_status(None, Some(3478), Some("stun.example.org:3478"));
+        assert_eq!(url.as_deref(), Some("stun:stun.example.org:3478"));
+        assert_eq!(source, Some("configured"));
+    }
+
+    #[test]
+    fn stun_status_neither() {
+        let (url, source) = stun_status(None, None, None);
+        assert_eq!(url, None);
+        assert_eq!(source, None);
+    }
+
+    #[test]
+    fn stun_status_invalid_configured_never_reported() {
+        for bad in [
+            "stuns:stun.example.org:5349",
+            "stun:stun.example.org:3478",
+            "not-a-host",
+            "h.example",
+            "",
+        ] {
+            let (url, source) = stun_status(None, Some(3478), Some(bad));
+            assert_eq!(url, None, "{bad}");
+            assert_eq!(source, None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn configured_stun_url_normalizes_host_port() {
+        assert_eq!(
+            configured_stun_url("stun.example.org:3478").as_deref(),
+            Some("stun:stun.example.org:3478")
+        );
+        assert_eq!(
+            configured_stun_url(" 203.0.113.7:3478 ").as_deref(),
+            Some("stun:203.0.113.7:3478")
+        );
+        assert_eq!(
+            configured_stun_url("[2001:db8::1]:3478").as_deref(),
+            Some("stun:[2001:db8::1]:3478")
+        );
+    }
+
+    #[test]
+    fn stun_url_uses_the_dialable_host_only() {
+        assert_eq!(
+            stun_url(Some("203.0.113.5:9000"), Some(3478)).as_deref(),
+            Some("stun:203.0.113.5:3478")
+        );
+        assert_eq!(
+            stun_url(Some("[2001:db8::1]:9000"), Some(3478)).as_deref(),
+            Some("stun:[2001:db8::1]:3478")
+        );
+        assert_eq!(
+            stun_url(Some(" node.example.org:9000 "), Some(1)).as_deref(),
+            Some("stun:node.example.org:1")
+        );
+        for bad in [
+            "127.0.0.1:9000",
+            "[::1]:9000",
+            "0.0.0.0:9000",
+            "localhost:9000",
+            "nohost",
+            ":9000",
+            "a b:1",
+            "user@h:1",
+            "2001:db8::1:9000",
+        ] {
+            assert_eq!(stun_url(Some(bad), Some(3478)), None, "{bad}");
+        }
+        assert_eq!(stun_url(None, Some(3478)), None);
+        assert_eq!(stun_url(Some("203.0.113.5:9000"), None), None);
+    }
 }

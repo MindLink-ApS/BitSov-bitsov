@@ -7,6 +7,7 @@ fn channel() -> ChannelInfo {
         peer_pubkey: "02".repeat(33),
         capacity_msat: 100_000_000,
         local_balance_msat: 0,
+        outbound_capacity_msat: None,
         remote_balance_msat: 100_000_000,
         active: true,
         short_channel_id: None,
