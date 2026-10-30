@@ -39,6 +39,22 @@ const CRITICAL_PERIOD_BOOST: f64 = 2.0;
 /// Duration of the critical period after first connection.
 const CRITICAL_PERIOD_DURATION: Duration = Duration::from_secs(3600);
 
+/// Timechain plasticity: a weight halves after this many blocks without use
+/// (about one day). Decay counted in blocks is identical on every node that
+/// sees the same height and does not depend on a node's clock or uptime.
+pub const DECAY_HALF_LIFE_BLOCKS: u64 = 144;
+
+/// Most blocks a single height observation may decay a weight by (about two
+/// weeks). A wildly wrong height from a chain source cannot erase every
+/// relation at once; a real long absence still decays over later observations.
+pub const MAX_DECAY_STEP_BLOCKS: u64 = 2016;
+
+/// Factor a weight keeps after `blocks` blocks of disuse:
+/// `0.5 ^ (blocks / DECAY_HALF_LIFE_BLOCKS)`.
+pub fn decay_factor(blocks: u64) -> f64 {
+    0.5f64.powf(blocks as f64 / DECAY_HALF_LIFE_BLOCKS as f64)
+}
+
 /// Queue depth at which homeostatic scaling activates, reducing all weights globally.
 pub const HOMEOSTATIC_QUEUE_THRESHOLD: usize = 5000;
 
@@ -79,10 +95,16 @@ pub struct SynapticWeight {
     /// per-peer relay count is here for the dendritic growth check.
     relay_count: u32,
 
-    /// When this weight was last updated (decay reference point).
-    /// Serialized as milliseconds since epoch for persistence.
+    /// When this weight was last updated (wall-clock decay reference point).
+    /// Not persisted: an `Instant` has no meaning across restarts.
     #[serde(skip, default = "Instant::now")]
     last_updated: Instant,
+
+    /// Block height of the last chain-time decay (timechain plasticity).
+    /// `None` until a height is first observed. Persisted, so decay over
+    /// blocks that passed while the node was offline is applied on load.
+    #[serde(default)]
+    last_height: Option<u64>,
 
     /// When the first connection to this peer was established.
     /// Used for critical period (boosted learning) calculation.
@@ -116,6 +138,7 @@ impl SynapticWeight {
             attempts: 0,
             relay_count: 0,
             last_updated: Instant::now(),
+            last_height: None,
             first_connected: Instant::now(),
             below_threshold_since: None,
             pruned: false,
@@ -285,6 +308,40 @@ impl SynapticWeight {
         self.update_pruning_state();
     }
 
+    /// Block height this weight was last decayed at, if one has been observed.
+    pub fn last_height(&self) -> Option<u64> {
+        self.last_height
+    }
+
+    /// Apply chain-time decay (timechain plasticity) up to block `height`.
+    ///
+    /// The weight halves every [`DECAY_HALF_LIFE_BLOCKS`] blocks. The result
+    /// depends only on the weight and the heights observed, never on a clock:
+    /// - height 0 means the chain view is unknown: decay is frozen;
+    /// - the first observed height only stamps the weight;
+    /// - a height at or below the last one is ignored (a reorg or a lagging
+    ///   source never "un-decays" or decays twice);
+    /// - one observation decays by at most [`MAX_DECAY_STEP_BLOCKS`].
+    ///
+    /// Wall-clock [`Self::apply_decay`] stays for existing callers; a caller
+    /// uses one clock or the other for a given weight, never both.
+    pub fn apply_decay_at(&mut self, height: u64) {
+        if height > 0 {
+            match self.last_height {
+                None => self.last_height = Some(height),
+                Some(last) if height > last => {
+                    self.weight *= decay_factor((height - last).min(MAX_DECAY_STEP_BLOCKS));
+                    self.last_height = Some(height);
+                }
+                Some(_) => {}
+            }
+        }
+        if !self.weight.is_finite() {
+            self.weight = INITIAL_WEIGHT;
+        }
+        self.update_pruning_state();
+    }
+
     /// Apply homeostatic scaling — reduce weight by a global factor.
     ///
     /// Called when the node's message queue exceeds the homeostatic threshold,
@@ -371,6 +428,75 @@ impl SynapticWeight {
 
 #[cfg(test)]
 mod tests {
+    use super::{decay_factor, DECAY_HALF_LIFE_BLOCKS, MAX_DECAY_STEP_BLOCKS};
+
+    #[test]
+    fn chain_time_decay_halves_per_half_life() {
+        let mut w = super::SynapticWeight::with_initial_weight(0.8);
+        w.apply_decay_at(1_000);
+        assert_eq!(w.weight(), 0.8, "the first height only stamps");
+        assert_eq!(w.last_height(), Some(1_000));
+        w.apply_decay_at(1_000 + DECAY_HALF_LIFE_BLOCKS);
+        assert!((w.weight() - 0.4).abs() < 1e-12, "{}", w.weight());
+        w.apply_decay_at(1_000 + 3 * DECAY_HALF_LIFE_BLOCKS);
+        assert!((w.weight() - 0.1).abs() < 1e-12, "{}", w.weight());
+        assert!((decay_factor(DECAY_HALF_LIFE_BLOCKS) - 0.5).abs() < 1e-15);
+        assert_eq!(decay_factor(0), 1.0);
+    }
+
+    #[test]
+    fn unknown_lower_or_equal_heights_never_decay() {
+        let mut w = super::SynapticWeight::with_initial_weight(0.6);
+        w.apply_decay_at(0);
+        assert_eq!((w.weight(), w.last_height()), (0.6, None), "height 0 is unknown: frozen");
+        w.apply_decay_at(500);
+        w.apply_decay_at(500);
+        w.apply_decay_at(400);
+        w.apply_decay_at(0);
+        assert_eq!((w.weight(), w.last_height()), (0.6, Some(500)), "equal, lower and unknown heights are no-ops");
+    }
+
+    #[test]
+    fn one_observation_decays_at_most_the_step_limit() {
+        let mut w = super::SynapticWeight::with_initial_weight(1.0);
+        w.apply_decay_at(10);
+        w.apply_decay_at(10 + 10 * MAX_DECAY_STEP_BLOCKS);
+        assert!((w.weight() - decay_factor(MAX_DECAY_STEP_BLOCKS)).abs() < 1e-15);
+        assert_eq!(w.last_height(), Some(10 + 10 * MAX_DECAY_STEP_BLOCKS));
+    }
+
+    #[test]
+    fn chain_time_decay_is_deterministic_across_nodes() {
+        let heights = [7u64, 30, 30, 29, 200, 0, 345, 9_000];
+        let run = || {
+            let mut w = super::SynapticWeight::with_initial_weight(0.73);
+            for h in heights { w.apply_decay_at(h); }
+            w.weight().to_bits()
+        };
+        assert_eq!(run(), run(), "same heights, bit-identical weight");
+    }
+
+    #[test]
+    fn chain_time_reference_survives_serialization_and_old_records_load() {
+        let mut w = super::SynapticWeight::with_initial_weight(0.5);
+        w.apply_decay_at(800);
+        let restored: super::SynapticWeight = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
+        assert_eq!(restored.last_height(), Some(800));
+        // A record written before this field existed loads unstamped.
+        let mut old = serde_json::to_value(&w).unwrap();
+        old.as_object_mut().unwrap().remove("last_height");
+        let restored: super::SynapticWeight = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.last_height(), None);
+    }
+
+    #[test]
+    fn chain_time_decay_repairs_a_corrupt_weight() {
+        let mut w = super::SynapticWeight::with_initial_weight(0.5);
+        w.weight = f64::NAN;
+        w.apply_decay_at(1);
+        assert_eq!(w.weight(), super::INITIAL_WEIGHT);
+    }
+
     use super::*;
 
     #[test]
