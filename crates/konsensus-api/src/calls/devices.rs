@@ -19,9 +19,43 @@ struct Invite {
     deadline_ms: u64,
     waiting: bool,
     ack_pending: bool,
-    /// A device stream wrote this invite but its delivery did not commit.
-    /// The sweep reconciles it from this time before it may expire the wait.
+    /// Earliest completed device stream write of this invite. It anchors the
+    /// ring clock on every delivery path, and the sweep reconciles it before
+    /// it may expire the wait.
     witnessed_ms: Option<u64>,
+    /// Stream writes in flight. The sweep never expires a wait under one.
+    sending: u32,
+}
+
+/// One device stream write of a waiting invite, armed under the call lock so
+/// the sweep cannot expire the wait while it is in flight. Dropping it ends
+/// the write; a completed write leaves its time as delivery evidence first.
+pub struct StreamTicket<'a> {
+    devices: &'a Devices,
+    id: MessageId,
+    armed: bool,
+    written_ms: Option<u64>,
+}
+
+impl StreamTicket<'_> {
+    /// The device received the invite at `at_ms`.
+    pub fn written(&mut self, at_ms: u64) {
+        self.written_ms = Some(at_ms);
+    }
+}
+
+impl Drop for StreamTicket<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(tracked) = self.devices.invites.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&self.id) {
+            tracked.sending = tracked.sending.saturating_sub(1);
+            if let Some(at_ms) = self.written_ms.filter(|_| tracked.waiting) {
+                tracked.witnessed_ms = Some(tracked.witnessed_ms.map_or(at_ms, |first| first.min(at_ms)));
+            }
+        }
+    }
 }
 
 /// This node's current incoming invites, identified by envelope, not call id.
@@ -127,6 +161,7 @@ impl Devices {
                         waiting: true,
                         ack_pending: false,
                         witnessed_ms: None,
+                        sending: 0,
                     },
                 );
             store
@@ -182,18 +217,10 @@ impl Devices {
             self.adopt(store, &envelope.id, &invite).await?;
             return Ok(());
         }
-        self.deliver(store, &envelope.id, &invite, now_ms).await.map(|_| ())
-    }
-
-    /// A device stream wrote `id` but recording its delivery failed. Keep that
-    /// evidence, so the sweep rings from the write rather than reporting the
-    /// call not reachable (Codex FAIL on #472).
-    pub fn witnessed(&self, id: &MessageId, at_ms: u64) {
-        if let Some(tracked) = self.invites.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id) {
-            if tracked.waiting {
-                tracked.witnessed_ms.get_or_insert(at_ms);
-            }
-        }
+        // The first device delivery starts the ring clock, whichever path
+        // finally records it (Codex FAIL on #472).
+        let at_ms = invite.witnessed_ms.map_or(now_ms, |first| first.min(now_ms));
+        self.deliver(store, &envelope.id, &invite, at_ms).await.map(|_| ())
     }
 
     /// Start ringing from a delivery at `at_ms`. The receipt and the ringing
@@ -256,12 +283,27 @@ impl Devices {
         plaintext: Option<&str>,
         clock: impl FnOnce() -> u64,
     ) -> Result<bool, StorageError> {
+        Ok(self.stream(store, envelope, plaintext, clock).await?.is_some())
+    }
+
+    /// [`Self::deliverable`] for a device stream about to write `envelope`.
+    /// For a waiting invite the ticket is armed under the call lock, so the
+    /// deadline sweep cannot expire the wait until the write has finished and
+    /// left its evidence (Codex FAIL on #472).
+    pub async fn stream(
+        &self,
+        store: &dyn Storage,
+        envelope: &UkmEnvelope,
+        plaintext: Option<&str>,
+        clock: impl FnOnce() -> u64,
+    ) -> Result<Option<StreamTicket<'_>>, StorageError> {
+        let ticket = |armed| StreamTicket { devices: self, id: envelope.id, armed, written_ms: None };
         if envelope.kind != konsensus_core::kind::KIND_CALL_INVITE {
-            return Ok(true);
+            return Ok(Some(ticket(false)));
         }
         let Some(signal) = plaintext.and_then(|text| CallSignal::parse(envelope.kind, text).ok())
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let _guard = super::lock().lock().await;
         let now_ms = clock();
@@ -274,10 +316,10 @@ impl Devices {
         let Some(invite) =
             tracked.filter(|i| i.peer == envelope.sender && i.call_id == signal.call_id)
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let row = store.call_get(&envelope.sender, &signal.call_id).await?;
-        Ok(row.and_then(|e| e.at(now_ms)).is_some_and(|e| {
+        let live = row.and_then(|e| e.at(now_ms)).is_some_and(|e| {
             e.side == Side::Callee
                 && matches!(
                     e.phase,
@@ -288,7 +330,16 @@ impl Devices {
                     Phase::Ringing | Phase::Live => !invite.waiting,
                     _ => false,
                 }
-        }))
+        });
+        if !live {
+            return Ok(None);
+        }
+        if invite.waiting {
+            if let Some(tracked) = self.invites.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&envelope.id) {
+                tracked.sending = tracked.sending.saturating_add(1);
+            }
+        }
+        Ok(Some(ticket(invite.waiting)))
     }
 
     /// Expire waits before the existing call-state sweep. Return bounded
@@ -314,6 +365,12 @@ impl Devices {
         let mut notices = Vec::with_capacity(due.len());
         for (id, invite) in due {
             let result: Result<(), StorageError> = async {
+                // Decide on the current entry, not the snapshot: a stream write
+                // may have finished and left its evidence since. No write can
+                // start meanwhile, as arming one needs the call lock held here.
+                let Some(invite) = self.invites.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned() else {
+                    return Ok(());
+                };
                 let row = store.call_get(&invite.peer, &invite.call_id).await?;
                 if invite.ack_pending {
                     notices.push((invite.peer, Frame::MessageAck { id, duplicate: false, paid_until_ms: None }));
@@ -332,7 +389,7 @@ impl Devices {
                         }
                     }
                 }
-                if invite.waiting && invite.deadline_ms > now_ms {
+                if invite.waiting && (invite.deadline_ms > now_ms || invite.sending > 0) {
                     return Ok(());
                 }
                 if invite.waiting {

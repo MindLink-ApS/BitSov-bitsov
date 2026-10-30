@@ -844,28 +844,83 @@ async fn delivery_and_expiry_are_mutually_exclusive_in_either_order() {
     }
 }
 
-/// A device stream wrote the invite but recording the delivery failed. The
-/// write is kept as evidence: once storage recovers, even after the original
-/// device deadline, the sweep rings from the write and acknowledges, never
-/// reporting the call not reachable.
+/// A stream write in flight holds off expiry: the sweep at the deadline
+/// waits for it, and a completed write rings from its own time even when it
+/// finished after the deadline and storage failed to record it at once.
 #[tokio::test]
-async fn witnessed_stream_delivery_rings_after_storage_recovers() {
+async fn in_flight_stream_write_cannot_lose_to_expiry() {
     let db = SqliteStorage::in_memory().await.unwrap();
     let devices = Devices::default();
     let (env, text) = invite(18);
     db.accept_paid_envelope(&env).await.unwrap();
     devices.admit(&db, &own(), &env, Some(&text), 1_000, || 1_000).await.unwrap();
-    sqlx::raw_sql("CREATE TRIGGER fail_fetch BEFORE UPDATE OF accepted ON payment_receipts BEGIN SELECT RAISE(ABORT, 'injected'); END;")
-        .execute(db.pool()).await.unwrap();
-    assert!(devices.fetched(&db, &env, || 11_000).await.is_err());
-    devices.witnessed(&env.id, 11_000);
-    // Storage still failing at the device deadline: nothing is refused.
-    let notices = devices.sweep(&db, 16_500).await.unwrap();
-    assert!(notices.is_empty(), "{notices:?}");
-    sqlx::raw_sql("DROP TRIGGER fail_fetch").execute(db.pool()).await.unwrap();
-    let notices = devices.sweep(&db, 17_000).await.unwrap();
+    let mut ticket = devices.stream(&db, &env, Some(&text), || 15_900).await.unwrap().expect("deliverable");
+    assert!(devices.sweep(&db, 16_100).await.unwrap().is_empty(), "expired under an in-flight write");
+    assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::AwaitingDevice);
+    ticket.written(15_950);
+    drop(ticket);
+    let notices = devices.sweep(&db, 16_200).await.unwrap();
     assert!(matches!(&notices[..], [(_, konsensus_message::Frame::MessageAck { .. })]), "{notices:?}");
     let row = db.call_get(&env.sender, CALL).await.unwrap().unwrap();
-    assert_eq!((row.phase, row.deadline_ms), (Phase::Ringing, 11_000 + konsensus_core::payloads::call::RING_TIMEOUT_MS));
-    assert_eq!(db.call_invite_outcome(&env).await.unwrap(), Some(konsensus_storage::CallInviteOutcome::Fetched));
+    assert_eq!((row.phase, row.deadline_ms), (Phase::Ringing, 15_950 + konsensus_core::payloads::call::RING_TIMEOUT_MS));
+    // An interrupted write leaves no evidence: the next wait expires normally.
+    let (env, text) = invite(19);
+    let devices = Devices::default();
+    let db = SqliteStorage::in_memory().await.unwrap();
+    db.accept_paid_envelope(&env).await.unwrap();
+    devices.admit(&db, &own(), &env, Some(&text), 1_000, || 1_000).await.unwrap();
+    drop(devices.stream(&db, &env, Some(&text), || 15_900).await.unwrap());
+    let notices = devices.sweep(&db, 16_100).await.unwrap();
+    assert!(matches!(&notices[..], [(_, konsensus_message::Frame::MessageReject { reason, .. })] if reason == "call_not_reachable"));
+}
+
+/// Through the real WebSocket handler: the device receives the invite but
+/// recording the delivery fails. The sweep past the device deadline refuses
+/// nothing; a later paired fetch after storage recovers rings from the first
+/// write, not from itself, and the caller is acknowledged.
+#[tokio::test]
+async fn websocket_delivery_survives_a_failed_record_and_anchors_the_ring_clock() {
+    use axum::{body::Body, http::Request};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tower::ServiceExt;
+    let (_dir, state, db, token) = paired_state().await;
+    let (env, text) = stored_invite(&state, &db).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = konsensus_api::build_router_for_addr(state.clone(), addr);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    });
+    let (status, mut socket) = ws_connect(addr, &token, true).await;
+    assert_eq!(status, 101);
+    socket.write_all(&[0x89, 0x80, 0, 0, 0, 0]).await.unwrap();
+    assert_eq!(socket.read_u8().await.unwrap(), 0x8a);
+    assert_eq!(socket.read_u8().await.unwrap(), 0);
+    sqlx::raw_sql("CREATE TRIGGER fail_fetch BEFORE UPDATE OF accepted ON payment_receipts WHEN NEW.accepted = 1 BEGIN SELECT RAISE(ABORT, 'injected'); END;")
+        .execute(db.pool()).await.unwrap();
+    let before = konsensus_api::calls::now_ms();
+    state.ws_broadcast.send(std::sync::Arc::new(konsensus_api::state::WsMessage { envelope: env.clone(), plaintext: Some(text) })).unwrap();
+    let received: serde_json::Value = serde_json::from_str(&read_ws_text(&mut socket).await).unwrap();
+    assert_eq!(received["id"], env.id.to_hex());
+    let written = konsensus_api::calls::now_ms();
+    // The handler gives up on the connection once recording fails.
+    let mut rest = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), socket.read_to_end(&mut rest)).await.unwrap().ok();
+    assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::AwaitingDevice);
+    let notices = state.call_devices.sweep(db.as_ref(), written + 16_000).await.unwrap();
+    assert!(notices.is_empty(), "delivered invite refused: {notices:?}");
+    sqlx::raw_sql("DROP TRIGGER fail_fetch").execute(db.pool()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let reply = common::test_router(state.clone())
+        .oneshot(Request::builder().uri("/api/v1/messages").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(reply.status().is_success());
+    let row = db.call_get(&env.sender, CALL).await.unwrap().unwrap();
+    assert_eq!(row.phase, Phase::Ringing);
+    let ring = konsensus_core::payloads::call::RING_TIMEOUT_MS;
+    assert!((before + ring..=written + ring).contains(&row.deadline_ms), "ring clock moved to the later fetch");
+    let notices = state.call_devices.sweep(db.as_ref(), konsensus_api::calls::now_ms()).await.unwrap();
+    assert!(matches!(&notices[..], [(_, konsensus_message::Frame::MessageAck { .. })]), "{notices:?}");
+    server.abort();
 }
