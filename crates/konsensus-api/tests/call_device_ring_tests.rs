@@ -858,13 +858,13 @@ async fn in_flight_stream_write_cannot_lose_to_expiry() {
     assert!(devices.sweep(&db, 16_100).await.unwrap().is_empty(), "expired under an in-flight write");
     assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::AwaitingDevice);
     // Armed before the 16 000 deadline, finished after it: still delivered,
-    // ringing from the last instant of the wait.
+    // and the ring clock starts at the actual completion.
     ticket.written(16_050);
     drop(ticket);
     let notices = devices.sweep(&db, 16_200).await.unwrap();
     assert!(matches!(&notices[..], [(_, konsensus_message::Frame::MessageAck { .. })]), "{notices:?}");
     let row = db.call_get(&env.sender, CALL).await.unwrap().unwrap();
-    assert_eq!((row.phase, row.deadline_ms), (Phase::Ringing, 15_999 + konsensus_core::payloads::call::RING_TIMEOUT_MS));
+    assert_eq!((row.phase, row.deadline_ms), (Phase::Ringing, 16_050 + konsensus_core::payloads::call::RING_TIMEOUT_MS));
     // An interrupted write leaves no evidence: the next wait expires normally.
     let (env, text) = invite(19);
     let devices = Devices::default();
@@ -966,4 +966,40 @@ async fn expired_wait_fetch_is_declined() {
     devices.admit(&db, &own(), &env, Some(&text), 1_000, || 1_000).await.unwrap();
     assert!(!devices.fetched(&db, &env, || 16_000).await.unwrap());
     assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::AwaitingDevice);
+}
+
+/// A read that loaded the invite before the sweep expired it finds no
+/// binding afterwards; the durable not-reachable outcome decides, so the
+/// request cannot report a successful delivery of an unanswerable invite.
+#[tokio::test]
+async fn fetch_after_completed_expiry_is_declined() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let devices = Devices::default();
+    let (env, text) = invite(23);
+    db.accept_paid_envelope(&env).await.unwrap();
+    devices.admit(&db, &own(), &env, Some(&text), 1_000, || 1_000).await.unwrap();
+    let notices = devices.sweep(&db, 16_000).await.unwrap();
+    assert!(matches!(&notices[..], [(_, konsensus_message::Frame::MessageReject { .. })]));
+    assert!(!devices.fetched(&db, &env, || 16_100).await.unwrap());
+    assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::Ended);
+}
+
+/// Through the handlers: once the invite expired and was withdrawn, neither
+/// the message nor its cached plaintext is served to the paired device.
+#[tokio::test]
+async fn withdrawn_invite_is_not_served_by_get_or_plaintext() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let (_dir, state, db, token) = paired_state().await;
+    let (env, _) = stored_invite(&state, &db).await;
+    let notices = state.call_devices.sweep(db.as_ref(), konsensus_api::calls::now_ms() + 16_000).await.unwrap();
+    assert!(matches!(&notices[..], [(_, konsensus_message::Frame::MessageReject { .. })]));
+    for path in ["", "/plaintext"] {
+        let reply = common::test_router(state.clone())
+            .oneshot(Request::builder().uri(format!("/api/v1/messages/{}{path}", env.id.to_hex()))
+                .header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(!reply.status().is_success(), "{path}: {}", reply.status());
+    }
 }

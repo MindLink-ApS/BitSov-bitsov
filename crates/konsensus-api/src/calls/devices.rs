@@ -51,10 +51,10 @@ impl Drop for StreamTicket<'_> {
         }
         if let Some(tracked) = self.devices.invites.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&self.id) {
             tracked.sending = tracked.sending.saturating_sub(1);
-            if let Some(written_ms) = self.written_ms.filter(|_| tracked.waiting) {
-                // Armed before the deadline, so it counts as delivered within
-                // the wait even if the socket write finished just after it.
-                let at_ms = written_ms.min(tracked.deadline_ms.saturating_sub(1));
+            if let Some(at_ms) = self.written_ms.filter(|_| tracked.waiting) {
+                // The actual completion time anchors the ring clock. Armed
+                // before the deadline, it counts as delivered within the wait
+                // even if the socket write finished just after it.
                 tracked.witnessed_ms = Some(tracked.witnessed_ms.map_or(at_ms, |first| first.min(at_ms)));
             }
         }
@@ -209,7 +209,14 @@ impl Devices {
             .get(&envelope.id)
             .cloned();
         let Some(invite) = invite.filter(|i| i.peer == envelope.sender) else {
-            return Ok(true);
+            // No binding: possibly expired while this request was reading the
+            // invite. Only durable evidence decides; an invite that ended not
+            // reachable, or still pending without a wait, is never handed out
+            // (Codex FAIL on #472).
+            return Ok(!matches!(
+                store.call_invite_outcome(envelope).await?,
+                Some(CallInviteOutcome::NotReachable | CallInviteOutcome::Pending)
+            ));
         };
         if !invite.waiting {
             return Ok(true);
@@ -235,14 +242,21 @@ impl Devices {
         let Some(row) = store.call_get(&invite.peer, &invite.call_id).await? else {
             return Ok(false);
         };
+        // A stream write armed before the deadline is eligible even if it
+        // completed after it; any other delivery must land within the wait.
+        let witnessed = invite.witnessed_ms == Some(at_ms);
         if row.side != Side::Callee
             || row.phase != Phase::AwaitingDevice
             || row.deadline_ms != invite.deadline_ms
-            || at_ms >= row.deadline_ms
+            || (at_ms >= row.deadline_ms && !witnessed)
         {
             return Ok(false);
         }
-        let next = row.device_fetched(at_ms).expect("unexpired row");
+        let deadline_ms = row.deadline_ms;
+        let next = rules::CallEntry {
+            deadline_ms: at_ms.saturating_add(rules::RING_TIMEOUT_MS),
+            ..row.device_fetched(at_ms.min(deadline_ms.saturating_sub(1))).expect("unexpired row")
+        };
         if store.call_invite_deliver(id, &invite.peer, &invite.call_id, &next).await? {
             self.delivered(id, next.deadline_ms);
             return Ok(true);

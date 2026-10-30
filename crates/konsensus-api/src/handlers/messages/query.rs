@@ -249,10 +249,12 @@ pub(super) async fn get_message_plaintext(
         }
     };
 
-    if let Some(envelope) = state.storage.get_message(&id).await.map_err(|e| ApiError::Storage(e.to_string()))? {
-        if !device_fetched(&auth, &state, &envelope).await? {
-            return Err(ApiError::Conflict("call invite is no longer deliverable".into()));
-        }
+    // Cached plaintext is only served with its message: a withdrawn invite
+    // (e.g. expired not reachable) must not leak out through this path.
+    let envelope = state.storage.get_message(&id).await.map_err(|e| ApiError::Storage(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("message {id_hex} not found")))?;
+    if !device_fetched(&auth, &state, &envelope).await? {
+        return Err(ApiError::Conflict("call invite is no longer deliverable".into()));
     }
     Ok(Json(content))
 }
