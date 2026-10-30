@@ -377,10 +377,15 @@ impl IncomingBlock<'_> {
 
     /// Publish only after the envelope's payment proof is accepted. Do not
     /// recheck time: expiry cannot race the admission decision under this lock.
-    pub async fn commit(self) -> Result<CallSignal, konsensus_storage::StorageError> {
+    ///
+    /// The grant and the release of the admission hold on `message` are one
+    /// storage transaction: once this returns `Ok`, the block is admitted and
+    /// no sweep or retry can withdraw it; on `Err` nothing was granted.
+    /// Returns the granted boundary, the `paid_until_ms` the grant ACK carries.
+    pub async fn commit(self, message: &konsensus_core::MessageId) -> Result<(CallSignal, Option<u64>), konsensus_storage::StorageError> {
         let next = self.next.map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
-        self.store.call_put(&self.peer, &self.signal.call_id, &next).await?;
-        Ok(self.signal)
+        self.store.call_commit_admitted(&self.peer, &self.signal.call_id, &next, message).await?;
+        Ok((self.signal, next.paid_until_ms))
     }
 }
 

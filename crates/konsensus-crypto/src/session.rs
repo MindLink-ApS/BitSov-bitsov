@@ -142,6 +142,15 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+/// What to do with a session that already exists when a new one is derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionReplacement {
+    /// Fail with [`SessionError::SessionExists`]; the existing session stays.
+    Keep,
+    /// Replace it, in one write, once the new session is fully derived.
+    Replace,
+}
+
 /// An active E2EE session with a peer.
 struct PeerSession {
     /// The Double Ratchet for this session.
@@ -544,6 +553,9 @@ impl SessionManager {
     /// Performs X3DH key agreement and initializes a Double Ratchet session
     /// as the sender. Returns the session init data that must be sent to
     /// the peer so they can derive the same shared secret.
+    ///
+    /// Fails with [`SessionError::SessionExists`] while a session with the
+    /// peer exists; [`Self::reinitiate_session`] replaces one.
     pub async fn initiate_session(
         &self,
         peer_id: &NodeId,
@@ -553,11 +565,38 @@ impl SessionManager {
         if self.sessions.read().await.contains_key(peer_id) {
             return Err(SessionError::SessionExists(*peer_id));
         }
+        self.initiate_with(peer_id, peer_bundle, SessionReplacement::Keep)
+            .await
+    }
 
-        // Deserialize peer's prekey bundle
+    /// Initiate an E2EE session with a peer, replacing any session that
+    /// already exists with it.
+    ///
+    /// The existing session is replaced only after the bundle has been fully
+    /// validated (key formats, node id, signed pre-key signature) and X3DH
+    /// has succeeded, in one write of the session map. Until then, and after
+    /// any failure, the existing session stays in place and usable, so a
+    /// malformed or forged offer cannot erase a working session.
+    pub async fn reinitiate_session(
+        &self,
+        peer_id: &NodeId,
+        peer_bundle: &SerializablePrekeyBundle,
+    ) -> Result<SerializableSessionInit, SessionError> {
+        self.initiate_with(peer_id, peer_bundle, SessionReplacement::Replace)
+            .await
+    }
+
+    async fn initiate_with(
+        &self,
+        peer_id: &NodeId,
+        peer_bundle: &SerializablePrekeyBundle,
+        replacement: SessionReplacement,
+    ) -> Result<SerializableSessionInit, SessionError> {
+        // Validate the peer's bundle and derive the whole session before the
+        // session map is touched: nothing below can fail once it is.
         let bundle = deserialize_prekey_bundle(peer_bundle)?;
 
-        // Perform X3DH as initiator (Alice)
+        // Perform X3DH as initiator (Alice); this verifies the signed pre-key.
         let alice_secret = self.identity.x25519_secret();
         let alice_public = self.identity.x25519_public();
 
@@ -572,11 +611,8 @@ impl SessionManager {
 
         let ratchet_key = *ratchet.public_key().as_bytes();
 
-        // Store session
-        self.sessions
-            .write()
-            .await
-            .insert(*peer_id, PeerSession { ratchet });
+        // Store (or atomically replace) the session.
+        self.install_session(peer_id, ratchet, replacement).await?;
 
         // Persist to storage
         self.persist_session(peer_id).await;
@@ -593,6 +629,11 @@ impl SessionManager {
     ///
     /// Performs X3DH key agreement as the responder and initializes a
     /// Double Ratchet session as the receiver.
+    ///
+    /// Fails with [`SessionError::SessionExists`] while a session with the
+    /// peer exists; [`Self::reaccept_session`] replaces one. An init that
+    /// names a one-time pre-key this node does not hold is invalid: it could
+    /// only derive a secret the initiator does not share.
     pub async fn accept_session(
         &self,
         peer_id: &NodeId,
@@ -602,21 +643,51 @@ impl SessionManager {
         if self.sessions.read().await.contains_key(peer_id) {
             return Err(SessionError::SessionExists(*peer_id));
         }
+        self.accept_with(peer_id, init_data, SessionReplacement::Keep)
+            .await
+    }
 
-        // Parse init data
+    /// Accept an E2EE session initiated by a peer, replacing any session that
+    /// already exists with it.
+    ///
+    /// The existing session is replaced only after the init has been fully
+    /// validated (key formats, a one-time pre-key id this node holds) and
+    /// X3DH has succeeded, in one write of the session map. Until then, and
+    /// after any failure, the existing session stays in place and usable, and
+    /// no one-time pre-key is consumed.
+    pub async fn reaccept_session(
+        &self,
+        peer_id: &NodeId,
+        init_data: &SerializableSessionInit,
+    ) -> Result<(), SessionError> {
+        self.accept_with(peer_id, init_data, SessionReplacement::Replace)
+            .await
+    }
+
+    async fn accept_with(
+        &self,
+        peer_id: &NodeId,
+        init_data: &SerializableSessionInit,
+        replacement: SessionReplacement,
+    ) -> Result<(), SessionError> {
+        // Parse init data. The ratchet key is read from message headers, but
+        // an init whose key is malformed is not one a conforming peer sends.
         let alice_identity_key = parse_x25519_key(&init_data.identity_key)?;
         let alice_ephemeral_key = parse_x25519_key(&init_data.ephemeral_key)?;
+        parse_x25519_key(&init_data.ratchet_key)?;
 
         // Look up our signed pre-key
         let spk = self.signed_prekey.read().await.clone();
 
-        // Look up and consume the one-time pre-key if used
-        let otpk = if let Some(opk_id) = init_data.one_time_prekey_id {
-            let mut otpks = self.one_time_prekeys.write().await;
-            let idx = otpks.iter().position(|k| k.id == opk_id);
-            idx.map(|i| otpks.remove(i))
-        } else {
-            None
+        // Look up the one-time pre-key if one is named. The pool stays locked
+        // across the key agreement so the key is consumed only once the
+        // agreement has succeeded; a failed init consumes nothing.
+        let mut otpks = self.one_time_prekeys.write().await;
+        let otpk_idx = match init_data.one_time_prekey_id {
+            Some(opk_id) => Some(otpks.iter().position(|k| k.id == opk_id).ok_or_else(|| {
+                SessionError::InvalidPeerData(format!("unknown one-time prekey id {opk_id}"))
+            })?),
+            None => None,
         };
 
         // Perform X3DH as responder (Bob)
@@ -627,7 +698,7 @@ impl SessionManager {
             bob_identity_secret,
             bob_identity_public,
             &spk,
-            otpk.as_ref(),
+            otpk_idx.map(|i| &otpks[i]),
             &alice_identity_key,
             &alice_ephemeral_key,
         )?;
@@ -640,11 +711,12 @@ impl SessionManager {
             shared_secret.associated_data.clone(),
         );
 
-        // Store session
-        self.sessions
-            .write()
-            .await
-            .insert(*peer_id, PeerSession { ratchet });
+        // Store (or atomically replace) the session, then consume the key.
+        self.install_session(peer_id, ratchet, replacement).await?;
+        if let Some(i) = otpk_idx {
+            otpks.remove(i);
+        }
+        drop(otpks);
 
         // Persist to storage
         self.persist_session(peer_id).await;
@@ -652,6 +724,23 @@ impl SessionManager {
         // Replenish one-time pre-keys if running low
         self.replenish_prekeys().await;
 
+        Ok(())
+    }
+
+    /// Install a fully derived session under one write of the session map.
+    /// With [`SessionReplacement::Keep`] an existing session is left as it is
+    /// and the new one is dropped.
+    async fn install_session(
+        &self,
+        peer_id: &NodeId,
+        ratchet: DoubleRatchet,
+        replacement: SessionReplacement,
+    ) -> Result<(), SessionError> {
+        let mut sessions = self.sessions.write().await;
+        if replacement == SessionReplacement::Keep && sessions.contains_key(peer_id) {
+            return Err(SessionError::SessionExists(*peer_id));
+        }
+        sessions.insert(*peer_id, PeerSession { ratchet });
         Ok(())
     }
 

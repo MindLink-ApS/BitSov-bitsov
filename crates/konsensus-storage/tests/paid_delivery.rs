@@ -334,3 +334,29 @@ async fn legacy_duplicate_receipt_lookup_preserves_binding_before_retention() {
     db.delete_messages_older_than(10).await.unwrap();
     assert!(db.is_paid_envelope_accepted(&env).await.unwrap(), "a lost duplicate ACK must remain recoverable after retention");
 }
+
+#[tokio::test]
+async fn withdrawn_envelope_is_reported_withdrawn_to_its_sender_only() {
+    use konsensus_storage::PaidAcceptance::*;
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let env = envelope();
+    assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), Accepted);
+    db.reject_accepted_envelope(&env).await.unwrap();
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    // The same envelope again: withdrawn, not re-accepted, not "reused".
+    assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), Withdrawn);
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    // Another message, or another sender, on the burned payment: reused.
+    let mut other_id = env.clone();
+    other_id.id = konsensus_core::MessageId::from_bytes([9; 32]);
+    assert_eq!(
+        db.accept_paid_envelope(&other_id).await.unwrap(),
+        PaymentReused
+    );
+    let mut other_sender = env.clone();
+    other_sender.sender = NodeId::from_bytes([9; 32]);
+    assert_eq!(
+        db.accept_paid_envelope(&other_sender).await.unwrap(),
+        PaymentReused
+    );
+}

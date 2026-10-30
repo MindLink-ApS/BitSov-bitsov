@@ -77,7 +77,7 @@ async fn bound_invoice_accounting(overpayment: bool) {
             chrono::Utc::now().timestamp_millis() as u64 + 60_000).await.unwrap();
         assert_eq!(fx.state.storage.call_get(&peer, CALL).await.unwrap(), entry);
     } else {
-        incoming.commit().await.unwrap();
+        incoming.commit(&envelope.id).await.unwrap();
         assert!(konsensus_api::calls::call_media_admitted(callee.as_ref(), &caller, CALL,
             chrono::Utc::now().timestamp_millis() as u64).await);
     }

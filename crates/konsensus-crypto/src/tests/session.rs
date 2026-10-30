@@ -770,3 +770,128 @@ async fn decrypt_without_session_fails() {
     let result = mgr_a.decrypt(&node_b, &fake_msg).await;
     assert!(matches!(result, Err(SessionError::NoSession(_))));
 }
+
+// ── Validate before replace ─────────────────────────────────────────
+
+#[tokio::test]
+async fn reinitiate_session_replaces_only_after_the_bundle_validates() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_a = *id_a.node_id();
+    let node_b = *id_b.node_id();
+    let mgr_a = SessionManager::new(id_a);
+    let mgr_b = SessionManager::new(id_b);
+
+    let init = mgr_a
+        .initiate_session(&node_b, &mgr_b.prekey_bundle().await)
+        .await
+        .unwrap();
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+
+    // A forged signature and a malformed key are refused before anything
+    // is touched: the session keeps working.
+    let genuine = mgr_b.prekey_bundle().await;
+    let mut forged = genuine.clone();
+    forged.signed_prekey_sig = hex::encode([0u8; 64]);
+    assert!(matches!(
+        mgr_a.reinitiate_session(&node_b, &forged).await,
+        Err(SessionError::KeyAgreement(_))
+    ));
+    let mut short = genuine.clone();
+    short.identity_key = hex::encode([1u8; 31]);
+    assert!(matches!(
+        mgr_a.reinitiate_session(&node_b, &short).await,
+        Err(SessionError::InvalidPeerData(_))
+    ));
+    let msg = mgr_a.encrypt(&node_b, b"still here").await.unwrap();
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"still here");
+
+    // The non-replacing entry point still refuses while a session exists;
+    // a valid bundle through the replacing one re-keys.
+    assert!(matches!(
+        mgr_a.initiate_session(&node_b, &genuine).await,
+        Err(SessionError::SessionExists(_))
+    ));
+    let init = mgr_a.reinitiate_session(&node_b, &genuine).await.unwrap();
+    assert!(mgr_a.can_send(&node_b).await);
+    mgr_b.reaccept_session(&node_a, &init).await.unwrap();
+    let msg = mgr_a.encrypt(&node_b, b"new session").await.unwrap();
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"new session");
+}
+
+#[tokio::test]
+async fn reaccept_session_refuses_bad_inits_and_consumes_no_prekey() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_a = *id_a.node_id();
+    let node_b = *id_b.node_id();
+    let mgr_a = SessionManager::new(id_a);
+    let mgr_b = SessionManager::new(id_b);
+
+    let init = mgr_a
+        .initiate_session(&node_b, &mgr_b.prekey_bundle().await)
+        .await
+        .unwrap();
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+
+    let pool_before: Vec<u32> = mgr_b
+        .one_time_prekeys
+        .read()
+        .await
+        .iter()
+        .map(|k| k.id)
+        .collect();
+    let held = pool_before[0];
+    let key = hex::encode([2u8; 32]);
+    let unknown_prekey = SerializableSessionInit {
+        identity_key: key.clone(),
+        ephemeral_key: key.clone(),
+        one_time_prekey_id: Some(u32::MAX),
+        ratchet_key: key.clone(),
+    };
+    assert!(matches!(
+        mgr_b.reaccept_session(&node_a, &unknown_prekey).await,
+        Err(SessionError::InvalidPeerData(_))
+    ));
+    let bad_key = SerializableSessionInit {
+        identity_key: "not hex".into(),
+        one_time_prekey_id: Some(held),
+        ..unknown_prekey.clone()
+    };
+    assert!(matches!(
+        mgr_b.reaccept_session(&node_a, &bad_key).await,
+        Err(SessionError::InvalidPeerData(_))
+    ));
+    let bad_ratchet_key = SerializableSessionInit {
+        ratchet_key: hex::encode([3u8; 16]),
+        one_time_prekey_id: Some(held),
+        ..unknown_prekey.clone()
+    };
+    assert!(matches!(
+        mgr_b.reaccept_session(&node_a, &bad_ratchet_key).await,
+        Err(SessionError::InvalidPeerData(_))
+    ));
+
+    // Nothing consumed, nothing replaced.
+    let pool_after: Vec<u32> = mgr_b
+        .one_time_prekeys
+        .read()
+        .await
+        .iter()
+        .map(|k| k.id)
+        .collect();
+    assert_eq!(
+        pool_after, pool_before,
+        "a refused init consumes no one-time pre-key"
+    );
+    let msg = mgr_a.encrypt(&node_b, b"still here").await.unwrap();
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"still here");
+
+    // The non-replacing entry point is as strict about the pre-key id.
+    let mgr_c = SessionManager::new(make_identity(TEST_MNEMONIC_B));
+    assert!(matches!(
+        mgr_c.accept_session(&node_a, &unknown_prekey).await,
+        Err(SessionError::InvalidPeerData(_))
+    ));
+    assert!(!mgr_c.has_session(&node_a).await);
+}

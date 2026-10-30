@@ -793,13 +793,12 @@ async fn handle_prekey_offer(
         return;
     }
 
-    // We are the initiator — perform X3DH with peer's bundle.
-    if session_manager.has_session(peer_id).await {
-        warn!(peer = %peer_id, "peer sent PrekeyOffer but session exists — replacing stale session");
-        session_manager.remove_session(peer_id).await;
-        // Paid ciphertext remains queued until its recipient ACKs, even after a session reset.
-    }
-
+    // We are the initiator — perform X3DH with peer's bundle. Any session we
+    // already have with this peer stays in place and usable until the offer
+    // has been validated and a new session fully derived; the swap is then
+    // atomic (`reinitiate_session`). A malformed or forged offer changes
+    // nothing. Paid ciphertext remains queued until its recipient ACKs, even
+    // across a session replacement.
     let peer_bundle: konsensus_crypto::SerializablePrekeyBundle =
         match serde_json::from_value(bundle).map_err(|_| konsensus_core::wire_json::DecodeError) {
             Ok(b) => b,
@@ -808,10 +807,24 @@ async fn handle_prekey_offer(
                 return;
             }
         };
+    // The bundle must be the offering peer's own: its signed pre-key is
+    // verified against the node id it names, so a bundle naming another node
+    // would bind the session to keys that are not this peer's.
+    if NodeId::from_hex(&peer_bundle.node_id).ok().as_ref() != Some(peer_id) {
+        warn!(peer = %peer_id, "prekey bundle names another node; offer ignored");
+        return;
+    }
 
-    match session_manager.initiate_session(peer_id, &peer_bundle).await {
+    let had_session = session_manager.has_session(peer_id).await;
+    match session_manager
+        .reinitiate_session(peer_id, &peer_bundle)
+        .await
+    {
         Ok(init_data) => {
             last_negotiation.insert(*peer_id, tokio::time::Instant::now());
+            if had_session {
+                info!(peer = %peer_id, "peer re-offered its prekey; previous session replaced after a successful X3DH");
+            }
             info!(peer = %peer_id, "X3DH initiated, sending SessionInit");
             let init_json = match serde_json::to_value(&init_data) {
                 Ok(v) => v,
@@ -826,7 +839,10 @@ async fn handle_prekey_offer(
             }
         }
         Err(e) => {
-            warn!(peer = %peer_id, error = %e, "X3DH initiation failed");
+            warn!(
+                peer = %peer_id, error = %e, session_kept = had_session,
+                "X3DH initiation failed; the prekey offer changed nothing"
+            );
         }
     }
 
@@ -854,13 +870,12 @@ async fn handle_session_init(
         }
     }
 
-    // If a session already exists, replace the stale one.
-    if session_manager.has_session(peer_id).await {
-        warn!(peer = %peer_id, "peer sent SessionInit but session exists — replacing stale session");
-        session_manager.remove_session(peer_id).await;
-        // Paid ciphertext remains queued until its recipient ACKs, even after a session reset.
-    }
-
+    // Any session we already have with this peer stays in place and usable
+    // until the init has been validated and a new session fully derived; the
+    // swap is then atomic (`reaccept_session`). A malformed init, or one
+    // naming a one-time pre-key we do not hold, changes nothing. Paid
+    // ciphertext remains queued until its recipient ACKs, even across a
+    // session replacement.
     let init: konsensus_crypto::SerializableSessionInit =
         match serde_json::from_value(init_data).map_err(|_| konsensus_core::wire_json::DecodeError) {
             Ok(d) => d,
@@ -870,9 +885,13 @@ async fn handle_session_init(
             }
         };
 
-    match session_manager.accept_session(peer_id, &init).await {
+    let had_session = session_manager.has_session(peer_id).await;
+    match session_manager.reaccept_session(peer_id, &init).await {
         Ok(()) => {
             last_negotiation.insert(*peer_id, tokio::time::Instant::now());
+            if had_session {
+                info!(peer = %peer_id, "peer re-initiated; previous session replaced after a successful X3DH");
+            }
             info!(peer = %peer_id, "E2EE session accepted, sending SessionAck");
             let frame = Frame::SessionAck;
             if let Err(e) = transport.send_frame(peer_id, &frame).await {
@@ -885,7 +904,10 @@ async fn handle_session_init(
             );
         }
         Err(e) => {
-            warn!(peer = %peer_id, error = %e, "session accept failed");
+            warn!(
+                peer = %peer_id, error = %e, session_kept = had_session,
+                "session accept failed; the SessionInit changed nothing"
+            );
         }
     }
 }
@@ -1067,6 +1089,15 @@ fn terminal_paid_rejection(reason: &str) -> bool {
     [
         "payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:",
         "room_binding_invalid:", "room_sender_not_member:", "room_recipient_not_member:",
+        // The recipient's gate kept the payment but withdrew the envelope
+        // (`crate::msg_handler::ReceiptRefusal`, a refused call or room chat):
+        // a resend of the same bytes can never be accepted, and is answered
+        // with the withdrawal again, so a lost refusal is not a delivery.
+        "undecryptable:",
+        "not_persisted:",
+        "file_corrupted:",
+        "message withdrawn",
+        "call signal withdrawn",
     ]
     .iter().any(|prefix| reason.starts_with(prefix))
 }
