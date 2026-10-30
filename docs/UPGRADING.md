@@ -3,6 +3,19 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## rc19 → rc20
+
+rc20 adds M6 paid calls and the onboarding/pairing work merged since rc19.
+SQL migrations **031** and **032** (starter requests and queries, signet,
+off by default) and **035**, **036** and **037** (call blocks, the Unpaid
+notice and call-block invoice provenance) run on first start. They are
+additive with no down migration: keep a consistent database backup before
+upgrading, because an older binary refuses a database that has a migration
+version it does not know. Migration **035** ends every in-flight live call;
+restart calls after the upgrade (their replay tombstones are kept and no
+unpaid media interval is granted). The two sections below cover the call
+ledger and invoice bindings in detail.
+
 ## Call-block invoice provenance (migration 037)
 
 Migration **037** adds invoice-hash bindings to `(peer, call_id, seq)` on
