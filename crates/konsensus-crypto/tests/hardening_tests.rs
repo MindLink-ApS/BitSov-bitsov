@@ -538,20 +538,20 @@ fn plaintext_cache_different_master_keys_produce_different_ciphertexts() {
     let cipher2 = PlaintextCacheCipher::new(&[0x02u8; 32]);
 
     let pt = b"same plaintext";
-    let enc1 = cipher1.encrypt(pt).unwrap();
-    let enc2 = cipher2.encrypt(pt).unwrap();
+    let enc1 = cipher1.encrypt("message-a", pt).unwrap();
+    let enc2 = cipher2.encrypt("message-a", pt).unwrap();
 
     // Can't cross-decrypt
-    assert!(cipher1.decrypt(&enc2).is_err());
-    assert!(cipher2.decrypt(&enc1).is_err());
+    assert!(cipher1.decrypt("message-a", &enc2).is_err());
+    assert!(cipher2.decrypt("message-a", &enc1).is_err());
 }
 
 #[test]
 fn plaintext_cache_large_payload() {
     let cipher = PlaintextCacheCipher::new(&[0x42u8; 32]);
     let large = vec![0xFFu8; 4 * 1024 * 1024]; // 4 MiB
-    let enc = cipher.encrypt(&large).unwrap();
-    let dec = cipher.decrypt(&enc).unwrap();
+    let enc = cipher.encrypt("message-a", &large).unwrap();
+    let dec = cipher.decrypt("message-a", &enc).unwrap();
     assert_eq!(dec, large);
 }
 
@@ -559,7 +559,7 @@ fn plaintext_cache_large_payload() {
 fn plaintext_cache_nonce_only_data_fails() {
     let cipher = PlaintextCacheCipher::new(&[0x42u8; 32]);
     // Exactly 12 bytes (nonce only, no ciphertext) — should fail with DecryptionFailed
-    let err = cipher.decrypt(&[0u8; 12]).unwrap_err();
+    let err = cipher.decrypt("message-a", &[0u8; 12]).unwrap_err();
     assert!(matches!(err, PlaintextCacheError::DecryptionFailed));
 }
 

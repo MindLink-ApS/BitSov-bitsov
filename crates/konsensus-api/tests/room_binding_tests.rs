@@ -288,7 +288,7 @@ async fn store(f: &Fixture, sender: NodeId, recipient: NodeId, plaintext: &str, 
     let proof = PaymentProof::new([n; 32], [n; 32], 1_000);
     let env = UkmEnvelopeBuilder::new(0, sender, Recipient::Node(recipient), b"ct".to_vec(), proof).build();
     f.storage.store_message(&env).await.unwrap();
-    f.storage.store_message_plaintext(&env.id, &test_plaintext_cipher().encrypt(plaintext.as_bytes()).unwrap()).await.unwrap();
+    f.storage.store_message_plaintext(&env.id, &test_plaintext_cipher().encrypt(&env.id.to_hex(), plaintext.as_bytes()).unwrap()).await.unwrap();
 }
 
 /// The room thread (`?room=`) lists both directions: received chats bound to
@@ -360,7 +360,7 @@ async fn a_sent_room_message_is_in_the_thread_once_on_sqlite() {
     let proof = PaymentProof::new([9; 32], [9; 32], 1_000);
     let reply = UkmEnvelopeBuilder::new(0, others[1], Recipient::Node(f.own), b"ct".to_vec(), proof).build();
     f.state.storage.store_message(&reply).await.unwrap();
-    f.state.storage.store_message_plaintext(&reply.id, &test_plaintext_cipher().encrypt(room_chat(&r, "reply").as_bytes()).unwrap()).await.unwrap();
+    f.state.storage.store_message_plaintext(&reply.id, &test_plaintext_cipher().encrypt(&reply.id.to_hex(), room_chat(&r, "reply").as_bytes()).unwrap()).await.unwrap();
     let (status, thread) = f.call("GET", &format!("/api/v1/messages?room={}", r.id), None).await;
     assert_eq!(status, StatusCode::OK, "{thread}");
     let thread = thread.as_array().unwrap();
@@ -390,7 +390,7 @@ async fn the_room_thread_pages_by_whole_messages() {
             let mut env = UkmEnvelopeBuilder::new(0, sender, Recipient::Node(recipient), b"ct".to_vec(), PaymentProof::new([n; 32], [n; 32], 1_000)).build();
             env.timestamp = ts;
             state.storage.store_message(&env).await.unwrap();
-            state.storage.store_message_plaintext(&env.id, &test_plaintext_cipher().encrypt(plaintext.as_bytes()).unwrap()).await.unwrap();
+            state.storage.store_message_plaintext(&env.id, &test_plaintext_cipher().encrypt(&env.id.to_hex(), plaintext.as_bytes()).unwrap()).await.unwrap();
         }
     };
     let sent = || chat_with(serde_json::to_value(&r).unwrap(), &ours, "ours");

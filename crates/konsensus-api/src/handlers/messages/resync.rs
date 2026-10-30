@@ -160,7 +160,7 @@ async fn fulfill(
 
         let plaintext = if let Some(c) = cipher {
             match state.storage.get_message_plaintext(id).await {
-                Ok(Some(enc)) => match c.decrypt(&enc) {
+                Ok(Some(enc)) => match c.decrypt(&id.to_hex(), &enc) {
                     Ok(bytes) => match String::from_utf8(bytes) {
                         Ok(text) => { plaintext_count += 1; Some(text) }
                         Err(_)   => None,

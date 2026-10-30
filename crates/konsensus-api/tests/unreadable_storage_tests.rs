@@ -71,7 +71,7 @@ async fn lists_report_partial_reads_and_owner_status_warns_without_public_disclo
         .store_message_plaintext(
             &good.id,
             &common::test_plaintext_cipher()
-                .encrypt(b"searchable")
+                .encrypt(&good.id.to_hex(), b"searchable")
                 .unwrap(),
         )
         .await
@@ -496,7 +496,7 @@ async fn search_continuation_preserves_matches_not_yet_returned() {
             n.to_le_bytes().to_vec(), PaymentProof::new([1; 32], [2; 32], 10)).timestamp(n).build();
         if n >= 5001 {
             store.store_message(&env).await.unwrap();
-            store.store_message_plaintext(&env.id, &common::test_plaintext_cipher().encrypt(b"match").unwrap()).await.unwrap();
+            store.store_message_plaintext(&env.id, &common::test_plaintext_cipher().encrypt(&env.id.to_hex(), b"match").unwrap()).await.unwrap();
         } else { store.inner().store_message(&env).await.unwrap(); }
     }
     let (status, headers, body) = call(&state, "/api/v1/messages/search?q=match&limit=1", None, true).await;
@@ -527,7 +527,7 @@ async fn room_source_checkpoints_are_separate_from_logical_pages() {
         if n == 1 || n == 5002 {
             expected_copies.insert(env.id.to_hex());
             store.store_message(&env).await.unwrap();
-            store.store_message_plaintext(&env.id, &common::test_plaintext_cipher().encrypt(plaintext.as_bytes()).unwrap()).await.unwrap();
+            store.store_message_plaintext(&env.id, &common::test_plaintext_cipher().encrypt(&env.id.to_hex(), plaintext.as_bytes()).unwrap()).await.unwrap();
         } else { store.inner().store_message(&env).await.unwrap(); }
     }
     let uri = format!("/api/v1/messages?room={}&limit=1", room.id);

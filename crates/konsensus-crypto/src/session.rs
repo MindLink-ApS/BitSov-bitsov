@@ -24,11 +24,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Key, Nonce as AesNonce};
+use crate::record_cipher::{RecordCipher, LegacyReadPolicy, SESSION_KEY_CONTEXT};
 use async_trait::async_trait;
 use ed25519_dalek::Signer;
-use rand::RngCore;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -151,7 +149,7 @@ struct PeerSession {
 /// Domain-separation context for deriving the session-encryption key from the
 /// node's AES master key. This ensures the session-at-rest key is independent
 /// of the key used for `EncryptedStorage` envelope encryption.
-const SESSION_ENCRYPTION_CTX: &str = "konsensus-v2 session-at-rest encryption key";
+const SESSION_ENCRYPTION_CTX: &str = SESSION_KEY_CONTEXT;
 
 /// Manages E2EE sessions with all peers.
 ///
@@ -177,15 +175,21 @@ pub struct SessionManager {
     store: Option<Arc<dyn SessionStore>>,
     /// AES-256-GCM cipher for encrypting session state at rest.
     /// Derived from the node's AES key with domain separation.
-    session_cipher: Aes256Gcm,
+    session_cipher: RecordCipher,
 }
 
 impl SessionManager {
     /// Derive the AES-256-GCM cipher for session-at-rest encryption from
     /// the node's AES master key using domain separation.
-    fn derive_session_cipher(identity: &NodeIdentity) -> Aes256Gcm {
-        let derived: [u8; 32] = blake3::derive_key(SESSION_ENCRYPTION_CTX, identity.aes_key());
-        Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived))
+    fn derive_session_cipher(identity: &NodeIdentity) -> RecordCipher {
+        RecordCipher::derived(identity.aes_key(), SESSION_ENCRYPTION_CTX, LegacyReadPolicy::default())
+    }
+
+    pub fn record_policy(&self) -> LegacyReadPolicy { self.session_cipher.policy() }
+
+    pub fn with_record_policy(mut self, policy: LegacyReadPolicy) -> Self {
+        self.session_cipher = RecordCipher::derived(self.identity.aes_key(), SESSION_ENCRYPTION_CTX, policy.for_crypto());
+        self
     }
 
     /// Create a new session manager for the given identity.
@@ -256,51 +260,15 @@ impl SessionManager {
             }
         };
 
-        // L0b (2026-04-30): the previous code path AES-decrypted the stored
-        // session blob and, on failure, fell through to deserializing the
-        // raw blob bytes as plaintext JSON. An attacker with disk-write
-        // access could rewrite an encrypted blob with attacker-known
-        // ratchet state in plaintext; on next restart the plaintext branch
-        // would load it, then `persist_session` would re-encrypt it under
-        // the legitimate key — laundering the injection. The fallback is
-        // removed entirely. Decryption failure is now a hard "skip this
-        // session" with a warning, and the session re-establishes via the
-        // normal X3DH flow on next contact.
-        //
-        // For one-time migration of legacy plaintext sessions written
-        // before AES-GCM-at-rest landed (ADR-019), a dedicated migration
-        // binary built with `--features legacy-session-migration` AND booted
-        // with `KONSENSUS_LEGACY_SESSION_MIGRATION=1` may import a plaintext
-        // blob ONCE (it is immediately re-persisted encrypted). Both gates
-        // are required:
-        //
-        //   * the cargo feature compiles the plaintext-accepting code IN —
-        //     a default/production build does not contain it at all, so a
-        //     plaintext blob is rejected unconditionally regardless of any
-        //     env var an attacker might set on the process;
-        //   * the env var is a second, per-boot operator opt-in so the
-        //     migration capability is not active just because a migration
-        //     binary happens to be running.
-        //
-        // `allow_legacy_plaintext_migration` is the AND of both gates. In a
-        // default build it is a compile-time `false`, so every plaintext
-        // branch below is dead code the optimizer drops.
-        let allow_legacy_plaintext_migration = legacy_plaintext_migration_enabled();
-        if allow_legacy_plaintext_migration {
-            warn!(
-                "legacy-session-migration build with KONSENSUS_LEGACY_SESSION_MIGRATION=1 — \
-                 plaintext-fallback restore enabled FOR THIS BOOT ONLY. Operator MUST unset \
-                 this env var (and redeploy a default-build binary) after the first \
-                 successful boot. Legacy plaintext sessions are a downgrade-attack vector if \
-                 left enabled; use only for a single legacy migration boot."
-            );
-        }
+        // Plaintext session imports retain the existing build and runtime gates.
+        let allow_legacy_plaintext_migration = legacy_plaintext_migration_enabled()
+            && self.session_cipher.allows_v1();
 
         let mut restored = 0;
         for peer_id in &peer_ids {
             match store.load_session(peer_id).await {
                 Ok(Some(blob)) => {
-                    // Decrypt the stored session state (AES-256-GCM: nonce || ciphertext).
+                    // Read persisted session state using its peer location.
                     // `decrypt_or_migrate_blob` returns the JSON bytes on success, or
                     // `None` to skip the session. In a default (production) build it ONLY
                     // ever returns `Some` for a blob that authenticated under AES-256-GCM;
@@ -329,7 +297,7 @@ impl SessionManager {
                             // gate keeps this branch out of default builds entirely.
                             #[cfg(feature = "legacy-session-migration")]
                             if allow_legacy_plaintext_migration
-                                && self.decrypt_session_blob(&blob).is_err()
+                                && self.decrypt_session_blob(peer_id, &blob).is_err()
                             {
                                 debug!(peer = %peer_id, "re-encrypting legacy plaintext session");
                                 self.persist_session(peer_id).await;
@@ -351,33 +319,19 @@ impl SessionManager {
         restored
     }
 
-    /// Resolve a stored session blob to its JSON bytes during restore.
-    ///
-    /// Returns `Some(json)` for a blob to load, or `None` to skip the session
-    /// (it will re-establish via X3DH on next contact).
-    ///
-    /// # Security
-    ///
-    /// In a default (production) build — i.e. WITHOUT the
-    /// `legacy-session-migration` feature — this function ONLY returns `Some`
-    /// for a blob that authenticated under AES-256-GCM. The plaintext-accepting
-    /// branches are compiled out, so a non-encrypted blob is unconditionally
-    /// rejected (`None`) no matter what `KONSENSUS_LEGACY_SESSION_MIGRATION` is
-    /// set to. This closes the downgrade vector where an attacker with
-    /// disk-write access plants attacker-known ratchet state in plaintext and a
-    /// flipped env var would launder it (L0b / MED-A).
-    ///
-    /// `allow_legacy` is the AND of the build feature and the per-boot env var;
-    /// in a default build it is always `false`.
+    /// Resolve stored session data, retaining the optional plaintext import gates.
     fn decrypt_or_migrate_blob(
         &self,
         peer_id: &NodeId,
         blob: &[u8],
         allow_legacy: bool,
     ) -> Option<Vec<u8>> {
+        if RecordCipher::is_v2(blob) || !self.session_cipher.allows_v1() {
+            return self.decrypt_session_blob(peer_id, blob).ok();
+        }
         // Authenticated path: a valid AES-GCM blob is `nonce(12) || ciphertext`.
         if blob.len() > 12 {
-            match self.decrypt_session_blob(blob) {
+            match self.decrypt_session_blob(peer_id, blob) {
                 Ok(decrypted) => return Some(decrypted),
                 Err(e) => {
                     // Decryption failed. In a default build the only safe action
@@ -441,34 +395,12 @@ impl SessionManager {
         }
     }
 
-    /// Encrypt a session state blob with AES-256-GCM.
-    /// Returns nonce (12 bytes) || ciphertext.
-    fn encrypt_session_blob(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-        let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = AesNonce::from_slice(&nonce_bytes);
-
-        let encrypted = self
-            .session_cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|e| format!("session encrypt: {e}"))?;
-
-        let mut result = Vec::with_capacity(12 + encrypted.len());
-        result.extend_from_slice(&nonce_bytes);
-        result.extend_from_slice(&encrypted);
-        Ok(result)
+    fn encrypt_session_blob(&self, peer: &NodeId, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        self.session_cipher.encrypt("sessions", "state_blob", &peer.to_hex(), plaintext)
     }
 
-    /// Decrypt a session state blob. Expects nonce (12 bytes) || ciphertext.
-    fn decrypt_session_blob(&self, data: &[u8]) -> Result<Vec<u8>, String> {
-        if data.len() < 12 {
-            return Err("session blob too short for nonce".into());
-        }
-        let (nonce_bytes, ciphertext) = data.split_at(12);
-        let nonce = AesNonce::from_slice(nonce_bytes);
-        self.session_cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| format!("session decrypt: {e}"))
+    fn decrypt_session_blob(&self, peer: &NodeId, data: &[u8]) -> Result<Vec<u8>, String> {
+        self.session_cipher.decrypt("sessions", "state_blob", &peer.to_hex(), data)
     }
 
     /// Persist the current session state for a peer.
@@ -493,7 +425,7 @@ impl SessionManager {
         match serde_json::to_vec(&state) {
             Ok(json_blob) => {
                 // Encrypt the JSON before persisting (Principle 4)
-                match self.encrypt_session_blob(&json_blob) {
+                match self.encrypt_session_blob(peer_id, &json_blob) {
                     Ok(encrypted_blob) => {
                         if let Err(e) = store.save_session(peer_id, &encrypted_blob).await {
                             warn!(peer = %peer_id, error = %e, "failed to persist session state");

@@ -1627,7 +1627,7 @@ async fn a_refused_signal_whose_cleanup_failed_stays_invisible_and_is_withdrawn(
     // As the receive path does it: hold, paid acceptance, plaintext, admission.
     assert!(konsensus_api::calls::hold_incoming(f.db.as_ref(), &env).await.unwrap());
     assert_eq!(f.db.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::Accepted);
-    f.db.store_message_plaintext(&env.id, &cipher.encrypt(text.as_bytes()).unwrap()).await.unwrap();
+    f.db.store_message_plaintext(&env.id, &cipher.encrypt(&env.id.to_hex(), text.as_bytes()).unwrap()).await.unwrap();
     assert!(konsensus_api::calls::admit_incoming(f.db.as_ref(), &own(), &f.peer, 402, Some(&text)).await.is_err());
     sqlx::raw_sql("CREATE TRIGGER cleanup_failure BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'simulated storage failure'); END").execute(f.db.pool()).await.unwrap();
     assert!(f.db.reject_accepted_envelope(&env).await.is_err());

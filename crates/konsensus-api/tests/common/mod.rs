@@ -1847,7 +1847,7 @@ pub async fn store_test_message_with_plaintext(
     state.storage.store_message(&envelope).await.unwrap();
 
     let encrypted = test_plaintext_cipher()
-        .encrypt(plaintext.as_bytes())
+        .encrypt(&msg_id, plaintext.as_bytes())
         .unwrap();
     state
         .storage

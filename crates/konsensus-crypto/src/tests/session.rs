@@ -770,3 +770,38 @@ async fn decrypt_without_session_fails() {
     let result = mgr_a.decrypt(&node_b, &fake_msg).await;
     assert!(matches!(result, Err(SessionError::NoSession(_))));
 }
+
+#[tokio::test]
+async fn stored_session_cannot_move_to_another_peer() {
+    let identity = make_identity(TEST_MNEMONIC_A);
+    let other = SessionManager::new(make_identity(TEST_MNEMONIC_B));
+    let store = MemorySessionStore::new();
+    let manager = SessionManager::with_store(identity.clone(), store.clone());
+    let peer = *other.identity.node_id();
+    manager.initiate_session(&peer, &other.prekey_bundle().await).await.unwrap();
+    let blob = store.load_session(&peer).await.unwrap().unwrap();
+    let moved = NodeId::from_bytes([19; 32]);
+    store.save_session(&moved, &blob).await.unwrap();
+    store.delete_session(&peer).await.unwrap();
+    let restarted = SessionManager::with_store(identity, store);
+    assert_eq!(restarted.restore_sessions().await, 0);
+    assert!(!restarted.has_session(&moved).await);
+}
+
+#[test]
+fn session_v1_is_readable_only_before_local_cutoff() {
+    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
+    let identity = make_identity(TEST_MNEMONIC_A);
+    let dir = tempfile::tempdir().unwrap();
+    let policy = LegacyReadPolicy::in_data_dir(dir.path());
+    let manager = SessionManager::new(identity.clone()).with_record_policy(policy.clone());
+    let key = blake3::derive_key(SESSION_ENCRYPTION_CTX, identity.aes_key());
+    let nonce = [3u8; 12];
+    let mut blob = nonce.to_vec();
+    blob.extend(Aes256Gcm::new_from_slice(&key).unwrap().encrypt((&nonce).into(), b"legacy".as_slice()).unwrap());
+    let peer = NodeId::from_bytes([19; 32]);
+    assert_eq!(manager.decrypt_session_blob(&peer, &blob).unwrap(), b"legacy");
+    policy.complete().unwrap();
+    assert!(manager.decrypt_session_blob(&peer, &blob).is_err());
+    assert!(manager.decrypt_or_migrate_blob(&peer, b"{}", true).is_none());
+}
