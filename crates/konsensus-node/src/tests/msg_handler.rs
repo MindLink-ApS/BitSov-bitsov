@@ -474,7 +474,10 @@ async fn decrypt_no_session_returns_none() {
     )
     .await;
 
-    assert!(result.is_none(), "no session should return None");
+    assert!(
+        result.into_option().is_none(),
+        "no session should return None"
+    );
 }
 
 #[tokio::test]
@@ -521,7 +524,7 @@ async fn decrypt_invalid_ratchet_message_returns_none() {
     .await;
 
     assert!(
-        result.is_none(),
+        result.into_option().is_none(),
         "invalid ratchet message should return None"
     );
 }
@@ -575,7 +578,7 @@ async fn decrypt_valid_message_returns_plaintext_and_caches() {
     )
     .await;
 
-    assert_eq!(result, Some("Hello from Alice!".to_string()));
+    assert_eq!(result.into_option(), Some("Hello from Alice!".to_string()));
     // Verify plaintext was cached in storage
     assert!(storage.has_plaintext(&envelope.id));
 }
@@ -641,7 +644,7 @@ async fn decrypt_file_ref_stores_and_returns_label() {
     )
     .await;
 
-    assert_eq!(result, Some("[file: report.pdf]".to_string()));
+    assert_eq!(result.into_option(), Some("[file: report.pdf]".to_string()));
     assert_eq!(storage.file_count(), 1);
 }
 
@@ -680,11 +683,11 @@ async fn web_manifest_no_content_server_returns_label() {
     )
     .await;
 
-    assert_eq!(result, Some("[web manifest request]".to_string()));
+    assert_eq!(result, Ok(Some("[web manifest request]".to_string())));
 }
 
 #[tokio::test]
-async fn web_manifest_with_content_server_returns_label() {
+async fn web_manifest_with_content_server_returns_label_without_session_is_unfinished() {
     let alice = alice_identity();
     let bob = bob_identity();
     let session_mgr = SessionManager::new(Arc::clone(&bob));
@@ -727,7 +730,7 @@ async fn web_manifest_with_content_server_returns_label() {
     )
     .await;
 
-    assert_eq!(result, Some("[web manifest request]".to_string()));
+    assert_eq!(result, Err(()), "no session: the reply remains unfinished");
 }
 
 #[tokio::test]
@@ -803,11 +806,11 @@ async fn page_request_invalid_json_returns_none() {
     )
     .await;
 
-    assert!(result.is_none());
+    assert!(result.unwrap().is_none());
 }
 
 #[tokio::test]
-async fn page_request_no_content_server_returns_label() {
+async fn page_request_no_content_server_returns_label_without_session_is_unfinished() {
     let alice = alice_identity();
     let bob = bob_identity();
     let session_mgr = SessionManager::new(Arc::clone(&bob));
@@ -848,11 +851,11 @@ async fn page_request_no_content_server_returns_label() {
     )
     .await;
 
-    assert_eq!(result, Some("[page request: /index.md]".to_string()));
+    assert_eq!(result, Err(()), "no session: the reply remains unfinished");
 }
 
 #[tokio::test]
-async fn page_request_with_content_server_serves_page() {
+async fn page_request_with_content_server_serves_page_without_session_is_unfinished() {
     let alice = alice_identity();
     let bob = bob_identity();
     let session_mgr = SessionManager::new(Arc::clone(&bob));
@@ -905,11 +908,11 @@ async fn page_request_with_content_server_serves_page() {
     )
     .await;
 
-    assert_eq!(result, Some("[page request: /hello.md]".to_string()));
+    assert_eq!(result, Err(()), "no session: the reply remains unfinished");
 }
 
 #[tokio::test]
-async fn page_request_nonexistent_path_returns_label() {
+async fn page_request_nonexistent_path_returns_label_without_session_is_unfinished() {
     let alice = alice_identity();
     let bob = bob_identity();
     let session_mgr = SessionManager::new(Arc::clone(&bob));
@@ -961,7 +964,7 @@ async fn page_request_nonexistent_path_returns_label() {
     )
     .await;
 
-    assert_eq!(result, Some("[page request: /nonexistent.md]".to_string()));
+    assert_eq!(result, Err(()), "no session: the reply remains unfinished");
 }
 
 // ── decrypt_and_process with stale session ──────────────────────────
@@ -1024,7 +1027,7 @@ async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
     .await;
 
     // Decryption failed → returns None
-    assert!(result.is_none());
+    assert!(result.into_option().is_none());
     // Session should be removed for re-negotiation
     assert!(!bob_mgr.has_session(alice.node_id()).await);
 }
@@ -1081,7 +1084,7 @@ async fn decrypt_non_utf8_returns_none() {
     .await;
 
     // Non-UTF8 for a chat message returns None
-    assert!(result.is_none());
+    assert!(result.into_option().is_none());
 }
 
 // ── HARD-11: registry read guard released before the gate await ──────
@@ -3446,6 +3449,292 @@ async fn room_chats_stay_hidden_until_their_binding_is_admitted() {
     target.shutdown();
 }
 
+/// Refuses session saves while `fail_saves` is set, so the receive loop takes
+/// the `IncomingPlaintext::Unsaved` branch (the error from `SessionManager::decrypt`).
+struct FlakySessionStore {
+    data: tokio::sync::Mutex<HashMap<NodeId, Vec<u8>>>,
+    fail_saves: std::sync::atomic::AtomicBool,
+    failed_saves: std::sync::atomic::AtomicUsize,
+    saves_before_failure: std::sync::atomic::AtomicUsize,
+}
+
+impl FlakySessionStore {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            data: tokio::sync::Mutex::new(HashMap::new()),
+            fail_saves: std::sync::atomic::AtomicBool::new(false),
+            failed_saves: std::sync::atomic::AtomicUsize::new(0),
+            saves_before_failure: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        })
+    }
+
+    async fn blob(&self, peer_id: &NodeId) -> Option<Vec<u8>> {
+        self.data.lock().await.get(peer_id).cloned()
+    }
+}
+
+#[async_trait::async_trait]
+impl konsensus_crypto::SessionStore for FlakySessionStore {
+    async fn save_session(
+        &self,
+        peer_id: &NodeId,
+        state_json: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.fail_saves.load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .saves_before_failure
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+        {
+            self.fail_saves
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.failed_saves
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err("simulated session store failure".into());
+        }
+        self.data.lock().await.insert(*peer_id, state_json.to_vec());
+        Ok(())
+    }
+
+    async fn load_session(
+        &self,
+        peer_id: &NodeId,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.data.lock().await.get(peer_id).cloned())
+    }
+
+    async fn delete_session(
+        &self,
+        peer_id: &NodeId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.data.lock().await.remove(peer_id);
+        Ok(())
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.data.lock().await.keys().copied().collect())
+    }
+}
+
+/// A `KIND_CHAT` whose first decrypt cannot save the ratchet is not acked and
+/// stays held. The sender's retry of that same envelope decrypts, is acked as
+/// delivered, and must leave no admission hold: the sweep would otherwise
+/// withdraw a chat the sender was told was delivered.
+#[tokio::test]
+async fn unsaved_chat_retry_releases_admission_hold() {
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let transport = |id| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    while !matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ) {}
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let session_store = FlakySessionStore::new();
+    let sessions_b = Arc::new(SessionManager::with_store(
+        bob.clone(),
+        session_store.clone(),
+    ));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let blob_before = session_store.blob(alice.node_id()).await;
+    assert!(blob_before.is_some(), "accepted session was not stored");
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, mut ws_rx) = broadcast::channel(16);
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
+        konsensus_pricing::StaticPricingEngine::new(Default::default()),
+    );
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(),
+        transport_ack: target.clone(),
+        storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        })),
+        pricing,
+        lightning: wallet.clone(),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b,
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None,
+        front_door: Default::default(),
+        routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(),
+        plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx,
+        audit_log: audit,
+        admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None,
+        shutdown_rx,
+    }));
+
+    let body = "retry me";
+    let msat = 10_000;
+    let hash = wallet.inject_inbound_keysend(msat, None).await;
+    let payment = wallet.get_payment_status(&hash).await.unwrap();
+    let proof = PaymentProof::new(
+        hex::decode(&hash).unwrap().try_into().unwrap(),
+        hex::decode(payment.preimage.unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        msat,
+    );
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+        &sessions_a
+            .encrypt(bob.node_id(), body.as_bytes())
+            .await
+            .unwrap(),
+    );
+    let mut env = UkmEnvelopeBuilder::new(
+        konsensus_core::kind::KIND_CHAT,
+        *alice.node_id(),
+        Recipient::Node(*bob.node_id()),
+        ciphertext,
+        proof,
+    )
+    .build();
+    env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+
+    let outcome = |source: Arc<NoiseTransport>| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source.recv_control().await.unwrap() {
+                    ControlEvent::MessageAcked { duplicate, .. } => break Ok(duplicate),
+                    ControlEvent::MessageRejected { reason, .. } => break Err(reason),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap()
+    };
+
+    // First delivery: the tag matches and the session save fails. No ack, the
+    // chat stays held, and the stored ratchet blob is unchanged.
+    let failed_before = session_store.failed_saves.load(Ordering::SeqCst);
+    session_store.fail_saves.store(true, Ordering::SeqCst);
+    source.send(bob.node_id(), &env).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let row: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+            .bind(env.id.to_hex())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let plain_missing: i64 = sqlx::query_scalar(
+            "SELECT CASE WHEN plaintext_enc IS NULL THEN 1 ELSE 0 END FROM messages WHERE id = ?",
+        )
+        .bind(env.id.to_hex())
+        .fetch_optional(db.pool())
+        .await
+        .unwrap()
+        .unwrap_or(0);
+        if row == 1
+            && plain_missing == 0
+            && db.call_admission_held(&env.id).await.unwrap()
+            && session_store.failed_saves.load(Ordering::SeqCst) > failed_before
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "unsaved chat was not held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let silent = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match source.recv_control().await.unwrap() {
+                ControlEvent::MessageAcked { duplicate, .. } => {
+                    panic!("unsaved chat was acknowledged (duplicate={duplicate})")
+                }
+                ControlEvent::MessageRejected { reason, .. } => {
+                    panic!("unsaved chat was rejected: {reason}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(silent.is_err(), "unsaved chat produced a terminal frame");
+    assert!(ws_rx.try_recv().is_err(), "unsaved chat was delivered");
+    assert!(
+        db.get_message(&env.id).await.unwrap().is_none(),
+        "held chat visible"
+    );
+    assert!(
+        !db.is_paid_envelope_accepted(&env).await.unwrap(),
+        "held chat would be duplicate-acked instead of decrypted again"
+    );
+    assert_eq!(session_store.blob(alice.node_id()).await, blob_before);
+
+    // The same envelope again. Decrypt saves this time. The ack says delivered,
+    // and the hold from the first attempt is gone, so the sweep cannot withdraw it.
+    session_store.fail_saves.store(false, Ordering::SeqCst);
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    let got = tokio::time::timeout(Duration::from_secs(5), ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.plaintext.as_deref(), Some(body));
+    assert_eq!(got.envelope.kind, konsensus_core::kind::KIND_CHAT);
+    assert!(
+        !db.call_admission_held(&env.id).await.unwrap(),
+        "retry left the chat in call_admission_hold"
+    );
+    assert!(db.get_message(&env.id).await.unwrap().is_some());
+    assert!(db.get_message_plaintext(&env.id).await.unwrap().is_some());
+    assert!(db.is_paid_envelope_accepted(&env).await.unwrap());
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(true));
+    assert!(
+        ws_rx.try_recv().is_err(),
+        "duplicate retry was delivered again"
+    );
+    assert_eq!(
+        konsensus_api::calls::withdraw_held(db.as_ref(), true)
+            .await
+            .unwrap(),
+        0,
+        "sweep withdrew an acknowledged chat"
+    );
+    assert!(db.get_message(&env.id).await.unwrap().is_some());
+    assert!(db.is_paid_envelope_accepted(&env).await.unwrap());
+    assert!(!db.call_admission_held(&env.id).await.unwrap());
+
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    source.shutdown();
+    target.shutdown();
+}
+
 #[tokio::test]
 async fn porch_wire_manifest_matches_discounted_gate_price() {
     let dir = tempfile::tempdir().unwrap();
@@ -3514,4 +3803,1074 @@ async fn porch_card_repricing_failure_returns_correlated_error() {
         !response.body.contains("page_msat"),
         "never serve the stale price"
     );
+}
+
+#[tokio::test]
+async fn web_reply_save_failure_retries_cached_request() {
+    for kind in [
+        konsensus_core::kind::KIND_PAGE_REQUEST,
+        konsensus_core::kind::KIND_WEB_MANIFEST,
+    ] {
+        recovered_message_case(kind, RecoveryFailure::ReplySave).await;
+    }
+}
+
+#[tokio::test]
+async fn web_completion_cache_failure_resends_identical_reply_after_restart() {
+    for kind in [
+        konsensus_core::kind::KIND_PAGE_REQUEST,
+        konsensus_core::kind::KIND_WEB_MANIFEST,
+    ] {
+        recovered_message_case(kind, RecoveryFailure::CompletionCache).await;
+    }
+}
+
+#[tokio::test]
+async fn web_plaintext_cache_failure_leaves_receive_key_retryable() {
+    for kind in [
+        konsensus_core::kind::KIND_PAGE_REQUEST,
+        konsensus_core::kind::KIND_WEB_MANIFEST,
+    ] {
+        recovered_message_case(kind, RecoveryFailure::PlaintextCache).await;
+    }
+}
+
+#[tokio::test]
+async fn web_receive_save_failure_retries_cached_request_after_restart() {
+    for kind in [
+        konsensus_core::kind::KIND_PAGE_REQUEST,
+        konsensus_core::kind::KIND_WEB_MANIFEST,
+    ] {
+        recovered_message_case(kind, RecoveryFailure::ReceiveSave).await;
+    }
+}
+
+#[tokio::test]
+async fn recovered_non_chat_without_plaintext_is_rejected() {
+    for kind in [
+        konsensus_core::kind::KIND_FILE_REF,
+        konsensus_core::kind::KIND_CALENDAR_EVENT,
+    ] {
+        recovered_message_case(kind, RecoveryFailure::ReceiveSave).await;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryFailure {
+    ReceiveSave,
+    ReplySave,
+    PlaintextCache,
+    CompletionCache,
+}
+
+// Exercise the real cache and ratchet stores without a receive-loop admission hold.
+async fn retry_decrypt(
+    envelope: &konsensus_core::UkmEnvelope,
+    sessions: &SessionManager,
+    storage: &Arc<dyn Storage>,
+    bob: &Arc<NodeIdentity>,
+    first_attempt: bool,
+) -> IncomingPlaintext {
+    decrypt_incoming(
+        envelope,
+        &envelope.sender,
+        sessions,
+        &PlaintextCacheCipher::new(bob.aes_key()),
+        storage,
+        &None,
+        &Default::default(),
+        &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
+        &(Arc::new(konsensus_pricing::StaticPricingEngine::new(
+            Default::default(),
+        )) as Arc<dyn PricingEngine>),
+        bob,
+        &make_transport(bob),
+        &make_audit_log(),
+        &PaymentGate::new(),
+        0.0,
+        first_attempt,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn ordinary_plaintext_cache_failure_preserves_receive_key_after_restart() {
+    for kind in [
+        konsensus_core::kind::KIND_CHAT,
+        konsensus_core::kind::KIND_FILE_REF,
+        konsensus_core::kind::KIND_CALENDAR_EVENT,
+        konsensus_core::kind::KIND_CALENDAR_UPDATE,
+        konsensus_core::kind::KIND_RSVP,
+    ] {
+        let alice = alice_identity();
+        let bob = bob_identity();
+        let sender = SessionManager::new(alice.clone());
+        let store = FlakySessionStore::new();
+        let receiver = SessionManager::with_store(bob.clone(), store.clone());
+        establish_sessions(&sender, &receiver, &alice, &bob).await;
+        let msg = sender
+            .encrypt(bob.node_id(), b"paid message")
+            .await
+            .unwrap();
+        let envelope = make_envelope(
+            &alice,
+            *bob.node_id(),
+            kind,
+            konsensus_crypto::ratchet_message_to_bytes(&msg),
+        );
+        let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+        let storage: Arc<dyn Storage> = db.clone();
+        db.store_message(&envelope).await.unwrap();
+        let before = store.blob(alice.node_id()).await;
+        sqlx::raw_sql("CREATE TRIGGER fail_cache BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(FAIL, 'injected cache failure'); END").execute(db.pool()).await.unwrap();
+        assert!(
+            matches!(
+                retry_decrypt(&envelope, &receiver, &storage, &bob, true).await,
+                IncomingPlaintext::Unsaved
+            ),
+            "cache failure must withhold acceptance for kind {kind}"
+        );
+        assert!(
+            store.blob(alice.node_id()).await == before,
+            "cache failure consumed receive key for kind {kind}"
+        );
+        let restored = SessionManager::with_store(bob, store);
+        assert_eq!(restored.restore_sessions().await, 1);
+        assert_eq!(
+            restored.decrypt(alice.node_id(), &msg).await.unwrap(),
+            b"paid message"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cached_web_retry_does_not_advance_an_unrelated_session() {
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let sender = SessionManager::new(alice.clone());
+    let store = FlakySessionStore::new();
+    let receiver = SessionManager::with_store(bob.clone(), store.clone());
+    establish_sessions(&sender, &receiver, &alice, &bob).await;
+    let body = br#"{"request_id":"retry","path":"/missing.md","method":"GET"}"#;
+    let msg = sender.encrypt(bob.node_id(), body).await.unwrap();
+    let envelope = make_envelope(
+        &alice,
+        *bob.node_id(),
+        konsensus_core::kind::KIND_PAGE_REQUEST,
+        konsensus_crypto::ratchet_message_to_bytes(&msg),
+    );
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
+    // Authentication succeeds and saves the request, but the receive commit fails.
+    store
+        .fail_saves
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        retry_decrypt(&envelope, &receiver, &storage, &bob, true).await,
+        IncomingPlaintext::Unsaved
+    ));
+    store
+        .fail_saves
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    // Replace the session, leaving the authenticated request cache intact.
+    sender.remove_session(bob.node_id()).await;
+    receiver.remove_session(alice.node_id()).await;
+    establish_sessions(&sender, &receiver, &alice, &bob).await;
+    let opener = sender.encrypt(bob.node_id(), b"opener").await.unwrap();
+    receiver.decrypt(alice.node_id(), &opener).await.unwrap();
+    let before = store.blob(alice.node_id()).await;
+    assert!(matches!(
+        retry_decrypt(&envelope, &receiver, &storage, &bob, false).await,
+        IncomingPlaintext::ReplyPending
+    ));
+    assert!(
+        store.blob(alice.node_id()).await == before,
+        "a ratchet authentication error was mistaken for a consumed request"
+    );
+}
+
+#[tokio::test]
+async fn consumed_message_without_plaintext_is_a_terminal_paid_failure() {
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let sender = SessionManager::new(alice.clone());
+    let receiver = SessionManager::new(bob.clone());
+    establish_sessions(&sender, &receiver, &alice, &bob).await;
+    let msg = sender
+        .encrypt(bob.node_id(), b"lost legacy plaintext")
+        .await
+        .unwrap();
+    receiver.decrypt(alice.node_id(), &msg).await.unwrap();
+    let envelope = make_envelope(
+        &alice,
+        *bob.node_id(),
+        konsensus_core::kind::KIND_FILE_REF,
+        konsensus_crypto::ratchet_message_to_bytes(&msg),
+    );
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
+    assert!(matches!(
+        retry_decrypt(&envelope, &receiver, &storage, &bob, false).await,
+        IncomingPlaintext::Consumed
+    ));
+    assert!(receiver.has_session(alice.node_id()).await);
+}
+
+#[tokio::test]
+async fn ordinary_receive_save_failure_resumes_application_after_restart() {
+    ordinary_receive_recovery_case(false).await;
+}
+
+#[tokio::test]
+async fn retained_web_reply_renews_expired_wrapper_without_changing_ciphertext() {
+    use std::time::Duration;
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let buyer = SessionManager::new(alice.clone());
+    let seller = SessionManager::new(bob.clone());
+    establish_sessions(&buyer, &seller, &alice, &bob).await;
+    let opener = buyer.encrypt(bob.node_id(), b"request").await.unwrap();
+    seller.decrypt(alice.node_id(), &opener).await.unwrap();
+    let request = make_envelope(
+        &alice,
+        *bob.node_id(),
+        konsensus_core::kind::KIND_PAGE_REQUEST,
+        konsensus_crypto::ratchet_message_to_bytes(&opener),
+    );
+    let wire = seller
+        .encrypt_retained(
+            alice.node_id(),
+            &web_reply_retention_key(&request),
+            b"saved response",
+            |message| {
+                let mut reply = konsensus_core::UkmEnvelopeBuilder::new(
+                    konsensus_core::kind::KIND_PAGE_RESPONSE,
+                    *bob.node_id(),
+                    Recipient::Node(*alice.node_id()),
+                    konsensus_crypto::ratchet_message_to_bytes(message),
+                    konsensus_core::reply_bound_proof(&request.payment_proof),
+                )
+                .references(vec![request.id])
+                .build();
+                reply.timestamp = 1;
+                reply.signature = Signature::from_ed25519(&bob.sign(&reply.signable_bytes()));
+                Ok(serde_json::to_vec(&reply).unwrap())
+            },
+        )
+        .await
+        .unwrap();
+    let saved: konsensus_core::UkmEnvelope = serde_json::from_slice(&wire).unwrap();
+    let target = make_transport(&alice);
+    let source = make_transport(&bob);
+    target.add_to_whitelist(bob.node_id()).await;
+    source.add_to_whitelist(alice.node_id()).await;
+    target.start_listener().await.unwrap();
+    source
+        .connect(alice.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    send_encrypted_response(
+        alice.node_id(),
+        &request,
+        &"new content",
+        konsensus_core::kind::KIND_PAGE_RESPONSE,
+        &bob,
+        &seller,
+        &source,
+    )
+    .await
+    .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), target.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reply.timestamp > 1, "expired reply wrapper was not renewed");
+    assert_eq!(reply.id, saved.id);
+    assert_eq!(reply.nonce, saved.nonce);
+    assert_eq!(reply.references, vec![request.id]);
+    assert!(reply.ciphertext == saved.ciphertext);
+    assert!(reply.payment_proof == saved.payment_proof);
+    use ed25519_dalek::Verifier;
+    bob.ed25519_signing_key()
+        .verifying_key()
+        .verify(&reply.signable_bytes(), &reply.signature.to_ed25519())
+        .unwrap();
+    let message = konsensus_crypto::ratchet_message_from_bytes(&reply.ciphertext).unwrap();
+    assert_eq!(
+        buyer.decrypt(bob.node_id(), &message).await.unwrap(),
+        b"saved response"
+    );
+    source.shutdown();
+    target.shutdown();
+}
+
+#[tokio::test]
+async fn ordinary_completion_cache_failure_recovers_after_dh_rotation() {
+    ordinary_receive_recovery_case(true).await;
+}
+
+async fn ordinary_receive_recovery_case(completion_failure: bool) {
+    for kind in [
+        konsensus_core::kind::KIND_FILE_REF,
+        konsensus_core::kind::KIND_CALENDAR_EVENT,
+        konsensus_core::kind::KIND_CALENDAR_UPDATE,
+        konsensus_core::kind::KIND_RSVP,
+    ] {
+        let alice = alice_identity();
+        let bob = bob_identity();
+        let sender = SessionManager::new(alice.clone());
+        let store = FlakySessionStore::new();
+        let receiver = SessionManager::with_store(bob.clone(), store.clone());
+        establish_sessions(&sender, &receiver, &alice, &bob).await;
+        let payload = match kind {
+            konsensus_core::kind::KIND_FILE_REF => serde_json::json!({
+                "filename":"retry.txt", "mime_type":"text/plain", "size_bytes":5,
+                "data_b64":"aGVsbG8=", "blake3_hash":blake3::hash(b"hello").to_hex().to_string()
+            }),
+            konsensus_core::kind::KIND_RSVP => {
+                serde_json::json!({"event_id":"retry-event", "response":"accepted"})
+            }
+            _ => {
+                serde_json::json!({"event_id":"retry-event", "title":"Retry event", "start_ms":1000, "end_ms":2000, "tz":"UTC", "organizer":alice.node_id().to_hex()})
+            }
+        };
+        let body = serde_json::to_vec(&payload).unwrap();
+        let message = sender.encrypt(bob.node_id(), &body).await.unwrap();
+        let envelope = make_envelope(
+            &alice,
+            *bob.node_id(),
+            kind,
+            konsensus_crypto::ratchet_message_to_bytes(&message),
+        );
+        let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+        let storage: Arc<dyn Storage> = db.clone();
+        // Calendar tables are provisioned by the calendar integration, not the
+        // core in-memory storage fixture. Match its existing test schema here.
+        sqlx::raw_sql("CREATE TABLE calendar_events (id TEXT PRIMARY KEY, message_id TEXT, organizer TEXT NOT NULL, title TEXT NOT NULL, description TEXT, start_ms BIGINT, end_ms BIGINT, tz TEXT, location TEXT, attendees_json TEXT, recurrence_json TEXT, color TEXT, created_at TEXT NOT NULL DEFAULT '', parent_id TEXT); CREATE TABLE calendar_rsvps (id TEXT PRIMARY KEY, event_id TEXT, responder TEXT, response TEXT, comment TEXT, created_at TEXT NOT NULL DEFAULT '', UNIQUE(event_id, responder))")
+            .execute(db.pool()).await.unwrap();
+        storage.store_message(&envelope).await.unwrap();
+        if completion_failure {
+            sqlx::raw_sql("CREATE TRIGGER fail_completion BEFORE UPDATE OF plaintext_enc ON messages WHEN OLD.plaintext_enc IS NOT NULL BEGIN SELECT RAISE(FAIL, 'injected completion failure'); END").execute(db.pool()).await.unwrap();
+        } else {
+            store
+                .fail_saves
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert!(matches!(
+            retry_decrypt(&envelope, &receiver, &storage, &bob, true).await,
+            IncomingPlaintext::Unsaved
+        ));
+        assert!(
+            needs_plaintext_recovery(
+                &envelope,
+                storage.as_ref(),
+                &PlaintextCacheCipher::new(bob.aes_key())
+            )
+            .await,
+            "cached plaintext bypassed the failed receive commit for kind {kind}"
+        );
+        store
+            .fail_saves
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if completion_failure {
+            let reply = receiver
+                .encrypt(alice.node_id(), b"rotate DH")
+                .await
+                .unwrap();
+            sender.decrypt(bob.node_id(), &reply).await.unwrap();
+            let next = sender.encrypt(bob.node_id(), b"next DH").await.unwrap();
+            receiver.decrypt(alice.node_id(), &next).await.unwrap();
+            sqlx::raw_sql("DROP TRIGGER fail_completion")
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let restored = SessionManager::with_store(bob.clone(), store);
+        assert_eq!(restored.restore_sessions().await, 1);
+        assert!(matches!(
+            retry_decrypt(&envelope, &restored, &storage, &bob, false).await,
+            IncomingPlaintext::Ready(_)
+        ));
+        let table = match kind {
+            konsensus_core::kind::KIND_FILE_REF => "files",
+            konsensus_core::kind::KIND_RSVP => "calendar_rsvps",
+            _ => "calendar_events",
+        };
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "application side effect was lost for kind {kind}");
+        assert!(
+            !needs_plaintext_recovery(
+                &envelope,
+                storage.as_ref(),
+                &PlaintextCacheCipher::new(bob.aes_key())
+            )
+            .await
+        );
+    }
+}
+
+async fn recovered_message_case(kind: u16, failure: RecoveryFailure) {
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let web_reply = matches!(
+        kind,
+        konsensus_core::kind::KIND_PAGE_REQUEST | konsensus_core::kind::KIND_WEB_MANIFEST
+    );
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let transport = |id| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    while !matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ) {}
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let session_store = FlakySessionStore::new();
+    let mut sessions_b = Arc::new(SessionManager::with_store(
+        bob.clone(),
+        session_store.clone(),
+    ));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let (mut shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, mut ws_rx) = broadcast::channel(16);
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
+        konsensus_pricing::StaticPricingEngine::new(Default::default()),
+    );
+    let start_handler = |sessions_b: Arc<SessionManager>, shutdown_rx| {
+        tokio::spawn(run(MsgHandlerDeps {
+            transport: target.clone(),
+            transport_ack: target.clone(),
+            storage: storage.clone(),
+            gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+                verify_lightning_settlement: true,
+                ..Default::default()
+            })),
+            pricing: pricing.clone(),
+            lightning: wallet.clone(),
+            chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+            peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+            session_manager: sessions_b.clone(),
+            nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage.clone())),
+            content_server: Some(Arc::new(
+                ContentServer::new(crate::content_server::ContentServerConfig {
+                    content_dir: dir.path().to_path_buf(),
+                    max_file_size: 4096,
+                    cache_seconds: 60,
+                    site_name: "Retry test".into(),
+                })
+                .unwrap(),
+            )),
+            front_door: Default::default(),
+            routing: Arc::new(RoutingTable::new(Default::default())),
+            identity: bob.clone(),
+            plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+            ws_tx: ws_tx.clone(),
+            audit_log: audit.clone(),
+            admission_mode: ReachabilityMode::PriceOpen,
+            relay_engine: None,
+            shutdown_rx,
+        }))
+    };
+
+    let mut worker = start_handler(sessions_b.clone(), shutdown_rx);
+
+    let body = br#"{"request_id":"retry-page","path":"/missing.md","method":"GET"}"#;
+    let hash = wallet.inject_inbound_keysend(10_000, None).await;
+    let payment = wallet.get_payment_status(&hash).await.unwrap();
+    let proof = PaymentProof::new(
+        hex::decode(&hash).unwrap().try_into().unwrap(),
+        hex::decode(payment.preimage.unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        10_000,
+    );
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+        &sessions_a.encrypt(bob.node_id(), body).await.unwrap(),
+    );
+    let mut env = UkmEnvelopeBuilder::new(
+        kind,
+        *alice.node_id(),
+        Recipient::Node(*bob.node_id()),
+        ciphertext,
+        proof,
+    )
+    .build();
+    env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+    let before_receive = session_store.blob(alice.node_id()).await;
+    if matches!(failure, RecoveryFailure::PlaintextCache) {
+        sqlx::raw_sql("CREATE TRIGGER fail_plaintext_cache BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(FAIL, 'injected plaintext cache failure'); END")
+            .execute(db.pool()).await.unwrap();
+    } else if matches!(failure, RecoveryFailure::CompletionCache) {
+        sqlx::raw_sql("CREATE TRIGGER fail_plaintext_cache BEFORE UPDATE OF plaintext_enc ON messages WHEN OLD.plaintext_enc IS NOT NULL BEGIN SELECT RAISE(FAIL, 'injected completion cache failure'); END")
+            .execute(db.pool()).await.unwrap();
+    } else {
+        session_store.saves_before_failure.store(
+            usize::from(matches!(failure, RecoveryFailure::ReplySave)),
+            Ordering::SeqCst,
+        );
+    }
+    source.send(bob.node_id(), &env).await.unwrap();
+    let first_reply = if matches!(failure, RecoveryFailure::CompletionCache) {
+        Some(
+            tokio::time::timeout(Duration::from_secs(5), source.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while if matches!(failure, RecoveryFailure::CompletionCache) {
+            false
+        } else if matches!(failure, RecoveryFailure::PlaintextCache) {
+            db.get_message(&env.id).await.unwrap().is_none()
+        } else {
+            session_store.failed_saves.load(Ordering::SeqCst) == 0
+        } {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let first_reply_plaintext = if let Some(reply) = &first_reply {
+        let reply_message =
+            konsensus_crypto::ratchet_message_from_bytes(&reply.ciphertext).unwrap();
+        let plaintext = sessions_a
+            .decrypt(bob.node_id(), &reply_message)
+            .await
+            .unwrap();
+        let follow_on = sessions_a
+            .encrypt(bob.node_id(), b"follow-on traffic")
+            .await
+            .unwrap();
+        sessions_b
+            .decrypt(alice.node_id(), &follow_on)
+            .await
+            .unwrap();
+        Some(plaintext)
+    } else {
+        None
+    };
+    // Finish the active receive before inspecting state, even if the cache write failed.
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    let terminal = |source: Arc<NoiseTransport>| async move {
+        loop {
+            match source.recv_control().await.unwrap() {
+                ControlEvent::MessageAcked { duplicate, .. } => break Ok(duplicate),
+                ControlEvent::MessageRejected { reason, .. } => break Err(reason),
+                _ => {}
+            }
+        }
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), terminal(source.clone()))
+            .await
+            .is_err(),
+        "failed recovery-data save must not complete the request"
+    );
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(
+        db.get_message_plaintext(&env.id).await.unwrap().is_some(),
+        !matches!(failure, RecoveryFailure::PlaintextCache)
+    );
+    if matches!(failure, RecoveryFailure::PlaintextCache) {
+        assert!(
+            session_store.blob(alice.node_id()).await == before_receive,
+            "a failed plaintext cache write consumed the paid request's receive key"
+        );
+        sqlx::raw_sql("DROP TRIGGER fail_plaintext_cache")
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    session_store
+        .saves_before_failure
+        .store(usize::MAX, Ordering::SeqCst);
+    session_store.fail_saves.store(false, Ordering::SeqCst);
+    if web_reply {
+        // Both the ratchet and pending request must survive a process restart.
+        sessions_b = Arc::new(SessionManager::with_store(
+            bob.clone(),
+            session_store.clone(),
+        ));
+        assert_eq!(sessions_b.restore_sessions().await, 1);
+    } else {
+        // Simulate a legacy crash window with no durable plaintext.
+        sqlx::query("UPDATE messages SET plaintext_enc = NULL WHERE id = ?")
+            .bind(env.id.to_hex())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sessions_b.remove_session(alice.node_id()).await;
+    }
+    let (next_shutdown, next_rx) = watch::channel(false);
+    shutdown = next_shutdown;
+    worker = start_handler(sessions_b.clone(), next_rx);
+    if let Some(first) = &first_reply {
+        // Keep the completion fault active through a restart and another resend.
+        source.send(bob.node_id(), &env).await.unwrap();
+        let repeated = tokio::time::timeout(Duration::from_secs(5), source.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown.send(true).unwrap();
+        worker.await.unwrap();
+        assert!(
+            serde_json::to_vec(&repeated).unwrap() == serde_json::to_vec(first).unwrap(),
+            "completion failure encrypted a new reply"
+        );
+        sqlx::raw_sql("DROP TRIGGER fail_plaintext_cache")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let (next_shutdown, next_rx) = watch::channel(false);
+        shutdown = next_shutdown;
+        worker = start_handler(sessions_b.clone(), next_rx);
+    }
+    source.send(bob.node_id(), &env).await.unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), terminal(source.clone()))
+        .await
+        .unwrap();
+    if web_reply {
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let reply = tokio::time::timeout(Duration::from_secs(5), source.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.references, vec![env.id]);
+        assert_eq!(reply.payment_proof.amount_msat, 0);
+        if let Some(first) = first_reply {
+            assert!(serde_json::to_vec(&reply).unwrap() == serde_json::to_vec(&first).unwrap());
+        }
+        let message = konsensus_crypto::ratchet_message_from_bytes(&reply.ciphertext).unwrap();
+        let plaintext = match first_reply_plaintext {
+            Some(plaintext) => plaintext,
+            None => sessions_a.decrypt(bob.node_id(), &message).await.unwrap(),
+        };
+        let payload: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        if kind == konsensus_core::kind::KIND_PAGE_REQUEST {
+            assert_eq!(reply.kind, konsensus_core::kind::KIND_PAGE_RESPONSE);
+            assert_eq!(payload["request_id"], "retry-page");
+        } else {
+            assert_eq!(reply.kind, konsensus_core::kind::KIND_WEB_MANIFEST);
+            assert_eq!(payload["site_name"], "Retry test");
+        }
+        // Completion must restore the original plaintext cache and stop re-serving.
+        let cached = db.get_message_plaintext(&env.id).await.unwrap().unwrap();
+        assert_eq!(
+            PlaintextCacheCipher::new(bob.aes_key())
+                .decrypt(&cached)
+                .unwrap(),
+            body
+        );
+        source.send(bob.node_id(), &env).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), terminal(source.clone()))
+                .await
+                .unwrap(),
+            Ok(true)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), source.recv())
+                .await
+                .is_err(),
+            "a completed request bought another response without a new payment"
+        );
+        // A consumed receive ratchet cannot decrypt this again: only the cache can resume it.
+        assert!(sessions_b
+            .decrypt(
+                alice.node_id(),
+                &konsensus_crypto::ratchet_message_from_bytes(&env.ciphertext).unwrap()
+            )
+            .await
+            .is_err());
+    } else {
+        assert!(
+            outcome.is_err(),
+            "undecryptable recovered message was acknowledged"
+        );
+        // A known plaintext is sufficient for a later duplicate ACK, even without a session.
+        let cached = PlaintextCacheCipher::new(bob.aes_key())
+            .encrypt(body)
+            .unwrap();
+        db.store_message_plaintext(&env.id, &cached).await.unwrap();
+        source.send(bob.node_id(), &env).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), terminal(source.clone()))
+                .await
+                .unwrap(),
+            Ok(true)
+        );
+    }
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    source.shutdown();
+    target.shutdown();
+}
+
+/// Codex P1 on #406: a call block commits its interval before decrypt, and the
+/// ratchet save then fails. The retry must recover the committed grant (not
+/// refuse the block as an overpayment), release the hold, and ACK with
+/// `paid_until_ms` without applying the block a second time.
+#[tokio::test]
+async fn committed_call_block_with_unsaved_ratchet_recovers_its_grant_on_retry() {
+    use konsensus_core::payloads::call::{self as calls};
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let transport = |id| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    while !matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ) {}
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let session_store = FlakySessionStore::new();
+    let sessions_b = Arc::new(SessionManager::with_store(bob.clone(), session_store.clone()));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, mut ws_rx) = broadcast::channel(16);
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
+        konsensus_pricing::StaticPricingEngine::new(Default::default()),
+    );
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(),
+        transport_ack: target.clone(),
+        storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        })),
+        pricing,
+        lightning: wallet.clone(),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b,
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None,
+        front_door: Default::default(),
+        routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(),
+        plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx,
+        audit_log: audit,
+        admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None,
+        shutdown_rx,
+    }));
+
+    // A live call answered 20 s ago; block 0 is due.
+    let block_id = format!("{:032x}", rand::random::<u128>());
+    let answered_at = chrono::Utc::now().timestamp_millis() as u64 - 20_000;
+    let ringing = calls::receive(None, 400, None, answered_at).unwrap();
+    let pending = calls::reserve(Some(ringing), 401, "answer", "hash", answered_at).unwrap();
+    db.call_put(alice.node_id(), &block_id, &calls::commit(pending, "answer", answered_at).unwrap())
+        .await
+        .unwrap();
+
+    // Block 0, paid through a bound block invoice.
+    let body = format!(r#"{{"v":1,"call_id":"{block_id}","seq":0}}"#);
+    let invoice = wallet
+        .create_invoice(10_000, "call block", calls::CALL_BLOCK_INVOICE_EXPIRY_SECS)
+        .await
+        .unwrap();
+    let hash: [u8; 32] = hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap();
+    db.record_call_block_invoice(alice.node_id(), &block_id, 0, &hash,
+        chrono::Utc::now().timestamp_millis() as u64 + 120_000).await.unwrap();
+    let paid = wallet.pay_invoice(&invoice.bolt11).await.unwrap();
+    let proof = PaymentProof::new(hash, hex::decode(paid.preimage.unwrap()).unwrap().try_into().unwrap(), 10_000);
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+        &sessions_a.encrypt(bob.node_id(), body.as_bytes()).await.unwrap(),
+    );
+    let mut env = UkmEnvelopeBuilder::new(404, *alice.node_id(), Recipient::Node(*bob.node_id()), ciphertext, proof).build();
+    env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+
+    let outcome = |source: Arc<NoiseTransport>| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source.recv_control().await.unwrap() {
+                    ControlEvent::MessageAcked { duplicate, paid_until_ms, .. } => break Ok((duplicate, paid_until_ms)),
+                    ControlEvent::MessageRejected { reason, .. } => break Err(reason),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap()
+    };
+
+    // First delivery: the block commits, then the ratchet save fails. No ACK.
+    session_store.fail_saves.store(true, Ordering::SeqCst);
+    source.send(bob.node_id(), &env).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap();
+        if row.next_block_seq == 1 && session_store.failed_saves.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "block was not committed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let committed = db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap();
+    assert_eq!(committed.paid_until_ms, Some(answered_at + 60_000));
+    assert!(db.call_admission_held(&env.id).await.unwrap(), "unsaved block must stay held");
+    assert!(ws_rx.try_recv().is_err());
+
+    // Retry with saves working: delivered with its grant, applied only once.
+    session_store.fail_saves.store(false, Ordering::SeqCst);
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok((false, Some(answered_at + 60_000))));
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap(), committed);
+    assert!(!db.call_admission_held(&env.id).await.unwrap());
+    assert!(!db.is_paid_envelope_rejected(&env).await.unwrap());
+
+    // A later duplicate keeps the same grant and is never an overpayment.
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok((true, Some(answered_at + 60_000))));
+    assert!(ws_rx.try_recv().is_err());
+
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    source.shutdown();
+    target.shutdown();
+}
+
+/// Codex P2 on #406: a chat left held by an unsaved ratchet and then withdrawn
+/// by the sweep must not be reported as delivered on a later retry.
+#[tokio::test]
+async fn swept_unsaved_chat_retry_is_withdrawn_not_reported_delivered() {
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let transport = |id| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    while !matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ) {}
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let session_store = FlakySessionStore::new();
+    let sessions_b = Arc::new(SessionManager::with_store(
+        bob.clone(),
+        session_store.clone(),
+    ));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let blob_before = session_store.blob(alice.node_id()).await;
+    assert!(blob_before.is_some(), "accepted session was not stored");
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, mut ws_rx) = broadcast::channel(16);
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
+        konsensus_pricing::StaticPricingEngine::new(Default::default()),
+    );
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(),
+        transport_ack: target.clone(),
+        storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        })),
+        pricing,
+        lightning: wallet.clone(),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b,
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None,
+        front_door: Default::default(),
+        routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(),
+        plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx,
+        audit_log: audit,
+        admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None,
+        shutdown_rx,
+    }));
+
+    let body = "retry me";
+    let msat = 10_000;
+    let hash = wallet.inject_inbound_keysend(msat, None).await;
+    let payment = wallet.get_payment_status(&hash).await.unwrap();
+    let proof = PaymentProof::new(
+        hex::decode(&hash).unwrap().try_into().unwrap(),
+        hex::decode(payment.preimage.unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        msat,
+    );
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+        &sessions_a
+            .encrypt(bob.node_id(), body.as_bytes())
+            .await
+            .unwrap(),
+    );
+    let mut env = UkmEnvelopeBuilder::new(
+        konsensus_core::kind::KIND_CHAT,
+        *alice.node_id(),
+        Recipient::Node(*bob.node_id()),
+        ciphertext,
+        proof,
+    )
+    .build();
+    env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+
+    let outcome = |source: Arc<NoiseTransport>| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source.recv_control().await.unwrap() {
+                    ControlEvent::MessageAcked { duplicate, .. } => break Ok(duplicate),
+                    ControlEvent::MessageRejected { reason, .. } => break Err(reason),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap()
+    };
+
+    // First delivery: the tag matches and the session save fails. No ack, the
+    // chat stays held, and the stored ratchet blob is unchanged.
+    let failed_before = session_store.failed_saves.load(Ordering::SeqCst);
+    session_store.fail_saves.store(true, Ordering::SeqCst);
+    source.send(bob.node_id(), &env).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let row: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+            .bind(env.id.to_hex())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let plain_missing: i64 = sqlx::query_scalar(
+            "SELECT CASE WHEN plaintext_enc IS NULL THEN 1 ELSE 0 END FROM messages WHERE id = ?",
+        )
+        .bind(env.id.to_hex())
+        .fetch_optional(db.pool())
+        .await
+        .unwrap()
+        .unwrap_or(0);
+        if row == 1
+            && plain_missing == 0
+            && db.call_admission_held(&env.id).await.unwrap()
+            && session_store.failed_saves.load(Ordering::SeqCst) > failed_before
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "unsaved chat was not held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let silent = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match source.recv_control().await.unwrap() {
+                ControlEvent::MessageAcked { duplicate, .. } => {
+                    panic!("unsaved chat was acknowledged (duplicate={duplicate})")
+                }
+                ControlEvent::MessageRejected { reason, .. } => {
+                    panic!("unsaved chat was rejected: {reason}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(silent.is_err(), "unsaved chat produced a terminal frame");
+    assert!(ws_rx.try_recv().is_err(), "unsaved chat was delivered");
+    assert!(
+        db.get_message(&env.id).await.unwrap().is_none(),
+        "held chat visible"
+    );
+    assert!(
+        !db.is_paid_envelope_accepted(&env).await.unwrap(),
+        "held chat would be duplicate-acked instead of decrypted again"
+    );
+    assert_eq!(session_store.blob(alice.node_id()).await, blob_before);
+
+    // The sweep withdraws the abandoned hold: message gone, receipt rejected.
+    konsensus_api::calls::withdraw_held(db.as_ref(), true).await.unwrap();
+    assert!(db.is_paid_envelope_rejected(&env).await.unwrap());
+    // A retry must be a terminal withdrawal, not "payment proof already used"
+    // (which the sender's compatibility path counts as delivered).
+    session_store.fail_saves.store(false, Ordering::SeqCst);
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("message withdrawn".to_string()));
+    assert!(ws_rx.try_recv().is_err(), "withdrawn chat was delivered");
+    assert!(!db.call_admission_held(&env.id).await.unwrap());
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    source.shutdown();
+    target.shutdown();
 }

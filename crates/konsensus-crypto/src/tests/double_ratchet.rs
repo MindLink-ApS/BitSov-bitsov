@@ -862,6 +862,101 @@ fn tampered_header_message_number_rejected() {
     let mut msg = alice.encrypt(b"original").unwrap();
     // Tamper with the message number
     msg.header.message_number = msg.header.message_number.wrapping_add(5);
+    let before = bob.export_state();
     let result = bob.decrypt(&msg);
     assert!(result.is_err(), "tampered message_number should cause decryption failure");
+    assert_ratchet_state_unchanged(&before, &bob.export_state());
+}
+
+fn assert_ratchet_state_unchanged(before: &RatchetState, after: &RatchetState) {
+    assert_eq!(before.dh_secret, after.dh_secret);
+    assert_eq!(before.dh_public, after.dh_public);
+    assert_eq!(before.remote_dh_public, after.remote_dh_public);
+    assert_eq!(before.root_key, after.root_key);
+    assert_eq!(before.sending_chain, after.sending_chain);
+    assert_eq!(before.receiving_chain, after.receiving_chain);
+    assert_eq!(before.send_count, after.send_count);
+    assert_eq!(before.recv_count, after.recv_count);
+    assert_eq!(before.previous_chain_length, after.previous_chain_length);
+    assert_eq!(before.associated_data, after.associated_data);
+    assert_eq!(before.skipped_keys.len(), after.skipped_keys.len());
+    for (left, right) in before.skipped_keys.iter().zip(after.skipped_keys.iter()) {
+        assert_eq!(left.ratchet_public, right.ratchet_public);
+        assert_eq!(left.message_number, right.message_number);
+        assert_eq!(left.message_key, right.message_key);
+    }
+}
+
+fn pair() -> (DoubleRatchet, DoubleRatchet) {
+    let shared_secret = [42u8; 32];
+    let ad = b"alice||bob".to_vec();
+    let bob_spk = x3dh::SignedPreKey::generate();
+    let alice = DoubleRatchet::init_sender(&shared_secret, &bob_spk.public, ad.clone()).unwrap();
+    let bob = DoubleRatchet::init_receiver(&shared_secret, bob_spk.secret(), &bob_spk.public, ad);
+    (alice, bob)
+}
+
+/// A flipped ciphertext byte must not move chains, skipped keys, or DH keys,
+/// and the unmodified message must still decrypt afterward.
+#[test]
+fn tampered_ciphertext_leaves_ratchet_state_unchanged() {
+    let (mut alice, mut bob) = pair();
+
+    let msg = alice.encrypt(b"hello bob").unwrap();
+    assert_eq!(msg.header.to_bytes().len(), 40);
+
+    let mut bad = msg.clone();
+    let last = bad.ciphertext.len() - 1;
+    bad.ciphertext[last] ^= 0x5a;
+
+    let before = bob.export_state();
+    assert!(bob.decrypt(&bad).is_err());
+    assert_ratchet_state_unchanged(&before, &bob.export_state());
+    assert_eq!(bob.decrypt(&msg).unwrap(), b"hello bob");
+
+    let follow = alice.encrypt(b"second").unwrap();
+    let mut follow_bad = follow.clone();
+    follow_bad.ciphertext[0] ^= 0xff;
+    let before = bob.export_state();
+    assert!(bob.decrypt(&follow_bad).is_err());
+    assert_ratchet_state_unchanged(&before, &bob.export_state());
+    assert_eq!(bob.decrypt(&follow).unwrap(), b"second");
+}
+
+/// A bad tag on a skipped message must leave that skipped key stored.
+#[test]
+fn tampered_skipped_ciphertext_keeps_skipped_key() {
+    let (mut alice, mut bob) = pair();
+    let messages: Vec<_> = (0..3)
+        .map(|i| alice.encrypt(format!("m{i}").as_bytes()).unwrap())
+        .collect();
+
+    assert_eq!(bob.decrypt(&messages[2]).unwrap(), b"m2");
+    let before = bob.export_state();
+    assert_eq!(before.skipped_keys.len(), 2);
+
+    let mut bad = messages[0].clone();
+    bad.ciphertext[0] ^= 0xff;
+    assert!(bob.decrypt(&bad).is_err());
+    assert_ratchet_state_unchanged(&before, &bob.export_state());
+    assert_eq!(bob.decrypt(&messages[0]).unwrap(), b"m0");
+    assert_eq!(bob.decrypt(&messages[1]).unwrap(), b"m1");
+}
+
+/// A header that would start a DH ratchet step must not stick when the tag fails.
+#[test]
+fn tampered_header_does_not_commit_dh_ratchet() {
+    let (mut alice, mut bob) = pair();
+    let msg = alice.encrypt(b"first contact").unwrap();
+    let mut bad = msg.clone();
+    bad.header.dh_public[0] ^= 0x01;
+
+    let before = bob.export_state();
+    assert!(bob.remote_dh_public.is_none());
+    assert!(bob.decrypt(&bad).is_err());
+    assert_ratchet_state_unchanged(&before, &bob.export_state());
+    assert!(bob.remote_dh_public.is_none());
+    assert!(!bob.can_send());
+    assert_eq!(bob.decrypt(&msg).unwrap(), b"first contact");
+    assert!(bob.can_send());
 }
