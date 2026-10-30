@@ -5,6 +5,13 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- **Breaking for exposed APIs:** a non-loopback `[api].listen_addr` (`0.0.0.0`,
+  `::`, a LAN address) now fails config validation unless
+  `[api].allow_non_loopback_bind = true` is set, because the owner API is
+  plaintext HTTP (#412). The default stays `127.0.0.1:3141`. A node that already
+  binds the API off-loopback refuses to start with an error naming the flag; add
+  it to keep that bind. `[remote_access]` still requires a loopback API, and the
+  flag does not lift that rule.
 - Payment truth on the owner API: `POST /payments/pay` and `/payments/keysend`
   answer `202 Accepted` with `status: in_flight` (payment hash and operation id,
   no preimage or fee) until the backend reports a final state, and `200` with
