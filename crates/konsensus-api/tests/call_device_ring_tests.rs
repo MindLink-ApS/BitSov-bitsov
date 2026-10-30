@@ -1003,3 +1003,50 @@ async fn withdrawn_invite_is_not_served_by_get_or_plaintext() {
         assert!(!reply.status().is_success(), "{path}: {}", reply.status());
     }
 }
+
+fn hangup(seed: u8) -> (UkmEnvelope, String) {
+    (
+        UkmEnvelopeBuilder::new(
+            konsensus_core::kind::KIND_CALL_HANGUP,
+            NodeId::from_bytes([202; 32]),
+            Recipient::Node(own()),
+            vec![seed],
+            PaymentProof::new([seed; 32], [seed; 32], 10_000),
+        )
+        .build(),
+        format!(r#"{{"v":1,"call_id":"{CALL}","reason":"hangup"}}"#),
+    )
+}
+
+/// A caller hangup after the device deadline ends the wait durably, even
+/// though the late hangup itself is refused: neither a stream write armed
+/// before the deadline nor retained delivery evidence can ring it afterwards.
+#[tokio::test]
+async fn late_cancellation_prevents_retained_delivery_from_ringing() {
+    for (seed, witnessed_first) in [(24, false), (26, true)] {
+        let db = SqliteStorage::in_memory().await.unwrap();
+        let devices = Devices::default();
+        let (env, text) = invite(seed);
+        db.accept_paid_envelope(&env).await.unwrap();
+        devices.admit(&db, &own(), &env, Some(&text), 1_000, || 1_000).await.unwrap();
+        let mut ticket = Some(devices.stream(&db, &env, Some(&text), || 15_900).await.unwrap().expect("deliverable"));
+        if witnessed_first {
+            // The write completed but recording it failed: evidence retained.
+            ticket.as_mut().unwrap().written(15_950);
+            ticket = None;
+        }
+        let (h, htext) = hangup(seed + 1);
+        assert!(devices.admit(&db, &own(), &h, Some(&htext), 16_050, || 16_050).await.is_err(), "late hangup is refused");
+        assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::Ended, "wait ended durably");
+        // A write spanning the deadline completes after the cancellation.
+        if let Some(t) = ticket.as_mut() {
+            t.written(16_060);
+        }
+        drop(ticket);
+        let notices = devices.sweep(&db, 16_200).await.unwrap();
+        assert!(notices.iter().all(|(_, f)| !matches!(f, konsensus_message::Frame::MessageAck { .. })), "{notices:?}");
+        assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::Ended);
+        assert!(devices.fetched(&db, &env, || 16_300).await.is_ok());
+        assert_ne!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::Ringing);
+    }
+}

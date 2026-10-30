@@ -418,7 +418,19 @@ pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind:
 
 async fn admit_locked(store: Store<'_>, peer: &NodeId, kind: u16, signal: &CallSignal, now: u64, arrived: u64) -> Result<(), CallRefusal> {
     let unavailable = |_| CallRefusal::Invalid("call state unavailable");
-    let entry = current(store, peer, &signal.call_id, now).await.map_err(unavailable)?;
+    let raw = store.call_get(peer, &signal.call_id).await.map_err(unavailable)?;
+    let entry = raw.clone().and_then(|e| e.at(now));
+    if kind == konsensus_core::kind::KIND_CALL_HANGUP {
+        // A device wait past its deadline can still be rung by a stream write
+        // armed before it, or by retained delivery evidence. A cancellation
+        // must end that wait durably first, even when the hangup itself is
+        // refused as late (Codex FAIL on #472).
+        if let (Some(raw), Some(aged)) = (&raw, &entry) {
+            if raw.side == rules::Side::Callee && raw.phase == rules::Phase::AwaitingDevice && aged.phase == rules::Phase::Ended {
+                write(store, peer, &signal.call_id, Some(aged)).await.map_err(unavailable)?;
+            }
+        }
+    }
     // Only an offer opens a new call id; an unknown-id answer/ICE/hangup is
     // refused below and must never make room by evicting a burned id (Fable R2).
     if entry.is_none() && kind == konsensus_core::kind::KIND_CALL_INVITE {
