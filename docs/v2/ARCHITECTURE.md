@@ -126,7 +126,7 @@ Six core traits define the abstraction boundaries. Each trait has multiple imple
 
 ### 2.1 ChainProvider
 
-Provides Bitcoin blockchain data for payment verification and chain-aware message pricing (Principle 5 · ADR-027).
+Provides timechain (Bitcoin block chain) data for payment verification and chain-aware message pricing (Principle 5 · ADR-027).
 
 ```rust
 /// Abstraction over Bitcoin chain data sources.
@@ -581,7 +581,7 @@ impl NodeIdentity {
 
 ## 4. Message Flow
 
-### Payment-Gated, Timechain-Priced, E2EE Message Flow
+### Payment-Gated, Chain-Aware-Priced, E2EE Message Flow
 
 ```
 Sender Node                                              Recipient Node
@@ -655,7 +655,7 @@ Sender Node                                              Recipient Node
 - **Payment before delivery:** Message is rejected if payment verification fails (step 12). This is fail-closed — any error in payment verification results in rejection, not acceptance.
 - **E2EE at composition time:** The sender encrypts before transmission (step 6). Neither node's operator can read the plaintext.
 - **Double encryption at rest:** E2EE ciphertext is additionally encrypted with AES-256-GCM using the node's storage key before persistence (steps 14, 16).
-- **Timechain-aware pricing:** The price is computed dynamically from chain state (step 2), not a static configuration value.
+- **Chain-aware message pricing (ADR-027):** The price is computed dynamically from chain state (step 2), not a static configuration value.
 - **Federation signatures on every message:** Even between known peers, every message is signed and verified (steps 8, 10).
 
 ---
@@ -1069,10 +1069,7 @@ whitelist = [
 ]
 
 [pricing]
-engine = "timechain"
-min_price_msat = 10
-max_price_msat = 100000
-fee_sensitivity = 0.5  # How much mempool fees affect pricing
+mode = "chain_aware"  # chain-aware message pricing (ADR-027); "static" is the default
 
 [api]
 listen = "127.0.0.1:3000"
@@ -1141,10 +1138,7 @@ whitelist = [
 ]
 
 [pricing]
-engine = "timechain"
-min_price_msat = 10
-max_price_msat = 100000
-fee_sensitivity = 0.5
+mode = "chain_aware"  # chain-aware message pricing (ADR-027); "static" is the default
 
 [api]
 listen = "0.0.0.0:3000"

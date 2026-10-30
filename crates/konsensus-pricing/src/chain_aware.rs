@@ -635,7 +635,7 @@ impl ChainAwarePricingEngine {
             let ceiled = if rem > 0 { div + 1 } else { div };
             // Clamp to u64 range. Do NOT early-return here: a bare `return u64::MAX`
             // bypasses the max_multiplier cap below, letting an absurd fee produce an
-            // UNCAPPED price and defeating the plasticity "bounded adaptation" invariant.
+            // UNCAPPED price and defeating the "bounded adaptation" invariant.
             // Yield u64::MAX as the adjustment so it flows through saturating_add and the
             // cap, which pins the final price to base*max_multiplier. (the-fool)
             if ceiled > u64::MAX as u128 {
