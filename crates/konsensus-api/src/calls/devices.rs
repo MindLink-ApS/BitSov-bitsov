@@ -8,7 +8,7 @@ use konsensus_core::{
     MessageId, NodeId, UkmEnvelope,
 };
 use konsensus_message::Frame;
-use konsensus_storage::{CallInviteOutcome, Storage, StorageError};
+use konsensus_storage::{CallInviteExpiry, CallInviteOutcome, Storage, StorageError};
 
 pub const NOT_REACHABLE: &str = "call_not_reachable";
 
@@ -51,7 +51,10 @@ impl Drop for StreamTicket<'_> {
         }
         if let Some(tracked) = self.devices.invites.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&self.id) {
             tracked.sending = tracked.sending.saturating_sub(1);
-            if let Some(at_ms) = self.written_ms.filter(|_| tracked.waiting) {
+            if let Some(written_ms) = self.written_ms.filter(|_| tracked.waiting) {
+                // Armed before the deadline, so it counts as delivered within
+                // the wait even if the socket write finished just after it.
+                let at_ms = written_ms.min(tracked.deadline_ms.saturating_sub(1));
                 tracked.witnessed_ms = Some(tracked.witnessed_ms.map_or(at_ms, |first| first.min(at_ms)));
             }
         }
@@ -193,9 +196,9 @@ impl Devices {
         store: &dyn Storage,
         envelope: &UkmEnvelope,
         clock: impl FnOnce() -> u64,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         if envelope.kind != konsensus_core::kind::KIND_CALL_INVITE {
-            return Ok(());
+            return Ok(true);
         }
         let _guard = super::lock().lock().await;
         let now_ms = clock();
@@ -206,21 +209,22 @@ impl Devices {
             .get(&envelope.id)
             .cloned();
         let Some(invite) = invite.filter(|i| i.peer == envelope.sender) else {
-            return Ok(());
+            return Ok(true);
         };
         if !invite.waiting {
-            return Ok(());
+            return Ok(true);
         }
-        if store.call_invite_outcome(envelope).await? == Some(CallInviteOutcome::Fetched) {
+        if store.call_invite_outcome(envelope).await? == Some(CallInviteOutcome::Fetched)
+            && self.adopt(store, &envelope.id, &invite).await?
+        {
             // An earlier delivery committed but its request was cancelled before
             // the registry saw it: adopt the durable state (Codex FAIL on #472).
-            self.adopt(store, &envelope.id, &invite).await?;
-            return Ok(());
+            return Ok(true);
         }
         // The first device delivery starts the ring clock, whichever path
         // finally records it (Codex FAIL on #472).
         let at_ms = invite.witnessed_ms.map_or(now_ms, |first| first.min(now_ms));
-        self.deliver(store, &envelope.id, &invite, at_ms).await.map(|_| ())
+        self.deliver(store, &envelope.id, &invite, at_ms).await
     }
 
     /// Start ringing from a delivery at `at_ms`. The receipt and the ringing
@@ -241,19 +245,21 @@ impl Devices {
         let next = row.device_fetched(at_ms).expect("unexpired row");
         if store.call_invite_deliver(id, &invite.peer, &invite.call_id, &next).await? {
             self.delivered(id, next.deadline_ms);
-        } else {
-            self.adopt(store, id, invite).await?;
+            return Ok(true);
         }
-        Ok(true)
+        self.adopt(store, id, invite).await
     }
 
     /// Adopt a delivery another request committed: owe its ACK, and follow
-    /// the stored ring deadline rather than any local snapshot.
-    async fn adopt(&self, store: &dyn Storage, id: &MessageId, invite: &Invite) -> Result<(), StorageError> {
+    /// the stored ring deadline rather than any local snapshot. Only a row
+    /// that is ringing or live proves one; a receipt alone never does.
+    async fn adopt(&self, store: &dyn Storage, id: &MessageId, invite: &Invite) -> Result<bool, StorageError> {
         let row = store.call_get(&invite.peer, &invite.call_id).await?;
-        self.delivered(id, row.filter(|e| e.side == Side::Callee && e.phase != Phase::AwaitingDevice)
-            .map_or(invite.deadline_ms, |e| e.deadline_ms));
-        Ok(())
+        let Some(row) = row.filter(|e| e.side == Side::Callee && matches!(e.phase, Phase::Ringing | Phase::Live)) else {
+            return Ok(false);
+        };
+        self.delivered(id, row.deadline_ms);
+        Ok(true)
     }
 
     /// Send a committed delivery's owed ACK now, from the sweep itself.
@@ -398,10 +404,19 @@ impl Devices {
                     // Expiry and delivery are decided by one storage transaction
                     // on the receipt: a delivery that committed first, even by a
                     // cancelled request, is acknowledged and never refused.
-                    if !store.call_invite_expire(&id, &invite.peer, &invite.call_id, invite.deadline_ms).await? {
-                        self.adopt(store, &id, &invite).await?;
-                        self.take_ack(&id, &invite.peer, &mut notices);
-                        return Ok(());
+                    match store.call_invite_expire(&id, &invite.peer, &invite.call_id, invite.deadline_ms).await? {
+                        CallInviteExpiry::Expired => {}
+                        CallInviteExpiry::Delivered => {
+                            if self.adopt(store, &id, &invite).await? {
+                                self.take_ack(&id, &invite.peer, &mut notices);
+                            }
+                            return Ok(());
+                        }
+                        CallInviteExpiry::Gone => {
+                            // Moved on without a delivery: no ACK, no refusal.
+                            self.invites.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                            return Ok(());
+                        }
                     }
                     // The hold is committed with the expiry, so a failed deletion
                     // stays protected and the existing held-message sweep retries.

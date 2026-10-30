@@ -864,7 +864,7 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_invite_set_outcome(id, peer, outcome).await
     }
 
-    async fn call_invite_expire(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, deadline_ms: u64) -> Result<bool, StorageError> {
+    async fn call_invite_expire(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, deadline_ms: u64) -> Result<crate::CallInviteExpiry, StorageError> {
         self.inner.call_invite_expire(id, peer, call_id, deadline_ms).await
     }
 

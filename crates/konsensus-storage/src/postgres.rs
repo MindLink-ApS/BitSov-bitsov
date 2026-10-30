@@ -1792,40 +1792,46 @@ impl Storage for PostgresStorage {
 
     async fn call_invite_deliver(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<bool, StorageError> {
         let mut tx = self.pool.begin().await?;
-        // The receipt row decides delivery versus expiry: whichever commits
-        // first wins, and the loser writes nothing (Codex FAIL on #472).
-        let marked = sqlx::query("UPDATE payment_receipts SET accepted = 1 WHERE message_id = $1 AND sender = $2 AND kind = 400 AND accepted = -2")
-            .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
-        if marked.rows_affected() != 1 {
-            let state: Option<i32> = sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE message_id = $1 AND sender = $2 AND kind = 400")
-                .bind(id.to_hex()).bind(peer.to_hex()).fetch_optional(&mut *tx).await?;
-            if state == Some(1) { return Ok(false); }
-            return Err(StorageError::Conversion("call invite receipt not pending".into()));
+        let (phase, _, accepted) = call_invite_locked(&mut tx, id, peer, call_id).await?;
+        // The awaiting row, not the receipt alone, proves no delivery yet: a
+        // paid acceptance whose Pending mark was never written also reads 1.
+        if phase.as_deref() == Some("awaiting_device") && matches!(accepted, Some(1 | -2)) {
+            sqlx::query("UPDATE payment_receipts SET accepted = 1 WHERE message_id = $1 AND sender = $2 AND kind = 400")
+                .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
+            call_put_on(&mut *tx, peer, call_id, entry).await?;
+            tx.commit().await?;
+            return Ok(true);
         }
-        call_put_on(&mut *tx, peer, call_id, entry).await?;
-        tx.commit().await?;
-        Ok(true)
+        if call_invite_delivered(phase.as_deref(), accepted) {
+            return Ok(false);
+        }
+        Err(StorageError::Conversion("call invite receipt not pending".into()))
     }
 
-    async fn call_invite_expire(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, deadline_ms: u64) -> Result<bool, StorageError> {
+    async fn call_invite_expire(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, deadline_ms: u64) -> Result<crate::CallInviteExpiry, StorageError> {
         let deadline = i64::try_from(deadline_ms).map_err(|_| StorageError::Conversion("call deadline overflow".into()))?;
         let tombstone = deadline.saturating_add(i64::try_from(konsensus_core::payloads::call::TOMBSTONE_MS).unwrap_or(i64::MAX));
         let mut tx = self.pool.begin().await?;
-        let marked = sqlx::query("UPDATE payment_receipts SET accepted = -3 WHERE message_id = $1 AND sender = $2 AND kind = 400 AND accepted IN (-2, -3)")
-            .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
-        if marked.rows_affected() != 1 {
-            let state: Option<i32> = sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE message_id = $1 AND sender = $2 AND kind = 400")
-                .bind(id.to_hex()).bind(peer.to_hex()).fetch_optional(&mut *tx).await?;
-            if state == Some(1) { return Ok(false); }
+        let (phase, row_deadline, accepted) = call_invite_locked(&mut tx, id, peer, call_id).await?;
+        if call_invite_delivered(phase.as_deref(), accepted) {
+            return Ok(crate::CallInviteExpiry::Delivered);
         }
+        let awaiting = phase.as_deref() == Some("awaiting_device") && row_deadline == Some(deadline);
+        if !awaiting && !matches!(accepted, Some(-2 | -3)) {
+            return Ok(crate::CallInviteExpiry::Gone);
+        }
+        sqlx::query("UPDATE payment_receipts SET accepted = -3 WHERE message_id = $1 AND sender = $2 AND kind = 400 AND accepted IN (1, -2, -3)")
+            .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
         // Held before it is withdrawn: a failed withdrawal stays protected
         // and the held-message sweep retries it.
         sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT id, sender, 0 FROM messages WHERE id = $1 AND sender = $2 ON CONFLICT DO NOTHING")
             .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
-        sqlx::query("UPDATE call_state SET phase = 'ended', deadline_ms = $1, replay_until_ms = $2 WHERE peer = $3 AND call_id = $4 AND side = 'callee' AND phase = 'awaiting_device' AND deadline_ms = $5")
-            .bind(tombstone).bind(tombstone).bind(peer.to_hex()).bind(call_id).bind(deadline).execute(&mut *tx).await?;
+        if awaiting {
+            sqlx::query("UPDATE call_state SET phase = 'ended', deadline_ms = $1, replay_until_ms = $2 WHERE peer = $3 AND call_id = $4")
+                .bind(tombstone).bind(tombstone).bind(peer.to_hex()).bind(call_id).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
-        Ok(true)
+        Ok(crate::CallInviteExpiry::Expired)
     }
 
     async fn call_delete(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(), StorageError> {
@@ -4027,3 +4033,22 @@ async fn call_put_on<'e, E: sqlx::Executor<'e, Database = sqlx::Postgres>>(execu
     Ok(())
 }
 
+
+/// Lock an invite's call row first, so delivery and expiry of the same wait
+/// serialize, then read the row phase/deadline and the receipt state.
+async fn call_invite_locked(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(Option<String>, Option<i64>, Option<i32>), StorageError> {
+    sqlx::query("UPDATE call_state SET phase = phase WHERE peer = $1 AND call_id = $2")
+        .bind(peer.to_hex()).bind(call_id).execute(&mut **tx).await?;
+    let row: Option<(String, i64)> = sqlx::query_as("SELECT phase, deadline_ms FROM call_state WHERE peer = $1 AND call_id = $2")
+        .bind(peer.to_hex()).bind(call_id).fetch_optional(&mut **tx).await?;
+    let accepted: Option<i32> = sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE message_id = $1 AND sender = $2 AND kind = 400")
+        .bind(id.to_hex()).bind(peer.to_hex()).fetch_optional(&mut **tx).await?;
+    let (phase, deadline) = row.unzip();
+    Ok((phase, deadline, accepted))
+}
+
+/// Committed device delivery: the receipt reads delivered and the row moved
+/// on to ringing or live. Never the receipt alone (Codex FAIL on #472).
+fn call_invite_delivered(phase: Option<&str>, accepted: Option<i32>) -> bool {
+    accepted == Some(1) && matches!(phase, Some("ringing" | "live"))
+}

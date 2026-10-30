@@ -824,7 +824,7 @@ async fn delivery_and_expiry_are_mutually_exclusive_in_either_order() {
         let ringing = awaiting.clone().device_fetched(11_000).unwrap();
         if delivery_first {
             assert!(db.call_invite_deliver(&env.id, &env.sender, CALL, &ringing).await.unwrap());
-            assert!(!db.call_invite_expire(&env.id, &env.sender, CALL, awaiting.deadline_ms).await.unwrap());
+            assert_eq!(db.call_invite_expire(&env.id, &env.sender, CALL, awaiting.deadline_ms).await.unwrap(), konsensus_storage::CallInviteExpiry::Delivered);
             // A stale snapshot's second delivery adopts, never overwrites.
             let later = awaiting.clone().device_fetched(12_000).unwrap();
             assert!(!db.call_invite_deliver(&env.id, &env.sender, CALL, &later).await.unwrap());
@@ -833,13 +833,13 @@ async fn delivery_and_expiry_are_mutually_exclusive_in_either_order() {
             assert_eq!(db.call_invite_outcome(&env).await.unwrap(), Some(Fetched));
             assert!(!db.call_admission_held(&env.id).await.unwrap());
         } else {
-            assert!(db.call_invite_expire(&env.id, &env.sender, CALL, awaiting.deadline_ms).await.unwrap());
+            assert_eq!(db.call_invite_expire(&env.id, &env.sender, CALL, awaiting.deadline_ms).await.unwrap(), konsensus_storage::CallInviteExpiry::Expired);
             assert!(db.call_invite_deliver(&env.id, &env.sender, CALL, &ringing).await.is_err());
             assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::Ended);
             assert_eq!(db.call_invite_outcome(&env).await.unwrap(), Some(NotReachable));
             assert!(db.call_admission_held(&env.id).await.unwrap());
             // A retried expiry (e.g. after a failed withdrawal) still proceeds.
-            assert!(db.call_invite_expire(&env.id, &env.sender, CALL, awaiting.deadline_ms).await.unwrap());
+            assert_eq!(db.call_invite_expire(&env.id, &env.sender, CALL, awaiting.deadline_ms).await.unwrap(), konsensus_storage::CallInviteExpiry::Expired);
         }
     }
 }
@@ -857,12 +857,14 @@ async fn in_flight_stream_write_cannot_lose_to_expiry() {
     let mut ticket = devices.stream(&db, &env, Some(&text), || 15_900).await.unwrap().expect("deliverable");
     assert!(devices.sweep(&db, 16_100).await.unwrap().is_empty(), "expired under an in-flight write");
     assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::AwaitingDevice);
-    ticket.written(15_950);
+    // Armed before the 16 000 deadline, finished after it: still delivered,
+    // ringing from the last instant of the wait.
+    ticket.written(16_050);
     drop(ticket);
     let notices = devices.sweep(&db, 16_200).await.unwrap();
     assert!(matches!(&notices[..], [(_, konsensus_message::Frame::MessageAck { .. })]), "{notices:?}");
     let row = db.call_get(&env.sender, CALL).await.unwrap().unwrap();
-    assert_eq!((row.phase, row.deadline_ms), (Phase::Ringing, 15_950 + konsensus_core::payloads::call::RING_TIMEOUT_MS));
+    assert_eq!((row.phase, row.deadline_ms), (Phase::Ringing, 15_999 + konsensus_core::payloads::call::RING_TIMEOUT_MS));
     // An interrupted write leaves no evidence: the next wait expires normally.
     let (env, text) = invite(19);
     let devices = Devices::default();
@@ -923,4 +925,45 @@ async fn websocket_delivery_survives_a_failed_record_and_anchors_the_ring_clock(
     let notices = state.call_devices.sweep(db.as_ref(), konsensus_api::calls::now_ms()).await.unwrap();
     assert!(matches!(&notices[..], [(_, konsensus_message::Frame::MessageAck { .. })]), "{notices:?}");
     server.abort();
+}
+
+/// Admission held the invite and wrote its awaiting row, but its Pending
+/// receipt mark never landed, so the receipt still reads as plain paid
+/// acceptance. That is never mistaken for device delivery: expiry refuses it
+/// (no ACK), and a real fetch before the deadline still rings it.
+#[tokio::test]
+async fn unmarked_paid_acceptance_is_not_device_delivery() {
+    for (seed, fetch) in [(20, false), (21, true)] {
+        let db = SqliteStorage::in_memory().await.unwrap();
+        let devices = Devices::default();
+        let (env, text) = invite(seed);
+        db.accept_paid_envelope(&env).await.unwrap();
+        devices.admit(&db, &own(), &env, Some(&text), 1_000, || 1_000).await.unwrap();
+        sqlx::query("UPDATE payment_receipts SET accepted = 1 WHERE message_id = ?")
+            .bind(env.id.to_hex()).execute(db.pool()).await.unwrap();
+        if fetch {
+            assert!(devices.fetched(&db, &env, || 11_000).await.unwrap());
+            let row = db.call_get(&env.sender, CALL).await.unwrap().unwrap();
+            assert_eq!((row.phase, row.deadline_ms), (Phase::Ringing, 11_000 + konsensus_core::payloads::call::RING_TIMEOUT_MS));
+            assert!(matches!(&devices.sweep(&db, 11_100).await.unwrap()[..], [(_, konsensus_message::Frame::MessageAck { .. })]));
+        } else {
+            let notices = devices.sweep(&db, 16_000).await.unwrap();
+            assert!(matches!(&notices[..], [(_, konsensus_message::Frame::MessageReject { reason, .. })] if reason == "call_not_reachable"), "{notices:?}");
+            assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::Ended);
+            assert_eq!(db.call_invite_outcome(&env).await.unwrap(), Some(konsensus_storage::CallInviteOutcome::NotReachable));
+        }
+    }
+}
+
+/// A fetch after the device wait expired is declined, and the listing does
+/// not hand that invite out, rather than reporting success for it.
+#[tokio::test]
+async fn expired_wait_fetch_is_declined() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let devices = Devices::default();
+    let (env, text) = invite(22);
+    db.accept_paid_envelope(&env).await.unwrap();
+    devices.admit(&db, &own(), &env, Some(&text), 1_000, || 1_000).await.unwrap();
+    assert!(!devices.fetched(&db, &env, || 16_000).await.unwrap());
+    assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::AwaitingDevice);
 }

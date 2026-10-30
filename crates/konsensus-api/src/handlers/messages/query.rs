@@ -163,12 +163,14 @@ impl MessageResponse {
 }
 
 /// Inspection by an owner token or an internal reader is not device receipt.
-async fn device_fetched(auth: &ScopedAuth<Read>, state: &AppState, envelope: &konsensus_core::UkmEnvelope) -> Result<(), ApiError> {
+/// Whether the paired device may be handed `envelope`: false for a waiting
+/// invite whose delivery could not start ringing (e.g. its wait expired).
+async fn device_fetched(auth: &ScopedAuth<Read>, state: &AppState, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, ApiError> {
     if auth.pairing.is_some() && auth.node_id == state.identity.node_id().to_hex() {
-        state.call_devices.fetched(state.storage.as_ref(), envelope, crate::calls::now_ms).await
-            .map_err(|e| ApiError::Storage(e.to_string()))?;
+        return state.call_devices.fetched(state.storage.as_ref(), envelope, crate::calls::now_ms).await
+            .map_err(|e| ApiError::Storage(e.to_string()));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// `GET /api/v1/messages/:id` — get a specific message.
@@ -194,7 +196,9 @@ pub(super) async fn get_message(
         .unwrap_or(None);
 
     let cipher = state.plaintext_cipher.as_deref();
-    device_fetched(&auth, &state, &envelope).await?;
+    if !device_fetched(&auth, &state, &envelope).await? {
+        return Err(ApiError::Conflict("call invite is no longer deliverable".into()));
+    }
     Ok(Json(MessageResponse::from_envelope(&envelope).with_cached_plaintext(cached, cipher)))
 }
 
@@ -246,7 +250,9 @@ pub(super) async fn get_message_plaintext(
     };
 
     if let Some(envelope) = state.storage.get_message(&id).await.map_err(|e| ApiError::Storage(e.to_string()))? {
-        device_fetched(&auth, &state, &envelope).await?;
+        if !device_fetched(&auth, &state, &envelope).await? {
+            return Err(ApiError::Conflict("call invite is no longer deliverable".into()));
+        }
     }
     Ok(Json(content))
 }
@@ -341,9 +347,13 @@ pub(super) async fn list_messages(
     // listing retries it; other items are unaffected (Codex FAIL on #472).
     let mut undelivered = std::collections::HashSet::new();
     for env in &messages.items {
-        if let Err(error) = device_fetched(&auth, &state, env).await {
-            tracing::warn!(msg_id = %env.id, ?error, "listed call invite not marked delivered; withheld");
-            undelivered.insert(env.id);
+        match device_fetched(&auth, &state, env).await {
+            Ok(true) => {}
+            Ok(false) => { undelivered.insert(env.id); }
+            Err(error) => {
+                tracing::warn!(msg_id = %env.id, ?error, "listed call invite not marked delivered; withheld");
+                undelivered.insert(env.id);
+            }
         }
     }
     let responses = messages.items.iter().zip(responses)

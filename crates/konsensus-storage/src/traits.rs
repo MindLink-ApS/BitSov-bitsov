@@ -33,6 +33,17 @@ impl CallInviteOutcome {
     }
 }
 
+/// How a device wait's expiry resolved against delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallInviteExpiry {
+    /// Not delivered: marked not reachable, held, and its awaiting row ended.
+    Expired,
+    /// A device delivery committed first: the call is ringing or live.
+    Delivered,
+    /// Neither: the call moved on without a delivery. Nothing was written.
+    Gone,
+}
+
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
@@ -56,9 +67,9 @@ pub trait Storage: Send + Sync {
     /// Expire a device wait atomically against delivery: only while the
     /// invite's receipt is still pending (or already not reachable, on a
     /// retry) mark it not reachable, re-hold the envelope and end the
-    /// awaiting row of this generation (`deadline_ms`). Returns false, writing
-    /// nothing, when a delivery committed first.
-    async fn call_invite_expire(&self, _id: &MessageId, _peer: &NodeId, _call_id: &str, _deadline_ms: u64) -> Result<bool, StorageError> {
+    /// awaiting row of this generation (`deadline_ms`). Writes nothing when a
+    /// delivery committed first, or the call moved on without one.
+    async fn call_invite_expire(&self, _id: &MessageId, _peer: &NodeId, _call_id: &str, _deadline_ms: u64) -> Result<CallInviteExpiry, StorageError> {
         Err(StorageError::Unsupported("call invite expiry".into()))
     }
 
