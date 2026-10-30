@@ -32,6 +32,8 @@
 //!   `NodeOffline` UI can detect a reachable but un-tokened node. Identity,
 //!   peer IDs, wallet balance, and LN pubkey are owner-only at `/api/v1/status`.
 //! - `GET  /api/v1/status` — owner-only full node status (behind `AuthUser`).
+//! - `GET  /api/v1/owner/claim-code` — authenticated, and additionally bound to
+//!   a loopback source and an owner actor; absent from the remote router.
 //! - `GET  /api/v1/preflight` and `GET /livez` — cheap operator liveness
 //!   probes mounted only when `AppState::operator_probes_enabled` is true.
 //!   They do not query Lightning, chain, storage, peers, or user state.
@@ -52,10 +54,15 @@
 //!   from the `?token=<jwt>` query parameter inside `ws_handler`
 //!   (browsers cannot set `Authorization` on the WS handshake).
 //!   Functionally gated; see `ws.rs`.
+//! - `GET  /api/v1/calls/:call_id/media` — binary media WebSocket (M6 N2).
+//!   Validates the JWT inline like `/ws`, then requires a live pairing
+//!   binding, the `spend` scope, the owner subject and an admitted call.
+//!   Functionally gated; see `call_media.rs`.
 
 pub mod audit;
 pub mod auth;
 pub mod bootstrap;
+pub mod call_media;
 pub mod calls;
 pub mod control;
 pub mod custody;
@@ -238,7 +245,8 @@ fn build_router_with_options(
         .merge(handlers::starter_channel::routes())
         .merge(handlers::organism::routes())
         .merge(handlers::gossip::routes())
-        .merge(ws::routes());
+        .merge(ws::routes())
+        .merge(call_media::routes());
     let router = if remote {
         router.layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -246,7 +254,26 @@ fn build_router_with_options(
         ))
     } else {
         // Prometheus scrape endpoint — unauthenticated, restrict via network ACL.
-        router.route("/metrics", get(metrics_handler))
+        router
+            .route("/metrics", get(metrics_handler))
+            // Owner-local only: never mounted behind the tunnel (`remote` above).
+            // Every response of the route, refusals included, is `no-store`.
+            .merge(
+                Router::new()
+                    .route(
+                        "/api/v1/owner/claim-code",
+                        get(handlers::owner_claim_code::show),
+                    )
+                    .layer(middleware::map_response(
+                        |mut response: axum::response::Response| async move {
+                            response.headers_mut().insert(
+                                header::CACHE_CONTROL,
+                                HeaderValue::from_static("no-store"),
+                            );
+                            response
+                        },
+                    )),
+            )
     };
     router
         .layer(middleware::from_fn_with_state(
@@ -346,6 +373,24 @@ pub async fn serve(
             }
         }
     });
+    // Paid call deadlines are enforced independently of connected apps.
+    let call_state = state.clone();
+    let mut call_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64).unwrap_or(0);
+                    if let Err(error) = calls::maintain_calls(&call_state, now).await {
+                        tracing::warn!(%error, "call expiry maintenance failed");
+                    }
+                },
+                _ = call_shutdown.changed() => break,
+            }
+        }
+    });
     // Recovery only polls recorded payments and queues their encrypted envelopes.
     let operation_state = state.clone();
     let mut operation_shutdown = shutdown_rx.clone();
@@ -393,7 +438,10 @@ mod tests {
     #[test]
     fn cors_rejects_wildcard_and_null_origin() {
         let origins = parse_cors_allowed_origins("*, null, NULL, http://localhost:1420");
-        assert_eq!(origins, vec![HeaderValue::from_static("http://localhost:1420")]);
+        assert_eq!(
+            origins,
+            vec![HeaderValue::from_static("http://localhost:1420")]
+        );
     }
 
     #[test]

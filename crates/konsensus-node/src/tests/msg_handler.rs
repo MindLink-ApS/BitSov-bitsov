@@ -2906,7 +2906,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
         lightning: wallet.clone(),
         chain: Arc::new(konsensus_chain::MockChainProvider::new()),
         peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
-        session_manager: sessions_b,
+        session_manager: sessions_b.clone(),
         nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
         content_server: None,
         front_door: Default::default(),
@@ -2922,10 +2922,23 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
 
     // Alice pays `msat` to Bob and sends one signal of `kind`.
     let signal = |kind: u16, msat: u64, body: String| {
-        let (wallet, sessions_a, alice, bob) =
-            (wallet.clone(), &sessions_a, alice.clone(), bob.clone());
+        let (wallet, sessions_a, alice, bob, db) =
+            (wallet.clone(), &sessions_a, alice.clone(), bob.clone(), db.clone());
         async move {
-            let hash = wallet.inject_inbound_keysend(msat, None).await;
+            let hash = if kind == 404 {
+                // Issue and bind a real invoice before paying it. These fixtures
+                // model issuance before the delayed settlement/delivery below.
+                let invoice = wallet.create_invoice(msat, "call block",
+                    konsensus_core::payloads::call::CALL_BLOCK_INVOICE_EXPIRY_SECS).await.unwrap();
+                let block = konsensus_core::payloads::call::CallSignal::parse(404, &body).unwrap();
+                db.record_call_block_invoice(alice.node_id(), &block.call_id, block.seq.unwrap(),
+                    &hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap(),
+                    chrono::Utc::now().timestamp_millis() as u64 + 120_000).await.unwrap();
+                wallet.pay_invoice(&invoice.bolt11).await.unwrap();
+                invoice.payment_hash
+            } else {
+                wallet.inject_inbound_keysend(msat, None).await
+            };
             let payment = wallet.get_payment_status(&hash).await.unwrap();
             let proof = PaymentProof::new(
                 hex::decode(&hash).unwrap().try_into().unwrap(),
@@ -3078,6 +3091,161 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     source.send(bob.node_id(), &env).await.unwrap();
     assert!(outcome(source.clone()).await.is_err());
     assert!(ws_rx.try_recv().is_err());
+
+    // Block zero may take longer than ten seconds to reach the callee.
+    // The paid interval stays anchored to answer, and the gate remains single-use.
+    use konsensus_core::payloads::call::{self as calls, HangupReason, Phase};
+    let block_id = format!("{:032x}", rand::random::<u128>());
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let answered_at = now - 20_000;
+    let pending = calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
+    let entry = calls::commit(pending, "answer", answered_at).unwrap();
+    db.call_put(alice.node_id(), &block_id, &entry).await.unwrap();
+    let block = |seq| format!(r#"{{"v":1,"call_id":"{block_id}","seq":{seq}}}"#);
+    // A generic 3600-second invoice cannot buy call media, even for a valid seq.
+    let invoice = wallet.create_invoice(10_000, "generic", 3600).await.unwrap();
+    let payment = wallet.pay_invoice(&invoice.bolt11).await.unwrap();
+    let mut generic = signal(404, 10_000, block(0)).await;
+    generic.payment_proof = PaymentProof::new(
+        hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap(),
+        hex::decode(payment.preimage.unwrap()).unwrap().try_into().unwrap(), 10_000);
+    generic.signature = Signature::from_ed25519(&alice.sign(&generic.signable_bytes()));
+    source.send(bob.node_id(), &generic).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap(), Some(entry.clone()));
+    assert!(ws_rx.try_recv().is_err());
+    assert!(db.is_paid_envelope_rejected(&generic).await.unwrap());
+    source.send(bob.node_id(), &generic).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    assert!(log.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .any(|event| event["event"] == "call.block_overpayment" && event["detail"]["message_id"] == generic.id.to_hex()));
+
+    let env = signal(404, 10_000, block(0)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    let paid = db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap();
+    assert_eq!(paid.paid_until_ms, Some(answered_at + 60_000));
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(true));
+    assert!(ws_rx.try_recv().is_err());
+
+    // Outside the resume window the settled block is a durable, terminal
+    // overpayment. Its proof is single-use; the audit survives reopening.
+    let late_id = format!("{:032x}", rand::random::<u128>());
+    let late_initial = calls::CallEntry { deadline_ms: now - calls::CALL_BLOCK_RESUME_MS - 1, ..entry };
+    db.call_put(alice.node_id(), &late_id, &late_initial).await.unwrap();
+    let env = signal(404, 10_000, format!(r#"{{"v":1,"call_id":"{late_id}","seq":0}}"#)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert!(db.has_nonce(&env.nonce).await.unwrap());
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    assert!(db.get_message_plaintext(&env.id).await.unwrap().is_none());
+    assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert!(!db.store_payment_receipt(&env.payment_proof.payment_hash, alice.node_id(), &env.id).await.unwrap());
+    assert!(ws_rx.try_recv().is_err());
+    assert!(!konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &late_id, now).await);
+    let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    let events: Vec<serde_json::Value> = audit_entries.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    let overpayment = events.iter().find(|event| event["event"] == "call.block_overpayment"
+        && event["detail"]["message_id"] == env.id.to_hex()).expect("durable overpayment audit");
+    assert_eq!(overpayment["detail"]["call_id"], late_id);
+    assert_eq!(overpayment["detail"]["seq"], 0);
+    assert_eq!(overpayment["detail"]["amount_msat"], 10_000);
+    assert_eq!(overpayment["detail"]["payment_hash"], hex::encode(env.payment_proof.payment_hash));
+    assert_eq!(overpayment["detail"]["reconciliation_required"], true);
+    assert_eq!(events.iter().filter(|event| event["event"] == "call.block_overpayment"
+        && event["detail"]["message_id"] == env.id.to_hex()).count(), 1);
+
+    // An incorrect sequence is also an audited overpayment, never a grant.
+    let wrong_id = format!("{:032x}", rand::random::<u128>());
+    let wrong_entry = calls::CallEntry { deadline_ms: now + 30_000, ..late_initial.clone() };
+    db.call_put(alice.node_id(), &wrong_id, &wrong_entry).await.unwrap();
+    let wrong = signal(404, 10_000, format!(r#"{{"call_id":"{wrong_id}","seq":1}}"#)).await;
+    source.send(bob.node_id(), &wrong).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert!(db.is_paid_envelope_rejected(&wrong).await.unwrap());
+    assert_eq!(db.call_get(alice.node_id(), &wrong_id).await.unwrap(), Some(wrong_entry));
+    let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    assert!(audit_entries.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .any(|event| event["event"] == "call.block_overpayment" && event["detail"]["call_id"] == wrong_id
+            && event["detail"]["seq"] == 1 && event["detail"]["reconciliation_required"] == true));
+
+    // A paid block whose call-state write fails leaves explicit evidence for
+    // reconciliation, bound to its retained payment receipt, without media.
+    let failed_id = format!("{:032x}", rand::random::<u128>());
+    let failed_entry = calls::CallEntry { deadline_ms: now + 30_000, ..late_initial.clone() };
+    db.call_put(alice.node_id(), &failed_id, &failed_entry).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_call_commit BEFORE UPDATE ON call_state BEGIN SELECT RAISE(ABORT, 'injected call commit failure'); END")
+        .execute(db.pool()).await.unwrap();
+    let failed = signal(404, 10_000, format!(r#"{{"v":1,"call_id":"{failed_id}","seq":0}}"#)).await;
+    source.send(bob.node_id(), &failed).await.unwrap();
+    assert!(outcome(source.clone()).await.is_err());
+    sqlx::query("DROP TRIGGER fail_call_commit").execute(db.pool()).await.unwrap();
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &failed_id).await.unwrap(), Some(failed_entry));
+    assert!(db.get_message(&failed.id).await.unwrap().is_none());
+    assert!(db.get_message_plaintext(&failed.id).await.unwrap().is_none());
+    let receipt: (String, i64, i32) = sqlx::query_as("SELECT message_id, amount_msat, accepted FROM payment_receipts WHERE payment_hash = ?")
+        .bind(hex::encode(failed.payment_proof.payment_hash)).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(receipt, (failed.id.to_hex(), 10_000, -1));
+    let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    let reconciliation = audit_entries.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["event"] == "call.block_commit_failed" && event["detail"]["message_id"] == failed.id.to_hex())
+        .expect("failed paid block needs a reconciliation record");
+    assert_eq!(reconciliation["detail"]["call_id"], failed_id);
+    assert_eq!(reconciliation["detail"]["seq"], 0);
+    assert_eq!(reconciliation["detail"]["amount_msat"], 10_000);
+    assert_eq!(reconciliation["detail"]["reconciliation_required"], true);
+
+    // A settled next renewal within the window resumes even after the
+    // callee already emitted its single-use Unpaid notice, and tells the caller.
+    let expired = calls::CallEntry { deadline_ms: now - 1, ..paid };
+    let ended = calls::CallEntry { unpaid_notice_used: true, ..expired.clone().at(now).unwrap() };
+    db.call_put(alice.node_id(), &block_id, &ended).await.unwrap();
+    let env = signal(404, 10_000, block(1)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    let grant = tokio::time::timeout(Duration::from_secs(5), source.recv_control()).await.unwrap().unwrap();
+    let granted_until = match grant {
+        ControlEvent::MessageAcked { message_id, paid_until_ms: Some(paid_until_ms), duplicate: false, .. } => {
+            assert_eq!(message_id, env.id);
+            assert!(paid_until_ms >= now + 60_000);
+            paid_until_ms
+        },
+        other => panic!("expected paid interval confirmation, got {other:?}"),
+    };
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    let resumed = db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap();
+    assert_eq!(resumed.phase, Phase::Live);
+    assert_eq!(resumed.next_block_seq, 2);
+    assert_eq!(resumed.paid_until_ms, Some(granted_until));
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(matches!(source.recv_control().await.unwrap(), ControlEvent::MessageAcked { paid_until_ms: Some(paid_until_ms), duplicate: true, .. } if paid_until_ms == granted_until));
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap(), Some(resumed));
+
+    // The peer can observe the callee's unpaid termination even after its
+    // own timer expired. Replaying that envelope never notifies the app twice.
+    let ended = calls::CallEntry { side: calls::Side::Caller, ..expired.at(now).unwrap() };
+    assert_eq!(ended.end_reason, Some(HangupReason::Unpaid));
+    db.call_put(alice.node_id(), &block_id, &ended).await.unwrap();
+    let env = signal(403, 1_000, format!(r#"{{"v":1,"call_id":"{block_id}","reason":"unpaid"}}"#)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    let notification = ws_rx.recv().await.unwrap();
+    assert_eq!(notification.plaintext.as_deref(), Some(format!(r#"{{"v":1,"call_id":"{block_id}","reason":"unpaid"}}"#).as_str()));
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap(), Some(calls::CallEntry { unpaid_notice_used: true, ..ended }));
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(true));
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap().phase, Phase::Ended);
+    let second = signal(403, 1_000, format!(r#"{{"v":1,"call_id":"{block_id}","reason":"unpaid"}}"#)).await;
+    assert_ne!(second.id, env.id);
+    source.send(bob.node_id(), &second).await.unwrap();
+    assert!(outcome(source.clone()).await.is_err());
+    assert!(ws_rx.try_recv().is_err(), "a distinct paid notice must not reach the app twice");
     shutdown.send(true).unwrap();
     worker.await.unwrap();
     source.shutdown();

@@ -4,9 +4,23 @@
 use super::*;
 use axum::http::StatusCode;
 use konsensus_api::control::{self, ControlRequest, ControlResponse};
+use konsensus_core::traits::lightning::RoutingFeePolicy;
 use konsensus_core::traits::transport::MessageTransport;
 use konsensus_message::Frame;
 use std::path::Path;
+
+/// Direct A–B and A–C channels settle at a known zero routing fee. The 6 sat
+/// messaging cap bounds a call's authorized all-in, including both first-contact
+/// fee ceilings. This fixture's 2,001 + 2,001 quote plus the production 5,000 msat
+/// floor on each leg is 14,002 msat, which the cap refuses before anything is paid.
+/// Authorize the fee the regtest actually pays so the quote stays at 4,002 msat.
+pub(super) fn direct_channel_fee_policy() -> RoutingFeePolicy {
+    RoutingFeePolicy {
+        minimum_msat: 0,
+        proportional_millionths: 0,
+        maximum_msat: 0,
+    }
+}
 
 #[path = "fault_proxy.rs"]
 mod fault_proxy;
@@ -56,7 +70,7 @@ async fn owner(app: &app::App, request: ControlRequest, incident: &str) {
     );
 }
 
-async fn elevate(app: &mut app::App, recipients: &[String]) {
+pub(super) async fn elevate(app: &mut app::App, recipients: &[String]) {
     use std::os::unix::fs::PermissionsExt;
     let scopes = app.refresh_token().await;
     assert_eq!(
@@ -145,10 +159,19 @@ async fn elevate(app: &mut app::App, recipients: &[String]) {
         StatusCode::OK,
         "{APPROVAL}: remote grant read: {grant}"
     );
+    assert_eq!(
+        grant["grant"]["per_call_max_msat"],
+        konsensus_api::spend_budget::MESSAGING_PER_CALL_MAX_MSAT,
+        "{APPROVAL}: node keeps the 6 sat messaging cap: {grant}"
+    );
+    assert_eq!(
+        grant["grant"]["budget_msat"], 1_000_000,
+        "{APPROVAL}: the cap does not shrink the total budget: {grant}"
+    );
     assert_eq!(app.used(), 0, "{APPROVAL}: granting never spends");
 }
 
-async fn connect(from: &app::App, to: &app::App, incident: &str) {
+pub(super) async fn connect(from: &app::App, to: &app::App, incident: &str) {
     from.transport
         .connect(
             to.state.identity.node_id(),
@@ -261,6 +284,14 @@ async fn quote(from: &app::App, to: &app::App, incident: &str) -> Value {
     assert_eq!(status, StatusCode::OK, "{incident}: {body}");
     assert_eq!(body["admission_msat"], 2_001, "{incident}: {body}");
     assert_eq!(body["message_msat"], 2_001, "{incident}: {body}");
+    assert_eq!(
+        body["max_routing_fee_msat"], 0,
+        "{incident}: direct channel authorizes no routing fee: {body}"
+    );
+    assert_eq!(
+        body["total_msat"], 4_002,
+        "{incident}: all-in quote must fit the 6 sat messaging cap: {body}"
+    );
     body
 }
 
@@ -288,7 +319,7 @@ async fn approve_contact(
     .await;
 }
 
-async fn list_contact(from: &app::App, to: &app::App, incident: &str) {
+pub(super) async fn list_contact(from: &app::App, to: &app::App, incident: &str) {
     let (status, body) = from
         .post(
             "/api/v1/peers",
@@ -382,6 +413,7 @@ async fn start_app(
         Some(app::Options {
             identity: Arc::new(NodeIdentity::from_mnemonic(&config.mnemonic, "").unwrap()),
             chain_url: chain_url.to_owned(),
+            calls: None,
         }),
     )
     .await
@@ -409,9 +441,25 @@ async fn three_node_paid_e2e() {
         infra::lightning_config(dirs[1].path(), &fault.url),
         infra::lightning_config(dirs[2].path(), &chain.url),
     ];
-    let a = Arc::new(LdkProvider::new(configs[0].clone()).await.unwrap());
-    let mut b = Arc::new(LdkProvider::new(configs[1].clone()).await.unwrap());
-    let c = Arc::new(LdkProvider::new(configs[2].clone()).await.unwrap());
+    let direct_fees = direct_channel_fee_policy();
+    let a = Arc::new(
+        LdkProvider::new(configs[0].clone())
+            .await
+            .unwrap()
+            .with_routing_fee_policy(direct_fees),
+    );
+    let mut b = Arc::new(
+        LdkProvider::new(configs[1].clone())
+            .await
+            .unwrap()
+            .with_routing_fee_policy(direct_fees),
+    );
+    let c = Arc::new(
+        LdkProvider::new(configs[2].clone())
+            .await
+            .unwrap()
+            .with_routing_fee_policy(direct_fees),
+    );
     // Fund the acceptor reserve without granting any outbound Lightning balance.
     chain.fund(b.node()).await;
     chain.fund(a.node()).await;
@@ -1071,7 +1119,12 @@ async fn three_node_paid_e2e() {
         !alice.transport.is_connected(&bob_id).await
     })
     .await;
-    b = Arc::new(LdkProvider::new(configs[1].clone()).await.expect(RESTART));
+    b = Arc::new(
+        LdkProvider::new(configs[1].clone())
+            .await
+            .expect(RESTART)
+            .with_routing_fee_policy(direct_channel_fee_policy()),
+    );
     bob = start_app(dirs[1].path(), &chain, b.clone(), &configs[1], &fault.url).await;
     assert_eq!(
         *bob.state.identity.node_id(),

@@ -32,10 +32,13 @@ pub struct StaticPricingConfig {
     /// Price for real-time signaling messages (kinds 400-499) in millisatoshis.
     #[serde(default = "default_realtime_signal_msat")]
     pub realtime_signal_msat: u64,
-    /// Per-call admission: the price of a call offer (KIND_CALL_INVITE = 400)
+    /// Call setup: the price of a call offer (KIND_CALL_INVITE = 400)
     /// in millisatoshis. Answers, ICE and hangups keep `realtime_signal_msat`.
     #[serde(default = "default_call_msat")]
     pub call_msat: u64,
+    /// Receiver-owned price of each 60-second CALL_BLOCK (404), in msat.
+    #[serde(default = "default_call_msat")]
+    pub call_block_msat: u64,
     /// Price for app extension messages (kinds 1000+) in millisatoshis.
     #[serde(default = "default_app_ext_msat")]
     pub app_ext_msat: u64,
@@ -86,6 +89,7 @@ impl Default for StaticPricingConfig {
             collaboration_msat: 25,
             realtime_signal_msat: 50,
             call_msat: default_call_msat(),
+            call_block_msat: default_call_msat(),
             app_ext_msat: 10,
             web_content_msat: default_web_content_msat(),
             relay_storage_msat: 100,
@@ -133,6 +137,9 @@ impl PricingEngine for StaticPricingEngine {
         if self.config.call_msat != self.config.realtime_signal_msat {
             kinds.push(konsensus_core::kind::KIND_CALL_INVITE);
         }
+        if self.config.call_block_msat != self.config.realtime_signal_msat {
+            kinds.push(konsensus_core::kind::KIND_CALL_BLOCK);
+        }
         Some(kinds)
     }
 
@@ -150,10 +157,13 @@ impl PricingEngine for StaticPricingEngine {
         if kind == konsensus_core::kind::KIND_LONGFORM {
             return Ok(self.config.longform_msat);
         }
-        // A call offer is the per-call admission; the rest of the call's
+        // A call offer pays for setup; the rest of the call's
         // signalling stays at the realtime category price.
         if kind == konsensus_core::kind::KIND_CALL_INVITE {
             return Ok(self.config.call_msat);
+        }
+        if kind == konsensus_core::kind::KIND_CALL_BLOCK {
+            return Ok(self.config.call_block_msat);
         }
         self.price_for_category(category)
     }

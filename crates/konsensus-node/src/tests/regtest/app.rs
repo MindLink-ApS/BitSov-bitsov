@@ -106,6 +106,13 @@ fn paired_client(
 pub struct Options {
     pub identity: Arc<NodeIdentity>,
     pub chain_url: String,
+    pub calls: Option<CallOptions>,
+}
+
+/// Production call settings; the block clock is never shortened by the fixture.
+pub struct CallOptions {
+    pub block_msat: u64,
+    pub max_minutes: u16,
 }
 
 struct NoTerminal;
@@ -179,7 +186,8 @@ pub struct App {
     pub received: tokio::sync::broadcast::Receiver<Arc<konsensus_api::state::WsMessage>>,
     router: axum::Router,
     remote_router: Option<axum::Router>,
-    token: String,
+    pub(super) token: String,
+    pub(super) media_addr: Option<SocketAddr>,
     pub service: Arc<konsensus_api::pairing::PairingService>,
     pub client: String,
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -264,6 +272,13 @@ impl App {
             }
         }
         let invoice_requests: InvoiceRequests = Default::default();
+        let calls = options.as_ref().and_then(|o| o.calls.as_ref());
+        let media = calls.map(|_| {
+            crate::call_media::CallMediaRouter::new(
+                transport.clone(),
+                Arc::new(crate::call_media::PaidCallAdmission::new(storage.clone())),
+            )
+        });
         let state = Arc::new(konsensus_api::AppState {
             starter: Default::default(),
             identity: Arc::clone(identity),
@@ -282,6 +297,10 @@ impl App {
             pricing: Arc::new(konsensus_pricing::StaticPricingEngine::new(
                 konsensus_pricing::StaticPricingConfig {
                     chat_msat: 2_001,
+                    call_block_msat: calls.map_or(10_000, |c| c.block_msat),
+                    // The ordinary paid offer remains under the messaging
+                    // per-act ceiling; only the block bundle has call authority.
+                    call_msat: if calls.is_some() { 1_000 } else { 10_000 },
                     ..Default::default()
                 },
             )),
@@ -331,7 +350,12 @@ impl App {
             front_door: Default::default(),
             sponsor: Default::default(),
             stun_port: None,
+            max_call_minutes: calls.map_or(60, |c| c.max_minutes),
+            configured_stun_server: None,
             custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+            call_media: media
+                .clone()
+                .map(|m| m as Arc<dyn konsensus_api::call_media::CallMediaPort>),
             recovery_dir: None,
             gossip_validator: None,
             file_staging: Default::default(),
@@ -434,6 +458,26 @@ impl App {
                 ))
         });
         let mut tasks = vec![session, messages];
+        let media_addr = if let Some(media) = media {
+            tasks.push(media.spawn(shutdown.subscribe()));
+            let addr = infra::loopback().parse::<SocketAddr>().unwrap();
+            let api_state = state.clone();
+            let api_shutdown = shutdown.subscribe();
+            // Use production serve, including its real one-second expiry and
+            // reservation maintenance timers, not a test-driven expiry loop.
+            tasks.push(tokio::spawn(async move {
+                konsensus_api::serve(addr, api_state, api_shutdown)
+                    .await
+                    .unwrap();
+            }));
+            wait("owner media API listening", || async {
+                tokio::net::TcpStream::connect(addr).await.is_ok()
+            })
+            .await;
+            Some(addr)
+        } else {
+            None
+        };
         #[cfg(unix)]
         if options.is_some() {
             use konsensus_api::control::{ControlContext, ControlServer, ReplacementGuard};
@@ -467,6 +511,7 @@ impl App {
             service,
             client,
             token,
+            media_addr,
             shutdown,
             tasks,
         }
