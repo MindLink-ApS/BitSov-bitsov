@@ -1701,16 +1701,42 @@ impl Storage for SqliteStorage {
         call_put_on(&self.pool, peer, call_id, entry).await
     }
 
-    async fn call_invite_deliver(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+    async fn call_invite_deliver(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<bool, StorageError> {
         let mut tx = self.pool.begin().await?;
-        let marked = sqlx::query("UPDATE payment_receipts SET accepted = 1 WHERE message_id = ? AND sender = ? AND kind = 400 AND accepted IN (1, -2)")
+        // The receipt row decides delivery versus expiry: whichever commits
+        // first wins, and the loser writes nothing (Codex FAIL on #472).
+        let marked = sqlx::query("UPDATE payment_receipts SET accepted = 1 WHERE message_id = ? AND sender = ? AND kind = 400 AND accepted = -2")
             .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
         if marked.rows_affected() != 1 {
+            let state: Option<i32> = sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE message_id = ? AND sender = ? AND kind = 400")
+                .bind(id.to_hex()).bind(peer.to_hex()).fetch_optional(&mut *tx).await?;
+            if state == Some(1) { return Ok(false); }
             return Err(StorageError::Conversion("call invite receipt not pending".into()));
         }
         call_put_on(&mut *tx, peer, call_id, entry).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
+    }
+
+    async fn call_invite_expire(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, deadline_ms: u64) -> Result<bool, StorageError> {
+        let deadline = i64::try_from(deadline_ms).map_err(|_| StorageError::Conversion("call deadline overflow".into()))?;
+        let tombstone = deadline.saturating_add(i64::try_from(konsensus_core::payloads::call::TOMBSTONE_MS).unwrap_or(i64::MAX));
+        let mut tx = self.pool.begin().await?;
+        let marked = sqlx::query("UPDATE payment_receipts SET accepted = -3 WHERE message_id = ? AND sender = ? AND kind = 400 AND accepted IN (-2, -3)")
+            .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
+        if marked.rows_affected() != 1 {
+            let state: Option<i32> = sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE message_id = ? AND sender = ? AND kind = 400")
+                .bind(id.to_hex()).bind(peer.to_hex()).fetch_optional(&mut *tx).await?;
+            if state == Some(1) { return Ok(false); }
+        }
+        // Held before it is withdrawn: a failed withdrawal stays protected
+        // and the held-message sweep retries it.
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT id, sender, 0 FROM messages WHERE id = ? AND sender = ? ON CONFLICT DO NOTHING")
+            .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE call_state SET phase = 'ended', deadline_ms = ?, replay_until_ms = ? WHERE peer = ? AND call_id = ? AND side = 'callee' AND phase = 'awaiting_device' AND deadline_ms = ?")
+            .bind(tombstone).bind(tombstone).bind(peer.to_hex()).bind(call_id).bind(deadline).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn call_delete(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(), StorageError> {

@@ -864,7 +864,11 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_invite_set_outcome(id, peer, outcome).await
     }
 
-    async fn call_invite_deliver(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+    async fn call_invite_expire(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, deadline_ms: u64) -> Result<bool, StorageError> {
+        self.inner.call_invite_expire(id, peer, call_id, deadline_ms).await
+    }
+
+    async fn call_invite_deliver(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<bool, StorageError> {
         // Routing metadata only, like call_put and the receipt outcome.
         self.inner.call_invite_deliver(id, peer, call_id, entry).await
     }

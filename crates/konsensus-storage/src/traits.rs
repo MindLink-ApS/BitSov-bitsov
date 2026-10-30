@@ -49,8 +49,17 @@ pub trait Storage: Send + Sync {
     /// Record a device delivery atomically: the invite's receipt becomes
     /// `Fetched` and its call row is written in one transaction, so no reader
     /// and no restart can observe one without the other.
-    async fn call_invite_deliver(&self, _id: &MessageId, _peer: &NodeId, _call_id: &str, _entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+    async fn call_invite_deliver(&self, _id: &MessageId, _peer: &NodeId, _call_id: &str, _entry: &konsensus_core::payloads::call::CallEntry) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("call invite delivery".into()))
+    }
+
+    /// Expire a device wait atomically against delivery: only while the
+    /// invite's receipt is still pending (or already not reachable, on a
+    /// retry) mark it not reachable, re-hold the envelope and end the
+    /// awaiting row of this generation (`deadline_ms`). Returns false, writing
+    /// nothing, when a delivery committed first.
+    async fn call_invite_expire(&self, _id: &MessageId, _peer: &NodeId, _call_id: &str, _deadline_ms: u64) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("call invite expiry".into()))
     }
 
     /// Startup: withdraw at most `max` pending device waits, retaining refusals.

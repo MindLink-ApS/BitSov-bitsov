@@ -806,3 +806,66 @@ async fn delivery_committed_by_a_cancelled_request_is_acknowledged_not_refused()
         assert_eq!(phase, if answered { Phase::Live } else { Phase::Ringing }, "seed {seed}");
     }
 }
+
+/// Delivery and expiry are each one transaction decided on the invite's
+/// receipt, so in either commit order exactly one wins and the loser writes
+/// nothing: no committed delivery is refused, no expired wait rings, and a
+/// stale second delivery never moves the first one's ring deadline.
+#[tokio::test]
+async fn delivery_and_expiry_are_mutually_exclusive_in_either_order() {
+    use konsensus_storage::CallInviteOutcome::{Fetched, NotReachable};
+    for (seed, delivery_first) in [(16, true), (17, false)] {
+        let db = SqliteStorage::in_memory().await.unwrap();
+        let devices = Devices::default();
+        let (env, text) = invite(seed);
+        db.accept_paid_envelope(&env).await.unwrap();
+        devices.admit(&db, &own(), &env, Some(&text), 1_000, || 1_000).await.unwrap();
+        let awaiting = db.call_get(&env.sender, CALL).await.unwrap().unwrap();
+        let ringing = awaiting.clone().device_fetched(11_000).unwrap();
+        if delivery_first {
+            assert!(db.call_invite_deliver(&env.id, &env.sender, CALL, &ringing).await.unwrap());
+            assert!(!db.call_invite_expire(&env.id, &env.sender, CALL, awaiting.deadline_ms).await.unwrap());
+            // A stale snapshot's second delivery adopts, never overwrites.
+            let later = awaiting.clone().device_fetched(12_000).unwrap();
+            assert!(!db.call_invite_deliver(&env.id, &env.sender, CALL, &later).await.unwrap());
+            let row = db.call_get(&env.sender, CALL).await.unwrap().unwrap();
+            assert_eq!((row.phase, row.deadline_ms), (Phase::Ringing, ringing.deadline_ms));
+            assert_eq!(db.call_invite_outcome(&env).await.unwrap(), Some(Fetched));
+            assert!(!db.call_admission_held(&env.id).await.unwrap());
+        } else {
+            assert!(db.call_invite_expire(&env.id, &env.sender, CALL, awaiting.deadline_ms).await.unwrap());
+            assert!(db.call_invite_deliver(&env.id, &env.sender, CALL, &ringing).await.is_err());
+            assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::Ended);
+            assert_eq!(db.call_invite_outcome(&env).await.unwrap(), Some(NotReachable));
+            assert!(db.call_admission_held(&env.id).await.unwrap());
+            // A retried expiry (e.g. after a failed withdrawal) still proceeds.
+            assert!(db.call_invite_expire(&env.id, &env.sender, CALL, awaiting.deadline_ms).await.unwrap());
+        }
+    }
+}
+
+/// A device stream wrote the invite but recording the delivery failed. The
+/// write is kept as evidence: once storage recovers, even after the original
+/// device deadline, the sweep rings from the write and acknowledges, never
+/// reporting the call not reachable.
+#[tokio::test]
+async fn witnessed_stream_delivery_rings_after_storage_recovers() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let devices = Devices::default();
+    let (env, text) = invite(18);
+    db.accept_paid_envelope(&env).await.unwrap();
+    devices.admit(&db, &own(), &env, Some(&text), 1_000, || 1_000).await.unwrap();
+    sqlx::raw_sql("CREATE TRIGGER fail_fetch BEFORE UPDATE OF accepted ON payment_receipts BEGIN SELECT RAISE(ABORT, 'injected'); END;")
+        .execute(db.pool()).await.unwrap();
+    assert!(devices.fetched(&db, &env, || 11_000).await.is_err());
+    devices.witnessed(&env.id, 11_000);
+    // Storage still failing at the device deadline: nothing is refused.
+    let notices = devices.sweep(&db, 16_500).await.unwrap();
+    assert!(notices.is_empty(), "{notices:?}");
+    sqlx::raw_sql("DROP TRIGGER fail_fetch").execute(db.pool()).await.unwrap();
+    let notices = devices.sweep(&db, 17_000).await.unwrap();
+    assert!(matches!(&notices[..], [(_, konsensus_message::Frame::MessageAck { .. })]), "{notices:?}");
+    let row = db.call_get(&env.sender, CALL).await.unwrap().unwrap();
+    assert_eq!((row.phase, row.deadline_ms), (Phase::Ringing, 11_000 + konsensus_core::payloads::call::RING_TIMEOUT_MS));
+    assert_eq!(db.call_invite_outcome(&env).await.unwrap(), Some(konsensus_storage::CallInviteOutcome::Fetched));
+}

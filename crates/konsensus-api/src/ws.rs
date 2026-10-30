@@ -141,7 +141,11 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
                                     break;
                                 }
                                 if !stream_authorized(&state, &claims) { break; }
-                                if let Err(e) = state.call_devices.fetched(state.storage.as_ref(), &ws_msg.envelope, crate::calls::now_ms).await {
+                                let written_ms = crate::calls::now_ms();
+                                if let Err(e) = state.call_devices.fetched(state.storage.as_ref(), &ws_msg.envelope, || written_ms).await {
+                                    // The device has the invite: keep that evidence for
+                                    // the sweep to ring from, never report it unreachable.
+                                    state.call_devices.witnessed(&ws_msg.envelope.id, written_ms);
                                     warn!(error = %e, "could not record call device delivery");
                                     break;
                                 }
