@@ -3558,6 +3558,27 @@ async fn duplicate_invites_age_before_ack_even_after_a_long_outage() {
 }
 
 
+/// A stale offer refused before ringing: if that refusal is lost, the exact
+/// retry replays `call_not_reachable`, never an ACK the caller would read as
+/// delivered (Codex FAIL on #472).
+#[tokio::test]
+async fn stale_offer_refusal_is_replayed_to_a_retry() {
+    use konsensus_api::calls::{devices::Devices, now_ms};
+    use konsensus_core::payloads::call::INVITE_MAX_AGE_MS;
+    let bob = bob_identity();
+    let db = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let devices = Devices::default();
+    let arrived = now_ms();
+    let env = UkmEnvelopeBuilder::new(400, *alice_identity().node_id(), Recipient::Node(*bob.node_id()), vec![2], PaymentProof::new([42;32], [42;32], 10_000))
+        .timestamp(arrived - INVITE_MAX_AGE_MS - 1)
+        .build();
+    let text = r#"{"v":1,"call_id":"0123456789abcdef0123456789abcdef","media":"audio","sdp":"v=0"}"#;
+    db.accept_paid_envelope(&env).await.unwrap();
+    assert!(devices.admit(&db, bob.node_id(), &env, Some(text), arrived, || arrived).await.is_err());
+    db.reject_accepted_envelope(&env).await.unwrap();
+    assert!(matches!(duplicate_reply(&db, &env, None).await, Some(Frame::MessageReject { reason, .. }) if reason == "call_not_reachable"));
+}
+
 #[tokio::test]
 async fn invite_resend_during_device_wait_defers_ack_until_fetch() {
     use konsensus_api::calls::{devices::Devices, now_ms};

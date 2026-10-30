@@ -1071,6 +1071,10 @@ async fn stale_or_future_offer_is_refused_as_not_reachable() {
         assert_eq!(refused, CallRefusal::NotReachable);
         assert_eq!(refused.to_string(), konsensus_api::calls::devices::NOT_REACHABLE);
         assert!(db.call_get(&env.sender, CALL).await.unwrap().is_none());
+        // The refusal is durable and survives the withdrawal that follows,
+        // so a retry replays it rather than passing as delivered.
+        db.reject_accepted_envelope(&env).await.unwrap();
+        assert_eq!(db.call_invite_outcome(&env).await.unwrap(), Some(konsensus_storage::CallInviteOutcome::NotReachable));
     }
     // At the edge it still rings.
     let (env, text) = invite_at(29, 1_000);

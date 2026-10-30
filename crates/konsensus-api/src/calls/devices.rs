@@ -92,6 +92,12 @@ impl Devices {
         {
             // Too old (or too far ahead) to ring inside the caller's answer
             // window: refuse it as not reachable, so the caller ends the call.
+            // Record that outcome first, so withdrawal keeps it and a retry
+            // replays the refusal instead of passing as delivered.
+            store
+                .call_invite_set_outcome(&envelope.id, &envelope.sender, CallInviteOutcome::NotReachable)
+                .await
+                .map_err(unavailable)?;
             return Err(CallRefusal::NotReachable);
         }
         if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE {
@@ -260,8 +266,11 @@ impl Devices {
             return Ok(false);
         }
         let deadline_ms = row.deadline_ms;
+        // A crossing write rings from its completion, bounded by the write
+        // timeout the caller's answer window allows for.
+        let start_ms = at_ms.min(deadline_ms.saturating_add(rules::DEVICE_WRITE_TIMEOUT_MS));
         let next = rules::CallEntry {
-            deadline_ms: at_ms.saturating_add(rules::RING_TIMEOUT_MS),
+            deadline_ms: start_ms.saturating_add(rules::RING_TIMEOUT_MS),
             ..row.device_fetched(at_ms.min(deadline_ms.saturating_sub(1))).expect("unexpired row")
         };
         if store.call_invite_deliver(id, &invite.peer, &invite.call_id, &next).await? {

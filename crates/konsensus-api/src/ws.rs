@@ -140,7 +140,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
                         // Serialize WsMessage to JSON for the client
                         match serde_json::to_string(ws_msg.as_ref()) {
                             Ok(json) => {
-                                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2), socket.send(Message::Text(json))).await, Ok(Ok(()))) {
+                                if !matches!(tokio::time::timeout(std::time::Duration::from_millis(konsensus_core::payloads::call::DEVICE_WRITE_TIMEOUT_MS), socket.send(Message::Text(json))).await, Ok(Ok(()))) {
                                     debug!("WebSocket client disconnected");
                                     break;
                                 }

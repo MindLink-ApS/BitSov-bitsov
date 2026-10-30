@@ -25,14 +25,22 @@ pub const INVITE_MAX_AGE_MS: u64 = 30_000;
 pub const CALL_CLOCK_SKEW_MS: u64 = 15_000;
 /// Allowance for the callee's answer to reach the caller.
 pub const ANSWER_TRANSIT_MS: u64 = 15_000;
+/// Longest device stream write. One armed before the device deadline still
+/// counts as delivery and rings from its completion, at most this late.
+pub const DEVICE_WRITE_TIMEOUT_MS: u64 = 2_000;
 /// The caller's answer window from payment. A callee rings an offer only if
 /// it arrives within [`INVITE_MAX_AGE_MS`] of the offer's timestamp (taken no
-/// later than payment), waits at most [`DEVICE_WAIT_MS`] for a device, then
-/// rings for [`RING_TIMEOUT_MS`]; its last answer still needs transit and may
-/// be off by the clock skew. So every answer the callee may send in its window
-/// reaches the caller inside this one.
-pub const CALLER_ANSWER_WINDOW_MS: u64 =
-    INVITE_MAX_AGE_MS + CALL_CLOCK_SKEW_MS + DEVICE_WAIT_MS + RING_TIMEOUT_MS + ANSWER_TRANSIT_MS;
+/// later than payment, never renewed), waits at most [`DEVICE_WAIT_MS`] for a
+/// device (whose stream write may finish up to [`DEVICE_WRITE_TIMEOUT_MS`]
+/// later), then rings for [`RING_TIMEOUT_MS`]; its last answer still needs
+/// transit and may be off by the clock skew. So every answer the callee may
+/// send in its window reaches the caller inside this one.
+pub const CALLER_ANSWER_WINDOW_MS: u64 = INVITE_MAX_AGE_MS
+    + CALL_CLOCK_SKEW_MS
+    + DEVICE_WAIT_MS
+    + DEVICE_WRITE_TIMEOUT_MS
+    + RING_TIMEOUT_MS
+    + ANSWER_TRANSIT_MS;
 
 /// Whether a callee may still ring an offer stamped `offer_ms` that arrived at
 /// `arrived_ms` (callee clock): not older than [`INVITE_MAX_AGE_MS`], and not
@@ -798,8 +806,10 @@ mod tests {
         assert!(!invite_fresh(offer_ms, arrived_local + 1), "an older offer is refused");
         assert!(!invite_fresh(arrived_local + skew + 1, arrived_local), "a future offer beyond the skew is refused");
         let callee = receive(None, 400, None, arrived_local).unwrap();
-        let fetched_local = callee.deadline_ms - 1;
-        let ringing = callee.device_fetched(fetched_local).unwrap();
+        // A stream write armed at the last moment of the wait completes as
+        // late as the write timeout allows and rings from its completion.
+        let written_local = callee.deadline_ms - 1 + DEVICE_WRITE_TIMEOUT_MS;
+        let ringing = CallEntry { deadline_ms: written_local + RING_TIMEOUT_MS, ..callee.clone().device_fetched(callee.deadline_ms - 1).unwrap() };
         let answered_local = ringing.deadline_ms - 1;
         assert_eq!(ringing.clone().at(answered_local).unwrap().phase, Phase::Ringing, "callee may still answer");
         let answer_reaches_caller = answered_local + skew + ANSWER_TRANSIT_MS;
