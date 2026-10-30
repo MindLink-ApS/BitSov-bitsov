@@ -175,6 +175,14 @@ impl Devices {
         let Some(row) = store.call_get(&invite.peer, &invite.call_id).await? else {
             return Ok(());
         };
+        if row.side == Side::Callee && row.phase == Phase::Ringing && row.deadline_ms > now_ms
+            && store.call_invite_outcome(envelope).await? == Some(CallInviteOutcome::Fetched)
+        {
+            // An earlier delivery committed but its request was cancelled before
+            // the registry saw it: adopt the durable state (Codex FAIL on #472).
+            self.delivered(&envelope.id, row.deadline_ms);
+            return Ok(());
+        }
         if row.side != Side::Callee
             || row.phase != Phase::AwaitingDevice
             || row.deadline_ms != invite.deadline_ms
@@ -187,18 +195,17 @@ impl Devices {
         // request leaves the invite awaiting; nothing can later ring it or report
         // it fetched, before or after a restart (Codex FAIL on #472).
         store.call_invite_deliver(&envelope.id, &invite.peer, &invite.call_id, &next).await?;
-        let deadline_ms = next.deadline_ms;
-        if let Some(tracked) = self
-            .invites
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&envelope.id)
-        {
+        self.delivered(&envelope.id, next.deadline_ms);
+        Ok(())
+    }
+
+    /// Record a committed delivery: stop waiting and owe the caller its ACK.
+    fn delivered(&self, id: &MessageId, deadline_ms: u64) {
+        if let Some(tracked) = self.invites.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id) {
             tracked.waiting = false;
             tracked.ack_pending = true;
             tracked.deadline_ms = deadline_ms;
         }
-        Ok(())
     }
 
     /// Age rows before classifying a duplicate or streaming a retained invite.
@@ -274,7 +281,22 @@ impl Devices {
                     }
                     if invite.deadline_ms > now_ms { return Ok(()); }
                 }
-                if invite.waiting {
+                // Durable delivery evidence outranks the volatile wait: a
+                // delivery whose commit outlived its cancelled request rang the
+                // call, so it is acknowledged and never refused, whatever the
+                // call did since (Codex FAIL on #472).
+                let committed = invite.waiting && match store.get_message(&id).await? {
+                    Some(envelope) => store.call_invite_outcome(&envelope).await? == Some(CallInviteOutcome::Fetched),
+                    None => false,
+                };
+                if committed {
+                    self.delivered(&id, invite.deadline_ms);
+                    notices.push((invite.peer, Frame::MessageAck { id, duplicate: false, paid_until_ms: None }));
+                    if let Some(tracked) = self.invites.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
+                        tracked.ack_pending = false;
+                    }
+                }
+                if invite.waiting && !committed {
                     // Capture before reholding: held envelopes become invisible.
                     // The hold is committed independently, so a failed deletion
                     // stays protected and the existing held-message sweep retries.

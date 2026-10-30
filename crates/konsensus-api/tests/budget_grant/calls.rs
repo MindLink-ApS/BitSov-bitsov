@@ -726,10 +726,32 @@ async fn stale_unreachable_refusal_cannot_end_a_newer_call() {
     let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", fx.tmp.path().join("calls.sqlite").display()))
         .await
         .unwrap();
-    sqlx::query("UPDATE outbox_operations SET created_at = 0 WHERE message_id = ?")
-        .bind(offer.to_hex()).execute(&db).await.unwrap();
+    // A newer draft of the operation replaced this offer: its refusal is stale.
+    let newer = konsensus_core::MessageId::from_hex(&"ab".repeat(32)).unwrap();
+    sqlx::query("UPDATE outbox_operations SET message_id = ? WHERE message_id = ?")
+        .bind(newer.to_hex()).bind(offer.to_hex()).execute(&db).await.unwrap();
     assert!(!konsensus_api::calls::end_unreachable_invite(
         fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
     ).await.unwrap());
     assert_eq!(fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap().phase, Phase::Ringing);
+}
+
+#[tokio::test]
+async fn delayed_operation_refusal_still_ends_its_current_call() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", fx.tmp.path().join("calls.sqlite").display()))
+        .await
+        .unwrap();
+    // A retry or late settlement long after the operation was created still
+    // dispatches this offer; operation age never voids its refusal.
+    sqlx::query("UPDATE outbox_operations SET created_at = 0 WHERE message_id = ?")
+        .bind(offer.to_hex()).execute(&db).await.unwrap();
+    assert!(konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    let ended = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!((ended.phase, ended.end_reason), (Phase::Ended, Some(HangupReason::Timeout)));
 }

@@ -739,3 +739,70 @@ async fn interrupted_fetch_transition_reverts_its_receipt() {
     assert_eq!(db.call_invite_outcome(&env).await.unwrap(), Some(konsensus_storage::CallInviteOutcome::Fetched));
     assert!(matches!(&devices.sweep(&db, 12_100).await.unwrap()[..], [(_, konsensus_message::Frame::MessageAck { .. })]));
 }
+
+/// A listing whose delivery write fails withholds that invite: the device is
+/// never handed a call it cannot answer, and the next listing delivers it.
+#[tokio::test]
+async fn listing_withholds_an_invite_whose_delivery_did_not_commit() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let (_dir, state, db, token) = paired_state().await;
+    let (env, _) = stored_invite(&state, &db).await;
+    let list = || async {
+        let reply = common::test_router(state.clone())
+            .oneshot(Request::builder().uri("/api/v1/messages")
+                .header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(reply.status().is_success(), "{}", reply.status());
+        let body = axum::body::to_bytes(reply.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+    };
+    let listed = |page: &serde_json::Value| {
+        page.as_array().unwrap().iter().any(|m| m["id"].as_str() == Some(env.id.to_hex().as_str()))
+    };
+    sqlx::raw_sql("CREATE TRIGGER fail_fetch BEFORE UPDATE OF accepted ON payment_receipts WHEN NEW.accepted = 1 BEGIN SELECT RAISE(ABORT, 'injected'); END;")
+        .execute(db.pool()).await.unwrap();
+    assert!(!listed(&list().await), "unanswerable invite returned");
+    assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::AwaitingDevice);
+    sqlx::raw_sql("DROP TRIGGER fail_fetch").execute(db.pool()).await.unwrap();
+    assert!(listed(&list().await));
+    assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::Ringing);
+}
+
+/// The delivery transaction commits but its request is cancelled before the
+/// registry hears of it. Durable evidence wins: a retry adopts the ringing
+/// state, and the original deadline sweep acknowledges instead of refusing.
+#[tokio::test]
+async fn delivery_committed_by_a_cancelled_request_is_acknowledged_not_refused() {
+    for (seed, retry, answered) in [(13, false, false), (14, true, false), (15, false, true)] {
+        let db = SqliteStorage::in_memory().await.unwrap();
+        let devices = Devices::default();
+        let (env, text) = invite(seed);
+        db.accept_paid_envelope(&env).await.unwrap();
+        devices.admit(&db, &own(), &env, Some(&text), 1_000, || 1_000).await.unwrap();
+        let row = db.call_get(&env.sender, CALL).await.unwrap().unwrap();
+        // The commit lands; the cancelled future never updates the registry.
+        db.call_invite_deliver(&env.id, &env.sender, CALL, &row.device_fetched(11_000).unwrap())
+            .await
+            .unwrap();
+        if retry {
+            devices.fetched(&db, &env, || 12_000).await.unwrap();
+            assert!(matches!(&devices.sweep(&db, 12_100).await.unwrap()[..],
+                [(_, konsensus_message::Frame::MessageAck { .. })]));
+        }
+        if answered {
+            // The device got the invite through the committed delivery and answered.
+            let ringing = db.call_get(&env.sender, CALL).await.unwrap().unwrap();
+            db.call_put(&env.sender, CALL, &konsensus_core::payloads::call::CallEntry { phase: Phase::Live, ..ringing })
+                .await
+                .unwrap();
+        }
+        let notices = devices.sweep(&db, 16_000).await.unwrap();
+        assert!(notices.iter().all(|(_, f)| !matches!(f, konsensus_message::Frame::MessageReject { .. })), "seed {seed}");
+        assert_eq!(notices.len(), usize::from(!retry), "seed {seed}: {notices:?}");
+        assert_eq!(db.call_invite_outcome(&env).await.unwrap(), Some(konsensus_storage::CallInviteOutcome::Fetched));
+        let phase = db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase;
+        assert_eq!(phase, if answered { Phase::Live } else { Phase::Ringing }, "seed {seed}");
+    }
+}

@@ -869,15 +869,13 @@ pub async fn end_unreachable_invite(store: Store<'_>, own: &NodeId, peer: &NodeI
     // the binding recorded when it was drafted.
     let Some(op) = store.get_outbox_operation_by_message(id).await? else { return Ok(false) };
     let Some(call_id) = crate::handlers::messages::operations::call_invite_binding(&op)? else { return Ok(false) };
+    // Bind to this offer's generation, not the operation's age: every draft
+    // replaces the operation's message id, so only a refusal of its current
+    // offer finds it. A delayed retry or settlement keeps the generation; a
+    // refusal of an earlier draft can never end the call a newer one rings.
+    if op.message_id.as_deref() != Some(id.to_hex().as_str()) { return Ok(false); }
     let _guard = lock().lock().await;
     let now = now_ms();
-    // Bind to this offer's generation: a call id stays burned for the 24 h
-    // tombstone, so a call ringing now with an offer this recent is this one.
-    // A stale refusal for an older offer can never end a newer call.
-    let ringing_window = rules::DEVICE_WAIT_MS + rules::RING_TIMEOUT_MS + 60_000;
-    if u64::try_from(op.created_at).unwrap_or(0).saturating_add(ringing_window) < now {
-        return Ok(false);
-    }
     let Some(entry) = current(store, peer, &call_id, now).await? else { return Ok(false) };
     // A pending cancellation keeps its reservation mark (its own commit or
     // release still resolves it) but cannot keep an unreachable call ringing.

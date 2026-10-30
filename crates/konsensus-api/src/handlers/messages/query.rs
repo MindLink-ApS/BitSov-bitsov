@@ -336,13 +336,20 @@ pub(super) async fn list_messages(
 
     // Mark device delivery only once the whole response is built, so a later
     // item's failure can never leave earlier invites ringing but unreturned.
-    // A marking failure keeps that invite awaiting (it may end not-reachable)
-    // but never fails the listing the device already gets.
+    // An invite whose delivery did not commit is left out: returning it would
+    // hand the device a call it cannot answer. It stays awaiting, so the next
+    // listing retries it; other items are unaffected (Codex FAIL on #472).
+    let mut undelivered = std::collections::HashSet::new();
     for env in &messages.items {
         if let Err(error) = device_fetched(&auth, &state, env).await {
-            tracing::warn!(msg_id = %env.id, ?error, "listed call invite not marked delivered");
+            tracing::warn!(msg_id = %env.id, ?error, "listed call invite not marked delivered; withheld");
+            undelivered.insert(env.id);
         }
     }
+    let responses = messages.items.iter().zip(responses)
+        .filter(|(env, _)| !undelivered.contains(&env.id))
+        .map(|(_, resp)| resp)
+        .collect::<Vec<_>>();
     Ok((store_read, diagnostics, Json(responses)))
 }
 
