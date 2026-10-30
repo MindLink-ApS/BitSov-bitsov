@@ -1,0 +1,15 @@
+{
+  "body": {
+    "accepted": false,
+    "amount_msat": 10000,
+    "delivered": true,
+    "max_routing_fee_msat": 5000,
+    "message_id": "<hex64>",
+    "operation_id": "6f1d2b1e-7a5c-4c9f-9d8e-1f2a3b4c5d6e",
+    "payment_hash": "<hex64>",
+    "retry_allowed": true,
+    "state": "sent"
+  },
+  "request": "POST /api/v1/messages/compose (kind 400)",
+  "status": 200
+}

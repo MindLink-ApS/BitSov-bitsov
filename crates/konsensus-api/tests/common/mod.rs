@@ -61,7 +61,14 @@ impl PeerWriteGate {
 pub struct MemStorage {
     pub peer_upsert_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub peer_delete_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub call_block_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub call_offer_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub fail_call_get_for: Mutex<Option<String>>,
+    pub fail_call_put_for: Mutex<Option<String>>,
+    calls: Mutex<HashMap<(NodeId, String), konsensus_core::payloads::call::CallEntry>>,
     outbox: Mutex<HashMap<String, konsensus_storage::OutboxOperation>>,
+    /// The channel-open / send-onchain / direct-payment operation ledger.
+    operations: Mutex<HashMap<String, konsensus_storage::ChannelOpenOperation>>,
     calendar: Mutex<HashMap<String, konsensus_storage::calendar::CalendarEventRecord>>,
     messages: Mutex<HashMap<String, UkmEnvelope>>,
     /// AES-GCM-encrypted plaintext blobs keyed by message id hex (mirrors prod).
@@ -75,6 +82,7 @@ pub struct MemStorage {
     onboarding_state: Mutex<Option<OnboardingStateRecord>>,
     invite_schema_capabilities: InviteSchemaCapabilities,
     fail_next_whitelist_write: Mutex<bool>,
+    fail_next_outcome_write: Mutex<bool>,
 }
 
 impl MemStorage {
@@ -82,7 +90,13 @@ impl MemStorage {
         Self {
             peer_upsert_gate: Mutex::new(None),
             peer_delete_gate: Mutex::new(None),
+            call_block_dispatch_gate: Mutex::new(None),
+            call_offer_dispatch_gate: Mutex::new(None),
+            fail_call_get_for: Mutex::new(None),
+            fail_call_put_for: Mutex::new(None),
+            calls: Mutex::new(HashMap::new()),
             outbox: Mutex::new(HashMap::new()),
+            operations: Mutex::new(HashMap::new()),
             calendar: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
             message_plaintext: Mutex::new(HashMap::new()),
@@ -95,6 +109,7 @@ impl MemStorage {
             onboarding_state: Mutex::new(None),
             invite_schema_capabilities: InviteSchemaCapabilities::v2_ready_default(),
             fail_next_whitelist_write: Mutex::new(false),
+            fail_next_outcome_write: Mutex::new(false),
         }
     }
 
@@ -105,6 +120,11 @@ impl MemStorage {
         }
     }
 
+    /// The next `record_channel_open_outcome` fails with a storage error.
+    pub fn fail_next_outcome_write(&self) {
+        *self.fail_next_outcome_write.lock().unwrap() = true;
+    }
+
     pub fn fail_next_whitelist_write(&self) {
         *self.fail_next_whitelist_write.lock().unwrap() = true;
     }
@@ -112,6 +132,121 @@ impl MemStorage {
 
 #[async_trait]
 impl Storage for MemStorage {
+    async fn call_get(&self, peer: &NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+        if self.fail_call_get_for.lock().unwrap().as_deref() == Some(call_id) {
+            return Err(StorageError::Serialization("injected call read failure".into()));
+        }
+        Ok(self.calls.lock().unwrap().get(&(*peer, call_id.to_owned())).cloned())
+    }
+
+    async fn call_put(&self, peer: &NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+        if self.fail_call_put_for.lock().unwrap().as_deref() == Some(call_id) {
+            return Err(StorageError::Serialization("injected call write failure".into()));
+        }
+        self.calls.lock().unwrap().insert((*peer, call_id.to_owned()), entry.clone());
+        Ok(())
+    }
+
+    async fn call_delete(&self, peer: &NodeId, call_id: &str) -> Result<(), StorageError> {
+        self.calls.lock().unwrap().remove(&(*peer, call_id.to_owned()));
+        Ok(())
+    }
+
+    async fn call_counts(&self, peer: &NodeId, now: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
+        use konsensus_core::payloads::call::{CallCounts, Phase};
+        let mut counts = CallCounts::default();
+        for ((p, _), entry) in self.calls.lock().unwrap().iter() {
+            let Some(entry) = entry.clone().at(now) else { continue };
+            if entry.pending.is_some() || entry.phase != Phase::Ended {
+                counts.open_total += 1;
+                counts.open_peer += u64::from(p == peer);
+            } else {
+                counts.burned_total += 1;
+                counts.burned_peer += u64::from(p == peer);
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn call_live(&self) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Ok(self.calls.lock().unwrap().iter().filter(|(_, e)| e.phase != konsensus_core::payloads::call::Phase::Ended)
+            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone())).collect())
+    }
+
+    async fn call_pending(&self) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Ok(self.calls.lock().unwrap().iter().filter(|(_, e)| e.pending.is_some())
+            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone())).collect())
+    }
+
+    async fn insert_channel_open_operation(
+        &self,
+        op: &konsensus_storage::ChannelOpenOperation,
+    ) -> Result<bool, StorageError> {
+        let mut rows = self.operations.lock().unwrap();
+        if rows.contains_key(&op.operation_id) {
+            return Ok(false);
+        }
+        rows.insert(op.operation_id.clone(), op.clone());
+        Ok(true)
+    }
+    async fn get_channel_open_operation(
+        &self,
+        id: &str,
+    ) -> Result<Option<konsensus_storage::ChannelOpenOperation>, StorageError> {
+        Ok(self.operations.lock().unwrap().get(id).cloned())
+    }
+    async fn resolve_channel_open_operation(
+        &self,
+        id: &str,
+        state: &str,
+        result: Option<&[u8]>,
+        last_error: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let mut rows = self.operations.lock().unwrap();
+        let Some(op) = rows.get_mut(id).filter(|op| op.state == "pending") else {
+            return Ok(false);
+        };
+        op.state = state.to_owned();
+        op.result = result.map(<[u8]>::to_vec);
+        op.last_error = last_error.map(str::to_owned);
+        op.updated_at = chrono::Utc::now().timestamp_millis();
+        Ok(true)
+    }
+    async fn record_channel_open_outcome(
+        &self,
+        expected: &konsensus_storage::ChannelOpenOperation,
+        state: &str,
+        result: Option<&[u8]>,
+        last_error: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        if std::mem::take(&mut *self.fail_next_outcome_write.lock().unwrap()) {
+            return Err(StorageError::Serialization(
+                "injected outcome write failure".into(),
+            ));
+        }
+        let mut rows = self.operations.lock().unwrap();
+        let Some(op) = rows.get_mut(&expected.operation_id).filter(|op| {
+            op.state != "opened"
+                && op.state == expected.state
+                && op.request_hash == expected.request_hash
+                && op.created_at == expected.created_at
+        }) else {
+            return Ok(false);
+        };
+        op.state = state.to_owned();
+        op.result = result.map(<[u8]>::to_vec);
+        op.last_error = last_error.map(str::to_owned);
+        op.updated_at = chrono::Utc::now().timestamp_millis();
+        Ok(true)
+    }
+    async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
+        let mut rows = self.operations.lock().unwrap();
+        if rows.get(id).is_some_and(|op| op.state == "pending") {
+            rows.remove(id);
+            return Ok(true);
+        }
+        Ok(false)
+    }
     async fn insert_outbox_operation(
         &self,
         op: &konsensus_storage::OutboxOperation,
@@ -127,6 +262,14 @@ impl Storage for MemStorage {
         &self,
         op: &konsensus_storage::OutboxOperation,
     ) -> Result<bool, StorageError> {
+        let dispatched = op.kind == 404 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
+            .is_ok_and(|data| data["dispatched"] == true);
+        let gate = if dispatched { self.call_block_dispatch_gate.lock().unwrap().take() } else { None };
+        if let Some(gate) = gate { gate.run().await?; }
+        let offer_dispatched = op.kind == 400 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
+            .is_ok_and(|data| data["dispatched"] == true);
+        let gate = if offer_dispatched { self.call_offer_dispatch_gate.lock().unwrap().take() } else { None };
+        if let Some(gate) = gate { gate.run().await?; }
         let mut rows = self.outbox.lock().unwrap();
         if rows
             .get(&op.operation_id)
@@ -169,21 +312,37 @@ impl Storage for MemStorage {
         Ok(true)
     }
 
-
-    async fn store_calendar_event(&self, event: &konsensus_storage::calendar::CalendarEventRecord) -> Result<(), StorageError> {
-        self.calendar.lock().unwrap().insert(event.id.clone(), event.clone());
+    async fn store_calendar_event(
+        &self,
+        event: &konsensus_storage::calendar::CalendarEventRecord,
+    ) -> Result<(), StorageError> {
+        self.calendar
+            .lock()
+            .unwrap()
+            .insert(event.id.clone(), event.clone());
         Ok(())
     }
-    async fn get_calendar_event(&self, id: &str) -> Result<Option<konsensus_storage::calendar::CalendarEventRecord>, StorageError> {
+    async fn get_calendar_event(
+        &self,
+        id: &str,
+    ) -> Result<Option<konsensus_storage::calendar::CalendarEventRecord>, StorageError> {
         Ok(self.calendar.lock().unwrap().get(id).cloned())
     }
 
     async fn list_calendar_events_in_range(
-        &self, from_ms: u64, to_ms: u64, limit: u32,
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+        limit: u32,
     ) -> Result<Vec<konsensus_storage::calendar::CalendarEventRecord>, StorageError> {
-        let mut events: Vec<_> = self.calendar.lock().unwrap().values()
+        let mut events: Vec<_> = self
+            .calendar
+            .lock()
+            .unwrap()
+            .values()
             .filter(|event| event.start_ms < to_ms && event.end_ms > from_ms)
-            .cloned().collect();
+            .cloned()
+            .collect();
         events.sort_by_key(|event| event.start_ms);
         events.truncate(limit as usize);
         Ok(events)
@@ -261,9 +420,16 @@ impl Storage for MemStorage {
         before_timestamp: Option<u64>,
     ) -> Result<Vec<UkmEnvelope>, StorageError> {
         let before = before_timestamp.unwrap_or(u64::MAX);
-        let mut result: Vec<_> = self.messages.lock().unwrap().values()
+        let mut result: Vec<_> = self
+            .messages
+            .lock()
+            .unwrap()
+            .values()
             .filter(|env| env.kind == kind && env.timestamp < before)
-            .filter(|env| matches!(&env.recipient, Recipient::Node(n) if n.to_hex() == my_node_id) || env.sender.to_hex() == my_node_id)
+            .filter(|env| {
+                matches!(&env.recipient, Recipient::Node(n) if n.to_hex() == my_node_id)
+                    || env.sender.to_hex() == my_node_id
+            })
             .filter(|env| matches!(env.recipient, Recipient::Node(_)))
             .cloned()
             .collect();
@@ -401,8 +567,13 @@ impl Storage for MemStorage {
 
     // This general route fixture accepts replay keys; the real SQLite and gate
     // suites exercise atomic replay rejection and rollback.
-    async fn store_paid_nonce(&self, _nonce: &Nonce, _hash: &[u8; 32], _sender: &NodeId, _message: &MessageId)
-        -> Result<konsensus_core::gate::PaidReplay, StorageError> {
+    async fn store_paid_nonce(
+        &self,
+        _nonce: &Nonce,
+        _hash: &[u8; 32],
+        _sender: &NodeId,
+        _message: &MessageId,
+    ) -> Result<konsensus_core::gate::PaidReplay, StorageError> {
         Ok(konsensus_core::gate::PaidReplay::Accepted)
     }
 
@@ -449,7 +620,9 @@ impl Storage for MemStorage {
         Ok(Vec::new())
     }
 
-    async fn mark_pending_sent(&self, _: &MessageId, _: &NodeId) -> Result<(), StorageError> { Ok(()) }
+    async fn mark_pending_sent(&self, _: &MessageId, _: &NodeId) -> Result<(), StorageError> {
+        Ok(())
+    }
     async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
         let mut messages = self.messages.lock().unwrap();
         if let Some(stored) = messages.get_mut(&envelope.id.to_hex()) {
@@ -720,11 +893,27 @@ pub struct StubLightning;
 
 #[async_trait]
 impl LightningProvider for StubLightning {
-    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        invoice: &str,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.pay_invoice(invoice).await
     }
 
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn keysend_with_fee_limit(
+        &self,
+        dest: &str,
+        amount: u64,
+        memo: Option<&str>,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.keysend(dest, amount, memo).await
     }
 
@@ -747,9 +936,13 @@ impl LightningProvider for StubLightning {
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
         let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().ok();
         Ok(PaymentDetails {
-            payment_hash: invoice.as_ref().map_or("bb".repeat(32), |i| i.payment_hash().to_string()),
+            payment_hash: invoice
+                .as_ref()
+                .map_or("bb".repeat(32), |i| i.payment_hash().to_string()),
             preimage: Some("cc".repeat(32)),
-            amount_msat: invoice.and_then(|i| i.amount_milli_satoshis()).unwrap_or(1000),
+            amount_msat: invoice
+                .and_then(|i| i.amount_milli_satoshis())
+                .unwrap_or(1000),
             status: PaymentStatus::Settled,
             direction: PaymentDirection::Outgoing,
             timestamp: 1_700_000_000,
@@ -854,7 +1047,12 @@ impl LightningProvider for StubLightning {
                 "stub cannot enforce a per-channel funding fee rate".into(),
             ));
         }
-        Ok(if announce { "stub-announced-channel-id" } else { "stub-channel-id" }.into())
+        Ok(if announce {
+            "stub-announced-channel-id"
+        } else {
+            "stub-channel-id"
+        }
+        .into())
     }
 
     async fn close_channel(
@@ -1048,7 +1246,10 @@ pub fn test_state() -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
+        configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1114,7 +1315,10 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
+        configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1168,7 +1372,10 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
+        configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1232,7 +1439,10 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
+        configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1286,7 +1496,10 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
+        configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1310,7 +1523,14 @@ pub struct ConnectedStubTransport {
     pub invoice_responder: Option<Box<InvoiceResponder>>,
     /// Shared reference to the invoice_requests map so the transport can
     /// fulfill pending requests (simulating the peer responding).
-    pub invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
+    pub invoice_requests: Arc<
+        tokio::sync::Mutex<
+            HashMap<
+                String,
+                tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>,
+            >,
+        >,
+    >,
     /// One live connection per peer, established when the stub was built.
     pub since: Option<std::time::Instant>,
     /// Every raw control frame sent (e.g. `PriceQuery`), in order.
@@ -1323,7 +1543,14 @@ pub struct ConnectedStubTransport {
 impl ConnectedStubTransport {
     pub fn new(
         connected_peers: Vec<NodeId>,
-        invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
+        invoice_requests: Arc<
+            tokio::sync::Mutex<
+                HashMap<
+                    String,
+                    tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>,
+                >,
+            >,
+        >,
     ) -> Self {
         Self {
             connected: std::sync::Mutex::new(connected_peers.into_iter().collect()),
@@ -1338,7 +1565,10 @@ impl ConnectedStubTransport {
 
     /// `peer` advertised `capabilities` in its Hello (e.g. `Custom("room_binding_v1")`).
     pub fn advertise(&self, peer: NodeId, capabilities: &[&str]) {
-        self.peer_capabilities.lock().unwrap().insert(peer, capabilities.iter().map(|c| c.to_string()).collect());
+        self.peer_capabilities
+            .lock()
+            .unwrap()
+            .insert(peer, capabilities.iter().map(|c| c.to_string()).collect());
     }
 
     pub fn with_invoice_responder(
@@ -1383,7 +1613,8 @@ impl MessageTransport for ConnectedStubTransport {
     }
 
     async fn connected_since(&self, peer: &NodeId) -> Option<std::time::Instant> {
-        self.since.filter(|_| self.connected.lock().unwrap().contains(peer))
+        self.since
+            .filter(|_| self.connected.lock().unwrap().contains(peer))
     }
 
     async fn peer_info(&self, peer: &NodeId) -> Option<konsensus_core::traits::ConnectedPeerInfo> {
@@ -1391,7 +1622,10 @@ impl MessageTransport for ConnectedStubTransport {
             return None;
         }
         let capabilities = self.peer_capabilities.lock().unwrap().get(peer)?.clone();
-        Some(konsensus_core::traits::ConnectedPeerInfo { tier: "T1".into(), capabilities })
+        Some(konsensus_core::traits::ConnectedPeerInfo {
+            tier: "T1".into(),
+            capabilities,
+        })
     }
 
     async fn connected_peers(&self) -> Vec<NodeId> {
@@ -1547,7 +1781,10 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
+        configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: Some(Arc::new(konsensus_gossip::GossipValidator::new(
             Default::default(),
@@ -1648,11 +1885,27 @@ impl CountingLightning {
 
 #[async_trait]
 impl LightningProvider for CountingLightning {
-    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        invoice: &str,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.pay_invoice(invoice).await
     }
 
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+    async fn keysend_with_fee_limit(
+        &self,
+        dest: &str,
+        amount: u64,
+        memo: Option<&str>,
+        _cap: u64,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
         self.keysend(dest, amount, memo).await
     }
 
@@ -1791,7 +2044,10 @@ pub fn test_state_with_lightning_and_storage(
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
+        configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })

@@ -402,6 +402,7 @@ impl KonsensusNode {
             collaboration_msat: config.pricing.collaboration_msat,
             realtime_signal_msat: config.pricing.realtime_signal_msat,
             call_msat: config.pricing.call_msat,
+            call_block_msat: config.pricing.call_block_msat,
             app_ext_msat: config.pricing.app_ext_msat,
             web_content_msat: config.pricing.web_content_msat,
             // T2R3: relay storage uses the pricing-engine default until the node
@@ -759,6 +760,7 @@ pub(crate) fn default_advertised_capabilities(relay_enabled: bool) -> Vec<Capabi
     let mut caps = vec![
         Capability::X3dh,
         Capability::Custom(konsensus_core::payloads::call::MEETING_CAPABILITY.to_string()),
+        Capability::Custom(konsensus_message::wire::CALL_MEDIA_CAPABILITY.to_string()),
         Capability::Custom(konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY.to_string()),
         Capability::Custom(konsensus_core::payloads::content::PORCH_READ_CAPABILITY.to_string()),
         Capability::Custom(konsensus_core::payloads::content::PORCH_QUOTE_CAPABILITY.to_string()),
@@ -799,6 +801,14 @@ mod relay_capability_tests {
             serde_json::from_str::<Vec<Capability>>(&wire).unwrap(),
             caps
         );
+    }
+
+    #[test]
+    fn call_media_capability_is_advertised_in_the_form_peers_list_shows() {
+        // M6 N2: a node forwards call media only to a peer that lists this.
+        let media = Capability::Custom("call_media_v1".into());
+        assert!(default_advertised_capabilities(false).contains(&media));
+        assert_eq!(format!("{media:?}"), r#"Custom("call_media_v1")"#);
     }
 
     #[test]

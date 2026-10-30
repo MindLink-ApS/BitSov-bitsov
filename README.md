@@ -32,12 +32,21 @@ git clone https://github.com/MindLink-ApS/BitSov-bitsov.git
 cd BitSov-bitsov
 cargo build --release -p konsensus-node
 
-# Initialize a local light node (generates BIP-39 identity material)
-./target/release/konsensus init --dir ./node-data --non-interactive --tier light
+# Initialize a light node in your home directory, outside the source checkout.
+# Shows the 24-word recovery phrase, asks you to confirm three words, and
+# encrypts the stored phrase with a password you type at the prompt.
+./target/release/konsensus init --dir ~/bitsov-node --tier light --encrypt
 
-# Start the node from the generated config
-./target/release/konsensus start --config ./node-data/konsensus.toml
+# Start the node from the generated config; it prompts for the password.
+./target/release/konsensus start --config ~/bitsov-node/konsensus.toml
 ```
+
+Keep the node data directory out of source checkouts: it holds the recovery
+phrase, identity and databases. `init` writes a `.gitignore` ignoring everything
+into the data directory and warns when that directory is inside a git working
+tree. For unattended setups, pass the password on a descriptor instead of the
+prompt (`init --non-interactive --password-fd 0`, then `start --password-fd 0`);
+see [password input](docs/operations/password-input.md).
 
 ## Configuration
 
