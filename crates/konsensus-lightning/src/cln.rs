@@ -6,6 +6,7 @@ use std::{
     io::Read,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
+    sync::Mutex,
     time::Duration,
 };
 
@@ -61,6 +62,7 @@ pub struct ClnProvider {
     network: String,
     minimum_version: (u32, u32, u32),
     routing_fee_policy: RoutingFeePolicy,
+    invoice_labels: Mutex<HashMap<String, String>>,
 }
 impl fmt::Debug for ClnProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -258,8 +260,10 @@ struct Invoices {
 }
 #[derive(Deserialize)]
 struct ClnInvoice {
+    label: Option<String>,
     payment_hash: String,
     status: String,
+    expires_at: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_invoice_amount")]
     amount_msat: Option<Msat>,
     amount_received_msat: Option<Msat>,
@@ -449,9 +453,60 @@ impl ClnProvider {
             network: config.network,
             minimum_version,
             routing_fee_policy: RoutingFeePolicy::default(),
+            invoice_labels: Mutex::new(HashMap::new()),
         };
         provider.getinfo().await?;
         Ok(provider)
+    }
+
+    async fn delinvoice_for_status(
+        &self,
+        label: &str,
+        status: &str,
+        payment_hash: &str,
+    ) -> Result<bool, LightningError> {
+        let _: ClnInvoice = self
+            .rpc(
+                "delinvoice",
+                json!({
+                    "label": label,
+                    "status": status,
+                }),
+            )
+            .await?;
+        self.invoice_labels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(payment_hash);
+        Ok(true)
+    }
+
+    async fn pending_invoice_inventory(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        let mut pending = Vec::new();
+        let mut start = 0u64;
+        loop {
+            let response: Invoices = self
+                .rpc(
+                    "listinvoices",
+                    json!({"index": "created", "start": start, "limit": 100}),
+                )
+                .await?;
+            if response.invoices.is_empty() {
+                break;
+            }
+            let mut next = start;
+            for row in response.invoices {
+                next = next.max(next_index(row.created_index, start)?);
+                if row.status != "unpaid" {
+                    continue;
+                }
+                let payment_hash = hex32(&row.payment_hash)?;
+                let expires_at = required(row.expires_at)?;
+                pending.push((payment_hash, expires_at));
+            }
+            start = next;
+        }
+        Ok(pending)
     }
 
     async fn outgoing_status(&self, hash: &str) -> Result<PaymentDetails, LightningError> {
@@ -586,6 +641,35 @@ impl ClnProvider {
         }
         Ok(info)
     }
+
+    async fn purge_terminal_invoices(&self, statuses: &[&str]) -> Result<u32, LightningError> {
+        let mut removed = 0u32;
+        let mut start = 0u64;
+        loop {
+            let response: Invoices = self
+                .rpc(
+                    "listinvoices",
+                    json!({"index": "created", "start": start, "limit": 100}),
+                )
+                .await?;
+            if response.invoices.is_empty() {
+                break;
+            }
+            let mut next = start;
+            for row in response.invoices {
+                next = next.max(next_index(row.created_index, start)?);
+                if !statuses.contains(&row.status.as_str()) {
+                    continue;
+                }
+                let payment_hash = hex32(&row.payment_hash)?;
+                if self.forget_pending_invoice(&payment_hash).await? {
+                    removed += 1;
+                }
+            }
+            start = next;
+        }
+        Ok(removed)
+    }
 }
 
 #[async_trait]
@@ -600,18 +684,23 @@ impl LightningProvider for ClnProvider {
         rand::rngs::OsRng
             .try_fill_bytes(&mut random)
             .map_err(|_| error("CLN invoice label generation failed"))?;
+        let label = format!("bitsov:{}", hex::encode(random));
         let response: CreatedInvoice = self
             .rpc(
                 "invoice",
                 json!({
                     "amount_msat": amount_msat,
-                    "label": format!("bitsov:{}", hex::encode(random)),
+                    "label": label,
                     "description": description,
                     "expiry": expiry_secs,
                 }),
             )
             .await?;
         let payment_hash = hex32(&response.payment_hash)?;
+        self.invoice_labels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(payment_hash.clone(), label);
         let bolt11 = response
             .bolt11
             .parse::<lightning_invoice::Bolt11Invoice>()
@@ -631,6 +720,63 @@ impl LightningProvider for ClnProvider {
                 .ok_or_else(|| error("CLN invoice expiry is invalid"))?,
         })
     }
+
+    async fn forget_pending_invoice(&self, payment_hash: &str) -> Result<bool, LightningError> {
+        let hash = hex32(payment_hash)?;
+        let remembered = self
+            .invoice_labels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(payment_hash)
+            .cloned();
+        let response: Invoices = self
+            .rpc("listinvoices", json!({"payment_hash": hash}))
+            .await?;
+        if response.invoices.is_empty() {
+            self.invoice_labels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(payment_hash);
+            return Ok(false);
+        }
+        if response.invoices.len() != 1 {
+            return Err(error("CLN invoice lookup is ambiguous"));
+        }
+        let invoice = response.invoices.into_iter().next().unwrap();
+        let label = invoice
+            .label
+            .or(remembered)
+            .ok_or_else(|| error("CLN invoice label is missing"))?;
+        match invoice.status.as_str() {
+            "unpaid" | "expired" => {
+                self.delinvoice_for_status(&label, &invoice.status, payment_hash)
+                    .await
+            }
+            _ => {
+                self.invoice_labels
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(payment_hash);
+                Ok(false)
+            }
+        }
+    }
+
+    async fn purge_expired_pending_invoices(&self, now_unix: u64) -> Result<u32, LightningError> {
+        let mut removed = 0u32;
+        for (hash, expires_at) in self.pending_invoice_inventory().await? {
+            if expires_at <= now_unix && self.forget_pending_invoice(&hash).await? {
+                removed += 1;
+            }
+        }
+        removed += self.purge_terminal_invoices(&["expired"]).await?;
+        Ok(removed)
+    }
+
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        self.pending_invoice_inventory().await
+    }
+
     async fn pay_invoice(&self, _bolt11: &str) -> Result<PaymentDetails, LightningError> {
         Err(LightningError::PaymentNotDispatched(
             "not_supported: CLN preview payments".into(),
@@ -734,6 +880,9 @@ impl LightningProvider for ClnProvider {
     }
     async fn money_ready(&self) -> bool {
         false
+    }
+    async fn receive_invoice_capable(&self) -> bool {
+        self.is_available().await
     }
 }
 

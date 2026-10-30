@@ -548,7 +548,7 @@ pub(crate) async fn create_metered_payment_proof(
     }
 
     // Invoice-request fallback (only reached when keysend was not dispatched).
-    match create_payment_proof_via_invoice(state, payment_amount_msat, peer_id, debit, None).await {
+    match create_payment_proof_via_invoice(state, payment_amount_msat, peer_id, debit, kind, None).await {
         Err(e) if is_admission_refusal(&e) => {
             readmit_then_pay(state, payment_amount_msat, peer_id, debit, readmission, kind, charge).await
         }
@@ -596,6 +596,9 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
     match refusal.as_deref() {
         Some(invoice_refusal::ADMISSION_REQUIRED) => admission_refusal(peer_id),
         Some("disk_low") => ApiError::NotDispatched("disk_low".into()),
+        Some(invoice_refusal::PRICE_CHANGED) => ApiError::NotDispatched(
+            "recipient lowered its prices since they were quoted; refresh its prices and retry; nothing was paid".into()
+        ).with_reason("price_changed"),
         Some(invoice_refusal::CALL_BLOCK_UNPAYABLE) => ApiError::NotDispatched(
             "callee refused the call block invoice: deadline margin or call sequence; nothing was paid".into()
         ).with_reason("call_block_unpayable"),
@@ -773,7 +776,7 @@ async fn readmit_then_pay(
         if tokio::time::Instant::now() >= deadline {
             return Err(admission_refusal(peer_id));
         }
-        match create_payment_proof_via_invoice(state, amount_msat, peer_id, debit, Some(deadline)).await {
+        match create_payment_proof_via_invoice(state, amount_msat, peer_id, debit, kind, Some(deadline)).await {
             // One wall-clock budget includes every prepayment request/response
             // and retry sleep. A payment already dispatched is never cancelled.
             Err(e) if is_admission_refusal(&e) => {
@@ -864,6 +867,7 @@ async fn create_payment_proof_via_invoice(
     invoice_amount_msat: u64,
     peer_id: &NodeId,
     debit: &Debit,
+    kind: Option<u16>,
     promotion_deadline: Option<tokio::time::Instant>,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
     // Generate a unique request ID for correlating request/response.
@@ -891,7 +895,7 @@ async fn create_payment_proof_via_invoice(
     let frame = Frame::RequestInvoice {
         request_id: request_id.clone(),
         amount_msat: invoice_amount_msat,
-        purpose: debit.invoice_purpose(),
+        purpose: debit.invoice_purpose(kind),
     };
     let frame_bytes = frame
         .to_bytes()

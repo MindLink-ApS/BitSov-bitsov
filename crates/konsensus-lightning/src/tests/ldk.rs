@@ -71,15 +71,9 @@ fn offline_safety_window_uses_our_to_self_delay() {
 fn parse_network_variants() {
     assert_eq!(parse_network("bitcoin").unwrap(), bitcoin::Network::Bitcoin);
     assert_eq!(parse_network("mainnet").unwrap(), bitcoin::Network::Bitcoin);
-    assert_eq!(
-        parse_network("testnet").unwrap(),
-        bitcoin::Network::Testnet
-    );
+    assert_eq!(parse_network("testnet").unwrap(), bitcoin::Network::Testnet);
     assert_eq!(parse_network("signet").unwrap(), bitcoin::Network::Signet);
-    assert_eq!(
-        parse_network("regtest").unwrap(),
-        bitcoin::Network::Regtest
-    );
+    assert_eq!(parse_network("regtest").unwrap(), bitcoin::Network::Regtest);
     assert!(parse_network("invalid").is_err());
 }
 
@@ -230,7 +224,10 @@ fn our_to_self_delay_bounds() {
     for refused in [0, 143, 2017, u16::MAX] {
         let error = validate_our_to_self_delay(Some(refused)).unwrap_err();
         assert!(matches!(error, LightningError::InvalidStartupConfig(_)));
-        assert!(error.to_string().contains(&format!("got {refused}")), "{error}");
+        assert!(
+            error.to_string().contains(&format!("got {refused}")),
+            "{error}"
+        );
     }
 }
 
@@ -324,7 +321,8 @@ async fn invalid_mnemonic_errors() {
         passphrase: None,
         network: "regtest".to_string(),
         esplora_url: "http://localhost:3002".to_string(),
-        esplora_url_fallback: None, credentials_file: None,
+        esplora_url_fallback: None,
+        credentials_file: None,
         rgs_url: None,
         lsp_node_id: None,
         lsp_address: None,
@@ -367,22 +365,40 @@ async fn out_of_range_our_to_self_delay_refuses_startup() {
     };
     let err = LdkProvider::new(config).await.unwrap_err();
     assert!(matches!(err, LightningError::InvalidStartupConfig(_)));
-    assert!(err.to_string().contains("our_to_self_delay_blocks"), "{err}");
+    assert!(
+        err.to_string().contains("our_to_self_delay_blocks"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
 async fn hub_only_allowlist_parses_hub_keys_and_refuses_the_hub_service() {
     use konsensus_core::traits::lightning::HUB_ONLY_WHILE_LOCKABLE;
     let hub = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string();
-    assert!(channel_peer_allowlist(None, true).unwrap().is_none(), "no allowlist leaves the service role unchanged");
-    let parsed = channel_peer_allowlist(Some(std::slice::from_ref(&hub)), false).unwrap().unwrap();
-    assert_eq!(parsed.iter().map(|k| k.to_string()).collect::<Vec<_>>(), vec![hub.clone()]);
-    assert_eq!(channel_peer_allowlist(Some(&[]), false).unwrap(), Some(vec![]), "no hub configured refuses every peer");
+    assert!(
+        channel_peer_allowlist(None, true).unwrap().is_none(),
+        "no allowlist leaves the service role unchanged"
+    );
+    let parsed = channel_peer_allowlist(Some(std::slice::from_ref(&hub)), false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        parsed.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+        vec![hub.clone()]
+    );
+    assert_eq!(
+        channel_peer_allowlist(Some(&[]), false).unwrap(),
+        Some(vec![]),
+        "no hub configured refuses every peer"
+    );
     for error in [
         channel_peer_allowlist(Some(&["not-a-key".into()]), false).unwrap_err(),
         channel_peer_allowlist(Some(std::slice::from_ref(&hub)), true).unwrap_err(),
     ] {
-        assert!(matches!(&error, LightningError::InvalidStartupConfig(m) if m.starts_with(HUB_ONLY_WHILE_LOCKABLE)), "{error}");
+        assert!(
+            matches!(&error, LightningError::InvalidStartupConfig(m) if m.starts_with(HUB_ONLY_WHILE_LOCKABLE)),
+            "{error}"
+        );
     }
     // Wired before any key derivation or network work.
     let config = LdkConfig {
@@ -408,7 +424,8 @@ async fn hub_only_allowlist_parses_hub_keys_and_refuses_the_hub_service() {
         passphrase: None,
         network: "regtest".to_string(),
         esplora_url: "http://localhost:3002".to_string(),
-        esplora_url_fallback: None, credentials_file: None,
+        esplora_url_fallback: None,
+        credentials_file: None,
         rgs_url: None,
         lsp_node_id: None,
         lsp_address: None,
@@ -416,7 +433,10 @@ async fn hub_only_allowlist_parses_hub_keys_and_refuses_the_hub_service() {
         listening_address: None,
     };
     let error = LdkProvider::new(config).await.err().unwrap();
-    assert!(error.to_string().contains(HUB_ONLY_WHILE_LOCKABLE), "{error}");
+    assert!(
+        error.to_string().contains(HUB_ONLY_WHILE_LOCKABLE),
+        "{error}"
+    );
 }
 
 #[test]
@@ -582,7 +602,10 @@ fn convert_spontaneous_payment_details() {
     let result = convert_payment_details(&ldk_details);
 
     assert_eq!(result.payment_hash, hex::encode([31u8; 32]));
-    assert!(result.preimage.is_none(), "pending payment should have no preimage");
+    assert!(
+        result.preimage.is_none(),
+        "pending payment should have no preimage"
+    );
     assert_eq!(result.amount_msat, 5_000);
     assert!(result.fee_msat.is_none());
     assert_eq!(result.direction, PaymentDirection::Incoming);
@@ -1054,13 +1077,20 @@ fn jit_purpose_fee_and_net_survive_ldk_serialization_without_admission_proof() {
         let details = LdkDetails {
             id: PaymentId([70; 32]),
             kind: LdkPaymentKind::Bolt11Jit {
-                hash: PaymentHash([70; 32]), preimage: Some(PaymentPreimage([71; 32])),
-                secret: Some(PaymentSecret([72; 32])), counterparty_skimmed_fee_msat: fee,
-                lsp_fee_limits: LSPFeeLimits { max_total_opening_fee_msat: Some(2_000), max_proportional_opening_fee_ppm_msat: None },
+                hash: PaymentHash([70; 32]),
+                preimage: Some(PaymentPreimage([71; 32])),
+                secret: Some(PaymentSecret([72; 32])),
+                counterparty_skimmed_fee_msat: fee,
+                lsp_fee_limits: LSPFeeLimits {
+                    max_total_opening_fee_msat: Some(2_000),
+                    max_proportional_opening_fee_ppm_msat: None,
+                },
             },
-            amount_msat: Some(100_000 - fee.unwrap_or(0)), fee_paid_msat: None,
+            amount_msat: Some(100_000 - fee.unwrap_or(0)),
+            fee_paid_msat: None,
             direction: ldk_node::payment::PaymentDirection::Inbound,
-            status: LdkPaymentStatus::Succeeded, latest_update_timestamp: 1_700_000_000,
+            status: LdkPaymentStatus::Succeeded,
+            latest_update_timestamp: 1_700_000_000,
         };
         let bytes = details.encode();
         let restored = LdkDetails::read(&mut &bytes[..]).unwrap();
@@ -1087,9 +1117,11 @@ fn invoice_and_keysend_ldk_call_arguments_include_exact_fee_ceiling() {
         .description("fee cap".into())
         .payment_hash(sha256::Hash::hash(&[7; 32]))
         .payment_secret(PaymentSecret([8; 32]))
-        .current_timestamp().min_final_cltv_expiry_delta(18)
+        .current_timestamp()
+        .min_final_cltv_expiry_delta(18)
         .amount_milli_satoshis(1000)
-        .build_signed(|h| secp.sign_ecdsa_recoverable(h, &key)).unwrap();
+        .build_signed(|h| secp.sign_ecdsa_recoverable(h, &key))
+        .unwrap();
     for ceiling in [0, 7, 1000, 100_000] {
         dispatch_invoice_with_fee_limit(&invoice, ceiling, |arg, route| {
             assert_eq!(arg, &invoice);
@@ -1106,14 +1138,25 @@ fn invoice_and_keysend_ldk_call_arguments_include_exact_fee_ceiling() {
 #[test]
 fn dispatch_error_classification_retains_ambiguous_liabilities() {
     use ldk_node::NodeError;
-    for error in [NodeError::PaymentSendingFailed, NodeError::InvalidInvoice,
-        NodeError::InvalidAmount, NodeError::InvalidCustomTlvs, NodeError::NotRunning] {
+    for error in [
+        NodeError::PaymentSendingFailed,
+        NodeError::InvalidInvoice,
+        NodeError::InvalidAmount,
+        NodeError::InvalidCustomTlvs,
+        NodeError::NotRunning,
+    ] {
         let capable = std::sync::atomic::AtomicBool::new(true);
-        assert!(matches!(super::classify_dispatch_error(error, &capable), LightningError::PaymentNotDispatched(_)));
+        assert!(matches!(
+            super::classify_dispatch_error(error, &capable),
+            LightningError::PaymentNotDispatched(_)
+        ));
         assert!(capable.load(std::sync::atomic::Ordering::Relaxed));
     }
     for error in [NodeError::PersistenceFailed, NodeError::DuplicatePayment] {
-        assert!(matches!(super::classify_dispatch_error(error, &std::sync::atomic::AtomicBool::new(true)), LightningError::PaymentFailed(_)));
+        assert!(matches!(
+            super::classify_dispatch_error(error, &std::sync::atomic::AtomicBool::new(true)),
+            LightningError::PaymentFailed(_)
+        ));
     }
 }
 
@@ -1190,13 +1233,16 @@ fn channel_fee_announcement_selects_ldk_method_and_preserves_args() {
     }
 }
 
-
 #[test]
 fn channel_fee_real_provider_refuses_announcement_without_alias() {
     // Cover absent, empty, and nonempty listening addresses without an alias.
     // Alias-without-addresses is rejected at build time; the mock preflight
     // test below covers that combination.
-    for addresses in [None, Some(Vec::new()), Some(vec!["127.0.0.1:19735".parse().unwrap()])] {
+    for addresses in [
+        None,
+        Some(Vec::new()),
+        Some(vec!["127.0.0.1:19735".parse().unwrap()]),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let config = ldk_node::config::Config {
             network: bitcoin::Network::Regtest,
@@ -1210,12 +1256,17 @@ fn channel_fee_real_provider_refuses_announcement_without_alias() {
         let provider = LdkProvider::from_node(node.clone());
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let result = runtime.block_on(provider.open_channel(
-            CHANNEL_PEER, "127.0.0.1:19736", 50_000, true, None,
+            CHANNEL_PEER,
+            "127.0.0.1:19736",
+            50_000,
+            true,
+            None,
         ));
         assert!(
             matches!(&result, Err(LightningError::PaymentNotDispatched(reason))
                 if reason.contains("announce_unavailable")),
-            "addresses={:?}: {result:?}", node.listening_addresses()
+            "addresses={:?}: {result:?}",
+            node.listening_addresses()
         );
         assert!(node.node_alias().is_none());
         assert!(node.list_channels().is_empty());
@@ -1238,39 +1289,52 @@ fn channel_fee_creation_refusal_is_not_dispatched_but_persistence_is_ambiguous()
                 node.expect_has_node_alias().return_const(true);
                 node.expect_has_listening_addresses().return_const(true);
                 node.expect_open_channel().never();
-                node.expect_open_announced_channel().times(1)
+                node.expect_open_announced_channel()
+                    .times(1)
                     .return_once(move |_, _, _, _, _| Err(error));
             } else {
                 node.expect_open_announced_channel().never();
-                node.expect_open_channel().times(1)
+                node.expect_open_channel()
+                    .times(1)
                     .return_once(move |_, _, _, _, _| Err(error));
             }
             let result = open_ldk_channel(
-                &node, CHANNEL_PEER, "127.0.0.1:9735", 50_000, announce, None,
+                &node,
+                CHANNEL_PEER,
+                "127.0.0.1:9735",
+                50_000,
+                announce,
+                None,
             );
             if creation_refused {
-                assert!(matches!(result, Err(LightningError::PaymentNotDispatched(_))), "{result:?}");
+                assert!(
+                    matches!(result, Err(LightningError::PaymentNotDispatched(_))),
+                    "{result:?}"
+                );
             } else {
-                assert!(matches!(result, Err(LightningError::Backend(_))), "{result:?}");
+                assert!(
+                    matches!(result, Err(LightningError::Backend(_))),
+                    "{result:?}"
+                );
             }
         }
     }
 }
-
 
 #[test]
 fn channel_fee_announcement_preflight_never_calls_ldk_when_unavailable() {
     for (alias, addresses) in [(false, false), (false, true), (true, false)] {
         let mut node = MockChannelOpener::new();
         node.expect_has_node_alias().return_const(alias);
-        node.expect_has_listening_addresses().return_const(addresses);
+        node.expect_has_listening_addresses()
+            .return_const(addresses);
         node.expect_open_channel().never();
         node.expect_open_announced_channel().never();
-        let result = open_ldk_channel(
-            &node, CHANNEL_PEER, "127.0.0.1:9735", 50_000, true, None,
+        let result = open_ldk_channel(&node, CHANNEL_PEER, "127.0.0.1:9735", 50_000, true, None);
+        assert!(
+            matches!(result, Err(LightningError::PaymentNotDispatched(reason))
+            if reason.contains("announce_unavailable"))
         );
-        assert!(matches!(result, Err(LightningError::PaymentNotDispatched(reason))
-            if reason.contains("announce_unavailable")));
     }
 }
 
@@ -1284,11 +1348,14 @@ fn actual_fee_conversion_preserves_zero_and_unknown() {
         let details = ldk_node::payment::PaymentDetails {
             id: PaymentId([1; 32]),
             kind: LdkPaymentKind::Spontaneous {
-                hash: PaymentHash([2; 32]), preimage: Some(PaymentPreimage([3; 32])),
+                hash: PaymentHash([2; 32]),
+                preimage: Some(PaymentPreimage([3; 32])),
             },
-            amount_msat: Some(1000), fee_paid_msat: fee,
+            amount_msat: Some(1000),
+            fee_paid_msat: fee,
             direction: ldk_node::payment::PaymentDirection::Outbound,
-            status: LdkPaymentStatus::Succeeded, latest_update_timestamp: 0,
+            status: LdkPaymentStatus::Succeeded,
+            latest_update_timestamp: 0,
         };
         let result = convert_payment_details(&details);
         assert_eq!(result.fee_msat, fee);
@@ -1384,8 +1451,15 @@ fn sync_readiness_still_requires_running_and_post_startup_syncs() {
 #[test]
 fn owner_funding_priorities_reach_the_expected_ldk_targets() {
     use konsensus_core::traits::lightning::FundingPriority;
-    for (priority, blocks) in [(FundingPriority::Economy, 144), (FundingPriority::Normal, 12), (FundingPriority::Fast, 6)] {
-        assert_eq!(super::ldk_funding_priority(priority).confirmation_target_blocks(), blocks);
+    for (priority, blocks) in [
+        (FundingPriority::Economy, 144),
+        (FundingPriority::Normal, 12),
+        (FundingPriority::Fast, 6),
+    ] {
+        assert_eq!(
+            super::ldk_funding_priority(priority).confirmation_target_blocks(),
+            blocks
+        );
     }
 }
 
@@ -1712,4 +1786,202 @@ fn starter_open_and_ready_info_logs_exclude_lightning_identity_and_socket() {
     assert!(log.contains("opening initiated") && log.contains("channel ready"));
     assert!(!log.contains(CHANNEL_PEER));
     assert!(!log.contains("192.0.2.23"));
+}
+
+#[test]
+fn invoice_expiry_atomic_replace_failure_preserves_previous_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("expiry.tsv");
+    let before = std::collections::HashMap::from([("11".repeat(32), 123)]);
+    store_invoice_expiries(&path, &before).unwrap();
+    // Fail creation of the same-directory staging file, before replacement.
+    std::fs::create_dir(path.with_extension("tmp")).unwrap();
+    let after = std::collections::HashMap::from([("22".repeat(32), 456)]);
+    assert!(store_invoice_expiries(&path, &after).is_err());
+    assert_eq!(load_invoice_expiries(&path).unwrap(), before);
+    std::fs::remove_dir(path.with_extension("tmp")).unwrap();
+    store_invoice_expiries(&path, &after).unwrap();
+    assert_eq!(load_invoice_expiries(&path).unwrap(), after);
+}
+
+#[tokio::test]
+async fn invoice_persistence_failure_refuses_and_removes_unpublished_invoice() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ldk_node::Builder::new();
+    builder.set_network(bitcoin::Network::Regtest);
+    builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+    let node = Arc::new(builder.build().unwrap());
+    let mut provider = LdkProvider::from_node(node.clone());
+    let path = dir.path().join("expiry.tsv");
+    std::fs::create_dir(path.with_extension("tmp")).unwrap();
+    provider.invoice_expiry_path = Some(path);
+    assert!(provider
+        .create_invoice(1000, "unpublished", 120)
+        .await
+        .is_err());
+    assert!(node.list_payments().is_empty());
+    assert!(provider
+        .pending_invoice_expiries()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn invoice_restart_preserves_an_invoice_whose_expiry_is_unknown() {
+    // Codex P1 on #403: a two-hour owner invoice with no sidecar row must not
+    // be given a guessed one-hour lifetime and deleted.
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ldk_node::Builder::new();
+    builder.set_network(bitcoin::Network::Regtest);
+    builder.set_entropy_seed_bytes([45; 64]);
+    builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+    let node = Arc::new(builder.build().unwrap());
+    let provider = LdkProvider::from_node(node.clone());
+    let invoice = provider
+        .create_invoice(1000, "owner invoice", 7_200)
+        .await
+        .unwrap();
+    drop(provider);
+    drop(node);
+    let node = Arc::new(builder.build().unwrap());
+    let path = dir.path().join("expiry.tsv");
+    // Unrelated committed row and a truncated line. The live invoice has no row.
+    std::fs::write(&path, format!("{} 10\npartial", "ff".repeat(32))).unwrap();
+    let map = reconcile_invoice_expiries(&node, load_invoice_expiries(&path).unwrap());
+    assert_eq!(map.len(), 1);
+    assert_eq!(map[&invoice.payment_hash], super::UNKNOWN_INVOICE_EXPIRY);
+    store_invoice_expiries(&path, &map).unwrap();
+    assert_eq!(load_invoice_expiries(&path).unwrap(), map);
+    let provider = LdkProvider::from_node(node);
+    *provider.invoice_expiries.lock().unwrap() = map;
+    let much_later = invoice.created_at + 30 * 24 * 3600;
+    assert_eq!(provider.purge_expired_pending_invoices(much_later).await.unwrap(), 0);
+    assert_eq!(
+        provider
+            .get_payment_status(&invoice.payment_hash)
+            .await
+            .unwrap()
+            .status,
+        PaymentStatus::Pending
+    );
+}
+
+#[test]
+fn review_regression_legacy_orphan_expiry_guess_is_never_shortened() {
+    let timestamp = 1_700_000_000u64;
+    let legacy = timestamp.saturating_add(u64::from(u32::MAX));
+    assert_eq!(
+        super::migrate_service_invoice_expiry(Some(legacy), timestamp),
+        legacy
+    );
+}
+
+#[test]
+fn missing_invoice_expiry_is_recorded_as_unknown() {
+    let created = 1_700_000_000u64;
+    assert_eq!(super::migrate_service_invoice_expiry(None, created), super::UNKNOWN_INVOICE_EXPIRY);
+    assert_eq!(
+        super::migrate_service_invoice_expiry(Some(u64::MAX), created),
+        super::UNKNOWN_INVOICE_EXPIRY
+    );
+    assert_eq!(super::migrate_service_invoice_expiry(Some(created + 60), created), created + 60);
+}
+
+#[tokio::test]
+async fn legacy_pending_invoices_without_stored_expiry_are_kept_and_new_invoices_still_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ldk_node::Builder::new();
+    builder.set_network(bitcoin::Network::Regtest);
+    builder.set_entropy_seed_bytes([46; 64]);
+    builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+    let node = Arc::new(builder.build().unwrap());
+    let provider = LdkProvider::from_node(node.clone());
+    let count = 33usize;
+    for i in 0..count {
+        provider
+            .create_invoice(1_000, &format!("legacy pending {i}"), 3_600)
+            .await
+            .unwrap();
+    }
+    drop(provider);
+    drop(node);
+    let node = Arc::new(builder.build().unwrap());
+    let map = reconcile_invoice_expiries(&node, std::collections::HashMap::new());
+    assert_eq!(map.len(), count);
+    assert!(map.values().all(|expiry| *expiry == super::UNKNOWN_INVOICE_EXPIRY));
+    let provider = LdkProvider::from_node(node);
+    *provider.invoice_expiries.lock().unwrap() = map;
+    assert_eq!(provider.purge_expired_pending_invoices(u64::MAX - 1).await.unwrap(), 0);
+    assert_eq!(provider.list_payments(100).await.unwrap().len(), count);
+    provider
+        .create_invoice(1_000, "after restart", 120)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn invoice_restart_does_not_trust_truncated_numeric_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ldk_node::Builder::new();
+    builder.set_network(bitcoin::Network::Regtest);
+    builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+    let node = Arc::new(builder.build().unwrap());
+    let provider = LdkProvider::from_node(node.clone());
+    let invoice = provider
+        .create_invoice(1000, "truncated timestamp", 120)
+        .await
+        .unwrap();
+    let path = dir.path().join("expiry.tsv");
+    std::fs::write(&path, format!("{} 1792", invoice.payment_hash)).unwrap();
+    let map = reconcile_invoice_expiries(&node, load_invoice_expiries(&path).unwrap());
+    *provider.invoice_expiries.lock().unwrap() = map;
+    assert_eq!(
+        provider
+            .purge_expired_pending_invoices(invoice.created_at + 121)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        provider
+            .get_payment_status(&invoice.payment_hash)
+            .await
+            .unwrap()
+            .status,
+        PaymentStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn review_regression_known_invoice_expiry_is_preserved_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ldk_node::Builder::new();
+    builder.set_network(bitcoin::Network::Regtest);
+    builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+    let node = Arc::new(builder.build().unwrap());
+    let provider = LdkProvider::from_node(node.clone());
+    let invoice = provider
+        .create_invoice(1000, "short expiry", 30)
+        .await
+        .unwrap();
+    let recorded =
+        std::collections::HashMap::from([(invoice.payment_hash.clone(), invoice.created_at + 30)]);
+    let map = reconcile_invoice_expiries(&node, recorded);
+    assert_eq!(map[&invoice.payment_hash], invoice.created_at + 30);
+    *provider.invoice_expiries.lock().unwrap() = map;
+    assert_eq!(
+        provider
+            .purge_expired_pending_invoices(invoice.created_at + 29)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        provider
+            .purge_expired_pending_invoices(invoice.created_at + 30)
+            .await
+            .unwrap(),
+        1
+    );
 }

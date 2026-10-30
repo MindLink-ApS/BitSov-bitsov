@@ -196,6 +196,10 @@ async fn porch_read_pays_once_and_returns_the_verified_card() {
         "{body}"
     );
     *net.payee.front_door.card.lock().await = Some(card(&net.payee, 1));
+    // Four service invoices have been paid. Their slots are released by the
+    // background sweep, not by a backend query on the next request. Wait for
+    // that sweep before testing card rollback semantics with a fifth invoice.
+    tokio::time::sleep(crate::peer_invoices::CLEANUP_INTERVAL + std::time::Duration::from_secs(1)).await;
     let (_, body) = net.payer.browse(&owner, PORCH_CARD_PATH).await;
     assert_eq!(
         (

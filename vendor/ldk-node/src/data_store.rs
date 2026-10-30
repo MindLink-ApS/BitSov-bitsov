@@ -120,6 +120,17 @@ where
 		Ok(())
 	}
 
+	/// Check and remove under the same lock as insert/update, including the durable delete.
+	pub(crate) fn remove_if<F: FnOnce(&SO) -> bool>(&self, id: &SO::Id, predicate: F) -> Result<bool, Error> {
+		let mut objects = self.objects.lock().unwrap();
+		if !objects.get(id).is_some_and(predicate) { return Ok(false); }
+		KVStoreSync::remove(&*self.kv_store, &self.primary_namespace,
+			&self.secondary_namespace, &id.encode_to_hex_str(), false)
+			.map_err(|_| Error::PersistenceFailed)?;
+		objects.remove(id);
+		Ok(true)
+	}
+
 	pub(crate) fn get(&self, id: &SO::Id) -> Option<SO> {
 		self.objects.lock().unwrap().get(id).cloned()
 	}

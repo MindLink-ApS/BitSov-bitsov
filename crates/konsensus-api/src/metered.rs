@@ -300,11 +300,14 @@ impl Debit {
         self
     }
 
-    pub(crate) fn invoice_purpose(&self) -> String {
+    /// Call blocks name their call and sequence; other messages name their
+    /// kind so the recipient can price the invoice locally (#403).
+    pub(crate) fn invoice_purpose(&self, kind: Option<u16>) -> String {
         self.call_block.as_ref().and_then(|(_, plaintext)|
             konsensus_core::payloads::call::CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, plaintext).ok()
         ).map(|signal| format!("{}{}:{}", konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX,
             signal.call_id, signal.seq.unwrap_or_default()))
+        .or_else(|| kind.map(konsensus_core::gate::service_invoice_purpose))
         .unwrap_or_else(|| "konsensus message".into())
     }
 

@@ -31,6 +31,7 @@ mod onboarding;
 mod owner_cmd;
 mod password;
 mod peer_exchange;
+mod peer_invoices;
 mod pending_handler;
 mod profile_handler;
 #[path = "cli/recover.rs"]
