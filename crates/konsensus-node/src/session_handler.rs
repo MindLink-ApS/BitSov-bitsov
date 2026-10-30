@@ -2071,3 +2071,7 @@ mod budgeted_reconnect_two_node;
 #[cfg(test)]
 #[path = "tests/paid_first_contact_two_node.rs"]
 mod paid_first_contact_two_node;
+
+#[cfg(test)]
+#[path = "tests/sim_many_nodes.rs"]
+mod sim_many_nodes;

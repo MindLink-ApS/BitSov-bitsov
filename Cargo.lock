@@ -2367,6 +2367,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rpassword",
+ "rusqlite",
  "secp256k1",
  "serde",
  "serde_json",

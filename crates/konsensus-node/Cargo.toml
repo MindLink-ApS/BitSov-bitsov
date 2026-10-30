@@ -87,6 +87,8 @@ log = "0.4"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 async-trait.workspace = true
 tempfile = "3"
+# Many-node simulation reads the shared mock ledger directly (already in the tree via konsensus-lightning).
+rusqlite = "0.31"
 ldk-node.workspace = true
 tower = { workspace = true, features = ["util"] }
 lightning-invoice.workspace = true
