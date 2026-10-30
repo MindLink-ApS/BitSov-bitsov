@@ -770,3 +770,52 @@ async fn decrypt_without_session_fails() {
     let result = mgr_a.decrypt(&node_b, &fake_msg).await;
     assert!(matches!(result, Err(SessionError::NoSession(_))));
 }
+
+/// BUG-SIM-1 (found by the many-node simulation, konsensus-node
+/// `sim_many_nodes`): `prekey_bundle` offers the same first one-time prekey
+/// to every peer until a SessionInit consumes it. When two peers initiate
+/// from bundles offered before either init arrived, the second
+/// `accept_session` finds the referenced one-time prekey gone, silently runs
+/// X3DH without it, and stores a session whose keys differ from the
+/// initiator's. Nothing fails until the first ratchet message: the acceptor
+/// cannot decrypt, drops the session, and every paid message sent on it in
+/// the meantime is acked yet unreadable.
+///
+/// Fails today. Either each offer must carry a distinct one-time prekey, or
+/// `accept_session` must refuse an init whose one-time prekey is unknown
+/// (so the initiator never holds a session the acceptor cannot match).
+#[tokio::test]
+#[ignore = "BUG-SIM-1: one-time prekey offered twice; second session silently mismatched (still failing)"]
+async fn two_initiators_from_concurrent_offers_both_get_working_sessions() {
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_b = *id_b.node_id();
+    let mgr_b = SessionManager::new(id_b);
+    let (_, id_a1) = NodeIdentity::generate().unwrap();
+    let (_, id_a2) = NodeIdentity::generate().unwrap();
+    let (node_a1, node_a2) = (*id_a1.node_id(), *id_a2.node_id());
+    let mgr_a1 = SessionManager::new(Arc::new(id_a1));
+    let mgr_a2 = SessionManager::new(Arc::new(id_a2));
+
+    // B offers its bundle to both before either SessionInit arrives.
+    let offer_1 = mgr_b.prekey_bundle().await;
+    let offer_2 = mgr_b.prekey_bundle().await;
+    let init_1 = mgr_a1.initiate_session(&node_b, &offer_1).await.unwrap();
+    let init_2 = mgr_a2.initiate_session(&node_b, &offer_2).await.unwrap();
+
+    let accepted_1 = mgr_b.accept_session(&node_a1, &init_1).await;
+    let accepted_2 = mgr_b.accept_session(&node_a2, &init_2).await;
+    assert!(accepted_1.is_ok());
+
+    let m1 = mgr_a1.encrypt(&node_b, b"ratchet-init").await.unwrap();
+    assert_eq!(mgr_b.decrypt(&node_a1, &m1).await.unwrap(), b"ratchet-init");
+    // An accepted session must decrypt its initiator's first message; a
+    // refused init is fine (the initiator re-negotiates), a silent mismatch is not.
+    if accepted_2.is_ok() {
+        let m2 = mgr_a2.encrypt(&node_b, b"ratchet-init").await.unwrap();
+        assert_eq!(
+            mgr_b.decrypt(&node_a2, &m2).await.ok().as_deref(),
+            Some(&b"ratchet-init"[..]),
+            "B accepted A2's SessionInit but cannot decrypt A2's first message (one-time prekey reused across offers)"
+        );
+    }
+}
