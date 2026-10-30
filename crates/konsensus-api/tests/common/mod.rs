@@ -66,6 +66,7 @@ pub struct MemStorage {
     pub fail_call_get_for: Mutex<Option<String>>,
     pub fail_call_put_for: Mutex<Option<String>>,
     calls: Mutex<HashMap<(NodeId, String), konsensus_core::payloads::call::CallEntry>>,
+    call_offers: Mutex<HashMap<(NodeId, String), MessageId>>,
     outbox: Mutex<HashMap<String, konsensus_storage::OutboxOperation>>,
     /// The channel-open / send-onchain / direct-payment operation ledger.
     operations: Mutex<HashMap<String, konsensus_storage::ChannelOpenOperation>>,
@@ -95,6 +96,7 @@ impl MemStorage {
             fail_call_get_for: Mutex::new(None),
             fail_call_put_for: Mutex::new(None),
             calls: Mutex::new(HashMap::new()),
+            call_offers: Mutex::new(HashMap::new()),
             outbox: Mutex::new(HashMap::new()),
             operations: Mutex::new(HashMap::new()),
             calendar: Mutex::new(HashMap::new()),
@@ -145,6 +147,19 @@ impl Storage for MemStorage {
         }
         self.calls.lock().unwrap().insert((*peer, call_id.to_owned()), entry.clone());
         Ok(())
+    }
+
+    async fn call_offer_bind(&self, peer: &NodeId, call_id: &str, offer: &MessageId) -> Result<(), StorageError> {
+        let key = (*peer, call_id.to_owned());
+        if !self.calls.lock().unwrap().get(&key).is_some_and(|e| e.side == konsensus_core::payloads::call::Side::Caller) {
+            return Err(StorageError::Conversion("no caller call row to bind its offer to".into()));
+        }
+        self.call_offers.lock().unwrap().insert(key, *offer);
+        Ok(())
+    }
+
+    async fn call_offer(&self, peer: &NodeId, call_id: &str) -> Result<Option<MessageId>, StorageError> {
+        Ok(self.call_offers.lock().unwrap().get(&(*peer, call_id.to_owned())).copied())
     }
 
     async fn call_delete(&self, peer: &NodeId, call_id: &str) -> Result<(), StorageError> {

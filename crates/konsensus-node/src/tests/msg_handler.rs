@@ -3540,7 +3540,7 @@ async fn duplicate_invites_age_before_ack_even_after_a_long_outage() {
         let db = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
         let devices = Devices::default();
         let arrived = now_ms() - age;
-        let env = UkmEnvelopeBuilder::new(400, *alice_identity().node_id(), Recipient::Node(*identity.node_id()), vec![1], PaymentProof::new([41;32], [41;32], 10_000)).build();
+        let env = UkmEnvelopeBuilder::new(400, *alice_identity().node_id(), Recipient::Node(*identity.node_id()), vec![1], PaymentProof::new([41;32], [41;32], 10_000)).timestamp(arrived).build();
         let text = r#"{"v":1,"call_id":"0123456789abcdef0123456789abcdef","media":"audio","sdp":"v=0"}"#;
         let cipher = PlaintextCacheCipher::new(identity.aes_key());
         db.accept_paid_envelope(&env).await.unwrap();
