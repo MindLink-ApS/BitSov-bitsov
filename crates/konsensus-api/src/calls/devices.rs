@@ -360,10 +360,10 @@ impl Devices {
                     || invite.deadline_ms <= now_ms
                     || (invite.waiting && invite.witnessed_ms.is_some())
             })
-            .map(|(id, invite)| (*id, invite.clone()))
+            .map(|(id, _)| *id)
             .collect();
         let mut notices = Vec::with_capacity(due.len());
-        for (id, invite) in due {
+        for id in due {
             let result: Result<(), StorageError> = async {
                 // Decide on the current entry, not the snapshot: a stream write
                 // may have finished and left its evidence since. No write can
