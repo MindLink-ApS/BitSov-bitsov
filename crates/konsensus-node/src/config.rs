@@ -1731,6 +1731,16 @@ impl NodeConfig {
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        // `[network].tier` is what peers see; it must not contradict `tier`.
+        let expected_tier = self.tier.to_sovereignty_tier();
+        if self.network.tier != expected_tier {
+            anyhow::bail!(
+                "[network].tier = \"{:?}\" disagrees with tier = \"{}\", which advertises \
+                 {expected_tier:?}; set [network].tier = \"{expected_tier:?}\"",
+                self.network.tier,
+                self.tier
+            );
+        }
         anyhow::ensure!((1..=240).contains(&self.calls.max_call_minutes), "calls.max_call_minutes must be between 1 and 240");
         self.lightning.validate_address_lengths()?;
         self.validate_starter_hub(false)?;
