@@ -9,9 +9,12 @@ rc20 adds M6 paid calls and the onboarding/pairing work merged since rc19.
 SQL migrations **031** and **032** (starter requests and queries, signet,
 off by default) and **035**, **036** and **037** (call blocks, the Unpaid
 notice and call-block invoice provenance) run on first start. They are
-additive with no down migration: keep a consistent database backup before
-upgrading, because an older binary refuses a database that has a migration
-version it does not know. Migration **035** ends every in-flight live call;
+additive and have no down migration. Keep a consistent database backup
+before upgrading. Do not downgrade; roll forward on the migrated database.
+On SQLite, an older binary refuses startup when the database records a
+migration version the binary does not know (`VersionMissing`). The
+PostgreSQL backend has no such check and starts on the newer schema.
+Migration **035** ends every in-flight live call;
 restart calls after the upgrade (their replay tombstones are kept and no
 unpaid media interval is granted). The two sections below cover the call
 ledger and invoice bindings in detail.
@@ -20,10 +23,11 @@ ledger and invoice bindings in detail.
 
 Migration **037** adds invoice-hash bindings to `(peer, call_id, seq)` on
 SQLite and PostgreSQL. It is additive and idempotent, with no down migration.
-Keep a consistent database backup before upgrading: an older SQLite binary
-that does not know version 037 refuses the upgraded database (`VersionMissing`).
-Returning to that binary requires restoring the pre-upgrade database; do not
-delete migration history or invoice bindings to bypass the check.
+Keep a consistent database backup before upgrading. Do not downgrade; roll
+forward. On SQLite, an older binary that does not know version 037 refuses
+the upgraded database (`VersionMissing`). PostgreSQL has no such check and
+starts on the newer schema. Do not delete migration history or invoice
+bindings to make an older binary start.
 
 ## Call reservations (#460)
 
