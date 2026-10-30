@@ -81,6 +81,7 @@ async fn messaging_fixture(relation: bool, requested_cap: u64) -> (Fx, String) {
                 &sign(&device::intent_message(
                     &fingerprint,
                     &fx.client_id,
+                    1,
                     &intent,
                 )),
             )

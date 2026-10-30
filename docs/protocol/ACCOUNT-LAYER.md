@@ -86,8 +86,10 @@ An app is a **paired client**. It never holds the seed or any node key.
 **Use.** A `RelationIntent`:
 
 ```
-bitsov-relation-intent-v1\nnode:{fp}\nclient:{client_id}\ndevice:{key_id}\npeer:{hex}\nlevel:{n}\nbudget_msat:{n}\nper_act_max_msat:{n}\nwindow_secs:{n}\nissued_at:{t}\nnonce:{hex}
+bitsov-relation-intent-v2\nnode:{fp}\nclient:{client_id}\nepoch:{epoch}\ndevice:{key_id}\npeer:{hex}\nlevel:{n}\nbudget_msat:{n}\nper_act_max_msat:{n}\nwindow_secs:{n}\nissued_at:{t}\nnonce:{hex}
 ```
+
+`epoch` is the pairing epoch from the caller's token. The node copies it into the signed bytes; v1, which omitted it, is refused. See `docs/security/device-keys.md`.
 
 - `level` is the relation-ladder rung: 0 Knock, 1 Contact, 2 Close, 3 Anchored. Only 1 is accepted until first contact (step 4). The field is fixed now so that plasticity can move relations later.
 - Enforcement, limits and residual risks are in `docs/security/device-keys.md`.
