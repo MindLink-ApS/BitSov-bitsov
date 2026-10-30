@@ -6,12 +6,18 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from scripts.ci.review_gate import evaluate, github_api, run_gate
+from scripts.ci.review_gate import carried_shas, evaluate, github_api, run_gate
 
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/review-gate.yml"
 HEAD = "a" * 40
 STALE = "b" * 40
+MAIN = "c" * 40
+OLD_MAIN = "d" * 40
+
+
+def change(patch, name="src/lib.rs"):
+    return {"filename": name, "status": "modified", "changes": 1, "patch": patch}
 
 
 def verdict(vendor, outcome="PASS", sha=HEAD, *, number=1, author="reviewer",
@@ -340,8 +346,13 @@ class EvaluationTests(unittest.TestCase):
 class FakeAPI:
     """Small API boundary double; all gate decisions use the real evaluator."""
 
-    def __init__(self, *, second_head=HEAD, changed_files=1, files=None, comments=None):
+    def __init__(self, *, second_head=HEAD, changed_files=1, files=None, comments=None,
+                 commits=None, compares=None):
         self.second_head = second_head
+        # sha -> parent shas; "base...sha" -> compare payload. Defaults: a
+        # single-parent head, so no verdict is carried.
+        self.commits = commits or {}
+        self.compares = compares or {}
         self.comments = (comments if comments is not None
                          else [verdict("CODEX"), verdict("CURSOR")])
         self.changed_files = changed_files
@@ -359,12 +370,20 @@ class FakeAPI:
             self.pr_reads += 1
             return {"head": {"sha": HEAD if self.pr_reads == 1 else self.second_head,
                              "ref": "feature/topic"},
+                    "base": {"ref": "main"},
                     "labels": [{"name": "builder:claude"}],
                     "changed_files": self.changed_files}
         if endpoint == "repos/owner/repo/pulls/7/files?per_page=100":
             return self.files
         if endpoint == "repos/owner/repo/issues/7/comments?per_page=100":
             return self.comments
+        if endpoint == "repos/owner/repo/commits/main":
+            return {"sha": MAIN}
+        if endpoint.startswith("repos/owner/repo/commits/"):
+            sha = endpoint.rsplit("/", 1)[1]
+            return {"parents": [{"sha": p} for p in self.commits.get(sha, [STALE])]}
+        if endpoint.startswith("repos/owner/repo/compare/"):
+            return self.compares.get(endpoint.rsplit("/", 1)[1], {"status": "diverged", "files": []})
         raise AssertionError(f"Unexpected API request: {endpoint}")
 
 
@@ -511,3 +530,56 @@ class APITests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CarryOverTests(unittest.TestCase):
+    """Verdicts survive a clean merge of the base branch, and nothing else."""
+
+    def api(self, *, head_patch="@@ -10,2 +12,2 @@\n-a\n+b",
+            stale_patch="@@ -10,2 +10,2 @@\n-a\n+b", second=OLD_MAIN, second_on_main=True,
+            head_parents=(STALE, OLD_MAIN), comments=None):
+        return FakeAPI(
+            comments=comments if comments is not None else [
+                verdict("CODEX", sha=STALE, number=1), verdict("CURSOR", sha=STALE, number=2)],
+            commits={HEAD: list(head_parents) if head_parents else [STALE]},
+            compares={
+                f"{MAIN}...{HEAD}": {"files": [change(head_patch)]},
+                f"{MAIN}...{STALE}": {"files": [change(stale_patch)]},
+                f"{second}...{MAIN}": {"status": "ahead" if second_on_main else "diverged"},
+            })
+
+    def state(self, api):
+        run_gate("pull_request", {"number": 7}, "owner/repo", api=api)
+        return api.statuses[-1][1]["state"]
+
+    def test_clean_main_merge_carries_verdicts_even_with_shifted_hunks(self):
+        self.assertEqual(self.state(self.api()), "success")
+
+    def test_changed_own_diff_needs_fresh_review(self):
+        self.assertEqual(self.state(self.api(head_patch="@@ -10,2 +12,2 @@\n-a\n+c")), "pending")
+
+    def test_merge_of_a_non_base_branch_does_not_carry(self):
+        self.assertEqual(self.state(self.api(second_on_main=False)), "pending")
+
+    def test_ordinary_commit_does_not_carry(self):
+        self.assertEqual(self.state(self.api(head_parents=None)), "pending")
+
+    def test_carried_fail_still_blocks(self):
+        api = self.api(comments=[verdict("CODEX", "FAIL", sha=STALE, number=1),
+                                 verdict("CURSOR", sha=HEAD, number=2)])
+        self.assertEqual(self.state(api), "failure")
+
+    def test_truncated_patch_fails_closed(self):
+        api = self.api()
+        api.compares[f"{MAIN}...{STALE}"] = {"files": [{"filename": "src/lib.rs",
+                                                        "status": "modified", "changes": 900}]}
+        self.assertEqual(carried_shas(api, "repos/owner/repo", HEAD, MAIN), set())
+
+    def test_carry_follows_several_clean_merges(self):
+        older = "e" * 40
+        api = self.api(comments=[verdict("CODEX", sha=older, number=1),
+                                 verdict("CURSOR", sha=older, number=2)])
+        api.commits[STALE] = [older, OLD_MAIN]
+        api.compares[f"{MAIN}...{older}"] = {"files": [change("@@ -1 +1 @@\n-a\n+b")]}
+        self.assertEqual(carried_shas(api, "repos/owner/repo", HEAD, MAIN), {STALE, older})
+        self.assertEqual(self.state(api), "success")

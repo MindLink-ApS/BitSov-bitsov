@@ -87,8 +87,14 @@ def is_docs_path(path):
     return path.endswith(".md") or path.startswith("docs/")
 
 
-def evaluate(head_sha, branch, labels, files, comments, authors=""):
-    """Return (state, description); never execute or inspect file contents."""
+def evaluate(head_sha, branch, labels, files, comments, authors="", carried=()):
+    """Return (state, description); never execute or inspect file contents.
+
+    `carried` lists earlier commits whose verdicts still apply to the head
+    because it differs from them only by clean merges of the base branch
+    (see `carried_shas`).
+    """
+    accepted = {head_sha.lower()} | {sha.lower() for sha in carried}
     labels = {label.lower() for label in labels}
     builders = {family for family in set(FAMILIES.values())
                 if f"builder:{family.lower()}" in labels}
@@ -112,7 +118,7 @@ def evaluate(head_sha, branch, labels, files, comments, authors=""):
             continue
         outcomes = {}
         for match in verdict_lines(comment.get("body")):
-            if match[3].lower() != head_sha.lower():
+            if match[3].lower() not in accepted:
                 continue
             family = FAMILIES[match[1]]
             # Conflicting verdicts for one family in one comment fail closed.
@@ -151,6 +157,53 @@ def evaluate(head_sha, branch, labels, files, comments, authors=""):
         missing = " and ".join(sorted(others - passes))
         return "pending", f"needs {missing} PASS on {short_sha}"
     return "success", f"2 non-builder families PASS on {short_sha}"
+
+
+HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.MULTILINE)
+COMPARE_FILE_LIMIT = 300
+MAX_CARRY_STEPS = 5
+
+
+def own_changes(api, root, base_sha, sha):
+    """The PR's own changes at `sha`: the diff from its merge-base with the
+    base branch. Returns None when GitHub cannot show it completely."""
+    data = api(f"{root}/compare/{base_sha}...{sha}")
+    files = data.get("files") or []
+    if len(files) >= COMPARE_FILE_LIMIT:
+        return None  # The compare API truncates large file lists.
+    changes = set()
+    for item in files:
+        if item.get("changes", 0) and "patch" not in item:
+            return None  # Large or binary diffs omit the patch text.
+        patch = HUNK_HEADER.sub("@@", item.get("patch", ""))
+        changes.add((item["filename"], item.get("previous_filename"), item["status"], patch))
+    return frozenset(changes)
+
+
+def carried_shas(api, root, head_sha, base_sha):
+    """Earlier commits whose verdicts still apply to `head_sha`.
+
+    Each step back must be a two-parent merge whose second parent is on the
+    base branch, and the PR's own changes (hunk line numbers aside) must be
+    identical before and after it. A conflict fix or any other edit changes
+    them, so it needs a fresh review. Anything unreadable fails closed.
+    """
+    head_changes = own_changes(api, root, base_sha, head_sha)
+    if head_changes is None:
+        return set()
+    carried, sha = set(), head_sha
+    for _ in range(MAX_CARRY_STEPS):
+        parents = [parent["sha"] for parent in api(f"{root}/commits/{sha}")["parents"]]
+        if len(parents) != 2:
+            break
+        first, second = parents
+        if api(f"{root}/compare/{second}...{base_sha}")["status"] not in ("identical", "ahead"):
+            break  # Not a merge of the base branch.
+        if own_changes(api, root, base_sha, first) != head_changes:
+            break
+        carried.add(first)
+        sha = first
+    return carried
 
 
 def github_api(endpoint, *, method="GET", payload=None, paginate=False):
@@ -210,9 +263,11 @@ def run_gate(event_name, event, repository, authors="", *, api=github_api):
         return
     paths = [file[key] for file in files for key in ("filename", "previous_filename")
              if key in file]
+    base_sha = api(f"{root}/commits/{pr['base']['ref']}")["sha"]
+    carried = carried_shas(api, root, sha, base_sha)
     state, description = evaluate(sha, pr["head"]["ref"],
                                   [label["name"] for label in pr["labels"]],
-                                  paths, comments, authors)
+                                  paths, comments, authors, carried)
     post(sha, state, description)
 
 

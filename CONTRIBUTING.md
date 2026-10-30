@@ -43,7 +43,13 @@ inline-code, indented-code and fenced-code verdicts do not count. A comment
 that gives one family both PASS and FAIL for the head counts as FAIL.
 
 Families are CLAUDE (CLAUDE/FABLE/OPUS), CODEX, and CURSOR
-(GROK/COMPOSER/CURSOR). Only the current PR head counts; the most recently
+(GROK/COMPOSER/CURSOR). Only the current PR head counts, with one exception: a
+verdict on an earlier commit still applies when the head differs from it only by
+clean merges of the base branch. The gate checks that each step is a two-parent
+merge whose second parent is on the base branch, and that the PR's own diff
+against the base is identical before and after (hunk line numbers aside). A
+conflict fix or any other edit needs a fresh review; anything GitHub cannot show
+completely (large or binary diffs, 300+ files) fails closed. The most recently
 *posted* verdict per family wins. Editing a comment does not make it newer, so
 post a new comment to change a verdict. Deleting a comment recomputes the gate. Set one `builder:claude`, `builder:codex`, or
 `builder:cursor` label; otherwise `cursor/` and `cloud/` branch prefixes imply
