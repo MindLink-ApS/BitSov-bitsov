@@ -251,6 +251,23 @@ async fn duplicate_reply(
     Some(Frame::MessageAck { id: envelope.id, duplicate: true, paid_until_ms })
 }
 
+/// Reply to a call offer the general age limit refused. A known exact offer
+/// replays its durable outcome; an unseen one can no longer ring and is
+/// refused as not reachable, which the caller treats as terminal.
+async fn expired_offer_reply(
+    storage: &dyn konsensus_storage::Storage,
+    envelope: &konsensus_core::UkmEnvelope,
+) -> Option<Frame> {
+    match storage.call_invite_outcome(envelope).await {
+        Ok(Some(_)) => duplicate_reply(storage, envelope, None).await,
+        Ok(None) => Some(Frame::MessageReject { id: envelope.id, reason: konsensus_api::calls::devices::NOT_REACHABLE.into() }),
+        Err(e) => {
+            error!(error = %e, "cannot read call offer receipt; withholding response");
+            None
+        }
+    }
+}
+
 /// Receives envelopes from the transport, validates them through the payment gate,
 /// stores them, decrypts if possible, and broadcasts to WebSocket clients.
 pub(crate) async fn run(deps: MsgHandlerDeps) {
@@ -357,6 +374,22 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             is_relay_control,
                         )
                         .await;
+
+                        // A call offer keeps its stamp (its generation's timing), so the
+                        // general age limit can refuse an exact retry before its receipt
+                        // is seen. A known offer replays its durable outcome without
+                        // readmission; an unseen expired one is refused for good, so the
+                        // caller ends the call instead of retrying it (Codex FAIL on #472).
+                        if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE
+                            && matches!(gate_result, Err(konsensus_core::gate::GateRejection::MessageTooOld { .. }))
+                        {
+                            if let Some(reply) = expired_offer_reply(storage_for_recv.as_ref(), &envelope).await {
+                                if let Err(e) = transport_for_ack.send_frame(&sender, &reply).await {
+                                    warn!(error = %e, "failed to answer an expired call offer");
+                                }
+                            }
+                            continue;
+                        }
 
                         if envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
                             match storage_for_recv.is_paid_envelope_rejected(&envelope).await {

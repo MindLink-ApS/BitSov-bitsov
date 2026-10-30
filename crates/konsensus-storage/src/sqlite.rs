@@ -1866,7 +1866,7 @@ impl Storage for SqliteStorage {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM messages WHERE id = ? AND sender = ?")
             .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
-        sqlx::query("UPDATE payment_receipts SET accepted = CASE WHEN accepted IN (-2, -3) THEN -3 ELSE -1 END WHERE payment_hash = ? AND message_id = ?")
+        sqlx::query("UPDATE payment_receipts SET accepted = CASE WHEN accepted IN (-2, -3) OR kind = 400 THEN -3 ELSE -1 END WHERE payment_hash = ? AND message_id = ?")
             .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(&id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
             .bind(&id).execute(&mut *tx).await?;
@@ -1903,7 +1903,7 @@ impl Storage for SqliteStorage {
     async fn call_admission_withdraw(&self, held_before_ms: u64) -> Result<u64, StorageError> {
         let before = i64::try_from(held_before_ms).unwrap_or(i64::MAX);
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE payment_receipts SET accepted = CASE WHEN accepted IN (-2, -3) THEN -3 ELSE -1 END WHERE (message_id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < ?)")
+        sqlx::query("UPDATE payment_receipts SET accepted = CASE WHEN accepted IN (-2, -3) OR kind = 400 THEN -3 ELSE -1 END WHERE (message_id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < ?)")
             .bind(before).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM messages WHERE (id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < ?)")
             .bind(before).execute(&mut *tx).await?;

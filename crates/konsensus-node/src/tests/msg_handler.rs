@@ -3579,6 +3579,31 @@ async fn stale_offer_refusal_is_replayed_to_a_retry() {
     assert!(matches!(duplicate_reply(&db, &env, None).await, Some(Frame::MessageReject { reason, .. }) if reason == "call_not_reachable"));
 }
 
+/// An offer past the general age limit: a known exact retry replays its
+/// durable outcome (here delivered: ACK; withdrawn: not reachable), and an
+/// unseen one is refused as not reachable rather than left to retry forever.
+/// A withdrawal whose outcome write failed still reads as not reachable.
+#[tokio::test]
+async fn expired_offer_retries_replay_their_outcome_or_end() {
+    use konsensus_storage::CallInviteOutcome;
+    let bob = bob_identity();
+    let db = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let offer = |seed: u8| UkmEnvelopeBuilder::new(400, *alice_identity().node_id(), Recipient::Node(*bob.node_id()), vec![seed], PaymentProof::new([seed;32], [seed;32], 10_000)).timestamp(1_000).build();
+    let delivered = offer(51);
+    db.accept_paid_envelope(&delivered).await.unwrap();
+    db.call_invite_set_outcome(&delivered.id, &delivered.sender, CallInviteOutcome::Fetched).await.unwrap();
+    assert!(matches!(expired_offer_reply(&db, &delivered).await, Some(Frame::MessageAck { duplicate: true, .. })));
+    // Refused at admission but its NotReachable write failed: the receipt
+    // still reads as plain paid acceptance until the withdrawal runs.
+    let withdrawn = offer(52);
+    db.accept_paid_envelope(&withdrawn).await.unwrap();
+    db.reject_accepted_envelope(&withdrawn).await.unwrap();
+    assert_eq!(db.call_invite_outcome(&withdrawn).await.unwrap(), Some(CallInviteOutcome::NotReachable));
+    assert!(matches!(expired_offer_reply(&db, &withdrawn).await, Some(Frame::MessageReject { reason, .. }) if reason == "call_not_reachable"));
+    let unseen = offer(53);
+    assert!(matches!(expired_offer_reply(&db, &unseen).await, Some(Frame::MessageReject { reason, .. }) if reason == "call_not_reachable"));
+}
+
 #[tokio::test]
 async fn invite_resend_during_device_wait_defers_ack_until_fetch() {
     use konsensus_api::calls::{devices::Devices, now_ms};
