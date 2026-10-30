@@ -64,6 +64,24 @@ pub enum SessionError {
     InvalidPeerData(String),
 }
 
+impl SessionError {
+    /// Whether this failure should advance the per-peer decrypt-failure budget.
+    ///
+    /// A message number that was already received does not. The session is
+    /// intact, and counting the retransmission would eventually replace it.
+    pub fn counts_toward_decrypt_budget(&self) -> bool {
+        !matches!(self, SessionError::Ratchet(RatchetError::AlreadyReceived))
+    }
+}
+
+/// Consecutive decrypt failures tolerated for one peer before the caller
+/// should drop the session and offer prekeys again.
+pub const DECRYPT_FAILURE_BUDGET: u32 = 3;
+
+/// Largest RatchetInit payload retained so a repeated SessionAck can resend
+/// the same frame without encrypting a new one.
+const MAX_CACHED_RATCHET_INIT: usize = 64 * 1024;
+
 /// Data sent from initiator to responder to establish an E2EE session.
 ///
 /// After performing X3DH, the initiator sends this to the responder so
@@ -146,6 +164,32 @@ pub trait SessionStore: Send + Sync {
 struct PeerSession {
     /// The Double Ratchet for this session.
     ratchet: DoubleRatchet,
+    /// Fingerprint of the SessionInit that created this session, when known.
+    init_fingerprint: Option<[u8; 32]>,
+    /// The initiator has already handled a SessionAck for this session.
+    ack_handled: bool,
+    /// Hash of the RatchetInit payload already decrypted for this session.
+    ratchet_init_hash: Option<[u8; 32]>,
+    /// RatchetInit payload already produced for this session, so a repeated
+    /// SessionAck can resend it without advancing the sending chain.
+    ratchet_init_payload: Option<Vec<u8>>,
+}
+
+/// On-disk session blob. Ratchet fields stay flat so a blob written before
+/// the handshake metadata existed still deserializes; the extra fields are
+/// optional and ignored by a reader that only knows `RatchetState`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedSession {
+    #[serde(flatten)]
+    ratchet: RatchetState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    init_fingerprint: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    ack_handled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ratchet_init_hash: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ratchet_init_payload: Option<Vec<u8>>,
 }
 
 /// Domain-separation context for deriving the session-encryption key from the
@@ -173,6 +217,9 @@ pub struct SessionManager {
     next_opk_id: RwLock<u32>,
     /// Active sessions keyed by peer NodeId.
     sessions: RwLock<HashMap<NodeId, PeerSession>>,
+    /// Consecutive decrypt failures per peer. Not persisted: a restart starts
+    /// the budget over, and a successful decrypt clears it.
+    decrypt_failures: RwLock<HashMap<NodeId, u32>>,
     /// Optional persistent session store.
     store: Option<Arc<dyn SessionStore>>,
     /// AES-256-GCM cipher for encrypting session state at rest.
@@ -207,6 +254,7 @@ impl SessionManager {
             one_time_prekeys: RwLock::new(otpks),
             next_opk_id: RwLock::new(10),
             sessions: RwLock::new(HashMap::new()),
+            decrypt_failures: RwLock::new(HashMap::new()),
             store: None,
             session_cipher,
         }
@@ -233,6 +281,7 @@ impl SessionManager {
             one_time_prekeys: RwLock::new(otpks),
             next_opk_id: RwLock::new(10),
             sessions: RwLock::new(HashMap::new()),
+            decrypt_failures: RwLock::new(HashMap::new()),
             store: Some(store),
             session_cipher,
         }
@@ -314,13 +363,19 @@ impl SessionManager {
                         None => continue,
                     };
 
-                    match serde_json::from_slice::<RatchetState>(&json_bytes) {
-                        Ok(state) => {
-                            let ratchet = DoubleRatchet::from_state(&state);
-                            self.sessions
-                                .write()
-                                .await
-                                .insert(*peer_id, PeerSession { ratchet });
+                    match serde_json::from_slice::<PersistedSession>(&json_bytes) {
+                        Ok(persisted) => {
+                            let ratchet = DoubleRatchet::from_state(&persisted.ratchet);
+                            self.sessions.write().await.insert(
+                                *peer_id,
+                                PeerSession {
+                                    ratchet,
+                                    init_fingerprint: persisted.init_fingerprint,
+                                    ack_handled: persisted.ack_handled,
+                                    ratchet_init_hash: persisted.ratchet_init_hash,
+                                    ratchet_init_payload: persisted.ratchet_init_payload,
+                                },
+                            );
                             restored += 1;
                             debug!(peer = %peer_id, "restored E2EE session from storage");
 
@@ -347,7 +402,11 @@ impl SessionManager {
             }
         }
 
-        debug!(count = restored, total = peer_ids.len(), "session restore complete");
+        debug!(
+            count = restored,
+            total = peer_ids.len(),
+            "session restore complete"
+        );
         restored
     }
 
@@ -489,8 +548,14 @@ impl SessionManager {
             None => return,
         };
 
-        let state = session.ratchet.export_state();
-        match serde_json::to_vec(&state) {
+        let persisted = PersistedSession {
+            ratchet: session.ratchet.export_state(),
+            init_fingerprint: session.init_fingerprint,
+            ack_handled: session.ack_handled,
+            ratchet_init_hash: session.ratchet_init_hash,
+            ratchet_init_payload: session.ratchet_init_payload.clone(),
+        };
+        match serde_json::to_vec(&persisted) {
             Ok(json_blob) => {
                 // Encrypt the JSON before persisting (Principle 4)
                 match self.encrypt_session_blob(&json_blob) {
@@ -571,22 +636,30 @@ impl SessionManager {
         )?;
 
         let ratchet_key = *ratchet.public_key().as_bytes();
-
-        // Store session
-        self.sessions
-            .write()
-            .await
-            .insert(*peer_id, PeerSession { ratchet });
-
-        // Persist to storage
-        self.persist_session(peer_id).await;
-
-        Ok(SerializableSessionInit {
+        let init_preview = SerializableSessionInit {
             identity_key: hex::encode(initiation.identity_key.as_bytes()),
             ephemeral_key: hex::encode(initiation.ephemeral_key.as_bytes()),
             one_time_prekey_id: initiation.one_time_prekey_id,
             ratchet_key: hex::encode(ratchet_key),
-        })
+        };
+        let init_fingerprint = session_init_fingerprint(&init_preview);
+
+        // Store session
+        self.sessions.write().await.insert(
+            *peer_id,
+            PeerSession {
+                ratchet,
+                init_fingerprint,
+                ack_handled: false,
+                ratchet_init_hash: None,
+                ratchet_init_payload: None,
+            },
+        );
+
+        // Persist to storage
+        self.persist_session(peer_id).await;
+
+        Ok(init_preview)
     }
 
     /// Accept an E2EE session initiated by a peer.
@@ -610,11 +683,19 @@ impl SessionManager {
         // Look up our signed pre-key
         let spk = self.signed_prekey.read().await.clone();
 
-        // Look up and consume the one-time pre-key if used
+        // Look up and consume the one-time pre-key if the init names one.
+        // A missing key means this init was already accepted (or the id is
+        // unknown). Continuing without it would derive a different secret.
         let otpk = if let Some(opk_id) = init_data.one_time_prekey_id {
             let mut otpks = self.one_time_prekeys.write().await;
-            let idx = otpks.iter().position(|k| k.id == opk_id);
-            idx.map(|i| otpks.remove(i))
+            match otpks.iter().position(|k| k.id == opk_id) {
+                Some(i) => Some(otpks.remove(i)),
+                None => {
+                    return Err(SessionError::InvalidPeerData(format!(
+                        "one-time prekey {opk_id} is not available"
+                    )));
+                }
+            }
         } else {
             None
         };
@@ -641,10 +722,16 @@ impl SessionManager {
         );
 
         // Store session
-        self.sessions
-            .write()
-            .await
-            .insert(*peer_id, PeerSession { ratchet });
+        self.sessions.write().await.insert(
+            *peer_id,
+            PeerSession {
+                ratchet,
+                init_fingerprint: session_init_fingerprint(init_data),
+                ack_handled: false,
+                ratchet_init_hash: None,
+                ratchet_init_payload: None,
+            },
+        );
 
         // Persist to storage
         self.persist_session(peer_id).await;
@@ -714,6 +801,7 @@ impl SessionManager {
 
         // Persist updated ratchet state after chain advancement
         self.persist_session(peer_id).await;
+        self.decrypt_failures.write().await.remove(peer_id);
         Ok(plaintext)
     }
 
@@ -755,7 +843,113 @@ impl SessionManager {
                 }
             }
         }
+        self.decrypt_failures.write().await.remove(peer_id);
         removed
+    }
+
+    /// Record one failed decrypt for `peer_id`.
+    ///
+    /// Returns `true` when [`DECRYPT_FAILURE_BUDGET`] is reached. The counter
+    /// resets in that case so the next session starts clean. A successful
+    /// decrypt also clears it.
+    pub async fn record_decrypt_failure(&self, peer_id: &NodeId) -> bool {
+        let mut failures = self.decrypt_failures.write().await;
+        let count = failures.entry(*peer_id).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count >= DECRYPT_FAILURE_BUDGET {
+            failures.remove(peer_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether `init` is the SessionInit that created the live session with `peer_id`.
+    pub async fn is_repeat_session_init(
+        &self,
+        peer_id: &NodeId,
+        init: &SerializableSessionInit,
+    ) -> bool {
+        let Some(fingerprint) = session_init_fingerprint(init) else {
+            return false;
+        };
+        self.sessions
+            .read()
+            .await
+            .get(peer_id)
+            .and_then(|session| session.init_fingerprint)
+            == Some(fingerprint)
+    }
+
+    /// Whether the one-time pre-key `id` is still in the local pool.
+    pub async fn one_time_prekey_available(&self, id: u32) -> bool {
+        self.one_time_prekeys
+            .read()
+            .await
+            .iter()
+            .any(|prekey| prekey.id == id)
+    }
+
+    /// Whether this initiator has already handled a SessionAck for `peer_id`.
+    pub async fn session_ack_already_handled(&self, peer_id: &NodeId) -> bool {
+        self.sessions
+            .read()
+            .await
+            .get(peer_id)
+            .is_some_and(|session| session.ack_handled)
+    }
+
+    /// RatchetInit payload previously produced for `peer_id`, if still cached.
+    pub async fn cached_ratchet_init(&self, peer_id: &NodeId) -> Option<Vec<u8>> {
+        self.sessions
+            .read()
+            .await
+            .get(peer_id)
+            .and_then(|session| session.ratchet_init_payload.clone())
+    }
+
+    /// Remember a RatchetInit payload this initiator already encrypted.
+    ///
+    /// A later SessionAck for the same session resends these bytes instead of
+    /// encrypting a second message.
+    pub async fn note_sent_ratchet_init(&self, peer_id: &NodeId, payload: &[u8]) {
+        {
+            let mut sessions = self.sessions.write().await;
+            let Some(session) = sessions.get_mut(peer_id) else {
+                return;
+            };
+            session.ack_handled = true;
+            session.ratchet_init_payload = if payload.len() <= MAX_CACHED_RATCHET_INIT {
+                Some(payload.to_vec())
+            } else {
+                None
+            };
+        }
+        self.persist_session(peer_id).await;
+    }
+
+    /// Whether `payload` is the RatchetInit already decrypted for `peer_id`.
+    pub async fn is_repeat_ratchet_init(&self, peer_id: &NodeId, payload: &[u8]) -> bool {
+        let hash = payload_hash(payload);
+        self.sessions
+            .read()
+            .await
+            .get(peer_id)
+            .and_then(|session| session.ratchet_init_hash)
+            == Some(hash)
+    }
+
+    /// Remember a RatchetInit payload that decrypted successfully.
+    pub async fn note_ratchet_init(&self, peer_id: &NodeId, payload: &[u8]) {
+        let hash = payload_hash(payload);
+        {
+            let mut sessions = self.sessions.write().await;
+            let Some(session) = sessions.get_mut(peer_id) else {
+                return;
+            };
+            session.ratchet_init_hash = Some(hash);
+        }
+        self.persist_session(peer_id).await;
     }
 
     /// Replenish one-time pre-keys when running low.
@@ -798,6 +992,40 @@ pub fn ratchet_message_from_bytes(data: &[u8]) -> Result<RatchetMessage, Session
     let ciphertext = data[40..].to_vec();
 
     Ok(RatchetMessage { header, ciphertext })
+}
+
+/// Fingerprint of the public SessionInit fields. Hex is decoded so letter
+/// case does not change the identity of an init.
+fn session_init_fingerprint(init: &SerializableSessionInit) -> Option<[u8; 32]> {
+    let identity = hex::decode(&init.identity_key).ok()?;
+    let ephemeral = hex::decode(&init.ephemeral_key).ok()?;
+    let ratchet = hex::decode(&init.ratchet_key).ok()?;
+    if identity.len() != 32 || ephemeral.len() != 32 || ratchet.len() != 32 {
+        return None;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"konsensus-v2-session-init-fingerprint");
+    hasher.update(&identity);
+    hasher.update(&ephemeral);
+    hasher.update(&ratchet);
+    match init.one_time_prekey_id {
+        Some(id) => {
+            hasher.update(&[1]);
+            hasher.update(&id.to_be_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    Some(*hasher.finalize().as_bytes())
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn payload_hash(payload: &[u8]) -> [u8; 32] {
+    *blake3::hash(payload).as_bytes()
 }
 
 /// Parse an X25519 public key from hex.

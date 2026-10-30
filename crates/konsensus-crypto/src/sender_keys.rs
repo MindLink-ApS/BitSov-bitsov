@@ -346,15 +346,16 @@ impl GroupSession {
 
         // If this is a newer generation, replace entirely
         // If same generation, it's a duplicate (idempotent)
-        let entry = self.member_keys.entry(dist.sender).or_insert_with(|| {
-            ReceiverSenderKey {
+        let entry = self
+            .member_keys
+            .entry(dist.sender)
+            .or_insert_with(|| ReceiverSenderKey {
                 chain_key: [0u8; 32],
                 chain_index: 0,
                 signing_key: verifying_key,
                 generation: 0,
                 skipped_keys: HashMap::new(),
-            }
-        });
+            });
 
         if dist.generation >= entry.generation {
             entry.chain_key = dist.chain_key;
@@ -402,8 +403,11 @@ impl GroupSession {
         }
 
         // Verify signature
-        let sig_payload =
-            build_sig_payload(message.generation, message.message_number, &message.ciphertext);
+        let sig_payload = build_sig_payload(
+            message.generation,
+            message.message_number,
+            &message.ciphertext,
+        );
         let signature = ed25519_dalek::Signature::from_bytes(&message.signature);
         entry
             .signing_key
@@ -415,11 +419,23 @@ impl GroupSession {
         // ciphertext minted for a different (group, sender) context — or with
         // rewritten counters — yields a different AAD and fails the GCM tag
         // check, so cross-context substitution cannot smuggle plaintext through.
-        let aad = build_aad(&group_id, sender, message.generation, message.message_number);
+        let aad = build_aad(
+            &group_id,
+            sender,
+            message.generation,
+            message.message_number,
+        );
 
-        // Check for skipped key
-        if let Some(message_key) = entry.skipped_keys.remove(&message.message_number) {
-            return aead_decrypt(&message_key, &message.ciphertext, &aad);
+        // A skipped key is removed only after the tag verifies, so a corrupt
+        // copy of an out-of-order message cannot consume it.
+        if let Some(mut message_key) = entry.skipped_keys.get(&message.message_number).copied() {
+            let result = aead_decrypt(&message_key, &message.ciphertext, &aad);
+            message_key.zeroize();
+            let plaintext = result?;
+            if let Some(mut stored) = entry.skipped_keys.remove(&message.message_number) {
+                stored.zeroize();
+            }
+            return Ok(plaintext);
         }
 
         // Message is behind our chain — can't go backwards
@@ -435,20 +451,33 @@ impl GroupSession {
             return Err(SenderKeyError::TooManySkipped(skip_count, MAX_SKIP));
         }
 
-        // Ratchet forward, storing skipped keys
+        // Ratchet on locals. `entry` is updated only after the tag verifies.
         let mut chain_key = entry.chain_key;
+        let mut staged_skips: Vec<(u32, [u8; 32])> = Vec::with_capacity(skip_count as usize);
         for i in entry.chain_index..message.message_number {
             let (next_chain, msg_key) = ratchet_chain_key(&chain_key);
-            entry.skipped_keys.insert(i, msg_key);
+            staged_skips.push((i, msg_key));
             chain_key = next_chain;
         }
+        let (mut next_chain, mut message_key) = ratchet_chain_key(&chain_key);
+        chain_key.zeroize();
 
-        // Derive the target message key
-        let (next_chain, message_key) = ratchet_chain_key(&chain_key);
+        let result = aead_decrypt(&message_key, &message.ciphertext, &aad);
+        message_key.zeroize();
+        let plaintext = match result {
+            Ok(plaintext) => plaintext,
+            Err(e) => {
+                next_chain.zeroize();
+                finish_staged_skips(&mut staged_skips, None);
+                return Err(e);
+            }
+        };
+
+        finish_staged_skips(&mut staged_skips, Some(&mut entry.skipped_keys));
+        entry.chain_key.zeroize();
         entry.chain_key = next_chain;
         entry.chain_index = message.message_number + 1;
-
-        aead_decrypt(&message_key, &message.ciphertext, &aad)
+        Ok(plaintext)
     }
 
     /// Remove a member from the group.
@@ -479,6 +508,19 @@ impl GroupSession {
 }
 
 // ─── Cryptographic primitives ────────────────────────────────────────────────
+
+fn finish_staged_skips(
+    staged: &mut [(u32, [u8; 32])],
+    mut destination: Option<&mut HashMap<u32, [u8; 32]>>,
+) {
+    // Borrow each element so the Vec's allocation, not a moved copy, is wiped.
+    for (index, key) in staged.iter_mut() {
+        if let Some(ref mut destination) = destination {
+            destination.insert(*index, *key);
+        }
+        key.zeroize();
+    }
+}
 
 /// Ratchet a chain key forward: derive next chain key + message key.
 fn ratchet_chain_key(chain_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
@@ -512,7 +554,12 @@ fn ratchet_chain_key(chain_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
 /// beyond the (signed, then re-checked) counters, so a ciphertext is
 /// cryptographically pinned to exactly one
 /// `(domain, version, group, sender, generation, message_number)` tuple.
-fn build_aad(group_id: &[u8; 32], sender: &NodeId, generation: u32, message_number: u32) -> Vec<u8> {
+fn build_aad(
+    group_id: &[u8; 32],
+    sender: &NodeId,
+    generation: u32,
+    message_number: u32,
+) -> Vec<u8> {
     let sender_bytes = sender.as_bytes();
     let mut aad =
         Vec::with_capacity(SENDER_KEY_AAD_DOMAIN.len() + 1 + 32 + sender_bytes.len() + 4 + 4);
@@ -557,7 +604,13 @@ fn aead_encrypt(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>,
     let nonce_bytes = derive_nonce(key, aad);
     let aes_nonce = AesNonce::from_slice(&nonce_bytes);
     cipher
-        .encrypt(aes_nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            aes_nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))
 }
 
@@ -567,7 +620,13 @@ fn aead_decrypt(key: &[u8; 32], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>
     let nonce_bytes = derive_nonce(key, aad);
     let aes_nonce = AesNonce::from_slice(&nonce_bytes);
     cipher
-        .decrypt(aes_nonce, Payload { msg: ciphertext, aad })
+        .decrypt(
+            aes_nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|e| SenderKeyError::DecryptionFailed(e.to_string()))
 }
 

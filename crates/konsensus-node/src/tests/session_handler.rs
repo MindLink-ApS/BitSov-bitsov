@@ -4013,6 +4013,7 @@ async fn session_decode_logs_do_not_echo_peer_json() {
     let transport = make_gossip_test_transport();
     let audit = make_gossip_audit_log();
     let mut negotiations = std::collections::HashMap::new();
+    let mut control_replays = std::collections::HashMap::new();
     let peer = NodeId::from_bytes([255; 32]);
     let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
     let _guard = tracing::subscriber::set_default(
@@ -4027,13 +4028,206 @@ async fn session_decode_logs_do_not_echo_peer_json() {
     ).await;
     handle_session_init(
         &peer, hostile, &manager, &storage, &transport, &audit, &mut negotiations,
+        &mut control_replays,
     ).await;
     assert!(!manager.has_session(&peer).await);
     assert!(negotiations.is_empty());
+    assert!(control_replays.is_empty());
     assert_eq!(
         *captured.lock().unwrap(),
         vec!["invalid wire JSON", "invalid wire JSON"],
     );
+}
+
+fn expired_negotiation() -> tokio::time::Instant {
+    tokio::time::Instant::now()
+        .checked_sub(SESSION_NEGOTIATION_COOLDOWN + std::time::Duration::from_secs(1))
+        .unwrap_or_else(tokio::time::Instant::now)
+}
+
+#[tokio::test]
+async fn replayed_session_init_keeps_live_session_after_opk_consumed() {
+    let alice = identity_from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    );
+    let bob = identity_from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
+    let alice_mgr = SessionManager::new(Arc::clone(&alice));
+    let bob_mgr = SessionManager::new(Arc::clone(&bob));
+    let bundle = bob_mgr.prekey_bundle().await;
+    let opk_id = bundle
+        .one_time_prekey_id
+        .expect("bundle includes a one-time prekey");
+    let init = alice_mgr
+        .initiate_session(bob.node_id(), &bundle)
+        .await
+        .unwrap();
+    let init_json = serde_json::to_value(&init).unwrap();
+
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+    let mut negotiations = std::collections::HashMap::new();
+    let mut control_replays = std::collections::HashMap::new();
+
+    handle_session_init(
+        alice.node_id(),
+        init_json.clone(),
+        &bob_mgr,
+        &storage,
+        &transport,
+        &audit,
+        &mut negotiations,
+        &mut control_replays,
+    )
+    .await;
+    assert!(bob_mgr.has_session(alice.node_id()).await);
+    assert!(!bob_mgr.one_time_prekey_available(opk_id).await);
+
+    // Cooldown has elapsed, so the replay is not dropped by the rate limit.
+    // A recognized repeat must also leave that timestamp alone.
+    let expired = expired_negotiation();
+    negotiations.insert(*alice.node_id(), expired);
+    handle_session_init(
+        alice.node_id(),
+        init_json,
+        &bob_mgr,
+        &storage,
+        &transport,
+        &audit,
+        &mut negotiations,
+        &mut control_replays,
+    )
+    .await;
+    assert_eq!(negotiations.get(alice.node_id()).copied(), Some(expired));
+
+    assert!(bob_mgr.has_session(alice.node_id()).await);
+    assert!(!bob_mgr.one_time_prekey_available(opk_id).await);
+    let msg = alice_mgr
+        .encrypt(bob.node_id(), b"still-here")
+        .await
+        .unwrap();
+    assert_eq!(
+        bob_mgr.decrypt(alice.node_id(), &msg).await.unwrap(),
+        b"still-here"
+    );
+}
+
+#[tokio::test]
+async fn repeated_session_ack_does_not_advance_the_sending_chain() {
+    let alice = identity_from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    );
+    let bob = identity_from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
+    let alice_mgr = SessionManager::new(Arc::clone(&alice));
+    let bob_mgr = SessionManager::new(Arc::clone(&bob));
+    let bundle = bob_mgr.prekey_bundle().await;
+    let init = alice_mgr
+        .initiate_session(bob.node_id(), &bundle)
+        .await
+        .unwrap();
+    bob_mgr
+        .accept_session(alice.node_id(), &init)
+        .await
+        .unwrap();
+
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+    let mut negotiations = std::collections::HashMap::new();
+    negotiations.insert(*bob.node_id(), expired_negotiation());
+
+    handle_session_ack(
+        bob.node_id(),
+        &alice_mgr,
+        &transport,
+        &audit,
+        &mut negotiations,
+    )
+    .await;
+    let first = alice_mgr
+        .cached_ratchet_init(bob.node_id())
+        .await
+        .expect("first ack caches the ratchet init");
+    negotiations.insert(*bob.node_id(), expired_negotiation());
+    handle_session_ack(
+        bob.node_id(),
+        &alice_mgr,
+        &transport,
+        &audit,
+        &mut negotiations,
+    )
+    .await;
+    let second = alice_mgr.cached_ratchet_init(bob.node_id()).await.unwrap();
+    assert_eq!(first, second);
+
+    let ratchet_msg = konsensus_crypto::ratchet_message_from_bytes(&first).unwrap();
+    assert_eq!(
+        bob_mgr
+            .decrypt(alice.node_id(), &ratchet_msg)
+            .await
+            .unwrap(),
+        b"ratchet-init"
+    );
+    let follow = alice_mgr
+        .encrypt(bob.node_id(), b"after-ack")
+        .await
+        .unwrap();
+    assert_eq!(
+        bob_mgr.decrypt(alice.node_id(), &follow).await.unwrap(),
+        b"after-ack"
+    );
+}
+
+#[tokio::test]
+async fn ratchet_init_failures_keep_session_until_budget() {
+    let alice = identity_from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    );
+    let bob = identity_from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
+    let alice_mgr = SessionManager::new(Arc::clone(&alice));
+    let bob_mgr = SessionManager::new(Arc::clone(&bob));
+    let bundle = bob_mgr.prekey_bundle().await;
+    let init = alice_mgr
+        .initiate_session(bob.node_id(), &bundle)
+        .await
+        .unwrap();
+    bob_mgr
+        .accept_session(alice.node_id(), &init)
+        .await
+        .unwrap();
+
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = make_gossip_test_transport();
+    let bad = vec![0u8; 48];
+    let below = konsensus_crypto::DECRYPT_FAILURE_BUDGET - 1;
+    for _ in 0..below {
+        handle_ratchet_init(alice.node_id(), &bad, &bob_mgr, &storage, &transport).await;
+        assert!(bob_mgr.has_session(alice.node_id()).await);
+    }
+
+    let good = alice_mgr
+        .encrypt(bob.node_id(), b"ratchet-init")
+        .await
+        .unwrap();
+    let good_bytes = konsensus_crypto::ratchet_message_to_bytes(&good);
+    handle_ratchet_init(alice.node_id(), &good_bytes, &bob_mgr, &storage, &transport).await;
+    assert!(bob_mgr.can_send(alice.node_id()).await);
+
+    handle_ratchet_init(alice.node_id(), &good_bytes, &bob_mgr, &storage, &transport).await;
+    assert!(bob_mgr.has_session(alice.node_id()).await);
+    let next = alice_mgr.encrypt(bob.node_id(), b"next").await.unwrap();
+    assert_eq!(
+        bob_mgr.decrypt(alice.node_id(), &next).await.unwrap(),
+        b"next"
+    );
+
+    for _ in 0..below {
+        handle_ratchet_init(alice.node_id(), &bad, &bob_mgr, &storage, &transport).await;
+        assert!(bob_mgr.has_session(alice.node_id()).await);
+    }
+    handle_ratchet_init(alice.node_id(), &bad, &bob_mgr, &storage, &transport).await;
+    assert!(!bob_mgr.has_session(alice.node_id()).await);
 }
 
 #[tokio::test]

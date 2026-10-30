@@ -966,70 +966,122 @@ async fn page_request_nonexistent_path_returns_label() {
 
 // ── decrypt_and_process with stale session ──────────────────────────
 
+// ── decrypt_and_process failure budget ──────────────────────────────
+
+struct DecryptChat {
+    bob: Arc<NodeIdentity>,
+    bob_mgr: SessionManager,
+    plaintext_cipher: PlaintextCacheCipher,
+    storage: Arc<dyn Storage>,
+    audit: Arc<AuditLog>,
+    transport: Arc<konsensus_message::NoiseTransport>,
+    chain: Arc<dyn ChainProvider>,
+    pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
+}
+
+impl DecryptChat {
+    fn new(bob: Arc<NodeIdentity>) -> Self {
+        let bob_mgr = SessionManager::new(Arc::clone(&bob));
+        Self {
+            plaintext_cipher: PlaintextCacheCipher::new(bob.aes_key()),
+            storage: Arc::new(TestStorage::new()),
+            audit: make_audit_log(),
+            transport: make_transport(&bob),
+            chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+            pricing: Arc::new(konsensus_pricing::StaticPricingEngine::new(Default::default())),
+            bob,
+            bob_mgr,
+        }
+    }
+
+    async fn run(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+        sender: &NodeId,
+    ) -> Option<String> {
+        decrypt_and_process(
+            envelope,
+            sender,
+            &self.bob_mgr,
+            &self.plaintext_cipher,
+            &self.storage,
+            &None,
+            &Default::default(),
+            &self.chain,
+            &self.pricing,
+            &self.bob,
+            &self.transport,
+            &self.audit,
+            &PaymentGate::new(),
+            0.0,
+        )
+        .await
+    }
+}
+
 #[tokio::test]
-async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
+async fn decrypt_failures_keep_session_until_budget() {
     let alice = alice_identity();
     let bob = bob_identity();
-    let bob_mgr = SessionManager::new(Arc::clone(&bob));
+    let harness = DecryptChat::new(Arc::clone(&bob));
+    let bob_mgr = &harness.bob_mgr;
     let alice_mgr = SessionManager::new(Arc::clone(&alice));
-    let plaintext_cipher = PlaintextCacheCipher::new(bob.aes_key());
-    let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
-    let audit = make_audit_log();
-    let transport = make_transport(&bob);
 
-    // Establish sessions
-    establish_sessions(&alice_mgr, &bob_mgr, &alice, &bob).await;
+    establish_sessions(&alice_mgr, bob_mgr, &alice, &bob).await;
 
-    // Alice encrypts with a DIFFERENT session manager (simulating stale keys)
+    // A ciphertext from a different ratchet. Bob cannot decrypt it.
     let alice_mgr2 = SessionManager::new(Arc::clone(&alice));
     let bob_mgr2 = SessionManager::new(Arc::clone(&bob));
     establish_sessions(&alice_mgr2, &bob_mgr2, &alice, &bob).await;
-
-    // Encrypt with the second session (bob_mgr can't decrypt this)
-    let ratchet_msg = alice_mgr2
+    let stale = alice_mgr2
         .encrypt(bob.node_id(), b"stale message")
         .await
         .unwrap();
-    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
-
-    let envelope = make_envelope(
+    let stale_envelope = make_envelope(
         alice.as_ref(),
         *bob.node_id(),
         konsensus_core::kind::KIND_CHAT,
-        ciphertext,
+        konsensus_crypto::ratchet_message_to_bytes(&stale),
     );
     let sender = *alice.node_id();
 
-    // Before: session exists
+    assert!(bob_mgr.has_session(alice.node_id()).await);
+    let below_budget = konsensus_crypto::DECRYPT_FAILURE_BUDGET - 1;
+    for _ in 0..below_budget {
+        let result = harness.run(&stale_envelope, &sender).await;
+        assert!(result.is_none());
+        assert!(bob_mgr.has_session(alice.node_id()).await);
+    }
+
+    let good = alice_mgr
+        .encrypt(bob.node_id(), b"still here")
+        .await
+        .unwrap();
+    let good_envelope = make_envelope(
+        alice.as_ref(),
+        *bob.node_id(),
+        konsensus_core::kind::KIND_CHAT,
+        konsensus_crypto::ratchet_message_to_bytes(&good),
+    );
+    let plaintext = harness.run(&good_envelope, &sender).await;
+    assert_eq!(plaintext.as_deref(), Some("still here"));
+
+    // A retransmission of the message just decrypted does not count.
+    let replay = harness.run(&good_envelope, &sender).await;
+    assert!(replay.is_none());
     assert!(bob_mgr.has_session(alice.node_id()).await);
 
-    let result = decrypt_and_process(
-        &envelope,
-        &sender,
-        &bob_mgr,
-        &plaintext_cipher,
-        &storage,
-        &None,
-        &Default::default(),
-        &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
-        &(Arc::new(konsensus_pricing::StaticPricingEngine::new(
-            Default::default(),
-        )) as Arc<dyn konsensus_core::traits::pricing::PricingEngine>),
-        &bob,
-        &transport,
-        &audit,
-        &PaymentGate::new(),
-        0.0,
-    )
-    .await;
+    for _ in 0..below_budget {
+        assert!(harness.run(&stale_envelope, &sender).await.is_none());
+        assert!(bob_mgr.has_session(alice.node_id()).await);
+    }
 
-    // Decryption failed → returns None
-    assert!(result.is_none());
-    // Session should be removed for re-negotiation
-    assert!(!bob_mgr.has_session(alice.node_id()).await);
+    assert!(harness.run(&stale_envelope, &sender).await.is_none());
+    assert!(
+        !bob_mgr.has_session(alice.node_id()).await,
+        "the per-peer budget should remove the session and re-offer prekeys"
+    );
 }
-
-// ── Non-UTF8 plaintext ──────────────────────────────────────────────
 
 #[tokio::test]
 async fn decrypt_non_utf8_returns_none() {

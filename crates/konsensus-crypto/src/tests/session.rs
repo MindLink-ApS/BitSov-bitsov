@@ -770,3 +770,84 @@ async fn decrypt_without_session_fails() {
     let result = mgr_a.decrypt(&node_b, &fake_msg).await;
     assert!(matches!(result, Err(SessionError::NoSession(_))));
 }
+
+#[tokio::test]
+async fn accept_rejects_missing_one_time_prekey_without_creating_a_session() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_a = *id_a.node_id();
+    let node_b = *id_b.node_id();
+    let mgr_a = SessionManager::new(id_a);
+    let mgr_b = SessionManager::new(id_b);
+
+    let bundle = mgr_b.prekey_bundle().await;
+    let mut init = mgr_a.initiate_session(&node_b, &bundle).await.unwrap();
+    let real_opk = init.one_time_prekey_id;
+    init.one_time_prekey_id = Some(u32::MAX);
+
+    let err = mgr_b.accept_session(&node_a, &init).await.unwrap_err();
+    assert!(matches!(err, SessionError::InvalidPeerData(_)));
+    assert!(!mgr_b.has_session(&node_a).await);
+    assert!(mgr_b.one_time_prekey_available(real_opk.unwrap()).await);
+
+    init.one_time_prekey_id = real_opk;
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_b.is_repeat_session_init(&node_a, &init).await);
+}
+
+#[tokio::test]
+async fn accepted_init_fingerprint_survives_restore() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_a = *id_a.node_id();
+    let node_b = *id_b.node_id();
+    let store = MemorySessionStore::new();
+
+    let mgr_a = SessionManager::new(id_a);
+    let mgr_b =
+        SessionManager::with_store(Arc::clone(&id_b), store.clone() as Arc<dyn SessionStore>);
+    let bundle = mgr_b.prekey_bundle().await;
+    let init = mgr_a.initiate_session(&node_b, &bundle).await.unwrap();
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_b.is_repeat_session_init(&node_a, &init).await);
+
+    let restored = SessionManager::with_store(id_b, store);
+    assert_eq!(restored.restore_sessions().await, 1);
+    assert!(restored.is_repeat_session_init(&node_a, &init).await);
+    let msg = mgr_a.encrypt(&node_b, b"after-restore").await.unwrap();
+    assert_eq!(
+        restored.decrypt(&node_a, &msg).await.unwrap(),
+        b"after-restore"
+    );
+}
+
+#[test]
+fn persisted_session_reads_legacy_ratchet_json() {
+    let shared = [7u8; 32];
+    let spk = crate::x3dh::SignedPreKey::generate();
+    let alice =
+        crate::double_ratchet::DoubleRatchet::init_sender(&shared, &spk.public, b"ad".to_vec())
+            .unwrap();
+    let json = serde_json::to_vec(&alice.export_state()).unwrap();
+    let persisted: super::PersistedSession = serde_json::from_slice(&json).unwrap();
+    assert!(persisted.init_fingerprint.is_none());
+    assert!(!persisted.ack_handled);
+    assert!(persisted.ratchet_init_hash.is_none());
+    assert!(persisted.ratchet_init_payload.is_none());
+    let restored = crate::double_ratchet::DoubleRatchet::from_state(&persisted.ratchet);
+    assert!(restored.can_send());
+}
+
+#[tokio::test]
+async fn decrypt_failure_budget_trips_then_resets() {
+    let mgr = SessionManager::new(make_identity(TEST_MNEMONIC_A));
+    let peer = NodeId::from_bytes([1u8; 32]);
+    for _ in 1..DECRYPT_FAILURE_BUDGET {
+        assert!(!mgr.record_decrypt_failure(&peer).await);
+    }
+    assert!(mgr.record_decrypt_failure(&peer).await);
+    assert!(
+        !mgr.record_decrypt_failure(&peer).await,
+        "tripping the budget resets the counter"
+    );
+}
