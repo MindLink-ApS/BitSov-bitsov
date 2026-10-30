@@ -13,6 +13,8 @@
 //! Read-modify-write is serialised by one process-wide async lock; the
 //! backing store is one node's database.
 
+pub mod devices;
+
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -37,7 +39,7 @@ fn lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -410,8 +412,25 @@ pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind:
     signal.check_leg(peer, own)?;
     let _g = lock().lock().await;
     let now = now_ms();
+    admit_locked(store, peer, kind, &signal, now, now).await?;
+    Ok(signal)
+}
+
+async fn admit_locked(store: Store<'_>, peer: &NodeId, kind: u16, signal: &CallSignal, now: u64, arrived: u64) -> Result<(), CallRefusal> {
     let unavailable = |_| CallRefusal::Invalid("call state unavailable");
-    let entry = current(store, peer, &signal.call_id, now).await.map_err(unavailable)?;
+    let raw = store.call_get(peer, &signal.call_id).await.map_err(unavailable)?;
+    let entry = raw.clone().and_then(|e| e.at(now));
+    if kind == konsensus_core::kind::KIND_CALL_HANGUP {
+        // A device wait past its deadline can still be rung by a stream write
+        // armed before it, or by retained delivery evidence. A cancellation
+        // must end that wait durably first, even when the hangup itself is
+        // refused as late (Codex FAIL on #472).
+        if let (Some(raw), Some(aged)) = (&raw, &entry) {
+            if raw.side == rules::Side::Callee && raw.phase == rules::Phase::AwaitingDevice && aged.phase == rules::Phase::Ended {
+                write(store, peer, &signal.call_id, Some(aged)).await.map_err(unavailable)?;
+            }
+        }
+    }
     // Only an offer opens a new call id; an unknown-id answer/ICE/hangup is
     // refused below and must never make room by evicting a burned id (Fable R2).
     if entry.is_none() && kind == konsensus_core::kind::KIND_CALL_INVITE {
@@ -420,16 +439,19 @@ pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind:
     let next = if kind == konsensus_core::kind::KIND_CALL_BLOCK {
         return Err(CallRefusal::Invalid("call blocks require invoice-bound admission"));
     } else {
-        rules::receive(entry, kind, signal.reason, now)?
+        // The device wait runs from arrival, not from when admission got the lock.
+        let transition_time = if kind == konsensus_core::kind::KIND_CALL_INVITE { arrived } else { now };
+        rules::receive(entry, kind, signal.reason, transition_time)?
     };
     write(store, peer, &signal.call_id, Some(&next)).await.map_err(unavailable)?;
-    Ok(signal)
+    Ok(())
 }
 
 fn refused(e: CallRefusal, new_operation: bool) -> ApiError {
     let reason = match e {
         CallRefusal::Replayed => "call_id_used",
         CallRefusal::Full => "call_busy",
+        CallRefusal::NotReachable => "call_not_reachable",
         CallRefusal::InFlight => "call_signal_in_flight",
         CallRefusal::Invalid(_) | CallRefusal::NotCallKind => "call_signal_invalid",
         _ => "call_not_live",
@@ -637,6 +659,7 @@ pub(crate) async fn release_abandoned(store: Store<'_>, operation_id: &str) -> R
 /// operation journal. Ambiguous ones stay for a same-operation retry. Run
 /// before the receive loop and the outbox resend start.
 pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_storage::StorageError> {
+    recover_devices(store).await?;
     let (mut committed, mut released) = (0, 0);
     for (peer, call_id, entry) in store.call_pending().await? {
         let Some(p) = entry.pending.clone() else { continue };
@@ -654,6 +677,25 @@ pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_stora
         }
     }
     Ok((committed, released))
+}
+
+/// Startup prerequisite before serving devices or receiving peer messages.
+/// A failure must prevent startup: volatile bindings cannot recover pending
+/// receipt outcomes by an ordinary same-operation retry.
+pub async fn recover_devices(store: Store<'_>) -> Result<(), konsensus_storage::StorageError> {
+    while store.call_invite_recover(10_000).await? != 0 {}
+    // Device bindings are intentionally volatile. On restart, fail closed
+    // rather than attach a historical envelope to an awaiting call id.
+    let _guard = lock().lock().await;
+    loop {
+        let rows = store.call_awaiting().await?;
+        if rows.is_empty() { break; }
+        for (peer, id, row) in rows {
+            let ended = CallEntry { phase: rules::Phase::Ended, deadline_ms: row.deadline_ms.saturating_add(rules::TOMBSTONE_MS), ..row };
+            store.call_put(&peer, &id, &ended).await?;
+        }
+    }
+    Ok(())
 }
 
 /// How long an incoming signal may stay held by a live handler before the
@@ -824,6 +866,44 @@ pub async fn receive_block_grant(store: Store<'_>, cipher: &konsensus_crypto::Pl
         next_block_seq: seq.saturating_add(1), deadline_ms: paid_until_ms.saturating_add(rules::CALL_BLOCK_GRACE_MS),
         pending, end_reason: None, unpaid_notice_used: false, ..entry };
     store.call_put(peer, &call_id, &next).await
+}
+
+/// The callee answered our dispatched invite `id` with `call_not_reachable`:
+/// no paired device took it, so the call can never ring. End our still-ringing
+/// caller row, so the reservation sweep releases the call's unused hold now
+/// rather than at the ringing deadline. Returns whether a call was ended.
+pub async fn end_unreachable_invite(store: Store<'_>, own: &NodeId, peer: &NodeId,
+    id: &konsensus_core::MessageId,
+) -> Result<bool, konsensus_storage::StorageError> {
+    let Some(envelope) = store.get_message(id).await? else { return Ok(false) };
+    if envelope.kind != konsensus_core::kind::KIND_CALL_INVITE || envelope.sender != *own
+        || envelope.recipient != konsensus_core::Recipient::Node(*peer) { return Ok(false); }
+    // Our own offer is ratchet-encrypted to the peer; its call id comes from
+    // the binding recorded when it was drafted.
+    let Some(op) = store.get_outbox_operation_by_message(id).await? else { return Ok(false) };
+    let Some(call_id) = crate::handlers::messages::operations::call_invite_binding(&op)? else { return Ok(false) };
+    // Bind to this offer's generation, not the operation's age: every draft
+    // replaces the operation's message id, so only a refusal of its current
+    // offer finds it. A delayed retry or settlement keeps the generation; a
+    // refusal of an earlier draft can never end the call a newer one rings.
+    if op.message_id.as_deref() != Some(id.to_hex().as_str()) { return Ok(false); }
+    let _guard = lock().lock().await;
+    let now = now_ms();
+    let Some(entry) = current(store, peer, &call_id, now).await? else { return Ok(false) };
+    // A pending cancellation keeps its reservation mark (its own commit or
+    // release still resolves it) but cannot keep an unreachable call ringing.
+    if entry.side != rules::Side::Caller || entry.phase != rules::Phase::Ringing {
+        return Ok(false);
+    }
+    // The ringing lifecycle must be this offer's: a reused call id rebinds
+    // its row to the newer offer, so an older offer's refusal stops here.
+    if store.call_offer(peer, &call_id).await? != Some(*id) {
+        return Ok(false);
+    }
+    let ended = CallEntry { phase: rules::Phase::Ended, end_reason: Some(rules::HangupReason::Timeout),
+        deadline_ms: now.saturating_add(rules::TOMBSTONE_MS), ..entry };
+    write(store, peer, &call_id, Some(&ended)).await?;
+    Ok(true)
 }
 
 async fn cached_call_block_binding(store: Store<'_>, cipher: &konsensus_crypto::PlaintextCacheCipher,

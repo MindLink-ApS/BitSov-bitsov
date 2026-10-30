@@ -142,6 +142,9 @@ pub struct AppState {
     /// Messages include decrypted plaintext when E2EE session is available.
     pub ws_broadcast: broadcast::Sender<Arc<WsMessage>>,
 
+    /// Callee invite waits, shared by receive, paired fetch and stream delivery.
+    pub call_devices: Arc<crate::calls::devices::Devices>,
+
     /// Broadcast channel for delivery status updates (ack/reject).
     ///
     /// Separate from `ws_broadcast` to avoid changing the existing message

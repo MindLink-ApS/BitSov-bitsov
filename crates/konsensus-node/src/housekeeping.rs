@@ -54,11 +54,6 @@ pub(crate) async fn run_nonce_cleanup(
         tokio::select! {
             _ = tokio::time::sleep(cleanup_interval) => {
                 sweep_outstanding_web_requests(storage.as_ref()).await;
-                // Call ids whose replay protection ended (never one still pending).
-                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-                if let Err(e) = storage.call_sweep(now_ms, 10_000).await {
-                    warn!(error = %e, "call state sweep failed");
-                }
                 // Held call signals whose handler never finished: fail closed.
                 if let Err(e) = konsensus_api::calls::withdraw_held(storage.as_ref(), false).await {
                     warn!(error = %e, "held call signal sweep failed; they stay invisible");
@@ -77,6 +72,41 @@ pub(crate) async fn run_nonce_cleanup(
                 debug!("nonce cleanup task shutting down");
                 break;
             }
+        }
+    }
+}
+
+/// Sweep device waits and call replay tombstones together. Control replies use
+/// the transport's bounded writer, independently of inbox requests.
+pub(crate) async fn run_call_cleanup(
+    storage: Arc<dyn konsensus_storage::Storage>,
+    devices: Arc<konsensus_api::calls::devices::Devices>,
+    transport: Arc<NoiseTransport>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next_tombstone_sweep = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let now_ms = konsensus_api::calls::now_ms();
+                match devices.sweep(storage.as_ref(), now_ms).await {
+                    Ok(notices) => for (peer, frame) in notices {
+                        if let Err(e) = transport.enqueue_control_frame(&peer, &frame).await {
+                            debug!(peer = %peer, error = %e, "call refusal could not be queued");
+                        }
+                    },
+                    Err(e) => warn!(error = %e, "call device sweep failed"),
+                }
+                if tokio::time::Instant::now() >= next_tombstone_sweep {
+                    next_tombstone_sweep = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+                    if let Err(e) = storage.call_sweep(now_ms, 10_000).await {
+                        warn!(error = %e, "call state sweep failed");
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => break,
         }
     }
 }

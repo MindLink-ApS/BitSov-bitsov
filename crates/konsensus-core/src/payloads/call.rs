@@ -14,8 +14,41 @@ pub const CALL_SIGNAL_VERSION: u8 = 1;
 pub const MAX_SDP_BYTES: usize = 16 * 1024;
 /// Largest single ICE candidate line.
 pub const MAX_CANDIDATE_BYTES: usize = 1024;
+/// How long a callee waits for a paired device to take an invite.
+pub const DEVICE_WAIT_MS: u64 = 15_000;
 /// How long an unanswered offer rings.
 pub const RING_TIMEOUT_MS: u64 = 60_000;
+/// Oldest offer (by its envelope timestamp, on the callee's clock) a callee
+/// still rings: covers payment, routing and resend delay.
+pub const INVITE_MAX_AGE_MS: u64 = 30_000;
+/// Clock difference between two nodes the call timing tolerates.
+pub const CALL_CLOCK_SKEW_MS: u64 = 15_000;
+/// Allowance for the callee's answer to reach the caller.
+pub const ANSWER_TRANSIT_MS: u64 = 15_000;
+/// Longest device stream write. One armed before the device deadline still
+/// counts as delivery and rings from its completion, at most this late.
+pub const DEVICE_WRITE_TIMEOUT_MS: u64 = 2_000;
+/// The caller's answer window from payment. A callee rings an offer only if
+/// it arrives within [`INVITE_MAX_AGE_MS`] of the offer's timestamp (taken no
+/// later than payment, never renewed), waits at most [`DEVICE_WAIT_MS`] for a
+/// device (whose stream write may finish up to [`DEVICE_WRITE_TIMEOUT_MS`]
+/// later), then rings for [`RING_TIMEOUT_MS`]; its last answer still needs
+/// transit and may be off by the clock skew. So every answer the callee may
+/// send in its window reaches the caller inside this one.
+pub const CALLER_ANSWER_WINDOW_MS: u64 = INVITE_MAX_AGE_MS
+    + CALL_CLOCK_SKEW_MS
+    + DEVICE_WAIT_MS
+    + DEVICE_WRITE_TIMEOUT_MS
+    + RING_TIMEOUT_MS
+    + ANSWER_TRANSIT_MS;
+
+/// Whether a callee may still ring an offer stamped `offer_ms` that arrived at
+/// `arrived_ms` (callee clock): not older than [`INVITE_MAX_AGE_MS`], and not
+/// from further in the future than the tolerated skew.
+pub fn invite_fresh(offer_ms: u64, arrived_ms: u64) -> bool {
+    arrived_ms <= offer_ms.saturating_add(INVITE_MAX_AGE_MS)
+        && offer_ms <= arrived_ms.saturating_add(CALL_CLOCK_SKEW_MS)
+}
 /// Length of a paid media interval.
 pub const CALL_BLOCK_MS: u64 = 60_000;
 /// Renewal is due this long before the paid interval ends.
@@ -174,6 +207,9 @@ pub enum CallRefusal {
     Sequence,
     #[error("call block is not due yet")]
     NotDue,
+    /// The callee cannot ring this offer inside the caller's answer window.
+    #[error("call_not_reachable")]
+    NotReachable,
 }
 
 fn is_lower_hex(id: &str, len: usize) -> bool {
@@ -276,6 +312,8 @@ impl Side {
 pub enum Phase {
     /// Our offer is reserved but not yet paid: nobody has been rung.
     Reserved,
+    /// An incoming offer has not yet reached one of our devices.
+    AwaitingDevice,
     Ringing,
     Live,
     Ended,
@@ -283,11 +321,12 @@ pub enum Phase {
 
 impl Phase {
     pub fn as_str(self) -> &'static str {
-        match self { Phase::Reserved => "reserved", Phase::Ringing => "ringing", Phase::Live => "live", Phase::Ended => "ended" }
+        match self { Phase::Reserved => "reserved", Phase::AwaitingDevice => "awaiting_device", Phase::Ringing => "ringing", Phase::Live => "live", Phase::Ended => "ended" }
     }
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "reserved" => Some(Phase::Reserved),
+            "awaiting_device" => Some(Phase::AwaitingDevice),
             "ringing" => Some(Phase::Ringing),
             "live" => Some(Phase::Live),
             "ended" => Some(Phase::Ended),
@@ -383,8 +422,21 @@ impl CallEntry {
         }
     }
 
+    /// First device delivery anchors only the callee's ring deadline. Age the
+    /// row first so late delivery can never revive an expired call.
+    pub fn device_fetched(self, now_ms: u64) -> Option<Self> {
+        self.at(now_ms).map(|e| match (e.side, e.phase) {
+            (Side::Callee, Phase::AwaitingDevice) => Self {
+                phase: Phase::Ringing,
+                deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS),
+                ..e
+            },
+            _ => e,
+        })
+    }
+
     fn open(&self) -> bool {
-        matches!(self.phase, Phase::Ringing | Phase::Live)
+        matches!(self.phase, Phase::AwaitingDevice | Phase::Ringing | Phase::Live)
     }
 }
 
@@ -430,7 +482,9 @@ pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> Result<CallE
     };
     let cleared = CallEntry { pending: None, ..entry };
     Ok(match (p.kind, cleared.phase) {
-        (KIND_CALL_INVITE, Phase::Reserved) => CallEntry { phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), ..cleared },
+        // Outlast every answer the callee may send inside its own window,
+        // including routing, its device wait, transit and clock skew.
+        (KIND_CALL_INVITE, Phase::Reserved) => CallEntry { phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(CALLER_ANSWER_WINDOW_MS), ..cleared },
         (KIND_CALL_ANSWER, Phase::Ringing) => cleared.answered(now_ms),
         (KIND_CALL_BLOCK, _) => {
             // The callee decides whether a paid interval can still be served.
@@ -457,7 +511,7 @@ pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> Result<CallE
             // A notice reserved before a late block must never end the resumed interval.
             CallEntry { unpaid_notice_used: false, ..cleared }
         },
-        (KIND_CALL_HANGUP, Phase::Ringing | Phase::Live | Phase::Reserved) => {
+        (KIND_CALL_HANGUP, Phase::AwaitingDevice | Phase::Ringing | Phase::Live | Phase::Reserved) => {
             CallEntry { phase: Phase::Ended, deadline_ms: now_ms.saturating_add(TOMBSTONE_MS), ..cleared }
         }
         _ => cleared,
@@ -485,14 +539,14 @@ pub fn release(entry: CallEntry, operation_id: &str) -> Option<CallEntry> {
 pub fn receive(entry: Option<CallEntry>, kind: u16, reason: Option<HangupReason>, now_ms: u64) -> Result<CallEntry, CallRefusal> {
     match kind {
         KIND_CALL_INVITE => match entry {
-            None => Ok(CallEntry { side: Side::Callee, phase: Phase::Ringing, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false }),
+            None => Ok(CallEntry { side: Side::Callee, phase: Phase::AwaitingDevice, deadline_ms: now_ms.saturating_add(DEVICE_WAIT_MS), pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false }),
             Some(_) => Err(CallRefusal::Replayed),
         },
         KIND_CALL_ANSWER => {
             let e = entry.ok_or(CallRefusal::UnknownCall)?;
             match (e.phase, e.side) {
                 // A reserved offer was never paid: nobody can answer it.
-                (Phase::Reserved | Phase::Ended, _) => Err(CallRefusal::UnknownCall),
+                (Phase::Reserved | Phase::AwaitingDevice | Phase::Ended, _) => Err(CallRefusal::UnknownCall),
                 (Phase::Ringing, Side::Caller) => Ok(e.answered(now_ms)),
                 (Phase::Ringing, Side::Callee) => Err(CallRefusal::WrongSide),
                 (Phase::Live, _) => Err(CallRefusal::NotRinging),
@@ -693,6 +747,79 @@ mod tests {
     const ID: &str = "0123456789abcdef0123456789abcdef";
 
     #[test]
+    fn an_unfetched_invite_ends_after_fifteen_seconds_without_ringing() {
+        let entry = receive(None, 400, None, 1_000).unwrap();
+        assert_eq!(entry.phase.as_str(), "awaiting_device");
+        assert_eq!(entry.deadline_ms, 16_000);
+        assert_eq!(entry.clone().at(15_999).unwrap().phase.as_str(), "awaiting_device");
+        assert_eq!(entry.at(16_000).unwrap().phase, Phase::Ended);
+    }
+
+    #[test]
+    fn first_device_gets_sixty_seconds_and_second_device_does_not_reset_it() {
+        let entry = receive(None, 400, None, 1_000).unwrap().device_fetched(11_000).unwrap();
+        assert_eq!((entry.phase, entry.deadline_ms), (Phase::Ringing, 71_000));
+        assert_eq!(entry.clone().device_fetched(15_000), Some(entry.clone()));
+        assert_eq!(entry.clone().at(70_999).unwrap().phase, Phase::Ringing);
+        assert_eq!(entry.at(71_000).unwrap().phase, Phase::Ended);
+    }
+
+    #[test]
+    fn late_device_fetch_never_revives_an_awaiting_row() {
+        for now in [16_000, 16_001, 16_000 + TOMBSTONE_MS + 1] {
+            let entry = receive(None, 400, None, 1_000).unwrap().device_fetched(now);
+            assert!(entry.is_none_or(|e| e.phase == Phase::Ended));
+        }
+    }
+
+    #[test]
+    fn awaiting_device_accepts_paid_ice_and_hangup() {
+        let entry = receive(None, 400, None, 1_000).unwrap();
+        assert_eq!(receive(Some(entry.clone()), 402, None, 2_000).unwrap(), entry);
+        assert_eq!(receive(Some(entry.clone()), 403, Some(HangupReason::Hangup), 2_000).unwrap().phase, Phase::Ended);
+        assert!(reserve(Some(entry.clone()), 402, "ice", "h", 2_000).is_ok());
+        let pending = reserve(Some(entry), 403, "hangup", "h", 2_000).unwrap();
+        assert_eq!(commit(pending, "hangup", 2_001).unwrap().phase, Phase::Ended);
+    }
+
+    #[test]
+    fn caller_deadline_starts_at_payment_and_outlasts_the_device_wait() {
+        let entry = commit(reserve(None, 400, "offer", "h", 1_000).unwrap(), "offer", 2_000).unwrap();
+        assert_eq!((entry.phase, entry.deadline_ms), (Phase::Ringing, 2_000 + CALLER_ANSWER_WINDOW_MS));
+        assert_eq!(entry.clone().device_fetched(11_000), Some(entry.clone()));
+    }
+
+    /// Two nodes, worst case: the offer is stamped before payment, arrives as
+    /// late as the callee accepts on a callee clock running behind by the full
+    /// skew, a device takes it at the end of the wait, and the callee answers
+    /// at the end of its ring window. The answer, after transit, still finds
+    /// the caller ringing; one the callee could not send in time is refused.
+    #[test]
+    fn caller_window_covers_every_answer_inside_the_callee_window() {
+        let offer_ms = 1_000;
+        let paid_ms = offer_ms; // the offer is stamped no later than payment
+        let caller = commit(reserve(None, 400, "offer", "h", offer_ms).unwrap(), "offer", paid_ms).unwrap();
+        // Real time = caller clock; the callee's clock is behind by the skew.
+        let skew = CALL_CLOCK_SKEW_MS;
+        let arrived_local = offer_ms + INVITE_MAX_AGE_MS;
+        assert!(invite_fresh(offer_ms, arrived_local));
+        assert!(!invite_fresh(offer_ms, arrived_local + 1), "an older offer is refused");
+        assert!(!invite_fresh(arrived_local + skew + 1, arrived_local), "a future offer beyond the skew is refused");
+        let callee = receive(None, 400, None, arrived_local).unwrap();
+        // A stream write armed at the last moment of the wait completes as
+        // late as the write timeout allows and rings from its completion.
+        let written_local = callee.deadline_ms - 1 + DEVICE_WRITE_TIMEOUT_MS;
+        let ringing = CallEntry { deadline_ms: written_local + RING_TIMEOUT_MS, ..callee.clone().device_fetched(callee.deadline_ms - 1).unwrap() };
+        let answered_local = ringing.deadline_ms - 1;
+        assert_eq!(ringing.clone().at(answered_local).unwrap().phase, Phase::Ringing, "callee may still answer");
+        let answer_reaches_caller = answered_local + skew + ANSWER_TRANSIT_MS;
+        let live = receive(Some(caller.clone().at(answer_reaches_caller).unwrap()), 401, None, answer_reaches_caller).unwrap();
+        assert_eq!(live.phase, Phase::Live);
+        // Tight, not unbounded: only the two "last moment" milliseconds spare.
+        assert_eq!(caller.deadline_ms - answer_reaches_caller, 2);
+    }
+
+    #[test]
     fn each_kind_carries_only_its_own_fields() {
         let offer = CallSignal::parse(400, &format!(r#"{{"v":1,"call_id":"{ID}","media":"audio","sdp":"v=0"}}"#)).unwrap();
         assert_eq!(offer.media, Some(CallMedia::Audio));
@@ -780,7 +907,7 @@ mod tests {
 
     #[test]
     fn our_answer_and_hangup_change_state_only_when_paid() {
-        let ringing = receive(None, 400, None, 0).unwrap();
+        let ringing = receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap();
         assert_eq!(reserve(Some(ringing.clone()), 401, "a", "h", 1).unwrap().phase, Phase::Ringing, "reserved, not yet live");
         let pending = reserve(Some(ringing.clone()), 401, "a", "h", 1).unwrap();
         // A second signal while the answer is being paid waits.
@@ -815,7 +942,7 @@ mod tests {
         assert!(ended.clone().at(2 + TOMBSTONE_MS - 1).is_some());
         assert!(ended.at(2 + TOMBSTONE_MS).is_none());
         // Unanswered: stops ringing at the deadline, id stays burned a day after.
-        let r = receive(None, 400, None, 0).unwrap();
+        let r = receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap();
         let late = r.at(RING_TIMEOUT_MS).unwrap();
         assert_eq!((late.phase, late.deadline_ms), (Phase::Ended, RING_TIMEOUT_MS + TOMBSTONE_MS));
         assert_eq!(receive(Some(late.clone()), 401, None, RING_TIMEOUT_MS), Err(CallRefusal::UnknownCall));

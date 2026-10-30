@@ -1063,7 +1063,7 @@ async fn send_prekey_offer(
 /// Wire reasons are the gate's stable Display prefixes; unknown reasons stay
 /// retryable so older peers and temporary gate failures cannot burn delivery.
 fn terminal_paid_rejection(reason: &str) -> bool {
-    if reason == "call_block_overpayment" { return true; }
+    if matches!(reason, "call_block_overpayment" | konsensus_api::calls::devices::NOT_REACHABLE) { return true; }
     [
         "payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:",
         "room_binding_invalid:", "room_sender_not_member:", "room_recipient_not_member:",
@@ -1148,6 +1148,13 @@ async fn handle_delivery_confirmation(
         if !matches!(storage.reject_pending(id, peer, own_id, reason, terminal).await, Ok(true)) {
             if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
             return;
+        }
+        if reason == konsensus_api::calls::devices::NOT_REACHABLE {
+            // Validated refusal of our pending offer: the call can never ring.
+            // End it so its spend hold is released now, not at the deadline.
+            if let Err(e) = konsensus_api::calls::end_unreachable_invite(storage.as_ref(), own_id, peer, id).await {
+                warn!(error = %e, "unreachable call not ended; it expires at its ringing deadline");
+            }
         }
         timestamps.lock().await.remove(id);
         handle_message_rejected(peer, id, reason, routing, ws, privileged).await;

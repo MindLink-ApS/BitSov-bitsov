@@ -138,6 +138,7 @@ async fn start_node(identity: Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Node
         sensitive_identity_routes_enabled: false,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::mnemonic_reveal_default()),

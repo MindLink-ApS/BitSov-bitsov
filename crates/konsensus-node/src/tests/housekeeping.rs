@@ -646,3 +646,29 @@ async fn invoice_requests_cleanup_shuts_down_on_signal() {
         .expect("should finish within timeout")
         .expect("should not panic");
 }
+
+#[tokio::test]
+async fn call_cleanup_expires_an_unfetched_invite_and_shuts_down() {
+    use konsensus_api::calls::{devices::Devices, now_ms};
+    use konsensus_core::payloads::call::Phase;
+    let identity = Arc::new(konsensus_core::NodeIdentity::from_mnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "").unwrap());
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let devices = Arc::new(Devices::default());
+    let env = UkmEnvelopeBuilder::new(400, NodeId::from_bytes([41;32]), Recipient::Node(*identity.node_id()), vec![1], make_proof()).build();
+    let text = r#"{"v":1,"call_id":"0123456789abcdef0123456789abcdef","media":"audio","sdp":"v=0"}"#;
+    db.accept_paid_envelope(&env).await.unwrap();
+    let arrived = now_ms() - 15_000;
+    devices.admit(db.as_ref(), identity.node_id(), &env, Some(text), arrived, || arrived).await.unwrap();
+    let transport = Arc::new(NoiseTransport::new(identity, Default::default()));
+    let (shutdown, rx) = watch::channel(false);
+    let worker = tokio::spawn(run_call_cleanup(db.clone(), devices, transport, rx));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if db.call_get(&env.sender, "0123456789abcdef0123456789abcdef").await.unwrap().unwrap().phase == Phase::Ended { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("background cleanup must expire the device wait");
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker).await.unwrap().unwrap();
+}

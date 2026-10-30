@@ -29,6 +29,9 @@ struct Recovery {
     /// Call/sequence binding survives missing plaintext caches and recovery.
     #[serde(default)]
     call_block: Option<(String, u32)>,
+    /// Call id of an outgoing offer, so a terminal refusal can end the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    call_invite: Option<String>,
     caller: Option<String>,
     #[serde(default)]
     execution_id: Option<String>,
@@ -278,10 +281,19 @@ impl Operation {
         fee_ceiling: u64,
         admission_msat: u64,
         call_block: Option<(String, u32)>,
+        call_invite: Option<String>,
     ) -> Result<(), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
+        if let Some(call_id) = call_invite.as_deref() {
+            // Bind the call row to this exact offer before the operation names
+            // it, so only a refusal of the current offer can end the call
+            // (Codex FAIL on #472). A failed bind leaves the draft unrecorded.
+            let peer = NodeId::from_hex(&op.recipient).map_err(storage)?;
+            self.state.storage.call_offer_bind(&peer, call_id, &draft.id).await.map_err(storage)?;
+        }
         data.call_block = call_block;
+        data.call_invite = call_invite;
         op.message_id = Some(draft.id.to_hex());
         data.draft = Some(draft);
         data.expected_msat = expected_msat;
@@ -1720,6 +1732,11 @@ fn incomplete_settled_recovery(op: &OutboxOperation) -> bool {
 
 pub(crate) fn call_block_binding(op: &OutboxOperation) -> Result<Option<(String, u32)>, konsensus_storage::StorageError> {
     recovery(op).map(|r| r.call_block).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
+}
+
+/// Call id of a dispatched offer, recorded when it was drafted.
+pub(crate) fn call_invite_binding(op: &OutboxOperation) -> Result<Option<String>, konsensus_storage::StorageError> {
+    recovery(op).map(|r| r.call_invite).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
 }
 
 pub(crate) fn settled_call_block(op: &OutboxOperation) -> Result<bool, konsensus_storage::StorageError> {

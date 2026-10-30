@@ -316,6 +316,7 @@ impl App {
             sensitive_identity_routes_enabled: true,
             has_identity_passphrase: false,
             ws_broadcast: tokio::sync::broadcast::channel(16).0,
+            call_devices: Default::default(),
             ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
             rate_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::new(100)),
             mnemonic_reveal_limiter: Arc::new(
@@ -430,6 +431,7 @@ impl App {
                 plaintext_cipher: Arc::new(konsensus_crypto::PlaintextCacheCipher::new(
                     identity.aes_key(),
                 )),
+                call_devices: state.call_devices.clone(),
                 ws_tx: state.ws_broadcast.clone(),
                 audit_log: state.audit_log.clone(),
                 admission_mode: ReachabilityMode::PriceOpen,

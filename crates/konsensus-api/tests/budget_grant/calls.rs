@@ -428,7 +428,7 @@ async fn slow_liquidity_query_does_not_block_another_calls_transitions() {
     fx.wallet.pause_capacity.store(true, Ordering::SeqCst);
     let peer = NodeId::from_bytes([8; 32]);
     let now = chrono::Utc::now().timestamp_millis() as u64;
-    let entry = rules::receive(None, 400, None, now).unwrap();
+    let entry = rules::receive(None, 400, None, now).unwrap().device_fetched(now).unwrap();
     let entry = rules::commit(
         rules::reserve(Some(entry), 401, "answer", "hash", now).unwrap(),
         "answer",
@@ -537,7 +537,7 @@ async fn broken_hold_cleanup_preserves_paid_response_and_other_expiry_notificati
     fx.state.storage.call_put(&fx.peer, other, &ended).await.unwrap();
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let notification_id = "bbbbbbbb222243338444555555555555";
-    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap();
+    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap().device_fetched(now - 31_000).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", now - 31_000).unwrap();
     let live = rules::commit(pending, "answer", now - 31_000).unwrap();
     fx.state.storage.call_put(&fx.peer, notification_id, &live).await.unwrap();
@@ -665,3 +665,110 @@ async fn recovered_failure_cannot_repay_when_call_cleanup_write_fails() {
 mod consent;
 #[path = "calls_settlement.rs"]
 mod settlement;
+
+/// Codex FAIL on #472: a `call_not_reachable` refusal ends the caller's ringing
+/// call so its unused whole-call hold is released at once, not at the ringing
+/// deadline. The offer itself stays paid (unchanged admission rule).
+#[tokio::test]
+async fn unreachable_invite_ends_the_call_and_releases_its_hold() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.used(), 421_000);
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let ringing = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!(ringing.phase, Phase::Ringing);
+    assert!(konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    let ended = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!((ended.phase, ended.end_reason), (Phase::Ended, Some(HangupReason::Timeout)));
+    konsensus_api::calls::reconcile_call_spend(&fx.state, chrono::Utc::now().timestamp_millis() as u64)
+        .await
+        .unwrap();
+    assert_eq!(fx.used(), 1_000, "only the paid offer remains");
+    // Another peer, or a second refusal, cannot end anything else.
+    assert!(!konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+}
+
+
+/// Codex FAIL on #472 (round 2): a pending cancellation must not keep an
+/// unreachable call ringing with its hold.
+#[tokio::test]
+async fn unreachable_invite_ends_the_call_even_with_a_pending_cancellation() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let mut ringing = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    ringing.pending = Some(konsensus_core::payloads::call::Pending {
+        operation_id: "cancel".into(), kind: konsensus_core::kind::KIND_CALL_HANGUP, request_hash: "h".into(),
+    });
+    fx.state.storage.call_put(&fx.peer, CALL, &ringing).await.unwrap();
+    assert!(konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    let ended = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!(ended.phase, Phase::Ended);
+    assert!(ended.pending.is_some(), "the cancellation's own mark is kept for its commit/release");
+}
+
+/// A stale refusal for an old offer never ends a newer call: the offer must be
+/// recent enough to be the one now ringing.
+#[tokio::test]
+async fn stale_unreachable_refusal_cannot_end_a_newer_call() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", fx.tmp.path().join("calls.sqlite").display()))
+        .await
+        .unwrap();
+    // A newer draft of the operation replaced this offer: its refusal is stale.
+    let newer = konsensus_core::MessageId::from_hex(&"ab".repeat(32)).unwrap();
+    sqlx::query("UPDATE outbox_operations SET message_id = ? WHERE message_id = ?")
+        .bind(newer.to_hex()).bind(offer.to_hex()).execute(&db).await.unwrap();
+    assert!(!konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    assert_eq!(fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap().phase, Phase::Ringing);
+}
+
+#[tokio::test]
+async fn delayed_operation_refusal_still_ends_its_current_call() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", fx.tmp.path().join("calls.sqlite").display()))
+        .await
+        .unwrap();
+    // A retry or late settlement long after the operation was created still
+    // dispatches this offer; operation age never voids its refusal.
+    sqlx::query("UPDATE outbox_operations SET created_at = 0 WHERE message_id = ?")
+        .bind(offer.to_hex()).execute(&db).await.unwrap();
+    assert!(konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    let ended = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!((ended.phase, ended.end_reason), (Phase::Ended, Some(HangupReason::Timeout)));
+}
+
+#[tokio::test]
+async fn refusal_of_an_intact_older_operation_cannot_end_a_newer_offer() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    assert_eq!(fx.state.storage.call_offer(&fx.peer, CALL).await.unwrap(), Some(offer));
+    // A distinct, newer operation reuses the call id and binds its own offer;
+    // the older operation stays intact and still names its own offer.
+    let newer = konsensus_core::MessageId::from_hex(&"cd".repeat(32)).unwrap();
+    fx.state.storage.call_offer_bind(&fx.peer, CALL, &newer).await.unwrap();
+    assert!(!konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    assert_eq!(fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap().phase, Phase::Ringing);
+}

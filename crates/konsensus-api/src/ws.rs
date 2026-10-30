@@ -126,11 +126,32 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
                 match result {
                     Ok(ws_msg) => {
                         if !stream_authorized(&state, &claims) { break; }
+                        // A waiting invite's ticket holds off its expiry until this
+                        // write has finished and, if it completed, left its evidence.
+                        let mut ticket = if ws_msg.envelope.sender != *state.identity.node_id() {
+                            match state.call_devices.stream(state.storage.as_ref(), &ws_msg.envelope, ws_msg.plaintext.as_deref(), crate::calls::now_ms).await {
+                                Ok(Some(ticket)) => Some(ticket),
+                                Ok(None) => continue,
+                                Err(e) => { warn!(error = %e, "call state unavailable for device stream"); break; }
+                            }
+                        } else {
+                            None
+                        };
                         // Serialize WsMessage to JSON for the client
                         match serde_json::to_string(ws_msg.as_ref()) {
                             Ok(json) => {
-                                if socket.send(Message::Text(json)).await.is_err() {
+                                if !matches!(tokio::time::timeout(std::time::Duration::from_millis(konsensus_core::payloads::call::DEVICE_WRITE_TIMEOUT_MS), socket.send(Message::Text(json))).await, Ok(Ok(()))) {
                                     debug!("WebSocket client disconnected");
+                                    break;
+                                }
+                                if !stream_authorized(&state, &claims) { break; }
+                                let written_ms = crate::calls::now_ms();
+                                // Evidence first, then the transition: a failed or
+                                // delayed recording can no longer lose to expiry.
+                                if let Some(ticket) = ticket.as_mut() { ticket.written(written_ms); }
+                                drop(ticket);
+                                if let Err(e) = state.call_devices.fetched(state.storage.as_ref(), &ws_msg.envelope, || written_ms).await {
+                                    warn!(error = %e, "could not record call device delivery; the sweep reconciles it");
                                     break;
                                 }
                             }

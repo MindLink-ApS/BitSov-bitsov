@@ -125,6 +125,11 @@ impl UkmEnvelope {
             return Err(CoreError::EnvelopeValidation("cannot re-sign another sender's envelope".into()));
         }
         if now_ms.saturating_sub(self.timestamp) <= 240_000 { return Ok(false); }
+        // A call offer's timestamp is its generation's timing: the callee
+        // rings it only while fresh, and the caller's answer window assumes
+        // it never moves. A renewed stamp could reopen a call the caller has
+        // already let expire (Codex FAIL on #472).
+        if self.kind == crate::kind::KIND_CALL_INVITE { return Ok(false); }
         self.timestamp = now_ms;
         self.signature = Signature::from_ed25519(&identity.sign(&self.signable_bytes()));
         Ok(true)
@@ -308,6 +313,21 @@ mod tests {
         let preimage = [42u8; 32];
         let hash: [u8; 32] = Sha256::digest(preimage).into();
         PaymentProof::new(hash, preimage, 10)
+    }
+
+    #[test]
+    fn call_offer_timestamp_is_never_renewed_for_resend() {
+        let identity = crate::identity::NodeIdentity::from_seed(&[42; 64]).unwrap();
+        let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
+        let mut offer = UkmEnvelopeBuilder::new(crate::kind::KIND_CALL_INVITE, *identity.node_id(), recipient, vec![1], make_valid_proof())
+            .timestamp(1_000)
+            .build();
+        assert!(!offer.refresh_for_resend(&identity, 1_000 + 300_000).unwrap());
+        assert_eq!(offer.timestamp, 1_000, "the offer keeps its generation timing");
+        let mut chat = UkmEnvelopeBuilder::new(KIND_CHAT, *identity.node_id(), recipient, vec![1], make_valid_proof())
+            .timestamp(1_000)
+            .build();
+        assert!(chat.refresh_for_resend(&identity, 1_000 + 300_000).unwrap());
     }
 
     #[test]
