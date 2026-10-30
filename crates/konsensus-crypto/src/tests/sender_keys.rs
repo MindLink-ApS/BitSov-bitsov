@@ -634,3 +634,53 @@ fn aead_roundtrip_same_context_succeeds() {
     let ct = alice.encrypt(b"post-rotation").unwrap();
     assert_eq!(bob.decrypt(&alice_id, &ct).unwrap(), b"post-rotation");
 }
+
+#[test]
+fn skipped_keys_are_capped_across_all_senders_oldest_first() {
+    let group_id = test_group_id();
+    let (alice_id, carol_id, bob_id) = (make_node_id(1), make_node_id(3), make_node_id(2));
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let mut carol = GroupSession::new(group_id, carol_id);
+    let mut bob = GroupSession::new(group_id, bob_id);
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+    bob.process_distribution(&carol.our_distribution()).unwrap();
+
+    // Each sender emits 2,048 messages; Bob receives every 257th, so each
+    // delivery skips the per-sender maximum of 256 keys.
+    let send = |session: &mut GroupSession| -> Vec<GroupCiphertext> {
+        (0..2048)
+            .map(|i| session.encrypt(format!("m{i}").as_bytes()).unwrap())
+            .collect()
+    };
+    let (from_alice, from_carol) = (send(&mut alice), send(&mut carol));
+
+    // Alice's skips are the oldest; Carol's arrive afterwards.
+    for i in (256..2048).step_by(257) {
+        bob.decrypt(&alice_id, &from_alice[i]).unwrap();
+    }
+    for i in (256..2048).step_by(257) {
+        bob.decrypt(&carol_id, &from_carol[i]).unwrap();
+        assert!(bob.skipped_key_count() <= MAX_TOTAL_SKIPPED_KEYS);
+    }
+    assert_eq!(bob.skipped_key_count(), MAX_TOTAL_SKIPPED_KEYS);
+
+    // 7 deliveries x 256 skips per sender = 3,584 keys; the 1,584 oldest
+    // (all Alice's) are evicted and every key Carol skipped is still held.
+    assert!(bob.decrypt(&alice_id, &from_alice[0]).is_err());
+    assert_eq!(bob.decrypt(&carol_id, &from_carol[0]).unwrap(), b"m0");
+    assert_eq!(bob.decrypt(&carol_id, &from_carol[1797]).unwrap(), b"m1797");
+}
+
+#[test]
+fn removing_a_member_drops_its_skipped_keys() {
+    let group_id = test_group_id();
+    let (alice_id, bob_id) = (make_node_id(1), make_node_id(2));
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let mut bob = GroupSession::new(group_id, bob_id);
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+    let cts: Vec<_> = (0..11).map(|_| alice.encrypt(b"x").unwrap()).collect();
+    bob.decrypt(&alice_id, &cts[10]).unwrap();
+    assert_eq!(bob.skipped_key_count(), 10);
+    bob.remove_member(&alice_id);
+    assert_eq!(bob.skipped_key_count(), 0);
+}
