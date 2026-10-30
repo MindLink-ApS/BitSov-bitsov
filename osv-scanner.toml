@@ -93,3 +93,23 @@ reason = "Shared alias of RUSTSEC-2026-0382 and RUSTSEC-2026-0381; same legacy r
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0381"
 reason = "webpki-roots 0.25.4 via sqlx-core 0.8.0 / rustls 0.21 Postgres TLS, pinned by the sqlx/ldk-node SQLite conflict (#59), plus test-only minreq. The runtime Electrum copy is remediated via vendor/electrum-client (webpki-roots >=1.0.10), and the 1.0.x line is patched to 1.0.10. The default SQLite node opens no TLS through the legacy stack; Postgres TLS is already selectable. RESIDUAL RISK: the legacy root bundle can allow chains through distrusted emSign intermediates with publicly known private keys, enabling server impersonation in Postgres-over-TLS deployments and test-only minreq. This accepts only the remaining legacy copies, not a downgrade of 1.0.x or a new Electrum copy. Recheck TLS/trust-store changes, new 0.25.4 consumers or runtime minreq use; remove on the sqlx/ldk-node island upgrade (#59). Full triage: .cargo/audit.toml; alias CVE-2026-111943."
+
+# Triage 2026-10-30 (Daily Security Scan red since 27 Oct): four OSV-only
+# GHSA records with no RustSec counterpart yet; none applies to the shipped
+# konsensus binary. Recheck when any trigger named below changes.
+
+[[IgnoredVulns]]
+id = "GHSA-m665-v7pm-7grj"
+reason = "zip <= 9.0.4 parser differential: ZipStreamReader::extract writes the Local File Header name while ZipArchive lookups use the Central Directory. zip 0.6.6 comes only from the electrsd/corepc-node test-harness download feature and is absent from the shipped konsensus graph (cargo tree -p konsensus-node -e normal,build has no zip). It extracts pinned downloads only after bundled SHA-256 checks, never attacker-supplied archives, and inspects nothing through a separate gateway. Same applicability as RUSTSEC-2026-0367..0369; remove when zip is dropped or >= 9.0.5."
+
+[[IgnoredVulns]]
+id = "GHSA-8hxf-qr8p-62x4"
+reason = "zip >= 0.6, < 9.0 AES entry HMAC bypass on premature EOF, reachable only through password-bearing decrypt reads (by_*_decrypt, by_index_with_options with a password). The test-harness zip 0.6.6 never opens encrypted entries and is absent from the shipped konsensus graph; extracted content is hash-pinned before extraction. Remove when zip is dropped or >= 9.0.0."
+
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+reason = "False positive. The advisory covers block-buffer >= 0.11.0, < 0.12.1 (EagerBuffer/ReadBuffer position stored in-block). The workspace locks block-buffer 0.10.4, which is outside the affected range. Recheck if block-buffer 0.11.x enters Cargo.lock (for example via a digest 0.11 / sha2 0.11 bump)."
+
+[[IgnoredVulns]]
+id = "GHSA-h2v8-394m-p7vv"
+reason = "rustls < 0.23.46 Brotli certificate decompression memory amplification, only with the optional brotli feature. The 0.23 copy is already 0.23.46 (patched). The legacy rustls 0.21.12 (sqlx-core 0.8.0 island, #59) has no certificate-compression support and no brotli crate is in Cargo.lock. Recheck if brotli or certificate compression is enabled; remove on the sqlx/ldk-node island upgrade."
