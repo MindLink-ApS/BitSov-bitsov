@@ -179,7 +179,7 @@ async fn start_sender(
         transport: Arc::clone(transport) as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(sessions),
         jwt_secret: JWT_SECRET.into(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: pairing.as_ref().map(|(service, _, _)| Arc::clone(service)),
         cors_enabled: false,
         operator_probes_enabled: true,

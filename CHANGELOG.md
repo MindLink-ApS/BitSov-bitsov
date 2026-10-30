@@ -5,6 +5,11 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Count a home-setup cancel only when a pairing is in progress, cap pending
+  pairing requests per client key and in a shared pool, and refuse further
+  requests at either cap without evicting an existing ceremony.
+- Limit local sign-in challenges per source, rate-limit issuance, and apply
+  the local token route's Host and Origin admission to challenge issuance.
 - Payment truth on the owner API: `POST /payments/pay` and `/payments/keysend`
   answer `202 Accepted` with `status: in_flight` (payment hash and operation id,
   no preimage or fee) until the backend reports a final state, and `200` with

@@ -309,7 +309,7 @@ impl App {
             transport: Arc::clone(transport) as Arc<dyn MessageTransport>,
             session_manager: Arc::clone(sessions),
             jwt_secret: JWT_SECRET.into(),
-            auth_challenges: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            auth_challenges: konsensus_api::AuthChallenges::new(),
             pairing: Some(pairing.0.clone()),
             cors_enabled: false,
             operator_probes_enabled: true,

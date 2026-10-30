@@ -95,6 +95,12 @@ pub const PENDING_PAIRING_TTL: Duration = Duration::from_secs(120);
 /// rest rather than letting the directory grow without limit.
 pub const MAX_PENDING_PAIRINGS: usize = 32;
 
+/// Pending pairing requests one client key may hold at once.
+///
+/// Excess requests are refused: the submitted public key is not proof of
+/// ownership, so it must never authorize eviction of an existing ceremony.
+pub const MAX_PENDING_PAIRINGS_PER_SOURCE: usize = 4;
+
 /// Paired-token lifetime: 10 minutes.
 ///
 /// Minutes, not the 24 hours a loopback token gets. The durable secret is the
@@ -1536,8 +1542,16 @@ impl PairingService {
         name: &str,
         client_pubkey_hex: &str,
     ) -> Result<PairingRequestOutcome, PairingError> {
-        let pubkey = parse_pubkey(client_pubkey_hex)?;
-        let _ = pubkey;
+        self.request_pairing_with_writer(name, client_pubkey_hex, write_protected)
+    }
+
+    fn request_pairing_with_writer(
+        &self,
+        name: &str,
+        client_pubkey_hex: &str,
+        write_challenge: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
+    ) -> Result<PairingRequestOutcome, PairingError> {
+        parse_pubkey(client_pubkey_hex)?;
         let name = sanitize_name(name);
 
         let mut challenge = [0u8; CHALLENGE_LEN];
@@ -1546,11 +1560,11 @@ impl PairingService {
         rand::thread_rng().fill_bytes(&mut pair_id_bytes);
         let pair_id = hex::encode(pair_id_bytes);
 
-        let now = Instant::now();
         let expires_at_unix = chrono::Utc::now().timestamp() + PENDING_PAIRING_TTL.as_secs() as i64;
 
         {
             let mut inner = self.lock();
+            let now = Instant::now();
             if !Self::open_inner(&inner) {
                 return Err(PairingError::Closed);
             }
@@ -1561,24 +1575,42 @@ impl PairingService {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in stale {
-                inner.pending.remove(&id);
-                let _ = std::fs::remove_file(self.challenge_path(&id));
+                // A failed unlink keeps that reservation counted for a later
+                // retry; it must not block requests within the remaining quota.
+                if let Err(error) = self.remove_pending_locked(&mut inner, &id) {
+                    tracing::warn!(pair_id = %id, %error, "expired pairing challenge not removed; still reserved");
+                }
             }
-            if inner.pending.len() >= MAX_PENDING_PAIRINGS {
+            let source = client_pubkey_hex.to_ascii_lowercase();
+            let own_count = inner
+                .pending
+                .values()
+                .filter(|pending| pending.client_pubkey == source)
+                .count();
+            if inner.pending.len() >= MAX_PENDING_PAIRINGS
+                || own_count >= MAX_PENDING_PAIRINGS_PER_SOURCE
+            {
                 return Err(PairingError::TooManyPending);
             }
             inner.pending.insert(
                 pair_id.clone(),
                 PendingPairing {
-                    client_pubkey: client_pubkey_hex.to_ascii_lowercase(),
+                    client_pubkey: source,
                     name,
                     challenge,
                     expires_at: now + PENDING_PAIRING_TTL,
                 },
             );
+            // Publish under the same lock as pending removal, so expiry or
+            // confirmation cannot remove the reservation before its file exists.
+            let path = self.challenge_path(&pair_id);
+            if let Err(error) = write_challenge(&path, &challenge) {
+                // Failed deletion keeps an expired reservation for cleanup,
+                // so a partial file cannot escape the pending quota.
+                let _ = self.remove_pending_locked(&mut inner, &pair_id);
+                return Err(error.into());
+            }
         }
-
-        write_protected(&self.challenge_path(&pair_id), &challenge)?;
 
         let code = short_code(&challenge);
         if self.print_pairing_instruction {
@@ -1626,17 +1658,12 @@ impl PairingService {
 
         let pending = {
             let mut inner = self.lock();
-            let pending = inner
-                .pending
-                .remove(pair_id)
-                .ok_or(PairingError::UnknownPending)?;
+            let pending = self.remove_pending_locked(&mut inner, pair_id)?;
             if pending.expires_at <= Instant::now() {
-                let _ = std::fs::remove_file(self.challenge_path(pair_id));
                 return Err(PairingError::UnknownPending);
             }
             pending
         };
-        let _ = std::fs::remove_file(self.challenge_path(pair_id));
 
         let verifying = parse_pubkey(&pending.client_pubkey)?;
         let msg = Self::proof_message(pair_id, &pending.client_pubkey, &pending.challenge);
@@ -2517,7 +2544,12 @@ impl PairingService {
         // Nothing pending from bootstrap carries into the live node. Pending
         // ceremonies are also cleared, but that alone is not the identity
         // authority gate — see the final-lock check in `confirm_pairing`.
-        inner.pending.clear();
+        let pending_ids: Vec<_> = inner.pending.keys().cloned().collect();
+        for id in pending_ids {
+            // Failed deletions remain expired and tracked for cleanup; they
+            // cannot carry ceremony authority into the new identity.
+            let _ = self.remove_pending_locked(&mut inner, &id);
+        }
         inner.file.revoke_grants(None);
         inner.file.pending_elevations.clear();
         inner.file.replacement_approvals.clear();
@@ -4172,6 +4204,31 @@ impl PairingService {
 
     // ── Durable persistence ────────────────────────────────────────
 
+    /// Unlink before releasing the quota slot. A failed deletion still burns
+    /// the ceremony's authority, but retains its cleanup obligation.
+    fn remove_pending_locked(
+        &self,
+        inner: &mut Inner,
+        pair_id: &str,
+    ) -> Result<PendingPairing, PairingError> {
+        let pending = inner
+            .pending
+            .get_mut(pair_id)
+            .ok_or(PairingError::UnknownPending)?;
+        match std::fs::remove_file(self.challenge_path(pair_id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                pending.expires_at = Instant::now();
+                return Err(error.into());
+            }
+        }
+        inner
+            .pending
+            .remove(pair_id)
+            .ok_or(PairingError::UnknownPending)
+    }
+
     fn challenge_path(&self, pair_id: &str) -> PathBuf {
         self.dir.join(format!("challenge-{pair_id}"))
     }
@@ -4565,3 +4622,7 @@ mod headless_tests;
 #[cfg(test)]
 #[path = "pairing/token_challenge_tests.rs"]
 mod token_challenge_tests;
+
+#[cfg(test)]
+#[path = "pairing/pending_tests.rs"]
+mod pending_tests;
