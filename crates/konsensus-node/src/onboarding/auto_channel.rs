@@ -1949,6 +1949,7 @@ mod tests {
             remote_balance_msat: 25_000_000,
             active: true,
             short_channel_id: Some("100x1x0".to_string()),
+            outbound_capacity_msat: None,
         }];
         let notifier = Arc::new(RecordingNotifier::default());
         let (storage_dyn, lightning_dyn, chain_dyn, notifier_dyn) =
