@@ -483,7 +483,8 @@ async fn start_recipient(
                         continue;
                     }
                     if privileged
-                        && purpose == "konsensus message"
+                        && (purpose == "konsensus message"
+                            || konsensus_core::gate::parse_service_invoice_purpose(&purpose).is_some())
                         && refuse_message.load(std::sync::atomic::Ordering::Acquire)
                     {
                         super::send_invoice_refusal(
