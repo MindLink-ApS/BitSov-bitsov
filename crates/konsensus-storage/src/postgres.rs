@@ -1787,20 +1787,18 @@ impl Storage for PostgresStorage {
     }
 
     async fn call_put(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
-        let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
-        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
-            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, paid_until_ms = excluded.paid_until_ms, next_block_seq = excluded.next_block_seq, end_reason = excluded.end_reason, unpaid_notice_used = excluded.unpaid_notice_used")
-            .bind(peer.to_hex()).bind(call_id)
-            .bind(entry.side.as_str()).bind(entry.phase.as_str())
-            .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
-            .bind(entry.pending.as_ref().map(|p| p.operation_id.clone()))
-            .bind(entry.pending.as_ref().map(|p| i64::from(p.kind)))
-            .bind(entry.pending.as_ref().map(|p| p.request_hash.clone()))
-            .bind(entry.paid_until_ms.map(ms).transpose()?)
-            .bind(i64::from(entry.next_block_seq))
-            .bind(entry.end_reason.map(|reason| reason.as_str()))
-            .bind(i64::from(entry.unpaid_notice_used))
-            .execute(&self.pool).await?;
+        call_put_on(&self.pool, peer, call_id, entry).await
+    }
+
+    async fn call_invite_deliver(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let marked = sqlx::query("UPDATE payment_receipts SET accepted = 1 WHERE message_id = $1 AND sender = $2 AND kind = 400 AND accepted IN (1, -2)")
+            .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
+        if marked.rows_affected() != 1 {
+            return Err(StorageError::Conversion("call invite receipt not pending".into()));
+        }
+        call_put_on(&mut *tx, peer, call_id, entry).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3983,3 +3981,23 @@ fn call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason
         pending,
     })
 }
+
+/// Upsert one call row on a pool or inside a transaction.
+async fn call_put_on<'e, E: sqlx::Executor<'e, Database = sqlx::Postgres>>(executor: E, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+    let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
+    sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+        ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, paid_until_ms = excluded.paid_until_ms, next_block_seq = excluded.next_block_seq, end_reason = excluded.end_reason, unpaid_notice_used = excluded.unpaid_notice_used")
+        .bind(peer.to_hex()).bind(call_id)
+        .bind(entry.side.as_str()).bind(entry.phase.as_str())
+        .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
+        .bind(entry.pending.as_ref().map(|p| p.operation_id.clone()))
+        .bind(entry.pending.as_ref().map(|p| i64::from(p.kind)))
+        .bind(entry.pending.as_ref().map(|p| p.request_hash.clone()))
+        .bind(entry.paid_until_ms.map(ms).transpose()?)
+        .bind(i64::from(entry.next_block_seq))
+        .bind(entry.end_reason.map(|reason| reason.as_str()))
+        .bind(i64::from(entry.unpaid_notice_used))
+        .execute(executor).await?;
+    Ok(())
+}
+

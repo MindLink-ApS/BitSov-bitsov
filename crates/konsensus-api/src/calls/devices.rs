@@ -183,21 +183,10 @@ impl Devices {
             return Ok(());
         }
         let next = row.device_fetched(now_ms).expect("unexpired row");
-        // Receipt first, then the ringing row. Either failure leaves nothing that
-        // a sweep or a restart could turn into a ringing ACK: the device request
-        // fails and the invite stays awaiting (Codex FAIL on #472).
-        store
-            .call_invite_set_outcome(&envelope.id, &invite.peer, CallInviteOutcome::Fetched)
-            .await?;
-        if let Err(error) = store.call_put(&invite.peer, &invite.call_id, &next).await {
-            if let Err(revert) = store
-                .call_invite_set_outcome(&envelope.id, &invite.peer, CallInviteOutcome::Pending)
-                .await
-            {
-                tracing::warn!(error = %revert, "fetched receipt not reverted; expiry will refuse the invite");
-            }
-            return Err(error);
-        }
+        // One transaction: receipt and ringing row together, or neither. A failed
+        // request leaves the invite awaiting; nothing can later ring it or report
+        // it fetched, before or after a restart (Codex FAIL on #472).
+        store.call_invite_deliver(&envelope.id, &invite.peer, &invite.call_id, &next).await?;
         let deadline_ms = next.deadline_ms;
         if let Some(tracked) = self
             .invites

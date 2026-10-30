@@ -871,8 +871,17 @@ pub async fn end_unreachable_invite(store: Store<'_>, own: &NodeId, peer: &NodeI
     let Some(call_id) = crate::handlers::messages::operations::call_invite_binding(&op)? else { return Ok(false) };
     let _guard = lock().lock().await;
     let now = now_ms();
+    // Bind to this offer's generation: a call id stays burned for the 24 h
+    // tombstone, so a call ringing now with an offer this recent is this one.
+    // A stale refusal for an older offer can never end a newer call.
+    let ringing_window = rules::DEVICE_WAIT_MS + rules::RING_TIMEOUT_MS + 60_000;
+    if u64::try_from(op.created_at).unwrap_or(0).saturating_add(ringing_window) < now {
+        return Ok(false);
+    }
     let Some(entry) = current(store, peer, &call_id, now).await? else { return Ok(false) };
-    if entry.side != rules::Side::Caller || entry.phase != rules::Phase::Ringing || entry.pending.is_some() {
+    // A pending cancellation keeps its reservation mark (its own commit or
+    // release still resolves it) but cannot keep an unreachable call ringing.
+    if entry.side != rules::Side::Caller || entry.phase != rules::Phase::Ringing {
         return Ok(false);
     }
     let ended = CallEntry { phase: rules::Phase::Ended, end_reason: Some(rules::HangupReason::Timeout),

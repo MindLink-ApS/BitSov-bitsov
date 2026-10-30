@@ -56,6 +56,8 @@ async fn device_delivery_starts_once_and_historical_fetch_cannot_ring_a_new_call
     let db = SqliteStorage::in_memory().await.unwrap();
     let devices = Devices::default();
     let (old, text) = invite(2);
+    // The receive gate has accepted each paid invite before admission.
+    db.accept_paid_envelope(&old).await.unwrap();
     devices
         .admit(&db, &own(), &old, Some(&text), 1_000, || 1_000)
         .await
@@ -70,6 +72,7 @@ async fn device_delivery_starts_once_and_historical_fetch_cannot_ring_a_new_call
     assert!(devices.sweep(&db, 16_100).await.unwrap().is_empty());
     assert_eq!(row.at(71_000).unwrap().phase, Phase::Ended);
     let (new, text) = invite(3);
+    db.accept_paid_envelope(&new).await.unwrap();
     devices
         .admit(
             &db,

@@ -331,10 +331,18 @@ pub(super) async fn list_messages(
                 .unwrap_or(None);
             resp = resp.with_cached_plaintext(cached, cipher);
         }
-        device_fetched(&auth, &state, env).await?;
         responses.push(resp);
     }
 
+    // Mark device delivery only once the whole response is built, so a later
+    // item's failure can never leave earlier invites ringing but unreturned.
+    // A marking failure keeps that invite awaiting (it may end not-reachable)
+    // but never fails the listing the device already gets.
+    for env in &messages.items {
+        if let Err(error) = device_fetched(&auth, &state, env).await {
+            tracing::warn!(msg_id = %env.id, ?error, "listed call invite not marked delivered");
+        }
+    }
     Ok((store_read, diagnostics, Json(responses)))
 }
 

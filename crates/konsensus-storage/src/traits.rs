@@ -46,6 +46,13 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("call invite outcome".into()))
     }
 
+    /// Record a device delivery atomically: the invite's receipt becomes
+    /// `Fetched` and its call row is written in one transaction, so no reader
+    /// and no restart can observe one without the other.
+    async fn call_invite_deliver(&self, _id: &MessageId, _peer: &NodeId, _call_id: &str, _entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call invite delivery".into()))
+    }
+
     /// Startup: withdraw at most `max` pending device waits, retaining refusals.
     async fn call_invite_recover(&self, _max: u32) -> Result<u64, StorageError> {
         Ok(0)

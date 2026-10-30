@@ -693,3 +693,43 @@ async fn unreachable_invite_ends_the_call_and_releases_its_hold() {
     ).await.unwrap());
 }
 
+
+/// Codex FAIL on #472 (round 2): a pending cancellation must not keep an
+/// unreachable call ringing with its hold.
+#[tokio::test]
+async fn unreachable_invite_ends_the_call_even_with_a_pending_cancellation() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let mut ringing = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    ringing.pending = Some(konsensus_core::payloads::call::Pending {
+        operation_id: "cancel".into(), kind: konsensus_core::kind::KIND_CALL_HANGUP, request_hash: "h".into(),
+    });
+    fx.state.storage.call_put(&fx.peer, CALL, &ringing).await.unwrap();
+    assert!(konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    let ended = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!(ended.phase, Phase::Ended);
+    assert!(ended.pending.is_some(), "the cancellation's own mark is kept for its commit/release");
+}
+
+/// A stale refusal for an old offer never ends a newer call: the offer must be
+/// recent enough to be the one now ringing.
+#[tokio::test]
+async fn stale_unreachable_refusal_cannot_end_a_newer_call() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", fx.tmp.path().join("calls.sqlite").display()))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE outbox_operations SET created_at = 0 WHERE message_id = ?")
+        .bind(offer.to_hex()).execute(&db).await.unwrap();
+    assert!(!konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    assert_eq!(fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap().phase, Phase::Ringing);
+}
