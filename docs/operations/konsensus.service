@@ -9,6 +9,7 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
+UMask=0077
 ExecStart=%h/.local/bin/konsensus start --config %h/.local/share/konsensus/konsensus.toml --remote-unlock --local-owner-device
 Restart=on-failure
 RestartSec=10

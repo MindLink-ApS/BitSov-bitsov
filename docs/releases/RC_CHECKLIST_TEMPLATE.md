@@ -75,10 +75,16 @@ Pre-release; not for production use. Copy this template for each new RC.
 
 ## Independently verify and publish
 
-- [ ] In a fresh download directory, verify the tag commit/signature, checksum
-      signature and all 17 source assets against `SHA256SUMS`: five binaries,
-      their five `.sha256` files, five `.sbom.spdx.json` files, and
+- [ ] In a fresh download directory, run
+      `bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc` with the
+      reviewed key file. Do not fetch that key from `main`. The script accepts
+      a signature only when `[GNUPG:] VALIDSIG` field 10 is the release key,
+      requires the five CLI binaries, and refuses any other file in the
+      directory. Confirm `SHA256SUMS` has 17 entries: five binaries, their five
+      `.sha256` files, five `.sbom.spdx.json` files, and
       `bitsov-darwin-aarch64.toolchain.txt` and `bitsov-darwin-x86_64.toolchain.txt`.
+      Check the tag with `git verify-tag` against the same key. A bare
+      `gpg --verify` exit code is not this check.
 - [ ] Check SBOM, provenance and release notes. Record unverified targets as such;
       their signed checksums do not prove they were independently rebuilt.
 - [ ] Obtain operator publication sign-off. The signing script never publishes.
