@@ -3,11 +3,13 @@
 //! Entry point for `konsensus init` and `konsensus start`.
 
 mod admission_quotes;
+mod call_media;
 mod claim_code;
 mod cli;
 mod config;
 mod content_server;
 mod contracts;
+mod data_dir_hygiene;
 mod delivery_prices;
 mod endpoints;
 mod guarded_lightning;
@@ -459,6 +461,7 @@ fn cmd_init(
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create directory: {}", dir.display()))?;
     restrict_data_dir(dir)?;
+    data_dir_hygiene::prepare(dir)?;
 
     let config_path = dir.join("konsensus.toml");
     let mnemonic_path = dir.join("mnemonic.txt");
@@ -591,6 +594,8 @@ fn cmd_restore(
         "restore requires an empty directory; never reuse a live store or snapshot"
     );
     let _lease = safety::ensure_generation(dir, safety::STATE_GENERATION)?;
+    // After the emptiness check: the ignore file must not count as prior state.
+    data_dir_hygiene::prepare(dir)?;
 
     let config_path = dir.join("konsensus.toml");
     let mnemonic_path = dir.join("mnemonic.txt");
@@ -1176,6 +1181,10 @@ async fn cmd_start(
     let data_dir = owner_cmd::data_dir_of(config_path);
     if data_dir.is_dir() {
         restrict_data_dir(&data_dir)?;
+        // Best effort on existing nodes: hygiene never blocks startup.
+        if let Err(error) = data_dir_hygiene::prepare(&data_dir) {
+            eprintln!("WARNING: could not write data directory .gitignore: {error:#}");
+        }
     }
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
@@ -1639,6 +1648,14 @@ async fn start_node_services<'a>(
         _ => None,
     };
 
+    // M6 N2: node-routed call media, admitted by N1's settled-block
+    // coverage and paid-until grace check.
+    let call_media = call_media::CallMediaRouter::new(
+        Arc::clone(node.transport()) as Arc<dyn call_media::MediaLink>,
+        Arc::new(call_media::PaidCallAdmission::new(Arc::clone(node.storage()))),
+    );
+    let call_media_handle = call_media.spawn(node.shutdown_rx());
+
     let api_state = Arc::new(konsensus_api::AppState {
         starter: config.starter_settings(),
         identity: Arc::clone(node.identity()),
@@ -1705,11 +1722,17 @@ async fn start_node_services<'a>(
         ),
         // Validated at config load; an over-ceiling policy never starts.
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,
+        max_call_minutes: config.calls.max_call_minutes,
         stun_port: stun_socket
             .as_ref()
             .and_then(|s| s.local_addr().ok())
             .map(|a| a.port()),
+        configured_stun_server: config
+            .network
+            .stun_server_addr()
+            .map_err(|e| anyhow::anyhow!(e))?,
         custody_mode: custody_mode(config),
+        call_media: Some(Arc::clone(&call_media) as Arc<dyn konsensus_api::call_media::CallMediaPort>),
         recovery_dir: matches!(config.lightning, LightningConfig::Ldk { .. }).then(|| {
             config
                 .identity
@@ -1860,6 +1883,13 @@ async fn start_node_services<'a>(
         Err(e) => {
             warn!(error = %e, "call state recovery failed; reservations stay for a same-operation retry")
         }
+    }
+    // Release unused call spending after restoring the durable call lifecycle.
+    // Unresolved block payments keep their operation-linked liabilities.
+    if let Err(error) = konsensus_api::calls::reconcile_call_spend(
+        &api_state, chrono::Utc::now().timestamp_millis() as u64,
+    ).await {
+        warn!(%error, "call spend recovery deferred to maintenance");
     }
     // Incoming call signals still held were never admitted (refusal cleanup
     // failed, or a crash): withdraw them before anything can read them.
@@ -2218,6 +2248,9 @@ async fn start_node_services<'a>(
         }
         if let Err(e) = session_handle.await {
             warn!(error = %e, "session handler task panicked");
+        }
+        if let Err(e) = call_media_handle.await {
+            warn!(error = %e, "call media router task panicked");
         }
         if let Err(e) = offline_safety_handle.await {
             warn!(error = %e, "offline safety task panicked");

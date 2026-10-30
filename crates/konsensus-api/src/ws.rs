@@ -28,7 +28,7 @@ pub struct WsParams {
     pub token: Option<String>,
 }
 
-const WS_PROTOCOL: &str = "bitsov.v1";
+pub(crate) const WS_PROTOCOL: &str = "bitsov.v1";
 const WS_JWT_PROTOCOL_PREFIX: &str = "bitsov.jwt.";
 
 /// `GET /api/v1/ws` — WebSocket connection.
@@ -77,7 +77,7 @@ async fn ws_handler(
     }
 }
 
-fn extract_ws_token(query_token: Option<&str>, headers: &HeaderMap) -> Option<String> {
+pub(crate) fn extract_ws_token(query_token: Option<&str>, headers: &HeaderMap) -> Option<String> {
     // Prefer the subprotocol. A `?token=` value must not replace a token the
     // client already sent in a header that proxies are less likely to log.
     let from_protocol = headers

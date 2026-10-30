@@ -162,6 +162,7 @@ mod tests {
                 collaboration_msat: base,
                 realtime_signal_msat: base,
                 call_msat: base,
+                call_block_msat: base,
                 app_ext_msat: base,
                 web_content_msat: base,
                 relay_storage_msat: base,

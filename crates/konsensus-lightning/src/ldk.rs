@@ -2979,6 +2979,7 @@ fn channel_info(ch: ldk_node::ChannelDetails) -> ChannelInfo {
         peer_pubkey: ch.counterparty_node_id.to_string(),
         capacity_msat: ch.channel_value_sats * 1000,
         local_balance_msat: ch.outbound_capacity_msat,
+        outbound_capacity_msat: Some(ch.outbound_capacity_msat),
         remote_balance_msat: ch.inbound_capacity_msat,
         active: ch.is_usable,
         short_channel_id: ch.short_channel_id.map(|id| id.to_string()),

@@ -21,7 +21,7 @@ concurrency:
 jobs:
   paid-regtest:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 70
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -87,6 +87,19 @@ jobs:
         run: cargo fetch --locked
       - name: Runner lifecycle tests
         run: python3 scripts/regress/test_regtest_e2e_runner.py -v
+      - name: M6 two-node paid call (real 60-second blocks)
+        shell: bash
+        env:
+          REGTEST_TIMEOUT_SECONDS: '1200'
+        run: |
+          set -euo pipefail
+          # Exit 77 is a failure here: a compiled/skipped call is not proof.
+          {
+            git log -1 --format='M6 NODE SHA %H'
+            scripts/regress/two_node_paid_call_e2e.sh
+          } 2>&1 | tee paid-call.log
+          grep -q '^M6 CALL PASS reason=unpaid paid_blocks=3 ' paid-call.log
+          grep -q '^M6 CALL PASS reason=duration_cap paid_blocks=1 ' paid-call.log
       - name: Production private hub forwarding (#225)
         shell: bash
         env:
@@ -122,4 +135,5 @@ jobs:
           path: |
             regtest.log
             private-forwarding.log
+            paid-call.log
           if-no-files-found: ignore
