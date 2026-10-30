@@ -19,9 +19,6 @@ struct Invite {
     deadline_ms: u64,
     waiting: bool,
     ack_pending: bool,
-    // Set only by this envelope's own successful device transition. Another
-    // invite can legitimately reuse the call id while failed cleanup retries.
-    fetched_deadline_ms: Option<u64>,
 }
 
 /// This node's current incoming invites, identified by envelope, not call id.
@@ -126,7 +123,6 @@ impl Devices {
                         deadline_ms: arrived_ms.saturating_add(rules::DEVICE_WAIT_MS),
                         waiting: true,
                         ack_pending: false,
-                        fetched_deadline_ms: None,
                     },
                 );
             store
@@ -176,34 +172,33 @@ impl Devices {
         if !invite.waiting {
             return Ok(());
         }
-        let deadline_ms = if let Some(deadline) = invite.fetched_deadline_ms {
-            deadline
-        } else {
-            let Some(row) = store.call_get(&invite.peer, &invite.call_id).await? else {
-                return Ok(());
-            };
-            if row.side != Side::Callee
-                || row.phase != Phase::AwaitingDevice
-                || row.deadline_ms != invite.deadline_ms
-                || now_ms >= row.deadline_ms
-            {
-                return Ok(());
-            }
-            let next = row.device_fetched(now_ms).expect("unexpired row");
-            store.call_put(&invite.peer, &invite.call_id, &next).await?;
-            if let Some(tracked) = self
-                .invites
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_mut(&envelope.id)
-            {
-                tracked.fetched_deadline_ms = Some(next.deadline_ms);
-            }
-            next.deadline_ms
+        let Some(row) = store.call_get(&invite.peer, &invite.call_id).await? else {
+            return Ok(());
         };
+        if row.side != Side::Callee
+            || row.phase != Phase::AwaitingDevice
+            || row.deadline_ms != invite.deadline_ms
+            || now_ms >= row.deadline_ms
+        {
+            return Ok(());
+        }
+        let next = row.device_fetched(now_ms).expect("unexpired row");
+        // Receipt first, then the ringing row. Either failure leaves nothing that
+        // a sweep or a restart could turn into a ringing ACK: the device request
+        // fails and the invite stays awaiting (Codex FAIL on #472).
         store
             .call_invite_set_outcome(&envelope.id, &invite.peer, CallInviteOutcome::Fetched)
             .await?;
+        if let Err(error) = store.call_put(&invite.peer, &invite.call_id, &next).await {
+            if let Err(revert) = store
+                .call_invite_set_outcome(&envelope.id, &invite.peer, CallInviteOutcome::Pending)
+                .await
+            {
+                tracing::warn!(error = %revert, "fetched receipt not reverted; expiry will refuse the invite");
+            }
+            return Err(error);
+        }
+        let deadline_ms = next.deadline_ms;
         if let Some(tracked) = self
             .invites
             .lock()
@@ -275,9 +270,7 @@ impl Devices {
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|(_, invite)| {
-                invite.ack_pending
-                    || (invite.waiting && invite.fetched_deadline_ms.is_some())
-                    || invite.deadline_ms <= now_ms
+                invite.ack_pending || invite.deadline_ms <= now_ms
             })
             .map(|(id, invite)| (*id, invite.clone()))
             .collect();
@@ -291,16 +284,6 @@ impl Devices {
                         tracked.ack_pending = false;
                     }
                     if invite.deadline_ms > now_ms { return Ok(()); }
-                }
-                if let Some(deadline) = invite.fetched_deadline_ms.filter(|_| invite.waiting) {
-                    // Retry only a delivery this exact envelope recorded.
-                    store.call_invite_set_outcome(&id, &invite.peer, CallInviteOutcome::Fetched).await?;
-                    if let Some(tracked) = self.invites.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
-                        tracked.waiting = false;
-                        tracked.deadline_ms = deadline;
-                    }
-                    notices.push((invite.peer, Frame::MessageAck { id, duplicate: false, paid_until_ms: None }));
-                    return Ok(());
                 }
                 if invite.waiting {
                     // Capture before reholding: held envelopes become invisible.

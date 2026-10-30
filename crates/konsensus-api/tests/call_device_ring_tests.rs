@@ -694,3 +694,45 @@ async fn device_sweep_leaves_live_expiry_and_its_unpaid_notice_to_expire_calls()
         vec![(env.sender, CALL.to_owned())]
     );
 }
+
+/// Codex FAIL on #472: a device fetch whose receipt write fails must not later
+/// produce a ringing ACK; the invite stays awaiting and ends not-reachable.
+#[tokio::test]
+async fn failed_fetch_receipt_write_never_rings() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let devices = Devices::default();
+    let (env, text) = invite(11);
+    db.accept_paid_envelope(&env).await.unwrap();
+    devices.admit(&db, &own(), &env, Some(&text), 1_000, || 1_000).await.unwrap();
+    sqlx::raw_sql("CREATE TRIGGER fail_fetch BEFORE UPDATE OF accepted ON payment_receipts WHEN NEW.accepted = 1 BEGIN SELECT RAISE(ABORT, 'injected'); END;")
+        .execute(db.pool()).await.unwrap();
+    assert!(devices.fetched(&db, &env, || 11_000).await.is_err());
+    let row = db.call_get(&env.sender, CALL).await.unwrap().unwrap();
+    assert_eq!(row.phase, Phase::AwaitingDevice);
+    assert!(devices.sweep(&db, 11_100).await.unwrap().is_empty(), "rang without a fetch");
+    sqlx::raw_sql("DROP TRIGGER fail_fetch").execute(db.pool()).await.unwrap();
+    let notices = devices.sweep(&db, 16_000).await.unwrap();
+    assert!(matches!(&notices[..], [(_, konsensus_message::Frame::MessageReject { reason, .. })] if reason == "call_not_reachable"));
+}
+
+/// An interrupted transition (receipt written, ringing row not) reverts the
+/// receipt, so neither a duplicate nor a restart can report a delivery.
+#[tokio::test]
+async fn interrupted_fetch_transition_reverts_its_receipt() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let devices = Devices::default();
+    let (env, text) = invite(12);
+    db.accept_paid_envelope(&env).await.unwrap();
+    devices.admit(&db, &own(), &env, Some(&text), 1_000, || 1_000).await.unwrap();
+    sqlx::raw_sql("CREATE TRIGGER fail_ring BEFORE UPDATE ON call_state WHEN NEW.phase = 'ringing' BEGIN SELECT RAISE(ABORT, 'injected'); END;")
+        .execute(db.pool()).await.unwrap();
+    assert!(devices.fetched(&db, &env, || 11_000).await.is_err());
+    assert_eq!(db.call_invite_outcome(&env).await.unwrap(), Some(konsensus_storage::CallInviteOutcome::Pending));
+    assert_eq!(db.call_get(&env.sender, CALL).await.unwrap().unwrap().phase, Phase::AwaitingDevice);
+    assert!(devices.sweep(&db, 11_100).await.unwrap().is_empty());
+    // A later fetch, once storage works again, rings normally.
+    sqlx::raw_sql("DROP TRIGGER fail_ring").execute(db.pool()).await.unwrap();
+    devices.fetched(&db, &env, || 12_000).await.unwrap();
+    assert_eq!(db.call_invite_outcome(&env).await.unwrap(), Some(konsensus_storage::CallInviteOutcome::Fetched));
+    assert!(matches!(&devices.sweep(&db, 12_100).await.unwrap()[..], [(_, konsensus_message::Frame::MessageAck { .. })]));
+}

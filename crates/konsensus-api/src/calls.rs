@@ -855,6 +855,32 @@ pub async fn receive_block_grant(store: Store<'_>, cipher: &konsensus_crypto::Pl
     store.call_put(peer, &call_id, &next).await
 }
 
+/// The callee answered our dispatched invite `id` with `call_not_reachable`:
+/// no paired device took it, so the call can never ring. End our still-ringing
+/// caller row, so the reservation sweep releases the call's unused hold now
+/// rather than at the ringing deadline. Returns whether a call was ended.
+pub async fn end_unreachable_invite(store: Store<'_>, own: &NodeId, peer: &NodeId,
+    id: &konsensus_core::MessageId,
+) -> Result<bool, konsensus_storage::StorageError> {
+    let Some(envelope) = store.get_message(id).await? else { return Ok(false) };
+    if envelope.kind != konsensus_core::kind::KIND_CALL_INVITE || envelope.sender != *own
+        || envelope.recipient != konsensus_core::Recipient::Node(*peer) { return Ok(false); }
+    // Our own offer is ratchet-encrypted to the peer; its call id comes from
+    // the binding recorded when it was drafted.
+    let Some(op) = store.get_outbox_operation_by_message(id).await? else { return Ok(false) };
+    let Some(call_id) = crate::handlers::messages::operations::call_invite_binding(&op)? else { return Ok(false) };
+    let _guard = lock().lock().await;
+    let now = now_ms();
+    let Some(entry) = current(store, peer, &call_id, now).await? else { return Ok(false) };
+    if entry.side != rules::Side::Caller || entry.phase != rules::Phase::Ringing || entry.pending.is_some() {
+        return Ok(false);
+    }
+    let ended = CallEntry { phase: rules::Phase::Ended, end_reason: Some(rules::HangupReason::Timeout),
+        deadline_ms: now.saturating_add(rules::TOMBSTONE_MS), ..entry };
+    write(store, peer, &call_id, Some(&ended)).await?;
+    Ok(true)
+}
+
 async fn cached_call_block_binding(store: Store<'_>, cipher: &konsensus_crypto::PlaintextCacheCipher,
     id: &konsensus_core::MessageId,
 ) -> Result<(String, u32), konsensus_storage::StorageError> {

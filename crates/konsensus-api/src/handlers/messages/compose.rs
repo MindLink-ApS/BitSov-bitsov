@@ -3726,7 +3726,11 @@ pub(super) async fn compose_peer(
                 let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
                     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
                 Some((signal.call_id, signal.seq.unwrap_or_default()))
-            } else { None }).await?;
+            } else { None },
+            (req.kind == konsensus_core::kind::KIND_CALL_INVITE)
+                .then(|| konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext).ok())
+                .flatten()
+                .map(|signal| signal.call_id)).await?;
 
         // Create payment proof — requests invoice from recipient's wallet (Principle 2).
         if let Some(mut attempt) = super::admission_journal::load(&state, &peer_id)? {

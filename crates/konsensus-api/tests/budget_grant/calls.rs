@@ -665,3 +665,31 @@ async fn recovered_failure_cannot_repay_when_call_cleanup_write_fails() {
 mod consent;
 #[path = "calls_settlement.rs"]
 mod settlement;
+
+/// Codex FAIL on #472: a `call_not_reachable` refusal ends the caller's ringing
+/// call so its unused whole-call hold is released at once, not at the ringing
+/// deadline. The offer itself stays paid (unchanged admission rule).
+#[tokio::test]
+async fn unreachable_invite_ends_the_call_and_releases_its_hold() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.used(), 421_000);
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let ringing = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!(ringing.phase, Phase::Ringing);
+    assert!(konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    let ended = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!((ended.phase, ended.end_reason), (Phase::Ended, Some(HangupReason::Timeout)));
+    konsensus_api::calls::reconcile_call_spend(&fx.state, chrono::Utc::now().timestamp_millis() as u64)
+        .await
+        .unwrap();
+    assert_eq!(fx.used(), 1_000, "only the paid offer remains");
+    // Another peer, or a second refusal, cannot end anything else.
+    assert!(!konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+}
+

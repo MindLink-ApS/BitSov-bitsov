@@ -295,6 +295,12 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     ControlEvent::MessageRejected { peer_id, message_id, reason, privileged } => {
                         handle_delivery_confirmation(&peer_id, &message_id, Some(&reason), privileged,
                             identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget, None).await;
+                        if reason == konsensus_api::calls::devices::NOT_REACHABLE {
+                            // The call can never ring: end it so its spend hold is released now.
+                            if let Err(e) = konsensus_api::calls::end_unreachable_invite(storage.as_ref(), identity.node_id(), &peer_id, &message_id).await {
+                                warn!(error = %e, "unreachable call not ended; it expires at its ringing deadline");
+                            }
+                        }
                     }
 
                     ControlEvent::PriceTableReceived { peer_id, prices, block_height, valid_blocks, trust_discount, privileged } => {
