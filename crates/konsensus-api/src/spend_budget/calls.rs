@@ -1,5 +1,7 @@
 //! Durable accounting for one call and its recoverable block payments.
 use super::*;
+/// Maintenance never pays more than this for a closing signal, with no fee.
+pub(crate) const CALL_CLOSING_MSAT: u64 = 1_000;
 // Missing on pre-cap holds: preserve their original four-hour reservation.
 fn legacy_max_call_minutes() -> u16 { 240 }
 
@@ -20,6 +22,14 @@ pub struct CallSpendTerms {
 }
 
 impl CallSpendTerms {
+    /// Keep the closing signal in the same budget/liquidity reservation as
+    /// the blocks. Owner calls do not create this grant reservation.
+    pub(crate) fn with_closing_signal(mut self) -> Result<Self, BudgetRefusal> {
+        self.reserved_msat = self.reserved_msat.checked_add(CALL_CLOSING_MSAT)
+            .ok_or_else(|| BudgetRefusal::Unpriced("call reservation overflow".into()))?;
+        Ok(self)
+    }
+
     pub fn new(peer: &str, call_id: &str, price: u64, fee: u64, max_call_minutes: u16) -> Result<Self, BudgetRefusal> {
         if !(1..=240).contains(&max_call_minutes) {
             return Err(BudgetRefusal::Unpriced("call duration must be between 1 and 240 minutes".into()));
@@ -58,7 +68,8 @@ pub struct CallSpend {
     pub(crate) payment_failed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) finished_at: Option<i64>,
-    /// Child reservation ID -> block sequence; each child also has an outbox link.
+    /// Child reservation ID -> block sequence (u32::MAX for closure); each
+    /// child also has an outbox link.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) draws: BTreeMap<String, u32>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]

@@ -3629,7 +3629,8 @@ pub(super) async fn compose_peer(
                     }
                     // Widen before comparing: even a u64 quote whose bundle
                     // overflows must produce the caller's typed consent refusal.
-                    let hold = ((u128::from(block_price) + u128::from(fee)) * u128::from(minutes))
+                    let closing = if auth.is_metered() { u128::from(crate::spend_budget::CALL_CLOSING_MSAT) } else { 0 };
+                    let hold = ((u128::from(block_price) + u128::from(fee)) * u128::from(minutes) + closing)
                         .max(u128::from(existing.as_ref().map_or(0, |hold| hold.reserved_msat)));
                     if req.max_hold_msat.is_some_and(|cap| hold > u128::from(cap)) {
                         return Err(ApiError::NotDispatched("call reservation exceeds caller consent; nothing was paid".into())
@@ -3659,6 +3660,7 @@ pub(super) async fn compose_peer(
                 }
                 if existing.is_none() {
                     let terms = crate::spend_budget::CallSpendTerms::new(&peer_id.to_hex(), &signal.call_id, block_price, fee, minutes)
+                        .and_then(|terms| if auth.is_metered() { terms.with_closing_signal() } else { Ok(terms) })
                         .map_err(ApiError::BudgetExceeded)?
                         .over_direct_channel(direct && fee == 0);
                     // An offer's hold is reserved with the offer below, in one
@@ -3847,7 +3849,7 @@ pub(super) async fn compose_peer(
         operation.draft(draft, price_msat,
             debit.fee_limit(&state, price_msat).saturating_add(admission.fee_ceiling_msat),
             admission.settled_msat.saturating_sub(admission.readmission_msat),
-            if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+            if matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK) {
                 let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
                     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
                 Some((signal.call_id, signal.seq.unwrap_or_default()))

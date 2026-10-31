@@ -174,8 +174,8 @@ async fn call_reserves_before_offer_draws_above_message_cap_and_releases_each_en
             .service
             .call_spend_status(&fx.peer.to_hex(), CALL)
             .unwrap();
-        assert_eq!((hold.reserved_msat, hold.spent_msat), (420_000, 0));
-        assert_eq!(fx.used(), 421_000); // offer plus the complete block hold
+        assert_eq!((hold.reserved_msat, hold.spent_msat), (421_000, 0));
+        assert_eq!(fx.used(), 422_000); // offer plus the complete block hold
         answer(&fx).await;
         let (status, body) = send(&fx, &token, 404, 7_000, 0).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -187,8 +187,8 @@ async fn call_reserves_before_offer_draws_above_message_cap_and_releases_each_en
             .service
             .call_spend_status(&fx.peer.to_hex(), CALL)
             .unwrap();
-        assert_eq!((view.spent_msat, view.remaining_msat), (7_000, 413_000));
-        assert_eq!(fx.used(), 421_000);
+        assert_eq!((view.spent_msat, view.remaining_msat), (7_000, 414_000));
+        assert_eq!(fx.used(), 422_000);
         let request = Request::builder()
             .uri(format!("/api/v1/calls?peer={}", fx.peer))
             .header("authorization", common::auth_header(&fx.state))
@@ -560,7 +560,7 @@ async fn default_duration_cap_ends_at_paid_boundary_and_releases_hold() {
     assert_eq!(send(&fx, &token, 400, 7_000, 0).await.0, StatusCode::OK);
     let status = serde_json::to_value(fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap()).unwrap();
     assert_eq!(status["max_call_minutes"], 60);
-    assert_eq!(status["reserved_msat"], 420_000);
+    assert_eq!(status["reserved_msat"], 421_000);
     answer(&fx).await;
     assert_eq!(send(&fx, &token, 404, 7_000, 0).await.0, StatusCode::OK);
     let now = chrono::Utc::now().timestamp_millis() as u64;
@@ -573,13 +573,13 @@ async fn default_duration_cap_ends_at_paid_boundary_and_releases_hold() {
     assert_ne!(status, StatusCode::OK);
     assert_eq!(body["reason"], "call_duration_cap");
     assert_eq!(fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap().phase, Phase::Live);
-    konsensus_api::calls::maintain_calls(&fx.state, now + 10_000).await.unwrap();
+    finish_at_cap(&fx).await;
     let ended = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
     assert_eq!(ended.phase, Phase::Ended);
     assert_eq!(ended.end_reason.unwrap().as_str(), "duration_cap");
     assert!(!ended.media_admitted(now + 10_000));
     assert!(fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap().closed);
-    assert_eq!(fx.used(), 8_000);
+    assert_eq!(fx.used(), 9_000);
 }
 
 #[tokio::test]
@@ -618,7 +618,7 @@ async fn broken_hold_cleanup_preserves_paid_response_and_other_expiry_notificati
 
 #[tokio::test]
 async fn configured_duration_sizes_and_pins_the_hold() {
-    for (minutes, reserved) in [(1, 7_000), (240, 1_680_000)] {
+    for (minutes, reserved) in [(1, 8_000), (240, 1_681_000)] {
     let (mut fx, token) = prepared().await;
     fx.state = Arc::new(AppState { max_call_minutes: minutes, ..(*fx.state).clone() });
     assert_eq!(send(&fx, &token, 400, 7_000, 0).await.0, StatusCode::OK);
@@ -737,7 +737,7 @@ async fn approved_messaging_grant_pays_a_call_within_its_pinned_block_ceiling() 
     let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
     // 10 sat per block plus the 5 sat routing ceiling, for ten minutes.
     assert_eq!((hold.per_block_msat, hold.per_block_fee_msat), (10_000, 5_000));
-    assert_eq!(hold.reserved_msat, 150_000);
+    assert_eq!(hold.reserved_msat, 151_000);
     answer(&fx).await;
     let (status, body) = send_request(&fx, &token, 10_000, ordinary(&fx, 404, 0, None)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -846,7 +846,7 @@ async fn approved_per_payment_value_is_signed_shown_and_binds_calls_and_messages
         if block_paid {
             assert_eq!(status, StatusCode::OK, "{body}");
             let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
-            assert_eq!((hold.per_block_msat, hold.per_block_fee_msat, hold.reserved_msat), (10_000, 0, 100_000));
+            assert_eq!((hold.per_block_msat, hold.per_block_fee_msat, hold.reserved_msat), (10_000, 0, 101_000));
             assert_eq!(fx.wallet.money(), 1);
         } else {
             assert_budget_exceeded(status, &body, "per_call");
@@ -871,8 +871,8 @@ async fn offer_is_paid_under_its_own_cap_and_the_owners_limit() {
     let (status, body) = send_priced(&fx, &token, 11_000, 10_000, capped_offer(&fx, 11_000)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
-    assert_eq!((hold.per_block_msat, hold.per_block_fee_msat, hold.reserved_msat), (10_000, 0, 100_000));
-    assert_eq!((fx.wallet.money(), fx.wallet.left(), fx.used()), (1, 11_000, 111_000));
+    assert_eq!((hold.per_block_msat, hold.per_block_fee_msat, hold.reserved_msat), (10_000, 0, 101_000));
+    assert_eq!((fx.wallet.money(), fx.wallet.left(), fx.used()), (1, 11_000, 112_000));
     // A 10 sat offer above the owner's 1 sat limit, though its 1 sat block
     // fits: refused with nothing paid, no hold and no breaker count.
     let (fx, token) = approved_call_capped(false, 1_000, 10).await;
@@ -899,7 +899,7 @@ async fn a_drained_direct_channel_ends_the_call_instead_of_routing_a_block_with_
     answer(&fx).await;
     let (status, body) = send_request(&fx, &token, 10_000, ordinary(&fx, 404, 0, None)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!((fx.wallet.money(), fx.used()), (2, 101_000));
+    assert_eq!((fx.wallet.money(), fx.used()), (2, 102_000));
     // The direct channel is drained before block 1 is due.
     fx.wallet.call_capacity.store(0, Ordering::SeqCst);
     let now = chrono::Utc::now().timestamp_millis() as u64;
@@ -942,8 +942,8 @@ async fn console_per_call_limit_binds_a_calls_block_ceiling() {
     let (status, body) = send(&fx, &token, 400, 8_000, 0).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
-    assert_eq!((hold.per_block_msat, hold.reserved_msat), (8_000, 480_000));
-    assert_eq!((fx.wallet.money(), fx.used()), (1, 481_000));
+    assert_eq!((hold.per_block_msat, hold.reserved_msat), (8_000, 481_000));
+    assert_eq!((fx.wallet.money(), fx.used()), (1, 482_000));
 }
 
 #[tokio::test]
@@ -957,7 +957,7 @@ async fn relation_envelope_per_act_maximum_still_bounds_each_call_payment() {
     let (fx, token) = approved_call_capped(true, 10_000, 10).await;
     let (status, body) = ten_sat_call(&fx, &token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap().reserved_msat, 100_000);
+    assert_eq!(fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap().reserved_msat, 101_000);
     assert_eq!(fx.wallet.money(), 1);
 }
 
@@ -986,8 +986,8 @@ async fn offer_refused_against_its_ceiling_leaves_no_hold_and_the_next_call_pays
     assert_eq!(status, StatusCode::OK, "{body}");
     let hold = fx.service.call_spend_status(&fx.peer.to_hex(), NEXT).unwrap();
     assert!(!hold.closed);
-    assert_eq!(hold.reserved_msat, 100_000);
-    assert_eq!((fx.wallet.money(), fx.used(), recipient_used(&fx)), (1, 101_000, 101_000));
+    assert_eq!(hold.reserved_msat, 101_000);
+    assert_eq!((fx.wallet.money(), fx.used(), recipient_used(&fx)), (1, 102_000, 102_000));
 }
 
 #[tokio::test]
@@ -1003,7 +1003,7 @@ async fn a_second_offer_for_the_same_call_is_refused_before_payment() {
     assert_eq!(fx.wallet.money(), 1, "one offer payment: {body}");
     let budget = fx.service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
     assert_eq!(budget.call_reservations.len(), 1, "one hold");
-    assert_eq!(fx.used(), 421_000, "one offer plus one hold");
+    assert_eq!(fx.used(), 422_000, "one offer plus one hold");
     assert_eq!(budget.breaker_status(chrono::Utc::now().timestamp()).payments_last_hour, 2);
 }
 
@@ -1051,8 +1051,8 @@ fn assert_nothing_held(fx: &Fx) {
 
 #[tokio::test]
 async fn offer_over_the_remaining_budget_leaves_no_hold_or_breaker_count() {
-    // The 100 sat hold fits 105 sat; the hold plus a 10 sat offer does not.
-    let mut terms = GrantTerms::new(105_000);
+    // The 101 sat hold, including closure, fits 106 sat; the hold plus a 10 sat offer does not.
+    let mut terms = GrantTerms::new(106_000);
     terms.breakers.max_msat_per_10_minutes = 5_000_000;
     let (fx, token) = console_call(terms).await;
     let (status, body) = send_priced(&fx, &token, 10_000, 10_000, capped_offer(&fx, 10_000)).await;
@@ -1062,7 +1062,7 @@ async fn offer_over_the_remaining_budget_leaves_no_hold_or_breaker_count() {
     reprice(&fx, 5_000, 10_000).await;
     let (status, body) = send_priced(&fx, &token, 5_000, 10_000, capped_offer(&fx, 5_000)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!((fx.wallet.money(), fx.used(), breaker_payments(&fx)), (1, 105_000, 2));
+    assert_eq!((fx.wallet.money(), fx.used(), breaker_payments(&fx)), (1, 106_000, 2));
 }
 
 #[tokio::test]
@@ -1109,7 +1109,7 @@ async fn a_kept_hold_above_the_grants_per_payment_value_ends_the_call() {
         answer(&fx).await;
         let (status, body) = send(&fx, &token, 404, 10_000, 0).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!((fx.wallet.money(), fx.used()), (2, 101_000));
+        assert_eq!((fx.wallet.money(), fx.used()), (2, 102_000));
         restart_with_signed_value(&mut fx, signed);
         let now = chrono::Utc::now().timestamp_millis() as u64;
         let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
@@ -1133,4 +1133,165 @@ async fn a_kept_hold_above_the_grants_per_payment_value_ends_the_call() {
             assert_eq!(entry.phase, Phase::Ended);
         }
     }
+}
+
+/// Finish the one paid block at the configured cap, then wait for the
+/// best-effort notification's operation to resolve (including nonpayment).
+async fn finish_at_cap(fx: &Fx) {
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let mut entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    entry.paid_until_ms = Some(now);
+    entry.deadline_ms = now + 20_000;
+    fx.state.storage.call_put(&fx.peer, CALL, &entry).await.unwrap();
+    fx.state.peer_prices.update_kind_price(fx.peer, 403, 1_000, 850_000).await;
+    konsensus_api::calls::maintain_calls(&fx.state, now).await.unwrap();
+    let pool = sqlx::SqlitePool::connect(fx.tmp.path().join("calls.sqlite").to_str().unwrap()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(7), async {
+        loop {
+            let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+            let notification: Option<String> = sqlx::query_scalar("SELECT operation_id FROM outbox_operations WHERE kind = 403")
+                .fetch_optional(&pool).await.unwrap();
+            if let Some(id) = notification {
+                let op = fx.state.storage.get_outbox_operation(&id).await.unwrap().unwrap();
+                let closed = fx.service.call_spend_status(&fx.peer.to_hex(), CALL)
+                    .is_none_or(|hold| hold.closed && hold.remaining_msat == 0);
+                if closed && entry.pending.is_none() && matches!(op.state.as_str(), "released" | "paid" | "sent" | "acked") { break; }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("closing notification did not resolve");
+    let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!((entry.phase, entry.end_reason), (Phase::Ended, Some(HangupReason::DurationCap)));
+    assert!(!entry.media_admitted(now));
+}
+
+async fn one_block_call(budget: u64) -> (Fx, String) {
+    one_block_call_for(budget, 1).await
+}
+
+async fn one_block_call_for(budget: u64, minutes: u16) -> (Fx, String) {
+    let mut fx = call_ready(fixture().await).await;
+    fx.state = Arc::new(AppState { max_call_minutes: minutes, ..(*fx.state).clone() });
+    let mut terms = GrantTerms::new(budget).per_call(1_000);
+    terms.breakers.max_msat_per_10_minutes = budget;
+    let token = fx.grant(None, terms).await;
+    let (status, body) = send(&fx, &token, 400, 1_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    answer(&fx).await;
+    let (status, body) = send(&fx, &token, 404, 1_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    (fx, token)
+}
+
+#[tokio::test]
+async fn cap_hangup_is_reserved_at_admission_and_paid_by_the_calls_grant() {
+    // The original 2,000-msat repro cannot admit an offer, a block and closure.
+    let (fx, token, _) = approved_call_with(2_000, Some(1_000), 1).await;
+    let (status, body) = send(&fx, &token, 400, 1_000, 0).await;
+    assert_budget_exceeded(status, &body, "total");
+    assert_eq!((fx.wallet.left(), fx.used()), (0, 0));
+    assert_nothing_held(&fx);
+
+    let (mut fx, _) = one_block_call(3_000).await;
+    assert_eq!(fx.used(), 3_000, "the closing allowance is already held");
+    fx.restart();
+    finish_at_cap(&fx).await;
+    assert_eq!((fx.wallet.money(), fx.wallet.left(), fx.used()), (3, 3_000, 3_000));
+    assert_eq!(recipient_used(&fx), 3_000);
+    assert_eq!(breaker_payments(&fx), 2, "closing draws on the prepaid hold");
+    let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+    assert!(hold.closed);
+    assert_eq!((hold.spent_msat, hold.remaining_msat), (2_000, 0));
+    let budget = fx.service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert!(budget.pending.is_empty());
+    let hangups = fx.state.storage.get_node_messages_of_kind(&fx.state.identity.node_id().to_hex(), 403, 10, None).await.unwrap();
+    assert_eq!(hangups.len(), 1);
+    assert_eq!(hangups[0].payment_proof.amount_msat, 1_000);
+}
+
+#[tokio::test]
+async fn cap_hangup_never_falls_back_to_owner_when_the_grant_cannot_pay() {
+    for invalidation in ["revoked", "legacy_revoked", "legacy_already_revoked", "exhausted", "breaker", "replaced"] {
+        let (mut fx, _) = one_block_call(3_000).await;
+        if invalidation == "legacy_revoked" {
+            let path = fx.service.dir().join("clients.json");
+            let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            file.as_object_mut().unwrap().remove("call_spend_grants");
+            std::fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+            fx.restart();
+        }
+        if matches!(invalidation, "revoked" | "legacy_revoked" | "legacy_already_revoked" | "replaced") {
+            fx.service.revoke_grants(Some(&fx.client_id)).unwrap();
+            if invalidation == "replaced" {
+                fx.grant(None, GrantTerms::new(10_000)).await;
+            }
+        } else {
+            let path = fx.service.dir().join("clients.json");
+            let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            if invalidation == "exhausted" {
+                // Models a legacy call with no closing allowance left.
+                let budget = &mut file["grants"][0]["budget"];
+                budget["budget_msat"] = json!(2_000);
+                budget["used_msat"] = json!(2_000);
+                budget["used_by_recipient"][fx.peer.to_hex()] = json!(2_000);
+                let hold_id = budget["call_reservations"].as_object().unwrap().keys().next().unwrap().clone();
+                budget["call_reservations"][&hold_id]["terms"]["reserved_msat"] = json!(1_000);
+                budget["pending"][&hold_id][fx.peer.to_hex()] = json!(0);
+            } else {
+                file["grants"][0]["budget"]["breaker_state"]["paused"] = json!(true);
+            }
+            std::fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+        }
+        if invalidation == "legacy_already_revoked" {
+            let path = fx.service.dir().join("clients.json");
+            let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            file.as_object_mut().unwrap().remove("call_spend_grants");
+            std::fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+        }
+        fx.restart();
+        finish_at_cap(&fx).await;
+        assert_eq!((fx.wallet.money(), fx.wallet.left()), (2, 2_000), "{invalidation}");
+        assert!(fx.service.call_spend_status(&fx.peer.to_hex(), CALL).is_none_or(|hold| hold.closed && hold.remaining_msat == 0));
+        if invalidation == "exhausted" || invalidation == "breaker" {
+            assert_eq!(fx.used(), 2_000, "{invalidation}");
+            assert!(fx.service.reload_from_disk().unwrap().grants[0].budget.as_ref().unwrap().pending.is_empty());
+        }
+        if invalidation == "replaced" { assert_eq!(fx.used(), 0); }
+    }
+}
+
+#[tokio::test]
+async fn owner_cap_hangup_keeps_its_existing_payment_behavior() {
+    let mut fx = call_ready(fixture().await).await;
+    fx.state = Arc::new(AppState { max_call_minutes: 1, ..(*fx.state).clone() });
+    let token = konsensus_api::auth::create_token(&fx.state.identity.node_id().to_hex(), &fx.state.jwt_secret, Scope::all()).unwrap();
+    assert_eq!(send(&fx, &token, 400, 1_000, 0).await.0, StatusCode::OK);
+    answer(&fx).await;
+    assert_eq!(send(&fx, &token, 404, 1_000, 0).await.0, StatusCode::OK);
+    finish_at_cap(&fx).await;
+    assert_eq!((fx.wallet.money(), fx.wallet.left(), fx.used()), (3, 3_000, 0));
+    assert!(fx.service.call_spend_status(&fx.peer.to_hex(), CALL).is_none());
+}
+
+#[tokio::test]
+async fn cap_hangup_of_a_legacy_grant_call_cannot_inherit_an_owner_renewal() {
+    let (mut fx, _) = one_block_call_for(4_000, 2).await;
+    let token = konsensus_api::auth::create_token(&fx.state.identity.node_id().to_hex(), &fx.state.jwt_secret, Scope::all()).unwrap();
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let mut entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    entry.paid_until_ms = Some(now + 10_000);
+    entry.deadline_ms = now + 20_000;
+    fx.state.storage.call_put(&fx.peer, CALL, &entry).await.unwrap();
+    let (status, body) = send(&fx, &token, 404, 1_000, 1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.wallet.left(), 3_000);
+    fx.service.revoke_grants(Some(&fx.client_id)).unwrap();
+    // Simulate revocation on an older node, which had no funding marker.
+    let path = fx.service.dir().join("clients.json");
+    let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    file.as_object_mut().unwrap().remove("call_spend_grants");
+    std::fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+    fx.restart();
+    finish_at_cap(&fx).await;
+    assert_eq!((fx.wallet.money(), fx.wallet.left()), (3, 3_000));
 }

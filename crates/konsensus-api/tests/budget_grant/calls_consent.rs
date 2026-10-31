@@ -96,8 +96,8 @@ async fn offer_within_consent_accepts_equal_boundaries_and_absent_ceilings() {
     for ceilings in [
         json!({}),
         json!({"max_block_msat": 7000}),
-        json!({"max_hold_msat": 420000}),
-        json!({"max_block_msat": 7000, "max_hold_msat": 450000, "max_routing_fee_msat": 500}),
+        json!({"max_hold_msat": 421000}),
+        json!({"max_block_msat": 7000, "max_hold_msat": 451000, "max_routing_fee_msat": 500}),
     ] {
         let (fx, token) = prepared().await;
         let mut request = offer(&fx);
@@ -106,9 +106,9 @@ async fn offer_within_consent_accepts_equal_boundaries_and_absent_ceilings() {
             .unwrap()
             .extend(ceilings.as_object().unwrap().clone());
         let expected_hold = if ceilings.get("max_routing_fee_msat").is_some() {
-            450_000
+            451_000
         } else {
-            420_000
+            421_000
         };
         let (status, body) = send_request(&fx, &token, 7000, request).await;
         assert_eq!(status, StatusCode::OK, "{body}");
