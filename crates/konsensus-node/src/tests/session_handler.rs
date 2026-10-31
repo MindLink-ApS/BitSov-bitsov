@@ -4036,6 +4036,141 @@ async fn session_decode_logs_do_not_echo_peer_json() {
     );
 }
 
+/// A peer's calendar refusal consumed the payment proof and withdrew the
+/// envelope, so the sender must treat it as terminal: `failed_paid`, no resend,
+/// and no later ACK or reused-proof compatibility path may report delivery.
+/// The reasons are built by the receive side's own formatter.
+#[tokio::test]
+async fn calendar_refusals_are_terminal_and_never_deliver_later() {
+    use konsensus_core::payloads::calendar::CalendarPayloadError;
+    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
+    let refusals = [
+        CalendarPayloadError::TooLarge {
+            actual: 70_000,
+            max: 65_536,
+        },
+        CalendarPayloadError::FieldTooLong {
+            field: "title",
+            max: 512,
+        },
+        CalendarPayloadError::TooManyEntries {
+            field: "attendees",
+            max: 100,
+        },
+        CalendarPayloadError::RecurrenceTooLarge {
+            estimated: 5_001,
+            max: 5_000,
+        },
+        CalendarPayloadError::RecurrenceInvalid("interval must be at least 1"),
+        CalendarPayloadError::TimestampOutOfRange { field: "until" },
+        CalendarPayloadError::Malformed,
+    ];
+    assert_eq!(refusals.len(), CalendarPayloadError::CODES.len());
+    let mut reasons: Vec<String> = refusals
+        .iter()
+        .map(|refusal| {
+            // The bare code without the separator is not a refusal line.
+            assert!(!terminal_paid_rejection(refusal.code()));
+            assert!(!terminal_paid_rejection(&format!("{}x: y", refusal.code())));
+            crate::msg_handler::calendar_reject_reason(refusal)
+        })
+        .collect();
+    // The reject frame was lost and the sender retried: the recipient answers
+    // the replay of a withdrawn envelope with this reason instead of a
+    // payment-reuse one, which the compatibility path below would take as an
+    // acknowledgement.
+    reasons.push(crate::msg_handler::application_rejected_reason());
+    assert!(!terminal_paid_rejection("application_rejected"));
+    for reason in reasons {
+        assert!(terminal_paid_rejection(&reason), "{reason}");
+
+        let mut limits = DeliveryConfirmationBudget::default();
+        let own = make_peer_id(71);
+        let peer = make_peer_id(72);
+        let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+        let storage: Arc<dyn Storage> = db.clone();
+        let routing = konsensus_routing::RoutingTable::new(Default::default());
+        let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (ws, mut updates) = broadcast::channel(16);
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+        let env = UkmEnvelopeBuilder::new(
+            konsensus_core::kind::KIND_CALENDAR_EVENT,
+            own,
+            Recipient::Node(peer),
+            vec![1],
+            PaymentProof::new(sha2::Sha256::digest([5; 32]).into(), [5; 32], 1000),
+        )
+        .build();
+        db.store_message(&env).await.unwrap();
+        db.prepare_delivery(&env.id, &peer).await.unwrap();
+
+        handle_delivery_confirmation(
+            &peer,
+            &env.id,
+            Some(&reason),
+            false,
+            &own,
+            &storage,
+            &timestamps,
+            &routing,
+            &ws,
+            &audit,
+            &mut limits, None,
+        )
+        .await;
+        let update = updates.try_recv().unwrap();
+        assert_eq!(update.status, "failed_paid", "{reason}");
+        assert_eq!(update.reason.as_deref(), Some(reason.as_str()));
+        let (state, attempts): (String, i64) =
+            sqlx::query_as("SELECT state, attempts FROM pending_deliveries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((state.as_str(), attempts), ("failed_paid", 1));
+        assert!(
+            db.get_pending_for_peer(&peer).await.unwrap().is_empty(),
+            "no resend after a calendar refusal: {reason}"
+        );
+        db.cleanup_stale_pending(1).await.unwrap();
+        assert!(db.get_pending_for_peer(&peer).await.unwrap().is_empty());
+        assert!(
+            db.mark_pending_sent(&env.id, &peer).await.is_err(),
+            "a stale flusher snapshot cannot resend a refused calendar payload"
+        );
+
+        // A later plain ACK and a later reused-proof compatibility reply for
+        // the same id must not turn the withdrawn message into a delivery.
+        for later in [None, Some("replay detected: nonce already used")] {
+            handle_delivery_confirmation(
+                &peer,
+                &env.id,
+                later,
+                false,
+                &own,
+                &storage,
+                &timestamps,
+                &routing,
+                &ws,
+                &audit,
+                &mut limits, None,
+            )
+            .await;
+            assert!(
+                updates.try_recv().is_err(),
+                "late {later:?} after a calendar refusal must emit nothing"
+            );
+            let state: String = sqlx::query_scalar("SELECT state FROM pending_deliveries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(state, "failed_paid");
+        }
+        assert!(!db.acknowledge_pending(&env.id, &peer, &own).await.unwrap());
+        assert!(routing.get_peer_weight(&peer).await.is_none());
+    }
+}
+
 // ── Validate before replace ─────────────────────────────────────────
 
 /// Two identities with an established, bidirectional E2EE session, returned

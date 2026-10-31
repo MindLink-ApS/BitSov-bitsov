@@ -5,6 +5,39 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Bound inbound calendar payloads before any copy or expansion: invites,
+  updates and RSVPs from peers are decoded under byte caps (64 KiB per event,
+  4 KiB per RSVP), per-field string caps, an attendee cap (100) and a
+  recurrence cap (5000 implied instances by `COUNT` or `UNTIL`), checked
+  after the transport's per-peer byte budget and the payment gate and before
+  the plaintext cache, the stored record or any recurrence expansion. An
+  over-cap payload is withdrawn and refused with a typed `calendar_*` reason
+  the sender can read; the sender records such a refusal as final
+  (`failed_paid`) and never retries it. Calendar envelopes are held from
+  before paid acceptance until the caps pass, like call signals and room
+  chats, and the event or RSVP is written and the hold released in one
+  storage transaction (`commit_calendar_admission`) that requires the hold
+  and, on PostgreSQL, locks it against the hold sweep, so a failed withdrawal
+  leaves them hidden for the hold sweep with no calendar change behind and an
+  admitted decryptable envelope never lacks its change. Held kinds (call
+  signals, room chats, calendar) are accepted under their hold inside the
+  acceptance transaction, so a hold the sweep withdrew cannot be followed by
+  an unheld acceptance. A held envelope whose paid acceptance returns an
+  error keeps its hold (the acceptance may have committed); a retry re-admits
+  it or the sweep withdraws it. A calendar envelope that cannot be decrypted
+  is admitted as an opaque message through the same transaction (live hold
+  and stored sender-bound envelope required, one hold consumed), and a resend
+  is acknowledged as a duplicate only on positive evidence of its durable
+  admission, never on the mere absence of a hold, so an envelope the sweep
+  withdrew meanwhile is refused. Calendar timestamps past the representable
+  range are refused (`calendar_timestamp_out_of_range`). A
+  resend of any envelope this node withdrew at the application is answered
+  with a terminal `application_rejected:` reason instead of a payment-reuse
+  one, which a sender's compatibility path could read as delivered. The owner
+  API refuses the same payloads before they are stored or paid for,
+  including a partial update whose retained recurrence would exceed the cap
+  from its new start.
+
 ## [0.3.0-rc20] — 2026-10-31 (prep; not tagged yet)
 
 - Payment truth on the owner API: `POST /payments/pay` and `/payments/keysend`

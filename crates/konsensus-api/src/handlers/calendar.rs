@@ -18,7 +18,9 @@ use uuid::Uuid;
 use konsensus_core::calendar::{CalendarEvent, Freq, RRule};
 use konsensus_core::calendar::expand_occurrences as core_expand_occurrences;
 use konsensus_core::kind::{KIND_CALENDAR_EVENT, KIND_CALENDAR_UPDATE, KIND_RSVP};
-use konsensus_core::payloads::calendar::{CalendarEventPayload, RsvpPayload, RsvpResponse, WireRRule};
+use konsensus_core::payloads::calendar::{
+    CalendarEventPayload, CalendarPayloadError, RsvpPayload, RsvpResponse, WireRRule, MAX_ATTENDEES,
+};
 use konsensus_core::types::{NodeId, Recipient};
 use konsensus_crypto::ratchet_message_to_bytes;
 use konsensus_storage::{CalendarEventRecord, RsvpRecord};
@@ -118,6 +120,11 @@ fn default_calendar_to_ms(from_ms: u64) -> Result<u64, ApiError> {
                 "calendar default time range exceeds supported timestamp bounds".into(),
             )
         })
+}
+
+/// An owner request that peers would refuse at their inbound calendar caps.
+fn calendar_cap_rejected(e: CalendarPayloadError) -> ApiError {
+    ApiError::BadRequest(format!("{}: {e}", e.code()))
 }
 
 /// Optional recurrence rule in API requests.
@@ -478,8 +485,10 @@ async fn create_event(
     if req.attendees.is_empty() {
         return Err(ApiError::BadRequest("at least one attendee required".into()));
     }
-    if req.attendees.len() > 100 {
-        return Err(ApiError::BadRequest("too many attendees (max 100)".into()));
+    if req.attendees.len() > MAX_ATTENDEES {
+        return Err(ApiError::BadRequest(format!(
+            "too many attendees (max {MAX_ATTENDEES})"
+        )));
     }
 
     let event_id = Uuid::new_v4().to_string();
@@ -503,6 +512,24 @@ async fn create_event(
         count: r.count,
         byday: r.byday.clone(),
     });
+
+    // Refuse here what every attendee's node would refuse at its inbound caps,
+    // before the event is stored locally or any delivery is paid for.
+    CalendarEventPayload {
+        event_id: event_id.clone(),
+        title: req.title.clone(),
+        description: req.description.clone(),
+        start_ms: req.start,
+        end_ms: req.end,
+        tz: req.tz.clone(),
+        location: req.location.clone(),
+        organizer: organizer.clone(),
+        attendees: req.attendees.clone(),
+        recurrence: wire_rrule.clone(),
+        color: req.color.clone(),
+    }
+    .validate()
+    .map_err(calendar_cap_rejected)?;
 
     let attendees_json = serde_json::to_string(&req.attendees)
         .map_err(|e| ApiError::Internal(format!("attendees serialization: {e}")))?;
@@ -706,6 +733,40 @@ async fn update_event(
         .map_err(|e| ApiError::Internal(format!("recurrence serialization: {e}")))?
         .or(existing.recurrence_json.clone());
 
+    // Parse attendees; refuse an update the attendees' nodes would refuse at
+    // their inbound caps before it is stored or paid for. A partial update that
+    // keeps the stored recurrence is checked with that rule against the new
+    // start, since the retained series is what the record will imply.
+    let attendees: Vec<String> = serde_json::from_str(&existing.attendees_json)
+        .map_err(|e| ApiError::Internal(format!("attendees deserialization: {e}")))?;
+    let effective_rrule: Option<WireRRule> = match &wire_rrule {
+        Some(rule) => Some(rule.clone()),
+        None => recurrence_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|_| {
+                calendar_cap_rejected(CalendarPayloadError::RecurrenceInvalid(
+                    "the stored recurrence cannot be decoded; supply a replacement",
+                ))
+            })?,
+    };
+    CalendarEventPayload {
+        event_id: event_id.clone(),
+        title: title.clone(),
+        description: description.clone(),
+        start_ms,
+        end_ms,
+        tz: tz.clone(),
+        location: location.clone(),
+        organizer: existing.organizer.clone(),
+        attendees: attendees.clone(),
+        recurrence: effective_rrule,
+        color: color.clone(),
+    }
+    .validate()
+    .map_err(calendar_cap_rejected)?;
+
     let updated = CalendarEventRecord {
         id: existing.id.clone(),
         message_id: existing.message_id.clone(),
@@ -728,9 +789,7 @@ async fn update_event(
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 
-    // Parse attendees and send update
-    let attendees: Vec<String> = serde_json::from_str(&existing.attendees_json)
-        .map_err(|e| ApiError::Internal(format!("attendees deserialization: {e}")))?;
+    // Send update
     let peer_ids: Vec<NodeId> = attendees
         .iter()
         .filter_map(|a| NodeId::from_hex(a).ok())
@@ -897,6 +956,9 @@ async fn create_rsvp(
         response: rsvp_response,
         comment: req.comment.clone(),
     };
+    // The organizer's node refuses an RSVP over its inbound caps; say so here
+    // before the ratchet advances or a delivery is paid for.
+    payload.validate().map_err(calendar_cap_rejected)?;
     let payload_bytes = serde_json::to_vec(&payload)
         .map_err(|e| ApiError::Internal(format!("payload serialization: {e}")))?;
 

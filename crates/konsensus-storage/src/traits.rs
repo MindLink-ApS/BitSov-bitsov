@@ -7,7 +7,7 @@ use konsensus_core::{
     OperatorHostingPayment, Recipient, RoomId, UkmEnvelope,
 };
 
-use crate::calendar::{CalendarEventRecord, RsvpRecord};
+use crate::calendar::{CalendarAdmission, CalendarEventRecord, RsvpRecord};
 use crate::error::StorageError;
 use crate::invites::{
     AcceptedInviteRecord, InviteIssuedRecord, InviteSchemaCapabilities, InviteState,
@@ -267,6 +267,20 @@ pub trait Storage: Send + Sync {
     /// ciphertext; backends compare the validated ID and immutable metadata.
     async fn accept_paid_envelope(&self, _envelope: &UkmEnvelope) -> Result<PaidAcceptance, StorageError> {
         Err(StorageError::Unsupported("accept_paid_envelope".into()))
+    }
+
+    /// Paid acceptance for a kind that is held before acceptance (call
+    /// signals, room chats, calendar). Identical to `accept_paid_envelope`,
+    /// except that a FRESH acceptance requires the envelope's admission hold to
+    /// exist, checked inside the acceptance transaction (hold-first row lock on
+    /// PostgreSQL; under the writer lock on SQLite). A hold the sweep already
+    /// withdrew therefore cannot be followed by an unheld acceptance: the
+    /// acceptance fails with `NotFound` and nothing is written, and the
+    /// sender's retry places a fresh hold. A replay of an already accepted
+    /// envelope needs no hold. Backends with holds must override this; the
+    /// default is for backends without holds.
+    async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<PaidAcceptance, StorageError> {
+        self.accept_paid_envelope(envelope).await
     }
 
     /// Exact, previously accepted proof subsequently rejected by the application.
@@ -913,6 +927,24 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Admit an accepted inbound calendar envelope: in one transaction, require
+    /// its live admission hold, check that the envelope is stored for this
+    /// sender, persist its event (upsert by id) or RSVP (upsert by
+    /// `(event_id, responder)`) or nothing (`Opaque`, an undecryptable
+    /// envelope), and consume exactly that one hold. Rolls back on any failure, so the envelope either has
+    /// its mutation and is visible, or stays held (hidden, withdrawn by the
+    /// sweep) with no mutation. An envelope that is not stored is refused with
+    /// `NotFound` and nothing is written.
+    async fn commit_calendar_admission(
+        &self,
+        _envelope: &konsensus_core::UkmEnvelope,
+        _admission: &CalendarAdmission,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported(
+            "calendar storage not implemented for this backend".into(),
+        ))
+    }
+
     /// Return all recurring master events (recurrence_json IS NOT NULL, parent_id IS NULL).
     ///
     /// HARD-4: correctness-complete. The calendar view expands every master into
@@ -1215,6 +1247,16 @@ pub trait Storage: Send + Sync {
 
     // ── Incoming call signal admission hold (Codex delta2 #4) ──────────
     // A held message is invisible to history, resync and duplicate ACKs.
+
+    /// Whether `envelope` is a replay of a paid envelope this node accepted and
+    /// then refused at the application (`reject_accepted_envelope`, or the hold
+    /// sweep): its receipt is bound to this exact id and sender with
+    /// `accepted = -1`. The receive loop answers such a replay with a terminal
+    /// application rejection instead of a payment-reuse reason, which an older
+    /// sender would read as a legacy acknowledgement.
+    async fn is_application_rejected(&self, _envelope: &konsensus_core::UkmEnvelope) -> Result<bool, StorageError> {
+        Ok(false)
+    }
 
     /// Hold `envelope` before its paid acceptance, unless a message with its
     /// id is already stored. Returns whether this call placed the hold.
