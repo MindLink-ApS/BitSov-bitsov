@@ -1,0 +1,20 @@
+name: PR flow trigger
+
+# Read-only. A fork's pull_request token cannot write statuses, so this
+# workflow only marks that PR state changed. The "PR flow" workflow then runs
+# from the default branch (workflow_run) with a write token and recomputes
+# every open PR from API metadata. No PR code or PR-supplied data is used.
+on:
+  pull_request:
+    types: [opened, reopened, closed, synchronize, edited, labeled, unlabeled,
+            ready_for_review, converted_to_draft]
+
+permissions: {}
+
+jobs:
+  mark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: PR state changed
+        run: echo "PR flow recompute requested"
