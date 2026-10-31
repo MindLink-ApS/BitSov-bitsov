@@ -13,6 +13,10 @@ pub const CAPABILITY: &str = "paid_send_caps_v1";
 pub const QUOTED_READMISSION_CAPABILITY: &str = "quoted_readmission_v1";
 pub const ROOM_CAPABILITY: &str = "room_terminal_outcomes_v1";
 
+/// A call block refused because the direct channel its zero fee relies on no
+/// longer carries it. Terminal for the call: it ends and its hold is released.
+pub const CALL_DIRECT_CHANNEL_LOST: &str = "call_direct_channel_lost";
+
 pub fn payable(price: u64) -> u64 { if price == 0 { 0 } else { price.max(1000) } }
 
 pub fn check(amount: u64, cap: Option<u64>) -> Result<(), ApiError> {

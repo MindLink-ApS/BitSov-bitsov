@@ -13,6 +13,10 @@ pub struct CallSpendTerms {
     #[serde(default = "legacy_max_call_minutes")]
     pub max_call_minutes: u16,
     pub reserved_msat: u64,
+    /// The zero per-block fee was pinned for a direct channel to the payee:
+    /// each block is paid only while that channel still carries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub direct: bool,
 }
 
 impl CallSpendTerms {
@@ -31,7 +35,14 @@ impl CallSpendTerms {
             per_block_fee_msat: fee,
             max_call_minutes,
             reserved_msat,
+            direct: false,
         })
+    }
+
+    /// Mark the zero per-block fee as pinned for a direct channel.
+    pub fn over_direct_channel(mut self, direct: bool) -> Self {
+        self.direct = direct;
+        self
     }
 }
 
@@ -65,6 +76,9 @@ pub struct CallSpendStatus {
     pub per_block_fee_msat: u64,
     pub released_msat: u64,
     pub closed: bool,
+    /// Blocks are paid only over the direct channel their zero fee relies on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub direct: bool,
 }
 
 impl CallSpend {
@@ -96,6 +110,7 @@ impl CallSpend {
             per_block_fee_msat: self.terms.per_block_fee_msat,
             released_msat: self.released_msat,
             closed: self.closed,
+            direct: self.terms.direct,
         }
     }
 }

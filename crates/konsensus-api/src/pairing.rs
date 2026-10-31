@@ -757,8 +757,9 @@ struct ReservationAuthority<'a> {
     before_persist: Option<ReservationJournal<'a>>,
     operation: Option<crate::spend_budget::OperationReservationLink>,
     call: Option<crate::spend_budget::CallSpendTerms>,
-    /// The call id of a call offer, paid under that call's existing hold.
-    call_offer: Option<&'a str>,
+    /// A call offer, paid under that call's existing hold: its call id and
+    /// the caller's consented all-in cap for it, if any.
+    call_offer: Option<(&'a str, Option<u64>)>,
 }
 
 /// Consumed, single-use authorization. Its grant identity survives the handoff
@@ -3300,12 +3301,20 @@ impl PairingService {
                 "too many unresolved reservations".into(),
             ));
         }
-        // A call's hold and its offer are bounded per payment by the call's
-        // pinned per-block ceiling, not the messaging cap. An offer without a
-        // matching hold in this grant keeps the messaging cap.
-        let call_ceiling = match (&authority.call, authority.call_offer) {
-            (Some(terms), _) => Some(terms),
-            (None, Some(call_id)) => budget
+        // Neither a call's hold nor its offer is bounded by the messaging cap.
+        // The hold funds payments of at most its pinned per-block ceiling. An
+        // offer under a matching open hold in this grant is its own payment:
+        // bounded by the caller's consented cap for it or, without one, by
+        // that ceiling. Both stay within the owner's per-payment limit
+        // (`GrantBudget::call_per_payment_max_msat`). An offer without a
+        // matching hold keeps the messaging cap.
+        let ceiling = |terms: &crate::spend_budget::CallSpendTerms| {
+            terms.per_block_msat.saturating_add(terms.per_block_fee_msat)
+        };
+        let hold_ceiling = authority.call.as_ref().map(ceiling);
+        let offer = authority.call_offer.filter(|_| authority.call.is_none());
+        let offer_limit = offer.and_then(|(call_id, cap)| {
+            budget
                 .call_reservations
                 .values()
                 .find(|c| {
@@ -3313,17 +3322,18 @@ impl PairingService {
                         && c.terms.call_id == call_id
                         && charges.iter().all(|charge| charge.recipient == c.terms.peer)
                 })
-                .map(|c| &c.terms),
-            _ => None,
-        }
-        .map(|terms| terms.per_block_msat.saturating_add(terms.per_block_fee_msat));
+                .map(|c| cap.unwrap_or_else(|| ceiling(&c.terms)))
+        });
+        let offer_msat = charges
+            .iter()
+            .fold(0u64, |total, c| total.saturating_add(c.amount_msat));
         // Purpose, not grant provenance, determines the effective ceiling.
         // Enforce it without changing stored/signed terms, so live grants are
         // covered immediately and explicit payments retain the owner's limit.
         let purpose_limit = if authority.payment || authority.call.is_some() {
             Ok(())
         } else {
-            let max_msat = call_ceiling.unwrap_or_else(|| budget.messaging_per_call_max_msat());
+            let max_msat = offer_limit.unwrap_or_else(|| budget.messaging_per_call_max_msat());
             charges
                 .iter()
                 .try_fold(0u64, |total, charge| {
@@ -3334,9 +3344,10 @@ impl PairingService {
                 })
                 .map(|_| ())
         };
-        let reserved = purpose_limit.and_then(|()| match call_ceiling {
-            Some(ceiling) => budget.reserve_call_at(&charges, ceiling, now),
-            None => budget.reserve_at(&charges, now),
+        let reserved = purpose_limit.and_then(|()| match (hold_ceiling, offer_limit) {
+            (Some(ceiling), _) => budget.reserve_call_at(&charges, ceiling, now),
+            (None, Some(_)) => budget.reserve_call_at(&charges, offer_msat, now),
+            (None, None) => budget.reserve_at(&charges, now),
         });
         if let Err(refusal) = reserved {
             if budget.record_breaker_refusal(&refusal, now) {
@@ -4282,6 +4293,7 @@ fn grant_view(g: &SpendGrant) -> Option<GrantView> {
         used_msat: b.used_msat,
         remaining_msat: b.remaining_msat(),
         per_call_max_msat: b.messaging_per_call_max_msat(),
+        call_per_payment_max_msat: b.call_per_payment_max_msat(),
         per_recipient_msat: b.per_recipient_msat.clone(),
         used_by_recipient: b.used_by_recipient.clone(),
         recipients_only: b.recipients_only,
