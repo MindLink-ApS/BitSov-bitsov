@@ -1,0 +1,46 @@
+name: Flaky test report
+
+# Nightly: a CI run whose first attempt failed and whose re-run of the same
+# commit passed is a flaky signal. Each failing test gets one open issue
+# labelled "flaky" (comments for new occurrences). Reporting only: nothing is
+# skipped, retried or marked green, so a flaky test never counts as passing on
+# money or security paths. Runs from the default branch only.
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  issues: write
+  contents: read
+
+concurrency:
+  group: flaky-report
+  cancel-in-progress: false
+
+jobs:
+  report-flaky-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TRUSTED_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+      FLAKY_LOOKBACK_HOURS: "24"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      # No checkout: the report code comes from the default branch through the API.
+      - name: Load trusted report and tests through the API
+        run: |
+          python3 -c 'from pathlib import Path; Path("scripts/ci").mkdir(parents=True, exist_ok=True); Path(".github/workflows").mkdir(parents=True, exist_ok=True)'
+          trusted_sha=$(gh api --method GET "repos/$GH_REPO/commits/$TRUSTED_BRANCH" --jq .sha)
+          [[ "$trusted_sha" =~ ^[0-9a-f]{40}$ ]]
+          for path in scripts/ci/flaky_report.py scripts/ci/test_flaky_report.py .github/workflows/flaky-report.yml; do
+            gh api --method GET "repos/$GH_REPO/contents/$path" -f "ref=$trusted_sha" --jq .content |
+              python3 -c 'import base64, pathlib, sys; pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(sys.stdin.read()))' "$path"
+          done
+      - name: Test the flaky report
+        run: python3 -m unittest scripts/ci/test_flaky_report.py
+      - name: Report flaky tests from the last 24 hours
+        run: python3 scripts/ci/flaky_report.py
