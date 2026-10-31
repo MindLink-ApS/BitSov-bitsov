@@ -259,6 +259,15 @@ pub(crate) async fn fail_outgoing(state: &AppState, peer: &NodeId, plaintext: &s
 pub(crate) async fn ensure_call_spend(auth: &crate::metered::MeteredSpend, state: &AppState,
     peer: &NodeId, signal: &CallSignal, terms: crate::spend_budget::CallSpendTerms) -> Result<(), ApiError> {
     if !auth.is_metered() { return Ok(()) }
+    with_new_call_spend(state, peer, signal, |capacity| auth.reserve_call(state, terms, capacity)).await?;
+    Ok(())
+}
+
+/// Run `reserve` with the observed call capacity once the call is checked to
+/// be an open outgoing call without a hold. `None` if it already has one.
+/// The call lock orders the reservation with expiry.
+pub(crate) async fn with_new_call_spend<T>(state: &AppState, peer: &NodeId, signal: &CallSignal,
+    reserve: impl FnOnce(u64) -> Result<T, ApiError>) -> Result<Option<T>, ApiError> {
     // Serialize capacity observations only with other new holds. A remote
     // wallet RPC must never stall block renewal, incoming media or hangup.
     static RESERVATIONS: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -274,7 +283,7 @@ pub(crate) async fn ensure_call_spend(auth: &crate::metered::MeteredSpend, state
         return Err(ApiError::BadRequest("caller reservation requires an open outgoing call".into()));
     }
     if state.pairing.as_ref().and_then(|s| s.call_spend_status(&peer.to_hex(), &signal.call_id)).is_some() {
-        return Ok(());
+        return Ok(None);
     }
     if entry.next_block_seq != 0 {
         return Err(ApiError::BadRequest("call reservation missing after block zero; start a new call".into()));
@@ -283,7 +292,7 @@ pub(crate) async fn ensure_call_spend(auth: &crate::metered::MeteredSpend, state
     // capacity from wallet balance, channel size, or an unknown provider field.
     let capacity = channels.iter().filter(|c| c.active)
         .filter_map(|c| c.outbound_capacity_msat).max().unwrap_or(0);
-    auth.reserve_call(state, terms, capacity)
+    reserve(capacity).map(Some)
 }
 
 /// Recovery may resend settled blocks, but a new charge needs a still-payable

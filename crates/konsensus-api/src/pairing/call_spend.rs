@@ -60,17 +60,124 @@ impl PairingService {
         self.prune_call_spend(chrono::Utc::now().timestamp())
             .map_err(|e| BudgetRefusal::Ledger(e.to_string()))?;
         let mut inner = self.lock();
-        let idx = self.call_grant_index(&inner, client, epoch)?;
+        if let Some(existing) = self.check_call_hold(&inner, client, epoch, &terms, capacity_msat)? {
+            return Ok(existing);
+        }
+        self.reserve_spend_locked(
+            &mut inner,
+            client,
+            epoch,
+            vec![Charge {
+                recipient: terms.peer.clone(),
+                amount_msat: terms.reserved_msat,
+            }],
+            ReservationAuthority {
+                call: Some(terms),
+                ..Default::default()
+            },
+            || chrono::Utc::now().timestamp(),
+        )
+    }
+
+    /// Reserve a new call's hold and its offer together. Every check of both
+    /// runs before anything is kept: a refusal of either leaves no hold and
+    /// no breaker count, only the refusal observation. Both are persisted in
+    /// one write. Returns the offer's reservation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_call_with_offer(
+        &self,
+        client: &str,
+        epoch: u64,
+        terms: CallSpendTerms,
+        capacity_msat: u64,
+        offer: Vec<Charge>,
+        offer_cap: Option<u64>,
+        link: OperationReservationLink,
+    ) -> Result<Reservation, BudgetRefusal> {
+        self.prune_call_spend(chrono::Utc::now().timestamp())
+            .map_err(|e| BudgetRefusal::Ledger(e.to_string()))?;
+        let mut inner = self.lock();
+        if self.check_call_hold(&inner, client, epoch, &terms, capacity_msat)?.is_some() {
+            return Err(BudgetRefusal::Unpriced(
+                "call already reserved; send its offer again".into(),
+            ));
+        }
+        let before = inner.file.clone();
+        let call_id = terms.call_id.clone();
+        let hold = vec![Charge {
+            recipient: terms.peer.clone(),
+            amount_msat: terms.reserved_msat,
+        }];
+        let clock = || chrono::Utc::now().timestamp();
+        let reserved = self
+            .reserve_spend_locked(&mut inner, client, epoch, hold, ReservationAuthority {
+                call: Some(terms),
+                in_memory: true,
+                ..Default::default()
+            }, clock)
+            .and_then(|_| {
+                self.reserve_spend_locked(&mut inner, client, epoch, offer, ReservationAuthority {
+                    operation: Some(link),
+                    call_offer: Some((call_id.as_str(), offer_cap)),
+                    in_memory: true,
+                    ..Default::default()
+                }, clock)
+            });
+        let reservation = match reserved {
+            Ok(reservation) => reservation,
+            Err(refusal) => {
+                // Undo the hold and every count it made; keep only what the
+                // refusal observed, as a lone refusal would.
+                let refused = std::mem::replace(&mut inner.file, before);
+                let mut changed = false;
+                for (grant, seen) in inner.file.grants.iter_mut().zip(&refused.grants) {
+                    if let (Some(budget), Some(seen)) = (grant.budget.as_mut(), seen.budget.as_ref()) {
+                        let kept = budget.clone();
+                        budget.keep_refusal_observation(seen);
+                        changed |= *budget != kept;
+                    }
+                }
+                if changed {
+                    if let Err(error) = self.persist(&mut inner.file) {
+                        return Err(BudgetRefusal::Ledger(error.to_string()));
+                    }
+                }
+                return Err(refusal);
+            }
+        };
+        if let Err(error) = self.persist(&mut inner.file) {
+            inner.file = before;
+            return Err(BudgetRefusal::Ledger(error.to_string()));
+        }
+        // Persistence may have pruned this grant at the expiry boundary.
+        let now = chrono::Utc::now().timestamp();
+        if !inner.file.grants.iter().any(|g| g.op_id == reservation.op_id && g.is_live(now)) {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        Ok(reservation)
+    }
+
+    /// Checks before a new hold, under the ledger lock: the grant, the call's
+    /// existing hold (returned when identical), liquidity and ledger room.
+    fn check_call_hold(
+        &self,
+        inner: &Inner,
+        client: &str,
+        epoch: u64,
+        terms: &CallSpendTerms,
+        capacity_msat: u64,
+    ) -> Result<Option<Reservation>, BudgetRefusal> {
+        let idx = self.call_grant_index(inner, client, epoch)?;
         for (grant_idx, grant) in inner.file.grants.iter().enumerate() {
             if let Some(budget) = &grant.budget {
                 for (id, call) in &budget.call_reservations {
                     if call.terms.peer == terms.peer && call.terms.call_id == terms.call_id {
-                        if grant_idx != idx || call.closed || call.terms != terms {
+                        if grant_idx != idx || call.closed || call.terms != *terms {
                             return Err(BudgetRefusal::Unpriced(
                                 "call already reserved with different authority or terms".into(),
                             ));
                         }
-                        return Ok(call_reference(grant, id, &call.terms));
+                        return Ok(Some(call_reference(grant, id, &call.terms)));
                     }
                 }
             }
@@ -100,20 +207,7 @@ impl PairingService {
                 "call reservation ledger is full; ask the owner for a new grant".into(),
             ));
         }
-        self.reserve_spend_locked(
-            &mut inner,
-            client,
-            epoch,
-            vec![Charge {
-                recipient: terms.peer.clone(),
-                amount_msat: terms.reserved_msat,
-            }],
-            ReservationAuthority {
-                call: Some(terms),
-                ..Default::default()
-            },
-            || chrono::Utc::now().timestamp(),
-        )
+        Ok(None)
     }
 
     /// Reserve a call offer under the call's existing hold: bounded by `cap`,
