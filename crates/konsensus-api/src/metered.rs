@@ -175,6 +175,15 @@ impl MeteredSpend {
         Ok(Debit::reserved(Arc::clone(service), reservation))
     }
 
+    /// Debit a call offer, bounded per payment by its call's pinned hold.
+    pub(crate) fn debit_call_offer(&self, state: &AppState, charges: Vec<Charge>, call_id: &str, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()); };
+        let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        let reservation = service.reserve_call_offer_spend(client_id, *epoch, charges, call_id, operation.reservation_link(false))
+            .map_err(ApiError::BudgetExceeded)?;
+        Ok(Debit::reserved(Arc::clone(service), reservation))
+    }
+
     /// Debit a call's charges before anything is dispatched.
     ///
     /// Returns a [`Debit`] the handler resolves once each outcome is known.

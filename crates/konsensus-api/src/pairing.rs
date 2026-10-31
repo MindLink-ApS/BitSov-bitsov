@@ -757,6 +757,8 @@ struct ReservationAuthority<'a> {
     before_persist: Option<ReservationJournal<'a>>,
     operation: Option<crate::spend_budget::OperationReservationLink>,
     call: Option<crate::spend_budget::CallSpendTerms>,
+    /// The call id of a call offer, paid under that call's existing hold.
+    call_offer: Option<&'a str>,
 }
 
 /// Consumed, single-use authorization. Its grant identity survives the handoff
@@ -3298,13 +3300,30 @@ impl PairingService {
                 "too many unresolved reservations".into(),
             ));
         }
+        // A call's hold and its offer are bounded per payment by the call's
+        // pinned per-block ceiling, not the messaging cap. An offer without a
+        // matching hold in this grant keeps the messaging cap.
+        let call_ceiling = match (&authority.call, authority.call_offer) {
+            (Some(terms), _) => Some(terms),
+            (None, Some(call_id)) => budget
+                .call_reservations
+                .values()
+                .find(|c| {
+                    !c.closed
+                        && c.terms.call_id == call_id
+                        && charges.iter().all(|charge| charge.recipient == c.terms.peer)
+                })
+                .map(|c| &c.terms),
+            _ => None,
+        }
+        .map(|terms| terms.per_block_msat.saturating_add(terms.per_block_fee_msat));
         // Purpose, not grant provenance, determines the effective ceiling.
         // Enforce it without changing stored/signed terms, so live grants are
         // covered immediately and explicit payments retain the owner's limit.
         let purpose_limit = if authority.payment || authority.call.is_some() {
             Ok(())
         } else {
-            let max_msat = budget.messaging_per_call_max_msat();
+            let max_msat = call_ceiling.unwrap_or_else(|| budget.messaging_per_call_max_msat());
             charges
                 .iter()
                 .try_fold(0u64, |total, charge| {
@@ -3315,7 +3334,11 @@ impl PairingService {
                 })
                 .map(|_| ())
         };
-        if let Err(refusal) = purpose_limit.and_then(|()| budget.reserve_at(&charges, now)) {
+        let reserved = purpose_limit.and_then(|()| match call_ceiling {
+            Some(ceiling) => budget.reserve_call_at(&charges, ceiling, now),
+            None => budget.reserve_at(&charges, now),
+        });
+        if let Err(refusal) = reserved {
             if budget.record_breaker_refusal(&refusal, now) {
                 if let Err(e) = self.persist(&mut inner.file) {
                     if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {

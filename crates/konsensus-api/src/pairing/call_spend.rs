@@ -116,6 +116,31 @@ impl PairingService {
         )
     }
 
+    /// Reserve a call offer under the call's existing hold: its per-payment
+    /// bound is the hold's pinned per-block ceiling (`GrantBudget::reserve_call_at`).
+    pub(crate) fn reserve_call_offer_spend(
+        &self,
+        client: &str,
+        epoch: u64,
+        charges: Vec<Charge>,
+        call_id: &str,
+        link: OperationReservationLink,
+    ) -> Result<Reservation, BudgetRefusal> {
+        let mut inner = self.lock();
+        self.reserve_spend_locked(
+            &mut inner,
+            client,
+            epoch,
+            charges,
+            ReservationAuthority {
+                operation: Some(link),
+                call_offer: Some(call_id),
+                ..Default::default()
+            },
+            || chrono::Utc::now().timestamp(),
+        )
+    }
+
     /// Transfer a bounded part of a hold to an ordinary recoverable operation.
     /// No reserve_at here: neither budget nor breakers are charged again.
     #[allow(clippy::too_many_arguments)]

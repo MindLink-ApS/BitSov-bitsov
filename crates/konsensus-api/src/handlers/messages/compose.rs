@@ -3527,6 +3527,15 @@ pub(super) async fn compose_peer(
                 price_msat = super::caps::payable(crate::calls::peer_call_kind_price(&state, &peer_id, req.kind).await?);
             }
         }
+        // A payee at the far end of a usable direct channel is paid in one hop,
+        // which owes no routing fee. The zero ceiling also bounds the payment,
+        // so it can never fall back to a fee-paying route. A call block keeps
+        // the fee pinned by its call's hold.
+        if req.kind != konsensus_core::kind::KIND_CALL_BLOCK
+            && super::caps::direct_channel(&state, &peer_id, price_msat).await
+        {
+            req.max_routing_fee_msat = Some(0);
+        }
         if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
             crate::calls::revalidate_outgoing_block(&state, &peer_id, &req.plaintext).await?;
         }
@@ -3600,10 +3609,17 @@ pub(super) async fn compose_peer(
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?;
             auth.debit_call_block(&state, &signal, &peer_key, price_msat,
                 state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat), &operation)
-        } else { auth.debit_operation(&state, vec![Charge {
-            recipient: peer_key.clone(),
-            amount_msat: if first_contact { cap.unwrap_or(ADMISSION_MAX_MSAT) } else { super::caps::all_in(&state, price_msat, req.max_routing_fee_msat)? },
-        }], confirmation, cap, &operation) }
+        } else {
+            let charges = vec![Charge {
+                recipient: peer_key.clone(),
+                amount_msat: if first_contact { cap.unwrap_or(ADMISSION_MAX_MSAT) } else { super::caps::all_in(&state, price_msat, req.max_routing_fee_msat)? },
+            }];
+            if req.kind == konsensus_core::kind::KIND_CALL_INVITE {
+                let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                auth.debit_call_offer(&state, charges, &signal.call_id, &operation)
+            } else { auth.debit_operation(&state, charges, confirmation, cap, &operation) }
+        }
             .map_err(|e| e.with_routing_fee(state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat)))?
             .with_fee_limit(req.max_routing_fee_msat);
         let debit = debit.with_operation(operation.clone());

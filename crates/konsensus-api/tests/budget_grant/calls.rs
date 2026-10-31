@@ -33,12 +33,16 @@ async fn send_operation(fx: &Fx, token: &str, kind: u16, price: u64, seq: u32, c
 }
 
 async fn send_request(fx: &Fx, token: &str, price: u64, request: Value) -> (StatusCode, Value) {
+    send_priced(fx, token, 1_000, price, request).await
+}
+
+async fn send_priced(fx: &Fx, token: &str, offer: u64, price: u64, request: Value) -> (StatusCode, Value) {
     let prices = fx.state.peer_prices.clone();
     let peer = fx.peer;
     let quotes = tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            prices.update_kind_price(peer, 400, 1_000, 850_000).await;
+            prices.update_kind_price(peer, 400, offer, 850_000).await;
             prices.update_kind_price(peer, 404, price, 850_000).await;
             prices.update_kind_price(peer, 403, 0, 850_000).await;
         }
@@ -49,7 +53,15 @@ async fn send_request(fx: &Fx, token: &str, price: u64, request: Value) -> (Stat
 }
 
 async fn prepared() -> (Fx, String) {
-    let mut fx = fixture().await;
+    let fx = call_ready(fixture().await).await;
+    let mut terms = GrantTerms::new(5_000_000);
+    terms.breakers.max_msat_per_10_minutes = 5_000_000;
+    let token = fx.grant(None, terms).await;
+    (fx, token)
+}
+
+/// A fixture with a callable contact and call storage; grants are left as they are.
+async fn call_ready(mut fx: Fx) -> Fx {
     // Admission locks and price-query throttles are process-wide and peer keyed.
     // Independent node fixtures therefore need independent peers.
     let (_, identity) = konsensus_core::NodeIdentity::generate().unwrap();
@@ -85,10 +97,30 @@ async fn prepared() -> (Fx, String) {
         ..(*fx.state).clone()
     });
     fx.wallet.call_capacity.store(10_000_000, Ordering::SeqCst);
-    let mut terms = GrantTerms::new(5_000_000);
-    terms.breakers.max_msat_per_10_minutes = 5_000_000;
-    let token = fx.grant(None, terms).await;
+    fx
+}
+
+/// A paired app under an owner-approved grant, whose per-payment cap is the
+/// 6 sat messaging cap, calling a contact that charges 10 sat per block.
+async fn approved_call(minutes: u16) -> (Fx, String) {
+    let (fx, token) = super::messaging_cap::messaging_fixture(false, 20_000).await;
+    let mut fx = call_ready(fx).await;
+    fx.state = Arc::new(AppState { max_call_minutes: minutes, ..(*fx.state).clone() });
     (fx, token)
+}
+
+/// A call signal under the node's ordinary routing ceiling (no explicit fee limit).
+fn ordinary(fx: &Fx, kind: u16, seq: u32, consent: Option<u64>) -> Value {
+    let plaintext = if kind == 400 {
+        json!({"v": 1, "call_id": CALL, "sdp": "offer", "media": "audio"})
+    } else {
+        json!({"v": 1, "call_id": CALL, "seq": seq})
+    };
+    json!({
+        "operation_id": uuid::Uuid::new_v4().to_string(), "recipient": fx.peer.to_hex(),
+        "kind": kind, "plaintext": plaintext.to_string(), "max_routing_fee_msat": null,
+        "max_block_msat": consent, "wait_ack_ms": 0,
+    })
 }
 
 async fn answer(fx: &Fx) {
@@ -223,7 +255,7 @@ async fn call_liquidity_and_grant_cap_refuse_before_any_offer_payment() {
             if liquidity {
                 "call_liquidity_insufficient"
             } else {
-                "per_call"
+                "total"
             }
         );
         assert_eq!(fx.wallet.money(), 0);
@@ -442,12 +474,19 @@ async fn slow_liquidity_query_does_not_block_another_calls_transitions() {
     fx.state.storage.record_call_block_invoice(&peer, CALL, 0, &[1; 32],
         entry.deadline_ms + rules::CALL_BLOCK_RESUME_MS).await.unwrap();
     let accept_block = async {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            fx.wallet.capacity_entered.notified(),
-        )
-        .await
-        .unwrap();
+        // The offer first asks whether the contact is a direct channel peer;
+        // release that query, then hold the call's own liquidity query.
+        for query in 0..2 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                fx.wallet.capacity_entered.notified(),
+            )
+            .await
+            .unwrap();
+            if query == 0 {
+                fx.wallet.capacity_resume.notify_one();
+            }
+        }
         let plaintext = json!({"call_id": CALL, "seq": 0}).to_string();
         let accepted = tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -665,3 +704,52 @@ async fn recovered_failure_cannot_repay_when_call_cleanup_write_fails() {
 mod consent;
 #[path = "calls_settlement.rs"]
 mod settlement;
+
+#[tokio::test]
+async fn approved_messaging_grant_pays_a_call_within_its_pinned_block_ceiling() {
+    let (fx, token) = approved_call(10).await;
+    let (status, body) = send_request(&fx, &token, 10_000, ordinary(&fx, 400, 0, Some(10_000))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+    // 10 sat per block plus the 5 sat routing ceiling, for ten minutes.
+    assert_eq!((hold.per_block_msat, hold.per_block_fee_msat), (10_000, 5_000));
+    assert_eq!(hold.reserved_msat, 150_000);
+    answer(&fx).await;
+    let (status, body) = send_request(&fx, &token, 10_000, ordinary(&fx, 404, 0, None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+    assert_eq!(hold.spent_msat, 10_000);
+    assert_eq!(fx.wallet.money(), 2);
+    assert_eq!(fx.wallet.left(), 11_000);
+    // Messaging under the same grant keeps the 6 sat per-payment cap.
+    fx.state.peer_prices.update_kind_price(fx.peer, 100, 7_000, 850_000).await;
+    let (status, body) = fx.compose(&token).await;
+    assert_budget_exceeded(status, &body, "per_call");
+    assert_eq!(fx.wallet.money(), 2);
+    let (status, body) = fx.call("GET", "/api/v1/pair/grant", None, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["grant"]["per_call_max_msat"], 6_000);
+}
+
+#[tokio::test]
+async fn approved_messaging_grant_refuses_calls_above_their_ceiling_or_budget() {
+    // Above the caller's consented block price: no hold, nothing paid.
+    let (fx, token) = approved_call(10).await;
+    let (status, body) = send_request(&fx, &token, 10_000, ordinary(&fx, 400, 0, Some(9_999))).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["reason"], "call_price_above_consent");
+    assert!(fx.service.call_spend_status(&fx.peer.to_hex(), CALL).is_none());
+    assert_eq!((fx.wallet.money(), fx.used()), (0, 0));
+    // An offer whose all-in exceeds the call's pinned per-block ceiling.
+    let (fx, token) = approved_call(10).await;
+    let (status, body) =
+        send_priced(&fx, &token, 11_000, 10_000, ordinary(&fx, 400, 0, None)).await;
+    assert_budget_exceeded(status, &body, "per_call");
+    assert_eq!(fx.wallet.money(), 0);
+    // A hold larger than the grant's remaining budget (60 minutes x 15 sat).
+    let (fx, token) = approved_call(60).await;
+    let (status, body) = send_request(&fx, &token, 10_000, ordinary(&fx, 400, 0, None)).await;
+    assert_budget_exceeded(status, &body, "total");
+    assert!(fx.service.call_spend_status(&fx.peer.to_hex(), CALL).is_none());
+    assert_eq!((fx.wallet.money(), fx.used()), (0, 0));
+}

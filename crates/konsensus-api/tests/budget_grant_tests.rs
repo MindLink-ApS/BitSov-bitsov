@@ -58,6 +58,8 @@ struct Wallet {
     capacity_entered: tokio::sync::Notify,
     capacity_resume: tokio::sync::Notify,
     fee: AtomicU64,
+    /// Every routing-fee limit a payment was dispatched under, in order.
+    fee_limits: std::sync::Mutex<Vec<u64>>,
     unknown_fee: AtomicBool,
     recover_preimage: AtomicBool,
     outgoing: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
@@ -150,6 +152,7 @@ impl LightningProvider for Wallet {
         konsensus_core::traits::lightning::PaymentDetails,
         konsensus_core::traits::lightning::LightningError,
     > {
+        self.fee_limits.lock().unwrap().push(_cap);
         if self.fee.load(Ordering::SeqCst) > _cap {
             return Err(LightningError::PaymentNotDispatched(
                 "route exceeds fee ceiling".into(),
@@ -203,6 +206,7 @@ impl LightningProvider for Wallet {
         bolt11: &str,
         _max_fee_msat: u64,
     ) -> Result<PaymentDetails, LightningError> {
+        self.fee_limits.lock().unwrap().push(_max_fee_msat);
         if self.fee.load(Ordering::SeqCst) > _max_fee_msat {
             return Err(LightningError::PaymentNotDispatched(
                 "route exceeds fee ceiling".into(),

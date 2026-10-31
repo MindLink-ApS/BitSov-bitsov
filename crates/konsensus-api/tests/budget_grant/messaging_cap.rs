@@ -3,7 +3,7 @@ use konsensus_api::pairing::approval::ApprovalRequest;
 use konsensus_api::pairing::device;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
-async fn messaging_fixture(relation: bool, requested_cap: u64) -> (Fx, String) {
+pub(super) async fn messaging_fixture(relation: bool, requested_cap: u64) -> (Fx, String) {
     let mut fx = fixture().await;
     let root = konsensus_core::OwnerApprovalKey::from_mnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
@@ -346,4 +346,80 @@ async fn console_room_fanout_is_capped_as_one_call() {
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(fx.wallet.left(), 6_000);
     assert_eq!(fx.used(), 6_000);
+}
+
+#[tokio::test]
+async fn direct_channel_contact_needs_no_routing_fee_under_the_messaging_cap() {
+    let (fx, token) = messaging_fixture(false, 20_000).await;
+    fx.state
+        .peer_prices
+        .update_kind_price(fx.peer, 100, 2_000, 850_000)
+        .await;
+    // The node's ordinary routing ceiling applies: no explicit fee limit.
+    let body = json!({"recipient": fx.peer.to_hex(), "kind": 100, "plaintext": "hi",
+        "max_routing_fee_msat": null});
+    // No usable direct channel: 2 sat plus the 5 sat routing ceiling exceeds 6 sat.
+    let (status, result) = fx
+        .call("POST", "/api/v1/messages/compose", Some(body.clone()), Some(&token))
+        .await;
+    assert_budget_exceeded(status, &result, "per_call");
+    assert_eq!(fx.wallet.money(), 0);
+    assert_eq!(fx.used(), 0);
+    // A direct channel too small for the payment keeps the ordinary ceiling.
+    fx.wallet.call_capacity.store(1_999, Ordering::SeqCst);
+    let (status, result) = fx
+        .call("POST", "/api/v1/messages/compose", Some(body.clone()), Some(&token))
+        .await;
+    assert_budget_exceeded(status, &result, "per_call");
+    assert_eq!(fx.wallet.money(), 0);
+    // A direct channel that carries it: one hop, no routing fee, within 6 sat.
+    fx.wallet.call_capacity.store(2_000, Ordering::SeqCst);
+    let (status, result) = fx
+        .call("POST", "/api/v1/messages/compose", Some(body), Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["max_routing_fee_msat"], 0);
+    assert_eq!(fx.wallet.left(), 2_000);
+    assert_eq!(fx.used(), 2_000);
+    // The payment itself was bounded to a zero routing fee.
+    assert_eq!(*fx.wallet.fee_limits.lock().unwrap(), vec![0]);
+}
+
+#[tokio::test]
+async fn direct_channel_payment_never_falls_back_to_a_fee_paying_route() {
+    let (mut fx, token) = messaging_fixture(false, 20_000).await;
+    // The contact answers invoice requests, so the invoice fallback is tried too.
+    let peer = fx.peer;
+    fx.state = Arc::new(AppState {
+        transport: Arc::new(
+            ConnectedStubTransport::new(vec![peer], fx.state.invoice_requests.clone())
+                .with_invoice_responder(move |_, amount| {
+                    let bolt11 = create_test_bolt11(amount);
+                    let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse().unwrap();
+                    Some(konsensus_api::state::InvoiceResponseData {
+                        payment_hash: invoice.payment_hash().to_string(),
+                        recipient: peer,
+                        bolt11,
+                    })
+                }),
+        ),
+        ..(*fx.state).clone()
+    });
+    fx.state
+        .peer_prices
+        .update_kind_price(fx.peer, 100, 2_000, 850_000)
+        .await;
+    fx.wallet.call_capacity.store(2_000, Ordering::SeqCst);
+    // Only a route that charges a fee is available.
+    fx.wallet.fee.store(1, Ordering::SeqCst);
+    let body = json!({"recipient": fx.peer.to_hex(), "kind": 100, "plaintext": "hi",
+        "max_routing_fee_msat": null, "wait_ack_ms": 0});
+    let (status, result) = fx
+        .call("POST", "/api/v1/messages/compose", Some(body), Some(&token))
+        .await;
+    assert_ne!(status, StatusCode::OK, "{result}");
+    assert_eq!(fx.wallet.money(), 0);
+    assert_eq!(fx.wallet.left(), 0);
+    let limits = fx.wallet.fee_limits.lock().unwrap().clone();
+    assert!(!limits.is_empty() && limits.iter().all(|limit| *limit == 0), "{limits:?}");
 }
