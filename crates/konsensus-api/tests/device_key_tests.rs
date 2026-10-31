@@ -155,7 +155,7 @@ fn registered(
         .request_device_key(
             &client.client_id,
             &device.public_hex(),
-            "Rasmus's MacBook",
+            "Alice's MacBook",
             &device.proof(&client.client_id),
         )
         .unwrap();
@@ -1259,7 +1259,7 @@ fn a_node_started_without_an_owner_key_honours_no_device_key() {
 
 #[test]
 fn a_node_running_from_a_plaintext_seed_disables_device_authority_node_wide() {
-    // Codex #147 delta repro: a same-user process reads the plaintext seed,
+    // Review #147 delta repro: a same-user process reads the plaintext seed,
     // derives an owner key and writes a correctly signed device record. With
     // the node started from a plaintext seed, nothing device-signed works.
     let tmp = tempfile::tempdir().unwrap();

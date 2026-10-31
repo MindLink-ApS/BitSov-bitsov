@@ -1099,7 +1099,7 @@ async fn seeded_chain_state_reports_an_expired_fetch_time() {
     );
 }
 
-// ── Freshness of reused values (Codex P2 on #78) ───────────────────
+// ── Freshness of reused values (review P2 on #78) ───────────────────
 
 /// Synced provider whose `estimate_fee` fails for the targets in `failing`.
 struct FlakyFeeChain {

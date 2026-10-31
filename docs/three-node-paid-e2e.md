@@ -1,4 +1,4 @@
-# Three-node paid flow: Atlas TEST5 regression
+# Three-node paid flow: TEST5 regression
 
 Doctrine: **1–6 hold.** Delivered content has a settled, recipient-bound payment
 per act; tested refusals leave balances and spend budgets unchanged. Node/device
@@ -105,8 +105,8 @@ loopback proxy connection limits, or onboarding screens. B's restart stops and
 reconstructs its handlers, transport, pairing service, SQLite/session manager and
 LDK from disk inside the test process; it is not an OS crash/power-loss test.
 
-Every scenario assertion/helper carries an incident label from
-`pm/projects/bitsov/TEST5-SANITY-LOG.md` (Atlas runs 1–4):
+Every scenario assertion/helper carries an incident label from the
+TEST5 sanity runs 1–4:
 
 | Incident | Regression assertion |
 | --- | --- |
@@ -280,7 +280,7 @@ closed/paid flags, E2EE existence, local supervision endpoint, worker completion
 contact/operation/quote interest, and dial-handle/lock state. These are local,
 independently sampled diagnostics, not a public endpoint or an atomic snapshot.
 
-Fable N1 remains: `Connection::register` prefers the lower key's outbound socket
+Review N1 remains: `Connection::register` prefers the lower key's outbound socket
 against an opposite-direction candidate until the old socket is locally closed.
 A restarted remote can therefore be rejected until read/keepalive detects that
 old connection's death (about 30 seconds, plus retry scheduling). This bounded

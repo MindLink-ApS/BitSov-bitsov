@@ -93,14 +93,14 @@ konsensus peer remove --node-id <64hex> [--yes] [-c konsensus.toml]         (opt
      node id:        <64hex>
      fingerprint:    <8 hex>          (NodeId::short_fingerprint, as /peers shows)
      address:        203.0.113.7:9735
-     label:          "Dad"
+     label:          "Bob"
    This node will accept paid traffic from that key and keep a connection to it.
    Press Enter to continue, or Ctrl-C to cancel.
    ```
-   `--yes` skips the prompt (for scripts and the Atlas runbook). The prompt is a client-side courtesy, not a security boundary — see §5.
+   `--yes` skips the prompt (for scripts and runbooks). The prompt is a client-side courtesy, not a security boundary — see §5.
 3. `send(config, ControlRequest::AddPeer{..})` → `report(resp)`.
 4. On `Ok`, `detail` tells the owner whether the first dial succeeded, e.g.
-   `added Dad (ab12cd34) at 203.0.113.7:9735 — connected` or
+   `added Bob (ab12cd34) at 203.0.113.7:9735 — connected` or
    `added ... — not reachable yet (connection refused); the node keeps retrying. Check the address and that the peer has whitelisted <our id>.`
    Exit code 0 in both cases (the peer *is* added); the second case is a warning line, not a failure.
 
@@ -126,7 +126,7 @@ AddPeer {
 },
 ```
 
-Wire: `{"op":"add-peer","node_id":"…","addr":"203.0.113.7:9735","label":"Dad"}`.
+Wire: `{"op":"add-peer","node_id":"…","addr":"203.0.113.7:9735","label":"Bob"}`.
 Add the matching arm to `encode_request` (`control.rs:1044-1111`, `fields!("add-peer", node_id, addr, label)`) and a fixture line to `wire_tests` (`control.rs:1199-1213`).
 
 ### 4.2 Response
@@ -182,7 +182,7 @@ Config-collision check (§2.4 limitation): `handle_local` can see neither `confi
 | Topic | Finding | Decision |
 |-------|---------|----------|
 | Who can reach `control.sock` | Same uid as the node, or root (`control.rs:900-909`, mode 0600 in `data_dir`). Not reachable over loopback TCP, browsers, other OS users, SSH port-forwards (`control.rs:30-33`). The sidecar app has `data_dir` access but the sidecar never binds the socket (`control.rs:19-23`, `main.rs:1879`). | Same trust boundary as `pair-window` and `approve-first-contact`. Acceptable. |
-| Does it need the `/dev/tty` nonce like grants? | The nonce exists to stop an untrusted *requester* (paired app) from approving its own elevation (`control.rs:3-26`). `peer add` has no requester; the owner types the whole tuple. Whitelisting a key grants admission + outbound dial + paid-gate acceptance — not spend authority, not identity. `OpenWindow` (which lets a new client pair) already ships without a nonce. | **No node-side nonce.** CLI-side Enter/`--yes` prompt only (§3). Flagged as open question §8.1 in case Atlas wants parity with `ApproveFirstContact`'s "exact tuple" style — which it already has. |
+| Does it need the `/dev/tty` nonce like grants? | The nonce exists to stop an untrusted *requester* (paired app) from approving its own elevation (`control.rs:3-26`). `peer add` has no requester; the owner types the whole tuple. Whitelisting a key grants admission + outbound dial + paid-gate acceptance — not spend authority, not identity. `OpenWindow` (which lets a new client pair) already ships without a nonce. | **No node-side nonce.** CLI-side Enter/`--yes` prompt only (§3). Flagged as open question §8.1 in case reviewers want parity with `ApproveFirstContact`'s "exact tuple" style — which it already has. |
 | Same-uid malware | Could already call `open-window`, `revoke`, `approve-first-contact`. A nonce for `add-peer` would not change that class; `/dev/tty` delivery is readable by the same uid anyway (the module doc says so, `control.rs:42-44`). | Document, do not engineer around. |
 | Audit entry | `peer.added` with actor = node id, `source: "owner_control"`, `connected: bool`, plus `whitelist_source` metadata on the DB row (preserved key, `models.rs:139`). Distinguishes console adds from HTTP admin adds in both the audit log and `GET /peers` diagnostics. | Required. |
 | Rate limits | None on the socket; `admit_peer` is one DB upsert + one dial. Dial has a 10 s timeout so a hostile address cannot pin the connection task. | None added. Cap label at 256 bytes (existing const). |
@@ -194,14 +194,14 @@ Config-collision check (§2.4 limitation): `handle_local` can see neither `confi
 
 | Layer | File | Cases |
 |-------|------|-------|
-| Wire | `control.rs` `wire_tests` (`:1194-1223`) | Add `{"op":"add-peer","node_id":"…","addr":"127.0.0.1:9735","label":"Dad"}` and the `label` omitted form to the round-trip fixtures. |
+| Wire | `control.rs` `wire_tests` (`:1194-1223`) | Add `{"op":"add-peer","node_id":"…","addr":"127.0.0.1:9735","label":"Bob"}` and the `label` omitted form to the round-trip fixtures. |
 | Pure dispatch | `control.rs` unit | `handle(ctx, AddPeer{..})` returns `Error` (no state) — mirrors `ApproveGift`. |
 | Admission function | `konsensus-api/tests/peers_*` (existing `POST /peers` tests + `common::mod` state builders, `tests/common/mod.rs:983`) | `admit_peer`: (a) happy path: row in `storage.list_peers()`, `registry.get()` present, `transport.whitelist` contains id, `supervise_peer` called; (b) rejects self id; (c) rejects hostname addr; (d) rejects 257-byte and control-char labels; (e) `dial_now=true` with unreachable addr → `Ok` with `dialed: Err(..)`, row still persisted; (f) persist failure → `Err`, registry/whitelist untouched. |
 | Socket end-to-end | `konsensus-api/tests/pairing_tests.rs` next to `owner_control_socket_permissions` (`:675`) | Bind `ControlServer` with `with_approval_state(state)`, `control::send(AddPeer)`, assert `Ok`, assert audit line `peer.added` with `source=owner_control`, assert `GET /peers` (Read token) lists it with `connected=false`. Also: server without `with_approval_state` → `Error("…requires the running node…")`. |
 | CLI | `konsensus-node/tests/peer_add_cli.rs`, copy the fake-socket harness from `tests/grant_cli.rs:14-60` | (a) prints summary, waits for Enter, sends exactly one `add-peer` request with the given tuple; (b) `--yes` sends without prompt; (c) bad hex / hostname / long label exit non-zero **before** connecting (fake listener sees zero requests); (d) `Error{message}` from socket → non-zero exit, message shown via `terminal_safe` (feed an ANSI escape in the message and assert it is escaped); (e) no socket file → the "`--owner-control`" hint. |
 | Node integration (restart survival) | `konsensus-node/tests/` (pattern: `local_bootstrap_cli.rs`, `locked_mode_tests.rs`) | Start node A with `--owner-control`, start node B, `konsensus peer add` B on A, assert A↔B connected via `GET /peers/connected`; stop A, start A again without touching `konsensus.toml`, assert B is whitelisted and the supervisor reconnects (poll `GET /peers` `connected=true`). Then the config-collision case: put B in `[[peers]]` with a different port, restart, assert registry shows the config port (documents the precedence). |
 | Regression | existing `POST /peers`, `import`, `connect` API tests | Must pass unchanged after the `admit_peer` extraction. |
-| Manual (DAD node runbook) | `pm/projects/bitsov/FATHER-NODE-ONBOARD.md` | One line: `konsensus peer add --node-id … --addr … --label Dad`, read the connected/not-reachable line, confirm in app. |
+| Manual (home-node runbook) | `docs/operations/home-node.md` | One line: `konsensus peer add --node-id … --addr … --label <name>`, read the connected/not-reachable line, confirm in app. |
 
 ## 7. Estimate
 
@@ -218,9 +218,9 @@ Files touched: `konsensus-api/src/control.rs`, `konsensus-api/src/handlers/peers
 
 ## 8. Open questions
 
-1. **Nonce or not.** §5 argues `add-peer` is a tuple-is-consent op like `open-window`. If Atlas wants the stronger form anyway, the cheap version is: node prints `PEER-ADD <fingerprint> CODE <nonce>` to `/dev/tty` via `console_challenge` (`pairing.rs:973`) and the CLI reads the code like `grant` does. Cost +0.5 d, and it breaks the headless/`--yes` path unless the protected-file fallback is used.
+1. **Nonce or not.** §5 argues `add-peer` is a tuple-is-consent op like `open-window`. If the stronger form is wanted anyway, the cheap version is: node prints `PEER-ADD <fingerprint> CODE <nonce>` to `/dev/tty` via `console_challenge` (`pairing.rs:973`) and the CLI reads the code like `grant` does. Cost +0.5 d, and it breaks the headless/`--yes` path unless the protected-file fallback is used.
 2. **`peer list` / `peer remove` in the same PR?** `list` is a `Status`-style read of `registry.all()` + `connected_peers()`; `remove` reuses `remove_peer` (`peers.rs:256-293`) after the same extraction. Both are small; `remove` of a `[[peers]]` entry has the same config-precedence caveat (it comes back at restart).
 3. **Config precedence.** Should `merge_persisted_peers` (`node.rs:708`) let a DB row with a *newer* address override a config entry? Today config wins unconditionally. Leaving as-is and warning from the CLI is the minimal change; flipping it is a behaviour change for every existing node and needs its own note.
 4. **`auto_connect` flag.** DB-loaded peers get `auto_connect: false` (`node.rs:725`) but are supervised anyway (`supervisor.rs:111-116`); the flag is legacy. `GET /peers` will show `auto_connect=false` for console-added peers after a restart even though they reconnect. Either store `auto_connect` in `Peer.metadata` and honour it in the merge, or drop the field from the API. Cosmetic; out of scope here.
-5. **Dial timeout and wording.** 10 s is a guess; LDK/Noise handshake timing on a Pi may need 15 s. The "not reachable yet" line also needs to mention that the *other* node must whitelist us — for the Dad case both nodes run `peer add` pointing at each other.
-6. **Packaged sidecar.** The desktop/phone app's sidecar never has `control.sock`, so this command is owner-run-node only (home node, Pi, NOVA). The app path for the same action remains `POST /peers` with an Admin token; nothing here changes that.
+5. **Dial timeout and wording.** 10 s is a guess; LDK/Noise handshake timing on a Pi may need 15 s. The "not reachable yet" line also needs to mention that the *other* node must whitelist us — when two owners connect their nodes, both run `peer add` pointing at each other.
+6. **Packaged sidecar.** The desktop/phone app's sidecar never has `control.sock`, so this command is owner-run-node only (home node, Pi, release Mac). The app path for the same action remains `POST /peers` with an Admin token; nothing here changes that.

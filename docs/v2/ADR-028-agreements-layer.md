@@ -245,7 +245,7 @@ To keep BitSov v2 focused on its three-node mesh + frontend finish
 line, the Agreements crate is **deferred** to a later milestone. It
 is documented here so:
 - Operators understand the architecture before any task touches it.
-- Factory cannot accidentally implement it inside core.
+- No task can accidentally implement it inside core.
 - Future strategic decisions (whether to keep it in-tree or spin
   out as an external monorepo per the vision doc) have an
   authoritative reference.
@@ -331,8 +331,8 @@ Before the first commit lands in `crates/konsensus-agreements/`:
 - [ ] Operator explicitly approves Agreements as the next workstream
   (vs. Lightning hardening continuation, frontend polish, or other
   v2 finish-line work).
-- [ ] A new factory scope regex is added (e.g. `^A[0-9]+$`) gated
-  on this ADR. Without the regex, no factory lane can pick
+- [ ] A new task scope regex is added (e.g. `^A[0-9]+$`) gated
+  on this ADR. Without the regex, no work lane can pick
   Agreements tasks.
 - [ ] Maintainer key set is documented in
   `crates/konsensus-agreements/MAINTAINERS.md` and ≥2 keys are

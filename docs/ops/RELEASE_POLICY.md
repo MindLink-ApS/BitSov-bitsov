@@ -183,7 +183,7 @@ use the reasoned host break-glass and retain its evidence.
 Do not claim cross-platform reproducibility solely from a successful native-host
 check.
 
-## Pinned macOS release toolchain (NOVA)
+## Pinned macOS release toolchain (release Mac)
 
 Both Release CLI Darwin targets use GitHub's **`xcode-27` Apple Silicon runner**
 and explicitly select `/Applications/Xcode_27.1.app` with `sudo xcode-select -s`.
@@ -211,12 +211,12 @@ The [dedicated Xcode 27 image](https://github.com/actions/runner-images/blob/mai
 27.0 for Xcode 27.1. CI selects the documented `Xcode_27.1.app` symlink; the
 `Release_Candidate` directory name does not change the exact version/build check.
 The image README lists Clang/LLVM 21.0.0 but not its full build string. The full
-Apple clang pin above comes from NOVA's reported toolchain; CI must pass that
+Apple clang pin above comes from the release Mac's reported toolchain; CI must pass that
 same exact check before building. This is a versioned runner family, **not an
 immutable VM snapshot**; GitHub still updates it. Exact compiler/SDK checks fail
 closed if the selected toolchain changes or disappears.
 
-NOVA already reports **Xcode 27.1 build 27A9275**, SDK **27.0**, and the Apple
+The release Mac already reports **Xcode 27.1 build 27A9275**, SDK **27.0**, and the Apple
 clang line pinned above; no reinstall is needed when those checks pass. Do not
 downgrade it to Xcode 27.0 or substitute a different build. If installation is
 needed, download the matching Xcode `.xip` from

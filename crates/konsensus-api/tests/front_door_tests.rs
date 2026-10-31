@@ -151,7 +151,7 @@ async fn admin_publishes_and_read_exports_link() {
         "/api/v1/front-door",
         admin,
         Some(json!({
-            "display_name": "Rasmus",
+            "display_name": "Alice",
             "tagline": "BitSov",
             "about": "Mesh doorstep",
             "admission_msat": 50_000,
@@ -164,7 +164,7 @@ async fn admin_publishes_and_read_exports_link() {
     assert_eq!(cache.as_deref(), Some("no-store"));
     assert_eq!(body["card"]["v"], 1);
     assert_eq!(body["card"]["seq"], 1);
-    assert_eq!(body["card"]["profile"]["display_name"], "Rasmus");
+    assert_eq!(body["card"]["profile"]["display_name"], "Alice");
     assert_eq!(body["card"]["prices"]["admission_msat"], 50_000);
     let link = body["link"].as_str().unwrap();
     assert!(link.starts_with(LINK_PREFIX), "{link}");
@@ -189,7 +189,7 @@ async fn admin_publishes_and_read_exports_link() {
         "/api/v1/front-door",
         bearer(&state, vec![auth::Scope::Admin]),
         Some(json!({
-            "display_name": "Rasmus",
+            "display_name": "Alice",
             "tagline": "Updated"
         })),
     )
@@ -346,7 +346,7 @@ async fn seq_survives_restart_via_pages_file() {
         "PUT",
         "/api/v1/front-door",
         admin,
-        Some(json!({ "display_name": "Rasmus", "tagline": "one" })),
+        Some(json!({ "display_name": "Alice", "tagline": "one" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -360,7 +360,7 @@ async fn seq_survives_restart_via_pages_file() {
         "PUT",
         "/api/v1/front-door",
         bearer(&restarted, vec![auth::Scope::Admin]),
-        Some(json!({ "display_name": "Rasmus", "tagline": "two" })),
+        Some(json!({ "display_name": "Alice", "tagline": "two" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body2}");
@@ -458,7 +458,7 @@ async fn corrupt_card_keeps_seq_floor() {
         "PUT",
         "/api/v1/front-door",
         bearer(&state, vec![auth::Scope::Admin]),
-        Some(json!({ "display_name": "Rasmus" })),
+        Some(json!({ "display_name": "Alice" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -490,7 +490,7 @@ async fn corrupt_card_keeps_seq_floor() {
         "PUT",
         "/api/v1/front-door",
         bearer(&restarted, vec![auth::Scope::Admin]),
-        Some(json!({ "display_name": "Rasmus" })),
+        Some(json!({ "display_name": "Alice" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body2}");
@@ -552,7 +552,7 @@ async fn absurd_seq_floor_is_not_adopted() {
         "PUT",
         "/api/v1/front-door",
         bearer(&state, vec![auth::Scope::Admin]),
-        Some(json!({ "display_name": "Rasmus" })),
+        Some(json!({ "display_name": "Alice" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -568,7 +568,7 @@ async fn absurd_seq_floor_is_not_adopted() {
         "PUT",
         "/api/v1/front-door",
         bearer(&restarted, vec![auth::Scope::Admin]),
-        Some(json!({ "display_name": "Rasmus" })),
+        Some(json!({ "display_name": "Alice" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body2}");

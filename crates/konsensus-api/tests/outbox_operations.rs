@@ -189,7 +189,7 @@ struct Wallet {
     pause_next_status_poll: AtomicBool,
     status_poll_started: tokio::sync::Notify,
     pool: sqlx::SqlitePool,
-    /// Park the next `money_ready` until `ready_continue` (Codex delta3 probe).
+    /// Park the next `money_ready` until `ready_continue` (review delta3 probe).
     pause_next_ready: AtomicBool,
     ready_started: tokio::sync::Notify,
     ready_continue: tokio::sync::Notify,
@@ -1429,7 +1429,7 @@ async fn terminal_retention_keeps_duplicate_post_and_receipt_binding() {
     assert!(f.db.get_message(&id).await.unwrap().is_none());
 }
 
-/// Fable N1 (#131 delta): a call offer whose payment was dispatched but not
+/// Review N1 (#131 delta): a call offer whose payment was dispatched but not
 /// resolved when compose was cut off (crash, cancel, app gave up) stays
 /// reserved through startup recovery; when the background reconciler later
 /// finds it paid, it commits the call before resending, so the callee's
@@ -1484,7 +1484,7 @@ async fn background_reconcile_commits_a_paid_call_offer_before_resending() {
     answering.abort();
 }
 
-// ── Codex delta2 (#131, FAIL at 088d198): the four probes as regressions ──
+// ── Review delta2 (#131, FAIL at 088d198): the four probes as regressions ──
 
 fn call_request(f: &Fixture, op: &str, call: &str, sdp: &str, wait: u64) -> Request<Body> {
     Request::builder().method("POST").uri("/api/v1/messages/compose")
@@ -1514,7 +1514,7 @@ async fn until_dispatched(f: &Fixture) {
     .unwrap();
 }
 
-/// Probe `codex_review_uppercase_uuid_loses_paid_call_and_allows_second_charge`,
+/// Probe `review_uppercase_uuid_loses_paid_call_and_allows_second_charge`,
 /// fixed: an uppercase operation id is canonicalized before the reservation,
 /// so the paid offer commits under the journal's key, rings, and the same
 /// call id cannot be paid for again.
@@ -1539,7 +1539,7 @@ async fn an_uppercase_operation_id_commits_the_paid_call_under_one_key() {
     answering.abort();
 }
 
-/// Probe `codex_review_concurrent_mismatch_releases_winners_ambiguous_call`,
+/// Probe `review_concurrent_mismatch_releases_winners_ambiguous_call`,
 /// fixed: two concurrent requests sharing the operation id and call id but
 /// not the payload never share a reservation. The loser is refused
 /// (operation_mismatch) and neither commits nor releases the winner's
@@ -1576,7 +1576,7 @@ async fn a_concurrent_mismatch_never_touches_the_winners_reservation() {
     }
 }
 
-/// Probe `codex_review_retry_resends_before_committing_call`, fixed: a
+/// Probe `review_retry_resends_before_committing_call`, fixed: a
 /// same-operation retry that reconciles the ambiguous payment commits the
 /// call before resending, so an answer arriving right after the resend is
 /// admitted.
@@ -1610,7 +1610,7 @@ async fn a_retry_that_finds_the_offer_paid_commits_before_resending() {
     answering.abort();
 }
 
-/// Probe `codex_review_failed_refusal_cleanup_exposes_signal_through_resync`,
+/// Probe `review_failed_refusal_cleanup_exposes_signal_through_resync`,
 /// fixed: the receive path holds a call signal before its paid acceptance.
 /// When the refusal cleanup fails (or the node crashes before it), the held
 /// signal stays out of history, duplicate acceptance and resync; the startup
@@ -1670,7 +1670,7 @@ async fn a_refused_signal_whose_cleanup_failed_stays_invisible_and_is_withdrawn(
     assert!(f.db.get_message(&admitted.id).await.unwrap().is_some());
 }
 
-/// Codex delta3 probe `same_request_cap_race`, fixed: two concurrent requests
+/// Review delta3 probe `same_request_cap_race`, fixed: two concurrent requests
 /// for the same operation and the same call payload, one capped below the
 /// price and one uncapped, run one after the other under the operation lock.
 /// The capped one is refused and releases only its own reservation; the
@@ -1988,7 +1988,7 @@ async fn a_live_compose_failure_is_not_released_against_a_dispatched_journal() {
     assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
 }
 
-/// Codex review of #144: first contact resumes a possibly dispatched admission
+/// Review of #144: first contact resumes a possibly dispatched admission
 /// the wallet does not know; the operation must not report nothing paid.
 #[tokio::test]
 async fn a_recovered_dispatch_unknown_admission_is_not_released() {

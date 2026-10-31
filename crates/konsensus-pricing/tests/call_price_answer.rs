@@ -1,4 +1,4 @@
-//! Codex delta3 (#131): a fresh kind-400 answer and its price are published
+//! Review delta3 (#131): a fresh kind-400 answer and its price are published
 //! together. The reviewer's probe, kept as a regression.
 
 use std::{sync::Arc, time::{Duration, Instant}};

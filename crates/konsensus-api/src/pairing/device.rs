@@ -1662,7 +1662,7 @@ mod tests {
     use crate::spend_budget::{BudgetRefusal, Charge};
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
-    /// Codex #146 P1: A has a 60 s envelope, B a 3600 s one. A payment to A
+    /// Review #146 P1: A has a 60 s envelope, B a 3600 s one. A payment to A
     /// reserved inside A's window must not dispatch after it, even though B
     /// keeps the shared grant alive.
     #[test]
@@ -1797,7 +1797,7 @@ mod clock_tests {
     use super::*;
     use crate::spend_budget::{BudgetRefusal, Charge};
 
-    /// Codex #146 delta: the dispatch deadline is judged at the moment the
+    /// Review #146 delta: the dispatch deadline is judged at the moment the
     /// lock is held, not when the caller arrived. The clock runs only after
     /// the lock is acquired (it would deadlock re-locking otherwise), and a
     /// clock read then that is past the deadline refuses.

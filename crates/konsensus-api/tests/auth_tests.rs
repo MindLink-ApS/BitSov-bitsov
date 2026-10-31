@@ -1780,7 +1780,7 @@ async fn auth_token_get_method_not_allowed() {
 /// passing re-auth (fresh challenge + node-key signature) and assert the given
 /// post-re-auth failure path STILL records a `success:false`
 /// `identity.mnemonic_revealed` audit event with the expected reason — and never
-/// writes a seed phrase. These are the sensitive cases Codex flagged on #238:
+/// writes a seed phrase. These are the sensitive cases a review flagged on #238:
 /// the caller has already proven possession of the node key, so the
 /// "every reveal attempt is audited" contract must hold on these returns too.
 async fn assert_post_reauth_reveal_failure_audited(

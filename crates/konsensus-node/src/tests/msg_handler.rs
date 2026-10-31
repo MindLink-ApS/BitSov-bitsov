@@ -1122,7 +1122,7 @@ async fn decrypt_non_utf8_returns_none() {
 
 // ── HARD-11: registry read guard released before the gate await ──────
 //
-// Codex objection on #230: the code shape scopes the read guard before
+// Review objection on #230: the code shape scopes the read guard before
 // `PaymentGate::verify().await`, but no test proved the REAL seam — that a peer
 // add/remove (a registry writer) can acquire the write lock while verification
 // is pending. These tests drive the extracted `whitelist_then_verify` helper
@@ -3030,7 +3030,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
         .unwrap_err()
         .contains("replayed"));
     assert!(ws_rx.try_recv().is_err());
-    // Codex P1: the refused signal is withdrawn (no history/resync), and a
+    // Review P1: the refused signal is withdrawn (no history/resync), and a
     // resend of the very same paid envelope is refused, not duplicate-ACKed.
     assert!(db.get_message(&env.id).await.unwrap().is_none());
     assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
@@ -3359,7 +3359,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
             && (event["detail"]["message_id"] == env0.id.to_hex() || event["detail"]["message_id"] == env1.id.to_hex())));
     sqlx::query("DROP TRIGGER fail_second_plaintext").execute(db.pool()).await.unwrap();
 
-    // Codex P1 (#441): a failing hold release can no longer strand a committed
+    // Review P1 (#441): a failing hold release can no longer strand a committed
     // grant behind a hold that recovery withdraws. The grant and the release
     // are one transaction: under the fault the grant rolls back with the
     // release (no interval, a refusal, a reconciliation record), and a block

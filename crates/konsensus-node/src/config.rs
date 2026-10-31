@@ -1934,7 +1934,7 @@ impl NodeConfig {
             );
         }
 
-        // 2d (Codex #3): the ciphertext relay and price-open admission are
+        // 2d (review #3): the ciphertext relay and price-open admission are
         // SETTLEMENT-GATED — they admit strangers (price_open) or hold paid
         // deposits (relay) on the strength of a settled, recipient-bound payment.
         // With settlement verification resolving OFF (the default for a Mock

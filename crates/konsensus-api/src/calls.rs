@@ -29,7 +29,7 @@ const PRICE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// A call price answer older than this is not a quote.
 const PRICE_ANSWER_MAX_AGE: Duration = Duration::from_secs(60);
 /// At most one `PriceQuery` per peer this often; callers inside the window
-/// wait for that query's answer instead of sending another (Fable follow-up).
+/// wait for that query's answer instead of sending another (review follow-up).
 const PRICE_QUERY_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 fn lock() -> &'static tokio::sync::Mutex<()> {
@@ -335,7 +335,7 @@ async fn write(store: Store<'_>, peer: &NodeId, call_id: &str, entry: Option<&Ca
 /// Room for a new call id. Open calls must fit their bounds and are never
 /// evicted. Burned ids have their own bounds: past one, the oldest ids burned
 /// for at least `BURN_MIN_MS` make room, so ended calls cannot block a pair or
-/// the node for the whole tombstone (Fable N3); younger ones are never
+/// the node for the whole tombstone (review N3); younger ones are never
 /// dropped, and if they alone fill a bound the call is refused.
 async fn room(store: Store<'_>, peer: &NodeId, now: u64) -> Result<(), CallRefusal> {
     let unavailable = |_: konsensus_storage::StorageError| CallRefusal::Invalid("call state unavailable");
@@ -418,7 +418,7 @@ pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind:
     let unavailable = |_| CallRefusal::Invalid("call state unavailable");
     let entry = current(store, peer, &signal.call_id, now).await.map_err(unavailable)?;
     // Only an offer opens a new call id; an unknown-id answer/ICE/hangup is
-    // refused below and must never make room by evicting a burned id (Fable R2).
+    // refused below and must never make room by evicting a burned id (review R2).
     if entry.is_none() && kind == konsensus_core::kind::KIND_CALL_INVITE {
         room(store, peer, now).await?;
     }
@@ -450,8 +450,8 @@ fn refused(e: CallRefusal, new_operation: bool) -> ApiError {
 /// Reserve one of our signals under `operation_id` and the exact request
 /// (`request_hash`), before any quote or payment. The operation id must be the
 /// canonical one the journal uses. One operation reserves one signal of one
-/// call for one request: the same id reserving another call (Fable N2) or the
-/// same call with another payload (Codex delta2 #2) is refused without
+/// call for one request: the same id reserving another call (review N2) or the
+/// same call with another payload (review delta2 #2) is refused without
 /// touching the existing reservation. A meeting leg we (`own`) place must go
 /// to a later participant of its roster.
 pub async fn reserve_outgoing(
@@ -559,7 +559,7 @@ pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, o
 
 /// How the journal says this request's reservation ends. A journal entry of
 /// another request (other payload, kind or recipient) never paid for it
-/// (Fable N2 / R1): unpaid, and since `settle` only touches this request's own
+/// (review N2 / R1): unpaid, and since `settle` only touches this request's own
 /// reservation, never the winner's.
 fn journal_settlement(op: Option<&konsensus_storage::OutboxOperation>, peer: &NodeId, kind: u16, request_hash: &str) -> Settlement {
     match op {
@@ -590,8 +590,8 @@ pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, 
 }
 
 /// The journal moved call operation `op` without the compose request that
-/// reserved it: the background reconciler (Fable N1) or a same-operation
-/// retry that reconciled an ambiguous payment (Codex delta2 #3). Commit (or,
+/// reserved it: the background reconciler (review N1) or a same-operation
+/// retry that reconciled an ambiguous payment (review delta2 #3). Commit (or,
 /// with `release`, also release) that request's reservation, before the paid
 /// envelope is (re)sent, so the callee's answer finds a ringing call. A retry
 /// passes `release = false`: an unpaid operation it is about to pay again
@@ -649,7 +649,7 @@ pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_stora
         // A legacy reservation without a request hash follows its operation.
         let hash = if p.request_hash.is_empty() { op.as_ref().map(|o| o.request_hash.clone()).unwrap_or_default() } else { p.request_hash.clone() };
         // Startup commits only if the journal row is this request: same
-        // payload hash, kind and recipient (Fable R1).
+        // payload hash, kind and recipient (review R1).
         let how = journal_settlement(op.as_ref(), &peer, p.kind, &hash);
         settle(store, &peer, &call_id, &p.operation_id, &p.request_hash, how).await?;
         match how {
@@ -665,7 +665,7 @@ pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_stora
 /// periodic sweep treats it as abandoned and withdraws it.
 pub const HOLD_MAX_MS: u64 = 5 * 60 * 1000;
 
-/// Hold an incoming call signal before its paid acceptance (Codex delta2 #4):
+/// Hold an incoming call signal before its paid acceptance (review delta2 #4):
 /// until released, it is invisible to history, resync and duplicate ACKs.
 pub async fn hold_incoming(store: Store<'_>, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, konsensus_storage::StorageError> {
     store.call_admission_hold(envelope, now_ms()).await
@@ -687,7 +687,7 @@ fn last_query() -> &'static Mutex<HashMap<(NodeId, u16), Instant>> {
 
 /// The callee's current call-offer price (trust discount applied), answered
 /// by the callee itself to a `PriceQuery` for kind 400. Only an answer *for
-/// kind 400* that arrived after the query counts (Codex P2): another kind's
+/// kind 400* that arrived after the query counts (review P2): another kind's
 /// response refreshing the peer entry never satisfies it. Queries to one peer
 /// are sent at most every 2 s; callers in between wait for that answer. The
 /// sender never falls back to its own tariff: with no fresh answer, nothing
@@ -709,7 +709,7 @@ pub async fn peer_call_kind_price(state: &AppState, peer: &NodeId, kind: u16) ->
         .with_reason("call_price_unknown")
     };
     let now = Instant::now();
-    // A query counts as asked only once it was sent (Fable N4): the slot is
+    // A query counts as asked only once it was sent (review N4): the slot is
     // claimed so concurrent callers share one frame, and given back if the
     // send fails, so nobody waits for an answer to a query never sent.
     let (asked, send) = {

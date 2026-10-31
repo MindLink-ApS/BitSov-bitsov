@@ -9,7 +9,7 @@ fn pair_ticket_cli_writes_a_protected_prebootstrap_ticket_and_rejects_bad_ttl() 
         &config,
         r#"
 [node]
-hosted_by = "Rasmus's Pi"
+hosted_by = "Alice's Pi"
 [identity]
 mnemonic_file = "absent.enc"
 [network]
@@ -45,7 +45,7 @@ advertised_endpoint = "node.example:18443"
     )
     .unwrap();
     assert!(ticket.get("node_id").is_none());
-    assert_eq!(ticket["hosted_by"], "Rasmus's Pi");
+    assert_eq!(ticket["hosted_by"], "Alice's Pi");
     assert_eq!(ticket["box_transport_pubkey"].as_str().unwrap().len(), 64);
     assert_eq!(
         URL_SAFE_NO_PAD
@@ -173,7 +173,7 @@ advertised_endpoint = "{}.example:18443"
     assert_eq!(ticket["hosted_by"], longest.as_str());
     let path = dir.path().join("pairing/remote-access-link");
     for bad in [
-        "Rasmus\\u0007Pi".to_string(),
+        "Alice\\u0007Pi".to_string(),
         "Pi\\u202Ekcab".to_string(),
         " Pi".to_string(),
         "x".repeat(65),

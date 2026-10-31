@@ -2218,7 +2218,7 @@ async fn owner_peer_add_requires_matching_services_and_audits_admission() {
         let request = || control::ControlRequest::AddPeer {
             node_id: "ab".repeat(32),
             addr: "127.0.0.1:9735".into(),
-            label: Some("Dad".into()),
+            label: Some("Bob".into()),
         };
         assert!(
             matches!(control::handle(&ctx, request()), control::ControlResponse::Error { message } if message.contains("requires the running node"))
@@ -2259,7 +2259,7 @@ async fn owner_peer_add_requires_matching_services_and_audits_admission() {
         assert_eq!(event["actor"], state.identity.node_id().to_hex());
         assert_eq!(event["detail"]["source"], "owner_control");
         assert_eq!(event["detail"]["peer_node_id"], "ab".repeat(32));
-        assert_eq!(event["detail"]["label"], "Dad");
+        assert_eq!(event["detail"]["label"], "Bob");
         assert_eq!(event["detail"]["connected"], false);
         let app = test_router(state.clone());
         let (_, token) = pair_and_token(
