@@ -9,7 +9,16 @@ pub(super) async fn messaging_fixture(relation: bool, requested_cap: u64) -> (Fx
 
 /// An owner-approved grant (or, with `relation`, a relation envelope for
 /// `fx.peer`) on an existing fixture; returns a token that carries it.
-pub(super) async fn messaging_grant(mut fx: Fx, relation: bool, requested_cap: u64) -> (Fx, String) {
+pub(super) async fn messaging_grant(fx: Fx, relation: bool, requested_cap: u64) -> (Fx, String) {
+    let (fx, token, _) = approved_grant(fx, relation, 200_000, Some(requested_cap)).await;
+    (fx, token)
+}
+
+/// [`messaging_grant`] with its budget and optional per-payment maximum;
+/// also returns the exact text the owner's device signed (empty for a
+/// relation envelope, whose per-act maximum is `per_call` or the budget).
+pub(super) async fn approved_grant(mut fx: Fx, relation: bool, budget_msat: u64, per_call: Option<u64>) -> (Fx, String, String) {
+    let mut signed = String::new();
     let root = konsensus_core::OwnerApprovalKey::from_mnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
         "", &[9; 32],
@@ -72,8 +81,8 @@ pub(super) async fn messaging_grant(mut fx: Fx, relation: bool, requested_cap: u
             device_key_id: op.key_id,
             peer: fx.peer.to_hex(),
             level: 1,
-            budget_msat: 200_000,
-            per_act_max_msat: requested_cap,
+            budget_msat,
+            per_act_max_msat: per_call.unwrap_or(budget_msat),
             window_secs: 3600,
             issued_at: chrono::Utc::now().timestamp(),
             nonce: "ab".repeat(16),
@@ -97,8 +106,8 @@ pub(super) async fn messaging_grant(mut fx: Fx, relation: bool, requested_cap: u
                 &fx.client_id,
                 1,
                 ApprovalRequest::SpendGrant {
-                    budget_msat: 200_000,
-                    per_call_max_msat: requested_cap,
+                    budget_msat,
+                    per_call_max_msat: per_call,
                     window_secs: 3600,
                     recipient: None,
                 },
@@ -113,9 +122,10 @@ pub(super) async fn messaging_grant(mut fx: Fx, relation: bool, requested_cap: u
                 &sign(&approval.approval_message),
             )
             .unwrap();
+        signed = approval.approval_message;
     }
     let token = fx.token().await;
-    (fx, token)
+    (fx, token, signed)
 }
 
 #[tokio::test]
@@ -165,7 +175,9 @@ async fn messaging_quotes_above_six_sats_never_pay_and_six_sats_pays() {
         assert_eq!(fx.used(), 6_000);
         let (status, body) = fx.call("GET", "/api/v1/pair/grant", None, Some(&token)).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["grant"]["per_call_max_msat"], 6_000);
+        // The view shows what the owner approved and what messages may pay.
+        assert_eq!(body["grant"]["per_call_max_msat"], if relation { 6_000 } else { 20_000 });
+        assert_eq!(body["grant"]["message_per_payment_max_msat"], 6_000);
         assert_eq!(body["grant"]["budget_msat"], 200_000);
         // Reopening verifies the signed receipt and preserves the stored cap.
         let restarted = PairingService::open(fx.tmp.path(),
@@ -174,7 +186,8 @@ async fn messaging_quotes_above_six_sats_never_pay_and_six_sats_pays() {
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
                 "", &[9;32]).unwrap().verifying_key());
         let view = restarted.grant_view_for(&fx.client_id).unwrap();
-        assert_eq!(view.per_call_max_msat, 6_000);
+        assert_eq!(view.per_call_max_msat, if relation { 6_000 } else { 20_000 });
+        assert_eq!(view.message_per_payment_max_msat, 6_000);
         assert_eq!(view.budget_msat, 200_000);
     }
     }.with_subscriber(subscriber).await;
@@ -225,7 +238,8 @@ async fn console_grant_caps_messages_but_allows_twenty_sat_payments() {
         .call("GET", "/api/v1/pair/grant", None, Some(&token))
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["grant"]["per_call_max_msat"], 6_000);
+    assert_eq!(body["grant"]["per_call_max_msat"], 20_000);
+    assert_eq!(body["grant"]["message_per_payment_max_msat"], 6_000);
     let (status, body) = fx.keysend(&token, PEER_LN, 20_000).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = fx

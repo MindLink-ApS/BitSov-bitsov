@@ -760,6 +760,9 @@ struct ReservationAuthority<'a> {
     /// A call offer, paid under that call's existing hold: its call id and
     /// the caller's consented all-in cap for it, if any.
     call_offer: Option<(&'a str, Option<u64>)>,
+    /// Change the ledger in memory only: the caller persists (or rolls back)
+    /// this reservation together with others under the same lock.
+    in_memory: bool,
 }
 
 /// Consumed, single-use authorization. Its grant identity survives the handoff
@@ -3232,6 +3235,7 @@ impl PairingService {
         mut clock: impl FnMut() -> i64,
     ) -> Result<Reservation, BudgetRefusal> {
         let now = clock();
+        let in_memory = authority.in_memory;
         let fingerprint = inner.identity_fingerprint.clone();
         let current_epoch = inner
             .file
@@ -3350,7 +3354,7 @@ impl PairingService {
             (None, None) => budget.reserve_at(&charges, now),
         });
         if let Err(refusal) = reserved {
-            if budget.record_breaker_refusal(&refusal, now) {
+            if budget.record_breaker_refusal(&refusal, now) && !in_memory {
                 if let Err(e) = self.persist(&mut inner.file) {
                     if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
                         g.budget = before;
@@ -3388,6 +3392,9 @@ impl PairingService {
         {
             inner.file.grants[idx].budget = before;
             return Err(e);
+        }
+        if in_memory {
+            return Ok(reservation);
         }
         if let Err(e) = self.persist_with_clock(&mut inner.file, &mut clock) {
             if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
@@ -4292,7 +4299,8 @@ fn grant_view(g: &SpendGrant) -> Option<GrantView> {
         budget_msat: b.budget_msat,
         used_msat: b.used_msat,
         remaining_msat: b.remaining_msat(),
-        per_call_max_msat: b.messaging_per_call_max_msat(),
+        per_call_max_msat: b.per_call_max_msat,
+        message_per_payment_max_msat: b.messaging_per_call_max_msat(),
         call_per_payment_max_msat: b.call_per_payment_max_msat(),
         per_recipient_msat: b.per_recipient_msat.clone(),
         used_by_recipient: b.used_by_recipient.clone(),

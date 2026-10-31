@@ -766,7 +766,7 @@ fn legacy_relation_cap_applies_on_first_reservation_without_rewriting_terms() {
     ));
     assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 0);
     assert_eq!(
-        service.grant_view_for(&client).unwrap().per_call_max_msat,
+        service.grant_view_for(&client).unwrap().message_per_payment_max_msat,
         6_000
     );
     service.reserve_spend(&client, 1, charge(6_000)).unwrap();

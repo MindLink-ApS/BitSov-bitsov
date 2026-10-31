@@ -34,8 +34,11 @@ pub enum ApprovalRequest {
     SpendGrant {
         /// Total budget in millisatoshis.
         budget_msat: u64,
-        /// Maximum reservation for one call.
-        per_call_max_msat: u64,
+        /// Most one payment may carry, msat, as the owner approves it: at
+        /// most the budget, which is also the default. Messages and every
+        /// other non-call payment are further held to the messaging cap.
+        #[serde(default)]
+        per_call_max_msat: Option<u64>,
         /// Window from approval, bounded by the console's limits.
         window_secs: i64,
         /// Optional exclusive recipient (node id).
@@ -71,7 +74,7 @@ impl ApprovalRequest {
             return Err(PairingError::BadProof);
         };
         let mut terms = GrantTerms::new(*budget_msat)
-            .per_call(*per_call_max_msat)
+            .per_call(per_call_max_msat.unwrap_or(*budget_msat))
             .for_secs(*window_secs);
         if let Some(recipient) = recipient {
             terms = terms.recipient(recipient, *budget_msat);
@@ -104,14 +107,16 @@ impl ApprovalRequest {
             }
             _ => {}
         }
-        // Cap the request before presenting/signing it, so the receipt and
-        // the grant carry the same effective terms. Preserve tighter limits.
+        // Present and sign the real per-payment value, defaulting to the
+        // budget, so the receipt and the grant carry exactly what the owner
+        // approved. The messaging cap is applied when spending, not stored.
         if let Self::SpendGrant {
-            per_call_max_msat, ..
+            budget_msat,
+            per_call_max_msat,
+            ..
         } = &mut self
         {
-            *per_call_max_msat =
-                (*per_call_max_msat).min(crate::spend_budget::MESSAGING_PER_CALL_MAX_MSAT);
+            *per_call_max_msat = Some(per_call_max_msat.unwrap_or(*budget_msat));
         }
         Ok(self)
     }
@@ -196,11 +201,6 @@ pub struct ApprovalOperation {
     pub breaker_reset: Option<BreakerResetTerms>,
     /// Canonical bounded terms.
     pub request: ApprovalRequest,
-    /// spend_grant only: the per-payment limit as requested, before the
-    /// messaging clamp on `per_call_max_msat`. It bounds each call payment
-    /// of the grant (see `GrantBudget::call_per_payment_max_msat`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_per_payment: Option<crate::spend_budget::OwnerPerPayment>,
     /// Server-generated 16-byte nonce, hex.
     pub nonce: String,
     /// Absolute approval deadline, included in the signed bytes.
@@ -230,7 +230,7 @@ impl ApprovalOperation {
                 recipient.as_deref().unwrap_or("-"),
                 *budget_msat,
                 budget_msat.to_string(),
-                per_call_max_msat.to_string(),
+                per_call_max_msat.unwrap_or(*budget_msat).to_string(),
                 window_secs.to_string(),
             ),
             ApprovalRequest::FirstContact {
@@ -432,13 +432,6 @@ impl PairingService {
         request: ApprovalRequest,
     ) -> Result<ApprovalView, PairingError> {
         self.approval_mode()?;
-        // Read before normalizing: the messaging clamp would hide the choice.
-        let owner_per_payment = match &request {
-            ApprovalRequest::SpendGrant { budget_msat, per_call_max_msat, .. } => Some(
-                crate::spend_budget::OwnerPerPayment::requested(*per_call_max_msat, *budget_msat),
-            ),
-            _ => None,
-        };
         let request = request.normalize()?;
         let mut inner = self.lock();
         let client = self.approval_client(&inner, client_id, epoch)?.clone();
@@ -485,7 +478,6 @@ impl PairingService {
             grant_op,
             breaker_reset,
             request,
-            owner_per_payment,
             nonce: hex::encode(nonce),
             expires_at: now + TTL,
         };
@@ -639,12 +631,7 @@ impl PairingService {
             }
             ApprovalRequest::SpendGrant { .. } => {
                 let terms = op.request.spend_terms()?;
-                let mut budget = GrantBudget::from_terms(&terms);
-                // The clamped terms cannot say what the owner chose. Without
-                // the recorded choice, keep the clamped value (fail closed).
-                budget.owner_per_payment = Some(op.owner_per_payment.unwrap_or(
-                    crate::spend_budget::OwnerPerPayment::MaxMsat(terms.per_call_max_msat),
-                ));
+                let budget = GrantBudget::from_terms(&terms);
                 let grant = SpendGrant {
                     op_id: op.op_id.clone(),
                     client_id: op.client_id.clone(),
@@ -812,7 +799,7 @@ mod tests {
                     self.requester.epoch,
                     ApprovalRequest::SpendGrant {
                         budget_msat: 100_000,
-                        per_call_max_msat: 10_000,
+                        per_call_max_msat: Some(10_000),
                         window_secs: 600,
                         recipient: None,
                     },
@@ -881,7 +868,7 @@ mod tests {
                         .operation
                         .request = ApprovalRequest::SpendGrant {
                         budget_msat: 99999,
-                        per_call_max_msat: 10000,
+                        per_call_max_msat: Some(10000),
                         window_secs: 600,
                         recipient: None,
                     }
@@ -954,7 +941,7 @@ mod tests {
                 f.requester.epoch,
                 ApprovalRequest::SpendGrant {
                     budget_msat: 100,
-                    per_call_max_msat: 100,
+                    per_call_max_msat: Some(100),
                     window_secs: 60,
                     recipient: None
                 }

@@ -3587,6 +3587,8 @@ pub(super) async fn compose_peer(
         }
         let offer_consent = req.kind == konsensus_core::kind::KIND_CALL_INVITE
             && (req.max_block_msat.is_some() || req.max_hold_msat.is_some());
+        // A metered offer's new hold, reserved together with the offer.
+        let mut new_hold = None;
         if (auth.is_metered() && matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK)) || offer_consent {
             let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -3653,7 +3655,13 @@ pub(super) async fn compose_peer(
                     let terms = crate::spend_budget::CallSpendTerms::new(&peer_id.to_hex(), &signal.call_id, block_price, fee, minutes)
                         .map_err(ApiError::BudgetExceeded)?
                         .over_direct_channel(direct && fee == 0);
-                    crate::calls::ensure_call_spend(&auth, &state, &peer_id, &signal, terms).await?;
+                    // An offer's hold is reserved with the offer below, in one
+                    // ledger transaction, so a refusal of either keeps neither.
+                    if req.kind == konsensus_core::kind::KIND_CALL_INVITE && auth.is_metered() {
+                        new_hold = Some(terms);
+                    } else {
+                        crate::calls::ensure_call_spend(&auth, &state, &peer_id, &signal, terms).await?;
+                    }
                 }
             }
             if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
@@ -3703,7 +3711,15 @@ pub(super) async fn compose_peer(
             if req.kind == konsensus_core::kind::KIND_CALL_INVITE {
                 let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
                     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-                auth.debit_call_offer(&state, charges, &signal.call_id, cap, &operation)
+                let reserved = match new_hold.take() {
+                    Some(terms) => crate::calls::with_new_call_spend(&state, &peer_id, &signal, |capacity|
+                        auth.debit_call_with_offer(&state, terms, capacity, charges.clone(), cap, &operation)).await?,
+                    None => None,
+                };
+                match reserved {
+                    Some(debit) => Ok(debit),
+                    None => auth.debit_call_offer(&state, charges, &signal.call_id, cap, &operation),
+                }
             } else { auth.debit_operation(&state, charges, confirmation, cap, &operation) }
         }
             .map_err(|e| e.with_routing_fee(state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat)))?

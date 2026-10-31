@@ -108,6 +108,20 @@ impl MeteredSpend {
         Ok(())
     }
 
+    /// Reserve a new call's hold and debit its offer in one ledger
+    /// transaction: a refusal of either keeps neither (see
+    /// `PairingService::reserve_call_with_offer`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn debit_call_with_offer(&self, state: &AppState, terms: crate::spend_budget::CallSpendTerms,
+        capacity: u64, charges: Vec<Charge>, cap: Option<u64>,
+        operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()) };
+        let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        let reservation = service.reserve_call_with_offer(client_id, *epoch, terms, capacity, charges, cap,
+            operation.reservation_link(false)).map_err(ApiError::BudgetExceeded)?;
+        Ok(Debit::reserved(Arc::clone(service), reservation))
+    }
+
     pub(crate) fn debit_call_block(&self, state: &AppState, signal: &konsensus_core::payloads::call::CallSignal,
         peer: &str, price: u64, fee: u64, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
         let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()) };
