@@ -595,6 +595,7 @@ pub(super) async fn compose_call(
 async fn call_payment_failed(state: &AppState, id: &str, error: Option<&ApiError>) -> bool {
     fn price_changed(error: &ApiError) -> bool {
         match error {
+            ApiError::Reasoned { reason, .. } if *reason == super::caps::CALL_DIRECT_CHANNEL_LOST => true,
             ApiError::Operation { source, .. } | ApiError::RoutingFee { source, .. }
                 | ApiError::Reasoned { source, .. } => price_changed(source),
             ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::CallPriceChanged) => true,

@@ -13,6 +13,10 @@ pub const CAPABILITY: &str = "paid_send_caps_v1";
 pub const QUOTED_READMISSION_CAPABILITY: &str = "quoted_readmission_v1";
 pub const ROOM_CAPABILITY: &str = "room_terminal_outcomes_v1";
 
+/// A call block refused because the direct channel its zero fee relies on no
+/// longer carries it. Terminal for the call: it ends and its hold is released.
+pub const CALL_DIRECT_CHANNEL_LOST: &str = "call_direct_channel_lost";
+
 pub fn payable(price: u64) -> u64 { if price == 0 { 0 } else { price.max(1000) } }
 
 pub fn check(amount: u64, cap: Option<u64>) -> Result<(), ApiError> {
@@ -49,6 +53,20 @@ pub fn first_contact_total(admission: u64, message: u64, cap: Option<u64>) -> Re
 pub fn all_in(state: &crate::state::AppState, principal: u64, caller: Option<u64>) -> Result<u64, ApiError> {
     let fee = state.lightning.routing_fee_policy().ceiling(principal, caller);
     principal.checked_add(fee).ok_or_else(|| ApiError::PriceCapExceeded(format!("all-in amount overflow; max_routing_fee_msat={fee}")))
+}
+/// Whether `peer`'s Lightning node is the counterparty of an active channel
+/// whose known outbound capacity carries each of `principals` in one hop. They
+/// are paid one after another over that channel, so their sum must fit. An
+/// unknown key or capacity, nothing to pay, or a failed channel listing answer
+/// false, keeping the ordinary routing ceiling.
+pub async fn direct_channel(state: &crate::state::AppState, peer: &konsensus_core::types::NodeId, principals: &[u64]) -> bool {
+    let Some(total) = principals.iter().try_fold(0u64, |sum, p| sum.checked_add(payable(*p))) else { return false };
+    if total == 0 { return false; }
+    let Some(key) = state.peer_ln_pubkeys.lock().await.get(peer).cloned() else { return false };
+    state.lightning.list_channels().await.is_ok_and(|channels| channels.iter().any(|c| {
+        c.active && c.is_channel_ready != Some(false) && c.peer_pubkey.eq_ignore_ascii_case(&key)
+            && c.outbound_capacity_msat.is_some_and(|cap| cap >= total)
+    }))
 }
 pub fn check_payment(state: &crate::state::AppState, principal: u64, caller: Option<u64>, cap: Option<u64>) -> Result<u64, ApiError> {
     let total = all_in(state, principal, caller)?;
