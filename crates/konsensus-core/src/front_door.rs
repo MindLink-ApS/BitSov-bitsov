@@ -567,7 +567,7 @@ mod tests {
             },
             profile: FrontDoorProfile {
                 kind: ProfileKind::Person,
-                display_name: "Maya".into(),
+                display_name: "Carol".into(),
                 tagline: "Build in the open".into(),
                 about: "Pilot peer.".into(),
                 avatar: None,

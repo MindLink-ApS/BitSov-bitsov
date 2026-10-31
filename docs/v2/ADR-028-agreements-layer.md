@@ -263,7 +263,7 @@ is documented here so:
 4. Wire `konsensus-ai` orchestration interface (read-only API into
    Agreements; no write-through to core; oracle resolution against
    the signed `ORACLES.md` list only).
-5. Validate UX with real users (Maya, Josh) before scaling
+5. Validate UX with real users (Carol, Dave) before scaling
    templates.
 6. Decide in-tree vs external monorepo at that point. Vision doc
    recommends external; in-tree is acceptable for the first 1-2

@@ -161,7 +161,7 @@ regtest runtime was not available for this correction.
    The slow-owner scenario explicitly asserts >30 seconds between quote and
    send, unchanged generations on both ends, and successful paid delivery.
    Transport liveness has no chain-readiness dependency. This does not establish
-   the cause of Maya's separate live-run reachability issue.
+   the cause of Carol's separate live-run reachability issue.
 2. **The ghost bound assumed durable absence evidence.** The existing test already
    passed channel removal, real `/tx/{txid}` 404, provider existence lookup,
    `closing_sats == 0`, and aggregate exclusion before reaching the failed bound.

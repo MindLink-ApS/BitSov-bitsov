@@ -162,7 +162,7 @@ The first transport plaintext is compact JSON. For a new pairing:
 {
   "v": 1,
   "code": "<code from link>",
-  "client_name": "Maya's phone",
+  "client_name": "Carol's phone",
   "client_pubkey": "<64 lowercase hex Ed25519 pairing key>",
   "signature": "<base64url-no-pad Ed25519 signature>"
 }

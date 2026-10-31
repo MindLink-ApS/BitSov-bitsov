@@ -74,7 +74,7 @@ pub struct UnsignedDeviceAttestation {
     pub device_pubkey:   [u8; 32],         // per-device Ed25519
     pub device_kx_pubkey:[u8; 32],         // per-device X25519
     pub device_id:       [u8; 16],
-    pub device_label:    String,           // "Maya's iPhone"
+    pub device_label:    String,           // "Carol's iPhone"
     pub device_kind:     DeviceKind,       // Mobile | Desktop | Browser | Tablet | Headless
     pub issued_at_unix:  u64,
     pub expires_at_unix: u64,              // recommended: issued + 2 years
@@ -251,9 +251,9 @@ Matches Cell Test (DNA in nucleus = whitelist in home nodes; receptors on surfac
 
 ### B. Device revocation — **Mnemonic-signed `DeviceRevocation` + short-TTL session caching**
 
-Maya loses phone:
+Carol loses phone:
 
-1. From any mnemonic-holding device (laptop), Maya signs:
+1. From any mnemonic-holding device (laptop), Carol signs:
    ```
    DeviceRevocation {
        version: 1,
@@ -277,7 +277,7 @@ Maya loses phone:
 
 ### C. Mnemonic recovery — **Identity birth certificate + relay re-registration**
 
-Maya loses every device, has only 24 words.
+Carol loses every device, has only 24 words.
 
 1. Install BitSov on new device
 2. Enter mnemonic. App calls `NodeIdentity::from_mnemonic`. Mnemonic re-derives **same** `identity_pubkey`.
@@ -293,14 +293,14 @@ Maya loses every device, has only 24 words.
 
 ### D. Pairing without prior contact (new user) — **Layer 0: install ⇒ generate**
 
-Lisa has no BitSov identity. Cannot accept Maya's invite via L1 (requires primary with mnemonic).
+Lisa has no BitSov identity. Cannot accept Carol's invite via L1 (requires primary with mnemonic).
 
 **Layer 0 (one-time, before L1 exists):**
 
 1. Lisa installs BitSov on phone
 2. App generates **fresh 24-word mnemonic** (`NodeIdentity::generate`). Phone IS primary device.
 3. App calls `from_mnemonic`, derives identity_pubkey, generates `device_key`, self-signs **first** DeviceAttestation, writes birth_cert (generation 0).
-4. **Mandatory backup gate**: until user has (a) written down 24 words or (b) printed steel/paper backup, app gates write capability. Maya's invite accepted, but Lisa cannot accept payment downgrade or revoke anything until backup confirmed.
+4. **Mandatory backup gate**: until user has (a) written down 24 words or (b) printed steel/paper backup, app gates write capability. Carol's invite accepted, but Lisa cannot accept payment downgrade or revoke anything until backup confirmed.
 
 Lisa's phone is BOTH mnemonic-holder AND paired device. Subsequent devices (laptop, tablet) follow normal L1 with phone as primary.
 
@@ -308,17 +308,17 @@ This is existing `NodeIdentity::generate` formalized. No new crypto. Novelty: **
 
 ### E. Borrowed-browser at friend's house — **Yes, via primary-device-issued ephemeral biscuit OR mnemonic entry**
 
-Maya, no phone, no laptop, friend's browser. 15 minutes of email needed.
+Carol, no phone, no laptop, friend's browser. 15 minutes of email needed.
 
 **Flow:**
 
 1. Open `https://node-alice.example` in friend's browser. Static page from home node asks: "Trusted or borrowed device?" -> "borrowed"
 2. Page generates **ephemeral browser device_key in-memory** (Web Crypto API, non-extractable). Displays 9-digit pairing code + QR.
-3. Maya needs to pair from another device... but she has none.
+3. Carol needs to pair from another device... but she has none.
 
 **Principled answer: borrowed-browser session requires EITHER (a) one paired device OR (b) the mnemonic.**
 
-If Maya has mnemonic memorized: she may enter directly in friend's browser to derive identity, generate **short-lived (15min, read-only) biscuit**, and go. **Deliberate sovereignty trade-off**: typing mnemonic into foreign device is risky and **should be explicit opt-in**, with screen saying "this device may keylog your mnemonic — rotate to new mnemonic within 24h if you do this." Rotate action is recovery flow §C.
+If Carol has mnemonic memorized: she may enter directly in friend's browser to derive identity, generate **short-lived (15min, read-only) biscuit**, and go. **Deliberate sovereignty trade-off**: typing mnemonic into foreign device is risky and **should be explicit opt-in**, with screen saying "this device may keylog your mnemonic — rotate to new mnemonic within 24h if you do this." Rotate action is recovery flow §C.
 
 If she has neither mnemonic nor paired device: **cannot access BitSov.** Correct. Sovereignty means user is bottleneck when user has surrendered all key material. There is no "forgot password" because there is no password.
 
@@ -354,7 +354,7 @@ If she has neither mnemonic nor paired device: **cannot access BitSov.** Correct
 | Side-channel timing on Ed25519 | The mnemonic key | **Defense:** `ed25519-dalek` constant-time impl, already in use. |
 | FCM/APNS observing push payloads | User's online signal | **Out of scope here** — see THREAT_MODEL_TIER2_RELAY.md §2.11. Auth layer doesn't send push. |
 
-**To impersonate Maya at relay**: attacker needs **either** (a) Maya's mnemonic, **or** (b) non-revoked Maya-issued attestation AND its corresponding device key. Both explicit user-held secrets. No phone number, no email, no SaaS pwn-and-takeover path.
+**To impersonate Carol at relay**: attacker needs **either** (a) Carol's mnemonic, **or** (b) non-revoked Carol-issued attestation AND its corresponding device key. Both explicit user-held secrets. No phone number, no email, no SaaS pwn-and-takeover path.
 
 ## 7. UX Implications
 
