@@ -1976,10 +1976,11 @@ async fn held_calendar_envelope_is_withdrawn_by_the_startup_sweep_after_reopen()
         .await
         .unwrap();
     assert_eq!(count, 0);
-    // The replay keys stay burned: a resend is a reuse of a withdrawn envelope.
+    // The replay keys stay burned: a resend of the withdrawn envelope is
+    // answered as withdrawn (#441), never re-accepted.
     assert!(matches!(
         db.accept_paid_envelope(&env).await.unwrap(),
-        crate::PaidAcceptance::PaymentReused
+        crate::PaidAcceptance::Withdrawn
     ));
 }
 
@@ -2114,7 +2115,7 @@ async fn opaque_admission_requires_the_live_hold_direct_and_through_the_wrapper(
         assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
         assert!(matches!(
             db.accept_held_paid_envelope(&env).await.unwrap(),
-            PaidAcceptance::PaymentReused | PaidAcceptance::NonceReused
+            PaidAcceptance::Withdrawn
         ));
         // Uncontended: the opaque admission consumes the hold and the envelope
         // becomes visible and durably accepted; a second admission finds no hold.

@@ -454,7 +454,7 @@ async fn slow_liquidity_query_does_not_block_another_calls_transitions() {
             async {
                 konsensus_api::calls::prepare_incoming_block(
                     fx.state.storage.as_ref(), &peer, Some(&plaintext), &[1; 32],
-                ).await.unwrap().commit().await
+                ).await.unwrap().commit(&konsensus_core::MessageId::from_bytes([0; 32])).await
             },
         )
         .await;

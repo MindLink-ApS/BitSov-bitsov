@@ -15,9 +15,18 @@ use crate::invites::{
 use crate::models::{EnergyRow, FileMetadata, FileRecord, OnboardingStateRecord, Peer, Room};
 use crate::reactions::ReactionRecord;
 
-/// Outcome of the durable recipient acceptance transaction.
+/// Outcome of the durable recipient acceptance transaction. `Withdrawn`: this
+/// exact envelope (same id and sender) was accepted and later withdrawn by the
+/// application (`reject_accepted_envelope`, receipt `accepted = -1`); its
+/// payment stays burned and it is never acknowledged or re-accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaidAcceptance { Accepted, AlreadyAccepted, NonceReused, PaymentReused }
+pub enum PaidAcceptance {
+    Accepted,
+    AlreadyAccepted,
+    NonceReused,
+    PaymentReused,
+    Withdrawn,
+}
 
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
@@ -1166,6 +1175,16 @@ pub trait Storage: Send + Sync {
 
     /// Insert or replace `(peer, call_id)`.
     async fn call_put(&self, _peer: &konsensus_core::NodeId, _call_id: &str, _entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
+    /// Commit a paid call block: insert or replace `(peer, call_id)` AND
+    /// release the admission hold on its message `id`, in ONE transaction.
+    /// A granted interval is durable exactly when its message is admitted:
+    /// no failure can leave a committed grant behind a hold that the sweep
+    /// would later withdraw (marking a paid, granted block rejected). If the
+    /// release fails, the grant is rolled back with it.
+    async fn call_commit_admitted(&self, _peer: &konsensus_core::NodeId, _call_id: &str, _entry: &konsensus_core::payloads::call::CallEntry, _id: &MessageId) -> Result<(), StorageError> {
         Err(StorageError::Unsupported("call state".into()))
     }
 

@@ -548,11 +548,11 @@ async fn process_file_valid_stores_file() {
 
     let result = process_file_message(&bytes, &sender, &envelope, &storage, &audit).await;
 
-    assert_eq!(result, Some("[file: test.txt]".to_string()));
+    assert_eq!(result, Ok("[file: test.txt]".to_string()));
 }
 
 #[tokio::test]
-async fn process_file_hash_mismatch_discards_data() {
+async fn process_file_hash_mismatch_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
@@ -580,12 +580,18 @@ async fn process_file_hash_mismatch_discards_data() {
 
     let result = process_file_message(&bytes, &sender, &envelope, &storage, &audit).await;
 
-    // Returns filename (for display) but does NOT store the file (hash mismatch)
-    assert_eq!(result, Some("[file: corrupt.txt]".to_string()));
+    // A hash mismatch is a damaged file: refused, never stored, never shown.
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::FileCorrupted(
+            "the file data does not match its hash"
+        ))
+    );
+    assert!(storage.list_files(10).await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn process_file_invalid_json_returns_none() {
+async fn process_file_invalid_json_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
@@ -601,11 +607,14 @@ async fn process_file_invalid_json_returns_none() {
     let sender = *alice.node_id();
 
     let result = process_file_message(bytes, &sender, &envelope, &storage, &audit).await;
-    assert_eq!(result, None);
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::FileCorrupted("the payload is not a file"))
+    );
 }
 
 #[tokio::test]
-async fn process_file_invalid_base64_returns_filename() {
+async fn process_file_invalid_base64_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
@@ -630,14 +639,17 @@ async fn process_file_invalid_base64_returns_filename() {
 
     let result = process_file_message(&bytes, &sender, &envelope, &storage, &audit).await;
 
-    // Invalid base64 returns filename (graceful degradation)
-    assert_eq!(result, Some("[file: broken.bin]".to_string()));
+    // Undecodable data is a damaged file: refused, not reported as arrived.
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::FileCorrupted("the file data is not base64"))
+    );
 }
 
 // ── decrypt_and_process tests ───────────────────────────────────────
 
 #[tokio::test]
-async fn decrypt_no_session_returns_none() {
+async fn decrypt_no_session_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let session_mgr = SessionManager::new(Arc::clone(&bob));
@@ -671,15 +683,21 @@ async fn decrypt_no_session_returns_none() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
     )
-    .await
-    .expect("not a calendar refusal");
+    .await;
 
-    assert!(result.is_none(), "no session should return None");
+    assert_eq!(
+        result,
+        Err(InboundRefusal::Receipt(ReceiptRefusal::Undecryptable(
+            "no E2EE session with the sender"
+        ))),
+        "a paid message with no session to read it is refused, not acknowledged"
+    );
 }
 
 #[tokio::test]
-async fn decrypt_invalid_ratchet_message_returns_none() {
+async fn decrypt_invalid_ratchet_message_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let bob_mgr = SessionManager::new(Arc::clone(&bob));
@@ -718,13 +736,16 @@ async fn decrypt_invalid_ratchet_message_returns_none() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
     )
-    .await
-    .expect("not a calendar refusal");
+    .await;
 
-    assert!(
-        result.is_none(),
-        "invalid ratchet message should return None"
+    assert_eq!(
+        result,
+        Err(InboundRefusal::Receipt(ReceiptRefusal::Undecryptable(
+            "ciphertext is not a ratchet message"
+        ))),
+        "a paid message that is not a ratchet message is refused, not acknowledged"
     );
 }
 
@@ -774,11 +795,11 @@ async fn decrypt_valid_message_returns_plaintext_and_caches() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
     )
-    .await
-    .expect("not a calendar refusal");
+    .await;
 
-    assert_eq!(result, Some("Hello from Alice!".to_string()));
+    assert_eq!(result, Ok(Some("Hello from Alice!".to_string())));
     // Verify plaintext was cached in storage
     assert!(storage.has_plaintext(&envelope.id));
 }
@@ -841,11 +862,11 @@ async fn decrypt_file_ref_stores_and_returns_label() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
     )
-    .await
-    .expect("not a calendar refusal");
+    .await;
 
-    assert_eq!(result, Some("[file: report.pdf]".to_string()));
+    assert_eq!(result, Ok(Some("[file: report.pdf]".to_string())));
     assert_eq!(storage.file_count(), 1);
 }
 
@@ -1224,12 +1245,17 @@ async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
     )
-    .await
-    .expect("not a calendar refusal");
+    .await;
 
-    // Decryption failed → returns None
-    assert!(result.is_none());
+    // Decryption failed → refused, never acknowledged as delivered
+    assert_eq!(
+        result,
+        Err(InboundRefusal::Receipt(ReceiptRefusal::Undecryptable(
+            "the session could not decrypt the ciphertext"
+        )))
+    );
     // Session should be removed for re-negotiation
     assert!(!bob_mgr.has_session(alice.node_id()).await);
 }
@@ -1282,12 +1308,16 @@ async fn decrypt_non_utf8_returns_none() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
     )
-    .await
-    .expect("not a calendar refusal");
+    .await;
 
     // Non-UTF8 for a chat message returns None
-    assert!(result.is_none());
+    assert_eq!(
+        result,
+        Ok(None),
+        "kept, but not text: nothing to show, still delivered"
+    );
 }
 
 // ── HARD-11: registry read guard released before the gate await ──────
@@ -3003,6 +3033,23 @@ async fn kind_offer_publication_serializes_discount_and_fails_closed() {
     target.shutdown();
 }
 
+/// The caller's journal of a settled, dispatched paid block, as compose
+/// leaves it before the callee's grant ACK arrives.
+async fn journal_dispatched_block(store: &konsensus_storage::SqliteStorage, env: &konsensus_core::UkmEnvelope, call_id: &str, seq: u32) {
+    let Recipient::Node(peer) = env.recipient else { panic!("a block goes to one node") };
+    store.store_message(env).await.unwrap();
+    let mut op = konsensus_storage::OutboxOperation::prepared(format!("block-{call_id}-{seq}"), peer.to_hex(), 404, format!("request-{seq}"));
+    op.state = "sent".into();
+    op.message_id = Some(env.id.to_hex());
+    op.recovery = serde_json::to_vec(&serde_json::json!({
+        "call_block": [call_id, seq], "dispatched": true, "expected_msat": env.payment_proof.amount_msat,
+        "fee_ceiling_msat": 0, "admission_msat": 0,
+    })).unwrap();
+    store.insert_outbox_operation(&op).await.unwrap();
+    store.queue_pending_delivery(&env.id, &peer).await.unwrap();
+    store.mark_pending_sent(&env.id, &peer).await.unwrap();
+}
+
 /// 1:1 call signalling (kinds 400-403) end to end over Noise, through the
 /// real receive loop: the offer is admitted only when paid at the recipient's
 /// `call_msat`, once per call id; answer/ICE/hangup reach the app only for a
@@ -3043,12 +3090,12 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     let sessions_b = Arc::new(SessionManager::new(bob.clone()));
     establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
     let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-    let (shutdown, shutdown_rx) = watch::channel(false);
     let (ws_tx, mut ws_rx) = broadcast::channel(16);
     let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
         konsensus_pricing::StaticPricingEngine::new(Default::default()),
     );
-    let worker = tokio::spawn(run(MsgHandlerDeps {
+    // The receive loop over Bob's durable store; started again for a restart.
+    let start = |shutdown_rx| tokio::spawn(run(MsgHandlerDeps {
         transport: target.clone(),
         transport_ack: target.clone(),
         storage: storage.clone(),
@@ -3056,23 +3103,25 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
             verify_lightning_settlement: true,
             ..Default::default()
         })),
-        pricing,
+        pricing: pricing.clone(),
         lightning: wallet.clone(),
         chain: Arc::new(konsensus_chain::MockChainProvider::new()),
         peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
         session_manager: sessions_b.clone(),
-        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage.clone())),
         content_server: None,
         front_door: Default::default(),
         routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
-        ws_tx,
-        audit_log: audit,
+        ws_tx: ws_tx.clone(),
+        audit_log: audit.clone(),
         admission_mode: ReachabilityMode::PriceOpen,
         relay_engine: None,
         shutdown_rx,
     }));
+    let (mut shutdown, shutdown_rx) = watch::channel(false);
+    let mut worker = start(shutdown_rx);
 
     // Alice pays `msat` to Bob and sends one signal of `kind`.
     let signal = |kind: u16, msat: u64, body: String| {
@@ -3400,6 +3449,218 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     source.send(bob.node_id(), &second).await.unwrap();
     assert!(outcome(source.clone()).await.is_err());
     assert!(ws_rx.try_recv().is_err(), "a distinct paid notice must not reach the app twice");
+
+    // A committed block is never withdrawn by a failure of the generic
+    // (second) plaintext write: its interval is granted, so the sender gets
+    // the normal grant ACK and the caller reconciles to paid. The fault hits
+    // ONLY that write: the metadata write before commit finds the fresh row's
+    // cache empty, any later write would find it set and abort.
+    sqlx::query("CREATE TRIGGER fail_second_plaintext BEFORE UPDATE OF plaintext_enc ON messages WHEN OLD.plaintext_enc IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected second plaintext write failure'); END")
+        .execute(db.pool()).await.unwrap();
+    let grant_outcome = |source: Arc<NoiseTransport>, id: MessageId| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source.recv_control().await.unwrap() {
+                    ControlEvent::MessageAcked { message_id, duplicate, paid_until_ms, .. } if message_id == id => break Ok((duplicate, paid_until_ms)),
+                    ControlEvent::MessageRejected { message_id, reason, .. } if message_id == id => break Err(reason),
+                    _ => {}
+                }
+            }
+        }).await.unwrap()
+    };
+    let caller_db = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let caller_cipher = PlaintextCacheCipher::new(alice.aes_key());
+    let fault_id = format!("{:032x}", rand::random::<u128>());
+    let fault_block = |seq: u32| format!(r#"{{"v":1,"call_id":"{fault_id}","seq":{seq}}}"#);
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let answered_at = now - 20_000;
+    let pending = calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
+    let fault_entry = calls::commit(pending, "answer", answered_at).unwrap();
+    db.call_put(alice.node_id(), &fault_id, &fault_entry).await.unwrap();
+
+    // Delayed block zero. The caller advanced its sequence when it settled.
+    let caller_entry = calls::CallEntry { side: calls::Side::Caller, next_block_seq: 1, ..fault_entry.clone() };
+    caller_db.call_put(bob.node_id(), &fault_id, &caller_entry).await.unwrap();
+    assert!(!konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &fault_id, now).await);
+    let env0 = signal(404, 10_000, fault_block(0)).await;
+    journal_dispatched_block(&caller_db, &env0, &fault_id, 0).await;
+    source.send(bob.node_id(), &env0).await.unwrap();
+    let granted0 = match grant_outcome(source.clone(), env0.id).await {
+        Ok((false, Some(until))) => until,
+        other => panic!("a committed block must be granted, not withdrawn: {other:?}"),
+    };
+    assert_eq!(granted0, answered_at + 60_000);
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    let callee0 = db.call_get(alice.node_id(), &fault_id).await.unwrap().unwrap();
+    assert_eq!((callee0.phase, callee0.next_block_seq, callee0.paid_until_ms), (Phase::Live, 1, Some(granted0)));
+    assert!(db.get_message(&env0.id).await.unwrap().is_some(), "not withdrawn");
+    assert!(db.is_paid_envelope_accepted(&env0).await.unwrap());
+    assert!(!db.is_paid_envelope_rejected(&env0).await.unwrap());
+    // Duplicate: the same durable grant is replayed, never extended.
+    source.send(bob.node_id(), &env0).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), env0.id).await, Ok((true, Some(granted0))));
+    assert_eq!(db.call_get(alice.node_id(), &fault_id).await.unwrap(), Some(callee0.clone()));
+    assert!(ws_rx.try_recv().is_err());
+    // The caller applies the ACK (and its duplicate) and is paid to the same boundary.
+    for _ in 0..2 {
+        konsensus_api::calls::receive_block_grant(&caller_db, &caller_cipher, alice.node_id(), bob.node_id(), &env0.id, granted0).await.unwrap();
+    }
+    let caller0 = caller_db.call_get(bob.node_id(), &fault_id).await.unwrap().unwrap();
+    assert_eq!((caller0.phase, caller0.next_block_seq, caller0.paid_until_ms), (Phase::Live, 1, Some(granted0)));
+    let at = chrono::Utc::now().timestamp_millis() as u64;
+    assert!(konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &fault_id, at).await);
+    assert!(konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &fault_id, at).await);
+
+    // Resumed renewal after both timers expired: only the grant ACK reopens
+    // the caller, so it must survive the same second-write failure.
+    let expired = calls::CallEntry { deadline_ms: now - 1, ..callee0 };
+    let callee_ended = calls::CallEntry { unpaid_notice_used: true, ..expired.clone().at(now).unwrap() };
+    db.call_put(alice.node_id(), &fault_id, &callee_ended).await.unwrap();
+    let caller_ended = calls::CallEntry { side: calls::Side::Caller, next_block_seq: 2, ..expired }.at(now).unwrap();
+    assert_eq!((caller_ended.phase, caller_ended.end_reason), (Phase::Ended, Some(HangupReason::Unpaid)));
+    caller_db.call_put(bob.node_id(), &fault_id, &caller_ended).await.unwrap();
+    let env1 = signal(404, 10_000, fault_block(1)).await;
+    journal_dispatched_block(&caller_db, &env1, &fault_id, 1).await;
+    source.send(bob.node_id(), &env1).await.unwrap();
+    let granted1 = match grant_outcome(source.clone(), env1.id).await {
+        Ok((false, Some(until))) => until,
+        other => panic!("a committed resume must be granted, not withdrawn: {other:?}"),
+    };
+    assert!(granted1 >= now + 60_000);
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    let callee1 = db.call_get(alice.node_id(), &fault_id).await.unwrap().unwrap();
+    assert_eq!((callee1.phase, callee1.next_block_seq, callee1.paid_until_ms), (Phase::Live, 2, Some(granted1)));
+    assert!(db.get_message(&env1.id).await.unwrap().is_some(), "not withdrawn");
+    assert!(!db.is_paid_envelope_rejected(&env1).await.unwrap());
+    source.send(bob.node_id(), &env1).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), env1.id).await, Ok((true, Some(granted1))));
+    assert_eq!(db.call_get(alice.node_id(), &fault_id).await.unwrap(), Some(callee1));
+    assert!(ws_rx.try_recv().is_err());
+    assert!(!konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &fault_id, now).await);
+    for _ in 0..2 {
+        konsensus_api::calls::receive_block_grant(&caller_db, &caller_cipher, alice.node_id(), bob.node_id(), &env1.id, granted1).await.unwrap();
+    }
+    let caller1 = caller_db.call_get(bob.node_id(), &fault_id).await.unwrap().unwrap();
+    assert_eq!((caller1.phase, caller1.next_block_seq, caller1.paid_until_ms), (Phase::Live, 2, Some(granted1)));
+    let at = chrono::Utc::now().timestamp_millis() as u64;
+    assert!(konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &fault_id, at).await);
+    assert!(konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &fault_id, at).await);
+
+    // One payment each, kept accepted; no withdrawal and no reconciliation event.
+    for env in [&env0, &env1] {
+        let receipts: Vec<(String, i32)> = sqlx::query_as("SELECT message_id, accepted FROM payment_receipts WHERE payment_hash = ?")
+            .bind(hex::encode(env.payment_proof.payment_hash)).fetch_all(db.pool()).await.unwrap();
+        assert_eq!(receipts, vec![(env.id.to_hex(), 1)]);
+    }
+    let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    assert!(!audit_entries.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .any(|event| (event["event"] == "message.rejected" || event["event"] == "call.block_commit_failed"
+            || event["event"] == "call.block_overpayment")
+            && (event["detail"]["message_id"] == env0.id.to_hex() || event["detail"]["message_id"] == env1.id.to_hex())));
+    sqlx::query("DROP TRIGGER fail_second_plaintext").execute(db.pool()).await.unwrap();
+
+    // Codex P1 (#441): a failing hold release can no longer strand a committed
+    // grant behind a hold that recovery withdraws. The grant and the release
+    // are one transaction: under the fault the grant rolls back with the
+    // release (no interval, a refusal, a reconciliation record), and a block
+    // that did commit has no hold left, so neither restart recovery nor a
+    // retry under the same fault can withdraw it; a retry re-ACKs the same
+    // boundary and never grants twice.
+    let receipts = |env: &konsensus_core::UkmEnvelope| {
+        let (pool, hash) = (db.pool().clone(), hex::encode(env.payment_proof.payment_hash));
+        async move {
+            sqlx::query_as::<_, (String, i32)>("SELECT message_id, accepted FROM payment_receipts WHERE payment_hash = ?")
+                .bind(hash).fetch_all(&pool).await.unwrap()
+        }
+    };
+    let audited = |id: MessageId| -> Vec<String> {
+        std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap().lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["detail"]["message_id"] == id.to_hex())
+            .map(|event| event["event"].as_str().unwrap().to_owned()).collect()
+    };
+    let fail_release = "CREATE TRIGGER fail_release BEFORE DELETE ON call_admission_hold BEGIN SELECT RAISE(ABORT, 'injected hold release failure'); END";
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let answered_at = now - 20_000;
+    let answered = || calls::commit(calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()),
+        401, "answer", "hash", answered_at).unwrap(), "answer", answered_at).unwrap();
+
+    // The release fails: the grant rolls back with it and the block is refused.
+    let stranded_id = format!("{:032x}", rand::random::<u128>());
+    let stranded_entry = answered();
+    db.call_put(alice.node_id(), &stranded_id, &stranded_entry).await.unwrap();
+    sqlx::query(fail_release).execute(db.pool()).await.unwrap();
+    let stranded = signal(404, 10_000, format!(r#"{{"v":1,"call_id":"{stranded_id}","seq":0}}"#)).await;
+    source.send(bob.node_id(), &stranded).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), stranded.id).await, Err("storage error".into()));
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &stranded_id).await.unwrap(), Some(stranded_entry.clone()),
+        "a grant must never be committed without the release of its hold");
+    assert!(!konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &stranded_id, now).await);
+    assert!(db.call_admission_held(&stranded.id).await.unwrap(), "its withdrawal failed too: it stays hidden");
+    // Still held: a retry is refused, never acknowledged or granted.
+    source.send(bob.node_id(), &stranded).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), stranded.id).await, Err("call signal withdrawn".into()));
+    assert_eq!(db.call_get(alice.node_id(), &stranded_id).await.unwrap(), Some(stranded_entry.clone()));
+    sqlx::query("DROP TRIGGER fail_release").execute(db.pool()).await.unwrap();
+
+    // A block that commits is admitted in the same transaction: no hold remains.
+    let kept_id = format!("{:032x}", rand::random::<u128>());
+    db.call_put(alice.node_id(), &kept_id, &answered()).await.unwrap();
+    let caller_entry = calls::CallEntry { side: calls::Side::Caller, next_block_seq: 1, ..answered() };
+    caller_db.call_put(bob.node_id(), &kept_id, &caller_entry).await.unwrap();
+    let kept = signal(404, 10_000, format!(r#"{{"v":1,"call_id":"{kept_id}","seq":0}}"#)).await;
+    journal_dispatched_block(&caller_db, &kept, &kept_id, 0).await;
+    source.send(bob.node_id(), &kept).await.unwrap();
+    let kept_until = match grant_outcome(source.clone(), kept.id).await {
+        Ok((false, Some(until))) => until,
+        other => panic!("a committed block must be granted: {other:?}"),
+    };
+    assert_eq!(kept_until, answered_at + 60_000);
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    assert!(!db.call_admission_held(&kept.id).await.unwrap());
+    let callee_kept = db.call_get(alice.node_id(), &kept_id).await.unwrap().unwrap();
+    assert_eq!((callee_kept.phase, callee_kept.next_block_seq, callee_kept.paid_until_ms), (Phase::Live, 1, Some(kept_until)));
+
+    // That ACK is lost and Bob restarts: startup recovery withdraws only the
+    // stranded block. The release fault is back for everything that follows.
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    assert_eq!(konsensus_api::calls::withdraw_held(db.as_ref(), true).await.unwrap(), 1);
+    sqlx::query(fail_release).execute(db.pool()).await.unwrap();
+    let (restarted, shutdown_rx) = watch::channel(false);
+    shutdown = restarted;
+    worker = start(shutdown_rx);
+
+    // The stranded block: withdrawn, never granted, refused on retry, and its
+    // settled payment is on record for reconciliation.
+    assert_eq!(receipts(&stranded).await, vec![(stranded.id.to_hex(), -1)]);
+    assert!(db.get_message(&stranded.id).await.unwrap().is_none());
+    source.send(bob.node_id(), &stranded).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), stranded.id).await, Err("call_block_overpayment".into()));
+    assert_eq!(db.call_get(alice.node_id(), &stranded_id).await.unwrap(), Some(stranded_entry));
+    assert!(audited(stranded.id).contains(&"call.block_commit_failed".to_owned()));
+
+    // The committed block survived recovery; the retry re-ACKs the same
+    // boundary without a second grant, and the caller's media gate opens.
+    assert!(db.get_message(&kept.id).await.unwrap().is_some(), "not withdrawn");
+    assert_eq!(receipts(&kept).await, vec![(kept.id.to_hex(), 1)]);
+    assert!(!konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &kept_id, now).await);
+    source.send(bob.node_id(), &kept).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), kept.id).await, Ok((true, Some(kept_until))));
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &kept_id).await.unwrap(), Some(callee_kept));
+    for _ in 0..2 {
+        konsensus_api::calls::receive_block_grant(&caller_db, &caller_cipher, alice.node_id(), bob.node_id(), &kept.id, kept_until).await.unwrap();
+    }
+    let caller_kept = caller_db.call_get(bob.node_id(), &kept_id).await.unwrap().unwrap();
+    assert_eq!((caller_kept.phase, caller_kept.next_block_seq, caller_kept.paid_until_ms), (Phase::Live, 1, Some(kept_until)));
+    let at = chrono::Utc::now().timestamp_millis() as u64;
+    assert!(konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &kept_id, at).await);
+    assert!(konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &kept_id, at).await);
+    assert_eq!(receipts(&kept).await, vec![(kept.id.to_hex(), 1)]);
+    assert!(audited(kept.id).is_empty(), "no withdrawal, overpayment or reconciliation for a kept grant");
+    sqlx::query("DROP TRIGGER fail_release").execute(db.pool()).await.unwrap();
     shutdown.send(true).unwrap();
     worker.await.unwrap();
     source.shutdown();
@@ -3777,6 +4038,7 @@ async fn deliver_to_bob(
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
     )
     .await;
     (result, storage, envelope)
@@ -4141,14 +4403,15 @@ async fn over_cap_calendar_invite_is_refused_withdrawn_and_terminal_for_the_send
         .contains("calendar_too_large"));
 
     // The reject frame was lost and the sender retried: the resend is answered
-    // with a terminal application rejection, not `payment proof already used`
-    // (which the sender's compatibility path would record as delivered) and
-    // not a duplicate ACK. Nothing is re-accepted.
+    // with a terminal withdrawal (`PaidAcceptance::Withdrawn`, #441), not
+    // `payment proof already used` (which the sender's compatibility path
+    // would record as delivered) and not a duplicate ACK. Nothing is
+    // re-accepted.
     for _ in 0..2 {
         source.send(bob.node_id(), &env).await.unwrap();
         let again = outcome(source.clone()).await.unwrap_err();
-        assert!(
-            again.starts_with(APPLICATION_REJECTED_PREFIX),
+        assert_eq!(
+            again, "message withdrawn",
             "resend of a withdrawn invite answered with: {again}"
         );
         assert!(crate::session_handler::terminal_paid_rejection(&again));
@@ -4160,7 +4423,7 @@ async fn over_cap_calendar_invite_is_refused_withdrawn_and_terminal_for_the_send
 
     // The withdrawal fails: still held, so hidden; a resend is refused, not
     // duplicate-ACKed; the startup sweep withdraws it and a later resend gets
-    // the terminal application rejection.
+    // the terminal withdrawal (`PaidAcceptance::Withdrawn`, #441).
     sqlx::raw_sql("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
         .execute(db.pool())
         .await
@@ -4199,7 +4462,8 @@ async fn over_cap_calendar_invite_is_refused_withdrawn_and_terminal_for_the_send
     assert!(!db.call_admission_held(&stuck.id).await.unwrap());
     source.send(bob.node_id(), &stuck).await.unwrap();
     let again = outcome(source.clone()).await.unwrap_err();
-    assert!(again.starts_with(APPLICATION_REJECTED_PREFIX), "{again}");
+    assert_eq!(again, "message withdrawn");
+    assert!(crate::session_handler::terminal_paid_rejection(&again));
 
     // In cap: acknowledged, released before the app sees it, and forwarded.
     let ok = invite(calendar_json("agenda", 1, serde_json::Value::Null)).await;
@@ -4338,7 +4602,9 @@ async fn over_cap_calendar_invite_is_refused_withdrawn_and_terminal_for_the_send
         assert_eq!(receipt_accepted(env.clone()).await, -1);
         source.send(bob.node_id(), env).await.unwrap();
         let again = outcome(source.clone()).await.unwrap_err();
-        assert!(again.starts_with(APPLICATION_REJECTED_PREFIX), "{again}");
+        // Swept: `PaidAcceptance::Withdrawn` (#441), a terminal withdrawal.
+        assert_eq!(again, "message withdrawn");
+        assert!(crate::session_handler::terminal_paid_rejection(&again));
     }
     assert!(db
         .get_calendar_event("evt-unreleased")
@@ -4404,7 +4670,9 @@ async fn over_cap_calendar_invite_is_refused_withdrawn_and_terminal_for_the_send
         .is_none());
     source.send(bob.node_id(), &unwritten).await.unwrap();
     let again = outcome(source.clone()).await.unwrap_err();
-    assert!(again.starts_with(APPLICATION_REJECTED_PREFIX), "{again}");
+    // Swept: `PaidAcceptance::Withdrawn` (#441), a terminal withdrawal.
+    assert_eq!(again, "message withdrawn");
+    assert!(crate::session_handler::terminal_paid_rejection(&again));
     assert!(ws_rx.try_recv().is_err());
 
     // With the release working, an RSVP is released, persisted and acknowledged.
@@ -4648,14 +4916,14 @@ async fn uncertain_paid_acceptance_keeps_the_calendar_hold() {
     target.shutdown();
 }
 
-/// Receive side over Noise where the hold sweep wins a race, deterministically:
-/// once inside the opaque admission of an undecryptable calendar envelope
-/// (the withdrawal commits before the admission's hold check) and once between
-/// a replay's acceptance transaction and the handler's replay check. Neither
-/// may be acknowledged: the first is a transient reject with the envelope
-/// withdrawn, the second a terminal `application_rejected:` reject, and a
-/// missing hold is never read as proof of admission. An uncontended opaque
-/// admission is acknowledged and visible.
+/// Receive side over Noise for undecryptable calendar envelopes. Since the
+/// honest receipts of #441 an undecryptable paid envelope of any kind, a
+/// calendar one included, is refused (`undecryptable:`) and withdrawn before
+/// any admission: it is never admitted as an opaque message, acknowledged or
+/// shown, and its resend is terminal. The hold sweep still wins a race,
+/// deterministically, between a replay's acceptance transaction and the
+/// handler's replay check: that replay is a terminal `application_rejected:`
+/// reject, and a missing hold is never read as proof of admission.
 #[tokio::test]
 async fn sweep_winning_against_opaque_admission_or_replay_check_never_acknowledges() {
     use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
@@ -4688,7 +4956,7 @@ async fn sweep_winning_against_opaque_admission_or_replay_check_never_acknowledg
     ) {}
     let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
     // No E2EE session on Bob's side: every calendar envelope is undecryptable
-    // and admitted, if at all, as an opaque message.
+    // and refused, never admitted.
     let sessions_b = Arc::new(SessionManager::new(bob.clone()));
     let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
     let (shutdown, shutdown_rx) = watch::channel(false);
@@ -4765,15 +5033,14 @@ async fn sweep_winning_against_opaque_admission_or_replay_check_never_acknowledg
         .unwrap()
     };
 
-    // 1. Withdrawal before the opaque release: the envelope is held, accepted,
-    //    and the sweep withdraws it before the opaque admission's hold check.
-    //    Nothing is acknowledged or shown; the sender gets a transient reject.
-    fixture
-        .sweep_before_opaque_once
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // 1. Undecryptable: the envelope is held and accepted, then refused and
+    //    withdrawn before any admission. Nothing is acknowledged or shown; the
+    //    sender gets a terminal typed reject.
     let env = invite(vec![1, 2, 3]).await;
     source.send(bob.node_id(), &env).await.unwrap();
-    assert_eq!(outcome(source.clone()).await, Err("storage error".into()));
+    let refused = outcome(source.clone()).await.unwrap_err();
+    assert_eq!(refused, "undecryptable: no E2EE session with the sender");
+    assert!(crate::session_handler::terminal_paid_rejection(&refused));
     assert!(!fixture.call_admission_held(&env.id).await.unwrap());
     assert!(fixture.is_application_rejected(&env).await.unwrap());
     assert!(!fixture.is_paid_envelope_accepted(&env).await.unwrap());
@@ -4808,26 +5075,886 @@ async fn sweep_winning_against_opaque_admission_or_replay_check_never_acknowledg
     assert!(fixture.get_message(&env.id).await.unwrap().is_none());
     assert!(ws_rx.try_recv().is_err());
 
-    // 3. Uncontended: the opaque admission consumes the hold and the envelope
-    //    is acknowledged, visible and forwarded; its replay is a duplicate ACK
-    //    on positive evidence.
-    let ok = invite(vec![7, 8, 9]).await;
-    source.send(bob.node_id(), &ok).await.unwrap();
-    assert_eq!(outcome(source.clone()).await, Ok(false));
-    assert!(!fixture.call_admission_held(&ok.id).await.unwrap());
-    assert!(fixture.is_paid_envelope_accepted(&ok).await.unwrap());
-    assert!(fixture.get_message(&ok.id).await.unwrap().is_some());
-    let shown = tokio::time::timeout(Duration::from_secs(5), ws_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(shown.envelope.id, ok.id);
-    source.send(bob.node_id(), &ok).await.unwrap();
-    assert_eq!(outcome(source.clone()).await, Ok(true));
+    // Nothing calendar-shaped was ever admitted from an unreadable envelope.
     assert_eq!(fixture.calendar_event_count(), 0);
 
     shutdown.send(true).unwrap();
     worker.await.unwrap();
     source.shutdown();
     target.shutdown();
+}
+
+// ── Honest receipts: refuse what cannot be read or kept ─────────────
+
+/// Bob's live receive loop (`run`) behind a PriceOpen Noise transport, an
+/// in-memory SQLite store and a mock wallet, with Alice connected and holding
+/// an E2EE session with Bob (`sessions_a` with Bob's manager).
+struct ReceiveLoop {
+    alice: Arc<NodeIdentity>,
+    bob: Arc<NodeIdentity>,
+    source: Arc<NoiseTransport>,
+    target: Arc<NoiseTransport>,
+    db: Arc<konsensus_storage::SqliteStorage>,
+    wallet: Arc<konsensus_lightning::MockLightningProvider>,
+    sessions_a: SessionManager,
+    sessions_b: Arc<SessionManager>,
+    audit_path: std::path::PathBuf,
+    ws_rx: broadcast::Receiver<Arc<WsMessage>>,
+    shutdown: watch::Sender<bool>,
+    worker: tokio::task::JoinHandle<()>,
+    _dir: tempfile::TempDir,
+}
+
+async fn receive_loop() -> ReceiveLoop {
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let transport = |id| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    assert!(matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ));
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let sessions_b = Arc::new(SessionManager::new(bob.clone()));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let audit_path = dir.path().join("audit.jsonl");
+    let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, ws_rx) = broadcast::channel(8);
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(),
+        transport_ack: target.clone(),
+        storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        })),
+        pricing: Arc::new(MutableDeliveryPrice(std::sync::atomic::AtomicU64::new(
+            1_000,
+        ))),
+        lightning: wallet.clone(),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b.clone(),
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None,
+        front_door: Default::default(),
+        routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(),
+        plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx,
+        audit_log: audit,
+        admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None,
+        shutdown_rx,
+    }));
+    ReceiveLoop {
+        alice,
+        bob,
+        source,
+        target,
+        db,
+        wallet,
+        sessions_a,
+        sessions_b,
+        audit_path,
+        ws_rx,
+        shutdown,
+        worker,
+        _dir: dir,
+    }
+}
+
+impl ReceiveLoop {
+    /// A signed envelope from Alice to Bob paid with a fresh settled keysend.
+    async fn paid_envelope(&self, kind: u16, ciphertext: Vec<u8>) -> konsensus_core::UkmEnvelope {
+        let hash = self.wallet.inject_inbound_keysend(1_000, None).await;
+        let payment = self.wallet.get_payment_status(&hash).await.unwrap();
+        let proof = PaymentProof::new(
+            hex::decode(&hash).unwrap().try_into().unwrap(),
+            hex::decode(payment.preimage.unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            1_000,
+        );
+        let mut env = UkmEnvelopeBuilder::new(
+            kind,
+            *self.alice.node_id(),
+            Recipient::Node(*self.bob.node_id()),
+            ciphertext,
+            proof,
+        )
+        .build();
+        env.signature = Signature::from_ed25519(&self.alice.sign(&env.signable_bytes()));
+        env
+    }
+
+    /// Alice's ciphertext for Bob under their session.
+    async fn ciphertext(&self, plaintext: &[u8]) -> Vec<u8> {
+        konsensus_crypto::ratchet_message_to_bytes(
+            &self
+                .sessions_a
+                .encrypt(self.bob.node_id(), plaintext)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// Send `env` and return Bob's delivery verdict: an ACK or a reject.
+    async fn verdict(&self, env: &konsensus_core::UkmEnvelope) -> konsensus_message::ControlEvent {
+        use konsensus_message::ControlEvent;
+        self.source.send(self.bob.node_id(), env).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                // Prekey offers and the like are not delivery verdicts.
+                if let event @ (ControlEvent::MessageAcked { .. }
+                | ControlEvent::MessageRejected { .. }) =
+                    self.source.recv_control().await.unwrap()
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("Bob answers every paid envelope")
+    }
+
+    /// The receipt state Bob keeps for `env`'s payment: 1 accepted, -1
+    /// application-rejected (the payment stays burned), None unknown.
+    async fn receipt_state(&self, env: &konsensus_core::UkmEnvelope) -> Option<i32> {
+        sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE message_id = ?")
+            .bind(env.id.to_hex())
+            .fetch_optional(self.db.pool())
+            .await
+            .unwrap()
+    }
+
+    fn audit_log(&self) -> String {
+        std::fs::read_to_string(&self.audit_path).unwrap_or_default()
+    }
+
+    async fn stop(self) {
+        self.shutdown.send(true).unwrap();
+        self.worker.await.unwrap();
+        self.source.shutdown();
+        self.target.shutdown();
+    }
+}
+
+fn file_payload(filename: &str, sent: &[u8], received: &[u8]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "filename": filename,
+        "mime_type": "application/octet-stream",
+        "size_bytes": received.len(),
+        "blake3_hash": blake3::hash(sent).to_hex().to_string(),
+        "data_b64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, received),
+    }))
+    .unwrap()
+}
+
+/// A paid chat Bob cannot decrypt is refused with a typed reject, withdrawn
+/// (its payment stays burned) and never shown to the app; it is never
+/// acknowledged as delivered, and a resend of the same bytes is refused too.
+#[tokio::test]
+async fn undecryptable_paid_chat_is_refused_not_acknowledged() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+
+    // Alice's ciphertext comes from a session Bob never had.
+    let stale_a = SessionManager::new(net.alice.clone());
+    let stale_b = SessionManager::new(net.bob.clone());
+    establish_sessions(&stale_a, &stale_b, &net.alice, &net.bob).await;
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+        &stale_a
+            .encrypt(net.bob.node_id(), b"unreadable")
+            .await
+            .unwrap(),
+    );
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext)
+        .await;
+
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason == "undecryptable: the session could not decrypt the ciphertext"),
+        "expected a typed reject, got {verdict:?}"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "withdrawn from history"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        net.receipt_state(&env).await,
+        Some(-1),
+        "the payment stays burned, application-rejected"
+    );
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it");
+    assert!(
+        net.audit_log().contains("message.rejected"),
+        "{}",
+        net.audit_log()
+    );
+    assert!(
+        !net.sessions_b.has_session(net.alice.node_id()).await,
+        "the unreadable session is dropped for re-negotiation, as before"
+    );
+
+    // The sender treats the reason as terminal and resends nothing. Even a
+    // resend of the same bytes (the refusal was lost) is answered with the
+    // withdrawal, terminal too, never acknowledged and never the reused-proof
+    // reply the sender's legacy receipt path could take for a delivery.
+    let again = net.verdict(&env).await;
+    assert!(
+        matches!(&again, ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"),
+        "a resend is refused, not acknowledged: {again:?}"
+    );
+    assert!(net.ws_rx.try_recv().is_err());
+    assert!(net.db.get_message(&env.id).await.unwrap().is_none());
+    net.stop().await;
+}
+
+/// A received file that fails its integrity check is reported failed to the
+/// app (never listed, never stored, audited) and to the sender (a typed
+/// reject, never a delivered ACK); the session stays usable for the next file.
+#[tokio::test]
+async fn corrupted_file_is_failed_to_the_app_and_the_sender() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+
+    let damaged = net
+        .ciphertext(&file_payload(
+            "damaged.bin",
+            b"the bytes that were sent",
+            b"the bytes that arrived",
+        ))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, damaged)
+        .await;
+
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason == "file_corrupted: the file data does not match its hash"),
+        "expected a typed reject, got {verdict:?}"
+    );
+    assert!(
+        net.db.list_files(10).await.unwrap().is_empty(),
+        "never stored"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "never listed as received"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        net.receipt_state(&env).await,
+        Some(-1),
+        "the payment stays burned, application-rejected"
+    );
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it arrive");
+    let audit = net.audit_log();
+    assert!(
+        audit.contains("file.integrity_failed") && audit.contains("message.rejected"),
+        "{audit}"
+    );
+
+    // An intact file after it is received as usual: the session was not harmed.
+    let intact = net
+        .ciphertext(&file_payload("intact.bin", b"intact", b"intact"))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, intact)
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageAcked {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(net.db.list_files(10).await.unwrap().len(), 1);
+    assert_eq!(net.receipt_state(&env).await, Some(1));
+    let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.plaintext.as_deref(), Some("[file: intact.bin]"));
+    net.stop().await;
+}
+
+/// The admission-proof carve-out is the compose handler's exact shape: a
+/// `KIND_CHAT` carrying the marker is acknowledged as received; the marker
+/// under any other kind is an ordinary paid envelope and is refused like one,
+/// never acknowledged, never published.
+#[tokio::test]
+async fn admission_proof_is_acknowledged_but_the_marker_under_another_kind_is_refused() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+
+    let proof = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_CHAT,
+            ADMISSION_ENVELOPE_MARKER.to_vec(),
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&proof).await,
+        ControlEvent::MessageAcked {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(net.receipt_state(&proof).await, Some(1));
+    let published = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.envelope.id, proof.id);
+    assert!(
+        published.plaintext.is_none(),
+        "a proof carries nothing to read"
+    );
+
+    let file = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_FILE_REF,
+            ADMISSION_ENVELOPE_MARKER.to_vec(),
+        )
+        .await;
+    let verdict = net.verdict(&file).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == file.id && reason == "undecryptable: ciphertext is not a ratchet message"),
+        "the marker under another kind is no proof: {verdict:?}"
+    );
+    assert!(net.db.list_files(10).await.unwrap().is_empty());
+    assert!(
+        net.db.get_message(&file.id).await.unwrap().is_none(),
+        "withdrawn"
+    );
+    assert_eq!(net.receipt_state(&file).await, Some(-1));
+    assert!(net.ws_rx.try_recv().is_err(), "never published");
+    net.stop().await;
+}
+
+/// A chat whose plaintext cannot be stored is refused, not acknowledged: the
+/// envelope is withdrawn, the receipt stays burned as application-rejected,
+/// the app sees nothing, and the session is unharmed for the next chat.
+#[tokio::test]
+async fn plaintext_store_failure_is_refused_not_acknowledged() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_plaintext BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_CHAT,
+            net.ciphertext(b"cannot be kept").await,
+        )
+        .await;
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason == "not_persisted: the plaintext could not be stored"),
+        "{verdict:?}"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "withdrawn"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it");
+    // The replay keys stay consumed: the same bytes are refused, not acknowledged.
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    sqlx::query("DROP TRIGGER fail_plaintext")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_CHAT,
+            net.ciphertext(b"kept").await,
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageAcked {
+            duplicate: false,
+            ..
+        }
+    ));
+    let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.plaintext.as_deref(), Some("kept"));
+    net.stop().await;
+}
+
+/// A file that cannot be stored is refused, not acknowledged, and never
+/// surfaced as received.
+#[tokio::test]
+async fn file_store_failure_is_refused_not_acknowledged() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_file BEFORE INSERT ON files BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let intact = net
+        .ciphertext(&file_payload("intact.bin", b"intact", b"intact"))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, intact)
+        .await;
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason == "not_persisted: the file could not be stored"),
+        "{verdict:?}"
+    );
+    assert!(net.db.list_files(10).await.unwrap().is_empty());
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "withdrawn"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it arrive");
+    net.stop().await;
+}
+
+/// When even the withdrawal fails, the refused chat is still never
+/// acknowledged or published: its admission hold keeps it hidden, a resend is
+/// refused as withdrawn, and the sweep withdraws it later.
+#[tokio::test]
+async fn withdrawal_failure_still_refuses_and_keeps_the_chat_hidden() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_plaintext BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_CHAT,
+            net.ciphertext(b"cannot be kept").await,
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "not_persisted: the plaintext could not be stored"
+    ));
+    // The withdrawal rolled back whole: the row is still there, still held,
+    // and the hold hides it from history.
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+        .bind(env.id.to_hex())
+        .fetch_one(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "the delete was rolled back");
+    assert!(
+        net.db.call_admission_held(&env.id).await.unwrap(),
+        "the hold keeps it hidden"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "hidden from history"
+    );
+    assert_eq!(net.receipt_state(&env).await, Some(1));
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it");
+
+    // A resend is refused as withdrawn, never acknowledged as a duplicate.
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    // The sweep finishes the withdrawal once the store recovers.
+    sqlx::query("DROP TRIGGER fail_withdraw")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(net.db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    assert!(net.db.get_message(&env.id).await.unwrap().is_none());
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    net.stop().await;
+}
+
+/// A file is held until it is stored. When the file store and then the
+/// withdrawal both fail, the hold keeps the envelope out of history and off
+/// the duplicate-ACK path: a resend is refused as withdrawn, nothing is
+/// published, and the sweep finishes the withdrawal.
+#[tokio::test]
+async fn file_withdrawal_failure_keeps_the_file_hidden_and_refuses_a_resend() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_file BEFORE INSERT ON files BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let intact = net
+        .ciphertext(&file_payload("intact.bin", b"intact", b"intact"))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, intact)
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "not_persisted: the file could not be stored"
+    ));
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+        .bind(env.id.to_hex())
+        .fetch_one(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "the delete was rolled back");
+    assert!(
+        net.db.call_admission_held(&env.id).await.unwrap(),
+        "the hold keeps it hidden"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "hidden from history"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(net.db.list_files(10).await.unwrap().is_empty());
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it arrive");
+
+    // A resend is refused as withdrawn, never acknowledged as a duplicate.
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    sqlx::query("DROP TRIGGER fail_withdraw")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(net.db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+    net.stop().await;
+}
+
+/// Every paid envelope is held until it is kept, whatever its kind. A
+/// long-form message whose plaintext store and withdrawal both fail stays
+/// hidden and unacknowledged; a resend is refused as withdrawn, the sweep
+/// finishes the withdrawal, and a sound message of the same kind is received
+/// and released as usual.
+#[tokio::test]
+async fn any_kind_withdrawal_failure_keeps_the_message_hidden_and_refuses_a_resend() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_plaintext BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_LONGFORM,
+            net.ciphertext(b"a long one").await,
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "not_persisted: the plaintext could not be stored"
+    ));
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+        .bind(env.id.to_hex())
+        .fetch_one(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "the delete was rolled back");
+    assert!(
+        net.db.call_admission_held(&env.id).await.unwrap(),
+        "the hold keeps it hidden"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "hidden from history"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(net.receipt_state(&env).await, Some(1));
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it");
+
+    // A resend is refused as withdrawn, never acknowledged as a duplicate.
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    // The sweep finishes the withdrawal once the store recovers; the resend
+    // is still refused, now from the rejected receipt.
+    sqlx::query("DROP TRIGGER fail_withdraw")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER fail_plaintext")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(net.db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    // A sound message of the same kind is received, released and published.
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_LONGFORM,
+            net.ciphertext(b"another long one").await,
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageAcked {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert!(
+        !net.db.call_admission_held(&env.id).await.unwrap(),
+        "released once kept"
+    );
+    assert_eq!(
+        net.db.get_message(&env.id).await.unwrap().map(|m| m.id),
+        Some(env.id)
+    );
+    let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.plaintext.as_deref(), Some("another long one"));
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageAcked {
+            duplicate: true,
+            ..
+        }
+    ));
+    net.stop().await;
+}
+
+/// A corrupted file whose withdrawal also fails stays hidden and
+/// unacknowledged; a resend is refused as withdrawn.
+#[tokio::test]
+async fn corrupted_file_with_failed_withdrawal_stays_hidden() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let damaged = net
+        .ciphertext(&file_payload("damaged.bin", b"sent", b"arrived"))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, damaged)
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "file_corrupted: the file data does not match its hash"
+    ));
+    assert!(
+        net.db.call_admission_held(&env.id).await.unwrap(),
+        "the hold keeps it hidden"
+    );
+    assert!(net.db.get_message(&env.id).await.unwrap().is_none());
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(net.db.list_files(10).await.unwrap().is_empty());
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it arrive");
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+    sqlx::query("DROP TRIGGER fail_withdraw")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(net.db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    net.stop().await;
+}
+
+/// A hold inherited from an earlier attempt (its paid acceptance rolled back
+/// and its hold cleanup failed) is released before the successful retry is
+/// published and acknowledged, so the acknowledged message is never hidden
+/// and the sweep leaves it alone. Checked for a chat and for a long-form
+/// message, the two release paths.
+#[tokio::test]
+async fn inherited_hold_is_released_before_a_retry_is_acknowledged() {
+    use konsensus_message::ControlEvent;
+    for kind in [
+        konsensus_core::kind::KIND_CHAT,
+        konsensus_core::kind::KIND_LONGFORM,
+    ] {
+        let mut net = receive_loop().await;
+        sqlx::query("CREATE TRIGGER fail_message BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+            .execute(net.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER fail_release BEFORE DELETE ON call_admission_hold BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+            .execute(net.db.pool())
+            .await
+            .unwrap();
+
+        let env = net
+            .paid_envelope(kind, net.ciphertext(b"retried").await)
+            .await;
+        assert!(matches!(
+            net.verdict(&env).await,
+            ControlEvent::MessageRejected { reason, .. } if reason == "storage error"
+        ));
+        assert!(
+            net.db.call_admission_held(&env.id).await.unwrap(),
+            "the hold outlived the failed attempt"
+        );
+        assert!(net.ws_rx.try_recv().is_err());
+
+        // The store recovers; the sender retries the same bytes.
+        sqlx::query("DROP TRIGGER fail_message")
+            .execute(net.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER fail_release")
+            .execute(net.db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            net.verdict(&env).await,
+            ControlEvent::MessageAcked {
+                duplicate: false,
+                ..
+            }
+        ));
+        assert!(
+            !net.db.call_admission_held(&env.id).await.unwrap(),
+            "kind {kind}: released before the ACK"
+        );
+        let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shown.plaintext.as_deref(), Some("retried"));
+        assert_eq!(
+            net.db.get_message(&env.id).await.unwrap().map(|m| m.id),
+            Some(env.id),
+            "visible in history"
+        );
+        assert_eq!(
+            net.db.call_admission_withdraw(u64::MAX).await.unwrap(),
+            0,
+            "nothing for the sweep"
+        );
+        assert_eq!(net.receipt_state(&env).await, Some(1));
+        assert!(
+            net.db.get_message(&env.id).await.unwrap().is_some(),
+            "kept after the sweep"
+        );
+        assert!(matches!(
+            net.verdict(&env).await,
+            ControlEvent::MessageAcked {
+                duplicate: true,
+                ..
+            }
+        ));
+        net.stop().await;
+    }
 }

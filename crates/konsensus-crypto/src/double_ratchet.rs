@@ -291,44 +291,31 @@ impl DoubleRatchet {
     ///
     /// Handles out-of-order delivery by checking skipped keys and performing
     /// DH ratchet steps as needed.
+    ///
+    /// Decryption is atomic: the DH ratchet step, receiving-chain advance and
+    /// any skipped-key derivation are staged apart from the live session and
+    /// committed only after the AEAD tag verifies. If decryption fails for any
+    /// reason the session is left exactly as it was, so later messages from the
+    /// peer are unaffected. A stored skipped key is consumed (single use) only
+    /// when it successfully decrypts its message.
     pub fn decrypt(&mut self, message: &RatchetMessage) -> Result<Vec<u8>, RatchetError> {
+        let ad = self.aead_ad(&message.header);
+
         // Check if we have a skipped key for this message
         let skip_key = (message.header.dh_public, message.header.message_number);
-        if let Some((message_key, _seq)) = self.skipped_keys.remove(&skip_key) {
-            return aead_decrypt(&message_key, &message.ciphertext, &self.aead_ad(&message.header));
-        }
-
-        let remote_pub = PublicKey::from(message.header.dh_public);
-
-        // Check if this is a new DH ratchet key from the peer
-        let is_new_ratchet = match &self.remote_dh_public {
-            Some(current) => current.as_bytes() != &message.header.dh_public,
-            None => true, // First message from peer
-        };
-
-        if is_new_ratchet {
-            // Skip any remaining messages in the current receiving chain
-            if self.receiving_chain.is_some() {
-                self.skip_messages(message.header.previous_chain_length)?;
+        if let Some((message_key, _seq)) = self.skipped_keys.get(&skip_key) {
+            let plaintext = aead_decrypt(message_key, &message.ciphertext, &ad)?;
+            if let Some((mut used, _seq)) = self.skipped_keys.remove(&skip_key) {
+                used.zeroize();
             }
-
-            // Perform DH ratchet step
-            self.dh_ratchet(&remote_pub)?;
+            return Ok(plaintext);
         }
 
-        // Skip any messages before this one in the current chain
-        self.skip_messages(message.header.message_number)?;
-
-        // Derive the message key
-        let chain = self
-            .receiving_chain
-            .as_ref()
-            .ok_or(RatchetError::NotInitialized)?;
-        let (next_chain, message_key) = chain.ratchet()?;
-        self.receiving_chain = Some(next_chain);
-        self.recv_count += 1;
-
-        aead_decrypt(&message_key, &message.ciphertext, &self.aead_ad(&message.header))
+        let pending = self.stage_receive(&message.header)?;
+        // On failure `pending` is dropped here, zeroizing its staged keys.
+        let plaintext = aead_decrypt(&pending.message_key, &message.ciphertext, &ad)?;
+        self.commit_receive(pending);
+        Ok(plaintext)
     }
 
     /// Get our current DH ratchet public key.
@@ -345,71 +332,141 @@ impl DoubleRatchet {
         ad
     }
 
-    /// Perform a DH ratchet step with a new remote public key.
-    fn dh_ratchet(&mut self, remote_pub: &PublicKey) -> Result<(), RatchetError> {
-        self.remote_dh_public = Some(*remote_pub);
-        self.previous_chain_length = self.send_count;
-        self.send_count = 0;
-        self.recv_count = 0;
+    /// Derive, without touching the live session, every state change needed
+    /// to receive a message with `header`: an optional DH ratchet step, skipped
+    /// message keys for the previous and current receiving chains, and the
+    /// message key itself.
+    fn stage_receive(&self, header: &MessageHeader) -> Result<PendingReceive, RatchetError> {
+        let mut pending = PendingReceive {
+            dh_step: None,
+            receiving_chain: self.receiving_chain.clone(),
+            recv_count: self.recv_count,
+            skipped: Vec::new(),
+            message_key: [0u8; 32],
+        };
+        let mut chain_public = self.remote_dh_public.map(|p| *p.as_bytes());
 
-        // Derive new receiving chain
-        let dh_output = self.dh_secret.diffie_hellman(remote_pub);
-        let (root_key, receiving_chain_key) = kdf_rk(&self.root_key, dh_output.as_bytes())?;
-        self.root_key = root_key;
-        self.receiving_chain = Some(ChainKey {
-            key: receiving_chain_key,
-        });
+        // Check if this is a new DH ratchet key from the peer
+        let is_new_ratchet = match &self.remote_dh_public {
+            Some(current) => current.as_bytes() != &header.dh_public,
+            None => true, // First message from peer
+        };
 
-        // Generate new DH key pair and derive new sending chain
-        self.dh_secret = StaticSecret::random_from_rng(rand::thread_rng());
-        self.dh_public = PublicKey::from(&self.dh_secret);
+        if is_new_ratchet {
+            // Skip any remaining messages in the current receiving chain
+            if let (Some(chain), Some(ratchet_public)) =
+                (pending.receiving_chain.as_mut(), chain_public)
+            {
+                stage_skipped_keys(
+                    chain,
+                    &mut pending.recv_count,
+                    header.previous_chain_length,
+                    ratchet_public,
+                    &mut pending.skipped,
+                )?;
+            }
 
-        let dh_output = self.dh_secret.diffie_hellman(remote_pub);
-        let (root_key, sending_chain_key) = kdf_rk(&self.root_key, dh_output.as_bytes())?;
-        self.root_key = root_key;
-        self.sending_chain = Some(ChainKey {
-            key: sending_chain_key,
-        });
+            // Stage the DH ratchet step
+            let remote_pub = PublicKey::from(header.dh_public);
+            let (step, receiving_chain) = self.stage_dh_ratchet(&remote_pub)?;
+            pending.dh_step = Some(step);
+            pending.receiving_chain = Some(receiving_chain);
+            pending.recv_count = 0;
+            chain_public = Some(header.dh_public);
+        }
 
-        Ok(())
+        // Skip any messages before this one in the current chain
+        if let (Some(chain), Some(ratchet_public)) =
+            (pending.receiving_chain.as_mut(), chain_public)
+        {
+            stage_skipped_keys(
+                chain,
+                &mut pending.recv_count,
+                header.message_number,
+                ratchet_public,
+                &mut pending.skipped,
+            )?;
+        }
+
+        // Derive the message key
+        let chain = pending
+            .receiving_chain
+            .as_mut()
+            .ok_or(RatchetError::NotInitialized)?;
+        let (next_chain, mut message_key) = chain.ratchet()?;
+        *chain = next_chain;
+        pending.message_key = message_key;
+        message_key.zeroize();
+        pending.recv_count += 1;
+
+        Ok(pending)
     }
 
-    /// Store skipped message keys for out-of-order decryption.
-    fn skip_messages(&mut self, until: u32) -> Result<(), RatchetError> {
-        let chain = match &self.receiving_chain {
-            Some(c) => c,
-            None => return Ok(()), // No chain yet, nothing to skip
+    /// Derive a DH ratchet step with a new remote public key, returning the
+    /// staged sending-side changes and the new receiving chain.
+    fn stage_dh_ratchet(
+        &self,
+        remote_pub: &PublicKey,
+    ) -> Result<(PendingDhStep, ChainKey), RatchetError> {
+        // Derive new receiving chain
+        let dh_output = self.dh_secret.diffie_hellman(remote_pub);
+        let (mut root_key, receiving_chain_key) = kdf_rk(&self.root_key, dh_output.as_bytes())?;
+        let receiving_chain = ChainKey {
+            key: receiving_chain_key,
         };
 
-        if self.recv_count + MAX_SKIP < until {
-            return Err(RatchetError::TooManySkipped(
-                until - self.recv_count,
-                MAX_SKIP,
-            ));
+        // Generate new DH key pair and derive new sending chain
+        let dh_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let dh_public = PublicKey::from(&dh_secret);
+
+        let dh_output = dh_secret.diffie_hellman(remote_pub);
+        let derived = kdf_rk(&root_key, dh_output.as_bytes());
+        root_key.zeroize();
+        let (root_key, sending_chain_key) = derived?;
+
+        let step = PendingDhStep {
+            remote_dh_public: Some(*remote_pub),
+            dh_secret,
+            dh_public,
+            root_key,
+            sending_chain: Some(ChainKey {
+                key: sending_chain_key,
+            }),
+            previous_chain_length: self.send_count,
+        };
+        Ok((step, receiving_chain))
+    }
+
+    /// Apply staged receive-side changes to the live session.
+    ///
+    /// Values are swapped in, so the replaced live keys end up in `pending` and
+    /// are zeroized when it is dropped.
+    fn commit_receive(&mut self, mut pending: PendingReceive) {
+        if let Some(step) = pending.dh_step.as_mut() {
+            self.remote_dh_public = step.remote_dh_public;
+            std::mem::swap(&mut self.dh_secret, &mut step.dh_secret);
+            self.dh_public = step.dh_public;
+            std::mem::swap(&mut self.root_key, &mut step.root_key);
+            std::mem::swap(&mut self.sending_chain, &mut step.sending_chain);
+            self.previous_chain_length = step.previous_chain_length;
+            self.send_count = 0;
         }
 
-        let remote_pub = match &self.remote_dh_public {
-            Some(p) => *p.as_bytes(),
-            None => return Ok(()),
-        };
+        std::mem::swap(&mut self.receiving_chain, &mut pending.receiving_chain);
+        self.recv_count = pending.recv_count;
 
-        let mut chain = chain.clone();
-        while self.recv_count < until {
-            let (next_chain, message_key) = chain.ratchet()?;
+        for (id, key) in pending.skipped.iter_mut() {
             let seq = self.skipped_key_seq;
             self.skipped_key_seq += 1;
-            self.skipped_keys
-                .insert((remote_pub, self.recv_count), (message_key, seq));
-            chain = next_chain;
-            self.recv_count += 1;
+            if let Some((mut replaced, _seq)) = self.skipped_keys.insert(*id, (*key, seq)) {
+                replaced.zeroize();
+            }
+            key.zeroize();
         }
-        self.receiving_chain = Some(chain);
 
         // Evict oldest skipped keys if we exceed the total cap.
         // This bounds memory: at 2000 entries × 68 bytes = ~136 KB max per session.
         self.evict_excess_skipped_keys();
-
-        Ok(())
     }
 
     /// Evict oldest-inserted skipped keys when total exceeds the cap.
@@ -434,6 +491,75 @@ impl DoubleRatchet {
             }
         }
     }
+}
+
+/// A skipped message key staged for storage: ((ratchet_public, message_number), message_key).
+type StagedSkippedKey = (([u8; 32], u32), [u8; 32]);
+
+/// Receive-side state changes derived for one incoming message.
+///
+/// Built from a read-only view of the live session and applied only after the
+/// message authenticates. Dropping it (e.g. on a failed decrypt) zeroizes the
+/// staged key material and leaves the live session untouched.
+struct PendingReceive {
+    /// Present when the message carried a new remote ratchet key.
+    dh_step: Option<PendingDhStep>,
+    /// Receiving chain after deriving this message's key.
+    receiving_chain: Option<ChainKey>,
+    /// Receive counter after this message.
+    recv_count: u32,
+    /// Skipped message keys to store, in derivation order.
+    skipped: Vec<StagedSkippedKey>,
+    /// Key for this message.
+    message_key: [u8; 32],
+}
+
+impl Drop for PendingReceive {
+    fn drop(&mut self) {
+        self.message_key.zeroize();
+        for (_, key) in self.skipped.iter_mut() {
+            key.zeroize();
+        }
+    }
+}
+
+/// Sending-side changes from a staged DH ratchet step.
+struct PendingDhStep {
+    remote_dh_public: Option<PublicKey>,
+    dh_secret: StaticSecret,
+    dh_public: PublicKey,
+    root_key: [u8; 32],
+    sending_chain: Option<ChainKey>,
+    previous_chain_length: u32,
+}
+
+impl Drop for PendingDhStep {
+    fn drop(&mut self) {
+        self.root_key.zeroize();
+    }
+}
+
+/// Advance `chain` from `*recv_count` up to `until`, collecting the
+/// intermediate message keys into `out` for out-of-order decryption.
+fn stage_skipped_keys(
+    chain: &mut ChainKey,
+    recv_count: &mut u32,
+    until: u32,
+    ratchet_public: [u8; 32],
+    out: &mut Vec<StagedSkippedKey>,
+) -> Result<(), RatchetError> {
+    if recv_count.saturating_add(MAX_SKIP) < until {
+        return Err(RatchetError::TooManySkipped(until - *recv_count, MAX_SKIP));
+    }
+
+    while *recv_count < until {
+        let (next_chain, mut message_key) = chain.ratchet()?;
+        out.push(((ratchet_public, *recv_count), message_key));
+        message_key.zeroize();
+        *chain = next_chain;
+        *recv_count += 1;
+    }
+    Ok(())
 }
 
 // ─── Serializable session state ──────────────────────────────────────────────

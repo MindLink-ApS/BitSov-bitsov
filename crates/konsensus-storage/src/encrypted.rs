@@ -872,6 +872,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_put(peer, call_id, entry).await
     }
 
+    async fn call_commit_admitted(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry, id: &MessageId) -> Result<(), StorageError> {
+        self.inner.call_commit_admitted(peer, call_id, entry, id).await
+    }
+
     async fn call_delete(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(), StorageError> {
         self.inner.call_delete(peer, call_id).await
     }

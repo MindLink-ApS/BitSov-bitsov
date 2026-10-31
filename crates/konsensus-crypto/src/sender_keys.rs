@@ -417,9 +417,14 @@ impl GroupSession {
         // check, so cross-context substitution cannot smuggle plaintext through.
         let aad = build_aad(&group_id, sender, message.generation, message.message_number);
 
-        // Check for skipped key
-        if let Some(message_key) = entry.skipped_keys.remove(&message.message_number) {
-            return aead_decrypt(&message_key, &message.ciphertext, &aad);
+        // Check for skipped key. It is consumed only once it has decrypted
+        // its message, so a message that fails to decrypt cannot burn it.
+        if let Some(message_key) = entry.skipped_keys.get(&message.message_number) {
+            let plaintext = aead_decrypt(message_key, &message.ciphertext, &aad)?;
+            if let Some(mut used) = entry.skipped_keys.remove(&message.message_number) {
+                used.zeroize();
+            }
+            return Ok(plaintext);
         }
 
         // Message is behind our chain — can't go backwards
@@ -435,20 +440,40 @@ impl GroupSession {
             return Err(SenderKeyError::TooManySkipped(skip_count, MAX_SKIP));
         }
 
-        // Ratchet forward, storing skipped keys
-        let mut chain_key = entry.chain_key;
+        // Ratchet forward on a working copy, staging skipped keys. Nothing is
+        // written back to `entry` until the AEAD tag verifies, so a message
+        // that fails to decrypt leaves the receiver state unchanged.
+        let mut staged = StagedChain {
+            chain_key: entry.chain_key,
+            skipped: Vec::with_capacity(skip_count as usize),
+            message_key: [0u8; 32],
+        };
         for i in entry.chain_index..message.message_number {
-            let (next_chain, msg_key) = ratchet_chain_key(&chain_key);
-            entry.skipped_keys.insert(i, msg_key);
-            chain_key = next_chain;
+            let (next_chain, mut msg_key) = ratchet_chain_key(&staged.chain_key);
+            staged.skipped.push((i, msg_key));
+            msg_key.zeroize();
+            staged.chain_key = next_chain;
         }
 
         // Derive the target message key
-        let (next_chain, message_key) = ratchet_chain_key(&chain_key);
-        entry.chain_key = next_chain;
+        let (next_chain, message_key) = ratchet_chain_key(&staged.chain_key);
+        staged.chain_key = next_chain;
+        staged.message_key = message_key;
+
+        // On failure `staged` is dropped here, zeroizing its key material.
+        let plaintext = aead_decrypt(&staged.message_key, &message.ciphertext, &aad)?;
+
+        // Authenticated: commit the staged chain advance and skipped keys.
+        for (i, key) in staged.skipped.iter_mut() {
+            if let Some(mut replaced) = entry.skipped_keys.insert(*i, *key) {
+                replaced.zeroize();
+            }
+            key.zeroize();
+        }
+        entry.chain_key = staged.chain_key;
         entry.chain_index = message.message_number + 1;
 
-        aead_decrypt(&message_key, &message.ciphertext, &aad)
+        Ok(plaintext)
     }
 
     /// Remove a member from the group.
@@ -475,6 +500,27 @@ impl GroupSession {
     /// The group identifier.
     pub fn group_id(&self) -> &[u8; 32] {
         &self.group_id
+    }
+}
+
+/// Receiver chain changes derived for one incoming group message, held apart
+/// from the live [`ReceiverSenderKey`] until the message authenticates.
+struct StagedChain {
+    /// Chain key after deriving the target message key.
+    chain_key: [u8; 32],
+    /// Skipped message keys to store: message_number → message_key.
+    skipped: Vec<(u32, [u8; 32])>,
+    /// Key for the target message.
+    message_key: [u8; 32],
+}
+
+impl Drop for StagedChain {
+    fn drop(&mut self) {
+        self.chain_key.zeroize();
+        self.message_key.zeroize();
+        for (_, key) in self.skipped.iter_mut() {
+            key.zeroize();
+        }
     }
 }
 
