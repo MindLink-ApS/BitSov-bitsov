@@ -142,6 +142,16 @@ impl MeteredSpend {
         }
     }
 
+    /// The owner's per-payment limit on a call payment under this caller's
+    /// grant, if any (see `GrantBudget::call_per_payment_max_msat`). `None`
+    /// for the owner's own key. The ledger enforces it again at reservation.
+    pub(crate) fn call_per_payment_max_msat(&self, state: &AppState) -> Option<u64> {
+        let Meter::Grant { client_id, .. } = &self.meter else { return None };
+        state.pairing.as_ref()
+            .and_then(|service| service.grant_view_for(client_id))
+            .and_then(|view| view.call_per_payment_max_msat)
+    }
+
     /// For a first contact: the owner's approval for `recipient`, consumed
     /// once and still bound to its original budget until reservation. `Ok(None)` for the owner's own key, which is not
     /// metered. A paired client without a live matching first-contact grant is
@@ -175,11 +185,12 @@ impl MeteredSpend {
         Ok(Debit::reserved(Arc::clone(service), reservation))
     }
 
-    /// Debit a call offer, bounded per payment by its call's pinned hold.
-    pub(crate) fn debit_call_offer(&self, state: &AppState, charges: Vec<Charge>, call_id: &str, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
+    /// Debit a call offer under its call's hold, bounded by the caller's
+    /// consented `cap` (or the hold's per-block ceiling) and the owner's limit.
+    pub(crate) fn debit_call_offer(&self, state: &AppState, charges: Vec<Charge>, call_id: &str, cap: Option<u64>, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
         let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()); };
         let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
-        let reservation = service.reserve_call_offer_spend(client_id, *epoch, charges, call_id, operation.reservation_link(false))
+        let reservation = service.reserve_call_offer_spend(client_id, *epoch, charges, call_id, cap, operation.reservation_link(false))
             .map_err(ApiError::BudgetExceeded)?;
         Ok(Debit::reserved(Arc::clone(service), reservation))
     }

@@ -196,6 +196,11 @@ pub struct ApprovalOperation {
     pub breaker_reset: Option<BreakerResetTerms>,
     /// Canonical bounded terms.
     pub request: ApprovalRequest,
+    /// spend_grant only: the per-payment limit as requested, before the
+    /// messaging clamp on `per_call_max_msat`. It bounds each call payment
+    /// of the grant (see `GrantBudget::call_per_payment_max_msat`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_per_payment: Option<crate::spend_budget::OwnerPerPayment>,
     /// Server-generated 16-byte nonce, hex.
     pub nonce: String,
     /// Absolute approval deadline, included in the signed bytes.
@@ -427,6 +432,13 @@ impl PairingService {
         request: ApprovalRequest,
     ) -> Result<ApprovalView, PairingError> {
         self.approval_mode()?;
+        // Read before normalizing: the messaging clamp would hide the choice.
+        let owner_per_payment = match &request {
+            ApprovalRequest::SpendGrant { budget_msat, per_call_max_msat, .. } => Some(
+                crate::spend_budget::OwnerPerPayment::requested(*per_call_max_msat, *budget_msat),
+            ),
+            _ => None,
+        };
         let request = request.normalize()?;
         let mut inner = self.lock();
         let client = self.approval_client(&inner, client_id, epoch)?.clone();
@@ -473,6 +485,7 @@ impl PairingService {
             grant_op,
             breaker_reset,
             request,
+            owner_per_payment,
             nonce: hex::encode(nonce),
             expires_at: now + TTL,
         };
@@ -626,6 +639,12 @@ impl PairingService {
             }
             ApprovalRequest::SpendGrant { .. } => {
                 let terms = op.request.spend_terms()?;
+                let mut budget = GrantBudget::from_terms(&terms);
+                // The clamped terms cannot say what the owner chose. Without
+                // the recorded choice, keep the clamped value (fail closed).
+                budget.owner_per_payment = Some(op.owner_per_payment.unwrap_or(
+                    crate::spend_budget::OwnerPerPayment::MaxMsat(terms.per_call_max_msat),
+                ));
                 let grant = SpendGrant {
                     op_id: op.op_id.clone(),
                     client_id: op.client_id.clone(),
@@ -635,7 +654,7 @@ impl PairingService {
                     identity_fingerprint: op.node.clone(),
                     epoch: op.epoch,
                     granted_by: format!("device:{key_id}"),
-                    budget: Some(GrantBudget::from_terms(&terms)),
+                    budget: Some(budget),
                     owner_approval: Some(ApprovalReceipt {
                         operation: op.clone(),
                         approver,

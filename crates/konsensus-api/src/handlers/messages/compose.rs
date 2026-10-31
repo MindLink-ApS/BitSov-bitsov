@@ -3628,9 +3628,31 @@ pub(super) async fn compose_peer(
                             .with_reason("call_hold_above_consent"));
                     }
                 }
+                // Every refusal that needs no hold is decided before the hold
+                // is reserved: a reserved hold counts against the grant's
+                // breakers even when released. The ledger checks them again.
+                if auth.is_metered() {
+                    let ceiling = existing.as_ref().map_or(block_price.saturating_add(fee),
+                        |hold| hold.per_block_msat.saturating_add(hold.per_block_fee_msat));
+                    let owner_max = auth.call_per_payment_max_msat(&state);
+                    if let Some(max_msat) = owner_max.filter(|max| ceiling > *max) {
+                        return Err(ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::PerCall { max_msat }));
+                    }
+                    if req.kind == konsensus_core::kind::KIND_CALL_INVITE {
+                        // The offer is its own payment: within the caller's
+                        // cap for it or, without one, the per-block ceiling,
+                        // and within the owner's per-payment limit.
+                        let offer = super::caps::check_payment(&state, price_msat, req.max_routing_fee_msat, cap)?;
+                        let limit = owner_max.into_iter().chain(cap.is_none().then_some(ceiling)).min();
+                        if let Some(max_msat) = limit.filter(|max| offer > *max) {
+                            return Err(ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::PerCall { max_msat }));
+                        }
+                    }
+                }
                 if existing.is_none() {
                     let terms = crate::spend_budget::CallSpendTerms::new(&peer_id.to_hex(), &signal.call_id, block_price, fee, minutes)
-                        .map_err(ApiError::BudgetExceeded)?;
+                        .map_err(ApiError::BudgetExceeded)?
+                        .over_direct_channel(direct && fee == 0);
                     crate::calls::ensure_call_spend(&auth, &state, &peer_id, &signal, terms).await?;
                 }
             }
@@ -3639,6 +3661,14 @@ pub(super) async fn compose_peer(
                     .ok_or_else(|| ApiError::BadRequest("call reservation unavailable".into()))?;
                 if price_msat > hold.per_block_msat {
                     return Err(ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::CallPriceChanged));
+                }
+                // A zero block fee pinned for a direct channel never routes
+                // with a fee: once that channel cannot carry this block, the
+                // call ends and its hold is released, with nothing paid.
+                if hold.direct && !super::caps::direct_channel(&state, &peer_id, &[price_msat]).await {
+                    return Err(ApiError::NotDispatched(
+                        "the direct channel to this contact no longer carries the next call block; the call ends and nothing more is paid".into(),
+                    ).with_reason(super::caps::CALL_DIRECT_CHANNEL_LOST));
                 }
                 req.max_routing_fee_msat = Some(req.max_routing_fee_msat.unwrap_or(u64::MAX).min(hold.per_block_fee_msat));
             }
@@ -3673,7 +3703,7 @@ pub(super) async fn compose_peer(
             if req.kind == konsensus_core::kind::KIND_CALL_INVITE {
                 let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
                     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-                auth.debit_call_offer(&state, charges, &signal.call_id, &operation)
+                auth.debit_call_offer(&state, charges, &signal.call_id, cap, &operation)
             } else { auth.debit_operation(&state, charges, confirmation, cap, &operation) }
         }
             .map_err(|e| e.with_routing_fee(state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat)))?
