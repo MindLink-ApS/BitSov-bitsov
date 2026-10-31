@@ -1,0 +1,85 @@
+name: PR flow
+
+# wip-cap: only the first WIP_CAP open, non-draft PRs (priority label, then age)
+# get a success status; the rest are pending with their queue position.
+# pr-size: a PR over PR_SIZE_LIMIT counted lines needs label large-ok and a
+# "## Design note" section. Both limits are repository variables.
+on:
+  pull_request:
+    types: [opened, reopened, closed, synchronize, edited, labeled, unlabeled,
+            ready_for_review, converted_to_draft]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  statuses: write
+  pull-requests: read
+  contents: read
+
+jobs:
+  wip-cap:
+    # One run recomputes every open PR, so the newest run wins.
+    if: github.event_name != 'pull_request' || github.event.action != 'edited'
+    concurrency:
+      group: pr-flow-wip-cap
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TRUSTED_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+      WIP_CAP: ${{ vars.WIP_CAP }}
+      PR_SIZE_LIMIT: ${{ vars.PR_SIZE_LIMIT }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      # No checkout: the gate code always comes from the default branch through
+      # the API, never from a PR ref. These files must be on main before the
+      # gates can run, including on their own initial PR.
+      - name: Load trusted gate and tests through the API
+        run: |
+          python3 -c 'from pathlib import Path; Path("scripts/ci").mkdir(parents=True, exist_ok=True); Path(".github/workflows").mkdir(parents=True, exist_ok=True)'
+          trusted_sha=$(gh api --method GET "repos/$GH_REPO/commits/$TRUSTED_BRANCH" --jq .sha)
+          [[ "$trusted_sha" =~ ^[0-9a-f]{40}$ ]]
+          for path in scripts/ci/pr_flow.py scripts/ci/test_pr_flow.py .github/workflows/pr-flow.yml; do
+            gh api --method GET "repos/$GH_REPO/contents/$path" -f "ref=$trusted_sha" --jq .content |
+              python3 -c 'import base64, pathlib, sys; pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(sys.stdin.read()))' "$path"
+          done
+      - name: Test PR flow gates
+        run: python3 -m unittest scripts/ci/test_pr_flow.py
+      - name: Publish wip-cap statuses
+        run: python3 scripts/ci/pr_flow.py
+        env:
+          PR_FLOW_GATE: wip-cap
+
+  pr-size:
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    concurrency:
+      group: pr-flow-size-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TRUSTED_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+      WIP_CAP: ${{ vars.WIP_CAP }}
+      PR_SIZE_LIMIT: ${{ vars.PR_SIZE_LIMIT }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Load trusted gate and tests through the API
+        run: |
+          python3 -c 'from pathlib import Path; Path("scripts/ci").mkdir(parents=True, exist_ok=True); Path(".github/workflows").mkdir(parents=True, exist_ok=True)'
+          trusted_sha=$(gh api --method GET "repos/$GH_REPO/commits/$TRUSTED_BRANCH" --jq .sha)
+          [[ "$trusted_sha" =~ ^[0-9a-f]{40}$ ]]
+          for path in scripts/ci/pr_flow.py scripts/ci/test_pr_flow.py .github/workflows/pr-flow.yml; do
+            gh api --method GET "repos/$GH_REPO/contents/$path" -f "ref=$trusted_sha" --jq .content |
+              python3 -c 'import base64, pathlib, sys; pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(sys.stdin.read()))' "$path"
+          done
+      - name: Test PR flow gates
+        run: python3 -m unittest scripts/ci/test_pr_flow.py
+      - name: Publish pr-size status
+        run: python3 scripts/ci/pr_flow.py
+        env:
+          PR_FLOW_GATE: pr-size

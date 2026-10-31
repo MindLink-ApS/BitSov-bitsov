@@ -24,6 +24,14 @@ and deploy inventories belong outside the open core.
 - Prefer config-gated behavior that defaults off for relay/operator roles.
 - Public issues must not contain secrets, live node IDs, customer names, channel
   balances, txids, internal IPs, or unreleased security details.
+- Keep a PR under 500 counted lines (the `pr-size` status). Tests, fixtures,
+  lockfiles, vendored code and test evidence are not counted. A larger PR
+  needs the `large-ok` label and a `## Design note` section explaining why it
+  cannot be split.
+- Review capacity sets the pace: only the first few open, non-draft PRs (the
+  `wip-cap` status, ranked by `m6`/`deadline`, then `security`/`money`, then
+  `merge-ready`, then age) are in review. Open new work as a draft while the
+  queue is full.
 
 ## Security Reports
 
