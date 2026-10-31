@@ -100,6 +100,17 @@ jobs:
           } 2>&1 | tee paid-call.log
           grep -q '^M6 CALL PASS reason=unpaid paid_blocks=3 ' paid-call.log
           grep -q '^M6 CALL PASS reason=duration_cap paid_blocks=1 ' paid-call.log
+      - name: Two-node approved app grants (messages and real call blocks)
+        shell: bash
+        env:
+          REGTEST_TIMEOUT_SECONDS: '1200'
+        run: |
+          set -euo pipefail
+          scripts/regress/two_node_app_grant_e2e.sh 2>&1 | tee app-grant.log
+          grep -q '^APP GRANT PASS message_reply ' app-grant.log
+          grep -q '^APP GRANT PASS paid_call paid_blocks=2 ' app-grant.log
+          grep -q '^APP GRANT PASS refusal_total ' app-grant.log
+          grep -q '^APP GRANT PASS refusal_per_call ' app-grant.log
       - name: Production private hub forwarding (#225)
         shell: bash
         env:
@@ -136,4 +147,5 @@ jobs:
             regtest.log
             private-forwarding.log
             paid-call.log
+            app-grant.log
           if-no-files-found: ignore

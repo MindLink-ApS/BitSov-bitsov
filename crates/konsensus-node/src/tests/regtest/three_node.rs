@@ -414,6 +414,7 @@ async fn start_app(
             identity: Arc::new(NodeIdentity::from_mnemonic(&config.mnemonic, "").unwrap()),
             chain_url: chain_url.to_owned(),
             calls: None,
+            owner_approval_key: None,
         }),
     )
     .await

@@ -19,6 +19,9 @@ mod three_node;
 #[cfg(unix)]
 #[path = "regtest/paid_call.rs"]
 mod paid_call;
+#[cfg(unix)]
+#[path = "regtest/app_grant.rs"]
+mod app_grant;
 
 async fn wait<F, Fut>(label: &str, mut check: F)
 where
