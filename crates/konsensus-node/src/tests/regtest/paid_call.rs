@@ -14,9 +14,9 @@ use tokio_tungstenite::{
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const PRICE: u64 = 23_001;
 const CALL: &str = "00112233445566778899aabbccddeeff";
-const SDP: &str = "v=0\r\ns=M6 node-routed audio\r\nt=0 0\r\n";
+pub(super) const SDP: &str = "v=0\r\ns=M6 node-routed audio\r\nt=0 0\r\n";
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().try_into().unwrap()
 }
 
@@ -129,93 +129,145 @@ async fn compose(
     app.post("/api/v1/messages/compose", request, false).await
 }
 
+/// Shared production pair: callers choose tariffs, limits and approval roots.
+pub(super) struct Pair {
+    pub caller: app::App,
+    pub callee: app::App,
+    pub a: Arc<LdkProvider>,
+    pub b: Arc<LdkProvider>,
+    _dirs: [tempfile::TempDir; 2],
+    _chain: infra::Chain,
+}
+
+impl Pair {
+    pub async fn start(
+        caller_calls: app::CallOptions,
+        callee_calls: app::CallOptions,
+        approval_keys: [Option<ed25519_dalek::VerifyingKey>; 2],
+        fee_policy: konsensus_core::traits::lightning::RoutingFeePolicy,
+    ) -> Self {
+        let chain = infra::Chain::start().await;
+        let dirs = [(); 2].map(|_| tempfile::tempdir().unwrap());
+        let configs = dirs
+            .each_ref()
+            .map(|dir| infra::lightning_config(dir.path(), &chain.url));
+        let a = Arc::new(
+            LdkProvider::new(configs[0].clone())
+                .await
+                .unwrap()
+                .with_routing_fee_policy(fee_policy),
+        );
+        let b = Arc::new(
+            LdkProvider::new(configs[1].clone())
+                .await
+                .unwrap()
+                .with_routing_fee_policy(fee_policy),
+        );
+        chain.fund(a.node()).await;
+        chain.fund(b.node()).await;
+        let start = |index: usize, wallet, calls| {
+            app::App::start_with_options(
+                dirs[index].path(),
+                &chain,
+                wallet,
+                Some(app::Options {
+                    identity: Arc::new(
+                        NodeIdentity::from_mnemonic(&configs[index].mnemonic, "").unwrap(),
+                    ),
+                    chain_url: chain.api_url.clone(),
+                    calls: Some(calls),
+                    owner_approval_key: approval_keys[index],
+                }),
+            )
+        };
+        // Different prices catch an accidental fallback to the caller's tariff.
+        let caller = start(0, a.clone(), caller_calls).await;
+        let callee = start(1, b.clone(), callee_calls).await;
+        let aid = *caller.state.identity.node_id();
+        let bid = *callee.state.identity.node_id();
+
+        let (status, body) = caller
+            .post(
+                "/api/v1/payments/open-channel",
+                json!({
+                    "peer_pubkey": b.node().node_id().to_string(),
+                    "peer_addr": configs[1].listening_address,
+                    "amount_sats": 1_000_000, "announce": false,
+                }),
+                true,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "owner channel open: {body}");
+        chain.confirm_channel(a.node(), b.node(), &[]).await;
+        // B must pay its answer and terminal signal. Move real channel liquidity,
+        // including the acceptor's reserve, rather than minting a mock balance.
+        let liquidity = b
+            .create_invoice(50_000_000, "regtest callee signaling liquidity", 600)
+            .await
+            .unwrap();
+        a.pay_invoice_with_fee_limit(&liquidity.bolt11, 0)
+            .await
+            .unwrap();
+        settle(&a, &liquidity.payment_hash).await;
+        settle(&b, &liquidity.payment_hash).await;
+        wait("callee outbound liquidity", || async {
+            capacity(b.node()) > 10_000_000
+        })
+        .await;
+        wait("both wallets ready", || async {
+            a.money_ready().await && b.money_ready().await
+        })
+        .await;
+        three_node::list_contact(&caller, &callee, "M6 owners list their call peer").await;
+        three_node::list_contact(&callee, &caller, "M6 owners list their call peer").await;
+        three_node::connect(&caller, &callee, "M6 Noise connection").await;
+        // Listing contacts can race the first supervised handshake. A transport
+        // connection alone does not prove the prekey exchange has completed.
+        wait("both signaling sessions established", || async {
+            caller.state.session_manager.can_send(&bid).await
+                && callee.state.session_manager.can_send(&aid).await
+        })
+        .await;
+
+        Self {
+            caller,
+            callee,
+            a,
+            b,
+            _dirs: dirs,
+            _chain: chain,
+        }
+    }
+}
+
 async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
     let mut steps = Steps::new();
-    let chain = infra::Chain::start().await;
-    let dirs = [(); 2].map(|_| tempfile::tempdir().unwrap());
-    let configs = dirs
-        .each_ref()
-        .map(|dir| infra::lightning_config(dir.path(), &chain.url));
-    let a = Arc::new(
-        LdkProvider::new(configs[0].clone())
-            .await
-            .unwrap()
-            .with_routing_fee_policy(three_node::direct_channel_fee_policy()),
-    );
-    let b = Arc::new(
-        LdkProvider::new(configs[1].clone())
-            .await
-            .unwrap()
-            .with_routing_fee_policy(three_node::direct_channel_fee_policy()),
-    );
-    chain.fund(a.node()).await;
-    chain.fund(b.node()).await;
-    let start = |index: usize, wallet, block_msat, max_minutes| {
-        app::App::start_with_options(
-            dirs[index].path(),
-            &chain,
-            wallet,
-            Some(app::Options {
-                identity: Arc::new(
-                    NodeIdentity::from_mnemonic(&configs[index].mnemonic, "").unwrap(),
-                ),
-                chain_url: chain.api_url.clone(),
-                calls: Some(app::CallOptions {
-                    block_msat,
-                    max_minutes,
-                }),
-            }),
-        )
-    };
-    // Different prices catch an accidental fallback to the caller's tariff.
-    let mut caller = start(0, a.clone(), 7_001, max_minutes).await;
-    let mut callee = start(1, b.clone(), PRICE, 60).await;
+    let Pair {
+        mut caller,
+        mut callee,
+        a,
+        b,
+        _dirs,
+        _chain,
+    } = Pair::start(
+        app::CallOptions {
+            block_msat: 7_001,
+            max_minutes,
+            offer_msat: 1_000,
+            chat_msat: 2_001,
+        },
+        app::CallOptions {
+            block_msat: PRICE,
+            max_minutes: 60,
+            offer_msat: 1_000,
+            chat_msat: 2_001,
+        },
+        [None; 2],
+        three_node::direct_channel_fee_policy(),
+    )
+    .await;
     let aid = *caller.state.identity.node_id();
     let bid = *callee.state.identity.node_id();
-
-    let (status, body) = caller
-        .post(
-            "/api/v1/payments/open-channel",
-            json!({
-                "peer_pubkey": b.node().node_id().to_string(),
-                "peer_addr": configs[1].listening_address,
-                "amount_sats": 1_000_000, "announce": false,
-            }),
-            true,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "owner channel open: {body}");
-    chain.confirm_channel(a.node(), b.node(), &[]).await;
-    // B must pay its answer and terminal signal. Move real channel liquidity,
-    // including the acceptor's reserve, rather than minting a mock balance.
-    let liquidity = b
-        .create_invoice(50_000_000, "regtest callee signaling liquidity", 600)
-        .await
-        .unwrap();
-    a.pay_invoice_with_fee_limit(&liquidity.bolt11, 0)
-        .await
-        .unwrap();
-    settle(&a, &liquidity.payment_hash).await;
-    settle(&b, &liquidity.payment_hash).await;
-    wait("callee outbound liquidity", || async {
-        capacity(b.node()) > 10_000_000
-    })
-    .await;
-    wait("both wallets ready", || async {
-        a.money_ready().await && b.money_ready().await
-    })
-    .await;
-    three_node::list_contact(&caller, &callee, "M6 owners list their call peer").await;
-    three_node::list_contact(&callee, &caller, "M6 owners list their call peer").await;
-    three_node::connect(&caller, &callee, "M6 Noise connection").await;
-    // Listing contacts can race the first supervised handshake. A transport
-    // connection alone does not prove the prekey exchange has completed.
-    wait("both signaling sessions established", || async {
-        caller.state.session_manager.can_send(&bid).await
-            && callee.state.session_manager.can_send(&aid).await
-    })
-    .await;
-
     let offer = json!({"v":1, "call_id":CALL, "media":"audio", "sdp":SDP});
     let before = a.list_payments(100).await.unwrap().len();
     let (status, _) = compose(&caller, &bid, 400, offer.clone(), 1_000).await;
