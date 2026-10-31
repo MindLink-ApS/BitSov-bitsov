@@ -291,7 +291,7 @@ Unlock promptly after every restart; do not treat these estimates as guarantees.
 The local watchtower client core cannot yet send to a guard. There is no active
 keyless watch-only protection in W2a. Started with `--remote-unlock`,
 the node therefore opens and accepts new channels only with the configured
-hub/LSPs (see [hub-only channels](#hub-only-channels-hub_only_while_lockable)).
+hub/LSPs (see [channel capacity and hub-only admission](#channel-capacity-and-hub-only-admission)).
 A longer breach window (below) gives more time to unlock but does not lift that
 rule.
 
