@@ -193,6 +193,21 @@ pub async fn reconcile_call_spend(state: &AppState, now: u64) -> Result<(), kons
             first_error.get_or_insert(error);
         }
     }
+    for (peer, call_id) in service.call_media_clients() {
+        let result = async {
+            let node = NodeId::from_hex(&peer).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+            let entry = state.storage.call_get(&node, &call_id).await?.and_then(|e| e.at(now));
+            if entry.is_none_or(|e| e.phase == rules::Phase::Ended
+                && !(e.end_reason == Some(rules::HangupReason::Unpaid)
+                    && now <= e.deadline_ms.saturating_sub(rules::TOMBSTONE_MS)
+                        .saturating_add(rules::CALL_BLOCK_RESUME_MS).saturating_add(rules::CALL_BLOCK_MS)
+                        .saturating_add(rules::CALL_BLOCK_GRACE_MS))) {
+                service.forget_call_client(&peer, &call_id);
+            }
+            Ok::<_, konsensus_storage::StorageError>(())
+        }.await;
+        if let Err(error) = result { first_error.get_or_insert(error); }
+    }
     if let Err(error) = service.prune_call_spend((now / 1000).min(i64::MAX as u64) as i64) {
         first_error.get_or_insert(konsensus_storage::StorageError::Serialization(error.to_string()));
     }
@@ -519,12 +534,21 @@ pub async fn reserve_outgoing(
 
 /// Commit or release the reservation of exactly this request; anything else
 /// (another request's reservation, none at all) is left alone.
-async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &str, request_hash: &str, how: Settlement) -> Result<(), konsensus_storage::StorageError> {
+async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &str, request_hash: &str, how: Settlement, media_owner: Option<(&crate::pairing::PairingService, Option<&crate::auth::PairingBinding>)>) -> Result<(), konsensus_storage::StorageError> {
     let _g = lock().lock().await;
     let now = now_ms();
     let Some(entry) = store.call_get(peer, call_id).await? else { return Ok(()) };
     if !entry.pending.as_ref().is_some_and(|p| p.is(operation_id, request_hash)) {
         return Ok(());
+    }
+    if how == Settlement::Paid && entry.pending.as_ref().is_some_and(|p|
+        matches!(p.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_ANSWER))
+    {
+        if let Some((service, binding)) = media_owner {
+            // Record before publishing: an admitted call must never be visible
+            // with a different client's binding. Recovery without this proof fails closed.
+            service.commit_call_client(binding, &peer.to_hex(), call_id, operation_id, request_hash)?;
+        }
     }
     // Preserve terminal failure across restart and same-operation retries. A
     // mere pre-dispatch release has no failed payment evidence and stays live.
@@ -545,7 +569,11 @@ async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &s
         Settlement::Unpaid => rules::release(entry, operation_id),
         Settlement::Ambiguous => return Ok(()),
     }};
-    write(store, peer, call_id, next.as_ref()).await
+    write(store, peer, call_id, next.as_ref()).await?;
+    if let Some((service, _)) = media_owner {
+        service.finish_call_client(&peer.to_hex(), call_id, operation_id, request_hash);
+    }
+    Ok(())
 }
 
 /// Publish a paid call transition before queuing its envelope. A refused
@@ -554,7 +582,17 @@ async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &s
 pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) -> Result<(), konsensus_storage::StorageError> {
     let signal = konsensus_core::wire_json::from_str::<CallSignal>(plaintext)
         .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
-    settle(store, peer, &signal.call_id, operation_id, request_hash, Settlement::Paid).await
+    settle(store, peer, &signal.call_id, operation_id, request_hash, Settlement::Paid, None).await
+}
+
+/// Publish an authenticated invite/answer and its media ownership together.
+/// Recovery can promote only an exact pending binding retained in this process.
+pub async fn commit_outgoing_for(state: &AppState, user: &crate::auth::AuthUser, peer: &NodeId,
+    plaintext: &str, operation_id: &str, request_hash: &str) -> Result<(), konsensus_storage::StorageError> {
+    let signal = konsensus_core::wire_json::from_str::<CallSignal>(plaintext)
+        .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+    let owner = state.pairing.as_deref().map(|service| (service, user.pairing.as_ref()));
+    settle(state.storage.as_ref(), peer, &signal.call_id, operation_id, request_hash, Settlement::Paid, owner).await
 }
 
 /// How the journal says this request's reservation ends. A journal entry of
@@ -570,7 +608,8 @@ fn journal_settlement(op: Option<&konsensus_storage::OutboxOperation>, peer: &No
 
 /// After compose returned (either way): read the operation journal and commit,
 /// release (definite nonpayment) or keep (ambiguous) this request's reservation.
-pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) {
+pub async fn resolve_outgoing(state: &AppState, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) {
+    let store = state.storage.as_ref();
     let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else { return };
     // The reservation's own kind (an ICE reserves nothing; then this is moot).
     let kind = match store.call_get(peer, &signal.call_id).await {
@@ -584,7 +623,8 @@ pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, 
             return;
         }
     };
-    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, request_hash, how).await {
+    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, request_hash, how,
+        state.pairing.as_deref().map(|service| (service, None))).await {
         tracing::warn!(peer = %peer, error = %e, "call reservation not resolved; recovery will retry");
     }
 }
@@ -597,7 +637,8 @@ pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, 
 /// passes `release = false`: an unpaid operation it is about to pay again
 /// keeps its reservation. Ambiguous stays reserved. Never fails the caller; a
 /// store error leaves it for the next sweep or the compose resolve.
-pub async fn settle_operation(store: Store<'_>, op: &konsensus_storage::OutboxOperation, release: bool) {
+pub async fn settle_operation(state: &AppState, op: &konsensus_storage::OutboxOperation, release: bool) {
+    let store = state.storage.as_ref();
     if !u16::try_from(op.kind).is_ok_and(is_call_kind) {
         return;
     }
@@ -616,7 +657,8 @@ pub async fn settle_operation(store: Store<'_>, op: &konsensus_storage::OutboxOp
     };
     for (p, call_id, entry) in pending {
         if p == peer && entry.pending.is_some_and(|x| x.is(&op.operation_id, &op.request_hash) && i64::from(x.kind) == op.kind) {
-            if let Err(e) = settle(store, &peer, &call_id, &op.operation_id, &op.request_hash, how).await {
+            if let Err(e) = settle(store, &peer, &call_id, &op.operation_id, &op.request_hash, how,
+                state.pairing.as_deref().map(|service| (service, None))).await {
                 tracing::warn!(operation_id = %op.operation_id, error = %e, "call reservation not settled; next sweep retries");
             }
         }
@@ -651,7 +693,7 @@ pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_stora
         // Startup commits only if the journal row is this request: same
         // payload hash, kind and recipient (Fable R1).
         let how = journal_settlement(op.as_ref(), &peer, p.kind, &hash);
-        settle(store, &peer, &call_id, &p.operation_id, &p.request_hash, how).await?;
+        settle(store, &peer, &call_id, &p.operation_id, &p.request_hash, how, None).await?;
         match how {
             Settlement::Paid => committed += 1,
             Settlement::Unpaid => released += 1,

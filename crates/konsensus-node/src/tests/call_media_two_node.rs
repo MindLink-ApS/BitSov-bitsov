@@ -54,6 +54,8 @@ struct Node {
     id: NodeId,
     transport: Arc<NoiseTransport>,
     storage: Arc<dyn konsensus_storage::Storage>,
+    state: Arc<konsensus_api::AppState>,
+    console: Console,
     api_addr: SocketAddr,
     /// A paired device's token carrying `spend`.
     token: String,
@@ -93,29 +95,7 @@ async fn start_node(identity: Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Node
             .with_owner_console(Box::new(console.clone()))
             .without_stdout_code(),
     );
-    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
-    service.open_pairing_window(Duration::from_secs(60));
-    let client = service
-        .create_verified_remote_pairing("app", &hex::encode(key.verifying_key().to_bytes()), &[9; 32])
-        .unwrap();
-    let op = service.create_elevation_request(&client.client_id, vec![Scope::Spend]).unwrap();
-    service
-        .grant_elevation(
-            &op.op_id,
-            &console.confirmation(&pairing::grant_confirmation_phrase(&op)),
-            konsensus_api::spend_budget::GrantTerms::new(100_000),
-        )
-        .unwrap();
-    let epoch = service.list_clients().into_iter().find(|c| c.client_id == client.client_id).unwrap().epoch;
-    let token = konsensus_api::auth::create_paired_token(
-        &id.to_hex(),
-        JWT_SECRET,
-        vec![Scope::Read, Scope::Receive, Scope::Spend],
-        &client.client_id,
-        epoch,
-        &service.bound_fingerprint(),
-    )
-    .unwrap();
+    let token = paired_token(&service, &console, &id, 7);
 
     let audit = Arc::new(konsensus_api::audit::AuditLog::open(dir.path().join("audit.log")).unwrap());
     let state = Arc::new(konsensus_api::AppState {
@@ -169,12 +149,38 @@ async fn start_node(identity: Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Node
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_addr = listener.local_addr().unwrap();
-    let app = konsensus_api::build_router_for_addr(state, api_addr);
+    let app = konsensus_api::build_router_for_addr(state.clone(), api_addr);
     tokio::spawn(async move {
         axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
     });
 
-    Node { id, transport, storage, api_addr, token, shutdown, _dir: dir }
+    Node { id, transport, storage, state, console, api_addr, token, shutdown, _dir: dir }
+}
+
+fn paired_token(service: &PairingService, console: &Console, id: &NodeId, seed: u8) -> String {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    service.open_pairing_window(Duration::from_secs(60));
+    let client = service
+        .create_verified_remote_pairing("app", &hex::encode(key.verifying_key().to_bytes()), &[seed; 32])
+        .unwrap();
+    let op = service.create_elevation_request(&client.client_id, vec![Scope::Spend]).unwrap();
+    service
+        .grant_elevation(
+            &op.op_id,
+            &console.confirmation(&pairing::grant_confirmation_phrase(&op)),
+            konsensus_api::spend_budget::GrantTerms::new(100_000),
+        )
+        .unwrap();
+    let epoch = service.list_clients().into_iter().find(|c| c.client_id == client.client_id).unwrap().epoch;
+    konsensus_api::auth::create_paired_token(
+        &id.to_hex(),
+        JWT_SECRET,
+        vec![Scope::Read, Scope::Receive, Scope::Spend],
+        &client.client_id,
+        epoch,
+        &service.bound_fingerprint(),
+    )
+    .unwrap()
 }
 
 impl Node {
@@ -184,6 +190,20 @@ impl Node {
 
     /// An answered call with its first 60-second block settled.
     async fn live_call(&self, peer: &NodeId, side: Side) {
+        let claims = konsensus_api::auth::validate_token(&self.token, JWT_SECRET).unwrap();
+        let user = konsensus_api::auth::AuthUser { node_id: claims.sub.clone(), scopes: claims.scp.clone(),
+            pairing: konsensus_api::auth::PairingBinding::from_claims(&claims).unwrap() };
+        let offer = serde_json::json!({"v":1,"call_id":CALL,"sdp":"offer","media":"audio"}).to_string();
+        if side == Side::Callee {
+            konsensus_api::calls::admit_incoming(self.storage.as_ref(), &self.id, peer, 400, Some(&offer)).await.unwrap();
+        }
+        let signal = if side == Side::Caller { offer }
+            else { serde_json::json!({"v":1,"call_id":CALL,"sdp":"answer"}).to_string() };
+        let kind = if side == Side::Caller { 400 } else { 401 };
+        let operation = uuid::Uuid::new_v4().to_string();
+        konsensus_api::calls::reserve_outgoing(self.storage.as_ref(), &self.id, peer, kind, &signal,
+            &operation, "ownership").await.unwrap();
+        konsensus_api::calls::commit_outgoing_for(&self.state, &user, peer, &signal, &operation, "ownership").await.unwrap();
         let now = chrono::Utc::now().timestamp_millis() as u64;
         self.storage
             .call_put(peer, CALL, &CallEntry { side, phase: Phase::Live, deadline_ms: now + 70_000, pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1, end_reason: None, unpaid_notice_used: false })
@@ -267,9 +287,6 @@ async fn a_packet_into_node_a_s_socket_comes_out_of_node_b_s_socket() {
 
     a.live_call(&b.id, Side::Caller).await;
     b.live_call(&a.id, Side::Callee).await;
-    // The owner's key-proof token is not a paired device: refused.
-    let owner = konsensus_api::auth::create_token(&a.id.to_hex(), JWT_SECRET, Scope::all()).unwrap();
-    assert_eq!(a.media_socket(&b.id, &owner).await.err(), Some(403));
 
     let mut app_a = a.media_socket(&b.id, &a.token).await.unwrap();
     let mut app_b = b.media_socket(&a.id, &b.token).await.unwrap();
@@ -326,6 +343,38 @@ async fn a_packet_into_node_a_s_socket_comes_out_of_node_b_s_socket() {
     .expect("B's socket closes after the call ended");
     assert!(closed, "no media after the call ended");
 
+    let _ = a.shutdown.send(true);
+    let _ = b.shutdown.send(true);
+}
+
+#[tokio::test]
+async fn black_holed_socket_allows_only_the_call_clients_reattach() {
+    let id_a = Arc::new(NodeIdentity::generate().unwrap().1);
+    let id_b = Arc::new(NodeIdentity::generate().unwrap().1);
+    let a = start_node(id_a.clone(), vec![*id_b.node_id()]).await;
+    let b = start_node(id_b, vec![a.id]).await;
+    a.transport.connect(&b.id, &b.addr()).await.unwrap();
+    wait_until("both see the connection", || async {
+        a.transport.is_connected(&b.id).await && b.transport.is_connected(&a.id).await
+    }).await;
+    a.live_call(&b.id, Side::Caller).await;
+    b.live_call(&a.id, Side::Callee).await;
+    let other = paired_token(a.state.pairing.as_ref().unwrap(), &a.console, &a.id, 8);
+    assert_eq!(a.media_socket(&b.id, &other).await.err(), Some(403));
+    let black_holed = a.media_socket(&b.id, &a.token).await.unwrap();
+    assert_eq!(a.media_socket(&b.id, &a.token).await.err(), Some(409), "a live attachment keeps its slot");
+    // Real socket and SQLite I/O must share the timers' wall-clock progress.
+    // Paused time is exercised separately by the router's unit tests.
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    assert_eq!(a.media_socket(&b.id, &other).await.err(), Some(403), "silence cannot transfer ownership");
+    let mut replacement = a.media_socket(&b.id, &a.token).await.expect("stale attachment must not return 409");
+    let mut app_b = b.media_socket(&a.id, &b.token).await.unwrap();
+    // Verify the replacement still owns the single slot after the old client drops.
+    drop(black_holed);
+    assert_eq!(a.media_socket(&b.id, &other).await.err(), Some(403));
+    replacement.send(packet(2, b"replacement")).await.unwrap();
+    assert_eq!(next_binary(&mut app_b).await, [&2u32.to_be_bytes()[..], b"replacement"].concat());
+    replacement.close(None).await.unwrap();
     let _ = a.shutdown.send(true);
     let _ = b.shutdown.send(true);
 }

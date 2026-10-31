@@ -8,6 +8,8 @@ fn call_reservation_draw_release_and_restart() {
     let service = first_contact_service(dir.path());
     let client = service.snapshot().clients[0].client_id.clone();
     let peer = "aa".repeat(32);
+    let binding = auth::PairingBinding { client_id: client.clone(), epoch: 1, fingerprint: "identity".into() };
+    let other = auth::PairingBinding { client_id: "another-client".into(), ..binding.clone() };
     let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 20, 5, 240).unwrap();
     let hold = service.reserve_call_spend(&client, 1, terms.clone(), 10_000).unwrap();
     assert_eq!(service.reserve_call_spend(&client, 1, terms, 10_000).unwrap(), hold);
@@ -19,6 +21,12 @@ fn call_reservation_draw_release_and_restart() {
     service.try_resolve_spend(&debit, &peer, 22).unwrap();
     drop(service);
     let service = PairingService::open(dir.path(), "identity".into(), true).unwrap();
+    assert!(service.owns_call_spend(&binding, &peer, "call"));
+    assert!(!service.owns_call_media(&binding, &peer, "call"), "a restart must not restore ownership from a hold");
+    assert!(!service.owns_call_media(&other, &peer, "call"));
+    assert!(!service.owns_call_media(&auth::PairingBinding { epoch: 2, ..binding.clone() }, &peer, "call"));
+    assert!(!service.owns_call_media(&binding, "another-peer", "call"));
+    assert!(!service.owns_call_media(&binding, &peer, "another-call"));
     let view = service.call_spend_status(&peer, "call").unwrap();
     assert_eq!((view.reserved_msat, view.spent_msat, view.remaining_msat, view.per_block_msat), (6000, 22, 5978, 20));
     service.close_call_spend(&hold).unwrap();
@@ -947,4 +955,63 @@ fn call_terms_keep_legacy_duration_and_bound_new_reservations() {
     }
     assert!(CallSpendTerms::new("peer", "call", u64::MAX, 1, 60).is_err());
     assert!(CallSpendTerms::new("peer", "call", u64::MAX / 2, 0, 60).is_err());
+}
+
+#[test]
+fn a_spend_hold_without_a_committed_invite_does_not_own_media() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let binding = auth::PairingBinding { client_id: service.snapshot().clients[0].client_id.clone(),
+        epoch: 1, fingerprint: "identity".into() };
+    let terms = crate::spend_budget::CallSpendTerms::new("peer", "call", 20, 5, 60).unwrap();
+    service.reserve_call_spend(&binding.client_id, 1, terms, 10_000).unwrap();
+    assert!(service.owns_call_spend(&binding, "peer", "call"));
+    assert!(!service.owns_call_media(&binding, "peer", "call"), "paying a later block cannot acquire media");
+}
+
+#[test]
+fn pending_media_authority_requires_exact_paid_operation_and_is_lost_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let binding = auth::PairingBinding { client_id: service.snapshot().clients[0].client_id.clone(),
+        epoch: 1, fingerprint: "identity".into() };
+    service.remember_call_client(Some(&binding), "peer", "call", "answer", "request").unwrap();
+    assert!(!service.owns_call_media(&binding, "peer", "call"), "a pending payment grants no media");
+    assert!(service.commit_call_client(None, "peer", "call", "other-operation", "request").is_err());
+    assert!(service.commit_call_client(None, "peer", "call", "answer", "other-request").is_err());
+    assert!(!service.owns_call_media(&binding, "peer", "call"));
+    service.commit_call_client(None, "peer", "call", "answer", "request").unwrap();
+    assert!(service.owns_call_media(&binding, "peer", "call"));
+    service.finish_call_client("peer", "call", "answer", "request");
+    // A subsequent owner-authorized answer cannot inherit a failed app attempt.
+    service.remember_call_client(None, "peer", "owner-call", "owner-answer", "request").unwrap();
+    service.commit_call_client(Some(&binding), "peer", "owner-call", "owner-answer", "request").unwrap();
+    assert!(!service.owns_call_media(&binding, "peer", "owner-call"));
+    drop(service);
+    let restarted = PairingService::open(dir.path(), "identity".into(), true).unwrap();
+    restarted.commit_call_client(None, "peer", "call", "answer", "request").unwrap();
+    assert!(!restarted.owns_call_media(&binding, "peer", "call"));
+}
+
+#[test]
+fn media_ownership_capacity_is_reserved_before_payment() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let binding = auth::PairingBinding { client_id: service.snapshot().clients[0].client_id.clone(),
+        epoch: 1, fingerprint: "identity".into() };
+    {
+        let mut inner = service.lock();
+        for n in 1..konsensus_core::payloads::call::MAX_OPEN_CALLS {
+            inner.call_media_clients.insert(("peer".into(), n.to_string()), binding.clone());
+        }
+    }
+    service.remember_call_client(Some(&binding), "peer", "last", "answer", "request").unwrap();
+    assert!(service.remember_call_client(Some(&binding), "peer", "excess", "answer", "request").is_err(),
+        "the pending last slot must count before another payment starts");
+    service.commit_call_client(None, "peer", "last", "answer", "request").unwrap();
+    service.finish_call_client("peer", "last", "answer", "request");
+    assert!(service.owns_call_media(&binding, "peer", "last"));
+    assert!(service.remember_call_client(Some(&binding), "peer", "excess", "answer", "request").is_err());
+    service.forget_call_client("peer", "last");
+    assert!(service.remember_call_client(Some(&binding), "peer", "excess", "answer", "request").is_ok());
 }

@@ -1,6 +1,6 @@
 //! The owner media socket's gate (M6 N2): every refusal before the upgrade.
-//! Only a paired device holding `spend`, as the node's owner, on a call the
-//! router admits, gets `101`; everything else is a plain HTTP refusal.
+//! A paired client holding `spend` must own the admitted call. Node-owner
+//! authority also gets `101`; other callers get a plain HTTP refusal.
 //!
 //! Upgrade cases use disposable loopback listeners: the WebSocket extractor
 //! needs a real connection, so `oneshot` cannot reach the handler's gate.
@@ -20,7 +20,7 @@ use ed25519_dalek::SigningKey;
 use tower::ServiceExt;
 
 use konsensus_api::auth::Scope;
-use konsensus_api::call_media::{AttachRefusal, CallMediaPort, MediaAttachment, MediaQueue};
+use konsensus_api::call_media::{AttachRefusal, CallMediaPort, MediaActivity, MediaAttachment, MediaQueue};
 use konsensus_api::pairing::{self, PairingService};
 use konsensus_api::state::AppState;
 use konsensus_core::NodeId;
@@ -34,10 +34,10 @@ struct StubPort(Option<AttachRefusal>);
 
 #[async_trait]
 impl CallMediaPort for StubPort {
-    async fn attach(&self, peer: &NodeId, _call_id: &str) -> Result<MediaAttachment, AttachRefusal> {
+    async fn attach(&self, peer: &NodeId, _call_id: &str, _: Option<&konsensus_api::auth::PairingBinding>) -> Result<MediaAttachment, AttachRefusal> {
         match self.0 {
             Some(refusal) => Err(refusal),
-            None => Ok(MediaAttachment::new(*peer, MediaQueue::new(4), MediaQueue::new(4), || {})),
+            None => Ok(MediaAttachment::new(*peer, MediaQueue::new(4), MediaQueue::new(4), MediaActivity::new(), || {})),
         }
     }
 }
@@ -61,15 +61,18 @@ async fn fixture(dir: &std::path::Path, port: Option<Arc<dyn CallMediaPort>>) ->
             .without_stdout_code(),
     );
     let state = Arc::new(AppState { pairing: Some(Arc::clone(&service)), call_media: port, ..(*base).clone() });
+    let addr = serve(state.clone()).await;
+    Fixture { state, service, console, addr }
+}
+
+async fn serve(state: Arc<AppState>) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = konsensus_api::build_router_for_addr(Arc::clone(&state), addr);
+    let app = konsensus_api::build_router_for_addr(state, addr);
     tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await
-            .unwrap();
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
     });
-    Fixture { state, service, console, addr }
+    addr
 }
 
 impl Fixture {
@@ -102,6 +105,26 @@ impl Fixture {
             &self.service.bound_fingerprint(),
         )
         .unwrap()
+    }
+
+    /// Commit the same authenticated invite/answer transition used by compose.
+    async fn own_call(&self, token: &str, peer: &NodeId, answer: bool) {
+        use konsensus_api::{auth, calls};
+        let claims = auth::validate_token(token, &self.state.jwt_secret).unwrap();
+        let user = auth::AuthUser { node_id: claims.sub.clone(), scopes: claims.scp.clone(),
+            pairing: auth::PairingBinding::from_claims(&claims).unwrap() };
+        if answer {
+            calls::admit_incoming(self.state.storage.as_ref(), self.state.identity.node_id(), peer, 400,
+                Some(&serde_json::json!({"v":1,"call_id":CALL,"sdp":"offer","media":"audio"}).to_string()))
+                .await.unwrap();
+        }
+        let kind = if answer { 401 } else { 400 };
+        let signal = if answer { serde_json::json!({"v":1,"call_id":CALL,"sdp":"answer"}) }
+            else { serde_json::json!({"v":1,"call_id":CALL,"sdp":"offer","media":"audio"}) }.to_string();
+        let operation = uuid::Uuid::new_v4().to_string();
+        calls::reserve_outgoing(self.state.storage.as_ref(), self.state.identity.node_id(), peer,
+            kind, &signal, &operation, "ownership").await.unwrap();
+        calls::commit_outgoing_for(&self.state, &user, peer, &signal, &operation, "ownership").await.unwrap();
     }
 
     /// The upgrade request as a browser sends it; the status it gets.
@@ -158,9 +181,9 @@ async fn media_socket_refuses_everything_but_a_paired_spending_owner_on_an_admit
     assert_eq!(f.upgrade(&path, None).await, StatusCode::UNAUTHORIZED);
     assert_eq!(f.upgrade(&path, Some("not-a-jwt")).await, StatusCode::UNAUTHORIZED);
 
-    // The owner's own key-proof token is not a paired device: 403.
+    // The node owner retains direct authority over admitted media.
     let owner = auth_header(&f.state).trim_start_matches("Bearer ").to_owned();
-    assert_eq!(f.upgrade(&path, Some(&owner)).await, StatusCode::FORBIDDEN);
+    assert_eq!(f.upgrade(&path, Some(&owner)).await, StatusCode::SWITCHING_PROTOCOLS);
 
     // A paired device without `spend` (the default pairing): 403.
     let read_only = f.paired_token(21, vec![Scope::Read, Scope::Receive]);
@@ -168,6 +191,7 @@ async fn media_socket_refuses_everything_but_a_paired_spending_owner_on_an_admit
 
     // A paired device the owner granted `spend`: through to the router.
     let spender = f.paired_token(22, vec![Scope::Read, Scope::Receive, Scope::Spend]);
+    f.own_call(&spender, &peer, false).await;
     assert_eq!(f.upgrade(&path, Some(&spender)).await, StatusCode::SWITCHING_PROTOCOLS);
 
     // Malformed call or peer ids never reach the router.
@@ -194,6 +218,7 @@ async fn media_socket_reports_the_router_s_refusal() {
         let dir = tempfile::tempdir().unwrap();
         let f = fixture(dir.path(), Some(Arc::new(StubPort(refusal)))).await;
         let spender = f.paired_token(23, vec![Scope::Read, Scope::Receive, Scope::Spend]);
+        f.own_call(&spender, &peer, false).await;
         assert_eq!(f.upgrade(&media_path(&peer), Some(&spender)).await, status, "{refusal:?}");
     }
 
@@ -201,6 +226,7 @@ async fn media_socket_reports_the_router_s_refusal() {
     let dir = tempfile::tempdir().unwrap();
     let f = fixture(dir.path(), None).await;
     let spender = f.paired_token(24, vec![Scope::Read, Scope::Receive, Scope::Spend]);
+    f.own_call(&spender, &peer, false).await;
     assert_eq!(f.upgrade(&media_path(&peer), Some(&spender)).await, StatusCode::SERVICE_UNAVAILABLE);
 }
 
@@ -237,9 +263,9 @@ impl ObservedPort {
 }
 #[async_trait]
 impl CallMediaPort for ObservedPort {
-    async fn attach(&self, peer: &NodeId, _: &str) -> Result<MediaAttachment, AttachRefusal> {
+    async fn attach(&self, peer: &NodeId, _: &str, _: Option<&konsensus_api::auth::PairingBinding>) -> Result<MediaAttachment, AttachRefusal> {
         let released = self.released.clone();
-        Ok(MediaAttachment::new(*peer, self.to_node.clone(), self.from_node.clone(), move || released.notify_one()))
+        Ok(MediaAttachment::new(*peer, self.to_node.clone(), self.from_node.clone(), MediaActivity::new(), move || released.notify_one()))
     }
 }
 
@@ -263,6 +289,7 @@ async fn oversize_frame_header_is_rejected_before_the_body_arrives() {
     let port = ObservedPort::new();
     let f = fixture(dir.path(), Some(port.clone())).await;
     let token = f.paired_token(30, vec![Scope::Spend]);
+    f.own_call(&token, &NodeId::from_bytes([8; 32]), false).await;
     let (status, mut socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
     assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
     // Declares 4101 bytes, but sends only the header and mask. Waiting for
@@ -280,6 +307,7 @@ async fn fragmented_message_cannot_exceed_the_media_limit() {
     let port = ObservedPort::new();
     let f = fixture(dir.path(), Some(port.clone())).await;
     let token = f.paired_token(31, vec![Scope::Spend]);
+    f.own_call(&token, &NodeId::from_bytes([8; 32]), false).await;
     let (_, mut socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
     socket.write_all(&masked_frame(0x02, &vec![0; 3000])).await.unwrap();
     socket.write_all(&masked_frame(0x80, &vec![0; 1101])).await.unwrap();
@@ -296,6 +324,7 @@ async fn text_malformed_and_control_floods_share_the_ingress_budget() {
         let port = ObservedPort::new();
         let f = fixture(dir.path(), Some(port.clone())).await;
         let token = f.paired_token(32, vec![Scope::Spend]);
+    f.own_call(&token, &NodeId::from_bytes([8; 32]), false).await;
         let (_, mut socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
         // Text is deliberately not JSON. Binary is deliberately too short.
         let frame = masked_frame(opcode, b"x");
@@ -328,6 +357,7 @@ async fn stalled_socket_releases(reason: &str) {
     let port = ObservedPort::new();
     let f = fixture(dir.path(), Some(port.clone())).await;
     let token = f.paired_token(33, vec![Scope::Spend]);
+    f.own_call(&token, &NodeId::from_bytes([8; 32]), false).await;
     let (_, socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
     // Keep the client alive but never read. A small TCP receive window plus
     // sustained bounded-queue production forces the server's send to stall.
@@ -366,6 +396,7 @@ async fn websocket_ping_gets_one_automatic_pong_and_media_continues() {
     let port = ObservedPort::new();
     let f = fixture(dir.path(), Some(port.clone())).await;
     let token = f.paired_token(36, vec![Scope::Spend]);
+    f.own_call(&token, &NodeId::from_bytes([8; 32]), false).await;
     let (_, mut socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
     socket.write_all(&masked_frame(0x89, b"probe")).await.unwrap();
     let mut pong = [0; 7];
@@ -384,6 +415,7 @@ async fn text_ping_is_ignored_without_a_json_reply() {
     let port = ObservedPort::new();
     let f = fixture(dir.path(), Some(port.clone())).await;
     let token = f.paired_token(34, vec![Scope::Spend]);
+    f.own_call(&token, &NodeId::from_bytes([8; 32]), false).await;
     let (_, mut socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
     socket.write_all(&masked_frame(0x81, br#"{"type":"ping"}"#)).await.unwrap();
     let mut byte = [0; 1];
@@ -399,6 +431,7 @@ async fn socket_ingress_byte_budget_counts_before_routing() {
     let port = ObservedPort::new();
     let f = fixture(dir.path(), Some(port.clone())).await;
     let token = f.paired_token(35, vec![Scope::Spend]);
+    f.own_call(&token, &NodeId::from_bytes([8; 32]), false).await;
     let (_, mut socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
     // Every packet is valid and exactly at the per-message limit; the 16th
     // crosses 64 KiB including headers, well below the 100-message limit.
@@ -406,4 +439,89 @@ async fn socket_ingress_byte_budget_counts_before_routing() {
     tokio::time::timeout(std::time::Duration::from_secs(2), port.released.notified()).await.unwrap();
     assert_eq!(port.to_node.len(), 15);
     assert_eq!(port.to_node.try_pop().unwrap().payload.len(), 4096);
+}
+
+#[tokio::test]
+async fn another_paired_spender_cannot_attach_to_an_admitted_call() {
+    for answered in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fixture(dir.path(), Some(Arc::new(StubPort(None)))).await;
+        let peer = NodeId::from_bytes([8; 32]);
+        let owner = f.paired_token(41, vec![Scope::Spend]);
+        f.own_call(&owner, &peer, answered).await;
+        let other = f.paired_token(42, vec![Scope::Spend]);
+        assert_eq!(f.upgrade(&media_path(&peer), Some(&other)).await, StatusCode::FORBIDDEN);
+        assert_eq!(f.upgrade(&media_path(&peer), Some(&owner)).await, StatusCode::SWITCHING_PROTOCOLS);
+    }
+}
+
+#[tokio::test]
+async fn node_owner_authority_can_attach_to_an_admitted_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fixture(dir.path(), Some(Arc::new(StubPort(None)))).await;
+    let owner = auth_header(&f.state).trim_start_matches("Bearer ").to_owned();
+    assert_eq!(f.upgrade(&media_path(&NodeId::from_bytes([8; 32])), Some(&owner)).await,
+        StatusCode::SWITCHING_PROTOCOLS);
+}
+
+#[tokio::test]
+async fn black_holed_socket_releases_attachment_on_read_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = ObservedPort::new();
+    let f = fixture(dir.path(), Some(port.clone())).await;
+    let token = f.paired_token(43, vec![Scope::Spend]);
+    f.own_call(&token, &NodeId::from_bytes([8; 32]), false).await;
+    let (status, _socket) = f.open(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await;
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(16)).await;
+    tokio::time::resume();
+    tokio::time::timeout(std::time::Duration::from_secs(1), port.released.notified()).await
+        .expect("a socket without reads or pongs kept its attachment");
+}
+
+#[tokio::test]
+async fn missing_call_ownership_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fixture(dir.path(), Some(Arc::new(StubPort(None)))).await;
+    let token = f.paired_token(44, vec![Scope::Spend]);
+    assert_eq!(f.upgrade(&media_path(&NodeId::from_bytes([8; 32])), Some(&token)).await, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn answered_call_ownership_fails_closed_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fixture(dir.path(), Some(Arc::new(StubPort(None)))).await;
+    let peer = NodeId::from_bytes([8; 32]);
+    let token = f.paired_token(45, vec![Scope::Spend]);
+    f.own_call(&token, &peer, true).await;
+    let claims = konsensus_api::auth::validate_token(&token, &f.state.jwt_secret).unwrap();
+    let binding = konsensus_api::auth::PairingBinding::from_claims(&claims).unwrap().unwrap();
+    assert!(f.service.owns_call_media(&binding, &peer.to_hex(), CALL));
+    let restarted = Arc::new(PairingService::open(dir.path(), f.service.bound_fingerprint(), true).unwrap());
+    let state = Arc::new(AppState { pairing: Some(restarted), ..(*f.state).clone() });
+    // The same paired token is still live, but the call binding was not persisted.
+    state.pairing.as_ref().unwrap().verify_token_binding(&binding.client_id, binding.epoch,
+        &binding.fingerprint, &claims.scp).unwrap();
+    assert!(!state.pairing.as_ref().unwrap().owns_call_media(&binding, &peer.to_hex(), CALL));
+    let restarted = Fixture { addr: serve(state.clone()).await, service: state.pairing.clone().unwrap(),
+        state, console: f.console.clone() };
+    assert_eq!(restarted.upgrade(&media_path(&peer), Some(&token)).await, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn stream_rechecks_call_ownership_without_waiting_for_media() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = ObservedPort::new();
+    let f = fixture(dir.path(), Some(port.clone())).await;
+    let token = f.paired_token(46, vec![Scope::Spend]);
+    let peer = NodeId::from_bytes([8; 32]);
+    f.own_call(&token, &peer, true).await;
+    let (status, _socket) = f.open(&media_path(&peer), Some(&token)).await;
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+    f.state.storage.call_delete(&peer, CALL).await.unwrap();
+    konsensus_api::calls::reconcile_call_spend(&f.state, chrono::Utc::now().timestamp_millis() as u64).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_millis(1300), port.released.notified()).await
+        .expect("the open stream did not recheck its ownership binding");
+    assert_eq!(f.upgrade(&media_path(&peer), Some(&token)).await, StatusCode::FORBIDDEN);
 }

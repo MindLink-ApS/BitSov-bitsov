@@ -2,6 +2,12 @@
 use super::*;
 use crate::spend_budget::{CallSpendStatus, CallSpendTerms, OperationReservationLink};
 
+pub(super) struct PendingMediaClient {
+    operation_id: String,
+    request_hash: String,
+    client: Option<auth::PairingBinding>,
+}
+
 impl PairingService {
     pub(crate) fn prune_call_spend(&self, now: i64) -> Result<(), PairingError> {
         let mut inner = self.lock();
@@ -257,12 +263,99 @@ impl PairingService {
             .map(|call| call.status())
     }
 
-    pub(crate) fn owns_call_spend(&self, client: &str, peer: &str, call_id: &str) -> bool {
+    /// Preserve authenticated authority before dispatch. An ambiguous payment
+    /// can settle later in this process, but a restart loses this proof.
+    pub(crate) fn remember_call_client(&self, client: Option<&auth::PairingBinding>, peer: &str,
+        call_id: &str, operation_id: &str, request_hash: &str) -> Result<(), konsensus_storage::StorageError>
+    {
+        let mut inner = self.lock();
+        let key = (peer.to_owned(), call_id.to_owned());
+        if inner.pending_call_media_clients.len() >= konsensus_core::payloads::call::MAX_OPEN_CALLS as usize
+            && !inner.pending_call_media_clients.contains_key(&key)
+        {
+            return Err(konsensus_storage::StorageError::Conversion("call media ownership capacity reached".into()));
+        }
+        let reserved = inner.pending_call_media_clients.iter().filter(|(key, pending)|
+            pending.client.is_some() && !inner.call_media_clients.contains_key(*key)).count();
+        let already_reserved = inner.call_media_clients.contains_key(&key)
+            || inner.pending_call_media_clients.get(&key).is_some_and(|pending| pending.client.is_some());
+        if client.is_some() && !already_reserved
+            && inner.call_media_clients.len() + reserved >= konsensus_core::payloads::call::MAX_OPEN_CALLS as usize
+        {
+            return Err(konsensus_storage::StorageError::Conversion("call media ownership capacity reached".into()));
+        }
+        inner.pending_call_media_clients.insert(key, PendingMediaClient {
+            operation_id: operation_id.into(), request_hash: request_hash.into(), client: client.cloned(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn commit_call_client(&self, fallback: Option<&auth::PairingBinding>, peer: &str,
+        call_id: &str, operation_id: &str, request_hash: &str) -> Result<(), konsensus_storage::StorageError>
+    {
+        let mut inner = self.lock();
+        let key = (peer.to_owned(), call_id.to_owned());
+        let client = match inner.pending_call_media_clients.get(&key) {
+            Some(pending) if pending.operation_id == operation_id && pending.request_hash == request_hash => pending.client.clone(),
+            Some(_) => return Err(konsensus_storage::StorageError::Conversion("call media operation mismatch".into())),
+            None => match fallback {
+                Some(client) => Some(client.clone()),
+                None => return Ok(()),
+            },
+        };
+        if let Some(client) = client {
+            if inner.call_media_clients.len() >= konsensus_core::payloads::call::MAX_OPEN_CALLS as usize
+                && !inner.call_media_clients.contains_key(&key)
+            {
+                return Err(konsensus_storage::StorageError::Conversion("call media ownership capacity reached".into()));
+            }
+            inner.call_media_clients.insert(key, client);
+        } else {
+            inner.call_media_clients.remove(&key);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_call_client(&self, peer: &str, call_id: &str, operation_id: &str, request_hash: &str) {
+        let mut inner = self.lock();
+        let key = (peer.to_owned(), call_id.to_owned());
+        if inner.pending_call_media_clients.get(&key).is_some_and(|p|
+            p.operation_id == operation_id && p.request_hash == request_hash)
+        {
+            inner.pending_call_media_clients.remove(&key);
+        }
+    }
+
+    pub(crate) fn call_media_clients(&self) -> Vec<(String, String)> {
+        let inner = self.lock();
+        inner.call_media_clients.keys().chain(inner.pending_call_media_clients.keys())
+            .cloned().collect::<HashSet<_>>().into_iter().collect()
+    }
+
+    pub(crate) fn forget_call_client(&self, peer: &str, call_id: &str) {
+        let mut inner = self.lock();
+        let key = (peer.to_owned(), call_id.to_owned());
+        inner.call_media_clients.remove(&key);
+        inner.pending_call_media_clients.remove(&key);
+    }
+
+    /// Only a committed invite/answer establishes paired media ownership.
+    /// Spend holds alone never grant media; all bindings fail closed on restart.
+    /// Live token/grant checks and paid call admission are still required.
+    pub fn owns_call_media(&self, binding: &auth::PairingBinding, peer: &str, call_id: &str) -> bool {
+        if self.lock().call_media_clients.get(&(peer.to_owned(), call_id.to_owned())) != Some(binding) {
+            return false;
+        }
+        self.call_spend_status(peer, call_id).is_none() || self.owns_call_spend(binding, peer, call_id)
+    }
+
+    pub(crate) fn owns_call_spend(&self, binding: &auth::PairingBinding, peer: &str, call_id: &str) -> bool {
         self.lock()
             .file
             .grants
             .iter()
-            .filter(|g| g.client_id == client)
+            .filter(|g| g.client_id == binding.client_id && g.epoch == binding.epoch
+                && g.identity_fingerprint == binding.fingerprint)
             .filter_map(|g| g.budget.as_ref())
             .flat_map(|b| b.call_reservations.values())
             .any(|call| call.terms.peer == peer && call.terms.call_id == call_id)

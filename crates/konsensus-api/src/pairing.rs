@@ -743,6 +743,9 @@ struct Inner {
     // One-time first-contact confirmations, by client id. Memory only: never
     // serialized, dropped on restart (fail closed). See `FirstContactGrant`.
     first_contact: HashMap<String, PendingFirstContact>,
+    // Call media ownership is memory only; missing bindings fail closed after restart.
+    call_media_clients: HashMap<(String, String), auth::PairingBinding>,
+    pending_call_media_clients: HashMap<(String, String), call_spend::PendingMediaClient>,
 }
 
 type ReservationJournal<'a> = Box<dyn FnOnce(&Reservation) -> Result<(), BudgetRefusal> + 'a>;
@@ -987,6 +990,8 @@ impl PairingService {
                 owner_approvals: approval::OwnerApprovals::default(),
                 cancelled_ops: std::collections::HashMap::new(),
                 first_contact: HashMap::new(),
+                call_media_clients: HashMap::new(),
+                pending_call_media_clients: HashMap::new(),
             }),
             grant_changes: tokio::sync::Notify::new(),
             authority_changes,
