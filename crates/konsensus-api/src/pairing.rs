@@ -3980,7 +3980,9 @@ impl PairingService {
                         .get(&reservation.id)
                         .is_some_and(|recipients| b.envelopes_live(recipients.keys(), now))
                         && call.is_none_or(|(peer, id)| b.call_reservations.values().any(|hold|
-                            hold.terms.peer == peer && hold.terms.call_id == id && !hold.closed))
+                            hold.terms.peer == peer && hold.terms.call_id == id && !hold.closed
+                                // Recovery re-dispatches under the grant as it is now.
+                                && b.check_call_hold(&hold.terms).is_ok()))
                 })
                 && g.client_id == reservation.client_id
                 && g.identity_fingerprint == inner.identity_fingerprint

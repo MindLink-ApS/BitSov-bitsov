@@ -116,6 +116,48 @@ impl CallSpend {
 }
 
 impl GrantBudget {
+    /// The most one call payment to `peer` may carry under this grant now,
+    /// msat: the signed per-payment value, or on a relation grant the peer's
+    /// envelope per-act maximum (none: nothing).
+    pub(crate) fn call_payment_limit(&self, peer: &str) -> u64 {
+        if self.recipients_only {
+            self.per_act_max_by_recipient.get(peer).copied().unwrap_or(0)
+        } else {
+            self.per_call_max_msat
+        }
+    }
+
+    /// Every draw from a hold (a block, its retry or its recovery) is bounded
+    /// by the grant as it is now: the hold's pinned per-block ceiling must fit
+    /// [`Self::call_payment_limit`]. A hold persisted under an earlier rule
+    /// can exceed it; such a hold never pays again.
+    pub(crate) fn check_call_hold(&self, terms: &CallSpendTerms) -> Result<(), BudgetRefusal> {
+        let max_msat = self.call_payment_limit(&terms.peer);
+        if terms.per_block_msat.saturating_add(terms.per_block_fee_msat) > max_msat {
+            return Err(BudgetRefusal::PerCall { max_msat });
+        }
+        Ok(())
+    }
+
+    /// Close each open hold that fails [`Self::check_call_hold`], releasing
+    /// what it has not paid. With `only`, just that call (peer, call id).
+    /// Returns the refusal for the last hold closed, if any.
+    pub(crate) fn close_holds_over_limit(&mut self, only: Option<(&str, &str)>) -> Option<BudgetRefusal> {
+        let over: Vec<(String, BudgetRefusal)> = self
+            .call_reservations
+            .iter()
+            .filter(|(_, call)| !call.closed)
+            .filter(|(_, call)| only.is_none_or(|(peer, id)| call.terms.peer == peer && call.terms.call_id == id))
+            .filter_map(|(id, call)| self.check_call_hold(&call.terms).err().map(|refusal| (id.clone(), refusal)))
+            .collect();
+        let mut refused = None;
+        for (id, refusal) in over {
+            self.close_call(&id);
+            refused = Some(refusal);
+        }
+        refused
+    }
+
     /// Keep only small, recent finished receipts. Open holds and unresolved
     /// children are never evicted, even under count pressure.
     pub(crate) fn prune_call_tombstones(&mut self, now: i64) {

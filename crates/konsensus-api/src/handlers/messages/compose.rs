@@ -3597,6 +3597,12 @@ pub(super) async fn compose_peer(
                 return Err(ApiError::BadRequest("call reservation is closed; start a new call".into())
                     .with_reason("call_reservation_closed"));
             }
+            // A hold kept from before its grant's current per-payment value
+            // never pays above it: the hold is closed and the call ends.
+            if let (true, Some(service)) = (existing.is_some() && auth.is_metered(), state.pairing.as_ref()) {
+                service.enforce_call_hold_limit(&peer_id.to_hex(), &signal.call_id)
+                    .map_err(|refusal| ApiError::BudgetExceeded(refusal).with_reason(super::caps::CALL_ABOVE_PAYMENT_LIMIT))?;
+            }
             if existing.is_none() || offer_consent {
                 let block_price = if req.kind == konsensus_core::kind::KIND_CALL_BLOCK { price_msat }
                     else { super::caps::payable(crate::calls::peer_call_kind_price(&state, &peer_id, konsensus_core::kind::KIND_CALL_BLOCK).await?) };

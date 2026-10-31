@@ -7,6 +7,8 @@ impl PairingService {
         let mut inner = self.lock();
         let before = inner.file.clone();
         for budget in inner.file.grants.iter_mut().filter_map(|g| g.budget.as_mut()) {
+            // A hold above what its grant now allows per payment never pays.
+            budget.close_holds_over_limit(None);
             budget.prune_call_tombstones(now);
         }
         if inner.file.grants.iter().zip(&before.grants).any(|(a, b)| a.budget != b.budget) {
@@ -16,6 +18,24 @@ impl PairingService {
             }
         }
         Ok(())
+    }
+
+    /// Before a call draws on its existing hold: if the hold's per-block
+    /// ceiling no longer fits its grant (`GrantBudget::check_call_hold`),
+    /// close it, releasing what it has not paid, and refuse.
+    pub(crate) fn enforce_call_hold_limit(&self, peer: &str, call_id: &str) -> Result<(), BudgetRefusal> {
+        let mut inner = self.lock();
+        let before = inner.file.clone();
+        let mut refused = None;
+        for budget in inner.file.grants.iter_mut().filter_map(|g| g.budget.as_mut()) {
+            refused = budget.close_holds_over_limit(Some((peer, call_id))).or(refused);
+        }
+        let Some(refusal) = refused else { return Ok(()) };
+        if let Err(error) = self.persist(&mut inner.file) {
+            inner.file = before;
+            return Err(BudgetRefusal::Ledger(error.to_string()));
+        }
+        Err(refusal)
     }
 
     fn call_grant_index(
@@ -259,6 +279,13 @@ impl PairingService {
         let budget = grant.budget.as_mut().ok_or(BudgetRefusal::NoGrant)?;
         if budget.is_paused() {
             return Err(BudgetRefusal::GrantPaused);
+        }
+        if let Some(refusal) = budget.close_holds_over_limit(Some((peer, call_id))) {
+            if let Err(error) = self.persist(&mut inner.file) {
+                inner.file = before;
+                return Err(BudgetRefusal::Ledger(error.to_string()));
+            }
+            return Err(refusal);
         }
         if !budget.envelopes_live(
             std::iter::once(&peer.to_owned()),

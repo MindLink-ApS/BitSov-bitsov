@@ -1086,3 +1086,51 @@ async fn offer_refused_by_the_rate_breaker_leaves_no_hold_or_breaker_count() {
     assert_eq!(body["reason"], "rate_limit_minute", "{body}");
     assert_nothing_held(&fx);
 }
+
+/// Rewrite the stored grant's per-payment value and restart the node, as an
+/// upgraded node loads a grant stored under an earlier rule.
+fn restart_with_signed_value(fx: &mut Fx, max_msat: u64) {
+    let path = fx.service.dir().join("clients.json");
+    let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    file["grants"][0]["budget"]["per_call_max_msat"] = json!(max_msat);
+    std::fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+    fx.restart();
+}
+
+#[tokio::test]
+async fn a_kept_hold_above_the_grants_per_payment_value_ends_the_call() {
+    // (stored per-payment value after the restart, block 1 paid)
+    for (signed, block_paid) in [(6_000, false), (10_000, true)] {
+        let mut terms = GrantTerms::new(1_000_000);
+        terms.breakers.max_msat_per_10_minutes = 5_000_000;
+        let (mut fx, token) = console_call(terms).await;
+        let (status, body) = send(&fx, &token, 400, 10_000, 0).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        answer(&fx).await;
+        let (status, body) = send(&fx, &token, 404, 10_000, 0).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((fx.wallet.money(), fx.used()), (2, 101_000));
+        restart_with_signed_value(&mut fx, signed);
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+        let due = konsensus_core::payloads::call::CallEntry {
+            paid_until_ms: Some(now + 10_000), deadline_ms: now + 20_000, ..entry
+        };
+        fx.state.storage.call_put(&fx.peer, CALL, &due).await.unwrap();
+        let (status, body) = send(&fx, &token, 404, 10_000, 1).await;
+        let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+        if block_paid {
+            // A hold within the stored value keeps paying.
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!((fx.wallet.money(), hold.spent_msat, hold.closed), (3, 20_000, false));
+        } else {
+            assert_budget_exceeded(status, &body, "call_above_payment_limit");
+            assert_eq!(fx.wallet.money(), 2, "nothing more paid: {body}");
+            assert!(hold.closed);
+            assert_eq!((hold.spent_msat, hold.remaining_msat), (10_000, 0));
+            assert_eq!(fx.used(), 11_000, "the unused hold is released");
+            let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+            assert_eq!(entry.phase, Phase::Ended);
+        }
+    }
+}
