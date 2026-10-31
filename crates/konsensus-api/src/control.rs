@@ -1441,7 +1441,7 @@ mod wire_tests {
     #[test]
     fn transport_encoding_preserves_all_request_variants() {
         let fixtures = [
-            r#"{"op":"add-peer","node_id":"abababababababababababababababababababababababababababababababab","addr":"127.0.0.1:9735","label":"Dad"}"#,
+            r#"{"op":"add-peer","node_id":"abababababababababababababababababababababababababababababababab","addr":"127.0.0.1:9735","label":"Bob"}"#,
             r#"{"op":"add-peer","node_id":"abababababababababababababababababababababababababababababababab","addr":"127.0.0.1:9735","label":null}"#,
             r#"{"op":"status"}"#,
             r#"{"op":"describe","op_id":"test"}"#,

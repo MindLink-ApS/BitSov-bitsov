@@ -474,7 +474,7 @@ const BAN_EVICTION_INTERVAL: Duration = Duration::from_secs(300);
 /// the per-message [`PaymentGate`], the sole admission authority in every mode.
 /// The type was renamed from `AdmissionMode` to `ReachabilityMode` (R1/A3)
 /// precisely because the old name implied the whitelist *was* the admission
-/// authority, contradicting the gate's role (CODEX.md: "PaymentGate is the sole
+/// authority, contradicting the gate's role (doctrine: "PaymentGate is the sole
 /// admission authority").
 ///
 /// `Whitelist` (default): only explicitly whitelisted peers may handshake or be
@@ -490,7 +490,7 @@ const BAN_EVICTION_INTERVAL: Duration = Duration::from_secs(300);
 /// `konsensus.toml` carries `admission_mode = "whitelist" | "price_open"`). There
 /// is deliberately **no** `#[serde(other)]` catch-all: an unknown or stale token
 /// fails loud (errors) instead of falling back to `Whitelist`, which would
-/// otherwise re-install membership-as-admission invisibly (CODEX.md §Renames).
+/// otherwise re-install membership-as-admission invisibly (renames fail loud).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ReachabilityMode {
     /// Closed mesh — whitelist gates handshake + connect (default). Token: `"whitelist"`.
@@ -532,7 +532,7 @@ mod reachability_mode_serde {
 
     #[test]
     fn unknown_token_errors_never_silent_default() {
-        // Doctrine (CODEX.md §Renames fail loud): an unknown/stale/typo token must
+        // Doctrine (renames fail loud): an unknown/stale/typo token must
         // FAIL LOUD, never fall back to the Whitelist default — a silent default
         // would re-install membership-as-admission invisibly. This includes the old
         // type name, the CLI hyphen spelling, and case variants.

@@ -73,7 +73,7 @@ tier = "light"
 [setup_page]
 port = {page_port}
 [node]
-hosted_by = "Rasmus's Pi"
+hosted_by = "Alice's Pi"
 [identity]
 mnemonic_file = "{d}/mnemonic.enc"
 [network]
@@ -705,7 +705,7 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
 
     // 8. Normal startup in the same process, with the device's authority.
     let health = f.ready(&mut node, "/api/v1/health", &log).await;
-    assert_eq!(health["hosted_by"], "Rasmus's Pi");
+    assert_eq!(health["hosted_by"], "Alice's Pi");
     let (_live_tunnel, live_auth) = Tunnel::connect(f.remote, live_pin, json!({"v": 1})).await;
     assert_eq!(live_auth["status"], "ok");
     assert_eq!(live_auth["client_id"], client_id);

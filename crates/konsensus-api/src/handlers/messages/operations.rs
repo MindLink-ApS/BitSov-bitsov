@@ -519,7 +519,7 @@ pub(super) async fn compose(
 
 /// A 1:1 call signal (kinds 400-403). Its reservation is made, the operation
 /// run, and the reservation resolved all under the one per-operation lock
-/// (Codex delta3 #1), so concurrent requests for the same operation (same
+/// (review delta3 #1), so concurrent requests for the same operation (same
 /// payload, different caps) run one after another: a refused one resolves
 /// only its own reservation before the next reserves, and can never release
 /// a reservation another request is paying under.
@@ -532,11 +532,11 @@ pub(super) async fn compose_call(
 ) -> Result<Json<ComposeResponse>, ApiError> {
     let peer = NodeId::from_hex(&req.recipient)
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
-    // The journal's canonical key, for the reservation too (Codex delta2 #1).
+    // The journal's canonical key, for the reservation too (review delta2 #1).
     let id = operation_id(req.operation_id.as_deref())?;
     req.operation_id = Some(id.clone());
     let _guard = lock(&state, &id).await?;
-    // One operation id, one request (Fable N2): an id reused for another
+    // One operation id, one request (review N2): an id reused for another
     // signal is refused before any reservation. A retry of an operation that
     // already paid is answered from the journal, without reserving.
     let request_hash = request_digest(&peer, &req)?;
@@ -678,7 +678,7 @@ async fn compose_locked(
             reconcile(&state, &mut op).await?;
         }
         // A call signal this retry found paid is committed before the resend,
-        // so the callee's immediate answer finds a ringing call (Codex
+        // so the callee's immediate answer finds a ringing call (review
         // delta2 #3). Never a release here: an unpaid one is paid again below.
         crate::calls::settle_operation(state.storage.as_ref(), &op, false).await;
         // Call-state cleanup is best effort. Its storage failure must never
@@ -1332,7 +1332,7 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             }
             recover_budget(state, &mut op).await?;
             // A call signal's reservation follows its operation here too, and
-            // before any resend (Fable N1).
+            // before any resend (review N1).
             crate::calls::settle_operation(state.storage.as_ref(), &op, true).await;
             if op.state == "paid" {
                 recover_paid(state, &mut op).await?;

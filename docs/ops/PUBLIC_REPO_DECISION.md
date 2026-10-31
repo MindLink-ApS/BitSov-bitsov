@@ -12,7 +12,7 @@ history private.
 - `MindLink-ApS/BitSov-bitsov` — open protocol, reference node, API/CLI, tests,
   and public protocol docs. After debut this is the canonical public protocol
   development repo, not a stale downstream showroom. The post-merge refresh
-  removes `frontend/` from this protocol tree and preserves Josh's existing
+  removes `frontend/` from this protocol tree and preserves Dave's existing
   `feat/blvm-lightning-free-payments` branch.
 - The reference desktop app/client will be published later as its own public
   repository; it is not yet published. It consumes the public node API and

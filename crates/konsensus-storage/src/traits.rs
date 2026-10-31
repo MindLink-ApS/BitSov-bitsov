@@ -1213,7 +1213,7 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("reject accepted envelope".into()))
     }
 
-    // ── Incoming call signal admission hold (Codex delta2 #4) ──────────
+    // ── Incoming call signal admission hold (review delta2 #4) ──────────
     // A held message is invisible to history, resync and duplicate ACKs.
 
     /// Hold `envelope` before its paid acceptance, unless a message with its

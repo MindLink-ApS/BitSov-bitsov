@@ -1,4 +1,4 @@
-//! Calls review (#131, Codex FAIL at 34a722d): the reviewer's five probes as
+//! Calls review (#131, FAIL at 34a722d): the reviewer's five probes as
 //! regressions, asserting the fixed behaviour, plus restart, recovery, bounds
 //! and price-query rate limiting. Real SQLite call state throughout.
 
@@ -151,7 +151,7 @@ async fn burn(store: &SqliteStorage, peer: &NodeId, from: usize, n: usize) {
 
 /// Probe `unexpired_burned_id_is_readmitted_under_capacity_pressure`, still
 /// fixed: under pressure, an id burned less than `BURN_MIN_MS` ago is never
-/// dropped; the pair is refused instead. Fable N3: that refusal is per pair,
+/// dropped; the pair is refused instead. Review N3: that refusal is per pair,
 /// not node-wide, and ended calls never count against open ones.
 #[tokio::test]
 async fn young_burned_ids_are_never_dropped_and_only_block_their_own_pair() {
@@ -168,7 +168,7 @@ async fn young_burned_ids_are_never_dropped_and_only_block_their_own_pair() {
     calls::reserve_outgoing(&store, &own(), &NodeId::from_bytes([78; 32]), 400, &body(400, &id(100_002)), "op-elsewhere", "h").await.unwrap();
 }
 
-/// Fable N3: past `BURN_MIN_MS`, the oldest burned ids of a pair make room for
+/// Review N3: past `BURN_MIN_MS`, the oldest burned ids of a pair make room for
 /// a new call instead of blocking the pair for the rest of the day; younger
 /// ones stay burned.
 #[tokio::test]
@@ -192,7 +192,7 @@ async fn burned_ids_older_than_the_minimum_make_room_oldest_first() {
     assert!(calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(1)))).await.is_err(), "an old id not needed for room stays burned");
 }
 
-/// Fable N3: open calls have their own small bound, and ending one frees it.
+/// Review N3: open calls have their own small bound, and ending one frees it.
 #[tokio::test]
 async fn open_calls_are_bounded_per_peer_and_freed_by_hangup() {
     let store = SqliteStorage::in_memory().await.unwrap();
@@ -206,7 +206,7 @@ async fn open_calls_are_bounded_per_peer_and_freed_by_hangup() {
     calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &next))).await.unwrap();
 }
 
-/// Fable N2: one operation id pays for one signal of one call. Reusing it for
+/// Review N2: one operation id pays for one signal of one call. Reusing it for
 /// another call id is refused before any reservation, whether the first
 /// request is still reserved or already in the journal.
 #[tokio::test]
@@ -260,7 +260,7 @@ async fn an_unrelated_price_response_is_not_a_call_quote() {
     assert_eq!(price.unwrap(), 12_000);
 }
 
-/// Fable follow-up: concurrent quotes to one peer send one `PriceQuery`.
+/// Review follow-up: concurrent quotes to one peer send one `PriceQuery`.
 #[tokio::test]
 async fn price_queries_to_one_peer_are_rate_limited() {
     let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
@@ -280,7 +280,7 @@ async fn price_queries_to_one_peer_are_rate_limited() {
     assert_eq!(queries, 1);
 }
 
-/// Fable N4: a price query that could not be sent does not hold the peer's
+/// Review N4: a price query that could not be sent does not hold the peer's
 /// query slot: it fails at once, and the next quote sends its own query.
 #[tokio::test]
 async fn a_price_query_that_was_not_sent_does_not_hold_the_slot() {
@@ -340,7 +340,7 @@ async fn a_refused_signal_is_not_delivered_by_resync_or_counted_accepted() {
     assert!(ws.try_recv().is_err(), "refused signal must not reach WS");
 }
 
-/// Codex P2: a restart keeps burned ids and live calls.
+/// Review P2: a restart keeps burned ids and live calls.
 #[tokio::test]
 async fn call_state_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -360,7 +360,7 @@ async fn call_state_survives_a_restart() {
     assert!(calls::admit_incoming(&store, &own(), &peer, 401, Some(&body(401, &mine))).await.is_ok(), "our paid offer still rings");
 }
 
-/// Codex P1/P2: recovery settles what a crash left, from the operation journal.
+/// Review P1/P2: recovery settles what a crash left, from the operation journal.
 #[tokio::test]
 async fn recovery_commits_paid_releases_unpaid_and_keeps_ambiguous() {
     let store = SqliteStorage::in_memory().await.unwrap();
@@ -385,7 +385,7 @@ async fn recovery_commits_paid_releases_unpaid_and_keeps_ambiguous() {
     let _ = CallSignal::parse(400, &body(400, &id(3))).unwrap();
 }
 
-/// Fable R1 (delta2): startup recovery commits a reservation only if the
+/// Review R1 (delta2): startup recovery commits a reservation only if the
 /// journal row under its operation id is this very request. A call reserved
 /// under an operation id whose journal row is a paid chat (app misuse plus a
 /// crash) is released, never rung unpaid.
@@ -413,7 +413,7 @@ async fn recovery_never_commits_a_call_under_another_requests_journal_row() {
     assert!(store.call_get(&peer, &id(2)).await.unwrap().is_none());
 }
 
-/// Fable R2 (delta2): a refused answer/ICE/hangup for an unknown call id never
+/// Review R2 (delta2): a refused answer/ICE/hangup for an unknown call id never
 /// makes room, so it cannot evict a burned id even past the minimum age.
 #[tokio::test]
 async fn unknown_call_signals_never_evict_burned_ids() {

@@ -1,4 +1,4 @@
-//! Atlas TEST5 runs 1–4, local regtest only. Doctrine: 1–6 hold: all
+//! TEST5 runs 1–4, local regtest only. Doctrine: 1–6 hold: all
 //! delivered content settles, refusals spend nothing, keys identify nodes and
 //! devices, contacts stay local, seeds are disposable and self-custodied.
 use super::*;
@@ -28,16 +28,16 @@ mod fault_proxy;
 #[path = "lsps2_service.rs"]
 mod lsps2_service;
 
-const APPROVAL: &str = "Atlas run 2 #15 / run 3 #2: remote elevation + headless owner approval";
-const QUOTE: &str = "Atlas runs 1–2: read-scope quote and paid receipt blocked";
-const SYNC: &str = "Atlas run 2 #13 / run 4 steps 1,3: 429 stalls and silent recipient timeout";
-const REPLY: &str = "Atlas run 2 #17: A has zero inbound liquidity; B cannot reply yet";
-const RESTART: &str = "Atlas run 4 steps 2–3: recipient restart during an active client flow";
-const SKEW: &str = "Atlas run 4 step 6: stale peer prices at quote time";
+const APPROVAL: &str = "TEST5 run 2 #15 / run 3 #2: remote elevation + headless owner approval";
+const QUOTE: &str = "TEST5 runs 1–2: read-scope quote and paid receipt blocked";
+const SYNC: &str = "TEST5 run 2 #13 / run 4 steps 1,3: 429 stalls and silent recipient timeout";
+const REPLY: &str = "TEST5 run 2 #17: A has zero inbound liquidity; B cannot reply yet";
+const RESTART: &str = "TEST5 run 4 steps 2–3: recipient restart during an active client flow";
+const SKEW: &str = "TEST5 run 4 step 6: stale peer prices at quote time";
 const SENDER_SYNC: &str = "sender-side 429: local not_ready before dispatch";
 const SLOW_OWNER: &str = "quote TTL expires while owner approves";
 const READMISSION: &str = "reconnect needs a per-recipient allowance";
-const ROOM: &str = "Atlas run 2 #14–18: paid room flow never reached";
+const ROOM: &str = "TEST5 run 2 #14–18: paid room flow never reached";
 
 async fn eventually<F, Fut>(incident: &str, mut check: F)
 where
@@ -501,12 +501,12 @@ async fn three_node_paid_e2e() {
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
-            "Atlas run 2 #7: paired channel open: {body}"
+            "TEST5 run 2 #7: paired channel open: {body}"
         );
         assert_eq!(
             a.node().list_channels().len(),
             channels_before,
-            "Atlas run 2 #7: refusal must not open"
+            "TEST5 run 2 #7: refusal must not open"
         );
         let (status, body) = alice
             .post("/api/v1/payments/open-channel", request, true)
@@ -514,7 +514,7 @@ async fn three_node_paid_e2e() {
         assert_eq!(
             status,
             StatusCode::OK,
-            "Atlas run 2 #10–12: owner channel open: {body}"
+            "TEST5 run 2 #10–12: owner channel open: {body}"
         );
         chain
             .confirm_channel(a.node(), wallet.node(), &[other])
@@ -523,7 +523,7 @@ async fn three_node_paid_e2e() {
     assert_eq!(
         a.node().list_channels().len(),
         2,
-        "Atlas run 2 #12: A has channels to B and C"
+        "TEST5 run 2 #12: A has channels to B and C"
     );
     assert_eq!(
         capacity(b.node()),
@@ -532,7 +532,7 @@ async fn three_node_paid_e2e() {
     );
     connect(&alice, &bob, QUOTE).await;
     connect(&alice, &carol, QUOTE).await;
-    steps.pass("Atlas run 2 channels: A->B and A->C usable, three application nodes");
+    steps.pass("TEST5 run 2 channels: A->B and A->C usable, three application nodes");
 
     // Noise and Esplora are separate hops. Capture connection generations so
     // automatic reconnects cannot hide chain-triggered transport loss.
@@ -622,7 +622,7 @@ async fn three_node_paid_e2e() {
             && u64::from(b.node().status().current_best_block.height) == tip
     })
     .await;
-    steps.pass("Atlas run 4 429: typed refusal in <8s, background sync recovers without restart/manual sync");
+    steps.pass("TEST5 run 4 429: typed refusal in <8s, background sync recovers without restart/manual sync");
 
     // The refused quote consumed the recipient's 10s source cooldown.
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -678,13 +678,13 @@ async fn three_node_paid_e2e() {
     );
     elevate(&mut alice, &[]).await;
     approve_contact(&alice, &bob, &first, None).await;
-    paid(&alice, &mut bob, "Atlas paid first contact A to B", QUOTE).await;
+    paid(&alice, &mut bob, "TEST5 paid first contact A to B", QUOTE).await;
     assert_eq!(
         alice.used(),
         4_002,
         "{QUOTE}: admission + message, zero routing fee"
     );
-    steps.pass("Atlas runs 1–3: read quote, remote spend request, headless control grant, paid E2EE receipt");
+    steps.pass("TEST5 runs 1–3: read quote, remote spend request, headless control grant, paid E2EE receipt");
 
     sender_fault.set_limited(true);
     eventually(SENDER_SYNC, || async {
@@ -788,7 +788,7 @@ async fn three_node_paid_e2e() {
         "{REPLY}: admitted reply requires no first-contact payment"
     );
     steps.pass(
-        "Atlas run 2 liquidity: unfunded reply refused without payment, rebalanced reply delivered",
+        "TEST5 run 2 liquidity: unfunded reply refused without payment, rebalanced reply delivered",
     );
 
     let first_c = quote(&alice, &carol, ROOM).await;
@@ -1100,7 +1100,7 @@ async fn three_node_paid_e2e() {
             })
     })
     .await;
-    steps.pass("Atlas run 4 stale pricing: invalid update preserves usable cache; quote and wire refresh use target price");
+    steps.pass("TEST5 run 4 stale pricing: invalid update preserves usable cache; quote and wire refresh use target price");
 
     // Restart the whole recipient stack between paid acts while A stays live.
     let bob_id = *bob.state.identity.node_id();
@@ -1185,7 +1185,7 @@ async fn three_node_paid_e2e() {
         "{RESTART}: exactly one re-admission plus one message"
     );
     steps.pass(
-        "Atlas run 4 restart: same keys/channels/session storage, A's existing client sends again",
+        "TEST5 run 4 restart: same keys/channels/session storage, A's existing client sends again",
     );
 
     use konsensus_core::payloads::room::RoomBinding;
@@ -1195,7 +1195,7 @@ async fn three_node_paid_e2e() {
         *carol.state.identity.node_id(),
     ])
     .unwrap();
-    let text = json!({"v": 1, "room": room, "msg": format!("{:032x}", rand::random::<u128>()), "text": "Atlas room B+C"}).to_string();
+    let text = json!({"v": 1, "room": room, "msg": format!("{:032x}", rand::random::<u128>()), "text": "TEST5 room B+C"}).to_string();
     bob.received = bob.state.ws_broadcast.subscribe();
     carol.received = carol.state.ws_broadcast.subscribe();
     let used = alice.used();
@@ -1242,7 +1242,7 @@ async fn three_node_paid_e2e() {
         );
         assert_eq!(got.envelope.payment_proof.amount_msat, 2_001, "{ROOM}");
     }
-    steps.pass("Atlas room: B+C each receive a recipient-bound paid E2EE message");
+    steps.pass("TEST5 room: B+C each receive a recipient-bound paid E2EE message");
     alice.stop().await;
     bob.stop().await;
     carol.stop().await;
@@ -1250,7 +1250,7 @@ async fn three_node_paid_e2e() {
         wallet
             .shutdown()
             .await
-            .expect("Atlas run 2 #25: clean wallet shutdown");
+            .expect("TEST5 run 2 #25: clean wallet shutdown");
     }
     println!(
         "THREE-NODE PAID E2E PASS; Doctrine: 1–6 hold; elapsed {:?}",

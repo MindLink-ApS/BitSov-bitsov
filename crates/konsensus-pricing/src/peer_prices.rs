@@ -351,7 +351,7 @@ impl PeerPriceCache {
             );
         }
         // Publish the fresh-answer time only now, while the price table is
-        // still write-locked (Codex delta3 #2): a reader that sees this answer
+        // still write-locked (review delta3 #2): a reader that sees this answer
         // reads the price under that lock afterwards, so it can never pair the
         // new answer with the previous tariff. Lock order: entries, then answers.
         // Only privileged peers reach here; still bound the map (4 096

@@ -313,7 +313,7 @@ async fn issue66_unusable_primary_falls_over_to_healthy_fallback() {
 }
 
 // ---------------------------------------------------------------------------
-// #66 round 2 (Codex R1): the probe must mirror LDK's CONCRETE type.
+// #66 round 2 (review R1): the probe must mirror LDK's CONCRETE type.
 // esplora-client 0.12.3 parses the whole body as HashMap<u16, f64>, so one key
 // LDK cannot represent fails its entire fetch. A probe that accepts "at least
 // one usable entry" would pass these and still kill startup — same defect, one

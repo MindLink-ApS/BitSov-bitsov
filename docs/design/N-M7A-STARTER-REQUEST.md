@@ -6,7 +6,7 @@ Original design baseline. Source read at `origin/main` `e8ed587` (v0.3.0-rc19 pr
 
 **Scope.** One owner-requested starter channel per node, funded by the hub from its own wallet under Option A / T4a (`docs/DESIGN-REASONING.md` T4a). Signet only, invite-only. Implementable in two PRs (§11).
 
-**Decided (Atlas, 21 Oct):** invite-only admission for v1 (no open mode); `receive` scope + verified paired session, no Admin; signet caps 20 opens/day, 2,000,000 sats lifetime, 2,000-sat funding-fee cap; ship without idle reclaim on signet (reclaim is required before mainnet); the hub logs node id and amount only, and retains no IP address or LN alias.
+**Decided (21 Oct):** invite-only admission for v1 (no open mode); `receive` scope + verified paired session, no Admin; signet caps 20 opens/day, 2,000,000 sats lifetime, 2,000-sat funding-fee cap; ship without idle reclaim on signet (reclaim is required before mainnet); the hub logs node id and amount only, and retains no IP address or LN alias.
 
 ## 1. Why rc18/rc19 has no app-callable path
 
@@ -311,7 +311,7 @@ Verification runs before the owner can have spent anything from the channel, and
 | Layer | Rule |
 |---|---|
 | Startup, both roles | `[starter] enabled` or `[starter_hub] enabled` requires an LDK backend with `bitcoin_network()` ∈ {`signet`, `regtest`} (`konsensus-node/src/config.rs:820`). Anything else (mainnet, testnet, or a backend that states no network) is a startup config error, `starter_network_not_allowed` |
-| Mainnet flag | `allow_mainnet` exists in both sections and defaults to `false`. `true` is **rejected at startup** in this release with `starter_mainnet_not_approved`. Lifting it is a code change after Rasmus says GO, and it also requires idle reclaim (Option A H3) to exist |
+| Mainnet flag | `allow_mainnet` exists in both sections and defaults to `false`. `true` is **rejected at startup** in this release with `starter_mainnet_not_approved`. Lifting it is a code change after the owner says GO, and it also requires idle reclaim (Option A H3) to exist |
 | Newcomer POST | Re-checks the network → `not_dispatched / network_not_allowed` |
 | Hub, per request | `request.network` must equal the hub's network; checked again immediately before `open_channel_with_funding` |
 | Regtest | Allowed only so the E2E fixtures can run; documented as test-only |
@@ -390,8 +390,8 @@ Out of scope: idle reclaim (Option A H3; not needed on signet, **required before
 
 | Date (CST) | Question | Decision | By |
 |---|---|---|---|
-| 21 Oct 2026, 10:38 | **Signet hub and funder** (was open question 1) | The dedicated, non-lockable signet hub is the GCP `beta` signet VM, which already hubs the beta/Maya/Josh mesh. If beta is gone or unfit, fall back to a new small GCP VM. **Never** the Pi (Rasmus's lockable owner node) and **never** the Umbrel. MindLink funds it from signet faucets plus its own signet wallets; Claude and Atlas may top it up on their own (signet coins have no value). Budget: the 2,000,000-sat lifetime cap + 25,000-sat anchor reserve per channel + fees. | Atlas, delegated by Rasmus (explicit GO 10:33) |
-| 21 Oct 2026, 10:38 | **Mainnet** (was open question 2) | `allow_mainnet` stays hard-refused; this lane changes nothing. Shape for later: (a) the funding vehicle is MindLink's own hub node wallet, never a user's and never Rasmus's father's; (b) the gift is 10,000 sats per new person, one channel per node, daily cap unchanged; (c) **cooperative-only** reclaim (as T4a defines it, so it stays non-custodial) after 90 days with no outbound activity, and reclaim must be built and tested on signet before any mainnet switch; (d) going live on mainnet is a separate Rasmus GO, because it sends sats to external nodes. | Atlas, delegated by Rasmus (explicit GO 10:33) |
+| 21 Oct 2026, 10:38 | **Signet hub and funder** (was open question 1) | The dedicated, non-lockable signet hub is the GCP `beta` signet VM, which already hubs the beta/Carol/Dave mesh. If beta is gone or unfit, fall back to a new small GCP VM. **Never** the Pi (the owner's lockable node) and **never** the Umbrel. MindLink funds it from signet faucets plus its own signet wallets; operators may top it up on their own (signet coins have no value). Budget: the 2,000,000-sat lifetime cap + 25,000-sat anchor reserve per channel + fees. | Owner-delegated (explicit GO 10:33) |
+| 21 Oct 2026, 10:38 | **Mainnet** (was open question 2) | `allow_mainnet` stays hard-refused; this lane changes nothing. Shape for later: (a) the funding vehicle is MindLink's own hub node wallet, never a user's; (b) the gift is 10,000 sats per new person, one channel per node, daily cap unchanged; (c) **cooperative-only** reclaim (as T4a defines it, so it stays non-custodial) after 90 days with no outbound activity, and reclaim must be built and tested on signet before any mainnet switch; (d) going live on mainnet is a separate owner GO, because it sends sats to external nodes. | Owner-delegated (explicit GO 10:33) |
 
 No open questions remain for signet. Mainnet stays behind (c) and (d), and the 20-per-day cap is re-checked at the mainnet GO.
 
@@ -432,7 +432,7 @@ optional `[starter] hub_alias` on the newcomer: an operator-supplied display nam
 never a peer-discovered LN alias or an identifier used for routing. It is omitted
 when no hub is configured. Discovery does not mutate config or request state.
 
-Atlas's no-approval ruling retains `receive` plus a verified paired session for
+The no-approval ruling retains `receive` plus a verified paired session for
 POST, without adding an approval kind. The body is an explicit allowlist of
 `request_id` only (`deny_unknown_fields`): caller-supplied cost, fee, amount or
 push fields are refused before persistence, replay, or dispatch, even if zero.

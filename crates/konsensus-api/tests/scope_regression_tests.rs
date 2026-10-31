@@ -1,4 +1,4 @@
-//! Regressions for the three authorization defects Codex found on 9df55f2 (genome #72).
+//! Regressions for the three authorization defects a review found on 9df55f2 (genome #72).
 //!
 //! Each of these passed CI and passed the scope coverage tests while broken, so each one
 //! is pinned here by behaviour rather than by source inspection:

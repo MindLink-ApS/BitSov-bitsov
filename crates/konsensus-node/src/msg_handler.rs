@@ -429,7 +429,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // and kept (a file once stored). A refusal withdraws the
                         // hold with the envelope; should that withdrawal fail, the
                         // hold still keeps the envelope hidden and unacknowledged
-                        // until the startup/periodic sweep withdraws it (Codex
+                        // until the startup/periodic sweep withdraws it (review
                         // delta2 #4, #155).
                         let mut call_hold = false;
                         if gate_result.is_ok() && !is_relay_control {
@@ -865,7 +865,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             // sweep: fail closed, the peer gets a reject, not an ACK.
                             // A committed block's hold was lifted in its commit
                             // transaction: nothing is left that could withhold its
-                            // grant ACK or let the sweep withdraw it (Codex P1).
+                            // grant ACK or let the sweep withdraw it (review P1).
                             let admitted = match admitted {
                                 Ok(signal) if committed_block => Ok(signal),
                                 Ok(signal) => match storage_for_recv.call_admission_release(&msg_id).await {
@@ -884,9 +884,9 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 // Paid but refused: withdraw the stored message and its
                                 // plaintext and mark the receipt application-rejected, so
                                 // history, resync and a resend never present it as
-                                // delivered (Codex P1). Payment hash and nonce stay burned.
+                                // delivered (review P1). Payment hash and nonce stay burned.
                                 // If this fails the hold keeps it invisible and the
-                                // startup/periodic sweep withdraws it (Codex delta2 #4).
+                                // startup/periodic sweep withdraws it (review delta2 #4).
                                 if let Err(e) = storage_for_recv.reject_accepted_envelope(&envelope).await {
                                     error!(msg_id = %msg_id, error = %e, "failed to withdraw a refused call signal; it stays held until the sweep");
                                 }

@@ -329,7 +329,7 @@ pub(super) async fn list_messages(
 /// is built from the newest [`MAX_SEARCH_SCAN`] chats with any node, always
 /// from the top: copies of one message can be far apart (a resend to a member
 /// that was refused), so `before` cannot be applied to single envelopes
-/// without splitting a message across pages (Codex #155 delta 1). Each entry
+/// without splitting a message across pages (review #155 delta 1). Each entry
 /// is placed at its newest copy's timestamp, ordered newest first (ties by
 /// id); `before` and `limit` then apply to entries, so a page never repeats
 /// or splits a message.

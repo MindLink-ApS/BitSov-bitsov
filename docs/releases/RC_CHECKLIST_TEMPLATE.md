@@ -21,9 +21,9 @@ Pre-release; not for production use. Copy this template for each new RC.
 - [ ] Review the tag's `scripts/release-toolchain`, `scripts/release-build.sh`,
       `scripts/release-macos-toolchain.sh`, lockfile and CI release matrix together.
       Install the pinned Rust toolchain.
-- [ ] On NOVA, install/select **Xcode 27.1 build 27A9275**, macOS SDK **27.0**,
+- [ ] On the release Mac, install/select **Xcode 27.1 build 27A9275**, macOS SDK **27.0**,
       Apple clang **21.0.0 (clang-2100.3.34.2)** using the
-      [installation steps](../ops/RELEASE_POLICY.md#pinned-macos-release-toolchain-nova).
+      [installation steps](../ops/RELEASE_POLICY.md#pinned-macos-release-toolchain-release-mac).
       From the reviewed release commit, run
       `bash scripts/release-build.sh --check-toolchain aarch64-apple-darwin`.
       A mismatch must stop before rebuilding or signing; host break-glass cannot
@@ -59,7 +59,7 @@ Pre-release; not for production use. Copy this template for each new RC.
       Retain every non-host `ACCEPT UNVERIFIED` entry and its rationale.
 - [ ] On any mismatch, inspect and archive the printed `REBUILD EVIDENCE` directory:
       rebuilt binary, hash diff, `SHA256SUMS`, `manifest.txt`, both CI Darwin
-      toolchain records and (on NOVA) `host-toolchain.txt`. It survives exit
+      toolchain records and (on the release Mac) `host-toolchain.txt`. It survives exit
       even on rejection or dry-run; later attempts create separate directories.
 - [ ] If proceeding despite an investigated host mismatch, supply
       `--accept-unverified-host "<incident-specific reason>"` explicitly. Confirm

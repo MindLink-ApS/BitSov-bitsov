@@ -650,7 +650,7 @@ async fn readmit_then_pay(
         .ok_or_else(|| ApiError::PriceCapExceeded("message all-in overflow".into()))?;
     // One call-wide ceiling: admissions already settled in this compose consume
     // the confirmed cap and must not be re-authorized for a mid-call reconnect
-    // (Codex #111 finding 4).
+    // (review #111 finding 4).
     let already_spent_all_in = charge
         .settled_msat
         .saturating_add(charge.fee_ceiling_msat);
@@ -2167,7 +2167,7 @@ async fn validate_admission_invoice(
 /// it is valid, so confirming never makes the target issue a second one (it
 /// rate-limits strangers). Memory only; one per peer; validated again on use.
 /// Bound to the connection generation that obtained the quote — a reconnect
-/// must fetch a fresh one (Codex #111 finding 5).
+/// must fetch a fresh one (review #111 finding 5).
 struct CachedQuote {
     request_id: String,
     response: InvoiceResponseData,
@@ -2791,7 +2791,7 @@ async fn first_contact_admission_at(
     // A re-admission reserves the fresh message all-in (replacing the prior
     // message reservation) plus admission+fee against the grant before anything
     // is dispatched; the owner's key is not metered. A refusal here leaves
-    // nothing requested on our wallet or paid (Codex #111 finding 3).
+    // nothing requested on our wallet or paid (review #111 finding 3).
     let readmission_event = readmit.as_ref().map(|r| super::admission_journal::ReadmissionSettlement {
         budget_msat: r.parent.contact_budget(&peer_id.to_hex()), reported: false,
     });
@@ -4671,7 +4671,7 @@ mod admission_tests {
         );
     }
 
-    /// Regression for Codex review finding after ae36b69: first attempt
+    /// Regression for a review finding after ae36b69: first attempt
     /// dispatches a trackable admission payment, settlement polling times out,
     /// and a second compose retries. The second attempt must observe the
     /// in-flight ledger state and poll/resume the original payment hash instead

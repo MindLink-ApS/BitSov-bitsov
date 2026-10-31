@@ -9,7 +9,7 @@
 //! mock Lightning ledger. The payer is driven through its real
 //! `POST /api/v1/messages/compose` route.
 //!
-//! The fix (Atlas CoS, after the Fable 5.1 review): a connection on which WE
+//! The fix (after review): a connection on which WE
 //! settled the peer's admission (`Connection::admission_paid`, set before our
 //! proof goes out, dying with the connection) accepts the frames that complete
 //! the act we paid for: PrekeyOffer, SessionInit, SessionAck, RatchetInit,
@@ -915,7 +915,7 @@ async fn m4_retry_on_the_same_connection_does_not_repay() {
 
 /// 5: the connection flaps after the admission settled, before its proof went
 /// out. The proof never reached the payee, so it is unspent: the retry
-/// delivers it on the new connection and pays the message only (Codex review
+/// delivers it on the new connection and pays the message only (review
 /// of b424ac5, P1: never pay again on settlement time vs connection time
 /// alone). A proof that DID go out on an older connection is covered by m9
 /// and the restart tests in `reconnect_recovery_tests.rs`.
@@ -1220,7 +1220,7 @@ async fn post_peers_whitelist_takes_effect_on_the_live_connection() {
     net.stop();
 }
 
-// ── Codex review of b424ac5 ──────────────────────────────────────────────
+// ── Review of b424ac5 ────────────────────────────────────────────────────
 
 /// P1: the connection is replaced between `mark_admission_paid` and the proof
 /// send (the reviewer's pause-after-mark hook). The proof is bound to the
@@ -1491,7 +1491,7 @@ async fn slow_return_proxy(upstream: String, delay: Duration) -> String {
     addr
 }
 
-/// Fable review of #102: in the payer-higher order the payer is the X3DH
+/// Review of #102: in the payer-higher order the payer is the X3DH
 /// acceptor. It holds a session (SessionInit received) before its sending
 /// chain exists, which needs the payee's RatchetInit a round trip later.
 /// Compose must wait until it can SEND, not only until a session exists, or
@@ -1523,7 +1523,7 @@ async fn speed_payer_higher_first_compose_delivers_while_ratchet_init_is_in_flig
     net.stop();
 }
 
-/// Codex review of 7af1bc8 (#102 P1): the connection is replaced after the
+/// Review of 7af1bc8 (#102 P1): the connection is replaced after the
 /// payer's eager PrekeyOffer was found eligible (its proof went out on the
 /// paid connection) and before it is written. The offer is bound to the paid
 /// generation: it never reaches the unpaid replacement (whose P2 gate at the
@@ -1568,7 +1568,7 @@ async fn speed_eager_offer_never_reaches_an_unpaid_replacement() {
     net.stop();
 }
 
-/// Codex review of e56d018 (P2): the connection is replaced after a settled,
+/// Review of e56d018 (P2): the connection is replaced after a settled,
 /// already-delivered proof was classified against it and before the proof is
 /// re-sent. The re-send must not mark the replacement paid for a proof that
 /// was consumed on the old connection (that would block the admission the

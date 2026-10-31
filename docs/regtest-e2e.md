@@ -1,6 +1,6 @@
 # Real LDK regtest regression (REGTEST-E2E)
 
-For the Atlas TEST5 robustness lane (three application nodes, remote spend
+For the TEST5 robustness lane (three application nodes, remote spend
 elevation, sender/recipient 429, restart, quote expiry and stale peer pricing), use
 [`scripts/regress/three_node_paid_e2e.sh`](three-node-paid-e2e.md). The existing
 routed scenarios below retain their assertions.
@@ -289,7 +289,7 @@ No blocks are mined after opening in any scenario. This is a regtest proof for
 the signet-first design, not a signet deployment or an app/message test. Startup
 provider connection (N2), N3 and hub H1–H6 remain out of scope.
 
-**Observed on 2026-10-20 after the Atlas ruling: 4 passed, 0 failed.** All four
+**Observed on 2026-10-20 after the ruling: 4 passed, 0 failed.** All four
 Phase 0 items pass, including all three negative controls' unchanged final
 rejection, no-surviving-channel and no-funding-broadcast assertions. The positive
 scenario has 9,000 sats spendable plus 1,000 sats punishment reserve.

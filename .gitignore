@@ -16,8 +16,8 @@
 # OS junk
 .DS_Store
 
-# Agent worktrees (checkouts, not source)
-.claude/worktrees/
+# Local worktrees (checkouts, not source)
+.worktrees/
 
 # SQLite runtime state (not source)
 *.db

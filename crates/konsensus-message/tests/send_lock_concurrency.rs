@@ -16,7 +16,7 @@
 //! What this test does NOT do: prove starvation timing on pre-fix code.
 //! That would require a slow-mock writer to extend send latency past
 //! loopback's near-zero floor. The fix's correctness is verified at the
-//! source level (codex review per L0 freeze policy); this test is the
+//! source level (review per L0 freeze policy); this test is the
 //! happy-path regression that the pattern doesn't break working code.
 
 use std::sync::Arc;

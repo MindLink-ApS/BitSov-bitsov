@@ -1,4 +1,4 @@
-//! RV-RESTORE-wire (#208) — the REAL recovery seam Codex asked for: after a
+//! RV-RESTORE-wire (#208) — the REAL recovery seam a review asked for: after a
 //! whitelist backup is restored onto fresh storage, a *paid message from a
 //! pre-kill invite-onboarded peer* must be ACCEPTED by the payment gate.
 //!

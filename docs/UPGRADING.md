@@ -251,7 +251,7 @@ There is no intermediate rc15 installation step.
 `fix/ldk-node-late-failure`. The candidate is `main` at
 `3088c53cbb3f6b609545e93844f3d1eec84cbdea` plus the reviewed release/upgrade
 docs and this security update on `docs/rc15-release-notes-security`. This
-update changes documentation only; versions remain rc14. Rasmus will select
+update changes documentation only; versions remain rc14. The release operator will select
 the final rc15 release commit and tag/sign separately. See the
 [signing checklist](releases/v0.3.0-rc15.md).
 For nodes skipping releases, apply the earlier procedures first, then

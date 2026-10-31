@@ -507,7 +507,7 @@ const ROOM_MEMBERS_SELECT: &str =
 
 // ── HARD-4 complete-set query constants (SQLite) ─────────────────────────
 //
-// Each query below was flagged (HARD-4, Codex red-team on #225) as
+// Each query below was flagged (HARD-4, red-team review on #225) as
 // "untruncated". STEP 0 of HARD-4 is to classify each as AUTHORITY (used by the
 // gate / recovery / fan-out / money-path) vs READ-SURFACE, then enforce: an
 // AUTHORITY query MUST return the COMPLETE set. Adding a bare `LIMIT` to any of
