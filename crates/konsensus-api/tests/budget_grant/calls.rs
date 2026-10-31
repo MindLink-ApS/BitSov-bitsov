@@ -37,6 +37,10 @@ async fn send_request(fx: &Fx, token: &str, price: u64, request: Value) -> (Stat
 }
 
 async fn send_priced(fx: &Fx, token: &str, offer: u64, price: u64, request: Value) -> (StatusCode, Value) {
+    send_priced_with_closing(fx, token, offer, price, 0, request).await
+}
+
+async fn send_priced_with_closing(fx: &Fx, token: &str, offer: u64, price: u64, closing: u64, request: Value) -> (StatusCode, Value) {
     let prices = fx.state.peer_prices.clone();
     let peer = fx.peer;
     let quotes = tokio::spawn(async move {
@@ -44,7 +48,7 @@ async fn send_priced(fx: &Fx, token: &str, offer: u64, price: u64, request: Valu
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             prices.update_kind_price(peer, 400, offer, 850_000).await;
             prices.update_kind_price(peer, 404, price, 850_000).await;
-            prices.update_kind_price(peer, 403, 0, 850_000).await;
+            prices.update_kind_price(peer, 403, closing, 850_000).await;
         }
     });
     let result = fx.call("POST", "/api/v1/messages/compose", Some(request), Some(token)).await;
@@ -737,7 +741,7 @@ async fn approved_messaging_grant_pays_a_call_within_its_pinned_block_ceiling() 
     let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
     // 10 sat per block plus the 5 sat routing ceiling, for ten minutes.
     assert_eq!((hold.per_block_msat, hold.per_block_fee_msat), (10_000, 5_000));
-    assert_eq!(hold.reserved_msat, 151_000);
+    assert_eq!(hold.reserved_msat, 156_000); // 150,000 minutes + 1,000 signal + 5,000 routing
     answer(&fx).await;
     let (status, body) = send_request(&fx, &token, 10_000, ordinary(&fx, 404, 0, None)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1138,12 +1142,16 @@ async fn a_kept_hold_above_the_grants_per_payment_value_ends_the_call() {
 /// Finish the one paid block at the configured cap, then wait for the
 /// best-effort notification's operation to resolve (including nonpayment).
 async fn finish_at_cap(fx: &Fx) {
+    finish_at_cap_priced(fx, 1_000).await;
+}
+
+async fn finish_at_cap_priced(fx: &Fx, price: u64) {
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let mut entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
     entry.paid_until_ms = Some(now);
     entry.deadline_ms = now + 20_000;
     fx.state.storage.call_put(&fx.peer, CALL, &entry).await.unwrap();
-    fx.state.peer_prices.update_kind_price(fx.peer, 403, 1_000, 850_000).await;
+    fx.state.peer_prices.update_kind_price(fx.peer, 403, price, 850_000).await;
     konsensus_api::calls::maintain_calls(&fx.state, now).await.unwrap();
     let pool = sqlx::SqlitePool::connect(fx.tmp.path().join("calls.sqlite").to_str().unwrap()).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(7), async {
@@ -1207,6 +1215,59 @@ async fn cap_hangup_is_reserved_at_admission_and_paid_by_the_calls_grant() {
     let hangups = fx.state.storage.get_node_messages_of_kind(&fx.state.identity.node_id().to_hex(), 403, 10, None).await.unwrap();
     assert_eq!(hangups.len(), 1);
     assert_eq!(hangups[0].payment_proof.amount_msat, 1_000);
+}
+
+#[tokio::test]
+async fn cap_hangup_uses_its_quoted_allowance_and_refuses_a_price_above_it() {
+    for closing_price in [2_000, 3_000] {
+        let (mut fx, token) = prepared().await;
+        fx.state = Arc::new(AppState { max_call_minutes: 1, ..(*fx.state).clone() });
+        let request = json!({
+            "operation_id": uuid::Uuid::new_v4().to_string(), "recipient": fx.peer.to_hex(),
+            "kind": 400, "wait_ack_ms": 0, "max_routing_fee_msat": 500,
+            "plaintext": json!({"v": 1, "call_id": CALL, "sdp": "offer", "media": "audio"}).to_string(),
+        });
+        let (status, body) = send_priced_with_closing(&fx, &token, 1_000, 7_000, 2_000, request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+        assert_eq!(hold.reserved_msat, 10_000); // 7,500 minute + 2,500 closure
+        assert_eq!(fx.used(), 11_000);
+        answer(&fx).await;
+        let (status, body) = send(&fx, &token, 404, 7_000, 0).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        fx.restart();
+        finish_at_cap_priced(&fx, closing_price).await;
+        let expected = if closing_price == 2_000 { (3, 10_000, 9_000) } else { (2, 8_000, 7_000) };
+        let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+        assert_eq!((fx.wallet.money(), fx.wallet.left(), hold.spent_msat), expected);
+        assert_eq!(fx.used(), expected.1);
+        assert!(hold.closed);
+        assert_eq!(hold.remaining_msat, 0);
+    }
+}
+
+#[tokio::test]
+async fn cap_hangup_keeps_routing_allowance_when_only_the_offer_and_block_fit_directly() {
+    let (mut fx, token) = prepared().await;
+    fx.state = Arc::new(AppState { max_call_minutes: 1, ..(*fx.state).clone() });
+    *fx.wallet.channel_peer.lock().unwrap() = Some(invoice_payee());
+    fx.wallet.call_capacity.store(2_000, Ordering::SeqCst);
+    fx.wallet.other_channel_capacity.store(10_000, Ordering::SeqCst);
+    let request = json!({
+        "operation_id": uuid::Uuid::new_v4().to_string(), "recipient": fx.peer.to_hex(),
+        "kind": 400, "wait_ack_ms": 0, "max_routing_fee_msat": 500, "max_hold_msat": 1_000,
+        "plaintext": json!({"v": 1, "call_id": CALL, "sdp": "offer", "media": "audio"}).to_string(),
+    });
+    let (status, body) = send_priced_with_closing(&fx, &token, 1_000, 1_000, 3_000, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+    assert_eq!((hold.reserved_msat, hold.per_block_fee_msat), (4_500, 0));
+    answer(&fx).await;
+    assert_eq!(send(&fx, &token, 404, 1_000, 0).await.0, StatusCode::OK);
+    fx.restart();
+    finish_at_cap_priced(&fx, 3_000).await;
+    assert_eq!((fx.wallet.money(), fx.wallet.left(), fx.used()), (3, 5_000, 5_000));
+    assert_eq!(fx.wallet.fee_limits.lock().unwrap().last(), Some(&500));
 }
 
 #[tokio::test]

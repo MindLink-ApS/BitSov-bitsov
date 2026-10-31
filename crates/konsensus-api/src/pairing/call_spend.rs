@@ -17,6 +17,14 @@ impl PairingService {
         self.lock().file.call_spend_grants.keys().cloned().collect()
     }
 
+    pub(crate) fn call_closing_limits(&self, peer: &str, call_id: &str) -> Option<(u64, u64)> {
+        let inner = self.lock();
+        inner.file.grants.iter().filter_map(|g| g.budget.as_ref())
+            .flat_map(|b| b.call_reservations.values())
+            .find(|call| call.terms.peer == peer && call.terms.call_id == call_id)
+            .map(|call| (call.terms.closing_allowance_msat(), call.terms.closing_fee_msat))
+    }
+
     pub(crate) fn forget_call_spend_grants(&self, keys: &[String]) -> Result<(), PairingError> {
         if keys.is_empty() { return Ok(()) }
         let mut inner = self.lock();
@@ -39,7 +47,7 @@ impl PairingService {
             (grant.client_id.clone(), grant.epoch)
         };
         let [charge] = charges.as_slice() else { return Err(BudgetRefusal::NoGrant) };
-        if charge.recipient != peer || charge.amount_msat > crate::spend_budget::CALL_CLOSING_MSAT {
+        if charge.recipient != peer {
             return Err(BudgetRefusal::NoGrant);
         }
         self.draw_call_spend_for_grant(&client, epoch, peer, call_id, u32::MAX, charge.amount_msat, 0, link, Some(grant_op_id))
@@ -373,6 +381,9 @@ impl PairingService {
         let amount = price
             .checked_add(fee)
             .ok_or(BudgetRefusal::CallPriceChanged)?;
+        if closing_grant.is_some() && amount > call.terms.closing_allowance_msat() {
+            return Err(BudgetRefusal::CallPriceChanged);
+        }
         let remaining = budget
             .pending
             .get_mut(parent)

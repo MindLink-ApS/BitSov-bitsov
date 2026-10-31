@@ -96,8 +96,8 @@ async fn offer_within_consent_accepts_equal_boundaries_and_absent_ceilings() {
     for ceilings in [
         json!({}),
         json!({"max_block_msat": 7000}),
-        json!({"max_hold_msat": 421000}),
-        json!({"max_block_msat": 7000, "max_hold_msat": 451000, "max_routing_fee_msat": 500}),
+        json!({"max_hold_msat": 420000}),
+        json!({"max_block_msat": 7000, "max_hold_msat": 450000, "max_routing_fee_msat": 500}),
     ] {
         let (fx, token) = prepared().await;
         let mut request = offer(&fx);
@@ -106,7 +106,7 @@ async fn offer_within_consent_accepts_equal_boundaries_and_absent_ceilings() {
             .unwrap()
             .extend(ceilings.as_object().unwrap().clone());
         let expected_hold = if ceilings.get("max_routing_fee_msat").is_some() {
-            451_000
+            451_500 // 450,000 minute hold + 1,000 signal + 500 routing
         } else {
             421_000
         };
@@ -125,6 +125,21 @@ async fn offer_within_consent_accepts_equal_boundaries_and_absent_ceilings() {
             (1, 1000, expected_hold + 1000)
         );
     }
+}
+
+#[tokio::test]
+async fn exact_minute_hold_consent_accepts_a_separately_reserved_closing_quote() {
+    let (mut fx, token) = prepared().await;
+    fx.state = Arc::new(AppState { max_call_minutes: 3, ..(*fx.state).clone() });
+    let mut request = offer(&fx);
+    request["max_routing_fee_msat"] = json!(500);
+    // Three minutes at 7,000 + 500; the caller need not know the closing price.
+    request["max_hold_msat"] = json!(22_500);
+    let (status, body) = send_priced_with_closing(&fx, &token, 1_000, 7_000, 2_000, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+    assert_eq!((hold.reserved_msat, hold.spent_msat, hold.closed), (25_000, 0, false));
+    assert_eq!(fx.used(), 26_000);
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 //! Durable accounting for one call and its recoverable block payments.
 use super::*;
-/// Maintenance never pays more than this for a closing signal, with no fee.
+/// Minimum closing reserve; also the legacy owner notification cap.
 pub(crate) const CALL_CLOSING_MSAT: u64 = 1_000;
 // Missing on pre-cap holds: preserve their original four-hour reservation.
 fn legacy_max_call_minutes() -> u16 { 240 }
@@ -15,6 +15,9 @@ pub struct CallSpendTerms {
     #[serde(default = "legacy_max_call_minutes")]
     pub max_call_minutes: u16,
     pub reserved_msat: u64,
+    /// Routing ceiling for the closing signal, pinned at admission.
+    #[serde(default)]
+    pub(crate) closing_fee_msat: u64,
     /// The zero per-block fee was pinned for a direct channel to the payee:
     /// each block is paid only while that channel still carries it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -24,10 +27,20 @@ pub struct CallSpendTerms {
 impl CallSpendTerms {
     /// Keep the closing signal in the same budget/liquidity reservation as
     /// the blocks. Owner calls do not create this grant reservation.
-    pub(crate) fn with_closing_signal(mut self) -> Result<Self, BudgetRefusal> {
-        self.reserved_msat = self.reserved_msat.checked_add(CALL_CLOSING_MSAT)
+    pub(crate) fn with_closing_signal(mut self, price: u64, fee: u64) -> Result<Self, BudgetRefusal> {
+        let closing = price.checked_add(fee)
+            .ok_or_else(|| BudgetRefusal::Unpriced("call reservation overflow".into()))?
+            .max(CALL_CLOSING_MSAT);
+        self.reserved_msat = self.reserved_msat.checked_add(closing)
             .ok_or_else(|| BudgetRefusal::Unpriced("call reservation overflow".into()))?;
+        self.closing_fee_msat = fee;
         Ok(self)
+    }
+
+    pub(crate) fn closing_allowance_msat(&self) -> u64 {
+        let minutes = self.per_block_msat.saturating_add(self.per_block_fee_msat)
+            .saturating_mul(u64::from(self.max_call_minutes));
+        self.reserved_msat.saturating_sub(minutes)
     }
 
     pub fn new(peer: &str, call_id: &str, price: u64, fee: u64, max_call_minutes: u16) -> Result<Self, BudgetRefusal> {
@@ -45,6 +58,7 @@ impl CallSpendTerms {
             per_block_fee_msat: fee,
             max_call_minutes,
             reserved_msat,
+            closing_fee_msat: 0,
             direct: false,
         })
     }

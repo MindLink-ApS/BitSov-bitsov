@@ -3576,6 +3576,7 @@ pub(super) async fn compose_peer(
         // message, and any admission paid before it (`direct_admission_fits`).
         // A call block keeps the fee pinned by its call's hold; an offer's
         // blocks are checked with its hold below.
+        let caller_fee_cap = req.max_routing_fee_msat;
         let direct = req.kind != konsensus_core::kind::KIND_CALL_BLOCK
             && super::caps::direct_channel(&state, &peer_id, &[price_msat]).await
             && direct_admission_fits(&state, &peer_id, first_contact, req.kind).await;
@@ -3629,9 +3630,12 @@ pub(super) async fn compose_peer(
                     }
                     // Widen before comparing: even a u64 quote whose bundle
                     // overflows must produce the caller's typed consent refusal.
-                    let closing = if auth.is_metered() { u128::from(crate::spend_budget::CALL_CLOSING_MSAT) } else { 0 };
-                    let hold = ((u128::from(block_price) + u128::from(fee)) * u128::from(minutes) + closing)
-                        .max(u128::from(existing.as_ref().map_or(0, |hold| hold.reserved_msat)));
+                    // Caller consent covers minutes only. The grant's extra
+                    // closing reserve is outside that consent, also on retry.
+                    let pinned = existing.as_ref().map_or(0, |hold|
+                        (u128::from(hold.per_block_msat) + u128::from(hold.per_block_fee_msat))
+                            * u128::from(hold.max_call_minutes));
+                    let hold = ((u128::from(block_price) + u128::from(fee)) * u128::from(minutes)).max(pinned);
                     if req.max_hold_msat.is_some_and(|cap| hold > u128::from(cap)) {
                         return Err(ApiError::NotDispatched("call reservation exceeds caller consent; nothing was paid".into())
                             .with_reason("call_hold_above_consent"));
@@ -3659,8 +3663,17 @@ pub(super) async fn compose_peer(
                     }
                 }
                 if existing.is_none() {
+                    // Quote closure as an ordinary hangup: the callee's
+                    // payable signal price plus its approved routing ceiling.
+                    let (closing_price, closing_fee) = if auth.is_metered() {
+                        let price = quoted_price(&state, &peer_id, konsensus_core::kind::KIND_CALL_HANGUP, height).await?;
+                        let fee_cap = if caller_fee_cap == Some(0)
+                            || super::caps::direct_channel(&state, &peer_id, &[price]).await { Some(0) }
+                            else { caller_fee_cap };
+                        (price, state.lightning.routing_fee_policy().ceiling(price, fee_cap))
+                    } else { (0, 0) };
                     let terms = crate::spend_budget::CallSpendTerms::new(&peer_id.to_hex(), &signal.call_id, block_price, fee, minutes)
-                        .and_then(|terms| if auth.is_metered() { terms.with_closing_signal() } else { Ok(terms) })
+                        .and_then(|terms| if auth.is_metered() { terms.with_closing_signal(closing_price, closing_fee) } else { Ok(terms) })
                         .map_err(ApiError::BudgetExceeded)?
                         .over_direct_channel(direct && fee == 0);
                     // An offer's hold is reserved with the offer below, in one

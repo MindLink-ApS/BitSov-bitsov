@@ -169,7 +169,7 @@ pub async fn maintain_calls(state: &std::sync::Arc<AppState>, now: u64) -> Resul
         tokio::spawn(async move {
             let _permit = permit;
             let plaintext = serde_json::json!({"v": 1, "call_id": call_id, "reason": reason.as_str()}).to_string();
-            let request = ComposeRequest {
+            let mut request = ComposeRequest {
                 operation_id: Some(uuid::Uuid::new_v4().to_string()), wait_ack_ms: Some(0),
                 max_routing_fee_msat: Some(0), max_total_msat: Some(crate::spend_budget::CALL_CLOSING_MSAT), max_recipient_msat: None,
                 max_block_msat: None, max_hold_msat: None,
@@ -180,6 +180,12 @@ pub async fn maintain_calls(state: &std::sync::Arc<AppState>, now: u64) -> Resul
             // is gone. A refusal leaves the call ended without an owner debit.
             let result = tokio::time::timeout(Duration::from_secs(5), async {
                 let auth = crate::metered::MeteredSpend::call_timeout(&state, &peer, &call_id, reason).await;
+                if auth.is_metered() {
+                    let (allowance, fee) = state.pairing.as_ref()
+                        .and_then(|s| s.call_closing_limits(&peer.to_hex(), &call_id)).unwrap_or((0, 0));
+                    request.max_total_msat = Some(allowance);
+                    request.max_routing_fee_msat = Some(fee);
+                }
                 compose_for(auth, state.clone(), request).await
             }).await;
             if !matches!(result, Ok(Ok(_))) {
