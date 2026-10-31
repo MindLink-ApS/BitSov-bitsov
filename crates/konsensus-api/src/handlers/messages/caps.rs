@@ -51,15 +51,17 @@ pub fn all_in(state: &crate::state::AppState, principal: u64, caller: Option<u64
     principal.checked_add(fee).ok_or_else(|| ApiError::PriceCapExceeded(format!("all-in amount overflow; max_routing_fee_msat={fee}")))
 }
 /// Whether `peer`'s Lightning node is the counterparty of an active channel
-/// whose known outbound capacity covers `price` in one hop. An unknown key or
-/// capacity, a zero price, or a failed channel listing answer false, keeping
-/// the ordinary routing ceiling.
-pub async fn direct_channel(state: &crate::state::AppState, peer: &konsensus_core::types::NodeId, price: u64) -> bool {
-    if price == 0 { return false; }
+/// whose known outbound capacity carries each of `principals` in one hop. They
+/// are paid one after another over that channel, so their sum must fit. An
+/// unknown key or capacity, nothing to pay, or a failed channel listing answer
+/// false, keeping the ordinary routing ceiling.
+pub async fn direct_channel(state: &crate::state::AppState, peer: &konsensus_core::types::NodeId, principals: &[u64]) -> bool {
+    let Some(total) = principals.iter().try_fold(0u64, |sum, p| sum.checked_add(payable(*p))) else { return false };
+    if total == 0 { return false; }
     let Some(key) = state.peer_ln_pubkeys.lock().await.get(peer).cloned() else { return false };
     state.lightning.list_channels().await.is_ok_and(|channels| channels.iter().any(|c| {
         c.active && c.is_channel_ready != Some(false) && c.peer_pubkey.eq_ignore_ascii_case(&key)
-            && c.outbound_capacity_msat.is_some_and(|cap| cap >= payable(price))
+            && c.outbound_capacity_msat.is_some_and(|cap| cap >= total)
     }))
 }
 pub fn check_payment(state: &crate::state::AppState, principal: u64, caller: Option<u64>, cap: Option<u64>) -> Result<u64, ApiError> {

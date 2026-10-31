@@ -523,9 +523,10 @@ impl GrantBudget {
     /// [`Self::reserve_at`] for a call's hold or offer. `per_payment_msat` is
     /// the call's pinned per-block ceiling (block price plus routing fee), the
     /// most any single payment the reservation funds may carry. It replaces
-    /// the per-call maximum, and a relation envelope's per-act maximum is
-    /// checked against it. Budget, recipient budgets and breakers apply as
-    /// for any other reservation.
+    /// the messaging cap, never an owner's own tighter per-payment limit (see
+    /// [`Self::check_call_ceiling`]), and a relation envelope's per-act
+    /// maximum is checked against it. Budget, recipient budgets and breakers
+    /// apply as for any other reservation.
     pub(crate) fn reserve_call_at(
         &mut self,
         charges: &[Charge],
@@ -535,12 +536,37 @@ impl GrantBudget {
         self.reserve_bounded(charges, Some(per_payment_msat), now)
     }
 
+    /// A call's pinned per-block ceiling must fit the owner's own per-payment
+    /// limit. Approval stores `min(requested, MESSAGING_PER_CALL_MAX_MSAT)`,
+    /// so the stored value alone cannot say who chose it: a value exactly
+    /// equal to the messaging cap is read as that imposed clamp and does not
+    /// bind a call (an owner who asked for exactly that amount is treated the
+    /// same way). Any other value, tighter on an approved grant or any
+    /// explicit console value, is the owner's choice and binds every call
+    /// payment. A relation grant derives its stored value from its envelopes;
+    /// its owner's per-payment limit is the envelope's per-act maximum,
+    /// checked by [`Self::check_envelopes`].
+    fn check_call_ceiling(&self, per_payment_msat: u64) -> Result<(), BudgetRefusal> {
+        if self.recipients_only
+            || self.per_call_max_msat == MESSAGING_PER_CALL_MAX_MSAT
+            || per_payment_msat <= self.per_call_max_msat
+        {
+            return Ok(());
+        }
+        Err(BudgetRefusal::PerCall {
+            max_msat: self.per_call_max_msat,
+        })
+    }
+
     fn reserve_bounded(
         &mut self,
         charges: &[Charge],
         per_payment_msat: Option<u64>,
         now: i64,
     ) -> Result<(), BudgetRefusal> {
+        if let Some(ceiling) = per_payment_msat {
+            self.check_call_ceiling(ceiling)?;
+        }
         let mut per_recipient: BTreeMap<&str, u64> = BTreeMap::new();
         for charge in charges {
             let entry = per_recipient.entry(charge.recipient.as_str()).or_insert(0);
@@ -1373,6 +1399,44 @@ mod envelope_tests {
         ));
         r.reserve_call_at(&[charge("aa", 100_000)], 10_000, 50).unwrap();
         assert_eq!(r.used_msat, 100_000);
+    }
+
+    #[test]
+    fn an_owner_chosen_per_payment_limit_binds_a_calls_block_ceiling() {
+        // Approved tighter than the messaging cap: a 10 sat block is refused,
+        // reserving nothing and counting no breaker payment.
+        let mut tight = GrantBudget::from_terms(&GrantTerms::new(200_000).per_call(1_000));
+        assert!(matches!(
+            tight.reserve_call_at(&[charge("aa", 100_000)], 10_000, 0),
+            Err(BudgetRefusal::PerCall { max_msat: 1_000 })
+        ));
+        assert_eq!(tight.used_msat, 0);
+        assert_eq!(tight.breaker_status(0).payments_last_hour, 0);
+        tight.reserve_call_at(&[charge("aa", 10_000)], 1_000, 0).unwrap();
+        // The messaging cap itself is the imposed clamp: it never binds a call.
+        let mut clamp =
+            GrantBudget::from_terms(&GrantTerms::new(200_000).per_call(MESSAGING_PER_CALL_MAX_MSAT));
+        clamp.reserve_call_at(&[charge("aa", 100_000)], 10_000, 0).unwrap();
+        // An explicit console value binds, above the messaging cap too.
+        let mut console = GrantBudget::from_terms(&GrantTerms::new(1_000_000).per_call(8_000));
+        assert!(matches!(
+            console.reserve_call_at(&[charge("aa", 100_000)], 10_000, 0),
+            Err(BudgetRefusal::PerCall { max_msat: 8_000 })
+        ));
+        assert_eq!(console.used_msat, 0);
+        console.reserve_call_at(&[charge("aa", 80_000)], 8_000, 0).unwrap();
+        assert_eq!(console.used_msat, 80_000);
+        // A relation grant is bounded by its envelope's per-act maximum.
+        let mut r = GrantBudget::relations();
+        r.open_envelope("aa", 5_000, 4_000, 100);
+        assert_eq!(r.per_call_max_msat, 5_000);
+        assert!(matches!(
+            r.reserve_call_at(&[charge("aa", 4_001)], 4_001, 50),
+            Err(BudgetRefusal::PerCall { max_msat: 4_000 })
+        ));
+        assert_eq!(r.used_msat, 0);
+        r.reserve_call_at(&[charge("aa", 4_000)], 4_000, 50).unwrap();
+        assert_eq!(r.used_msat, 4_000);
     }
 }
 

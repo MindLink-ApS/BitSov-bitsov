@@ -278,6 +278,9 @@ pub struct Debit {
     operation: Option<crate::handlers::messages::operations::Operation>,
     held: Option<(Arc<PairingService>, Reservation)>,
     max_routing_fee_msat: Option<u64>,
+    /// The zero routing ceiling was pinned because the payee is a direct
+    /// channel peer: every payment under it must fit that channel.
+    direct: bool,
     call_block: Option<(konsensus_core::NodeId, String)>,
     call_offer: Option<(konsensus_core::NodeId, String)>,
     call_spend: Option<(String, String)>,
@@ -364,6 +367,12 @@ impl Debit {
         self.max_routing_fee_msat = limit;
         self
     }
+    pub(crate) fn with_direct_channel(mut self, direct: bool) -> Self {
+        self.direct = direct;
+        self
+    }
+    /// Whether the zero routing ceiling relies on a direct channel.
+    pub(crate) fn is_direct(&self) -> bool { self.direct }
     pub(crate) fn fee_limit(&self, state: &AppState, principal: u64) -> u64 {
         state.lightning.routing_fee_policy().ceiling(principal, self.max_routing_fee_msat)
     }
@@ -382,12 +391,12 @@ impl Debit {
 
     /// Owner-only paths have no grant to revalidate.
     pub(crate) fn unmetered() -> Self {
-        Self { operation: None, max_routing_fee_msat: None, call_block: None, call_offer: None, call_spend: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
+        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_spend: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
     }
 
     fn reserved(service: Arc<PairingService>, reservation: Reservation) -> Self {
         let total = reservation.charges.iter().map(|c| c.amount_msat).sum();
-        Self { operation: None, max_routing_fee_msat: None, call_block: None, call_offer: None, call_spend: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
+        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_spend: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
     }
 
     /// Whether this debit is held against a budget grant.
@@ -423,7 +432,7 @@ impl Debit {
         admission_all_in: u64,
     ) -> Result<Debit, ApiError> {
         let Some((service, reservation)) = &self.held else {
-            return Ok(Debit::unmetered().with_fee_limit(self.max_routing_fee_msat));
+            return Ok(Debit::unmetered().with_fee_limit(self.max_routing_fee_msat).with_direct_channel(self.direct));
         };
         let mut call_total = self.call_reserved_msat.lock().unwrap_or_else(|e| e.into_inner());
         let (new_total, admission) = service
@@ -437,7 +446,7 @@ impl Debit {
             )
             .map_err(ApiError::BudgetExceeded)?;
         *call_total = new_total; // checked against the grant limit under its ledger lock
-        Ok(Debit::reserved(Arc::clone(service), admission).with_fee_limit(self.max_routing_fee_msat))
+        Ok(Debit::reserved(Arc::clone(service), admission).with_fee_limit(self.max_routing_fee_msat).with_direct_channel(self.direct))
     }
 
     /// Reconciliation reference only; never restores dispatch authority.

@@ -107,6 +107,8 @@ struct LosingWallet {
     lose_next: AtomicBool,
     /// Lightning key of a peer with a usable direct channel, if any.
     direct_to: std::sync::Mutex<Option<String>>,
+    /// Outbound capacity of that channel, msat; zero means the whole balance.
+    direct_capacity: AtomicU64,
     /// Every routing-fee limit an invoice was paid under, in order.
     fee_limits: std::sync::Mutex<Vec<u64>>,
 }
@@ -136,11 +138,12 @@ impl LightningProvider for LosingWallet {
     }
     async fn list_channels(&self) -> Result<Vec<konsensus_core::traits::lightning::ChannelInfo>, LightningError> {
         let peer = self.direct_to.lock().unwrap().clone();
+        let capacity = match self.direct_capacity.load(Ordering::SeqCst) { 0 => START_MSAT, c => c };
         Ok(peer.into_iter().map(|peer_pubkey| konsensus_core::traits::lightning::ChannelInfo {
             is_outbound: Some(true), is_announced: Some(false), is_channel_ready: Some(true),
             local_reserve_msat: Some(0), initial_push_msat: None, channel_id: "direct".into(),
-            user_channel_id: None, funding_txo: None, peer_pubkey, capacity_msat: START_MSAT,
-            local_balance_msat: START_MSAT, outbound_capacity_msat: Some(START_MSAT),
+            user_channel_id: None, funding_txo: None, peer_pubkey, capacity_msat: capacity,
+            local_balance_msat: capacity, outbound_capacity_msat: Some(capacity),
             remote_balance_msat: 0, active: true, short_channel_id: None,
         }).collect())
     }
@@ -191,7 +194,8 @@ impl Probe {
         });
         let wallet = Arc::new(LosingWallet {
             inner: payer.clone(), lose_next: AtomicBool::new(false),
-            direct_to: Default::default(), fee_limits: Default::default(),
+            direct_to: Default::default(), direct_capacity: AtomicU64::new(0),
+            fee_limits: Default::default(),
         });
         fx.state = Arc::new(AppState { transport: contact.clone(), lightning: wallet.clone(), ..(*fx.state).clone() });
         fx.peer = peer;
@@ -355,4 +359,29 @@ async fn readmission_without_a_direct_channel_keeps_the_routing_ceiling() {
     let (status, body) = send_quoted(&p, &quote).await;
     assert_budget_exceeded(status, &body, "per_call");
     assert_eq!(p.spent().await, 0, "{body}");
+}
+
+#[tokio::test]
+async fn direct_readmission_needs_the_channel_to_carry_admission_and_message() {
+    // The owner's own key: a routed re-admission is not held to a messaging cap.
+    let p = Probe::new(false).await;
+    p.contact.price.store(1_000, Ordering::SeqCst);
+    p.fx.state.peer_prices.update_kind_price(p.contact.peer, 0, 1_000, 850_000).await;
+    let key = contact_ln(&p).await;
+    p.fx.state.peer_ln_pubkeys.lock().await.insert(p.contact.peer, key.clone());
+    *p.wallet.direct_to.lock().unwrap() = Some(key);
+    // The channel carries the 1 sat message alone, not admission before it.
+    p.wallet.direct_capacity.store(1_500, Ordering::SeqCst);
+    let (status, body) = p.compose_with_fee("admitted again", 12_000, None).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["reason"], "direct_channel_insufficient", "{body}");
+    assert_eq!(p.spent().await, 0, "nothing paid: {body}");
+    assert!(p.wallet.fee_limits.lock().unwrap().is_empty());
+    // The refused quote is kept: the quote and the send under it are routed.
+    let quote = readmission_quote(&p).await;
+    assert_eq!((quote["max_routing_fee_msat"].as_u64(), quote["total_msat"].as_u64()), (Some(10_000), Some(12_000)));
+    let (status, body) = send_quoted(&p, &quote).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(p.spent().await, 2_000, "{body}");
+    assert_eq!(*p.wallet.fee_limits.lock().unwrap(), vec![5_000, 5_000]);
 }

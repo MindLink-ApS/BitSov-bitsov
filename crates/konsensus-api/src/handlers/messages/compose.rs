@@ -2357,11 +2357,30 @@ pub(super) async fn first_contact_quote(
 
 /// Admission plus message, each with its routing ceiling: zero when the
 /// contact is a usable direct channel for both together. A send capped at this
-/// total applies the same rule (see `compose_peer`), so it pays what was quoted.
+/// total applies the same rule (see `direct_admission_fits`), so it pays what was quoted.
 async fn quote_total(state: &AppState, peer: &NodeId, admission: u64, message: u64) -> Result<u64, ApiError> {
-    let direct = super::caps::direct_channel(state, peer, admission.saturating_add(message)).await;
+    let direct = super::caps::direct_channel(state, peer, &[admission, message]).await;
     let fee = direct.then_some(0);
     super::caps::first_contact_total(super::caps::all_in(state, admission, fee)?, super::caps::all_in(state, message, fee)?, None)
+}
+
+/// A send whose message fits a direct channel may first pay an admission: it
+/// is due on a first contact and may be due on a chat to a contact. When that
+/// admission's signed quote is already held for this connection, the channel
+/// must carry the quote's admission and message, paid one after the other.
+/// An admission quoted only during the send is checked once known
+/// (`first_contact_admission_at`). The caller's cap is enforced separately.
+async fn direct_admission_fits(state: &AppState, peer: &NodeId, first_contact: bool, kind: u16) -> bool {
+    if !first_contact && kind != konsensus_core::kind::KIND_CHAT {
+        return true;
+    }
+    let generation = state.transport.connected_since(peer).await;
+    let Some((request_id, response)) = peek_cached_quote(peer, generation) else { return true };
+    match validate_admission_invoice(state, peer, &request_id, &response).await {
+        Ok(quote) => super::caps::direct_channel(state, peer, &[quote.admission_msat, quote.message_price]).await,
+        // Not payable as held: the send asks for a fresh quote, checked then.
+        Err(_) => true,
+    }
 }
 
 async fn reconcile_admission_budget(
@@ -2787,6 +2806,20 @@ async fn first_contact_admission_at(
              send again under a cap that fits.",
             admission_all_in.saturating_add(message_all_in), cap.unwrap_or(ADMISSION_MAX_MSAT),
         )).with_reason(READMISSION_REQUIRED));
+    }
+    // A zero routing ceiling pinned for a direct channel holds only if that
+    // channel carries this admission and the message after it. Refuse before
+    // anything is reserved or paid, and keep this quote: a send that finds it
+    // held classifies by it (`direct_admission_fits`) and is routed within its cap.
+    if debit.is_direct() && !super::caps::direct_channel(state, peer_id, &[admission_msat, message_price]).await {
+        state.transport.reconnect_for(peer_id,
+            Duration::from_secs(expires_at_unix.saturating_sub(now_unix()))).await;
+        cache_quote(*peer_id, request_id, response, expires_at_unix, quote_generation);
+        return Err(ApiError::NotDispatched(format!(
+            "{peer_id} asks {admission_msat} msat for admission plus {message_price} msat for this \
+             message, more than the direct channel to it carries; no invoice was paid. Send again \
+             to pay over a routed path within your cap."
+        )).with_reason("direct_channel_insufficient"));
     }
     // The admission fee ceiling is recorded only at the wallet dispatch boundary
     // below (#127 follow-up): generation checks and grant reservation can still
@@ -3539,12 +3572,14 @@ pub(super) async fn compose_peer(
         // A payee at the far end of a usable direct channel is paid in one hop,
         // which owes no routing fee. The zero ceiling also bounds the payment,
         // so it can never fall back to a fee-paying route. The channel must
-        // also carry a confirmed cap, which covers any admission this send
-        // pays, as a first-contact quote checks admission plus message. A call
-        // block keeps the fee pinned by its call's hold.
-        if req.kind != konsensus_core::kind::KIND_CALL_BLOCK
-            && super::caps::direct_channel(&state, &peer_id, price_msat.max(cap.unwrap_or(0))).await
-        {
+        // carry the exact principals this send dispatches, not its cap: the
+        // message, and any admission paid before it (`direct_admission_fits`).
+        // A call block keeps the fee pinned by its call's hold; an offer's
+        // blocks are checked with its hold below.
+        let direct = req.kind != konsensus_core::kind::KIND_CALL_BLOCK
+            && super::caps::direct_channel(&state, &peer_id, &[price_msat]).await
+            && direct_admission_fits(&state, &peer_id, first_contact, req.kind).await;
+        if direct {
             req.max_routing_fee_msat = Some(0);
         }
         if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
@@ -3563,6 +3598,16 @@ pub(super) async fn compose_peer(
             if existing.is_none() || offer_consent {
                 let block_price = if req.kind == konsensus_core::kind::KIND_CALL_BLOCK { price_msat }
                     else { super::caps::payable(crate::calls::peer_call_kind_price(&state, &peer_id, konsensus_core::kind::KIND_CALL_BLOCK).await?) };
+                // The offer's zero fee would be pinned for every block. Each
+                // block goes over the same channel after the offer, so it must
+                // fit there too; otherwise refuse before any hold or payment.
+                if direct && req.kind == konsensus_core::kind::KIND_CALL_INVITE
+                    && !super::caps::direct_channel(&state, &peer_id, &[price_msat, block_price]).await
+                {
+                    return Err(ApiError::NotDispatched(
+                        "the direct channel to this contact carries the call offer but not its per-block payment; nothing was paid".into(),
+                    ).with_reason("call_block_not_direct"));
+                }
                 let fee = state.lightning.routing_fee_policy().ceiling(block_price, req.max_routing_fee_msat);
                 let minutes = crate::calls::call_max_minutes(&state, &peer_id, &signal.call_id);
                 // Check before any ledger reservation or offer payment. A retry
@@ -3632,7 +3677,8 @@ pub(super) async fn compose_peer(
             } else { auth.debit_operation(&state, charges, confirmation, cap, &operation) }
         }
             .map_err(|e| e.with_routing_fee(state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat)))?
-            .with_fee_limit(req.max_routing_fee_msat);
+            .with_fee_limit(req.max_routing_fee_msat)
+            .with_direct_channel(direct);
         let debit = debit.with_operation(operation.clone());
         let debit = if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
             debit.for_call_block(peer_id, req.plaintext.clone())

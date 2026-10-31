@@ -4,7 +4,12 @@ use konsensus_api::pairing::device;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
 pub(super) async fn messaging_fixture(relation: bool, requested_cap: u64) -> (Fx, String) {
-    let mut fx = fixture().await;
+    messaging_grant(fixture().await, relation, requested_cap).await
+}
+
+/// An owner-approved grant (or, with `relation`, a relation envelope for
+/// `fx.peer`) on an existing fixture; returns a token that carries it.
+pub(super) async fn messaging_grant(mut fx: Fx, relation: bool, requested_cap: u64) -> (Fx, String) {
     let root = konsensus_core::OwnerApprovalKey::from_mnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
         "", &[9; 32],
@@ -422,4 +427,32 @@ async fn direct_channel_payment_never_falls_back_to_a_fee_paying_route() {
     assert_eq!(fx.wallet.left(), 0);
     let limits = fx.wallet.fee_limits.lock().unwrap().clone();
     assert!(!limits.is_empty() && limits.iter().all(|limit| *limit == 0), "{limits:?}");
+}
+
+#[tokio::test]
+async fn direct_channel_is_judged_by_the_payment_not_the_cap() {
+    let (fx, token) = messaging_fixture(false, 20_000).await;
+    fx.state
+        .peer_prices
+        .update_kind_price(fx.peer, 100, 2_000, 850_000)
+        .await;
+    // The 2 sat payment fits the 5 sat channel; the 6 sat cap would not.
+    fx.wallet.call_capacity.store(5_000, Ordering::SeqCst);
+    let body = json!({"recipient": fx.peer.to_hex(), "kind": 100, "plaintext": "hi",
+        "max_total_msat": 6_000, "max_routing_fee_msat": null});
+    let (status, result) = fx
+        .call("POST", "/api/v1/messages/compose", Some(body.clone()), Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["max_routing_fee_msat"], 0);
+    assert_eq!((fx.wallet.left(), fx.used()), (2_000, 2_000));
+    assert_eq!(*fx.wallet.fee_limits.lock().unwrap(), vec![0]);
+    // The cap is still enforced on its own.
+    let mut capped = body;
+    capped["max_total_msat"] = json!(1_999);
+    let (status, result) = fx
+        .call("POST", "/api/v1/messages/compose", Some(capped), Some(&token))
+        .await;
+    assert_ne!(status, StatusCode::OK, "{result}");
+    assert_eq!((fx.wallet.left(), fx.used()), (2_000, 2_000));
 }
