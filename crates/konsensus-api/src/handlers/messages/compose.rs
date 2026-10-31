@@ -3617,6 +3617,21 @@ pub(super) async fn compose_peer(
             debit.released(&peer_key);
             return Err(error);
         }
+        if matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_ANSWER) {
+            if let Some(service) = state.pairing.as_ref() {
+                let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                let request_hash = super::operations::request_digest(&peer_id, &req)?;
+                // This follows the operation's caller check and precedes every
+                // payment dispatch. Recovery may promote only this exact proof.
+                if let Err(error) = service.remember_call_client(auth.user.pairing.as_ref(), &peer_key,
+                    &signal.call_id, &operation.id, &request_hash)
+                {
+                    debit.released(&peer_key);
+                    return Err(ApiError::Storage(error.to_string()));
+                }
+            }
+        }
         let result = async {
 
         // Encrypt via Double Ratchet.
@@ -3759,7 +3774,7 @@ pub(super) async fn compose_peer(
         if crate::calls::is_call_kind(req.kind) {
             // Paid: publish the call transition before the envelope goes out.
             let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
-            crate::calls::commit_outgoing(state.storage.as_ref(), &peer_id, &req.plaintext, &operation.id, &request_hash).await
+            crate::calls::commit_outgoing_for(&state, &auth.user, &peer_id, &req.plaintext, &operation.id, &request_hash).await
                 .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("paid call transition failed: {e}") })?;
         }
         let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;

@@ -126,7 +126,7 @@ async fn frames_for_unknown_calls_or_from_non_counterparties_are_dropped_without
     // Nothing attached yet: every frame is an unknown call.
     assert_eq!(f.router.inbound(event(peer(), CALL, 1, true)).await, Err(MediaDrop::UnknownCall));
 
-    let attachment = f.router.attach(&peer(), CALL).await.unwrap();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
     assert_eq!(f.router.inbound(event(peer(), OTHER_CALL, 1, true)).await, Err(MediaDrop::UnknownCall));
     assert_eq!(f.router.inbound(event(stranger(), CALL, 1, true)).await, Err(MediaDrop::UnknownCall));
     assert_eq!(f.router.inbound(event(peer(), CALL, 1, false)).await, Err(MediaDrop::Unprivileged));
@@ -148,10 +148,10 @@ async fn same_call_id_routes_independently_for_each_peer() {
     let f = fixture();
     f.link.connected.lock().unwrap().insert(stranger());
     f.admission.admit(stranger(), CALL);
-    let first = f.router.attach(&peer(), CALL).await.unwrap();
-    let second = f.router.attach(&stranger(), CALL).await.expect("distinct peer, distinct route");
+    let first = f.router.attach(&peer(), CALL, None).await.unwrap();
+    let second = f.router.attach(&stranger(), CALL, None).await.expect("distinct peer, distinct route");
     assert_eq!(f.router.routed_calls(), 2);
-    assert_eq!(f.router.attach(&stranger(), CALL).await.err(), Some(AttachRefusal::AlreadyAttached));
+    assert_eq!(f.router.attach(&stranger(), CALL, None).await.err(), Some(AttachRefusal::AlreadyAttached));
     f.router.inbound(event(peer(), CALL, 11, true)).await.unwrap();
     f.router.inbound(event(stranger(), CALL, 22, true)).await.unwrap();
     assert_eq!(first.from_node.try_pop().unwrap().seq, 11);
@@ -162,7 +162,7 @@ async fn same_call_id_routes_independently_for_each_peer() {
     assert!(!second.from_node.is_closed());
     f.router.inbound(event(stranger(), CALL, 23, true)).await.unwrap();
     assert_eq!(second.from_node.try_pop().unwrap().seq, 23);
-    let replacement = f.router.attach(&peer(), CALL).await.unwrap();
+    let replacement = f.router.attach(&peer(), CALL, None).await.unwrap();
     drop(second);
     assert_eq!(f.router.routed_calls(), 1);
     assert!(!replacement.from_node.is_closed());
@@ -173,30 +173,30 @@ async fn same_call_id_routes_independently_for_each_peer() {
 #[tokio::test]
 async fn attach_requires_an_admitted_call_and_a_media_capable_peer_once() {
     let f = fixture();
-    assert_eq!(f.router.attach(&peer(), OTHER_CALL).await.err(), Some(AttachRefusal::NotAdmitted));
-    assert_eq!(f.router.attach(&stranger(), CALL).await.err(), Some(AttachRefusal::NotAdmitted));
-    assert_eq!(f.router.attach(&peer(), "not-a-call-id").await.err(), Some(AttachRefusal::NotAdmitted));
+    assert_eq!(f.router.attach(&peer(), OTHER_CALL, None).await.err(), Some(AttachRefusal::NotAdmitted));
+    assert_eq!(f.router.attach(&stranger(), CALL, None).await.err(), Some(AttachRefusal::NotAdmitted));
+    assert_eq!(f.router.attach(&peer(), "not-a-call-id", None).await.err(), Some(AttachRefusal::NotAdmitted));
 
     // Admitted, but the peer is not connected (or runs an older node).
     f.admission.admit(stranger(), CALL);
-    assert_eq!(f.router.attach(&stranger(), CALL).await.err(), Some(AttachRefusal::Unavailable));
+    assert_eq!(f.router.attach(&stranger(), CALL, None).await.err(), Some(AttachRefusal::Unavailable));
 
-    let first = f.router.attach(&peer(), CALL).await.unwrap();
+    let first = f.router.attach(&peer(), CALL, None).await.unwrap();
     assert_eq!(first.peer, peer());
-    assert_eq!(f.router.attach(&peer(), CALL).await.err(), Some(AttachRefusal::AlreadyAttached));
+    assert_eq!(f.router.attach(&peer(), CALL, None).await.err(), Some(AttachRefusal::AlreadyAttached));
     assert_eq!(f.router.routed_calls(), 1);
 
     // Dropping the socket's attachment frees the call for the next socket.
     drop(first);
     assert_eq!(f.router.routed_calls(), 0);
-    let second = f.router.attach(&peer(), CALL).await.unwrap();
+    let second = f.router.attach(&peer(), CALL, None).await.unwrap();
     assert!(!second.from_node.is_closed());
 }
 
 #[tokio::test]
 async fn media_stops_once_the_call_is_no_longer_admitted() {
     let f = fixture();
-    let attachment = f.router.attach(&peer(), CALL).await.unwrap();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
     f.router.inbound(event(peer(), CALL, 1, true)).await.unwrap();
 
     // Admission is revoked; the timer releases the route without another packet.
@@ -246,7 +246,7 @@ fn rate_cap_bounds_frames_and_bytes_per_second() {
 #[tokio::test]
 async fn inbound_frames_over_the_cap_are_dropped() {
     let f = fixture();
-    let attachment = f.router.attach(&peer(), CALL).await.unwrap();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
     for seq in 0..MAX_FRAMES_PER_SECOND {
         f.router.inbound(event(peer(), CALL, seq, true)).await.unwrap();
     }
@@ -260,7 +260,7 @@ async fn inbound_frames_over_the_cap_are_dropped() {
 #[tokio::test]
 async fn to_app_queue_drops_the_oldest_audio_rather_than_block() {
     let f = fixture();
-    let attachment = f.router.attach(&peer(), CALL).await.unwrap();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
     let total = MEDIA_QUEUE_FRAMES as u32 + 8;
     for seq in 0..total {
         f.router.inbound(event(peer(), CALL, seq, true)).await.unwrap();
@@ -275,7 +275,7 @@ async fn to_app_queue_drops_the_oldest_audio_rather_than_block() {
 #[tokio::test]
 async fn app_packets_go_to_the_peer_as_call_media_frames_in_order() {
     let f = fixture();
-    let attachment = f.router.attach(&peer(), CALL).await.unwrap();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
     for seq in 1..=10u32 {
         attachment.to_node.push(MediaFrame { seq, payload: vec![seq as u8; 100] }).unwrap();
     }
@@ -326,7 +326,7 @@ async fn inbound_loop_routes_transport_events_until_shutdown() {
     *f.link.inbound.lock().unwrap() = Some(rx);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let worker = f.router.spawn(shutdown_rx);
-    let attachment = f.router.attach(&peer(), CALL).await.unwrap();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
 
     tx.send(event(peer(), CALL, 5, true)).await.unwrap();
     tx.send(event(stranger(), CALL, 6, true)).await.unwrap();
@@ -370,7 +370,7 @@ async fn production_admission_requires_paid_live_blocks_and_fails_closed() {
 #[tokio::test]
 async fn idle_route_is_released_without_another_media_packet() {
     let f = fixture();
-    let attachment = f.router.attach(&peer(), CALL).await.unwrap();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
     f.admission.revoke(peer(), CALL);
     tokio::time::timeout(Duration::from_millis(1600), async {
         while f.router.routed_calls() != 0 {
@@ -384,7 +384,7 @@ async fn idle_route_is_released_without_another_media_packet() {
 async fn ended_call_releases_even_while_peer_write_is_stalled() {
     let f = fixture();
     f.link.stalled.store(true, std::sync::atomic::Ordering::SeqCst);
-    let attachment = f.router.attach(&peer(), CALL).await.unwrap();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
     attachment.to_node.push(MediaFrame { seq: 1, payload: vec![1] }).unwrap();
     tokio::time::timeout(Duration::from_secs(1), f.link.sending.notified()).await.unwrap();
     f.admission.revoke(peer(), CALL);
@@ -406,9 +406,41 @@ async fn idle_paid_route_expires_after_grace_without_media() {
     }).await.unwrap();
     let f = fixture();
     let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store)));
-    let attachment = router.attach(&peer(), CALL).await.unwrap();
+    let attachment = router.attach(&peer(), CALL, None).await.unwrap();
     tokio::time::timeout(Duration::from_millis(1600), async {
         while router.routed_calls() != 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
     }).await.expect("paid expiry was not rechecked without media");
     assert!(attachment.from_node.is_closed() && attachment.to_node.is_closed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_attachment_gives_way_and_its_late_drop_preserves_the_replacement() {
+    let f = fixture();
+    let client = konsensus_api::auth::PairingBinding {
+        client_id: "call-client".into(), epoch: 1, fingerprint: "identity".into(),
+    };
+    let other = konsensus_api::auth::PairingBinding { client_id: "other-client".into(), ..client.clone() };
+    let old = f.router.attach(&peer(), CALL, Some(&client)).await.unwrap();
+    tokio::time::advance(Duration::from_secs(16)).await;
+    assert_eq!(f.router.attach(&peer(), CALL, Some(&other)).await.err(), Some(AttachRefusal::AlreadyAttached));
+    assert!(!old.to_node.is_closed(), "another client must never retire this route");
+    let replacement = f.router.attach(&peer(), CALL, Some(&client)).await
+        .expect("a stale socket must give way to its client's reattach");
+    assert!(old.to_node.is_closed() && old.from_node.is_closed());
+    drop(old);
+    assert_eq!(f.router.routed_calls(), 1);
+    f.router.inbound(event(peer(), CALL, 90, true)).await.unwrap();
+    assert_eq!(replacement.from_node.pop().await.unwrap().seq, 90);
+}
+
+#[tokio::test(start_paused = true)]
+async fn received_pong_or_read_keeps_an_attachment_live() {
+    let f = fixture();
+    let first = f.router.attach(&peer(), CALL, None).await.unwrap();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    first.activity.received();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert_eq!(f.router.attach(&peer(), CALL, None).await.err(), Some(AttachRefusal::AlreadyAttached));
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert!(f.router.attach(&peer(), CALL, None).await.is_ok());
 }

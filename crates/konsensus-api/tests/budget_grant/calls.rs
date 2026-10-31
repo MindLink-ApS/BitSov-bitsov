@@ -665,3 +665,29 @@ async fn recovered_failure_cannot_repay_when_call_cleanup_write_fails() {
 mod consent;
 #[path = "calls_settlement.rs"]
 mod settlement;
+
+#[tokio::test]
+async fn an_answer_recovered_after_an_ambiguous_payment_keeps_its_media_client() {
+    let (mut fx, token) = prepared().await;
+    fx.state.peer_ln_pubkeys.lock().await.remove(&fx.peer);
+    fx.state = Arc::new(AppState { plaintext_cipher: Some(Arc::new(
+        konsensus_crypto::PlaintextCacheCipher::new(&[7; 32]))), ..(*fx.state).clone() });
+    konsensus_api::calls::admit_incoming(fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, 400,
+        Some(&json!({"v":1,"call_id":CALL,"sdp":"offer","media":"audio"}).to_string())).await.unwrap();
+    fx.wallet.set(UNKNOWN);
+    let (status, body) = send_request(&fx, &token, 7000, json!({
+        "operation_id": uuid::Uuid::new_v4().to_string(), "recipient": fx.peer.to_hex(), "kind": 401,
+        "plaintext": json!({"v":1,"call_id":CALL,"sdp":"answer"}).to_string(),
+        "max_routing_fee_msat": 0, "wait_ack_ms": 0,
+    })).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.wallet.money(), 1, "{body}");
+    let claims = konsensus_api::auth::validate_token(&token, &fx.state.jwt_secret).unwrap();
+    let binding = konsensus_api::auth::PairingBinding::from_claims(&claims).unwrap().unwrap();
+    assert!(!fx.service.owns_call_media(&binding, &fx.peer.to_hex(), CALL));
+    fx.wallet.set(SETTLE);
+    fx.wallet.recover_preimage.store(true, Ordering::SeqCst);
+    konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+    assert_eq!(fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap().phase, Phase::Live);
+    assert!(fx.service.owns_call_media(&binding, &fx.peer.to_hex(), CALL), "settlement lost the original answerer's binding");
+}

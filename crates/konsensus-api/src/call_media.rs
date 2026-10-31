@@ -9,9 +9,9 @@
 //! into a `Frame::CallMedia` on the Noise link to the peer, and delivers the
 //! peer's packets back on the same socket in the same form.
 //!
-//! The socket is owner-scoped (the token's subject is this node), bound to a
-//! live pairing (a paired device, re-checked while the socket is open) and
-//! needs `spend`: the scope that places and answers paid calls. It opens only
+//! The socket needs this node's `spend` authority. Paired tokens are bound to
+//! the client that placed or answered the call, re-checked while it is open.
+//! The node owner's own authority can also attach. It opens only
 //! while the router admits media for `(peer, call_id)`; the router closes it
 //! once the call is no longer admitted.
 //!
@@ -202,6 +202,39 @@ pub enum AttachRefusal {
     Unavailable,
 }
 
+/// Maximum silence from the app, including WebSocket pongs. Outbound audio
+/// cannot extend this deadline; a lost app must release its call's only slot.
+pub const SOCKET_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Shared socket liveness, so reattachment can retire a stale route even if
+/// the old handler has not yet run its deadline task.
+pub struct MediaActivity(Mutex<tokio::time::Instant>);
+
+impl MediaActivity {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(tokio::time::Instant::now())))
+    }
+
+    pub fn received(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = tokio::time::Instant::now();
+    }
+
+    pub fn deadline(&self) -> tokio::time::Instant {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) + SOCKET_READ_DEADLINE
+    }
+
+    pub fn is_stale(&self) -> bool {
+        tokio::time::Instant::now() >= self.deadline()
+    }
+
+    async fn expired(&self) {
+        loop {
+            tokio::time::sleep_until(self.deadline()).await;
+            if self.is_stale() { return; }
+        }
+    }
+}
+
 /// An app socket's two ends of one call, handed out by [`CallMediaPort::attach`].
 /// Dropping it detaches the socket from the router.
 pub struct MediaAttachment {
@@ -211,6 +244,7 @@ pub struct MediaAttachment {
     pub to_node: Arc<MediaQueue>,
     /// Packets from the peer, for the socket to deliver to the app.
     pub from_node: Arc<MediaQueue>,
+    pub activity: Arc<MediaActivity>,
     release: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -220,9 +254,10 @@ impl MediaAttachment {
         peer: NodeId,
         to_node: Arc<MediaQueue>,
         from_node: Arc<MediaQueue>,
+        activity: Arc<MediaActivity>,
         release: impl FnOnce() + Send + 'static,
     ) -> Self {
-        Self { peer, to_node, from_node, release: Some(Box::new(release)) }
+        Self { peer, to_node, from_node, activity, release: Some(Box::new(release)) }
     }
 }
 
@@ -240,9 +275,10 @@ impl Drop for MediaAttachment {
 /// admitted call.
 #[async_trait]
 pub trait CallMediaPort: Send + Sync {
-    /// Attach the owner's socket to call `call_id` with `peer`, if the call
-    /// is admitted for media right now.
-    async fn attach(&self, peer: &NodeId, call_id: &str) -> Result<MediaAttachment, AttachRefusal>;
+    /// The API verifies that `client` owns the call before attaching. `None`
+    /// represents node-owner authority. Only the same client may replace a
+    /// stale attachment; live attachments keep their single slot.
+    async fn attach(&self, peer: &NodeId, call_id: &str, client: Option<&auth::PairingBinding>) -> Result<MediaAttachment, AttachRefusal>;
 }
 
 /// Query parameters of the media socket.
@@ -277,13 +313,10 @@ async fn media_handler(
             return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
     };
-    // Bound to the paired device: a token without a live pairing binding
-    // (the owner's own key, a loopback token) does not open media.
-    match auth::check_pairing_binding(&state, &claims) {
-        Ok(Some(_)) => {}
-        Ok(None) => return (StatusCode::FORBIDDEN, "paired device required").into_response(),
+    let client = match auth::check_pairing_binding(&state, &claims) {
+        Ok(client) => client,
         Err(_) => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-    }
+    };
     if !claims.scp.contains(&auth::Scope::Spend) {
         warn!(node_id = %claims.sub, "call media socket refused: token lacks the spend scope");
         return (StatusCode::FORBIDDEN, "token lacks required scope: spend").into_response();
@@ -297,10 +330,13 @@ async fn media_handler(
     let Some(peer) = params.peer.as_deref().and_then(|p| NodeId::from_hex(p).ok()) else {
         return (StatusCode::BAD_REQUEST, "invalid peer id").into_response();
     };
+    if !stream_authorized(&state, &claims, &peer, &call_id) {
+        return (StatusCode::FORBIDDEN, "call media belongs to another client").into_response();
+    }
     let Some(port) = state.call_media.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "call media is not available on this node").into_response();
     };
-    let attachment = match port.attach(&peer, &call_id).await {
+    let attachment = match port.attach(&peer, &call_id, client.as_ref()).await {
         Ok(attachment) => attachment,
         Err(AttachRefusal::NotAdmitted) => {
             debug!(peer = %peer, "call media socket refused: call not admitted");
@@ -317,12 +353,12 @@ async fn media_handler(
     ws.max_message_size(SEQ_HEADER_BYTES + MAX_MEDIA_PAYLOAD_BYTES)
         .max_frame_size(SEQ_HEADER_BYTES + MAX_MEDIA_PAYLOAD_BYTES)
         .protocols([crate::ws::WS_PROTOCOL])
-        .on_upgrade(move |socket| handle_media(socket, state, claims, attachment))
+        .on_upgrade(move |socket| handle_media(socket, state, claims, call_id, attachment))
         .into_response()
 }
 
-/// Keepalive ping interval, as on `/api/v1/ws`.
-const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(45);
+/// Probe idle apps often enough to receive a pong before the read deadline.
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How often the token and pairing are re-checked while the socket is open.
 const AUTH_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -363,7 +399,7 @@ async fn socket_send(socket: &mut WebSocket, message: Message) -> bool {
     matches!(tokio::time::timeout(SOCKET_WRITE_DEADLINE, socket.send(message)).await, Ok(Ok(())))
 }
 
-async fn handle_media(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Claims, attachment: MediaAttachment) {
+async fn handle_media(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Claims, call_id: String, attachment: MediaAttachment) {
     // Keep these futures outside the I/O loop: a pending send cannot suspend
     // revocation, expiry or route termination. Cancelling socket I/O is safe
     // here because this socket is dropped, never reused by another handler.
@@ -371,14 +407,15 @@ async fn handle_media(mut socket: WebSocket, state: Arc<AppState>, claims: auth:
         biased;
         _ = attachment.from_node.closed() => false,
         _ = attachment.to_node.closed() => false,
+        _ = attachment.activity.expired() => false,
         _ = async {
             let mut recheck = tokio::time::interval(AUTH_RECHECK_INTERVAL);
             loop {
                 recheck.tick().await;
-                if !stream_authorized(&state, &claims) { break; }
+                if !stream_authorized(&state, &claims, &attachment.peer, &call_id) { break; }
             }
         } => false,
-        close = media_io(&mut socket, &attachment.from_node, &attachment.to_node) => close,
+        close = media_io(&mut socket, &attachment.from_node, &attachment.to_node, &attachment.activity) => close,
     };
     // Release the route before any best-effort close handshake. A write
     // failure/timeout drops immediately, with no attempt to reuse the socket.
@@ -389,7 +426,7 @@ async fn handle_media(mut socket: WebSocket, state: Arc<AppState>, claims: auth:
 }
 
 /// Returns false when a failed/timed-out write requires an immediate drop.
-async fn media_io(socket: &mut WebSocket, from_node: &MediaQueue, to_node: &MediaQueue) -> bool {
+async fn media_io(socket: &mut WebSocket, from_node: &MediaQueue, to_node: &MediaQueue, activity: &MediaActivity) -> bool {
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     keepalive.tick().await;
     let mut ingress = IngressBudget::new();
@@ -411,6 +448,7 @@ async fn media_io(socket: &mut WebSocket, from_node: &MediaQueue, to_node: &Medi
                     debug!("call media socket: ingress budget exhausted");
                     return true;
                 }
+                activity.received();
                 match msg {
                     Message::Binary(bytes) => match MediaFrame::from_ws_bytes(&bytes) {
                         Some(frame) => {
@@ -439,10 +477,19 @@ async fn media_io(socket: &mut WebSocket, from_node: &MediaQueue, to_node: &Medi
     }
 }
 
-fn stream_authorized(state: &Arc<AppState>, claims: &auth::Claims) -> bool {
-    claims.exp > chrono::Utc::now().timestamp()
-        && claims.scp.contains(&auth::Scope::Spend)
-        && matches!(auth::check_pairing_binding(state, claims), Ok(Some(_)))
+fn stream_authorized(state: &Arc<AppState>, claims: &auth::Claims, peer: &NodeId, call_id: &str) -> bool {
+    if claims.exp <= chrono::Utc::now().timestamp()
+        || !claims.scp.contains(&auth::Scope::Spend)
+        || claims.sub != state.identity.node_id().to_hex()
+    {
+        return false;
+    }
+    match auth::check_pairing_binding(state, claims) {
+        Ok(None) => true,
+        Ok(Some(binding)) => state.pairing.as_ref()
+            .is_some_and(|service| service.owns_call_media(&binding, &peer.to_hex(), call_id)),
+        Err(_) => false,
+    }
 }
 
 /// Registers the owner media socket.
@@ -516,6 +563,7 @@ mod tests {
             NodeId::from_bytes([1; 32]),
             Arc::clone(&to_node),
             Arc::clone(&from_node),
+            MediaActivity::new(),
             move || flag.store(true, std::sync::atomic::Ordering::SeqCst),
         );
         drop(attachment);
