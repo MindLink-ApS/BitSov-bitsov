@@ -2314,7 +2314,7 @@ pub(super) async fn first_contact_quote(
         // Reuse the quote the refused send already fetched: the target
         // rate-limits quotes, and the send pays exactly this invoice.
         let quote = validate_admission_invoice(&state, &peer_id, &request_id, &response).await?;
-        let total_msat = super::caps::first_contact_total(super::caps::all_in(&state, quote.admission_msat, None)?, super::caps::all_in(&state, quote.message_price, None)?, None)?;
+        let total_msat = quote_total(&state, &peer_id, quote.admission_msat, quote.message_price).await?;
         return Ok(Json(FirstContactQuoteResponse {
             max_routing_fee_msat: total_msat - quote.admission_msat - quote.message_price,
             recipient: peer_id.to_hex(),
@@ -2336,7 +2336,7 @@ pub(super) async fn first_contact_quote(
         &state, &peer_id, konsensus_core::kind::KIND_CHAT, &Debit::unmetered(),
     ).await?;
     let quote = validate_admission_invoice(&state, &peer_id, &request_id, &response).await?;
-    let total_msat = super::caps::first_contact_total(super::caps::all_in(&state, quote.admission_msat, None)?, super::caps::all_in(&state, quote.message_price, None)?, None)?;
+    let total_msat = quote_total(&state, &peer_id, quote.admission_msat, quote.message_price).await?;
     // Bound to the generation that obtained it, never the one live after the
     // response: a reconnect at any point before the send pays means a new quote.
     if state.transport.connected_since(&peer_id).await != generation {
@@ -2353,6 +2353,15 @@ pub(super) async fn first_contact_quote(
         total_msat,
         expires_at: quote.expires_at_unix,
     }))
+}
+
+/// Admission plus message, each with its routing ceiling: zero when the
+/// contact is a usable direct channel for both together. A send capped at this
+/// total applies the same rule (see `compose_peer`), so it pays what was quoted.
+async fn quote_total(state: &AppState, peer: &NodeId, admission: u64, message: u64) -> Result<u64, ApiError> {
+    let direct = super::caps::direct_channel(state, peer, admission.saturating_add(message)).await;
+    let fee = direct.then_some(0);
+    super::caps::first_contact_total(super::caps::all_in(state, admission, fee)?, super::caps::all_in(state, message, fee)?, None)
 }
 
 async fn reconcile_admission_budget(
@@ -3529,10 +3538,12 @@ pub(super) async fn compose_peer(
         }
         // A payee at the far end of a usable direct channel is paid in one hop,
         // which owes no routing fee. The zero ceiling also bounds the payment,
-        // so it can never fall back to a fee-paying route. A call block keeps
-        // the fee pinned by its call's hold.
+        // so it can never fall back to a fee-paying route. The channel must
+        // also carry a confirmed cap, which covers any admission this send
+        // pays, as a first-contact quote checks admission plus message. A call
+        // block keeps the fee pinned by its call's hold.
         if req.kind != konsensus_core::kind::KIND_CALL_BLOCK
-            && super::caps::direct_channel(&state, &peer_id, price_msat).await
+            && super::caps::direct_channel(&state, &peer_id, price_msat.max(cap.unwrap_or(0))).await
         {
             req.max_routing_fee_msat = Some(0);
         }
