@@ -377,7 +377,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } => {
                         if purpose.starts_with(konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX) {
                             if privileged {
-                                let result = prepare_call_block_invoice(storage.as_ref(), &peer_id, &purpose, amount_msat, &request_id, lightning.as_ref()).await;
+                                let result = prepare_call_block_invoice(storage.as_ref(), pricing.as_ref(), &peer_id, &purpose, amount_msat, &request_id, lightning.as_ref()).await;
                                 match result {
                                     Ok(invoice) => {
                                         let _ = transport.send_frame(&peer_id, &Frame::InvoiceResponse {
@@ -2056,7 +2056,9 @@ async fn handle_gossip_received(
 /// Refuse before touching the wallet and again after asynchronous creation.
 /// No invoice is returned to the caller when the safety margin is exhausted.
 async fn prepare_call_block_invoice(
-    storage: &dyn konsensus_storage::Storage, peer: &NodeId, purpose: &str,
+    storage: &dyn konsensus_storage::Storage,
+    pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
+    peer: &NodeId, purpose: &str,
     amount_msat: u64, request_id: &str, lightning: &dyn LightningProvider,
 ) -> Result<konsensus_core::traits::lightning::Invoice, &'static str> {
     use konsensus_core::payloads::call as calls;
@@ -2076,6 +2078,13 @@ async fn prepare_call_block_invoice(
         Ok::<_, &'static str>(entry.deadline_ms.saturating_add(calls::CALL_BLOCK_RESUME_MS))
     };
     validate().await?;
+    // A delivery quote may honour an earlier settled payment, but cannot
+    // authorize a new minute invoice at an old (or caller-selected) price.
+    let current_price = pricing.get_price_msat(konsensus_core::kind::KIND_CALL_BLOCK)
+        .await.map_err(|_| REFUSED)?;
+    if amount_msat != current_price {
+        return Err(konsensus_api::invoice_refusal::CALL_PRICE_CHANGED);
+    }
     let invoice = lightning.create_invoice(amount_msat, &format!("konsensus:{request_id}"),
         calls::CALL_BLOCK_INVOICE_EXPIRY_SECS).await.map_err(invoice_refusal_reason)?;
     let retain_until = validate().await?;

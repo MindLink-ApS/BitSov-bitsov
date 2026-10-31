@@ -4375,6 +4375,106 @@ async fn withdrawn_reply_after_a_lost_refusal_is_terminal_not_delivery() {
     assert_eq!(state, "failed_paid");
 }
 
+fn call_block_pricing(amount_msat: u64) -> konsensus_pricing::StaticPricingEngine {
+    konsensus_pricing::StaticPricingEngine::new(konsensus_pricing::StaticPricingConfig {
+        call_block_msat: amount_msat,
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn call_block_invoice_at_exact_price_is_minted_without_granting_a_minute() {
+    use konsensus_core::payloads::call as calls;
+    let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let ringing = calls::receive(None, 400, None, now).unwrap();
+    let live = calls::commit(calls::reserve(Some(ringing), 401, "answer", "hash", now).unwrap(), "answer", now).unwrap();
+    storage.call_put(&peer, id, &live).await.unwrap();
+    let wallet = konsensus_lightning::MockLightningProvider::new();
+    let balance = wallet.get_balance_msat().await.unwrap();
+    let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
+
+    let invoice = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &peer, &purpose, 23_000, "exact", &wallet).await.unwrap();
+
+    assert_eq!(invoice.amount_msat, 23_000);
+    let payments = wallet.list_payments(10).await.unwrap();
+    assert_eq!(payments.len(), 1);
+    assert_eq!(payments[0].amount_msat, 23_000);
+    assert_eq!(payments[0].status, konsensus_core::traits::lightning::PaymentStatus::Pending);
+    let hash = hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap();
+    assert!(storage.has_call_block_invoice(&peer, id, 0, &hash).await.unwrap());
+    assert_eq!(storage.call_get(&peer, id).await.unwrap(), Some(live));
+    assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
+}
+
+#[tokio::test]
+async fn call_block_invoice_refuses_lower_and_higher_amounts_without_an_invoice() {
+    use konsensus_core::payloads::call as calls;
+    for amount in [22_000, 24_000] {
+        let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+        let peer = test_peer_id();
+        let id = "0123456789abcdef0123456789abcdef";
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let ringing = calls::receive(None, 400, None, now).unwrap();
+        let live = calls::commit(calls::reserve(Some(ringing), 401, "answer", "hash", now).unwrap(), "answer", now).unwrap();
+        storage.call_put(&peer, id, &live).await.unwrap();
+        // A still-valid lower delivery quote must not authorize a new invoice.
+        let unix = now / 1000;
+        storage.record_delivery_prices(&peer, &[("kind:404".into(), 22_000)], &[], unix, unix + 3600).await.unwrap();
+        let wallet = konsensus_lightning::MockLightningProvider::new();
+        let balance = wallet.get_balance_msat().await.unwrap();
+        let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
+
+        let result = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &peer, &purpose, amount, "mismatch", &wallet).await;
+
+        assert_eq!(result.unwrap_err(), "konsensus:call_price_changed", "requested {amount}");
+        assert!(wallet.list_payments(10).await.unwrap().is_empty(), "no invoice created");
+        let invoices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_block_invoices")
+            .fetch_one(storage.pool()).await.unwrap();
+        assert_eq!(invoices, 0);
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts")
+            .fetch_one(storage.pool()).await.unwrap();
+        assert_eq!(receipts, 0);
+        assert_eq!(storage.call_get(&peer, id).await.unwrap(), Some(live));
+        assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
+    }
+}
+
+#[tokio::test]
+async fn call_block_invoice_after_price_raise_refuses_the_next_block_at_the_old_price() {
+    use konsensus_core::payloads::call as calls;
+    let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let ringing = calls::receive(None, 400, None, now).unwrap();
+    let live = calls::commit(calls::reserve(Some(ringing), 401, "answer", "hash", now).unwrap(), "answer", now).unwrap();
+    storage.call_put(&peer, id, &live).await.unwrap();
+    let wallet = konsensus_lightning::MockLightningProvider::new();
+    let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
+    let first = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &peer, &purpose, 23_000, "first", &wallet).await.unwrap();
+    wallet.pay_invoice(&first.bolt11).await.unwrap();
+    let paid = calls::receive_block(Some(live), 0, now).unwrap();
+    // Move the paid interval into its renewal window without sleeping a minute.
+    let paid = calls::CallEntry { paid_until_ms: Some(now + 10_000), deadline_ms: now + 20_000, ..paid };
+    storage.call_put(&peer, id, &paid).await.unwrap();
+    let balance = wallet.get_balance_msat().await.unwrap();
+    let payment_count = wallet.list_payments(10).await.unwrap().len();
+    let purpose = format!("{}{id}:1", calls::CALL_BLOCK_INVOICE_PREFIX);
+
+    let result = prepare_call_block_invoice(&storage, &call_block_pricing(31_000), &peer, &purpose, 23_000, "stale-next", &wallet).await;
+
+    assert_eq!(result.unwrap_err(), "konsensus:call_price_changed");
+    assert_eq!(wallet.list_payments(10).await.unwrap().len(), payment_count);
+    let invoices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_block_invoices")
+        .fetch_one(storage.pool()).await.unwrap();
+    assert_eq!(invoices, 1, "only the first block invoice exists");
+    assert_eq!(storage.call_get(&peer, id).await.unwrap(), Some(paid));
+    assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
+}
+
 #[tokio::test]
 async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     use konsensus_core::payloads::call as calls;
@@ -4389,12 +4489,12 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     let wallet = konsensus_lightning::MockLightningProvider::new();
     let balance = wallet.get_balance_msat().await.unwrap();
     let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
-    let refused = prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, "block", &wallet).await;
+    let refused = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &peer, &purpose, 23_000, "block", &wallet).await;
     assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert!(wallet.list_payments(10).await.unwrap().is_empty(), "no invoice or payment should be created");
     assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
     storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
-    let issued = prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, "block-ok", &wallet).await.unwrap();
+    let issued = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &peer, &purpose, 23_000, "block-ok", &wallet).await.unwrap();
     assert_eq!(issued.expiry_secs, 5);
     let hash = hex::decode(&issued.payment_hash).unwrap().try_into().unwrap();
     assert!(storage.has_call_block_invoice(&peer, id, 0, &hash).await.unwrap());
@@ -4402,7 +4502,7 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     // An unavailable provenance store withholds the invoice before any payment.
     sqlx::query("CREATE TRIGGER fail_block_invoice BEFORE INSERT ON call_block_invoices BEGIN SELECT RAISE(FAIL, 'test'); END")
         .execute(storage.pool()).await.unwrap();
-    assert_eq!(prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, "write-fails", &wallet).await.unwrap_err(),
+    assert_eq!(prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &peer, &purpose, 23_000, "write-fails", &wallet).await.unwrap_err(),
         konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
 }

@@ -862,7 +862,7 @@ impl Reservation {
 pub enum BudgetRefusal {
     #[error("call reservation requires {required_msat} msat but outbound liquidity has {available_msat} msat available; nothing was dispatched")]
     CallLiquidity { required_msat: u64, available_msat: u64 },
-    #[error("call block price or routing fee exceeds the reserved ceiling; nothing was dispatched")]
+    #[error("call block price changed or routing fee exceeds the reserved ceiling; nothing was dispatched")]
     CallPriceChanged,
     #[error("grant paused after consecutive failures; owner console reset required")]
     GrantPaused,
