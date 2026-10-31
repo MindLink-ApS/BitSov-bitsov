@@ -903,8 +903,8 @@ fn cmd_node_id(
 /// The three inputs are mutually exclusive at the CLI. Absent all three,
 /// returns `None` so the caller can prompt. The password is never logged.
 /// `--password-file` uses [`seed_cmd::read_password_file`] (chmod 600, regular
-/// file). `--password-fd` uses [`password::read_password_fd`] (one read to EOF,
-/// trailing CR/LF stripped, 4096-byte maximum).
+/// file, 4096-byte maximum). `--password-fd` uses [`password::read_password_fd`]
+/// (one read to EOF, trailing CR/LF stripped, 4096-byte maximum).
 fn supplied_seed_password(
     password: Option<Zeroizing<String>>,
     password_file: Option<&Path>,

@@ -147,7 +147,22 @@ impl OwnerBox {
 }
 
 async fn get(router: axum::Router, token: Option<&str>) -> (StatusCode, Value, Option<String>) {
+    get_at(router, token, Some("127.0.0.1:3141"), None).await
+}
+
+async fn get_at(
+    router: axum::Router,
+    token: Option<&str>,
+    host: Option<&str>,
+    origin: Option<&str>,
+) -> (StatusCode, Value, Option<String>) {
     let mut req = Request::builder().method("GET").uri(PATH);
+    if let Some(host) = host {
+        req = req.header("host", host);
+    }
+    if let Some(origin) = origin {
+        req = req.header("origin", origin);
+    }
     if let Some(t) = token {
         req = req.header("authorization", format!("Bearer {t}"));
     }
@@ -382,6 +397,52 @@ async fn unauthenticated_peer_lan_and_tunnel_requests_are_refused() {
     refused(&body);
     // None of the refusals consumed the pending claim.
     b.finish_claim(&op_id, &device, &nonce, &b.claim).unwrap();
+}
+
+#[tokio::test]
+async fn foreign_host_or_origin_hides_the_code_and_does_not_spend_the_actor_budget() {
+    let b = owner_box(21);
+    let _pending = b.start_claim();
+    let token = b.console_token.as_str();
+    for (host, origin) in [
+        (None, None),
+        (Some("attacker.example:3141"), None),
+        (Some("127.0.0.1:9"), None),
+        (Some("127.0.0.1:3141"), Some("http://attacker.example:3141")),
+        (Some("127.0.0.1:3141"), Some("null")),
+    ] {
+        let (status, body, cache) =
+            get_at(b.local_router("127.0.0.1:50000"), Some(token), host, origin).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{host:?} {origin:?} {body}");
+        let code = body["code"].as_str().unwrap();
+        assert!(
+            code == "local_host_forbidden" || code == "local_origin_forbidden",
+            "{body}"
+        );
+        assert!(body.get("state").is_none(), "{body}");
+        assert!(!body.to_string().contains(&b.claim), "{body}");
+        assert_eq!(cache.as_deref(), Some("no-store"));
+    }
+    // Header refusals run before the per-actor limiter, so the owner still
+    // has the full five reads.
+    for i in 0..5 {
+        let (status, body, _) = get(b.local_router("127.0.0.1:50000"), Some(token)).await;
+        assert_eq!(status, StatusCode::OK, "read {i}: {body}");
+        assert_eq!(body["code"], b.claim);
+    }
+    let (status, body, _) = get(b.local_router("[::1]:50000"), Some(token)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(!body.to_string().contains(&b.claim), "{body}");
+    // A case-insensitive allowed Host still shows the code to the other actor.
+    let (status, body, _) = get_at(
+        b.local_router("127.0.0.1:50000"),
+        Some(&b.owner_token),
+        Some("LOCALHOST:3141"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"], b.claim);
 }
 
 #[tokio::test]

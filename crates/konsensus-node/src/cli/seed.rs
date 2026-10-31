@@ -6,7 +6,7 @@
 //! identity**, and until the config points at it and reloads. Any failure
 //! before that leaves the plaintext file and the config exactly as they were.
 
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -17,6 +17,9 @@ use crate::mnemonic_crypto;
 
 /// Shortest password accepted for the recovery-phrase file.
 pub const MIN_PASSWORD_CHARS: usize = 10;
+
+/// Same raw-byte ceiling as `--password-fd`. Trailing CR/LF count toward it.
+const MAX_PASSWORD_FILE_BYTES: usize = 4096;
 
 /// What `seed encrypt` did.
 #[derive(Debug)]
@@ -361,7 +364,8 @@ fn shred(path: &Path) -> std::io::Result<()> {
 
 /// `konsensus start --password-file <path>`: read the recovery-phrase password
 /// from a file the owner opted into. Only a regular file (not a symlink) with
-/// no group or other permissions (0600 or 0400) is accepted.
+/// no group or other permissions (0600 or 0400) is accepted. The file must be
+/// at most 4096 bytes, the same ceiling as `--password-fd`.
 pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
     let before = std::fs::symlink_metadata(path)
         .with_context(|| format!("cannot read the password file {}", path.display()))?;
@@ -391,9 +395,31 @@ pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
             anyhow::bail!("{} is owned by another user; refusing it", path.display());
         }
     }
-    let mut raw = Zeroizing::new(String::new());
-    std::io::Read::read_to_string(&mut file, &mut raw).with_context(|| format!("cannot read {}", path.display()))?;
-    let pw = Zeroizing::new(raw.trim_end_matches(['\n', '\r']).to_string());
+    // Fixed buffer, same shape as `--password-fd`: one extra byte detects an
+    // over-long file without growing a copy of the secret.
+    let mut bytes = Zeroizing::new([0u8; MAX_PASSWORD_FILE_BYTES + 1]);
+    let mut len = 0;
+    loop {
+        match file.read(&mut bytes[len..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                len += n;
+                if len > MAX_PASSWORD_FILE_BYTES {
+                    anyhow::bail!(
+                        "{} exceeds 4096 bytes; the password file must be at most 4096 bytes",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("cannot read {}", path.display()));
+            }
+        }
+    }
+    let text = std::str::from_utf8(&bytes[..len])
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+    let pw = Zeroizing::new(text.trim_end_matches(['\n', '\r']).to_string());
     if pw.is_empty() {
         anyhow::bail!("the password file {} is empty", path.display());
     }
@@ -517,6 +543,36 @@ mod tests {
             std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert!(read_password_file(&empty).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn password_file_stops_at_4096_bytes_and_does_not_echo_the_secret() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("ok");
+        std::fs::write(&ok, "a".repeat(4096)).unwrap();
+        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_password_file(&ok).unwrap().len(), 4096);
+
+        let trimmed = dir.path().join("trimmed");
+        let mut with_newline = "b".repeat(4095);
+        with_newline.push('\n');
+        std::fs::write(&trimmed, &with_newline).unwrap();
+        std::fs::set_permissions(&trimmed, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_password_file(&trimmed).unwrap().as_str(),
+            "b".repeat(4095)
+        );
+
+        let marker = "MARKER-SECRET-PASSWORD-FILE";
+        let over = dir.path().join("over");
+        std::fs::write(&over, format!("{marker}{}", "c".repeat(4096))).unwrap();
+        std::fs::set_permissions(&over, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = read_password_file(&over).unwrap_err().to_string();
+        assert!(error.contains("4096"), "{error}");
+        assert!(!error.contains(marker), "{error}");
+        assert!(!error.contains(&"c".repeat(32)), "{error}");
     }
 
     #[test]
