@@ -3,7 +3,7 @@ use super::*;
 use axum::http::StatusCode;
 use konsensus_api::pairing::device;
 use konsensus_core::payloads::call::Phase;
-use konsensus_core::{NodeId, OwnerApprovalKey};
+use konsensus_core::{MessageTransport, NodeId, OwnerApprovalKey};
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
 const BUDGET: u64 = 500_000;
@@ -81,7 +81,9 @@ async fn approve(app: &mut app::App, root: &OwnerApprovalKey, requested_max: u64
         .await;
     assert_eq!(status, StatusCode::OK, "grant request: {pending}");
     assert!(service.grant_view_for(&app.client).is_none());
-    let cap = requested_max.min(6_000);
+    // Approval signs and stores the owner's own per-payment value; messages
+    // are capped at 6 sats only when they are paid.
+    let cap = requested_max;
     assert_eq!(pending["request"]["terms"]["per_call_max_msat"], cap);
     let signature = key
         .sign(
@@ -119,6 +121,11 @@ async fn approve(app: &mut app::App, root: &OwnerApprovalKey, requested_max: u64
     assert_eq!(status, StatusCode::OK, "grant view: {view}");
     assert_eq!(view["grant"]["budget_msat"], BUDGET);
     assert_eq!(view["grant"]["per_call_max_msat"], cap);
+    assert_eq!(
+        view["grant"]["message_per_payment_max_msat"],
+        cap.min(6_000)
+    );
+    assert_eq!(view["grant"]["call_per_payment_max_msat"], cap);
     assert_eq!(view["grant"]["used_msat"], 0);
 }
 
@@ -145,7 +152,69 @@ async fn pair(minutes: u16, caller_max: u64) -> paid_call::Pair {
     .await;
     approve(&mut pair.caller, &roots[0], caller_max).await;
     approve(&mut pair.callee, &roots[1], BUDGET).await;
+    // The first contact listing can dial before the reciprocal listing, losing
+    // the one-time Lightning info exchange. Reconnect once both are listed.
+    let aid = pair.caller.state.identity.node_id();
+    let bid = pair.callee.state.identity.node_id();
+    let old_caller = pair.caller.transport.connected_since(bid).await.unwrap();
+    let old_callee = pair.callee.transport.connected_since(aid).await.unwrap();
+    pair.caller.transport.disconnect(bid).await.unwrap();
+    three_node::connect(
+        &pair.caller,
+        &pair.callee,
+        "app-grant listed peers reconnect",
+    )
+    .await;
+    // Supervision may reconnect first; require a fresh socket at both ends
+    // rather than waiting to observe a transient disconnected state.
+    wait("app-grant replacement connections established", || async {
+        pair.caller
+            .transport
+            .connected_since(bid)
+            .await
+            .is_some_and(|generation| generation != old_caller)
+            && pair
+                .callee
+                .transport
+                .connected_since(aid)
+                .await
+                .is_some_and(|generation| generation != old_callee)
+    })
+    .await;
+    wait_direct_channel(&pair.caller, bid).await;
+    wait_direct_channel(&pair.callee, aid).await;
     pair
+}
+
+/// Match the API's direct-channel check for an offer followed by one block.
+/// Repeat after reconnecting, before any further paid step.
+async fn wait_direct_channel(app: &app::App, peer: &NodeId) {
+    wait(
+        &format!(
+            "app-grant direct channel usable for offer plus one block {} -> {peer}",
+            app.state.identity.node_id()
+        ),
+        || async {
+            let Some(key) = app.state.peer_ln_pubkeys.lock().await.get(peer).cloned() else {
+                return false;
+            };
+            app.state
+                .lightning
+                .list_channels()
+                .await
+                .is_ok_and(|channels| {
+                    channels.iter().any(|channel| {
+                        channel.active
+                            && channel.is_channel_ready != Some(false)
+                            && channel.peer_pubkey.eq_ignore_ascii_case(&key)
+                            && channel
+                                .outbound_capacity_msat
+                                .is_some_and(|cap| cap >= 2 * PRICE)
+                    })
+                })
+        },
+    )
+    .await;
 }
 
 async fn signal(app: &app::App, peer: &NodeId, kind: u16, body: Value) -> (StatusCode, Value) {
@@ -154,14 +223,34 @@ async fn signal(app: &app::App, peer: &NodeId, kind: u16, body: Value) -> (Statu
     } else {
         1_000
     };
+    signal_with_hold(
+        app,
+        peer,
+        kind,
+        body,
+        amount,
+        u64::from(app.state.max_call_minutes) * PRICE,
+    )
+    .await
+}
+
+/// `signal` with explicit payment and hold consent for a call offer.
+async fn signal_with_hold(
+    app: &app::App,
+    peer: &NodeId,
+    kind: u16,
+    body: Value,
+    max_total_msat: u64,
+    max_hold_msat: u64,
+) -> (StatusCode, Value) {
     let mut request = json!({
         "operation_id": uuid::Uuid::new_v4().to_string(),
         "recipient": peer.to_hex(), "kind":kind, "plaintext":body.to_string(),
-        "max_total_msat":amount,
+        "max_total_msat":max_total_msat,
     });
     if kind == 400 {
         request["max_block_msat"] = json!(PRICE);
-        request["max_hold_msat"] = json!(u64::from(app.state.max_call_minutes) * PRICE);
+        request["max_hold_msat"] = json!(max_hold_msat);
     }
     app.post("/api/v1/messages/compose", request, false).await
 }
@@ -447,7 +536,9 @@ async fn refused(minutes: u16, cap: u64, reason: &str) {
     let pair = pair(minutes, cap).await;
     let before = Books::snapshot(&pair).await;
     let bid = pair.callee.state.identity.node_id();
-    let (status, body) = signal(&pair.caller, bid, 400, offer()).await;
+    // Generous offer and hold consent leave the grant as the refusal boundary.
+    let (status, body) =
+        signal_with_hold(&pair.caller, bid, 400, offer(), 10 * BUDGET, 10 * BUDGET).await;
     assert_eq!(status, StatusCode::CONFLICT, "offer refusal: {body}");
     assert_eq!(body["code"], "budget_exceeded");
     assert_eq!(body["reason"], reason);
