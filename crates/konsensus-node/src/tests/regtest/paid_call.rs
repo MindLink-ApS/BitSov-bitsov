@@ -13,6 +13,9 @@ use tokio_tungstenite::{
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const PRICE: u64 = 23_001;
+const SIGNAL_PRICE: u64 = 1_000;
+// Direct-channel signaling pays the one-sat invoice floor with no routing fee.
+const CLOSING_ALLOWANCE: u64 = SIGNAL_PRICE;
 const CALL: &str = "00112233445566778899aabbccddeeff";
 const SDP: &str = "v=0\r\ns=M6 node-routed audio\r\nt=0 0\r\n";
 
@@ -218,7 +221,7 @@ async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
 
     let offer = json!({"v":1, "call_id":CALL, "media":"audio", "sdp":SDP});
     let before = a.list_payments(100).await.unwrap().len();
-    let (status, _) = compose(&caller, &bid, 400, offer.clone(), 1_000).await;
+    let (status, _) = compose(&caller, &bid, 400, offer.clone(), SIGNAL_PRICE).await;
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
@@ -242,14 +245,15 @@ async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
     assert_eq!(quoted, PRICE, "callee's live kind-404 answer");
     steps.pass("two funded nodes, direct channel, paired clients and owner consent");
 
-    let (status, body) = compose(&caller, &bid, 400, offer, 1_000).await;
+    let (status, body) = compose(&caller, &bid, 400, offer, SIGNAL_PRICE).await;
     assert_eq!(status, StatusCode::OK, "offer: {body}");
     recv_kind(&mut callee, &aid, 400).await;
     let held = caller
         .service
         .call_spend_status(&bid.to_hex(), CALL)
         .unwrap();
-    assert_eq!(held.reserved_msat, u64::from(max_minutes) * PRICE);
+    let reserved = u64::from(max_minutes) * PRICE + CLOSING_ALLOWANCE;
+    assert_eq!(held.reserved_msat, reserved);
     assert_eq!(held.remaining_msat, held.reserved_msat);
     assert_eq!(held.spent_msat, 0);
     assert_eq!(held.per_block_msat, PRICE);
@@ -261,7 +265,7 @@ async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
         &aid,
         401,
         json!({"v":1, "call_id":CALL, "sdp":SDP}),
-        1_000,
+        SIGNAL_PRICE,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "answer: {body}");
@@ -335,7 +339,7 @@ async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
         assert_eq!(status.spent_msat, spent);
         assert_eq!(status.remaining_msat, held.reserved_msat - spent);
         assert_eq!(status.released_msat, 0);
-        assert_eq!(caller.used(), used_before + 1_000 + held.reserved_msat);
+        assert_eq!(caller.used(), used_before + SIGNAL_PRICE + reserved);
         // One reservation plus the offer; renewal never consumes another count.
         assert_eq!(
             caller
@@ -453,7 +457,7 @@ async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
                 .await
                 .unwrap()
                 .amount_msat,
-            1_000
+            SIGNAL_PRICE
         );
     }
     wait("both nodes ended", || async {
@@ -486,15 +490,21 @@ async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
         .service
         .call_spend_status(&bid.to_hex(), CALL)
         .unwrap();
-    assert_eq!(receipt.spent_msat, u64::from(paid_blocks) * PRICE);
+    // The caller's duration-cap notice draws from its grant hold. For unpaid,
+    // the callee sends the notice, leaving the caller's allowance to release.
+    let closing_spent = if reason == HangupReason::DurationCap {
+        SIGNAL_PRICE
+    } else {
+        0
+    };
+    let spent = u64::from(paid_blocks) * PRICE + closing_spent;
+    assert_eq!(receipt.spent_msat, spent);
     assert_eq!(receipt.remaining_msat, 0);
-    assert_eq!(
-        receipt.released_msat,
-        held.reserved_msat - receipt.spent_msat
-    );
+    assert_eq!(receipt.released_msat, reserved - spent);
     let final_used = caller.used();
-    // Timer notifications use bounded node authority, not the paired grant.
-    assert_eq!(final_used, used_before + 1_000 + receipt.spent_msat);
+    // The offer and all settled draws, including a caller closing signal,
+    // remain charged to the paired grant after the unused remainder releases.
+    assert_eq!(final_used, used_before + SIGNAL_PRICE + spent);
     for _ in 0..3 {
         konsensus_api::calls::maintain_calls(&caller.state, now_ms())
             .await
@@ -529,7 +539,7 @@ async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
         "no hidden extra block payments"
     );
     assert!(frame_seq >= 20, "bidirectional audio exercised");
-    println!("M6 CALL PASS reason={} paid_blocks={paid_blocks} price_msat={PRICE} reserved_msat={} spent_msat={} released_msat={} frames_each_direction={frame_seq}",
+    println!("M6 CALL PASS reason={} paid_blocks={paid_blocks} price_msat={PRICE} closing_allowance_msat={CLOSING_ALLOWANCE} closing_spent_msat={closing_spent} reserved_msat={} spent_msat={} released_msat={} frames_each_direction={frame_seq}",
         reason.as_str(), held.reserved_msat, receipt.spent_msat, receipt.released_msat);
     steps.pass("cutoff, ordered media and exactly-once remainder release");
     caller.stop().await;

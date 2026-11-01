@@ -25,20 +25,44 @@ also live on the corresponding GitHub pre-release pages.
   an unheld acceptance. A held envelope whose paid acceptance returns an
   error keeps its hold (the acceptance may have committed); a retry re-admits
   it or the sweep withdraws it. A calendar envelope that cannot be decrypted
-  is admitted as an opaque message through the same transaction (live hold
-  and stored sender-bound envelope required, one hold consumed), and a resend
-  is acknowledged as a duplicate only on positive evidence of its durable
-  admission, never on the mere absence of a hold, so an envelope the sweep
-  withdrew meanwhile is refused. Calendar timestamps past the representable
-  range are refused (`calendar_timestamp_out_of_range`). A
-  resend of any envelope this node withdrew at the application is answered
-  with a terminal `application_rejected:` reason instead of a payment-reuse
-  one, which a sender's compatibility path could read as delivered. The owner
+  is refused with the typed `undecryptable:` receipt refusal and withdrawn,
+  like any other unreadable envelope (#441), and a resend is acknowledged as
+  a duplicate only on positive evidence of its durable admission, never on
+  the mere absence of a hold, so an envelope the sweep withdrew meanwhile is
+  refused. Calendar timestamps past the representable range are refused
+  (`calendar_timestamp_out_of_range`). A resend of any envelope this node
+  withdrew at the application is answered with a terminal reason
+  (`message withdrawn`, or `application_rejected:` for a withdrawal recorded
+  on the receipt) instead of a payment-reuse one, which a sender's
+  compatibility path could read as delivered. The owner
   API refuses the same payloads before they are stored or paid for,
   including a partial update whose retained recurrence would exceed the cap
   from its new start.
 
-## [0.3.0-rc20] — 2026-10-31 (prep; not tagged yet)
+## [0.3.0-rc21] — 2026-11-01
+
+- App spend grants now show, sign and store the owner's real per-payment
+  value. Paid messages, files, rooms and admission remain capped at 6 sats
+  (or the signed value when lower). Calls are bounded by the signed value
+  and the call's pinned per-block ceiling; the offer has its own cap. A
+  direct-channel contact is paid with no routing fee when the channel can
+  carry the payments; a failed direct payment never falls back to a route
+  with a fee. A call's hold and offer are reserved together, and every draw
+  from a hold re-checks the signed value. Existing grants stored at 6,000
+  msat per payment bind calls at that value until re-granted (#493).
+- A grant-funded call's closing signal is paid by its grant. Its closing
+  allowance is reserved from the grant outside the caller's hold consent;
+  a refused closing payment leaves the call ended without an owner debit
+  (#498).
+- Grant-funded calls: every paid call signal (offer, block, answer, ICE,
+  hangup and the closing signal) is checked again at wallet dispatch against
+  the grant's current per-payment limit, so a relation envelope renewed lower
+  never pays the earlier amount. Answers, ICE candidates and hangups,
+  including the closing signal, stay within the 6 sat message cap. A call
+  whose quoted closing signal cannot fit is refused before any hold or payment
+  (`budget_exceeded`, reason `call_closing_above_limit`) (#500).
+
+## [0.3.0-rc20] — 2026-10-31
 
 - Payment truth on the owner API: `POST /payments/pay` and `/payments/keysend`
   answer `202 Accepted` with `status: in_flight` (payment hash and operation id,

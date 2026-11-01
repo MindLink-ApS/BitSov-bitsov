@@ -3,6 +3,35 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## rc20 → rc21
+
+rc21 fixes app-grant call spending and closing signals (#493, #498). There
+are no new SQL migrations or pairing-store or peer-store schema version
+changes since rc20; pairing storage remains **v8**. Retain the latest data
+directory, config and encrypted seed; do not re-run `init` or restore a
+historical snapshot. Existing rollback constraints still apply.
+
+Existing app grants bind calls at their stored **6,000 msat per payment**
+until re-granted. Re-issue each app client's grant with
+`konsensus grant --op <op>`. With no `--per-call`, the client's proposed
+per-payment value is signed, capped at the budget; pass `--per-call <sats>`
+to set the limit explicitly, and review the value shown before signing.
+The owner now sees and signs the real per-payment value; paid messages,
+files, rooms and admission still use the lower of that value and 6 sats.
+Calls use the signed value and their pinned per-block ceiling, with the
+offer bounded by its own cap. Every draw re-checks the signed value.
+
+Set `[calls] max_call_minutes` so a call's hold fits typical app budgets.
+For example, use **10 minutes for a 500-sat grant at 10 sat/min**; the
+default 60-minute hold would exceed that budget even before fees. Allow
+room for routing fees, the offer and the closing allowance. The closing
+signal is paid by the call's grant, with its allowance reserved outside
+the caller's hold consent (`max_hold_msat`); it still counts against the
+grant's budget and available liquidity. A refused closing payment leaves
+the call ended without an owner debit.
+
+Follow the [rc21 signing and beta-node checklist](releases/v0.3.0-rc21.md).
+
 ## rc19 → rc20
 
 rc20 adds M6 paid calls and the onboarding/pairing work merged since rc19.
