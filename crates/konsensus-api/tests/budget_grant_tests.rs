@@ -54,10 +54,14 @@ const FAILED: u8 = 3;
 #[derive(Default)]
 struct Wallet {
     call_capacity: AtomicU64,
+    /// Lightning key at the far end of the one channel; `PEER_LN` when unset.
+    channel_peer: std::sync::Mutex<Option<String>>,
     pause_capacity: AtomicBool,
     capacity_entered: tokio::sync::Notify,
     capacity_resume: tokio::sync::Notify,
     fee: AtomicU64,
+    /// Every routing-fee limit a payment was dispatched under, in order.
+    fee_limits: std::sync::Mutex<Vec<u64>>,
     unknown_fee: AtomicBool,
     recover_preimage: AtomicBool,
     outgoing: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
@@ -132,10 +136,11 @@ impl LightningProvider for Wallet {
             self.capacity_resume.notified().await;
         }
         let capacity = self.call_capacity.load(Ordering::SeqCst);
+        let peer_pubkey = self.channel_peer.lock().unwrap().clone().unwrap_or_else(|| PEER_LN.into());
         Ok(vec![konsensus_core::traits::lightning::ChannelInfo {
             is_outbound: Some(true), is_announced: Some(false), is_channel_ready: Some(true),
             local_reserve_msat: Some(0), initial_push_msat: None, channel_id: "test-channel".into(),
-            user_channel_id: None, funding_txo: None, peer_pubkey: PEER_LN.into(),
+            user_channel_id: None, funding_txo: None, peer_pubkey,
             capacity_msat: capacity, local_balance_msat: capacity, outbound_capacity_msat: Some(capacity),
             remote_balance_msat: 0, active: true, short_channel_id: None,
         }])
@@ -150,6 +155,7 @@ impl LightningProvider for Wallet {
         konsensus_core::traits::lightning::PaymentDetails,
         konsensus_core::traits::lightning::LightningError,
     > {
+        self.fee_limits.lock().unwrap().push(_cap);
         if self.fee.load(Ordering::SeqCst) > _cap {
             return Err(LightningError::PaymentNotDispatched(
                 "route exceeds fee ceiling".into(),
@@ -203,6 +209,7 @@ impl LightningProvider for Wallet {
         bolt11: &str,
         _max_fee_msat: u64,
     ) -> Result<PaymentDetails, LightningError> {
+        self.fee_limits.lock().unwrap().push(_max_fee_msat);
         if self.fee.load(Ordering::SeqCst) > _max_fee_msat {
             return Err(LightningError::PaymentNotDispatched(
                 "route exceeds fee ceiling".into(),

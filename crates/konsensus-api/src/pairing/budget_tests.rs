@@ -766,7 +766,7 @@ fn legacy_relation_cap_applies_on_first_reservation_without_rewriting_terms() {
     ));
     assert_eq!(service.grant_view_for(&client).unwrap().used_msat, 0);
     assert_eq!(
-        service.grant_view_for(&client).unwrap().per_call_max_msat,
+        service.grant_view_for(&client).unwrap().message_per_payment_max_msat,
         6_000
     );
     service.reserve_spend(&client, 1, charge(6_000)).unwrap();
@@ -947,4 +947,88 @@ fn call_terms_keep_legacy_duration_and_bound_new_reservations() {
     }
     assert!(CallSpendTerms::new("peer", "call", u64::MAX, 1, 60).is_err());
     assert!(CallSpendTerms::new("peer", "call", u64::MAX / 2, 0, 60).is_err());
+}
+
+/// Store a lower per-payment value on the grant, as a grant stored under an
+/// earlier rule would read after an upgrade.
+fn lower_signed_value(service: &PairingService, max_msat: u64) {
+    let mut inner = service.lock();
+    inner.file.grants[0].budget.as_mut().unwrap().per_call_max_msat = max_msat;
+    service.persist(&mut inner.file).unwrap();
+}
+
+#[test]
+fn a_hold_above_the_grants_per_payment_value_never_pays_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 4_000, 0, 2).unwrap();
+    service.reserve_call_spend(&client, 1, terms, 10_000).unwrap();
+    let link = |op: &str| crate::spend_budget::OperationReservationLink {
+        operation_id: op.into(), execution_id: "attempt".into(), readmission: false,
+    };
+    // Within the signed value, a block pays.
+    let paid = service.draw_call_spend(&client, 1, &peer, "call", 0, 4_000, 0, link("block-0")).unwrap();
+    assert!(service.with_call_spend_authority(&paid, Some((&peer, "call")), || ()).is_ok());
+    service.try_resolve_spend(&paid, &peer, 4_000).unwrap();
+    // A block drawn but not yet dispatched when the stored value drops.
+    let pending = service.draw_call_spend(&client, 1, &peer, "call", 1, 4_000, 0, link("block-1")).unwrap();
+    lower_signed_value(&service, 3_000);
+    // Its dispatch or recovery is refused before any payment.
+    assert!(matches!(
+        service.with_call_spend_authority(&pending, Some((&peer, "call")), || ()),
+        Err(BudgetRefusal::NoGrant)
+    ));
+    assert!(matches!(
+        service.enforce_call_hold_limit(&peer, "call"),
+        Err(BudgetRefusal::PerCall { max_msat: 3_000 })
+    ));
+    assert!(service.call_spend_status(&peer, "call").unwrap().closed);
+    service.try_resolve_spend(&pending, &peer, 0).unwrap();
+    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert_eq!(budget.used_msat, 4_000, "only the paid block remains charged");
+    assert!(budget.pending.is_empty());
+}
+
+#[test]
+fn a_hold_above_the_grants_per_payment_value_is_closed_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 4_000, 0, 2).unwrap();
+    service.reserve_call_spend(&client, 1, terms, 10_000).unwrap();
+    lower_signed_value(&service, 3_000);
+    drop(service);
+    let service = PairingService::open(dir.path(), "identity".into(), true).unwrap();
+    let link = crate::spend_budget::OperationReservationLink {
+        operation_id: "block-0".into(), execution_id: "attempt".into(), readmission: false,
+    };
+    assert!(matches!(
+        service.draw_call_spend(&client, 1, &peer, "call", 0, 4_000, 0, link),
+        Err(BudgetRefusal::PerCall { max_msat: 3_000 })
+    ));
+    assert!(service.call_spend_status(&peer, "call").unwrap().closed);
+    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert_eq!(budget.used_msat, 0);
+    assert!(budget.pending.is_empty());
+}
+
+#[test]
+fn the_call_sweep_closes_a_hold_above_the_grants_per_payment_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    for (call, price) in [("over", 4_000), ("within", 3_000)] {
+        let terms = crate::spend_budget::CallSpendTerms::new(&peer, call, price, 0, 1).unwrap();
+        service.reserve_call_spend(&client, 1, terms, 10_000).unwrap();
+    }
+    lower_signed_value(&service, 3_000);
+    service.prune_call_spend(chrono::Utc::now().timestamp()).unwrap();
+    assert!(service.call_spend_status(&peer, "over").unwrap().closed);
+    assert!(!service.call_spend_status(&peer, "within").unwrap().closed);
+    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert_eq!(budget.used_msat, 3_000, "only the compatible hold stays reserved");
 }

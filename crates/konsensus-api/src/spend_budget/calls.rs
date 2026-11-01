@@ -13,6 +13,10 @@ pub struct CallSpendTerms {
     #[serde(default = "legacy_max_call_minutes")]
     pub max_call_minutes: u16,
     pub reserved_msat: u64,
+    /// The zero per-block fee was pinned for a direct channel to the payee:
+    /// each block is paid only while that channel still carries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub direct: bool,
 }
 
 impl CallSpendTerms {
@@ -31,7 +35,14 @@ impl CallSpendTerms {
             per_block_fee_msat: fee,
             max_call_minutes,
             reserved_msat,
+            direct: false,
         })
+    }
+
+    /// Mark the zero per-block fee as pinned for a direct channel.
+    pub fn over_direct_channel(mut self, direct: bool) -> Self {
+        self.direct = direct;
+        self
     }
 }
 
@@ -65,6 +76,9 @@ pub struct CallSpendStatus {
     pub per_block_fee_msat: u64,
     pub released_msat: u64,
     pub closed: bool,
+    /// Blocks are paid only over the direct channel their zero fee relies on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub direct: bool,
 }
 
 impl CallSpend {
@@ -96,11 +110,54 @@ impl CallSpend {
             per_block_fee_msat: self.terms.per_block_fee_msat,
             released_msat: self.released_msat,
             closed: self.closed,
+            direct: self.terms.direct,
         }
     }
 }
 
 impl GrantBudget {
+    /// The most one call payment to `peer` may carry under this grant now,
+    /// msat: the signed per-payment value, or on a relation grant the peer's
+    /// envelope per-act maximum (none: nothing).
+    pub(crate) fn call_payment_limit(&self, peer: &str) -> u64 {
+        if self.recipients_only {
+            self.per_act_max_by_recipient.get(peer).copied().unwrap_or(0)
+        } else {
+            self.per_call_max_msat
+        }
+    }
+
+    /// Every draw from a hold (a block, its retry or its recovery) is bounded
+    /// by the grant as it is now: the hold's pinned per-block ceiling must fit
+    /// [`Self::call_payment_limit`]. A hold persisted under an earlier rule
+    /// can exceed it; such a hold never pays again.
+    pub(crate) fn check_call_hold(&self, terms: &CallSpendTerms) -> Result<(), BudgetRefusal> {
+        let max_msat = self.call_payment_limit(&terms.peer);
+        if terms.per_block_msat.saturating_add(terms.per_block_fee_msat) > max_msat {
+            return Err(BudgetRefusal::PerCall { max_msat });
+        }
+        Ok(())
+    }
+
+    /// Close each open hold that fails [`Self::check_call_hold`], releasing
+    /// what it has not paid. With `only`, just that call (peer, call id).
+    /// Returns the refusal for the last hold closed, if any.
+    pub(crate) fn close_holds_over_limit(&mut self, only: Option<(&str, &str)>) -> Option<BudgetRefusal> {
+        let over: Vec<(String, BudgetRefusal)> = self
+            .call_reservations
+            .iter()
+            .filter(|(_, call)| !call.closed)
+            .filter(|(_, call)| only.is_none_or(|(peer, id)| call.terms.peer == peer && call.terms.call_id == id))
+            .filter_map(|(id, call)| self.check_call_hold(&call.terms).err().map(|refusal| (id.clone(), refusal)))
+            .collect();
+        let mut refused = None;
+        for (id, refusal) in over {
+            self.close_call(&id);
+            refused = Some(refusal);
+        }
+        refused
+    }
+
     /// Keep only small, recent finished receipts. Open holds and unresolved
     /// children are never evicted, even under count pressure.
     pub(crate) fn prune_call_tombstones(&mut self, now: i64) {

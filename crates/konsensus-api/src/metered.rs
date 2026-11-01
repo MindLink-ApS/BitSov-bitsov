@@ -108,6 +108,20 @@ impl MeteredSpend {
         Ok(())
     }
 
+    /// Reserve a new call's hold and debit its offer in one ledger
+    /// transaction: a refusal of either keeps neither (see
+    /// `PairingService::reserve_call_with_offer`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn debit_call_with_offer(&self, state: &AppState, terms: crate::spend_budget::CallSpendTerms,
+        capacity: u64, charges: Vec<Charge>, cap: Option<u64>,
+        operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()) };
+        let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        let reservation = service.reserve_call_with_offer(client_id, *epoch, terms, capacity, charges, cap,
+            operation.reservation_link(false)).map_err(ApiError::BudgetExceeded)?;
+        Ok(Debit::reserved(Arc::clone(service), reservation))
+    }
+
     pub(crate) fn debit_call_block(&self, state: &AppState, signal: &konsensus_core::payloads::call::CallSignal,
         peer: &str, price: u64, fee: u64, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
         let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()) };
@@ -142,6 +156,16 @@ impl MeteredSpend {
         }
     }
 
+    /// The owner's per-payment limit on a call payment under this caller's
+    /// grant, if any (see `GrantBudget::call_per_payment_max_msat`). `None`
+    /// for the owner's own key. The ledger enforces it again at reservation.
+    pub(crate) fn call_per_payment_max_msat(&self, state: &AppState) -> Option<u64> {
+        let Meter::Grant { client_id, .. } = &self.meter else { return None };
+        state.pairing.as_ref()
+            .and_then(|service| service.grant_view_for(client_id))
+            .and_then(|view| view.call_per_payment_max_msat)
+    }
+
     /// For a first contact: the owner's approval for `recipient`, consumed
     /// once and still bound to its original budget until reservation. `Ok(None)` for the owner's own key, which is not
     /// metered. A paired client without a live matching first-contact grant is
@@ -172,6 +196,16 @@ impl MeteredSpend {
             Some(approval) => service.reserve_first_contact_operation(approval, cap, Some(link)),
             None => service.reserve_operation_spend(client_id, *epoch, charges, link),
         }.map_err(ApiError::BudgetExceeded)?;
+        Ok(Debit::reserved(Arc::clone(service), reservation))
+    }
+
+    /// Debit a call offer under its call's hold, bounded by the caller's
+    /// consented `cap` (or the hold's per-block ceiling) and the owner's limit.
+    pub(crate) fn debit_call_offer(&self, state: &AppState, charges: Vec<Charge>, call_id: &str, cap: Option<u64>, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()); };
+        let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        let reservation = service.reserve_call_offer_spend(client_id, *epoch, charges, call_id, cap, operation.reservation_link(false))
+            .map_err(ApiError::BudgetExceeded)?;
         Ok(Debit::reserved(Arc::clone(service), reservation))
     }
 
@@ -269,6 +303,9 @@ pub struct Debit {
     operation: Option<crate::handlers::messages::operations::Operation>,
     held: Option<(Arc<PairingService>, Reservation)>,
     max_routing_fee_msat: Option<u64>,
+    /// The zero routing ceiling was pinned because the payee is a direct
+    /// channel peer: every payment under it must fit that channel.
+    direct: bool,
     call_block: Option<(konsensus_core::NodeId, String)>,
     call_offer: Option<(konsensus_core::NodeId, String)>,
     call_spend: Option<(String, String)>,
@@ -355,6 +392,12 @@ impl Debit {
         self.max_routing_fee_msat = limit;
         self
     }
+    pub(crate) fn with_direct_channel(mut self, direct: bool) -> Self {
+        self.direct = direct;
+        self
+    }
+    /// Whether the zero routing ceiling relies on a direct channel.
+    pub(crate) fn is_direct(&self) -> bool { self.direct }
     pub(crate) fn fee_limit(&self, state: &AppState, principal: u64) -> u64 {
         state.lightning.routing_fee_policy().ceiling(principal, self.max_routing_fee_msat)
     }
@@ -373,12 +416,12 @@ impl Debit {
 
     /// Owner-only paths have no grant to revalidate.
     pub(crate) fn unmetered() -> Self {
-        Self { operation: None, max_routing_fee_msat: None, call_block: None, call_offer: None, call_spend: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
+        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_spend: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
     }
 
     fn reserved(service: Arc<PairingService>, reservation: Reservation) -> Self {
         let total = reservation.charges.iter().map(|c| c.amount_msat).sum();
-        Self { operation: None, max_routing_fee_msat: None, call_block: None, call_offer: None, call_spend: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
+        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_spend: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
     }
 
     /// Whether this debit is held against a budget grant.
@@ -414,7 +457,7 @@ impl Debit {
         admission_all_in: u64,
     ) -> Result<Debit, ApiError> {
         let Some((service, reservation)) = &self.held else {
-            return Ok(Debit::unmetered().with_fee_limit(self.max_routing_fee_msat));
+            return Ok(Debit::unmetered().with_fee_limit(self.max_routing_fee_msat).with_direct_channel(self.direct));
         };
         let mut call_total = self.call_reserved_msat.lock().unwrap_or_else(|e| e.into_inner());
         let (new_total, admission) = service
@@ -428,7 +471,7 @@ impl Debit {
             )
             .map_err(ApiError::BudgetExceeded)?;
         *call_total = new_total; // checked against the grant limit under its ledger lock
-        Ok(Debit::reserved(Arc::clone(service), admission).with_fee_limit(self.max_routing_fee_msat))
+        Ok(Debit::reserved(Arc::clone(service), admission).with_fee_limit(self.max_routing_fee_msat).with_direct_channel(self.direct))
     }
 
     /// Reconciliation reference only; never restores dispatch authority.
