@@ -1,5 +1,26 @@
 //! Durable accounting for one call and its recoverable block payments.
 use super::*;
+/// What a paid call signal is, for its per-payment limit at wallet dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallPayment {
+    /// An offer (400) or a media block (404): the grant's call limit.
+    Media,
+    /// An answer, ICE candidate or hangup (401 to 403), including a call's
+    /// closing signal: also held to the messaging cap, as when reserved.
+    Signal,
+}
+
+impl CallPayment {
+    pub(crate) fn of_kind(kind: u16) -> Option<Self> {
+        use konsensus_core::kind::{KIND_CALL_ANSWER, KIND_CALL_BLOCK, KIND_CALL_HANGUP, KIND_CALL_INVITE, KIND_ICE_CANDIDATE};
+        match kind {
+            KIND_CALL_INVITE | KIND_CALL_BLOCK => Some(Self::Media),
+            KIND_CALL_ANSWER | KIND_ICE_CANDIDATE | KIND_CALL_HANGUP => Some(Self::Signal),
+            _ => None,
+        }
+    }
+}
+
 /// Minimum closing reserve; also the legacy owner notification cap.
 pub(crate) const CALL_CLOSING_MSAT: u64 = 1_000;
 // Missing on pre-cap holds: preserve their original four-hour reservation.
@@ -160,6 +181,44 @@ impl GrantBudget {
         let max_msat = self.call_payment_limit(&terms.peer);
         if terms.per_block_msat.saturating_add(terms.per_block_fee_msat) > max_msat {
             return Err(BudgetRefusal::PerCall { max_msat });
+        }
+        Ok(())
+    }
+
+    /// The most one paid call signal of this purpose to `peer` may carry
+    /// now, msat. A signal is a message-sized payment: the call limit held
+    /// to the messaging cap.
+    pub(crate) fn call_debit_limit(&self, peer: &str, purpose: CallPayment) -> u64 {
+        match purpose {
+            CallPayment::Media => self.call_payment_limit(peer),
+            CallPayment::Signal => self.call_payment_limit(peer).min(self.messaging_per_call_max_msat()),
+        }
+    }
+
+    /// A new hold also funds its closing signal, outside the caller's hold
+    /// consent. Its reserved allowance (the quoted price plus routing
+    /// allowance, at least the minimum closing reserve) must fit the limit
+    /// that signal is paid under ([`Self::call_debit_limit`]), so an
+    /// unpayable or outsized quote never holds the budget. It is refused
+    /// before anything is reserved.
+    pub(crate) fn check_call_closing(&self, terms: &CallSpendTerms) -> Result<(), BudgetRefusal> {
+        let closing_msat = terms.closing_allowance_msat();
+        let max_msat = self.call_debit_limit(&terms.peer, CallPayment::Signal);
+        if closing_msat > max_msat {
+            return Err(BudgetRefusal::CallClosingAboveLimit { closing_msat, max_msat });
+        }
+        Ok(())
+    }
+
+    /// A paid call signal at wallet dispatch, on every guarded poll: each of
+    /// its whole charges (routing allowance included) must fit
+    /// [`Self::call_debit_limit`] as the grant is now, after any renewal.
+    pub(crate) fn check_call_debit(&self, charges: &[Charge], purpose: CallPayment) -> Result<(), BudgetRefusal> {
+        for charge in charges {
+            let max_msat = self.call_debit_limit(&charge.recipient, purpose);
+            if charge.amount_msat > max_msat {
+                return Err(BudgetRefusal::PerCall { max_msat });
+            }
         }
         Ok(())
     }

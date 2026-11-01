@@ -5,6 +5,14 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Grant-funded calls: every paid call signal (offer, block, answer, ICE,
+  hangup and the closing signal) is checked again at wallet dispatch against
+  the grant's current per-payment limit, so a relation envelope renewed lower
+  never pays the earlier amount. Answers, ICE candidates and hangups,
+  including the closing signal, stay within the 6 sat message cap. A call
+  whose quoted closing signal cannot fit is refused before any hold or payment
+  (`budget_exceeded`, reason `call_closing_above_limit`).
+
 ## [0.3.0-rc20] — 2026-10-31 (prep; not tagged yet)
 
 - Payment truth on the owner API: `POST /payments/pay` and `/payments/keysend`

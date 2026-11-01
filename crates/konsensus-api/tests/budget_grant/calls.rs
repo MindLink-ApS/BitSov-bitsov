@@ -1356,3 +1356,124 @@ async fn cap_hangup_of_a_legacy_grant_call_cannot_inherit_an_owner_renewal() {
     finish_at_cap(&fx).await;
     assert_eq!((fx.wallet.money(), fx.wallet.left()), (3, 3_000));
 }
+
+#[tokio::test]
+async fn an_unpayable_closing_quote_refuses_the_call_before_any_hold() {
+    // Signed 1 sat per payment; 1 sat offer and block; a 99 sat closing quote.
+    for relation in [false, true] {
+        let (fx, token) = if relation {
+            approved_call_capped(true, 1_000, 1).await
+        } else {
+            let (fx, token, _) = approved_call_with(200_000, Some(1_000), 1).await;
+            (fx, token)
+        };
+        let mut request = capped_offer(&fx, 1_000);
+        request["max_hold_msat"] = json!(1_000);
+        let (status, body) = send_priced_with_closing(&fx, &token, 1_000, 1_000, 99_000, request.clone()).await;
+        assert_budget_exceeded(status, &body, "call_closing_above_limit");
+        assert_nothing_held(&fx);
+        // A payable closing quote admits the same call.
+        fx.state.peer_prices.update_kind_price(fx.peer, 403, 1_000, 850_000).await;
+        request["operation_id"] = json!(uuid::Uuid::new_v4().to_string());
+        let (status, body) = send_priced_with_closing(&fx, &token, 1_000, 1_000, 1_000, request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+        assert_eq!(hold.reserved_msat, 2_000, "one block and the closing allowance");
+        assert_eq!((fx.wallet.money(), fx.used(), breaker_payments(&fx)), (1, 3_000, 2));
+    }
+}
+
+/// Holds the next invoice request, so a test can act before it is answered.
+#[derive(Default)]
+struct HeldInvoice {
+    armed: AtomicBool,
+    request: std::sync::Mutex<Option<(String, u64)>>,
+}
+
+fn invoice_for(peer: NodeId, amount: u64) -> konsensus_api::state::InvoiceResponseData {
+    let bolt11 = create_test_bolt11(amount);
+    let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse().unwrap();
+    konsensus_api::state::InvoiceResponseData { payment_hash: invoice.payment_hash().to_string(), recipient: peer, bolt11 }
+}
+
+/// A one-minute call admitted under a relation envelope of `per_act` msat,
+/// every payment over an invoice whose response the test may hold.
+async fn relation_call_with_held_invoice(per_act: u64)
+    -> (Fx, String, super::messaging_cap::Renewal, Arc<HeldInvoice>, u64) {
+    let mut fx = call_ready(fixture().await).await;
+    fx.state.peer_ln_pubkeys.lock().await.remove(&fx.peer);
+    let held = Arc::new(HeldInvoice::default());
+    let (peer, gate) = (fx.peer, held.clone());
+    fx.state = Arc::new(AppState {
+        transport: Arc::new(ConnectedStubTransport::new(vec![peer], fx.state.invoice_requests.clone())
+            .with_invoice_responder(move |id, amount| {
+                if gate.armed.swap(false, Ordering::SeqCst) {
+                    *gate.request.lock().unwrap() = Some((id, amount));
+                    return None;
+                }
+                Some(invoice_for(peer, amount))
+            })),
+        max_call_minutes: 1,
+        ..(*fx.state).clone()
+    });
+    let (fx, token, _, renewal) =
+        super::messaging_cap::approved_grant_renewable(fx, true, 200_000, Some(per_act)).await;
+    let (status, body) = send_priced_with_closing(&fx, &token, 1_000, 1_000, 1_000, capped_offer(&fx, 1_000)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    answer(&fx).await;
+    let used = fx.used();
+    assert_eq!((fx.wallet.money(), used), (1, 3_000), "the offer, one block and the closing allowance");
+    (fx, token, renewal, held, used)
+}
+
+/// Start an ordinary paid hangup priced at `price`, in the background.
+async fn hangup(fx: &Fx, token: &str, price: u64) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+    fx.state.peer_prices.update_kind_price(fx.peer, 403, price, 850_000).await;
+    let request = json!({
+        "operation_id": uuid::Uuid::new_v4().to_string(), "recipient": fx.peer.to_hex(), "kind": 403,
+        "plaintext": json!({"v": 1, "call_id": CALL, "reason": "hangup"}).to_string(),
+        "max_routing_fee_msat": 0, "wait_ack_ms": 0,
+    });
+    let (state, token) = (fx.state.clone(), token.to_string());
+    tokio::spawn(async move { call(&state, "POST", "/api/v1/messages/compose", Some(request), Some(&token)).await })
+}
+
+#[tokio::test]
+async fn a_hangup_never_pays_above_an_envelope_renewed_lower_before_dispatch() {
+    let (fx, token, renewal, held, used) = relation_call_with_held_invoice(3_000).await;
+    // A 3 sat hangup is reserved under the 3 sat envelope; its invoice waits.
+    held.armed.store(true, Ordering::SeqCst);
+    let pending = hangup(&fx, &token, 3_000).await;
+    let (id, amount) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(request) = held.request.lock().unwrap().clone() { break request; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }).await.expect("hangup invoice requested");
+    assert_eq!(amount, 3_000);
+    assert_eq!(fx.used(), used + 3_000, "the hangup is reserved");
+    // The envelope is renewed at 1 sat per act, then the invoice arrives.
+    renewal.renew(1_000);
+    let reply = fx.state.invoice_requests.lock().await.remove(&id).unwrap();
+    reply.send(Ok(invoice_for(fx.peer, amount))).unwrap();
+    let (status, body) = pending.await.unwrap();
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.wallet.money(), 1, "the hangup never reached the wallet: {body}");
+    assert_eq!(fx.used(), used, "its reservation is released: {body}");
+}
+
+#[tokio::test]
+async fn a_hangup_pending_in_the_wallet_keeps_its_liability_after_a_lower_renewal() {
+    let (fx, token, renewal, _, used) = relation_call_with_held_invoice(3_000).await;
+    fx.wallet.pause_dispatch.store(true, Ordering::SeqCst);
+    let pending = hangup(&fx, &token, 3_000).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), fx.wallet.entered.notified())
+        .await.expect("hangup payment polled");
+    fx.wallet.pause_dispatch.store(false, Ordering::SeqCst);
+    renewal.renew(1_000);
+    fx.wallet.resume.notify_one();
+    let (status, body) = pending.await.unwrap();
+    assert!(status.is_server_error(), "{status} {body}");
+    // Polled once: the payment may be in flight, so it stays reserved.
+    assert_eq!(fx.used(), used + 3_000, "{body}");
+}

@@ -3746,7 +3746,7 @@ pub(super) async fn compose_peer(
             .map_err(|e| e.with_routing_fee(state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat)))?
             .with_fee_limit(req.max_routing_fee_msat)
             .with_direct_channel(direct);
-        let debit = debit.with_operation(operation.clone());
+        let debit = debit.with_operation(operation.clone()).for_call_payment(req.kind);
         let debit = if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
             debit.for_call_block(peer_id, req.plaintext.clone())
         } else if req.kind == konsensus_core::kind::KIND_CALL_INVITE && auth.is_metered() {

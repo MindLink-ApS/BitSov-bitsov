@@ -207,6 +207,7 @@ impl MeteredSpend {
                 .map_err(ApiError::BudgetExceeded)?;
             let mut debit = Debit::reserved(Arc::clone(service), reservation);
             debit.call_spend = Some((peer.clone(), call_id.clone()));
+            debit.call_payment = Some(crate::spend_budget::CallPayment::Signal);
             return Ok(debit);
         }
         let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()); };
@@ -329,6 +330,8 @@ pub struct Debit {
     call_block: Option<(konsensus_core::NodeId, String)>,
     call_offer: Option<(konsensus_core::NodeId, String)>,
     call_spend: Option<(String, String)>,
+    /// A paid call signal: rechecked against the grant on every guarded poll.
+    call_payment: Option<crate::spend_budget::CallPayment>,
     // None means a settled payment's fee is still unknown. Never release that liability.
     fees: std::sync::Mutex<std::collections::BTreeMap<String, Option<u64>>>,
     // Shared by every member of a room fan-out. Reservations consume this
@@ -349,6 +352,13 @@ impl Debit {
     }
 
     pub(crate) fn is_call_block(&self) -> bool { self.call_block.is_some() }
+
+    /// Mark a paid call signal of `kind` (400 to 404), whether or not it
+    /// draws on a hold; any other kind is left unmarked.
+    pub(crate) fn for_call_payment(mut self, kind: u16) -> Self {
+        self.call_payment = crate::spend_budget::CallPayment::of_kind(kind);
+        self
+    }
 
     pub(crate) fn for_call_offer(mut self, peer: konsensus_core::NodeId, plaintext: String) -> Self {
         self.call_spend = konsensus_core::wire_json::from_str::<konsensus_core::payloads::call::CallSignal>(&plaintext)
@@ -436,12 +446,12 @@ impl Debit {
 
     /// Owner-only paths have no grant to revalidate.
     pub(crate) fn unmetered() -> Self {
-        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_spend: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
+        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_spend: None, call_payment: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
     }
 
     fn reserved(service: Arc<PairingService>, reservation: Reservation) -> Self {
         let total = reservation.charges.iter().map(|c| c.amount_msat).sum();
-        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_spend: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
+        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_spend: None, call_payment: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
     }
 
     /// Whether this debit is held against a budget grant.
@@ -515,7 +525,7 @@ impl Debit {
         let mut operation = std::pin::pin!(operation);
         let mut polled = false;
         futures::future::poll_fn(|cx| {
-            match service.with_call_spend_authority(reservation, self.call_spend.as_ref().map(|(peer, id)| (peer.as_str(), id.as_str())), || {
+            match service.with_call_payment_authority(reservation, self.call_spend.as_ref().map(|(peer, id)| (peer.as_str(), id.as_str())), self.call_payment, || {
                 polled = true;
                 operation.as_mut().poll(cx)
             }) {
@@ -545,8 +555,9 @@ impl Debit {
         };
         let mut operation = std::pin::pin!(operation);
         let first = futures::future::poll_fn(|cx| {
-            Poll::Ready(service.with_call_spend_authority(reservation,
-                self.call_spend.as_ref().map(|(peer, id)| (peer.as_str(), id.as_str())), || operation.as_mut().poll(cx)))
+            Poll::Ready(service.with_call_payment_authority(reservation,
+                self.call_spend.as_ref().map(|(peer, id)| (peer.as_str(), id.as_str())), self.call_payment,
+                || operation.as_mut().poll(cx)))
         })
         .await
         .map_err(ApiError::BudgetExceeded)?;

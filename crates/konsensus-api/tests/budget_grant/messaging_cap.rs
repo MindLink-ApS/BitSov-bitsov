@@ -17,7 +17,50 @@ pub(super) async fn messaging_grant(fx: Fx, relation: bool, requested_cap: u64) 
 /// [`messaging_grant`] with its budget and optional per-payment maximum;
 /// also returns the exact text the owner's device signed (empty for a
 /// relation envelope, whose per-act maximum is `per_call` or the budget).
-pub(super) async fn approved_grant(mut fx: Fx, relation: bool, budget_msat: u64, per_call: Option<u64>) -> (Fx, String, String) {
+pub(super) async fn approved_grant(fx: Fx, relation: bool, budget_msat: u64, per_call: Option<u64>) -> (Fx, String, String) {
+    let (fx, token, signed, _) = approved_grant_renewable(fx, relation, budget_msat, per_call).await;
+    (fx, token, signed)
+}
+
+/// The owner's enrolled device, able to sign a fresh relation envelope for
+/// the fixture's peer, as a renewal does.
+pub(super) struct Renewal {
+    service: Arc<PairingService>,
+    fingerprint: String,
+    client_id: String,
+    key_id: String,
+    peer: String,
+    budget_msat: u64,
+    key: EcdsaKeyPair,
+}
+
+fn device_sign(key: &EcdsaKeyPair, msg: &str) -> String {
+    hex::encode(key.sign(&ring::rand::SystemRandom::new(), msg.as_bytes()).unwrap().as_ref())
+}
+
+impl Renewal {
+    /// Sign and apply a new envelope for the peer at `per_act_max_msat`.
+    pub(super) fn renew(&self, per_act_max_msat: u64) {
+        let mut nonce = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
+        let intent = pairing::RelationIntent {
+            device_key_id: self.key_id.clone(),
+            peer: self.peer.clone(),
+            level: 1,
+            budget_msat: self.budget_msat,
+            per_act_max_msat,
+            window_secs: 3600,
+            issued_at: chrono::Utc::now().timestamp(),
+            nonce: hex::encode(nonce),
+        };
+        let signature = device_sign(&self.key, &device::intent_message(&self.fingerprint, &self.client_id, &intent));
+        self.service.apply_relation_intent(&self.client_id, 1, &intent, &signature).unwrap();
+    }
+}
+
+/// [`approved_grant`], also returning the device that can renew a relation
+/// envelope.
+pub(super) async fn approved_grant_renewable(mut fx: Fx, relation: bool, budget_msat: u64, per_call: Option<u64>) -> (Fx, String, String, Renewal) {
     let mut signed = String::new();
     let root = konsensus_core::OwnerApprovalKey::from_mnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
@@ -51,7 +94,7 @@ pub(super) async fn approved_grant(mut fx: Fx, relation: bool, budget_msat: u64,
     let key =
         EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
     let public = hex::encode(key.public_key().as_ref());
-    let sign = |msg: &str| hex::encode(key.sign(&rng, msg.as_bytes()).unwrap().as_ref());
+    let sign = |msg: &str| device_sign(&key, msg);
     let op = fx
         .service
         .request_device_key(
@@ -78,7 +121,7 @@ pub(super) async fn approved_grant(mut fx: Fx, relation: bool, budget_msat: u64,
         .unwrap();
     if relation {
         let intent = pairing::RelationIntent {
-            device_key_id: op.key_id,
+            device_key_id: op.key_id.clone(),
             peer: fx.peer.to_hex(),
             level: 1,
             budget_msat,
@@ -125,7 +168,16 @@ pub(super) async fn approved_grant(mut fx: Fx, relation: bool, budget_msat: u64,
         signed = approval.approval_message;
     }
     let token = fx.token().await;
-    (fx, token, signed)
+    let renewal = Renewal {
+        service: fx.service.clone(),
+        fingerprint,
+        client_id: fx.client_id.clone(),
+        key_id: op.key_id.clone(),
+        peer: fx.peer.to_hex(),
+        budget_msat,
+        key,
+    };
+    (fx, token, signed, renewal)
 }
 
 #[tokio::test]
