@@ -13,8 +13,9 @@ historical snapshot. Existing rollback constraints still apply.
 
 Existing app grants bind calls at their stored **6,000 msat per payment**
 until re-granted. Re-issue each app client's grant with
-`konsensus grant --op <op>`: with no `--per-call`, the budget is signed as
-the per-payment value. An explicit `--per-call` signs that chosen limit.
+`konsensus grant --op <op>`. With no `--per-call`, the client's proposed
+per-payment value is signed, capped at the budget; pass `--per-call <sats>`
+to set the limit explicitly, and review the value shown before signing.
 The owner now sees and signs the real per-payment value; paid messages,
 files, rooms and admission still use the lower of that value and 6 sats.
 Calls use the signed value and their pinned per-block ceiling, with the
