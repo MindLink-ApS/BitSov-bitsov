@@ -3356,7 +3356,10 @@ impl PairingService {
         // Purpose, not grant provenance, determines the effective ceiling.
         // Enforce it without changing stored/signed terms, so live grants are
         // covered immediately and explicit payments retain the owner's limit.
-        let purpose_limit = if authority.payment || authority.call.is_some() {
+        let purpose_limit = if let Some(terms) = &authority.call {
+            // Checked before the hold counts against any breaker.
+            budget.check_call_closing(terms)
+        } else if authority.payment {
             Ok(())
         } else {
             let max_msat = offer_limit.unwrap_or_else(|| budget.messaging_per_call_max_msat());
@@ -3960,10 +3963,9 @@ impl PairingService {
         })
     }
 
-    /// Validate a persisted reservation and run one synchronous dispatch step
-    /// under the same lock used by debit, revoke, rotation and identity rebind.
-    /// The closure must never block or re-enter the pairing service. Async
-    /// callers poll once here and release the lock before returning Pending.
+    /// [`Self::with_call_payment_authority`] for a payment that is not a call
+    /// payment.
+    #[cfg(test)]
     pub(crate) fn with_spend_authority<T>(
         &self,
         reservation: &Reservation,
@@ -3972,31 +3974,52 @@ impl PairingService {
         self.with_spend_authority_at(reservation, || chrono::Utc::now().timestamp(), action)
     }
 
-    /// [`Self::with_spend_authority`] with an injected clock. The clock is read
-    /// **after** the pairing lock is held: a dispatch that waited behind
-    /// another writer must judge deadlines at the time it actually runs.
+    /// [`Self::with_spend_authority`] with an injected clock.
+    #[cfg(test)]
     pub(crate) fn with_spend_authority_at<T>(
         &self,
         reservation: &Reservation,
         clock: impl FnOnce() -> i64,
         action: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefusal> {
-        self.with_call_spend_authority_at(reservation, None, clock, action)
+        self.with_call_spend_authority_at(reservation, None, None, clock, action)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_call_spend_authority<T>(
         &self, reservation: &Reservation, call: Option<(&str, &str)>, action: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefusal> {
         match call {
             None => self.with_spend_authority(reservation, action),
-            Some(call) => self.with_call_spend_authority_at(reservation, Some(call), || chrono::Utc::now().timestamp(), action),
+            Some(call) => self.with_call_spend_authority_at(reservation, Some(call), None, || chrono::Utc::now().timestamp(), action),
         }
     }
 
+    /// Validate a persisted reservation and run one synchronous dispatch step
+    /// under the same lock used by debit, revoke, rotation and identity rebind.
+    /// The closure must never block or re-enter the pairing service. Async
+    /// callers poll once here and release the lock before returning Pending.
+    /// `call` is the hold the payment draws on, if any; `purpose` marks a paid
+    /// call signal, whether or not it draws on a hold.
+    pub(crate) fn with_call_payment_authority<T>(
+        &self, reservation: &Reservation, call: Option<(&str, &str)>, purpose: Option<crate::spend_budget::CallPayment>,
+        action: impl FnOnce() -> T,
+    ) -> Result<T, BudgetRefusal> {
+        self.with_call_spend_authority_at(reservation, call, purpose, || chrono::Utc::now().timestamp(), action)
+    }
+
+    /// The clock is read **after** the pairing lock is held: a dispatch that
+    /// waited behind another writer must judge deadlines at the time it
+    /// actually runs. `call`: the hold this payment draws on, which must be
+    /// open and fit the grant. `purpose`: a paid call signal, whose whole
+    /// charge must fit the grant as it is now.
     fn with_call_spend_authority_at<T>(
         &self, reservation: &Reservation, call: Option<(&str, &str)>,
+        purpose: Option<crate::spend_budget::CallPayment>,
         clock: impl FnOnce() -> i64, action: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefusal> {
+        // A payment drawing on a hold is a call payment even if unmarked.
+        let purpose = purpose.or(call.map(|_| crate::spend_budget::CallPayment::Media));
         let inner = self.lock();
         let now = clock();
         let valid = inner.file.grants.iter().any(|g| {
@@ -4013,6 +4036,10 @@ impl PairingService {
                             hold.terms.peer == peer && hold.terms.call_id == id && !hold.closed
                                 // Recovery re-dispatches under the grant as it is now.
                                 && b.check_call_hold(&hold.terms).is_ok()))
+                        // On every guarded poll, a paid call signal's own
+                        // whole charge fits the grant as it is now: a renewal
+                        // may have lowered it since reservation.
+                        && purpose.is_none_or(|purpose| b.check_call_debit(&reservation.charges, purpose).is_ok())
                 })
                 && g.client_id == reservation.client_id
                 && g.identity_fingerprint == inner.identity_fingerprint
