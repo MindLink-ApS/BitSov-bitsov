@@ -1032,3 +1032,96 @@ fn the_call_sweep_closes_a_hold_above_the_grants_per_payment_value() {
     let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
     assert_eq!(budget.used_msat, 3_000, "only the compatible hold stays reserved");
 }
+
+#[test]
+fn a_closing_payment_is_held_to_a_renewed_envelopes_lower_limit_at_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    let envelope = |per_act: u64| {
+        let mut inner = service.lock();
+        let budget = inner.file.grants[0].budget.as_mut().unwrap();
+        if !budget.recipients_only {
+            *budget = GrantBudget::relations();
+        }
+        budget.open_envelope(&peer, 100_000, per_act, chrono::Utc::now().timestamp() + 600);
+        service.persist(&mut inner.file).unwrap();
+    };
+    // A relation grant of 3 sat per act: 1 sat blocks and a 3 sat closing.
+    envelope(3_000);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 1_000, 0, 1)
+        .unwrap()
+        .with_closing_signal(3_000, 0)
+        .unwrap();
+    let hold = service.reserve_call_spend(&client, 1, terms, 100_000).unwrap();
+    let link = crate::spend_budget::OperationReservationLink {
+        operation_id: "closing".into(), execution_id: "attempt".into(), readmission: false,
+    };
+    let closing = service
+        .reserve_call_closing_spend("grant", &peer, "call", vec![Charge { recipient: peer.clone(), amount_msat: 3_000 }], link)
+        .unwrap();
+    assert!(service.with_call_spend_authority(&closing, Some((&peer, "call")), || ()).is_ok());
+    // The envelope is renewed at 1 sat per act before the closing is paid.
+    envelope(1_000);
+    let mut paid = false;
+    assert!(matches!(
+        service.with_call_spend_authority(&closing, Some((&peer, "call")), || paid = true),
+        Err(BudgetRefusal::NoGrant)
+    ));
+    assert!(!paid, "nothing is dispatched");
+    // Not dispatched: the child goes back to its hold, and closing it
+    // returns everything to the grant.
+    service.try_resolve_spend(&closing, &peer, 0).unwrap();
+    let view = service.call_spend_status(&peer, "call").unwrap();
+    assert_eq!((view.spent_msat, view.remaining_msat), (0, 4_000));
+    service.close_call_spend(&hold).unwrap();
+    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert_eq!(budget.used_msat, 0);
+    assert!(budget.pending.is_empty());
+}
+
+#[test]
+fn a_closing_quote_above_the_grant_limit_reserves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    {
+        let mut inner = service.lock();
+        let budget = inner.file.grants[0].budget.as_mut().unwrap();
+        *budget = GrantBudget::from_terms(&GrantTerms::new(200_000).per_call(1_000));
+        service.persist(&mut inner.file).unwrap();
+    }
+    let terms = |closing| crate::spend_budget::CallSpendTerms::new(&peer, "call", 1_000, 0, 1)
+        .unwrap()
+        .with_closing_signal(closing, 0)
+        .unwrap();
+    assert!(matches!(
+        service.reserve_call_spend(&client, 1, terms(99_000), 200_000),
+        Err(BudgetRefusal::CallClosingAboveLimit { closing_msat: 99_000, max_msat: 1_000 })
+    ));
+    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert_eq!(budget.used_msat, 0);
+    assert!(budget.call_reservations.is_empty());
+    assert_eq!(budget.breaker_status(chrono::Utc::now().timestamp()).payments_last_hour, 0);
+    assert_eq!(budget.breaker_status(chrono::Utc::now().timestamp()).reserved_msat_last_10_minutes, 0);
+    // A closing within the limit is reserved with the call.
+    service.reserve_call_spend(&client, 1, terms(1_000), 200_000).unwrap();
+}
+
+#[test]
+fn a_closing_quote_costs_no_more_than_a_message_or_one_block() {
+    let budget = GrantBudget::from_terms(&GrantTerms::new(1_000_000));
+    let terms = |block: u64, closing: u64| crate::spend_budget::CallSpendTerms::new(&"aa".repeat(32), "call", block, 0, 1)
+        .unwrap()
+        .with_closing_signal(closing, 0)
+        .unwrap();
+    budget.check_call_closing(&terms(1_000, 6_000)).unwrap();
+    assert!(matches!(
+        budget.check_call_closing(&terms(1_000, 6_001)),
+        Err(BudgetRefusal::CallClosingAboveLimit { max_msat: 6_000, .. })
+    ));
+    budget.check_call_closing(&terms(20_000, 20_000)).unwrap();
+    assert!(budget.check_call_closing(&terms(20_000, 20_001)).is_err());
+}

@@ -3356,7 +3356,10 @@ impl PairingService {
         // Purpose, not grant provenance, determines the effective ceiling.
         // Enforce it without changing stored/signed terms, so live grants are
         // covered immediately and explicit payments retain the owner's limit.
-        let purpose_limit = if authority.payment || authority.call.is_some() {
+        let purpose_limit = if let Some(terms) = &authority.call {
+            // Checked before the hold counts against any breaker.
+            budget.check_call_closing(terms)
+        } else if authority.payment {
             Ok(())
         } else {
             let max_msat = offer_limit.unwrap_or_else(|| budget.messaging_per_call_max_msat());
@@ -4012,7 +4015,11 @@ impl PairingService {
                         && call.is_none_or(|(peer, id)| b.call_reservations.values().any(|hold|
                             hold.terms.peer == peer && hold.terms.call_id == id && !hold.closed
                                 // Recovery re-dispatches under the grant as it is now.
-                                && b.check_call_hold(&hold.terms).is_ok()))
+                                && b.check_call_hold(&hold.terms).is_ok())
+                            // On every guarded poll, this debit's own whole
+                            // charge also fits the grant as it is now: a
+                            // renewal may have lowered it since allocation.
+                            && b.check_call_debit(&reservation.charges).is_ok())
                 })
                 && g.client_id == reservation.client_id
                 && g.identity_fingerprint == inner.identity_fingerprint

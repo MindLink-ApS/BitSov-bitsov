@@ -164,6 +164,36 @@ impl GrantBudget {
         Ok(())
     }
 
+    /// A new hold also funds its closing signal, outside the caller's hold
+    /// consent. Its reserved allowance (the quoted price plus routing
+    /// allowance, at least the minimum closing reserve) must fit
+    /// [`Self::call_payment_limit`], so it can be paid at all, and cost no
+    /// more than a message may or one block does, so an outsized quote cannot
+    /// hold the budget. Either is refused before anything is reserved.
+    pub(crate) fn check_call_closing(&self, terms: &CallSpendTerms) -> Result<(), BudgetRefusal> {
+        let closing_msat = terms.closing_allowance_msat();
+        let sane = terms.per_block_msat.saturating_add(terms.per_block_fee_msat)
+            .max(MESSAGING_PER_CALL_MAX_MSAT);
+        let max_msat = self.call_payment_limit(&terms.peer).min(sane);
+        if closing_msat > max_msat {
+            return Err(BudgetRefusal::CallClosingAboveLimit { closing_msat, max_msat });
+        }
+        Ok(())
+    }
+
+    /// One debit drawn for a call (a block, the offer or the closing signal)
+    /// at wallet dispatch: each of its charges must fit
+    /// [`Self::call_payment_limit`] as the grant is now, after any renewal.
+    pub(crate) fn check_call_debit(&self, charges: &[Charge]) -> Result<(), BudgetRefusal> {
+        for charge in charges {
+            let max_msat = self.call_payment_limit(&charge.recipient);
+            if charge.amount_msat > max_msat {
+                return Err(BudgetRefusal::PerCall { max_msat });
+            }
+        }
+        Ok(())
+    }
+
     /// Close each open hold that fails [`Self::check_call_hold`], releasing
     /// what it has not paid. With `only`, just that call (peer, call id).
     /// Returns the refusal for the last hold closed, if any.

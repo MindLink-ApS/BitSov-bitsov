@@ -1356,3 +1356,29 @@ async fn cap_hangup_of_a_legacy_grant_call_cannot_inherit_an_owner_renewal() {
     finish_at_cap(&fx).await;
     assert_eq!((fx.wallet.money(), fx.wallet.left()), (3, 3_000));
 }
+
+#[tokio::test]
+async fn an_unpayable_closing_quote_refuses_the_call_before_any_hold() {
+    // Signed 1 sat per payment; 1 sat offer and block; a 99 sat closing quote.
+    for relation in [false, true] {
+        let (fx, token) = if relation {
+            approved_call_capped(true, 1_000, 1).await
+        } else {
+            let (fx, token, _) = approved_call_with(200_000, Some(1_000), 1).await;
+            (fx, token)
+        };
+        let mut request = capped_offer(&fx, 1_000);
+        request["max_hold_msat"] = json!(1_000);
+        let (status, body) = send_priced_with_closing(&fx, &token, 1_000, 1_000, 99_000, request.clone()).await;
+        assert_budget_exceeded(status, &body, "call_closing_above_limit");
+        assert_nothing_held(&fx);
+        // A payable closing quote admits the same call.
+        fx.state.peer_prices.update_kind_price(fx.peer, 403, 1_000, 850_000).await;
+        request["operation_id"] = json!(uuid::Uuid::new_v4().to_string());
+        let (status, body) = send_priced_with_closing(&fx, &token, 1_000, 1_000, 1_000, request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+        assert_eq!(hold.reserved_msat, 2_000, "one block and the closing allowance");
+        assert_eq!((fx.wallet.money(), fx.used(), breaker_payments(&fx)), (1, 3_000, 2));
+    }
+}
