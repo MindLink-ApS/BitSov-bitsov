@@ -892,6 +892,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_live().await
     }
 
+    async fn call_block_invoice_count(&self, peer: &NodeId, call_id: &str, seq: u32) -> Result<u32, StorageError> {
+        self.inner.call_block_invoice_count(peer, call_id, seq).await
+    }
+
     async fn record_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32], retain_until_ms: u64) -> Result<(), StorageError> {
         // Routing/payment metadata only, like call_state; no payload or preimage.
         self.inner.record_call_block_invoice(peer, call_id, seq, payment_hash, retain_until_ms).await

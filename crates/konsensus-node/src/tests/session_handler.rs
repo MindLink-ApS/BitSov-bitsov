@@ -4408,6 +4408,50 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
 }
 
 #[tokio::test]
+async fn call_block_invoice_stops_at_the_cap_before_the_wallet() {
+    use konsensus_core::payloads::call as calls;
+    let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let ringing = calls::receive(None, 400, None, now - 16_000).unwrap();
+    let pending = calls::reserve(Some(ringing), 401, "answer", "hash", now - 16_000).unwrap();
+    let live = calls::commit(pending, "answer", now - 16_000).unwrap();
+    storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
+    let wallet = konsensus_lightning::MockLightningProvider::new();
+    let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
+    assert_eq!(
+        prepare_call_block_invoice(&storage, &peer, &purpose, 0, "zero", &wallet).await.unwrap_err(),
+        konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE,
+    );
+    assert_eq!(
+        prepare_call_block_invoice(
+            &storage, &peer, &purpose, calls::MAX_CALL_BLOCK_INVOICE_MSAT + 1, "huge", &wallet,
+        )
+        .await
+        .unwrap_err(),
+        konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE,
+    );
+    assert!(wallet.list_payments(20).await.unwrap().is_empty());
+    for n in 0..calls::MAX_CALL_BLOCK_INVOICES {
+        prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, &format!("block-{n}"), &wallet)
+            .await
+            .unwrap();
+    }
+    assert_eq!(wallet.list_payments(20).await.unwrap().len(), calls::MAX_CALL_BLOCK_INVOICES as usize);
+    assert_eq!(
+        prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, "one-past", &wallet).await.unwrap_err(),
+        konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE,
+    );
+    assert_eq!(
+        wallet.list_payments(20).await.unwrap().len(),
+        calls::MAX_CALL_BLOCK_INVOICES as usize,
+        "a request past the cap must not mint another invoice",
+    );
+    assert_eq!(storage.call_block_invoice_count(&peer, id, 0).await.unwrap(), calls::MAX_CALL_BLOCK_INVOICES);
+}
+
+#[tokio::test]
 async fn call_block_ack_storage_failure_retains_delivery_until_grant_is_durable() {
     use konsensus_core::{payloads::call as calls, PaymentProof, Recipient, UkmEnvelopeBuilder};
     let own = make_peer_id(71);

@@ -35,6 +35,9 @@ pub const CALL_BLOCK_INVOICE_PREFIX: &str = "konsensus:call_block:";
 /// Maximum outstanding invoice bindings per peer, call and block sequence.
 /// Refuse further issuance without evicting a hash that may already be paid.
 pub const MAX_CALL_BLOCK_INVOICES: u32 = 8;
+/// Largest amount a peer may name on a call-block invoice request: 1 BTC.
+/// The same ceiling an owner invoice uses. Zero is not an amount.
+pub const MAX_CALL_BLOCK_INVOICE_MSAT: u64 = 100_000_000_000;
 /// Longest continuously paid call.
 pub const MAX_CALL_MS: u64 = 4 * 60 * 60 * 1000;
 /// How long an ended or expired call id stays burned.
