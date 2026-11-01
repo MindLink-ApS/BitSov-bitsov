@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 
 mod calls;
 pub use calls::{CallSpend, CallSpendStatus, CallSpendTerms};
-pub(crate) use calls::CALL_CLOSING_MSAT;
+pub(crate) use calls::{CallPayment, CALL_CLOSING_MSAT};
 
 /// Capability advertised on `/api/v1/status` once this node meters grants.
 pub const CAPABILITY: &str = "spend_budget_grant_v1";

@@ -357,8 +357,9 @@ impl PairingService {
         ) {
             return Err(BudgetRefusal::NoGrant);
         }
-        if closing_grant.is_some() && price > budget.call_payment_limit(peer) {
-            return Err(BudgetRefusal::PerCall { max_msat: budget.call_payment_limit(peer) });
+        let closing_limit = budget.call_debit_limit(peer, crate::spend_budget::CallPayment::Signal);
+        if closing_grant.is_some() && price > closing_limit {
+            return Err(BudgetRefusal::PerCall { max_msat: closing_limit });
         }
         let (parent, call) = budget
             .call_reservations

@@ -1061,21 +1061,25 @@ fn a_closing_payment_is_held_to_a_renewed_envelopes_lower_limit_at_dispatch() {
     let closing = service
         .reserve_call_closing_spend("grant", &peer, "call", vec![Charge { recipient: peer.clone(), amount_msat: 3_000 }], link)
         .unwrap();
-    assert!(service.with_call_spend_authority(&closing, Some((&peer, "call")), || ()).is_ok());
+    assert!(service.with_call_payment_authority(&closing, Some((&peer, "call")), Some(crate::spend_budget::CallPayment::Signal), || ()).is_ok());
     // The envelope is renewed at 1 sat per act before the closing is paid.
     envelope(1_000);
     let mut paid = false;
     assert!(matches!(
-        service.with_call_spend_authority(&closing, Some((&peer, "call")), || paid = true),
+        service.with_call_payment_authority(&closing, Some((&peer, "call")), Some(crate::spend_budget::CallPayment::Signal), || paid = true),
         Err(BudgetRefusal::NoGrant)
     ));
     assert!(!paid, "nothing is dispatched");
     // Not dispatched: the child goes back to its hold, and closing it
     // returns everything to the grant.
-    service.try_resolve_spend(&closing, &peer, 0).unwrap();
-    let view = service.call_spend_status(&peer, "call").unwrap();
-    assert_eq!((view.spent_msat, view.remaining_msat), (0, 4_000));
+    // A replayed resolution changes nothing, before or after the hold closes.
+    for _ in 0..2 {
+        service.try_resolve_spend(&closing, &peer, 0).unwrap();
+        let view = service.call_spend_status(&peer, "call").unwrap();
+        assert_eq!((view.spent_msat, view.remaining_msat), (0, 4_000));
+    }
     service.close_call_spend(&hold).unwrap();
+    service.try_resolve_spend(&closing, &peer, 0).unwrap();
     let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
     assert_eq!(budget.used_msat, 0);
     assert!(budget.pending.is_empty());
@@ -1111,17 +1115,39 @@ fn a_closing_quote_above_the_grant_limit_reserves_nothing() {
 }
 
 #[test]
-fn a_closing_quote_costs_no_more_than_a_message_or_one_block() {
+fn a_closing_quote_is_held_to_the_message_cap() {
     let budget = GrantBudget::from_terms(&GrantTerms::new(1_000_000));
-    let terms = |block: u64, closing: u64| crate::spend_budget::CallSpendTerms::new(&"aa".repeat(32), "call", block, 0, 1)
+    let terms = |block: u64, closing: u64, fee: u64| crate::spend_budget::CallSpendTerms::new(&"aa".repeat(32), "call", block, 0, 1)
         .unwrap()
-        .with_closing_signal(closing, 0)
+        .with_closing_signal(closing, fee)
         .unwrap();
-    budget.check_call_closing(&terms(1_000, 6_000)).unwrap();
+    // The routing allowance counts: 5,500 + 500 fits, 5,500 + 501 does not.
+    budget.check_call_closing(&terms(1_000, 5_500, 500)).unwrap();
     assert!(matches!(
-        budget.check_call_closing(&terms(1_000, 6_001)),
-        Err(BudgetRefusal::CallClosingAboveLimit { max_msat: 6_000, .. })
+        budget.check_call_closing(&terms(1_000, 5_500, 501)),
+        Err(BudgetRefusal::CallClosingAboveLimit { closing_msat: 6_001, max_msat: 6_000 })
     ));
-    budget.check_call_closing(&terms(20_000, 20_000)).unwrap();
-    assert!(budget.check_call_closing(&terms(20_000, 20_001)).is_err());
+    // A large block does not widen what the closing signal may cost.
+    assert!(budget.check_call_closing(&terms(20_000, 20_000, 0)).is_err());
+}
+
+#[test]
+fn a_call_signal_is_held_to_the_message_cap_and_media_to_the_call_limit() {
+    use crate::spend_budget::CallPayment;
+    let peer = "aa".repeat(32);
+    let charge = |amount_msat| [Charge { recipient: peer.clone(), amount_msat }];
+    let budget = GrantBudget::from_terms(&GrantTerms::new(1_000_000).per_call(20_000));
+    assert_eq!(CallPayment::of_kind(403), Some(CallPayment::Signal));
+    assert_eq!(CallPayment::of_kind(404), Some(CallPayment::Media));
+    assert_eq!(CallPayment::of_kind(100), None);
+    budget.check_call_debit(&charge(6_000), CallPayment::Signal).unwrap();
+    assert!(matches!(budget.check_call_debit(&charge(6_001), CallPayment::Signal), Err(BudgetRefusal::PerCall { max_msat: 6_000 })));
+    budget.check_call_debit(&charge(20_000), CallPayment::Media).unwrap();
+    assert!(matches!(budget.check_call_debit(&charge(20_001), CallPayment::Media), Err(BudgetRefusal::PerCall { max_msat: 20_000 })));
+    // A relation envelope's per-act maximum bounds both.
+    let mut relation = GrantBudget::relations();
+    relation.open_envelope(&peer, 100_000, 3_000, chrono::Utc::now().timestamp() + 600);
+    relation.check_call_debit(&charge(3_000), CallPayment::Signal).unwrap();
+    assert!(relation.check_call_debit(&charge(3_001), CallPayment::Signal).is_err());
+    assert!(relation.check_call_debit(&charge(3_001), CallPayment::Media).is_err());
 }
