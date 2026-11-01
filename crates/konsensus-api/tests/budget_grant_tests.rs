@@ -54,6 +54,7 @@ const FAILED: u8 = 3;
 #[derive(Default)]
 struct Wallet {
     call_capacity: AtomicU64,
+    other_channel_capacity: AtomicU64,
     /// Lightning key at the far end of the one channel; `PEER_LN` when unset.
     channel_peer: std::sync::Mutex<Option<String>>,
     pause_capacity: AtomicBool,
@@ -137,13 +138,24 @@ impl LightningProvider for Wallet {
         }
         let capacity = self.call_capacity.load(Ordering::SeqCst);
         let peer_pubkey = self.channel_peer.lock().unwrap().clone().unwrap_or_else(|| PEER_LN.into());
-        Ok(vec![konsensus_core::traits::lightning::ChannelInfo {
+        let mut channels = vec![konsensus_core::traits::lightning::ChannelInfo {
             is_outbound: Some(true), is_announced: Some(false), is_channel_ready: Some(true),
             local_reserve_msat: Some(0), initial_push_msat: None, channel_id: "test-channel".into(),
             user_channel_id: None, funding_txo: None, peer_pubkey,
             capacity_msat: capacity, local_balance_msat: capacity, outbound_capacity_msat: Some(capacity),
             remote_balance_msat: 0, active: true, short_channel_id: None,
-        }])
+        }];
+        let other_capacity = self.other_channel_capacity.load(Ordering::SeqCst);
+        if other_capacity > 0 {
+            let mut other = channels[0].clone();
+            other.channel_id = "other-channel".into();
+            other.peer_pubkey = OTHER_LN.into();
+            other.capacity_msat = other_capacity;
+            other.local_balance_msat = other_capacity;
+            other.outbound_capacity_msat = Some(other_capacity);
+            channels.push(other);
+        }
+        Ok(channels)
     }
     async fn keysend_with_fee_limit(
         &self,

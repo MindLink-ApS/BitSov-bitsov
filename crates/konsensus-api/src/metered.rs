@@ -40,6 +40,9 @@ enum Meter {
     Owner,
     /// A paired client: every paid call debits its grant.
     Grant { client_id: String, epoch: u64 },
+    /// Maintenance can charge only the grant that funded this call. This
+    /// identity remains metered even after that grant has been removed.
+    CallClosing { grant_op_id: Option<String>, peer: String, call_id: String },
 }
 
 impl std::ops::Deref for MeteredSpend {
@@ -77,12 +80,18 @@ impl FromRequestParts<Arc<AppState>> for MeteredSpend {
 }
 
 impl MeteredSpend {
-    /// Internal authority only for a paid protocol hangup after durable Unpaid
-    /// expiry. Call renewal always requires the app's authenticated spend grant.
-    pub(crate) fn call_timeout(state: &AppState) -> Self {
+    /// Internal authority only for a bounded protocol hangup after durable
+    /// expiry. A grant-funded call never gains owner authority at termination.
+    pub(crate) async fn call_timeout(state: &AppState, peer: &konsensus_core::NodeId, call_id: &str,
+        reason: konsensus_core::payloads::call::HangupReason) -> Self {
+        let grant_op_id = state.pairing.as_ref().and_then(|s| s.call_spend_grant(&peer.to_hex(), call_id));
+        let meter = if reason == konsensus_core::payloads::call::HangupReason::Unpaid
+            || (grant_op_id.is_none() && crate::calls::owner_funded_call(state, peer, call_id).await.unwrap_or(false)) {
+            Meter::Owner
+        } else { Meter::CallClosing { grant_op_id, peer: peer.to_hex(), call_id: call_id.into() } };
         Self {
             user: AuthUser { node_id: state.identity.node_id().to_hex(), scopes: vec![Scope::Spend], pairing: None },
-            meter: Meter::Owner,
+            meter,
         }
     }
 
@@ -97,7 +106,7 @@ impl MeteredSpend {
 
     /// Whether this caller spends from a budget grant.
     pub fn is_metered(&self) -> bool {
-        matches!(self.meter, Meter::Grant { .. })
+        !matches!(self.meter, Meter::Owner)
     }
 
     pub(crate) fn reserve_call(&self, state: &AppState, terms: crate::spend_budget::CallSpendTerms,
@@ -148,6 +157,8 @@ impl MeteredSpend {
     pub fn has_live_grant(&self, state: &AppState) -> bool {
         match &self.meter {
             Meter::Owner => true,
+            Meter::CallClosing { grant_op_id, .. } => state.pairing.as_ref().is_some_and(|s|
+                s.snapshot().grants.iter().any(|g| Some(&g.op_id) == grant_op_id.as_ref())),
             Meter::Grant { client_id, .. } => state
                 .pairing
                 .as_ref()
@@ -189,6 +200,15 @@ impl MeteredSpend {
     }
 
     pub(crate) fn debit_operation(&self, state: &AppState, charges: Vec<Charge>, approval: Option<FirstContactAuthorization>, cap: Option<u64>, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
+        if let Meter::CallClosing { grant_op_id, peer, call_id } = &self.meter {
+            let grant_op_id = grant_op_id.as_deref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+            let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+            let reservation = service.reserve_call_closing_spend(grant_op_id, peer, call_id, charges, operation.reservation_link(false))
+                .map_err(ApiError::BudgetExceeded)?;
+            let mut debit = Debit::reserved(Arc::clone(service), reservation);
+            debit.call_spend = Some((peer.clone(), call_id.clone()));
+            return Ok(debit);
+        }
         let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()); };
         let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
         let link = operation.reservation_link(false);

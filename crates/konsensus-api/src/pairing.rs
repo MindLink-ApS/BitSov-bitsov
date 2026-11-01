@@ -491,6 +491,11 @@ pub struct PairingFile {
     pub clients: Vec<PairedClient>,
     /// Owner-written grants.
     pub grants: Vec<SpendGrant>,
+    /// `(peer:call_id) -> originating grant`. Funding provenance survives
+    /// grant revocation/replacement, so maintenance cannot fall back to owner.
+    /// Removed only after the call's durable replay tombstone disappears.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub call_spend_grants: BTreeMap<String, String>,
     /// Owner-written `front_door` grants. Separate from `grants` so that no
     /// budget path can pick one up. Absent in files written before it existed.
     #[serde(default)]
@@ -929,7 +934,7 @@ impl PairingService {
             }
         }
         let file_path = dir.join("clients.json");
-        let file = if file_path.exists() {
+        let mut file = if file_path.exists() {
             let raw = std::fs::read(&file_path)?;
             let parsed: PairingFile = serde_json::from_slice(&raw).map_err(|e| {
                 // Fail closed and demand repair. Treating an unreadable pairing
@@ -960,6 +965,19 @@ impl PairingService {
                 ..PairingFile::default()
             }
         };
+
+        // Upgrade existing holds before any expired/revoked grant can lose
+        // their provenance. This is metadata only, never renewed authority.
+        let mut funding_upgraded = false;
+        for grant in &file.grants {
+            for call in grant.budget.iter().flat_map(|budget| budget.call_reservations.values()) {
+                let key = format!("{}:{}", call.terms.peer, call.terms.call_id);
+                if let std::collections::btree_map::Entry::Vacant(entry) = file.call_spend_grants.entry(key) {
+                    entry.insert(grant.op_id.clone());
+                    funding_upgraded = true;
+                }
+            }
+        }
 
         // A crash before rename can leave grant data in the temporary file,
         // even when the authoritative file has no grants to prune. Never
@@ -1010,6 +1028,9 @@ impl PairingService {
         };
         // A grant that expired while the node was down, or an unmetered
         // pre-G1 grant, must not survive the restart on disk either.
+        if funding_upgraded {
+            service.persist(&mut service.lock_without_cleanup().file)?;
+        }
         service.prune_expired_grants()?;
         service.sweep_provisional_pairings()?;
         Ok(service)
@@ -3276,6 +3297,7 @@ impl PairingService {
                 "grant does not authorize liquidity fees".into(),
             ));
         }
+        let call_binding = authority.call.as_ref().map(|terms| format!("{}:{}", terms.peer, terms.call_id));
         let before = inner.file.grants[idx].budget.clone();
         let op_id = inner.file.grants[idx].op_id.clone();
         let id = uuid::Uuid::new_v4().to_string();
@@ -3393,10 +3415,18 @@ impl PairingService {
             inner.file.grants[idx].budget = before;
             return Err(e);
         }
+        let previous_binding = call_binding.as_ref().and_then(|key|
+            inner.file.call_spend_grants.insert(key.clone(), op_id.clone()));
         if in_memory {
             return Ok(reservation);
         }
         if let Err(e) = self.persist_with_clock(&mut inner.file, &mut clock) {
+            if let Some(key) = call_binding {
+                match previous_binding {
+                    Some(previous) => { inner.file.call_spend_grants.insert(key, previous); },
+                    None => { inner.file.call_spend_grants.remove(&key); },
+                }
+            }
             if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
                 g.budget = before;
             }
