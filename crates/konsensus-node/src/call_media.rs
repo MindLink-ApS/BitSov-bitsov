@@ -14,8 +14,11 @@
 //! for a call that is no longer admitted is dropped, counted and logged at
 //! a bounded rate, and never answered.
 //!
-//! Each direction of each call is capped at [`MAX_FRAMES_PER_SECOND`] and
-//! [`MAX_BYTES_PER_SECOND`]; packets over the cap are dropped. Queues are
+//! Each direction of each call is held to [`MAX_FRAMES_PER_SECOND`] and
+//! [`MAX_BYTES_PER_SECOND`] sustained by a token bucket that may bank up to
+//! [`MEDIA_BURST_FRAMES`] and [`MEDIA_BURST_BYTES`]: a backlog released at
+//! once after a short stall on the path passes, a sustained overrun does
+//! not, and packets over the cap are dropped. Queues are
 //! bounded and drop the **oldest** packet rather than block: stale audio is
 //! worth less than fresh audio and nothing upstream ever waits on a slow
 //! consumer. Towards the peer, a packet waits at most
@@ -28,6 +31,7 @@
 //! or a stalled peer write, releasing the route when admission ends.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -48,6 +52,12 @@ use tracing::{debug, info, warn};
 pub const MAX_FRAMES_PER_SECOND: u32 = 100;
 /// Bytes per second one direction of one call may carry (payload bytes).
 pub const MAX_BYTES_PER_SECOND: u64 = 64 * 1024;
+/// Packets one direction may carry at once when it has been under the rate:
+/// two seconds' worth, so the backlog of a short stall on the path catches up
+/// instead of being dropped.
+pub const MEDIA_BURST_FRAMES: u32 = 2 * MAX_FRAMES_PER_SECOND;
+/// Payload bytes one direction may carry at once; two seconds' worth.
+pub const MEDIA_BURST_BYTES: u64 = 2 * MAX_BYTES_PER_SECOND;
 /// Calls this node routes media for at once (sockets attached).
 pub const MAX_ROUTED_CALLS: usize = 64;
 /// How long a positive admission answer is trusted before it is re-read.
@@ -160,42 +170,73 @@ impl MediaDrop {
     }
 }
 
-/// One direction's cap over a one-second window: at most `max_frames`
-/// packets and `max_bytes` payload bytes per second.
+/// Token units per packet or byte: credit is kept in millionths so that
+/// refill over any elapsed time is exact enough without floating point.
+const CREDIT_UNIT: u64 = 1_000_000;
+
+/// One direction's cap as a token bucket: credit refills at `frame_rate`
+/// packets and `byte_rate` payload bytes per second, up to `frame_burst`
+/// and `byte_burst`, and each admitted packet spends one packet and its
+/// bytes. The bucket starts full.
 #[derive(Debug, Clone)]
 pub struct RateCap {
-    window_start: Instant,
-    frames: u32,
-    bytes: u64,
-    max_frames: u32,
-    max_bytes: u64,
+    last: Instant,
+    /// Packet credit, in [`CREDIT_UNIT`]ths of a packet.
+    frame_credit: u64,
+    /// Byte credit, in [`CREDIT_UNIT`]ths of a byte.
+    byte_credit: u64,
+    frame_rate: u64,
+    byte_rate: u64,
+    frame_cap: u64,
+    byte_cap: u64,
 }
 
 impl RateCap {
-    pub fn new(max_frames: u32, max_bytes: u64, now: Instant) -> Self {
-        Self { window_start: now, frames: 0, bytes: 0, max_frames, max_bytes }
+    pub fn new(frame_rate: u32, byte_rate: u64, frame_burst: u32, byte_burst: u64, now: Instant) -> Self {
+        let frame_cap = u64::from(frame_burst).saturating_mul(CREDIT_UNIT);
+        let byte_cap = byte_burst.saturating_mul(CREDIT_UNIT);
+        Self {
+            last: now,
+            frame_credit: frame_cap,
+            byte_credit: byte_cap,
+            frame_rate: u64::from(frame_rate),
+            byte_rate,
+            frame_cap,
+            byte_cap,
+        }
     }
 
     /// The media caps.
     pub fn media(now: Instant) -> Self {
-        Self::new(MAX_FRAMES_PER_SECOND, MAX_BYTES_PER_SECOND, now)
+        Self::new(MAX_FRAMES_PER_SECOND, MAX_BYTES_PER_SECOND, MEDIA_BURST_FRAMES, MEDIA_BURST_BYTES, now)
     }
 
-    /// Whether a packet of `bytes` payload bytes fits the current window.
-    /// A refused packet counts nothing.
+    /// Whether a packet of `bytes` payload bytes fits the credit now.
+    /// A refused packet spends nothing.
     pub fn admit(&mut self, now: Instant, bytes: usize) -> bool {
-        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
-            self.window_start = now;
-            self.frames = 0;
-            self.bytes = 0;
-        }
-        let bytes = bytes as u64;
-        if self.frames >= self.max_frames || self.bytes.saturating_add(bytes) > self.max_bytes {
+        self.refill(now);
+        let need_bytes = (bytes as u64).saturating_mul(CREDIT_UNIT);
+        if self.frame_credit < CREDIT_UNIT || self.byte_credit < need_bytes {
             return false;
         }
-        self.frames += 1;
-        self.bytes += bytes;
+        self.frame_credit -= CREDIT_UNIT;
+        self.byte_credit -= need_bytes;
         true
+    }
+
+    fn refill(&mut self, now: Instant) {
+        if now <= self.last {
+            return;
+        }
+        let elapsed = now.duration_since(self.last).as_nanos();
+        self.last = now;
+        // rate per second × elapsed ns × CREDIT_UNIT / 1e9 ns.
+        let earned = |rate: u64| -> u64 {
+            let units = elapsed.saturating_mul(u128::from(rate)) / (1_000_000_000 / u128::from(CREDIT_UNIT));
+            u64::try_from(units).unwrap_or(u64::MAX)
+        };
+        self.frame_credit = self.frame_credit.saturating_add(earned(self.frame_rate)).min(self.frame_cap);
+        self.byte_credit = self.byte_credit.saturating_add(earned(self.byte_rate)).min(self.byte_cap);
     }
 }
 
@@ -250,6 +291,9 @@ struct Route {
     /// From the app's socket, to the peer.
     from_app: Arc<MediaQueue>,
     inbound_cap: Mutex<RateCap>,
+    /// Packets dropped over the rate cap, from the peer and from the app.
+    rate_capped_in: AtomicU64,
+    rate_capped_out: AtomicU64,
     /// When admission was last confirmed.
     admitted_at: Mutex<Instant>,
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -345,6 +389,7 @@ impl CallMediaRouter {
             return refuse(MediaDrop::NotAdmitted);
         }
         if !route.inbound_cap.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), data.len()) {
+            route.rate_capped_in.fetch_add(1, Ordering::Relaxed);
             return refuse(MediaDrop::RateCapped);
         }
         match route.to_app.push(MediaFrame { seq, payload: data }) {
@@ -384,7 +429,13 @@ impl CallMediaRouter {
         };
         route.end();
         if removed {
-            debug!(peer = %route.peer, call_id, "call media route ended");
+            info!(
+                peer = %route.peer,
+                call_id,
+                rate_capped_in = route.rate_capped_in.load(Ordering::Relaxed),
+                rate_capped_out = route.rate_capped_out.load(Ordering::Relaxed),
+                "call media route ended"
+            );
         }
     }
 
@@ -395,6 +446,7 @@ impl CallMediaRouter {
             while let Some(frame) = route.from_app.pop().await {
                 let now = Instant::now();
                 if !cap.admit(now, frame.payload.len()) {
+                    route.rate_capped_out.fetch_add(1, Ordering::Relaxed);
                     self.drops.note(MediaDrop::RateCapped, Some(&route.peer), &call_id);
                     continue;
                 }
@@ -460,6 +512,8 @@ impl CallMediaPort for CallMediaRouter {
             to_app: MediaQueue::new(MEDIA_QUEUE_FRAMES),
             from_app: MediaQueue::new(MEDIA_QUEUE_FRAMES),
             inbound_cap: Mutex::new(RateCap::media(now)),
+            rate_capped_in: AtomicU64::new(0),
+            rate_capped_out: AtomicU64::new(0),
             admitted_at: Mutex::new(now),
             pump: Mutex::new(None),
         });
