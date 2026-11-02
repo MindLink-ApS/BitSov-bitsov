@@ -859,6 +859,15 @@ async fn try_keysend(
 ///
 /// This is the original flow: send RequestInvoice to peer, wait for their
 /// InvoiceResponse, pay their invoice, extract preimage.
+/// Compressed Lightning keys. The peer chooses the hex case in `LightningInfo`;
+/// BOLT11 display is lowercase. Case does not name a different payee.
+fn invoice_payee_is(invoice: &lightning_invoice::Bolt11Invoice, expected: &str) -> bool {
+    invoice
+        .recover_payee_pub_key()
+        .to_string()
+        .eq_ignore_ascii_case(expected)
+}
+
 async fn create_payment_proof_via_invoice(
     state: &AppState,
     invoice_amount_msat: u64,
@@ -980,7 +989,7 @@ async fn create_payment_proof_via_invoice(
     }
 
     if let Some(expected) = state.peer_ln_pubkeys.lock().await.get(peer_id) {
-        if invoice.recover_payee_pub_key().to_string() != *expected {
+        if !invoice_payee_is(&invoice, expected) {
             return Err(ApiError::Lightning(
                 "invoice payee does not match recipient".into(),
             ));
@@ -2133,7 +2142,7 @@ async fn validate_admission_invoice(
         ));
     }
     if let Some(expected) = state.peer_ln_pubkeys.lock().await.get(peer_id) {
-        if invoice.recover_payee_pub_key().to_string() != *expected {
+        if !invoice_payee_is(&invoice, expected) {
             return Err(ApiError::Lightning(
                 "admission invoice payee does not match recipient".into(),
             ));
