@@ -1742,7 +1742,7 @@ async fn start_node_services<'a>(
                     warn!(
                         reason,
                         "[pairing] unattended_device_approvals is set but does not apply: {}",
-                        unattended_setting_note(&config, password_source, reason)
+                        unattended_setting_note(config, password_source, reason)
                     );
                 }
                 service.with_device_authority_disabled(reason)
@@ -3035,13 +3035,7 @@ mod owner_key_startup_tests {
         std::fs::remove_file(dir.path().join("mnemonic.txt")).unwrap();
         // Encrypted, password from a flag or file: off.
         assert_eq!(
-            owner_approval_key(
-                &enc,
-                Some("correct horse"),
-                DESCRIPTOR,
-                false
-            )
-            .unwrap_err(),
+            owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, false).unwrap_err(),
             SEED_PASSWORD_NOT_TYPED
         );
         // Encrypted and typed: on, and it is exactly the key the owner CLI signs with.
@@ -3311,13 +3305,7 @@ mod owner_key_startup_tests {
         let typed =
             owner_approval_key(&enc, Some("correct horse"), PasswordSource::Typed, false).unwrap();
         assert!(typed.signing_key.is_none());
-        let local = owner_approval_key(
-            &enc,
-            Some("correct horse"),
-            DESCRIPTOR,
-            true,
-        )
-        .unwrap();
+        let local = owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, true).unwrap();
         let signer = local
             .signing_key
             .as_ref()
@@ -3354,32 +3342,18 @@ mod owner_key_startup_tests {
         let typed =
             owner_approval_key(&enc, Some("correct horse"), PasswordSource::Typed, false).unwrap();
         assert_eq!(
-            owner_approval_key(
-                &enc,
-                Some("correct horse"),
-                DESCRIPTOR,
-                true
-            )
-            .unwrap()
-            .verifying_key,
+            owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, true)
+                .unwrap()
+                .verifying_key,
             typed.verifying_key
         );
-        for source in [
-            DESCRIPTOR,
-            PasswordSource::Flag,
-            FILE,
-            PasswordSource::None,
-        ] {
+        for source in [DESCRIPTOR, PasswordSource::Flag, FILE, PasswordSource::None] {
             assert_eq!(
                 owner_approval_key(&enc, Some("correct horse"), source, false).unwrap_err(),
                 SEED_PASSWORD_NOT_TYPED
             );
         }
-        for source in [
-            PasswordSource::Flag,
-            FILE,
-            PasswordSource::None,
-        ] {
+        for source in [PasswordSource::Flag, FILE, PasswordSource::None] {
             assert_eq!(
                 owner_approval_key(&enc, Some("correct horse"), source, true).unwrap_err(),
                 SEED_PASSWORD_NOT_TYPED
@@ -3388,24 +3362,12 @@ mod owner_key_startup_tests {
         assert!(owner_approval_key(&enc, Some("wrong"), DESCRIPTOR, true).is_err());
         std::fs::write(dir.path().join("mnemonic.txt"), PHRASE).unwrap();
         assert_eq!(
-            owner_approval_key(
-                &enc,
-                Some("correct horse"),
-                DESCRIPTOR,
-                true
-            )
-            .unwrap_err(),
+            owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, true).unwrap_err(),
             SEED_NOT_ENCRYPTED
         );
         let (_dir, plain) = config(None);
         assert_eq!(
-            owner_approval_key(
-                &plain,
-                Some("correct horse"),
-                DESCRIPTOR,
-                true
-            )
-            .unwrap_err(),
+            owner_approval_key(&plain, Some("correct horse"), DESCRIPTOR, true).unwrap_err(),
             SEED_NOT_ENCRYPTED
         );
     }

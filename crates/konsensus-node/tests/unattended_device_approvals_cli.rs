@@ -50,10 +50,7 @@ fn initialized_node() -> Node {
     assert!(dir.path().join("mnemonic.enc").exists());
 
     let config = dir.path().join("konsensus.toml");
-    let mut toml_config: toml::Value = std::fs::read_to_string(&config)
-        .unwrap()
-        .parse()
-        .unwrap();
+    let mut toml_config: toml::Value = std::fs::read_to_string(&config).unwrap().parse().unwrap();
     toml_config["network"]["listen_addr"] = "127.0.0.1:0".into();
     let api_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     toml_config["api"]["listen_addr"] = api_port.local_addr().unwrap().to_string().into();
@@ -134,7 +131,10 @@ fn a_password_file_start_follows_the_owner_setting_and_says_which_mode_it_is_in(
     assert!(log.contains("device approvals (Touch ID) are OFF"), "{log}");
     assert!(log.contains("seed_password_not_typed"), "{log}");
     assert!(log.contains("unattended_device_approvals"), "{log}");
-    assert!(!log.contains("device approvals (Touch ID) enabled"), "{log}");
+    assert!(
+        !log.contains("device approvals (Touch ID) enabled"),
+        "{log}"
+    );
 
     // Explicitly off is the same.
     set_setting(&node.config, false);
@@ -177,7 +177,10 @@ fn a_descriptor_start_follows_the_setting_and_refuses_a_too_open_redirected_file
     let node = initialized_node();
     let log = start_log_with(&node, descriptor_from_a_pipe);
     assert!(log.contains("seed_password_not_typed"), "{log}");
-    assert!(!log.contains("device approvals (Touch ID) enabled"), "{log}");
+    assert!(
+        !log.contains("device approvals (Touch ID) enabled"),
+        "{log}"
+    );
 
     set_setting(&node.config, true);
     let log = start_log_with(&node, descriptor_from_a_pipe);
@@ -214,8 +217,14 @@ fn a_password_on_the_command_line_keeps_approvals_off_with_the_setting_on() {
     });
     assert!(log.contains("seed_password_not_typed"), "{log}");
     assert!(log.contains("is set but does not apply"), "{log}");
-    assert!(log.contains("--password puts the password on the command line"), "{log}");
-    assert!(!log.contains("device approvals (Touch ID) enabled"), "{log}");
+    assert!(
+        log.contains("--password puts the password on the command line"),
+        "{log}"
+    );
+    assert!(
+        !log.contains("device approvals (Touch ID) enabled"),
+        "{log}"
+    );
 }
 
 #[test]
@@ -235,7 +244,10 @@ fn a_hosted_box_keeps_approvals_off_and_says_why() {
     assert!(log.contains("seed_password_not_typed"), "{log}");
     assert!(log.contains("is set but does not apply"), "{log}");
     assert!(log.contains("run for someone else"), "{log}");
-    assert!(!log.contains("device approvals (Touch ID) enabled"), "{log}");
+    assert!(
+        !log.contains("device approvals (Touch ID) enabled"),
+        "{log}"
+    );
 }
 
 #[test]
@@ -279,6 +291,9 @@ fn a_wrong_password_in_the_file_starts_nothing() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!all.contains("device approvals (Touch ID) enabled"), "{all}");
+    assert!(
+        !all.contains("device approvals (Touch ID) enabled"),
+        "{all}"
+    );
     assert!(!all.contains("not-the-password"), "{all}");
 }

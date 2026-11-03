@@ -109,7 +109,11 @@ mod tests {
         for (mode, owner_only) in [(0o600, true), (0o400, true), (0o640, false), (0o604, false)] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
             let file = std::fs::File::open(&path).unwrap();
-            assert_eq!(descriptor_is_owner_only(file.as_raw_fd()), owner_only, "{mode:o}");
+            assert_eq!(
+                descriptor_is_owner_only(file.as_raw_fd()),
+                owner_only,
+                "{mode:o}"
+            );
         }
         let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
         assert!(descriptor_is_owner_only(reader.as_raw_fd()));
