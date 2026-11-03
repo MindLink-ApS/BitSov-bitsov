@@ -1830,7 +1830,7 @@ mod startup_tests {
             let verifier = crate::owner_approval_key(
                 &repaired,
                 Some("crash-test-password"),
-                crate::PasswordSource::Descriptor,
+                crate::PasswordSource::Descriptor(crate::InputAccess::OwnerOnly),
                 true,
             )
             .unwrap();

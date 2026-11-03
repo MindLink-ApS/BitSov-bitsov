@@ -59,9 +59,63 @@ pub fn read_password_fd(fd: i32) -> Result<Zeroizing<String>> {
     }
 }
 
+/// Whether a password descriptor is free of a file another OS user can read.
+///
+/// A descriptor can be a redirected file (`--password-fd 3 3<pw`), and that file
+/// must pass the same owner-only rule as `--password-file`. A pipe or socket has
+/// no such file; its launcher protects the password. False when it cannot be
+/// checked: an invalid descriptor, or a platform without Unix modes.
+pub fn descriptor_is_owner_only(fd: i32) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::MetadataExt;
+        if fd < 0 {
+            return false;
+        }
+        // SAFETY: as in `read_password_fd`: fcntl validates fd and returns a new
+        // descriptor on success, without taking ownership of the input.
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate == -1 {
+            return false;
+        }
+        // SAFETY: duplicate is a newly opened, valid descriptor owned by us.
+        let file = unsafe { std::fs::File::from_raw_fd(duplicate) };
+        let Ok(meta) = file.metadata() else {
+            return false;
+        };
+        // SAFETY: getuid has no preconditions and cannot fail.
+        !meta.is_file() || (meta.mode() & 0o077 == 0 && meta.uid() == unsafe { libc::getuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_redirected_file_must_be_owner_only_and_a_pipe_has_no_file_to_check() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pw");
+        std::fs::write(&path, "secret").unwrap();
+        for (mode, owner_only) in [(0o600, true), (0o400, true), (0o640, false), (0o604, false)] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            assert_eq!(descriptor_is_owner_only(file.as_raw_fd()), owner_only, "{mode:o}");
+        }
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(descriptor_is_owner_only(reader.as_raw_fd()));
+        assert!(!descriptor_is_owner_only(2147483647));
+        assert!(!descriptor_is_owner_only(-1));
+    }
 
     #[test]
     fn preserves_spaces_unicode_and_interior_newlines() {

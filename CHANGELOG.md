@@ -5,6 +5,14 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- New owner setting `[pairing] unattended_device_approvals` (default off): a box
+  with an encrypted seed and its password in an owner-only file or a descriptor
+  can load the owner's approval verifier, so device approvals work while nobody
+  is at the keyboard. Whoever gets the disk and the password file can then
+  approve as the owner; the node says so at start. Refused for a plaintext seed,
+  a password on the command line, and a machine declared as run for someone else.
+  What an approval can authorize and all spending limits are unchanged.
+
 ## [0.3.0-rc21] — 2026-11-01
 
 - App spend grants now show, sign and store the owner's real per-payment

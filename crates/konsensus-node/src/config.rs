@@ -209,12 +209,21 @@ impl Default for SetupPageConfig {
 pub struct PairingConfig {
     pub second_device_enrollment: bool,
     pub second_device_claim_v1: bool,
+    /// The owner's choice for an unattended box: device approvals (Touch ID)
+    /// stay available when the password of an encrypted seed comes from an
+    /// owner-only file or a descriptor rather than being typed. Whoever gets
+    /// the disk and that file can then approve as the owner. Off by default,
+    /// and refused for a plaintext seed or a machine run for someone else.
+    /// See `docs/operations/password-input.md`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unattended_device_approvals: bool,
 }
 impl Default for PairingConfig {
     fn default() -> Self {
         Self {
             second_device_enrollment: false,
             second_device_claim_v1: true,
+            unattended_device_approvals: false,
         }
     }
 }
