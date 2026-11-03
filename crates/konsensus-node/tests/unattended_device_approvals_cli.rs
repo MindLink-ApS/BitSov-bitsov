@@ -82,8 +82,17 @@ fn set_setting(config: &Path, on: bool) {
     std::fs::write(config, toml::to_string(&value).unwrap()).unwrap();
 }
 
-/// Start until the API listens, kill the node, and return everything it printed.
+/// `start --password-file` until the API listens; see [`start_log_with`].
 fn start_log(node: &Node) -> String {
+    start_log_with(node, |cmd| {
+        cmd.arg("--password-file")
+            .arg(&node.password_file)
+            .stdin(Stdio::null());
+    })
+}
+
+/// Start until the API listens, kill the node, and return everything it printed.
+fn start_log_with(node: &Node, password_input: impl FnOnce(&mut Command)) -> String {
     struct Child(std::process::Child);
     impl Drop for Child {
         fn drop(&mut self) {
@@ -92,14 +101,11 @@ fn start_log(node: &Node) -> String {
         }
     }
     let output = tempfile::tempfile().unwrap();
+    let mut cmd = bin();
+    cmd.args(["start", "--config"]).arg(&node.config);
+    password_input(&mut cmd);
     let mut child = Child(
-        bin()
-            .args(["start", "--config"])
-            .arg(&node.config)
-            .arg("--password-file")
-            .arg(&node.password_file)
-            .stdin(Stdio::null())
-            .stdout(output.try_clone().unwrap())
+        cmd.stdout(output.try_clone().unwrap())
             .stderr(output.try_clone().unwrap())
             .spawn()
             .unwrap(),
@@ -154,6 +160,62 @@ fn a_password_file_start_follows_the_owner_setting_and_says_which_mode_it_is_in(
     set_setting(&node.config, false);
     let log = start_log(&node);
     assert!(log.contains("seed_password_not_typed"), "{log}");
+}
+
+/// Stdin as `--password-fd 0`, over a socket pair holding the password.
+fn descriptor_from_a_pipe(cmd: &mut Command) {
+    use std::io::Write;
+    let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    writer.write_all(PASSWORD.as_bytes()).unwrap();
+    drop(writer);
+    cmd.args(["--password-fd", "0"])
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(reader)));
+}
+
+#[test]
+fn a_descriptor_start_follows_the_setting_and_refuses_a_too_open_redirected_file() {
+    let node = initialized_node();
+    let log = start_log_with(&node, descriptor_from_a_pipe);
+    assert!(log.contains("seed_password_not_typed"), "{log}");
+    assert!(!log.contains("device approvals (Touch ID) enabled"), "{log}");
+
+    set_setting(&node.config, true);
+    let log = start_log_with(&node, descriptor_from_a_pipe);
+    assert!(log.contains("device approvals (Touch ID) enabled"), "{log}");
+    assert!(log.contains("owner_setting"), "{log}");
+
+    // The same password, redirected from a file: its mode decides.
+    for (mode, enabled) in [(0o640, false), (0o600, true)] {
+        std::fs::set_permissions(&node.password_file, std::fs::Permissions::from_mode(mode))
+            .unwrap();
+        let file = std::fs::File::open(&node.password_file).unwrap();
+        let log = start_log_with(&node, |cmd| {
+            cmd.args(["--password-fd", "0"]).stdin(file);
+        });
+        assert_eq!(
+            log.contains("device approvals (Touch ID) enabled"),
+            enabled,
+            "{mode:o}: {log}"
+        );
+        if !enabled {
+            assert!(log.contains("is set but does not apply"), "{log}");
+            assert!(log.contains("other OS users can read"), "{log}");
+        }
+    }
+}
+
+#[test]
+fn a_password_on_the_command_line_keeps_approvals_off_with_the_setting_on() {
+    let node = initialized_node();
+    set_setting(&node.config, true);
+    let log = start_log_with(&node, |cmd| {
+        cmd.args(["--insecure-argv", "--password", PASSWORD])
+            .stdin(Stdio::null());
+    });
+    assert!(log.contains("seed_password_not_typed"), "{log}");
+    assert!(log.contains("is set but does not apply"), "{log}");
+    assert!(log.contains("--password puts the password on the command line"), "{log}");
+    assert!(!log.contains("device approvals (Touch ID) enabled"), "{log}");
 }
 
 #[test]
