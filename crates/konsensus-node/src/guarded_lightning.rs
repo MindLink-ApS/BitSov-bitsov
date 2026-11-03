@@ -257,6 +257,12 @@ impl LightningProvider for GuardedLightning {
     ) -> Result<PaymentDetails, LightningError> {
         self.inner.get_payment_status(payment_hash).await
     }
+    async fn gate_payment_status(
+        &self,
+        payment_hash: &str,
+    ) -> Result<PaymentDetails, LightningError> {
+        self.inner.gate_payment_status(payment_hash).await
+    }
     fn outgoing_payment_updates(&self) -> Option<BoxStream<'static, String>> {
         self.inner.outgoing_payment_updates()
     }

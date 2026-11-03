@@ -3094,5 +3094,9 @@ mod custody_mode_tests {
 mod regtest_e2e;
 
 #[cfg(test)]
+#[path = "tests/gate_while_not_ready.rs"]
+mod gate_while_not_ready_tests;
+
+#[cfg(test)]
 #[path = "tests/shutdown.rs"]
 mod shutdown_tests;

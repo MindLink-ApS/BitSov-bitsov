@@ -107,6 +107,9 @@ pub struct Options {
     pub identity: Arc<NodeIdentity>,
     pub chain_url: String,
     pub calls: Option<CallOptions>,
+    /// The production readiness wrappers and settlement check on this node's
+    /// gate. Lets a scenario watch what it does while its chain sync has lapsed.
+    pub readiness_gated: bool,
 }
 
 /// Production call settings; the block clock is never shortened by the fixture.
@@ -279,11 +282,33 @@ impl App {
                 Arc::new(crate::call_media::PaidCallAdmission::new(storage.clone())),
             )
         });
+        let readiness_gated = options.as_ref().is_some_and(|o| o.readiness_gated);
+        let lightning: Arc<dyn LightningProvider> = if readiness_gated {
+            let policy = wallet.routing_fee_policy();
+            let backend = wallet.clone() as Arc<dyn LightningProvider>;
+            let recovering = konsensus_lightning::RecoveringLightning::new(
+                move || {
+                    let backend = backend.clone();
+                    async move { Ok(backend) }
+                },
+                policy,
+            )
+            .await
+            .unwrap();
+            Arc::new(crate::guarded_lightning::GuardedLightning {
+                inner: Arc::new(recovering),
+                disk: Arc::new(crate::safety::DiskGuard::new(dir.to_path_buf(), 0)),
+                channel_peers: Default::default(),
+                _state_guard: Arc::new(std::fs::File::open(dir).unwrap()),
+            })
+        } else {
+            wallet.clone()
+        };
         let state = Arc::new(konsensus_api::AppState {
             starter: Default::default(),
             identity: Arc::clone(identity),
             storage,
-            lightning: wallet.clone(),
+            lightning,
             chain: Arc::new(
                 konsensus_chain::EsploraProvider::new(konsensus_chain::EsploraConfig::custom(
                     options
@@ -304,7 +329,10 @@ impl App {
                     ..Default::default()
                 },
             )),
-            gate: Arc::new(konsensus_core::PaymentGate::new()),
+            gate: Arc::new(konsensus_core::PaymentGate::with_config(konsensus_core::gate::GateConfig {
+                verify_lightning_settlement: readiness_gated,
+                ..Default::default()
+            })),
             peer_registry: Arc::new(tokio::sync::RwLock::new(registry)),
             transport: Arc::clone(transport) as Arc<dyn MessageTransport>,
             session_manager: Arc::clone(sessions),
