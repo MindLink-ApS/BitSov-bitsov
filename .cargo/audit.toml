@@ -104,6 +104,24 @@ ignore = [
   "RUSTSEC-2026-0367",
   "RUSTSEC-2026-0368",
   "RUSTSEC-2026-0369",
+  # Triage 2026-11-03, review by 2027-02-03. Same test-only zip 0.6.6 as above:
+  # `cargo tree -p konsensus-node -e normal,build --target all --locked` has no
+  # zip. Neither build script calls ZipArchive::extract or ZipStreamReader, and
+  # inputs are SHA-256 pinned downloads. Remove when zip is dropped or >=9.0.5.
+  # -0429: symlink-entry allocation abort in extract; 0.6.6's extract has no
+  # symlink branch.
+  "RUSTSEC-2026-0429",
+  # OSV-only today, mirrored from osv-scanner.toml. cargo-audit matches only an
+  # advisory's primary ID, not its aliases, so these two lines record the review
+  # and would not silence a later RUSTSEC number. Add that number if one appears.
+  # GHSA-m665: ZipStreamReader parser differential, not called.
+  "GHSA-m665-v7pm-7grj",
+  # GHSA-8hxf: AES HMAC bypass; zip's aes-crypto feature is off, not compiled.
+  "GHSA-8hxf-qr8p-62x4",
+  # RUSTSEC-2026-0348 / GHSA-h2v8-394m-p7vv: Brotli certificate decompression.
+  # rustls 0.21.12 has no certificate compression and Cargo.lock has no brotli
+  # crate. Does not waive patched rustls 0.23.46. Remove on the upgrade in #59.
+  "RUSTSEC-2026-0348",
   # In Cargo.lock but NEVER COMPILED (the `mysql` feature is off, and neither rsa
   # nor sqlx-mysql appears in `cargo tree -e normal`). The ignore is still needed
   # because cargo-audit reads Cargo.lock and performs no feature resolution.
