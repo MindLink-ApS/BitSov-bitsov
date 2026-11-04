@@ -797,11 +797,11 @@ async fn handle_prekey_offer(
     }
 
     // We are the initiator — perform X3DH with peer's bundle. Any session we
-    // already have with this peer stays in place and usable until the offer
-    // has been validated and a new session fully derived; the swap is then
-    // atomic (`reinitiate_session`). A malformed or forged offer changes
-    // nothing. Paid ciphertext remains queued until its recipient ACKs, even
-    // across a session replacement.
+    // already have with this peer stays in place and usable until the peer
+    // confirms the new one with SessionAck (`reinitiate_session`): a valid
+    // bundle does not prove the peer will accept the init, since it can be
+    // stale. A malformed or forged offer changes nothing. Paid ciphertext
+    // remains queued until its recipient ACKs, even across a session replacement.
     let peer_bundle: konsensus_crypto::SerializablePrekeyBundle =
         match serde_json::from_value(bundle).map_err(|_| konsensus_core::wire_json::DecodeError) {
             Ok(b) => b,
@@ -826,7 +826,7 @@ async fn handle_prekey_offer(
         Ok(init_data) => {
             last_negotiation.insert(*peer_id, tokio::time::Instant::now());
             if had_session {
-                info!(peer = %peer_id, "peer re-offered its prekey; previous session replaced after a successful X3DH");
+                info!(peer = %peer_id, "peer re-offered its prekey; previous session stays until the peer confirms the new one");
             }
             info!(peer = %peer_id, "X3DH initiated, sending SessionInit");
             let init_json = match serde_json::to_value(&init_data) {
@@ -874,11 +874,10 @@ async fn handle_session_init(
     }
 
     // Any session we already have with this peer stays in place and usable
-    // until the init has been validated and a new session fully derived; the
-    // swap is then atomic (`reaccept_session`). A malformed init, or one
-    // naming a one-time pre-key we do not hold, changes nothing. Paid
-    // ciphertext remains queued until its recipient ACKs, even across a
-    // session replacement.
+    // until a message decrypts under the new one (`reaccept_session`), which
+    // proves the peer derived the same keys. A malformed init, or one naming a
+    // one-time pre-key we do not hold, changes nothing. Paid ciphertext remains
+    // queued until its recipient ACKs, even across a session replacement.
     let init: konsensus_crypto::SerializableSessionInit =
         match serde_json::from_value(init_data).map_err(|_| konsensus_core::wire_json::DecodeError) {
             Ok(d) => d,
@@ -893,7 +892,7 @@ async fn handle_session_init(
         Ok(()) => {
             last_negotiation.insert(*peer_id, tokio::time::Instant::now());
             if had_session {
-                info!(peer = %peer_id, "peer re-initiated; previous session replaced after a successful X3DH");
+                info!(peer = %peer_id, "peer re-initiated; previous session stays until the new one is proven");
             }
             info!(peer = %peer_id, "E2EE session accepted, sending SessionAck");
             let frame = Frame::SessionAck;
@@ -921,6 +920,12 @@ async fn handle_session_ack(
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
 ) {
+    // A confirmation is the only thing that retires the previous session, and one
+    // we did not ask for changes nothing.
+    if !session_manager.confirm_session(peer_id).await {
+        debug!(peer = %peer_id, "unexpected SessionAck ignored");
+        return;
+    }
     info!(peer = %peer_id, "E2EE session established (initiator), sending ratchet init");
     audit.record(
         "e2ee_session_established",
@@ -938,11 +943,8 @@ async fn handle_session_ack(
             }
         }
         Err(e) => {
-            warn!(
-                peer = %peer_id, error = %e,
-                "failed to encrypt ratchet init — removing corrupt session"
-            );
-            session_manager.remove_session(peer_id).await;
+            warn!(peer = %peer_id, error = %e, "failed to encrypt ratchet init; asking to renegotiate");
+            session_manager.mark_needs_renegotiation(peer_id).await;
         }
     }
 }
@@ -963,9 +965,11 @@ async fn handle_ratchet_init(
                 Err(e) => {
                     warn!(
                         peer = %peer_id, error = %e,
-                        "failed to decrypt ratchet init — removing broken session and re-negotiating"
+                        "failed to decrypt ratchet init; session kept, re-negotiating"
                     );
-                    session_manager.remove_session(peer_id).await;
+                    // A failed decrypt changes no ratchet state, so the session stays
+                    // until a new one is confirmed.
+                    session_manager.mark_needs_renegotiation(peer_id).await;
                     // Preserve paid envelopes across ratchet recovery; acceptance ACKs do not require decryption.
                     // Send fresh PrekeyOffer to trigger re-negotiation
                     if let Err(send_err) = send_prekey_offer(session_manager, transport, peer_id).await {
@@ -1130,7 +1134,7 @@ async fn answer_prekey_offer_for_recovery(
 }
 
 async fn e2ee_needs_self_heal(session_manager: &SessionManager, peer_id: &NodeId) -> bool {
-    !session_manager.can_send(peer_id).await
+    !session_manager.can_send(peer_id).await || session_manager.needs_renegotiation(peer_id).await
 }
 
 async fn send_prekey_offer(
@@ -1166,29 +1170,6 @@ fn terminal_paid_rejection(reason: &str) -> bool {
         "call signal withdrawn",
     ]
     .iter().any(|prefix| reason.starts_with(prefix))
-}
-
-/// A callee's refusal of a paid block whose ciphertext it could not read, before
-/// the block was admitted. It alone does not say whether a resend can succeed.
-const BLOCK_NOT_READABLE: &str = "invalid call signal: undecryptable";
-
-/// Whether a rejection of an envelope we sent to `peer` is final.
-///
-/// [`BLOCK_NOT_READABLE`] is final only when we hold the higher id, the X3DH
-/// responder. Our sending chain starts with the first message we decrypt under
-/// a session, so the lower id, which derived that session first, already had it
-/// when we encrypted. If it cannot read the block now, that session is gone
-/// there (removed or replaced, and a new X3DH never brings it back) or the bytes
-/// cannot decrypt under it, and a resend carries the same bytes. The one failure
-/// a later delivery could cure, too many skipped messages, is refused under
-/// another reason.
-///
-/// With the lower id it stays retryable: we encrypt on a new session the moment
-/// we derive it, so our block can reach the peer ahead of the SessionInit it
-/// needs. That fresh block decrypts when resent, and at this point it cannot be
-/// told apart from one encrypted under a session the peer has replaced.
-fn terminal_rejection_from_peer(reason: &str, own_id: &NodeId, peer: &NodeId) -> bool {
-    terminal_paid_rejection(reason) || (reason == BLOCK_NOT_READABLE && own_id.as_bytes() > peer.as_bytes())
 }
 
 /// Bound storage work before looking up an unprivileged confirmation. A
@@ -1264,13 +1245,13 @@ async fn handle_delivery_confirmation(
         handle_message_acked(peer, id, timestamps, storage, routing, ws, privileged && !legacy).await;
     } else {
         let reason = rejection.unwrap_or_default();
-        let terminal = terminal_rejection_from_peer(reason, own_id, peer);
+        let terminal = terminal_paid_rejection(reason);
         if !matches!(storage.reject_pending(id, peer, own_id, reason, terminal).await, Ok(true)) {
             if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
             return;
         }
         timestamps.lock().await.remove(id);
-        handle_message_rejected(peer, id, reason, terminal, routing, ws, privileged).await;
+        handle_message_rejected(peer, id, reason, routing, ws, privileged).await;
     }
 }
 
@@ -1331,7 +1312,6 @@ async fn handle_message_rejected(
     peer_id: &NodeId,
     message_id: &konsensus_core::types::MessageId,
     reason: &str,
-    terminal: bool,
     routing: &konsensus_routing::RoutingTable,
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
     update_weights: bool,
@@ -1343,7 +1323,7 @@ async fn handle_message_rejected(
         WsDeliveryStatus {
             event_type: "delivery_status",
             message_id: message_id.to_hex(),
-            status: if terminal { "failed_paid" } else { "rejected" }.to_string(),
+            status: if terminal_paid_rejection(reason) { "failed_paid" } else { "rejected" }.to_string(),
             reason: Some(reason.to_string()),
         },
     )) {
@@ -2145,9 +2125,9 @@ async fn handle_gossip_received(
 
 /// Refuse before touching the wallet and again after asynchronous creation.
 /// No invoice is returned to the caller when the safety margin is exhausted,
-/// or while this node has no E2EE session with the caller: the block could not
-/// be read, so the minute would be paid and not served. The caller pays nothing
-/// and may ask again once the session is back.
+/// or while this node has no E2EE session with the caller, or one it is waiting
+/// to renegotiate: the block could not be read, so the minute would be paid and
+/// not served. The caller pays nothing and may ask again once the session is back.
 async fn prepare_call_block_invoice(
     storage: &dyn konsensus_storage::Storage, session_manager: &SessionManager, peer: &NodeId, purpose: &str,
     amount_msat: u64, request_id: &str, lightning: &dyn LightningProvider,
@@ -2162,8 +2142,8 @@ async fn prepare_call_block_invoice(
     calls::CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK,
         &serde_json::json!({"call_id": call_id, "seq": seq}).to_string()).map_err(|_| REFUSED)?;
     let validate = async || {
-        if !session_manager.has_session(peer).await {
-            warn!(peer = %peer, "no E2EE session with the caller; call block invoice refused");
+        if !session_manager.has_session(peer).await || session_manager.needs_renegotiation(peer).await {
+            warn!(peer = %peer, "no readable E2EE session with the caller; call block invoice refused");
             return Err(REFUSED);
         }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)

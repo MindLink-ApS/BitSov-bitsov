@@ -569,7 +569,6 @@ async fn message_rejected_records_routing_failure() {
         &peer_id,
         &msg_id,
         "InsufficientPayment",
-        false,
         &routing,
         &ws_tx,
         true,
@@ -596,7 +595,6 @@ async fn message_rejected_broadcasts_status_with_reason() {
         &peer_id,
         &msg_id,
         "InsufficientPayment",
-        false,
         &routing,
         &ws_tx,
         true,
@@ -3776,7 +3774,7 @@ async fn peer_rejection_logs_strip_controls_at_downstream_handlers() {
     let reason = "peer\n\r\x1b\u{85}\u{2028}\u{2029}reason";
     handle_message_rejected(
         &test_peer_id(), &konsensus_core::MessageId::from_bytes([0; 32]),
-        reason, false, &routing, &ws_tx, false,
+        reason, &routing, &ws_tx, false,
     ).await;
     handle_invoice_error_received(
         &test_peer_id(), "log-test", reason, true,
@@ -4175,15 +4173,104 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
         negotiations.contains_key(high.node_id()),
         "a valid offer is a negotiation"
     );
-    assert!(low_mgr.can_send(high.node_id()).await);
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "unconfirmed re-key").await;
+    assert!(low_mgr.confirm_session(high.node_id()).await);
     let msg = low_mgr
         .encrypt(high.node_id(), b"after the re-key")
         .await
         .unwrap();
     assert!(
         high_mgr.decrypt(low.node_id(), &msg).await.is_err(),
-        "the previous session was replaced by the valid offer"
+        "the confirmation retired the previous session"
     );
+}
+
+/// A valid but stale offer: its one-time pre-key is gone, so the peer refuses the
+/// init and sends no SessionAck. Nothing confirms the new session, so the initiator
+/// keeps the working one and both sides still talk.
+#[tokio::test]
+async fn a_stale_offer_the_peer_refuses_leaves_the_working_session_alone() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+    let mut low_negotiations = std::collections::HashMap::new();
+    let mut high_negotiations = std::collections::HashMap::new();
+
+    // The bundle as first offered, then its one-time pre-key spent on a real re-key.
+    let stale = high_mgr.prekey_bundle().await;
+    let init = low_mgr.reinitiate_session(high.node_id(), &stale).await.unwrap();
+    high_mgr.reaccept_session(low.node_id(), &init).await.unwrap();
+    assert!(low_mgr.confirm_session(high.node_id()).await);
+    let first = low_mgr.encrypt(high.node_id(), b"ratchet-init").await.unwrap();
+    high_mgr.decrypt(low.node_id(), &first).await.unwrap();
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the real re-key").await;
+
+    handle_prekey_offer(
+        high.node_id(), serde_json::to_value(&stale).unwrap(), *low.node_id(), &low_mgr,
+        &storage, &transport, &audit, &mut low_negotiations,
+    ).await;
+    assert!(low_negotiations.contains_key(high.node_id()), "the stale offer validates");
+    let replay = low_mgr.reinitiate_session(high.node_id(), &stale).await.unwrap();
+    handle_session_init(
+        low.node_id(), serde_json::to_value(&replay).unwrap(), &high_mgr,
+        &storage, &transport, &audit, &mut high_negotiations,
+    ).await;
+    assert!(high_negotiations.is_empty(), "the peer refuses the init, so nothing confirms it");
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the stale offer").await;
+}
+
+/// A well-formed SessionInit whose keys the initiator does not share costs nothing:
+/// the working session stays until a message decrypts under the new one.
+#[tokio::test]
+async fn a_well_formed_session_init_alone_does_not_replace_the_session() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+    let mut negotiations = std::collections::HashMap::new();
+    let other = SessionManager::new(Arc::new(NodeIdentity::generate().unwrap().1));
+    let init = other.initiate_session(high.node_id(), &high_mgr.prekey_bundle().await).await.unwrap();
+    handle_session_init(
+        low.node_id(), serde_json::to_value(&init).unwrap(), &high_mgr,
+        &storage, &transport, &audit, &mut negotiations,
+    ).await;
+    assert!(negotiations.contains_key(low.node_id()), "the init was accepted");
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the init").await;
+}
+
+/// A SessionAck nobody asked for changes nothing: no session is promoted and no
+/// ratchet message is spent.
+#[tokio::test]
+async fn an_unexpected_session_ack_changes_nothing() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+    handle_session_ack(high.node_id(), &low_mgr, &transport, &audit).await;
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after a stray ack").await;
+    assert!(!low_mgr.needs_renegotiation(high.node_id()).await);
+}
+
+/// A RatchetInit the session cannot read does not cost the session: it stays, and
+/// the node asks for a replacement.
+#[tokio::test]
+async fn an_unreadable_ratchet_init_keeps_the_session_and_asks_to_renegotiate() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = Arc::new(make_gossip_test_transport());
+    let foreign = SessionManager::new(Arc::clone(&low));
+    let init = foreign.initiate_session(high.node_id(), &high_mgr.prekey_bundle().await).await.unwrap();
+    drop(init);
+    let unreadable = foreign.encrypt(high.node_id(), b"ratchet-init").await.unwrap();
+    handle_ratchet_init(
+        low.node_id(), &konsensus_crypto::ratchet_message_to_bytes(&unreadable), &high_mgr, &storage, &transport,
+    ).await;
+    assert!(high_mgr.needs_renegotiation(low.node_id()).await);
+    assert!(e2ee_needs_self_heal(&high_mgr, low.node_id()).await, "the tick keeps asking");
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after an unreadable ratchet init").await;
 }
 
 /// A malformed SessionInit, or one naming a one-time pre-key this node does
@@ -4287,64 +4374,14 @@ fn receipt_refusals_are_terminal_for_the_sender() {
     assert!(!terminal_paid_rejection("storage error"));
 }
 
-/// An unreadable block is final from the higher id, which only ever encrypts on
-/// a session the lower id already derived. From the lower id it may have overtaken
-/// its own SessionInit, so it stays retryable; other retryable reasons stay so.
+/// The legacy refusal of an unreadable block also covered the skip-limit failure a
+/// later delivery can cure, and older recipients still send it. It stays retryable;
+/// a recipient that knows the block is final says so with `undecryptable:`.
 #[test]
-fn unreadable_block_is_terminal_only_from_the_higher_id() {
-    let (lower, higher) = (make_peer_id(71), make_peer_id(72));
-    assert!(lower.as_bytes() < higher.as_bytes());
-    let refusal = konsensus_core::payloads::call::CallRefusal::Invalid("undecryptable").to_string();
-    assert_eq!(refusal, BLOCK_NOT_READABLE, "the callee's wire reason");
-    assert!(terminal_rejection_from_peer(&refusal, &higher, &lower));
-    assert!(!terminal_rejection_from_peer(&refusal, &lower, &higher));
-    for retryable in ["storage error", "invalid call signal: too many skipped messages", "invalid call signal: call state unavailable"] {
-        assert!(!terminal_rejection_from_peer(retryable, &higher, &lower), "{retryable}");
-    }
-    assert!(terminal_rejection_from_peer("message withdrawn", &lower, &higher));
-}
-
-/// From the higher id the block's delivery ends at the first refusal instead of
-/// retrying with backoff; from the lower id it stays queued for a retry.
-#[tokio::test]
-async fn unreadable_block_stops_its_retries_only_from_the_higher_id() {
-    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
-    let (lower, higher) = (make_peer_id(71), make_peer_id(72));
-    for (own, peer, status, state) in [(higher, lower, "failed_paid", "failed_paid"), (lower, higher, "rejected", "pending")] {
-        let mut limits = DeliveryConfirmationBudget::default();
-        let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
-        let storage: Arc<dyn Storage> = db.clone();
-        let routing = konsensus_routing::RoutingTable::new(Default::default());
-        let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
-        let (ws, mut updates) = broadcast::channel(16);
-        let dir = tempfile::tempdir().unwrap();
-        let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
-        let preimage = [7u8; 32];
-        let hash: [u8; 32] = sha2::Sha256::digest(preimage).into();
-        let env = UkmEnvelopeBuilder::new(
-            konsensus_core::kind::KIND_CALL_BLOCK,
-            own,
-            Recipient::Node(peer),
-            vec![1],
-            PaymentProof::new(hash, preimage, 1000),
-        )
-        .build();
-        db.store_message(&env).await.unwrap();
-        db.prepare_delivery(&env.id, &peer).await.unwrap();
-
-        handle_delivery_confirmation(
-            &peer, &env.id, Some(BLOCK_NOT_READABLE), true, &own, &storage,
-            &timestamps, &routing, &ws, &audit, &mut limits, None,
-        )
-        .await;
-        assert_eq!(updates.try_recv().unwrap().status, status);
-        let stored: String = sqlx::query_as::<_, (String,)>("SELECT state FROM pending_deliveries")
-            .fetch_one(db.pool())
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(stored, state);
-    }
+fn legacy_unreadable_block_refusal_stays_retryable() {
+    let legacy = konsensus_core::payloads::call::CallRefusal::Invalid("undecryptable").to_string();
+    assert_eq!(legacy, "invalid call signal: undecryptable");
+    assert!(!terminal_paid_rejection(&legacy));
 }
 
 /// The refusal was lost and the flusher resent the same bytes: the recipient
@@ -4503,6 +4540,12 @@ async fn call_block_invoice_is_refused_without_a_session() {
     let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "no-session", &wallet).await;
     assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert!(wallet.list_payments(10).await.unwrap().is_empty(), "the wallet was not asked for an invoice");
+
+    let sessions = session_with(&peer).await;
+    sessions.mark_needs_renegotiation(&peer).await;
+    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "disputed", &wallet).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
+    assert!(wallet.list_payments(10).await.unwrap().is_empty(), "nor for a session being renegotiated");
 
     let sessions = session_with(&peer).await;
     let issued = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "session-back", &wallet).await.unwrap();

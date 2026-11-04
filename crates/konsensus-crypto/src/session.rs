@@ -147,8 +147,10 @@ pub trait SessionStore: Send + Sync {
 enum SessionReplacement {
     /// Fail with [`SessionError::SessionExists`]; the existing session stays.
     Keep,
-    /// Replace it, in one write, once the new session is fully derived.
-    Replace,
+    /// Hold the new session aside; the existing one stays in use until the peer
+    /// proves it holds the new one: a SessionAck to the initiator
+    /// ([`SessionManager::confirm_session`]) or a message that decrypts under it.
+    AfterConfirmation,
 }
 
 /// An active E2EE session with a peer.
@@ -158,6 +160,30 @@ struct PeerSession {
     /// When this node derived the session, ms since the epoch. Held in memory
     /// only: `None` for a session restored from storage.
     established_at_ms: Option<u64>,
+    /// A newer session the peer has not yet proven it holds. Replaces `ratchet`
+    /// only on that proof; held in memory only, and overwritten by the next one.
+    unconfirmed: Option<DoubleRatchet>,
+    /// `unconfirmed` is one we initiated, so a SessionAck can confirm it. One we
+    /// accepted is proven only by a message that decrypts under it.
+    unconfirmed_initiated: bool,
+    /// We initiated this session and the peer has not yet confirmed it.
+    awaiting_confirmation: bool,
+    /// The peer sent something this session could not read, so the two sides may
+    /// disagree. Cleared when a new session is installed.
+    needs_renegotiation: bool,
+}
+
+impl PeerSession {
+    fn new(ratchet: DoubleRatchet, established_at_ms: Option<u64>, awaiting_confirmation: bool) -> Self {
+        Self { ratchet, established_at_ms, unconfirmed: None, unconfirmed_initiated: false, awaiting_confirmation, needs_renegotiation: false }
+    }
+}
+
+fn now_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_millis() as u64)
 }
 
 /// Domain-separation context for deriving the session-encryption key from the
@@ -332,7 +358,7 @@ impl SessionManager {
                             self.sessions
                                 .write()
                                 .await
-                                .insert(*peer_id, PeerSession { ratchet, established_at_ms: None });
+                                .insert(*peer_id, PeerSession::new(ratchet, None, false));
                             restored += 1;
                             debug!(peer = %peer_id, "restored E2EE session from storage");
 
@@ -572,20 +598,19 @@ impl SessionManager {
             .await
     }
 
-    /// Initiate an E2EE session with a peer, replacing any session that
-    /// already exists with it.
+    /// Initiate an E2EE session with a peer that may already have one.
     ///
-    /// The existing session is replaced only after the bundle has been fully
-    /// validated (key formats, node id, signed pre-key signature) and X3DH
-    /// has succeeded, in one write of the session map. Until then, and after
-    /// any failure, the existing session stays in place and usable, so a
-    /// malformed or forged offer cannot erase a working session.
+    /// The existing session stays in place and usable until the peer confirms
+    /// it holds the new one ([`Self::confirm_session`]): a bundle, even a valid
+    /// one, does not prove the peer will accept the init, since it can be stale.
+    /// With no existing session the new one is installed at once. A malformed or
+    /// forged offer changes nothing either way.
     pub async fn reinitiate_session(
         &self,
         peer_id: &NodeId,
         peer_bundle: &SerializablePrekeyBundle,
     ) -> Result<SerializableSessionInit, SessionError> {
-        self.initiate_with(peer_id, peer_bundle, SessionReplacement::Replace)
+        self.initiate_with(peer_id, peer_bundle, SessionReplacement::AfterConfirmation)
             .await
     }
 
@@ -614,8 +639,8 @@ impl SessionManager {
 
         let ratchet_key = *ratchet.public_key().as_bytes();
 
-        // Store (or atomically replace) the session.
-        self.install_session(peer_id, ratchet, replacement).await?;
+        // Store the session, or hold it aside until the peer confirms it.
+        self.install_session(peer_id, ratchet, replacement, true).await?;
 
         // Persist to storage
         self.persist_session(peer_id).await;
@@ -663,7 +688,7 @@ impl SessionManager {
         peer_id: &NodeId,
         init_data: &SerializableSessionInit,
     ) -> Result<(), SessionError> {
-        self.accept_with(peer_id, init_data, SessionReplacement::Replace)
+        self.accept_with(peer_id, init_data, SessionReplacement::AfterConfirmation)
             .await
     }
 
@@ -715,7 +740,7 @@ impl SessionManager {
         );
 
         // Store (or atomically replace) the session, then consume the key.
-        self.install_session(peer_id, ratchet, replacement).await?;
+        self.install_session(peer_id, ratchet, replacement, false).await?;
         if let Some(i) = otpk_idx {
             otpks.remove(i);
         }
@@ -732,23 +757,62 @@ impl SessionManager {
 
     /// Install a fully derived session under one write of the session map.
     /// With [`SessionReplacement::Keep`] an existing session is left as it is
-    /// and the new one is dropped.
+    /// and the new one is dropped. With [`SessionReplacement::AfterConfirmation`]
+    /// an existing session stays in use and the new one is held aside.
     async fn install_session(
         &self,
         peer_id: &NodeId,
         ratchet: DoubleRatchet,
         replacement: SessionReplacement,
+        initiator: bool,
     ) -> Result<(), SessionError> {
         let mut sessions = self.sessions.write().await;
-        if replacement == SessionReplacement::Keep && sessions.contains_key(peer_id) {
-            return Err(SessionError::SessionExists(*peer_id));
+        match (replacement, sessions.get_mut(peer_id)) {
+            (SessionReplacement::Keep, Some(_)) => return Err(SessionError::SessionExists(*peer_id)),
+            (SessionReplacement::AfterConfirmation, Some(existing)) => {
+                existing.unconfirmed = Some(ratchet);
+                existing.unconfirmed_initiated = initiator;
+                return Ok(());
+            }
+            _ => {}
         }
-        let established_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|since| since.as_millis() as u64);
-        sessions.insert(*peer_id, PeerSession { ratchet, established_at_ms });
+        sessions.insert(*peer_id, PeerSession::new(ratchet, now_ms(), initiator));
         Ok(())
+    }
+
+    /// The peer acknowledged the session we initiated. A session held aside replaces
+    /// the current one now. `true` if one was awaited; an unexpected acknowledgement
+    /// changes nothing.
+    pub async fn confirm_session(&self, peer_id: &NodeId) -> bool {
+        {
+            let mut sessions = self.sessions.write().await;
+            let Some(session) = sessions.get_mut(peer_id) else { return false };
+            match session.unconfirmed.take() {
+                Some(ratchet) if session.unconfirmed_initiated => *session = PeerSession::new(ratchet, now_ms(), false),
+                held => {
+                    session.unconfirmed = held;
+                    if !session.awaiting_confirmation {
+                        return false;
+                    }
+                    session.awaiting_confirmation = false;
+                }
+            }
+        }
+        self.persist_session(peer_id).await;
+        true
+    }
+
+    /// Record that the peer sent something the session could not read. The
+    /// session stays; the caller's recovery negotiates a replacement.
+    pub async fn mark_needs_renegotiation(&self, peer_id: &NodeId) {
+        if let Some(session) = self.sessions.write().await.get_mut(peer_id) {
+            session.needs_renegotiation = true;
+        }
+    }
+
+    /// Whether the session with a peer is waiting to be renegotiated.
+    pub async fn needs_renegotiation(&self, peer_id: &NodeId) -> bool {
+        self.sessions.read().await.get(peer_id).is_some_and(|session| session.needs_renegotiation)
     }
 
     /// Encrypt a plaintext message for a peer.
@@ -782,13 +846,22 @@ impl SessionManager {
         peer_id: &NodeId,
         message: &RatchetMessage,
     ) -> Result<Vec<u8>, SessionError> {
-        let mut preview = {
+        let (mut preview, mut unconfirmed) = {
             let sessions = self.sessions.read().await;
             let session = sessions.get(peer_id).ok_or(SessionError::NoSession(*peer_id))?;
-            DoubleRatchet::from_state(&session.ratchet.export_state())
+            (
+                DoubleRatchet::from_state(&session.ratchet.export_state()),
+                session.unconfirmed.as_ref().map(|ratchet| DoubleRatchet::from_state(&ratchet.export_state())),
+            )
         };
-        // Both the snapshot and disposable ratchet zeroize their secrets on drop.
-        Ok(preview.decrypt(message)?)
+        // Both the snapshots and disposable ratchets zeroize their secrets on drop.
+        match preview.decrypt(message) {
+            Ok(plaintext) => Ok(plaintext),
+            Err(error) => match unconfirmed.as_mut().map(|ratchet| ratchet.decrypt(message)) {
+                Some(Ok(plaintext)) => Ok(plaintext),
+                _ => Err(error.into()),
+            },
+        }
     }
 
     /// Decrypt a ciphertext message from a peer.
@@ -805,7 +878,22 @@ impl SessionManager {
             let session = sessions
                 .get_mut(peer_id)
                 .ok_or(SessionError::NoSession(*peer_id))?;
-            session.ratchet.decrypt(message)?
+            match session.ratchet.decrypt(message) {
+                Ok(plaintext) => plaintext,
+                Err(error) => {
+                    // A message under the newer session proves the peer holds it.
+                    let promoted = session.unconfirmed.as_mut().map(|ratchet| ratchet.decrypt(message));
+                    match promoted {
+                        Some(Ok(plaintext)) => {
+                            if let Some(ratchet) = session.unconfirmed.take() {
+                                *session = PeerSession::new(ratchet, now_ms(), false);
+                            }
+                            plaintext
+                        }
+                        _ => return Err(error.into()),
+                    }
+                }
+            }
         };
 
         // Persist updated ratchet state after chain advancement

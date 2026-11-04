@@ -814,7 +814,11 @@ async fn reinitiate_session_replaces_only_after_the_bundle_validates() {
     ));
     let init = mgr_a.reinitiate_session(&node_b, &genuine).await.unwrap();
     assert!(mgr_a.can_send(&node_b).await);
+    // Until the peer confirms, the initiator stays on the session it has.
+    let msg = mgr_a.encrypt(&node_b, b"old session").await.unwrap();
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"old session");
     mgr_b.reaccept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_a.confirm_session(&node_b).await);
     let msg = mgr_a.encrypt(&node_b, b"new session").await.unwrap();
     assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"new session");
 }
@@ -919,4 +923,85 @@ async fn session_age_is_known_only_for_a_session_derived_here() {
     assert_eq!(restored.restore_sessions().await, 1);
     assert!(restored.has_session(&node_a).await);
     assert!(!restored.session_newer_than(&node_a, 0).await, "age unknown after a restore");
+}
+
+/// A replacement never confirmed changes nothing, however it ends; an unexpected
+/// confirmation changes nothing either. The first session is confirmed once.
+#[tokio::test]
+async fn an_unconfirmed_replacement_leaves_the_session_in_use() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let mgr_a = SessionManager::new(Arc::clone(&id_a));
+    let mgr_b = SessionManager::new(Arc::clone(&id_b));
+    let init = mgr_a.initiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_a.confirm_session(&node_b).await, "the first session was awaited");
+    assert!(!mgr_a.confirm_session(&node_b).await, "once");
+    assert!(!mgr_b.confirm_session(&node_a).await, "the responder awaits nothing");
+
+    let roundtrip = async |text: &[u8]| {
+        let msg = mgr_a.encrypt(&node_b, text).await.unwrap();
+        assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), text);
+    };
+    roundtrip(b"first").await;
+    mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    roundtrip(b"still the first session").await;
+    roundtrip(b"however long it stays unconfirmed").await;
+}
+
+/// A well-formed init whose keys the peer does not share leaves the session in use:
+/// the acceptor moves only when a message decrypts under the new session, and a real
+/// re-key does that. An acknowledgement does not confirm a session we only accepted.
+#[tokio::test]
+async fn an_accepted_session_is_proven_only_by_a_message_under_it() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let mgr_a = SessionManager::new(Arc::clone(&id_a));
+    let mgr_b = SessionManager::new(Arc::clone(&id_b));
+    let init = mgr_a.initiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+
+    let key = hex::encode(*X25519Public::from(&x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng())).as_bytes());
+    let unproven = SerializableSessionInit { identity_key: key.clone(), ephemeral_key: key.clone(), one_time_prekey_id: None, ratchet_key: key };
+    mgr_b.reaccept_session(&node_a, &unproven).await.unwrap();
+    assert!(!mgr_b.confirm_session(&node_a).await, "an ack proves nothing here");
+    let msg = mgr_a.encrypt(&node_b, b"same session").await.unwrap();
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"same session");
+
+    let init = mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.reaccept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_a.confirm_session(&node_b).await);
+    let msg = mgr_a.encrypt(&node_b, b"new session").await.unwrap();
+    assert_eq!(mgr_b.preview_decrypt(&node_a, &msg).await.unwrap(), b"new session");
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"new session");
+    let back = mgr_b.encrypt(&node_a, b"on the new session").await.unwrap();
+    assert_eq!(mgr_a.decrypt(&node_b, &back).await.unwrap(), b"on the new session");
+}
+
+/// The renegotiation mark lasts until a new session is installed.
+#[tokio::test]
+async fn a_new_session_clears_the_renegotiation_mark() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let mgr_a = SessionManager::new(Arc::clone(&id_a));
+    let mgr_b = SessionManager::new(Arc::clone(&id_b));
+    let init = mgr_a.initiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+    assert!(!mgr_a.needs_renegotiation(&node_b).await);
+    mgr_a.mark_needs_renegotiation(&node_b).await;
+    mgr_b.mark_needs_renegotiation(&node_a).await;
+    assert!(mgr_a.needs_renegotiation(&node_b).await);
+
+    let init = mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    assert!(mgr_a.needs_renegotiation(&node_b).await, "not until the peer confirms");
+    mgr_b.reaccept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_b.needs_renegotiation(&node_a).await, "not until the new session is proven");
+    assert!(mgr_a.confirm_session(&node_b).await);
+    assert!(!mgr_a.needs_renegotiation(&node_b).await);
+    let msg = mgr_a.encrypt(&node_b, b"ratchet-init").await.unwrap();
+    mgr_b.decrypt(&node_a, &msg).await.unwrap();
+    assert!(!mgr_b.needs_renegotiation(&node_a).await);
 }

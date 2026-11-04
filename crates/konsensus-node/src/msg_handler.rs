@@ -400,25 +400,32 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 Ok(message) => Some(session_mgr_for_recv.preview_decrypt(&sender, &message).await),
                                 Err(_) => None,
                             };
-                            // A later delivery can bring this block back within the
-                            // skip limit, so it must not read as unreadable for good.
-                            let too_far_ahead = matches!(preview, Some(Err(konsensus_crypto::SessionError::Ratchet(konsensus_crypto::RatchetError::TooManySkipped(..)))));
+                            // A later delivery can bring a block back within the skip limit;
+                            // any other failure means these bytes never decrypt under this session.
+                            let unreadable = match &preview {
+                                Some(Err(konsensus_crypto::SessionError::Ratchet(konsensus_crypto::RatchetError::TooManySkipped(..)))) => false,
+                                Some(Err(_)) | None => true,
+                                Some(Ok(_)) => false,
+                            };
+                            if unreadable {
+                                note_unreadable_envelope(&envelope, &sender, &session_mgr_for_recv, &transport_for_ack).await;
+                            }
                             let block_plaintext = preview.and_then(Result::ok).and_then(|bytes| String::from_utf8(bytes).ok());
                             match konsensus_api::calls::prepare_incoming_block(
                                 storage_for_recv.as_ref(), &sender, block_plaintext.as_deref(), &envelope.payment_proof.payment_hash,
                             ).await {
                                 Ok(block) => incoming_block = Some(block),
                                 Err(refusal) => {
-                                    let refusal = if too_far_ahead { konsensus_core::payloads::call::CallRefusal::Invalid("too many skipped messages") } else { refusal };
+                                    let reason = refused_block_reason(&refusal, unreadable, &sender, identity_for_recv.node_id());
                                     audit_for_recv.record(
                                         konsensus_api::audit::events::MESSAGE_REJECTED,
                                         &sender.to_hex(),
                                         Some(serde_json::json!({
-                                            "reason": refusal.to_string(), "kind": envelope.kind,
+                                            "reason": reason.as_str(), "kind": envelope.kind,
                                             "message_id": msg_id.to_hex(),
                                         })),
                                     );
-                                    let reject = Frame::MessageReject { id: msg_id, reason: refusal.to_string() };
+                                    let reject = Frame::MessageReject { id: msg_id, reason };
                                     let _ = transport_for_ack.send_frame(&sender, &reject).await;
                                     continue;
                                 }
@@ -977,6 +984,60 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
     }
 }
 
+/// The reason a refused paid block goes back with. An unreadable block from the
+/// higher id is final: as the X3DH responder it only encrypts on a session we, the
+/// initiator, already hold, so if we cannot read it now that session is gone here
+/// and a new X3DH never brings it back. `undecryptable:` is terminal for every
+/// sender version. From the lower id the legacy reason stands, which senders keep
+/// retrying: it encrypts on a new session at once, so its block can overtake the
+/// SessionInit it needs, and it cannot be told apart from a stale one here.
+fn refused_block_reason(
+    refusal: &konsensus_core::payloads::call::CallRefusal,
+    unreadable: bool,
+    sender: &konsensus_core::NodeId,
+    own_id: &konsensus_core::NodeId,
+) -> String {
+    if unreadable && sender.as_bytes() > own_id.as_bytes() {
+        ReceiptRefusal::Undecryptable("the call block cannot be read under any session").to_string()
+    } else {
+        refusal.to_string()
+    }
+}
+
+/// A paid envelope could not be decrypted. That never costs the session: a failed
+/// decrypt changes no ratchet state, and one envelope cannot prove the session bad.
+///
+/// An envelope stamped before this session settled says nothing about it: it was
+/// encrypted under an earlier session (the stamp follows the encryption and a
+/// resend only moves it forward), or the peer was still encrypting under one until
+/// our SessionInit reached it, or its clock runs ahead. Anything later may mean the
+/// two sides disagree, so ask for a replacement. It is confirmed before it retires
+/// this session, and the self-heal tick keeps asking until it happens.
+async fn note_unreadable_envelope(
+    envelope: &konsensus_core::UkmEnvelope,
+    sender: &konsensus_core::NodeId,
+    session_mgr: &SessionManager,
+    transport: &Arc<NoiseTransport>,
+) {
+    if !session_mgr.has_session(sender).await {
+        return;
+    }
+    let settle_ms = crate::session_handler::SESSION_NEGOTIATION_COOLDOWN.as_millis() as u64;
+    if session_mgr.session_newer_than(sender, envelope.timestamp.saturating_sub(settle_ms)).await {
+        warn!(sender = %sender, "envelope from before the session settled could not be decrypted; session kept");
+        return;
+    }
+    warn!(sender = %sender, "envelope could not be decrypted; session kept, asking to renegotiate");
+    session_mgr.mark_needs_renegotiation(sender).await;
+    let bundle = session_mgr.prekey_bundle().await;
+    if let Ok(bundle_json) = serde_json::to_value(&bundle) {
+        let frame = Frame::PrekeyOffer { bundle: bundle_json };
+        if let Err(e) = transport.send_frame(sender, &frame).await {
+            warn!(peer = %sender, error = %e, "failed to send PrekeyOffer for re-negotiation");
+        }
+    }
+}
+
 /// Decrypts an incoming envelope and processes special message kinds (files, web content).
 ///
 /// Returns the plaintext string when it was produced and kept (`Ok(None)` when
@@ -1030,46 +1091,8 @@ async fn decrypt_and_process(
     let bytes = match session_mgr.decrypt(sender, &ratchet_msg).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            // An envelope stamped before this session was derived was encrypted
-            // under an earlier one (the stamp follows the encryption and a resend
-            // only moves it forward). So, usually, was one stamped just after: the
-            // peer keeps encrypting under its old session until our SessionInit
-            // reaches it, and its clock may run ahead of ours. None of these say
-            // anything about the session we hold, and a failed decrypt changes no
-            // ratchet state, so keep the session and refuse the envelope alone.
-            // Within the negotiation cooldown a removal could not start a new
-            // negotiation any sooner anyway. A sender's clock running behind can
-            // delay the removal below only until its stamps pass that point; the
-            // gate's freshness window bounds that.
-            let settle_ms = crate::session_handler::SESSION_NEGOTIATION_COOLDOWN.as_millis() as u64;
-            if session_mgr.session_newer_than(sender, envelope.timestamp.saturating_sub(settle_ms)).await {
-                warn!(
-                    sender = %sender,
-                    error = %e,
-                    "envelope older than the session could not be decrypted; session kept"
-                );
-                return Err(ReceiptRefusal::Undecryptable(
-                    "the session could not decrypt the ciphertext",
-                ));
-            }
-            // Decryption failed — session is likely stale (peer re-established with different keys).
-            // Remove the broken session so the session handler can re-negotiate.
-            warn!(
-                sender = %sender,
-                error = %e,
-                "decryption failed, removing stale session for re-negotiation"
-            );
-            session_mgr.remove_session(sender).await;
-            // Send our PrekeyOffer to trigger re-negotiation
-            let bundle = session_mgr.prekey_bundle().await;
-            if let Ok(bundle_json) = serde_json::to_value(&bundle) {
-                let frame = Frame::PrekeyOffer {
-                    bundle: bundle_json,
-                };
-                if let Err(e) = transport.send_frame(sender, &frame).await {
-                    warn!(peer = %sender, error = %e, "failed to send PrekeyOffer for re-negotiation");
-                }
-            }
+            debug!(sender = %sender, error = %e, "envelope could not be decrypted");
+            note_unreadable_envelope(envelope, sender, session_mgr, transport).await;
             return Err(ReceiptRefusal::Undecryptable(
                 "the session could not decrypt the ciphertext",
             ));

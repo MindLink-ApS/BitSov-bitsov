@@ -89,6 +89,73 @@ async fn a_session_lost_right_after_a_negotiation_recovers_too() {
     net.stop();
 }
 
+/// Both sides can send on sessions that do not match. One paid message is refused;
+/// the recipient keeps its session, asks for a replacement, and within the bound
+/// messages go each way on the same connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_that_disagree_renegotiate_on_the_same_connection() {
+    let mut net = ready_pair(Order::PayerHigher).await;
+    let (payer, payee) = (net.payer.id, net.payee.id);
+    let generation = net.payer.transport.connected_since(&payee).await.unwrap();
+    // The lower id moves to a session the higher id never saw.
+    net.payee.sessions.reinitiate_session(&payer, &net.payer.sessions.prekey_bundle().await).await.unwrap();
+    assert!(net.payee.sessions.confirm_session(&payer).await);
+    tokio::time::sleep(Duration::from_secs(11)).await;
+
+    let (status, body) = net.payer.compose(&payee, "unreadable").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["accepted"], true, "{body}");
+    assert!(net.payee.sessions.has_session(&payer).await, "one envelope does not cost the session");
+    wait_until("the sides agree again", RECOVERY_BOUND, || async {
+        !net.payee.sessions.needs_renegotiation(&payer).await
+    })
+    .await;
+    both_can_send(&net, Duration::from_secs(5)).await;
+    assert_eq!(net.payer.transport.connected_since(&payee).await.unwrap(), generation, "no new connection");
+
+    let (status, body) = net.payer.compose(&payee, "readable again").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["accepted"], true, "{body}");
+    while let Ok(Some(text)) = tokio::time::timeout(Duration::from_secs(2), net.payee.delivered.recv()).await {
+        if text == "readable again" {
+            net.stop();
+            return;
+        }
+    }
+    panic!("the message after recovery was not delivered");
+}
+
+/// A valid but stale offer is replayed at a healthy lower id: its one-time pre-key
+/// was spent on an earlier negotiation, so the higher id refuses the init and sends
+/// no confirmation. The working session stays, and messages go each way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_offer_does_not_replace_a_working_session() {
+    let net = ready_pair(Order::PayerHigher).await;
+    let (payer, payee) = (net.payer.id, net.payee.id);
+    let stale = net.payer.sessions.prekey_bundle().await;
+    net.payee.sessions.mark_needs_renegotiation(&payer).await;
+    wait_until("a negotiation spends that pre-key", RECOVERY_BOUND, || async {
+        !net.payee.sessions.needs_renegotiation(&payer).await
+    })
+    .await;
+    both_can_send(&net, Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(11)).await;
+
+    let mark = log_mark();
+    let offer = Frame::PrekeyOffer { bundle: serde_json::to_value(&stale).unwrap() };
+    net.payer.transport.send_frame(&payee, &offer).await.unwrap();
+    wait_until("the peer refuses the init", Duration::from_secs(5), || async {
+        !logged_since(mark, &["session accept failed", &format!("peer={payee}")]).is_empty()
+    })
+    .await;
+    for (from, to, text) in [(&net.payer, &payee, "from the higher id"), (&net.payee, &payer, "from the lower id")] {
+        let (status, body) = from.compose(to, text).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["accepted"], true, "{text}: {body}");
+    }
+    net.stop();
+}
+
 /// A healthy pair's connect offers get no answer, so a reconnect negotiates once
 /// and leaves the session it made alone. Both sides are listed, so the new
 /// connection is privileged from the start and both offer on it.

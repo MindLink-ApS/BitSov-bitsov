@@ -15,16 +15,17 @@ also live on the corresponding GitHub pre-release pages.
   (`call_block_unpayable`, nothing paid), so no minute is paid for a session
   that cannot read it. Messages and other call signals have no such step
   before payment.
-- A paid call block refused as `invalid call signal: undecryptable` is no longer
-  retried for up to an hour when its sender holds the higher node id: that
-  ciphertext can never be read. From the lower id it stays retryable, since a
-  fresh block can overtake the session setup it depends on and the two cannot
-  be told apart at that point.
-- A paid envelope stamped before the current E2EE session settled (derived, plus
-  the ten-second negotiation cooldown) no longer costs that session when it
-  cannot be decrypted. It is refused as before and the working session stays. A
-  later unreadable envelope still removes the session and starts a new
-  negotiation.
+- A call block from the higher-id side that its recipient cannot read is now
+  refused for good (`undecryptable:`), rather than retried for up to an hour. The
+  legacy `invalid call signal: undecryptable` stays retryable.
+- One envelope or control frame can no longer cost a working E2EE session. A paid
+  envelope that cannot be decrypted is refused as before and the session stays;
+  from after the session settled it also starts a new negotiation, repeated on the
+  self-heal tick until it completes. A new session retires the current one only
+  when the peer proves it holds it: a `SessionAck` to the initiator, a message that
+  decrypts under it to the acceptor. A stale prekey offer the peer refuses, or a
+  well-formed init with other keys, changes nothing. No frame or message format
+  changes.
 
 ## [0.3.0-rc21] — 2026-11-01
 
