@@ -1,28 +1,4 @@
 [[IgnoredVulns]]
-id = "RUSTSEC-2026-0367"
-reason = "zip 0.6.6 is test-harness build tooling only, never in the shipped konsensus binary. Pinned downloads have bundled SHA-256 checks before extraction; no bulk extract API or archive permission bits used. No fixed harness release available. Recheck harness/fixture/extraction/feature/release changes; remove when zip is dropped or >=9.0.0. Full triage: .cargo/audit.toml (2026-10-17)."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0368"
-reason = "zip 0.6.6 is test-harness build tooling only, never in the shipped konsensus binary. Pinned downloads have bundled SHA-256 checks before extraction; individual entry copies do not create archive symlinks. No fixed harness release available. Recheck harness/fixture/extraction/feature/release changes; remove when zip is dropped or >=9.0.0. Full triage: .cargo/audit.toml (2026-10-17)."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0369"
-reason = "zip 0.6.6 is test-harness build tooling only, never in the shipped konsensus binary. Pinned downloads have bundled SHA-256 checks before extraction; no bulk extract API or archive-derived chmod. Local output directories remain trusted. No fixed harness release available. Recheck harness/fixture/extraction/feature/release changes; remove when zip is dropped or >=9.0.0. Full triage: .cargo/audit.toml (2026-10-17)."
-
-[[IgnoredVulns]]
-id = "GHSA-vv5m-jxxh-4627"
-reason = "Alias of RUSTSEC-2026-0367; same test-only zip risk acceptance and recheck triggers in .cargo/audit.toml."
-
-[[IgnoredVulns]]
-id = "GHSA-4v9h-p7m9-rh26"
-reason = "Alias of RUSTSEC-2026-0368; same test-only zip risk acceptance and recheck triggers in .cargo/audit.toml."
-
-[[IgnoredVulns]]
-id = "GHSA-4684-h2q9-2vcp"
-reason = "Alias of RUSTSEC-2026-0369; same test-only zip risk acceptance and recheck triggers in .cargo/audit.toml."
-
-[[IgnoredVulns]]
 id = "RUSTSEC-2024-0436"
 reason = "Unmaintained paste 1.0.15 is transitive through sqlx-core 0.8.0; tracked as known dependency-island debt until the sqlx/ldk-node bump."
 
@@ -93,3 +69,12 @@ reason = "Shared alias of RUSTSEC-2026-0382 and RUSTSEC-2026-0381; same legacy r
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0381"
 reason = "webpki-roots 0.25.4 via sqlx-core 0.8.0 / rustls 0.21 Postgres TLS, pinned by the sqlx/ldk-node SQLite conflict (#59), plus test-only minreq. The runtime Electrum copy is remediated via vendor/electrum-client (webpki-roots >=1.0.10), and the 1.0.x line is patched to 1.0.10. The default SQLite node opens no TLS through the legacy stack; Postgres TLS is already selectable. RESIDUAL RISK: the legacy root bundle can allow chains through distrusted emSign intermediates with publicly known private keys, enabling server impersonation in Postgres-over-TLS deployments and test-only minreq. This accepts only the remaining legacy copies, not a downgrade of 1.0.x or a new Electrum copy. Recheck TLS/trust-store changes, new 0.25.4 consumers or runtime minreq use; remove on the sqlx/ldk-node island upgrade (#59). Full triage: .cargo/audit.toml; alias CVE-2026-111943."
+
+# Triage 2026-11-04. GHSA-h2v8 lists every rustls below 0.23.46. RUSTSEC-2026-0348,
+# the same issue, lists versions below 0.23.9 as unaffected, so cargo-audit and
+# cargo-deny do not report 0.21.12 and need no entry.
+
+[[IgnoredVulns]]
+id = "GHSA-h2v8-394m-p7vv"
+ignoreUntil = 2027-02-03
+reason = "rustls Brotli certificate decompression; alias RUSTSEC-2026-0348. Only 0.21.12 matches, via pinned sqlx-core 0.8.0. That version has no certificate compression code and no brotli feature, and Cargo.lock has no brotli crate. rustls 0.21 has no fixed release: the fix is 0.23.46, which sqlx 0.8.0 cannot use, and newer sqlx is blocked by the sqlite conflict (#59). The rustls 0.23 copy is already 0.23.46. Remove on the sqlx/ldk-node upgrade (#59); expires 2027-02-03. Recheck if a new rustls 0.21 consumer or a brotli crate appears."

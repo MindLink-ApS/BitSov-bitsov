@@ -47,8 +47,8 @@ panics instead of returning `ok`. Fixture startup and assertion failures never s
 Bitcoin Core **28.2** and Esplora electrs commit
 **a33e97e1a1fc63fa9c20a116bb92579bbf43b254**, verifies exact archive SHA-256s
 embedded in the workflow before extraction/use, caches Cargo dependencies, then
-runs the offline runner. The hash provenance is the pinned `corepc-node 0.10.1`
-and `electrsd 0.36.1` checksum manifests. Exit 77 is reported as **SKIPPED** in
+runs the offline runner. The hash provenance is the pinned `bitcoind 0.43.2`
+and `electrsd 0.43.2` checksum manifests. Exit 77 is reported as **SKIPPED** in
 the job summary and fails the job; exit zero also requires the runtime PASS marker.
 
 PR #200 is merged. The ghost/unfunded-channel scenario still requires explicit
