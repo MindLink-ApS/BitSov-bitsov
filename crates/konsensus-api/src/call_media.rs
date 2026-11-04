@@ -17,7 +17,14 @@
 //!
 //! The router itself (per-call queues, rate caps, forwarding) lives in the
 //! node crate and implements [`CallMediaPort`]; this crate only holds the
-//! bounded drop-oldest [`MediaQueue`] both sides share and the socket.
+//! bounded drop-oldest [`MediaQueue`] both sides share, the [`MediaLimits`]
+//! the operator configured, and the socket.
+//!
+//! Larger packets never get in the way of small ones. A packet of at most
+//! [`PRIORITY_PACKET_BYTES`] rides the priority lane and a larger one the
+//! bulk lane. The node reads no payload to tell them apart: it goes by the
+//! size it already sees. Audio is small, so a call that only carries audio
+//! never touches the bulk lane and behaves as if the lane did not exist.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -46,6 +53,68 @@ pub const SEQ_HEADER_BYTES: usize = 4;
 /// Packets a queue holds before it drops the oldest: at 20 ms per packet
 /// this is 640 ms of audio, more than any jitter buffer wants.
 pub const MEDIA_QUEUE_FRAMES: usize = 32;
+
+/// Largest payload that rides the priority lane. One 20 ms Opus or mu-law
+/// packet is far smaller (161 bytes at most), and so is a sealed one.
+pub const PRIORITY_PACKET_BYTES: usize = 512;
+
+/// Bulk packets a queue holds before it drops the oldest bulk packet. Stale
+/// bulk data is worth little: at the default byte cap this is about a second.
+pub const BULK_QUEUE_FRAMES: usize = 16;
+
+/// Packets per second one direction of one call may carry, by default.
+pub const DEFAULT_MAX_FRAMES_PER_SECOND: u32 = 100;
+
+/// Payload bytes per second one direction of one call may carry, by default.
+pub const DEFAULT_MAX_BYTES_PER_SECOND: u64 = 64 * 1024;
+
+/// Packets per second the bulk lane leaves for the priority lane: 20 ms audio
+/// is 50, and this leaves room for its control packets.
+pub const RESERVED_PRIORITY_FRAMES: u32 = 60;
+
+/// Bytes per second the bulk lane leaves for the priority lane: 60 packets of
+/// the largest audio frame (mu-law, 161 bytes) and their headers.
+pub const RESERVED_PRIORITY_BYTES: u64 = 12 * 1024;
+
+/// What one direction of one routed call may carry per second. The same
+/// values bound the router and the owner's socket. Configured on the node;
+/// the defaults are the fixed limits every node has always applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaLimits {
+    pub max_frames_per_second: u32,
+    pub max_bytes_per_second: u64,
+    /// What the socket does when bulk packets pass their share: drop them and
+    /// stay up, or (the default, and what nodes have always done past the
+    /// budget) count them and close at the budget.
+    pub drop_bulk_over_share: bool,
+}
+
+impl Default for MediaLimits {
+    fn default() -> Self {
+        Self {
+            max_frames_per_second: DEFAULT_MAX_FRAMES_PER_SECOND,
+            max_bytes_per_second: DEFAULT_MAX_BYTES_PER_SECOND,
+            drop_bulk_over_share: false,
+        }
+    }
+}
+
+impl MediaLimits {
+    /// Packets per second bulk packets may use: what the reservation leaves.
+    pub fn bulk_frames_per_second(&self) -> u32 {
+        self.max_frames_per_second.saturating_sub(RESERVED_PRIORITY_FRAMES)
+    }
+
+    /// Bytes per second bulk packets may use: what the reservation leaves.
+    pub fn bulk_bytes_per_second(&self) -> u64 {
+        self.max_bytes_per_second.saturating_sub(RESERVED_PRIORITY_BYTES)
+    }
+}
+
+/// Whether a payload of `len` bytes rides the bulk lane.
+pub fn is_bulk_payload(len: usize) -> bool {
+    len > PRIORITY_PACKET_BYTES
+}
 
 /// One media packet between app and node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,13 +153,27 @@ pub struct Closed;
 struct QueueState {
     frames: VecDeque<MediaFrame>,
     capacity: usize,
+    bulk: VecDeque<MediaFrame>,
+    bulk_capacity: usize,
     closed: bool,
     dropped: u64,
+    bulk_dropped: u64,
+}
+
+impl QueueState {
+    /// Priority packets first, then bulk, each lane in order.
+    fn next(&mut self) -> Option<MediaFrame> {
+        self.frames.pop_front().or_else(|| self.bulk.pop_front())
+    }
 }
 
 /// A bounded packet queue that drops the **oldest** packet when full, so a
 /// slow consumer costs stale audio, never a blocked producer and never
 /// unbounded memory. Closing it wakes the consumer with `None`.
+///
+/// Two lanes, each with its own bound: a bulk packet can only evict another
+/// bulk packet, and the consumer takes every priority packet first, so bulk
+/// data can neither push audio out of the queue nor make it wait in line.
 pub struct MediaQueue {
     state: Mutex<QueueState>,
     notify: Notify,
@@ -103,8 +186,11 @@ impl MediaQueue {
             state: Mutex::new(QueueState {
                 frames: VecDeque::with_capacity(capacity.max(1)),
                 capacity: capacity.max(1),
+                bulk: VecDeque::new(),
+                bulk_capacity: BULK_QUEUE_FRAMES.min(capacity.max(1)),
                 closed: false,
                 dropped: 0,
+                bulk_dropped: 0,
             }),
             notify: Notify::new(),
             closed: watch::channel(false).0,
@@ -123,15 +209,27 @@ impl MediaQueue {
             if q.closed {
                 return Err(Closed);
             }
-            let dropped = if q.frames.len() >= q.capacity {
-                q.frames.pop_front();
-                q.dropped += 1;
-                1
+            if is_bulk_payload(frame.payload.len()) {
+                let dropped = if q.bulk.len() >= q.bulk_capacity {
+                    q.bulk.pop_front();
+                    q.bulk_dropped += 1;
+                    1
+                } else {
+                    0
+                };
+                q.bulk.push_back(frame);
+                dropped
             } else {
-                0
-            };
-            q.frames.push_back(frame);
-            dropped
+                let dropped = if q.frames.len() >= q.capacity {
+                    q.frames.pop_front();
+                    q.dropped += 1;
+                    1
+                } else {
+                    0
+                };
+                q.frames.push_back(frame);
+                dropped
+            }
         };
         self.notify.notify_one();
         Ok(dropped)
@@ -143,7 +241,7 @@ impl MediaQueue {
         loop {
             {
                 let mut q = self.lock();
-                if let Some(frame) = q.frames.pop_front() {
+                if let Some(frame) = q.next() {
                     return Some(frame);
                 }
                 if q.closed {
@@ -156,7 +254,7 @@ impl MediaQueue {
 
     /// The next packet if one is queued.
     pub fn try_pop(&self) -> Option<MediaFrame> {
-        self.lock().frames.pop_front()
+        self.lock().next()
     }
 
     /// Stop accepting packets; queued ones can still be popped.
@@ -177,7 +275,8 @@ impl MediaQueue {
     }
 
     pub fn len(&self) -> usize {
-        self.lock().frames.len()
+        let q = self.lock();
+        q.frames.len() + q.bulk.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -186,6 +285,12 @@ impl MediaQueue {
 
     /// Packets evicted so far to make room.
     pub fn dropped(&self) -> u64 {
+        let q = self.lock();
+        q.dropped + q.bulk_dropped
+    }
+
+    /// Priority packets evicted so far: only other priority packets can do that.
+    pub fn priority_dropped(&self) -> u64 {
         self.lock().dropped
     }
 }
@@ -211,6 +316,8 @@ pub struct MediaAttachment {
     pub to_node: Arc<MediaQueue>,
     /// Packets from the peer, for the socket to deliver to the app.
     pub from_node: Arc<MediaQueue>,
+    /// What the socket may take from the app per second.
+    pub limits: MediaLimits,
     release: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -222,7 +329,13 @@ impl MediaAttachment {
         from_node: Arc<MediaQueue>,
         release: impl FnOnce() + Send + 'static,
     ) -> Self {
-        Self { peer, to_node, from_node, release: Some(Box::new(release)) }
+        Self { peer, to_node, from_node, limits: MediaLimits::default(), release: Some(Box::new(release)) }
+    }
+
+    /// The same attachment, bounded by `limits` instead of the defaults.
+    pub fn with_limits(mut self, limits: MediaLimits) -> Self {
+        self.limits = limits;
+        self
     }
 }
 
@@ -329,23 +442,50 @@ const AUTH_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 
 /// Applies to every explicit socket send, including pong, keepalive and close.
 const SOCKET_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
-const MAX_SOCKET_MESSAGES_PER_SECOND: u32 = 100;
-const MAX_SOCKET_BYTES_PER_SECOND: usize = 64 * 1024;
+
+/// What the socket does with one message from the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ingress {
+    Accept,
+    /// A bulk packet over the bulk share: dropped, the socket stays up.
+    DropBulk,
+    /// Over the budget: the socket closes.
+    Close,
+}
 
 struct IngressBudget {
+    limits: MediaLimits,
     start: tokio::time::Instant,
     messages: u32,
     bytes: usize,
+    bulk_messages: u32,
+    bulk_bytes: usize,
+    over_messages: u32,
+    over_bytes: usize,
 }
 
 impl IngressBudget {
-    fn new() -> Self {
-        Self { start: tokio::time::Instant::now(), messages: 0, bytes: 0 }
+    fn new(limits: MediaLimits) -> Self {
+        Self {
+            limits,
+            start: tokio::time::Instant::now(),
+            messages: 0,
+            bytes: 0,
+            bulk_messages: 0,
+            bulk_bytes: 0,
+            over_messages: 0,
+            over_bytes: 0,
+        }
     }
 
-    fn admit(&mut self, message: &Message) -> bool {
+    /// Every message counts against the budget and the socket closes past it.
+    /// With `drop_bulk_over_share`, bulk packets also count against their own
+    /// share, so a burst of them can never spend the budget audio needs: over
+    /// that share they are dropped, and the socket closes only if they also
+    /// pass the whole budget again on top (a flood, not a burst).
+    fn admit(&mut self, message: &Message) -> Ingress {
         if self.start.elapsed() >= std::time::Duration::from_secs(1) {
-            *self = Self::new();
+            *self = Self::new(self.limits);
         }
         // Count every message before parsing/copying application payloads.
         let bytes = match message {
@@ -353,9 +493,34 @@ impl IngressBudget {
             Message::Text(text) => text.len(),
             Message::Close(frame) => frame.as_ref().map_or(0, |frame| 2 + frame.reason.len()),
         };
+        let max_messages = self.limits.max_frames_per_second;
+        let max_bytes = usize::try_from(self.limits.max_bytes_per_second).unwrap_or(usize::MAX);
+        if self.limits.drop_bulk_over_share
+            && matches!(message, Message::Binary(_))
+            && is_bulk_payload(bytes.saturating_sub(SEQ_HEADER_BYTES))
+        {
+            let share_bytes = usize::try_from(self.limits.bulk_bytes_per_second()).unwrap_or(usize::MAX);
+            if self.bulk_messages >= self.limits.bulk_frames_per_second()
+                || self.bulk_bytes.saturating_add(bytes) > share_bytes
+            {
+                self.over_messages += 1;
+                self.over_bytes = self.over_bytes.saturating_add(bytes);
+                return if self.over_messages <= max_messages && self.over_bytes <= max_bytes {
+                    Ingress::DropBulk
+                } else {
+                    Ingress::Close
+                };
+            }
+            self.bulk_messages += 1;
+            self.bulk_bytes += bytes;
+        }
         self.messages += 1;
-        self.bytes += bytes;
-        self.messages <= MAX_SOCKET_MESSAGES_PER_SECOND && self.bytes <= MAX_SOCKET_BYTES_PER_SECOND
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.messages <= max_messages && self.bytes <= max_bytes {
+            Ingress::Accept
+        } else {
+            Ingress::Close
+        }
     }
 }
 
@@ -378,7 +543,7 @@ async fn handle_media(mut socket: WebSocket, state: Arc<AppState>, claims: auth:
                 if !stream_authorized(&state, &claims) { break; }
             }
         } => false,
-        close = media_io(&mut socket, &attachment.from_node, &attachment.to_node) => close,
+        close = media_io(&mut socket, &attachment.from_node, &attachment.to_node, attachment.limits) => close,
     };
     // Release the route before any best-effort close handshake. A write
     // failure/timeout drops immediately, with no attempt to reuse the socket.
@@ -389,10 +554,10 @@ async fn handle_media(mut socket: WebSocket, state: Arc<AppState>, claims: auth:
 }
 
 /// Returns false when a failed/timed-out write requires an immediate drop.
-async fn media_io(socket: &mut WebSocket, from_node: &MediaQueue, to_node: &MediaQueue) -> bool {
+async fn media_io(socket: &mut WebSocket, from_node: &MediaQueue, to_node: &MediaQueue, limits: MediaLimits) -> bool {
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     keepalive.tick().await;
-    let mut ingress = IngressBudget::new();
+    let mut ingress = IngressBudget::new(limits);
     let mut malformed: u64 = 0;
     loop {
         tokio::select! {
@@ -407,9 +572,13 @@ async fn media_io(socket: &mut WebSocket, from_node: &MediaQueue, to_node: &Medi
                     Some(Ok(msg)) => msg,
                     Some(Err(_)) | None => return false,
                 };
-                if !ingress.admit(&msg) {
-                    debug!("call media socket: ingress budget exhausted");
-                    return true;
+                match ingress.admit(&msg) {
+                    Ingress::Accept => {}
+                    Ingress::DropBulk => continue,
+                    Ingress::Close => {
+                        debug!("call media socket: ingress budget exhausted");
+                        return true;
+                    }
                 }
                 match msg {
                     Message::Binary(bytes) => match MediaFrame::from_ws_bytes(&bytes) {
@@ -485,6 +654,145 @@ mod tests {
         assert_eq!(q.dropped(), 2);
         let seqs: Vec<u32> = std::iter::from_fn(|| q.try_pop()).map(|f| f.seq).collect();
         assert_eq!(seqs, vec![3, 4, 5], "the newest audio survives");
+    }
+
+    fn sized(seq: u32, len: usize) -> MediaFrame {
+        MediaFrame { seq, payload: vec![seq as u8; len] }
+    }
+
+    #[test]
+    fn the_default_limits_are_the_fixed_limits_nodes_have_always_applied() {
+        let limits = MediaLimits::default();
+        assert_eq!(limits.max_frames_per_second, 100);
+        assert_eq!(limits.max_bytes_per_second, 64 * 1024);
+        assert_eq!(MEDIA_QUEUE_FRAMES, 32);
+        // 50 audio packets a second and their control packets fit the reservation...
+        let (frames, bytes) = (RESERVED_PRIORITY_FRAMES, RESERVED_PRIORITY_BYTES);
+        assert!(frames >= 51);
+        assert!(bytes >= u64::from(frames) * (161 + SEQ_HEADER_BYTES as u64));
+        // ...and every audio packet rides the priority lane.
+        assert!(!is_bulk_payload(161));
+        assert!(!is_bulk_payload(PRIORITY_PACKET_BYTES));
+        assert!(is_bulk_payload(PRIORITY_PACKET_BYTES + 1));
+    }
+
+    #[test]
+    fn a_bulk_packet_never_evicts_audio_and_audio_leaves_first() {
+        let q = MediaQueue::new(MEDIA_QUEUE_FRAMES);
+        for seq in 0..10 {
+            q.push(sized(seq, 160)).unwrap();
+        }
+        // Far more bulk than either lane holds.
+        for seq in 100..200 {
+            q.push(sized(seq, MAX_MEDIA_PAYLOAD_BYTES)).unwrap();
+        }
+        assert_eq!(q.priority_dropped(), 0, "bulk data cost no audio packet");
+        assert_eq!(q.dropped(), 100 - BULK_QUEUE_FRAMES as u64);
+        // Audio that arrives after the bulk backlog still leaves before it.
+        q.push(sized(10, 160)).unwrap();
+        let seqs: Vec<u32> = std::iter::from_fn(|| q.try_pop()).map(|f| f.seq).collect();
+        let audio: Vec<u32> = (0..=10).collect();
+        assert_eq!(&seqs[..11], &audio[..]);
+        // The newest bulk packets survive, in order.
+        let bulk: Vec<u32> = (200 - BULK_QUEUE_FRAMES as u32..200).collect();
+        assert_eq!(&seqs[11..], &bulk[..]);
+    }
+
+    #[test]
+    fn audio_alone_behaves_exactly_as_one_queue() {
+        let q = MediaQueue::new(MEDIA_QUEUE_FRAMES);
+        for seq in 0..(MEDIA_QUEUE_FRAMES as u32 + 5) {
+            let evicted = q.push(sized(seq, 161)).unwrap();
+            assert_eq!(evicted, usize::from(seq >= MEDIA_QUEUE_FRAMES as u32));
+        }
+        assert_eq!(q.len(), MEDIA_QUEUE_FRAMES);
+        assert_eq!(q.dropped(), 5);
+        let seqs: Vec<u32> = std::iter::from_fn(|| q.try_pop()).map(|f| f.seq).collect();
+        assert_eq!(seqs, (5..(MEDIA_QUEUE_FRAMES as u32 + 5)).collect::<Vec<_>>());
+    }
+
+    fn binary(payload: usize) -> Message {
+        Message::Binary(vec![0; SEQ_HEADER_BYTES + payload])
+    }
+
+    #[tokio::test]
+    async fn the_socket_budget_for_audio_is_unchanged_at_the_defaults() {
+        let mut budget = IngressBudget::new(MediaLimits::default());
+        for _ in 0..100 {
+            assert_eq!(budget.admit(&binary(161)), Ingress::Accept);
+        }
+        assert_eq!(budget.admit(&binary(161)), Ingress::Close, "the 101st message closes, as it always has");
+
+        // Small messages at a large size close on bytes the same way.
+        let mut budget = IngressBudget::new(MediaLimits { max_frames_per_second: 1000, max_bytes_per_second: 1000, drop_bulk_over_share: false });
+        assert_eq!(budget.admit(&binary(500)), Ingress::Accept);
+        assert_eq!(budget.admit(&binary(500)), Ingress::Close);
+
+        // Large messages close at the budget too unless the operator chose otherwise.
+        let mut budget = IngressBudget::new(MediaLimits::default());
+        for _ in 0..15 {
+            assert_eq!(budget.admit(&binary(MAX_MEDIA_PAYLOAD_BYTES)), Ingress::Accept);
+        }
+        assert_eq!(budget.admit(&binary(MAX_MEDIA_PAYLOAD_BYTES)), Ingress::Close);
+    }
+
+    const DROP_BULK: MediaLimits = MediaLimits {
+        max_frames_per_second: DEFAULT_MAX_FRAMES_PER_SECOND,
+        max_bytes_per_second: DEFAULT_MAX_BYTES_PER_SECOND,
+        drop_bulk_over_share: true,
+    };
+
+    #[tokio::test]
+    async fn a_burst_of_bulk_packets_is_dropped_and_leaves_audio_its_budget() {
+        let limits = DROP_BULK;
+        let mut budget = IngressBudget::new(limits);
+        let mut accepted = 0u64;
+        let mut dropped = 0;
+        for _ in 0..16 {
+            match budget.admit(&binary(MAX_MEDIA_PAYLOAD_BYTES)) {
+                Ingress::Accept => accepted += 1,
+                Ingress::DropBulk => dropped += 1,
+                Ingress::Close => panic!("a burst must not close the socket"),
+            }
+        }
+        assert!(accepted * (MAX_MEDIA_PAYLOAD_BYTES + SEQ_HEADER_BYTES) as u64 <= limits.bulk_bytes_per_second());
+        assert!(dropped > 0, "the bulk share is smaller than the burst");
+        // A full second of audio still fits on top of the burst.
+        for _ in 0..50 {
+            assert_eq!(budget.admit(&binary(161)), Ingress::Accept);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_bulk_packets_still_closes_the_socket() {
+        let mut budget = IngressBudget::new(DROP_BULK);
+        let mut outcome = Ingress::Accept;
+        let mut sent = 0;
+        while outcome != Ingress::Close && sent < 1000 {
+            outcome = budget.admit(&binary(MAX_MEDIA_PAYLOAD_BYTES));
+            sent += 1;
+        }
+        assert_eq!(outcome, Ingress::Close);
+        assert!(sent < 40, "closed after about two budgets, took {sent}");
+    }
+
+    #[tokio::test]
+    async fn configured_limits_widen_the_socket_budget() {
+        let limits = MediaLimits { max_frames_per_second: 160, max_bytes_per_second: 256 * 1024, drop_bulk_over_share: false };
+        let mut budget = IngressBudget::new(limits);
+        for _ in 0..60 {
+            assert_eq!(budget.admit(&binary(MAX_MEDIA_PAYLOAD_BYTES)), Ingress::Accept);
+        }
+        for _ in 0..50 {
+            assert_eq!(budget.admit(&binary(161)), Ingress::Accept);
+        }
+        // The default budget refuses the same traffic.
+        let mut budget = IngressBudget::new(MediaLimits::default());
+        let mut refused = false;
+        for _ in 0..60 {
+            refused |= budget.admit(&binary(MAX_MEDIA_PAYLOAD_BYTES)) != Ingress::Accept;
+        }
+        assert!(refused);
     }
 
     #[tokio::test]

@@ -133,6 +133,32 @@ unknown call, ringing, ended, unpaid first block and storage errors all fail
 closed. The pure `CallEntry::media_admitted(now_ms)` uses the same rule. No
 unpaid timeout notification or outstanding reservation can authorize media.
 
+## Media limits
+
+Each direction of each routed call is capped per second, at the router and at
+the owner's media socket. The defaults are the limits every node has always
+applied; an operator can raise them under `[calls]`. Both nodes of a call must
+allow a rate for the call to reach it, because each caps both directions.
+
+| Key | Default | Range |
+|---|---|---|
+| `media_max_frames_per_second` | 100 | 100 to 1000 |
+| `media_max_bytes_per_second` | 65536 | 65536 to 1048576 |
+| `media_drop_bulk_over_share` | `false` | |
+
+Packets of 512 bytes or less ride a priority lane; larger ones ride a bulk lane.
+The node reads no payload to do this, only the size it already sees. A bulk packet
+can evict only another bulk packet, leaves only after queued priority packets, and
+may use only what the cap leaves after 60 packets and 12 KiB per second, so bulk
+data cannot push out or outspend audio. Every audio packet is under the line, so
+a call with only audio behaves exactly as if the bulk lane did not exist. At the
+socket, going past the budget closes it; with `media_drop_bulk_over_share` on,
+bulk packets past their share are dropped instead, and the socket closes only if
+they pass the whole budget again on top.
+
+Nothing here changes a price or admission: a call is admitted and paid the same
+whatever it carries and whatever these limits are.
+
 ## Persistence, recovery and bounds
 
 `call_state` stores side, phase, effective deadline, replay deadline,
