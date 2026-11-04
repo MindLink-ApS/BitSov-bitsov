@@ -597,7 +597,7 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
         Some(invoice_refusal::ADMISSION_REQUIRED) => admission_refusal(peer_id),
         Some("disk_low") => ApiError::NotDispatched("disk_low".into()),
         Some(invoice_refusal::CALL_BLOCK_UNPAYABLE) => ApiError::NotDispatched(
-            "callee refused the call block invoice: deadline margin or call sequence; nothing was paid".into()
+            "callee refused the call block invoice: deadline margin, call sequence or no E2EE session; nothing was paid".into()
         ).with_reason("call_block_unpayable"),
         Some(reason) => ApiError::Lightning(format!(
             "Recipient refused the invoice request: {reason}"

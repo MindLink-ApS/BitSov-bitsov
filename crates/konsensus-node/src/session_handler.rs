@@ -380,7 +380,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } => {
                         if purpose.starts_with(konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX) {
                             if privileged {
-                                let result = prepare_call_block_invoice(storage.as_ref(), &peer_id, &purpose, amount_msat, &request_id, lightning.as_ref()).await;
+                                let result = prepare_call_block_invoice(storage.as_ref(), &session_manager, &peer_id, &purpose, amount_msat, &request_id, lightning.as_ref()).await;
                                 match result {
                                     Ok(invoice) => {
                                         let _ = transport.send_frame(&peer_id, &Frame::InvoiceResponse {
@@ -2120,9 +2120,12 @@ async fn handle_gossip_received(
 
 
 /// Refuse before touching the wallet and again after asynchronous creation.
-/// No invoice is returned to the caller when the safety margin is exhausted.
+/// No invoice is returned to the caller when the safety margin is exhausted,
+/// or while this node has no E2EE session with the caller: the block could not
+/// be read, so the minute would be paid and not served. The caller pays nothing
+/// and may ask again once the session is back.
 async fn prepare_call_block_invoice(
-    storage: &dyn konsensus_storage::Storage, peer: &NodeId, purpose: &str,
+    storage: &dyn konsensus_storage::Storage, session_manager: &SessionManager, peer: &NodeId, purpose: &str,
     amount_msat: u64, request_id: &str, lightning: &dyn LightningProvider,
 ) -> Result<konsensus_core::traits::lightning::Invoice, &'static str> {
     use konsensus_core::payloads::call as calls;
@@ -2135,6 +2138,10 @@ async fn prepare_call_block_invoice(
     calls::CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK,
         &serde_json::json!({"call_id": call_id, "seq": seq}).to_string()).map_err(|_| REFUSED)?;
     let validate = async || {
+        if !session_manager.has_session(peer).await {
+            warn!(peer = %peer, "no E2EE session with the caller; call block invoice refused");
+            return Err(REFUSED);
+        }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_millis() as u64;
         let entry = storage.call_get(peer, call_id).await.map_err(|_| REFUSED)?.ok_or(REFUSED)?;

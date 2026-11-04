@@ -4387,14 +4387,15 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     let live = calls::commit(pending, "answer", now - 16_000).unwrap();
     storage.call_put(&peer, id, &live).await.unwrap();
     let wallet = konsensus_lightning::MockLightningProvider::new();
+    let sessions = session_with(&peer).await;
     let balance = wallet.get_balance_msat().await.unwrap();
     let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
-    let refused = prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, "block", &wallet).await;
+    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "block", &wallet).await;
     assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert!(wallet.list_payments(10).await.unwrap().is_empty(), "no invoice or payment should be created");
     assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
     storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
-    let issued = prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, "block-ok", &wallet).await.unwrap();
+    let issued = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "block-ok", &wallet).await.unwrap();
     assert_eq!(issued.expiry_secs, 5);
     let hash = hex::decode(&issued.payment_hash).unwrap().try_into().unwrap();
     assert!(storage.has_call_block_invoice(&peer, id, 0, &hash).await.unwrap());
@@ -4402,9 +4403,49 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     // An unavailable provenance store withholds the invoice before any payment.
     sqlx::query("CREATE TRIGGER fail_block_invoice BEFORE INSERT ON call_block_invoices BEGIN SELECT RAISE(FAIL, 'test'); END")
         .execute(storage.pool()).await.unwrap();
-    assert_eq!(prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, "write-fails", &wallet).await.unwrap_err(),
+    assert_eq!(prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "write-fails", &wallet).await.unwrap_err(),
         konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
+}
+
+/// A session manager holding a session with `peer`.
+async fn session_with(peer: &NodeId) -> SessionManager {
+    let identity = Arc::new(NodeIdentity::generate().unwrap().1);
+    let our_id = *identity.node_id();
+    let ours = SessionManager::new(identity);
+    let theirs = SessionManager::new(Arc::new(NodeIdentity::generate().unwrap().1));
+    let init = theirs.initiate_session(&our_id, &ours.prekey_bundle().await).await.unwrap();
+    ours.accept_session(peer, &init).await.unwrap();
+    ours
+}
+
+/// A callee with no session refuses the invoice before any wallet call, so the
+/// caller pays nothing for a minute this node could not read. The refusal is
+/// not final: the same block is invoiced once the session is back.
+#[tokio::test]
+async fn call_block_invoice_is_refused_without_a_session() {
+    use konsensus_core::payloads::call as calls;
+    let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let ringing = calls::receive(None, 400, None, now - 16_000).unwrap();
+    let pending = calls::reserve(Some(ringing), 401, "answer", "hash", now - 16_000).unwrap();
+    let live = calls::commit(pending, "answer", now - 16_000).unwrap();
+    storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
+    let wallet = konsensus_lightning::MockLightningProvider::new();
+    let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
+    let sessions = session_with(&peer).await;
+
+    assert!(sessions.remove_session(&peer).await);
+    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "no-session", &wallet).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
+    assert!(wallet.list_payments(10).await.unwrap().is_empty(), "the wallet was not asked for an invoice");
+
+    let sessions = session_with(&peer).await;
+    let issued = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "session-back", &wallet).await.unwrap();
+    let hash = hex::decode(&issued.payment_hash).unwrap().try_into().unwrap();
+    assert!(storage.has_call_block_invoice(&peer, id, 0, &hash).await.unwrap());
 }
 
 #[tokio::test]

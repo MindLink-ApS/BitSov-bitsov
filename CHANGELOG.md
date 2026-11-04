@@ -11,6 +11,10 @@ also live on the corresponding GitHub pre-release pages.
   new connection get no answer, since both sides offer there anyway. Before,
   when the lower-id node lost its session while the peer kept one, nothing
   changed until the next connection.
+- A callee with no E2EE session with the caller refuses a call block invoice
+  (`call_block_unpayable`, nothing paid), so no minute is paid for a session
+  that cannot read it. Messages and other call signals have no such step
+  before payment.
 
 ## [0.3.0-rc21] — 2026-11-01
 
