@@ -120,6 +120,10 @@ impl konsensus_crypto::SessionStore for StorageSessionAdapter {
     }
 }
 
+#[cfg(test)]
+#[path = "tests/session_save_durability.rs"]
+mod session_save_durability;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();

@@ -3982,6 +3982,9 @@ pub(super) async fn compose_peer(
             readmission_msat: readmission.paid_msat(),
         }))
         }.await;
+        // Told apart here: `admission.error` turns this into the settled class below,
+        // which the debit handling matches on, so its reason goes back on afterwards.
+        let save_failed = matches!(&result, Err(error) if error.is_session_save_failure());
         let result = result.map_err(|error| admission.error(error));
         match &result {
             Ok(response) => debit.settled(&peer_key, response.0.amount_msat),
@@ -3992,7 +3995,10 @@ pub(super) async fn compose_peer(
             Err(_) => debit.released(&peer_key),
         }
         let message_msat = admission.message_authorized.unwrap_or(price_msat);
-        result.map_err(|e| e.with_routing_fee(debit.fee_limit(&state, message_msat).saturating_add(admission.fee_ceiling_msat)))
+        result.map_err(|e| {
+            let e = if save_failed && !e.is_session_save_failure() { e.with_reason(crate::error::SESSION_SAVE_FAILED) } else { e };
+            e.with_routing_fee(debit.fee_limit(&state, message_msat).saturating_add(admission.fee_ceiling_msat))
+        })
 }
 
 #[cfg(test)]

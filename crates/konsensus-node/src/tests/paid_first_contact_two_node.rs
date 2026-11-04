@@ -1662,6 +1662,7 @@ async fn failed_save_after_admission(order: Order) {
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{order:?}: {body}");
     assert_eq!(body["code"], "payment_settled_send_incomplete", "{body}");
     assert_eq!(body["amount_msat"], CHAT_MSAT, "the settled admission is reported: {body}");
+    assert_eq!(body["reason"], "session_save_failed", "{body}");
     assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT], "the admission alone was paid");
     assert!(net.payee.delivered.try_recv().is_err(), "the message did not leave");
 

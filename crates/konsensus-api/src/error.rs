@@ -142,6 +142,10 @@ impl ApiError {
     pub(crate) fn with_reason(self, reason: &'static str) -> Self {
         Self::Reasoned { source: Box::new(self), reason }
     }
+    /// Whether this is a send refused because its session state could not be saved.
+    pub(crate) fn is_session_save_failure(&self) -> bool {
+        matches!(self, Self::Reasoned { reason, .. } if *reason == SESSION_SAVE_FAILED)
+    }
     /// The error a `reason` was added to.
     pub(crate) fn without_reason(&self) -> &Self {
         match self { Self::Reasoned { source, .. } => source.without_reason(), other => other }

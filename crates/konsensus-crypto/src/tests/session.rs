@@ -1058,3 +1058,24 @@ async fn prekey_ids_start_at_a_random_point_per_boot() {
     distinct.dedup();
     assert_eq!(distinct.len(), starts.len(), "every boot picks its own: {starts:?}");
 }
+
+/// A ratchet failure during a send leaves the chain as it was, with a store and
+/// without one, so the next send takes the same position.
+#[tokio::test]
+async fn failed_aead_leaves_the_chain_as_it_was() {
+    let (_, _store, sender, receiver, node_a, node_b) = saving_sender().await;
+    let plain_sender = SessionManager::new(make_identity(TEST_MNEMONIC_A));
+    let plain_receiver = SessionManager::new(make_identity(TEST_MNEMONIC_B));
+    let init = plain_sender.initiate_session(&node_b, &plain_receiver.prekey_bundle().await).await.unwrap();
+    plain_receiver.accept_session(&node_a, &init).await.unwrap();
+
+    // Without a store this runs on this task's thread, where the failure is armed.
+    crate::double_ratchet::FAIL_NEXT_AEAD_ENCRYPT.with(|fail| fail.set(true));
+    assert!(plain_sender.encrypt(&node_b, b"fails").await.is_err());
+    let message = plain_sender.encrypt(&node_b, b"next").await.unwrap();
+    assert_eq!(message.header.message_number, 0, "the chain did not advance");
+    assert_eq!(plain_receiver.decrypt(&node_a, &message).await.unwrap(), b"next");
+
+    let message = sender.encrypt(&node_b, b"with a store").await.unwrap();
+    assert_eq!(receiver.decrypt(&node_a, &message).await.unwrap(), b"with a store");
+}
