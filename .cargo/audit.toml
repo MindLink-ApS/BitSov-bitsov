@@ -59,6 +59,8 @@
 # supported deployment scope, name a risk owner and a revisit date for the
 # remaining island, and assess the SQL encoded-size argument. This file records
 # what is known; it does not stand in for those decisions.
+# Every id below needs a date in .cargo/waiver-deadlines.toml. cargo-audit has no
+# expiry of its own, so scripts/check-waiver-deadlines.py enforces it in CI.
 ignore = [
   # In Cargo.lock but NEVER COMPILED (the `mysql` feature is off, and neither rsa
   # nor sqlx-mysql appears in `cargo tree -e normal`). The ignore is still needed

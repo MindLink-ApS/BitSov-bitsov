@@ -72,7 +72,9 @@ unused-ignored-advisory = "warn"
 #
 # Anything trivially fixable was BUMPED instead of ignored (rand 0.8.5 → 0.8.6
 # closed RUSTSEC-2026-0097 in this same PR). We ignore ONLY the unfixable-now set.
-# Each entry carries a `reason` per cargo-deny schema; no bare IDs.
+# Each entry carries a `reason` per cargo-deny schema; no bare IDs. Every id also
+# needs a date in .cargo/waiver-deadlines.toml. cargo-deny has no expiry of its own,
+# so scripts/check-waiver-deadlines.py enforces it in CI.
 ignore = [
     # RUSTSEC-2024-0363 — sqlx 0.8.0: protocol-level SQL smuggling via a length-
     # prefix overflow on values > 4 GiB. Reaches konsensus-storage. Deferred: the
