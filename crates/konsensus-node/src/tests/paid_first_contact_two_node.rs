@@ -1631,3 +1631,6 @@ async fn peer_exchange_payment_promoted_sender_still_requires_own_quote_and_paym
     assert_eq!(net.payer.paid_out().await, paid);
     net.stop();
 }
+
+#[path = "session_recovery_two_node.rs"]
+mod session_recovery;

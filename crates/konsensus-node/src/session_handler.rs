@@ -189,9 +189,9 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let exchange_nonces = konsensus_storage::StorageNonceAdapter::new(storage.clone());
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
     let readiness_height = ReadinessHeightCache::new(chain.clone());
-    // PSI-SPEED: bounds our prekey replies to a paid payee's offer. Separate
-    // from the other two eager limiters on purpose; see `eager_offers` in the
-    // compose handler.
+    // PSI-SPEED: bounds our prekey replies to a paid payee's offer, and our
+    // answers to a peer recovering a lost session. Separate from the other two
+    // eager limiters on purpose; see `eager_offers` in the compose handler.
     let mut eager_offers = konsensus_message::EagerOfferLimiter::new();
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
@@ -252,6 +252,9 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         }
                         reply_prekey_offer_to_paid_payee(
                             &peer_id, our_node_id, &session_manager, &transport, &mut eager_offers,
+                        ).await;
+                        answer_prekey_offer_for_recovery(
+                            &peer_id, our_node_id, &session_manager, &transport, &mut eager_offers, &last_negotiation,
                         ).await;
                         handle_prekey_offer(
                             &peer_id, bundle, our_node_id, &session_manager, &storage,
@@ -1060,6 +1063,69 @@ async fn reply_prekey_offer_to_paid_payee(
     match sent {
         Ok(()) => info!(peer = %peer_id, "answered the paid payee's PrekeyOffer with ours (PSI-SPEED)"),
         Err(e) => warn!(peer = %peer_id, error = %e, "failed to answer the paid payee's PrekeyOffer"),
+    }
+}
+
+/// Only the lower NodeId runs X3DH, and it needs the higher id's bundle. The
+/// higher id offers its bundle on a new connection and while it has no sending
+/// chain, so a lower id that loses its session while the higher id still has
+/// one would otherwise stay without a session until the next connection: it
+/// offers every self-heal tick and nothing answers.
+///
+/// So the higher id answers an offer with its own. Connection setup needs no
+/// answer: both sides offer on connect, and an offer that arrives while the
+/// connection is younger than the negotiation cooldown is such a connect offer
+/// (an answer would at best be throttled, at worst replace a healthy session
+/// when delayed). Nor does an offer right after a negotiation: the peer's
+/// cooldown would throttle the answer and our own its SessionInit. Either way
+/// the peer's next self-heal tick asks again if it still has no session, so a
+/// lost session recovers within the cooldown plus one tick, on this connection.
+///
+/// The peer's offers are in its hands, so answers pass [`EagerOfferLimiter`]
+/// (one per peer per cooldown, a node-wide cap). The answer is bound to the
+/// connection and standing read here, never a fresh NodeId lookup, so an
+/// unprivileged replacement gets no prekey.
+///
+/// [`EagerOfferLimiter`]: konsensus_message::EagerOfferLimiter
+async fn answer_prekey_offer_for_recovery(
+    peer_id: &NodeId,
+    our_node_id: NodeId,
+    session_manager: &SessionManager,
+    transport: &Arc<NoiseTransport>,
+    limiter: &mut konsensus_message::EagerOfferLimiter,
+    last_negotiation: &std::collections::HashMap<NodeId, tokio::time::Instant>,
+) {
+    if our_node_id.as_bytes() < peer_id.as_bytes() {
+        return;
+    }
+    let Some(since) = transport.connected_since(peer_id).await else { return };
+    if since.elapsed() < SESSION_NEGOTIATION_COOLDOWN
+        || last_negotiation.get(peer_id).is_some_and(|last| last.elapsed() < SESSION_NEGOTIATION_COOLDOWN)
+    {
+        return;
+    }
+    if !limiter.allow(peer_id, std::time::Instant::now()) {
+        debug!(peer = %peer_id, "prekey answer rate-limited; the peer's next offer asks again");
+        return;
+    }
+    let standing = if transport.admission_paid_on_connection(peer_id).await {
+        konsensus_message::Standing::AdmissionPaid
+    } else {
+        konsensus_message::Standing::Privileged
+    };
+    let sent = match serde_json::to_value(session_manager.prekey_bundle().await)
+        .map_err(|e| format!("serialize prekey bundle: {e}"))
+        .and_then(|bundle| Frame::PrekeyOffer { bundle }.to_bytes().map_err(|e| e.to_string()))
+    {
+        Ok(frame) => transport
+            .send_raw_frame_on(peer_id, since, standing, &frame)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    match sent {
+        Ok(()) => info!(peer = %peer_id, "answered the peer's PrekeyOffer with ours"),
+        Err(e) => warn!(peer = %peer_id, error = %e, "failed to answer the peer's PrekeyOffer"),
     }
 }
 

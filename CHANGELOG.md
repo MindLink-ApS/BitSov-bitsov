@@ -5,6 +5,13 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- A node that lost its E2EE session with a connected peer gets it back on the
+  same connection, within about 25 seconds. The higher-id peer now answers a
+  PrekeyOffer with its own, at most once per ten seconds per peer; offers on a
+  new connection get no answer, since both sides offer there anyway. Before,
+  when the lower-id node lost its session while the peer kept one, nothing
+  changed until the next connection.
+
 ## [0.3.0-rc21] — 2026-11-01
 
 - App spend grants now show, sign and store the owner's real per-payment
