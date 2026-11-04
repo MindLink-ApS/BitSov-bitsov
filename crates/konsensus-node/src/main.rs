@@ -15,6 +15,9 @@ mod endpoints;
 mod guarded_lightning;
 mod housekeeping;
 mod invoice_refusals;
+#[cfg(test)]
+#[path = "tests/fixtures/flaky_session_store.rs"]
+mod flaky_session_store;
 #[path = "cli/locked.rs"]
 mod locked_cmd;
 mod logging;

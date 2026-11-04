@@ -4,7 +4,15 @@ use konsensus_lightning::shared_mock::SharedMockProvider;
 type FirstContactFixture = (Fx, Arc<SharedMockProvider>, Arc<SharedMockProvider>, Arc<AtomicUsize>);
 
 async fn stranger(establish: bool) -> FirstContactFixture {
+    stranger_with_sessions(establish, None).await
+}
+
+async fn stranger_with_sessions(establish: bool, store: Option<Arc<FlakySessionStore>>) -> FirstContactFixture {
     let mut fx = fixture().await;
+    if let Some(store) = store {
+        let sessions = Arc::new(konsensus_crypto::SessionManager::with_store(fx.state.identity.clone(), store));
+        fx.state = Arc::new(AppState { session_manager: sessions, ..(*fx.state).clone() });
+    }
     let path = fx.tmp.path().join("lightning.db");
     let sender = Arc::new(SharedMockProvider::new(&path, "sender", 100_000).unwrap());
     let target = Arc::new(SharedMockProvider::new(&path, "target", 0).unwrap());
@@ -100,6 +108,24 @@ fn journal(fx: &Fx, reservation: &konsensus_api::spend_budget::Reservation, hash
 fn reserve(fx: &Fx, amount: u64) -> konsensus_api::spend_budget::Reservation {
     let epoch = fx.service.snapshot().clients.iter().find(|c| c.client_id == fx.client_id).unwrap().epoch;
     fx.service.reserve_spend(&fx.client_id, epoch, vec![Charge { recipient:fx.peer.to_hex(), amount_msat:amount }]).unwrap()
+}
+
+/// The session forms after a settled admission and the save of the first send then
+/// fails. The message is neither sent nor paid, but the admission stays settled and
+/// charged, reported as paid. This is the class that must not read as unpaid.
+#[tokio::test]
+async fn failed_save_after_admission_keeps_the_admission_settled_and_charged() {
+    let store = Arc::new(FlakySessionStore::default());
+    store.fail_all(true);
+    let (fx, sender, target, _) = stranger_with_sessions(true, Some(store)).await;
+    let token = fx.grant(None, GrantTerms::new(10_000)).await;
+    let (status, body) = send(&fx, &token, 4000).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["code"], "payment_settled_send_incomplete", "{body}");
+    assert_eq!(body["amount_msat"], 2000, "the settled admission is reported: {body}");
+    assert_eq!(sender.get_balance_msat().await.unwrap(), 98_000, "the admission alone was paid");
+    assert_eq!(target.get_balance_msat().await.unwrap(), 2000);
+    assert_eq!(fx.used(), 2000, "the admission stays charged to the grant");
 }
 
 #[tokio::test]

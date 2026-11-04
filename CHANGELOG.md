@@ -5,6 +5,12 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- An E2EE send now saves its advanced send chain before the ciphertext leaves the
+  session. If the save fails, the ciphertext is withheld and the chain put back,
+  so a restart cannot reuse a message key. The send is refused with
+  `not_dispatched`, reason `session_save_failed`, before any payment for it. An
+  admission already settled in the same call stays settled and is reported as paid.
+
 ## [0.3.0-rc21] — 2026-11-01
 
 - App spend grants now show, sign and store the owner's real per-payment

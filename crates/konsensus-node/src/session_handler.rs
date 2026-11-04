@@ -934,6 +934,11 @@ async fn handle_session_ack(
                 warn!(peer = %peer_id, error = %e, "failed to send RatchetInit");
             }
         }
+        // A disk failure says nothing about the session. It stays; the peer has no
+        // sending chain yet, so its self-heal tick offers again.
+        Err(konsensus_crypto::SessionError::NotPersisted) => {
+            warn!(peer = %peer_id, "ratchet init not sent: session state could not be saved");
+        }
         Err(e) => {
             warn!(
                 peer = %peer_id, error = %e,

@@ -62,6 +62,11 @@ pub enum SessionError {
     /// Invalid peer data.
     #[error("invalid peer data: {0}")]
     InvalidPeerData(String),
+
+    /// The advanced send chain could not be saved, so its ciphertext was withheld
+    /// and the chain put back. Nothing left this node for that plaintext.
+    #[error("session state could not be saved; the ciphertext was withheld")]
+    NotPersisted,
 }
 
 /// Data sent from initiator to responder to establish an E2EE session.
@@ -480,12 +485,20 @@ impl SessionManager {
             .map_err(|e| format!("session decrypt: {e}"))
     }
 
+    /// The encrypted blob that stores a session's current state.
+    fn session_blob(&self, session: &PeerSession) -> Result<Vec<u8>, String> {
+        let state = session.ratchet.export_state();
+        let json_blob = serde_json::to_vec(&state).map_err(|e| format!("serialize session state: {e}"))?;
+        // Encrypt the JSON before persisting (Principle 4)
+        self.encrypt_session_blob(&json_blob).map_err(|e| format!("encrypt session state: {e}"))
+    }
+
     /// Persist the current session state for a peer.
     ///
     /// Session state is serialized to JSON and then encrypted with AES-256-GCM
     /// before being written to the store (Principle 4: no plaintext at rest).
     /// Errors are logged but don't fail the operation (session state is still
-    /// in memory).
+    /// in memory). Sending does not use this: see [`Self::encrypt`].
     async fn persist_session(&self, peer_id: &NodeId) {
         let store = match &self.store {
             Some(s) => s,
@@ -498,23 +511,14 @@ impl SessionManager {
             None => return,
         };
 
-        let state = session.ratchet.export_state();
-        match serde_json::to_vec(&state) {
-            Ok(json_blob) => {
-                // Encrypt the JSON before persisting (Principle 4)
-                match self.encrypt_session_blob(&json_blob) {
-                    Ok(encrypted_blob) => {
-                        if let Err(e) = store.save_session(peer_id, &encrypted_blob).await {
-                            warn!(peer = %peer_id, error = %e, "failed to persist session state");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(peer = %peer_id, error = %e, "failed to encrypt session state for storage");
-                    }
+        match self.session_blob(session) {
+            Ok(encrypted_blob) => {
+                if let Err(e) = store.save_session(peer_id, &encrypted_blob).await {
+                    warn!(peer = %peer_id, error = %e, "failed to persist session state");
                 }
             }
             Err(e) => {
-                warn!(peer = %peer_id, error = %e, "failed to serialize session state");
+                warn!(peer = %peer_id, error = %e, "failed to prepare session state for storage");
             }
         }
     }
@@ -749,21 +753,35 @@ impl SessionManager {
     /// Uses the Double Ratchet to derive a per-message key and encrypt.
     /// Returns the ratchet message (header + ciphertext) which should be
     /// placed in the UKM envelope's `ciphertext` field.
+    ///
+    /// The advanced send chain is saved before the ciphertext is returned, so a
+    /// restart can never derive the key of a message that already left. If the save
+    /// fails this returns [`SessionError::NotPersisted`], withholds the ciphertext
+    /// and puts the chain back. The session lock is held across the save so that no
+    /// other send or receive on this manager can build on a chain that is put back.
     pub async fn encrypt(
         &self,
         peer_id: &NodeId,
         plaintext: &[u8],
     ) -> Result<RatchetMessage, SessionError> {
-        let msg = {
-            let mut sessions = self.sessions.write().await;
-            let session = sessions
-                .get_mut(peer_id)
-                .ok_or(SessionError::NoSession(*peer_id))?;
-            session.ratchet.encrypt(plaintext)?
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get_mut(peer_id)
+            .ok_or(SessionError::NoSession(*peer_id))?;
+        let Some(store) = &self.store else {
+            return Ok(session.ratchet.encrypt(plaintext)?);
         };
-
-        // Persist updated ratchet state after chain advancement
-        self.persist_session(peer_id).await;
+        let before = session.ratchet.export_state();
+        let msg = session.ratchet.encrypt(plaintext)?;
+        let saved = match self.session_blob(session) {
+            Ok(blob) => store.save_session(peer_id, &blob).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = saved {
+            warn!(peer = %peer_id, error = %e, "send chain not saved; ciphertext withheld");
+            session.ratchet = DoubleRatchet::from_state(&before);
+            return Err(SessionError::NotPersisted);
+        }
         Ok(msg)
     }
 

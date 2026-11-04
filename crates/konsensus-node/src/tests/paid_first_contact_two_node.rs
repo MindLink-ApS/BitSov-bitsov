@@ -393,6 +393,8 @@ struct NodeSpec<'a> {
     peer: Option<NodeId>,
     /// Reuse a data dir (a restart keeps the admission journal).
     data_dir: Option<PathBuf>,
+    /// Keep E2EE sessions in this store.
+    session_store: Option<Arc<dyn konsensus_crypto::SessionStore>>,
 }
 
 async fn start_node(spec: NodeSpec<'_>) -> Node {
@@ -431,7 +433,10 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
     };
     let storage: Arc<dyn konsensus_storage::Storage> =
         Arc::new(konsensus_storage::sqlite::SqliteStorage::in_memory().await.unwrap());
-    let sessions = Arc::new(SessionManager::new(Arc::clone(&identity)));
+    let sessions = Arc::new(match spec.session_store {
+        Some(store) => SessionManager::with_store(Arc::clone(&identity), store),
+        None => SessionManager::new(Arc::clone(&identity)),
+    });
     let registry = Arc::new(tokio::sync::RwLock::new(PeerRegistry::new()));
     let audit = Arc::new(konsensus_api::audit::AuditLog::open(data_dir.join(format!("audit-{id}.log"))).unwrap());
     let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> =
@@ -737,6 +742,16 @@ struct Pair {
 }
 
 async fn pair(shape: Shape, order: Order, payer_wallet: Wallet, payee_wallet: Wallet) -> Pair {
+    pair_with_payer_store(shape, order, payer_wallet, payee_wallet, None).await
+}
+
+async fn pair_with_payer_store(
+    shape: Shape,
+    order: Order,
+    payer_wallet: Wallet,
+    payee_wallet: Wallet,
+    payer_store: Option<Arc<dyn konsensus_crypto::SessionStore>>,
+) -> Pair {
     let (payer_id, payee_id) = identities(order);
     let (payer_node, payee_node) = (*payer_id.node_id(), *payee_id.node_id());
     let (payer_list, payee_list) = match shape {
@@ -748,12 +763,12 @@ async fn pair(shape: Shape, order: Order, payer_wallet: Wallet, payee_wallet: Wa
     let ledger_path = ledger.path().join("ledger.db");
     let payer = start_node(NodeSpec {
         identity: payer_id, whitelist: payer_list, ledger: &ledger_path, name: "payer",
-        balance_msat: 1_000_000, wallet: payer_wallet, peer: Some(payee_node), data_dir: None,
+        balance_msat: 1_000_000, wallet: payer_wallet, peer: Some(payee_node), data_dir: None, session_store: payer_store,
     })
     .await;
     let payee = start_node(NodeSpec {
         identity: payee_id, whitelist: payee_list, ledger: &ledger_path, name: "payee",
-        balance_msat: 0, wallet: payee_wallet, peer: None, data_dir: None,
+        balance_msat: 0, wallet: payee_wallet, peer: None, data_dir: None, session_store: None,
     })
     .await;
     // The payee issues no admission quote in its first second (F1 quarantine).
@@ -982,7 +997,7 @@ async fn m11_payer_restart_inside_the_window_pays_once_per_connection() {
     let restarted = start_node(NodeSpec {
         identity: Arc::clone(&net.payer.identity), whitelist: vec![], ledger: &net.ledger(),
         name: "payer", balance_msat: 1_000_000, wallet: Wallet::Plain, peer: None,
-        data_dir: Some(net.payer.data_dir.clone()),
+        data_dir: Some(net.payer.data_dir.clone()), session_store: None,
     })
     .await;
     let old = std::mem::replace(&mut net.payer, restarted);
@@ -1630,4 +1645,40 @@ async fn peer_exchange_payment_promoted_sender_still_requires_own_quote_and_paym
     }).await;
     assert_eq!(net.payer.paid_out().await, paid);
     net.stop();
+}
+
+/// First contact: the admission settles, the session forms, and the save of the first
+/// send fails. The message does not leave and is not paid. The admission stays settled
+/// and is reported as paid, and a retry once saves work pays only the message. Real
+/// handlers, both id orders.
+async fn failed_save_after_admission(order: Order) {
+    use crate::flaky_session_store::FlakySessionStore;
+    let store = Arc::new(FlakySessionStore::default());
+    store.fail(true);
+    let mut net = pair_with_payer_store(Shape::CardOnly, order, Wallet::Plain, Wallet::Plain, Some(store.clone())).await;
+    let payee = net.payee.id;
+
+    let (status, body) = net.payer.compose(&payee, "not saved").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{order:?}: {body}");
+    assert_eq!(body["code"], "payment_settled_send_incomplete", "{body}");
+    assert_eq!(body["amount_msat"], CHAT_MSAT, "the settled admission is reported: {body}");
+    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT], "the admission alone was paid");
+    assert!(net.payee.delivered.try_recv().is_err(), "the message did not leave");
+
+    store.fail(false);
+    let (status, body) = net.payer.compose(&payee, "saved").await;
+    assert_eq!(status, StatusCode::OK, "{order:?}: {body}");
+    net.payee.delivered_once("saved").await;
+    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT, CHAT_MSAT], "no second admission");
+    net.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_save_after_admission_keeps_it_paid_payer_initiates() {
+    failed_save_after_admission(Order::PayerLower).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_save_after_admission_keeps_it_paid_payee_initiates() {
+    failed_save_after_admission(Order::PayerHigher).await;
 }

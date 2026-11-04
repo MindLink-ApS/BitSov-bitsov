@@ -3075,6 +3075,10 @@ async fn compose_room_member(
     // Encrypt via Double Ratchet for this specific member.
     let ratchet_msg = match state.session_manager.encrypt(&member, ctx.plaintext.as_bytes()).await {
         Ok(msg) => msg,
+        Err(konsensus_crypto::SessionError::NotPersisted) => {
+            tracing::warn!(peer = %member, "skipping room member: session state could not be saved");
+            return RoomMemberOutcome::stopped(member, "refused", 0, "session state could not be saved; nothing paid to this member".into());
+        }
         Err(e) => {
             tracing::warn!(
                 peer = %member,
@@ -3787,9 +3791,9 @@ pub(super) async fn compose_peer(
                 let no_session = !state.session_manager.has_session(&peer_id).await;
                 let connected = state.transport.is_connected(&peer_id).await;
                 if !(first_contact && no_session && connected) {
-                    return Err(ApiError::BadRequest(format!(
+                    return Err(ApiError::from_encrypt_failure(e, |e| ApiError::BadRequest(format!(
                         "E2EE encryption failed (session may not be established): {e}"
-                    )));
+                    ))));
                 }
 
                 tracing::info!(
@@ -3843,10 +3847,12 @@ pub(super) async fn compose_peer(
                     .encrypt(&peer_id, req.plaintext.as_bytes())
                     .await
                     .map_err(|e| {
-                        ApiError::BadRequest(format!(
+                        // Reported through `admission.error` below, which keeps a
+                        // settled admission as paid.
+                        ApiError::from_encrypt_failure(e, |e| ApiError::BadRequest(format!(
                             "E2EE encryption failed after admission (session may not be \
                              established): {e}"
-                        ))
+                        )))
                     })?
             }
         };
