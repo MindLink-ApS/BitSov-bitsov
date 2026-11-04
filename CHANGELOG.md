@@ -5,6 +5,10 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- `POST /api/v1/files/:id/send` now returns optional `fee_paid_msat`, as compose
+  does: the actual routing fee of a settled LDK payment. It is omitted when any
+  component fee is unknown and on other backends.
+
 ## [0.3.0-rc21] — 2026-11-01
 
 - App spend grants now show, sign and store the owner's real per-payment

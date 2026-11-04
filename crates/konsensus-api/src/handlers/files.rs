@@ -179,6 +179,9 @@ pub struct SendFileRequest {
 #[derive(Serialize)]
 pub struct SendFileResponse {
     pub max_routing_fee_msat: u64,
+    /// Actual aggregate LDK routing fee; omitted unless every component is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_paid_msat: Option<u64>,
     /// The message ID of the UKM envelope.
     pub message_id: String,
     /// Whether the file was delivered to a connected peer.
@@ -618,6 +621,9 @@ async fn send_file_inner(
 
     Ok(Json(SendFileResponse {
         max_routing_fee_msat: (all_in - super::messages::caps::payable(price_msat)).saturating_add(readmission.fee_ceiling_msat()),
+        fee_paid_msat: if state.lightning_backend == "ldk" {
+            debit.recorded_fee_paid_msat().and_then(|fee| readmission.fee_paid_msat().and_then(|r| fee.checked_add(r)))
+        } else { None },
         message_id: envelope.id.to_hex(),
         delivered,
         amount_msat,

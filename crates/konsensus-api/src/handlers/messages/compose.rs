@@ -468,7 +468,7 @@ pub(crate) struct Readmission {
 }
 
 impl Readmission {
-    fn fee_paid_msat(&self) -> Option<u64> {
+    pub(crate) fn fee_paid_msat(&self) -> Option<u64> {
         if self.paid_msat().is_none() { Some(0) } else { *self.fee_paid_msat.lock().unwrap_or_else(|e| e.into_inner()) }
     }
     pub(crate) fn fee_ceiling_msat(&self) -> u64 {
