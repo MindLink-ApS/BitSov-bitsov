@@ -563,10 +563,10 @@ async fn one_minute_duration_cap() {
 }
 
 /// Real LDK settlement, then a callee whose chain sync has lapsed: acts it has
-/// been paid for still count, and it takes on no new money work.
+/// been paid for count for a bounded time, and it takes on no new money work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real Bitcoin Core + electrs; scripts/regress/two_node_paid_call_e2e.sh"]
-async fn paid_signals_count_while_callee_is_not_ready() {
+async fn paid_signals_count_briefly_while_callee_is_not_ready() {
     let mut steps = Steps::new();
     let chain = infra::Chain::start().await;
     let fault = three_node::fault_proxy::FaultProxy::start(&chain.url).await;
@@ -728,8 +728,52 @@ async fn paid_signals_count_while_callee_is_not_ready() {
     assert!(!money.money_ready().await, "still not ready after the hangup");
     steps.pass("offer rings, unpayable answer refused, hangup ends the ring, all while not ready");
 
+    // Past the bound a fresh settlement is not confirmed: refused as it would
+    // have been, nothing burned, and the sender's normal resend delivers it.
+    let cutoff = b.gate_settlement_cutoff().expect("a good sync is on record");
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while now_ms() / 1000 <= cutoff {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("the settlement cutoff passes");
+    assert!(!money.money_ready().await, "still not ready past the cutoff");
+    assert_eq!(b.gate_settlement_cutoff(), Some(cutoff), "no sync moved the cutoff");
+    const LATE: &str = "settled past the cutoff";
+    let operation = uuid::Uuid::new_v4().to_string();
+    let (status, body) = caller
+        .post(
+            "/api/v1/messages/compose",
+            json!({"operation_id": operation, "recipient": bid.to_hex(), "kind": 0, "plaintext": LATE}),
+            false,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "late message: {body}");
+    let late_state = || async {
+        let (status, body) = caller
+            .get(&format!("/api/v1/messages/operations/{operation}"), false)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["state"].as_str().unwrap().to_owned()
+    };
+    wait("the late message is refused, retryably", || async {
+        late_state().await == "rejected_retryable"
+    })
+    .await;
+    assert!(!money.money_ready().await, "still not ready when refused");
+    steps.pass("settlement past the bound refused while not ready");
+
     fault.set_limited(false);
-    wait("callee recovers", || money.money_ready()).await;
+    // Failed syncs have backed off by now, so this can take a few minutes.
+    tokio::time::timeout(Duration::from_secs(360), async {
+        while !money.money_ready().await {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("callee recovers");
+    assert_ne!(late_state().await, "failed_paid", "a refusal past the bound stays retryable");
     caller.compose(&mut callee, "after recovery").await;
     steps.pass("recovery needs no restart; delivery continues");
     println!("GATE WHILE NOT READY PASS");

@@ -299,11 +299,14 @@ async fn sync_failure_is_diagnostic_only_before_and_after_next_poll() {
     provider.shutdown().await.unwrap();
 }
 
+const SYNCED: u64 = 1_700_000_000;
+
 /// A local payment store with a chain-sync flag, like the embedded backend: its
 /// reads need no chain, and an unknown hash is `PaymentNotFound`.
 struct Store {
     ready: std::sync::atomic::AtomicBool,
     funding: bool,
+    cutoff: std::sync::Mutex<Option<u64>>,
     record: std::sync::Mutex<Option<PaymentDetails>>,
 }
 
@@ -312,6 +315,7 @@ impl Store {
         Arc::new(Self {
             ready: ready.into(),
             funding: false,
+            cutoff: Some(SYNCED).into(),
             record: record.into(),
         })
     }
@@ -326,6 +330,9 @@ impl Store {
 
 #[async_trait::async_trait]
 impl LightningProvider for Store {
+    fn gate_settlement_cutoff(&self) -> Option<u64> {
+        *self.cutoff.lock().unwrap()
+    }
     async fn money_ready(&self) -> bool {
         self.ready.load(Ordering::SeqCst)
     }
@@ -363,7 +370,7 @@ fn record(status: PaymentStatus, direction: PaymentDirection) -> PaymentDetails 
         amount_msat: 10_000,
         status,
         direction,
-        timestamp: 0,
+        timestamp: SYNCED,
         memo: None,
         fee_msat: None,
     }
@@ -420,6 +427,28 @@ async fn not_ready_gate_read_refuses_anything_but_a_stored_inbound_settlement() 
 }
 
 #[tokio::test]
+async fn not_ready_gate_read_refuses_a_settlement_past_the_cutoff() {
+    let at_cutoff = record(PaymentStatus::Settled, PaymentDirection::Incoming);
+    let mut past_cutoff = at_cutoff.clone();
+    past_cutoff.timestamp = SYNCED + 1;
+
+    let provider = over(Store::new(false, Some(at_cutoff.clone()))).await;
+    assert!(provider.gate_payment_status("aa").await.is_ok(), "the last second still counts");
+    provider.shutdown().await.unwrap();
+
+    let provider = over(Store::new(false, Some(past_cutoff))).await;
+    assert!(matches!(provider.gate_payment_status("aa").await, Err(LightningError::NotReady)));
+    provider.shutdown().await.unwrap();
+
+    // A backend with no good sync on record confirms nothing.
+    let store = Store::new(false, Some(at_cutoff));
+    *store.cutoff.lock().unwrap() = None;
+    let provider = over(store).await;
+    assert!(matches!(provider.gate_payment_status("aa").await, Err(LightningError::NotReady)));
+    provider.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn gate_read_stays_refused_without_a_backend_or_when_stopping() {
     let offline = RecoveringLightning::new(|| async { Err(offline()) }, Default::default())
         .await
@@ -437,6 +466,20 @@ async fn gate_read_stays_refused_without_a_backend_or_when_stopping() {
 
 #[tokio::test]
 async fn ready_gate_read_answers_exactly_like_the_ordinary_read() {
+    // Ready: the cutoff plays no part, even with no good sync on record.
+    let store = Store::new(true, Some(record(PaymentStatus::Settled, PaymentDirection::Incoming)));
+    *store.cutoff.lock().unwrap() = None;
+    let provider = over(store).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !provider.money_ready().await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(provider.gate_payment_status("aa").await.is_ok());
+    provider.shutdown().await.unwrap();
+
     let store = Store::new(true, Some(record(PaymentStatus::Failed, PaymentDirection::Incoming)));
     let provider = over(store).await;
     tokio::time::timeout(Duration::from_secs(5), async {

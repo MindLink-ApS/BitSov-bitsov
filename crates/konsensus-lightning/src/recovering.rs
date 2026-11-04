@@ -389,12 +389,14 @@ impl LightningProvider for RecoveringLightning {
         if ready {
             return p.gate_payment_status(payment_hash).await;
         }
-        // While not ready this can only confirm an inbound settlement already
-        // stored. Anything else keeps the refusal it has always had.
+        // While not ready this can only confirm an inbound settlement recorded
+        // while the chain view was recent. Anything else keeps the refusal it
+        // has always had.
         match p.gate_payment_status(payment_hash).await {
             Ok(details)
                 if details.status == PaymentStatus::Settled
-                    && details.direction == PaymentDirection::Incoming =>
+                    && details.direction == PaymentDirection::Incoming
+                    && p.gate_settlement_cutoff().is_some_and(|cutoff| details.timestamp <= cutoff) =>
             {
                 Ok(details)
             }

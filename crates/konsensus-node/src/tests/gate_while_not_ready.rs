@@ -17,10 +17,12 @@ use sha2::{Digest, Sha256};
 
 const AMOUNT: u64 = 10_000;
 const PREIMAGE: [u8; 32] = [7; 32];
+const SETTLED_AT: u64 = 1_700_000_000;
 
 struct Store {
     ready: AtomicBool,
     funding: AtomicBool,
+    cutoff: Mutex<Option<u64>>,
     record: Mutex<Option<PaymentDetails>>,
 }
 
@@ -36,6 +38,9 @@ impl Store {
 
 #[async_trait::async_trait]
 impl LightningProvider for Store {
+    fn gate_settlement_cutoff(&self) -> Option<u64> {
+        *self.cutoff.lock().unwrap()
+    }
     async fn money_ready(&self) -> bool {
         self.ready.load(Ordering::SeqCst)
     }
@@ -77,7 +82,7 @@ fn record(status: PaymentStatus, direction: PaymentDirection) -> PaymentDetails 
         amount_msat: AMOUNT,
         status,
         direction,
-        timestamp: 0,
+        timestamp: SETTLED_AT,
         memo: None,
         fee_msat: None,
     }
@@ -98,6 +103,7 @@ impl Node {
         let store = Arc::new(Store {
             ready: ready.into(),
             funding: false.into(),
+            cutoff: Some(SETTLED_AT).into(),
             record: stored.into(),
         });
         let backend = store.clone() as Arc<dyn LightningProvider>;
@@ -192,10 +198,10 @@ async fn settled_payment_is_admitted_while_not_ready() {
     node.money.shutdown().await.unwrap();
 }
 
-/// The order that lost a paid block: invoice while ready, settlement, then chain
-/// sync lapses before the envelope carrying the proof reaches the gate.
+/// Invoice while ready, settlement, then chain sync lapses before the envelope
+/// carrying the proof reaches the gate. The real call block is in the paid regtest.
 #[tokio::test]
-async fn block_settled_before_readiness_lapses_still_counts() {
+async fn payment_settled_before_readiness_lapses_still_counts() {
     let node = Node::start(true, None).await;
     node.wait_money_ready(true).await;
     node.money.create_invoice(AMOUNT, "call block", 60).await.unwrap();
@@ -231,6 +237,46 @@ async fn nothing_else_is_admitted_while_not_ready() {
             matches!(&refusal, GateRejection::LightningUnavailable(reason) if reason.contains("not_ready")),
             "{label}: {refusal:?}"
         );
+        node.money.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn settlement_past_the_cutoff_is_refused_while_not_ready() {
+    let mut late = record(PaymentStatus::Settled, PaymentDirection::Incoming);
+    late.timestamp = SETTLED_AT + 1;
+    let node = Node::start(false, Some(late)).await;
+    let envelope = node.envelope(&sender(), proof());
+    let refusal = node.gate(&envelope).await.unwrap_err();
+    assert!(
+        matches!(&refusal, GateRejection::LightningUnavailable(reason) if reason.contains("not_ready")),
+        "{refusal:?}"
+    );
+    assert_eq!(node.db.accept_paid_envelope(&envelope).await.unwrap(), PaidAcceptance::Accepted,
+        "a refusal burns nothing: the same envelope can still be accepted later");
+    node.money.shutdown().await.unwrap();
+
+    // No good sync on record: nothing to measure against.
+    let node = Node::start(false, Some(record(PaymentStatus::Settled, PaymentDirection::Incoming))).await;
+    *node.store.cutoff.lock().unwrap() = None;
+    assert!(node.gate(&node.envelope(&sender(), proof())).await.is_err());
+    node.money.shutdown().await.unwrap();
+}
+
+/// Repeated refusals the gate expects must not lock out a valid settlement.
+#[tokio::test]
+async fn refused_reads_do_not_block_a_valid_settlement_while_not_ready() {
+    for stored in [
+        record(PaymentStatus::Settled, PaymentDirection::Outgoing),
+        record(PaymentStatus::Pending, PaymentDirection::Incoming),
+    ] {
+        let node = Node::start(false, Some(stored)).await;
+        let peer = sender();
+        for _ in 0..20 {
+            assert!(node.gate(&node.envelope(&peer, proof())).await.is_err());
+        }
+        *node.store.record.lock().unwrap() = Some(record(PaymentStatus::Settled, PaymentDirection::Incoming));
+        assert!(!node.gate(&node.envelope(&peer, proof())).await.unwrap());
         node.money.shutdown().await.unwrap();
     }
 }

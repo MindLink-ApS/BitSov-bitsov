@@ -291,6 +291,12 @@ impl CircuitBreakerLightning {
                     "settlement verification timed out — fail-closed".into(),
                 ))
             }
+            // The backend answered in time: a refusal the gate expects says
+            // nothing about its health, and must not lock out other payments.
+            Ok(Err(e @ (LightningError::NotReady | LightningError::PaymentNotFound(_)))) => {
+                self.record_success(call.generation);
+                Err(e)
+            }
             Ok(Err(e)) => {
                 self.record_failure(call.generation, call.probe);
                 Err(e)
@@ -413,6 +419,8 @@ mod tests {
         Settled,
         Pending,
         Error,
+        NotReady,
+        NotFound,
         BlockedError,
         BlockedSettled,
         /// Sleep this long, then return `Settled` (simulates a slow backend).
@@ -490,6 +498,8 @@ mod tests {
                 Behavior::Settled => Ok(settled_details()),
                 Behavior::Pending => Ok(pending_details()),
                 Behavior::Error => Err(LightningError::Backend("boom".into())),
+                Behavior::NotReady => Err(LightningError::NotReady),
+                Behavior::NotFound => Err(LightningError::PaymentNotFound("hash".into())),
                 Behavior::BlockedError => {
                     self.release.notified().await;
                     Err(LightningError::Backend("boom".into()))
@@ -877,6 +887,36 @@ mod tests {
             assert_eq!(cb.gate_payment_status("hash").await.unwrap().status, PaymentStatus::Settled);
         }
         assert_eq!(fake.calls.load(Ordering::SeqCst), 2, "a settled answer is never cached");
+    }
+
+    // A refusal the gate expects is an answer, not a sick backend.
+    #[tokio::test]
+    async fn expected_refusals_do_not_open_the_circuit() {
+        for refusal in [Behavior::NotReady, Behavior::NotFound] {
+            let fake = FakeProvider::new(refusal);
+            let cb = CircuitBreakerLightning::new(fake.clone(), fast_cfg());
+            for _ in 0..20 {
+                assert!(cb.gate_payment_status("hash").await.is_err());
+            }
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 20, "every call reached the backend");
+            *fake.behavior.lock().unwrap() = Behavior::Settled;
+            assert_eq!(cb.gate_payment_status("hash").await.unwrap().status, PaymentStatus::Settled);
+        }
+    }
+
+    // A half-open probe that gets such an answer closes the circuit.
+    #[tokio::test]
+    async fn expected_refusal_closes_a_half_open_circuit() {
+        let fake = FakeProvider::new(Behavior::Error);
+        let cb = CircuitBreakerLightning::new(fake.clone(), fast_cfg());
+        for _ in 0..3 {
+            assert!(cb.gate_payment_status("hash").await.is_err());
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        *fake.behavior.lock().unwrap() = Behavior::NotReady;
+        assert!(matches!(cb.gate_payment_status("hash").await, Err(LightningError::NotReady)));
+        *fake.behavior.lock().unwrap() = Behavior::Settled;
+        assert!(cb.gate_payment_status("hash").await.is_ok(), "the probe answered, the circuit is closed");
     }
 
     // Freshness headers: the wrapper must report the inner wallet's sync
