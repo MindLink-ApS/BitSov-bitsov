@@ -1017,12 +1017,14 @@ async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
         .unwrap();
     let ciphertext = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
 
-    let envelope = make_envelope(
+    let mut envelope = make_envelope(
         alice.as_ref(),
         *bob.node_id(),
         konsensus_core::kind::KIND_CHAT,
         ciphertext,
     );
+    // Stamped past Bob's session settling, so the failure counts against it.
+    envelope.timestamp += 11_000;
     let sender = *alice.node_id();
 
     // Before: session exists
