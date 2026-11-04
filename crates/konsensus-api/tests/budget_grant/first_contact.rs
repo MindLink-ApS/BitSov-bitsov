@@ -123,6 +123,7 @@ async fn failed_save_after_admission_keeps_the_admission_settled_and_charged() {
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["code"], "payment_settled_send_incomplete", "{body}");
     assert_eq!(body["amount_msat"], 2000, "the settled admission is reported: {body}");
+    assert_eq!(body["reason"], "session_save_failed", "{body}");
     assert_eq!(sender.get_balance_msat().await.unwrap(), 98_000, "the admission alone was paid");
     assert_eq!(target.get_balance_msat().await.unwrap(), 2000);
     assert_eq!(fx.used(), 2000, "the admission stays charged to the grant");
