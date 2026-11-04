@@ -456,12 +456,6 @@ impl SessionManager {
         }
     }
 
-    /// Encrypt a session state blob with AES-256-GCM.
-    /// Returns nonce (12 bytes) || ciphertext.
-    fn encrypt_session_blob(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-        seal_session_blob(&self.session_cipher, plaintext)
-    }
-
     /// Decrypt a session state blob. Expects nonce (12 bytes) || ciphertext.
     fn decrypt_session_blob(&self, data: &[u8]) -> Result<Vec<u8>, String> {
         if data.len() < 12 {

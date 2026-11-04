@@ -749,13 +749,13 @@ fn kdf_rk(root_key: &[u8; 32], dh_output: &[u8; 32]) -> Result<([u8; 32], [u8; 3
     Ok((new_root, chain_key))
 }
 
-/// AEAD encrypt using AES-256-GCM.
 #[cfg(test)]
 thread_local! {
-    /// Makes the next `aead_encrypt` on this thread fail.
+    // Makes the next `aead_encrypt` on this thread fail.
     pub(crate) static FAIL_NEXT_AEAD_ENCRYPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// AEAD encrypt using AES-256-GCM.
 fn aead_encrypt(key: &[u8; 32], plaintext: &[u8], ad: &[u8]) -> Result<Vec<u8>, RatchetError> {
     #[cfg(test)]
     if FAIL_NEXT_AEAD_ENCRYPT.with(|fail| fail.replace(false)) {
