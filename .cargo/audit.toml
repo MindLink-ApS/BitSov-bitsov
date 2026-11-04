@@ -68,7 +68,7 @@ ignore = [
   # Postgres IS compiled and selectable — see the size-cap reasoning above for why
   # the >4 GiB precondition cannot be met. Not "unaffected because SQLite".
   "RUSTSEC-2024-0363",
-  # rustls-webpki 0.101.7 via the sqlx/minreq legacy island — CERTIFICATE
+  # rustls-webpki 0.101.7 via the sqlx legacy island — CERTIFICATE
   # VALIDATION bugs. A SQLite deployment opens no database TLS connection, so
   # this stack is never exercised there. Postgres TLS DOES exercise it;
   # applicability then differs per advisory and per configuration — see the
@@ -83,8 +83,6 @@ ignore = [
   # 0.23.46 in both the root and vendor/ldk-node lockfiles; these exceptions
   # accept ONLY the legacy rustls island. cargo-audit ignores advisory IDs,
   # not package versions: do not downgrade 0.23 or treat this as its waiver.
-  # The lockfile also has a test-feature-gated minreq 2.14.1 path via
-  # corepc/electrsd (optional dependencies, absent from the default build).
   #
   # TLS IS COMPILED AND REACHABLE: Cargo.toml enables runtime-tokio-rustls
   # and postgres. StorageConfig::Postgres -> PostgresStorage::connect(url)
@@ -97,9 +95,8 @@ ignore = [
   # RUSTSEC-2026-0346 — session-value Debug output can disclose TLS secrets.
   # SQLx's net/tls/tls_rustls.rs uses ClientConfig's built-in session cache;
   # neither SQLx nor our code installs a custom ClientSessionStore or formats
-  # Tls12ClientSessionValue/Tls13ClientSessionValue. Test-only minreq also uses
-  # the built-in cache. The advisory excludes ordinary connection/cache Debug
-  # output. No current secret-logging path was found, even with Postgres TLS.
+  # Tls12ClientSessionValue/Tls13ClientSessionValue. The advisory excludes
+  # ordinary connection/cache Debug output. No current secret-logging path was found, even with Postgres TLS.
   # RESIDUAL RISK: the vulnerable Debug impls remain compiled; adding session
   # value logging/custom cache instrumentation could expose master secrets or
   # resumption PSKs to log readers. Recheck any TLS/session/logging changes;
@@ -109,13 +106,12 @@ ignore = [
   # hint for later connections. SQLx constructs a fresh ClientConfig (and
   # session cache) per handshake, so hints are not reused across connections.
   # rustls 0.21.12's safe defaults offer only X25519/P-256/P-384: no hybrid/PQ
-  # group exists to lose. Test-only minreq DOES share a config/cache and can
-  # retain poisoned classical-group hints, but also has no PQ group to lose.
+  # group exists to lose.
   # RESIDUAL RISK: the pre-authentication hint write remains in this legacy
   # client, and Postgres TLS already provides classical-only confidentiality;
   # this is not a claim of post-quantum protection or a patched dependency.
-  # Recheck shared-config/cache changes, key-exchange policy, or promotion of
-  # minreq to runtime use. Remove on the sqlx/ldk-node island upgrade (#59).
+  # Recheck shared-config/cache changes, key-exchange policy, or any new
+  # rustls 0.21 consumer. Remove on the sqlx/ldk-node island upgrade (#59).
   "RUSTSEC-2026-0349",
   # Applicability triage 2026-10-20 — RUSTSEC-2026-0382 / CVE-2026-111943:
   # rustls-webpki 0.101.7 may accept certificate chains through distrusted
@@ -125,7 +121,6 @@ ignore = [
   # This is SQLx Postgres TLS only: the default SQLite node opens no TLS
   # through this stack. Postgres is already selectable and TLS is reachable;
   # neither the SQLite default nor query size caps mitigate that deployment.
-  # Test-feature-gated minreq also carries this legacy verifier (see above).
   # The 0.103.x copy is already patched to 0.103.16 in this branch; this
   # exception accepts only the 0.101.7 island held by the sqlx/ldk-node pin.
   # cargo-audit ignores advisory IDs, not versions: do not downgrade 0.103.x.
@@ -134,8 +129,8 @@ ignore = [
   # chain through a distrusted intermediate if its configured trust anchors
   # allow it, enabling server impersonation with a known intermediate key.
   # This is accepted residual certificate-validation risk, not a claim that
-  # the legacy verifier is patched. The same risk applies to test-only minreq.
-  # Recheck Postgres TLS/trust-store changes or promotion of minreq to runtime;
+  # the legacy verifier is patched.
+  # Recheck Postgres TLS/trust-store changes or any new rustls 0.21 consumer;
   # remove on the sqlx/ldk-node island upgrade (#59).
   "RUSTSEC-2026-0382",
   # Applicability triage 2026-10-20 — RUSTSEC-2026-0381 / CVE-2026-111943:
@@ -144,19 +139,19 @@ ignore = [
   # keys are publicly known. The runtime Electrum copy is now remediated via
   # vendor/electrum-client (webpki-roots >=1.0.10); the 1.0.x line is patched
   # to 1.0.10. Remaining 0.25.4 copies are reachable only via sqlx-core 0.8.0
-  # / rustls 0.21 Postgres TLS and test-only minreq. The default SQLite node
+  # / rustls 0.21 Postgres TLS. The default SQLite node
   # opens no TLS through this stack; Postgres TLS is already selectable.
-  # This exception accepts only that legacy sqlx/ldk-node dependency island
-  # and test-only minreq. cargo-audit ignores advisory IDs, not versions:
+  # This exception accepts only that legacy sqlx/ldk-node dependency island.
+  # cargo-audit ignores advisory IDs, not versions:
   # do not downgrade the patched 1.0.x line or reintroduce an Electrum copy.
   #
   # RESIDUAL RISK: the legacy root bundle can permit a Postgres-over-TLS
   # deployment to accept chains through distrusted emSign intermediates,
   # enabling server impersonation with a known intermediate private key.
-  # Test-only minreq shares this risk. This is accepted certificate-trust
+  # This is accepted certificate-trust
   # risk, not a claim that 0.25.4 is patched; SQLite defaults and query size
   # caps do not mitigate Postgres TLS. Recheck TLS/trust-store changes, new
-  # consumers of 0.25.4, or promotion of minreq to runtime;
+  # consumers of 0.25.4;
   # remove on the sqlx/ldk-node island upgrade (#59).
   "RUSTSEC-2026-0381",
   "RUSTSEC-2025-0134", # rustls-pemfile 1.0.4 UNMAINTAINED via sqlx-core 0.8.0 island (same pin); no known vuln. Remove on sqlx bump (#59).

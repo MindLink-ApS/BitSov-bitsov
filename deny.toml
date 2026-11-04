@@ -21,8 +21,7 @@
 # gated by the documented `sqlx = "=0.8.0"` / ldk-node 0.7 rusqlite pin
 # are listed in `[advisories].ignore` below WITH a
 # per-entry `reason` (crate, path, why-deferred, tracking ref) and mirrored as the
-# explicit known-debt set in docs/security/supply-chain-audit-scope.md. Test-only
-# zip exceptions have their full applicability triage in .cargo/audit.toml.
+# explicit known-debt set in docs/security/supply-chain-audit-scope.md.
 # The exception policy remains explicit and reviewable in the diff.
 #
 # Schema target: cargo-deny >= 0.14 (the `vulnerability` / `severity-threshold`
@@ -93,38 +92,38 @@ ignore = [
     # deployment defaults and input size caps do not waive TLS vulnerabilities.
     # These exceptions do not cover rustls 0.23, already patched to 0.23.46.
     # RUSTSEC-2026-0346 / GHSA-c8m5-c952-6cm4 — session-value Debug secrets.
-    { id = "RUSTSEC-2026-0346", reason = "rustls 0.21.12 via sqlx-core 0.8.0, pinned by the ldk-node/sqlx SQLite dependency conflict (#59), plus test-only minreq. SQLx and minreq use the built-in session cache; no custom ClientSessionStore or session-value Debug logging path was found. Vulnerable Debug impls remain compiled. Recheck TLS/session/logging changes; remove on the sqlx/ldk-node island upgrade. Full triage: .cargo/audit.toml; alias GHSA-c8m5-c952-6cm4." },
+    { id = "RUSTSEC-2026-0346", reason = "rustls 0.21.12 via sqlx-core 0.8.0, pinned by the ldk-node/sqlx SQLite dependency conflict (#59). SQLx uses the built-in session cache; no custom ClientSessionStore or session-value Debug logging path was found. Vulnerable Debug impls remain compiled. Recheck TLS/session/logging changes; remove on the sqlx/ldk-node island upgrade. Full triage: .cargo/audit.toml; alias GHSA-c8m5-c952-6cm4." },
     # RUSTSEC-2026-0349 / GHSA-w44r-93j7-qv28 — pre-auth key-share hints.
-    { id = "RUSTSEC-2026-0349", reason = "rustls 0.21.12 via sqlx-core 0.8.0, pinned by the ldk-node/sqlx SQLite dependency conflict (#59). SQLx creates a fresh ClientConfig/cache per handshake; safe defaults offer only classical groups. Test-only minreq shares a cache and can retain poisoned classical-group hints, but has no PQ group to lose. Vulnerable hint writes remain; no PQ protection is claimed. Recheck shared config/cache, key-exchange policy or runtime minreq use; remove on the sqlx/ldk-node island upgrade. Full triage: .cargo/audit.toml; alias GHSA-w44r-93j7-qv28." },
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.21.12 via sqlx-core 0.8.0, pinned by the ldk-node/sqlx SQLite dependency conflict (#59). SQLx creates a fresh ClientConfig/cache per handshake; safe defaults offer only classical groups. Vulnerable hint writes remain; no PQ protection is claimed. Recheck shared config/cache, key-exchange policy or any new rustls 0.21 consumer; remove on the sqlx/ldk-node island upgrade. Full triage: .cargo/audit.toml; alias GHSA-w44r-93j7-qv28." },
 
     # RUSTSEC-2026-0382 / CVE-2026-111943 — distrusted intermediates accepted.
-    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101.7 via sqlx-core 0.8.0 -> rustls 0.21.12, pinned by the sqlx/ldk-node SQLite conflict (#59), plus test-only minreq. Accepts distrusted emSign intermediates when trust anchors permit the path. Runtime use is SQLx Postgres TLS only; the default SQLite node opens no TLS through it. RESIDUAL RISK: a Postgres-over-TLS deployment could accept a chain through a distrusted intermediate, enabling server impersonation; test-only minreq shares this risk. The 0.103.x copy is already patched to 0.103.16 in this branch and is not waived. Recheck TLS/trust-store changes or runtime minreq use; remove on the sqlx/ldk-node island upgrade (#59). Full triage: .cargo/audit.toml; alias CVE-2026-111943." },
+    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101.7 via sqlx-core 0.8.0 -> rustls 0.21.12, pinned by the sqlx/ldk-node SQLite conflict (#59). Accepts distrusted emSign intermediates when trust anchors permit the path. Runtime use is SQLx Postgres TLS only; the default SQLite node opens no TLS through it. RESIDUAL RISK: a Postgres-over-TLS deployment could accept a chain through a distrusted intermediate, enabling server impersonation. The 0.103.x copy is already patched to 0.103.16 in this branch and is not waived. Recheck TLS/trust-store changes or any new rustls 0.21 consumer; remove on the sqlx/ldk-node island upgrade (#59). Full triage: .cargo/audit.toml; alias CVE-2026-111943." },
 
     # RUSTSEC-2026-0381 / CVE-2026-111943 — distrusted emSign root bundle.
-    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.25.4 via sqlx-core 0.8.0 / rustls 0.21 Postgres TLS, pinned by the sqlx/ldk-node SQLite conflict (#59), plus test-only minreq. The runtime Electrum copy is remediated via vendor/electrum-client (webpki-roots >=1.0.10), and the 1.0.x line is patched to 1.0.10. The default SQLite node opens no TLS through the legacy stack; Postgres TLS is already selectable. RESIDUAL RISK: the legacy root bundle can allow chains through distrusted emSign intermediates with publicly known private keys, enabling server impersonation in Postgres-over-TLS deployments and test-only minreq. This accepts only the remaining legacy copies, not a downgrade of 1.0.x or a new Electrum copy. Recheck TLS/trust-store changes, new 0.25.4 consumers or runtime minreq use; remove on the sqlx/ldk-node island upgrade (#59). Full triage: .cargo/audit.toml; alias CVE-2026-111943." },
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.25.4 via sqlx-core 0.8.0 / rustls 0.21 Postgres TLS, pinned by the sqlx/ldk-node SQLite conflict (#59). The runtime Electrum copy is remediated via vendor/electrum-client (webpki-roots >=1.0.10), and the 1.0.x line is patched to 1.0.10. The default SQLite node opens no TLS through the legacy stack; Postgres TLS is already selectable. RESIDUAL RISK: the legacy root bundle can allow chains through distrusted emSign intermediates with publicly known private keys, enabling server impersonation in Postgres-over-TLS deployments. This accepts only the remaining legacy copies, not a downgrade of 1.0.x or a new Electrum copy. Recheck TLS/trust-store changes, or new 0.25.4 consumers; remove on the sqlx/ldk-node island upgrade (#59). Full triage: .cargo/audit.toml; alias CVE-2026-111943." },
 
     # RUSTSEC-2026-0098 — rustls-webpki 0.101.7: URI-name constraints incorrectly
     # accepted. The 0.101.7 copy rides rustls 0.21 via sqlx-core 0.8.0 (same sqlx
-    # pin above) and dev-only electrsd→minreq. Reachable only AFTER signature
+    # pin above). Reachable only AFTER signature
     # verification and requires a misissued certificate to exploit; this library
     # exposes no URI-name assertion API to us. A patched webpki 0.103.13 is already
     # in the tree on the rustls 0.23 path; the old 0.101 cannot move until rustls
     # 0.21 leaves the graph (sqlx bump). Clear with the sqlx/ldk-node bump.
     # Tracking: docs/security/supply-chain-audit-scope.md (known-debt table).
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 via rustls 0.21 ← sqlx-core 0.8.0 (pinned) + dev-only electrsd; reachable only post-sig-verify with a misissued cert, no URI-name API used. Fix needs rustls 0.21 out of graph. Tracked in supply-chain-audit-scope.md." },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 via rustls 0.21 ← sqlx-core 0.8.0 (pinned); reachable only post-sig-verify with a misissued cert, no URI-name API used. Fix needs rustls 0.21 out of graph. Tracked in supply-chain-audit-scope.md." },
 
     # RUSTSEC-2026-0099 — rustls-webpki 0.101.7: DNS-name constraint accepted for a
     # wildcard cert. Same crate/path/pin as -0098. Reachable only after signature
     # verification and requires misissuance. Clear with the sqlx/ldk-node bump.
     # Tracking: docs/security/supply-chain-audit-scope.md (known-debt table).
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 via rustls 0.21 ← sqlx-core 0.8.0 (pinned) + dev-only electrsd; reachable only post-sig-verify with a misissued wildcard cert. Same root pin as RUSTSEC-2026-0098. Tracked in supply-chain-audit-scope.md." },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 via rustls 0.21 ← sqlx-core 0.8.0 (pinned); reachable only post-sig-verify with a misissued wildcard cert. Same root pin as RUSTSEC-2026-0098. Tracked in supply-chain-audit-scope.md." },
 
     # RUSTSEC-2026-0104 — rustls-webpki 0.101.7: reachable panic parsing a CRL with
     # an empty BIT STRING in onlySomeReasons. Same crate/path/pin as -0098/-0099.
     # "Applications that do not use CRLs are not affected" — BitSov does not parse
     # certificate revocation lists. Clear with the sqlx/ldk-node bump.
     # Tracking: docs/security/supply-chain-audit-scope.md (known-debt table).
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 via rustls 0.21 ← sqlx-core 0.8.0 (pinned) + dev-only electrsd; CRL-parsing panic and BitSov does not parse CRLs. Same root pin as RUSTSEC-2026-0098. Tracked in supply-chain-audit-scope.md." },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 via rustls 0.21 ← sqlx-core 0.8.0 (pinned); CRL-parsing panic and BitSov does not parse CRLs. Same root pin as RUSTSEC-2026-0098. Tracked in supply-chain-audit-scope.md." },
 ]
 
 # ── Bans: permissive (do NOT false-positive the existing tree) ─────────────────
