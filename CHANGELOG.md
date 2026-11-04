@@ -7,9 +7,10 @@ also live on the corresponding GitHub pre-release pages.
 
 - A prekey bundle or session init whose identity key is not the key that
   connection's Hello presented is now refused before anything changes, as is a
-  bundle that uses its identity key as its signed prekey. One-time prekey ids also
-  start at a random point per boot, so an init built on a bundle from an earlier
-  boot is refused rather than accepted on keys the two sides do not share.
+  bundle whose signed prekey is the same point as its identity key. One-time
+  prekey ids also start at a random point per boot, so an init naming an id not
+  held this boot is refused. An id can still repeat across boots, and an init with
+  no one-time prekey id is unchanged. This does not show that a bundle is fresh.
 
 - An E2EE send now saves its advanced send chain before the ciphertext leaves the
   session. If the save fails, the ciphertext is withheld and the chain put back,

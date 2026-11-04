@@ -1079,3 +1079,16 @@ async fn failed_aead_leaves_the_chain_as_it_was() {
     let message = sender.encrypt(&node_b, b"with a store").await.unwrap();
     assert_eq!(receiver.decrypt(&node_a, &message).await.unwrap(), b"with a store");
 }
+
+/// One point in different bytes compares equal; different points and bad hex do not.
+#[test]
+fn same_x25519_point_ignores_the_top_bit_only() {
+    let key = [7u8; 32];
+    let mut top_bit = key;
+    top_bit[31] ^= 0x80;
+    assert!(same_x25519_point(&hex::encode(key), &hex::encode(top_bit)));
+    let mut other = key;
+    other[0] ^= 0x01;
+    assert!(!same_x25519_point(&hex::encode(key), &hex::encode(other)));
+    assert!(!same_x25519_point(&hex::encode(key), "not hex"));
+}

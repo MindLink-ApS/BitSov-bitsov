@@ -4572,6 +4572,23 @@ async fn offer_with_the_identity_key_as_signed_prekey_changes_nothing() {
     assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the offer").await;
 }
 
+/// The same when only the top bit differs: X25519 ignores that bit, so these different
+/// bytes are the identity key's own point.
+#[tokio::test]
+async fn offer_with_the_identity_key_point_in_other_bytes_changes_nothing() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let mut bundle = high_mgr.prekey_bundle().await;
+    let mut point = *high.x25519_public().as_bytes();
+    point[31] ^= 0x80;
+    assert_ne!(point, *high.x25519_public().as_bytes());
+    bundle.signed_prekey = hex::encode(point);
+    let signature = ed25519_dalek::Signer::sign(high.ed25519_signing_key(), &point);
+    bundle.signed_prekey_sig = hex::encode(signature.to_bytes());
+    let offer = serde_json::to_value(&bundle).unwrap();
+    assert!(!offer_starts_negotiation(&low, &low_mgr, &high, offer, &connection_of(&high)).await);
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the offer").await;
+}
+
 /// An init whose identity key is not the connection's Hello key is refused before
 /// anything changes: the session stays and no one-time pre-key is consumed.
 #[tokio::test]

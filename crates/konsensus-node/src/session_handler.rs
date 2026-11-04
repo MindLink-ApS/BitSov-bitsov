@@ -819,7 +819,7 @@ async fn handle_prekey_offer(
         warn!(peer = %peer_id, "prekey bundle identity key is not this connection's; offer ignored");
         return;
     }
-    if hex::decode(&peer_bundle.signed_prekey).ok() == hex::decode(&peer_bundle.identity_key).ok() {
+    if konsensus_crypto::same_x25519_point(&peer_bundle.signed_prekey, &peer_bundle.identity_key) {
         warn!(peer = %peer_id, "prekey bundle reuses its identity key as signed prekey; offer ignored");
         return;
     }
