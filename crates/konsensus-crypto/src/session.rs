@@ -155,6 +155,9 @@ enum SessionReplacement {
 struct PeerSession {
     /// The Double Ratchet for this session.
     ratchet: DoubleRatchet,
+    /// When this node derived the session, ms since the epoch. Held in memory
+    /// only: `None` for a session restored from storage.
+    established_at_ms: Option<u64>,
 }
 
 /// Domain-separation context for deriving the session-encryption key from the
@@ -329,7 +332,7 @@ impl SessionManager {
                             self.sessions
                                 .write()
                                 .await
-                                .insert(*peer_id, PeerSession { ratchet });
+                                .insert(*peer_id, PeerSession { ratchet, established_at_ms: None });
                             restored += 1;
                             debug!(peer = %peer_id, "restored E2EE session from storage");
 
@@ -740,7 +743,11 @@ impl SessionManager {
         if replacement == SessionReplacement::Keep && sessions.contains_key(peer_id) {
             return Err(SessionError::SessionExists(*peer_id));
         }
-        sessions.insert(*peer_id, PeerSession { ratchet });
+        let established_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|since| since.as_millis() as u64);
+        sessions.insert(*peer_id, PeerSession { ratchet, established_at_ms });
         Ok(())
     }
 
@@ -822,6 +829,17 @@ impl SessionManager {
             .get(peer_id)
             .map(|s| s.ratchet.can_send())
             .unwrap_or(false)
+    }
+
+    /// Whether the session we hold with a peer was derived after `timestamp_ms`.
+    /// `false` when there is no session, or none whose age this node knows.
+    pub async fn session_newer_than(&self, peer_id: &NodeId, timestamp_ms: u64) -> bool {
+        self.sessions
+            .read()
+            .await
+            .get(peer_id)
+            .and_then(|session| session.established_at_ms)
+            .is_some_and(|established| timestamp_ms < established)
     }
 
     /// Count active E2EE sessions.

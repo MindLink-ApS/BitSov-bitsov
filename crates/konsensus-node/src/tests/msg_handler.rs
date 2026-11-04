@@ -3972,6 +3972,84 @@ fn file_payload(filename: &str, sent: &[u8], received: &[u8]) -> Vec<u8> {
     .unwrap()
 }
 
+/// Alice's paid chat under a session Bob does not hold, stamped `offset_ms` from now.
+async fn unreadable_chat_stamped(net: &ReceiveLoop, offset_ms: i64) -> konsensus_core::UkmEnvelope {
+    let stale_a = SessionManager::new(net.alice.clone());
+    let stale_b = SessionManager::new(net.bob.clone());
+    establish_sessions(&stale_a, &stale_b, &net.alice, &net.bob).await;
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+        &stale_a.encrypt(net.bob.node_id(), b"unreadable").await.unwrap(),
+    );
+    let mut env = net.paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext).await;
+    env.timestamp = env.timestamp.saturating_add_signed(offset_ms);
+    env.signature = Signature::from_ed25519(&net.alice.sign(&env.signable_bytes()));
+    env
+}
+
+/// An envelope from before Bob's session, or stamped just after it (still in
+/// flight when Alice took the new session, or her clock ahead), was encrypted
+/// under an earlier one. It is refused like any unreadable one and Bob's working
+/// session stays: no duplicate of either envelope reaches the decrypt, and the
+/// next message reads fine.
+#[tokio::test]
+async fn envelope_from_before_the_session_settled_does_not_remove_it() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    for offset_ms in [-60_000, 0, 5_000] {
+        let env = unreadable_chat_stamped(&net, offset_ms).await;
+        let verdict = net.verdict(&env).await;
+        assert!(
+            matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+                if *message_id == env.id && reason == "undecryptable: the session could not decrypt the ciphertext"),
+            "{offset_ms}: got {verdict:?}"
+        );
+        assert!(net.sessions_b.has_session(net.alice.node_id()).await, "{offset_ms}: the session stays");
+        // The same bytes again: answered from the withdrawal, no second decrypt.
+        let again = net.verdict(&env).await;
+        assert!(matches!(&again, ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"), "got {again:?}");
+        assert!(net.sessions_b.has_session(net.alice.node_id()).await);
+    }
+
+    let ciphertext = net.ciphertext(b"still readable").await;
+    let next = net.paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext).await;
+    let verdict = net.verdict(&next).await;
+    assert!(matches!(verdict, ControlEvent::MessageAcked { message_id, .. } if message_id == next.id), "got {verdict:?}");
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(delivered.plaintext.as_deref(), Some("still readable"));
+    // A duplicate of a read envelope is acknowledged again without a decrypt; its
+    // message key is spent, so reaching the decrypt would fail.
+    let verdict = net.verdict(&next).await;
+    assert!(matches!(verdict, ControlEvent::MessageAcked { message_id, duplicate: true, .. } if message_id == next.id), "got {verdict:?}");
+    assert!(net.sessions_b.has_session(net.alice.node_id()).await, "a duplicate costs no session");
+    net.stop().await;
+}
+
+/// An envelope stamped well after the session was derived and still unreadable
+/// means the two sides disagree: Bob removes the session and offers, as before.
+#[tokio::test]
+async fn unreadable_envelope_after_the_session_settled_removes_it_and_offers() {
+    use konsensus_message::ControlEvent;
+    let net = receive_loop().await;
+    let env = unreadable_chat_stamped(&net, 11_000).await;
+
+    net.source.send(net.bob.node_id(), &env).await.unwrap();
+    let mut offered = false;
+    let rejected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match net.source.recv_control().await.unwrap() {
+                ControlEvent::PrekeyOffer { .. } => offered = true,
+                ControlEvent::MessageRejected { .. } => break true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(rejected && offered, "refused, after offering");
+    assert!(!net.sessions_b.has_session(net.alice.node_id()).await, "the session is gone");
+    net.stop().await;
+}
+
 /// A paid block Bob cannot read is refused before it consumes its proof. The
 /// reason is the sender's cue: unreadable for good, or too far ahead of the
 /// receiving chain, which a later delivery can cure.
@@ -4028,9 +4106,12 @@ async fn undecryptable_paid_chat_is_refused_not_acknowledged() {
             .await
             .unwrap(),
     );
-    let env = net
+    let mut env = net
         .paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext)
         .await;
+    // Stamped past Bob's session settling, so the failure counts against it.
+    env.timestamp += 11_000;
+    env.signature = Signature::from_ed25519(&net.alice.sign(&env.signable_bytes()));
 
     let verdict = net.verdict(&env).await;
     assert!(

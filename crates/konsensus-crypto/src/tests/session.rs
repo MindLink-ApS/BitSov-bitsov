@@ -895,3 +895,28 @@ async fn reaccept_session_refuses_bad_inits_and_consumes_no_prekey() {
     ));
     assert!(!mgr_c.has_session(&node_a).await);
 }
+
+/// A derived session knows its age; one restored from storage does not, so
+/// nothing is ever judged older than it.
+#[tokio::test]
+async fn session_age_is_known_only_for_a_session_derived_here() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let store_b = MemorySessionStore::new();
+    let mgr_a = SessionManager::new(Arc::clone(&id_a));
+    let mgr_b = SessionManager::with_store(Arc::clone(&id_b), store_b.clone());
+    assert!(!mgr_a.session_newer_than(&node_b, 0).await, "no session");
+
+    let init_data = mgr_a.initiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.accept_session(&node_a, &init_data).await.unwrap();
+    assert!(mgr_a.session_newer_than(&node_b, 0).await);
+    assert!(mgr_b.session_newer_than(&node_a, 0).await);
+    assert!(!mgr_a.session_newer_than(&node_b, u64::MAX).await);
+    assert!(!mgr_b.session_newer_than(&node_a, u64::MAX).await);
+
+    let restored = SessionManager::with_store(id_b, store_b);
+    assert_eq!(restored.restore_sessions().await, 1);
+    assert!(restored.has_session(&node_a).await);
+    assert!(!restored.session_newer_than(&node_a, 0).await, "age unknown after a restore");
+}

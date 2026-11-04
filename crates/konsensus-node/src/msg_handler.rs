@@ -1030,6 +1030,28 @@ async fn decrypt_and_process(
     let bytes = match session_mgr.decrypt(sender, &ratchet_msg).await {
         Ok(bytes) => bytes,
         Err(e) => {
+            // An envelope stamped before this session was derived was encrypted
+            // under an earlier one (the stamp follows the encryption and a resend
+            // only moves it forward). So, usually, was one stamped just after: the
+            // peer keeps encrypting under its old session until our SessionInit
+            // reaches it, and its clock may run ahead of ours. None of these say
+            // anything about the session we hold, and a failed decrypt changes no
+            // ratchet state, so keep the session and refuse the envelope alone.
+            // Within the negotiation cooldown a removal could not start a new
+            // negotiation any sooner anyway. A sender's clock running behind can
+            // delay the removal below only until its stamps pass that point; the
+            // gate's freshness window bounds that.
+            let settle_ms = crate::session_handler::SESSION_NEGOTIATION_COOLDOWN.as_millis() as u64;
+            if session_mgr.session_newer_than(sender, envelope.timestamp.saturating_sub(settle_ms)).await {
+                warn!(
+                    sender = %sender,
+                    error = %e,
+                    "envelope older than the session could not be decrypted; session kept"
+                );
+                return Err(ReceiptRefusal::Undecryptable(
+                    "the session could not decrypt the ciphertext",
+                ));
+            }
             // Decryption failed — session is likely stale (peer re-established with different keys).
             // Remove the broken session so the session handler can re-negotiate.
             warn!(

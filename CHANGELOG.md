@@ -20,6 +20,11 @@ also live on the corresponding GitHub pre-release pages.
   ciphertext can never be read. From the lower id it stays retryable, since a
   fresh block can overtake the session setup it depends on and the two cannot
   be told apart at that point.
+- A paid envelope stamped before the current E2EE session settled (derived, plus
+  the ten-second negotiation cooldown) no longer costs that session when it
+  cannot be decrypted. It is refused as before and the working session stays. A
+  later unreadable envelope still removes the session and starts a new
+  negotiation.
 
 ## [0.3.0-rc21] — 2026-11-01
 

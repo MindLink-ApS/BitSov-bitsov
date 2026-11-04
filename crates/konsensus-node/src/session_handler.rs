@@ -75,7 +75,7 @@ pub(crate) struct SessionHandlerDeps {
 /// Per-peer session negotiation cooldown to prevent DoS via rapid
 /// PrekeyOffer/SessionInit flooding. A whitelisted peer could otherwise
 /// force expensive X3DH computations + storage churn with no rate limit.
-const SESSION_NEGOTIATION_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const SESSION_NEGOTIATION_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Periodic self-heal cadence for connected peers that have Noise transport
 /// but no bidirectional E2EE sending chain yet.
