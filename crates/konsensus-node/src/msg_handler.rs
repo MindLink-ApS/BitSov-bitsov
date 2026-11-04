@@ -396,16 +396,20 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         if gate_result.is_ok() && envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
                             // A refusal or storage failure must leave ratchet keys
                             // available for a retransmission of this paid envelope.
-                            let block_plaintext = match konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext) {
-                                Ok(message) => session_mgr_for_recv.preview_decrypt(&sender, &message).await.ok()
-                                    .and_then(|bytes| String::from_utf8(bytes).ok()),
+                            let preview = match konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext) {
+                                Ok(message) => Some(session_mgr_for_recv.preview_decrypt(&sender, &message).await),
                                 Err(_) => None,
                             };
+                            // A later delivery can bring this block back within the
+                            // skip limit, so it must not read as unreadable for good.
+                            let too_far_ahead = matches!(preview, Some(Err(konsensus_crypto::SessionError::Ratchet(konsensus_crypto::RatchetError::TooManySkipped(..)))));
+                            let block_plaintext = preview.and_then(Result::ok).and_then(|bytes| String::from_utf8(bytes).ok());
                             match konsensus_api::calls::prepare_incoming_block(
                                 storage_for_recv.as_ref(), &sender, block_plaintext.as_deref(), &envelope.payment_proof.payment_hash,
                             ).await {
                                 Ok(block) => incoming_block = Some(block),
                                 Err(refusal) => {
+                                    let refusal = if too_far_ahead { konsensus_core::payloads::call::CallRefusal::Invalid("too many skipped messages") } else { refusal };
                                     audit_for_recv.record(
                                         konsensus_api::audit::events::MESSAGE_REJECTED,
                                         &sender.to_hex(),

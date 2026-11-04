@@ -1168,6 +1168,29 @@ fn terminal_paid_rejection(reason: &str) -> bool {
     .iter().any(|prefix| reason.starts_with(prefix))
 }
 
+/// A callee's refusal of a paid block whose ciphertext it could not read, before
+/// the block was admitted. It alone does not say whether a resend can succeed.
+const BLOCK_NOT_READABLE: &str = "invalid call signal: undecryptable";
+
+/// Whether a rejection of an envelope we sent to `peer` is final.
+///
+/// [`BLOCK_NOT_READABLE`] is final only when we hold the higher id, the X3DH
+/// responder. Our sending chain starts with the first message we decrypt under
+/// a session, so the lower id, which derived that session first, already had it
+/// when we encrypted. If it cannot read the block now, that session is gone
+/// there (removed or replaced, and a new X3DH never brings it back) or the bytes
+/// cannot decrypt under it, and a resend carries the same bytes. The one failure
+/// a later delivery could cure, too many skipped messages, is refused under
+/// another reason.
+///
+/// With the lower id it stays retryable: we encrypt on a new session the moment
+/// we derive it, so our block can reach the peer ahead of the SessionInit it
+/// needs. That fresh block decrypts when resent, and at this point it cannot be
+/// told apart from one encrypted under a session the peer has replaced.
+fn terminal_rejection_from_peer(reason: &str, own_id: &NodeId, peer: &NodeId) -> bool {
+    terminal_paid_rejection(reason) || (reason == BLOCK_NOT_READABLE && own_id.as_bytes() > peer.as_bytes())
+}
+
 /// Bound storage work before looking up an unprivileged confirmation. A
 /// process-wide window caps identity churn; per-peer windows survive reconnects.
 /// Only budgeted frames allocate entries, so the map has at most 128 keys.
@@ -1241,13 +1264,13 @@ async fn handle_delivery_confirmation(
         handle_message_acked(peer, id, timestamps, storage, routing, ws, privileged && !legacy).await;
     } else {
         let reason = rejection.unwrap_or_default();
-        let terminal = terminal_paid_rejection(reason);
+        let terminal = terminal_rejection_from_peer(reason, own_id, peer);
         if !matches!(storage.reject_pending(id, peer, own_id, reason, terminal).await, Ok(true)) {
             if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
             return;
         }
         timestamps.lock().await.remove(id);
-        handle_message_rejected(peer, id, reason, routing, ws, privileged).await;
+        handle_message_rejected(peer, id, reason, terminal, routing, ws, privileged).await;
     }
 }
 
@@ -1308,6 +1331,7 @@ async fn handle_message_rejected(
     peer_id: &NodeId,
     message_id: &konsensus_core::types::MessageId,
     reason: &str,
+    terminal: bool,
     routing: &konsensus_routing::RoutingTable,
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
     update_weights: bool,
@@ -1319,7 +1343,7 @@ async fn handle_message_rejected(
         WsDeliveryStatus {
             event_type: "delivery_status",
             message_id: message_id.to_hex(),
-            status: if terminal_paid_rejection(reason) { "failed_paid" } else { "rejected" }.to_string(),
+            status: if terminal { "failed_paid" } else { "rejected" }.to_string(),
             reason: Some(reason.to_string()),
         },
     )) {

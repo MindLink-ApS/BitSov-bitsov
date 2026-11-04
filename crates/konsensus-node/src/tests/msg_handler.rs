@@ -3972,6 +3972,44 @@ fn file_payload(filename: &str, sent: &[u8], received: &[u8]) -> Vec<u8> {
     .unwrap()
 }
 
+/// A paid block Bob cannot read is refused before it consumes its proof. The
+/// reason is the sender's cue: unreadable for good, or too far ahead of the
+/// receiving chain, which a later delivery can cure.
+#[tokio::test]
+async fn unreadable_block_names_why_and_keeps_the_session() {
+    use konsensus_message::ControlEvent;
+    let net = receive_loop().await;
+
+    let stale_a = SessionManager::new(net.alice.clone());
+    let stale_b = SessionManager::new(net.bob.clone());
+    establish_sessions(&stale_a, &stale_b, &net.alice, &net.bob).await;
+    let stale = konsensus_crypto::ratchet_message_to_bytes(
+        &stale_a.encrypt(net.bob.node_id(), b"{}").await.unwrap(),
+    );
+    let env = net.paid_envelope(konsensus_core::kind::KIND_CALL_BLOCK, stale).await;
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason == "invalid call signal: undecryptable"),
+        "got {verdict:?}"
+    );
+
+    // Past the ratchet's skip limit on the session Bob does hold.
+    for _ in 0..1_001 {
+        net.ciphertext(b"not delivered").await;
+    }
+    let ahead = net.ciphertext(b"{}").await;
+    let env = net.paid_envelope(konsensus_core::kind::KIND_CALL_BLOCK, ahead).await;
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason == "invalid call signal: too many skipped messages"),
+        "got {verdict:?}"
+    );
+    assert!(net.sessions_b.has_session(net.alice.node_id()).await, "preview refusals touch no session");
+    net.stop().await;
+}
+
 /// A paid chat Bob cannot decrypt is refused with a typed reject, withdrawn
 /// (its payment stays burned) and never shown to the app; it is never
 /// acknowledged as delivered, and a resend of the same bytes is refused too.

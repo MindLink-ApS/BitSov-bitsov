@@ -15,6 +15,11 @@ also live on the corresponding GitHub pre-release pages.
   (`call_block_unpayable`, nothing paid), so no minute is paid for a session
   that cannot read it. Messages and other call signals have no such step
   before payment.
+- A paid call block refused as `invalid call signal: undecryptable` is no longer
+  retried for up to an hour when its sender holds the higher node id: that
+  ciphertext can never be read. From the lower id it stays retryable, since a
+  fresh block can overtake the session setup it depends on and the two cannot
+  be told apart at that point.
 
 ## [0.3.0-rc21] — 2026-11-01
 
