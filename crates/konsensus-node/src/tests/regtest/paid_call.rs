@@ -639,23 +639,16 @@ async fn lost_session_recovers_on_the_connection_and_the_next_call_works() {
     let generations = (connection(caller, bid).await, connection(callee, aid).await);
     let payments = a.list_payments(100).await.unwrap().len();
     let spent = caller.service.call_spend_status(&bid.to_hex(), LOST).unwrap().spent_msat;
-    // Self-heal keeps running: hold the session lost until the block is answered,
-    // so recovery cannot rebuild it before the invoice is decided.
-    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let holder = {
-        let (sessions, released) = (callee.state.session_manager.clone(), released.clone());
-        tokio::spawn(async move {
-            while !released.load(std::sync::atomic::Ordering::SeqCst) {
-                sessions.remove_session(&aid).await;
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-    };
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Self-heal keeps running, so bar recovery until the block has its answer. While
+    // the higher id does not answer offers, the lower id cannot get its bundle.
+    use std::sync::atomic::Ordering;
+    crate::session_handler::HOLD_PREKEY_ANSWERS.store(true, Ordering::SeqCst);
+    assert!(callee.state.session_manager.remove_session(&aid).await);
     let (status, body) = compose(caller, &bid, 404, block(1), PRICE).await;
-    released.store(true, std::sync::atomic::Ordering::SeqCst);
-    holder.await.unwrap();
+    let lost_throughout = !callee.state.session_manager.has_session(&aid).await;
+    crate::session_handler::HOLD_PREKEY_ANSWERS.store(false, Ordering::SeqCst);
     let lost_at = std::time::Instant::now();
+    assert!(lost_throughout, "the barrier held");
     assert_eq!(status, StatusCode::BAD_REQUEST, "no session, no invoice: {body}");
     assert_eq!(body["reason"], "call_block_unpayable", "{body}");
     assert_eq!(a.list_payments(100).await.unwrap().len(), payments, "nothing paid");
