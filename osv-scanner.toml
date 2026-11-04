@@ -94,9 +94,9 @@ reason = "Shared alias of RUSTSEC-2026-0382 and RUSTSEC-2026-0381; same legacy r
 id = "RUSTSEC-2026-0381"
 reason = "webpki-roots 0.25.4 via sqlx-core 0.8.0 / rustls 0.21 Postgres TLS, pinned by the sqlx/ldk-node SQLite conflict (#59), plus test-only minreq. The runtime Electrum copy is remediated via vendor/electrum-client (webpki-roots >=1.0.10), and the 1.0.x line is patched to 1.0.10. The default SQLite node opens no TLS through the legacy stack; Postgres TLS is already selectable. RESIDUAL RISK: the legacy root bundle can allow chains through distrusted emSign intermediates with publicly known private keys, enabling server impersonation in Postgres-over-TLS deployments and test-only minreq. This accepts only the remaining legacy copies, not a downgrade of 1.0.x or a new Electrum copy. Recheck TLS/trust-store changes, new 0.25.4 consumers or runtime minreq use; remove on the sqlx/ldk-node island upgrade (#59). Full triage: .cargo/audit.toml; alias CVE-2026-111943."
 
-# Triage 2026-11-03: no finding below is reachable from the shipped konsensus
-# binary. cargo tree -p konsensus-node -e normal,build --target all --locked has
-# no zip and no brotli. Mirrored in .cargo/audit.toml. Review by 2027-02-03.
+# Triage 2026-11-03: this finding does not reach the shipped konsensus binary.
+# cargo tree -p konsensus-node -e normal,build --target all --locked has no zip.
+# Mirrored in .cargo/audit.toml and deny.toml. Review by 2027-02-03.
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0429"
@@ -105,19 +105,3 @@ reason = "zip symlink-entry allocation abort in ZipArchive::extract. zip 0.6.6 i
 [[IgnoredVulns]]
 id = "GHSA-q7v9-x93c-xqv3"
 reason = "Alias of RUSTSEC-2026-0429; same test-only zip acceptance. Review by 2027-02-03."
-
-[[IgnoredVulns]]
-id = "GHSA-m665-v7pm-7grj"
-reason = "zip ZipStreamReader::extract parser differential. Same test-only zip 0.6.6 as RUSTSEC-2026-0429, absent from the shipped binary. The build scripts use ZipArchive, not ZipStreamReader, on SHA-256 pinned downloads. Remove when zip is dropped or >= 9.0.5. Review by 2027-02-03."
-
-[[IgnoredVulns]]
-id = "GHSA-8hxf-qr8p-62x4"
-reason = "zip AES entry HMAC bypass. Same test-only zip 0.6.6, absent from the shipped binary. The aes-crypto feature is off: Cargo.lock lists neither aes nor hmac for zip, so the AES code is not compiled. Remove when zip is dropped or >= 9.0.0. Review by 2027-02-03."
-
-[[IgnoredVulns]]
-id = "GHSA-h2v8-394m-p7vv"
-reason = "rustls Brotli certificate decompression amplification. rustls 0.21.12 (sqlx-core 0.8.0 pin, #59) has no certificate compression or brotli feature, and Cargo.lock has no brotli crate. The 0.23 copy is patched at 0.23.46 and is not waived. Remove on the sqlx/ldk-node upgrade (#59). Review by 2027-02-03."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0348"
-reason = "Alias of GHSA-h2v8-394m-p7vv; same legacy rustls 0.21.12 acceptance. Review by 2027-02-03."
