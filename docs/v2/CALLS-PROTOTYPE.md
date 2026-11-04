@@ -156,6 +156,10 @@ socket, going past the budget closes it; with `media_drop_bulk_over_share` on,
 bulk packets past their share are dropped instead, and the socket closes only if
 they pass the whole budget again on top.
 
+A node with raised limits says so in the socket's handshake answer, in the header
+`x-bitsov-media-limits: <packets> <bytes>`, so the owner's app can pace to them. A
+node at the default rates sends no such header and answers as it always did.
+
 Nothing here changes a price or admission: a call is admitted and paid the same
 whatever it carries and whatever these limits are.
 

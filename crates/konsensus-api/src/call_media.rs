@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -109,7 +109,20 @@ impl MediaLimits {
     pub fn bulk_bytes_per_second(&self) -> u64 {
         self.max_bytes_per_second.saturating_sub(RESERVED_PRIORITY_BYTES)
     }
+
+    /// The value of [`MEDIA_LIMITS_HEADER`]: none at the default rates.
+    pub fn advertised(&self) -> Option<String> {
+        (self.max_frames_per_second != DEFAULT_MAX_FRAMES_PER_SECOND
+            || self.max_bytes_per_second != DEFAULT_MAX_BYTES_PER_SECOND)
+            .then(|| format!("{} {}", self.max_frames_per_second, self.max_bytes_per_second))
+    }
 }
+
+/// Tells the owner's app, in the socket's handshake answer, what this node
+/// allows when its operator raised the limits: `<messages> <bytes>` per second,
+/// per direction. Absent means the defaults, so the answer of a node with no
+/// new config is what it always was. It changes nothing the node enforces.
+pub const MEDIA_LIMITS_HEADER: &str = "x-bitsov-media-limits";
 
 /// Whether a payload of `len` bytes rides the bulk lane.
 pub fn is_bulk_payload(len: usize) -> bool {
@@ -427,11 +440,17 @@ async fn media_handler(
         }
     };
     debug!(node_id = %claims.sub, peer = %peer, "call media socket attached");
-    ws.max_message_size(SEQ_HEADER_BYTES + MAX_MEDIA_PAYLOAD_BYTES)
+    let advertised = attachment.limits.advertised();
+    let mut response = ws
+        .max_message_size(SEQ_HEADER_BYTES + MAX_MEDIA_PAYLOAD_BYTES)
         .max_frame_size(SEQ_HEADER_BYTES + MAX_MEDIA_PAYLOAD_BYTES)
         .protocols([crate::ws::WS_PROTOCOL])
         .on_upgrade(move |socket| handle_media(socket, state, claims, attachment))
-        .into_response()
+        .into_response();
+    if let Some(value) = advertised.and_then(|value| HeaderValue::from_str(&value).ok()) {
+        response.headers_mut().insert(MEDIA_LIMITS_HEADER, value);
+    }
+    response
 }
 
 /// Keepalive ping interval, as on `/api/v1/ws`.
@@ -674,6 +693,14 @@ mod tests {
         assert!(!is_bulk_payload(161));
         assert!(!is_bulk_payload(PRIORITY_PACKET_BYTES));
         assert!(is_bulk_payload(PRIORITY_PACKET_BYTES + 1));
+    }
+
+    #[test]
+    fn only_raised_limits_are_advertised() {
+        assert_eq!(MediaLimits::default().advertised(), None);
+        assert_eq!(MediaLimits { drop_bulk_over_share: true, ..Default::default() }.advertised(), None);
+        let raised = MediaLimits { max_frames_per_second: 160, max_bytes_per_second: 262_144, drop_bulk_over_share: false };
+        assert_eq!(raised.advertised().as_deref(), Some("160 262144"));
     }
 
     #[test]

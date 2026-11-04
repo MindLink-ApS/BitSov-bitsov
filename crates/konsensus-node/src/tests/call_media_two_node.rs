@@ -325,6 +325,39 @@ async fn audio_under_bulk(a: &Node, b: &Node, every: u32) -> (Vec<u32>, usize, b
     (audio, bulk_seen, closed || send_failed)
 }
 
+/// What the socket's handshake answer says about the limits.
+async fn advertised_limits(a: &Node, b: &Node) -> Option<String> {
+    let mut request = format!("ws://{}/api/v1/calls/{CALL}/media?peer={}", a.api_addr, b.id.to_hex())
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        format!("bitsov.v1, bitsov.jwt.{}", a.token).parse().unwrap(),
+    );
+    let (_socket, answer) = tokio_tungstenite::connect_async(request).await.unwrap();
+    answer
+        .headers()
+        .get(konsensus_api::call_media::MEDIA_LIMITS_HEADER)
+        .map(|value| value.to_str().unwrap().to_string())
+}
+
+#[tokio::test]
+async fn the_handshake_says_the_limits_only_when_the_operator_raised_them() {
+    let (a, b) = connected_pair(Default::default()).await;
+    assert_eq!(advertised_limits(&a, &b).await, None, "a default node answers as it always did");
+    let _ = a.shutdown.send(true);
+    let _ = b.shutdown.send(true);
+    let limits = konsensus_api::call_media::MediaLimits {
+        max_frames_per_second: 160,
+        max_bytes_per_second: 262_144,
+        drop_bulk_over_share: false,
+    };
+    let (a, b) = connected_pair(limits).await;
+    assert_eq!(advertised_limits(&a, &b).await.as_deref(), Some("160 262144"));
+    let _ = a.shutdown.send(true);
+    let _ = b.shutdown.send(true);
+}
+
 #[tokio::test]
 async fn paced_bulk_at_the_default_limits_arrives_with_the_audio_whole() {
     // Ten 4 KiB packets over the second: what fits the bulk share.
