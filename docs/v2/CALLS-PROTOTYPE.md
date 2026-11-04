@@ -152,9 +152,10 @@ can evict only another bulk packet, leaves only after queued priority packets, a
 may use only what the cap leaves after 60 packets and 12 KiB per second, so bulk
 data cannot push out or outspend audio. Every audio packet is under the line, so
 a call with only audio behaves exactly as if the bulk lane did not exist. At the
-socket, going past the budget closes it; with `media_drop_bulk_over_share` on,
-bulk packets past their share are dropped instead, and the socket closes only if
-they pass the whole budget again on top.
+socket, going past the budget closes it. With `media_drop_bulk_over_share` on, bulk
+packets count against their own share and are dropped past it, so audio catching up
+after a stall has the whole budget to itself. The socket then closes for bulk only if
+it passes the whole budget again on top.
 
 A node with raised limits says so in the socket's handshake answer, in the header
 `x-bitsov-media-limits: <packets> <bytes>`, so the owner's app can pace to them. A

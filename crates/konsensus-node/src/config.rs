@@ -1338,9 +1338,10 @@ pub struct CallsConfig {
     /// allow a rate for a call to reach it. No effect on price or admission.
     #[serde(default = "default_media_max_bytes_per_second", deserialize_with = "deserialize_media_max_bytes_per_second")]
     pub media_max_bytes_per_second: u64,
-    /// When a call's packets larger than audio pass their share at the owner's
-    /// socket, drop them and keep the socket up, so a burst cannot cost the
-    /// audio. Off by default: the socket closes at the budget, as it always has.
+    /// At the owner's socket, count packets larger than audio against their own
+    /// share and drop them past it, so neither a burst of them nor audio catching
+    /// up beside them closes the socket. Off by default: every packet counts
+    /// against one budget and the socket closes past it, as it always has.
     #[serde(default)]
     pub media_drop_bulk_over_share: bool,
 }

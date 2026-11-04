@@ -498,10 +498,11 @@ impl IngressBudget {
     }
 
     /// Every message counts against the budget and the socket closes past it.
-    /// With `drop_bulk_over_share`, bulk packets also count against their own
-    /// share, so a burst of them can never spend the budget audio needs: over
-    /// that share they are dropped, and the socket closes only if they also
-    /// pass the whole budget again on top (a flood, not a burst).
+    /// With `drop_bulk_over_share`, bulk packets count against their own share
+    /// instead, so a burst of them can never cost the socket: audio catching up
+    /// after a stall has the whole budget to itself, and bulk over its share is
+    /// dropped. The socket closes for bulk only if it passes the whole budget
+    /// again on top (a flood, not a burst). The router still caps what goes on.
     fn admit(&mut self, message: &Message) -> Ingress {
         if self.start.elapsed() >= std::time::Duration::from_secs(1) {
             *self = Self::new(self.limits);
@@ -532,6 +533,7 @@ impl IngressBudget {
             }
             self.bulk_messages += 1;
             self.bulk_bytes += bytes;
+            return Ingress::Accept;
         }
         self.messages += 1;
         self.bytes = self.bytes.saturating_add(bytes);
@@ -788,6 +790,30 @@ mod tests {
         for _ in 0..50 {
             assert_eq!(budget.admit(&binary(161)), Ingress::Accept);
         }
+    }
+
+    #[tokio::test]
+    async fn audio_catching_up_after_a_stall_is_not_closed_by_the_bulk_in_its_window() {
+        // A stalled second's audio arrives with the next one's, and video in between.
+        let mut budget = IngressBudget::new(DROP_BULK);
+        for _ in 0..40 {
+            assert_eq!(budget.admit(&binary(1000)), Ingress::Accept);
+        }
+        for _ in 0..100 {
+            assert_eq!(budget.admit(&binary(161)), Ingress::Accept);
+        }
+        assert_eq!(budget.admit(&binary(161)), Ingress::Close, "audio alone still has its limit");
+
+        // The default mode closes on the same traffic, as it always has.
+        let mut budget = IngressBudget::new(MediaLimits::default());
+        let mut closed = false;
+        for _ in 0..40 {
+            closed |= budget.admit(&binary(1000)) == Ingress::Close;
+        }
+        for _ in 0..100 {
+            closed |= budget.admit(&binary(161)) == Ingress::Close;
+        }
+        assert!(closed);
     }
 
     #[tokio::test]
