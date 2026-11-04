@@ -54,8 +54,13 @@ async fn e2ee_self_heal_targets_missing_or_receiver_only_sessions() {
         .unwrap();
 
     assert!(
+        e2ee_needs_self_heal(&alice_mgr, bob.node_id()).await,
+        "an initiator the peer has not confirmed keeps asking"
+    );
+    assert!(alice_mgr.confirm_session(bob.node_id()).await);
+    assert!(
         !e2ee_needs_self_heal(&alice_mgr, bob.node_id()).await,
-        "initiator with an initialized sending chain should not churn"
+        "initiator with a confirmed sending chain should not churn"
     );
     assert!(
         e2ee_needs_self_heal(&bob_mgr, alice.node_id()).await,
@@ -4023,7 +4028,7 @@ async fn session_decode_logs_do_not_echo_peer_json() {
     let hostile = serde_json::json!("peer-controlled-secret");
     handle_prekey_offer(
         &peer, hostile.clone(), *identity.node_id(), &manager, &storage,
-        &transport, &audit, &mut negotiations,
+        &transport, &audit, &mut negotiations, &mut OfferWitness::default(),
     ).await;
     handle_session_init(
         &peer, hostile, &manager, &storage, &transport, &audit, &mut negotiations,
@@ -4146,6 +4151,7 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
             &transport,
             &audit,
             &mut negotiations,
+            &mut OfferWitness::default(),
         )
         .await;
         assert!(
@@ -4155,7 +4161,9 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
         assert_session_works(&low, &low_mgr, &high, &high_mgr, label).await;
     }
 
-    // A genuine re-offer (the peer restarted with fresh keys) still re-keys.
+    // A genuine re-offer (the peer restarted with fresh keys) still re-keys once
+    // the session is marked for it.
+    low_mgr.mark_needs_renegotiation(high.node_id()).await;
     let restarted = SessionManager::new(Arc::clone(&high));
     let offer = serde_json::to_value(restarted.prekey_bundle().await).unwrap();
     handle_prekey_offer(
@@ -4167,6 +4175,7 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
         &transport,
         &audit,
         &mut negotiations,
+        &mut OfferWitness::default(),
     )
     .await;
     assert!(
@@ -4185,9 +4194,10 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
     );
 }
 
-/// A valid but stale offer: its one-time pre-key is gone, so the peer refuses the
-/// init and sends no SessionAck. Nothing confirms the new session, so the initiator
-/// keeps the working one and both sides still talk.
+/// A valid but stale offer reaching a session marked for renegotiation is acted on,
+/// and its one-time pre-key is gone, so the peer refuses the init and sends no
+/// SessionAck. Nothing confirms the new session, so the initiator keeps the current
+/// one and both sides still talk.
 #[tokio::test]
 async fn a_stale_offer_the_peer_refuses_leaves_the_working_session_alone() {
     let (low, low_mgr, high, high_mgr) = established_pair().await;
@@ -4195,7 +4205,6 @@ async fn a_stale_offer_the_peer_refuses_leaves_the_working_session_alone() {
         Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
     let transport = make_gossip_test_transport();
     let audit = make_gossip_audit_log();
-    let mut low_negotiations = std::collections::HashMap::new();
     let mut high_negotiations = std::collections::HashMap::new();
 
     // The bundle as first offered, then its one-time pre-key spent on a real re-key.
@@ -4207,11 +4216,6 @@ async fn a_stale_offer_the_peer_refuses_leaves_the_working_session_alone() {
     high_mgr.decrypt(low.node_id(), &first).await.unwrap();
     assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the real re-key").await;
 
-    handle_prekey_offer(
-        high.node_id(), serde_json::to_value(&stale).unwrap(), *low.node_id(), &low_mgr,
-        &storage, &transport, &audit, &mut low_negotiations,
-    ).await;
-    assert!(low_negotiations.contains_key(high.node_id()), "the stale offer validates");
     let replay = low_mgr.reinitiate_session(high.node_id(), &stale).await.unwrap();
     handle_session_init(
         low.node_id(), serde_json::to_value(&replay).unwrap(), &high_mgr,
@@ -4219,6 +4223,111 @@ async fn a_stale_offer_the_peer_refuses_leaves_the_working_session_alone() {
     ).await;
     assert!(high_negotiations.is_empty(), "the peer refuses the init, so nothing confirms it");
     assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the stale offer").await;
+}
+
+/// One stale offer does not touch a healthy session on the lower id: no negotiation
+/// starts, and the session still works.
+#[tokio::test]
+async fn a_single_stale_offer_does_not_touch_a_healthy_session() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+    let mut negotiations = std::collections::HashMap::new();
+    assert!(low_mgr.confirm_session(high.node_id()).await);
+    handle_prekey_offer(
+        high.node_id(), serde_json::to_value(high_mgr.prekey_bundle().await).unwrap(), *low.node_id(), &low_mgr,
+        &storage, &transport, &audit, &mut negotiations, &mut OfferWitness::default(),
+    ).await;
+    assert!(negotiations.is_empty(), "no negotiation for one offer");
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after one offer").await;
+}
+
+/// The same with the responder restarted: restored from storage it holds the working
+/// session and new prekeys, so an offer from before the restart could only derive
+/// different keys. The lower id does not act on it, and the restored session works.
+#[tokio::test]
+async fn a_stale_offer_across_a_responder_restart_does_not_touch_the_session() {
+    #[derive(Default)]
+    struct Memory(std::sync::Mutex<std::collections::HashMap<NodeId, Vec<u8>>>);
+    #[async_trait::async_trait]
+    impl konsensus_crypto::SessionStore for Memory {
+        async fn save_session(&self, peer: &NodeId, state: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().unwrap().insert(*peer, state.to_vec());
+            Ok(())
+        }
+        async fn load_session(&self, peer: &NodeId) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.0.lock().unwrap().get(peer).cloned())
+        }
+        async fn delete_session(&self, peer: &NodeId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().unwrap().remove(peer);
+            Ok(())
+        }
+        async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.0.lock().unwrap().keys().copied().collect())
+        }
+    }
+    let (first, second) = (Arc::new(NodeIdentity::generate().unwrap().1), Arc::new(NodeIdentity::generate().unwrap().1));
+    let (low, high) = if first.node_id().as_bytes() < second.node_id().as_bytes() { (first, second) } else { (second, first) };
+    let store = Arc::new(Memory::default());
+    let low_mgr = SessionManager::new(Arc::clone(&low));
+    let high_mgr = SessionManager::with_store(Arc::clone(&high), store.clone());
+    let init = low_mgr.initiate_session(high.node_id(), &high_mgr.prekey_bundle().await).await.unwrap();
+    high_mgr.accept_session(low.node_id(), &init).await.unwrap();
+    assert!(low_mgr.confirm_session(high.node_id()).await);
+    let ratchet_init = low_mgr.encrypt(high.node_id(), b"ratchet-init").await.unwrap();
+    high_mgr.decrypt(low.node_id(), &ratchet_init).await.unwrap();
+    let stale = high_mgr.prekey_bundle().await;
+
+    let restored = SessionManager::with_store(Arc::clone(&high), store);
+    assert_eq!(restored.restore_sessions().await, 1);
+    assert_ne!(
+        restored.prekey_bundle().await.signed_prekey, stale.signed_prekey,
+        "the restart generated new prekeys"
+    );
+
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let mut negotiations = std::collections::HashMap::new();
+    handle_prekey_offer(
+        high.node_id(), serde_json::to_value(&stale).unwrap(), *low.node_id(), &low_mgr,
+        &storage, &make_gossip_test_transport(), &make_gossip_audit_log(), &mut negotiations,
+        &mut OfferWitness::default(),
+    ).await;
+    assert!(negotiations.is_empty(), "no negotiation from a stale offer");
+    assert_session_works(&low, &low_mgr, &high, &restored, "after a responder restart").await;
+}
+
+/// The rule for replacing a healthy session: a second offer on the same connection,
+/// a tick or more after the first and not long after it. Connect offers don't count.
+#[test]
+fn offer_witness_needs_two_spaced_offers_on_one_connection() {
+    use std::time::Duration;
+    let peer = test_peer_id();
+    let connection = std::time::Instant::now();
+    let at = |secs: u64| connection + Duration::from_secs(secs);
+    let mut witness = OfferWitness::default();
+
+    assert!(!witness.second_spaced_offer(&peer, connection, at(1)), "a connect offer");
+    assert!(!witness.second_spaced_offer(&peer, connection, at(9)), "still a connect offer");
+    assert!(!witness.second_spaced_offer(&peer, connection, at(10)), "the first that counts");
+    assert!(!witness.second_spaced_offer(&peer, connection, at(24)), "under a tick apart");
+    assert!(witness.second_spaced_offer(&peer, connection, at(25)), "a tick apart");
+    assert!(!witness.second_spaced_offer(&peer, connection, at(26)), "counting starts over");
+
+    // Too far apart: the old one has expired and this one counts as the first.
+    let mut witness = OfferWitness::default();
+    assert!(!witness.second_spaced_offer(&peer, connection, at(100)));
+    assert!(!witness.second_spaced_offer(&peer, connection, at(146)), "expired");
+    assert!(witness.second_spaced_offer(&peer, connection, at(161)));
+
+    // A new connection starts over.
+    let mut witness = OfferWitness::default();
+    assert!(!witness.second_spaced_offer(&peer, connection, at(100)));
+    let next = at(110);
+    assert!(!witness.second_spaced_offer(&peer, next, next + Duration::from_secs(10)));
+    assert!(!witness.second_spaced_offer(&peer, connection, at(125)), "not the old connection's second");
 }
 
 /// A well-formed SessionInit whose keys the initiator does not share costs nothing:

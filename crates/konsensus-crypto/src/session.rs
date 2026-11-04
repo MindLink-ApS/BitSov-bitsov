@@ -169,7 +169,7 @@ struct PeerSession {
     /// We initiated this session and the peer has not yet confirmed it.
     awaiting_confirmation: bool,
     /// The peer sent something this session could not read, so the two sides may
-    /// disagree. Cleared when a new session is installed.
+    /// disagree. Cleared when a new session is installed or a message decrypts.
     needs_renegotiation: bool,
 }
 
@@ -810,6 +810,11 @@ impl SessionManager {
         }
     }
 
+    /// Whether we initiated the session with a peer and it has not confirmed it.
+    pub async fn awaiting_confirmation(&self, peer_id: &NodeId) -> bool {
+        self.sessions.read().await.get(peer_id).is_some_and(|session| session.awaiting_confirmation)
+    }
+
     /// Whether the session with a peer is waiting to be renegotiated.
     pub async fn needs_renegotiation(&self, peer_id: &NodeId) -> bool {
         self.sessions.read().await.get(peer_id).is_some_and(|session| session.needs_renegotiation)
@@ -879,7 +884,11 @@ impl SessionManager {
                 .get_mut(peer_id)
                 .ok_or(SessionError::NoSession(*peer_id))?;
             match session.ratchet.decrypt(message) {
-                Ok(plaintext) => plaintext,
+                Ok(plaintext) => {
+                    // The peer and this session agree, whatever was unreadable before.
+                    session.needs_renegotiation = false;
+                    plaintext
+                }
                 Err(error) => {
                     // A message under the newer session proves the peer holds it.
                     let promoted = session.unconfirmed.as_mut().map(|ratchet| ratchet.decrypt(message));

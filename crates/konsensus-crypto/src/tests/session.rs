@@ -1005,3 +1005,27 @@ async fn a_new_session_clears_the_renegotiation_mark() {
     mgr_b.decrypt(&node_a, &msg).await.unwrap();
     assert!(!mgr_b.needs_renegotiation(&node_a).await);
 }
+
+/// A message that decrypts shows the two sides agree, so the mark clears. A session
+/// the peer has not confirmed is reported until it does.
+#[tokio::test]
+async fn a_readable_message_clears_the_mark_and_confirmation_is_reported() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let mgr_a = SessionManager::new(Arc::clone(&id_a));
+    let mgr_b = SessionManager::new(Arc::clone(&id_b));
+    let init = mgr_a.initiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_a.awaiting_confirmation(&node_b).await);
+    assert!(!mgr_b.awaiting_confirmation(&node_a).await, "the acceptor awaits nothing");
+    assert!(mgr_a.confirm_session(&node_b).await);
+    assert!(!mgr_a.awaiting_confirmation(&node_b).await);
+
+    mgr_b.mark_needs_renegotiation(&node_a).await;
+    let msg = mgr_a.encrypt(&node_b, b"readable").await.unwrap();
+    assert_eq!(mgr_b.preview_decrypt(&node_a, &msg).await.unwrap(), b"readable");
+    assert!(mgr_b.needs_renegotiation(&node_a).await, "a preview changes nothing");
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"readable");
+    assert!(!mgr_b.needs_renegotiation(&node_a).await);
+}

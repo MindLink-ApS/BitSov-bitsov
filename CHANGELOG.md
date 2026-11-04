@@ -6,14 +6,17 @@ also live on the corresponding GitHub pre-release pages.
 ## Unreleased
 
 - A node that lost its E2EE session with a connected peer gets it back on the
-  same connection, within about 25 seconds. The higher-id peer now answers a
-  PrekeyOffer with its own, at most once per ten seconds per peer; offers on a
-  new connection get no answer, since both sides offer there anyway. Before,
-  when the lower-id node lost its session while the peer kept one, nothing
-  changed until the next connection.
-- A callee with no E2EE session with the caller refuses a call block invoice
-  (`call_block_unpayable`, nothing paid), so no minute is paid for a session
-  that cannot read it. Messages and other call signals have no such step
+  same connection. When the lower-id node lost it, about 25 seconds: the higher-id
+  peer now answers a PrekeyOffer with its own, at most once per ten seconds per
+  peer. When the higher-id node lost it, up to about a minute.
+- A reconnect no longer replaces a healthy E2EE session. The lower-id node acts on
+  a PrekeyOffer only with no session, one marked for renegotiation or not yet
+  confirmed, or on a second offer on the same connection a self-heal tick or more
+  after the first. Two stale offers can still start a replacement; closing that
+  needs key confirmation, which is separate work.
+- A callee with no readable E2EE session with the caller refuses a call block
+  invoice (`call_block_unpayable`, nothing paid), so no minute is paid for a
+  session that cannot read it. Messages and other call signals have no such step
   before payment.
 - A call block from the higher-id side that its recipient cannot read is now
   refused for good (`undecryptable:`), rather than retried for up to an hour. The
@@ -21,7 +24,7 @@ also live on the corresponding GitHub pre-release pages.
 - One envelope or control frame can no longer cost a working E2EE session. A paid
   envelope that cannot be decrypted is refused as before and the session stays;
   from after the session settled it also starts a new negotiation, repeated on the
-  self-heal tick until it completes. A new session retires the current one only
+  self-heal tick until it completes or a readable message clears it. A new session retires the current one only
   when the peer proves it holds it: a `SessionAck` to the initiator, a message that
   decrypts under it to the acceptor. A stale prekey offer the peer refuses, or a
   well-formed init with other keys, changes nothing. No frame or message format

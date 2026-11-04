@@ -81,6 +81,16 @@ pub(crate) const SESSION_NEGOTIATION_COOLDOWN: std::time::Duration = std::time::
 /// but no bidirectional E2EE sending chain yet.
 const SESSION_SELF_HEAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// An offer that counts towards replacing a healthy session expires after this,
+/// so stale frames far apart never add up. Long enough for a jittered tick to miss
+/// the spacing once and the next one to qualify.
+const OFFER_WITNESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(3 * SESSION_SELF_HEAL_INTERVAL.as_secs());
+
+/// While set, the higher id does not answer prekey offers: a test's barrier, so a
+/// lost session cannot recover before the test has seen what it is checking.
+#[cfg(test)]
+pub(crate) static HOLD_PREKEY_ANSWERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Per-peer PeerExchange cooldown — prevents a peer from spamming
 /// PeerExchange requests/responses to trigger expensive registry writes.
 const PEER_EXCHANGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
@@ -179,6 +189,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
     let mut last_negotiation: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
+    let mut offer_witness = OfferWitness::default();
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
@@ -258,7 +269,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                         handle_prekey_offer(
                             &peer_id, bundle, our_node_id, &session_manager, &storage,
-                            &transport, &audit_log, &mut last_negotiation,
+                            &transport, &audit_log, &mut last_negotiation, &mut offer_witness,
                         ).await;
                     }
 
@@ -591,6 +602,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     warn!(len = last_negotiation.len(), cap = MAX_COOLDOWN_ENTRIES, "negotiation cooldown map exceeded cap, clearing");
                     last_negotiation.clear();
                 }
+                offer_witness.prune(std::time::Instant::now());
                 if last_peer_exchange.len() > MAX_COOLDOWN_ENTRIES {
                     warn!(len = last_peer_exchange.len(), cap = MAX_COOLDOWN_ENTRIES, "peer exchange cooldown map exceeded cap, clearing");
                     last_peer_exchange.clear();
@@ -774,6 +786,7 @@ async fn handle_prekey_offer(
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
     last_negotiation: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
+    offer_witness: &mut OfferWitness,
 ) {
     // Rate-limit session re-negotiation per peer.
     if let Some(last) = last_negotiation.get(peer_id) {
@@ -818,6 +831,22 @@ async fn handle_prekey_offer(
         return;
     }
 
+    // A bundle says nothing about whether it is fresh, and a healthy session must
+    // not be put at risk by one stale frame. So act at once only with no session, or
+    // one marked or still unconfirmed. Otherwise ask for a second offer on this
+    // connection: a peer that needs a new session offers on every self-heal tick.
+    let healthy = session_manager.has_session(peer_id).await
+        && !session_manager.needs_renegotiation(peer_id).await
+        && !session_manager.awaiting_confirmation(peer_id).await;
+    if healthy {
+        let Some(connection) = transport.connected_since(peer_id).await else { return };
+        if !offer_witness.second_spaced_offer(peer_id, connection, std::time::Instant::now()) {
+            debug!(peer = %peer_id, "prekey offer not acted on; the session is healthy");
+            return;
+        }
+    }
+    offer_witness.forget(peer_id);
+
     let had_session = session_manager.has_session(peer_id).await;
     match session_manager
         .reinitiate_session(peer_id, &peer_bundle)
@@ -850,6 +879,48 @@ async fn handle_prekey_offer(
     }
 
     let _ = audit;
+}
+
+/// Offers seen for peers whose session looks healthy. See [`Self::second_spaced_offer`].
+#[derive(Default)]
+struct OfferWitness {
+    /// peer -> (the connection the offer came on, when it was counted)
+    first: std::collections::HashMap<NodeId, (std::time::Instant, std::time::Instant)>,
+}
+
+impl OfferWitness {
+    /// Whether this offer is the second on `connection`, at least one self-heal tick
+    /// after the first and within [`OFFER_WITNESS_WINDOW`] of it. An offer on a
+    /// connection younger than the negotiation cooldown does not count: both sides
+    /// offer on connect, and that offer plus one stale frame must not add up.
+    fn second_spaced_offer(&mut self, peer: &NodeId, connection: std::time::Instant, now: std::time::Instant) -> bool {
+        if now.saturating_duration_since(connection) < SESSION_NEGOTIATION_COOLDOWN {
+            return false;
+        }
+        match self.first.get(peer) {
+            Some((seen_on, first)) if *seen_on == connection => {
+                let spacing = now.saturating_duration_since(*first);
+                if spacing < SESSION_SELF_HEAL_INTERVAL {
+                    return false;
+                }
+                if spacing <= OFFER_WITNESS_WINDOW {
+                    self.first.remove(peer);
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        self.first.insert(*peer, (connection, now));
+        false
+    }
+
+    fn forget(&mut self, peer: &NodeId) {
+        self.first.remove(peer);
+    }
+
+    fn prune(&mut self, now: std::time::Instant) {
+        self.first.retain(|_, (_, first)| now.saturating_duration_since(*first) <= OFFER_WITNESS_WINDOW);
+    }
 }
 
 async fn handle_session_init(
@@ -1102,6 +1173,10 @@ async fn answer_prekey_offer_for_recovery(
     if our_node_id.as_bytes() < peer_id.as_bytes() {
         return;
     }
+    #[cfg(test)]
+    if HOLD_PREKEY_ANSWERS.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     let Some(since) = transport.connected_since(peer_id).await else { return };
     if since.elapsed() < SESSION_NEGOTIATION_COOLDOWN
         || last_negotiation.get(peer_id).is_some_and(|last| last.elapsed() < SESSION_NEGOTIATION_COOLDOWN)
@@ -1134,7 +1209,9 @@ async fn answer_prekey_offer_for_recovery(
 }
 
 async fn e2ee_needs_self_heal(session_manager: &SessionManager, peer_id: &NodeId) -> bool {
-    !session_manager.can_send(peer_id).await || session_manager.needs_renegotiation(peer_id).await
+    !session_manager.can_send(peer_id).await
+        || session_manager.needs_renegotiation(peer_id).await
+        || session_manager.awaiting_confirmation(peer_id).await
 }
 
 async fn send_prekey_offer(
