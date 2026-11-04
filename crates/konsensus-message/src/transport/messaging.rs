@@ -393,6 +393,15 @@ pub(super) fn spawn_reader_task(
         if *shutdown.borrow() { conn.remove(&peer_id, &peers).await; return; }
         // Keep the read future alive across ping ticks: cancelling/restarting a
         // partial length-prefixed read would corrupt framing and reset its deadline.
+        // Fixed for this connection's life, and stamped on its session frames.
+        let connection = {
+            let state = conn.lock().await;
+            Arc::new(super::ConnectionContext {
+                generation: conn.connected_at,
+                hello_key: state.noise.remote_static_key().copied(),
+                capabilities: state.capabilities.clone(),
+            })
+        };
         let read_frames = async {
         loop {
             // Read the next encrypted message
@@ -577,6 +586,7 @@ pub(super) fn spawn_reader_task(
                             peer_id,
                             bundle,
                             privileged: bought,
+                            connection: Arc::clone(&connection),
                         })
                         .await
                     {
@@ -590,6 +600,7 @@ pub(super) fn spawn_reader_task(
                             peer_id,
                             init_data,
                             privileged: bought,
+                            connection: Arc::clone(&connection),
                         })
                         .await
                     {
@@ -599,7 +610,7 @@ pub(super) fn spawn_reader_task(
                 Frame::SessionAck => {
                     debug!(peer = %peer_id, "received session ack");
                     if let Err(e) = control_tx
-                        .send(ControlEvent::SessionAck { peer_id, privileged: bought })
+                        .send(ControlEvent::SessionAck { peer_id, privileged: bought, connection: Arc::clone(&connection) })
                         .await
                     {
                         warn!(peer = %peer_id, error = %e, "failed to send SessionAck control event");
@@ -612,6 +623,7 @@ pub(super) fn spawn_reader_task(
                             peer_id,
                             payload,
                             privileged: bought,
+                            connection: Arc::clone(&connection),
                         })
                         .await
                     {

@@ -1040,3 +1040,21 @@ async fn failed_save_does_not_refuse_a_readable_message() {
     let message = sender.encrypt(&node_b, b"readable").await.unwrap();
     assert_eq!(receiver.decrypt(&node_a, &message).await.unwrap(), b"readable");
 }
+
+/// Each boot starts its one-time pre-key ids at its own random point, and they count
+/// up from there.
+#[tokio::test]
+async fn prekey_ids_start_at_a_random_point_per_boot() {
+    let identity = make_identity(TEST_MNEMONIC_A);
+    let mut starts = Vec::new();
+    for _ in 0..4 {
+        let manager = SessionManager::new(Arc::clone(&identity));
+        starts.push(manager.prekey_bundle().await.one_time_prekey_id.unwrap());
+    }
+    let with_store = SessionManager::with_store(Arc::clone(&identity), MemorySessionStore::new());
+    starts.push(with_store.prekey_bundle().await.one_time_prekey_id.unwrap());
+    let mut distinct = starts.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), starts.len(), "every boot picks its own: {starts:?}");
+}

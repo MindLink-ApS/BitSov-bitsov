@@ -206,22 +206,29 @@ impl SessionManager {
     ///
     /// Generates an initial signed pre-key and a batch of one-time pre-keys.
     pub fn new(identity: Arc<NodeIdentity>) -> Self {
+        Self::with_optional_store(identity, None)
+    }
+
+    /// One-time pre-keys live in memory, so each boot makes new ones. Their ids start
+    /// at a random point per boot: an init built from a bundle of an earlier boot then
+    /// names an id this node does not hold, and is refused instead of deriving a secret
+    /// the initiator does not share. This reduces collisions. It does not show that a
+    /// bundle is fresh.
+    fn with_optional_store(identity: Arc<NodeIdentity>, store: Option<Arc<dyn SessionStore>>) -> Self {
         let spk = SignedPreKey::generate();
         let session_cipher = Self::derive_session_cipher(&identity);
 
-        // Generate initial batch of one-time pre-keys
-        let mut otpks = Vec::with_capacity(10);
-        for id in 0..10u32 {
-            otpks.push(OneTimePreKey::generate(id));
-        }
+        // Half the id space stays above the base, far more than a boot can use.
+        let base = rand::thread_rng().next_u32() / 2;
+        let otpks = (base..base + 10).map(OneTimePreKey::generate).collect();
 
         Self {
             identity,
             signed_prekey: RwLock::new(spk),
             one_time_prekeys: RwLock::new(otpks),
-            next_opk_id: RwLock::new(10),
+            next_opk_id: RwLock::new(base + 10),
             sessions: RwLock::new(HashMap::new()),
-            store: None,
+            store,
             session_cipher,
         }
     }
@@ -233,23 +240,7 @@ impl SessionManager {
     /// Session state is encrypted at rest using AES-256-GCM with a key
     /// derived from the node identity (Principle 4: no plaintext at any layer).
     pub fn with_store(identity: Arc<NodeIdentity>, store: Arc<dyn SessionStore>) -> Self {
-        let spk = SignedPreKey::generate();
-        let session_cipher = Self::derive_session_cipher(&identity);
-
-        let mut otpks = Vec::with_capacity(10);
-        for id in 0..10u32 {
-            otpks.push(OneTimePreKey::generate(id));
-        }
-
-        Self {
-            identity,
-            signed_prekey: RwLock::new(spk),
-            one_time_prekeys: RwLock::new(otpks),
-            next_opk_id: RwLock::new(10),
-            sessions: RwLock::new(HashMap::new()),
-            store: Some(store),
-            session_cipher,
-        }
+        Self::with_optional_store(identity, Some(store))
     }
 
     /// Restore sessions from persistent storage.

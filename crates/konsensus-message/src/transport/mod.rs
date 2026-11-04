@@ -53,6 +53,24 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::wire::{Capability, Frame, SovereigntyTier, WireError, MAX_FRAME_SIZE};
 
+/// What a connection established at its handshake, stamped on the session frames it
+/// carries. It is captured when the reader starts, so an event keeps describing the
+/// connection its frame arrived on, whatever has replaced that connection since.
+///
+/// This records what the peer presented. It says nothing about whether the key is
+/// the one this NodeId has used before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionContext {
+    /// When the connection finished its handshake; see `connected_since`.
+    pub generation: Instant,
+    /// The X25519 key from the peer's Hello, already checked to be the Noise remote
+    /// static key and signed by the NodeId. `None` if it was not available, which
+    /// callers must treat as a failed check.
+    pub hello_key: Option<[u8; 32]>,
+    /// What the peer advertised in its Hello.
+    pub capabilities: Vec<Capability>,
+}
+
 /// Control events from the transport layer to the application layer.
 ///
 /// These carry session management frames and connection lifecycle notifications
@@ -84,6 +102,8 @@ pub enum ControlEvent {
         /// M1b: privileged tag stamped from `conn.privileged` by the reader.
         /// `false` => the session handler DROPS this state-mutating frame.
         privileged: bool,
+        /// The connection this frame arrived on.
+        connection: Arc<ConnectionContext>,
     },
 
     /// Peer initiated an E2EE session (X3DH initiator → responder).
@@ -95,6 +115,8 @@ pub enum ControlEvent {
         /// M1b: privileged tag stamped from `conn.privileged` by the reader.
         /// `false` => the session handler DROPS this durable-session frame.
         privileged: bool,
+        /// The connection this frame arrived on.
+        connection: Arc<ConnectionContext>,
     },
 
     /// Peer acknowledged E2EE session establishment.
@@ -104,6 +126,8 @@ pub enum ControlEvent {
         /// M1b: privileged tag stamped from `conn.privileged` by the reader.
         /// `false` => the session handler DROPS this session-state frame.
         privileged: bool,
+        /// The connection this frame arrived on.
+        connection: Arc<ConnectionContext>,
     },
 
     /// Peer sent a ratchet initialization message (initiator → acceptor).
@@ -117,6 +141,8 @@ pub enum ControlEvent {
         /// M1b: privileged tag stamped from `conn.privileged` by the reader.
         /// `false` => the session handler DROPS this ratchet-state frame.
         privileged: bool,
+        /// The connection this frame arrived on.
+        connection: Arc<ConnectionContext>,
     },
 
     /// Peer acknowledged receipt of a message.
@@ -4467,3 +4493,71 @@ mod reply_tests;
 
 #[cfg(test)]
 mod idle_regressions;
+
+#[cfg(test)]
+mod connection_context_tests {
+    use super::*;
+
+    /// A session frame carries the connection it arrived on: the peer's Hello key and
+    /// capabilities, and that connection's generation even if it has been replaced by
+    /// the time the event is read.
+    #[tokio::test]
+    async fn session_frames_carry_the_connection_they_arrived_on() {
+        let id_a = Arc::new(NodeIdentity::generate().unwrap().1);
+        let id_b = Arc::new(NodeIdentity::generate().unwrap().1);
+        let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+        let hello_key = *id_a.x25519_public().as_bytes();
+        let capabilities = vec![Capability::Custom("test_capability".into())];
+        let transport_a = NoiseTransport::new(id_a, TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![node_b],
+            capabilities: capabilities.clone(),
+            ..Default::default()
+        });
+        let transport_b = NoiseTransport::new(id_b, TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![node_a],
+            ..Default::default()
+        });
+        transport_b.start_listener().await.unwrap();
+        let addr_b = transport_b.listen_addr().unwrap().to_string();
+        transport_a.connect(&node_b, &addr_b).await.unwrap();
+        let _ = transport_b.recv_control().await;
+        let first = transport_b.connected_since(&node_a).await.unwrap();
+
+        let frames = [
+            Frame::PrekeyOffer { bundle: serde_json::json!({}) },
+            Frame::SessionInit { init_data: serde_json::json!({}) },
+            Frame::SessionAck,
+            Frame::RatchetInit { payload: vec![1] },
+        ];
+        for frame in &frames {
+            transport_a.send_frame(&node_b, frame).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Replace the connection before reading any of those events.
+        transport_a.disconnect(&node_b).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        transport_a.connect(&node_b, &addr_b).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let second = transport_b.connected_since(&node_a).await.unwrap();
+        assert_ne!(first, second, "a new connection");
+
+        let mut stamped = 0;
+        while stamped < frames.len() {
+            let event = tokio::time::timeout(Duration::from_secs(5), transport_b.recv_control()).await.unwrap().unwrap();
+            let connection = match event {
+                ControlEvent::PrekeyOffer { connection, .. }
+                | ControlEvent::SessionInit { connection, .. }
+                | ControlEvent::SessionAck { connection, .. }
+                | ControlEvent::RatchetInit { connection, .. } => connection,
+                _ => continue,
+            };
+            assert_eq!(connection.generation, first, "stamped when the frame arrived");
+            assert_eq!(connection.hello_key, Some(hello_key));
+            assert_eq!(connection.capabilities, capabilities);
+            stamped += 1;
+        }
+    }
+}

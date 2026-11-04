@@ -5,6 +5,12 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- A prekey bundle or session init whose identity key is not the key that
+  connection's Hello presented is now refused before anything changes, as is a
+  bundle that uses its identity key as its signed prekey. One-time prekey ids also
+  start at a random point per boot, so an init built on a bundle from an earlier
+  boot is refused rather than accepted on keys the two sides do not share.
+
 - An E2EE send now saves its advanced send chain before the ciphertext leaves the
   session. If the save fails, the ciphertext is withheld and the chain put back,
   so a restart cannot reuse a message key. The send is refused with
