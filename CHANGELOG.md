@@ -28,6 +28,11 @@ also live on the corresponding GitHub pre-release pages.
   test-only `zip` 0.6.6, which is absent from the shipped binary (#505).
 - Not included: call cutoff is not yet verified on real hardware, and this
   release does not fix the other open reports.
+- Known limit, also present in rc21: If a link drops during a call and both nodes reconnect at nearly the same moment,
+  the two nodes can end up on different sessions. Messages and call minutes sent
+  then can be paid for and not read. It can clear within about a minute; otherwise
+  a new connection between the nodes clears it. This release does not change it,
+  and a fix is planned.
 
 ## [0.3.0-rc21] — 2026-11-01
 

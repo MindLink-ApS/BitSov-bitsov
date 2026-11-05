@@ -39,12 +39,22 @@ not. From the source, the bundles and inits an rc21 node builds pass the stricte
 checks, so rc21 and rc22 should interoperate. That reading comes from the source,
 not from running them together.
 
-Mixed rc21 and rc22 operation: not yet recorded.
+Mixed rc21 and rc22 operation: tested on regtest at `9c923c98`. Upgrade in place
+in both id orders, fresh sessions and file sends to and from rc21 passed. Not run
+on real hardware.
 
-Rollback from rc22 to rc21: not yet recorded.
+Rollback from rc22 to rc21: tested on regtest in both id orders. rc21 started on
+the candidate's data, and chat, calls and files passed. The earlier guidance that
+prefers rolling forward stands.
 
 Not included: call cutoff is not yet verified on real hardware, and this release
 does not fix the other open reports.
+
+Known limit, also present in rc21: If a link drops during a call and both nodes reconnect at nearly the same moment,
+the two nodes can end up on different sessions. Messages and call minutes sent
+then can be paid for and not read. It can clear within about a minute; otherwise
+a new connection between the nodes clears it. This release does not change it,
+and a fix is planned.
 
 Follow the [rc22 signing and node checklist](releases/v0.3.0-rc22.md).
 
