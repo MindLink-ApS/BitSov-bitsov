@@ -36,8 +36,8 @@ not mean zero.
 The diff from rc21 changes no frame, envelope, ratchet message, prekey bundle or
 session init format. One-time prekey id values change; the field and its type do
 not. From the source, the bundles and inits an rc21 node builds pass the stricter
-checks, so rc21 and rc22 should interoperate. That reading comes from the source,
-not from running them together.
+checks, so rc21 and rc22 should interoperate. The source supports this
+reading, and it was also run on regtest (below); not on real hardware.
 
 Mixed rc21 and rc22 operation: tested on regtest at `9c923c98`. Upgrade in place
 in both id orders, fresh sessions and file sends to and from rc21 passed. Not run
