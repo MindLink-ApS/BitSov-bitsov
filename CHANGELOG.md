@@ -41,24 +41,35 @@ also live on the corresponding GitHub pre-release pages.
   the initiator, a message that decrypts under it to the acceptor. A stale prekey
   offer the peer refuses, or a well-formed init with other keys, changes nothing.
   No frame or message format changes.
-- A prekey bundle or session init whose identity key is not the key that
-  connection's Hello presented is now refused before anything changes, as is a
-  bundle whose signed prekey is the same point as its identity key. One-time
-  prekey ids also start at a random point per boot, so an init naming an id not
-  held this boot is refused. An id can still repeat across boots, and an init with
-  no one-time prekey id is unchanged. This does not show that a bundle is fresh.
 
-- An E2EE send now saves its advanced send chain before the ciphertext leaves the
-  session. If the save fails, the ciphertext is withheld and the chain put back,
-  so a restart cannot reuse a message key. Saves and deletes of session state now
-  run to completion under the session lock even if the request that started them
-  goes away, so an older write cannot land on a newer one. The send is refused with
+## [0.3.0-rc22] — 2026-11-05
+
+- An E2EE send now saves its advanced send chain before the ciphertext leaves
+  the session; if the save fails, nothing is sent. The send is refused with
   `not_dispatched`, reason `session_save_failed`, before any payment for it. An
-  admission already settled in the same call stays settled and is reported as paid,
-  with the same reason.
-- `POST /api/v1/files/:id/send` now returns optional `fee_paid_msat`, as compose
-  does: the actual routing fee of a settled LDK payment. It is omitted when any
-  component fee is unknown and on other backends.
+  admission already settled in the same call stays settled and is reported as
+  paid, with the same reason. Saves and deletes of session state now run to
+  completion under the session lock even if the request that started them goes
+  away (#519).
+- Session setup applies stricter consistency checks to the keys it receives. A
+  prekey bundle or session init that fails them is refused before anything
+  changes (#520).
+- File sends report the routing fee actually paid: `POST /api/v1/files/:id/send`
+  now returns optional `fee_paid_msat`, as compose does. It is omitted when any
+  component fee is unknown and on backends other than LDK; absence does not mean
+  zero (#521).
+- Docs now say what encryption covers today: message content and call audio are
+  encrypted between nodes, and either node can read them. Encryption that
+  reaches the app is planned (#512).
+- RUSTSEC-2026-0429 is waived in the audit, deny and OSV configs for the
+  test-only `zip` 0.6.6, which is absent from the shipped binary (#505).
+- Not included: call cutoff is not yet verified on real hardware, and this
+  release does not fix the other open reports.
+- Known limit, also present in rc21: If a link drops during a call and both nodes reconnect at nearly the same moment,
+  the two nodes can end up on different sessions. Messages and call minutes sent
+  then can be paid for and not read. It can clear within about a minute; otherwise
+  follow the steps in [rc21 → rc22](docs/UPGRADING.md#rc21--rc22). This release
+  does not change it, and a fix is planned.
 
 ## [0.3.0-rc21] — 2026-11-01
 
