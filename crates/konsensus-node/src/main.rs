@@ -577,8 +577,35 @@ fn cmd_init(
             println!("  3. Run: konsensus start -c {}", config_path.display());
         }
     }
+    print_network_notice(&config);
 
     Ok(())
+}
+
+/// Lines naming the Bitcoin network a freshly written config pays on, when that
+/// is mainnet. `init` and `restore` write `network = "bitcoin"` today, while this
+/// beta supports signet only, so the owner is told before the first start.
+fn network_notice(config: &NodeConfig) -> Vec<String> {
+    if config.lightning.bitcoin_network().as_deref() != Some("bitcoin") {
+        return Vec::new();
+    }
+    vec![
+        "NOTE: This config uses the Bitcoin mainnet ([lightning] network = \"bitcoin\").".into(),
+        "      Mainnet is not supported in this beta. Before the first start, switch".into(),
+        "      [lightning] network and the [lightning] and [chain] server URLs to signet:".into(),
+        "      see docs/QUICKSTART-SIGNET.md, step 2.".into(),
+    ]
+}
+
+fn print_network_notice(config: &NodeConfig) {
+    let lines = network_notice(config);
+    if lines.is_empty() {
+        return;
+    }
+    println!();
+    for line in lines {
+        println!("{line}");
+    }
 }
 
 /// `konsensus restore` — recover a node from an existing mnemonic.
@@ -712,6 +739,7 @@ fn cmd_restore(
     } else {
         println!("Run: konsensus start -c {}", config_path.display());
     }
+    print_network_notice(&config);
     println!();
 
     Ok(())
@@ -3103,3 +3131,39 @@ mod regtest_e2e;
 #[cfg(test)]
 #[path = "tests/shutdown.rs"]
 mod shutdown_tests;
+
+#[cfg(test)]
+mod network_notice_tests {
+    use super::*;
+
+    fn fresh(tier: NodeTier) -> (tempfile::TempDir, NodeConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = NodeConfig::default_for_tier(tier, dir.path().join("mnemonic.txt"), dir.path());
+        (dir, config)
+    }
+
+    #[test]
+    fn a_fresh_full_node_is_told_it_is_on_mainnet_and_where_to_switch() {
+        let (_dir, config) = fresh(NodeTier::Full);
+        assert_eq!(config.lightning.bitcoin_network().as_deref(), Some("bitcoin"));
+        let text = network_notice(&config).join("\n");
+        assert!(text.contains("Bitcoin mainnet"), "{text}");
+        assert!(text.contains("not supported in this beta"), "{text}");
+        assert!(text.contains("docs/QUICKSTART-SIGNET.md"), "{text}");
+    }
+
+    #[test]
+    fn a_signet_or_mock_config_gets_no_notice() {
+        let (_dir, mut config) = fresh(NodeTier::Full);
+        if let LightningConfig::Ldk { network, .. } = &mut config.lightning {
+            *network = "signet".into();
+        } else {
+            panic!("full tier writes an LDK backend");
+        }
+        assert!(network_notice(&config).is_empty());
+        for tier in [NodeTier::Light, NodeTier::Cloud] {
+            let (_dir, config) = fresh(tier);
+            assert!(network_notice(&config).is_empty(), "{}", tier.description());
+        }
+    }
+}
