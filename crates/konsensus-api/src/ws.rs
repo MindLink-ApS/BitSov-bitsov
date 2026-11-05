@@ -111,6 +111,10 @@ const WS_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// Subscribes to the broadcast channel and forwards messages (with decrypted
 /// plaintext when available) to the client as JSON. Sends periodic keepalive
 /// pings to prevent idle connection timeouts.
+///
+/// Closes the socket when its token expires. Waiting for the next event to
+/// notice would take that event off the feed and drop it, and the client's
+/// next connection subscribes too late to see it.
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Claims) {
     let mut rx = state.ws_broadcast.subscribe();
     let mut delivery_rx = state.ws_delivery_broadcast.subscribe();
@@ -118,9 +122,20 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
     let mut keepalive = tokio::time::interval(WS_KEEPALIVE_INTERVAL);
     // The first tick fires immediately — skip it since we just connected.
     keepalive.tick().await;
+    let token_expired = tokio::time::sleep(until_expiry(&claims));
+    tokio::pin!(token_expired);
 
     loop {
         tokio::select! {
+            // Polled first: once the token has expired, the stream closes
+            // without taking another event off the feed.
+            biased;
+
+            () = &mut token_expired => {
+                debug!("WebSocket token expired; closing the stream");
+                break;
+            }
+
             // Forward new messages from broadcast channel to WebSocket
             result = rx.recv() => {
                 match result {
@@ -250,6 +265,17 @@ fn stream_authorized(state: &Arc<AppState>, claims: &auth::Claims) -> bool {
     claims.exp > chrono::Utc::now().timestamp()
         && claims.scp.contains(&auth::Scope::Read)
         && matches!(auth::check_pairing_binding(state, claims), Ok(Some(_)))
+}
+
+// Time left until `stream_authorized` starts refusing on expiry: from the
+// first instant of second `exp`. Milliseconds, so the stream is not left open
+// for up to a second after its token stops being valid.
+fn until_expiry(claims: &auth::Claims) -> std::time::Duration {
+    let left_ms = claims
+        .exp
+        .saturating_mul(1000)
+        .saturating_sub(chrono::Utc::now().timestamp_millis());
+    std::time::Duration::from_millis(u64::try_from(left_ms).unwrap_or(0))
 }
 
 /// Registers the WebSocket upgrade route for real-time event streaming.
