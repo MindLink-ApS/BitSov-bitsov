@@ -22,7 +22,7 @@ pub use sender_keys::{
 };
 pub use session::{
     SessionError, SessionManager, SessionStore, SerializablePrekeyBundle, SerializableSessionInit,
-    ratchet_message_from_bytes, ratchet_message_to_bytes,
+    ratchet_message_from_bytes, ratchet_message_to_bytes, same_x25519_point,
 };
 pub use plaintext_cache::{PlaintextCacheCipher, PlaintextCacheError};
 pub use x3dh::{

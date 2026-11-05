@@ -2155,15 +2155,18 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                     peer_id,
                     init_data: serde_json::json!({"secret": "do not retain"}),
                     privileged,
+                    connection: Arc::new(no_hello_connection()),
                 },
                 ControlEvent::SessionAck {
                     peer_id,
                     privileged,
+                    connection: Arc::new(no_hello_connection()),
                 },
                 ControlEvent::RatchetInit {
                     peer_id,
                     payload: b"do not retain".to_vec(),
                     privileged,
+                    connection: Arc::new(no_hello_connection()),
                 },
                 ControlEvent::MessageAcked {
                     paid_until_ms: None,
@@ -2204,6 +2207,7 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                     peer_id,
                     bundle: serde_json::json!({"secret": "do not retain"}),
                     privileged,
+                    connection: Arc::new(no_hello_connection()),
                 },
                 ControlEvent::PriceTableReceived {
                     peer_id,
@@ -4023,10 +4027,10 @@ async fn session_decode_logs_do_not_echo_peer_json() {
     let hostile = serde_json::json!("peer-controlled-secret");
     handle_prekey_offer(
         &peer, hostile.clone(), *identity.node_id(), &manager, &storage,
-        &transport, &audit, &mut negotiations,
+        &transport, &audit, &mut negotiations, &connection_of(&identity),
     ).await;
     handle_session_init(
-        &peer, hostile, &manager, &storage, &transport, &audit, &mut negotiations,
+        &peer, hostile, &manager, &storage, &transport, &audit, &mut negotiations, &connection_of(&identity),
     ).await;
     assert!(!manager.has_session(&peer).await);
     assert!(negotiations.is_empty());
@@ -4146,6 +4150,7 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
             &transport,
             &audit,
             &mut negotiations,
+            &connection_of(&high),
         )
         .await;
         assert!(
@@ -4167,6 +4172,7 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
         &transport,
         &audit,
         &mut negotiations,
+        &connection_of(&high),
     )
     .await;
     assert!(
@@ -4223,6 +4229,7 @@ async fn malformed_session_init_leaves_the_working_session_alone() {
             &transport,
             &audit,
             &mut negotiations,
+            &connection_of(&low),
         )
         .await;
         assert!(
@@ -4251,6 +4258,7 @@ async fn malformed_session_init_leaves_the_working_session_alone() {
         &transport,
         &audit,
         &mut negotiations,
+        &connection_of(&low),
     )
     .await;
     assert!(
@@ -4478,4 +4486,173 @@ async fn failed_save_of_the_ratchet_init_keeps_the_session() {
     let message = manager.encrypt(&peer, b"after the failure").await.unwrap();
     assert_eq!(message.header.message_number, 0, "the withheld init left no gap");
     assert_eq!(responder.decrypt(&our_id, &message).await.unwrap(), b"after the failure");
+}
+
+// ── Bundle and init against the connection's Hello ──────────────────
+
+/// A connection whose Hello presented this identity's key.
+fn connection_of(identity: &NodeIdentity) -> konsensus_message::ConnectionContext {
+    konsensus_message::ConnectionContext {
+        generation: std::time::Instant::now(),
+        hello_key: Some(*identity.x25519_public().as_bytes()),
+        capabilities: Vec::new(),
+    }
+}
+
+/// A connection with no Hello key available, which every check must treat as failed.
+fn no_hello_connection() -> konsensus_message::ConnectionContext {
+    konsensus_message::ConnectionContext {
+        generation: std::time::Instant::now(),
+        hello_key: None,
+        capabilities: Vec::new(),
+    }
+}
+
+/// `handle_prekey_offer` on the lower id, with empty negotiations, for this bundle and
+/// connection. Returns whether it started a negotiation.
+async fn offer_starts_negotiation(
+    low: &NodeIdentity,
+    low_mgr: &SessionManager,
+    high: &NodeIdentity,
+    bundle: serde_json::Value,
+    connection: &konsensus_message::ConnectionContext,
+) -> bool {
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let mut negotiations = std::collections::HashMap::new();
+    handle_prekey_offer(
+        high.node_id(), bundle, *low.node_id(), low_mgr, &storage,
+        &make_gossip_test_transport(), &make_gossip_audit_log(), &mut negotiations, connection,
+    ).await;
+    negotiations.contains_key(high.node_id())
+}
+
+/// `handle_session_init` on the higher id. Returns whether it accepted the init.
+async fn init_accepted(
+    low: &NodeIdentity,
+    high_mgr: &SessionManager,
+    init: serde_json::Value,
+    connection: &konsensus_message::ConnectionContext,
+) -> bool {
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let mut negotiations = std::collections::HashMap::new();
+    handle_session_init(
+        low.node_id(), init, high_mgr, &storage,
+        &make_gossip_test_transport(), &make_gossip_audit_log(), &mut negotiations, connection,
+    ).await;
+    negotiations.contains_key(low.node_id())
+}
+
+/// A bundle whose identity key is not the key of the connection it came on changes
+/// nothing, and neither does any bundle when the connection has no Hello key.
+#[tokio::test]
+async fn offer_with_an_identity_key_other_than_the_hello_key_changes_nothing() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let bundle = serde_json::to_value(high_mgr.prekey_bundle().await).unwrap();
+    let other = NodeIdentity::generate().unwrap().1;
+    for (label, connection) in [("another key", connection_of(&other)), ("no key", no_hello_connection())] {
+        assert!(!offer_starts_negotiation(&low, &low_mgr, &high, bundle.clone(), &connection).await, "{label}");
+        assert_session_works(&low, &low_mgr, &high, &high_mgr, label).await;
+    }
+    assert!(offer_starts_negotiation(&low, &low_mgr, &high, bundle, &connection_of(&high)).await, "the honest case");
+}
+
+/// A correctly signed bundle that uses its identity key as the signed prekey changes
+/// nothing.
+#[tokio::test]
+async fn offer_with_the_identity_key_as_signed_prekey_changes_nothing() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let mut bundle = high_mgr.prekey_bundle().await;
+    bundle.signed_prekey = bundle.identity_key.clone();
+    let signature = ed25519_dalek::Signer::sign(high.ed25519_signing_key(), high.x25519_public().as_bytes());
+    bundle.signed_prekey_sig = hex::encode(signature.to_bytes());
+    let offer = serde_json::to_value(&bundle).unwrap();
+    assert!(!offer_starts_negotiation(&low, &low_mgr, &high, offer, &connection_of(&high)).await);
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the offer").await;
+}
+
+/// The same when only the top bit differs: X25519 ignores that bit, so these different
+/// bytes are the identity key's own point.
+#[tokio::test]
+async fn offer_with_the_identity_key_point_in_other_bytes_changes_nothing() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let mut bundle = high_mgr.prekey_bundle().await;
+    let mut point = *high.x25519_public().as_bytes();
+    point[31] ^= 0x80;
+    assert_ne!(point, *high.x25519_public().as_bytes());
+    bundle.signed_prekey = hex::encode(point);
+    let signature = ed25519_dalek::Signer::sign(high.ed25519_signing_key(), &point);
+    bundle.signed_prekey_sig = hex::encode(signature.to_bytes());
+    let offer = serde_json::to_value(&bundle).unwrap();
+    assert!(!offer_starts_negotiation(&low, &low_mgr, &high, offer, &connection_of(&high)).await);
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the offer").await;
+}
+
+/// An init whose identity key is not the connection's Hello key is refused before
+/// anything changes: the session stays and no one-time pre-key is consumed.
+#[tokio::test]
+async fn init_with_an_identity_key_other_than_the_hello_key_changes_nothing() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let held = high_mgr.prekey_bundle().await.one_time_prekey_id;
+    let other = Arc::new(NodeIdentity::generate().unwrap().1);
+    let init = SessionManager::new(Arc::clone(&other))
+        .initiate_session(high.node_id(), &high_mgr.prekey_bundle().await)
+        .await
+        .unwrap();
+    let init = serde_json::to_value(&init).unwrap();
+    for (label, connection) in [("the sender's key", connection_of(&low)), ("no key", no_hello_connection())] {
+        assert!(!init_accepted(&low, &high_mgr, init.clone(), &connection).await, "{label}");
+        assert_eq!(high_mgr.prekey_bundle().await.one_time_prekey_id, held, "{label}: no pre-key consumed");
+        assert_session_works(&low, &low_mgr, &high, &high_mgr, label).await;
+    }
+    assert!(init_accepted(&low, &high_mgr, init, &connection_of(&other)).await, "the same init from its own key");
+}
+
+/// Bundles and inits as nodes without these checks already send them pass, with and
+/// without a one-time pre-key. The field list pins the shape on the wire.
+#[tokio::test]
+async fn honest_bundles_and_inits_pass_the_checks() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let bundle = serde_json::to_value(high_mgr.prekey_bundle().await).unwrap();
+    let mut fields: Vec<&str> = bundle.as_object().unwrap().keys().map(String::as_str).collect();
+    fields.sort();
+    assert_eq!(fields, ["identity_key", "node_id", "one_time_prekey", "one_time_prekey_id", "signed_prekey", "signed_prekey_sig"]);
+    let mut without_prekey = bundle.clone();
+    without_prekey["one_time_prekey"] = serde_json::Value::Null;
+    without_prekey["one_time_prekey_id"] = serde_json::Value::Null;
+    assert!(offer_starts_negotiation(&low, &low_mgr, &high, without_prekey, &connection_of(&high)).await);
+    assert!(offer_starts_negotiation(&low, &low_mgr, &high, bundle.clone(), &connection_of(&high)).await);
+
+    let init = SessionManager::new(Arc::clone(&low))
+        .initiate_session(high.node_id(), &serde_json::from_value(bundle).unwrap())
+        .await
+        .unwrap();
+    assert!(init_accepted(&low, &high_mgr, serde_json::to_value(&init).unwrap(), &connection_of(&low)).await);
+}
+
+/// A responder restored from storage has new prekeys under new ids. An init built on
+/// its earlier bundle names an id it does not hold, so it is refused and the restored
+/// session stays. With ids restarting from the same point, it would have been accepted
+/// on keys the initiator does not share.
+#[tokio::test]
+async fn restored_responder_refuses_an_init_from_an_older_boot() {
+    use crate::flaky_session_store::FlakySessionStore;
+    let (a, b) = (Arc::new(NodeIdentity::generate().unwrap().1), Arc::new(NodeIdentity::generate().unwrap().1));
+    let (low, high) = if a.node_id().as_bytes() < b.node_id().as_bytes() { (a, b) } else { (b, a) };
+    let store = Arc::new(FlakySessionStore::default());
+    let low_mgr = SessionManager::new(Arc::clone(&low));
+    let high_mgr = SessionManager::with_store(Arc::clone(&high), store.clone());
+    let init = low_mgr.initiate_session(high.node_id(), &high_mgr.prekey_bundle().await).await.unwrap();
+    high_mgr.accept_session(low.node_id(), &init).await.unwrap();
+    let first = low_mgr.encrypt(high.node_id(), b"ratchet-init").await.unwrap();
+    high_mgr.decrypt(low.node_id(), &first).await.unwrap();
+    let older_boot = high_mgr.prekey_bundle().await;
+    assert!(older_boot.one_time_prekey_id.is_some());
+
+    let restored = SessionManager::with_store(Arc::clone(&high), store);
+    assert_eq!(restored.restore_sessions().await, 1);
+    let init = SessionManager::new(Arc::clone(&low)).initiate_session(high.node_id(), &older_boot).await.unwrap();
+    assert!(!init_accepted(&low, &restored, serde_json::to_value(&init).unwrap(), &connection_of(&low)).await);
+    assert_session_works(&low, &low_mgr, &high, &restored, "after the older init").await;
 }

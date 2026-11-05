@@ -207,22 +207,29 @@ impl SessionManager {
     ///
     /// Generates an initial signed pre-key and a batch of one-time pre-keys.
     pub fn new(identity: Arc<NodeIdentity>) -> Self {
+        Self::with_optional_store(identity, None)
+    }
+
+    /// One-time pre-keys live in memory, so each boot makes new ones. Their ids start
+    /// at a random point per boot, so an init naming an id not held this boot is refused
+    /// instead of deriving a secret the initiator does not share. This reduces collisions:
+    /// an id can still repeat across boots, and an init naming no id is unaffected. It
+    /// does not show that a bundle is fresh.
+    fn with_optional_store(identity: Arc<NodeIdentity>, store: Option<Arc<dyn SessionStore>>) -> Self {
         let spk = SignedPreKey::generate();
         let session_cipher = Self::derive_session_cipher(&identity);
 
-        // Generate initial batch of one-time pre-keys
-        let mut otpks = Vec::with_capacity(10);
-        for id in 0..10u32 {
-            otpks.push(OneTimePreKey::generate(id));
-        }
+        // Half the id space stays above the base, far more than a boot can use.
+        let base = rand::thread_rng().next_u32() / 2;
+        let otpks = (base..base + 10).map(OneTimePreKey::generate).collect();
 
         Self {
             identity,
             signed_prekey: RwLock::new(spk),
             one_time_prekeys: RwLock::new(otpks),
-            next_opk_id: RwLock::new(10),
+            next_opk_id: RwLock::new(base + 10),
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            store: None,
+            store,
             session_cipher,
         }
     }
@@ -234,23 +241,7 @@ impl SessionManager {
     /// Session state is encrypted at rest using AES-256-GCM with a key
     /// derived from the node identity (Principle 4: no plaintext at any layer).
     pub fn with_store(identity: Arc<NodeIdentity>, store: Arc<dyn SessionStore>) -> Self {
-        let spk = SignedPreKey::generate();
-        let session_cipher = Self::derive_session_cipher(&identity);
-
-        let mut otpks = Vec::with_capacity(10);
-        for id in 0..10u32 {
-            otpks.push(OneTimePreKey::generate(id));
-        }
-
-        Self {
-            identity,
-            signed_prekey: RwLock::new(spk),
-            one_time_prekeys: RwLock::new(otpks),
-            next_opk_id: RwLock::new(10),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            store: Some(store),
-            session_cipher,
-        }
+        Self::with_optional_store(identity, Some(store))
     }
 
     /// Restore sessions from persistent storage.
@@ -928,6 +919,16 @@ pub fn ratchet_message_from_bytes(data: &[u8]) -> Result<RatchetMessage, Session
     let ciphertext = data[40..].to_vec();
 
     Ok(RatchetMessage { header, ciphertext })
+}
+
+/// Whether two hex-encoded X25519 public keys are the same curve point. Comparing the
+/// bytes is not enough: X25519 ignores the top bit, so different bytes can be one point.
+/// `false` if either does not parse.
+pub fn same_x25519_point(first: &str, second: &str) -> bool {
+    match (parse_x25519_key(first), parse_x25519_key(second)) {
+        (Ok(first), Ok(second)) => first == second,
+        _ => false,
+    }
 }
 
 /// Parse an X25519 public key from hex.
