@@ -585,8 +585,8 @@ struct Pair {
     to_lower: Relay,
     /// Connections the lower id dials go through this one.
     to_higher: Relay,
-    /// The lower id's session is marked, so it runs X3DH on the offer.
-    marked: bool,
+    /// The lower id's session is marked or gone, so it runs X3DH on the offer.
+    must_run_x3dh: bool,
     _ledger: tempfile::TempDir,
 }
 
@@ -618,7 +618,7 @@ async fn ready_pair() -> Pair {
     })
     .await;
 
-    let pair = Pair { higher, lower, to_lower, to_higher, marked: false, _ledger: ledger };
+    let pair = Pair { higher, lower, to_lower, to_higher, must_run_x3dh: false, _ledger: ledger };
     for (from, to, text) in [
         (&pair.higher, &pair.lower, "before the drop, from the higher id"),
         (&pair.lower, &pair.higher, "before the drop, from the lower id"),
@@ -734,8 +734,9 @@ impl Pair {
                         false
                     })
                     .await;
+                    // Written, so on the first connection: the second is still held at the relay.
                     wait_until("the lower id writes its ratchet init", STEP, || async {
-                        lower.logs.count_since(lower_mark, "sending ratchet init") > 0 && !first.frame_sizes().is_empty()
+                        lower.logs.count_since(lower_mark, "ratchet init after the acknowledgement written") > 0
                     })
                     .await;
                 }
@@ -797,10 +798,11 @@ impl Pair {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        // Marked, and it must have run X3DH, or the run proves nothing about that order.
+        // Marked, or with no session, it must have run X3DH, or the run proves nothing
+        // about that order.
         assert!(
-            !self.marked || lower.logs.count_since(lower_mark, "X3DH initiated") > 0,
-            "the lower id's session was marked, so it runs X3DH"
+            !self.must_run_x3dh || lower.logs.count_since(lower_mark, "X3DH initiated") > 0,
+            "the lower id's session was marked or absent, so it runs X3DH"
         );
         RaceFacts {
             order,
@@ -915,12 +917,18 @@ fn report(test: &str, facts: &RaceFacts, from_higher: &Delivery, from_lower: &De
     );
 }
 
-/// The forced order must really have happened, or a pass means nothing.
+/// The forced order must really have happened, or a pass means nothing. On the
+/// doomed connection the lower id either ran X3DH, and its init was lost, or left a
+/// healthy session alone; one of the two is logged every time.
 fn assert_race_happened(facts: &RaceFacts) {
     assert!(facts.first_connection_replaced, "{facts:?}");
     assert_eq!(facts.higher_accepted_a_session, 0, "the frame must not be read: {facts:?}");
     assert!(facts.held_write_to_closed_ok.is_some(), "{facts:?}");
     assert!(facts.setup_took < Duration::from_secs(8), "stalled past the cooldown, so this run proves nothing: {facts:?}");
+    assert!(facts.lower_ran_x3dh > 0 || facts.lower_not_acted_on_offer > 0, "the offer was handled one way or the other: {facts:?}");
+    if facts.lower_ran_x3dh > 0 {
+        assert!(!facts.frames_held_from_lower.is_empty(), "the init was written to the connection that closed: {facts:?}");
+    }
 }
 
 async fn race_then_messages(test: &str, order: Order, first: Side) {
@@ -980,6 +988,9 @@ async fn idle_then_probe(test: &str, pair: &Pair, order: Order) {
 /// message is delivered or the bound is up. The lower id says nothing.
 async fn only_the_higher_id_speaks(test: &str, pair: &Pair, order: Order) {
     let facts = pair.force_order(order).await;
+    if order == Order::HigherFirstInitLost {
+        assert_race_happened(&facts);
+    }
     let (higher, lower) = (&pair.higher, &pair.lower);
     let started = tokio::time::Instant::now();
     let paid_before = higher.paid_out().await;
@@ -1034,8 +1045,9 @@ async fn after_the_race_the_sessions_agree_without_any_traffic() {
 /// X3DH on the closing connection whatever rule it applies to a healthy session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn after_the_race_with_no_session_on_the_lower_id_messages_flow() {
-    let pair = ready_pair().await;
+    let mut pair = ready_pair().await;
     assert!(pair.lower.sessions.remove_session(&pair.higher.id).await);
+    pair.must_run_x3dh = true;
     // The lower id's new session is gone with the init, and it has no earlier one that
     // can read the higher id, so what is sent before they agree again is refused.
     run_race("no-session-on-lower", &pair, Order::HigherFirstInitLost, Side::Higher).await;
@@ -1091,7 +1103,7 @@ async fn control_when_the_lower_id_dials_first_messages_flow() {
 async fn marked_pair() -> Pair {
     let mut pair = ready_pair().await;
     pair.lower.sessions.mark_needs_renegotiation(&pair.higher.id).await;
-    pair.marked = true;
+    pair.must_run_x3dh = true;
     pair
 }
 
@@ -1103,6 +1115,12 @@ async fn marked_session_init_lost_higher_speaks_first() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn marked_session_init_lost_lower_speaks_first() {
     run_and_assert("marked-init-lost-lower-first", &marked_pair().await, Order::HigherFirstInitLost, Side::Lower).await;
+}
+
+/// The init is lost and only the higher id sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn marked_session_init_lost_higher_alone() {
+    only_the_higher_id_speaks("marked-init-lost-higher-alone", &marked_pair().await, Order::HigherFirstInitLost).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
