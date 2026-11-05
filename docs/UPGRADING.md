@@ -6,8 +6,9 @@ retained data directory without re-running `konsensus init`.
 ## rc21 → rc22
 
 An E2EE send now saves its advanced send chain before the ciphertext leaves the
-session; if the save fails, nothing is sent (#519). There are no new SQL
-migrations or pairing-store or peer-store schema version changes since rc21;
+session; if the save fails, nothing is sent (#519). Session setup applies
+stricter consistency checks to the keys it receives (#520). File sends report
+the routing fee actually paid (#521). There are no new SQL migrations or pairing-store or peer-store schema version changes since rc21;
 pairing storage remains **v8**, and stored session state keeps its format.
 Retain the latest data directory, config and encrypted seed; do not re-run
 `init` or restore a historical snapshot. Existing rollback constraints still
@@ -23,9 +24,24 @@ in the same call stays settled and is reported as paid, with the same reason.
 In a room or calendar fan-out, that recipient is skipped and nothing is paid to
 it. When this reason appears, check disk and database health.
 
-The diff from rc21 changes no frame, envelope, ratchet message or session
-handshake format, so rc21 and rc22 interoperate on that evidence. A mixed rc21
-and rc22 pair has not been run, and neither has a rollback from rc22 to rc21.
+An rc22 node refuses a prekey bundle or session init that fails the stricter
+checks. It logs a warning and adds no reply frame, so that peer gets no new
+session from it. If a session with a contact does not form after the upgrade,
+read the node log.
+
+`POST /api/v1/files/:id/send` now returns optional `fee_paid_msat`. It is omitted
+when any component fee is unknown and on backends other than LDK; absence does
+not mean zero.
+
+The diff from rc21 changes no frame, envelope, ratchet message, prekey bundle or
+session init format. One-time prekey id values change; the field and its type do
+not. From the source, the bundles and inits an rc21 node builds pass the stricter
+checks, so rc21 and rc22 should interoperate. That reading comes from the source,
+not from running them together.
+
+Mixed rc21 and rc22 operation: not yet recorded.
+
+Rollback from rc22 to rc21: not yet recorded.
 
 Not included: call cutoff is not yet verified on real hardware, and this release
 does not fix the other open reports.
