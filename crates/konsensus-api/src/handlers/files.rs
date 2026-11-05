@@ -535,9 +535,9 @@ async fn send_file_inner(
         .await
         .map_err(|e| {
             debit.released(&peer_key);
-            ApiError::BadRequest(format!(
+            ApiError::from_encrypt_failure(e, |e| ApiError::BadRequest(format!(
                 "E2EE encryption failed (session may not be established): {e}"
-            ))
+            )))
         })?;
     let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
