@@ -5,14 +5,22 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
-- An E2EE send now saves its advanced send chain before the ciphertext leaves the
-  session. If the save fails, the ciphertext is withheld and the chain put back,
-  so a restart cannot reuse a message key. Saves and deletes of session state now
-  run to completion under the session lock even if the request that started them
-  goes away, so an older write cannot land on a newer one. The send is refused with
+## [0.3.0-rc22] — 2026-11-05
+
+- An E2EE send now saves its advanced send chain before the ciphertext leaves
+  the session; if the save fails, nothing is sent. The send is refused with
   `not_dispatched`, reason `session_save_failed`, before any payment for it. An
-  admission already settled in the same call stays settled and is reported as paid,
-  with the same reason.
+  admission already settled in the same call stays settled and is reported as
+  paid, with the same reason. Saves and deletes of session state now run to
+  completion under the session lock even if the request that started them goes
+  away (#519).
+- Docs now say what encryption covers today: message content and call audio are
+  encrypted between nodes, and either node can read them. Encryption that
+  reaches the app is planned (#512).
+- RUSTSEC-2026-0429 is waived in the audit, deny and OSV configs for the
+  test-only `zip` 0.6.6, which is absent from the shipped binary (#505).
+- Not included: call cutoff is not yet verified on real hardware, and this
+  release does not fix the other open reports.
 
 ## [0.3.0-rc21] — 2026-11-01
 

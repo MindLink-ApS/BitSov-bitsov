@@ -3,6 +3,35 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## rc21 → rc22
+
+An E2EE send now saves its advanced send chain before the ciphertext leaves the
+session; if the save fails, nothing is sent (#519). There are no new SQL
+migrations or pairing-store or peer-store schema version changes since rc21;
+pairing storage remains **v8**, and stored session state keeps its format.
+Retain the latest data directory, config and encrypted seed; do not re-run
+`init` or restore a historical snapshot. Existing rollback constraints still
+apply. This change does not extend to a database restored from an older copy.
+
+Operators stop BitSov, switch its binary and restart with the same config and
+data. No config change or grant re-issue is needed. A node running rc20 follows
+[rc20 → rc21](#rc20--rc21) too.
+
+A send the node cannot save is now refused with `not_dispatched`, reason
+`session_save_failed`, before any payment for it. An admission already settled
+in the same call stays settled and is reported as paid, with the same reason.
+In a room or calendar fan-out, that recipient is skipped and nothing is paid to
+it. When this reason appears, check disk and database health.
+
+The diff from rc21 changes no frame, envelope, ratchet message or session
+handshake format, so rc21 and rc22 interoperate on that evidence. A mixed rc21
+and rc22 pair has not been run, and neither has a rollback from rc22 to rc21.
+
+Not included: call cutoff is not yet verified on real hardware, and this release
+does not fix the other open reports.
+
+Follow the [rc22 signing and node checklist](releases/v0.3.0-rc22.md).
+
 ## rc20 → rc21
 
 rc21 fixes app-grant call spending and closing signals (#493, #498). There
