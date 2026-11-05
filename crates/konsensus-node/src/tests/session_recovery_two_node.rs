@@ -143,11 +143,12 @@ async fn a_reconnect_finds_sessions_that_disagree_with_nobody_sending() {
     assert!(net.payee.sessions.preview_decrypt(&payer, &unreadable).await.is_err());
     assert!(!net.payer.sessions.needs_renegotiation(&payee).await, "nothing has found them yet");
     let paid = (net.payer.paid_out().await.len(), net.payee.paid_out().await.len());
+    let before = now_ms();
 
     net.flap().await;
     wait_until("the sides agree again", HIGHER_ID_RECOVERY_BOUND, || async {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        sessions_read_each_other(&net).await
+        net.payer.sessions.session_newer_than(&payee, before).await && sessions_read_each_other(&net).await
     })
     .await;
     assert_eq!((net.payer.paid_out().await.len(), net.payee.paid_out().await.len()), paid, "nothing was paid");
@@ -164,6 +165,7 @@ async fn a_message_under_a_replaced_session_is_read_and_the_sides_agree_again() 
     net.payee.sessions.reinitiate_session(&payer, &net.payer.sessions.prekey_bundle().await).await.unwrap();
     assert!(net.payee.sessions.confirm_session(&payer).await);
     let paid = net.payer.paid_out().await.len();
+    let before = now_ms();
 
     let (status, body) = net.payer.compose(&payee, "under the replaced session").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -173,11 +175,15 @@ async fn a_message_under_a_replaced_session_is_read_and_the_sides_agree_again() 
 
     wait_until("the sides agree again", HIGHER_ID_RECOVERY_BOUND, || async {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        sessions_read_each_other(&net).await
+        net.payer.sessions.session_newer_than(&payee, before).await && sessions_read_each_other(&net).await
     })
     .await;
     assert_messages_go_each_way(&net).await;
     net.stop();
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
 /// The lower id moves to a session the higher id never saw, with no earlier one kept.

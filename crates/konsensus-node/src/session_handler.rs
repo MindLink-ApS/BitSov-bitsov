@@ -2351,3 +2351,6 @@ mod budgeted_reconnect_two_node;
 mod paid_first_contact_two_node;
 
 
+#[cfg(test)]
+#[path = "tests/session_race_two_node.rs"]
+mod session_race_two_node;
