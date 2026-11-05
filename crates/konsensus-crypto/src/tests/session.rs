@@ -1029,3 +1029,200 @@ async fn a_readable_message_clears_the_mark_and_confirmation_is_reported() {
     assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"readable");
     assert!(!mgr_b.needs_renegotiation(&node_a).await);
 }
+
+/// A store whose saves fail on demand.
+#[derive(Default)]
+struct FlakyStore {
+    data: tokio::sync::RwLock<HashMap<NodeId, Vec<u8>>>,
+    fail: std::sync::atomic::AtomicBool,
+    /// When set, every second save fails.
+    alternate: std::sync::atomic::AtomicBool,
+    saves: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SessionStore for FlakyStore {
+    async fn save_session(&self, peer_id: &NodeId, state_json: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let save = self.saves.fetch_add(1, SeqCst);
+        // Saves take time, so that a send racing this one has a chance to interleave.
+        tokio::task::yield_now().await;
+        if self.fail.load(SeqCst) || (self.alternate.load(SeqCst) && save.is_multiple_of(2)) {
+            return Err("test: disk full".into());
+        }
+        self.data.write().await.insert(*peer_id, state_json.to_vec());
+        Ok(())
+    }
+    async fn load_session(&self, peer_id: &NodeId) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.data.read().await.get(peer_id).cloned())
+    }
+    async fn delete_session(&self, peer_id: &NodeId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.data.write().await.remove(peer_id);
+        Ok(())
+    }
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.data.read().await.keys().copied().collect())
+    }
+}
+
+/// A sender with a store and a receiver holding the matching session.
+async fn saving_sender() -> (Arc<NodeIdentity>, Arc<FlakyStore>, SessionManager, SessionManager, NodeId, NodeId) {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let store = Arc::new(FlakyStore::default());
+    let sender = SessionManager::with_store(Arc::clone(&id_a), store.clone());
+    let receiver = SessionManager::new(id_b);
+    let init = sender.initiate_session(&node_b, &receiver.prekey_bundle().await).await.unwrap();
+    receiver.accept_session(&node_a, &init).await.unwrap();
+    (id_a, store, sender, receiver, node_a, node_b)
+}
+
+/// A failed save returns no ciphertext. The chain goes back, so the next send takes
+/// the same position and the receiver sees no gap.
+#[tokio::test]
+async fn failed_save_withholds_the_ciphertext_and_puts_the_chain_back() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (_, store, sender, receiver, node_a, node_b) = saving_sender().await;
+    let first = sender.encrypt(&node_b, b"first").await.unwrap();
+    assert_eq!(receiver.decrypt(&node_a, &first).await.unwrap(), b"first");
+
+    store.fail.store(true, SeqCst);
+    assert!(matches!(sender.encrypt(&node_b, b"withheld").await, Err(SessionError::NotPersisted)));
+    assert!(sender.has_session(&node_b).await, "the session stays");
+
+    store.fail.store(false, SeqCst);
+    let next = sender.encrypt(&node_b, b"next").await.unwrap();
+    assert_eq!(next.header.message_number, first.header.message_number + 1, "the chain was put back");
+    assert_eq!(receiver.decrypt(&node_a, &next).await.unwrap(), b"next");
+}
+
+/// Failed save, then a restart: nothing that left is sent again under the same key
+/// and nonce. Before this fix the failed send left anyway, and the restored chain
+/// then used its position again for a different plaintext.
+#[tokio::test]
+async fn failed_save_then_restart_repeats_no_key_and_nonce() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (id_a, store, sender, receiver, node_a, node_b) = saving_sender().await;
+    let mut released = vec![sender.encrypt(&node_b, b"saved").await.unwrap()];
+
+    store.fail.store(true, SeqCst);
+    if let Ok(message) = sender.encrypt(&node_b, b"not saved").await {
+        released.push(message);
+    }
+    store.fail.store(false, SeqCst);
+    drop(sender);
+
+    let restarted = SessionManager::with_store(id_a, store.clone());
+    assert_eq!(restarted.restore_sessions().await, 1);
+    released.push(restarted.encrypt(&node_b, b"after the restart").await.unwrap());
+
+    // Key and nonce both derive from the chain position, so one position must never
+    // carry two messages.
+    let mut positions: Vec<_> = released.iter().map(|m| (m.header.dh_public, m.header.message_number)).collect();
+    positions.sort();
+    positions.dedup();
+    assert_eq!(positions.len(), released.len(), "a chain position was used twice");
+    let texts: Vec<&[u8]> = vec![b"saved", b"after the restart"];
+    for (message, text) in released.iter().zip(texts) {
+        assert_eq!(receiver.decrypt(&node_a, message).await.unwrap(), text);
+    }
+}
+
+/// Sends racing a failing save never build on a chain that is then put back: every
+/// ciphertext that left has its own position and reads at the receiver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_sends_with_failing_saves_never_share_a_position() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (_, store, sender, receiver, node_a, node_b) = saving_sender().await;
+    let sender = Arc::new(sender);
+    store.alternate.store(true, SeqCst);
+    let mut tasks = Vec::new();
+    for n in 0..64u8 {
+        let (sender, node_b) = (Arc::clone(&sender), node_b);
+        tasks.push(tokio::spawn(async move { sender.encrypt(&node_b, &[n]).await }));
+    }
+    let mut released = Vec::new();
+    for task in tasks {
+        if let Ok(message) = task.await.unwrap() {
+            released.push(message);
+        }
+    }
+    assert!(!released.is_empty() && released.len() < 64, "some saves failed: {}", released.len());
+    released.sort_by_key(|m| m.header.message_number);
+    let numbers: Vec<u32> = released.iter().map(|m| m.header.message_number).collect();
+    assert_eq!(numbers, (0..released.len() as u32).collect::<Vec<_>>(), "no gaps and no repeats");
+    for message in &released {
+        receiver.decrypt(&node_a, message).await.unwrap();
+    }
+}
+
+/// Receiving keeps its existing rule: a failed save does not refuse a readable
+/// message, so a paid envelope is not burned for that alone.
+#[tokio::test]
+async fn failed_save_does_not_refuse_a_readable_message() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let store = Arc::new(FlakyStore::default());
+    let sender = SessionManager::new(id_a);
+    let receiver = SessionManager::with_store(id_b, store.clone());
+    let init = sender.initiate_session(&node_b, &receiver.prekey_bundle().await).await.unwrap();
+    receiver.accept_session(&node_a, &init).await.unwrap();
+    store.fail.store(true, SeqCst);
+    let message = sender.encrypt(&node_b, b"readable").await.unwrap();
+    assert_eq!(receiver.decrypt(&node_a, &message).await.unwrap(), b"readable");
+}
+
+/// Each boot starts its one-time pre-key ids at its own random point, and they count
+/// up from there.
+#[tokio::test]
+async fn prekey_ids_start_at_a_random_point_per_boot() {
+    let identity = make_identity(TEST_MNEMONIC_A);
+    let mut starts = Vec::new();
+    for _ in 0..4 {
+        let manager = SessionManager::new(Arc::clone(&identity));
+        starts.push(manager.prekey_bundle().await.one_time_prekey_id.unwrap());
+    }
+    let with_store = SessionManager::with_store(Arc::clone(&identity), MemorySessionStore::new());
+    starts.push(with_store.prekey_bundle().await.one_time_prekey_id.unwrap());
+    let mut distinct = starts.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), starts.len(), "every boot picks its own: {starts:?}");
+}
+
+/// A ratchet failure during a send leaves the chain as it was, with a store and
+/// without one, so the next send takes the same position.
+#[tokio::test]
+async fn failed_aead_leaves_the_chain_as_it_was() {
+    let (_, _store, sender, receiver, node_a, node_b) = saving_sender().await;
+    let plain_sender = SessionManager::new(make_identity(TEST_MNEMONIC_A));
+    let plain_receiver = SessionManager::new(make_identity(TEST_MNEMONIC_B));
+    let init = plain_sender.initiate_session(&node_b, &plain_receiver.prekey_bundle().await).await.unwrap();
+    plain_receiver.accept_session(&node_a, &init).await.unwrap();
+
+    // Without a store this runs on this task's thread, where the failure is armed.
+    crate::double_ratchet::FAIL_NEXT_AEAD_ENCRYPT.with(|fail| fail.set(true));
+    assert!(plain_sender.encrypt(&node_b, b"fails").await.is_err());
+    let message = plain_sender.encrypt(&node_b, b"next").await.unwrap();
+    assert_eq!(message.header.message_number, 0, "the chain did not advance");
+    assert_eq!(plain_receiver.decrypt(&node_a, &message).await.unwrap(), b"next");
+
+    let message = sender.encrypt(&node_b, b"with a store").await.unwrap();
+    assert_eq!(receiver.decrypt(&node_a, &message).await.unwrap(), b"with a store");
+}
+
+/// One point in different bytes compares equal; different points and bad hex do not.
+#[test]
+fn same_x25519_point_ignores_the_top_bit_only() {
+    let key = [7u8; 32];
+    let mut top_bit = key;
+    top_bit[31] ^= 0x80;
+    assert!(same_x25519_point(&hex::encode(key), &hex::encode(top_bit)));
+    let mut other = key;
+    other[0] ^= 0x01;
+    assert!(!same_x25519_point(&hex::encode(key), &hex::encode(other)));
+    assert!(!same_x25519_point(&hex::encode(key), "not hex"));
+}

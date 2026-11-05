@@ -519,6 +519,38 @@ async fn late_settlement(resume: bool) {
     }
 }
 
+/// A call block whose send chain could not be saved is refused with nothing paid and
+/// nothing drawn from the hold, and the same block goes through once saves work.
+#[tokio::test]
+async fn failed_save_of_a_block_returns_the_draw_and_the_same_block_can_be_paid() {
+    let (mut fx, token) = prepared().await;
+    assert_eq!(send(&fx, &token, 400, 7000, 0).await.0, StatusCode::OK);
+    answer(&fx).await;
+    let store = Arc::new(FlakySessionStore::default());
+    let sessions = Arc::new(konsensus_crypto::SessionManager::with_store(fx.state.identity.clone(), store.clone()));
+    let (_, far_end) = konsensus_core::identity::NodeIdentity::generate().unwrap();
+    let far_end = konsensus_crypto::SessionManager::new(Arc::new(far_end));
+    sessions.initiate_session(&fx.peer, &far_end.prekey_bundle().await).await.unwrap();
+    fx.state = Arc::new(AppState { session_manager: sessions, ..(*fx.state).clone() });
+    let (money, used) = (fx.wallet.money(), fx.used());
+
+    store.fail_all(true);
+    let (status, body) = send(&fx, &token, 404, 7000, 0).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "not_dispatched", "{body}");
+    assert_eq!(body["reason"], "session_save_failed", "{body}");
+    assert_eq!((fx.wallet.money(), fx.used()), (money, used), "nothing paid, nothing more charged");
+    let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+    assert_eq!((hold.spent_msat, hold.closed), (0, false), "the hold is untouched");
+
+    store.fail_all(false);
+    let (status, body) = send(&fx, &token, 404, 7000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.wallet.money(), money + 1);
+    let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+    assert_eq!(hold.spent_msat, 7000);
+}
+
 #[tokio::test]
 async fn invoice_refused_near_deadline_returns_the_draw_without_spending() {
     let (mut fx, token) = prepared().await;

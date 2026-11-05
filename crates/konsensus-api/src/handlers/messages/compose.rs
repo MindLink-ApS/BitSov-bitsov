@@ -468,7 +468,7 @@ pub(crate) struct Readmission {
 }
 
 impl Readmission {
-    fn fee_paid_msat(&self) -> Option<u64> {
+    pub(crate) fn fee_paid_msat(&self) -> Option<u64> {
         if self.paid_msat().is_none() { Some(0) } else { *self.fee_paid_msat.lock().unwrap_or_else(|e| e.into_inner()) }
     }
     pub(crate) fn fee_ceiling_msat(&self) -> u64 {
@@ -3075,6 +3075,10 @@ async fn compose_room_member(
     // Encrypt via Double Ratchet for this specific member.
     let ratchet_msg = match state.session_manager.encrypt(&member, ctx.plaintext.as_bytes()).await {
         Ok(msg) => msg,
+        Err(konsensus_crypto::SessionError::NotPersisted) => {
+            tracing::warn!(peer = %member, "skipping room member: session state could not be saved");
+            return RoomMemberOutcome::stopped(member, "refused", 0, "session state could not be saved; nothing paid to this member".into());
+        }
         Err(e) => {
             tracing::warn!(
                 peer = %member,
@@ -3787,9 +3791,9 @@ pub(super) async fn compose_peer(
                 let no_session = !state.session_manager.has_session(&peer_id).await;
                 let connected = state.transport.is_connected(&peer_id).await;
                 if !(first_contact && no_session && connected) {
-                    return Err(ApiError::BadRequest(format!(
+                    return Err(ApiError::from_encrypt_failure(e, |e| ApiError::BadRequest(format!(
                         "E2EE encryption failed (session may not be established): {e}"
-                    )));
+                    ))));
                 }
 
                 tracing::info!(
@@ -3843,10 +3847,12 @@ pub(super) async fn compose_peer(
                     .encrypt(&peer_id, req.plaintext.as_bytes())
                     .await
                     .map_err(|e| {
-                        ApiError::BadRequest(format!(
+                        // Reported through `admission.error` below, which keeps a
+                        // settled admission as paid.
+                        ApiError::from_encrypt_failure(e, |e| ApiError::BadRequest(format!(
                             "E2EE encryption failed after admission (session may not be \
                              established): {e}"
-                        ))
+                        )))
                     })?
             }
         };
@@ -3976,6 +3982,9 @@ pub(super) async fn compose_peer(
             readmission_msat: readmission.paid_msat(),
         }))
         }.await;
+        // Told apart here: `admission.error` turns this into the settled class below,
+        // which the debit handling matches on, so its reason goes back on afterwards.
+        let save_failed = matches!(&result, Err(error) if error.is_session_save_failure());
         let result = result.map_err(|error| admission.error(error));
         match &result {
             Ok(response) => debit.settled(&peer_key, response.0.amount_msat),
@@ -3986,7 +3995,10 @@ pub(super) async fn compose_peer(
             Err(_) => debit.released(&peer_key),
         }
         let message_msat = admission.message_authorized.unwrap_or(price_msat);
-        result.map_err(|e| e.with_routing_fee(debit.fee_limit(&state, message_msat).saturating_add(admission.fee_ceiling_msat)))
+        result.map_err(|e| {
+            let e = if save_failed && !e.is_session_save_failure() { e.with_reason(crate::error::SESSION_SAVE_FAILED) } else { e };
+            e.with_routing_fee(debit.fee_limit(&state, message_msat).saturating_add(admission.fee_ceiling_msat))
+        })
 }
 
 #[cfg(test)]

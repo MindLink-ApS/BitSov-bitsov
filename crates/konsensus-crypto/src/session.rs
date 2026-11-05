@@ -62,6 +62,11 @@ pub enum SessionError {
     /// Invalid peer data.
     #[error("invalid peer data: {0}")]
     InvalidPeerData(String),
+
+    /// The advanced send chain could not be saved, so its ciphertext was withheld
+    /// and the chain put back. Nothing left this node for that plaintext.
+    #[error("session state could not be saved; the ciphertext was withheld")]
+    NotPersisted,
 }
 
 /// Data sent from initiator to responder to establish an E2EE session.
@@ -209,8 +214,9 @@ pub struct SessionManager {
     one_time_prekeys: RwLock<Vec<OneTimePreKey>>,
     /// Next OPK ID counter.
     next_opk_id: RwLock<u32>,
-    /// Active sessions keyed by peer NodeId.
-    sessions: RwLock<HashMap<NodeId, PeerSession>>,
+    /// Active sessions keyed by peer NodeId. Shared with the detached tasks that save
+    /// them; see [`Self::encrypt`].
+    sessions: Arc<RwLock<HashMap<NodeId, PeerSession>>>,
     /// Optional persistent session store.
     store: Option<Arc<dyn SessionStore>>,
     /// AES-256-GCM cipher for encrypting session state at rest.
@@ -230,22 +236,29 @@ impl SessionManager {
     ///
     /// Generates an initial signed pre-key and a batch of one-time pre-keys.
     pub fn new(identity: Arc<NodeIdentity>) -> Self {
+        Self::with_optional_store(identity, None)
+    }
+
+    /// One-time pre-keys live in memory, so each boot makes new ones. Their ids start
+    /// at a random point per boot, so an init naming an id not held this boot is refused
+    /// instead of deriving a secret the initiator does not share. This reduces collisions:
+    /// an id can still repeat across boots, and an init naming no id is unaffected. It
+    /// does not show that a bundle is fresh.
+    fn with_optional_store(identity: Arc<NodeIdentity>, store: Option<Arc<dyn SessionStore>>) -> Self {
         let spk = SignedPreKey::generate();
         let session_cipher = Self::derive_session_cipher(&identity);
 
-        // Generate initial batch of one-time pre-keys
-        let mut otpks = Vec::with_capacity(10);
-        for id in 0..10u32 {
-            otpks.push(OneTimePreKey::generate(id));
-        }
+        // Half the id space stays above the base, far more than a boot can use.
+        let base = rand::thread_rng().next_u32() / 2;
+        let otpks = (base..base + 10).map(OneTimePreKey::generate).collect();
 
         Self {
             identity,
             signed_prekey: RwLock::new(spk),
             one_time_prekeys: RwLock::new(otpks),
-            next_opk_id: RwLock::new(10),
-            sessions: RwLock::new(HashMap::new()),
-            store: None,
+            next_opk_id: RwLock::new(base + 10),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            store,
             session_cipher,
         }
     }
@@ -257,23 +270,7 @@ impl SessionManager {
     /// Session state is encrypted at rest using AES-256-GCM with a key
     /// derived from the node identity (Principle 4: no plaintext at any layer).
     pub fn with_store(identity: Arc<NodeIdentity>, store: Arc<dyn SessionStore>) -> Self {
-        let spk = SignedPreKey::generate();
-        let session_cipher = Self::derive_session_cipher(&identity);
-
-        let mut otpks = Vec::with_capacity(10);
-        for id in 0..10u32 {
-            otpks.push(OneTimePreKey::generate(id));
-        }
-
-        Self {
-            identity,
-            signed_prekey: RwLock::new(spk),
-            one_time_prekeys: RwLock::new(otpks),
-            next_opk_id: RwLock::new(10),
-            sessions: RwLock::new(HashMap::new()),
-            store: Some(store),
-            session_cipher,
-        }
+        Self::with_optional_store(identity, Some(store))
     }
 
     /// Restore sessions from persistent storage.
@@ -479,24 +476,6 @@ impl SessionManager {
         }
     }
 
-    /// Encrypt a session state blob with AES-256-GCM.
-    /// Returns nonce (12 bytes) || ciphertext.
-    fn encrypt_session_blob(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-        let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = AesNonce::from_slice(&nonce_bytes);
-
-        let encrypted = self
-            .session_cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|e| format!("session encrypt: {e}"))?;
-
-        let mut result = Vec::with_capacity(12 + encrypted.len());
-        result.extend_from_slice(&nonce_bytes);
-        result.extend_from_slice(&encrypted);
-        Ok(result)
-    }
-
     /// Decrypt a session state blob. Expects nonce (12 bytes) || ciphertext.
     fn decrypt_session_blob(&self, data: &[u8]) -> Result<Vec<u8>, String> {
         if data.len() < 12 {
@@ -514,37 +493,29 @@ impl SessionManager {
     /// Session state is serialized to JSON and then encrypted with AES-256-GCM
     /// before being written to the store (Principle 4: no plaintext at rest).
     /// Errors are logged but don't fail the operation (session state is still
-    /// in memory).
+    /// in memory). Sending does not use this: see [`Self::encrypt`].
+    ///
+    /// Runs like a send: detached, with the session lock held until the store answers.
     async fn persist_session(&self, peer_id: &NodeId) {
-        let store = match &self.store {
-            Some(s) => s,
-            None => return,
-        };
-
-        let sessions = self.sessions.read().await;
-        let session = match sessions.get(peer_id) {
-            Some(s) => s,
-            None => return,
-        };
-
-        let state = session.ratchet.export_state();
-        match serde_json::to_vec(&state) {
-            Ok(json_blob) => {
-                // Encrypt the JSON before persisting (Principle 4)
-                match self.encrypt_session_blob(&json_blob) {
-                    Ok(encrypted_blob) => {
-                        if let Err(e) = store.save_session(peer_id, &encrypted_blob).await {
-                            warn!(peer = %peer_id, error = %e, "failed to persist session state");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(peer = %peer_id, error = %e, "failed to encrypt session state for storage");
+        let Some(store) = self.store.clone() else { return };
+        let (sessions, cipher, peer) = (Arc::clone(&self.sessions), self.session_cipher.clone(), *peer_id);
+        let saved = tokio::spawn(async move {
+            let sessions = sessions.write().await;
+            let Some(session) = sessions.get(&peer) else { return };
+            match session_blob(&cipher, session) {
+                Ok(encrypted_blob) => {
+                    if let Err(e) = store.save_session(&peer, &encrypted_blob).await {
+                        warn!(peer = %peer, error = %e, "failed to persist session state");
                     }
                 }
+                Err(e) => {
+                    warn!(peer = %peer, error = %e, "failed to prepare session state for storage");
+                }
             }
-            Err(e) => {
-                warn!(peer = %peer_id, error = %e, "failed to serialize session state");
-            }
+        })
+        .await;
+        if let Err(e) = saved {
+            warn!(peer = %peer_id, error = %e, "session save task ended early");
         }
     }
 
@@ -825,22 +796,52 @@ impl SessionManager {
     /// Uses the Double Ratchet to derive a per-message key and encrypt.
     /// Returns the ratchet message (header + ciphertext) which should be
     /// placed in the UKM envelope's `ciphertext` field.
+    ///
+    /// The advanced send chain is saved before the ciphertext is returned, so a
+    /// restart can never derive the key of a message that already left. If the save
+    /// fails this returns [`SessionError::NotPersisted`], withholds the ciphertext
+    /// and puts the chain back.
+    ///
+    /// The advance, the save and any roll back run in a detached task that holds the
+    /// session lock until the store answers. A store write can still complete after
+    /// the future that asked for it is dropped, so if this ran in the caller's future,
+    /// a dropped send would free the lock with its write outstanding, and that write
+    /// could land on top of a newer chain. Only one save is ever outstanding this way,
+    /// so saves reach the store in order. If the caller goes away, the chain still
+    /// advances and is saved, its ciphertext is dropped, and the peer sees a gap.
     pub async fn encrypt(
         &self,
         peer_id: &NodeId,
         plaintext: &[u8],
     ) -> Result<RatchetMessage, SessionError> {
-        let msg = {
+        let Some(store) = self.store.clone() else {
             let mut sessions = self.sessions.write().await;
-            let session = sessions
-                .get_mut(peer_id)
-                .ok_or(SessionError::NoSession(*peer_id))?;
-            session.ratchet.encrypt(plaintext)?
+            let session = sessions.get_mut(peer_id).ok_or(SessionError::NoSession(*peer_id))?;
+            return Ok(session.ratchet.encrypt(plaintext)?);
         };
-
-        // Persist updated ratchet state after chain advancement
-        self.persist_session(peer_id).await;
-        Ok(msg)
+        let (sessions, cipher, peer, plaintext) =
+            (Arc::clone(&self.sessions), self.session_cipher.clone(), *peer_id, plaintext.to_vec());
+        tokio::spawn(async move {
+            let mut sessions = sessions.write().await;
+            let session = sessions.get_mut(&peer).ok_or(SessionError::NoSession(peer))?;
+            let before = session.ratchet.export_state();
+            let msg = session.ratchet.encrypt(&plaintext)?;
+            let saved = match session_blob(&cipher, session) {
+                Ok(blob) => store.save_session(&peer, &blob).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = saved {
+                warn!(peer = %peer, error = %e, "send chain not saved; ciphertext withheld");
+                session.ratchet = DoubleRatchet::from_state(&before);
+                return Err(SessionError::NotPersisted);
+            }
+            Ok(msg)
+        })
+        .await
+        .map_err(|e| {
+            warn!(peer = %peer_id, error = %e, "session save task ended early");
+            SessionError::NotPersisted
+        })?
     }
 
     /// Inspect a payment-validated payload before application admission without
@@ -950,16 +951,23 @@ impl SessionManager {
     }
 
     /// Remove a session with a peer (e.g., on disconnect or key rotation).
+    ///
+    /// Runs like a send: detached, with the session lock held until the store answers,
+    /// so a delete can never land on top of a newer session.
     pub async fn remove_session(&self, peer_id: &NodeId) -> bool {
-        let removed = self.sessions.write().await.remove(peer_id).is_some();
-        if removed {
-            if let Some(store) = &self.store {
-                if let Err(e) = store.delete_session(peer_id).await {
-                    warn!(peer = %peer_id, error = %e, "failed to delete stored session");
+        let (sessions, store, peer) = (Arc::clone(&self.sessions), self.store.clone(), *peer_id);
+        tokio::spawn(async move {
+            let mut sessions = sessions.write().await;
+            let removed = sessions.remove(&peer).is_some();
+            if let (true, Some(store)) = (removed, store) {
+                if let Err(e) = store.delete_session(&peer).await {
+                    warn!(peer = %peer, error = %e, "failed to delete stored session");
                 }
             }
-        }
-        removed
+            removed
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Replenish one-time pre-keys when running low.
@@ -974,6 +982,30 @@ impl SessionManager {
             }
         }
     }
+}
+
+/// Encrypt session state for storage: nonce (12 bytes) || ciphertext.
+fn seal_session_blob(cipher: &Aes256Gcm, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = AesNonce::from_slice(&nonce_bytes);
+
+    let encrypted = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| format!("session encrypt: {e}"))?;
+
+    let mut result = Vec::with_capacity(12 + encrypted.len());
+    result.extend_from_slice(&nonce_bytes);
+    result.extend_from_slice(&encrypted);
+    Ok(result)
+}
+
+/// The encrypted blob that stores a session's current state.
+fn session_blob(cipher: &Aes256Gcm, session: &PeerSession) -> Result<Vec<u8>, String> {
+    let state = session.ratchet.export_state();
+    let json_blob = serde_json::to_vec(&state).map_err(|e| format!("serialize session state: {e}"))?;
+    // Encrypt the JSON before persisting (Principle 4)
+    seal_session_blob(cipher, &json_blob).map_err(|e| format!("encrypt session state: {e}"))
 }
 
 /// Serialize a RatchetMessage to bytes for embedding in a UKM envelope's ciphertext field.
@@ -1002,6 +1034,16 @@ pub fn ratchet_message_from_bytes(data: &[u8]) -> Result<RatchetMessage, Session
     let ciphertext = data[40..].to_vec();
 
     Ok(RatchetMessage { header, ciphertext })
+}
+
+/// Whether two hex-encoded X25519 public keys are the same curve point. Comparing the
+/// bytes is not enough: X25519 ignores the top bit, so different bytes can be one point.
+/// `false` if either does not parse.
+pub fn same_x25519_point(first: &str, second: &str) -> bool {
+    match (parse_x25519_key(first), parse_x25519_key(second)) {
+        (Ok(first), Ok(second)) => first == second,
+        _ => false,
+    }
 }
 
 /// Parse an X25519 public key from hex.

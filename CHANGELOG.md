@@ -29,6 +29,24 @@ also live on the corresponding GitHub pre-release pages.
   decrypts under it to the acceptor. A stale prekey offer the peer refuses, or a
   well-formed init with other keys, changes nothing. No frame or message format
   changes.
+- A prekey bundle or session init whose identity key is not the key that
+  connection's Hello presented is now refused before anything changes, as is a
+  bundle whose signed prekey is the same point as its identity key. One-time
+  prekey ids also start at a random point per boot, so an init naming an id not
+  held this boot is refused. An id can still repeat across boots, and an init with
+  no one-time prekey id is unchanged. This does not show that a bundle is fresh.
+
+- An E2EE send now saves its advanced send chain before the ciphertext leaves the
+  session. If the save fails, the ciphertext is withheld and the chain put back,
+  so a restart cannot reuse a message key. Saves and deletes of session state now
+  run to completion under the session lock even if the request that started them
+  goes away, so an older write cannot land on a newer one. The send is refused with
+  `not_dispatched`, reason `session_save_failed`, before any payment for it. An
+  admission already settled in the same call stays settled and is reported as paid,
+  with the same reason.
+- `POST /api/v1/files/:id/send` now returns optional `fee_paid_msat`, as compose
+  does: the actual routing fee of a settled LDK payment. It is omitted when any
+  component fee is unknown and on other backends.
 
 ## [0.3.0-rc21] — 2026-11-01
 

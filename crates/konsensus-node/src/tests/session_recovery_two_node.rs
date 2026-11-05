@@ -319,7 +319,7 @@ async fn offer_flood_gets_a_rate_limited_answer_and_a_stranger_gets_none() {
     };
     let node = start_node(NodeSpec {
         identity: node_identity, whitelist: vec![*peer_identity.node_id()], ledger: &ledger_path, name: "node",
-        balance_msat: 0, wallet: Wallet::Plain, peer: None, data_dir: None,
+        balance_msat: 0, wallet: Wallet::Plain, peer: None, data_dir: None, session_store: None,
     })
     .await;
     for transport in [&peer_transport, &other_transport] {

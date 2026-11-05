@@ -257,7 +257,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                     }
 
-                    ControlEvent::PrekeyOffer { peer_id, bundle, privileged } => {
+                    ControlEvent::PrekeyOffer { peer_id, bundle, privileged, connection } => {
                         if !privileged {
                             continue;
                         }
@@ -269,21 +269,21 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                         handle_prekey_offer(
                             &peer_id, bundle, our_node_id, &session_manager, &storage,
-                            &transport, &audit_log, &mut last_negotiation, &mut offer_witness,
+                            &transport, &audit_log, &mut last_negotiation, &mut offer_witness, &connection,
                         ).await;
                     }
 
-                    ControlEvent::SessionInit { peer_id, init_data, privileged } => {
+                    ControlEvent::SessionInit { peer_id, init_data, privileged, connection } => {
                         if !privileged {
                             continue;
                         }
                         handle_session_init(
                             &peer_id, init_data, &session_manager, &storage,
-                            &transport, &audit_log, &mut last_negotiation,
+                            &transport, &audit_log, &mut last_negotiation, &connection,
                         ).await;
                     }
 
-                    ControlEvent::SessionAck { peer_id, privileged } => {
+                    ControlEvent::SessionAck { peer_id, privileged, .. } => {
                         if !privileged {
                             continue;
                         }
@@ -292,7 +292,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                     }
 
-                    ControlEvent::RatchetInit { peer_id, payload, privileged } => {
+                    ControlEvent::RatchetInit { peer_id, payload, privileged, .. } => {
                         if !privileged {
                             continue;
                         }
@@ -787,6 +787,7 @@ async fn handle_prekey_offer(
     audit: &Arc<AuditLog>,
     last_negotiation: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
     offer_witness: &mut OfferWitness,
+    connection: &konsensus_message::ConnectionContext,
 ) {
     // Rate-limit session re-negotiation per peer.
     if let Some(last) = last_negotiation.get(peer_id) {
@@ -828,6 +829,14 @@ async fn handle_prekey_offer(
     // would bind the session to keys that are not this peer's.
     if NodeId::from_hex(&peer_bundle.node_id).ok().as_ref() != Some(peer_id) {
         warn!(peer = %peer_id, "prekey bundle names another node; offer ignored");
+        return;
+    }
+    if !key_is_the_hello_key(&peer_bundle.identity_key, connection) {
+        warn!(peer = %peer_id, "prekey bundle identity key is not this connection's; offer ignored");
+        return;
+    }
+    if konsensus_crypto::same_x25519_point(&peer_bundle.signed_prekey, &peer_bundle.identity_key) {
+        warn!(peer = %peer_id, "prekey bundle reuses its identity key as signed prekey; offer ignored");
         return;
     }
 
@@ -881,6 +890,18 @@ async fn handle_prekey_offer(
     let _ = audit;
 }
 
+/// Whether a hex identity key from a bundle or init is the key this connection's
+/// Hello presented. An honest peer puts its own identity key in both places. This
+/// binds the key to the connection only: it does not show the NodeId has used this
+/// key before.
+fn key_is_the_hello_key(hex_key: &str, connection: &konsensus_message::ConnectionContext) -> bool {
+    match (hex::decode(hex_key), connection.hello_key) {
+        (Ok(key), Some(hello_key)) => key == hello_key,
+        _ => false,
+    }
+}
+
+
 /// Offers seen for peers whose session looks healthy. See [`Self::second_spaced_offer`].
 #[derive(Default)]
 struct OfferWitness {
@@ -923,6 +944,7 @@ impl OfferWitness {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_init(
     peer_id: &NodeId,
     init_data: serde_json::Value,
@@ -931,6 +953,7 @@ async fn handle_session_init(
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
     last_negotiation: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
+    connection: &konsensus_message::ConnectionContext,
 ) {
     // Rate-limit session re-negotiation per peer.
     if let Some(last) = last_negotiation.get(peer_id) {
@@ -957,6 +980,11 @@ async fn handle_session_init(
                 return;
             }
         };
+    // Before anything changes: no session replaced, no one-time pre-key consumed.
+    if !key_is_the_hello_key(&init.identity_key, connection) {
+        warn!(peer = %peer_id, "session init identity key is not this connection's; init refused");
+        return;
+    }
 
     let had_session = session_manager.has_session(peer_id).await;
     match session_manager.reaccept_session(peer_id, &init).await {
@@ -1012,6 +1040,11 @@ async fn handle_session_ack(
             if let Err(e) = transport.send_frame(peer_id, &frame).await {
                 warn!(peer = %peer_id, error = %e, "failed to send RatchetInit");
             }
+        }
+        // A disk failure says nothing about the session. It stays; the peer has no
+        // sending chain yet, so its self-heal tick offers again.
+        Err(konsensus_crypto::SessionError::NotPersisted) => {
+            warn!(peer = %peer_id, "ratchet init not sent: session state could not be saved");
         }
         Err(e) => {
             warn!(peer = %peer_id, error = %e, "failed to encrypt ratchet init; asking to renegotiate");
@@ -2256,3 +2289,4 @@ mod budgeted_reconnect_two_node;
 #[cfg(test)]
 #[path = "tests/paid_first_contact_two_node.rs"]
 mod paid_first_contact_two_node;
+
