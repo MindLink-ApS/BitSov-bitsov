@@ -276,6 +276,7 @@ without renewal grace. Restore the rehearsal cap before a five-minute run.
 | `call_price_unknown` | No fresh answer from B for the required tariff. Nothing should be paid; check connection/admission/readiness. |
 | `call_price_above_consent` / `call_hold_above_consent` | The offer exceeds an explicit block-price or whole-hold ceiling. No new hold/payment is dispatched; obtain fresh owner consent before changing terms. |
 | `call_block_unpayable` | Too little time remains to issue a new block invoice safely. No new payment is authorized; reconcile any existing operation. |
+| `session_save_failed` | The node could not save its session state, so this block was not sent and no payment started for it. The hold is untouched and the same block can be asked for again. Check disk and database health. |
 | `call_block_overpayment` | A settled block cannot be served. Preserve the payment receipt and audit evidence for reconciliation; do not treat this as nonpayment. |
 | `call_liquidity_insufficient` / `call_liquidity_unavailable` | Capacity is too small or cannot be established. Resolve liquidity/readiness before dialing. |
 | `budget_exceeded` / `price_cap_exceeded` | Approved limits do not cover the request. Inspect the structured reason and ask the owner for appropriate terms. |

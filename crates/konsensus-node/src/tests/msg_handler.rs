@@ -4657,3 +4657,37 @@ async fn inherited_hold_is_released_before_a_retry_is_acknowledged() {
         net.stop().await;
     }
 }
+
+/// A web reply whose send chain could not be saved does not leave. It costs no
+/// session, and the next reply reads at the requester with no gap.
+#[tokio::test]
+async fn reply_is_not_sent_when_its_save_fails() {
+    use crate::flaky_session_store::FlakySessionStore;
+    use konsensus_core::traits::transport::MessageTransport;
+    let net = receive_loop().await;
+    let store = Arc::new(FlakySessionStore::default());
+    let replier = SessionManager::with_store(net.bob.clone(), store.clone());
+    let requester = SessionManager::new(net.alice.clone());
+    establish_sessions(&replier, &requester, &net.bob, &net.alice).await;
+    let request = net.paid_envelope(konsensus_core::kind::KIND_PAGE_REQUEST, vec![1]).await;
+    let reply = |text: &'static str| {
+        let (replier, target, bob, alice, request) = (&replier, &net.target, &net.bob, &net.alice, &request);
+        async move {
+            send_encrypted_response(alice.node_id(), request, &text, konsensus_core::kind::KIND_PAGE_RESPONSE, bob, replier, target).await;
+        }
+    };
+
+    store.fail(true);
+    reply("withheld").await;
+    let nothing = tokio::time::timeout(std::time::Duration::from_millis(500), net.source.recv()).await;
+    assert!(nothing.is_err(), "nothing left for a failed save");
+    assert!(replier.has_session(net.alice.node_id()).await);
+
+    store.fail(false);
+    reply("sent").await;
+    let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), net.source.recv()).await.unwrap().unwrap();
+    let message = konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext).unwrap();
+    assert_eq!(message.header.message_number, 0, "the withheld reply left no gap");
+    assert_eq!(requester.decrypt(net.bob.node_id(), &message).await.unwrap(), b"\"sent\"");
+    net.stop().await;
+}

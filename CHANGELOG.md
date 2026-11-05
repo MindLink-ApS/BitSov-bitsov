@@ -5,6 +5,14 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- An E2EE send now saves its advanced send chain before the ciphertext leaves the
+  session. If the save fails, the ciphertext is withheld and the chain put back,
+  so a restart cannot reuse a message key. Saves and deletes of session state now
+  run to completion under the session lock even if the request that started them
+  goes away, so an older write cannot land on a newer one. The send is refused with
+  `not_dispatched`, reason `session_save_failed`, before any payment for it. An
+  admission already settled in the same call stays settled and is reported as paid,
+  with the same reason.
 - `POST /api/v1/files/:id/send` now returns optional `fee_paid_msat`, as compose
   does: the actual routing fee of a settled LDK payment. It is omitted when any
   component fee is unknown and on other backends.

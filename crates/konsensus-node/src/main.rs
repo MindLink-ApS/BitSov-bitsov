@@ -15,6 +15,9 @@ mod endpoints;
 mod guarded_lightning;
 mod housekeeping;
 mod invoice_refusals;
+#[cfg(test)]
+#[path = "tests/fixtures/flaky_session_store.rs"]
+mod flaky_session_store;
 #[path = "cli/locked.rs"]
 mod locked_cmd;
 mod logging;
@@ -116,6 +119,10 @@ impl konsensus_crypto::SessionStore for StorageSessionAdapter {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/session_save_durability.rs"]
+mod session_save_durability;
 
 #[tokio::main]
 async fn main() -> Result<()> {

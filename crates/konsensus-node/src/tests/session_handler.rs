@@ -4453,3 +4453,29 @@ async fn call_block_ack_storage_failure_retains_delivery_until_grant_is_durable(
     assert_eq!(paid.paid_until_ms, Some(now + 60_000));
     assert!(updates.try_recv().is_ok());
 }
+
+/// A disk failure while sending the ratchet init costs no session: it is kept with
+/// its chain put back, and the same acknowledgement works once saves do.
+#[tokio::test]
+async fn failed_save_of_the_ratchet_init_keeps_the_session() {
+    use crate::flaky_session_store::FlakySessionStore;
+    let (_, identity) = NodeIdentity::generate().unwrap();
+    let (_, responder) = NodeIdentity::generate().unwrap();
+    let (our_id, peer) = (*identity.node_id(), *responder.node_id());
+    let store = Arc::new(FlakySessionStore::default());
+    let manager = SessionManager::with_store(Arc::new(identity), store.clone());
+    let responder = SessionManager::new(Arc::new(responder));
+    let init = manager.initiate_session(&peer, &responder.prekey_bundle().await).await.unwrap();
+    responder.accept_session(&our_id, &init).await.unwrap();
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+
+    store.fail(true);
+    handle_session_ack(&peer, &manager, &transport, &audit).await;
+    assert!(manager.has_session(&peer).await, "a failed save does not remove the session");
+
+    store.fail(false);
+    let message = manager.encrypt(&peer, b"after the failure").await.unwrap();
+    assert_eq!(message.header.message_number, 0, "the withheld init left no gap");
+    assert_eq!(responder.decrypt(&our_id, &message).await.unwrap(), b"after the failure");
+}
