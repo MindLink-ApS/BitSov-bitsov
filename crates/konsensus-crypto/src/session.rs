@@ -825,6 +825,13 @@ impl SessionManager {
         self.sessions.read().await.get(peer_id).is_some_and(|session| session.unconfirmed.is_some() && session.unconfirmed_initiated)
     }
 
+    /// Whether a newer session with a peer is held aside, either side's, until the
+    /// peer proves it holds it. Until then the two sides can each send, and what the
+    /// acceptor sends is under the session before.
+    pub async fn replacement_pending(&self, peer_id: &NodeId) -> bool {
+        self.sessions.read().await.get(peer_id).is_some_and(|session| session.unconfirmed.is_some())
+    }
+
     /// Record that the peer still needs a `RatchetInit`.
     pub async fn owe_ratchet_init(&self, peer_id: &NodeId) {
         if let Some(session) = self.sessions.write().await.get_mut(peer_id) {

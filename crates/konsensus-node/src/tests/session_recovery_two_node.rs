@@ -26,10 +26,15 @@ async fn ready_pair(order: Order) -> Pair {
     net
 }
 
+/// Both sides can send, and neither holds a newer session aside: the acceptor has
+/// moved over, so what it sends is under the session the initiator uses.
 async fn both_can_send(net: &Pair, within: Duration) {
     let (payer, payee) = (net.payer.id, net.payee.id);
     wait_until("both sides can send", within, || async {
-        net.payer.sessions.can_send(&payee).await && net.payee.sessions.can_send(&payer).await
+        net.payer.sessions.can_send(&payee).await
+            && net.payee.sessions.can_send(&payer).await
+            && !net.payer.sessions.replacement_pending(&payee).await
+            && !net.payee.sessions.replacement_pending(&payer).await
     })
     .await;
 }
@@ -200,7 +205,8 @@ async fn sessions_read_each_other(net: &Pair) -> bool {
     let (payer, payee) = (net.payer.id, net.payee.id);
     if net.payer.sessions.needs_renegotiation(&payee).await
         || net.payee.sessions.needs_renegotiation(&payer).await
-        || net.payee.sessions.replacement_in_flight(&payer).await
+        || net.payer.sessions.replacement_pending(&payee).await
+        || net.payee.sessions.replacement_pending(&payer).await
     {
         return false;
     }
