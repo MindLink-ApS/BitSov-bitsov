@@ -15,7 +15,7 @@ pub mod sqlite;
 pub mod traits;
 pub mod whitelist_backup;
 
-pub use calendar::{CalendarEventRecord, RsvpRecord};
+pub use calendar::{CalendarAdmission, CalendarEventRecord, RsvpRecord};
 pub use contacts::{ContactRepo, ContactRow, PostgresContactRepo, SqliteContactRepo};
 pub use encrypted::EncryptedStorage;
 pub use error::StorageError;

@@ -607,6 +607,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.accept_paid_envelope(&self.encrypt_envelope(envelope)?).await
     }
 
+    async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.inner.accept_held_paid_envelope(&self.encrypt_envelope(envelope)?).await
+    }
+
     async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
         self.inner.update_message_wrapper(envelope).await
     }
@@ -907,6 +911,11 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn reject_accepted_envelope(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
         self.inner.reject_accepted_envelope(envelope).await
+    }
+
+    async fn is_application_rejected(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, StorageError> {
+        // Receipt matching uses immutable metadata, never the at-rest ciphertext.
+        self.inner.is_application_rejected(envelope).await
     }
 
     async fn call_admission_hold(&self, envelope: &konsensus_core::UkmEnvelope, now_ms: u64) -> Result<bool, StorageError> {
@@ -1255,6 +1264,16 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn store_rsvp(&self, record: &RsvpRecord) -> Result<(), StorageError> {
         self.inner.store_rsvp(record).await
+    }
+
+    async fn commit_calendar_admission(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+        admission: &crate::CalendarAdmission,
+    ) -> Result<(), StorageError> {
+        // Calendar rows stay plaintext (as `store_calendar_event`); the envelope
+        // is matched by id and sender only.
+        self.inner.commit_calendar_admission(envelope, admission).await
     }
 
     // ── Operator hosting (pass-through — contract state contains no message plaintext) ─
