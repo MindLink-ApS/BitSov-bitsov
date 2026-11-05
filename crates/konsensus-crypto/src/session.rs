@@ -176,11 +176,48 @@ struct PeerSession {
     /// The peer sent something this session could not read, so the two sides may
     /// disagree. Cleared when a new session is installed or a message decrypts.
     needs_renegotiation: bool,
+    /// The session this one replaced. It only ever reads, see [`RETIRED_SESSION_READS_FOR`].
+    retired: Option<RetiredSession>,
+    /// The peer may still be on the session before this one, so it should get a
+    /// `RatchetInit` under this one: it moves over on the first message that decrypts.
+    ratchet_init_owed: bool,
 }
+
+/// A replaced session, kept in memory only. Never encrypted with and never saved, so
+/// it cannot put a send chain position back in use.
+struct RetiredSession {
+    ratchet: DoubleRatchet,
+    since: std::time::Instant,
+}
+
+/// How long a replaced session can still read. The acceptor moves to a new session
+/// only when a message under it arrives, so until then what it sends is under the
+/// previous one, and a paid envelope is resent as it was encrypted, on a backoff that
+/// grows to an hour. Replacing a session must not make those unreadable.
+const RETIRED_SESSION_READS_FOR: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 impl PeerSession {
     fn new(ratchet: DoubleRatchet, established_at_ms: Option<u64>, awaiting_confirmation: bool) -> Self {
-        Self { ratchet, established_at_ms, unconfirmed: None, unconfirmed_initiated: false, awaiting_confirmation, needs_renegotiation: false }
+        Self {
+            ratchet,
+            established_at_ms,
+            unconfirmed: None,
+            unconfirmed_initiated: false,
+            awaiting_confirmation,
+            needs_renegotiation: false,
+            retired: None,
+            ratchet_init_owed: false,
+        }
+    }
+
+    /// A new session the peer has proven takes over; the one in use only reads now.
+    fn switch_to(&mut self, ratchet: DoubleRatchet) {
+        let previous = std::mem::replace(self, Self::new(ratchet, now_ms(), false));
+        self.retired = Some(RetiredSession { ratchet: previous.ratchet, since: std::time::Instant::now() });
+    }
+
+    fn retired_can_read(&self) -> bool {
+        self.retired.as_ref().is_some_and(|retired| retired.since.elapsed() <= RETIRED_SESSION_READS_FOR)
     }
 }
 
@@ -759,7 +796,7 @@ impl SessionManager {
             let mut sessions = self.sessions.write().await;
             let Some(session) = sessions.get_mut(peer_id) else { return false };
             match session.unconfirmed.take() {
-                Some(ratchet) if session.unconfirmed_initiated => *session = PeerSession::new(ratchet, now_ms(), false),
+                Some(ratchet) if session.unconfirmed_initiated => session.switch_to(ratchet),
                 held => {
                     session.unconfirmed = held;
                     if !session.awaiting_confirmation {
@@ -778,6 +815,34 @@ impl SessionManager {
     pub async fn mark_needs_renegotiation(&self, peer_id: &NodeId) {
         if let Some(session) = self.sessions.write().await.get_mut(peer_id) {
             session.needs_renegotiation = true;
+        }
+    }
+
+    /// Whether we started a replacement of the session with a peer and are waiting for
+    /// its answer. Until then the peer may already be on the replacement, so a message
+    /// under the session in use would tell it nothing.
+    pub async fn replacement_in_flight(&self, peer_id: &NodeId) -> bool {
+        self.sessions.read().await.get(peer_id).is_some_and(|session| session.unconfirmed.is_some() && session.unconfirmed_initiated)
+    }
+
+    /// Record that the peer still needs a `RatchetInit`.
+    pub async fn owe_ratchet_init(&self, peer_id: &NodeId) {
+        if let Some(session) = self.sessions.write().await.get_mut(peer_id) {
+            session.ratchet_init_owed = true;
+        }
+    }
+
+    /// Whether the peer needs a `RatchetInit`; asking clears it.
+    pub async fn take_ratchet_init_owed(&self, peer_id: &NodeId) -> bool {
+        self.sessions.write().await.get_mut(peer_id).is_some_and(|session| std::mem::take(&mut session.ratchet_init_owed))
+    }
+
+    /// Drop replaced sessions that have read for as long as they may.
+    pub async fn expire_retired_sessions(&self) {
+        for session in self.sessions.write().await.values_mut() {
+            if !session.retired_can_read() {
+                session.retired = None;
+            }
         }
     }
 
@@ -852,21 +917,20 @@ impl SessionManager {
         peer_id: &NodeId,
         message: &RatchetMessage,
     ) -> Result<Vec<u8>, SessionError> {
-        let (mut preview, mut unconfirmed) = {
+        let (mut preview, others) = {
             let sessions = self.sessions.read().await;
             let session = sessions.get(peer_id).ok_or(SessionError::NoSession(*peer_id))?;
-            (
-                DoubleRatchet::from_state(&session.ratchet.export_state()),
-                session.unconfirmed.as_ref().map(|ratchet| DoubleRatchet::from_state(&ratchet.export_state())),
-            )
+            let retired = session.retired.as_ref().filter(|_| session.retired_can_read()).map(|retired| &retired.ratchet);
+            let others: Vec<_> = session.unconfirmed.iter().chain(retired).map(DoubleRatchet::export_state).collect();
+            (DoubleRatchet::from_state(&session.ratchet.export_state()), others)
         };
         // Both the snapshots and disposable ratchets zeroize their secrets on drop.
         match preview.decrypt(message) {
             Ok(plaintext) => Ok(plaintext),
-            Err(error) => match unconfirmed.as_mut().map(|ratchet| ratchet.decrypt(message)) {
-                Some(Ok(plaintext)) => Ok(plaintext),
-                _ => Err(error.into()),
-            },
+            Err(error) => others
+                .iter()
+                .find_map(|state| DoubleRatchet::from_state(state).decrypt(message).ok())
+                .ok_or_else(|| error.into()),
         }
     }
 
@@ -896,11 +960,22 @@ impl SessionManager {
                     match promoted {
                         Some(Ok(plaintext)) => {
                             if let Some(ratchet) = session.unconfirmed.take() {
-                                *session = PeerSession::new(ratchet, now_ms(), false);
+                                session.switch_to(ratchet);
                             }
                             plaintext
                         }
-                        _ => return Err(error.into()),
+                        // The peer has not moved to this session yet. Nothing here proves
+                        // the two sides agree, so a mark stays.
+                        _ => {
+                            let can_read = session.retired_can_read();
+                            match session.retired.as_mut().filter(|_| can_read).map(|retired| retired.ratchet.decrypt(message)) {
+                                Some(Ok(plaintext)) => {
+                                    session.ratchet_init_owed = true;
+                                    plaintext
+                                }
+                                _ => return Err(error.into()),
+                            }
+                        }
                     }
                 }
             }

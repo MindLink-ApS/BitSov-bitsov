@@ -14,6 +14,17 @@ also live on the corresponding GitHub pre-release pages.
   confirmed, or on a second offer on the same connection a self-heal tick or more
   after the first. Two stale offers can still start a replacement; closing that
   needs key confirmation, which is separate work.
+- A reconnect now shows whether two E2EE sessions still agree, with nothing paid.
+  The lower-id node sends a `RatchetInit` under the session in use on each new
+  connection, and both nodes send one on a self-heal tick once the connection is ten
+  seconds old. Each takes its own send chain position, saved first. A peer still on
+  the session before moves over on it, which also recovers a `RatchetInit` lost with
+  its connection; a peer that cannot read it asks for a new session. Peers on earlier
+  versions read it like any `RatchetInit`, and drop their session if they cannot. A
+  send chain position is never reused: no frame or message format changes.
+- A replaced E2EE session keeps reading for up to an hour, in memory only, so a paid
+  envelope encrypted under it just before the switch, or resent later, is still read
+  rather than refused.
 - A callee with no readable E2EE session with the caller refuses a call block
   invoice (`call_block_unpayable`, nothing paid), so no minute is paid for a
   session that cannot read it. Messages and other call signals have no such step

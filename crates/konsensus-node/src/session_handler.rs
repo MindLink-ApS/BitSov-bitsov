@@ -190,6 +190,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let mut last_negotiation: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
     let mut offer_witness = OfferWitness::default();
+    let mut connections_checked = ConnectionsChecked::new();
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
@@ -603,6 +604,9 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     last_negotiation.clear();
                 }
                 offer_witness.prune(std::time::Instant::now());
+                if connections_checked.len() > MAX_COOLDOWN_ENTRIES {
+                    connections_checked.clear();
+                }
                 if last_peer_exchange.len() > MAX_COOLDOWN_ENTRIES {
                     warn!(len = last_peer_exchange.len(), cap = MAX_COOLDOWN_ENTRIES, "peer exchange cooldown map exceeded cap, clearing");
                     last_peer_exchange.clear();
@@ -623,6 +627,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     &storage, &ws_delivery_tx, our_node_id,
                 ).await;
                 heal_connected_e2ee_sessions(&session_manager, &transport).await;
+                check_connected_e2ee_sessions(&session_manager, &transport, &last_negotiation, &mut connections_checked).await;
             }
             _ = shutdown_rx.changed() => {
                 info!("session handler shutting down");
@@ -728,6 +733,7 @@ async fn handle_peer_connected(
     if let Err(e) = send_prekey_offer(session_manager, transport, peer_id).await {
         warn!(peer = %peer_id, error = %e, "failed to send prekey offer");
     }
+    check_session_on_connect(session_manager, transport, peer_id, our_node_id).await;
     if let Err(e) = funding_poll::emit_progress_step(
         storage.as_ref(),
         ws_delivery_tx,
@@ -1030,22 +1036,79 @@ async fn handle_session_ack(
     );
 
     // Send a ratchet init message so the acceptor can initialize their sending chain.
+    send_ratchet_init(session_manager, transport, peer_id).await;
+}
+
+/// Send a message under the session in use. Each one takes its own send chain
+/// position, saved before it leaves. The peer moves to this session if it was still
+/// on the one before, gets a sending chain if it had none, and finds out if the two
+/// sides disagree: it cannot read this, so it marks its session and offers.
+///
+/// Nothing acknowledges this frame. It can only go missing with its connection, so
+/// the lower id sends it again on each new one, and a failure here is owed to the
+/// next self-heal tick.
+async fn send_ratchet_init(session_manager: &SessionManager, transport: &Arc<NoiseTransport>, peer_id: &NodeId) {
     match session_manager.encrypt(peer_id, b"ratchet-init").await {
         Ok(ratchet_msg) => {
             let payload = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
             let frame = Frame::RatchetInit { payload };
             if let Err(e) = transport.send_frame(peer_id, &frame).await {
                 warn!(peer = %peer_id, error = %e, "failed to send RatchetInit");
+                session_manager.owe_ratchet_init(peer_id).await;
             }
         }
-        // A disk failure says nothing about the session. It stays; the peer has no
-        // sending chain yet, so its self-heal tick offers again.
+        // A disk failure says nothing about the session. It stays.
         Err(konsensus_crypto::SessionError::NotPersisted) => {
             warn!(peer = %peer_id, "ratchet init not sent: session state could not be saved");
+            session_manager.owe_ratchet_init(peer_id).await;
         }
         Err(e) => {
             warn!(peer = %peer_id, error = %e, "failed to encrypt ratchet init; asking to renegotiate");
             session_manager.mark_needs_renegotiation(peer_id).await;
+        }
+    }
+}
+
+/// A new connection may mean a frame was lost with the old one, and a reconnect no
+/// longer replaces a session, so this is what shows the two sides still agree. The
+/// lower id says so at once, unless it is waiting for the answer to a replacement.
+/// Both sides also check once on the self-heal tick, see [`check_connected_e2ee_sessions`].
+async fn check_session_on_connect(session_manager: &SessionManager, transport: &Arc<NoiseTransport>, peer_id: &NodeId, our_node_id: NodeId) {
+    if our_node_id.as_bytes() < peer_id.as_bytes()
+        && session_manager.can_send(peer_id).await
+        && !session_manager.replacement_in_flight(peer_id).await
+    {
+        send_ratchet_init(session_manager, transport, peer_id).await;
+    }
+}
+
+/// Which connection each peer's session was last checked on, as its `generation`.
+type ConnectionsChecked = std::collections::HashMap<NodeId, std::time::Instant>;
+
+/// On the self-heal tick: send what is owed, and check the session once per connection.
+/// Both wait out the negotiation cooldown, from the connection and from the last
+/// negotiation. A lower id on an earlier version runs X3DH on every connect and replaces
+/// its session at once, so until that has settled a message under the session in use
+/// would look to it like a failure, and it would drop the new session.
+async fn check_connected_e2ee_sessions(
+    session_manager: &SessionManager,
+    transport: &Arc<NoiseTransport>,
+    last_negotiation: &std::collections::HashMap<NodeId, tokio::time::Instant>,
+    checked: &mut ConnectionsChecked,
+) {
+    session_manager.expire_retired_sessions().await;
+    for peer_id in transport.connected_session_peers().await {
+        let Some(since) = transport.connected_since(&peer_id).await else { continue };
+        if since.elapsed() < SESSION_NEGOTIATION_COOLDOWN
+            || last_negotiation.get(&peer_id).is_some_and(|last| last.elapsed() < SESSION_NEGOTIATION_COOLDOWN)
+            || !session_manager.can_send(&peer_id).await
+        {
+            continue;
+        }
+        let owed = session_manager.take_ratchet_init_owed(&peer_id).await;
+        if owed || checked.get(&peer_id) != Some(&since) {
+            checked.insert(peer_id, since);
+            send_ratchet_init(session_manager, transport, &peer_id).await;
         }
     }
 }
@@ -2286,4 +2349,5 @@ mod budgeted_reconnect_two_node;
 #[cfg(test)]
 #[path = "tests/paid_first_contact_two_node.rs"]
 mod paid_first_contact_two_node;
+
 

@@ -4170,6 +4170,8 @@ async fn block_stale_at_its_real_decrypt_does_not_cost_the_new_session() {
     );
     assert_eq!(bob_mgr.preview_decrypt(alice.node_id(), &block).await.unwrap(), b"{}");
 
+    // The session before is gone, so nothing Bob holds can read the block.
+    assert!(bob_mgr.remove_session(alice.node_id()).await);
     let init = bob_mgr.reinitiate_session(alice.node_id(), &alice_mgr.prekey_bundle().await).await.unwrap();
     alice_mgr.reaccept_session(bob.node_id(), &init).await.unwrap();
     assert!(bob_mgr.confirm_session(alice.node_id()).await);

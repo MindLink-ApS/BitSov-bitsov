@@ -101,9 +101,7 @@ async fn sessions_that_disagree_renegotiate_on_the_same_connection() {
     let net = ready_pair(Order::PayerHigher).await;
     let (payer, payee) = (net.payer.id, net.payee.id);
     let generation = net.payer.transport.connected_since(&payee).await.unwrap();
-    // The lower id moves to a session the higher id never saw.
-    net.payee.sessions.reinitiate_session(&payer, &net.payer.sessions.prekey_bundle().await).await.unwrap();
-    assert!(net.payee.sessions.confirm_session(&payer).await);
+    disagree_with_no_earlier_session(&net).await;
     tokio::time::sleep(Duration::from_secs(11)).await;
 
     let (status, body) = net.payer.compose(&payee, "unreadable").await;
@@ -131,39 +129,83 @@ async fn assert_messages_go_each_way(net: &Pair) {
     }
 }
 
-/// Sessions that already disagree, with nothing marked, are not found while idle,
-/// and a reconnect does not reset them. The first unreadable message is what finds
-/// them: it is paid and refused, and recovery follows on the same connection.
+/// Sessions that already disagree, with nothing marked and nobody sending: a
+/// reconnect finds them and they agree again, with nothing paid.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unmarked_sessions_that_disagree_recover_only_after_the_first_refused_message() {
+async fn a_reconnect_finds_sessions_that_disagree_with_nobody_sending() {
     let net = ready_pair(Order::PayerHigher).await;
     let (payer, payee) = (net.payer.id, net.payee.id);
     net.payer.transport.add_to_whitelist(&payee).await;
     net.payee.transport.add_to_whitelist(&payer).await;
-    net.payee.sessions.reinitiate_session(&payer, &net.payer.sessions.prekey_bundle().await).await.unwrap();
-    assert!(net.payee.sessions.confirm_session(&payer).await);
+    disagree_with_no_earlier_session(&net).await;
     tokio::time::sleep(Duration::from_secs(11)).await;
+    let unreadable = net.payer.sessions.encrypt(&payee, b"unreadable").await.unwrap();
+    assert!(net.payee.sessions.preview_decrypt(&payer, &unreadable).await.is_err());
+    assert!(!net.payer.sessions.needs_renegotiation(&payee).await, "nothing has found them yet");
+    let paid = (net.payer.paid_out().await.len(), net.payee.paid_out().await.len());
 
-    let mark = log_mark();
     net.flap().await;
-    // Past the connection's own cooldown and one self-heal tick.
-    tokio::time::sleep(Duration::from_secs(16)).await;
-    assert!(logged_since(mark, &["X3DH initiated", &format!("peer={payer}")]).is_empty(), "a reconnect does not re-key");
-    assert!(net.payer.sessions.can_send(&payee).await && net.payee.sessions.can_send(&payer).await);
-    assert!(!net.payee.sessions.needs_renegotiation(&payer).await, "nothing has found them");
-
-    let paid = net.payer.paid_out().await.len();
-    let (status, body) = net.payer.compose(&payee, "unreadable").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_ne!(body["accepted"], true, "{body}");
-    assert_eq!(net.payer.paid_out().await.len(), paid + 1, "the message that found them was paid");
-    wait_until("the sides agree again", RECOVERY_BOUND, || async {
-        !net.payee.sessions.needs_renegotiation(&payer).await
+    wait_until("the sides agree again", HIGHER_ID_RECOVERY_BOUND, || async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        sessions_read_each_other(&net).await
     })
     .await;
-    both_can_send(&net, Duration::from_secs(5)).await;
+    assert_eq!((net.payer.paid_out().await.len(), net.payee.paid_out().await.len()), paid, "nothing was paid");
     assert_messages_go_each_way(&net).await;
     net.stop();
+}
+
+/// The higher id is still on the session the lower id replaced, and sends. The lower
+/// id reads it, so the paid message is not lost, and the two agree again unasked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_under_a_replaced_session_is_read_and_the_sides_agree_again() {
+    let mut net = ready_pair(Order::PayerHigher).await;
+    let (payer, payee) = (net.payer.id, net.payee.id);
+    net.payee.sessions.reinitiate_session(&payer, &net.payer.sessions.prekey_bundle().await).await.unwrap();
+    assert!(net.payee.sessions.confirm_session(&payer).await);
+    let paid = net.payer.paid_out().await.len();
+
+    let (status, body) = net.payer.compose(&payee, "under the replaced session").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["accepted"], true, "{body}");
+    assert_eq!(net.payer.paid_out().await.len(), paid + 1);
+    net.payee.delivered_once("under the replaced session").await;
+
+    wait_until("the sides agree again", HIGHER_ID_RECOVERY_BOUND, || async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        sessions_read_each_other(&net).await
+    })
+    .await;
+    assert_messages_go_each_way(&net).await;
+    net.stop();
+}
+
+/// The lower id moves to a session the higher id never saw, with no earlier one kept.
+async fn disagree_with_no_earlier_session(net: &Pair) {
+    let payer = net.payer.id;
+    assert!(net.payee.sessions.remove_session(&payer).await);
+    net.payee.sessions.reinitiate_session(&payer, &net.payer.sessions.prekey_bundle().await).await.unwrap();
+    assert!(net.payee.sessions.confirm_session(&payer).await);
+}
+
+/// Each side reads what the other would send now, and neither is waiting to replace
+/// its session. This takes send chain positions but puts nothing on the wire.
+async fn sessions_read_each_other(net: &Pair) -> bool {
+    let (payer, payee) = (net.payer.id, net.payee.id);
+    if net.payer.sessions.needs_renegotiation(&payee).await
+        || net.payee.sessions.needs_renegotiation(&payer).await
+        || net.payee.sessions.replacement_in_flight(&payer).await
+    {
+        return false;
+    }
+    let (Ok(to_payee), Ok(to_payer)) = (
+        net.payer.sessions.encrypt(&payee, b"check").await,
+        net.payee.sessions.encrypt(&payer, b"check").await,
+    ) else {
+        return false;
+    };
+    net.payee.sessions.preview_decrypt(&payer, &to_payee).await.is_ok()
+        && net.payer.sessions.preview_decrypt(&payee, &to_payer).await.is_ok()
 }
 
 /// The higher id loses its session while the lower id looks healthy. It offers on
@@ -194,11 +236,11 @@ async fn a_refused_initial_handshake_recovers_without_paid_traffic() {
     let (payer, payee) = (net.payer.id, net.payee.id);
     let stale = net.payer.sessions.prekey_bundle().await;
     // A real negotiation spends that bundle's one-time pre-key.
-    net.payee.sessions.mark_needs_renegotiation(&payer).await;
-    wait_until("a negotiation spends that pre-key", RECOVERY_BOUND, || async {
-        !net.payee.sessions.needs_renegotiation(&payer).await
-    })
-    .await;
+    let init = net.payee.sessions.reinitiate_session(&payer, &stale).await.unwrap();
+    net.payer.sessions.reaccept_session(&payee, &init).await.unwrap();
+    assert!(net.payee.sessions.confirm_session(&payer).await);
+    let moves_it = net.payee.sessions.encrypt(&payer, b"ratchet-init").await.unwrap();
+    net.payer.sessions.decrypt(&payee, &moves_it).await.unwrap();
     both_can_send(&net, Duration::from_secs(5)).await;
     tokio::time::sleep(Duration::from_secs(11)).await;
 
