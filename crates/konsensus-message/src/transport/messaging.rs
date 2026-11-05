@@ -587,6 +587,7 @@ pub(super) fn spawn_reader_task(
                             bundle,
                             privileged: bought,
                             connection: Arc::clone(&connection),
+                            received_at: std::time::Instant::now(),
                         })
                         .await
                     {

@@ -153,7 +153,7 @@ enum SessionReplacement {
     /// Fail with [`SessionError::SessionExists`]; the existing session stays.
     Keep,
     /// Hold the new session aside; the existing one stays in use until the peer
-    /// proves it holds the new one: a SessionAck to the initiator
+    /// answers for the new one: a SessionAck to the initiator, which names no session
     /// ([`SessionManager::confirm_session`]) or a message that decrypts under it.
     AfterConfirmation,
 }
@@ -171,6 +171,8 @@ struct PeerSession {
     /// `unconfirmed` is one we initiated, so a SessionAck can confirm it. One we
     /// accepted is proven only by a message that decrypts under it.
     unconfirmed_initiated: bool,
+    /// When `unconfirmed` was set.
+    unconfirmed_since: Option<std::time::Instant>,
     /// We initiated this session and the peer has not yet confirmed it.
     awaiting_confirmation: bool,
     /// The peer sent something this session could not read, so the two sides may
@@ -203,6 +205,7 @@ impl PeerSession {
             established_at_ms,
             unconfirmed: None,
             unconfirmed_initiated: false,
+            unconfirmed_since: None,
             awaiting_confirmation,
             needs_renegotiation: false,
             retired: None,
@@ -780,6 +783,7 @@ impl SessionManager {
             (SessionReplacement::AfterConfirmation, Some(existing)) => {
                 existing.unconfirmed = Some(ratchet);
                 existing.unconfirmed_initiated = initiator;
+                existing.unconfirmed_since = Some(std::time::Instant::now());
                 return Ok(());
             }
             _ => {}
@@ -830,6 +834,16 @@ impl SessionManager {
     /// acceptor sends is under the session before.
     pub async fn replacement_pending(&self, peer_id: &NodeId) -> bool {
         self.sessions.read().await.get(peer_id).is_some_and(|session| session.unconfirmed.is_some())
+    }
+
+    /// Whether we accepted a newer session from a peer at least `age` ago and no
+    /// message under it has arrived since.
+    pub async fn accepted_replacement_older_than(&self, peer_id: &NodeId, age: std::time::Duration) -> bool {
+        self.sessions.read().await.get(peer_id).is_some_and(|session| {
+            session.unconfirmed.is_some()
+                && !session.unconfirmed_initiated
+                && session.unconfirmed_since.is_some_and(|since| since.elapsed() >= age)
+        })
     }
 
     /// Record that the peer still needs a `RatchetInit`.

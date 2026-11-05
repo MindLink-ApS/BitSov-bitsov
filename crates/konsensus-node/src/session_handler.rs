@@ -258,7 +258,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                     }
 
-                    ControlEvent::PrekeyOffer { peer_id, bundle, privileged, connection } => {
+                    ControlEvent::PrekeyOffer { peer_id, bundle, privileged, connection, received_at } => {
                         if !privileged {
                             continue;
                         }
@@ -270,7 +270,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                         handle_prekey_offer(
                             &peer_id, bundle, our_node_id, &session_manager, &storage,
-                            &transport, &audit_log, &mut last_negotiation, &mut offer_witness, &connection,
+                            &transport, &audit_log, &mut last_negotiation, &mut offer_witness, &connection, received_at,
                         ).await;
                     }
 
@@ -794,6 +794,7 @@ async fn handle_prekey_offer(
     last_negotiation: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
     offer_witness: &mut OfferWitness,
     connection: &konsensus_message::ConnectionContext,
+    received_at: std::time::Instant,
 ) {
     // Rate-limit session re-negotiation per peer.
     if let Some(last) = last_negotiation.get(peer_id) {
@@ -853,7 +854,9 @@ async fn handle_prekey_offer(
     let healthy = session_manager.has_session(peer_id).await
         && !session_manager.needs_renegotiation(peer_id).await
         && !session_manager.awaiting_confirmation(peer_id).await;
-    if healthy && !offer_witness.second_spaced_offer(peer_id, connection.generation, std::time::Instant::now()) {
+    // Both ages count from when the frame came off its connection: an offer that sat in
+    // the queue while the connection grew old is still the offer it was.
+    if healthy && !offer_witness.second_spaced_offer(peer_id, connection.generation, received_at) {
         debug!(peer = %peer_id, "prekey offer not acted on; the session is healthy");
         return;
     }
@@ -1036,7 +1039,9 @@ async fn handle_session_ack(
     );
 
     // Send a ratchet init message so the acceptor can initialize their sending chain.
-    send_ratchet_init(session_manager, transport, peer_id).await;
+    if send_ratchet_init(session_manager, transport, peer_id).await {
+        debug!(peer = %peer_id, "ratchet init after the acknowledgement written");
+    }
 }
 
 /// Send a message under the session in use. Each one takes its own send chain
@@ -1047,7 +1052,7 @@ async fn handle_session_ack(
 /// Nothing acknowledges this frame. It can only go missing with its connection, so
 /// the lower id sends it again on each new one, and a failure here is owed to the
 /// next self-heal tick.
-async fn send_ratchet_init(session_manager: &SessionManager, transport: &Arc<NoiseTransport>, peer_id: &NodeId) {
+async fn send_ratchet_init(session_manager: &SessionManager, transport: &Arc<NoiseTransport>, peer_id: &NodeId) -> bool {
     match session_manager.encrypt(peer_id, b"ratchet-init").await {
         Ok(ratchet_msg) => {
             let payload = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
@@ -1055,16 +1060,20 @@ async fn send_ratchet_init(session_manager: &SessionManager, transport: &Arc<Noi
             if let Err(e) = transport.send_frame(peer_id, &frame).await {
                 warn!(peer = %peer_id, error = %e, "failed to send RatchetInit");
                 session_manager.owe_ratchet_init(peer_id).await;
+                return false;
             }
+            true
         }
         // A disk failure says nothing about the session. It stays.
         Err(konsensus_crypto::SessionError::NotPersisted) => {
             warn!(peer = %peer_id, "ratchet init not sent: session state could not be saved");
             session_manager.owe_ratchet_init(peer_id).await;
+            false
         }
         Err(e) => {
             warn!(peer = %peer_id, error = %e, "failed to encrypt ratchet init; asking to renegotiate");
             session_manager.mark_needs_renegotiation(peer_id).await;
+            false
         }
     }
 }
@@ -1076,9 +1085,9 @@ async fn send_ratchet_init(session_manager: &SessionManager, transport: &Arc<Noi
 async fn check_session_on_connect(session_manager: &SessionManager, transport: &Arc<NoiseTransport>, peer_id: &NodeId, our_node_id: NodeId) {
     if our_node_id.as_bytes() < peer_id.as_bytes()
         && session_manager.can_send(peer_id).await
-        && !session_manager.replacement_in_flight(peer_id).await
+        && !session_manager.replacement_pending(peer_id).await
     {
-        send_ratchet_init(session_manager, transport, peer_id).await;
+        let _ = send_ratchet_init(session_manager, transport, peer_id).await;
     }
 }
 
@@ -1089,7 +1098,9 @@ type ConnectionsChecked = std::collections::HashMap<NodeId, std::time::Instant>;
 /// Both wait out the negotiation cooldown, from the connection and from the last
 /// negotiation. A lower id on an earlier version runs X3DH on every connect and replaces
 /// its session at once, so until that has settled a message under the session in use
-/// would look to it like a failure, and it would drop the new session.
+/// would look to it like a failure, and it would drop the new session. For the same
+/// reason nothing is sent while a replacement is held aside on either side, or while
+/// this side is asking for a new session: the peer may already be on the new one.
 async fn check_connected_e2ee_sessions(
     session_manager: &SessionManager,
     transport: &Arc<NoiseTransport>,
@@ -1101,14 +1112,15 @@ async fn check_connected_e2ee_sessions(
         let Some(since) = transport.connected_since(&peer_id).await else { continue };
         if since.elapsed() < SESSION_NEGOTIATION_COOLDOWN
             || last_negotiation.get(&peer_id).is_some_and(|last| last.elapsed() < SESSION_NEGOTIATION_COOLDOWN)
-            || !session_manager.can_send(&peer_id).await
+            || session_manager.replacement_pending(&peer_id).await
+            || e2ee_needs_self_heal(session_manager, &peer_id).await
         {
             continue;
         }
         let owed = session_manager.take_ratchet_init_owed(&peer_id).await;
         if owed || checked.get(&peer_id) != Some(&since) {
             checked.insert(peer_id, since);
-            send_ratchet_init(session_manager, transport, &peer_id).await;
+            let _ = send_ratchet_init(session_manager, transport, &peer_id).await;
         }
     }
 }
@@ -1305,6 +1317,9 @@ async fn e2ee_needs_self_heal(session_manager: &SessionManager, peer_id: &NodeId
     !session_manager.can_send(peer_id).await
         || session_manager.needs_renegotiation(peer_id).await
         || session_manager.awaiting_confirmation(peer_id).await
+        // An accepted session nothing has moved us to since the cooldown: its
+        // `RatchetInit` is gone, and the peer may be using it already.
+        || session_manager.accepted_replacement_older_than(peer_id, SESSION_NEGOTIATION_COOLDOWN).await
 }
 
 async fn send_prekey_offer(

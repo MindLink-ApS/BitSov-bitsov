@@ -37,10 +37,12 @@ also live on the corresponding GitHub pre-release pages.
   envelope that cannot be decrypted is refused as before and the session stays;
   from after the session settled it also starts a new negotiation, repeated on the
   self-heal tick until it completes or a readable message clears it. A new session
-  retires the current one only when the peer proves it holds it: a `SessionAck` to
-  the initiator, a message that decrypts under it to the acceptor. A stale prekey
+  retires the current one only on an answer from the peer: for the initiator a
+  `SessionAck`, which names no session and so does not show the keys match; for
+  the acceptor a message that decrypts under the new session. A stale prekey
   offer the peer refuses, or a well-formed init with other keys, changes nothing.
-  No frame or message format changes.
+  Two stale offers, or a late `SessionAck`, can still retire a working session
+  until key confirmation lands. No frame or message format changes.
 
 ## [0.3.0-rc22] — 2026-11-05
 

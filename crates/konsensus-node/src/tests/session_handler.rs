@@ -2213,6 +2213,7 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                     bundle: serde_json::json!({"secret": "do not retain"}),
                     privileged,
                     connection: Arc::new(no_hello_connection()),
+                    received_at: std::time::Instant::now(),
                 },
                 ControlEvent::PriceTableReceived {
                     peer_id,
@@ -4032,7 +4033,7 @@ async fn session_decode_logs_do_not_echo_peer_json() {
     let hostile = serde_json::json!("peer-controlled-secret");
     handle_prekey_offer(
         &peer, hostile.clone(), *identity.node_id(), &manager, &storage,
-        &transport, &audit, &mut negotiations, &mut OfferWitness::default(), &connection_of(&identity),
+        &transport, &audit, &mut negotiations, &mut OfferWitness::default(), &connection_of(&identity), std::time::Instant::now(),
     ).await;
     handle_session_init(
         &peer, hostile, &manager, &storage, &transport, &audit, &mut negotiations, &connection_of(&identity),
@@ -4156,7 +4157,7 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
             &audit,
             &mut negotiations,
             &mut OfferWitness::default(),
-            &connection_of(&high),
+            &connection_of(&high), std::time::Instant::now(),
         )
         .await;
         assert!(
@@ -4181,7 +4182,7 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
         &audit,
         &mut negotiations,
         &mut OfferWitness::default(),
-        &connection_of(&high),
+        &connection_of(&high), std::time::Instant::now(),
     )
     .await;
     assert!(
@@ -4244,7 +4245,7 @@ async fn a_single_stale_offer_does_not_touch_a_healthy_session() {
     assert!(low_mgr.confirm_session(high.node_id()).await);
     handle_prekey_offer(
         high.node_id(), serde_json::to_value(high_mgr.prekey_bundle().await).unwrap(), *low.node_id(), &low_mgr,
-        &storage, &transport, &audit, &mut negotiations, &mut OfferWitness::default(), &connection_of(&high),
+        &storage, &transport, &audit, &mut negotiations, &mut OfferWitness::default(), &connection_of(&high), std::time::Instant::now(),
     ).await;
     assert!(negotiations.is_empty(), "no negotiation for one offer");
     assert_session_works(&low, &low_mgr, &high, &high_mgr, "after one offer").await;
@@ -4299,7 +4300,7 @@ async fn a_stale_offer_across_a_responder_restart_does_not_touch_the_session() {
     handle_prekey_offer(
         high.node_id(), serde_json::to_value(&stale).unwrap(), *low.node_id(), &low_mgr,
         &storage, &make_gossip_test_transport(), &make_gossip_audit_log(), &mut negotiations,
-        &mut OfferWitness::default(), &connection_of(&high),
+        &mut OfferWitness::default(), &connection_of(&high), std::time::Instant::now(),
     ).await;
     assert!(negotiations.is_empty(), "no negotiation from a stale offer");
     assert_session_works(&low, &low_mgr, &high, &restored, "after a responder restart").await;
@@ -4350,7 +4351,7 @@ async fn an_offer_counts_on_the_connection_it_came_on() {
     handle_prekey_offer(
         high.node_id(), serde_json::to_value(high_mgr.prekey_bundle().await).unwrap(), *low.node_id(), &low_mgr,
         &storage, &make_gossip_test_transport(), &make_gossip_audit_log(), &mut std::collections::HashMap::new(),
-        &mut witness, &connection,
+        &mut witness, &connection, std::time::Instant::now(),
     ).await;
     assert_eq!(witness.first.get(high.node_id()).map(|(seen_on, _)| *seen_on), Some(connection.generation));
 }
@@ -4379,15 +4380,26 @@ async fn a_well_formed_session_init_alone_does_not_replace_the_session() {
 }
 
 /// A SessionAck nobody asked for changes nothing: no session is promoted and no
-/// ratchet message is spent.
+/// ratchet message is spent, so nothing is written.
 #[tokio::test]
 async fn an_unexpected_session_ack_changes_nothing() {
     let (low, low_mgr, high, high_mgr) = established_pair().await;
+    // The first session's own acknowledgement: after it nothing awaits one.
+    assert!(low_mgr.confirm_session(high.node_id()).await);
+    let before = low_mgr.encrypt(high.node_id(), b"before the stray ack").await.unwrap();
+    assert_eq!(high_mgr.decrypt(low.node_id(), &before).await.unwrap(), b"before the stray ack");
+
     let transport = make_gossip_test_transport();
     let audit = make_gossip_audit_log();
     handle_session_ack(high.node_id(), &low_mgr, &transport, &audit).await;
-    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after a stray ack").await;
+
+    // A RatchetInit would have taken the next position, written or not.
+    let after = low_mgr.encrypt(high.node_id(), b"after the stray ack").await.unwrap();
+    assert_eq!(after.header.dh_public, before.header.dh_public, "same sending chain");
+    assert_eq!(after.header.message_number, before.header.message_number + 1, "no position spent");
+    assert_eq!(high_mgr.decrypt(low.node_id(), &after).await.unwrap(), b"after the stray ack");
     assert!(!low_mgr.needs_renegotiation(high.node_id()).await);
+    assert!(!low_mgr.replacement_pending(high.node_id()).await);
 }
 
 /// A RatchetInit the session cannot read does not cost the session: it stays, and
@@ -4799,7 +4811,7 @@ async fn offer_starts_negotiation(
     let mut negotiations = std::collections::HashMap::new();
     handle_prekey_offer(
         high.node_id(), bundle, *low.node_id(), low_mgr, &storage,
-        &make_gossip_test_transport(), &make_gossip_audit_log(), &mut negotiations, &mut OfferWitness::default(), connection,
+        &make_gossip_test_transport(), &make_gossip_audit_log(), &mut negotiations, &mut OfferWitness::default(), connection, std::time::Instant::now(),
     ).await;
     negotiations.contains_key(high.node_id())
 }
