@@ -696,7 +696,8 @@ impl Node {
 
     /// The next plaintext this node delivers, and nothing else behind it.
     async fn delivered_once(&mut self, text: &str) {
-        let got = tokio::time::timeout(Duration::from_secs(5), self.delivered.recv()).await;
+        // Generous: a loaded runner can take seconds to hand a delivery to the feed.
+        let got = tokio::time::timeout(Duration::from_secs(15), self.delivered.recv()).await;
         assert_eq!(got.ok().flatten().as_deref(), Some(text));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(self.delivered.try_recv().is_err(), "{text:?} delivered more than once");

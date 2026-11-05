@@ -70,6 +70,7 @@ async fn lower_id_that_lost_its_session_recovers_on_the_same_connection() {
     let (status, body) = net.payer.compose(&payee, "from the higher id").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["delivered"], true, "{body}");
+    assert_eq!(body["accepted"], true, "{body}");
     net.payee.delivered_once("from the higher id").await;
     let (status, body) = net.payee.compose(&payer, "from the lower id").await;
     assert_eq!(status, StatusCode::OK, "{body}");
