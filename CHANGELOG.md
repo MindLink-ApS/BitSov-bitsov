@@ -14,14 +14,15 @@ also live on the corresponding GitHub pre-release pages.
   confirmed, or on a second offer on the same connection a self-heal tick or more
   after the first. Two stale offers can still start a replacement; closing that
   needs key confirmation, which is separate work.
-- A reconnect now shows whether two E2EE sessions still agree, with nothing paid.
-  The lower-id node sends a `RatchetInit` under the session in use on each new
-  connection, and both nodes send one on a self-heal tick once the connection is ten
-  seconds old. Each takes its own send chain position, saved first. A peer still on
-  the session before moves over on it, which also recovers a `RatchetInit` lost with
-  its connection; a peer that cannot read it asks for a new session. Peers on earlier
-  versions read it like any `RatchetInit`, and drop their session if they cannot. A
-  send chain position is never reused: no frame or message format changes.
+- A reconnect now shows whether two E2EE sessions still agree, with nothing
+  paid. The lower-id node sends a `RatchetInit` under the session in use on each
+  new connection, and both nodes send one on a self-heal tick once the
+  connection and any negotiation are ten seconds old. Each takes its own send
+  chain position, saved first. A peer still on the session before moves over on
+  it, which also recovers a `RatchetInit` lost with its connection; a peer that
+  cannot read it asks for a new session. Peers on earlier versions read it like
+  any `RatchetInit`, and drop their session if they cannot. No frame or message
+  format changes.
 - A replaced E2EE session keeps reading for up to an hour, in memory only, so a paid
   envelope encrypted under it just before the switch, or resent later, is still read
   rather than refused.
@@ -35,11 +36,11 @@ also live on the corresponding GitHub pre-release pages.
 - One envelope or control frame can no longer cost a working E2EE session. A paid
   envelope that cannot be decrypted is refused as before and the session stays;
   from after the session settled it also starts a new negotiation, repeated on the
-  self-heal tick until it completes or a readable message clears it. A new session retires the current one only
-  when the peer proves it holds it: a `SessionAck` to the initiator, a message that
-  decrypts under it to the acceptor. A stale prekey offer the peer refuses, or a
-  well-formed init with other keys, changes nothing. No frame or message format
-  changes.
+  self-heal tick until it completes or a readable message clears it. A new session
+  retires the current one only when the peer proves it holds it: a `SessionAck` to
+  the initiator, a message that decrypts under it to the acceptor. A stale prekey
+  offer the peer refuses, or a well-formed init with other keys, changes nothing.
+  No frame or message format changes.
 - A prekey bundle or session init whose identity key is not the key that
   connection's Hello presented is now refused before anything changes, as is a
   bundle whose signed prekey is the same point as its identity key. One-time
