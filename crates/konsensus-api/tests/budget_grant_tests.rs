@@ -1615,6 +1615,43 @@ async fn all_in_reservation_settles_actual_fee_and_holds_unknown_fee() {
     );
 }
 
+/// A file send resolves its grant debit as a message does: the ceiling is held
+/// until the payment settles, then the principal plus the actual fee stays
+/// spent and the rest comes back. An unknown fee keeps the whole ceiling held.
+#[tokio::test]
+async fn file_send_settles_actual_fee_and_holds_unknown_fee() {
+    let fx = fixture().await;
+    fx.wallet.fee.store(400, Ordering::SeqCst);
+    let body = json!({"recipient": fx.peer.to_hex(), "max_total_msat": 2000, "max_routing_fee_msat": 1000});
+    let token = fx.grant(None, GrantTerms::new(2000)).await;
+    let path = upload_file(&fx, &token).await;
+    let (status, receipt) = fx.call("POST", &path, Some(body.clone()), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["max_routing_fee_msat"], 1000, "{receipt}");
+    assert_eq!(fx.used(), 1400, "principal plus the actual fee; the rest of the ceiling is released");
+
+    fx.wallet.unknown_fee.store(true, Ordering::SeqCst);
+    let token = fx.grant(None, GrantTerms::new(2000)).await;
+    let path = upload_file(&fx, &token).await;
+    let (status, receipt) = fx.call("POST", &path, Some(body), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(fx.used(), 2000, "unknown fee retains full durable liability");
+    assert!(receipt.get("fee_paid_msat").is_none(), "{receipt}");
+}
+
+async fn upload_file(fx: &Fx, token: &str) -> String {
+    let (status, file) = fx
+        .call(
+            "POST",
+            "/api/v1/files",
+            Some(json!({"filename":"fee.txt","mime_type":"text/plain","data_b64":"aGk="})),
+            Some(token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{file}");
+    format!("/api/v1/files/{}/send", file["file_id"].as_str().unwrap())
+}
+
 #[tokio::test]
 async fn all_in_invoice_reserves_fee_before_dispatch_and_settles_actual_fee() {
     let fx = fixture().await;

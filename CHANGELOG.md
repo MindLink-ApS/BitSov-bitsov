@@ -20,6 +20,9 @@ also live on the corresponding GitHub pre-release pages.
   `not_dispatched`, reason `session_save_failed`, before any payment for it. An
   admission already settled in the same call stays settled and is reported as paid,
   with the same reason.
+- `POST /api/v1/files/:id/send` now returns optional `fee_paid_msat`, as compose
+  does: the actual routing fee of a settled LDK payment. It is omitted when any
+  component fee is unknown and on other backends.
 
 ## [0.3.0-rc21] — 2026-11-01
 
