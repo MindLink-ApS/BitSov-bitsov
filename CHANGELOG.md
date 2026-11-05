@@ -14,6 +14,13 @@ also live on the corresponding GitHub pre-release pages.
   paid, with the same reason. Saves and deletes of session state now run to
   completion under the session lock even if the request that started them goes
   away (#519).
+- Session setup applies stricter consistency checks to the keys it receives. A
+  prekey bundle or session init that fails them is refused before anything
+  changes (#520).
+- File sends report the routing fee actually paid: `POST /api/v1/files/:id/send`
+  now returns optional `fee_paid_msat`, as compose does. It is omitted when any
+  component fee is unknown and on backends other than LDK; absence does not mean
+  zero (#521).
 - Docs now say what encryption covers today: message content and call audio are
   encrypted between nodes, and either node can read them. Encryption that
   reaches the app is planned (#512).

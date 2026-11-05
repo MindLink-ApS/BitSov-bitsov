@@ -1041,6 +1041,24 @@ async fn failed_save_does_not_refuse_a_readable_message() {
     assert_eq!(receiver.decrypt(&node_a, &message).await.unwrap(), b"readable");
 }
 
+/// Each boot starts its one-time pre-key ids at its own random point, and they count
+/// up from there.
+#[tokio::test]
+async fn prekey_ids_start_at_a_random_point_per_boot() {
+    let identity = make_identity(TEST_MNEMONIC_A);
+    let mut starts = Vec::new();
+    for _ in 0..4 {
+        let manager = SessionManager::new(Arc::clone(&identity));
+        starts.push(manager.prekey_bundle().await.one_time_prekey_id.unwrap());
+    }
+    let with_store = SessionManager::with_store(Arc::clone(&identity), MemorySessionStore::new());
+    starts.push(with_store.prekey_bundle().await.one_time_prekey_id.unwrap());
+    let mut distinct = starts.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), starts.len(), "every boot picks its own: {starts:?}");
+}
+
 /// A ratchet failure during a send leaves the chain as it was, with a store and
 /// without one, so the next send takes the same position.
 #[tokio::test]
@@ -1060,4 +1078,17 @@ async fn failed_aead_leaves_the_chain_as_it_was() {
 
     let message = sender.encrypt(&node_b, b"with a store").await.unwrap();
     assert_eq!(receiver.decrypt(&node_a, &message).await.unwrap(), b"with a store");
+}
+
+/// One point in different bytes compares equal; different points and bad hex do not.
+#[test]
+fn same_x25519_point_ignores_the_top_bit_only() {
+    let key = [7u8; 32];
+    let mut top_bit = key;
+    top_bit[31] ^= 0x80;
+    assert!(same_x25519_point(&hex::encode(key), &hex::encode(top_bit)));
+    let mut other = key;
+    other[0] ^= 0x01;
+    assert!(!same_x25519_point(&hex::encode(key), &hex::encode(other)));
+    assert!(!same_x25519_point(&hex::encode(key), "not hex"));
 }
