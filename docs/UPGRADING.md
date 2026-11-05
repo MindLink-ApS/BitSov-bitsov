@@ -53,8 +53,20 @@ does not fix the other open reports.
 Known limit, also present in rc21: If a link drops during a call and both nodes reconnect at nearly the same moment,
 the two nodes can end up on different sessions. Messages and call minutes sent
 then can be paid for and not read. It can clear within about a minute; otherwise
-a new connection between the nodes clears it. This release does not change it,
-and a fix is planned.
+follow the steps below. This release does not change it, and a fix is planned.
+
+If messages stop being read after a dropped link:
+
+1. Stop sending; a send can be paid for and not read.
+2. Restart one node with its existing config and data, and allow up to about 90
+   seconds; early sends may fail with nothing paid.
+3. In any app that reports a pending result, use Check pending result.
+4. In any app that still shows the call, use End.
+5. Check that messages are read in both directions, then call again.
+
+Amounts already paid for messages or minutes that were not read are not refunded.
+Tested on regtest on this release and on rc21, by calling the app's host
+functions, not on real hardware.
 
 Follow the [rc22 signing and node checklist](releases/v0.3.0-rc22.md).
 

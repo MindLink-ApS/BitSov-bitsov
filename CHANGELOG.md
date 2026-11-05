@@ -31,8 +31,8 @@ also live on the corresponding GitHub pre-release pages.
 - Known limit, also present in rc21: If a link drops during a call and both nodes reconnect at nearly the same moment,
   the two nodes can end up on different sessions. Messages and call minutes sent
   then can be paid for and not read. It can clear within about a minute; otherwise
-  a new connection between the nodes clears it. This release does not change it,
-  and a fix is planned.
+  follow the steps in [rc21 → rc22](docs/UPGRADING.md#rc21--rc22). This release
+  does not change it, and a fix is planned.
 
 ## [0.3.0-rc21] — 2026-11-01
 
