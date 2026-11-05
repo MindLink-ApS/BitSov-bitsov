@@ -4336,6 +4336,25 @@ fn offer_witness_needs_two_spaced_offers_on_one_connection() {
     assert!(!witness.second_spaced_offer(&peer, connection, at(125)), "not the old connection's second");
 }
 
+/// An offer counts on the connection it came on, whatever the transport holds by now:
+/// a frame read from a connection already replaced is not credited to its replacement.
+#[tokio::test]
+async fn an_offer_counts_on_the_connection_it_came_on() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    assert!(low_mgr.confirm_session(high.node_id()).await);
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let mut witness = OfferWitness::default();
+    let mut connection = connection_of(&high);
+    connection.generation -= std::time::Duration::from_secs(20);
+    handle_prekey_offer(
+        high.node_id(), serde_json::to_value(high_mgr.prekey_bundle().await).unwrap(), *low.node_id(), &low_mgr,
+        &storage, &make_gossip_test_transport(), &make_gossip_audit_log(), &mut std::collections::HashMap::new(),
+        &mut witness, &connection,
+    ).await;
+    assert_eq!(witness.first.get(high.node_id()).map(|(seen_on, _)| *seen_on), Some(connection.generation));
+}
+
 /// A well-formed SessionInit whose keys the initiator does not share costs nothing:
 /// the working session stays until a message decrypts under the new one.
 #[tokio::test]

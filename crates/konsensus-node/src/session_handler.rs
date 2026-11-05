@@ -847,12 +847,9 @@ async fn handle_prekey_offer(
     let healthy = session_manager.has_session(peer_id).await
         && !session_manager.needs_renegotiation(peer_id).await
         && !session_manager.awaiting_confirmation(peer_id).await;
-    if healthy {
-        let Some(connection) = transport.connected_since(peer_id).await else { return };
-        if !offer_witness.second_spaced_offer(peer_id, connection, std::time::Instant::now()) {
-            debug!(peer = %peer_id, "prekey offer not acted on; the session is healthy");
-            return;
-        }
+    if healthy && !offer_witness.second_spaced_offer(peer_id, connection.generation, std::time::Instant::now()) {
+        debug!(peer = %peer_id, "prekey offer not acted on; the session is healthy");
+        return;
     }
     offer_witness.forget(peer_id);
 
