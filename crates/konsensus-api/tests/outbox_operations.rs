@@ -189,7 +189,7 @@ struct Wallet {
     pause_next_status_poll: AtomicBool,
     status_poll_started: tokio::sync::Notify,
     pool: sqlx::SqlitePool,
-    /// Park the next `money_ready` until `ready_continue` (Codex delta3 probe).
+    /// Park the next `money_ready` until `ready_continue` (review delta3 probe).
     pause_next_ready: AtomicBool,
     ready_started: tokio::sync::Notify,
     ready_continue: tokio::sync::Notify,
@@ -1429,7 +1429,7 @@ async fn terminal_retention_keeps_duplicate_post_and_receipt_binding() {
     assert!(f.db.get_message(&id).await.unwrap().is_none());
 }
 
-/// Fable N1 (#131 delta): a call offer whose payment was dispatched but not
+/// Review N1 (#131 delta): a call offer whose payment was dispatched but not
 /// resolved when compose was cut off (crash, cancel, app gave up) stays
 /// reserved through startup recovery; when the background reconciler later
 /// finds it paid, it commits the call before resending, so the callee's
@@ -1496,7 +1496,7 @@ async fn background_reconcile_commits_a_paid_call_offer_before_resending() {
     answering.abort();
 }
 
-// ── Codex delta2 (#131, FAIL at 088d198): the four probes as regressions ──
+// ── Review delta2 (#131, FAIL at 088d198): the four probes as regressions ──
 
 fn call_request(f: &Fixture, op: &str, call: &str, sdp: &str, wait: u64) -> Request<Body> {
     Request::builder().method("POST").uri("/api/v1/messages/compose")
@@ -1526,7 +1526,7 @@ async fn until_dispatched(f: &Fixture) {
     .unwrap();
 }
 
-/// Probe `codex_review_uppercase_uuid_loses_paid_call_and_allows_second_charge`,
+/// Probe `review_uppercase_uuid_loses_paid_call_and_allows_second_charge`,
 /// fixed: an uppercase operation id is canonicalized before the reservation,
 /// so the paid offer commits under the journal's key, rings, and the same
 /// call id cannot be paid for again.
@@ -1551,7 +1551,7 @@ async fn an_uppercase_operation_id_commits_the_paid_call_under_one_key() {
     answering.abort();
 }
 
-/// Probe `codex_review_concurrent_mismatch_releases_winners_ambiguous_call`,
+/// Probe `review_concurrent_mismatch_releases_winners_ambiguous_call`,
 /// fixed: two concurrent requests sharing the operation id and call id but
 /// not the payload never share a reservation. The loser is refused
 /// (operation_mismatch) and neither commits nor releases the winner's
@@ -1588,7 +1588,7 @@ async fn a_concurrent_mismatch_never_touches_the_winners_reservation() {
     }
 }
 
-/// Probe `codex_review_retry_resends_before_committing_call`, fixed: a
+/// Probe `review_retry_resends_before_committing_call`, fixed: a
 /// same-operation retry that reconciles the ambiguous payment commits the
 /// call before resending, so an answer arriving right after the resend is
 /// admitted.
@@ -1622,7 +1622,7 @@ async fn a_retry_that_finds_the_offer_paid_commits_before_resending() {
     answering.abort();
 }
 
-/// Probe `codex_review_failed_refusal_cleanup_exposes_signal_through_resync`,
+/// Probe `review_failed_refusal_cleanup_exposes_signal_through_resync`,
 /// fixed: the receive path holds a call signal before its paid acceptance.
 /// When the refusal cleanup fails (or the node crashes before it), the held
 /// signal stays out of history, duplicate acceptance and resync; the startup
@@ -1682,7 +1682,7 @@ async fn a_refused_signal_whose_cleanup_failed_stays_invisible_and_is_withdrawn(
     assert!(f.db.get_message(&admitted.id).await.unwrap().is_some());
 }
 
-/// Codex delta3 probe `same_request_cap_race`, fixed: two concurrent requests
+/// Review delta3 probe `same_request_cap_race`, fixed: two concurrent requests
 /// for the same operation and the same call payload, one capped below the
 /// price and one uncapped, run one after the other under the operation lock.
 /// The capped one is refused and releases only its own reservation; the
@@ -1907,7 +1907,9 @@ async fn a_stuck_prepared_row_is_never_released_against_the_admission_journal() 
         "previous attempt dispatched",
         "wallet knows the journal hash",
         "journal hash differs from the row",
-        "another operation's attempt",
+        "this operation's attempt dispatched",
+        "this operation's attempt settled",
+        "this operation's attempt behind another's",
         "row hash with a dispatched journal",
         "unparsable",
         "unreadable",
@@ -1939,7 +1941,23 @@ async fn a_stuck_prepared_row_is_never_released_against_the_admission_journal() 
                     .bind("fd".repeat(32)).bind(&f.id).execute(f.db.pool()).await.unwrap();
                 json(attempt(&unknown, serde_json::json!({})))
             }
-            "another operation's attempt" => json(attempt(&unknown, link(&other))),
+            "this operation's attempt dispatched" => {
+                let mut mine = attempt(&unknown, serde_json::json!({"dispatch_started": true}));
+                mine["operation"] = link(&f.id)["operation"].clone();
+                json(mine)
+            }
+            "this operation's attempt settled" => {
+                let mut mine = attempt(&paid, serde_json::json!({"settled_at_unix": 1}));
+                mine["operation"] = link(&f.id)["operation"].clone();
+                json(mine)
+            }
+            "this operation's attempt behind another's" => {
+                let mut mine = attempt(&unknown, serde_json::json!({"dispatch_started": true}));
+                mine["operation"] = link(&f.id)["operation"].clone();
+                let mut newer = attempt(&"fd".repeat(32), link(&other));
+                newer["previous_attempt"] = mine;
+                json(newer)
+            }
             "row hash with a dispatched journal" => {
                 sqlx::query("UPDATE outbox_operations SET admission_payment_hash = ? WHERE operation_id = ?")
                     .bind(&unknown).bind(&f.id).execute(f.db.pool()).await.unwrap();
@@ -1988,6 +2006,145 @@ async fn a_stuck_prepared_row_is_never_released_against_the_admission_journal() 
     }
 }
 
+/// The admission that first let this contact in: paid, settled and proven by an
+/// earlier operation, and kept in the journal after it.
+fn older_operations_admission(paid: &str) -> Vec<u8> {
+    serde_json::to_vec(&attempt(paid, serde_json::json!({
+        "dispatch_started": true, "settled_at_unix": 1, "proof_delivered": true,
+        "operation": {"operation_id": uuid::Uuid::new_v4().to_string(), "execution_id": "e", "readmission": false}}))).unwrap()
+}
+
+impl Fixture {
+    /// Its contact has an older admission on file, and has just gone offline.
+    async fn offline_after_older_admission(&mut self) -> usize {
+        let paid = self.wallet_paid_hash().await;
+        self.journal(Some(&older_operations_admission(&paid)));
+        let transport = Arc::new(common::ConnectedStubTransport::new(vec![], self.state.invoice_requests.clone()));
+        Arc::get_mut(&mut self.state).unwrap().transport = transport;
+        self.wallet.calls.load(Ordering::SeqCst)
+    }
+    async fn post_kind(&self, kind: u16, plaintext: String) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
+            .header("authorization", common::auth_header(&self.state)).header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({"operation_id": self.id, "recipient": self.peer.to_hex(),
+                "kind": kind, "plaintext": plaintext, "wait_ack_ms": 0}).to_string())).unwrap();
+        operation_reply(common::test_router(self.state.clone()).oneshot(request).await.unwrap()).await
+    }
+}
+
+/// A send refused before paying is released, and can be abandoned, whatever an
+/// earlier operation paid this contact. A paid admission, then a call, then the
+/// callee offline is the ordinary road here: a row left `prepared` could not be
+/// abandoned, so a paired app stayed fenced for good.
+#[tokio::test]
+async fn a_send_refused_before_paying_is_released_despite_an_older_operations_admission() {
+    const CALL: &str = "0123456789abcdef0123456789abcdef";
+    for (kind, plaintext, refusal) in [
+        (1, "hello".to_string(), "Recipient is offline"),
+        (403, serde_json::json!({"v": 1, "call_id": CALL, "reason": "hangup"}).to_string(), "Recipient is offline"),
+    ] {
+        let mut f = Fixture::new().await;
+        let dispatches = f.offline_after_older_admission().await;
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        f.db.call_put(&f.peer, CALL, &konsensus_core::payloads::call::CallEntry {
+            side: konsensus_core::payloads::call::Side::Caller, phase: konsensus_core::payloads::call::Phase::Live,
+            deadline_ms: now + 15_000, pending: None, paid_until_ms: Some(now + 15_000), next_block_seq: 1,
+            end_reason: None, unpaid_notice_used: false,
+        }).await.unwrap();
+        let (status, body) = f.post_kind(kind, plaintext).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{kind}: {body}");
+        assert!(body["error"].as_str().unwrap().contains(refusal), "{kind}: {body}");
+        assert_eq!(body["state"], "released", "{kind}: {body}");
+        assert_eq!(body["payment_hash"], serde_json::Value::Null, "{kind}: {body}");
+        assert_eq!(f.get().await["amount_msat"], 0, "{kind}");
+        let (status, view) = f.abandon().await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {view}");
+        assert_eq!(view["state"], "abandoned", "{kind}: {view}");
+        assert_eq!(f.wallet.calls.load(Ordering::SeqCst), dispatches, "{kind}: nothing was dispatched");
+    }
+}
+
+/// The same for a minute the callee's node will not take while it catches up.
+#[tokio::test]
+async fn a_minute_refused_by_a_callee_catching_up_is_released_despite_an_older_operations_admission() {
+    const CALL: &str = "0123456789abcdef0123456789abcdef";
+    let mut f = Fixture::new().await;
+    let dispatches = f.offline_after_older_admission().await;
+    let transport = Arc::new(common::ConnectedStubTransport::new(vec![f.peer], f.state.invoice_requests.clone()));
+    Arc::get_mut(&mut f.state).unwrap().transport = transport;
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+    f.db.call_put(&f.peer, CALL, &konsensus_core::payloads::call::CallEntry {
+        side: konsensus_core::payloads::call::Side::Caller, phase: konsensus_core::payloads::call::Phase::Live,
+        deadline_ms: now + 25_000, pending: None, paid_until_ms: Some(now + 15_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    }).await.unwrap();
+    let (prices, peer) = (f.state.peer_prices.clone(), f.peer);
+    let answering = tokio::spawn(async move {
+        loop {
+            prices.update_kind_price(peer, 404, 10_000, 850_000).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    });
+    let requests = f.state.invoice_requests.clone();
+    let refusing = tokio::spawn(async move {
+        loop {
+            let mut pending = requests.lock().await;
+            if let Some(id) = pending.keys().next().cloned() {
+                pending.remove(&id).unwrap().send(Err(konsensus_api::state::InvoiceResponseError {
+                    recipient: peer, reason: "konsensus:not_ready:not_synced".into() })).unwrap();
+                break;
+            }
+            drop(pending);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    });
+    let (status, body) = f.post_kind(404, serde_json::json!({"v": 1, "call_id": CALL, "seq": 1}).to_string()).await;
+    answering.abort();
+    refusing.abort();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "peer_not_ready", "{body}");
+    assert_eq!(body["state"], "released", "{body}");
+    assert_eq!(body["payment_hash"], serde_json::Value::Null, "{body}");
+    assert_eq!(f.abandon().await.0, StatusCode::OK);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), dispatches, "nothing was dispatched");
+}
+
+/// A row an earlier build left `prepared` this way is released by the sweep, so an
+/// app fenced on it recovers on upgrade. `draft` had copied the older hash onto it.
+#[tokio::test]
+async fn a_row_left_prepared_by_an_older_operations_admission_recovers() {
+    let mut f = Fixture::new().await;
+    f.fail_before_payment().await;
+    f.post().await;
+    f.allow_payment().await;
+    f.stick_prepared().await;
+    let paid = f.wallet_paid_hash().await;
+    sqlx::query("UPDATE outbox_operations SET admission_payment_hash = ? WHERE operation_id = ?")
+        .bind(&paid).bind(&f.id).execute(f.db.pool()).await.unwrap();
+    f.journal(Some(&older_operations_admission(&paid)));
+    f.restart().await;
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(f.op().await.state, "released");
+    assert_eq!(f.abandon().await.0, StatusCode::OK);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
+}
+
+/// An older admission clears nothing else: this send's own evidence still counts.
+#[tokio::test]
+async fn an_older_operations_admission_does_not_hide_this_operations_payment() {
+    let mut f = Fixture::new().await;
+    f.offline_after_older_admission().await;
+    let transport = Arc::new(common::ConnectedStubTransport::new(vec![f.peer], f.state.invoice_requests.clone()));
+    Arc::get_mut(&mut f.state).unwrap().transport = transport;
+    f.wallet.mode.store(3, Ordering::SeqCst); // the wallet paid; its reply was lost
+    let (status, body) = f.post().await;
+    assert!(!status.is_success(), "{body}");
+    assert_eq!(body["state"], "payment_unknown", "{body}");
+    let (status, view) = f.abandon().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{view}");
+    assert_eq!(view["state"], "payment_unknown", "{view}");
+}
+
 #[tokio::test]
 async fn a_live_compose_failure_is_not_released_against_a_dispatched_journal() {
     let mut f = Fixture::new().await;
@@ -2000,7 +2157,7 @@ async fn a_live_compose_failure_is_not_released_against_a_dispatched_journal() {
     assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
 }
 
-/// Codex review of #144: first contact resumes a possibly dispatched admission
+/// Review of #144: first contact resumes a possibly dispatched admission
 /// the wallet does not know; the operation must not report nothing paid.
 #[tokio::test]
 async fn a_recovered_dispatch_unknown_admission_is_not_released() {

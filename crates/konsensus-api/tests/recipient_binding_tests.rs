@@ -70,7 +70,7 @@ impl LightningProvider for RejectedKeysend {
     }
 }
 
-async fn recipient_fallback_case(wrong_payee: bool) {
+async fn recipient_fallback_case(wrong_payee: bool, uppercase_expected: bool) {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("mock-ledger.db");
     let intended = SharedMockProvider::new(&ledger, "recipient-b", 0).unwrap();
@@ -102,9 +102,14 @@ async fn recipient_fallback_case(wrong_payee: bool) {
     } else {
         intended_invoice
     };
+    let stored_key = if uppercase_expected {
+        intended_key.to_ascii_uppercase()
+    } else {
+        intended_key.clone()
+    };
     let sender = Arc::new(RejectedKeysend {
         inner: SharedMockProvider::new(&ledger, "sender-a", 10_000).unwrap(),
-        expected_peer_key: intended_key.clone(),
+        expected_peer_key: stored_key.clone(),
         keysend_calls: AtomicUsize::new(0),
         invoice_payments: AtomicUsize::new(0),
     });
@@ -127,7 +132,7 @@ async fn recipient_fallback_case(wrong_payee: bool) {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(recipient, intended_key);
+        .insert(recipient, stored_key);
 
     let result = create_payment_proof(&state, 1000, &recipient).await;
     let a = sender.get_balance_msat().await.unwrap();
@@ -150,9 +155,13 @@ async fn recipient_fallback_case(wrong_payee: bool) {
 
 #[tokio::test]
 async fn known_recipient_fallback_must_reject_third_party_payee_before_payment() {
-    recipient_fallback_case(true).await;
+    recipient_fallback_case(true, false).await;
 }
 #[tokio::test]
 async fn known_recipient_fallback_pays_matching_payee_once() {
-    recipient_fallback_case(false).await;
+    recipient_fallback_case(false, false).await;
+}
+#[tokio::test]
+async fn known_recipient_fallback_pays_matching_payee_regardless_of_hex_case() {
+    recipient_fallback_case(false, true).await;
 }

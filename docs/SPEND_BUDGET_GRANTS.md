@@ -10,13 +10,18 @@ store is now version 8. Older nodes refuse to open it rather than ignore
 allowlists, payment deduplication, circuit breakers, device-reset limits or
 envelope identities; existing version 2–7 grants remain readable.
 
-Every non-payment call (messages, room fan-out, first contact, re-admission,
-files and porch pages) is limited to `min(per_call_max_msat, 6_000)` msat,
-including routing fees. This applies at reservation time to every grant type,
-including console grants and existing live grants, without migration or changes
-to signed terms. The grant view and `pair-status` report this effective limit.
-Explicit invoice payments and keysend retain the console grant's owner-approved
-per-call limit; messaging-only grants cannot fund them.
+Non-call payments (messages, room fan-out, first contact, re-admission,
+files and porch pages) are limited to `min(per_call_max_msat, 6_000)` msat,
+including routing fees. Call offers and blocks use the stored per-call value,
+or a relation envelope's per-act maximum, together with that call's pinned
+per-block ceiling. Answers, ICE candidates and hangups stay within the
+non-call cap. This applies at reservation time to every grant type, including
+console grants and existing live grants, without migration or changes to
+signed terms. The grant view reports the signed value as `per_call_max_msat`,
+the non-call cap as `message_per_payment_max_msat`, and the call cap as
+`call_per_payment_max_msat`. `pair-status` prints the signed per-call figure
+and the message cap. Explicit invoice payments and keysend retain the console
+grant's owner-approved per-call limit; messaging-only grants cannot fund them.
 
 ## Owner flow (one command per budget window)
 
@@ -50,6 +55,7 @@ per-call limit; messaging-only grants cannot fund them.
    This console path stays as the recovery fallback.
 3. The app re-issues its token. `GET /api/v1/pair/grant` returns the live
    grant (`budget_msat`, `used_msat`, `remaining_msat`, `per_call_max_msat`,
+   `message_per_payment_max_msat`, `call_per_payment_max_msat`,
    `per_recipient_msat`, `used_by_recipient`, `granted_at`, `expires_at`), or
    `{"grant": null}`.
 
