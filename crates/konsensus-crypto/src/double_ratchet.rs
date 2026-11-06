@@ -271,7 +271,6 @@ impl DoubleRatchet {
 
         // Derive message key from sending chain
         let (next_chain, message_key) = chain.ratchet()?;
-        self.sending_chain = Some(next_chain);
 
         let header = MessageHeader {
             dh_public: *self.dh_public.as_bytes(),
@@ -279,10 +278,12 @@ impl DoubleRatchet {
             message_number: self.send_count,
         };
 
-        self.send_count += 1;
-
         // AEAD encrypt: key = message_key, nonce = header bytes, AD = associated_data + header
         let ciphertext = aead_encrypt(&message_key, plaintext, &self.aead_ad(&header))?;
+
+        // The chain advances only once the message exists. A failure leaves it as it was.
+        self.sending_chain = Some(next_chain);
+        self.send_count += 1;
 
         Ok(RatchetMessage { header, ciphertext })
     }
@@ -748,8 +749,18 @@ fn kdf_rk(root_key: &[u8; 32], dh_output: &[u8; 32]) -> Result<([u8; 32], [u8; 3
     Ok((new_root, chain_key))
 }
 
+#[cfg(test)]
+thread_local! {
+    // Makes the next `aead_encrypt` on this thread fail.
+    pub(crate) static FAIL_NEXT_AEAD_ENCRYPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// AEAD encrypt using AES-256-GCM.
 fn aead_encrypt(key: &[u8; 32], plaintext: &[u8], ad: &[u8]) -> Result<Vec<u8>, RatchetError> {
+    #[cfg(test)]
+    if FAIL_NEXT_AEAD_ENCRYPT.with(|fail| fail.replace(false)) {
+        return Err(RatchetError::EncryptionError("test: aead failure".into()));
+    }
     let cipher = Aes256Gcm::new(key.into());
     // Derive nonce from key + AD via HKDF (deterministic but unique per message key)
     let nonce_bytes = derive_nonce(key, ad)?;

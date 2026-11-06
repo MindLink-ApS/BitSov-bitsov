@@ -173,8 +173,9 @@ after it was paid, so the node never pays a member without the advert.
 
 ## Honesty
 
-- Privacy is pairwise E2EE (Double Ratchet sessions), no more. Each member
-  gets their own ciphertext. No MLS, no group key.
+- Privacy is pairwise encryption between nodes (Double Ratchet sessions), no
+  more: each member's node can read its copy. Each member gets their own
+  ciphertext. No MLS, no group key.
 - The room id binds the roster, not the members' views: each member's node
   checks the id against the roster and that the sender and itself are in it.
   A sender can still show different members different text (or send some of
