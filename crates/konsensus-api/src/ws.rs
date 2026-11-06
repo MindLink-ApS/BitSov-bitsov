@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
+use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, warn};
 
 use crate::auth;
@@ -106,6 +107,14 @@ pub(crate) fn extract_ws_token(query_token: Option<&str>, headers: &HeaderMap) -
 /// connections. 45 seconds is safely under most proxy timeouts (60-120s).
 const WS_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(45);
 
+enum WsEvent {
+    Message(Result<Arc<crate::state::WsMessage>, RecvError>),
+    Delivery(Result<Arc<crate::state::WsDeliveryStatus>, RecvError>),
+    Membrane(Result<Arc<crate::membrane::MembraneEvent>, RecvError>),
+    Socket(Option<Result<Message, axum::Error>>),
+    Keepalive,
+}
+
 /// Handle an authenticated WebSocket connection.
 ///
 /// Subscribes to the broadcast channel and forwards messages (with decrypted
@@ -126,7 +135,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
     tokio::pin!(token_expired);
 
     loop {
-        tokio::select! {
+        let event = tokio::select! {
             // Polled first: once the token has expired, the stream closes
             // without taking another event off the feed.
             biased;
@@ -136,8 +145,22 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
                 break;
             }
 
+            // Only expiry has strict priority. Share service among all other
+            // ready sources, even while the message receiver is backlogged.
+            event = async {
+                tokio::select! {
+                    result = rx.recv() => WsEvent::Message(result),
+                    result = delivery_rx.recv() => WsEvent::Delivery(result),
+                    result = membrane_rx.recv() => WsEvent::Membrane(result),
+                    msg = socket.recv() => WsEvent::Socket(msg),
+                    _ = keepalive.tick() => WsEvent::Keepalive,
+                }
+            } => event,
+        };
+
+        match event {
             // Forward new messages from broadcast channel to WebSocket
-            result = rx.recv() => {
+            WsEvent::Message(result) => {
                 match result {
                     Ok(ws_msg) => {
                         if !stream_authorized(&state, &claims) { break; }
@@ -165,7 +188,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
             }
 
             // Forward delivery status updates to WebSocket
-            result = delivery_rx.recv() => {
+            WsEvent::Delivery(result) => {
                 match result {
                     Ok(status) => {
                         if !stream_authorized(&state, &claims) { break; }
@@ -191,7 +214,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
             }
 
             // Forward membrane events (N2): admission decisions at the gate.
-            result = membrane_rx.recv() => {
+            WsEvent::Membrane(result) => {
                 match result {
                     Ok(event) => {
                         if !stream_authorized(&state, &claims) { break; }
@@ -216,7 +239,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
             }
 
             // Handle incoming messages from the client
-            msg = socket.recv() => {
+            WsEvent::Socket(msg) => {
                 match msg {
                     Some(Ok(Message::Ping(data))) => match socket.send(Message::Pong(data)).await {
                         Ok(()) => {}
@@ -248,7 +271,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
             }
 
             // Send keepalive pings to prevent idle connection timeouts
-            _ = keepalive.tick() => {
+            WsEvent::Keepalive => {
                 if !stream_authorized(&state, &claims) { break; }
                 if socket.send(Message::Ping(vec![0x6b, 0x61])).await.is_err() {
                     debug!("WebSocket client disconnected during keepalive");

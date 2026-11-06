@@ -1411,9 +1411,15 @@ async fn ws_connect(
 }
 
 async fn read_ws_text(stream: &mut tokio::net::TcpStream) -> String {
+    let (opcode, bytes) = read_ws_frame(stream).await;
+    assert_eq!(opcode, 0x81);
+    String::from_utf8(bytes).unwrap()
+}
+
+async fn read_ws_frame(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
     use tokio::io::AsyncReadExt;
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        assert_eq!(stream.read_u8().await.unwrap(), 0x81);
+        let opcode = stream.read_u8().await.unwrap();
         let size = stream.read_u8().await.unwrap();
         assert!(size <= 126, "unmasked, bounded fixture frame");
         let size = if size == 126 {
@@ -1423,10 +1429,109 @@ async fn read_ws_text(stream: &mut tokio::net::TcpStream) -> String {
         };
         let mut bytes = vec![0; size];
         stream.read_exact(&mut bytes).await.unwrap();
-        String::from_utf8(bytes).unwrap()
+        (opcode, bytes)
     })
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn websocket_backlog_does_not_starve_delivery_or_control_frames() {
+    use tokio::io::AsyncWriteExt;
+
+    const BACKLOG: usize = 512;
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, service, _console) = state_with_pairing(tmp.path(), false);
+    let state = Arc::new(AppState {
+        ws_broadcast: tokio::sync::broadcast::channel(BACKLOG).0,
+        ..(*base).clone()
+    });
+    let app = test_router(Arc::clone(&state));
+    let (_, token) = pair_and_token(&app, &service, &SigningKey::from_bytes(&[65; 32])).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = konsensus_api::build_router_for_addr(state.clone(), addr);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let (status, mut socket) = ws_connect(addr, &token, true).await;
+    assert_eq!(status, 101);
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while state.ws_delivery_broadcast.receiver_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let message = Arc::new(konsensus_api::state::WsMessage {
+        envelope: konsensus_core::UkmEnvelopeBuilder::new(
+            100,
+            *state.identity.node_id(),
+            konsensus_core::types::Recipient::Node(*state.identity.node_id()),
+            vec![],
+            konsensus_core::PaymentProof::new([0; 32], [0; 32], 0),
+        )
+        .build(),
+        plaintext: Some("backlogged-message".into()),
+    });
+    // No yields while queuing: the current-thread runtime cannot consume any
+    // messages before the delivery update is also ready.
+    for _ in 0..BACKLOG {
+        state.ws_broadcast.send(Arc::clone(&message)).unwrap();
+    }
+    state
+        .ws_delivery_broadcast
+        .send(Arc::new(konsensus_api::state::WsDeliveryStatus {
+            event_type: "delivery_status",
+            message_id: "fairness-probe".into(),
+            status: "delivered".into(),
+            reason: None,
+        }))
+        .unwrap();
+    // A masked client Ping with payload "fair" must get its Pong while the
+    // message receiver is still backlogged, too.
+    socket
+        .write_all(&[0x89, 0x84, 0, 0, 0, 0, b'f', b'a', b'i', b'r'])
+        .await
+        .unwrap();
+
+    let (mut messages, mut delivery, mut pong) = (0, false, false);
+    while !(delivery && pong) && messages < BACKLOG {
+        let (opcode, bytes) = read_ws_frame(&mut socket).await;
+        match opcode {
+            0x81 => {
+                let event: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                if event["type"] == "delivery_status" {
+                    assert_eq!(event["message_id"], "fairness-probe");
+                    delivery = true;
+                } else {
+                    assert_eq!(event["plaintext"], "backlogged-message");
+                    messages += 1;
+                }
+            }
+            0x8a => {
+                assert_eq!(bytes, b"fair");
+                pong = true;
+            }
+            _ => panic!("unexpected WebSocket opcode: {opcode:#x}"),
+        }
+    }
+    server.abort();
+    let _ = server.await;
+    assert!(
+        delivery,
+        "delivery update starved until the message backlog drained"
+    );
+    assert!(
+        pong,
+        "control frame starved until the message backlog drained"
+    );
 }
 
 #[tokio::test]
