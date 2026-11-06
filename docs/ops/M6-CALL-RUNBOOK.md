@@ -209,7 +209,8 @@ The late-block policy is **stop early + honour**:
 - **Stop early:** B checks the call ID, next sequence and its own clock before
   issuing and returning a block invoice. With less than 15 seconds remaining
   before `deadline_ms` (which already includes grace, or the initial
-  30-second block-zero window), it refuses with `call_block_unpayable`.
+  30-second block-zero window), or while B holds no readable E2EE session with A, it
+  refuses with `call_block_unpayable`.
   A also checks its independent five-second margin before wallet dispatch.
   Block invoices have a five-second BOLT11 expiry, but expiry cannot cancel
   an in-flight HTLC or guarantee that settlement stops then.
@@ -275,7 +276,7 @@ without renewal grace. Restore the rehearsal cap before a five-minute run.
 | `call_price_changed` | B's new block price exceeds the reserved ceiling. Call ends; a new call needs fresh consent. |
 | `call_price_unknown` | No fresh answer from B for the required tariff. Nothing should be paid; check connection/admission/readiness. |
 | `call_price_above_consent` / `call_hold_above_consent` | The offer exceeds an explicit block-price or whole-hold ceiling. No new hold/payment is dispatched; obtain fresh owner consent before changing terms. |
-| `call_block_unpayable` | Too little time remains to issue a new block invoice safely. No new payment is authorized; reconcile any existing operation. |
+| `call_block_unpayable` | Too little time remains to issue a new block invoice safely, or the callee holds no readable E2EE session with the caller (it recovers by itself, usually within about 25 seconds and at most about a minute). No new payment is authorized; reconcile any existing operation. |
 | `session_save_failed` | The node could not save its session state, so this block was not sent and no payment started for it. The hold is untouched and the same block can be asked for again. Check disk and database health. |
 | `call_block_overpayment` | A settled block cannot be served. Preserve the payment receipt and audit evidence for reconciliation; do not treat this as nonpayment. |
 | `call_liquidity_insufficient` / `call_liquidity_unavailable` | Capacity is too small or cannot be established. Resolve liquidity/readiness before dialing. |
