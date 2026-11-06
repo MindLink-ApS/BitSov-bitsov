@@ -251,7 +251,7 @@ fn volatility_cap_limits_extreme_prices() {
     );
 
     // Non-finite/negative cap config is not a valid "disable cap" signal.
-    // It falls back to the default bounded-plasticity cap (5x).
+    // It falls back to the default bounded-adaptation cap (5x).
     assert_eq!(
         ChainAwarePricingEngine::apply_multiplier(10, 1000.0, 4.0, f64::NAN),
         50
