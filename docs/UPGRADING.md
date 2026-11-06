@@ -98,6 +98,12 @@ the caller's hold consent (`max_hold_msat`); it still counts against the
 grant's budget and available liquidity. A refused closing payment leaves
 the call ended without an owner debit.
 
+PostgreSQL startup now refuses a database whose `_konsensus_migrations`
+rows include a version this binary does not know (`FutureSchema`), before
+it applies anything else or serves. That matches the SQLite
+`VersionMissing` fence. The rc20 binary did not have the check. Do not
+delete migration history to make an older binary start.
+
 Follow the [rc21 signing and beta-node checklist](releases/v0.3.0-rc21.md).
 
 ## rc19 → rc20
@@ -109,8 +115,11 @@ notice and call-block invoice provenance) run on first start. They are
 additive and have no down migration. Keep a consistent database backup
 before upgrading. Do not downgrade; roll forward on the migrated database.
 On SQLite, an older binary refuses startup when the database records a
-migration version the binary does not know (`VersionMissing`). The
-PostgreSQL backend has no such check and starts on the newer schema.
+migration version the binary does not know (`VersionMissing`). The rc20
+PostgreSQL backend had no such check and would start on the newer schema.
+rc21 refuses that case (`FutureSchema`) before applying migrations or
+serving.
+
 Migration **035** ends every in-flight live call;
 restart calls after the upgrade (their replay tombstones are kept and no
 unpaid media interval is granted). The two sections below cover the call
@@ -122,9 +131,10 @@ Migration **037** adds invoice-hash bindings to `(peer, call_id, seq)` on
 SQLite and PostgreSQL. It is additive and idempotent, with no down migration.
 Keep a consistent database backup before upgrading. Do not downgrade; roll
 forward. On SQLite, an older binary that does not know version 037 refuses
-the upgraded database (`VersionMissing`). PostgreSQL has no such check and
-starts on the newer schema. Do not delete migration history or invoice
-bindings to make an older binary start.
+the upgraded database (`VersionMissing`). PostgreSQL refuses an applied
+version this binary does not know (`FutureSchema`) and does not start. Do
+not delete migration history or invoice bindings to make an older binary
+start.
 
 ## Call reservations (#460)
 
