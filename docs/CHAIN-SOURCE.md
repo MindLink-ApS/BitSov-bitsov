@@ -1,5 +1,9 @@
 # Choose your chain source
 
+Setting up a first node on signet, end to end, is covered in the
+[signet quickstart](QUICKSTART-SIGNET.md); this note is the reference for the
+chain source it configures.
+
 BitSov can use your own Bitcoin Core (pruned or full) for both embedded LDK
 Lightning and chain height, headers, fees and transaction confirmation. MindLink
 does not run a default chain server. Existing Esplora configurations and fresh

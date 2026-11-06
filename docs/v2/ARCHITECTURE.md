@@ -1,7 +1,9 @@
 # BitSov/Konsensus v2 — Core Stack Specification
 
-> **Status:** At rest — pending v1 field testing
-> **Related:** [PRD.md](PRD.md) | [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) | [CURRENT_GAPS.md](CURRENT_GAPS.md)
+> **Status:** Historical v2 design reference. It describes a design target, not
+> the shipped node. Nothing below is a claim that a feature exists today.
+> **Related:** the PRD, development plan and gap list it cites are not in this
+> public tree.
 
 > **Public-core note (2026-05-20):** This is an early v2 reference document.
 > The launch boundary is now governed by `CHARTER.md`,
@@ -10,6 +12,16 @@
 > Full/Infrastructure resource profiles, not custodial hosting. Any hosted or
 > relay deployment must remain non-custodial: user-held identity keys,
 > encrypted storage, and ciphertext-only relay surfaces.
+
+> **Public-beta note (2026-10-23):** the node today is a closed beta on signet
+> test nodes (regtest for tests); mainnet is not supported for the public beta.
+> Not shipped, and described below only as design: PQXDH and MLS (the node uses
+> X3DH and the Double Ratchet), Tor hidden services and `.onion` peers, the
+> `[tor]` tables, DHT and `.well-known` discovery, Neutrino, gRPC Lightning
+> backends (CLN is a clnrest preview, see `docs/CLN.md`), and the Tier-2 relay
+> (see `RELAY_PROTOCOL.md`, Proposed). The identity model is keys: Bitcoin
+> anchors energy and admission, never identity. For what is reachable today see
+> `docs/operations/reachability.md`.
 
 ---
 
@@ -114,7 +126,7 @@ Six core traits define the abstraction boundaries. Each trait has multiple imple
 
 ### 2.1 ChainProvider
 
-Provides Bitcoin blockchain data for payment verification and chain-aware message pricing (Principle 5 · ADR-027).
+Provides timechain (Bitcoin block chain) data for payment verification and chain-aware message pricing (Principle 5 · ADR-027).
 
 ```rust
 /// Abstraction over Bitcoin chain data sources.
@@ -569,7 +581,7 @@ impl NodeIdentity {
 
 ## 4. Message Flow
 
-### Payment-Gated, Timechain-Priced, E2EE Message Flow
+### Payment-Gated, Chain-Aware-Priced, E2EE Message Flow
 
 ```
 Sender Node                                              Recipient Node
@@ -641,14 +653,19 @@ Sender Node                                              Recipient Node
 ### Key Properties
 
 - **Payment before delivery:** Message is rejected if payment verification fails (step 12). This is fail-closed — any error in payment verification results in rejection, not acceptance.
-- **E2EE at composition time:** The sender encrypts before transmission (step 6). Neither node's operator can read the plaintext.
+- **E2EE at composition time:** The sender encrypts before transmission (step 6). Design target only: today the node does this encryption, so the operator of either node can read the plaintext.
 - **Double encryption at rest:** E2EE ciphertext is additionally encrypted with AES-256-GCM using the node's storage key before persistence (steps 14, 16).
-- **Timechain-aware pricing:** The price is computed dynamically from chain state (step 2), not a static configuration value.
+- **Chain-aware message pricing (ADR-027):** The price is computed dynamically from chain state (step 2), not a static configuration value.
 - **Federation signatures on every message:** Even between known peers, every message is signed and verified (steps 8, 10).
 
 ---
 
 ## 5. End-to-End Encryption Stack
+
+> Design target. The shipped node uses X3DH and the Double Ratchet
+> (`crates/konsensus-crypto`); PQXDH and MLS are not implemented. The ends of
+> that encryption are the two nodes, not the apps, so both nodes can read
+> messages. Encryption that reaches the app is planned.
 
 ### 1:1 Messages — PQXDH (Post-Quantum Extended Diffie-Hellman)
 
@@ -748,7 +765,7 @@ Properties:
 
 ## 6. DNS-Free Discovery
 
-v2 supports multiple peer discovery mechanisms that operate concurrently. No single mechanism is required — nodes use whatever is available and configured.
+This design describes multiple peer discovery mechanisms that would operate concurrently. Today only static peers are shipped; `.well-known`, Tor and DHT discovery are not implemented, and endpoints are learned out of band (invites, QR codes, manual entry).
 
 ### Discovery Mechanisms
 
@@ -799,7 +816,7 @@ GET /.well-known/konsensus-server.json
 
 ### Tor Hidden Service
 
-Nodes can expose a Tor `.onion` address for DNS-free, censorship-resistant connectivity:
+In this design a node would expose a Tor `.onion` address for DNS-free, censorship-resistant connectivity. Not shipped: there is no `[tor]` table, SOCKS proxy or onion service today (`docs/operations/reachability.md`).
 
 ```toml
 [tor]
@@ -811,7 +828,7 @@ hidden_service = true
 
 ### DHT (Distributed Hash Table)
 
-Kademlia-based DHT for decentralized peer discovery:
+Kademlia-based DHT for decentralized peer discovery (design only; no DHT is implemented, and the design reasoning doc records it as an open question):
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -978,7 +995,7 @@ backend = "ldk"
 
 [lightning.ldk]
 channel_dir = "/var/lib/konsensus/channels"
-network = "mainnet"
+network = "signet"  # public beta: signet or regtest only
 # Auto-connect to well-known LSPs for initial channel
 auto_channel = true
 
@@ -1021,7 +1038,7 @@ provider = "bitcoind"
 rpc_url = "http://127.0.0.1:8332"
 rpc_user = "konsensus"
 rpc_password_file = "/var/lib/konsensus/bitcoind_rpc.pass"
-network = "mainnet"
+network = "signet"  # public beta: signet or regtest only
 
 [lightning]
 backend = "lnd"
@@ -1054,10 +1071,7 @@ whitelist = [
 ]
 
 [pricing]
-engine = "timechain"
-min_price_msat = 10
-max_price_msat = 100000
-fee_sensitivity = 0.5  # How much mempool fees affect pricing
+mode = "chain_aware"  # chain-aware message pricing (ADR-027); "static" is the default
 
 [api]
 listen = "127.0.0.1:3000"
@@ -1090,7 +1104,7 @@ provider = "bitcoind"
 rpc_url = "http://127.0.0.1:8332"
 rpc_user = "konsensus"
 rpc_password_file = "/var/lib/konsensus/bitcoind_rpc.pass"
-network = "mainnet"
+network = "signet"  # public beta: signet or regtest only
 # Archival node — no pruning
 txindex = true
 
@@ -1126,10 +1140,7 @@ whitelist = [
 ]
 
 [pricing]
-engine = "timechain"
-min_price_msat = 10
-max_price_msat = 100000
-fee_sensitivity = 0.5
+mode = "chain_aware"  # chain-aware message pricing (ADR-027); "static" is the default
 
 [api]
 listen = "0.0.0.0:3000"

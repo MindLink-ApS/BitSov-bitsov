@@ -233,6 +233,8 @@ async fn fetch(
             operation_id: None,
             wait_ack_ms: None,
             max_routing_fee_msat: req.max_routing_fee_msat,
+            max_block_msat: None,
+            max_hold_msat: None,
             max_total_msat: req.max_total_msat,
             max_recipient_msat: None,
             recipient: req.node_id.clone(),

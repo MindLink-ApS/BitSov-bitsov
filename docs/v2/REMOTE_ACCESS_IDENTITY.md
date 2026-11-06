@@ -74,7 +74,7 @@ pub struct UnsignedDeviceAttestation {
     pub device_pubkey:   [u8; 32],         // per-device Ed25519
     pub device_kx_pubkey:[u8; 32],         // per-device X25519
     pub device_id:       [u8; 16],
-    pub device_label:    String,           // "Maya's iPhone"
+    pub device_label:    String,           // "Carol's iPhone"
     pub device_kind:     DeviceKind,       // Mobile | Desktop | Browser | Tablet | Headless
     pub issued_at_unix:  u64,
     pub expires_at_unix: u64,              // recommended: issued + 2 years
@@ -124,7 +124,7 @@ Primary device (D_p, has mnemonic)        New device (D_n)
 
 The user's instinct ("Lightning transaction from a whitelisted pubkey") is **not** needed for cryptographic authentication — Ed25519 signature suffices. But it has legitimate use: **anti-Sybil at relay onboarding**.
 
-Recommendation: at **first pairing to a new relay**, the user's home node issues a 1-sat keysend to the relay's pubkey, with TLV payload binding the keysend to `(identity_pubkey, device_pubkey, issued_at)`. Relay records this as one-shot proof-of-funds. Future devices paired to **same** identity inherit this anchor — no per-device keysend.
+Recommendation: at **first pairing to a new relay**, the user's home node issues a 1-sat keysend to the relay's pubkey, with TLV payload binding the keysend to `(identity_pubkey, device_pubkey, issued_at)`. Relay records this as one-shot proof-of-funds. Future devices paired to **same** identity inherit this proof-of-funds — no per-device keysend. The keysend shows that the identity holder controls spendable sats; it does not define or anchor the identity, which is the Ed25519 key.
 
 This is **not** auth (auth is the Ed25519 signature). It is admission policy. Relay operator may waive for known whitelisted identities.
 
@@ -244,16 +244,16 @@ The whitelist is small append-only log of `DeviceAttestation` + `DeviceRevocatio
 
 - **Primary copy:** user's home node(s) hold canonical state
 - **Relay copy:** stores log as **opaque AES-256-GCM ciphertext** keyed by `NodeIdentity::aes_key()` of the user. Relay cannot read; only confirms "signature came from key the user's biscuit-root authorized" — proven by biscuit, not whitelist.
-- **No on-chain storage** — Bitcoin OP_RETURN doesn't scale to 5M devices × N revocations. Reserve chain for genuine timestamp anchors (identity birth certificate — §C).
+- **No on-chain storage** — Bitcoin OP_RETURN doesn't scale to 5M devices × N revocations. At most, the chain could timestamp a recovery event (§C); identity itself stays in keys, never on-chain.
 - **No "primary must be online":** attestation is self-verifying offline. Primary only needed when **adding** or **revoking**.
 
 Matches Cell Test (DNA in nucleus = whitelist in home nodes; receptors on surface = attestations on devices); scales (~5 KB ciphertext per tenant); no third party; sovereignty-preserving (relay can't enumerate user's devices).
 
 ### B. Device revocation — **Mnemonic-signed `DeviceRevocation` + short-TTL session caching**
 
-Maya loses phone:
+Carol loses phone:
 
-1. From any mnemonic-holding device (laptop), Maya signs:
+1. From any mnemonic-holding device (laptop), Carol signs:
    ```
    DeviceRevocation {
        version: 1,
@@ -277,7 +277,7 @@ Maya loses phone:
 
 ### C. Mnemonic recovery — **Identity birth certificate + relay re-registration**
 
-Maya loses every device, has only 24 words.
+Carol loses every device, has only 24 words.
 
 1. Install BitSov on new device
 2. Enter mnemonic. App calls `NodeIdentity::from_mnemonic`. Mnemonic re-derives **same** `identity_pubkey`.
@@ -289,18 +289,18 @@ Maya loses every device, has only 24 words.
 - Every identity has `birth_cert`: `{ identity_pubkey, generation: u64, issued_at, signature_by_mnemonic_key }`. Generation increments **only on mnemonic recovery** (legitimately wipes whitelist). New generation invalidates **all** prior attestations + revocations under that identity.
 - birth_cert anchored lazily in **federation gossip envelope** (not on-chain — too slow for recovery). Relays accept higher-generation birth_cert from legitimate mnemonic.
 - After recovery: walk relay re-onboarding once per relay (one Lightning keysend, §2.4). Past **channels** recovered via LDK's `keys_manager` + same mnemonic — already in L5d recovery drill. **Channel recovery and identity recovery share mnemonic; don't need to share recovery flow.**
-- **Bitcoin anchor (optional, future ADR):** publish `blake3(birth_cert)` in OP_RETURN at generation creation. Relays refuse generation bump unless seeing anchor in confirmed Bitcoin tx ≥ N blocks deep. Defeats "attacker stole mnemonic, rotates whitelist faster than user reacts" — gives user window to publish own anchor first. **Do not require for v2; design field, leave optional.**
+- **Bitcoin timestamp (optional, future ADR; this would timestamp a generation bump, not define the identity — Bitcoin anchors energy and admission, never identity):** publish `blake3(birth_cert)` in OP_RETURN at generation creation. Relays refuse generation bump unless seeing anchor in confirmed Bitcoin tx ≥ N blocks deep. Defeats "attacker stole mnemonic, rotates whitelist faster than user reacts" — gives user window to publish own anchor first. **Do not require for v2; design field, leave optional.**
 
 ### D. Pairing without prior contact (new user) — **Layer 0: install ⇒ generate**
 
-Lisa has no BitSov identity. Cannot accept Maya's invite via L1 (requires primary with mnemonic).
+Lisa has no BitSov identity. Cannot accept Carol's invite via L1 (requires primary with mnemonic).
 
 **Layer 0 (one-time, before L1 exists):**
 
 1. Lisa installs BitSov on phone
 2. App generates **fresh 24-word mnemonic** (`NodeIdentity::generate`). Phone IS primary device.
 3. App calls `from_mnemonic`, derives identity_pubkey, generates `device_key`, self-signs **first** DeviceAttestation, writes birth_cert (generation 0).
-4. **Mandatory backup gate**: until user has (a) written down 24 words or (b) printed steel/paper backup, app gates write capability. Maya's invite accepted, but Lisa cannot accept payment downgrade or revoke anything until backup confirmed.
+4. **Mandatory backup gate**: until user has (a) written down 24 words or (b) printed steel/paper backup, app gates write capability. Carol's invite accepted, but Lisa cannot accept payment downgrade or revoke anything until backup confirmed.
 
 Lisa's phone is BOTH mnemonic-holder AND paired device. Subsequent devices (laptop, tablet) follow normal L1 with phone as primary.
 
@@ -308,17 +308,17 @@ This is existing `NodeIdentity::generate` formalized. No new crypto. Novelty: **
 
 ### E. Borrowed-browser at friend's house — **Yes, via primary-device-issued ephemeral biscuit OR mnemonic entry**
 
-Maya, no phone, no laptop, friend's browser. 15 minutes of email needed.
+Carol, no phone, no laptop, friend's browser. 15 minutes of email needed.
 
 **Flow:**
 
 1. Open `https://node-alice.example` in friend's browser. Static page from home node asks: "Trusted or borrowed device?" -> "borrowed"
 2. Page generates **ephemeral browser device_key in-memory** (Web Crypto API, non-extractable). Displays 9-digit pairing code + QR.
-3. Maya needs to pair from another device... but she has none.
+3. Carol needs to pair from another device... but she has none.
 
 **Principled answer: borrowed-browser session requires EITHER (a) one paired device OR (b) the mnemonic.**
 
-If Maya has mnemonic memorized: she may enter directly in friend's browser to derive identity, generate **short-lived (15min, read-only) biscuit**, and go. **Deliberate sovereignty trade-off**: typing mnemonic into foreign device is risky and **should be explicit opt-in**, with screen saying "this device may keylog your mnemonic — rotate to new mnemonic within 24h if you do this." Rotate action is recovery flow §C.
+If Carol has mnemonic memorized: she may enter directly in friend's browser to derive identity, generate **short-lived (15min, read-only) biscuit**, and go. **Deliberate sovereignty trade-off**: typing mnemonic into foreign device is risky and **should be explicit opt-in**, with screen saying "this device may keylog your mnemonic — rotate to new mnemonic within 24h if you do this." Rotate action is recovery flow §C.
 
 If she has neither mnemonic nor paired device: **cannot access BitSov.** Correct. Sovereignty means user is bottleneck when user has surrendered all key material. There is no "forgot password" because there is no password.
 
@@ -333,7 +333,7 @@ If she has neither mnemonic nor paired device: **cannot access BitSov.** Correct
 | L1 — pairing new device | **No** | Signature sufficient. LN here would block legitimate user mid-pairing if channel closed. |
 | L2 — establishing session | **No** | 5M LN payments/day to log in × 1M users × 5 devices. Breaks Lightning UX. |
 | L3 — per request | **Never** | Explicit Principle-2 boundary: payment gates **messages**, not authentication. |
-| First connection to new relay | **Yes — one 1-sat keysend** | Anti-Sybil + ties identity to Bitcoin-spendable key. Relay's policy. |
+| First connection to new relay | **Yes — one 1-sat keysend** | Anti-Sybil admission: proves the identity holder controls spendable sats. It does not bind identity to Bitcoin. Relay's policy. |
 | Recovery from mnemonic | **No for identity, yes for channels** | Identity recovery is signature-only. Channel recovery uses BIP-32 LDK paths (separate flow, L5d). |
 | Generation bump | **Not required, recommended OP_RETURN anchor** | See §C. |
 | Borrowed-browser | **No** | Cost is typing mnemonic, not sats. |
@@ -354,7 +354,7 @@ If she has neither mnemonic nor paired device: **cannot access BitSov.** Correct
 | Side-channel timing on Ed25519 | The mnemonic key | **Defense:** `ed25519-dalek` constant-time impl, already in use. |
 | FCM/APNS observing push payloads | User's online signal | **Out of scope here** — see THREAT_MODEL_TIER2_RELAY.md §2.11. Auth layer doesn't send push. |
 
-**To impersonate Maya at relay**: attacker needs **either** (a) Maya's mnemonic, **or** (b) non-revoked Maya-issued attestation AND its corresponding device key. Both explicit user-held secrets. No phone number, no email, no SaaS pwn-and-takeover path.
+**To impersonate Carol at relay**: attacker needs **either** (a) Carol's mnemonic, **or** (b) non-revoked Carol-issued attestation AND its corresponding device key. Both explicit user-held secrets. No phone number, no email, no SaaS pwn-and-takeover path.
 
 ## 7. UX Implications
 

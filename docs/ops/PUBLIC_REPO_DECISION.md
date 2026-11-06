@@ -12,19 +12,19 @@ history private.
 - `MindLink-ApS/BitSov-bitsov` — open protocol, reference node, API/CLI, tests,
   and public protocol docs. After debut this is the canonical public protocol
   development repo, not a stale downstream showroom. The post-merge refresh
-  removes `frontend/` from this protocol tree and preserves Josh's existing
+  removes `frontend/` from this protocol tree and preserves Dave's existing
   `feat/blvm-lightning-free-payments` branch.
-- `MindLink-ApS/bitsov-app` — open reference desktop app/client. It consumes
-  the public node API and must remain optional.
+- The reference desktop app/client will be published later as its own public
+  repository; it is not yet published. It consumes the public node API and
+  must remain optional.
 - `BitSov/bitsov-rfcs` — optional later split for ADR/RFC governance.
 - `BitSov/bitsov.dev` — optional public docs site generated from scrubbed docs.
 
 The repo-name decision is closed by D1/D2 in
 `docs/ops/LAUNCH_DECISION_REGISTER.md`: no fresh `bitsov-core` repo for the
 developer debut. Website metadata, release URLs, and public copy must point to
-`MindLink-ApS/BitSov-bitsov` for protocol and `MindLink-ApS/bitsov-app` for the
-reference app once those repositories are instantiated/published under the
-launch gates.
+`MindLink-ApS/BitSov-bitsov` for protocol, and to the app repository for the
+reference app once it is published under the launch gates.
 
 ### Private
 

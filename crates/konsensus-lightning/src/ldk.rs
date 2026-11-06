@@ -393,7 +393,7 @@ fn binding_tlv_record_for_send(binding: &[u8]) -> Result<CustomTlvRecord, Lightn
 /// Construct an in-flight spontaneous payment fallback when LDK has returned a
 /// `PaymentId` but its payment store has not surfaced the record yet. LDK Node
 /// sets spontaneous `PaymentId` bytes to the generated payment hash bytes, so a
-/// binding path must preserve those bytes instead of returning an empty hash.
+/// keysend path must preserve those bytes instead of returning an empty hash.
 fn in_flight_spontaneous_payment_details(
     payment_hash: [u8; 32],
     amount_msat: u64,
@@ -1919,16 +1919,11 @@ impl LightningProvider for LdkProvider {
             return Ok(convert_payment_details(&details));
         }
 
-        Ok(PaymentDetails {
-            payment_hash: String::new(),
-            preimage: None,
+        Ok(in_flight_spontaneous_payment_details(
+            payment_id.0,
             amount_msat,
-            status: PaymentStatus::InFlight,
-            direction: PaymentDirection::Outgoing,
-            timestamp: now,
-            memo: None,
-            fee_msat: None,
-        })
+            now,
+        ))
     }
 
     /// R2 seam-3b: send-half of ADR-037 over a real LDK node. Mirrors
@@ -2984,6 +2979,7 @@ fn channel_info(ch: ldk_node::ChannelDetails) -> ChannelInfo {
         peer_pubkey: ch.counterparty_node_id.to_string(),
         capacity_msat: ch.channel_value_sats * 1000,
         local_balance_msat: ch.outbound_capacity_msat,
+        outbound_capacity_msat: Some(ch.outbound_capacity_msat),
         remote_balance_msat: ch.inbound_capacity_msat,
         active: ch.is_usable,
         short_channel_id: ch.short_channel_id.map(|id| id.to_string()),

@@ -106,7 +106,7 @@ Items 5/6/7 are deltas. The Five Immutable Principles are silent on them today; 
 | Spam mitigation | Payment gate | Phone number | Apple ID | Captcha |
 | Hostile-operator failure mode | Switch relay, keep identity | Lose history, re-verify | Locked out | Lose history on server |
 
-**Strictly better:** identity portability, kind opacity, multi-relay fanout, payment-gated spam (incl. gated signalling), optional Tor user-leg. **Equivalent:** content E2EE. **Worse without mitigation:** LN routing leak is novel; call-presence/timing metadata is visible to a relay even though signalling is now gated (mitigable via padding/TURN); FCM parity is a known Signal weakness we should beat, not match.
+**Strictly better (as designed; the relay and the Tor user-leg are not shipped):** identity portability, kind opacity, multi-relay fanout, payment-gated spam (incl. gated signalling), optional Tor user-leg. **Equivalent:** content E2EE. **Worse without mitigation:** LN routing leak is novel; call-presence/timing metadata is visible to a relay even though signalling is now gated (mitigable via padding/TURN); FCM parity is a known Signal weakness we should beat, not match.
 
 ## Cell test
 
@@ -114,4 +114,4 @@ A cell does not let neighbours read its ATP transactions, count its action poten
 
 ---
 
-*Scale-tested mitigations only; global mixnet deferred. Items 5/6/7 mark divergences from `wire.rs` and ADR-032; treat as required deltas before promoting Tier-2 Relay from proposal to architecture.*
+*Only mitigations with scale precedent elsewhere are listed; nothing here is scale-tested in BitSov or shipped. Global mixnet deferred. Items 5/6/7 mark divergences from `wire.rs` and ADR-032; treat as required deltas before promoting Tier-2 Relay from proposal to architecture.*

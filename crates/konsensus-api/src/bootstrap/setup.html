@@ -27,7 +27,7 @@ async function refresh() {
  } catch(e) { el('error').textContent=e.message; }
 }
 el('start').onclick=async()=>{try{const t=await call('/setup/start',{});el('qr').innerHTML=t.qr;el('uri').textContent=t.uri;el('link').href=t.uri;el('ticket').hidden=false;expires=Date.now()+t.expires_in*1000;el('expiry').textContent='One use. Expires in '+t.expires_in+' seconds.';await refresh();}catch(e){el('error').textContent=e.message;}};
-el('approve').onclick=async()=>{try{await call('/setup/approve',{ceremony_id:ceremony.ceremony_id,sas_digest:ceremony.sas_digest});await refresh();}catch(e){el('error').textContent=e.message;}};
+el('approve').onclick=async()=>{try{await call('/setup/approve',{ceremony_id:ceremony.ceremony_id,words:ceremony.words});await refresh();}catch(e){el('error').textContent=e.message;}};
 el('cancel').onclick=async()=>{try{await call('/setup/cancel',{});el('ticket').hidden=true;await refresh();}catch(e){el('error').textContent=e.message;}};
 refresh();setInterval(refresh,2000);
 </script></body></html>

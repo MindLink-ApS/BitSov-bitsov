@@ -12,6 +12,7 @@ fn channel(peer: &str, capacity: u64) -> ChannelInfo {
         peer_pubkey: peer.into(),
         capacity_msat: capacity,
         local_balance_msat: 0,
+        outbound_capacity_msat: None,
         remote_balance_msat: 0,
         active: true,
         short_channel_id: None,

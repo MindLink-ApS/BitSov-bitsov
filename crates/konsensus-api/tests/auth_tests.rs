@@ -1780,7 +1780,7 @@ async fn auth_token_get_method_not_allowed() {
 /// passing re-auth (fresh challenge + node-key signature) and assert the given
 /// post-re-auth failure path STILL records a `success:false`
 /// `identity.mnemonic_revealed` audit event with the expected reason — and never
-/// writes a seed phrase. These are the sensitive cases Codex flagged on #238:
+/// writes a seed phrase. These are the sensitive cases a review flagged on #238:
 /// the caller has already proven possession of the node key, so the
 /// "every reveal attempt is audited" contract must hold on these returns too.
 async fn assert_post_reauth_reveal_failure_audited(
@@ -1964,6 +1964,34 @@ async fn auth_user_rejection_body_is_uniform_across_failure_classes() {
     }
 }
 
+/// `[calls] max_call_minutes`: the owner's `/status` reports the node's value so
+/// an app can compute the hold before ringing; the public `/health` never does.
+#[tokio::test]
+async fn status_reports_max_call_minutes_to_the_owner_only() {
+    async fn get(state: &Arc<AppState>, uri: &str, auth: bool) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder().uri(uri);
+        if auth {
+            req = req.header("authorization", auth_header(state));
+        }
+        let resp = build_router(Arc::clone(state)).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+    let state = Arc::new(AppState { max_call_minutes: 45, ..(*test_state()).clone() });
+    let (status, body) = get(&state, "/api/v1/status", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["max_call_minutes"], 45);
+
+    let (status, body) = get(&state, "/api/v1/status", false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.get("max_call_minutes").is_none());
+
+    let (status, body) = get(&state, "/api/v1/health", false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.get("max_call_minutes").is_none());
+}
+
 /// `[calls] stun_listen`: the owner's `/status` reports the STUN port only when
 /// the responder runs; the public `/health` never does.
 #[tokio::test]
@@ -1995,8 +2023,9 @@ async fn status_reports_stun_port_only_when_listening() {
         ),
         ..(*test_state()).clone()
     });
-    assert_eq!(get(&public, "/api/v1/status", true).await["stun_url"], "stun:node.example.org:3478");
     let status = get(&public, "/api/v1/status", true).await;
+    assert_eq!(status["stun_url"], "stun:node.example.org:3478");
+    assert_eq!(status["stun_source"], "own");
     assert_eq!(status["peer_endpoint"], "node.example.org:9000");
     assert_eq!(status["peer_endpoint_source"], "advertised");
     assert!(status.get("peer_endpoint_reason").is_none());
@@ -2013,17 +2042,58 @@ async fn status_reports_stun_port_only_when_listening() {
     assert_eq!((status["peer_endpoint"].as_str(), status["peer_endpoint_source"].as_str()), (Some("93.184.216.34:9000"), Some("stun")));
 }
 
-#[test]
-fn stun_url_uses_the_dialable_host_only() {
-    use konsensus_api::handlers::health::stun_url;
-    assert_eq!(stun_url(Some("203.0.113.5:9000"), Some(3478)).as_deref(), Some("stun:203.0.113.5:3478"));
-    assert_eq!(stun_url(Some("[2001:db8::1]:9000"), Some(3478)).as_deref(), Some("stun:[2001:db8::1]:3478"));
-    assert_eq!(stun_url(Some(" node.example.org:9000 "), Some(1)).as_deref(), Some("stun:node.example.org:1"));
-    for bad in ["127.0.0.1:9000", "[::1]:9000", "0.0.0.0:9000", "localhost:9000", "nohost", ":9000", "a b:1", "user@h:1", "2001:db8::1:9000"] {
-        assert_eq!(stun_url(Some(bad), Some(3478)), None, "{bad}");
+/// `/status` `stun_url` falls back to `[network] stun_server` when the node's own
+/// responder has no dialable host; own responder + public host always wins.
+#[tokio::test]
+async fn status_reports_configured_stun_server_when_own_has_no_url() {
+    async fn get(state: &Arc<AppState>, uri: &str, auth: bool) -> serde_json::Value {
+        let mut req = Request::builder().uri(uri);
+        if auth {
+            req = req.header("authorization", auth_header(state));
+        }
+        let resp = build_router(Arc::clone(state)).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap()).unwrap()
     }
-    assert_eq!(stun_url(None, Some(3478)), None);
-    assert_eq!(stun_url(Some("203.0.113.5:9000"), None), None);
+    let configured = Arc::new(AppState {
+        stun_port: Some(3478),
+        configured_stun_server: Some("hub.example.org:3478".into()),
+        ..(*test_state()).clone()
+    });
+    let status = get(&configured, "/api/v1/status", true).await;
+    assert_eq!(status["stun_url"], "stun:hub.example.org:3478");
+    assert_eq!(status["stun_source"], "configured");
+    assert!(status.get("peer_endpoint").is_none());
+    let health = get(&configured, "/api/v1/health", false).await;
+    assert!(
+        health.get("stun_url").is_none()
+            && health.get("stun_source").is_none()
+            && health.get("stun_port").is_none(),
+        "public /health must not expose configured STUN"
+    );
+
+    let own_wins = Arc::new(AppState {
+        stun_port: Some(3478),
+        configured_stun_server: Some("hub.example.org:3478".into()),
+        introduction: konsensus_api::handlers::introduction::IntroductionSettings::fixed(
+            None,
+            Some("node.example.org:9000"),
+        ),
+        ..(*test_state()).clone()
+    });
+    let status = get(&own_wins, "/api/v1/status", true).await;
+    assert_eq!(status["stun_url"], "stun:node.example.org:3478");
+    assert_eq!(status["stun_source"], "own");
+
+    let neither = Arc::new(AppState {
+        configured_stun_server: None,
+        ..(*test_state()).clone()
+    });
+    let status = get(&neither, "/api/v1/status", true).await;
+    assert!(status.get("stun_url").is_none());
+    assert!(status.get("stun_source").is_none());
+    let health = get(&neither, "/api/v1/health", false).await;
+    assert!(health.get("stun_url").is_none() && health.get("stun_source").is_none());
 }
 
 /// `custody_mode` (REMOTE-SIGNER.md §2) is owner-only: the owner's `/status`

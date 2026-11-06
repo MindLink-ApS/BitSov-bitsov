@@ -9,7 +9,7 @@
 //! mock Lightning ledger. The payer is driven through its real
 //! `POST /api/v1/messages/compose` route.
 //!
-//! The fix (Atlas CoS, after the Fable 5.1 review): a connection on which WE
+//! The fix (after review): a connection on which WE
 //! settled the peer's admission (`Connection::admission_paid`, set before our
 //! proof goes out, dying with the connection) accepts the frames that complete
 //! the act we paid for: PrekeyOffer, SessionInit, SessionAck, RatchetInit,
@@ -393,6 +393,8 @@ struct NodeSpec<'a> {
     peer: Option<NodeId>,
     /// Reuse a data dir (a restart keeps the admission journal).
     data_dir: Option<PathBuf>,
+    /// Keep E2EE sessions in this store.
+    session_store: Option<Arc<dyn konsensus_crypto::SessionStore>>,
 }
 
 async fn start_node(spec: NodeSpec<'_>) -> Node {
@@ -431,7 +433,10 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
     };
     let storage: Arc<dyn konsensus_storage::Storage> =
         Arc::new(konsensus_storage::sqlite::SqliteStorage::in_memory().await.unwrap());
-    let sessions = Arc::new(SessionManager::new(Arc::clone(&identity)));
+    let sessions = Arc::new(match spec.session_store {
+        Some(store) => SessionManager::with_store(Arc::clone(&identity), store),
+        None => SessionManager::new(Arc::clone(&identity)),
+    });
     let registry = Arc::new(tokio::sync::RwLock::new(PeerRegistry::new()));
     let audit = Arc::new(konsensus_api::audit::AuditLog::open(data_dir.join(format!("audit-{id}.log"))).unwrap());
     let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> =
@@ -507,7 +512,10 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         front_door: front_door.clone(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
+        configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
         file_staging: Default::default(),
@@ -688,7 +696,8 @@ impl Node {
 
     /// The next plaintext this node delivers, and nothing else behind it.
     async fn delivered_once(&mut self, text: &str) {
-        let got = tokio::time::timeout(Duration::from_secs(5), self.delivered.recv()).await;
+        // Generous: a loaded runner can take seconds to hand a delivery to the feed.
+        let got = tokio::time::timeout(Duration::from_secs(15), self.delivered.recv()).await;
         assert_eq!(got.ok().flatten().as_deref(), Some(text));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(self.delivered.try_recv().is_err(), "{text:?} delivered more than once");
@@ -734,6 +743,16 @@ struct Pair {
 }
 
 async fn pair(shape: Shape, order: Order, payer_wallet: Wallet, payee_wallet: Wallet) -> Pair {
+    pair_with_payer_store(shape, order, payer_wallet, payee_wallet, None).await
+}
+
+async fn pair_with_payer_store(
+    shape: Shape,
+    order: Order,
+    payer_wallet: Wallet,
+    payee_wallet: Wallet,
+    payer_store: Option<Arc<dyn konsensus_crypto::SessionStore>>,
+) -> Pair {
     let (payer_id, payee_id) = identities(order);
     let (payer_node, payee_node) = (*payer_id.node_id(), *payee_id.node_id());
     let (payer_list, payee_list) = match shape {
@@ -745,12 +764,12 @@ async fn pair(shape: Shape, order: Order, payer_wallet: Wallet, payee_wallet: Wa
     let ledger_path = ledger.path().join("ledger.db");
     let payer = start_node(NodeSpec {
         identity: payer_id, whitelist: payer_list, ledger: &ledger_path, name: "payer",
-        balance_msat: 1_000_000, wallet: payer_wallet, peer: Some(payee_node), data_dir: None,
+        balance_msat: 1_000_000, wallet: payer_wallet, peer: Some(payee_node), data_dir: None, session_store: payer_store,
     })
     .await;
     let payee = start_node(NodeSpec {
         identity: payee_id, whitelist: payee_list, ledger: &ledger_path, name: "payee",
-        balance_msat: 0, wallet: payee_wallet, peer: None, data_dir: None,
+        balance_msat: 0, wallet: payee_wallet, peer: None, data_dir: None, session_store: None,
     })
     .await;
     // The payee issues no admission quote in its first second (F1 quarantine).
@@ -912,7 +931,7 @@ async fn m4_retry_on_the_same_connection_does_not_repay() {
 
 /// 5: the connection flaps after the admission settled, before its proof went
 /// out. The proof never reached the payee, so it is unspent: the retry
-/// delivers it on the new connection and pays the message only (Codex review
+/// delivers it on the new connection and pays the message only (review
 /// of b424ac5, P1: never pay again on settlement time vs connection time
 /// alone). A proof that DID go out on an older connection is covered by m9
 /// and the restart tests in `reconnect_recovery_tests.rs`.
@@ -979,7 +998,7 @@ async fn m11_payer_restart_inside_the_window_pays_once_per_connection() {
     let restarted = start_node(NodeSpec {
         identity: Arc::clone(&net.payer.identity), whitelist: vec![], ledger: &net.ledger(),
         name: "payer", balance_msat: 1_000_000, wallet: Wallet::Plain, peer: None,
-        data_dir: Some(net.payer.data_dir.clone()),
+        data_dir: Some(net.payer.data_dir.clone()), session_store: None,
     })
     .await;
     let old = std::mem::replace(&mut net.payer, restarted);
@@ -1157,7 +1176,7 @@ async fn m9_m10_reconnect_needs_readmission_then_acks_count() {
     net.payee.transport.send_frame(&payer, &Frame::PrekeyOffer { bundle }).await.unwrap();
     net.payee
         .transport
-        .send_frame(&payer, &Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([3u8; 32]), duplicate: false })
+        .send_frame(&payer, &Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([3u8; 32]), duplicate: false, paid_until_ms: None })
         .await
         .unwrap();
     wait_until("the payer dropped both", Duration::from_secs(5), || async {
@@ -1217,7 +1236,7 @@ async fn post_peers_whitelist_takes_effect_on_the_live_connection() {
     net.stop();
 }
 
-// ── Codex review of b424ac5 ──────────────────────────────────────────────
+// ── Review of b424ac5 ────────────────────────────────────────────────────
 
 /// P1: the connection is replaced between `mark_admission_paid` and the proof
 /// send (the reviewer's pause-after-mark hook). The proof is bound to the
@@ -1488,7 +1507,7 @@ async fn slow_return_proxy(upstream: String, delay: Duration) -> String {
     addr
 }
 
-/// Fable review of #102: in the payer-higher order the payer is the X3DH
+/// Review of #102: in the payer-higher order the payer is the X3DH
 /// acceptor. It holds a session (SessionInit received) before its sending
 /// chain exists, which needs the payee's RatchetInit a round trip later.
 /// Compose must wait until it can SEND, not only until a session exists, or
@@ -1520,7 +1539,7 @@ async fn speed_payer_higher_first_compose_delivers_while_ratchet_init_is_in_flig
     net.stop();
 }
 
-/// Codex review of 7af1bc8 (#102 P1): the connection is replaced after the
+/// Review of 7af1bc8 (#102 P1): the connection is replaced after the
 /// payer's eager PrekeyOffer was found eligible (its proof went out on the
 /// paid connection) and before it is written. The offer is bound to the paid
 /// generation: it never reaches the unpaid replacement (whose P2 gate at the
@@ -1565,7 +1584,7 @@ async fn speed_eager_offer_never_reaches_an_unpaid_replacement() {
     net.stop();
 }
 
-/// Codex review of e56d018 (P2): the connection is replaced after a settled,
+/// Review of e56d018 (P2): the connection is replaced after a settled,
 /// already-delivered proof was classified against it and before the proof is
 /// re-sent. The re-send must not mark the replacement paid for a proof that
 /// was consumed on the old connection (that would block the admission the
@@ -1628,3 +1647,43 @@ async fn peer_exchange_payment_promoted_sender_still_requires_own_quote_and_paym
     assert_eq!(net.payer.paid_out().await, paid);
     net.stop();
 }
+
+/// First contact: the admission settles, the session forms, and the save of the first
+/// send fails. The message does not leave and is not paid. The admission stays settled
+/// and is reported as paid, and a retry once saves work pays only the message. Real
+/// handlers, both id orders.
+async fn failed_save_after_admission(order: Order) {
+    use crate::flaky_session_store::FlakySessionStore;
+    let store = Arc::new(FlakySessionStore::default());
+    store.fail(true);
+    let mut net = pair_with_payer_store(Shape::CardOnly, order, Wallet::Plain, Wallet::Plain, Some(store.clone())).await;
+    let payee = net.payee.id;
+
+    let (status, body) = net.payer.compose(&payee, "not saved").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{order:?}: {body}");
+    assert_eq!(body["code"], "payment_settled_send_incomplete", "{body}");
+    assert_eq!(body["amount_msat"], CHAT_MSAT, "the settled admission is reported: {body}");
+    assert_eq!(body["reason"], "session_save_failed", "{body}");
+    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT], "the admission alone was paid");
+    assert!(net.payee.delivered.try_recv().is_err(), "the message did not leave");
+
+    store.fail(false);
+    let (status, body) = net.payer.compose(&payee, "saved").await;
+    assert_eq!(status, StatusCode::OK, "{order:?}: {body}");
+    net.payee.delivered_once("saved").await;
+    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT, CHAT_MSAT], "no second admission");
+    net.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_save_after_admission_keeps_it_paid_payer_initiates() {
+    failed_save_after_admission(Order::PayerLower).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_save_after_admission_keeps_it_paid_payee_initiates() {
+    failed_save_after_admission(Order::PayerHigher).await;
+}
+
+#[path = "session_recovery_two_node.rs"]
+mod session_recovery;

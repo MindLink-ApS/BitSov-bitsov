@@ -16,13 +16,23 @@
 # OS junk
 .DS_Store
 
-# Agent worktrees (checkouts, not source)
-.claude/worktrees/
+# Local worktrees (checkouts, not source)
+.worktrees/
 
 # SQLite runtime state (not source)
 *.db
-*.db-shm
-*.db-wal
+*.db-*
+*.sqlite
+*.sqlite-*
+
+# Node data directories (keep them outside the checkout; see README)
+node-data/
+konsensus.toml
+mnemonic.txt
+mnemonic.txt.enc
+mnemonic.enc
+claim-code
+scb.bin
 
 # Tauri build artifacts (generated, not source)
 frontend/src-tauri/Cargo.lock

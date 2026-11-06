@@ -94,7 +94,7 @@ impl Fixture {
         let mut cfg: toml::Value = std::fs::read_to_string(&config).unwrap().parse().unwrap();
         cfg["node"] = toml::Value::try_from(std::collections::BTreeMap::from([(
             "hosted_by",
-            "Rasmus's Pi",
+            "Alice's Pi",
         )]))
         .unwrap();
         let api = address();
@@ -426,7 +426,7 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
         let mut node = f.start(&log, local);
         let lock = f.ready(&mut node, "/api/v1/node/lock", &log).await;
         assert_eq!(lock["node_id"], f.identity.node_id().to_hex());
-        assert_eq!(lock["hosted_by"], "Rasmus's Pi");
+        assert_eq!(lock["hosted_by"], "Alice's Pi");
         let refused = Command::new(env!("CARGO_BIN_EXE_konsensus"))
             .args(["pair-ticket", "--config"])
             .arg(&f.config)
@@ -521,7 +521,7 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
             "locked tunnel must close within 250ms"
         );
         let health = f.ready(&mut node, "/api/v1/health", &log).await;
-        assert_eq!(health["hosted_by"], "Rasmus's Pi");
+        assert_eq!(health["hosted_by"], "Alice's Pi");
         use tokio::io::AsyncReadExt;
         let mut byte = [0];
         assert_eq!(
@@ -541,7 +541,7 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
             json!({
                 "state":"unlocked", "node_id":f.identity.node_id().to_hex(),
                 "fingerprint":lock["fingerprint"], "locked_since":null,
-                "attempts_left":null, "hosted_by":"Rasmus's Pi"
+                "attempts_left":null, "hosted_by":"Alice's Pi"
             })
         );
         f.check_status_socket(&unlocked).await;
@@ -567,7 +567,7 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
         let uri = String::from_utf8(issued.stdout).unwrap();
         let ticket = wire::PairLink::from_uri(uri.trim()).unwrap();
         assert_eq!(ticket.node_id, f.identity.node_id().to_hex());
-        assert_eq!(ticket.hosted_by.as_deref(), Some("Rasmus's Pi"));
+        assert_eq!(ticket.hosted_by.as_deref(), Some("Alice's Pi"));
         assert_eq!(ticket.box_transport_pubkey, hex::encode(f.box_pin));
         assert!(ticket.box_transport_signature.is_some());
         assert!(!logs(&log).contains("bitsov://pair/"));
@@ -579,7 +579,7 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
         let timestamp = chrono::Utc::now().timestamp();
         let proof = format!(
             "bitsov-pair-challenge-v1:{}:{timestamp}",
-            &f.record.client_id
+            f.record.client_id
         );
         let proof_signature = hex::encode(f.client.sign(proof.as_bytes()).to_bytes());
         let challenge: Value = http
@@ -765,18 +765,24 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
             .await;
         assert_eq!(status, if local { 200 } else { 403 }, "{body}");
         if local {
-            assert_eq!(body["grant"]["per_recipient_msat"]["aa".repeat(32)], 100_000);
+            assert_eq!(
+                body["grant"]["per_recipient_msat"]["aa".repeat(32)],
+                100_000
+            );
         }
         drop(unlocked_tunnel);
         drop(node);
         let file_log = std::fs::read_to_string(f.dir.path().join("node.log")).unwrap();
         if !local {
-            assert!(file_log.lines().any(|line| {
-                line.contains("relation intent refused")
-                    && line.contains("/api/v1/pair/relation-intent")
-                    && line.contains("status=403")
-                    && line.contains("code=403")
-            }), "refusal must reach node.log");
+            assert!(
+                file_log.lines().any(|line| {
+                    line.contains("relation intent refused")
+                        && line.contains("/api/v1/pair/relation-intent")
+                        && line.contains("status=403")
+                        && line.contains("code=403")
+                }),
+                "refusal must reach node.log"
+            );
         }
         for captured in [logs(&log), file_log] {
             assert!(!captured.contains(&sig));

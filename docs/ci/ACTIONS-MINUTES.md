@@ -8,7 +8,7 @@ the exception: macOS is 10× and Windows is 2×, and it runs only on `v*` tags.
 `BitSov-bitsov` is a public repository, so standard hosted minutes are not
 deducted from the org allowance. The org spending limit still disables Actions
 for every repository once private usage exceeds it. The same workflow shape is
-the recipe for a private consumer such as `bitsov-app`.
+the recipe for a private consumer such as the app repository.
 
 ## What a run costs
 
