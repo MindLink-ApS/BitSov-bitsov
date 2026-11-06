@@ -1403,8 +1403,8 @@ fn default_for_tier_full() {
             ..
         }
     ));
-    // Full tier defaults to Esplora chain backend
-    assert!(matches!(config.chain, ChainConfig::Esplora { .. }));
+    // Full tier starts with the operator's Core, shared with embedded LDK.
+    assert!(matches!(config.chain, ChainConfig::Bitcoind(_)));
 }
 
 #[test]
@@ -2244,12 +2244,10 @@ fn issue66_explicit_primary_is_never_overridden() {
     }
 }
 
-/// genome #66, half one: a node created by `init` ships with TWO chain
-/// providers, written into its own config where the operator can see and edit
-/// them. A single unreachable or degraded provider must not stop a fresh node
-/// from starting.
+/// Fresh Full configs own the tip without retaining public explorer fallbacks.
+/// Existing configs still use the frozen #66 deserialization defaults above.
 #[test]
-fn issue66_fresh_full_tier_config_ships_a_chain_fallback() {
+fn fresh_full_tier_config_owns_tip_without_public_explorers() {
     let dir = tempfile::tempdir().unwrap();
     let config =
         NodeConfig::default_for_tier(NodeTier::Full, dir.path().join("mnemonic.txt"), dir.path());
@@ -2260,30 +2258,39 @@ fn issue66_fresh_full_tier_config_ships_a_chain_fallback() {
             esplora_url_fallback,
             ..
         } => {
-            let fallback = esplora_url_fallback
-                .as_deref()
-                .expect("init must write an LDK esplora fallback (#66)");
-            assert_ne!(
-                fallback, esplora_url,
-                "a fallback identical to the primary is not a fallback"
-            );
+            assert!(esplora_url.is_empty());
+            assert!(esplora_url_fallback.is_none());
         }
         other => panic!("full tier must use LDK, got {other:?}"),
     }
 
     match &config.chain {
-        ChainConfig::Esplora {
-            api_url,
-            esplora_url_fallback,
-            ..
-        } => {
-            let fallback = esplora_url_fallback
-                .as_deref()
-                .expect("init must write a chain esplora fallback (#66)");
-            assert_ne!(fallback, api_url, "fallback must differ from the primary");
+        ChainConfig::Bitcoind(rpc) => {
+            rpc.validate().unwrap();
+            assert_eq!(rpc.rpc_host, "127.0.0.1");
+            assert_eq!(rpc.rpc_port, 8332);
+            assert!(rpc
+                .cookie_file
+                .as_ref()
+                .unwrap()
+                .ends_with(".bitcoin/.cookie"));
+            assert!(rpc.rpc_user.is_none());
+            assert!(rpc.rpc_password_file.is_none());
         }
-        other => panic!("full tier must use esplora chain, got {other:?}"),
+        other => panic!("full tier must use bitcoind, got {other:?}"),
     }
+    assert_eq!(
+        config.lightning.bitcoin_network().as_deref(),
+        Some("bitcoin")
+    );
+    let text = toml::to_string(&config).unwrap();
+    assert!(!text.contains("blockstream.info"));
+    assert!(!text.contains("mempool.space"));
+    let loaded: NodeConfig = toml::from_str(&text).unwrap();
+    assert!(matches!(loaded.chain, ChainConfig::Bitcoind(_)));
+    assert!(
+        matches!(loaded.lightning, LightningConfig::Ldk { esplora_url, esplora_url_fallback: None, .. } if esplora_url.is_empty())
+    );
 }
 
 /// genome #66, half two: parsing an EXISTING config that names no fallback must

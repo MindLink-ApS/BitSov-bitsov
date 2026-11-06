@@ -6,10 +6,45 @@ chain source it configures.
 
 BitSov can use your own Bitcoin Core (pruned or full) for both embedded LDK
 Lightning and chain height, headers, fees and transaction confirmation. MindLink
-does not run a default chain server. Existing Esplora configurations and fresh
-`init` defaults remain unchanged;
-Electrum is also supported with an explicit server. Onboarding selection and
-Neutrino are later steps.
+does not run a default chain server. Fresh `init --tier full` starts on an owned
+tip: loopback Bitcoin Core by default, or an explicitly selected Electrum server.
+Embedded LDK uses the same source, with no public Esplora URLs or fallbacks in
+the generated config. Light and Cloud keep their Mock backends. Existing config
+files retain their frozen URL deserialization defaults; upgrading does not
+silently select a different provider. Neutrino remains a later step.
+
+```sh
+konsensus init --tier full --non-interactive
+konsensus init --tier full --non-interactive --chain bitcoind
+konsensus init --tier full --non-interactive --chain electrum \
+  --electrum-server-url tcp://127.0.0.1:50001 --electrum-operator own
+```
+
+Core defaults preserve the existing Lightning network (`bitcoin`, mainnet):
+`127.0.0.1:8332` and `$HOME/.bitcoin/.cookie`, expanded when generating the config.
+If `HOME` is unavailable, replace the literal `$HOME` placeholder before starting.
+Configure Core and grant the BitSov process read access to the cookie first.
+This beta supports signet only; follow the network notice and
+[signet quickstart](QUICKSTART-SIGNET.md), aligning the Lightning network and
+Core RPC port/cookie (signet uses port 38332 and `.bitcoin/signet/.cookie`).
+Init does not start or install Core, or silently switch Bitcoin networks.
+
+Electrum requires both `--electrum-server-url` and `--electrum-operator`
+(`own` or `third_party`); there is no public server default. Select `own` only
+for a server you control. See the ownership and transport limits below.
+
+Public Esplora is an explicit `third_party` opt-in:
+
+```sh
+konsensus init --tier full --non-interactive --chain esplora --accept-third-party-tip
+```
+
+Without `--accept-third-party-tip`, Full Esplora init refuses to write state.
+With acceptance, the generated config names Blockstream and mempool.space as
+the primary and fallback, and owner status reports `third_party`. This option
+trusts those operators with chain responses and wallet queries; it does not
+provide an owned tip. Chain selection does not add timechain phase or change
+the money-readiness policy.
 
 ## Esplora fallbacks
 

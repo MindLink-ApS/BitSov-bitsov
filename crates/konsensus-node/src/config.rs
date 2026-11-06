@@ -73,7 +73,7 @@ fn tighten_mnemonic_permissions(
 /// - **Cloud/Relay**: paired remote access; until a remote signer exists the
 ///   node holds its seed, so it reports `hosted_custody` (REMOTE-SIGNER.md)
 /// - **Light**: local node with user-selected Lightning
-/// - **Full**: fully sovereign node with own Lightning (maximum sovereignty)
+/// - **Full**: own Lightning + owned chain tip by default (Core or Electrum)
 ///
 /// The tier can be changed later in Settings. Identity is preserved across
 /// tier changes — the mnemonic always belongs to the user.
@@ -89,8 +89,8 @@ pub enum NodeTier {
     /// Your keys, your data, hosted wallet.
     #[default]
     Light,
-    /// Fully sovereign — own Lightning, own chain data.
-    /// Maximum sovereignty and independence.
+    /// Own Lightning + owned chain tip by default.
+    /// Public Esplora is an explicit third-party opt-in.
     Full,
 }
 
@@ -127,7 +127,7 @@ impl NodeTier {
                 "Cloud/Relay — paired remote access, hosted custody (the server holds the seed)"
             }
             Self::Light => "Light Node — your device, user-selected Lightning",
-            Self::Full => "Full Node — fully sovereign",
+            Self::Full => "Full Node — own Lightning + owned chain tip by default",
         }
     }
 }
@@ -597,20 +597,20 @@ pub enum LightningConfig {
         /// Bitcoin network: "bitcoin", "testnet", "signet", "regtest".
         #[serde(default = "default_ldk_network")]
         network: String,
-        /// Esplora server URL for chain data.
+        /// Esplora server URL for chain data; empty when chain selects Core/Electrum.
         #[serde(default = "default_ldk_esplora")]
         esplora_url: String,
         /// Optional fallback Esplora URL. Used by `LdkProvider::new` (L4b)
         /// when the primary endpoint fails its startup fee-fetch probe — the
         /// root cause of the 2026-04-23 alpha crash-loop.
         ///
-        /// #66: `init` WRITES a fallback into fresh configs (see the `Default`
-        /// impl), but parsing deliberately leaves this `None` when a config
+        /// #66: explicit Esplora init writes a fallback, but parsing
+        /// deliberately leaves this `None` when a config
         /// omits it. Injecting a default here would silently point an existing
         /// operator's node at a third-party endpoint they never chose — the
         /// node would disclose its existence and query pattern to a public
-        /// service behind the operator's back. Resilience is offered at `init`,
-        /// never imposed on an existing configuration.
+        /// service behind the operator's back. Public fallbacks are offered
+        /// only on explicit Esplora init, never imposed on an existing config.
         #[serde(default)]
         esplora_url_fallback: Option<String>,
         /// Esplora on-chain wallet polling interval (10..=3600 seconds; LDK default 80).
@@ -907,10 +907,9 @@ impl LightningConfig {
                 ("advertised_address", advertised_address),
                 ("listening_address", listening_address),
             ] {
-                if address
-                    .as_ref()
-                    .is_some_and(|address| address.len() > konsensus_message::wire::MAX_LN_ADDR_BYTES)
-                {
+                if address.as_ref().is_some_and(|address| {
+                    address.len() > konsensus_message::wire::MAX_LN_ADDR_BYTES
+                }) {
                     anyhow::bail!(
                         "Lightning address lightning.{field} exceeds the wire limit of {} UTF-8 bytes",
                         konsensus_message::wire::MAX_LN_ADDR_BYTES
@@ -1048,8 +1047,8 @@ impl ChainConfig {
 
 impl Default for ChainConfig {
     fn default() -> Self {
-        // Construction-only path (`chain` has no serde default — the stanza is
-        // required), so the fresh pair is safe here. #66.
+        // Explicit Esplora construction only. Full defaults to owned Core;
+        // `chain` has no serde default and existing URL defaults stay frozen. #66.
         Self::Esplora {
             api_url: FRESH_CHAIN_PRIMARY.to_string(),
             esplora_url_fallback: Some(FRESH_CHAIN_FALLBACK.to_string()),
@@ -2082,13 +2081,10 @@ impl NodeConfig {
 
     /// Generate a default configuration with absolute paths rooted in `node_dir`.
     ///
-    /// Uses mock Lightning and chain backends so the node starts immediately
-    /// Generate a tier-appropriate default configuration.
-    ///
     /// Each tier pre-configures different backend defaults:
     /// - **Cloud/Relay**: mock backends until paired with a relay/LSP, encrypted SQLite
     /// - **Light**: mock Lightning until user configures a provider, encrypted SQLite
-    /// - **Full**: mock Lightning (user switches to LND), Esplora chain, encrypted SQLite
+    /// - **Full**: embedded LDK + owned Bitcoin Core tip, encrypted SQLite
     pub fn default_for_tier(tier: NodeTier, mnemonic_file: PathBuf, node_dir: &Path) -> Self {
         let abs_dir = std::fs::canonicalize(node_dir).unwrap_or_else(|_| node_dir.to_path_buf());
         let db_path = abs_dir.join("konsensus.db");
@@ -2120,41 +2116,63 @@ impl NodeConfig {
                 },
                 SovereigntyTier::T1,
             ),
-            NodeTier::Full => (
-                LightningConfig::Ldk {
-                    max_channel_capacity_sats: default_max_channel_capacity_sats(),
-                    max_total_channel_capacity_sats: default_max_total_channel_capacity_sats(),
-                    hub_only_channels: None,
-                    network: default_ldk_network(),
-                    // #66: a fresh node ships with two chain providers, written
-                    // into the generated konsensus.toml so the operator can see
-                    // and change them. Never injected into an existing config —
-                    // the serde defaults above stay on the legacy provider.
-                    esplora_url: FRESH_LDK_PRIMARY.to_string(),
-                    esplora_url_fallback: Some(FRESH_LDK_FALLBACK.to_string()),
-                    credentials_file: None,
-                    onchain_wallet_sync_interval_secs: None,
-                    lightning_wallet_sync_interval_secs: None,
-                    fee_rate_cache_update_interval_secs: None,
-                    rgs_url: None,
-                    lsp_node_id: None,
-                    lsp_address: None,
-                    lsp_token: None,
-                    liquidity: Default::default(),
-                    lsps2_service: Default::default(),
-                    forward_to_private_channels: false,
-                    our_to_self_delay_blocks: None,
-                    listening_address: Some("0.0.0.0:9735".to_string()),
-                    advertised_address: None,
-                },
-                ChainConfig::default(),
-                StorageConfig::Sqlite {
-                    path: db_path.to_string_lossy().into_owned(),
-                    encrypted: true,
-                    retention_days: 0,
-                },
-                SovereigntyTier::T2,
-            ),
+            NodeTier::Full => {
+                let network = default_ldk_network();
+                let (rpc_port, cookie_subdir) = match network.as_str() {
+                    "bitcoin" | "mainnet" => (8332, ""),
+                    "testnet" | "testnet3" => (18332, "testnet3"),
+                    "signet" => (38332, "signet"),
+                    "regtest" => (18443, "regtest"),
+                    _ => unreachable!("default LDK network must be known"),
+                };
+                let cookie_file = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .unwrap_or_else(|| PathBuf::from("$HOME"))
+                    .join(".bitcoin")
+                    .join(cookie_subdir)
+                    .join(".cookie");
+                (
+                    LightningConfig::Ldk {
+                        max_channel_capacity_sats: default_max_channel_capacity_sats(),
+                        max_total_channel_capacity_sats: default_max_total_channel_capacity_sats(),
+                        hub_only_channels: None,
+                        network,
+                        // LdkProvider::new_inner selects Core from [chain] before
+                        // any Esplora probe. Keep the explicit empty string on disk
+                        // so loading cannot inject the frozen legacy URL default.
+                        esplora_url: String::new(),
+                        esplora_url_fallback: None,
+                        credentials_file: None,
+                        onchain_wallet_sync_interval_secs: None,
+                        lightning_wallet_sync_interval_secs: None,
+                        fee_rate_cache_update_interval_secs: None,
+                        rgs_url: None,
+                        lsp_node_id: None,
+                        lsp_address: None,
+                        lsp_token: None,
+                        liquidity: Default::default(),
+                        lsps2_service: Default::default(),
+                        forward_to_private_channels: false,
+                        our_to_self_delay_blocks: None,
+                        listening_address: Some("0.0.0.0:9735".to_string()),
+                        advertised_address: None,
+                    },
+                    ChainConfig::Bitcoind(konsensus_chain::BitcoindConfig {
+                        rpc_host: "127.0.0.1".into(),
+                        rpc_port,
+                        cookie_file: Some(cookie_file),
+                        rpc_user: None,
+                        rpc_password_file: None,
+                    }),
+                    StorageConfig::Sqlite {
+                        path: db_path.to_string_lossy().into_owned(),
+                        encrypted: true,
+                        retention_days: 0,
+                    },
+                    SovereigntyTier::T2,
+                )
+            }
         };
 
         let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
@@ -2258,7 +2276,7 @@ fn validate_remote_endpoint(endpoint: &str) -> Result<(), String> {
 /// DESERIALIZATION default — frozen. An existing `[chain]` stanza that omits
 /// `api_url` must keep resolving to what it resolved to before, or upgrading
 /// the binary silently moves that operator to a different provider. #66 changes
-/// what `init` WRITES (see `FRESH_CHAIN_PRIMARY`), never what an existing
+/// explicit Esplora init WRITES (see `FRESH_CHAIN_PRIMARY`), never what an existing
 /// configuration means.
 fn default_esplora_url() -> String {
     "https://mempool.space".into()
@@ -2269,23 +2287,19 @@ fn default_ldk_esplora() -> String {
     "https://mempool.space/api".to_string()
 }
 
-// --- genome #66: the provider pair `init` WRITES into a fresh config ---------
+// --- genome #66: the provider pair explicit Esplora init WRITES -------------
 //
-// A fresh node ships with two chain providers. mempool.space alone refused to
+// An operator opting into public Esplora gets two providers. mempool.space alone refused to
 // boot nodes on datacenter/VPS IPs (observed on GitHub-hosted runners,
 // 2026-09-13): it answered 2xx while its payload was unusable to LDK, so the
 // node died on its startup fee fetch. These constants are used ONLY by
-// construction paths — `default_for_tier` and `ChainConfig::default` — and are
+// the explicit Esplora construction path (`ChainConfig::default`) and are
 // deliberately NOT wired to any `#[serde(default = ...)]`.
 
 /// Base URL (no `/api`; the chain client appends it).
 const FRESH_CHAIN_PRIMARY: &str = "https://blockstream.info";
 /// Base URL (no `/api`).
 const FRESH_CHAIN_FALLBACK: &str = "https://mempool.space";
-/// LDK takes the full API URL, `/api` included.
-const FRESH_LDK_PRIMARY: &str = "https://blockstream.info/api";
-/// LDK takes the full API URL, `/api` included.
-const FRESH_LDK_FALLBACK: &str = "https://mempool.space/api";
 
 fn default_sqlite_path() -> String {
     "konsensus.db".into()
