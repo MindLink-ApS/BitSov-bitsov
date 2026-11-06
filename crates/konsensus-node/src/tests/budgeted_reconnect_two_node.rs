@@ -646,6 +646,7 @@ async fn two_nodes_with_outcome(
         .await
         .unwrap();
     sessions_b.accept_session(&alice_id, &init).await.unwrap();
+    assert!(sessions_a.confirm_session(&bob_id).await);
 
     let ledger_path = ledger.path().join("ledger.db");
     let wallet_a = Arc::new(SharedMockProvider::new(&ledger_path, "a", 1_000_000).unwrap());
@@ -1002,7 +1003,7 @@ async fn failed_message_after_readmission_charges_admission_only_once() {
 async fn fresh_quote_is_reserved_into_the_grant_before_admission_pay() {
     // Sender prices locally at 2_000; recipient quotes admission=3_000 and
     // message=3_000. Both must be reserved against the grant before any pay
-    // (Codex #111 finding 3) — previously admission paid then message refused.
+    // (review #111 finding 3) — previously admission paid then message refused.
     let mut net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000))), 3_000).await;
     let bob = net.bob_id;
     net.connect().await;
@@ -1473,7 +1474,7 @@ async fn capped_reconnect_readmission_refusal_carries_a_stable_reason() {
     net.shutdown();
 }
 
-/// Codex #111 finding 3: a higher fresh message quote must fail the grant
+/// Review #111 finding 3: a higher fresh message quote must fail the grant
 /// before any admission payment, not after.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn capped_reconnect_refuses_when_quoted_all_in_exceeds_grant_before_pay() {
@@ -1495,7 +1496,7 @@ async fn capped_reconnect_refuses_when_quoted_all_in_exceeds_grant_before_pay() 
     assert_eq!(body["code"], "budget_exceeded", "{body}");
 }
 
-/// Codex #111 finding 5: a quote obtained on a prior connection generation
+/// Review #111 finding 5: a quote obtained on a prior connection generation
 /// must not be paid after reconnect when the replacement refuses fresh quotes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn capped_reconnect_rejects_quote_from_prior_connection_generation() {

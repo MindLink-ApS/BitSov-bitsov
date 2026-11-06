@@ -1411,9 +1411,15 @@ async fn ws_connect(
 }
 
 async fn read_ws_text(stream: &mut tokio::net::TcpStream) -> String {
+    let (opcode, bytes) = read_ws_frame(stream).await;
+    assert_eq!(opcode, 0x81);
+    String::from_utf8(bytes).unwrap()
+}
+
+async fn read_ws_frame(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
     use tokio::io::AsyncReadExt;
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        assert_eq!(stream.read_u8().await.unwrap(), 0x81);
+        let opcode = stream.read_u8().await.unwrap();
         let size = stream.read_u8().await.unwrap();
         assert!(size <= 126, "unmasked, bounded fixture frame");
         let size = if size == 126 {
@@ -1423,10 +1429,109 @@ async fn read_ws_text(stream: &mut tokio::net::TcpStream) -> String {
         };
         let mut bytes = vec![0; size];
         stream.read_exact(&mut bytes).await.unwrap();
-        String::from_utf8(bytes).unwrap()
+        (opcode, bytes)
     })
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn websocket_backlog_does_not_starve_delivery_or_control_frames() {
+    use tokio::io::AsyncWriteExt;
+
+    const BACKLOG: usize = 512;
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, service, _console) = state_with_pairing(tmp.path(), false);
+    let state = Arc::new(AppState {
+        ws_broadcast: tokio::sync::broadcast::channel(BACKLOG).0,
+        ..(*base).clone()
+    });
+    let app = test_router(Arc::clone(&state));
+    let (_, token) = pair_and_token(&app, &service, &SigningKey::from_bytes(&[65; 32])).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = konsensus_api::build_router_for_addr(state.clone(), addr);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let (status, mut socket) = ws_connect(addr, &token, true).await;
+    assert_eq!(status, 101);
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while state.ws_delivery_broadcast.receiver_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let message = Arc::new(konsensus_api::state::WsMessage {
+        envelope: konsensus_core::UkmEnvelopeBuilder::new(
+            100,
+            *state.identity.node_id(),
+            konsensus_core::types::Recipient::Node(*state.identity.node_id()),
+            vec![],
+            konsensus_core::PaymentProof::new([0; 32], [0; 32], 0),
+        )
+        .build(),
+        plaintext: Some("backlogged-message".into()),
+    });
+    // No yields while queuing: the current-thread runtime cannot consume any
+    // messages before the delivery update is also ready.
+    for _ in 0..BACKLOG {
+        state.ws_broadcast.send(Arc::clone(&message)).unwrap();
+    }
+    state
+        .ws_delivery_broadcast
+        .send(Arc::new(konsensus_api::state::WsDeliveryStatus {
+            event_type: "delivery_status",
+            message_id: "fairness-probe".into(),
+            status: "delivered".into(),
+            reason: None,
+        }))
+        .unwrap();
+    // A masked client Ping with payload "fair" must get its Pong while the
+    // message receiver is still backlogged, too.
+    socket
+        .write_all(&[0x89, 0x84, 0, 0, 0, 0, b'f', b'a', b'i', b'r'])
+        .await
+        .unwrap();
+
+    let (mut messages, mut delivery, mut pong) = (0, false, false);
+    while !(delivery && pong) && messages < BACKLOG {
+        let (opcode, bytes) = read_ws_frame(&mut socket).await;
+        match opcode {
+            0x81 => {
+                let event: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                if event["type"] == "delivery_status" {
+                    assert_eq!(event["message_id"], "fairness-probe");
+                    delivery = true;
+                } else {
+                    assert_eq!(event["plaintext"], "backlogged-message");
+                    messages += 1;
+                }
+            }
+            0x8a => {
+                assert_eq!(bytes, b"fair");
+                pong = true;
+            }
+            _ => panic!("unexpected WebSocket opcode: {opcode:#x}"),
+        }
+    }
+    server.abort();
+    let _ = server.await;
+    assert!(
+        delivery,
+        "delivery update starved until the message backlog drained"
+    );
+    assert!(
+        pong,
+        "control frame starved until the message backlog drained"
+    );
 }
 
 #[tokio::test]
@@ -1505,6 +1610,137 @@ async fn websocket_pairing_binding_blocks_upgrade_and_post_revocation_plaintext(
         server.abort();
         let _ = server.await;
     }
+}
+
+/// The same paired token, re-signed to expire at `exp` (Unix seconds).
+fn with_expiry(token: &str, secret: &str, exp: i64) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    let mut parts = token.split('.');
+    let header = parts.next().unwrap();
+    let mut claims: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts.next().unwrap()).unwrap()).unwrap();
+    claims["exp"] = exp.into();
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(format!("{header}.{payload}").as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    format!("{header}.{payload}.{signature}")
+}
+
+/// True once the node has closed `stream`: a close frame or end of stream
+/// arrives within `wait`.
+async fn ws_closed_within(stream: &mut tokio::net::TcpStream, wait: std::time::Duration) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut byte = [0; 1];
+    match tokio::time::timeout(wait, stream.read(&mut byte)).await {
+        Err(_) => false,
+        Ok(Ok(0) | Err(_)) => true,
+        Ok(Ok(_)) => {
+            assert_eq!(byte[0], 0x88, "an expired stream must not deliver a frame");
+            true
+        }
+    }
+}
+
+// The first event published after reconnection reaches the client's next connection.
+// The app reconnects when the node closes its feed. If the expired stream
+// stays open until an event arrives, it takes that event and drops it, and the
+// next connection subscribes too late to see it.
+// This live feed does not replay events published between close and resubscribe;
+// this test reconnects before publishing and does not cover that delivery gap.
+#[tokio::test]
+async fn websocket_first_event_after_token_expiry_reaches_reconnected_client() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, service, _console) = state_with_pairing(tmp.path(), false);
+    let app = test_router(Arc::clone(&state));
+    let (_client_id, token) =
+        pair_and_token(&app, &service, &SigningKey::from_bytes(&[64; 32])).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = konsensus_api::build_router_for_addr(state.clone(), addr);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .await
+            .unwrap();
+    });
+    let subscribed = |count: usize| {
+        let state = Arc::clone(&state);
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while state.ws_broadcast.receiver_count() != count {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("expected {count} live stream(s)"));
+        }
+    };
+
+    let exp = chrono::Utc::now().timestamp() + 2;
+    let short = with_expiry(&token, &state.jwt_secret, exp);
+    let (status, mut expired) = ws_connect(addr, &short, true).await;
+    assert_eq!(status, 101);
+    subscribed(1).await;
+
+    // One second after expiry. Well inside the 45 s keepalive, which would
+    // otherwise be the next time the stream checks its token.
+    let wait_ms = (exp + 1) * 1000 - chrono::Utc::now().timestamp_millis();
+    tokio::time::sleep(std::time::Duration::from_millis(wait_ms.max(0) as u64)).await;
+    assert_eq!(
+        ws_connect(addr, &short, true).await.0,
+        401,
+        "the token has expired"
+    );
+
+    // Like the app: reconnect with a fresh token once the node closes the feed.
+    let mut fresh = None;
+    if ws_closed_within(&mut expired, std::time::Duration::from_millis(200)).await {
+        let (status, socket) = ws_connect(addr, &token, true).await;
+        assert_eq!(status, 101);
+        subscribed(1).await;
+        fresh = Some(socket);
+    }
+
+    let envelope = konsensus_core::UkmEnvelopeBuilder::new(
+        100,
+        *state.identity.node_id(),
+        konsensus_core::types::Recipient::Node(*state.identity.node_id()),
+        vec![],
+        konsensus_core::PaymentProof::new([0; 32], [0; 32], 0),
+    )
+    .build();
+    let _ = state.ws_broadcast.send(Arc::new(konsensus_api::state::WsMessage {
+        envelope,
+        plaintext: Some("first-event-after-expiry".into()),
+    }));
+
+    let mut fresh = match fresh {
+        Some(socket) => socket,
+        None => {
+            // The expired stream was still open, so it is the one that saw
+            // the event. It must close without delivering it.
+            assert!(
+                ws_closed_within(&mut expired, std::time::Duration::from_secs(3)).await,
+                "expired stream neither closed nor delivered"
+            );
+            let (status, socket) = ws_connect(addr, &token, true).await;
+            assert_eq!(status, 101);
+            socket
+        }
+    };
+    let mut first = [0; 1];
+    let arrived = tokio::time::timeout(std::time::Duration::from_secs(3), fresh.peek(&mut first))
+        .await
+        .is_ok_and(|read| matches!(read, Ok(1)));
+    assert!(
+        arrived,
+        "the first event after the token expired never reached the reconnected client"
+    );
+    assert!(read_ws_text(&mut fresh).await.contains("first-event-after-expiry"));
+    server.abort();
+    let _ = server.await;
 }
 
 // Paired staging stays ephemeral even with an active spend grant.
@@ -2218,7 +2454,7 @@ async fn owner_peer_add_requires_matching_services_and_audits_admission() {
         let request = || control::ControlRequest::AddPeer {
             node_id: "ab".repeat(32),
             addr: "127.0.0.1:9735".into(),
-            label: Some("Dad".into()),
+            label: Some("Bob".into()),
         };
         assert!(
             matches!(control::handle(&ctx, request()), control::ControlResponse::Error { message } if message.contains("requires the running node"))
@@ -2259,7 +2495,7 @@ async fn owner_peer_add_requires_matching_services_and_audits_admission() {
         assert_eq!(event["actor"], state.identity.node_id().to_hex());
         assert_eq!(event["detail"]["source"], "owner_control");
         assert_eq!(event["detail"]["peer_node_id"], "ab".repeat(32));
-        assert_eq!(event["detail"]["label"], "Dad");
+        assert_eq!(event["detail"]["label"], "Bob");
         assert_eq!(event["detail"]["connected"], false);
         let app = test_router(state.clone());
         let (_, token) = pair_and_token(
