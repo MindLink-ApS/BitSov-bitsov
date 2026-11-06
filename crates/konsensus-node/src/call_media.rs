@@ -28,6 +28,7 @@
 //! or a stalled peer write, releasing the route when admission ends.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -242,8 +243,58 @@ impl DropLog {
     }
 }
 
+/// Why a route ended, for the one summary line logged at its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndReason {
+    /// Admission ended: the call ended, expired or is no longer paid.
+    NotAdmitted,
+    /// The app's socket detached.
+    Detached,
+    /// The router stopped.
+    Shutdown,
+}
+
+impl EndReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            EndReason::NotAdmitted => "not_admitted",
+            EndReason::Detached => "detached",
+            EndReason::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// Packet counts for one direction of one call. Relaxed atomics: each is a
+/// plain tally, read once when the route ends.
+#[derive(Default)]
+struct DirectionCounts {
+    forwarded: AtomicU64,
+    rate_capped: AtomicU64,
+    not_admitted: AtomicU64,
+}
+
+impl DirectionCounts {
+    fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Per-route media counters. `outbound` is app → peer, `inbound` is peer →
+/// app. Counts only; no packet content is ever kept or logged.
+#[derive(Default)]
+struct RouteCounts {
+    outbound: DirectionCounts,
+    inbound: DirectionCounts,
+    /// Longest time one outbound send waited on the peer writer, in microseconds.
+    longest_writer_wait_us: AtomicU64,
+}
+
 /// One routed call: a socket's two queues and the inbound cap.
 struct Route {
+    call_id: String,
+    counts: RouteCounts,
+    /// Set by the first `end`, so the summary line is logged once.
+    ended: AtomicBool,
     peer: NodeId,
     client: Option<konsensus_api::auth::PairingBinding>,
     activity: Arc<MediaActivity>,
@@ -258,12 +309,36 @@ struct Route {
 }
 
 impl Route {
-    fn end(&self) {
+    fn end(&self, reason: EndReason) {
+        if !self.ended.swap(true, Ordering::AcqRel) {
+            self.log_summary(reason);
+        }
         self.to_app.close();
         self.from_app.close();
         if let Some(pump) = self.pump.lock().unwrap_or_else(|e| e.into_inner()).take() {
             pump.abort();
         }
+    }
+
+    /// One INFO line at the end of the route: per-direction totals, the
+    /// longest writer wait and why it ended. The call id is bounded hex.
+    fn log_summary(&self, reason: EndReason) {
+        let c = &self.counts;
+        let get = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        info!(
+            call_id = %self.call_id,
+            out_forwarded = get(&c.outbound.forwarded),
+            out_rate_capped = get(&c.outbound.rate_capped),
+            out_evicted = self.from_app.dropped(),
+            out_not_admitted = get(&c.outbound.not_admitted),
+            in_forwarded = get(&c.inbound.forwarded),
+            in_rate_capped = get(&c.inbound.rate_capped),
+            in_evicted = self.to_app.dropped(),
+            in_not_admitted = get(&c.inbound.not_admitted),
+            longest_writer_wait_us = get(&c.longest_writer_wait_us),
+            end_reason = reason.as_str(),
+            "call media route summary"
+        );
     }
 }
 
@@ -303,7 +378,7 @@ impl CallMediaRouter {
             let routes: Vec<Arc<Route>> = router.routes().drain().map(|(_, r)| r).collect();
             let ended = routes.len();
             for route in routes {
-                route.end();
+                route.end(EndReason::Shutdown);
             }
             info!(ended, remaining = router.routed_calls(), "call media router stopped");
         })
@@ -343,15 +418,21 @@ impl CallMediaRouter {
             return refuse(MediaDrop::Oversize);
         }
         if !self.still_admitted(&route, &call_id).await {
-            self.end_route(&call_id, &route);
+            DirectionCounts::bump(&route.counts.inbound.not_admitted);
+            self.end_route(&call_id, &route, EndReason::NotAdmitted);
             return refuse(MediaDrop::NotAdmitted);
         }
         if !route.inbound_cap.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), data.len()) {
+            DirectionCounts::bump(&route.counts.inbound.rate_capped);
             return refuse(MediaDrop::RateCapped);
         }
         match route.to_app.push(MediaFrame { seq, payload: data }) {
-            Ok(0) => Ok(()),
+            Ok(0) => {
+                DirectionCounts::bump(&route.counts.inbound.forwarded);
+                Ok(())
+            }
             Ok(evicted) => {
+                DirectionCounts::bump(&route.counts.inbound.forwarded);
                 debug!(peer = %peer_id, call_id, evicted, "call media: app socket slow; oldest packet dropped");
                 Ok(())
             }
@@ -375,7 +456,7 @@ impl CallMediaRouter {
     }
 
     /// Stop routing `call_id` if `route` is still its route.
-    fn end_route(&self, call_id: &str, route: &Arc<Route>) {
+    fn end_route(&self, call_id: &str, route: &Arc<Route>, reason: EndReason) {
         let key = (route.peer, call_id.to_string());
         let removed = {
             let mut routes = self.routes();
@@ -384,7 +465,7 @@ impl CallMediaRouter {
                 _ => false,
             }
         };
-        route.end();
+        route.end(reason);
         if removed {
             debug!(peer = %route.peer, call_id, "call media route ended");
         }
@@ -397,12 +478,14 @@ impl CallMediaRouter {
             while let Some(frame) = route.from_app.pop().await {
                 let now = Instant::now();
                 if !cap.admit(now, frame.payload.len()) {
+                    DirectionCounts::bump(&route.counts.outbound.rate_capped);
                     self.drops.note(MediaDrop::RateCapped, Some(&route.peer), &call_id);
                     continue;
                 }
                 if !self.still_admitted(&route, &call_id).await {
+                    DirectionCounts::bump(&route.counts.outbound.not_admitted);
                     self.drops.note(MediaDrop::NotAdmitted, Some(&route.peer), &call_id);
-                    self.end_route(&call_id, &route);
+                    self.end_route(&call_id, &route, EndReason::NotAdmitted);
                     break;
                 }
                 let bytes = match Frame::call_media(&call_id, frame.seq, frame.payload).and_then(|f| f.to_bytes()) {
@@ -412,8 +495,12 @@ impl CallMediaRouter {
                         continue;
                     }
                 };
-                match self.link.send_call_media(&route.peer, &bytes).await {
-                    Ok(()) => {}
+                let sent_at = Instant::now();
+                let sent = self.link.send_call_media(&route.peer, &bytes).await;
+                let waited = u64::try_from(sent_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+                route.counts.longest_writer_wait_us.fetch_max(waited, Ordering::Relaxed);
+                match sent {
+                    Ok(()) => DirectionCounts::bump(&route.counts.outbound.forwarded),
                     Err(TransportError::Timeout(_)) => self.drops.note(MediaDrop::PeerBusy, Some(&route.peer), &call_id),
                     Err(_) => self.drops.note(MediaDrop::NotConnected, Some(&route.peer), &call_id),
                 }
@@ -438,7 +525,7 @@ impl CallMediaRouter {
         };
         tokio::select! {
             biased;
-            _ = monitor => self.end_route(&call_id, &route),
+            _ = monitor => self.end_route(&call_id, &route, EndReason::NotAdmitted),
             _ = forward => {},
         }
 
@@ -458,6 +545,9 @@ impl CallMediaPort for CallMediaRouter {
         let me = self.me.upgrade().ok_or(AttachRefusal::Unavailable)?;
         let now = Instant::now();
         let route = Arc::new(Route {
+            call_id: call_id.to_string(),
+            counts: RouteCounts::default(),
+            ended: AtomicBool::new(false),
             peer: *peer,
             client: client.cloned(),
             activity: MediaActivity::new(),
@@ -476,7 +566,7 @@ impl CallMediaPort for CallMediaRouter {
                 }
                 // Close both queues and abort the old pump before publishing
                 // its replacement. A late old-socket drop cannot remove it.
-                current.end();
+                current.end(EndReason::Detached);
             }
             if routes.len() >= MAX_ROUTED_CALLS && !routes.contains_key(&key) {
                 warn!(call_id, max = MAX_ROUTED_CALLS, "call media: too many routed calls");
@@ -494,7 +584,7 @@ impl CallMediaPort for CallMediaRouter {
             let call_id = call_id.to_string();
             move || {
                 if let (Some(router), Some(route)) = (router.upgrade(), route.upgrade()) {
-                    router.end_route(&call_id, &route);
+                    router.end_route(&call_id, &route, EndReason::Detached);
                 }
             }
         };
