@@ -88,8 +88,8 @@ async fn bound_invoice_accounting(overpayment: bool) {
         assert_ne!(send(&fx, &token, 404, 7000, 0).await.0, StatusCode::OK);
         konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
         let hold = fx.service.call_spend_status(&peer.to_hex(), CALL).unwrap();
-        assert_eq!((hold.spent_msat, hold.remaining_msat, hold.released_msat), (7000, 413_000, 0));
-        assert_eq!((fx.wallet.money(), fx.wallet.left(), fx.used()), (2, 8000, 421_000));
+        assert_eq!((hold.spent_msat, hold.remaining_msat, hold.released_msat), (7000, 414_000, 0));
+        assert_eq!((fx.wallet.money(), fx.wallet.left(), fx.used()), (2, 8000, 422_000));
     }
     if !overpayment {
         assert!(fx.state.storage.acknowledge_pending(&id, &peer, &caller).await.unwrap());
@@ -103,7 +103,7 @@ async fn bound_invoice_accounting(overpayment: bool) {
     }
     let hold = fx.service.call_spend_status(&peer.to_hex(), CALL).unwrap();
     assert!(hold.closed);
-    assert_eq!((hold.spent_msat, hold.remaining_msat, hold.released_msat), (7000, 0, 413_000));
+    assert_eq!((hold.spent_msat, hold.remaining_msat, hold.released_msat), (7000, 0, 414_000));
     assert_eq!((fx.wallet.money(), fx.wallet.left(), fx.used()), (2, 8000, 8000));
     let budget = fx.service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
     assert!(budget.pending.is_empty());
@@ -265,9 +265,9 @@ async fn delayed_paid_block_grant_reopens_call_with_its_original_hold() {
         );
         assert_eq!(
             (hold.spent_msat, hold.remaining_msat, hold.released_msat),
-            (7000, 413_000, 0)
+            (7000, 414_000, 0)
         );
-        assert_eq!((fx.wallet.money(), fx.used()), (2, 421_000));
+        assert_eq!((fx.wallet.money(), fx.used()), (2, 422_000));
         let next = rules::CallEntry {
             paid_until_ms: Some(now + 10_000),
             deadline_ms: now + 20_000,
@@ -346,7 +346,7 @@ async fn delayed_grant_hold_releases_after_receipt_rejection_or_bounded_tail() {
         assert!(hold.closed, "{outcome}");
         assert_eq!(
             (hold.spent_msat, hold.remaining_msat, hold.released_msat),
-            (7000, 0, 413_000)
+            (7000, 0, 414_000)
         );
         assert_eq!((fx.wallet.money(), fx.used()), (2, 8000));
     }
@@ -427,7 +427,7 @@ async fn late_settlement(resume: bool) {
         held.closed, !resume,
         "a resumable pending block must retain the unused hold"
     );
-    assert_eq!(held.remaining_msat, if resume { 420_000 } else { 7000 });
+    assert_eq!(held.remaining_msat, if resume { 421_000 } else { 7000 });
     fx.wallet.set(SETTLE);
     fx.wallet.recover_preimage.store(true, Ordering::SeqCst);
     konsensus_api::handlers::messages::reconcile_operations(&fx.state)
@@ -465,7 +465,7 @@ async fn late_settlement(resume: bool) {
         assert!(!hold.closed);
         assert_eq!(
             (hold.remaining_msat, hold.released_msat, fx.used()),
-            (413_000, 0, 421_000)
+            (414_000, 0, 422_000)
         );
         // The reopened call can fund the next sequence from the original hold.
         let now = chrono::Utc::now().timestamp_millis() as u64;
@@ -497,7 +497,7 @@ async fn late_settlement(resume: bool) {
         assert!(hold.closed);
         assert_eq!(
             (hold.remaining_msat, hold.released_msat, fx.used()),
-            (0, 413_000, 8000)
+            (0, 414_000, 8000)
         );
         assert!(fx.service.reload_from_disk().unwrap().grants[0]
             .budget
@@ -517,6 +517,38 @@ async fn late_settlement(resume: bool) {
         assert_eq!(op.settled_msat, 7000);
         assert!(op.payment_hash.is_some());
     }
+}
+
+/// A call block whose send chain could not be saved is refused with nothing paid and
+/// nothing drawn from the hold, and the same block goes through once saves work.
+#[tokio::test]
+async fn failed_save_of_a_block_returns_the_draw_and_the_same_block_can_be_paid() {
+    let (mut fx, token) = prepared().await;
+    assert_eq!(send(&fx, &token, 400, 7000, 0).await.0, StatusCode::OK);
+    answer(&fx).await;
+    let store = Arc::new(FlakySessionStore::default());
+    let sessions = Arc::new(konsensus_crypto::SessionManager::with_store(fx.state.identity.clone(), store.clone()));
+    let (_, far_end) = konsensus_core::identity::NodeIdentity::generate().unwrap();
+    let far_end = konsensus_crypto::SessionManager::new(Arc::new(far_end));
+    sessions.initiate_session(&fx.peer, &far_end.prekey_bundle().await).await.unwrap();
+    fx.state = Arc::new(AppState { session_manager: sessions, ..(*fx.state).clone() });
+    let (money, used) = (fx.wallet.money(), fx.used());
+
+    store.fail_all(true);
+    let (status, body) = send(&fx, &token, 404, 7000, 0).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "not_dispatched", "{body}");
+    assert_eq!(body["reason"], "session_save_failed", "{body}");
+    assert_eq!((fx.wallet.money(), fx.used()), (money, used), "nothing paid, nothing more charged");
+    let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+    assert_eq!((hold.spent_msat, hold.closed), (0, false), "the hold is untouched");
+
+    store.fail_all(false);
+    let (status, body) = send(&fx, &token, 404, 7000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.wallet.money(), money + 1);
+    let hold = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+    assert_eq!(hold.spent_msat, 7000);
 }
 
 #[tokio::test]
@@ -576,12 +608,12 @@ async fn invoice_refused_near_deadline_returns_the_draw_without_spending() {
     assert_eq!(body["reason"], "call_block_unpayable", "{body}");
     assert_eq!(
         (fx.wallet.money(), fx.wallet.left(), fx.used()),
-        (1, 1000, 421_000)
+        (1, 1000, 422_000)
     );
     let hold = fx.service.call_spend_status(&peer.to_hex(), CALL).unwrap();
     assert_eq!(
         (hold.spent_msat, hold.remaining_msat, hold.closed),
-        (0, 420_000, false)
+        (0, 421_000, false)
     );
     let budget = fx.service.reload_from_disk().unwrap().grants[0]
         .budget

@@ -5,7 +5,98 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
-## [0.3.0-rc20] — 2026-10-31 (prep; not tagged yet)
+- A node that lost its E2EE session with a connected peer gets it back on the
+  same connection. When the lower-id node lost it, about 25 seconds: the higher-id
+  peer now answers a PrekeyOffer with its own, at most once per ten seconds per
+  peer. When the higher-id node lost it, up to about a minute.
+- A reconnect no longer replaces a healthy E2EE session. The lower-id node acts on
+  a PrekeyOffer only with no session, one marked for renegotiation or not yet
+  confirmed, or on a second offer on the same connection a self-heal tick or more
+  after the first. Two stale offers can still start a replacement; closing that
+  needs key confirmation, which is separate work.
+- A reconnect now shows whether two E2EE sessions still agree, with nothing
+  paid. The lower-id node sends a `RatchetInit` under the session in use on each
+  new connection, and both nodes send one on a self-heal tick once the
+  connection and any negotiation are ten seconds old. Each takes its own send
+  chain position, saved first. A peer still on the session before moves over on
+  it, which also recovers a `RatchetInit` lost with its connection; a peer that
+  cannot read it asks for a new session. Peers on earlier versions read it like
+  any `RatchetInit`, and drop their session if they cannot. No frame or message
+  format changes.
+- A replaced E2EE session keeps reading for up to an hour, in memory only, so a paid
+  envelope encrypted under it just before the switch, or resent later, is still read
+  rather than refused.
+- A callee with no readable E2EE session with the caller refuses a call block
+  invoice (`call_block_unpayable`, nothing paid), so no minute is paid for a
+  session that cannot read it. Messages and other call signals have no such step
+  before payment.
+- A call block from the higher-id side that its recipient cannot read is now
+  refused for good (`undecryptable:`), rather than retried for up to an hour. The
+  legacy `invalid call signal: undecryptable` stays retryable.
+- One envelope or control frame can no longer cost a working E2EE session. A paid
+  envelope that cannot be decrypted is refused as before and the session stays;
+  from after the session settled it also starts a new negotiation, repeated on the
+  self-heal tick until it completes or a readable message clears it. A new session
+  retires the current one only on an answer from the peer: for the initiator a
+  `SessionAck`, which names no session and so does not show the keys match; for
+  the acceptor a message that decrypts under the new session. A stale prekey
+  offer the peer refuses, or a well-formed init with other keys, changes nothing.
+  Two stale offers, or a late `SessionAck`, can still retire a working session
+  until key confirmation lands. No frame or message format changes.
+
+## [0.3.0-rc22] — 2026-11-05
+
+- An E2EE send now saves its advanced send chain before the ciphertext leaves
+  the session; if the save fails, nothing is sent. The send is refused with
+  `not_dispatched`, reason `session_save_failed`, before any payment for it. An
+  admission already settled in the same call stays settled and is reported as
+  paid, with the same reason. Saves and deletes of session state now run to
+  completion under the session lock even if the request that started them goes
+  away (#519).
+- Session setup applies stricter consistency checks to the keys it receives. A
+  prekey bundle or session init that fails them is refused before anything
+  changes (#520).
+- File sends report the routing fee actually paid: `POST /api/v1/files/:id/send`
+  now returns optional `fee_paid_msat`, as compose does. It is omitted when any
+  component fee is unknown and on backends other than LDK; absence does not mean
+  zero (#521).
+- Docs now say what encryption covers today: message content and call audio are
+  encrypted between nodes, and either node can read them. Encryption that
+  reaches the app is planned (#512).
+- RUSTSEC-2026-0429 is waived in the audit, deny and OSV configs for the
+  test-only `zip` 0.6.6, which is absent from the shipped binary (#505).
+- Not included: call cutoff is not yet verified on real hardware, and this
+  release does not fix the other open reports.
+- Known limit, also present in rc21: If a link drops during a call and both nodes reconnect at nearly the same moment,
+  the two nodes can end up on different sessions. Messages and call minutes sent
+  then can be paid for and not read. It can clear within about a minute; otherwise
+  follow the steps in [rc21 → rc22](docs/UPGRADING.md#rc21--rc22). This release
+  does not change it, and a fix is planned.
+
+## [0.3.0-rc21] — 2026-11-01
+
+- App spend grants now show, sign and store the owner's real per-payment
+  value. Paid messages, files, rooms and admission remain capped at 6 sats
+  (or the signed value when lower). Calls are bounded by the signed value
+  and the call's pinned per-block ceiling; the offer has its own cap. A
+  direct-channel contact is paid with no routing fee when the channel can
+  carry the payments; a failed direct payment never falls back to a route
+  with a fee. A call's hold and offer are reserved together, and every draw
+  from a hold re-checks the signed value. Existing grants stored at 6,000
+  msat per payment bind calls at that value until re-granted (#493).
+- A grant-funded call's closing signal is paid by its grant. Its closing
+  allowance is reserved from the grant outside the caller's hold consent;
+  a refused closing payment leaves the call ended without an owner debit
+  (#498).
+- Grant-funded calls: every paid call signal (offer, block, answer, ICE,
+  hangup and the closing signal) is checked again at wallet dispatch against
+  the grant's current per-payment limit, so a relation envelope renewed lower
+  never pays the earlier amount. Answers, ICE candidates and hangups,
+  including the closing signal, stay within the 6 sat message cap. A call
+  whose quoted closing signal cannot fit is refused before any hold or payment
+  (`budget_exceeded`, reason `call_closing_above_limit`) (#500).
+
+## [0.3.0-rc20] — 2026-10-31
 
 - Payment truth on the owner API: `POST /payments/pay` and `/payments/keysend`
   answer `202 Accepted` with `status: in_flight` (payment hash and operation id,
