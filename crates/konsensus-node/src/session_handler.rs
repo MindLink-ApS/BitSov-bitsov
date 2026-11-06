@@ -2341,6 +2341,7 @@ async fn handle_gossip_received(
 /// or while this node has no E2EE session with the caller, or one it is waiting
 /// to renegotiate: the block could not be read, so the minute would be paid and
 /// not served. The caller pays nothing and may ask again once the session is back.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_call_block_invoice(
     storage: &dyn konsensus_storage::Storage,
     pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
