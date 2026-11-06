@@ -60,3 +60,8 @@ deadline = 2027-02-03
 [[waiver]]
 ids = ["RUSTSEC-2026-0382", "RUSTSEC-2026-0381", "CVE-2026-111943"]
 deadline = 2027-02-03
+
+# OSV-only block-buffer advisory; the locked 0.10.4 is outside the affected range.
+[[waiver]]
+ids = ["GHSA-qwgh-2vcv-g2f7"]
+deadline = 2027-02-03
