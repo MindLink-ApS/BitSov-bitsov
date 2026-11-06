@@ -56,9 +56,9 @@ Pending/in-flight payments, missing fee evidence, and LND/LNbits/mock backends
 omit the field entirely; absence does not mean zero. The existing payment-list
 `fee_msat` field is unchanged.
 
-`POST /api/v1/messages/compose` and `GET /api/v1/messages/operations/:id`
-return the same optional `fee_paid_msat`, summed over the message and any
-admission/re-admission represented by the result. Room sends sum recipients'
+`POST /api/v1/messages/compose`, `GET /api/v1/messages/operations/:id` and
+`POST /api/v1/files/:id/send` return the same optional `fee_paid_msat`, summed
+over the message and any admission/re-admission represented by the result. Room sends sum recipients'
 fees. The aggregate is omitted if any payment is unresolved, any component fee
 is unknown, or the sum overflows. Durable operation retries retain known fees
 without paying again; historical records lacking evidence omit them.
