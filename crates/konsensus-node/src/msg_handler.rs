@@ -1022,6 +1022,11 @@ async fn note_unreadable_envelope(
     if !session_mgr.has_session(sender).await {
         return;
     }
+    // One undecryptable envelope asks for a replacement. Repeats stay quiet:
+    // the self-heal tick keeps offering until a new session is confirmed.
+    if session_mgr.needs_renegotiation(sender).await {
+        return;
+    }
     let settle_ms = crate::session_handler::SESSION_NEGOTIATION_COOLDOWN.as_millis() as u64;
     if session_mgr.session_newer_than(sender, envelope.timestamp.saturating_sub(settle_ms)).await {
         warn!(sender = %sender, "envelope from before the session settled could not be decrypted; session kept");
