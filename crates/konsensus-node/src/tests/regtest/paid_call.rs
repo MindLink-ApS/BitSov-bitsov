@@ -132,21 +132,46 @@ async fn compose(
     app.post("/api/v1/messages/compose", request, false).await
 }
 
-async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
+/// Two funded nodes with a direct channel, paired clients, owner consent and an
+/// E2EE session both ways.
+struct Lane {
+    steps: Steps,
+    _chain: infra::Chain,
+    _dirs: [tempfile::TempDir; 2],
+    a: Arc<LdkProvider>,
+    b: Arc<LdkProvider>,
+    caller: app::App,
+    callee: app::App,
+    aid: NodeId,
+    bid: NodeId,
+}
+
+async fn lane(max_minutes: u16, caller_higher: bool) -> Lane {
     let mut steps = Steps::new();
     let chain = infra::Chain::start().await;
     let dirs = [(); 2].map(|_| tempfile::tempdir().unwrap());
     let configs = dirs
         .each_ref()
         .map(|dir| infra::lightning_config(dir.path(), &chain.url));
+    let identity = |index: usize| {
+        *NodeIdentity::from_mnemonic(&configs[index].mnemonic, "")
+            .unwrap()
+            .node_id()
+    };
+    // Who holds the lower NodeId decides who runs X3DH.
+    let (first, second) = if caller_higher && identity(0).as_bytes() < identity(1).as_bytes() {
+        (1, 0)
+    } else {
+        (0, 1)
+    };
     let a = Arc::new(
-        LdkProvider::new(configs[0].clone())
+        LdkProvider::new(configs[first].clone())
             .await
             .unwrap()
             .with_routing_fee_policy(three_node::direct_channel_fee_policy()),
     );
     let b = Arc::new(
-        LdkProvider::new(configs[1].clone())
+        LdkProvider::new(configs[second].clone())
             .await
             .unwrap()
             .with_routing_fee_policy(three_node::direct_channel_fee_policy()),
@@ -171,8 +196,8 @@ async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
         )
     };
     // Different prices catch an accidental fallback to the caller's tariff.
-    let mut caller = start(0, a.clone(), 7_001, max_minutes).await;
-    let mut callee = start(1, b.clone(), PRICE, 60).await;
+    let mut caller = start(first, a.clone(), 7_001, max_minutes).await;
+    let mut callee = start(second, b.clone(), PRICE, 60).await;
     let aid = *caller.state.identity.node_id();
     let bid = *callee.state.identity.node_id();
 
@@ -181,7 +206,7 @@ async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
             "/api/v1/payments/open-channel",
             json!({
                 "peer_pubkey": b.node().node_id().to_string(),
-                "peer_addr": configs[1].listening_address,
+                "peer_addr": configs[second].listening_address,
                 "amount_sats": 1_000_000, "announce": false,
             }),
             true,
@@ -232,6 +257,21 @@ async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
     three_node::elevate(&mut callee, &[aid.to_hex()]).await;
     // Exercise the established encrypted session through the paid product path.
     caller.compose(&mut callee, "M6 call preflight").await;
+    let quoted = konsensus_api::calls::peer_call_kind_price(&caller.state, &bid, 404)
+        .await
+        .unwrap();
+    assert_eq!(quoted, PRICE, "callee's live kind-404 answer");
+    steps.pass("two funded nodes, direct channel, paired clients and owner consent");
+    Lane { steps, _chain: chain, _dirs: dirs, a, b, caller, callee, aid, bid }
+}
+
+async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
+    one_call(lane(max_minutes, false).await, max_minutes, paid_blocks, reason).await;
+}
+
+/// One whole call on `lane`, from the offer to the released reservation.
+async fn one_call(lane: Lane, max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
+    let Lane { mut steps, _chain, _dirs, a, b, mut caller, mut callee, aid, bid } = lane;
     let used_before = caller.used();
     let counts_before = caller
         .service
@@ -239,12 +279,18 @@ async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
         .unwrap()
         .breakers
         .payments_last_hour;
-    let quoted = konsensus_api::calls::peer_call_kind_price(&caller.state, &bid, 404)
+    let served_before = b
+        .list_payments(100)
         .await
-        .unwrap();
-    assert_eq!(quoted, PRICE, "callee's live kind-404 answer");
-    steps.pass("two funded nodes, direct channel, paired clients and owner consent");
-
+        .unwrap()
+        .into_iter()
+        .filter(|p| {
+            p.direction == PaymentDirection::Incoming
+                && p.status == PaymentStatus::Settled
+                && p.amount_msat == PRICE
+        })
+        .count();
+    let offer = json!({"v":1, "call_id":CALL, "media":"audio", "sdp":SDP});
     let (status, body) = compose(&caller, &bid, 400, offer, SIGNAL_PRICE).await;
     assert_eq!(status, StatusCode::OK, "offer: {body}");
     recv_kind(&mut callee, &aid, 400).await;
@@ -535,7 +581,7 @@ async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
         .collect();
     assert_eq!(
         paid.len(),
-        paid_blocks as usize,
+        served_before + paid_blocks as usize,
         "no hidden extra block payments"
     );
     assert!(frame_seq >= 20, "bidirectional audio exercised");
@@ -546,6 +592,104 @@ async fn scenario(max_minutes: u16, paid_blocks: u32, reason: HangupReason) {
     callee.stop().await;
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
+}
+
+/// The callee holds the lower NodeId, so it alone can run X3DH, and it loses its
+/// session during a paid call while the caller keeps a working one. The next
+/// block is refused before anything is paid. The session comes back on the same
+/// connection within the bound, a message goes each way, and the next call is
+/// paid and carries audio.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real Bitcoin Core + electrs; scripts/regress/two_node_paid_call_e2e.sh"]
+async fn lost_session_recovers_on_the_connection_and_the_next_call_works() {
+    /// The negotiation cooldown, one self-heal tick and round trips.
+    const RECOVERY_BOUND: Duration = Duration::from_secs(30);
+    const LOST: &str = "ffeeddccbbaa99887766554433221100";
+    const MINUTES: u16 = 2;
+
+    let mut lane = lane(MINUTES, true).await;
+    let (aid, bid) = (lane.aid, lane.bid);
+    assert!(bid.as_bytes() < aid.as_bytes(), "the callee initiates X3DH");
+    let (caller, callee) = (&mut lane.caller, &mut lane.callee);
+    let (a, b) = (&lane.a, &lane.b);
+
+    let offer = json!({"v":1, "call_id":LOST, "media":"audio", "sdp":SDP});
+    let (status, body) = compose(caller, &bid, 400, offer, SIGNAL_PRICE).await;
+    assert_eq!(status, StatusCode::OK, "offer: {body}");
+    recv_kind(callee, &aid, 400).await;
+    let answer = json!({"v":1, "call_id":LOST, "sdp":SDP});
+    let (status, body) = compose(callee, &aid, 401, answer, SIGNAL_PRICE).await;
+    assert_eq!(status, StatusCode::OK, "answer: {body}");
+    recv_kind(caller, &bid, 401).await;
+    let block = |seq: u32| json!({"call_id":LOST, "seq":seq});
+    let (status, body) = compose(caller, &bid, 404, block(0), PRICE).await;
+    assert_eq!(status, StatusCode::OK, "block 0: {body}");
+    recv_kind(callee, &aid, 404).await;
+    settle(a, body["payment_hash"].as_str().unwrap()).await;
+    settle(b, body["payment_hash"].as_str().unwrap()).await;
+    let live = caller.state.storage.call_get(&bid, LOST).await.unwrap().unwrap();
+    let due = live.next_block_due_ms().unwrap();
+    tokio::time::sleep(Duration::from_millis(due.saturating_sub(now_ms()) + 20)).await;
+    lane.steps.pass("a paid call is live and its next block is due");
+
+    let connection = |app: &app::App, peer: NodeId| {
+        let transport = app.state.transport.clone();
+        async move { transport.connected_since(&peer).await.unwrap() }
+    };
+    let generations = (connection(caller, bid).await, connection(callee, aid).await);
+    let payments = a.list_payments(100).await.unwrap().len();
+    let spent = caller.service.call_spend_status(&bid.to_hex(), LOST).unwrap().spent_msat;
+    // Self-heal keeps running, so bar recovery until the block has its answer. While
+    // the higher id does not answer offers, the lower id cannot get its bundle.
+    use std::sync::atomic::Ordering;
+    crate::session_handler::HOLD_PREKEY_ANSWERS.store(true, Ordering::SeqCst);
+    assert!(callee.state.session_manager.remove_session(&aid).await);
+    let (status, body) = compose(caller, &bid, 404, block(1), PRICE).await;
+    let lost_throughout = !callee.state.session_manager.has_session(&aid).await;
+    crate::session_handler::HOLD_PREKEY_ANSWERS.store(false, Ordering::SeqCst);
+    let lost_at = std::time::Instant::now();
+    assert!(lost_throughout, "the barrier held");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no session, no invoice: {body}");
+    assert_eq!(body["reason"], "call_block_unpayable", "{body}");
+    assert_eq!(a.list_payments(100).await.unwrap().len(), payments, "nothing paid");
+    let hold = caller.service.call_spend_status(&bid.to_hex(), LOST).unwrap();
+    assert_eq!((hold.spent_msat, hold.closed), (spent, false), "the hold is untouched");
+    lane.steps.pass("the block for a lost session is refused before payment");
+
+    wait("the callee has a session again", || async {
+        assert!(lost_at.elapsed() < RECOVERY_BOUND, "not recovered within the bound");
+        callee.state.session_manager.can_send(&aid).await
+            && caller.state.session_manager.can_send(&bid).await
+    })
+    .await;
+    println!("SESSION RECOVERED after {:?}", lost_at.elapsed());
+    assert_eq!(
+        (connection(caller, bid).await, connection(callee, aid).await),
+        generations,
+        "no new connection"
+    );
+    caller.compose(callee, "after recovery, from the caller").await;
+    callee.compose(caller, "after recovery, from the callee").await;
+    lane.steps.pass("the session recovers on the same connection and carries messages");
+
+    // Nothing more was paid, so the callee ends this call as unpaid.
+    wait("the lost call ends", || async {
+        let ended = |app: &app::App, peer: NodeId| {
+            let storage = app.state.storage.clone();
+            async move {
+                storage.call_get(&peer, LOST).await.unwrap().unwrap().phase == Phase::Ended
+            }
+        };
+        ended(caller, bid).await && ended(callee, aid).await
+    })
+    .await;
+    let notice = recv_kind(caller, &bid, 403).await;
+    settle(a, &hex::encode(notice.envelope.payment_proof.payment_hash)).await;
+    wait("its reservation closes", || async {
+        caller.service.call_spend_status(&bid.to_hex(), LOST).unwrap().closed
+    })
+    .await;
+    one_call(lane, MINUTES, 1, HangupReason::Unpaid).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
