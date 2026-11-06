@@ -1357,10 +1357,13 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
 
 /// Positive evidence that an operation holds no payment: nothing was
 /// dispatched or left pending, no settlement, proof or admission was recorded,
-/// the peer's admission journal (every retained attempt) shows no dispatch or
-/// settlement, and the wallet knows no payment for any admission hash involved.
-/// Any doubt (an unreadable journal, another operation's attempt, a hash that
-/// does not match, a wallet that cannot answer) is not evidence.
+/// no retained attempt of this operation or of none in the peer's admission
+/// journal shows a dispatch or settlement, and the wallet knows no payment for
+/// any admission hash involved. An attempt linked to another operation is that
+/// operation's payment, carried on its own row: a contact admitted last week
+/// says nothing about this send. Any doubt (an unreadable journal, an attempt
+/// with no link, a hash that does not match, a wallet that cannot answer) is
+/// not evidence.
 async fn proven_unpaid(state: &AppState, op: &OutboxOperation, data: &Recovery) -> bool {
     if data.dispatched
         || data.admission_pending
@@ -1382,21 +1385,26 @@ async fn proven_unpaid(state: &AppState, op: &OutboxOperation, data: &Recovery) 
         return false;
     };
     let mut hashes = Vec::new();
+    let mut others = Vec::new();
     let mut attempt = journal.as_ref();
     while let Some(a) = attempt {
-        if a.dispatch_started
-            || a.message_may_have_dispatched
-            || a.envelope.is_some()
-            || a.settled_at_unix.is_some()
-            || a.readmission.as_ref().is_some_and(|r| r.reported)
-            || a.operation.as_ref().is_some_and(|l| l.operation_id != op.operation_id)
-        {
-            return false;
+        if a.operation.as_ref().is_some_and(|l| l.operation_id != op.operation_id) {
+            others.push(a.payment_hash.as_str());
+        } else {
+            if a.dispatch_started
+                || a.message_may_have_dispatched
+                || a.envelope.is_some()
+                || a.settled_at_unix.is_some()
+                || a.readmission.as_ref().is_some_and(|r| r.reported)
+            {
+                return false;
+            }
+            hashes.push(a.payment_hash.clone());
         }
-        hashes.push(a.payment_hash.clone());
         attempt = a.previous_attempt.as_deref();
     }
-    if let Some(hash) = &op.admission_payment_hash {
+    // `draft` copies the peer's latest attempt onto the row, whoever made it.
+    if let Some(hash) = op.admission_payment_hash.as_ref().filter(|hash| !others.contains(&hash.as_str())) {
         if journal.is_some() && !hashes.contains(hash) {
             return false;
         }
