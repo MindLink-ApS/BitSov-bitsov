@@ -15,7 +15,7 @@ Node IDs and public keys are the protocol identity layer. IP addresses and DNS n
 1. **Sovereign Identity** -- Your node identity is derived from user-held key material.
 2. **Bitcoin/Lightning Gate** -- Message admission and abuse resistance are tied to settled payment policy. Paid admission raises the cost of unwanted traffic.
 3. **Opt-In Mesh** -- You choose who can reach you through paid-open admission policy, explicit peer policy, or closed/private operation.
-4. **Data Sovereignty** -- Message content is end-to-end encrypted using audited cryptographic primitives. Data lives on sender and receiver nodes, or their authorized ciphertext relays, with metadata caveats documented in the threat model.
+4. **Data Sovereignty** -- Message content is encrypted between nodes using audited cryptographic primitives. Your own node can read your messages, and the recipient's node can read what it receives; the same goes for call audio. End-to-end encryption that reaches the app is planned. Data lives on sender and receiver nodes, or their authorized ciphertext relays, with metadata caveats documented in the threat model.
 5. **Chain-Aware Message Pricing** -- Message costs can track Bitcoin's chain state (see `docs/v2/ADR-027`).
 
 ## Quick Start
@@ -86,7 +86,7 @@ BitSov's public protocol/core export is a Rust workspace with 13 crates (interna
 | Crate | Purpose |
 |-------|---------|
 | `konsensus-core` | Types, traits, identity, UKM envelope, payment gate |
-| `konsensus-crypto` | X3DH key agreement, Double Ratchet E2EE, Sender Keys |
+| `konsensus-crypto` | X3DH key agreement, Double Ratchet and Sender Keys encryption between nodes |
 | `konsensus-message` | Noise_XX transport, wire protocol, P2P mesh |
 | `konsensus-lightning` | LDK/LND providers, development mocks, and a legacy LNbits adapter (no fee-limited payments) |
 | `konsensus-chain` | Bitcoin chain provider + Esplora implementation |

@@ -523,6 +523,7 @@ async fn two_nodes_with_outcome(
         .await
         .unwrap();
     sessions_b.accept_session(&alice_id, &init).await.unwrap();
+    assert!(sessions_a.confirm_session(&bob_id).await);
 
     let ledger_path = ledger.path().join("ledger.db");
     let wallet_a = Arc::new(SharedMockProvider::new(&ledger_path, "a", 1_000_000).unwrap());

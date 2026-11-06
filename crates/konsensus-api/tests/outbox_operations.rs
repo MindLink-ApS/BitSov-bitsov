@@ -1895,7 +1895,9 @@ async fn a_stuck_prepared_row_is_never_released_against_the_admission_journal() 
         "previous attempt dispatched",
         "wallet knows the journal hash",
         "journal hash differs from the row",
-        "another operation's attempt",
+        "this operation's attempt dispatched",
+        "this operation's attempt settled",
+        "this operation's attempt behind another's",
         "row hash with a dispatched journal",
         "unparsable",
         "unreadable",
@@ -1927,7 +1929,23 @@ async fn a_stuck_prepared_row_is_never_released_against_the_admission_journal() 
                     .bind("fd".repeat(32)).bind(&f.id).execute(f.db.pool()).await.unwrap();
                 json(attempt(&unknown, serde_json::json!({})))
             }
-            "another operation's attempt" => json(attempt(&unknown, link(&other))),
+            "this operation's attempt dispatched" => {
+                let mut mine = attempt(&unknown, serde_json::json!({"dispatch_started": true}));
+                mine["operation"] = link(&f.id)["operation"].clone();
+                json(mine)
+            }
+            "this operation's attempt settled" => {
+                let mut mine = attempt(&paid, serde_json::json!({"settled_at_unix": 1}));
+                mine["operation"] = link(&f.id)["operation"].clone();
+                json(mine)
+            }
+            "this operation's attempt behind another's" => {
+                let mut mine = attempt(&unknown, serde_json::json!({"dispatch_started": true}));
+                mine["operation"] = link(&f.id)["operation"].clone();
+                let mut newer = attempt(&"fd".repeat(32), link(&other));
+                newer["previous_attempt"] = mine;
+                json(newer)
+            }
             "row hash with a dispatched journal" => {
                 sqlx::query("UPDATE outbox_operations SET admission_payment_hash = ? WHERE operation_id = ?")
                     .bind(&unknown).bind(&f.id).execute(f.db.pool()).await.unwrap();
@@ -1974,6 +1992,145 @@ async fn a_stuck_prepared_row_is_never_released_against_the_admission_journal() 
         assert_eq!(f.op().await.state, "released", "{control}");
         assert_eq!(f.abandon().await.0, StatusCode::OK, "{control}");
     }
+}
+
+/// The admission that first let this contact in: paid, settled and proven by an
+/// earlier operation, and kept in the journal after it.
+fn older_operations_admission(paid: &str) -> Vec<u8> {
+    serde_json::to_vec(&attempt(paid, serde_json::json!({
+        "dispatch_started": true, "settled_at_unix": 1, "proof_delivered": true,
+        "operation": {"operation_id": uuid::Uuid::new_v4().to_string(), "execution_id": "e", "readmission": false}}))).unwrap()
+}
+
+impl Fixture {
+    /// Its contact has an older admission on file, and has just gone offline.
+    async fn offline_after_older_admission(&mut self) -> usize {
+        let paid = self.wallet_paid_hash().await;
+        self.journal(Some(&older_operations_admission(&paid)));
+        let transport = Arc::new(common::ConnectedStubTransport::new(vec![], self.state.invoice_requests.clone()));
+        Arc::get_mut(&mut self.state).unwrap().transport = transport;
+        self.wallet.calls.load(Ordering::SeqCst)
+    }
+    async fn post_kind(&self, kind: u16, plaintext: String) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
+            .header("authorization", common::auth_header(&self.state)).header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({"operation_id": self.id, "recipient": self.peer.to_hex(),
+                "kind": kind, "plaintext": plaintext, "wait_ack_ms": 0}).to_string())).unwrap();
+        operation_reply(common::test_router(self.state.clone()).oneshot(request).await.unwrap()).await
+    }
+}
+
+/// A send refused before paying is released, and can be abandoned, whatever an
+/// earlier operation paid this contact. A paid admission, then a call, then the
+/// callee offline is the ordinary road here: a row left `prepared` could not be
+/// abandoned, so a paired app stayed fenced for good.
+#[tokio::test]
+async fn a_send_refused_before_paying_is_released_despite_an_older_operations_admission() {
+    const CALL: &str = "0123456789abcdef0123456789abcdef";
+    for (kind, plaintext, refusal) in [
+        (1, "hello".to_string(), "Recipient is offline"),
+        (403, serde_json::json!({"v": 1, "call_id": CALL, "reason": "hangup"}).to_string(), "Recipient is offline"),
+    ] {
+        let mut f = Fixture::new().await;
+        let dispatches = f.offline_after_older_admission().await;
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        f.db.call_put(&f.peer, CALL, &konsensus_core::payloads::call::CallEntry {
+            side: konsensus_core::payloads::call::Side::Caller, phase: konsensus_core::payloads::call::Phase::Live,
+            deadline_ms: now + 15_000, pending: None, paid_until_ms: Some(now + 15_000), next_block_seq: 1,
+            end_reason: None, unpaid_notice_used: false,
+        }).await.unwrap();
+        let (status, body) = f.post_kind(kind, plaintext).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{kind}: {body}");
+        assert!(body["error"].as_str().unwrap().contains(refusal), "{kind}: {body}");
+        assert_eq!(body["state"], "released", "{kind}: {body}");
+        assert_eq!(body["payment_hash"], serde_json::Value::Null, "{kind}: {body}");
+        assert_eq!(f.get().await["amount_msat"], 0, "{kind}");
+        let (status, view) = f.abandon().await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {view}");
+        assert_eq!(view["state"], "abandoned", "{kind}: {view}");
+        assert_eq!(f.wallet.calls.load(Ordering::SeqCst), dispatches, "{kind}: nothing was dispatched");
+    }
+}
+
+/// The same for a minute the callee's node will not take while it catches up.
+#[tokio::test]
+async fn a_minute_refused_by_a_callee_catching_up_is_released_despite_an_older_operations_admission() {
+    const CALL: &str = "0123456789abcdef0123456789abcdef";
+    let mut f = Fixture::new().await;
+    let dispatches = f.offline_after_older_admission().await;
+    let transport = Arc::new(common::ConnectedStubTransport::new(vec![f.peer], f.state.invoice_requests.clone()));
+    Arc::get_mut(&mut f.state).unwrap().transport = transport;
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+    f.db.call_put(&f.peer, CALL, &konsensus_core::payloads::call::CallEntry {
+        side: konsensus_core::payloads::call::Side::Caller, phase: konsensus_core::payloads::call::Phase::Live,
+        deadline_ms: now + 25_000, pending: None, paid_until_ms: Some(now + 15_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    }).await.unwrap();
+    let (prices, peer) = (f.state.peer_prices.clone(), f.peer);
+    let answering = tokio::spawn(async move {
+        loop {
+            prices.update_kind_price(peer, 404, 10_000, 850_000).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    });
+    let requests = f.state.invoice_requests.clone();
+    let refusing = tokio::spawn(async move {
+        loop {
+            let mut pending = requests.lock().await;
+            if let Some(id) = pending.keys().next().cloned() {
+                pending.remove(&id).unwrap().send(Err(konsensus_api::state::InvoiceResponseError {
+                    recipient: peer, reason: "konsensus:not_ready:not_synced".into() })).unwrap();
+                break;
+            }
+            drop(pending);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    });
+    let (status, body) = f.post_kind(404, serde_json::json!({"v": 1, "call_id": CALL, "seq": 1}).to_string()).await;
+    answering.abort();
+    refusing.abort();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "peer_not_ready", "{body}");
+    assert_eq!(body["state"], "released", "{body}");
+    assert_eq!(body["payment_hash"], serde_json::Value::Null, "{body}");
+    assert_eq!(f.abandon().await.0, StatusCode::OK);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), dispatches, "nothing was dispatched");
+}
+
+/// A row an earlier build left `prepared` this way is released by the sweep, so an
+/// app fenced on it recovers on upgrade. `draft` had copied the older hash onto it.
+#[tokio::test]
+async fn a_row_left_prepared_by_an_older_operations_admission_recovers() {
+    let mut f = Fixture::new().await;
+    f.fail_before_payment().await;
+    f.post().await;
+    f.allow_payment().await;
+    f.stick_prepared().await;
+    let paid = f.wallet_paid_hash().await;
+    sqlx::query("UPDATE outbox_operations SET admission_payment_hash = ? WHERE operation_id = ?")
+        .bind(&paid).bind(&f.id).execute(f.db.pool()).await.unwrap();
+    f.journal(Some(&older_operations_admission(&paid)));
+    f.restart().await;
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(f.op().await.state, "released");
+    assert_eq!(f.abandon().await.0, StatusCode::OK);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
+}
+
+/// An older admission clears nothing else: this send's own evidence still counts.
+#[tokio::test]
+async fn an_older_operations_admission_does_not_hide_this_operations_payment() {
+    let mut f = Fixture::new().await;
+    f.offline_after_older_admission().await;
+    let transport = Arc::new(common::ConnectedStubTransport::new(vec![f.peer], f.state.invoice_requests.clone()));
+    Arc::get_mut(&mut f.state).unwrap().transport = transport;
+    f.wallet.mode.store(3, Ordering::SeqCst); // the wallet paid; its reply was lost
+    let (status, body) = f.post().await;
+    assert!(!status.is_success(), "{body}");
+    assert_eq!(body["state"], "payment_unknown", "{body}");
+    let (status, view) = f.abandon().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{view}");
+    assert_eq!(view["state"], "payment_unknown", "{view}");
 }
 
 #[tokio::test]
