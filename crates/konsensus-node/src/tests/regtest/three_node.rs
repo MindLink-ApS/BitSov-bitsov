@@ -160,7 +160,11 @@ pub(super) async fn elevate(app: &mut app::App, recipients: &[String]) {
         "{APPROVAL}: remote grant read: {grant}"
     );
     assert_eq!(
-        grant["grant"]["per_call_max_msat"],
+        grant["grant"]["per_call_max_msat"], 200_000,
+        "{APPROVAL}: the grant shows the per-payment value the owner approved: {grant}"
+    );
+    assert_eq!(
+        grant["grant"]["message_per_payment_max_msat"],
         konsensus_api::spend_budget::MESSAGING_PER_CALL_MAX_MSAT,
         "{APPROVAL}: node keeps the 6 sat messaging cap: {grant}"
     );

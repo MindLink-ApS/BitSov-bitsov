@@ -37,6 +37,33 @@ fn lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+type ClosingKey = (usize, NodeId, String);
+fn closing_notices() -> &'static Mutex<std::collections::HashSet<ClosingKey>> {
+    static NOTICES: OnceLock<Mutex<std::collections::HashSet<ClosingKey>>> = OnceLock::new();
+    NOTICES.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+fn closing_key(state: &AppState, peer: NodeId, id: &str) -> ClosingKey {
+    (std::sync::Arc::as_ptr(&state.storage) as *const () as usize, peer, id.into())
+}
+
+/// At most eight maintenance notifications keep their holds available until
+/// compose can journal a child draw. Cancellation/restart leaves ordinary
+/// reconciliation responsible for releasing the hold.
+struct ClosingNotice(ClosingKey);
+type ClosingNotification = (NodeId, String, tokio::sync::OwnedSemaphorePermit, ClosingNotice);
+impl ClosingNotice {
+    fn new(state: &AppState, peer: NodeId, id: &str) -> Self {
+        let key = closing_key(state, peer, id);
+        closing_notices().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone());
+        Self(key)
+    }
+}
+impl Drop for ClosingNotice {
+    fn drop(&mut self) {
+        closing_notices().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -91,7 +118,8 @@ pub(crate) fn call_max_minutes(state: &AppState, peer: &NodeId, id: &str) -> u16
         .map_or(state.max_call_minutes, |s| s.max_call_minutes)
 }
 
-async fn expire_call_caps(state: &AppState, now: u64) -> Result<Vec<(NodeId, String)>, konsensus_storage::StorageError> {
+async fn expire_call_caps(state: &AppState, now: u64, slots: &std::sync::Arc<tokio::sync::Semaphore>)
+    -> Result<Vec<ClosingNotification>, konsensus_storage::StorageError> {
     let _guard = lock().lock().await;
     let mut expired = Vec::new();
     for (peer, id, mut entry) in state.storage.call_live().await? {
@@ -104,7 +132,14 @@ async fn expire_call_caps(state: &AppState, now: u64) -> Result<Vec<(NodeId, Str
         entry.end_reason = Some(rules::HangupReason::DurationCap);
         entry.deadline_ms = until.saturating_add(rules::TOMBSTONE_MS);
         match state.storage.call_put(&peer, &id, &entry).await {
-            Ok(()) => expired.push((peer, id)),
+            Ok(()) => {
+                // Register while the call lock still orders us with every
+                // reconciler: Ended must never expose an unprotected hold.
+                if let Ok(permit) = slots.clone().try_acquire_owned() {
+                    let closing = ClosingNotice::new(state, peer, &id);
+                    expired.push((peer, id, permit, closing));
+                }
+            },
             Err(error) => tracing::warn!(%error, "call duration expiry deferred"),
         }
     }
@@ -116,41 +151,102 @@ async fn expire_call_caps(state: &AppState, now: u64) -> Result<Vec<(NodeId, Str
 /// peer, and cannot restore media. A failed notification cannot prolong a call.
 pub async fn maintain_calls(state: &std::sync::Arc<AppState>, now: u64) -> Result<(), konsensus_storage::StorageError> {
     use crate::handlers::messages::{compose_for, ComposeRequest};
-    let mut expired: Vec<_> = expire_call_caps(state, now).await?.into_iter()
-        .map(|(peer, id)| (peer, id, rules::HangupReason::DurationCap)).collect();
-    match expire_calls(state.storage.as_ref(), now).await {
-        Ok(calls) => expired.extend(calls.into_iter().map(|(peer, id)| (peer, id, rules::HangupReason::Unpaid))),
-        Err(error) => tracing::warn!(%error, "call expiry sweep deferred"),
-    }
-    if let Err(error) = reconcile_call_spend(state, now).await {
-        tracing::warn!(%error, "call spend maintenance deferred");
-    }
     // No network wait in the expiry loop and no unbounded task/queue growth.
     static NOTIFICATIONS: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let slots = NOTIFICATIONS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(8)));
-    for (peer, call_id, reason) in expired {
-        let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
+    let mut expired: Vec<_> = expire_call_caps(state, now, slots).await?.into_iter()
+        .map(|(peer, id, permit, closing)| (peer, id, rules::HangupReason::DurationCap, permit, closing)).collect();
+    match expire_calls(state.storage.as_ref(), now).await {
+        Ok(calls) => expired.extend(calls.into_iter().filter_map(|(peer, id)| {
+            let permit = slots.clone().try_acquire_owned().ok()?;
+            let closing = ClosingNotice::new(state, peer, &id);
+            Some((peer, id, rules::HangupReason::Unpaid, permit, closing))
+        })),
+        Err(error) => tracing::warn!(%error, "call expiry sweep deferred"),
+    }
+    for (peer, call_id, reason, permit, closing) in expired {
         let state = state.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let plaintext = serde_json::json!({"v": 1, "call_id": call_id, "reason": reason.as_str()}).to_string();
-            let request = ComposeRequest {
+            let mut request = ComposeRequest {
                 operation_id: Some(uuid::Uuid::new_v4().to_string()), wait_ack_ms: Some(0),
-                max_routing_fee_msat: Some(0), max_total_msat: Some(1_000), max_recipient_msat: None,
+                max_routing_fee_msat: Some(0), max_total_msat: Some(crate::spend_budget::CALL_CLOSING_MSAT), max_recipient_msat: None,
                 max_block_msat: None, max_hold_msat: None,
                 recipient: peer.to_hex(), is_room: false, kind: konsensus_core::kind::KIND_CALL_HANGUP,
                 plaintext, references: Vec::new(),
             };
-            // Only this capped protocol termination uses internal authority;
-            // it cannot spend the app's grant or start/readmit a connection.
-            let result = tokio::time::timeout(Duration::from_secs(5),
-                compose_for(crate::metered::MeteredSpend::call_timeout(&state), state.clone(), request)).await;
+            // Keep the call's original funding authority, even when the grant
+            // is gone. A refusal leaves the call ended without an owner debit.
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                let auth = crate::metered::MeteredSpend::call_timeout(&state, &peer, &call_id, reason).await;
+                if auth.is_metered() {
+                    let (allowance, fee) = state.pairing.as_ref()
+                        .and_then(|s| s.call_closing_limits(&peer.to_hex(), &call_id)).unwrap_or((0, 0));
+                    request.max_total_msat = Some(allowance);
+                    request.max_routing_fee_msat = Some(fee);
+                }
+                compose_for(auth, state.clone(), request).await
+            }).await;
             if !matches!(result, Ok(Ok(_))) {
                 tracing::debug!(%peer, "call ended; best-effort hangup notification failed");
             }
+            drop(closing);
+            if let Err(error) = reconcile_call_spend(&state, now_ms()).await {
+                tracing::warn!(%error, "call closing hold cleanup deferred");
+            }
         });
     }
+    if let Err(error) = reconcile_call_spend(state, now).await {
+        tracing::warn!(%error, "call spend maintenance deferred");
+    }
     Ok(())
+}
+
+/// Before this version a revoked grant left no hold to identify its calls.
+/// Both the originating offer and block zero must prove owner authority;
+/// later owner-paid blocks cannot change a grant-funded call's provenance.
+/// Missing/unreadable evidence fails closed.
+pub(crate) async fn owner_funded_call(state: &AppState, peer: &NodeId, call_id: &str) -> Result<bool, konsensus_storage::StorageError> {
+    use crate::handlers::messages::operations;
+    let own = state.identity.node_id();
+    let own_hex = own.to_hex();
+    for kind in [konsensus_core::kind::KIND_CALL_INVITE, konsensus_core::kind::KIND_CALL_BLOCK] {
+        let query = konsensus_storage::MessageListQuery::NodeKind { me: &own_hex, kind };
+        let mut cursor = None;
+        let mut owner = false;
+        // Bound legacy history work as well as the enclosing notification timeout.
+        'pages: for _ in 0..64 {
+            let page = state.storage.message_page_with_diagnostics(&query, 64, None, cursor.as_ref()).await?;
+            if page.unreadable_count > 0 { return Ok(false); }
+            let Some(last) = page.items.last() else { return Ok(false) };
+            cursor = Some(konsensus_storage::ListCursor { timestamp: last.timestamp, id: last.id.to_hex() });
+            for envelope in page.items {
+                if envelope.sender != *own || envelope.recipient != konsensus_core::Recipient::Node(*peer) { continue; }
+                let Some(op) = state.storage.get_outbox_operation_by_message(&envelope.id).await? else { return Ok(false) };
+                let binding = if kind == konsensus_core::kind::KIND_CALL_BLOCK { operations::call_block_binding(&op)? }
+                    else { operations::call_offer_binding(&op)?.map(|id| (id, 0)) };
+                let (id, seq) = match binding {
+                    Some(binding) => binding,
+                    None => {
+                        let Some(cipher) = &state.plaintext_cipher else { return Ok(false) };
+                        let Some(cached) = state.storage.get_message_plaintext(&envelope.id).await? else { return Ok(false) };
+                        let plaintext = cipher.decrypt(&cached).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+                        let signal = CallSignal::parse(kind, std::str::from_utf8(&plaintext)
+                            .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?)
+                            .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+                        (signal.call_id, signal.seq.unwrap_or_default())
+                    },
+                };
+                if id == call_id && seq == 0 {
+                    owner = operations::owner_funded_call_operation(&op)?;
+                    break 'pages;
+                }
+            }
+        }
+        if !owner { return Ok(false); }
+    }
+    Ok(true)
 }
 
 /// End-path and restart cleanup. Missing, ended and expired call rows release
@@ -163,6 +259,8 @@ pub async fn reconcile_call_spend(state: &AppState, now: u64) -> Result<(), kons
     for (reservation, terms) in service.call_spend_holds() {
         let result = async {
             let peer = NodeId::from_hex(&terms.peer).map_err(|e| konsensus_storage::StorageError::Serialization(e.to_string()))?;
+            if closing_notices().lock().unwrap_or_else(|e| e.into_inner())
+                .contains(&closing_key(state, peer, &terms.call_id)) { return Ok(()); }
             let entry = state.storage.call_get(&peer, &terms.call_id).await?.and_then(|e| e.at(now));
             // A pending block can still reopen an Unpaid call. Keep the unused
             // bundle through that bounded window; never recreate a closed hold
@@ -209,6 +307,24 @@ pub async fn reconcile_call_spend(state: &AppState, now: u64) -> Result<(), kons
         if let Err(error) = result { first_error.get_or_insert(error); }
     }
     if let Err(error) = service.prune_call_spend((now / 1000).min(i64::MAX as u64) as i64) {
+        first_error.get_or_insert(konsensus_storage::StorageError::Serialization(error.to_string()));
+    }
+    // Revocation removes budgets, but must not erase the funding provenance
+    // of calls that can still expire. Retain it through each replay tombstone.
+    let mut forgotten = Vec::new();
+    for key in service.call_spend_grant_keys() {
+        let Some((peer, id)) = key.split_once(':') else { continue };
+        let result = async {
+            let peer = NodeId::from_hex(peer).map_err(|e| konsensus_storage::StorageError::Serialization(e.to_string()))?;
+            state.storage.call_get(&peer, id).await.map(|entry| entry.is_none())
+        }.await;
+        match result {
+            Ok(true) => forgotten.push(key),
+            Ok(false) => {},
+            Err(error) => { first_error.get_or_insert(error); },
+        }
+    }
+    if let Err(error) = service.forget_call_spend_grants(&forgotten) {
         first_error.get_or_insert(konsensus_storage::StorageError::Serialization(error.to_string()));
     }
     if let Some(error) = first_error { return Err(error); }
@@ -274,6 +390,15 @@ pub(crate) async fn fail_outgoing(state: &AppState, peer: &NodeId, plaintext: &s
 pub(crate) async fn ensure_call_spend(auth: &crate::metered::MeteredSpend, state: &AppState,
     peer: &NodeId, signal: &CallSignal, terms: crate::spend_budget::CallSpendTerms) -> Result<(), ApiError> {
     if !auth.is_metered() { return Ok(()) }
+    with_new_call_spend(state, peer, signal, |capacity| auth.reserve_call(state, terms, capacity)).await?;
+    Ok(())
+}
+
+/// Run `reserve` with the observed call capacity once the call is checked to
+/// be an open outgoing call without a hold. `None` if it already has one.
+/// The call lock orders the reservation with expiry.
+pub(crate) async fn with_new_call_spend<T>(state: &AppState, peer: &NodeId, signal: &CallSignal,
+    reserve: impl FnOnce(u64) -> Result<T, ApiError>) -> Result<Option<T>, ApiError> {
     // Serialize capacity observations only with other new holds. A remote
     // wallet RPC must never stall block renewal, incoming media or hangup.
     static RESERVATIONS: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -289,7 +414,7 @@ pub(crate) async fn ensure_call_spend(auth: &crate::metered::MeteredSpend, state
         return Err(ApiError::BadRequest("caller reservation requires an open outgoing call".into()));
     }
     if state.pairing.as_ref().and_then(|s| s.call_spend_status(&peer.to_hex(), &signal.call_id)).is_some() {
-        return Ok(());
+        return Ok(None);
     }
     if entry.next_block_seq != 0 {
         return Err(ApiError::BadRequest("call reservation missing after block zero; start a new call".into()));
@@ -298,7 +423,7 @@ pub(crate) async fn ensure_call_spend(auth: &crate::metered::MeteredSpend, state
     // capacity from wallet balance, channel size, or an unknown provider field.
     let capacity = channels.iter().filter(|c| c.active)
         .filter_map(|c| c.outbound_capacity_msat).max().unwrap_or(0);
-    auth.reserve_call(state, terms, capacity)
+    reserve(capacity).map(Some)
 }
 
 /// Recovery may resend settled blocks, but a new charge needs a still-payable
