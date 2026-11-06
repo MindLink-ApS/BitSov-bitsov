@@ -291,7 +291,7 @@ Unlock promptly after every restart; do not treat these estimates as guarantees.
 The local watchtower client core cannot yet send to a guard. There is no active
 keyless watch-only protection in W2a. Started with `--remote-unlock`,
 the node therefore opens and accepts new channels only with the configured
-hub/LSPs (see [hub-only channels](#hub-only-channels-hub_only_while_lockable)).
+hub/LSPs (see [channel capacity and hub-only admission](#channel-capacity-and-hub-only-admission)).
 A longer breach window (below) gives more time to unlock but does not lift that
 rule.
 
@@ -555,7 +555,7 @@ Set a human-readable box label independently of custody:
 
 ```toml
 [node]
-hosted_by = "Rasmus's Pi"
+hosted_by = "Alice's Pi"
 ```
 
 The label appears in tickets, `/api/v1/node/lock` and `/api/v1/health` (`null` when
@@ -893,7 +893,7 @@ On an owner-managed node started with `--owner-control`, run this in another
 terminal under the same OS account (use the running node's config path):
 
 ```sh
-konsensus peer add --node-id <64hex> --addr 203.0.113.7:9735 --label Dad --config /path/to/konsensus.toml
+konsensus peer add --node-id <64hex> --addr 203.0.113.7:9735 --label Bob --config /path/to/konsensus.toml
 ```
 
 Review the node ID, fingerprint, address and label, then press Enter. Use `--yes`
