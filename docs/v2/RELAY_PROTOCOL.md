@@ -211,8 +211,8 @@ by the chain-aware engine.**
 ```
 base_rate = configured_min_rate * KindCategory::Storage.multiplier()
 chain_adjusted = base_rate * PricingEngine::fee_rate_adjustment()
-plasticity = chain_adjusted * (1 - trust_discount(depositor))
-final_rate_msat_per_byte_day = plasticity
+discounted = chain_adjusted * (1 - trust_discount(depositor))  # plasticity discount
+final_rate_msat_per_byte_day = discounted
 ```
 
 **Divergence flag:** `PricingEngine::KindCategory` needs a new `Storage`
