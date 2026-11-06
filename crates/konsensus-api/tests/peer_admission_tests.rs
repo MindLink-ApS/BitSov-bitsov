@@ -13,7 +13,7 @@ fn request() -> AddPeerRequest {
     AddPeerRequest {
         node_id: "ab".repeat(32),
         addr: "127.0.0.1:9735".into(),
-        label: Some("Dad".into()),
+        label: Some("Bob".into()),
         auto_connect: true,
     }
 }
@@ -35,7 +35,7 @@ async fn admission_persists_before_live_changes_and_supervises_after_dial() {
         let rows = state.storage.list_peers().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].address.as_deref(), Some("127.0.0.1:9735"));
-        assert_eq!(rows[0].display_name.as_deref(), Some("Dad"));
+        assert_eq!(rows[0].display_name.as_deref(), Some("Bob"));
         assert_eq!(rows[0].metadata["whitelist_source"], "owner_control");
         assert!(state
             .peer_registry
@@ -90,11 +90,11 @@ async fn bad_peer_inputs_have_no_side_effects() {
         ("bad".into(), "127.0.0.1:9735", None),
         ("ab".repeat(32), "example.com:9735", None),
         ("ab".repeat(32), "127.0.0.1:9735", Some("a".repeat(257))),
-        ("ab".repeat(32), "127.0.0.1:9735", Some("Dad\nspoof".into())),
+        ("ab".repeat(32), "127.0.0.1:9735", Some("Bob\nspoof".into())),
         (
             "ab".repeat(32),
             "127.0.0.1:9735",
-            Some("Dad\u{1b}[2J".into()),
+            Some("Bob\u{1b}[2J".into()),
         ),
     ] {
         let req = AddPeerRequest {
@@ -130,7 +130,7 @@ async fn http_admission_uses_shared_persistence_and_audit_without_immediate_dial
     let req = Request::builder().method("POST").uri("/api/v1/peers")
         .header("authorization", common::auth_header(&state))
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::json!({"node_id":"ab".repeat(32),"addr":"127.0.0.1:9735","label":"Dad","auto_connect":false}).to_string())).unwrap();
+        .body(Body::from(serde_json::json!({"node_id":"ab".repeat(32),"addr":"127.0.0.1:9735","label":"Bob","auto_connect":false}).to_string())).unwrap();
     let response = common::test_router(state.clone())
         .oneshot(req)
         .await
@@ -154,7 +154,7 @@ async fn http_admission_uses_shared_persistence_and_audit_without_immediate_dial
         .find(|e| e["event"] == "peer.added")
         .unwrap();
     assert_eq!(event["detail"]["source"], "http_admin");
-    assert_eq!(event["detail"]["label"], "Dad");
+    assert_eq!(event["detail"]["label"], "Bob");
     assert_eq!(event["detail"]["peer_node_id"], "ab".repeat(32));
     assert_eq!(event["detail"]["addr"], "127.0.0.1:9735");
     assert_eq!(event["detail"]["connected"], false);
