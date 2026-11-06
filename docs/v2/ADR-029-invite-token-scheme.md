@@ -1,7 +1,7 @@
 # ADR-029 — Invite Token Scheme for Tier-2 Onboarding
 
 **Status:** Proposed (2026-05-09).
-**Decision-maker:** operator + factory writers.
+**Decision-maker:** operator + maintainers.
 **Authority:** BitSov onboarding requirements and the Five Principles.
 **Implementation track:** ON-B onboarding chain.
 
