@@ -6,7 +6,9 @@
 //! proxies do not log bearer tokens in URLs. The legacy query parameter remains
 //! accepted for local tooling only.
 
+use std::future::{poll_fn, Future};
 use std::sync::Arc;
+use std::task::Poll;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -131,7 +133,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
     let mut keepalive = tokio::time::interval(WS_KEEPALIVE_INTERVAL);
     // The first tick fires immediately — skip it since we just connected.
     keepalive.tick().await;
-    let token_expired = tokio::time::sleep(until_expiry(&claims));
+    let token_expired = wait_until_expired(claims.exp, chrono::Utc::now);
     tokio::pin!(token_expired);
 
     loop {
@@ -293,12 +295,33 @@ fn stream_authorized(state: &Arc<AppState>, claims: &auth::Claims) -> bool {
 // Time left until `stream_authorized` starts refusing on expiry: from the
 // first instant of second `exp`. Milliseconds, so the stream is not left open
 // for up to a second after its token stops being valid.
-fn until_expiry(claims: &auth::Claims) -> std::time::Duration {
-    let left_ms = claims
-        .exp
-        .saturating_mul(1000)
-        .saturating_sub(chrono::Utc::now().timestamp_millis());
+fn until_expiry(exp: i64, now: chrono::DateTime<chrono::Utc>) -> std::time::Duration {
+    let left_ms = exp.saturating_mul(1000).saturating_sub(now.timestamp_millis());
     std::time::Duration::from_millis(u64::try_from(left_ms).unwrap_or(0))
+}
+
+async fn wait_until_expired(exp: i64, now: impl Fn() -> chrono::DateTime<chrono::Utc>) {
+    loop {
+        let remaining = until_expiry(exp, now());
+        if remaining.is_zero() {
+            return;
+        }
+        // Re-read wall time at least once a second while idle, retaining the
+        // exact expiry deadline when it is closer. Monotonic time can diverge
+        // from JWT wall time after a clock adjustment or system suspend.
+        let recheck = tokio::time::sleep(remaining.min(std::time::Duration::from_secs(1)));
+        tokio::pin!(recheck);
+        poll_fn(|cx| {
+            // The biased outer select polls this before the feed on every
+            // wake, even if the periodic recheck timer is still pending.
+            if until_expiry(exp, now()).is_zero() {
+                Poll::Ready(())
+            } else {
+                recheck.as_mut().poll(cx)
+            }
+        })
+        .await;
+    }
 }
 
 /// Registers the WebSocket upgrade route for real-time event streaming.
@@ -309,6 +332,46 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_preempts_ready_event_after_wall_clock_step() {
+        let now = std::cell::Cell::new(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
+        let exp = now.get().timestamp() + 3600;
+        let expired = wait_until_expired(exp, || now.get());
+        tokio::pin!(expired);
+        assert!(futures::poll!(&mut expired).is_pending());
+
+        // Wall time jumps an hour, while the monotonic timer has not advanced.
+        now.set(chrono::DateTime::from_timestamp(exp, 0).unwrap());
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        tx.send("first event after expiry").unwrap();
+        tokio::select! {
+            biased;
+            () = &mut expired => {}
+            _ = rx.recv() => panic!("expired stream consumed the next broadcast event"),
+        }
+        assert_eq!(rx.try_recv(), Ok("first event after expiry"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_expiry_rechecks_wall_clock_after_step() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let now = Arc::new(AtomicI64::new(1_700_000_000));
+        let exp = 1_700_003_600;
+        let clock = Arc::clone(&now);
+        let expired = tokio::spawn(wait_until_expired(exp, move || {
+            chrono::DateTime::from_timestamp(clock.load(Ordering::SeqCst), 0).unwrap()
+        }));
+        tokio::task::yield_now().await;
+        assert!(!expired.is_finished());
+
+        now.store(exp, Ordering::SeqCst);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(expired.is_finished(), "idle stream stayed open after expiry");
+        expired.await.unwrap();
+    }
 
     #[test]
     fn extract_ws_token_prefers_subprotocol_over_query() {

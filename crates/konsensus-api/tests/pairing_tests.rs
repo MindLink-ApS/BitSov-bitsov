@@ -1644,10 +1644,12 @@ async fn ws_closed_within(stream: &mut tokio::net::TcpStream, wait: std::time::D
     }
 }
 
-// The first event after a token expires reaches the client's next connection.
+// The first event published after reconnection reaches the client's next connection.
 // The app reconnects when the node closes its feed. If the expired stream
 // stays open until an event arrives, it takes that event and drops it, and the
 // next connection subscribes too late to see it.
+// This live feed does not replay events published between close and resubscribe;
+// this test reconnects before publishing and does not cover that delivery gap.
 #[tokio::test]
 async fn websocket_first_event_after_token_expiry_reaches_reconnected_client() {
     let tmp = tempfile::tempdir().unwrap();
