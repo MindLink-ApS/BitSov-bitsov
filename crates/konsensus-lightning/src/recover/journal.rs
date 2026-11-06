@@ -188,6 +188,9 @@ pub struct Job {
     path: PathBuf,
     journal: Journal,
     poisoned: bool,
+    /// In-memory only: scripts the next seed-only pass polls instead of every
+    /// derived script. Empty means a full scan; see `Job::advance`.
+    pub(super) focus: Vec<bitcoin::ScriptBuf>,
 }
 impl Job {
     pub fn load_or_begin(storage: &Path, plan: Plan, funding: Vec<OutPoint>) -> Result<Self> {
@@ -222,6 +225,7 @@ impl Job {
             path,
             journal,
             poisoned: false,
+            focus: Vec::new(),
         })
     }
     pub fn verification(&self) -> Option<&Verification> {

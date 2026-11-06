@@ -75,7 +75,7 @@ pub const KIND_TOPIC_UNSUBSCRIBE: u16 = 523;
 
 // ── Real-time Signaling (400–499) ──────────────────────────────────────
 
-/// Call offer (SDP). Priced at the recipient's `call_msat`: the per-call admission.
+/// Call offer (SDP). Priced at the recipient's `call_msat`.
 /// Payload: [`crate::payloads::call::CallSignal`].
 pub const KIND_CALL_INVITE: u16 = 400;
 /// Call answer (SDP), from the callee while the offer rings.
@@ -84,6 +84,8 @@ pub const KIND_CALL_ANSWER: u16 = 401;
 pub const KIND_ICE_CANDIDATE: u16 = 402;
 /// Call hangup / decline.
 pub const KIND_CALL_HANGUP: u16 = 403;
+/// One paid 60-second interval, priced by the callee at `call_block_msat`.
+pub const KIND_CALL_BLOCK: u16 = 404;
 
 // ── Control (900–999) ──────────────────────────────────────────────────
 
@@ -290,6 +292,7 @@ mod tests {
             KIND_CALL_ANSWER,
             KIND_ICE_CANDIDATE,
             KIND_CALL_HANGUP,
+            KIND_CALL_BLOCK,
         ] {
             assert_eq!(
                 KindCategory::from_kind(kind),
@@ -420,7 +423,7 @@ mod tests {
             KIND_CRDT_OP, KIND_DOC_SNAPSHOT,
             KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE, KIND_WEB_MANIFEST,
             KIND_PEER_ENDORSE, KIND_CONTENT_ANNOUNCE, KIND_TOPIC_SUBSCRIBE, KIND_TOPIC_UNSUBSCRIBE,
-            KIND_CALL_INVITE, KIND_CALL_ANSWER, KIND_ICE_CANDIDATE, KIND_CALL_HANGUP,
+            KIND_CALL_INVITE, KIND_CALL_ANSWER, KIND_ICE_CANDIDATE, KIND_CALL_HANGUP, KIND_CALL_BLOCK,
             KIND_TYPING, KIND_READ_RECEIPT, KIND_PRESENCE,
             KIND_ROOM_CREATE, KIND_ROOM_INVITE, KIND_ROOM_JOIN, KIND_ROOM_LEAVE, KIND_ROOM_UPDATE,
             KIND_KEY_EXCHANGE, KIND_MLS_WELCOME, KIND_MLS_COMMIT, KIND_MLS_PROPOSAL,

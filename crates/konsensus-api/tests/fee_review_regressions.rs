@@ -27,12 +27,12 @@ async fn owner_can_pay_invoice_created_by_actual_stock_mock() {
     let signed: lightning_invoice::Bolt11Invoice = invoice["bolt11"].as_str().unwrap().parse().unwrap();
     assert_eq!(signed.currency(), lightning_invoice::Currency::Regtest);
     assert_eq!(signed.amount_milli_satoshis(), Some(1000));
-    let (status, refused) = post(&state, "/api/v1/payments/pay", json!({"bolt11": invoice["bolt11"], "max_routing_fee_msat":399})).await;
+    let (status, refused) = post(&state, "/api/v1/payments/pay", json!({"request_id":"review-pay-1","bolt11": invoice["bolt11"], "max_routing_fee_msat":399})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
     assert_eq!(refused["code"], "not_dispatched");
     assert_eq!(refused["max_routing_fee_msat"], 399);
     assert_eq!(wallet.get_balance_msat().await.unwrap(), before);
-    let (status, paid) = post(&state, "/api/v1/payments/pay", json!({"bolt11": invoice["bolt11"], "max_routing_fee_msat":400})).await;
+    let (status, paid) = post(&state, "/api/v1/payments/pay", json!({"request_id":"review-pay-2","bolt11": invoice["bolt11"], "max_routing_fee_msat":400})).await;
     assert_eq!(status, StatusCode::OK, "stock mock invoice rejected: {paid}");
     assert_eq!(paid["payment_hash"], invoice["payment_hash"]);
     assert_eq!(paid["max_routing_fee_msat"], 400);
@@ -97,7 +97,7 @@ async fn owner_amountless_invoice_is_bad_request_without_debit() {
     let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
     let before = wallet.get_balance_msat().await.unwrap();
     let state = test_state_with_lightning(wallet.clone());
-    let (status, body) = post(&state, "/api/v1/payments/pay", json!({"bolt11":invoice.to_string()})).await;
+    let (status, body) = post(&state, "/api/v1/payments/pay", json!({"request_id":"review-pay-3","bolt11":invoice.to_string()})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(wallet.get_balance_msat().await.unwrap(), before);
 }

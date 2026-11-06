@@ -287,7 +287,10 @@ async fn start_sender(
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
+        configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -471,6 +474,7 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
         .await
         .unwrap();
     sessions_b.accept_session(&alice_id, &init).await.unwrap();
+    assert!(sessions_a.confirm_session(&bob_id).await);
 
     let ledger = Arc::new(std::sync::Mutex::new(Ledger::default()));
     let sender = start_sender(&alice, &transport_a, &sessions_a, Arc::new(TestWallet::new(&ledger))).await;

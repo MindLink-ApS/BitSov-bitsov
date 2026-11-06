@@ -1,7 +1,6 @@
 # Paired device keys and signed relation intents
 
-Relation ladder, Before-Mexico steps 1–3. Direction:
-`MindLink-Private/pm/projects/bitsov/research/RELATION-LADDER-AND-DEVICE-KEYS.md`.
+Relation ladder, Before-Mexico steps 1–3. Direction: an internal design note.
 
 ## What changes for the owner
 
@@ -182,6 +181,7 @@ Console recovery and revocation remain available even for the last key.
 | `DELETE /api/v1/pair/device-keys/{key_id}` | paired, own | retire own key; its envelopes end |
 | `POST /api/v1/pair/relation-intent` | paired + device signature | opens or renews one peer's envelope |
 | `DELETE /api/v1/pair/elevation/{op}` | paired, own | cancel a pending console grant request |
+| `GET /api/v1/owner/claim-code` | loopback only: local console session, or paired token with an enrolled owner device key | `{state}` plus `code`, `expires_at`, `device_name` while a claim-bound (SAS v1) enrollment is pending; `claimed`, `closed` or `unavailable` otherwise. Not on the tunnel router. 5 reads/minute per actor, `no-store`, never logged. See [owner claim-code display](pairing.md#owner-claim-code-display) |
 | control socket `ApproveDeviceKey` | owner | registers the key (short code or full line) |
 | control socket `RevokeDeviceKey` | owner | retires a key |
 
@@ -219,21 +219,32 @@ for older records and is informational; it grants no authority.
 In local mode, `apply_relation_intent` clears the budgets on all other grants
 for that client, including console grants.
 
-New and renewed relation grants have a per-call ceiling of 6,000 msat (6 sats),
-including fan-out and routing fees, without reducing the total budget. A lower
-signed per-act limit still applies. Owner-device `spend_grant` budget approvals
-are also messaging grants: the node narrows their proposed per-call limit to
-6,000 msat before presenting the terms for signature. `GET /api/v1/pair/grant`
-and `konsensus pair-status` expose the effective non-payment `per_call_max_msat`.
-Quotes over this ceiling are refused before payment with a fixed explanation
-and an info log carrying `reason="per_call"`.
+Messages, room fan-out, files, first contact, re-admission and other
+non-call payments stay at `min(stored per-call maximum, 6_000)` msat, including
+routing fees, without reducing the total budget. A lower signed per-act limit
+still applies. A call offer or block is not under that 6 sat ceiling: it is
+bounded by the value the owner signed (on a relation grant, that recipient's
+per-act maximum) and by the call's pinned per-block ceiling. Answers, ICE
+candidates and hangups, including a call's closing signal, stay within the
+non-call cap.
+
+Owner-device `spend_grant` approvals show and sign the per-payment value in
+the request. Omitting it signs the budget. The node does not narrow that
+value to 6,000 msat before the signature, and it still refuses a value above
+the budget. Messages then apply the 6 sat cap at reservation. A grant already
+stored at 6,000 msat keeps that as its call limit until it is issued again.
+`GET /api/v1/pair/grant` reports the signed value as `per_call_max_msat`, the
+non-call cap as `message_per_payment_max_msat`, and the call cap as
+`call_per_payment_max_msat` (null on a relation grant). `konsensus pair-status`
+prints the signed per-call figure and the message cap. A quote over the cap
+that applies is refused before payment, with `reason="per_call"`.
 
 Invoice payments and keysend cannot draw from either messaging grant class;
 they require separate explicit owner authority. Console payment budgets retain
 the owner's chosen limits. No stored schema or existing signed terms are
-rewritten: every non-payment reservation uses the lesser of the stored limit
+rewritten: every non-call reservation uses the lesser of the stored limit
 and 6,000 msat, including console grants and existing live grants on their
-first request after upgrade. Renewal is not required.
+first request after upgrade. Renewal is not required for that message cap.
 
 A relation grant is the client's one budget grant, marked `recipients_only`:
 

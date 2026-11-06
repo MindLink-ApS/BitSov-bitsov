@@ -26,6 +26,12 @@ use std::{
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Recovery {
+    /// Original offer binding, retained with caller provenance for closing.
+    #[serde(default)]
+    call_offer: Option<String>,
+    /// Call/sequence binding survives missing plaintext caches and recovery.
+    #[serde(default)]
+    call_block: Option<(String, u32)>,
     caller: Option<String>,
     #[serde(default)]
     execution_id: Option<String>,
@@ -68,6 +74,8 @@ struct Recovery {
 #[derive(Clone, Serialize, Deserialize)]
 struct BudgetResolution {
     reservation: Reservation,
+    #[serde(default)]
+    payment_failed: bool,
     // None keeps the full liability when any fee is unknown.
     actual_msat: Option<u64>,
 }
@@ -272,9 +280,13 @@ impl Operation {
         expected_msat: u64,
         fee_ceiling: u64,
         admission_msat: u64,
+        call_binding: Option<(String, u32)>,
     ) -> Result<(), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
+        if op.kind == i64::from(konsensus_core::kind::KIND_CALL_INVITE) {
+            data.call_offer = call_binding.map(|(id, _)| id);
+        } else { data.call_block = call_binding; }
         op.message_id = Some(draft.id.to_hex());
         data.draft = Some(draft);
         data.expected_msat = expected_msat;
@@ -318,7 +330,7 @@ impl Operation {
         op.state = "paying".into();
         encode(&mut op, &data)?;
         save(&self.state, &mut op).await?;
-        let mut result = debit.dispatch(future).await;
+        let mut result = debit.dispatch_message_payment(&self.state, future).await;
         match &mut result {
             Ok(Ok(details)) => {
                 if details.payment_hash.is_empty() {
@@ -343,6 +355,13 @@ impl Operation {
         }
         result
     }
+    pub(crate) async fn release_call_debit(&self, debit: &Debit, recipient: &str) {
+        match self.load().await {
+            Ok(op) => debit.released_with_outcome(recipient, definite_call_payment_failure(&op)),
+            Err(error) => tracing::warn!(%error, "call debit release deferred; journal unavailable"),
+        }
+    }
+
     pub(crate) async fn record(&self, details: &PaymentDetails) -> Result<(), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
@@ -505,7 +524,7 @@ pub(super) async fn compose(
 
 /// A 1:1 call signal (kinds 400-403). Its reservation is made, the operation
 /// run, and the reservation resolved all under the one per-operation lock
-/// (Codex delta3 #1), so concurrent requests for the same operation (same
+/// (review delta3 #1), so concurrent requests for the same operation (same
 /// payload, different caps) run one after another: a refused one resolves
 /// only its own reservation before the next reserves, and can never release
 /// a reservation another request is paying under.
@@ -514,14 +533,15 @@ pub(super) async fn compose_call(
     state: Arc<AppState>,
     mut req: ComposeRequest,
     references: Vec<MessageId>,
+    policy: super::compose::ComposePolicy,
 ) -> Result<Json<ComposeResponse>, ApiError> {
     let peer = NodeId::from_hex(&req.recipient)
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
-    // The journal's canonical key, for the reservation too (Codex delta2 #1).
+    // The journal's canonical key, for the reservation too (review delta2 #1).
     let id = operation_id(req.operation_id.as_deref())?;
     req.operation_id = Some(id.clone());
     let _guard = lock(&state, &id).await?;
-    // One operation id, one request (Fable N2): an id reused for another
+    // One operation id, one request (review N2): an id reused for another
     // signal is refused before any reservation. A retry of an operation that
     // already paid is answered from the journal, without reserving.
     let request_hash = request_digest(&peer, &req)?;
@@ -536,7 +556,16 @@ pub(super) async fn compose_call(
         konsensus_core::payloads::call::settlement(Some(&op.state)) == konsensus_core::payloads::call::Settlement::Paid
     });
     let plaintext = req.plaintext.clone();
+    let spend_client = auth.user.pairing.clone();
+    let ends_on_failure = matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK);
     if !paid {
+        if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+            let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &plaintext)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            if signal.seq.is_some_and(|seq| seq >= u32::from(crate::calls::call_max_minutes(&state, &peer, &signal.call_id))) {
+                return Err(ApiError::BadRequest("call duration cap reached".into()).with_reason("call_duration_cap"));
+            }
+        }
         crate::calls::reserve_outgoing(state.storage.as_ref(), state.identity.node_id(), &peer, req.kind, &plaintext, &id, &request_hash).await?;
     }
     let result = compose_locked(
@@ -546,10 +575,53 @@ pub(super) async fn compose_call(
         references,
         peer,
         id.clone(),
-        super::compose::ComposePolicy::default(),
+        policy,
     ).await;
-    crate::calls::resolve_outgoing(state.storage.as_ref(), &peer, &plaintext, &id, &request_hash).await;
+    crate::calls::resolve_outgoing(&state, &peer, &plaintext, &id, &request_hash).await;
+    if ends_on_failure && call_payment_failed(&state, &id, result.as_ref().err()).await {
+        if let (Some(client), Some(service), Ok(signal)) = (spend_client, state.pairing.as_ref(),
+            konsensus_core::wire_json::from_str::<konsensus_core::payloads::call::CallSignal>(&plaintext)) {
+            if service.owns_call_spend(&client, &peer.to_hex(), &signal.call_id) {
+                if let Err(error) = crate::calls::fail_outgoing(&state, &peer, &plaintext).await {
+                    tracing::warn!(%error, "call failure cleanup deferred");
+                }
+            }
+        }
+    }
+    if let Err(error) = crate::calls::reconcile_call_spend(&state, chrono::Utc::now().timestamp_millis() as u64).await {
+        tracing::warn!(%error, "call spend cleanup deferred");
+    }
     result
+}
+
+// Validation and invoice refusals leave a live call retryable. Only terminal
+// payment evidence (or a price above the held ceiling) ends it here; ambiguous
+// outcomes retain their journal and are bounded by ordinary call expiry.
+async fn call_payment_failed(state: &AppState, id: &str, error: Option<&ApiError>) -> bool {
+    fn price_changed(error: &ApiError) -> bool {
+        match error {
+            ApiError::Reasoned { reason, .. } if *reason == super::caps::CALL_DIRECT_CHANNEL_LOST
+                || *reason == super::caps::CALL_ABOVE_PAYMENT_LIMIT => true,
+            ApiError::Operation { source, .. } | ApiError::RoutingFee { source, .. }
+                | ApiError::Reasoned { source, .. } => price_changed(source),
+            ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::CallPriceChanged) => true,
+            _ => false,
+        }
+    }
+    let Some(error) = error else { return false };
+    if price_changed(error) { return true; }
+    let Ok(Some(op)) = state.storage.get_outbox_operation(id).await else { return false };
+    definite_call_payment_failure(&op)
+}
+
+pub(crate) fn definite_call_payment_failure(op: &OutboxOperation) -> bool {
+    if !matches!(op.kind, 400 | 404) || op.settled_msat > 0 { return false; }
+    recovery(op).is_ok_and(|data| data.settlement.as_ref().is_some_and(|payment| {
+        payment.direction == PaymentDirection::Outgoing
+            && Some(&payment.payment_hash) == op.payment_hash.as_ref()
+            && payment.amount_msat == data.expected_msat
+            && matches!(payment.status, PaymentStatus::Failed | PaymentStatus::Expired)
+    }))
 }
 
 /// The operation itself; the caller holds its per-operation lock.
@@ -613,9 +685,14 @@ async fn compose_locked(
             reconcile(&state, &mut op).await?;
         }
         // A call signal this retry found paid is committed before the resend,
-        // so the callee's immediate answer finds a ringing call (Codex
+        // so the callee's immediate answer finds a ringing call (review
         // delta2 #3). Never a release here: an unpaid one is paid again below.
-        crate::calls::settle_operation(state.storage.as_ref(), &op, false).await;
+        crate::calls::settle_operation(&state, &op, false).await;
+        // Call-state cleanup is best effort. Its storage failure must never
+        // turn a confirmed failed call payment into permission to pay again.
+        if definite_call_payment_failure(&op) {
+            return Err(contextual(ApiError::Lightning("call payment failed; start a new call".into()), &op));
+        }
         match op.state.as_str() {
             "acked" => return Ok(Json(response(&state.lightning_backend, &op, true)?)),
             "paid" | "sent" | "rejected_retryable" => {
@@ -633,6 +710,9 @@ async fn compose_locked(
                 ))
             }
         }
+    }
+    if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+        crate::calls::revalidate_outgoing_block(&state, &peer, &req.plaintext).await?;
     }
     // The CAS also serializes processes sharing a database. A claimed operation
     // never re-enters the paying handler without positive nonpayment evidence.
@@ -683,6 +763,34 @@ async fn compose_locked(
             Err(contextual(error, &op))
         }
     }
+}
+
+/// Upsert the outstanding-reply row of a paid web request (kind 500/510)
+/// before it is (re)sent. Other kinds are untouched.
+pub(crate) async fn restore_outstanding_web_request(
+    state: &AppState,
+    env: &UkmEnvelope,
+) -> Result<(), ApiError> {
+    let Some(expected) = konsensus_core::expected_reply_kind(env.kind) else {
+        return Ok(());
+    };
+    let konsensus_core::Recipient::Node(peer) = env.recipient else {
+        return Err(storage("web request recipient must be a node"));
+    };
+    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    state
+        .storage
+        .record_outgoing_web_request(
+            &env.payment_proof.payment_hash,
+            konsensus_core::OutstandingWebRequest {
+                request_id: env.id,
+                peer,
+                expected_reply_kind: expected,
+                expires_at_ms: now_ms.saturating_add(konsensus_core::OUTSTANDING_TTL_MS),
+            },
+        )
+        .await
+        .map_err(storage)
 }
 
 async fn resend(state: &AppState, op: &OutboxOperation) -> Result<bool, ApiError> {
@@ -748,6 +856,10 @@ async fn resend(state: &AppState, op: &OutboxOperation) -> Result<bool, ApiError
         }
         return Err(storage(error));
     }
+    // A paid web request is only worth sending while its reply can be bound.
+    // The row was committed with the envelope; a resend restores it if it was
+    // consumed or lost, and extends the reply window from this attempt.
+    restore_outstanding_web_request(state, &env).await?;
     let delivered = state.transport.send(&peer, &env).await.is_ok();
     if delivered {
         state
@@ -1101,10 +1213,15 @@ fn settlement_preimage(details: &PaymentDetails) -> Option<[u8; 32]> {
 }
 
 fn queue_resolution(data: &mut Recovery, reservation: Reservation, actual_msat: Option<u64>) {
+    let payment_failed = actual_msat == Some(0) && data.settlement.as_ref().is_some_and(|payment| {
+        payment.direction == PaymentDirection::Outgoing && payment.amount_msat == data.expected_msat
+            && matches!(payment.status, PaymentStatus::Failed | PaymentStatus::Expired)
+    });
     if let Some(existing) = data.budget_resolutions.iter_mut().find(|r| r.reservation.id == reservation.id && r.reservation.op_id == reservation.op_id) {
         if existing.actual_msat.is_none() { existing.actual_msat = actual_msat; }
+        existing.payment_failed |= payment_failed;
     } else {
-        data.budget_resolutions.push(BudgetResolution { reservation, actual_msat });
+        data.budget_resolutions.push(BudgetResolution { reservation, actual_msat, payment_failed });
     }
 }
 
@@ -1123,7 +1240,7 @@ async fn drain_resolutions(state: &AppState, op: &mut OutboxOperation) -> Result
     let before = data.budget_resolutions.len();
     for resolution in &data.budget_resolutions {
         if let Some(actual) = resolution.actual_msat {
-            service.try_resolve_spend(&resolution.reservation, &op.recipient, actual).map_err(storage)?;
+            service.try_resolve_spend_outcome(&resolution.reservation, &op.recipient, actual, resolution.payment_failed).map_err(storage)?;
             if data.reservation.as_ref().is_some_and(|r| r.id == resolution.reservation.id && r.op_id == resolution.reservation.op_id) {
                 data.reservation = None;
             }
@@ -1222,8 +1339,8 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             }
             recover_budget(state, &mut op).await?;
             // A call signal's reservation follows its operation here too, and
-            // before any resend (Fable N1).
-            crate::calls::settle_operation(state.storage.as_ref(), &op, true).await;
+            // before any resend (review N1).
+            crate::calls::settle_operation(state, &op, true).await;
             if op.state == "paid" {
                 recover_paid(state, &mut op).await?;
             }
@@ -1240,10 +1357,13 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
 
 /// Positive evidence that an operation holds no payment: nothing was
 /// dispatched or left pending, no settlement, proof or admission was recorded,
-/// the peer's admission journal (every retained attempt) shows no dispatch or
-/// settlement, and the wallet knows no payment for any admission hash involved.
-/// Any doubt (an unreadable journal, another operation's attempt, a hash that
-/// does not match, a wallet that cannot answer) is not evidence.
+/// no retained attempt of this operation or of none in the peer's admission
+/// journal shows a dispatch or settlement, and the wallet knows no payment for
+/// any admission hash involved. An attempt linked to another operation is that
+/// operation's payment, carried on its own row: a contact admitted last week
+/// says nothing about this send. Any doubt (an unreadable journal, an attempt
+/// with no link, a hash that does not match, a wallet that cannot answer) is
+/// not evidence.
 async fn proven_unpaid(state: &AppState, op: &OutboxOperation, data: &Recovery) -> bool {
     if data.dispatched
         || data.admission_pending
@@ -1265,21 +1385,26 @@ async fn proven_unpaid(state: &AppState, op: &OutboxOperation, data: &Recovery) 
         return false;
     };
     let mut hashes = Vec::new();
+    let mut others = Vec::new();
     let mut attempt = journal.as_ref();
     while let Some(a) = attempt {
-        if a.dispatch_started
-            || a.message_may_have_dispatched
-            || a.envelope.is_some()
-            || a.settled_at_unix.is_some()
-            || a.readmission.as_ref().is_some_and(|r| r.reported)
-            || a.operation.as_ref().is_some_and(|l| l.operation_id != op.operation_id)
-        {
-            return false;
+        if a.operation.as_ref().is_some_and(|l| l.operation_id != op.operation_id) {
+            others.push(a.payment_hash.as_str());
+        } else {
+            if a.dispatch_started
+                || a.message_may_have_dispatched
+                || a.envelope.is_some()
+                || a.settled_at_unix.is_some()
+                || a.readmission.as_ref().is_some_and(|r| r.reported)
+            {
+                return false;
+            }
+            hashes.push(a.payment_hash.clone());
         }
-        hashes.push(a.payment_hash.clone());
         attempt = a.previous_attempt.as_deref();
     }
-    if let Some(hash) = &op.admission_payment_hash {
+    // `draft` copies the peer's latest attempt onto the row, whoever made it.
+    if let Some(hash) = op.admission_payment_hash.as_ref().filter(|hash| !others.contains(&hash.as_str())) {
         if journal.is_some() && !hashes.contains(hash) {
             return false;
         }
@@ -1432,6 +1557,8 @@ async fn compact_terminal_operations(
                 ldk_fee_evidence: data.ldk_fee_evidence,
                 compacted_fee_paid_msat,
                 caller: data.caller,
+                call_offer: data.call_offer,
+                call_block: data.call_block,
                 fee_ceiling_msat: data.fee_ceiling_msat,
                 admission_msat: data.admission_msat,
                 ..Default::default()
@@ -1605,6 +1732,33 @@ fn incomplete_settled_recovery(op: &OutboxOperation) -> bool {
         Some("settled payment has no valid proof")
             | Some("settled payment missing encrypted draft")
     )
+}
+
+
+pub(crate) fn call_block_binding(op: &OutboxOperation) -> Result<Option<(String, u32)>, konsensus_storage::StorageError> {
+    recovery(op).map(|r| r.call_block).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
+}
+
+pub(crate) fn call_offer_binding(op: &OutboxOperation) -> Result<Option<String>, konsensus_storage::StorageError> {
+    recovery(op).map(|r| r.call_offer).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
+}
+
+/// Caller provenance is retained even when payment recovery is compacted.
+pub(crate) fn owner_funded_call_operation(op: &OutboxOperation) -> Result<bool, konsensus_storage::StorageError> {
+    recovery(op).map(|r| r.caller.is_none() && !op.operation_id.starts_with("legacy:"))
+        .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
+}
+
+pub(crate) fn settled_call_block(op: &OutboxOperation) -> Result<bool, konsensus_storage::StorageError> {
+    if op.kind != i64::from(konsensus_core::kind::KIND_CALL_BLOCK) { return Ok(false); }
+    let data = recovery(op).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+    Ok(data.settlement.as_ref().is_some_and(|details| settlement_matches(op, &data, details)))
+}
+
+pub(crate) fn bind_legacy_call_block(op: &mut OutboxOperation, binding: (String, u32)) -> Result<(), konsensus_storage::StorageError> {
+    let mut data = recovery(op).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+    data.call_block = Some(binding);
+    encode(op, &data).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
 }
 
 #[cfg(test)]

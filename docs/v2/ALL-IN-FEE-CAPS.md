@@ -11,7 +11,7 @@ The default is `min(max(5000, floor(principal / 100)), 10000)` msat per
 payment. For paired messaging, the fee is further bounded by the message's
 all-in cap minus its price: 1 sat allows up to 5 sats in fees, 2 sats up to 4.
 The 6-sat cap applies per paid room member; the room reserves their sum as one
-total. Legacy grants with unlimited circuit breakers retain a whole-call
+total. Grants approved before per-act limits retain a whole-call
 message ceiling of `min(stored per_call_max_msat, 6000)` msat, including any
 message repricing. Admission has its own quoted all-in line; a signed recipient
 per-act cap also bounds admission. Payment routing policy retains its normal floor. See
@@ -64,9 +64,9 @@ Pending/in-flight payments, missing fee evidence, and LND/LNbits/mock backends
 omit the field entirely; absence does not mean zero. The existing payment-list
 `fee_msat` field is unchanged.
 
-`POST /api/v1/messages/compose` and `GET /api/v1/messages/operations/:id`
-return the same optional `fee_paid_msat`, summed over the message and any
-admission/re-admission represented by the result. Room sends sum recipients'
+`POST /api/v1/messages/compose`, `GET /api/v1/messages/operations/:id` and
+`POST /api/v1/files/:id/send` return the same optional `fee_paid_msat`, summed
+over the message and any admission/re-admission represented by the result. Room sends sum recipients'
 fees. The aggregate is omitted if any payment is unresolved, any component fee
 is unknown, or the sum overflows. Durable operation retries retain known fees
 without paying again; historical records lacking evidence omit them.

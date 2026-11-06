@@ -17,9 +17,10 @@ and new grants; no storage migration or rewriting of signed terms is required.
 | Act | All-in cap |
 |---|---|
 | Message, file or porch page | `min(stored per_call_max_msat, 6_000)` msat; any tighter recipient per-act cap also applies |
-| Room post | Sum of the paid members' per-member all-in caps (N × the value when identical), reserved as one total; legacy grants with unlimited breakers retain a whole-call ceiling of `min(stored per_call_max_msat, 6_000)` msat |
+| Room post | Sum of the paid members' per-member all-in caps (N × the value when identical), reserved as one total; grants approved before per-act limits retain a whole-call ceiling of `min(stored per_call_max_msat, 6_000)` msat |
 | First contact | Quoted admission + its maximum fee, shown separately from the capped message; the approved combined total still cannot exceed the 100,000-msat F1 safety ceiling |
 | Re-admission | Quoted admission + its maximum fee as its own act, at most 100,000 msat and any tighter signed recipient per-act cap, alongside the capped message |
+| Call offer or block | Stored owner-approved per-payment limit (or relation envelope), together with the call hold’s pinned block ceiling; answers, ICE and hangups retain the message cap |
 | Payment | Stored owner-approved per-call limit, unchanged |
 
 The message fee budget is **cap minus price**, further tightened by the caller
@@ -31,8 +32,8 @@ allowlists, expiry, circuit breakers and original-grant dispatch checks still
 apply to all reservations. Admission does not consume the message's 6-sat cap.
 
 `GET /pair/grant`, owner status and `pair-status` expose the effective messaging
-`per_call_max_msat` alongside `payment_per_call_max_msat` (the stored owner
-limit), `payment_authorized`, and `act_caps`. The latter contains
+`message_per_payment_max_msat` alongside `per_call_max_msat` and
+`payment_per_call_max_msat` (the stored owner limit), `call_per_payment_max_msat`, `payment_authorized`, and `act_caps`. The latter contains
 `message_all_in_msat`, `room_member_all_in_msat`,
 `first_contact_max_all_in_msat`, `readmission_max_all_in_msat`, and
 `payment_all_in_msat`. The room total is computed from the actual paid-member
@@ -84,6 +85,7 @@ messaging approval does not create either payment approval.
    This console path stays as the recovery fallback.
 3. The app re-issues its token. `GET /api/v1/pair/grant` returns the live
    grant (`budget_msat`, `used_msat`, `remaining_msat`, `per_call_max_msat`,
+   `message_per_payment_max_msat`, `call_per_payment_max_msat`,
    `per_recipient_msat`, `used_by_recipient`, `granted_at`, `expires_at`), or
    `{"grant": null}`.
 
@@ -122,16 +124,21 @@ add a payee to the allowlist. Refusals are HTTP 409 with `code: budget_exceeded`
 and `reason: payee_not_allowed`; nothing is dispatched.
 
 Within each grant, `/payments/pay` automatically deduplicates by the invoice's
-payment hash. Both `/payments/pay` and `/payments/keysend` also accept an
-optional `request_id` (1–128 printable ASCII bytes, without spaces). Reuse the
-same ID on retries; IDs are shared between these two routes within a grant.
-Keysend requests without an ID retain their legacy behavior: two otherwise
-identical keysend calls are separate payments.
+payment hash. Both `/payments/pay` and `/payments/keysend` require a
+`request_id` (1–128 printable ASCII bytes, without spaces); a request without
+one is HTTP 400 before anything is looked up or debited. Reuse the same ID on
+retries. The ID is recorded in the node's operation ledger before the budget
+debit, so a repeat with the same ID and parameters is answered from that
+record (`replayed: true`, or `202 in_flight` while the outcome is not final)
+without another debit or backend call; the same ID with other parameters is
+`409 operation_mismatch`. See [docs/v2/API_PAYMENTS.md](v2/API_PAYMENTS.md).
 
-The node atomically persists these identifiers with the reservation before
-dispatch. A concurrent or later duplicate receives HTTP 409,
-`code: budget_exceeded`, `reason: duplicate_payment`, without another debit or
-backend call. This is duplicate refusal, not replay of the original response.
+Within the grant the node still atomically persists the ID and the invoice
+hash with the reservation before dispatch. A payment of the same invoice under
+a new ID, or a new payment reusing an ID the grant already consumed (for
+example after a refusal before dispatch freed it in the ledger), receives HTTP
+409, `code: budget_exceeded`, `reason: duplicate_payment`, without another
+debit or backend call.
 For an invoice, read `/payments/:hash` for payment status. Reusing an ID with
 changed parameters is also refused. IDs remain consumed after settlement,
 confirmed failure, cancellation, unknown outcomes and restart, until the grant

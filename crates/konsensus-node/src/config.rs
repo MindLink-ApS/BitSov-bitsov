@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use konsensus_message::wire::SovereigntyTier;
 use serde::{Deserialize, Serialize};
 
@@ -1142,11 +1143,14 @@ pub struct PricingConfig {
     /// Price for real-time signaling messages (kinds 400-499) in millisatoshis.
     #[serde(default = "default_realtime_signal_msat")]
     pub realtime_signal_msat: u64,
-    /// Per-call admission: what a call offer (kind 400) to this node costs,
-    /// in millisatoshis. Paid once per call; answers, ICE and hangups keep
+    /// Call setup: what a call offer (kind 400) to this node costs,
+    /// in millisatoshis. Paid for ringing; answers, ICE and hangups keep
     /// `realtime_signal_msat`.
     #[serde(default = "default_call_msat")]
     pub call_msat: u64,
+    /// Receiver-owned price of each 60-second CALL_BLOCK (404), in msat.
+    #[serde(default = "default_call_msat")]
+    pub call_block_msat: u64,
     /// Price for application extension messages (kinds 1000+) in millisatoshis.
     #[serde(default = "default_app_ext_msat")]
     pub app_ext_msat: u64,
@@ -1173,6 +1177,7 @@ impl Default for PricingConfig {
             collaboration_msat: default_collab_msat(),
             realtime_signal_msat: default_realtime_signal_msat(),
             call_msat: default_call_msat(),
+            call_block_msat: default_call_msat(),
             app_ext_msat: default_app_ext_msat(),
             web_content_msat: default_web_content_msat(),
         }
@@ -1314,13 +1319,85 @@ pub struct RelayConfig {
 /// request/response only: no TURN, no relay, no auth, no per-caller state). It
 /// tells a caller the public address its request came from, which is all an
 /// app needs to connect directly across a router. Off unless `stun_listen` is set.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CallsConfig {
     /// UDP address for the STUN responder, for example `0.0.0.0:3478`.
     /// `None` (default): no UDP socket is opened.
     #[serde(default)]
     pub stun_listen: Option<SocketAddr>,
+    /// Outgoing paid minutes reserved per call; one minute per block.
+    #[serde(default = "default_max_call_minutes", deserialize_with = "deserialize_max_call_minutes")]
+    pub max_call_minutes: u16,
+    /// Media packets per second one direction of one routed call may carry,
+    /// from 100 (the default) to 1000. Both nodes of a call must allow a rate
+    /// for a call to reach it. No effect on price or admission.
+    #[serde(default = "default_media_max_frames_per_second", deserialize_with = "deserialize_media_max_frames_per_second")]
+    pub media_max_frames_per_second: u32,
+    /// Media payload bytes per second one direction of one routed call may
+    /// carry, from 65536 (the default) to 1048576. Both nodes of a call must
+    /// allow a rate for a call to reach it. No effect on price or admission.
+    #[serde(default = "default_media_max_bytes_per_second", deserialize_with = "deserialize_media_max_bytes_per_second")]
+    pub media_max_bytes_per_second: u64,
+    /// At the owner's socket, count packets larger than audio against their own
+    /// share and drop them past it, so neither a burst of them nor audio catching
+    /// up beside them closes the socket. Off by default: every packet counts
+    /// against one budget and the socket closes past it, as it always has.
+    #[serde(default)]
+    pub media_drop_bulk_over_share: bool,
+}
+
+fn default_media_max_frames_per_second() -> u32 { konsensus_api::call_media::DEFAULT_MAX_FRAMES_PER_SECOND }
+
+fn default_media_max_bytes_per_second() -> u64 { konsensus_api::call_media::DEFAULT_MAX_BYTES_PER_SECOND }
+
+fn deserialize_media_max_frames_per_second<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    let value = u32::deserialize(deserializer)?;
+    if !(default_media_max_frames_per_second()..=1000).contains(&value) {
+        return Err(serde::de::Error::custom("calls.media_max_frames_per_second must be between 100 and 1000"));
+    }
+    Ok(value)
+}
+
+fn deserialize_media_max_bytes_per_second<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let value = u64::deserialize(deserializer)?;
+    if !(default_media_max_bytes_per_second()..=1_048_576).contains(&value) {
+        return Err(serde::de::Error::custom("calls.media_max_bytes_per_second must be between 65536 and 1048576"));
+    }
+    Ok(value)
+}
+
+impl CallsConfig {
+    /// What each direction of each routed call may carry.
+    pub fn media_limits(&self) -> konsensus_api::call_media::MediaLimits {
+        konsensus_api::call_media::MediaLimits {
+            max_frames_per_second: self.media_max_frames_per_second,
+            max_bytes_per_second: self.media_max_bytes_per_second,
+            drop_bulk_over_share: self.media_drop_bulk_over_share,
+        }
+    }
+}
+
+fn default_max_call_minutes() -> u16 { 60 }
+
+fn deserialize_max_call_minutes<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u16, D::Error> {
+    let value = u16::deserialize(deserializer)?;
+    if !(1..=240).contains(&value) {
+        return Err(serde::de::Error::custom("calls.max_call_minutes must be between 1 and 240"));
+    }
+    Ok(value)
+}
+
+impl Default for CallsConfig {
+    fn default() -> Self {
+        Self {
+            stun_listen: None,
+            max_call_minutes: default_max_call_minutes(),
+            media_max_frames_per_second: default_media_max_frames_per_second(),
+            media_max_bytes_per_second: default_media_max_bytes_per_second(),
+            media_drop_bulk_over_share: false,
+        }
+    }
 }
 
 /// Storage backend selection.
@@ -1630,7 +1707,12 @@ impl NodeConfig {
 
     /// Bootstrap must inspect configured paths before requiring an identity.
     pub(crate) fn load_before_identity_validation(path: &Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+        let content = std::fs::read_to_string(path).with_context(|| {
+            let shown = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+            format!(
+                "could not read config file {shown:?} (--config defaults to konsensus.toml in the current directory)"
+            )
+        })?;
         // TOML errors include the source line, which may contain a rejected
         // inline password. Never attach the raw parser error to startup logs.
         let mut config: Self = toml::from_str(&content).map_err(|_| {
@@ -1708,6 +1790,7 @@ impl NodeConfig {
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!((1..=240).contains(&self.calls.max_call_minutes), "calls.max_call_minutes must be between 1 and 240");
         self.lightning.validate_address_lengths()?;
         self.validate_starter_hub(false)?;
         self.tower.validate()?;
@@ -1870,6 +1953,7 @@ impl NodeConfig {
             || self.pricing.collaboration_msat == 0
             || self.pricing.realtime_signal_msat == 0
             || self.pricing.call_msat == 0
+            || self.pricing.call_block_msat == 0
             || self.pricing.app_ext_msat == 0
         {
             anyhow::bail!(
@@ -1909,7 +1993,7 @@ impl NodeConfig {
             );
         }
 
-        // 2d (Codex #3): the ciphertext relay and price-open admission are
+        // 2d (review #3): the ciphertext relay and price-open admission are
         // SETTLEMENT-GATED — they admit strangers (price_open) or hold paid
         // deposits (relay) on the strength of a settled, recipient-bound payment.
         // With settlement verification resolving OFF (the default for a Mock

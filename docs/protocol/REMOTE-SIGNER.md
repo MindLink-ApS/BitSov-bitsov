@@ -5,7 +5,7 @@ ship now. The signer protocol (§3 to §5) is not built; every **GAP** marks
 that. It extends `ACCOUNT-LAYER.md` §7.
 
 Doctrine this must not break (genesis `01_Core_Module_and_Concept.md` §1.2,
-`BITSOV-NORTHSTAR.md`):
+an internal design note):
 
 - **The node is the sovereign identity.** A cloud VM may give a node
   reachability and uptime. It must not become the owner.
@@ -272,7 +272,7 @@ to use one:
   the exit bundle. The operator still has the phrase, so the owner should
   sweep funds to a new seed once they are home. The app's move-home flow must
   say this. **GAP**: the flow is not built.
-- Pilot VMs (Maya, Josh) are hosted custody today. They must set
+- Pilot VMs (Carol, Dave) are hosted custody today. They must set
   `[identity] hosted = true` at the next upgrade. Until then, the app's
   unverified-connection rule (§2) labels them anyway.
 

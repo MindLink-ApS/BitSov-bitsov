@@ -1,0 +1,8 @@
+{
+  "body": {
+    "code": 400,
+    "error": "invalid peer id"
+  },
+  "request": "GET /api/v1/calls?peer=not-a-node-id",
+  "status": 400
+}

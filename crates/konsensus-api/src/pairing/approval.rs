@@ -34,8 +34,11 @@ pub enum ApprovalRequest {
     SpendGrant {
         /// Total budget in millisatoshis.
         budget_msat: u64,
-        /// Maximum reservation for one call.
-        per_call_max_msat: u64,
+        /// Most one payment may carry, msat, as the owner approves it: at
+        /// most the budget, which is also the default. Messages and every
+        /// other non-call payment are further held to the messaging cap.
+        #[serde(default)]
+        per_call_max_msat: Option<u64>,
         /// Window from approval, bounded by the console's limits.
         window_secs: i64,
         /// Optional exclusive recipient (node id).
@@ -71,7 +74,7 @@ impl ApprovalRequest {
             return Err(PairingError::BadProof);
         };
         let mut terms = GrantTerms::new(*budget_msat)
-            .per_call(*per_call_max_msat)
+            .per_call(per_call_max_msat.unwrap_or(*budget_msat))
             .for_secs(*window_secs);
         if let Some(recipient) = recipient {
             terms = terms.recipient(recipient, *budget_msat);
@@ -104,14 +107,16 @@ impl ApprovalRequest {
             }
             _ => {}
         }
-        // Cap the request before presenting/signing it, so the receipt and
-        // the grant carry the same effective terms. Preserve tighter limits.
+        // Present and sign the real per-payment value, defaulting to the
+        // budget, so the receipt and the grant carry exactly what the owner
+        // approved. The messaging cap is applied when spending, not stored.
         if let Self::SpendGrant {
-            per_call_max_msat, ..
+            budget_msat,
+            per_call_max_msat,
+            ..
         } = &mut self
         {
-            *per_call_max_msat =
-                (*per_call_max_msat).min(crate::spend_budget::MESSAGING_PER_CALL_MAX_MSAT);
+            *per_call_max_msat = Some(per_call_max_msat.unwrap_or(*budget_msat));
         }
         Ok(self)
     }
@@ -229,7 +234,7 @@ impl ApprovalOperation {
                 recipient.as_deref().unwrap_or("-"),
                 *budget_msat,
                 budget_msat.to_string(),
-                per_call_max_msat.to_string(),
+                per_call_max_msat.unwrap_or(*budget_msat).to_string(),
                 window_secs.to_string(),
             ),
             ApprovalRequest::FirstContact {
@@ -286,8 +291,12 @@ impl Pending {
             approval_message: self.operation.message(),
             act_caps: match &self.operation.request {
                 ApprovalRequest::SpendGrant {
-                    per_call_max_msat, ..
-                } => Some(crate::spend_budget::ActCaps::new(*per_call_max_msat)),
+                    budget_msat,
+                    per_call_max_msat,
+                    ..
+                } => Some(crate::spend_budget::ActCaps::new(
+                    per_call_max_msat.unwrap_or(*budget_msat),
+                )),
                 _ => None,
             },
             status: if self.consumed {
@@ -817,7 +826,7 @@ mod tests {
                     self.requester.epoch,
                     ApprovalRequest::SpendGrant {
                         budget_msat: 100_000,
-                        per_call_max_msat: 10_000,
+                        per_call_max_msat: Some(10_000),
                         window_secs: 600,
                         recipient: None,
                     },
@@ -886,7 +895,7 @@ mod tests {
                         .operation
                         .request = ApprovalRequest::SpendGrant {
                         budget_msat: 99999,
-                        per_call_max_msat: 10000,
+                        per_call_max_msat: Some(10000),
                         window_secs: 600,
                         recipient: None,
                     }
@@ -959,7 +968,7 @@ mod tests {
                 f.requester.epoch,
                 ApprovalRequest::SpendGrant {
                     budget_msat: 100,
-                    per_call_max_msat: 100,
+                    per_call_max_msat: Some(100),
                     window_secs: 60,
                     recipient: None
                 }

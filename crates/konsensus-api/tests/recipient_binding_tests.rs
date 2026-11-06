@@ -85,9 +85,10 @@ impl LightningProvider for RejectedKeysend {
     }
 }
 
-async fn recipient_fallback_case(wrong_payee: bool) {
-    keysend_refusal_case(
+async fn recipient_fallback_case(wrong_payee: bool, uppercase_expected: bool) {
+    keysend_refusal_case_inner(
         wrong_payee,
+        uppercase_expected,
         "mock keysend unavailable before dispatch",
         false,
     )
@@ -95,6 +96,15 @@ async fn recipient_fallback_case(wrong_payee: bool) {
 }
 
 async fn keysend_refusal_case(wrong_payee: bool, refusal: &'static str, fee_refusal: bool) {
+    keysend_refusal_case_inner(wrong_payee, false, refusal, fee_refusal).await;
+}
+
+async fn keysend_refusal_case_inner(
+    wrong_payee: bool,
+    uppercase_expected: bool,
+    refusal: &'static str,
+    fee_refusal: bool,
+) {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("mock-ledger.db");
     let intended = SharedMockProvider::new(&ledger, "recipient-b", 0).unwrap();
@@ -126,9 +136,14 @@ async fn keysend_refusal_case(wrong_payee: bool, refusal: &'static str, fee_refu
     } else {
         intended_invoice
     };
+    let stored_key = if uppercase_expected {
+        intended_key.to_ascii_uppercase()
+    } else {
+        intended_key.clone()
+    };
     let sender = Arc::new(RejectedKeysend {
         inner: SharedMockProvider::new(&ledger, "sender-a", 10_000).unwrap(),
-        expected_peer_key: intended_key.clone(),
+        expected_peer_key: stored_key.clone(),
         keysend_calls: AtomicUsize::new(0),
         invoice_payments: AtomicUsize::new(0),
         refusal,
@@ -152,7 +167,7 @@ async fn keysend_refusal_case(wrong_payee: bool, refusal: &'static str, fee_refu
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(recipient, intended_key);
+        .insert(recipient, stored_key);
 
     let result = create_payment_proof(&state, 1000, &recipient).await;
     let a = sender.get_balance_msat().await.unwrap();
@@ -181,11 +196,15 @@ async fn keysend_refusal_case(wrong_payee: bool, refusal: &'static str, fee_refu
 
 #[tokio::test]
 async fn known_recipient_fallback_must_reject_third_party_payee_before_payment() {
-    recipient_fallback_case(true).await;
+    recipient_fallback_case(true, false).await;
 }
 #[tokio::test]
 async fn known_recipient_fallback_pays_matching_payee_once() {
-    recipient_fallback_case(false).await;
+    recipient_fallback_case(false, false).await;
+}
+#[tokio::test]
+async fn known_recipient_fallback_pays_matching_payee_regardless_of_hex_case() {
+    recipient_fallback_case(false, true).await;
 }
 
 #[tokio::test]
@@ -196,6 +215,16 @@ async fn generic_ldk_keysend_refusal_falls_back_to_invoice_once() {
 #[tokio::test]
 async fn unavailable_keysend_route_falls_back_to_invoice_once() {
     keysend_refusal_case(false, "no route to destination", false).await;
+}
+
+#[tokio::test]
+async fn unsupported_fee_limited_keysend_falls_back_to_invoice_once() {
+    keysend_refusal_case(
+        false,
+        "backend cannot enforce keysend routing fee limit",
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]

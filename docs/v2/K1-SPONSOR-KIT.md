@@ -1,6 +1,6 @@
 # K1 slice 2: capped sponsor sats in the introduction kit
 
-Spec: `MindLink-Private/pm/projects/bitsov/research/K1-FIRST-CONTACT-KIT-SPEC.md`. Builds on slice 1 (#89, signed introductions).
+Builds on slice 1 (#89, signed introductions).
 
 One person funds another. The inviter's node pays a small, capped gift of its own bitcoin into the newcomer's own node. The newcomer then pays for first contact and every message like anyone else.
 
