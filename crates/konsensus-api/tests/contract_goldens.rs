@@ -303,6 +303,7 @@ async fn status_stun_own_matches_golden() {
 async fn status_stun_absent_matches_golden() {
     let state = Arc::new(AppState {
         stun_port: None,
+        max_call_minutes: 60,
         introduction: IntroductionSettings::fixed(Some("regtest"), None),
         ..(*common::test_state()).clone()
     });

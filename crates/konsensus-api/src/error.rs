@@ -119,12 +119,32 @@ struct ErrorBody {
     code: u16,
 }
 
+/// `reason` of a send refused because the session state could not be saved.
+pub const SESSION_SAVE_FAILED: &str = "session_save_failed";
+
 impl ApiError {
+    /// An E2EE encrypt failed. When only the save failed, its ciphertext was withheld
+    /// and no payment was started for it. That says nothing about a whole operation:
+    /// callers that have already paid (an admission) keep their own accounting.
+    pub fn from_encrypt_failure(error: konsensus_crypto::SessionError, otherwise: impl FnOnce(konsensus_crypto::SessionError) -> ApiError) -> ApiError {
+        match error {
+            konsensus_crypto::SessionError::NotPersisted => ApiError::NotDispatched(
+                "the session state could not be saved, so this was not sent or paid for".into(),
+            )
+            .with_reason(SESSION_SAVE_FAILED),
+            other => otherwise(other),
+        }
+    }
+
     pub(crate) fn with_routing_fee(self, max_routing_fee_msat: u64) -> Self {
         Self::RoutingFee { source: Box::new(self), max_routing_fee_msat }
     }
     pub(crate) fn with_reason(self, reason: &'static str) -> Self {
         Self::Reasoned { source: Box::new(self), reason }
+    }
+    /// Whether this is a send refused because its session state could not be saved.
+    pub(crate) fn is_session_save_failure(&self) -> bool {
+        matches!(self, Self::Reasoned { reason, .. } if *reason == SESSION_SAVE_FAILED)
     }
     /// The error a `reason` was added to.
     pub(crate) fn without_reason(&self) -> &Self {

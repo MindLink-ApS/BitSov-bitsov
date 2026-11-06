@@ -17,6 +17,7 @@ use control_reply::Connection;
 mod cookie;
 mod edge;
 mod handshake;
+mod media_ingress;
 mod messaging;
 mod supervisor;
 
@@ -52,6 +53,24 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::wire::{Capability, Frame, SovereigntyTier, WireError, MAX_FRAME_SIZE};
 
+/// What a connection established at its handshake, stamped on the session frames it
+/// carries. It is captured when the reader starts, so an event keeps describing the
+/// connection its frame arrived on, whatever has replaced that connection since.
+///
+/// This records what the peer presented. It says nothing about whether the key is
+/// the one this NodeId has used before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionContext {
+    /// When the connection finished its handshake; see `connected_since`.
+    pub generation: Instant,
+    /// The X25519 key from the peer's Hello, already checked to be the Noise remote
+    /// static key and signed by the NodeId. `None` if it was not available, which
+    /// callers must treat as a failed check.
+    pub hello_key: Option<[u8; 32]>,
+    /// What the peer advertised in its Hello.
+    pub capabilities: Vec<Capability>,
+}
+
 /// Control events from the transport layer to the application layer.
 ///
 /// These carry session management frames and connection lifecycle notifications
@@ -83,6 +102,10 @@ pub enum ControlEvent {
         /// M1b: privileged tag stamped from `conn.privileged` by the reader.
         /// `false` => the session handler DROPS this state-mutating frame.
         privileged: bool,
+        /// The connection this frame arrived on.
+        connection: Arc<ConnectionContext>,
+        /// When the reader took the frame off that connection, before any queueing.
+        received_at: Instant,
     },
 
     /// Peer initiated an E2EE session (X3DH initiator → responder).
@@ -94,6 +117,8 @@ pub enum ControlEvent {
         /// M1b: privileged tag stamped from `conn.privileged` by the reader.
         /// `false` => the session handler DROPS this durable-session frame.
         privileged: bool,
+        /// The connection this frame arrived on.
+        connection: Arc<ConnectionContext>,
     },
 
     /// Peer acknowledged E2EE session establishment.
@@ -103,6 +128,8 @@ pub enum ControlEvent {
         /// M1b: privileged tag stamped from `conn.privileged` by the reader.
         /// `false` => the session handler DROPS this session-state frame.
         privileged: bool,
+        /// The connection this frame arrived on.
+        connection: Arc<ConnectionContext>,
     },
 
     /// Peer sent a ratchet initialization message (initiator → acceptor).
@@ -116,6 +143,8 @@ pub enum ControlEvent {
         /// M1b: privileged tag stamped from `conn.privileged` by the reader.
         /// `false` => the session handler DROPS this ratchet-state frame.
         privileged: bool,
+        /// The connection this frame arrived on.
+        connection: Arc<ConnectionContext>,
     },
 
     /// Peer acknowledged receipt of a message.
@@ -377,6 +406,37 @@ pub enum ControlEvent {
     },
 }
 
+/// One [`Frame::CallMedia`] a peer sent us (M6 N2). Media has its own
+/// channel ([`NoiseTransport::recv_call_media`]) so audio never queues
+/// behind control events the session handler is slow to work through.
+#[derive(Debug)]
+pub struct CallMediaEvent {
+    /// The authenticated peer the frame came from.
+    pub peer_id: NodeId,
+    pub call_id: String,
+    pub seq: u32,
+    pub data: Vec<u8>,
+    /// `privileged || admission_paid` on the receiving connection: a
+    /// whitelisted or promoted peer, or one whose admission we settled.
+    pub privileged: bool,
+}
+
+/// Hold the authenticated identity's queue slot until the router dequeues the
+/// frame, including across disconnects and replacement connections.
+struct QueuedCallMedia {
+    event: CallMediaEvent,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Media frames a reader may hold for the router before dropping the
+/// newest: at 50 packets per second per direction this is a few hundred
+/// milliseconds across every live call. The reader never blocks on it.
+const CALL_MEDIA_CHANNEL_CAPACITY: usize = 512;
+
+/// Longest a media frame waits for the connection's writer (a bulk frame
+/// in flight holds it): past this the packet is dropped, never queued.
+pub const CALL_MEDIA_WRITE_DEADLINE: Duration = Duration::from_millis(200);
+
 /// Each connection sends a Ping every ten seconds, on both ends, independent
 /// of reconnect eligibility. Sending never resets the 30-second read deadline.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -442,7 +502,7 @@ const BAN_EVICTION_INTERVAL: Duration = Duration::from_secs(300);
 /// the per-message [`PaymentGate`], the sole admission authority in every mode.
 /// The type was renamed from `AdmissionMode` to `ReachabilityMode` (R1/A3)
 /// precisely because the old name implied the whitelist *was* the admission
-/// authority, contradicting the gate's role (CODEX.md: "PaymentGate is the sole
+/// authority, contradicting the gate's role (doctrine: "PaymentGate is the sole
 /// admission authority").
 ///
 /// `Whitelist` (default): only explicitly whitelisted peers may handshake or be
@@ -458,7 +518,7 @@ const BAN_EVICTION_INTERVAL: Duration = Duration::from_secs(300);
 /// `konsensus.toml` carries `admission_mode = "whitelist" | "price_open"`). There
 /// is deliberately **no** `#[serde(other)]` catch-all: an unknown or stale token
 /// fails loud (errors) instead of falling back to `Whitelist`, which would
-/// otherwise re-install membership-as-admission invisibly (CODEX.md §Renames).
+/// otherwise re-install membership-as-admission invisibly (renames fail loud).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ReachabilityMode {
     /// Closed mesh — whitelist gates handshake + connect (default). Token: `"whitelist"`.
@@ -500,7 +560,7 @@ mod reachability_mode_serde {
 
     #[test]
     fn unknown_token_errors_never_silent_default() {
-        // Doctrine (CODEX.md §Renames fail loud): an unknown/stale/typo token must
+        // Doctrine (renames fail loud): an unknown/stale/typo token must
         // FAIL LOUD, never fall back to the Whitelist default — a silent default
         // would re-install membership-as-admission invisibly. This includes the old
         // type name, the CLI hyphen spelling, and case variants.
@@ -645,6 +705,8 @@ struct TransportCtx {
     banned_peers: BanMap,
     incoming_tx: mpsc::Sender<UkmEnvelope>,
     control_tx: mpsc::Sender<ControlEvent>,
+    call_media_tx: mpsc::Sender<QueuedCallMedia>,
+    media_ingress: Arc<media_ingress::MediaIngress>,
     /// Shared pre-Noise cookie secret, consulted when admission requires a cookie.
     cookie_keyring: Arc<cookie::CookieKeyring>,
 }
@@ -673,6 +735,11 @@ pub struct NoiseTransport {
     control_tx: mpsc::Sender<ControlEvent>,
     /// Receiver for control events (consumed by `recv_control()`).
     control_rx: Mutex<mpsc::Receiver<ControlEvent>>,
+    /// Call media frames from every reader (consumed by `recv_call_media()`).
+    call_media_tx: mpsc::Sender<QueuedCallMedia>,
+    call_media_rx: Mutex<mpsc::Receiver<QueuedCallMedia>>,
+    /// Per-identity rate and queue budgets survive all connection generations.
+    media_ingress: Arc<media_ingress::MediaIngress>,
     /// Listener shutdown signal.
     shutdown: tokio::sync::watch::Sender<bool>,
     /// Local reconnect reasons and one worker per known dial endpoint.
@@ -699,6 +766,7 @@ impl NoiseTransport {
         let initial_whitelist: HashSet<NodeId> = config.whitelist.iter().copied().collect();
         let (incoming_tx, incoming_rx) = mpsc::channel(1024);
         let (control_tx, control_rx) = mpsc::channel(256);
+        let (call_media_tx, call_media_rx) = mpsc::channel(CALL_MEDIA_CHANNEL_CAPACITY);
         let (shutdown, _) = tokio::sync::watch::channel(false);
         let (actual_listen_addr, actual_listen_addr_rx) = tokio::sync::watch::channel(None);
 
@@ -712,6 +780,9 @@ impl NoiseTransport {
             incoming_rx: Mutex::new(incoming_rx),
             control_tx,
             control_rx: Mutex::new(control_rx),
+            call_media_tx,
+            call_media_rx: Mutex::new(call_media_rx),
+            media_ingress: Arc::new(media_ingress::MediaIngress::default()),
             shutdown,
             supervision: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dial_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -915,6 +986,8 @@ impl MessageTransport for NoiseTransport {
             banned_peers: Arc::clone(&self.banned_peers),
             incoming_tx: self.incoming_tx.clone(),
             control_tx: self.control_tx.clone(),
+            call_media_tx: self.call_media_tx.clone(),
+            media_ingress: Arc::clone(&self.media_ingress),
             cookie_keyring: Arc::clone(&self.cookie_keyring),
         };
         handshake::connect_to_peer(peer, &socket_addr, &ctx).await?;
@@ -950,11 +1023,11 @@ impl MessageTransport for NoiseTransport {
     }
 
     async fn is_connected(&self, peer: &NodeId) -> bool {
-        self.peers.read().await.contains_key(peer)
+        self.peers.read().await.get(peer).is_some_and(|conn| !conn.is_closed())
     }
 
     async fn connected_peers(&self) -> Vec<NodeId> {
-        self.peers.read().await.keys().copied().collect()
+        self.peers.read().await.iter().filter_map(|(peer, conn)| (!conn.is_closed()).then_some(*peer)).collect()
     }
 
     async fn request_peer_exchange(&self, peer: &NodeId) -> Result<(), TransportError> {
@@ -4319,9 +4392,63 @@ mod tests {
 }
 
 #[cfg(test)]
+mod media_tests;
+
+#[cfg(test)]
 mod cancelled_noise_write_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn cancelled_media_send_invalidates_connection_before_signalling_reuse() {
+        let mut sender = NoiseSession::initiator(&[11; 32]).unwrap();
+        let mut receiver = NoiseSession::responder(&[22; 32]).unwrap();
+        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
+        sender.read_handshake(&receiver.write_handshake(&[]).unwrap()).unwrap();
+        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
+        assert!(sender.try_finish_handshake().unwrap());
+        assert!(receiver.try_finish_handshake().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
+        let (_reader, writer) = client.unwrap().into_split();
+        let (mut server, addr) = accepted.unwrap();
+        let identity = Arc::new(NodeIdentity::generate().unwrap().1);
+        let transport = NoiseTransport::new(identity, TransportConfig::default());
+        let peer = NodeId::from_bytes([44; 32]);
+        let now = Instant::now();
+        let conn = Connection::new(PeerConnection {
+            advertised_trust_discount: None, source_ip: addr.ip(), privileged: true,
+            noise: sender, writer, tier: SovereigntyTier::T1, capabilities: vec![],
+            connected_at: now, last_recv: now, pending_ping: None,
+            invalid_frame_level: 0.0, invalid_frame_last_leak: now,
+            bytes_received: 0, memory_budget_window_start: now,
+        }, peer, transport.peers.clone(), true).unwrap();
+        transport.peers.write().await.insert(peer, conn.clone());
+        // Cancellation before encryption must leave the connection usable.
+        let held = conn.lock().await;
+        assert!(tokio::time::timeout(Duration::from_millis(10), transport.send_call_media(&peer, b"waiting"))
+            .await.is_err());
+        assert!(!conn.is_closed());
+        drop(held);
+        // Synthetic large record forces a partial write even on hosts with
+        // large TCP buffers; exercise the actual media-send cancellation path.
+        let bytes = vec![0x5a; 4 * 1024 * 1024];
+        assert!(tokio::time::timeout(Duration::from_millis(30), transport.send_call_media(&peer, &bytes))
+            .await.is_err(), "record must be backpressured");
+        assert!(conn.is_closed(), "cancelled media write must immediately invalidate its connection");
+        assert!(!transport.is_connected(&peer).await);
+        assert!(!transport.connected_peers().await.contains(&peer));
+        let draining = tokio::spawn(async move {
+            let mut wire = Vec::new();
+            server.read_to_end(&mut wire).await.unwrap();
+            wire
+        });
+        assert!(transport.send_frame(&peer, &Frame::SessionAck).await.is_err());
+        let wire = tokio::time::timeout(Duration::from_secs(2), draining).await.unwrap().unwrap();
+        let advertised = u32::from_be_bytes(wire[..4].try_into().unwrap()) as usize;
+        assert!(wire.len() > 4 && wire.len() < advertised + 4, "interrupted record must be partial");
+        transport.shutdown();
+    }
 
     #[tokio::test]
     async fn cancelled_partial_frame_closes_socket_before_next_send() {
@@ -4368,3 +4495,71 @@ mod reply_tests;
 
 #[cfg(test)]
 mod idle_regressions;
+
+#[cfg(test)]
+mod connection_context_tests {
+    use super::*;
+
+    /// A session frame carries the connection it arrived on: the peer's Hello key and
+    /// capabilities, and that connection's generation even if it has been replaced by
+    /// the time the event is read.
+    #[tokio::test]
+    async fn session_frames_carry_the_connection_they_arrived_on() {
+        let id_a = Arc::new(NodeIdentity::generate().unwrap().1);
+        let id_b = Arc::new(NodeIdentity::generate().unwrap().1);
+        let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+        let hello_key = *id_a.x25519_public().as_bytes();
+        let capabilities = vec![Capability::Custom("test_capability".into())];
+        let transport_a = NoiseTransport::new(id_a, TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![node_b],
+            capabilities: capabilities.clone(),
+            ..Default::default()
+        });
+        let transport_b = NoiseTransport::new(id_b, TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![node_a],
+            ..Default::default()
+        });
+        transport_b.start_listener().await.unwrap();
+        let addr_b = transport_b.listen_addr().unwrap().to_string();
+        transport_a.connect(&node_b, &addr_b).await.unwrap();
+        let _ = transport_b.recv_control().await;
+        let first = transport_b.connected_since(&node_a).await.unwrap();
+
+        let frames = [
+            Frame::PrekeyOffer { bundle: serde_json::json!({}) },
+            Frame::SessionInit { init_data: serde_json::json!({}) },
+            Frame::SessionAck,
+            Frame::RatchetInit { payload: vec![1] },
+        ];
+        for frame in &frames {
+            transport_a.send_frame(&node_b, frame).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Replace the connection before reading any of those events.
+        transport_a.disconnect(&node_b).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        transport_a.connect(&node_b, &addr_b).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let second = transport_b.connected_since(&node_a).await.unwrap();
+        assert_ne!(first, second, "a new connection");
+
+        let mut stamped = 0;
+        while stamped < frames.len() {
+            let event = tokio::time::timeout(Duration::from_secs(5), transport_b.recv_control()).await.unwrap().unwrap();
+            let connection = match event {
+                ControlEvent::PrekeyOffer { connection, .. }
+                | ControlEvent::SessionInit { connection, .. }
+                | ControlEvent::SessionAck { connection, .. }
+                | ControlEvent::RatchetInit { connection, .. } => connection,
+                _ => continue,
+            };
+            assert_eq!(connection.generation, first, "stamped when the frame arrived");
+            assert_eq!(connection.hello_key, Some(hello_key));
+            assert_eq!(connection.capabilities, capabilities);
+            stamped += 1;
+        }
+    }
+}

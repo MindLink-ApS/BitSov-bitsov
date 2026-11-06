@@ -210,6 +210,44 @@ async fn open_calls_are_bounded_and_prioritize_unresolved_blockers() {
 }
 
 #[tokio::test]
+async fn open_calls_accept_uppercase_peer_ids_and_return_the_same_call() {
+    let (state, store) = fixture().await;
+    let peer = NodeId::from_bytes([0xab; 32]);
+    let future = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap() + 60_000;
+    store
+        .call_put(
+            &peer,
+            "outgoing",
+            &entry(Phase::Ringing, Side::Caller, future, None),
+        )
+        .await
+        .unwrap();
+    for peer_hex in ["ab".repeat(32), "AB".repeat(32)] {
+        let (status, body) = get(
+            &state,
+            &format!("?peer={peer_hex}"),
+            Some(common::auth_header(&state)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!([{
+                "id": "outgoing",
+                "state": "ringing",
+                "direction": "outgoing",
+                "unresolved_paid_admission": false,
+                "created": null,
+                "op_id": null,
+                "next_block_due_ms": null,
+                "next_block_seq": 0,
+                "paid_until_ms": null
+            }])
+        );
+    }
+}
+
+#[tokio::test]
 async fn open_calls_require_owner_read_scope_and_fixed_peer_errors() {
     let (state, _) = fixture().await;
     let query = format!("?peer={}", NodeId::from_bytes([11; 32]));

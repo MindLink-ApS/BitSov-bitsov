@@ -6,7 +6,7 @@
 //! [`ScopedAuth<Read>`] at `GET /api/v1/status`. Exposing identity/topology/funds on an
 //! unauthenticated endpoint links the node's IP to its NodeID, social graph,
 //! and wallet, and is precisely the kind of free, unpaid disclosure the
-//! payment-is-the-connection invariant forbids (see CODEX.md).
+//! payment-is-the-connection invariant forbids.
 
 use std::sync::Arc;
 
@@ -402,6 +402,7 @@ async fn status(
                 super::sponsor::CAPABILITY,
                 konsensus_core::payloads::call::MEETING_CAPABILITY,
                 konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY,
+                konsensus_message::wire::CALL_MEDIA_CAPABILITY,
             ];
             if state.starter.config.enabled {
                 capabilities.push("starter_channel_request_v1");

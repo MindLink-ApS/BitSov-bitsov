@@ -868,6 +868,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_put(peer, call_id, entry).await
     }
 
+    async fn call_commit_admitted(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry, id: &MessageId) -> Result<(), StorageError> {
+        self.inner.call_commit_admitted(peer, call_id, entry, id).await
+    }
+
     async fn call_delete(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(), StorageError> {
         self.inner.call_delete(peer, call_id).await
     }
@@ -886,6 +890,15 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn call_live(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         self.inner.call_live().await
+    }
+
+    async fn record_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32], retain_until_ms: u64) -> Result<(), StorageError> {
+        // Routing/payment metadata only, like call_state; no payload or preimage.
+        self.inner.record_call_block_invoice(peer, call_id, seq, payment_hash, retain_until_ms).await
+    }
+
+    async fn has_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32]) -> Result<bool, StorageError> {
+        self.inner.has_call_block_invoice(peer, call_id, seq, payment_hash).await
     }
 
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {

@@ -209,6 +209,11 @@ pub const MAX_CONTROL_ID_BYTES: usize = 256;
 /// Human-readable rejection/disconnect/invoice/call reasons.
 pub const MAX_CONTROL_REASON_BYTES: usize = 1024;
 /// Keep peer reasons on one log line and within the wire reason byte budget.
+/// Whether `id` is a call id as the call payloads define it (32 lowercase hex).
+pub fn is_call_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 pub fn sanitized_peer_reason(reason: &str) -> String {
     let mut safe = String::with_capacity(reason.len().min(MAX_CONTROL_REASON_BYTES));
     for ch in reason.chars() {
@@ -245,6 +250,21 @@ pub const MAX_RAW_STRING_TOKEN_BYTES: usize = konsensus_core::wire_json::MAX_RAW
 
 /// One trickled ICE candidate, including a JSON wrapper and extension fields.
 pub const MAX_ICE_CANDIDATE_BYTES: usize = 4096;
+
+/// Largest media payload one [`Frame::CallMedia`] carries (decoded bytes).
+/// One 20 ms Opus or G.711 packet is a few hundred bytes; this leaves room
+/// for a larger codec frame without letting a peer push bulk data through
+/// the media path (M6 N2).
+pub const MAX_CALL_MEDIA_BYTES: usize = 4096;
+
+/// Base64 (standard alphabet, padded) length of [`MAX_CALL_MEDIA_BYTES`]:
+/// the raw JSON string token is refused past this before it is decoded.
+const MAX_CALL_MEDIA_B64_BYTES: usize = MAX_CALL_MEDIA_BYTES.div_ceil(3) * 4;
+
+/// Advertised (as `Capability::Custom`) by a node that routes call media
+/// over its peer link ([`Frame::CallMedia`]). A node forwards media only to
+/// a peer that listed it: an older node would count the frame as invalid.
+pub const CALL_MEDIA_CAPABILITY: &str = "call_media_v1";
 /// Application-defined capability name.
 pub const MAX_CUSTOM_CAPABILITY_BYTES: usize = 128;
 /// Price category name (the normal taxonomy uses short ASCII tokens).
@@ -330,6 +350,34 @@ mod bounded {
     pub fn snapshot_deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
         let encoded = limited_string::<D, 49152>(deserializer)?;
         hex::decode(encoded).map_err(de::Error::custom)
+    }
+
+    /// A call id: exactly 32 lowercase hex characters, checked before copy.
+    pub fn call_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+        let id = limited_string::<D, 32>(deserializer)?;
+        if !is_call_id(&id) {
+            return Err(de::Error::custom("call_id must be 32 lowercase hex characters"));
+        }
+        Ok(id)
+    }
+
+    pub fn call_media_serialize<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine as _;
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    /// Media bytes: the base64 token is bounded before decoding and the
+    /// decoded payload must fit [`MAX_CALL_MEDIA_BYTES`].
+    pub fn call_media_deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        use base64::Engine as _;
+        let encoded = limited_string::<D, MAX_CALL_MEDIA_B64_BYTES>(deserializer)?;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| de::Error::custom("call media is not base64"))?;
+        if data.len() > MAX_CALL_MEDIA_BYTES {
+            return Err(de::Error::custom("call media exceeds the per-frame cap"));
+        }
+        Ok(data)
     }
 
     use super::bounded_json;
@@ -1136,6 +1184,28 @@ pub enum Frame {
         peers: Vec<PeerExchangeEntry>,
     },
 
+    /// One media packet of a node-routed call (M6 N2): app → own node →
+    /// peer node → peer app. Carried on the existing Noise peer link, so it
+    /// is encrypted hop by hop and never leaves the two nodes' connection.
+    ///
+    /// Unpaid and unacknowledged: the call it belongs to was opened by paid
+    /// signalling (kinds 400-403) and a receiving node forwards a frame only
+    /// while that call is live and `call_id` names a call whose counterparty
+    /// is this very peer. Anything else is dropped without a reply.
+    CallMedia {
+        /// The call this packet belongs to: 32 lowercase hex characters, as
+        /// chosen by the caller in its offer.
+        #[serde(deserialize_with = "bounded::call_id")]
+        call_id: String,
+        /// Sender's packet counter, so the receiving app can order and
+        /// detect loss. Wraps.
+        seq: u32,
+        /// The codec packet, at most [`MAX_CALL_MEDIA_BYTES`]; base64 on
+        /// the wire (frames are JSON).
+        #[serde(serialize_with = "bounded::call_media_serialize", deserialize_with = "bounded::call_media_deserialize")]
+        data: Vec<u8>,
+    },
+
     // ── Real-time Signaling (KIND range 400–499) ──────────────────────────
     /// VoIP call offer — initiates a WebRTC session via SDP offer.
     ///
@@ -1293,8 +1363,26 @@ impl Frame {
         Ok(frame)
     }
 
+    /// A media frame for `call_id`, refused here (never on the wire) when the
+    /// payload exceeds [`MAX_CALL_MEDIA_BYTES`] or the id is not a call id.
+    pub fn call_media(call_id: &str, seq: u32, data: Vec<u8>) -> Result<Self, WireError> {
+        let frame = Frame::CallMedia { call_id: call_id.to_string(), seq, data };
+        frame.validate()?;
+        Ok(frame)
+    }
+
     /// Validate frame invariants that serde alone cannot enforce.
     fn validate(&self) -> Result<(), WireError> {
+        if let Frame::CallMedia { call_id, data, .. } = self {
+            if !is_call_id(call_id) {
+                return Err(WireError::InvalidFrame("call_id must be 32 lowercase hex characters".into()));
+            }
+            if data.len() > MAX_CALL_MEDIA_BYTES {
+                return Err(WireError::InvalidFrame(format!(
+                    "call media exceeds the per-frame cap of {MAX_CALL_MEDIA_BYTES} bytes"
+                )));
+            }
+        }
         if let Frame::PriceTable { trust_discount, .. } = self {
             if !trust_discount.is_finite() {
                 return Err(WireError::Serialization(
@@ -3069,5 +3157,86 @@ mod porch_quote_bounds_tests {
                 assert_eq!(decoded.is_ok(), accepted, "response={response}, id={id_len}, path={path_len}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod call_media_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    const CALL: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn call_media_frame_round_trips_as_base64_json() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(960).collect();
+        let frame = Frame::call_media(CALL, 7, data.clone()).unwrap();
+        let bytes = frame.to_bytes().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["CallMedia"]["call_id"], CALL);
+        assert_eq!(json["CallMedia"]["seq"], 7);
+        assert_eq!(
+            json["CallMedia"]["data"].as_str().unwrap(),
+            base64::engine::general_purpose::STANDARD.encode(&data),
+            "media is base64, not a JSON byte array"
+        );
+        match Frame::from_bytes(&bytes).unwrap() {
+            Frame::CallMedia { call_id, seq, data: decoded } => {
+                assert_eq!(call_id, CALL);
+                assert_eq!(seq, 7);
+                assert_eq!(decoded, data);
+            }
+            other => panic!("expected CallMedia, got {other:?}"),
+        }
+        // Length-prefixed framing, as the peer link carries it.
+        let (decoded, used) = decode_frame(&encode_frame(&frame).unwrap()).unwrap().unwrap();
+        assert_eq!(used, 4 + bytes.len());
+        assert!(matches!(decoded, Frame::CallMedia { seq: 7, .. }));
+    }
+
+    #[test]
+    fn call_media_payload_is_capped_on_both_sides() {
+        // Exactly the cap goes through, in both directions.
+        let at_cap = vec![0xAAu8; MAX_CALL_MEDIA_BYTES];
+        let frame = Frame::call_media(CALL, 1, at_cap.clone()).unwrap();
+        let bytes = frame.to_bytes().unwrap();
+        assert!(matches!(Frame::from_bytes(&bytes).unwrap(), Frame::CallMedia { data, .. } if data == at_cap));
+
+        // One byte over is refused before it is encoded...
+        let over = vec![0xAAu8; MAX_CALL_MEDIA_BYTES + 1];
+        assert!(matches!(Frame::call_media(CALL, 1, over.clone()), Err(WireError::InvalidFrame(_))));
+
+        // ...and refused on decode even when a peer encodes it by hand.
+        let wire = format!(
+            r#"{{"CallMedia":{{"call_id":"{CALL}","seq":1,"data":"{}"}}}}"#,
+            base64::engine::general_purpose::STANDARD.encode(&over)
+        );
+        assert!(Frame::from_bytes(wire.as_bytes()).is_err(), "oversize media must not decode");
+
+        // A base64 token far past the cap is refused before decoding.
+        let huge = "A".repeat(64 * 1024);
+        let wire = format!(r#"{{"CallMedia":{{"call_id":"{CALL}","seq":1,"data":"{huge}"}}}}"#);
+        assert!(Frame::from_bytes(wire.as_bytes()).is_err());
+
+        // Not base64 at all.
+        let wire = format!(r#"{{"CallMedia":{{"call_id":"{CALL}","seq":1,"data":"not base64!"}}}}"#);
+        assert!(Frame::from_bytes(wire.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn call_media_call_id_must_be_a_call_id() {
+        for bad in ["", "0123456789ABCDEF0123456789ABCDEF", "0123456789abcdef0123456789abcde", "zz23456789abcdef0123456789abcdef"] {
+            assert!(Frame::call_media(bad, 0, vec![1]).is_err(), "{bad:?}");
+            let wire = format!(r#"{{"CallMedia":{{"call_id":"{bad}","seq":0,"data":"AQ=="}}}}"#);
+            assert!(Frame::from_bytes(wire.as_bytes()).is_err(), "{bad:?}");
+        }
+        assert!(is_call_id(CALL));
+    }
+
+    #[test]
+    fn empty_media_is_a_valid_frame() {
+        let frame = Frame::call_media(CALL, u32::MAX, Vec::new()).unwrap();
+        let decoded = Frame::from_bytes(&frame.to_bytes().unwrap()).unwrap();
+        assert!(matches!(decoded, Frame::CallMedia { seq: u32::MAX, data, .. } if data.is_empty()));
     }
 }

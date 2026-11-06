@@ -62,6 +62,9 @@ pub struct MemStorage {
     pub peer_upsert_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub peer_delete_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub call_block_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub call_offer_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub fail_call_get_for: Mutex<Option<String>>,
+    pub fail_call_put_for: Mutex<Option<String>>,
     calls: Mutex<HashMap<(NodeId, String), konsensus_core::payloads::call::CallEntry>>,
     outbox: Mutex<HashMap<String, konsensus_storage::OutboxOperation>>,
     /// The channel-open / send-onchain / direct-payment operation ledger.
@@ -88,6 +91,9 @@ impl MemStorage {
             peer_upsert_gate: Mutex::new(None),
             peer_delete_gate: Mutex::new(None),
             call_block_dispatch_gate: Mutex::new(None),
+            call_offer_dispatch_gate: Mutex::new(None),
+            fail_call_get_for: Mutex::new(None),
+            fail_call_put_for: Mutex::new(None),
             calls: Mutex::new(HashMap::new()),
             outbox: Mutex::new(HashMap::new()),
             operations: Mutex::new(HashMap::new()),
@@ -127,12 +133,54 @@ impl MemStorage {
 #[async_trait]
 impl Storage for MemStorage {
     async fn call_get(&self, peer: &NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+        if self.fail_call_get_for.lock().unwrap().as_deref() == Some(call_id) {
+            return Err(StorageError::Serialization("injected call read failure".into()));
+        }
         Ok(self.calls.lock().unwrap().get(&(*peer, call_id.to_owned())).cloned())
     }
 
     async fn call_put(&self, peer: &NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+        if self.fail_call_put_for.lock().unwrap().as_deref() == Some(call_id) {
+            return Err(StorageError::Serialization("injected call write failure".into()));
+        }
         self.calls.lock().unwrap().insert((*peer, call_id.to_owned()), entry.clone());
         Ok(())
+    }
+
+    /// No admission holds in memory: the grant alone, with the same fault hook.
+    async fn call_commit_admitted(&self, peer: &NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry, _id: &MessageId) -> Result<(), StorageError> {
+        self.call_put(peer, call_id, entry).await
+    }
+
+    async fn call_delete(&self, peer: &NodeId, call_id: &str) -> Result<(), StorageError> {
+        self.calls.lock().unwrap().remove(&(*peer, call_id.to_owned()));
+        Ok(())
+    }
+
+    async fn call_counts(&self, peer: &NodeId, now: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
+        use konsensus_core::payloads::call::{CallCounts, Phase};
+        let mut counts = CallCounts::default();
+        for ((p, _), entry) in self.calls.lock().unwrap().iter() {
+            let Some(entry) = entry.clone().at(now) else { continue };
+            if entry.pending.is_some() || entry.phase != Phase::Ended {
+                counts.open_total += 1;
+                counts.open_peer += u64::from(p == peer);
+            } else {
+                counts.burned_total += 1;
+                counts.burned_peer += u64::from(p == peer);
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn call_live(&self) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Ok(self.calls.lock().unwrap().iter().filter(|(_, e)| e.phase != konsensus_core::payloads::call::Phase::Ended)
+            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone())).collect())
+    }
+
+    async fn call_pending(&self) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Ok(self.calls.lock().unwrap().iter().filter(|(_, e)| e.pending.is_some())
+            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone())).collect())
     }
 
     async fn insert_channel_open_operation(
@@ -222,6 +270,10 @@ impl Storage for MemStorage {
         let dispatched = op.kind == 404 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
             .is_ok_and(|data| data["dispatched"] == true);
         let gate = if dispatched { self.call_block_dispatch_gate.lock().unwrap().take() } else { None };
+        if let Some(gate) = gate { gate.run().await?; }
+        let offer_dispatched = op.kind == 400 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
+            .is_ok_and(|data| data["dispatched"] == true);
+        let gate = if offer_dispatched { self.call_offer_dispatch_gate.lock().unwrap().take() } else { None };
         if let Some(gate) = gate { gate.run().await?; }
         let mut rows = self.outbox.lock().unwrap();
         if rows
@@ -1199,8 +1251,10 @@ pub fn test_state() -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1266,8 +1320,10 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1321,8 +1377,10 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1386,8 +1444,10 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1441,8 +1501,10 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
@@ -1724,8 +1786,10 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: Some(Arc::new(konsensus_gossip::GossipValidator::new(
             Default::default(),
@@ -1985,9 +2049,49 @@ pub fn test_state_with_lightning_and_storage(
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     })
+}
+
+/// A session store whose saves can be made to fail, for all peers or for one.
+#[derive(Default)]
+pub struct FlakySessionStore {
+    data: std::sync::Mutex<HashMap<NodeId, Vec<u8>>>,
+    fail_all: std::sync::atomic::AtomicBool,
+    fail_peer: std::sync::Mutex<Option<NodeId>>,
+}
+
+impl FlakySessionStore {
+    pub fn fail_all(&self, fail: bool) {
+        self.fail_all.store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn fail_peer(&self, peer: Option<NodeId>) {
+        *self.fail_peer.lock().unwrap() = peer;
+    }
+}
+
+#[async_trait]
+impl konsensus_crypto::SessionStore for FlakySessionStore {
+    async fn save_session(&self, peer: &NodeId, state: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.fail_all.load(std::sync::atomic::Ordering::SeqCst) || *self.fail_peer.lock().unwrap() == Some(*peer) {
+            return Err("test: disk full".into());
+        }
+        self.data.lock().unwrap().insert(*peer, state.to_vec());
+        Ok(())
+    }
+    async fn load_session(&self, peer: &NodeId) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.data.lock().unwrap().get(peer).cloned())
+    }
+    async fn delete_session(&self, peer: &NodeId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.data.lock().unwrap().remove(peer);
+        Ok(())
+    }
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.data.lock().unwrap().keys().copied().collect())
+    }
 }

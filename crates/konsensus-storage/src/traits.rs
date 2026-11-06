@@ -15,9 +15,18 @@ use crate::invites::{
 use crate::models::{EnergyRow, FileMetadata, FileRecord, OnboardingStateRecord, Peer, Room};
 use crate::reactions::ReactionRecord;
 
-/// Outcome of the durable recipient acceptance transaction.
+/// Outcome of the durable recipient acceptance transaction. `Withdrawn`: this
+/// exact envelope (same id and sender) was accepted and later withdrawn by the
+/// application (`reject_accepted_envelope`, receipt `accepted = -1`); its
+/// payment stays burned and it is never acknowledged or re-accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaidAcceptance { Accepted, AlreadyAccepted, NonceReused, PaymentReused }
+pub enum PaidAcceptance {
+    Accepted,
+    AlreadyAccepted,
+    NonceReused,
+    PaymentReused,
+    Withdrawn,
+}
 
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
@@ -1137,6 +1146,16 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("call state".into()))
     }
 
+    /// Commit a paid call block: insert or replace `(peer, call_id)` AND
+    /// release the admission hold on its message `id`, in ONE transaction.
+    /// A granted interval is durable exactly when its message is admitted:
+    /// no failure can leave a committed grant behind a hold that the sweep
+    /// would later withdraw (marking a paid, granted block rejected). If the
+    /// release fails, the grant is rolled back with it.
+    async fn call_commit_admitted(&self, _peer: &konsensus_core::NodeId, _call_id: &str, _entry: &konsensus_core::payloads::call::CallEntry, _id: &MessageId) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
     /// Forget `(peer, call_id)` (an offer that was never paid).
     async fn call_delete(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<(), StorageError> {
         Err(StorageError::Unsupported("call state".into()))
@@ -1166,7 +1185,21 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("call state".into()))
     }
 
-    /// Drop up to `max` entries whose replay protection ended, with no pending signal.
+    /// Bind an invoice hash to the peer and block before publishing it.
+    /// Stored separately from replay receipts; duplicates cannot rebind a hash.
+    /// Refuse past MAX_CALL_BLOCK_INVOICES per (peer, call_id, seq), retaining
+    /// all issued bindings until their retention window has been swept.
+    async fn record_call_block_invoice(&self, _peer: &NodeId, _call_id: &str, _seq: u32, _payment_hash: &[u8; 32], _retain_until_ms: u64) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call block invoice provenance".into()))
+    }
+
+    /// Only a callee-issued block invoice can admit a 404. Unknown is not valid.
+    async fn has_call_block_invoice(&self, _peer: &NodeId, _call_id: &str, _seq: u32, _payment_hash: &[u8; 32]) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("call block invoice provenance".into()))
+    }
+
+    /// Reclaim stale ended reservations and drop up to `max` expired tombstones.
+    /// Also prune up to `max` invoice bindings past their call's resume window.
     async fn call_sweep(&self, _now_ms: u64, _max: u32) -> Result<u64, StorageError> {
         Ok(0)
     }
@@ -1180,7 +1213,7 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("reject accepted envelope".into()))
     }
 
-    // ── Incoming call signal admission hold (Codex delta2 #4) ──────────
+    // ── Incoming call signal admission hold (review delta2 #4) ──────────
     // A held message is invisible to history, resync and duplicate ACKs.
 
     /// Hold `envelope` before its paid acceptance, unless a message with its
