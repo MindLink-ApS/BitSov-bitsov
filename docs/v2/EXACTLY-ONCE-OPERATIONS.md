@@ -26,7 +26,7 @@ Accounting recovery in every operation state resolves the original paired caller
 
 Offline paid operations skip transport sends and persist an exponential retry schedule: 15, 30, 60, 120, 240, then 300 seconds (capped). Restart preserves the deadline. Once a due check finds the peer connected, recovery resets the backoff and resends the stored envelope. Offline checks do not increment send attempts. Explicit client retries retain their existing behavior and rejection backoff; the independent pending-delivery flusher is unchanged.
 
-Slice 3 follow-up (Fable #113 finding 1): generate the keysend preimage locally and persist its hash before dispatch. Slice 2 still receives keysend identity from the backend, so a crash after dispatch but before the hash is recorded leaves the operation `payment_unknown` indefinitely. Time passing is never evidence that repayment is safe.
+Slice 3 follow-up (review #113 finding 1): generate the keysend preimage locally and persist its hash before dispatch. Slice 2 still receives keysend identity from the backend, so a crash after dispatch but before the hash is recorded leaves the operation `payment_unknown` indefinitely. Time passing is never evidence that repayment is safe.
 
 Existing pending deliveries receive `legacy:<message_id>:<recipient_id>` status IDs. Their original plaintext request binding is unavailable, so these are GET receipts rather than compose retry IDs. Existing legacy recipient acceptance and ACK behavior is unchanged.
 
