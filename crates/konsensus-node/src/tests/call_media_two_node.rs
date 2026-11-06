@@ -64,6 +64,14 @@ struct Node {
 }
 
 async fn start_node(identity: Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Node {
+    start_node_with(identity, whitelist, konsensus_api::call_media::MediaLimits::default()).await
+}
+
+async fn start_node_with(
+    identity: Arc<NodeIdentity>,
+    whitelist: Vec<NodeId>,
+    limits: konsensus_api::call_media::MediaLimits,
+) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let id = *identity.node_id();
     let transport = Arc::new(NoiseTransport::new(
@@ -80,9 +88,10 @@ async fn start_node(identity: Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Node
         Arc::new(konsensus_storage::sqlite::SqliteStorage::in_memory().await.unwrap());
     let (shutdown, shutdown_rx) = watch::channel(false);
 
-    let router = CallMediaRouter::new(
+    let router = CallMediaRouter::with_limits(
         Arc::clone(&transport) as Arc<dyn MediaLink>,
         Arc::new(PaidCallAdmission::new(Arc::clone(&storage))),
+        limits,
     );
     router.spawn(shutdown_rx);
 
@@ -266,6 +275,150 @@ where
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("timed out waiting until {what}");
+}
+
+async fn connected_pair(limits: konsensus_api::call_media::MediaLimits) -> (Node, Node) {
+    let (id_a, id_b) = (
+        Arc::new(NodeIdentity::generate().unwrap().1),
+        Arc::new(NodeIdentity::generate().unwrap().1),
+    );
+    let a = start_node_with(Arc::clone(&id_a), vec![*id_b.node_id()], limits).await;
+    let b = start_node_with(Arc::clone(&id_b), vec![*id_a.node_id()], limits).await;
+    a.transport.connect(&b.id, &b.addr()).await.unwrap();
+    wait_until("both see the connection", || async {
+        a.transport.is_connected(&b.id).await && b.transport.is_connected(&a.id).await
+    })
+    .await;
+    a.live_call(&b.id, Side::Caller).await;
+    b.live_call(&a.id, Side::Callee).await;
+    (a, b)
+}
+
+/// One second of 20 ms audio, with one bulk packet written after every
+/// `every`th audio packet. Returns the audio seqs B received in order, the bulk
+/// packets it saw, and whether a socket closed.
+async fn audio_under_bulk(a: &Node, b: &Node, every: u32) -> (Vec<u32>, usize, bool) {
+    const AUDIO: usize = 50;
+    let mut app_a = a.media_socket(&b.id, &a.token).await.unwrap();
+    let mut app_b = b.media_socket(&a.id, &b.token).await.unwrap();
+    let bulk = vec![0xB0u8; konsensus_message::wire::MAX_CALL_MEDIA_BYTES];
+    let send = async {
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        let mut bulk_seq = 1_000_000u32;
+        for seq in 0..AUDIO as u32 {
+            tick.tick().await;
+            if app_a.send(packet(seq, &[0xA0; 161])).await.is_err() {
+                return true;
+            }
+            if seq % every == 0 {
+                bulk_seq += 1;
+                if app_a.send(packet(bulk_seq, &bulk)).await.is_err() {
+                    return true;
+                }
+            }
+        }
+        // Stay open until the receiver has its share.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        false
+    };
+    let mut audio = Vec::new();
+    let mut bulk_seen = 0;
+    let mut closed = false;
+    let receive = async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(next) = tokio::time::timeout_at(deadline, app_b.next()).await else { break };
+            match next {
+                Some(Ok(Message::Binary(bytes))) if bytes.len() == 4 + 161 => {
+                    audio.push(u32::from_be_bytes(bytes[..4].try_into().unwrap()));
+                }
+                Some(Ok(Message::Binary(_))) => bulk_seen += 1,
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+    };
+    let (send_failed, ()) = tokio::join!(send, receive);
+    (audio, bulk_seen, closed || send_failed)
+}
+
+/// What the socket's handshake answer says about the limits.
+async fn advertised_limits(a: &Node, b: &Node) -> Option<String> {
+    let mut request = format!("ws://{}/api/v1/calls/{CALL}/media?peer={}", a.api_addr, b.id.to_hex())
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        format!("bitsov.v1, bitsov.jwt.{}", a.token).parse().unwrap(),
+    );
+    let (_socket, answer) = tokio_tungstenite::connect_async(request).await.unwrap();
+    answer
+        .headers()
+        .get(konsensus_api::call_media::MEDIA_LIMITS_HEADER)
+        .map(|value| value.to_str().unwrap().to_string())
+}
+
+#[tokio::test]
+async fn the_handshake_says_the_limits_only_when_the_operator_raised_them() {
+    let (a, b) = connected_pair(Default::default()).await;
+    assert_eq!(advertised_limits(&a, &b).await, None, "a default node answers as it always did");
+    let _ = a.shutdown.send(true);
+    let _ = b.shutdown.send(true);
+    let limits = konsensus_api::call_media::MediaLimits {
+        max_frames_per_second: 160,
+        max_bytes_per_second: 262_144,
+        drop_bulk_over_share: false,
+    };
+    let (a, b) = connected_pair(limits).await;
+    assert_eq!(advertised_limits(&a, &b).await.as_deref(), Some("160 262144"));
+    let _ = a.shutdown.send(true);
+    let _ = b.shutdown.send(true);
+}
+
+#[tokio::test]
+async fn paced_bulk_at_the_default_limits_arrives_with_the_audio_whole() {
+    // Ten 4 KiB packets over the second: what fits the bulk share.
+    let (a, b) = connected_pair(Default::default()).await;
+    let (audio, bulk, closed) = audio_under_bulk(&a, &b, 5).await;
+    assert!(!closed);
+    assert_eq!(audio, (0..50).collect::<Vec<u32>>(), "every audio packet, in order");
+    assert_eq!(bulk, 10);
+    let _ = a.shutdown.send(true);
+    let _ = b.shutdown.send(true);
+}
+
+#[tokio::test]
+async fn bulk_past_its_share_leaves_the_audio_whole_and_the_socket_up_when_set_to_drop() {
+    // A 4 KiB packet every other audio packet offers one and a half times the
+    // byte cap: past the bulk share, short of a flood.
+    let limits = konsensus_api::call_media::MediaLimits { drop_bulk_over_share: true, ..Default::default() };
+    let (a, b) = connected_pair(limits).await;
+    let (audio, bulk, closed) = audio_under_bulk(&a, &b, 2).await;
+    assert!(!closed, "bulk over its share closes nothing");
+    assert_eq!(audio, (0..50).collect::<Vec<u32>>(), "every audio packet, in order");
+    assert!(bulk > 0, "some bulk got through");
+    assert!(bulk < 25, "some bulk was dropped: {bulk}");
+    let _ = a.shutdown.send(true);
+    let _ = b.shutdown.send(true);
+}
+
+#[tokio::test]
+async fn higher_configured_limits_carry_what_the_default_cannot() {
+    let limits = konsensus_api::call_media::MediaLimits {
+        max_frames_per_second: 160,
+        max_bytes_per_second: 256 * 1024,
+        drop_bulk_over_share: false,
+    };
+    let (a, b) = connected_pair(limits).await;
+    let (audio, bulk, closed) = audio_under_bulk(&a, &b, 1).await;
+    assert!(!closed);
+    assert_eq!(audio, (0..50).collect::<Vec<u32>>());
+    assert_eq!(bulk, 50, "one 4 KiB packet per audio packet fits this cap");
+    let _ = a.shutdown.send(true);
+    let _ = b.shutdown.send(true);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
