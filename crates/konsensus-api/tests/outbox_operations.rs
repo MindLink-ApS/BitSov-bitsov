@@ -1453,19 +1453,22 @@ async fn background_reconcile_commits_a_paid_call_offer_before_resending() {
     let answer = format!(r#"{{"v":1,"call_id":"{call}","sdp":"v=0"}}"#);
     // Dispatched, but the wallet cannot say yet whether it settled.
     f.wallet.mode.store(1, Ordering::SeqCst);
+    f.wallet.pause_next_status_poll.store(true, Ordering::SeqCst);
     let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
         .header("authorization", common::auth_header(&f.state)).header("content-type", "application/json")
         .body(Body::from(serde_json::json!({"operation_id": f.id, "recipient": peer.to_hex(), "kind": 400, "plaintext": offer, "wait_ack_ms": 0}).to_string()))
         .unwrap();
     let app = common::test_router(f.state.clone());
     let job = tokio::spawn(async move { app.oneshot(request).await });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while f.db.get_outbox_operation(&f.id).await.unwrap().is_none_or(|op| op.payment_hash.is_none()) {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
+    // A visible hash can precede another SQLite checkpoint still running on
+    // its worker thread. Cancel only at the post-checkpoint wallet status poll,
+    // so that write cannot race the recovery sweep's versioned paid commit.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        f.wallet.status_poll_started.notified(),
+    )
     .await
-    .unwrap();
+    .expect("compose must finish checkpointing before cancellation");
     job.abort();
     assert!(job.await.unwrap_err().is_cancelled());
     assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
