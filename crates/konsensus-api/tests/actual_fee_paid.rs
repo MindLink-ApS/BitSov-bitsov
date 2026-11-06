@@ -199,6 +199,52 @@ async fn compose_and_operation_replay_report_fee_without_repaying() {
     }
 }
 
+#[tokio::test]
+async fn file_send_reports_the_actual_ldk_fee_and_omits_an_unknown_one() {
+    for (backend, fee) in [
+        ("ldk", 0),
+        ("ldk", 400),
+        ("mock", 400),
+        ("lnd", 400),
+        ("lnbits", 400),
+    ] {
+        let (mut state, wallet) = fixture(backend, fee);
+        let peer = setup_e2ee_session(&state.session_manager).await;
+        Arc::get_mut(&mut state).unwrap().transport = Arc::new(ConnectedStubTransport::new(
+            vec![peer],
+            state.invoice_requests.clone(),
+        ));
+        state
+            .peer_ln_pubkeys
+            .lock()
+            .await
+            .insert(peer, format!("02{}", "aa".repeat(32)));
+        let file = call(
+            &state,
+            "POST",
+            "/api/v1/files",
+            json!({"filename":"fee.txt","mime_type":"text/plain","data_b64":"aGk="}),
+        )
+        .await;
+        let before = wallet.get_balance_msat().await.unwrap();
+        let sent = call(
+            &state,
+            "POST",
+            &format!("/api/v1/files/{}/send", file["file_id"].as_str().unwrap()),
+            json!({"recipient":peer.to_hex(),"max_total_msat":2000,"max_routing_fee_msat":1000}),
+        )
+        .await;
+        assert_eq!(sent["amount_msat"], 1000, "{sent}");
+        assert_eq!(sent["max_routing_fee_msat"], 1000, "{sent}");
+        assert_eq!(before - wallet.get_balance_msat().await.unwrap(), 1000 + fee);
+        if backend == "ldk" {
+            assert_eq!(sent["fee_paid_msat"], fee, "{sent}");
+        } else {
+            assert!(sent.get("fee_paid_msat").is_none(), "{sent}");
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn room_fee_is_complete_sum_or_omitted_if_any_payment_is_unknown() {
     for (fee, pending) in [(0, false), (400, false), (400, true)] {
