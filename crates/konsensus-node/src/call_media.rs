@@ -14,11 +14,15 @@
 //! for a call that is no longer admitted is dropped, counted and logged at
 //! a bounded rate, and never answered.
 //!
-//! Each direction of each call is capped at [`MAX_FRAMES_PER_SECOND`] and
-//! [`MAX_BYTES_PER_SECOND`]; packets over the cap are dropped. Queues are
-//! bounded and drop the **oldest** packet rather than block: stale audio is
-//! worth less than fresh audio and nothing upstream ever waits on a slow
-//! consumer. Towards the peer, a packet waits at most
+//! Each direction of each call is capped by its [`MediaLimits`]: by default
+//! [`MAX_FRAMES_PER_SECOND`] and [`MAX_BYTES_PER_SECOND`], or what the operator
+//! set under `[calls]`. Packets over the cap are dropped. Packets larger than
+//! audio may use only what the cap leaves after a reservation for small
+//! packets, so they can never spend the budget audio needs ([`MediaCap`]).
+//! This changes no price and no admission: a call is admitted and paid the
+//! same whatever it carries. Queues are bounded and drop the **oldest** packet
+//! rather than block: stale audio is worth less than fresh audio and nothing
+//! upstream ever waits on a slow consumer. Towards the peer, a packet waits at most
 //! `CALL_MEDIA_WRITE_DEADLINE` for the connection's writer (a bulk frame in
 //! flight holds it) and is dropped past that, so audio never queues behind
 //! bulk data for longer than that bound.
@@ -34,8 +38,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use konsensus_api::call_media::{
-    AttachRefusal, CallMediaPort, MediaActivity, MediaAttachment, MediaFrame, MediaQueue, MEDIA_QUEUE_FRAMES,
+    is_bulk_payload, AttachRefusal, CallMediaPort, MediaActivity, MediaAttachment, MediaFrame, MediaLimits, MediaQueue,
+    MEDIA_QUEUE_FRAMES,
 };
+#[cfg(test)]
+use konsensus_api::call_media::{DEFAULT_MAX_BYTES_PER_SECOND, DEFAULT_MAX_FRAMES_PER_SECOND};
 use konsensus_core::traits::transport::{MessageTransport, TransportError};
 use konsensus_core::types::NodeId;
 use konsensus_message::wire::{is_call_id, CALL_MEDIA_CAPABILITY, MAX_CALL_MEDIA_BYTES};
@@ -44,11 +51,15 @@ use konsensus_storage::Storage;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-/// Packets per second one direction of one call may carry. 20 ms audio is
-/// 50 packets per second; this leaves room for a 10 ms codec or a burst.
-pub const MAX_FRAMES_PER_SECOND: u32 = 100;
-/// Bytes per second one direction of one call may carry (payload bytes).
-pub const MAX_BYTES_PER_SECOND: u64 = 64 * 1024;
+/// Packets per second one direction of one call may carry unless the operator
+/// set otherwise. 20 ms audio is 50 packets per second; this leaves room for a
+/// 10 ms codec or a burst.
+#[cfg(test)]
+pub const MAX_FRAMES_PER_SECOND: u32 = DEFAULT_MAX_FRAMES_PER_SECOND;
+/// Bytes per second one direction of one call may carry (payload bytes) unless
+/// the operator set otherwise.
+#[cfg(test)]
+pub const MAX_BYTES_PER_SECOND: u64 = DEFAULT_MAX_BYTES_PER_SECOND;
 /// Calls this node routes media for at once (sockets attached).
 pub const MAX_ROUTED_CALLS: usize = 64;
 /// How long a positive admission answer is trusted before it is re-read.
@@ -177,25 +188,73 @@ impl RateCap {
         Self { window_start: now, frames: 0, bytes: 0, max_frames, max_bytes }
     }
 
-    /// The media caps.
+    /// The default media caps.
+    #[cfg(test)]
     pub fn media(now: Instant) -> Self {
         Self::new(MAX_FRAMES_PER_SECOND, MAX_BYTES_PER_SECOND, now)
     }
 
     /// Whether a packet of `bytes` payload bytes fits the current window.
     /// A refused packet counts nothing.
+    #[cfg(test)]
     pub fn admit(&mut self, now: Instant, bytes: usize) -> bool {
+        self.roll(now);
+        if !self.fits(bytes) {
+            return false;
+        }
+        self.take(bytes);
+        true
+    }
+
+    fn roll(&mut self, now: Instant) {
         if now.duration_since(self.window_start) >= Duration::from_secs(1) {
             self.window_start = now;
             self.frames = 0;
             self.bytes = 0;
         }
-        let bytes = bytes as u64;
-        if self.frames >= self.max_frames || self.bytes.saturating_add(bytes) > self.max_bytes {
+    }
+
+    fn fits(&self, bytes: usize) -> bool {
+        self.frames < self.max_frames && self.bytes.saturating_add(bytes as u64) <= self.max_bytes
+    }
+
+    fn take(&mut self, bytes: usize) {
+        self.frames += 1;
+        self.bytes += bytes as u64;
+    }
+}
+
+/// One direction's cap with room kept for small packets: every packet counts
+/// against the whole budget, and a bulk packet must also fit the bulk share,
+/// which leaves the reservation free whatever order packets arrive in. With
+/// no bulk packets this is exactly [`RateCap`] over the whole budget.
+#[derive(Debug, Clone)]
+pub struct MediaCap {
+    total: RateCap,
+    bulk: RateCap,
+}
+
+impl MediaCap {
+    pub fn new(limits: MediaLimits, now: Instant) -> Self {
+        Self {
+            total: RateCap::new(limits.max_frames_per_second, limits.max_bytes_per_second, now),
+            bulk: RateCap::new(limits.bulk_frames_per_second(), limits.bulk_bytes_per_second(), now),
+        }
+    }
+
+    /// Whether a packet of `bytes` payload bytes fits the current window.
+    /// A refused packet counts nothing.
+    pub fn admit(&mut self, now: Instant, bytes: usize) -> bool {
+        self.total.roll(now);
+        self.bulk.roll(now);
+        let bulk = is_bulk_payload(bytes);
+        if !self.total.fits(bytes) || (bulk && !self.bulk.fits(bytes)) {
             return false;
         }
-        self.frames += 1;
-        self.bytes += bytes;
+        self.total.take(bytes);
+        if bulk {
+            self.bulk.take(bytes);
+        }
         true
     }
 }
@@ -302,7 +361,7 @@ struct Route {
     to_app: Arc<MediaQueue>,
     /// From the app's socket, to the peer.
     from_app: Arc<MediaQueue>,
-    inbound_cap: Mutex<RateCap>,
+    inbound_cap: Mutex<MediaCap>,
     /// When admission was last confirmed.
     admitted_at: Mutex<Instant>,
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -346,16 +405,29 @@ impl Route {
 pub struct CallMediaRouter {
     link: Arc<dyn MediaLink>,
     admission: Arc<dyn CallMediaAdmission>,
+    limits: MediaLimits,
     routes: Mutex<HashMap<(NodeId, String), Arc<Route>>>,
     drops: DropLog,
     me: Weak<Self>,
 }
 
 impl CallMediaRouter {
+    /// A router with the default limits.
+    #[cfg(test)]
     pub fn new(link: Arc<dyn MediaLink>, admission: Arc<dyn CallMediaAdmission>) -> Arc<Self> {
+        Self::with_limits(link, admission, MediaLimits::default())
+    }
+
+    /// A router whose routes are capped by `limits` (`[calls]` in the config).
+    pub fn with_limits(
+        link: Arc<dyn MediaLink>,
+        admission: Arc<dyn CallMediaAdmission>,
+        limits: MediaLimits,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             link,
             admission,
+            limits,
             routes: Mutex::new(HashMap::new()),
             drops: DropLog::default(),
             me: me.clone(),
@@ -474,7 +546,7 @@ impl CallMediaRouter {
     /// The app → peer direction of one call: pop, cap, admit, send.
     async fn pump(self: Arc<Self>, call_id: String, route: Arc<Route>) {
         let forward = async {
-            let mut cap = RateCap::media(Instant::now());
+            let mut cap = MediaCap::new(self.limits, Instant::now());
             while let Some(frame) = route.from_app.pop().await {
                 let now = Instant::now();
                 if !cap.admit(now, frame.payload.len()) {
@@ -553,7 +625,7 @@ impl CallMediaPort for CallMediaRouter {
             activity: MediaActivity::new(),
             to_app: MediaQueue::new(MEDIA_QUEUE_FRAMES),
             from_app: MediaQueue::new(MEDIA_QUEUE_FRAMES),
-            inbound_cap: Mutex::new(RateCap::media(now)),
+            inbound_cap: Mutex::new(MediaCap::new(self.limits, now)),
             admitted_at: Mutex::new(now),
             pump: Mutex::new(None),
         });
@@ -588,7 +660,8 @@ impl CallMediaPort for CallMediaRouter {
                 }
             }
         };
-        Ok(MediaAttachment::new(*peer, Arc::clone(&route.from_app), Arc::clone(&route.to_app), Arc::clone(&route.activity), release))
+        Ok(MediaAttachment::new(*peer, Arc::clone(&route.from_app), Arc::clone(&route.to_app), Arc::clone(&route.activity), release)
+            .with_limits(self.limits))
     }
 }
 

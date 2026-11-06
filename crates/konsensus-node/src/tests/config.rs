@@ -2680,6 +2680,44 @@ backend = "sqlite"
 }
 
 #[test]
+fn call_media_limits_default_to_the_fixed_limits_and_stay_in_bounds() {
+    let base = r#"
+[identity]
+mnemonic_file = "/tmp/m.txt"
+[network]
+[lightning]
+backend = "mock"
+[chain]
+backend = "mock"
+[storage]
+backend = "sqlite"
+"#;
+    let unset: NodeConfig = toml::from_str(base).unwrap();
+    assert_eq!(unset.calls.media_limits(), konsensus_api::call_media::MediaLimits::default());
+    assert_eq!(unset.calls.media_max_frames_per_second, 100);
+    assert_eq!(unset.calls.media_max_bytes_per_second, 65536);
+    assert!(!unset.calls.media_drop_bulk_over_share);
+    assert_eq!(crate::config::CallsConfig::default().media_limits(), unset.calls.media_limits());
+
+    let tier: NodeConfig = toml::from_str(&format!(
+        "{base}\n[calls]\nmedia_max_frames_per_second = 160\nmedia_max_bytes_per_second = 262144\nmedia_drop_bulk_over_share = true\n"
+    ))
+    .unwrap();
+    assert!(tier.calls.media_limits().drop_bulk_over_share);
+    assert_eq!(tier.calls.media_limits().max_frames_per_second, 160);
+    assert_eq!(tier.calls.media_limits().max_bytes_per_second, 262_144);
+
+    for bad in [
+        "media_max_frames_per_second = 99",
+        "media_max_frames_per_second = 1001",
+        "media_max_bytes_per_second = 65535",
+        "media_max_bytes_per_second = 1048577",
+    ] {
+        assert!(toml::from_str::<NodeConfig>(&format!("{base}\n[calls]\n{bad}\n")).is_err(), "{bad} must be refused");
+    }
+}
+
+#[test]
 fn bitcoind_config_accepts_file_auth_and_rejects_inline_secrets() {
     for auth in [
         "cookie_file = '/tmp/bitcoin.cookie'",
