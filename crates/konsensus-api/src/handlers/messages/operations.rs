@@ -26,6 +26,9 @@ use std::{
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Recovery {
+    /// Original offer binding, retained with caller provenance for closing.
+    #[serde(default)]
+    call_offer: Option<String>,
     /// Call/sequence binding survives missing plaintext caches and recovery.
     #[serde(default)]
     call_block: Option<(String, u32)>,
@@ -280,11 +283,13 @@ impl Operation {
         expected_msat: u64,
         fee_ceiling: u64,
         admission_msat: u64,
-        call_block: Option<(String, u32)>,
+        call_binding: Option<(String, u32)>,
     ) -> Result<(), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
-        data.call_block = call_block;
+        if op.kind == i64::from(konsensus_core::kind::KIND_CALL_INVITE) {
+            data.call_offer = call_binding.map(|(id, _)| id);
+        } else { data.call_block = call_binding; }
         op.message_id = Some(draft.id.to_hex());
         data.draft = Some(draft);
         data.expected_msat = expected_msat;
@@ -600,11 +605,22 @@ pub(super) async fn compose_call(
 }
 
 // Validation and other invoice refusals leave a live call retryable. Only terminal
-// payment evidence or a price change ends it here; ambiguous
+// payment evidence, a price change, or a direct-channel/payment-limit refusal
+// ends it here; ambiguous
 // outcomes retain their journal and are bounded by ordinary call expiry.
 async fn call_payment_failed(state: &AppState, id: &str, error: Option<&ApiError>) -> bool {
+    fn price_changed(error: &ApiError) -> bool {
+        match error {
+            ApiError::Reasoned { reason, .. } if *reason == super::caps::CALL_DIRECT_CHANNEL_LOST
+                || *reason == super::caps::CALL_ABOVE_PAYMENT_LIMIT => true,
+            ApiError::Operation { source, .. } | ApiError::RoutingFee { source, .. }
+                | ApiError::Reasoned { source, .. } => price_changed(source),
+            ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::CallPriceChanged) => true,
+            _ => false,
+        }
+    }
     let Some(error) = error else { return false };
-    if call_price_changed(error) { return true; }
+    if price_changed(error) { return true; }
     let Ok(Some(op)) = state.storage.get_outbox_operation(id).await else { return false };
     definite_call_payment_failure(&op)
 }
@@ -1365,10 +1381,13 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
 
 /// Positive evidence that an operation holds no payment: nothing was
 /// dispatched or left pending, no settlement, proof or admission was recorded,
-/// the peer's admission journal (every retained attempt) shows no dispatch or
-/// settlement, and the wallet knows no payment for any admission hash involved.
-/// Any doubt (an unreadable journal, another operation's attempt, a hash that
-/// does not match, a wallet that cannot answer) is not evidence.
+/// no retained attempt of this operation or of none in the peer's admission
+/// journal shows a dispatch or settlement, and the wallet knows no payment for
+/// any admission hash involved. An attempt linked to another operation is that
+/// operation's payment, carried on its own row: a contact admitted last week
+/// says nothing about this send. Any doubt (an unreadable journal, an attempt
+/// with no link, a hash that does not match, a wallet that cannot answer) is
+/// not evidence.
 async fn proven_unpaid(state: &AppState, op: &OutboxOperation, data: &Recovery) -> bool {
     if data.dispatched
         || data.admission_pending
@@ -1390,21 +1409,26 @@ async fn proven_unpaid(state: &AppState, op: &OutboxOperation, data: &Recovery) 
         return false;
     };
     let mut hashes = Vec::new();
+    let mut others = Vec::new();
     let mut attempt = journal.as_ref();
     while let Some(a) = attempt {
-        if a.dispatch_started
-            || a.message_may_have_dispatched
-            || a.envelope.is_some()
-            || a.settled_at_unix.is_some()
-            || a.readmission.as_ref().is_some_and(|r| r.reported)
-            || a.operation.as_ref().is_some_and(|l| l.operation_id != op.operation_id)
-        {
-            return false;
+        if a.operation.as_ref().is_some_and(|l| l.operation_id != op.operation_id) {
+            others.push(a.payment_hash.as_str());
+        } else {
+            if a.dispatch_started
+                || a.message_may_have_dispatched
+                || a.envelope.is_some()
+                || a.settled_at_unix.is_some()
+                || a.readmission.as_ref().is_some_and(|r| r.reported)
+            {
+                return false;
+            }
+            hashes.push(a.payment_hash.clone());
         }
-        hashes.push(a.payment_hash.clone());
         attempt = a.previous_attempt.as_deref();
     }
-    if let Some(hash) = &op.admission_payment_hash {
+    // `draft` copies the peer's latest attempt onto the row, whoever made it.
+    if let Some(hash) = op.admission_payment_hash.as_ref().filter(|hash| !others.contains(&hash.as_str())) {
         if journal.is_some() && !hashes.contains(hash) {
             return false;
         }
@@ -1558,6 +1582,8 @@ async fn compact_terminal_operations(
                 ldk_fee_evidence: data.ldk_fee_evidence,
                 compacted_fee_paid_msat,
                 caller: data.caller,
+                call_offer: data.call_offer,
+                call_block: data.call_block,
                 fee_ceiling_msat: data.fee_ceiling_msat,
                 admission_msat: data.admission_msat,
                 ..Default::default()
@@ -1736,6 +1762,16 @@ fn incomplete_settled_recovery(op: &OutboxOperation) -> bool {
 
 pub(crate) fn call_block_binding(op: &OutboxOperation) -> Result<Option<(String, u32)>, konsensus_storage::StorageError> {
     recovery(op).map(|r| r.call_block).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
+}
+
+pub(crate) fn call_offer_binding(op: &OutboxOperation) -> Result<Option<String>, konsensus_storage::StorageError> {
+    recovery(op).map(|r| r.call_offer).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
+}
+
+/// Caller provenance is retained even when payment recovery is compacted.
+pub(crate) fn owner_funded_call_operation(op: &OutboxOperation) -> Result<bool, konsensus_storage::StorageError> {
+    recovery(op).map(|r| r.caller.is_none() && !op.operation_id.starts_with("legacy:"))
+        .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))
 }
 
 pub(crate) fn settled_call_block(op: &OutboxOperation) -> Result<bool, konsensus_storage::StorageError> {

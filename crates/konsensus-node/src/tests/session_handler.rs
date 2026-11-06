@@ -1,6 +1,9 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use super::*;
 use konsensus_storage::{OnboardingStateRecord, Storage};
 use sha2::Digest;
+use tracing_subscriber::layer::SubscriberExt;
 
 fn test_peer_id() -> NodeId {
     NodeId::from_bytes([1u8; 32])
@@ -54,8 +57,13 @@ async fn e2ee_self_heal_targets_missing_or_receiver_only_sessions() {
         .unwrap();
 
     assert!(
+        e2ee_needs_self_heal(&alice_mgr, bob.node_id()).await,
+        "an initiator the peer has not confirmed keeps asking"
+    );
+    assert!(alice_mgr.confirm_session(bob.node_id()).await);
+    assert!(
         !e2ee_needs_self_heal(&alice_mgr, bob.node_id()).await,
-        "initiator with an initialized sending chain should not churn"
+        "initiator with a confirmed sending chain should not churn"
     );
     assert!(
         e2ee_needs_self_heal(&bob_mgr, alice.node_id()).await,
@@ -2155,15 +2163,18 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                     peer_id,
                     init_data: serde_json::json!({"secret": "do not retain"}),
                     privileged,
+                    connection: Arc::new(no_hello_connection()),
                 },
                 ControlEvent::SessionAck {
                     peer_id,
                     privileged,
+                    connection: Arc::new(no_hello_connection()),
                 },
                 ControlEvent::RatchetInit {
                     peer_id,
                     payload: b"do not retain".to_vec(),
                     privileged,
+                    connection: Arc::new(no_hello_connection()),
                 },
                 ControlEvent::MessageAcked {
                     paid_until_ms: None,
@@ -2204,6 +2215,8 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                     peer_id,
                     bundle: serde_json::json!({"secret": "do not retain"}),
                     privileged,
+                    connection: Arc::new(no_hello_connection()),
+                    received_at: std::time::Instant::now(),
                 },
                 ControlEvent::PriceTableReceived {
                     peer_id,
@@ -4023,10 +4036,10 @@ async fn session_decode_logs_do_not_echo_peer_json() {
     let hostile = serde_json::json!("peer-controlled-secret");
     handle_prekey_offer(
         &peer, hostile.clone(), *identity.node_id(), &manager, &storage,
-        &transport, &audit, &mut negotiations,
+        &transport, &audit, &mut negotiations, &mut OfferWitness::default(), &connection_of(&identity), std::time::Instant::now(),
     ).await;
     handle_session_init(
-        &peer, hostile, &manager, &storage, &transport, &audit, &mut negotiations,
+        &peer, hostile, &manager, &storage, &transport, &audit, &mut negotiations, &connection_of(&identity),
     ).await;
     assert!(!manager.has_session(&peer).await);
     assert!(negotiations.is_empty());
@@ -4146,6 +4159,8 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
             &transport,
             &audit,
             &mut negotiations,
+            &mut OfferWitness::default(),
+            &connection_of(&high), std::time::Instant::now(),
         )
         .await;
         assert!(
@@ -4155,7 +4170,9 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
         assert_session_works(&low, &low_mgr, &high, &high_mgr, label).await;
     }
 
-    // A genuine re-offer (the peer restarted with fresh keys) still re-keys.
+    // A genuine re-offer (the peer restarted with fresh keys) still re-keys once
+    // the session is marked for it.
+    low_mgr.mark_needs_renegotiation(high.node_id()).await;
     let restarted = SessionManager::new(Arc::clone(&high));
     let offer = serde_json::to_value(restarted.prekey_bundle().await).unwrap();
     handle_prekey_offer(
@@ -4167,21 +4184,325 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
         &transport,
         &audit,
         &mut negotiations,
+        &mut OfferWitness::default(),
+        &connection_of(&high), std::time::Instant::now(),
     )
     .await;
     assert!(
         negotiations.contains_key(high.node_id()),
         "a valid offer is a negotiation"
     );
-    assert!(low_mgr.can_send(high.node_id()).await);
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "unconfirmed re-key").await;
+    assert!(low_mgr.confirm_session(high.node_id()).await);
     let msg = low_mgr
         .encrypt(high.node_id(), b"after the re-key")
         .await
         .unwrap();
     assert!(
         high_mgr.decrypt(low.node_id(), &msg).await.is_err(),
-        "the previous session was replaced by the valid offer"
+        "the confirmation retired the previous session"
     );
+}
+
+/// A valid but stale offer reaching a session marked for renegotiation is acted on,
+/// and its one-time pre-key is gone, so the peer refuses the init and sends no
+/// SessionAck. Nothing confirms the new session, so the initiator keeps the current
+/// one and both sides still talk.
+#[tokio::test]
+async fn a_stale_offer_the_peer_refuses_leaves_the_working_session_alone() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+    let mut high_negotiations = std::collections::HashMap::new();
+
+    // The bundle as first offered, then its one-time pre-key spent on a real re-key.
+    let stale = high_mgr.prekey_bundle().await;
+    let init = low_mgr.reinitiate_session(high.node_id(), &stale).await.unwrap();
+    high_mgr.reaccept_session(low.node_id(), &init).await.unwrap();
+    assert!(low_mgr.confirm_session(high.node_id()).await);
+    let first = low_mgr.encrypt(high.node_id(), b"ratchet-init").await.unwrap();
+    high_mgr.decrypt(low.node_id(), &first).await.unwrap();
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the real re-key").await;
+
+    let replay = low_mgr.reinitiate_session(high.node_id(), &stale).await.unwrap();
+    handle_session_init(
+        low.node_id(), serde_json::to_value(&replay).unwrap(), &high_mgr,
+        &storage, &transport, &audit, &mut high_negotiations, &connection_of(&low),
+    ).await;
+    assert!(high_negotiations.is_empty(), "the peer refuses the init, so nothing confirms it");
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the stale offer").await;
+}
+
+/// One stale offer does not touch a healthy session on the lower id: no negotiation
+/// starts, and the session still works.
+#[tokio::test]
+async fn a_single_stale_offer_does_not_touch_a_healthy_session() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+    let mut negotiations = std::collections::HashMap::new();
+    assert!(low_mgr.confirm_session(high.node_id()).await);
+    handle_prekey_offer(
+        high.node_id(), serde_json::to_value(high_mgr.prekey_bundle().await).unwrap(), *low.node_id(), &low_mgr,
+        &storage, &transport, &audit, &mut negotiations, &mut OfferWitness::default(), &connection_of(&high), std::time::Instant::now(),
+    ).await;
+    assert!(negotiations.is_empty(), "no negotiation for one offer");
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after one offer").await;
+}
+
+/// The same with the responder restarted: restored from storage it holds the working
+/// session and new prekeys, so an offer from before the restart could only derive
+/// different keys. The lower id does not act on it, and the restored session works.
+#[tokio::test]
+async fn a_stale_offer_across_a_responder_restart_does_not_touch_the_session() {
+    #[derive(Default)]
+    struct Memory(std::sync::Mutex<std::collections::HashMap<NodeId, Vec<u8>>>);
+    #[async_trait::async_trait]
+    impl konsensus_crypto::SessionStore for Memory {
+        async fn save_session(&self, peer: &NodeId, state: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().unwrap().insert(*peer, state.to_vec());
+            Ok(())
+        }
+        async fn load_session(&self, peer: &NodeId) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.0.lock().unwrap().get(peer).cloned())
+        }
+        async fn delete_session(&self, peer: &NodeId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().unwrap().remove(peer);
+            Ok(())
+        }
+        async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.0.lock().unwrap().keys().copied().collect())
+        }
+    }
+    let (first, second) = (Arc::new(NodeIdentity::generate().unwrap().1), Arc::new(NodeIdentity::generate().unwrap().1));
+    let (low, high) = if first.node_id().as_bytes() < second.node_id().as_bytes() { (first, second) } else { (second, first) };
+    let store = Arc::new(Memory::default());
+    let low_mgr = SessionManager::new(Arc::clone(&low));
+    let high_mgr = SessionManager::with_store(Arc::clone(&high), store.clone());
+    let init = low_mgr.initiate_session(high.node_id(), &high_mgr.prekey_bundle().await).await.unwrap();
+    high_mgr.accept_session(low.node_id(), &init).await.unwrap();
+    assert!(low_mgr.confirm_session(high.node_id()).await);
+    let ratchet_init = low_mgr.encrypt(high.node_id(), b"ratchet-init").await.unwrap();
+    high_mgr.decrypt(low.node_id(), &ratchet_init).await.unwrap();
+    let stale = high_mgr.prekey_bundle().await;
+
+    let restored = SessionManager::with_store(Arc::clone(&high), store);
+    assert_eq!(restored.restore_sessions().await, 1);
+    assert_ne!(
+        restored.prekey_bundle().await.signed_prekey, stale.signed_prekey,
+        "the restart generated new prekeys"
+    );
+
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let mut negotiations = std::collections::HashMap::new();
+    handle_prekey_offer(
+        high.node_id(), serde_json::to_value(&stale).unwrap(), *low.node_id(), &low_mgr,
+        &storage, &make_gossip_test_transport(), &make_gossip_audit_log(), &mut negotiations,
+        &mut OfferWitness::default(), &connection_of(&high), std::time::Instant::now(),
+    ).await;
+    assert!(negotiations.is_empty(), "no negotiation from a stale offer");
+    assert_session_works(&low, &low_mgr, &high, &restored, "after a responder restart").await;
+}
+
+/// The rule for replacing a healthy session: a second offer on the same connection,
+/// a tick or more after the first and not long after it. Connect offers don't count.
+#[test]
+fn offer_witness_needs_two_spaced_offers_on_one_connection() {
+    use std::time::Duration;
+    let peer = test_peer_id();
+    let connection = std::time::Instant::now();
+    let at = |secs: u64| connection + Duration::from_secs(secs);
+    let mut witness = OfferWitness::default();
+
+    assert!(!witness.second_spaced_offer(&peer, connection, at(1)), "a connect offer");
+    assert!(!witness.second_spaced_offer(&peer, connection, at(9)), "still a connect offer");
+    assert!(!witness.second_spaced_offer(&peer, connection, at(10)), "the first that counts");
+    assert!(!witness.second_spaced_offer(&peer, connection, at(24)), "under a tick apart");
+    assert!(witness.second_spaced_offer(&peer, connection, at(25)), "a tick apart");
+    assert!(!witness.second_spaced_offer(&peer, connection, at(26)), "counting starts over");
+
+    // Too far apart: the old one has expired and this one counts as the first.
+    let mut witness = OfferWitness::default();
+    assert!(!witness.second_spaced_offer(&peer, connection, at(100)));
+    assert!(!witness.second_spaced_offer(&peer, connection, at(146)), "expired");
+    assert!(witness.second_spaced_offer(&peer, connection, at(161)));
+
+    // A new connection starts over.
+    let mut witness = OfferWitness::default();
+    assert!(!witness.second_spaced_offer(&peer, connection, at(100)));
+    let next = at(110);
+    assert!(!witness.second_spaced_offer(&peer, next, next + Duration::from_secs(10)));
+    assert!(!witness.second_spaced_offer(&peer, connection, at(125)), "not the old connection's second");
+}
+
+/// A burst of distinct peers cannot grow the witness past the cooldown-map cap.
+/// A peer that already has a slot can still complete the pair.
+#[test]
+fn offer_witness_stops_at_the_cap() {
+    use std::time::Duration;
+    let connection = std::time::Instant::now() - Duration::from_secs(30);
+    let now = std::time::Instant::now();
+    let mut witness = OfferWitness::default();
+    for n in 0..MAX_COOLDOWN_ENTRIES {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&(n as u32).to_be_bytes());
+        let peer = NodeId::from_bytes(bytes);
+        assert!(!witness.second_spaced_offer(&peer, connection, now), "first offer is recorded");
+    }
+    assert_eq!(witness.len(), MAX_COOLDOWN_ENTRIES);
+    let extra = NodeId::from_bytes([0xff; 32]);
+    assert!(!witness.second_spaced_offer(&extra, connection, now), "no new slot past the cap");
+    assert_eq!(witness.len(), MAX_COOLDOWN_ENTRIES, "the map does not grow");
+    let first = NodeId::from_bytes({
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&0u32.to_be_bytes());
+        bytes
+    });
+    assert!(
+        witness.second_spaced_offer(&first, connection, now + SESSION_SELF_HEAL_INTERVAL),
+        "a recorded peer still completes the pair"
+    );
+    assert_eq!(witness.len(), MAX_COOLDOWN_ENTRIES - 1);
+}
+
+/// An offer counts on the connection it came on, whatever the transport holds by now:
+/// a frame read from a connection already replaced is not credited to its replacement.
+#[tokio::test]
+async fn an_offer_counts_on_the_connection_it_came_on() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    assert!(low_mgr.confirm_session(high.node_id()).await);
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let mut witness = OfferWitness::default();
+    let mut connection = connection_of(&high);
+    connection.generation -= std::time::Duration::from_secs(20);
+    handle_prekey_offer(
+        high.node_id(), serde_json::to_value(high_mgr.prekey_bundle().await).unwrap(), *low.node_id(), &low_mgr,
+        &storage, &make_gossip_test_transport(), &make_gossip_audit_log(), &mut std::collections::HashMap::new(),
+        &mut witness, &connection, std::time::Instant::now(),
+    ).await;
+    assert_eq!(witness.first.get(high.node_id()).map(|(seen_on, _)| *seen_on), Some(connection.generation));
+}
+
+/// A well-formed SessionInit whose keys the initiator does not share costs nothing:
+/// the working session stays until a message decrypts under the new one.
+#[tokio::test]
+async fn a_well_formed_session_init_alone_does_not_replace_the_session() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+    let mut negotiations = std::collections::HashMap::new();
+    let other_identity = Arc::new(NodeIdentity::generate().unwrap().1);
+    let other = SessionManager::new(Arc::clone(&other_identity));
+    let init = other.initiate_session(high.node_id(), &high_mgr.prekey_bundle().await).await.unwrap();
+    // The Hello key matches the init's, so this passes the key check and reaches the
+    // rule under test.
+    handle_session_init(
+        low.node_id(), serde_json::to_value(&init).unwrap(), &high_mgr,
+        &storage, &transport, &audit, &mut negotiations, &connection_of(&other_identity),
+    ).await;
+    assert!(negotiations.contains_key(low.node_id()), "the init was accepted");
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the init").await;
+}
+
+/// A SessionAck nobody asked for changes nothing: no session is promoted and no
+/// ratchet message is spent, so nothing is written.
+#[tokio::test]
+async fn an_unexpected_session_ack_changes_nothing() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    // The first session's own acknowledgement: after it nothing awaits one.
+    assert!(low_mgr.confirm_session(high.node_id()).await);
+    let before = low_mgr.encrypt(high.node_id(), b"before the stray ack").await.unwrap();
+    assert_eq!(high_mgr.decrypt(low.node_id(), &before).await.unwrap(), b"before the stray ack");
+
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+    handle_session_ack(high.node_id(), &low_mgr, &transport, &audit).await;
+
+    // A RatchetInit would have taken the next position, written or not.
+    let after = low_mgr.encrypt(high.node_id(), b"after the stray ack").await.unwrap();
+    assert_eq!(after.header.dh_public, before.header.dh_public, "same sending chain");
+    assert_eq!(after.header.message_number, before.header.message_number + 1, "no position spent");
+    assert_eq!(high_mgr.decrypt(low.node_id(), &after).await.unwrap(), b"after the stray ack");
+    assert!(!low_mgr.needs_renegotiation(high.node_id()).await);
+    assert!(!low_mgr.replacement_pending(high.node_id()).await);
+}
+
+/// A RatchetInit the session cannot read does not cost the session: it stays, and
+/// the node asks for a replacement.
+#[tokio::test]
+async fn an_unreadable_ratchet_init_keeps_the_session_and_asks_to_renegotiate() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = Arc::new(make_gossip_test_transport());
+    let foreign = SessionManager::new(Arc::clone(&low));
+    let init = foreign.initiate_session(high.node_id(), &high_mgr.prekey_bundle().await).await.unwrap();
+    drop(init);
+    let unreadable = foreign.encrypt(high.node_id(), b"ratchet-init").await.unwrap();
+    handle_ratchet_init(
+        low.node_id(), &konsensus_crypto::ratchet_message_to_bytes(&unreadable), &high_mgr, &storage, &transport,
+    ).await;
+    assert!(high_mgr.needs_renegotiation(low.node_id()).await);
+    assert!(e2ee_needs_self_heal(&high_mgr, low.node_id()).await, "the tick keeps asking");
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after an unreadable ratchet init").await;
+}
+
+/// Further unreadable inits do not each ask again. One that does decrypt still
+/// retires the request.
+#[tokio::test(flavor = "current_thread")]
+async fn a_second_unreadable_ratchet_init_asks_only_once() {
+    struct Asks(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Asks {
+        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            let mut message = String::new();
+            struct Take<'a>(&'a mut String);
+            impl tracing::field::Visit for Take<'_> {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+            }
+            event.record(&mut Take(&mut message));
+            if message.contains("re-negotiating") {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = Arc::new(make_gossip_test_transport());
+    let foreign = SessionManager::new(Arc::clone(&low));
+    let init = foreign.initiate_session(high.node_id(), &high_mgr.prekey_bundle().await).await.unwrap();
+    drop(init);
+    let unreadable = konsensus_crypto::ratchet_message_to_bytes(
+        &foreign.encrypt(high.node_id(), b"ratchet-init").await.unwrap(),
+    );
+    let asks = Arc::new(AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(Asks(Arc::clone(&asks)));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    handle_ratchet_init(low.node_id(), &unreadable, &high_mgr, &storage, &transport).await;
+    handle_ratchet_init(low.node_id(), &unreadable, &high_mgr, &storage, &transport).await;
+    assert_eq!(asks.load(Ordering::SeqCst), 1, "the second failure does not ask again");
+    assert!(high_mgr.needs_renegotiation(low.node_id()).await);
+
+    let readable = konsensus_crypto::ratchet_message_to_bytes(
+        &low_mgr.encrypt(high.node_id(), b"ratchet-init").await.unwrap(),
+    );
+    handle_ratchet_init(low.node_id(), &readable, &high_mgr, &storage, &transport).await;
+    assert!(!high_mgr.needs_renegotiation(low.node_id()).await, "a readable init clears the request");
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the readable ratchet init").await;
 }
 
 /// A malformed SessionInit, or one naming a one-time pre-key this node does
@@ -4223,6 +4544,7 @@ async fn malformed_session_init_leaves_the_working_session_alone() {
             &transport,
             &audit,
             &mut negotiations,
+            &connection_of(&low),
         )
         .await;
         assert!(
@@ -4251,6 +4573,7 @@ async fn malformed_session_init_leaves_the_working_session_alone() {
         &transport,
         &audit,
         &mut negotiations,
+        &connection_of(&low),
     )
     .await;
     assert!(
@@ -4283,6 +4606,16 @@ fn receipt_refusals_are_terminal_for_the_sender() {
     assert!(terminal_paid_rejection("message withdrawn"));
     assert!(terminal_paid_rejection("call signal withdrawn"));
     assert!(!terminal_paid_rejection("storage error"));
+}
+
+/// The legacy refusal of an unreadable block also covered the skip-limit failure a
+/// later delivery can cure, and older recipients still send it. It stays retryable;
+/// a recipient that knows the block is final says so with `undecryptable:`.
+#[test]
+fn legacy_unreadable_block_refusal_stays_retryable() {
+    let legacy = konsensus_core::payloads::call::CallRefusal::Invalid("undecryptable").to_string();
+    assert_eq!(legacy, "invalid call signal: undecryptable");
+    assert!(!terminal_paid_rejection(&legacy));
 }
 
 /// The refusal was lost and the flusher resent the same bytes: the recipient
@@ -4387,6 +4720,7 @@ async fn call_block_invoice_at_exact_price_is_minted_without_granting_a_minute()
     use konsensus_core::payloads::call as calls;
     let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
     let peer = test_peer_id();
+    let sessions = session_with(&peer).await;
     let id = "0123456789abcdef0123456789abcdef";
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let ringing = calls::receive(None, 400, None, now).unwrap();
@@ -4396,7 +4730,7 @@ async fn call_block_invoice_at_exact_price_is_minted_without_granting_a_minute()
     let balance = wallet.get_balance_msat().await.unwrap();
     let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
 
-    let invoice = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &peer, &purpose, 23_000, "exact", &wallet).await.unwrap();
+    let invoice = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &sessions, &peer, &purpose, 23_000, "exact", &wallet).await.unwrap();
 
     assert_eq!(invoice.amount_msat, 23_000);
     let payments = wallet.list_payments(10).await.unwrap();
@@ -4415,6 +4749,7 @@ async fn call_block_invoice_refuses_lower_and_higher_amounts_without_an_invoice(
     for amount in [22_000, 24_000] {
         let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
         let peer = test_peer_id();
+        let sessions = session_with(&peer).await;
         let id = "0123456789abcdef0123456789abcdef";
         let now = chrono::Utc::now().timestamp_millis() as u64;
         let ringing = calls::receive(None, 400, None, now).unwrap();
@@ -4427,7 +4762,7 @@ async fn call_block_invoice_refuses_lower_and_higher_amounts_without_an_invoice(
         let balance = wallet.get_balance_msat().await.unwrap();
         let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
 
-        let result = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &peer, &purpose, amount, "mismatch", &wallet).await;
+        let result = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &sessions, &peer, &purpose, amount, "mismatch", &wallet).await;
 
         assert_eq!(result.unwrap_err(), "konsensus:call_price_changed", "requested {amount}");
         assert!(wallet.list_payments(10).await.unwrap().is_empty(), "no invoice created");
@@ -4447,6 +4782,7 @@ async fn call_block_invoice_after_price_raise_refuses_the_next_block_at_the_old_
     use konsensus_core::payloads::call as calls;
     let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
     let peer = test_peer_id();
+    let sessions = session_with(&peer).await;
     let id = "0123456789abcdef0123456789abcdef";
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let ringing = calls::receive(None, 400, None, now).unwrap();
@@ -4454,7 +4790,7 @@ async fn call_block_invoice_after_price_raise_refuses_the_next_block_at_the_old_
     storage.call_put(&peer, id, &live).await.unwrap();
     let wallet = konsensus_lightning::MockLightningProvider::new();
     let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
-    let first = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &peer, &purpose, 23_000, "first", &wallet).await.unwrap();
+    let first = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &sessions, &peer, &purpose, 23_000, "first", &wallet).await.unwrap();
     wallet.pay_invoice(&first.bolt11).await.unwrap();
     let paid = calls::receive_block(Some(live), 0, now).unwrap();
     // Move the paid interval into its renewal window without sleeping a minute.
@@ -4464,7 +4800,7 @@ async fn call_block_invoice_after_price_raise_refuses_the_next_block_at_the_old_
     let payment_count = wallet.list_payments(10).await.unwrap().len();
     let purpose = format!("{}{id}:1", calls::CALL_BLOCK_INVOICE_PREFIX);
 
-    let result = prepare_call_block_invoice(&storage, &call_block_pricing(31_000), &peer, &purpose, 23_000, "stale-next", &wallet).await;
+    let result = prepare_call_block_invoice(&storage, &call_block_pricing(31_000), &sessions, &peer, &purpose, 23_000, "stale-next", &wallet).await;
 
     assert_eq!(result.unwrap_err(), "konsensus:call_price_changed");
     assert_eq!(wallet.list_payments(10).await.unwrap().len(), payment_count);
@@ -4487,14 +4823,15 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     let live = calls::commit(pending, "answer", now - 16_000).unwrap();
     storage.call_put(&peer, id, &live).await.unwrap();
     let wallet = konsensus_lightning::MockLightningProvider::new();
+    let sessions = session_with(&peer).await;
     let balance = wallet.get_balance_msat().await.unwrap();
     let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
-    let refused = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &peer, &purpose, 23_000, "block", &wallet).await;
+    let refused = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &sessions, &peer, &purpose, 23_000, "block", &wallet).await;
     assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert!(wallet.list_payments(10).await.unwrap().is_empty(), "no invoice or payment should be created");
     assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
     storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
-    let issued = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &peer, &purpose, 23_000, "block-ok", &wallet).await.unwrap();
+    let issued = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &sessions, &peer, &purpose, 23_000, "block-ok", &wallet).await.unwrap();
     assert_eq!(issued.expiry_secs, 5);
     let hash = hex::decode(&issued.payment_hash).unwrap().try_into().unwrap();
     assert!(storage.has_call_block_invoice(&peer, id, 0, &hash).await.unwrap());
@@ -4502,9 +4839,55 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     // An unavailable provenance store withholds the invoice before any payment.
     sqlx::query("CREATE TRIGGER fail_block_invoice BEFORE INSERT ON call_block_invoices BEGIN SELECT RAISE(FAIL, 'test'); END")
         .execute(storage.pool()).await.unwrap();
-    assert_eq!(prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &peer, &purpose, 23_000, "write-fails", &wallet).await.unwrap_err(),
+    assert_eq!(prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &sessions, &peer, &purpose, 23_000, "write-fails", &wallet).await.unwrap_err(),
         konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
+}
+
+/// A session manager holding a session with `peer`.
+async fn session_with(peer: &NodeId) -> SessionManager {
+    let identity = Arc::new(NodeIdentity::generate().unwrap().1);
+    let our_id = *identity.node_id();
+    let ours = SessionManager::new(identity);
+    let theirs = SessionManager::new(Arc::new(NodeIdentity::generate().unwrap().1));
+    let init = theirs.initiate_session(&our_id, &ours.prekey_bundle().await).await.unwrap();
+    ours.accept_session(peer, &init).await.unwrap();
+    ours
+}
+
+/// A callee with no session refuses the invoice before any wallet call, so the
+/// caller pays nothing for a minute this node could not read. The refusal is
+/// not final: the same block is invoiced once the session is back.
+#[tokio::test]
+async fn call_block_invoice_is_refused_without_a_session() {
+    use konsensus_core::payloads::call as calls;
+    let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let ringing = calls::receive(None, 400, None, now - 16_000).unwrap();
+    let pending = calls::reserve(Some(ringing), 401, "answer", "hash", now - 16_000).unwrap();
+    let live = calls::commit(pending, "answer", now - 16_000).unwrap();
+    storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
+    let wallet = konsensus_lightning::MockLightningProvider::new();
+    let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
+    let sessions = session_with(&peer).await;
+
+    assert!(sessions.remove_session(&peer).await);
+    let refused = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &sessions, &peer, &purpose, 23_000, "no-session", &wallet).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
+    assert!(wallet.list_payments(10).await.unwrap().is_empty(), "the wallet was not asked for an invoice");
+
+    let sessions = session_with(&peer).await;
+    sessions.mark_needs_renegotiation(&peer).await;
+    let refused = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &sessions, &peer, &purpose, 23_000, "disputed", &wallet).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
+    assert!(wallet.list_payments(10).await.unwrap().is_empty(), "nor for a session being renegotiated");
+
+    let sessions = session_with(&peer).await;
+    let issued = prepare_call_block_invoice(&storage, &call_block_pricing(23_000), &sessions, &peer, &purpose, 23_000, "session-back", &wallet).await.unwrap();
+    let hash = hex::decode(&issued.payment_hash).unwrap().try_into().unwrap();
+    assert!(storage.has_call_block_invoice(&peer, id, 0, &hash).await.unwrap());
 }
 
 #[tokio::test]
@@ -4552,4 +4935,199 @@ async fn call_block_ack_storage_failure_retains_delivery_until_grant_is_durable(
     assert_eq!(paid.phase, calls::Phase::Live);
     assert_eq!(paid.paid_until_ms, Some(now + 60_000));
     assert!(updates.try_recv().is_ok());
+}
+
+/// A disk failure while sending the ratchet init costs no session: it is kept with
+/// its chain put back, and the same acknowledgement works once saves do.
+#[tokio::test]
+async fn failed_save_of_the_ratchet_init_keeps_the_session() {
+    use crate::flaky_session_store::FlakySessionStore;
+    let (_, identity) = NodeIdentity::generate().unwrap();
+    let (_, responder) = NodeIdentity::generate().unwrap();
+    let (our_id, peer) = (*identity.node_id(), *responder.node_id());
+    let store = Arc::new(FlakySessionStore::default());
+    let manager = SessionManager::with_store(Arc::new(identity), store.clone());
+    let responder = SessionManager::new(Arc::new(responder));
+    let init = manager.initiate_session(&peer, &responder.prekey_bundle().await).await.unwrap();
+    responder.accept_session(&our_id, &init).await.unwrap();
+    let transport = make_gossip_test_transport();
+    let audit = make_gossip_audit_log();
+
+    store.fail(true);
+    handle_session_ack(&peer, &manager, &transport, &audit).await;
+    assert!(manager.has_session(&peer).await, "a failed save does not remove the session");
+
+    store.fail(false);
+    let message = manager.encrypt(&peer, b"after the failure").await.unwrap();
+    assert_eq!(message.header.message_number, 0, "the withheld init left no gap");
+    assert_eq!(responder.decrypt(&our_id, &message).await.unwrap(), b"after the failure");
+}
+
+// ── Bundle and init against the connection's Hello ──────────────────
+
+/// A connection whose Hello presented this identity's key.
+fn connection_of(identity: &NodeIdentity) -> konsensus_message::ConnectionContext {
+    konsensus_message::ConnectionContext {
+        generation: std::time::Instant::now(),
+        hello_key: Some(*identity.x25519_public().as_bytes()),
+        capabilities: Vec::new(),
+    }
+}
+
+/// A connection with no Hello key available, which every check must treat as failed.
+fn no_hello_connection() -> konsensus_message::ConnectionContext {
+    konsensus_message::ConnectionContext {
+        generation: std::time::Instant::now(),
+        hello_key: None,
+        capabilities: Vec::new(),
+    }
+}
+
+/// `handle_prekey_offer` on the lower id, with empty negotiations, for this bundle and
+/// connection. Returns whether it started a negotiation.
+async fn offer_starts_negotiation(
+    low: &NodeIdentity,
+    low_mgr: &SessionManager,
+    high: &NodeIdentity,
+    bundle: serde_json::Value,
+    connection: &konsensus_message::ConnectionContext,
+) -> bool {
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let mut negotiations = std::collections::HashMap::new();
+    handle_prekey_offer(
+        high.node_id(), bundle, *low.node_id(), low_mgr, &storage,
+        &make_gossip_test_transport(), &make_gossip_audit_log(), &mut negotiations, &mut OfferWitness::default(), connection, std::time::Instant::now(),
+    ).await;
+    negotiations.contains_key(high.node_id())
+}
+
+/// `handle_session_init` on the higher id. Returns whether it accepted the init.
+async fn init_accepted(
+    low: &NodeIdentity,
+    high_mgr: &SessionManager,
+    init: serde_json::Value,
+    connection: &konsensus_message::ConnectionContext,
+) -> bool {
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let mut negotiations = std::collections::HashMap::new();
+    handle_session_init(
+        low.node_id(), init, high_mgr, &storage,
+        &make_gossip_test_transport(), &make_gossip_audit_log(), &mut negotiations, connection,
+    ).await;
+    negotiations.contains_key(low.node_id())
+}
+
+/// A bundle whose identity key is not the key of the connection it came on changes
+/// nothing, and neither does any bundle when the connection has no Hello key.
+#[tokio::test]
+async fn offer_with_an_identity_key_other_than_the_hello_key_changes_nothing() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let bundle = serde_json::to_value(high_mgr.prekey_bundle().await).unwrap();
+    let other = NodeIdentity::generate().unwrap().1;
+    for (label, connection) in [("another key", connection_of(&other)), ("no key", no_hello_connection())] {
+        assert!(!offer_starts_negotiation(&low, &low_mgr, &high, bundle.clone(), &connection).await, "{label}");
+        assert_session_works(&low, &low_mgr, &high, &high_mgr, label).await;
+    }
+    assert!(offer_starts_negotiation(&low, &low_mgr, &high, bundle, &connection_of(&high)).await, "the honest case");
+}
+
+/// A correctly signed bundle that uses its identity key as the signed prekey changes
+/// nothing.
+#[tokio::test]
+async fn offer_with_the_identity_key_as_signed_prekey_changes_nothing() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let mut bundle = high_mgr.prekey_bundle().await;
+    bundle.signed_prekey = bundle.identity_key.clone();
+    let signature = ed25519_dalek::Signer::sign(high.ed25519_signing_key(), high.x25519_public().as_bytes());
+    bundle.signed_prekey_sig = hex::encode(signature.to_bytes());
+    let offer = serde_json::to_value(&bundle).unwrap();
+    assert!(!offer_starts_negotiation(&low, &low_mgr, &high, offer, &connection_of(&high)).await);
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the offer").await;
+}
+
+/// The same when only the top bit differs: X25519 ignores that bit, so these different
+/// bytes are the identity key's own point.
+#[tokio::test]
+async fn offer_with_the_identity_key_point_in_other_bytes_changes_nothing() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let mut bundle = high_mgr.prekey_bundle().await;
+    let mut point = *high.x25519_public().as_bytes();
+    point[31] ^= 0x80;
+    assert_ne!(point, *high.x25519_public().as_bytes());
+    bundle.signed_prekey = hex::encode(point);
+    let signature = ed25519_dalek::Signer::sign(high.ed25519_signing_key(), &point);
+    bundle.signed_prekey_sig = hex::encode(signature.to_bytes());
+    let offer = serde_json::to_value(&bundle).unwrap();
+    assert!(!offer_starts_negotiation(&low, &low_mgr, &high, offer, &connection_of(&high)).await);
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the offer").await;
+}
+
+/// An init whose identity key is not the connection's Hello key is refused before
+/// anything changes: the session stays and no one-time pre-key is consumed.
+#[tokio::test]
+async fn init_with_an_identity_key_other_than_the_hello_key_changes_nothing() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let held = high_mgr.prekey_bundle().await.one_time_prekey_id;
+    let other = Arc::new(NodeIdentity::generate().unwrap().1);
+    let init = SessionManager::new(Arc::clone(&other))
+        .initiate_session(high.node_id(), &high_mgr.prekey_bundle().await)
+        .await
+        .unwrap();
+    let init = serde_json::to_value(&init).unwrap();
+    for (label, connection) in [("the sender's key", connection_of(&low)), ("no key", no_hello_connection())] {
+        assert!(!init_accepted(&low, &high_mgr, init.clone(), &connection).await, "{label}");
+        assert_eq!(high_mgr.prekey_bundle().await.one_time_prekey_id, held, "{label}: no pre-key consumed");
+        assert_session_works(&low, &low_mgr, &high, &high_mgr, label).await;
+    }
+    assert!(init_accepted(&low, &high_mgr, init, &connection_of(&other)).await, "the same init from its own key");
+}
+
+/// Bundles and inits as nodes without these checks already send them pass, with and
+/// without a one-time pre-key. The field list pins the shape on the wire.
+#[tokio::test]
+async fn honest_bundles_and_inits_pass_the_checks() {
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let bundle = serde_json::to_value(high_mgr.prekey_bundle().await).unwrap();
+    let mut fields: Vec<&str> = bundle.as_object().unwrap().keys().map(String::as_str).collect();
+    fields.sort();
+    assert_eq!(fields, ["identity_key", "node_id", "one_time_prekey", "one_time_prekey_id", "signed_prekey", "signed_prekey_sig"]);
+    let mut without_prekey = bundle.clone();
+    without_prekey["one_time_prekey"] = serde_json::Value::Null;
+    without_prekey["one_time_prekey_id"] = serde_json::Value::Null;
+    assert!(offer_starts_negotiation(&low, &low_mgr, &high, without_prekey, &connection_of(&high)).await);
+    assert!(offer_starts_negotiation(&low, &low_mgr, &high, bundle.clone(), &connection_of(&high)).await);
+
+    let init = SessionManager::new(Arc::clone(&low))
+        .initiate_session(high.node_id(), &serde_json::from_value(bundle).unwrap())
+        .await
+        .unwrap();
+    assert!(init_accepted(&low, &high_mgr, serde_json::to_value(&init).unwrap(), &connection_of(&low)).await);
+}
+
+/// A responder restored from storage has new prekeys under new ids. An init built on
+/// its earlier bundle names an id it does not hold, so it is refused and the restored
+/// session stays. With ids restarting from the same point, it would have been accepted
+/// on keys the initiator does not share.
+#[tokio::test]
+async fn restored_responder_refuses_an_init_from_an_older_boot() {
+    use crate::flaky_session_store::FlakySessionStore;
+    let (a, b) = (Arc::new(NodeIdentity::generate().unwrap().1), Arc::new(NodeIdentity::generate().unwrap().1));
+    let (low, high) = if a.node_id().as_bytes() < b.node_id().as_bytes() { (a, b) } else { (b, a) };
+    let store = Arc::new(FlakySessionStore::default());
+    let low_mgr = SessionManager::new(Arc::clone(&low));
+    let high_mgr = SessionManager::with_store(Arc::clone(&high), store.clone());
+    let init = low_mgr.initiate_session(high.node_id(), &high_mgr.prekey_bundle().await).await.unwrap();
+    high_mgr.accept_session(low.node_id(), &init).await.unwrap();
+    let first = low_mgr.encrypt(high.node_id(), b"ratchet-init").await.unwrap();
+    high_mgr.decrypt(low.node_id(), &first).await.unwrap();
+    let older_boot = high_mgr.prekey_bundle().await;
+    assert!(older_boot.one_time_prekey_id.is_some());
+
+    let restored = SessionManager::with_store(Arc::clone(&high), store);
+    assert_eq!(restored.restore_sessions().await, 1);
+    let init = SessionManager::new(Arc::clone(&low)).initiate_session(high.node_id(), &older_boot).await.unwrap();
+    assert!(!init_accepted(&low, &restored, serde_json::to_value(&init).unwrap(), &connection_of(&low)).await);
+    assert_session_works(&low, &low_mgr, &high, &restored, "after the older init").await;
 }
