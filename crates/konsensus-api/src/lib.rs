@@ -54,10 +54,15 @@
 //!   from the `?token=<jwt>` query parameter inside `ws_handler`
 //!   (browsers cannot set `Authorization` on the WS handshake).
 //!   Functionally gated; see `ws.rs`.
+//! - `GET  /api/v1/calls/:call_id/media` — binary media WebSocket (M6 N2).
+//!   Validates the JWT inline like `/ws`, then requires a live pairing
+//!   binding, the `spend` scope, the owner subject and an admitted call.
+//!   Functionally gated; see `call_media.rs`.
 
 pub mod audit;
 pub mod auth;
 pub mod bootstrap;
+pub mod call_media;
 pub mod calls;
 pub mod control;
 pub mod custody;
@@ -240,7 +245,8 @@ fn build_router_with_options(
         .merge(handlers::starter_channel::routes())
         .merge(handlers::organism::routes())
         .merge(handlers::gossip::routes())
-        .merge(ws::routes());
+        .merge(ws::routes())
+        .merge(call_media::routes());
     let router = if remote {
         router.layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -364,6 +370,24 @@ pub async fn serve(
             tokio::select! {
                 _ = tick.tick() => staging_state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).sweep(&staging_state),
                 _ = staging_shutdown.changed() => break,
+            }
+        }
+    });
+    // Paid call deadlines are enforced independently of connected apps.
+    let call_state = state.clone();
+    let mut call_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64).unwrap_or(0);
+                    if let Err(error) = calls::maintain_calls(&call_state, now).await {
+                        tracing::warn!(%error, "call expiry maintenance failed");
+                    }
+                },
+                _ = call_shutdown.changed() => break,
             }
         }
     });

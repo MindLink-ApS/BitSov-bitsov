@@ -78,7 +78,7 @@ fn encode_decode_roundtrip_session_ack() {
 #[test]
 fn encode_decode_roundtrip_message_ack() {
     let id = MessageId::from_bytes([0xBB; 32]);
-    let frame = Frame::MessageAck { id, duplicate: false };
+    let frame = Frame::MessageAck { id, duplicate: false, paid_until_ms: None };
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {

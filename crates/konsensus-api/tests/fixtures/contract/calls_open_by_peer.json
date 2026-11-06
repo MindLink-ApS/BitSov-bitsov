@@ -1,0 +1,39 @@
+{
+  "body": [
+    {
+      "created": "<unix_ms>",
+      "direction": "outgoing",
+      "id": "0000000000000000000000000000dead",
+      "next_block_due_ms": null,
+      "next_block_seq": 0,
+      "op_id": "2d7c6b5a-4938-4f2e-9a1b-0c9d8e7f6a5b",
+      "paid_until_ms": null,
+      "state": "ended",
+      "unresolved_paid_admission": true
+    },
+    {
+      "created": null,
+      "direction": "outgoing",
+      "id": "0000000000000000000000000000ca11",
+      "next_block_due_ms": null,
+      "next_block_seq": 0,
+      "op_id": null,
+      "paid_until_ms": null,
+      "state": "ringing",
+      "unresolved_paid_admission": false
+    },
+    {
+      "created": null,
+      "direction": "incoming",
+      "id": "000000000000000000000000000a11ce",
+      "next_block_due_ms": "<unix_ms>",
+      "next_block_seq": 0,
+      "op_id": null,
+      "paid_until_ms": null,
+      "state": "live",
+      "unresolved_paid_admission": false
+    }
+  ],
+  "request": "GET /api/v1/calls?peer=<node-id>",
+  "status": 200
+}

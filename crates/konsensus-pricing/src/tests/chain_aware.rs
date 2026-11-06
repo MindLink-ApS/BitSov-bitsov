@@ -124,7 +124,7 @@ async fn realtime_signaling_uses_payment_gate_price() {
     assert_eq!(engine.get_price_msat(KIND_ICE_CANDIDATE).await.unwrap(), 59);
     // The call offer's own base (call_msat 10 000) takes the same multiplier.
     assert!(engine.get_price_msat(KIND_CALL_INVITE).await.unwrap() > 10_000);
-    assert_eq!(engine.category_price_overrides(), Some(vec![konsensus_core::kind::KIND_LONGFORM, KIND_CALL_INVITE]));
+    assert_eq!(engine.category_price_overrides(), Some(vec![konsensus_core::kind::KIND_LONGFORM, KIND_CALL_INVITE, konsensus_core::kind::KIND_CALL_BLOCK]));
 }
 
 #[tokio::test]
@@ -1099,7 +1099,7 @@ async fn seeded_chain_state_reports_an_expired_fetch_time() {
     );
 }
 
-// ── Freshness of reused values (Codex P2 on #78) ───────────────────
+// ── Freshness of reused values (review P2 on #78) ───────────────────
 
 /// Synced provider whose `estimate_fee` fails for the targets in `failing`.
 struct FlakyFeeChain {

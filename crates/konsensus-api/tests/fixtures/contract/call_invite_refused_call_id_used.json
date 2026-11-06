@@ -1,0 +1,9 @@
+{
+  "body": {
+    "code": "not_dispatched",
+    "error": "call offer replayed: this call id was already used",
+    "reason": "call_id_used"
+  },
+  "request": "POST /api/v1/messages/compose (kind 400)",
+  "status": 400
+}

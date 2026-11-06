@@ -48,6 +48,7 @@ fn entry(phase: Phase, side: Side, deadline_ms: u64, op: Option<&str>) -> CallEn
         phase,
         side,
         deadline_ms,
+        paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false,
         pending: op.map(|op| Pending {
             operation_id: op.into(),
             kind: 400,
@@ -116,9 +117,9 @@ async fn open_calls_keep_expired_unresolved_admission_and_isolate_peers_without_
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap(),
             json!([
-                {"id":"expired", "state":"ended", "direction":"outgoing", "unresolved_paid_admission":true, "created":123456, "op_id":"pending-offer"},
-                {"id":"incoming", "state":"ringing", "direction":"incoming", "unresolved_paid_admission":false, "created":null, "op_id":null},
-                {"id":"live", "state":"live", "direction":"outgoing", "unresolved_paid_admission":false, "created":null, "op_id":null}
+                {"id":"expired", "state":"ended", "direction":"outgoing", "unresolved_paid_admission":true, "created":123456, "op_id":"pending-offer", "paid_until_ms":null, "next_block_seq":0, "next_block_due_ms":null},
+                {"id":"incoming", "state":"ringing", "direction":"incoming", "unresolved_paid_admission":false, "created":null, "op_id":null, "paid_until_ms":null, "next_block_seq":0, "next_block_due_ms":null},
+                {"id":"live", "state":"live", "direction":"outgoing", "unresolved_paid_admission":false, "created":null, "op_id":null, "paid_until_ms":null, "next_block_seq":0, "next_block_due_ms":future - 30_000}
             ])
         );
     }
@@ -206,6 +207,44 @@ async fn open_calls_are_bounded_and_prioritize_unresolved_blockers() {
     assert_eq!(rows[0]["unresolved_paid_admission"], true);
     assert_eq!(rows[0]["created"], Value::Null);
     assert_eq!(rows[0]["op_id"], "missing-journal");
+}
+
+#[tokio::test]
+async fn open_calls_accept_uppercase_peer_ids_and_return_the_same_call() {
+    let (state, store) = fixture().await;
+    let peer = NodeId::from_bytes([0xab; 32]);
+    let future = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap() + 60_000;
+    store
+        .call_put(
+            &peer,
+            "outgoing",
+            &entry(Phase::Ringing, Side::Caller, future, None),
+        )
+        .await
+        .unwrap();
+    for peer_hex in ["ab".repeat(32), "AB".repeat(32)] {
+        let (status, body) = get(
+            &state,
+            &format!("?peer={peer_hex}"),
+            Some(common::auth_header(&state)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!([{
+                "id": "outgoing",
+                "state": "ringing",
+                "direction": "outgoing",
+                "unresolved_paid_admission": false,
+                "created": null,
+                "op_id": null,
+                "next_block_due_ms": null,
+                "next_block_seq": 0,
+                "paid_until_ms": null
+            }])
+        );
+    }
 }
 
 #[tokio::test]
