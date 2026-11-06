@@ -102,8 +102,43 @@ impl PostgresStorage {
         self.apply_pending_migrations(&applied).await
     }
 
+    /// Applied versions this binary's migration list does not contain.
+    ///
+    /// The result is sorted and de-duplicated. Versions this binary knows,
+    /// including numbers it has not applied yet, are not returned.
+    pub(crate) fn unknown_applied_migrations(applied: &[i32], known: &[i32]) -> Vec<i32> {
+        let mut unknown: Vec<i32> = applied
+            .iter()
+            .copied()
+            .filter(|version| !known.contains(version))
+            .collect();
+        unknown.sort_unstable();
+        unknown.dedup();
+        unknown
+    }
+
+    fn refuse_future_schema(applied: &[i32]) -> Result<(), StorageError> {
+        let known: Vec<i32> = Self::pg_migrations()
+            .iter()
+            .map(|(version, _, _)| *version)
+            .collect();
+        let versions = Self::unknown_applied_migrations(applied, &known);
+        if versions.is_empty() {
+            return Ok(());
+        }
+        let max_known = known.iter().copied().max().unwrap_or(0);
+        Err(StorageError::FutureSchema {
+            versions,
+            max_known,
+        })
+    }
+
     /// Apply any migrations not yet in the applied list.
+    ///
+    /// A version recorded by a newer binary is refused before any statement
+    /// runs. SQLite already fails that case with `VersionMissing`.
     async fn apply_pending_migrations(&self, applied: &[i32]) -> Result<(), StorageError> {
+        Self::refuse_future_schema(applied)?;
         for (version, name, sql) in Self::pg_migrations() {
             if applied.contains(&version) {
                 continue;
@@ -3663,6 +3698,52 @@ mod accepted_invites_guard {
 #[cfg(test)]
 mod migration_recovery_tests {
     use super::*;
+
+    #[test]
+    fn postgres_refuses_a_schema_newer_than_this_binary() {
+        let known: Vec<i32> = PostgresStorage::pg_migrations()
+            .iter()
+            .map(|(version, _, _)| *version)
+            .collect();
+        let max_known = known.iter().copied().max().unwrap();
+        for version in [35, 36, 37] {
+            assert!(
+                known.contains(&version),
+                "call-block migration {version} must be inside the downgrade fence"
+            );
+        }
+        assert!(PostgresStorage::unknown_applied_migrations(&known, &known).is_empty());
+        let alien = (1..=max_known + 1)
+            .find(|version| !known.contains(version))
+            .unwrap();
+        let mut expected = vec![alien, max_known + 1];
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(
+            PostgresStorage::unknown_applied_migrations(
+                &[known[0], alien, max_known + 1, alien],
+                &known
+            ),
+            expected
+        );
+
+        let err = PostgresStorage::refuse_future_schema(&[1, max_known + 1]).unwrap_err();
+        let text = err.to_string();
+        match err {
+            StorageError::FutureSchema {
+                versions,
+                max_known: reported,
+            } => {
+                assert_eq!(versions, vec![max_known + 1]);
+                assert_eq!(reported, max_known);
+            }
+            other => panic!("expected FutureSchema, got {other}"),
+        }
+        assert!(text.contains(&format!("{max_known}")));
+        assert!(text.contains("Refusing to start"));
+        assert!(!text.contains("postgres://"));
+        assert!(!text.contains("password"));
+    }
 
     #[tokio::test]
     #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
