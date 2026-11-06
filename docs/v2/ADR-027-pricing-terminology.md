@@ -14,12 +14,12 @@
 ## Context
 
 The repo carries three distinct concepts that have collided under
-overlapping names. A second-pass review by codex (read-only QA) plus
-an independent investigation by Claude Code surfaced this pollution
+overlapping names. A second-pass read-only QA review plus
+an independent investigation surfaced this pollution
 2026-05-03. The collision shows up in the v2 protocol docs but not in
 the live trait surface, so today the pollution is documentation drift
-rather than implementation drift — but the drift will mislead the
-autonomous factory if any task touches `crates/konsensus-pricing/` or
+rather than implementation drift — but the drift will mislead
+contributors if any task touches `crates/konsensus-pricing/` or
 references "timechain pricing" in its task description.
 
 The three concepts are:
@@ -53,7 +53,7 @@ pollution was introduced by the v2 spec authors, not by the vision.
 ## Decision
 
 We adopt three distinct names going forward. Any future task,
-factory PR, or factory-runner prompt that touches pricing must use
+PR, or task prompt that touches pricing must use
 one of these — never the bare term "timechain pricing":
 
 ### Term 1 — "Chain-aware message pricing"
@@ -100,7 +100,7 @@ new mesh-node operators. Lives in operator strategy docs only, not in
 core protocol code.
 
 **Never appears in core protocol code, core protocol trait
-docstrings, or core protocol specs.** When future factory tasks
+docstrings, or core protocol specs.** When future tasks
 need to reason about revenue or subsidies, they reference this term
 explicitly and stay in the business-strategy crate or doc surface.
 
@@ -124,9 +124,9 @@ behind explicit scope approval.
 
 ### Positive
 
-- Future factory tasks reading the v2 specs no longer see a
+- Future work tasks reading the v2 specs no longer see a
   contract-shaped trait sketch and try to implement it.
-- Grok daily brief no longer flags false-positive drift between
+- The daily drift check no longer flags false-positive drift between
   spec text (claims contract API exists) and code (which doesn't).
 - The biological framework anchor for Principle 5 is preserved
   unambiguously.
