@@ -76,7 +76,7 @@ async fn reject_unsafe_labels(operation: &str) {
                 operation,
                 &"ab".repeat(32),
                 "127.0.0.1:9736",
-                &format!("Dad{c}spoof"),
+                &format!("Bob{c}spoof"),
             ))
             .await
             .unwrap();
@@ -210,7 +210,7 @@ async fn reject_unusable_addresses(operation: &str) {
         }
         transport.calls.lock().unwrap().clear();
         let response = common::test_router(state.clone())
-            .oneshot(request(&state, operation, &"ab".repeat(32), addr, "Dad"))
+            .oneshot(request(&state, operation, &"ab".repeat(32), addr, "Bob"))
             .await
             .unwrap();
         if operation == "import" {
