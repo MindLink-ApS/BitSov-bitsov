@@ -5,6 +5,45 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- A node that lost its E2EE session with a connected peer gets it back on the
+  same connection. When the lower-id node lost it, about 25 seconds: the higher-id
+  peer now answers a PrekeyOffer with its own, at most once per ten seconds per
+  peer. When the higher-id node lost it, up to about a minute.
+- A reconnect no longer replaces a healthy E2EE session. The lower-id node acts on
+  a PrekeyOffer only with no session, one marked for renegotiation or not yet
+  confirmed, or on a second offer on the same connection a self-heal tick or more
+  after the first. Two stale offers can still start a replacement; closing that
+  needs key confirmation, which is separate work.
+- A reconnect now shows whether two E2EE sessions still agree, with nothing
+  paid. The lower-id node sends a `RatchetInit` under the session in use on each
+  new connection, and both nodes send one on a self-heal tick once the
+  connection and any negotiation are ten seconds old. Each takes its own send
+  chain position, saved first. A peer still on the session before moves over on
+  it, which also recovers a `RatchetInit` lost with its connection; a peer that
+  cannot read it asks for a new session. Peers on earlier versions read it like
+  any `RatchetInit`, and drop their session if they cannot. No frame or message
+  format changes.
+- A replaced E2EE session keeps reading for up to an hour, in memory only, so a paid
+  envelope encrypted under it just before the switch, or resent later, is still read
+  rather than refused.
+- A callee with no readable E2EE session with the caller refuses a call block
+  invoice (`call_block_unpayable`, nothing paid), so no minute is paid for a
+  session that cannot read it. Messages and other call signals have no such step
+  before payment.
+- A call block from the higher-id side that its recipient cannot read is now
+  refused for good (`undecryptable:`), rather than retried for up to an hour. The
+  legacy `invalid call signal: undecryptable` stays retryable.
+- One envelope or control frame can no longer cost a working E2EE session. A paid
+  envelope that cannot be decrypted is refused as before and the session stays;
+  from after the session settled it also starts a new negotiation, repeated on the
+  self-heal tick until it completes or a readable message clears it. A new session
+  retires the current one only on an answer from the peer: for the initiator a
+  `SessionAck`, which names no session and so does not show the keys match; for
+  the acceptor a message that decrypts under the new session. A stale prekey
+  offer the peer refuses, or a well-formed init with other keys, changes nothing.
+  Two stale offers, or a late `SessionAck`, can still retire a working session
+  until key confirmation lands. No frame or message format changes.
+
 ## [0.3.0-rc22] — 2026-11-05
 
 - An E2EE send now saves its advanced send chain before the ciphertext leaves

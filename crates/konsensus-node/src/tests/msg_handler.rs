@@ -992,7 +992,7 @@ async fn page_request_nonexistent_path_returns_label() {
 // ── decrypt_and_process with stale session ──────────────────────────
 
 #[tokio::test]
-async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
+async fn decrypt_failure_keeps_the_session_and_asks_to_renegotiate() {
     let alice = alice_identity();
     let bob = bob_identity();
     let bob_mgr = SessionManager::new(Arc::clone(&bob));
@@ -1017,12 +1017,14 @@ async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
         .unwrap();
     let ciphertext = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
 
-    let envelope = make_envelope(
+    let mut envelope = make_envelope(
         alice.as_ref(),
         *bob.node_id(),
         konsensus_core::kind::KIND_CHAT,
         ciphertext,
     );
+    // Stamped past Bob's session settling, so the failure counts against it.
+    envelope.timestamp += 11_000;
     let sender = *alice.node_id();
 
     // Before: session exists
@@ -1056,8 +1058,9 @@ async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
             "the session could not decrypt the ciphertext"
         ))
     );
-    // Session should be removed for re-negotiation
-    assert!(!bob_mgr.has_session(alice.node_id()).await);
+    // The session stays, and the node asks for a replacement
+    assert!(bob_mgr.has_session(alice.node_id()).await);
+    assert!(bob_mgr.needs_renegotiation(alice.node_id()).await);
 }
 
 // ── Non-UTF8 plaintext ──────────────────────────────────────────────
@@ -3972,6 +3975,276 @@ fn file_payload(filename: &str, sent: &[u8], received: &[u8]) -> Vec<u8> {
     .unwrap()
 }
 
+/// Alice's paid chat under a session Bob does not hold, stamped `offset_ms` from now.
+async fn unreadable_chat_stamped(net: &ReceiveLoop, offset_ms: i64) -> konsensus_core::UkmEnvelope {
+    let stale_a = SessionManager::new(net.alice.clone());
+    let stale_b = SessionManager::new(net.bob.clone());
+    establish_sessions(&stale_a, &stale_b, &net.alice, &net.bob).await;
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+        &stale_a.encrypt(net.bob.node_id(), b"unreadable").await.unwrap(),
+    );
+    let mut env = net.paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext).await;
+    env.timestamp = env.timestamp.saturating_add_signed(offset_ms);
+    env.signature = Signature::from_ed25519(&net.alice.sign(&env.signable_bytes()));
+    env
+}
+
+/// An envelope from before Bob's session, or stamped just after it (still in
+/// flight when Alice took the new session, or her clock ahead), was encrypted
+/// under an earlier one. It is refused like any unreadable one and Bob's working
+/// session stays: no duplicate of either envelope reaches the decrypt, and the
+/// next message reads fine.
+#[tokio::test]
+async fn envelope_from_before_the_session_settled_does_not_remove_it() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    for offset_ms in [-60_000, 0, 5_000] {
+        let env = unreadable_chat_stamped(&net, offset_ms).await;
+        let verdict = net.verdict(&env).await;
+        assert!(
+            matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+                if *message_id == env.id && reason == "undecryptable: the session could not decrypt the ciphertext"),
+            "{offset_ms}: got {verdict:?}"
+        );
+        assert!(net.sessions_b.has_session(net.alice.node_id()).await, "{offset_ms}: the session stays");
+        assert!(!net.sessions_b.needs_renegotiation(net.alice.node_id()).await, "{offset_ms}: and no renegotiation");
+        // The same bytes again: answered from the withdrawal, no second decrypt.
+        let again = net.verdict(&env).await;
+        assert!(matches!(&again, ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"), "got {again:?}");
+        assert!(net.sessions_b.has_session(net.alice.node_id()).await);
+    }
+
+    let ciphertext = net.ciphertext(b"still readable").await;
+    let next = net.paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext).await;
+    let verdict = net.verdict(&next).await;
+    assert!(matches!(verdict, ControlEvent::MessageAcked { message_id, .. } if message_id == next.id), "got {verdict:?}");
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(delivered.plaintext.as_deref(), Some("still readable"));
+    // A duplicate of a read envelope is acknowledged again without a decrypt; its
+    // message key is spent, so reaching the decrypt would fail.
+    let verdict = net.verdict(&next).await;
+    assert!(matches!(verdict, ControlEvent::MessageAcked { message_id, duplicate: true, .. } if message_id == next.id), "got {verdict:?}");
+    assert!(net.sessions_b.has_session(net.alice.node_id()).await, "a duplicate costs no session");
+    net.stop().await;
+}
+
+/// An envelope stamped well after the session was derived and still unreadable
+/// may mean the two sides disagree. Bob asks for a replacement and keeps the session
+/// in use until one is confirmed: Alice's next message still reads.
+#[tokio::test]
+async fn unreadable_envelope_after_the_session_settled_keeps_it_and_offers() {
+    use konsensus_message::ControlEvent;
+    let net = receive_loop().await;
+    let env = unreadable_chat_stamped(&net, 11_000).await;
+
+    net.source.send(net.bob.node_id(), &env).await.unwrap();
+    let mut offered = false;
+    let rejected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match net.source.recv_control().await.unwrap() {
+                ControlEvent::PrekeyOffer { .. } => offered = true,
+                ControlEvent::MessageRejected { .. } => break true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(rejected && offered, "refused, after offering");
+    assert!(net.sessions_b.has_session(net.alice.node_id()).await, "the session stays");
+    assert!(net.sessions_b.needs_renegotiation(net.alice.node_id()).await);
+
+    let ciphertext = net.ciphertext(b"still readable").await;
+    let next = net.paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext).await;
+    let verdict = net.verdict(&next).await;
+    assert!(matches!(verdict, ControlEvent::MessageAcked { message_id, .. } if message_id == next.id), "got {verdict:?}");
+    net.stop().await;
+}
+
+/// A session restored from storage has no known age. An unreadable envelope still
+/// does not cost it, and the peer's next message reads under it.
+#[tokio::test]
+async fn restored_session_survives_an_unreadable_envelope() {
+    #[derive(Default)]
+    struct Memory(std::sync::Mutex<std::collections::HashMap<NodeId, Vec<u8>>>);
+    #[async_trait::async_trait]
+    impl konsensus_crypto::SessionStore for Memory {
+        async fn save_session(&self, peer: &NodeId, state: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().unwrap().insert(*peer, state.to_vec());
+            Ok(())
+        }
+        async fn load_session(&self, peer: &NodeId) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.0.lock().unwrap().get(peer).cloned())
+        }
+        async fn delete_session(&self, peer: &NodeId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().unwrap().remove(peer);
+            Ok(())
+        }
+        async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.0.lock().unwrap().keys().copied().collect())
+        }
+    }
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let store = Arc::new(Memory::default());
+    let alice_mgr = SessionManager::new(Arc::clone(&alice));
+    let live = SessionManager::with_store(Arc::clone(&bob), store.clone());
+    establish_sessions(&alice_mgr, &live, &alice, &bob).await;
+    let bob_mgr = SessionManager::with_store(Arc::clone(&bob), store.clone());
+    assert_eq!(bob_mgr.restore_sessions().await, 1);
+
+    let foreign_a = SessionManager::new(Arc::clone(&alice));
+    let foreign_b = SessionManager::new(Arc::clone(&bob));
+    establish_sessions(&foreign_a, &foreign_b, &alice, &bob).await;
+    let unreadable = foreign_a.encrypt(bob.node_id(), b"unreadable").await.unwrap();
+    let mut envelope = make_envelope(
+        alice.as_ref(),
+        *bob.node_id(),
+        konsensus_core::kind::KIND_CHAT,
+        konsensus_crypto::ratchet_message_to_bytes(&unreadable),
+    );
+    envelope.timestamp = 1;
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
+    let result = decrypt_and_process(
+        &envelope,
+        alice.node_id(),
+        &bob_mgr,
+        &PlaintextCacheCipher::new(bob.aes_key()),
+        &storage,
+        &None,
+        &Default::default(),
+        &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
+        &(Arc::new(konsensus_pricing::StaticPricingEngine::new(
+            Default::default(),
+        )) as Arc<dyn konsensus_core::traits::pricing::PricingEngine>),
+        &bob,
+        &make_transport(&bob),
+        &make_audit_log(),
+        &PaymentGate::new(),
+        0.0,
+        true,
+    )
+    .await;
+    assert!(matches!(result, Err(ReceiptRefusal::Undecryptable(_))));
+    assert!(bob_mgr.has_session(alice.node_id()).await, "the restored session stays");
+    assert!(store.0.lock().unwrap().contains_key(alice.node_id()), "and stays on disk");
+    let readable = alice_mgr.encrypt(bob.node_id(), b"still readable").await.unwrap();
+    assert_eq!(bob_mgr.decrypt(alice.node_id(), &readable).await.unwrap(), b"still readable");
+}
+
+/// A block from the higher id that cannot be read is refused for good, in the
+/// words every sender version treats as terminal. From the lower id, or past the
+/// skip limit, the legacy reason stands and senders keep retrying.
+#[test]
+fn refused_block_reason_is_final_only_when_proven() {
+    use konsensus_core::payloads::call::CallRefusal;
+    let (lower, higher) = (NodeId::from_bytes([1; 32]), NodeId::from_bytes([2; 32]));
+    let legacy = CallRefusal::Invalid("undecryptable");
+    assert_eq!(refused_block_reason(&legacy, false, &higher, &lower), "invalid call signal: undecryptable");
+    assert_eq!(refused_block_reason(&legacy, true, &lower, &higher), "invalid call signal: undecryptable");
+    let final_reason = refused_block_reason(&legacy, true, &higher, &lower);
+    assert!(final_reason.starts_with("undecryptable:"), "{final_reason}");
+}
+
+/// A restart's sequence for a block already in flight. The block passes its preview
+/// under the old session, a re-key completes, and the real decrypt then fails. The
+/// grant stands in the caller of this function; here the new session must survive.
+#[tokio::test]
+async fn block_stale_at_its_real_decrypt_does_not_cost_the_new_session() {
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let alice_mgr = SessionManager::new(Arc::clone(&alice));
+    let bob_mgr = SessionManager::new(Arc::clone(&bob));
+    // Bob initiates and Alice accepts, the shape where Bob could not recover alone.
+    establish_sessions(&bob_mgr, &alice_mgr, &bob, &alice).await;
+    assert!(bob_mgr.confirm_session(alice.node_id()).await);
+    let first = bob_mgr.encrypt(alice.node_id(), b"ratchet-init").await.unwrap();
+    alice_mgr.decrypt(bob.node_id(), &first).await.unwrap();
+
+    let block = alice_mgr.encrypt(bob.node_id(), b"{}").await.unwrap();
+    let envelope = make_envelope(
+        alice.as_ref(),
+        *bob.node_id(),
+        konsensus_core::kind::KIND_CALL_BLOCK,
+        konsensus_crypto::ratchet_message_to_bytes(&block),
+    );
+    assert_eq!(bob_mgr.preview_decrypt(alice.node_id(), &block).await.unwrap(), b"{}");
+
+    // The session before is gone, so nothing Bob holds can read the block.
+    assert!(bob_mgr.remove_session(alice.node_id()).await);
+    let init = bob_mgr.reinitiate_session(alice.node_id(), &alice_mgr.prekey_bundle().await).await.unwrap();
+    alice_mgr.reaccept_session(bob.node_id(), &init).await.unwrap();
+    assert!(bob_mgr.confirm_session(alice.node_id()).await);
+    let again = bob_mgr.encrypt(alice.node_id(), b"ratchet-init").await.unwrap();
+    alice_mgr.decrypt(bob.node_id(), &again).await.unwrap();
+
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
+    let result = decrypt_and_process(
+        &envelope,
+        alice.node_id(),
+        &bob_mgr,
+        &PlaintextCacheCipher::new(bob.aes_key()),
+        &storage,
+        &None,
+        &Default::default(),
+        &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
+        &(Arc::new(konsensus_pricing::StaticPricingEngine::new(
+            Default::default(),
+        )) as Arc<dyn konsensus_core::traits::pricing::PricingEngine>),
+        &bob,
+        &make_transport(&bob),
+        &make_audit_log(),
+        &PaymentGate::new(),
+        0.0,
+        false,
+    )
+    .await;
+    assert!(matches!(result, Err(ReceiptRefusal::Undecryptable(_))));
+    assert!(!bob_mgr.needs_renegotiation(alice.node_id()).await, "stale, so no renegotiation");
+    let next = alice_mgr.encrypt(bob.node_id(), b"next block").await.unwrap();
+    assert_eq!(bob_mgr.decrypt(alice.node_id(), &next).await.unwrap(), b"next block");
+}
+
+/// A paid block Bob cannot read is refused before it consumes its proof. Unreadable
+/// under the session he holds, he also asks for a replacement; past the skip limit,
+/// which a later delivery can cure, he does not. Neither touches the session.
+#[tokio::test]
+async fn unreadable_block_asks_to_renegotiate_and_keeps_the_session() {
+    use konsensus_message::ControlEvent;
+    let net = receive_loop().await;
+    let refused = |verdict: &ControlEvent, id| {
+        matches!(verdict, ControlEvent::MessageRejected { message_id, .. } if *message_id == id)
+    };
+
+    // Past the ratchet's skip limit on the session Bob does hold.
+    for _ in 0..1_001 {
+        net.ciphertext(b"not delivered").await;
+    }
+    let ahead = net.ciphertext(b"{}").await;
+    let env = net.paid_envelope(konsensus_core::kind::KIND_CALL_BLOCK, ahead).await;
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { reason, .. } if reason == "invalid call signal: undecryptable"),
+        "the retryable reason: {verdict:?}"
+    );
+    assert!(!net.sessions_b.needs_renegotiation(net.alice.node_id()).await);
+
+    let stale_a = SessionManager::new(net.alice.clone());
+    let stale_b = SessionManager::new(net.bob.clone());
+    establish_sessions(&stale_a, &stale_b, &net.alice, &net.bob).await;
+    let stale = konsensus_crypto::ratchet_message_to_bytes(
+        &stale_a.encrypt(net.bob.node_id(), b"{}").await.unwrap(),
+    );
+    let mut env = net.paid_envelope(konsensus_core::kind::KIND_CALL_BLOCK, stale).await;
+    env.timestamp += 11_000;
+    env.signature = Signature::from_ed25519(&net.alice.sign(&env.signable_bytes()));
+    let verdict = net.verdict(&env).await;
+    assert!(refused(&verdict, env.id), "got {verdict:?}");
+    assert!(net.sessions_b.needs_renegotiation(net.alice.node_id()).await);
+    assert!(net.sessions_b.has_session(net.alice.node_id()).await, "preview refusals touch no session");
+    net.stop().await;
+}
+
 /// A paid chat Bob cannot decrypt is refused with a typed reject, withdrawn
 /// (its payment stays burned) and never shown to the app; it is never
 /// acknowledged as delivered, and a resend of the same bytes is refused too.
@@ -3990,9 +4263,12 @@ async fn undecryptable_paid_chat_is_refused_not_acknowledged() {
             .await
             .unwrap(),
     );
-    let env = net
+    let mut env = net
         .paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext)
         .await;
+    // Stamped past Bob's session settling, so the failure counts against it.
+    env.timestamp += 11_000;
+    env.signature = Signature::from_ed25519(&net.alice.sign(&env.signable_bytes()));
 
     let verdict = net.verdict(&env).await;
     assert!(
@@ -4022,8 +4298,8 @@ async fn undecryptable_paid_chat_is_refused_not_acknowledged() {
         net.audit_log()
     );
     assert!(
-        !net.sessions_b.has_session(net.alice.node_id()).await,
-        "the unreadable session is dropped for re-negotiation, as before"
+        net.sessions_b.has_session(net.alice.node_id()).await,
+        "one unreadable envelope does not cost the session"
     );
 
     // The sender treats the reason as terminal and resends nothing. Even a
