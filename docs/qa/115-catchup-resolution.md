@@ -67,5 +67,5 @@ main's tests together, followed by #115's direct-payment contract tests.
   1,000 msat retained instead of zero. The original production code was
   restored before workspace validation.
 
-Validation results and the final pushed merge SHA are recorded in the requested
-`pm/_verdicts/115-catchup.txt` handoff.
+Validation results are recorded in this document. The merge commits are the
+ones named above.
