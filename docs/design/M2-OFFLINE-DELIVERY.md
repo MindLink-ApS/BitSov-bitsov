@@ -200,9 +200,9 @@ and a held `E0` proves nothing about payment.
 quote to be requested over a live Noise connection to the target, with a
 quote that expires in 60 s or less. M2 does not change that: the outbox may
 only hold `E0` for **existing contacts**: peers with a **prior settled,
-recipient-bound admission at R from S**. A session, address-book entry or
+recipient-bound admission at R from S**. A Double Ratchet session, address-book entry or
 known Lightning pubkey alone does not establish that history. The sender
-must also have the session and known Lightning pubkey needed for delivery.
+must also have the Double Ratchet session and known Lightning pubkey needed for delivery.
 Without evidence of prior settled admission, S3 refuses held delivery; a
 stranger still needs both nodes online (Q3).
 
@@ -369,11 +369,11 @@ settled before any relay `E0` carriage or dial hint can proceed.
 |---|---|---|
 | X loses or never stores `E0` | No relay copy | The outbox is the source of truth. S still delivers directly when R is reachable. No money is lost, because the message is not paid yet. |
 | X drops `E1` after S paid | R was paid, but the message is not received | S's op is `paid` or `sent`. The existing resend loop delivers directly when connected, or re-deposits. The money is safe (it went to R), and only delivery is delayed. |
-| X lies "R is online" (STATUS) | S tries to pay | Keysend or invoice to an offline R fails before settlement → `released`, and the op goes back to `held` with backoff. An ambiguous result → `payment_unknown` (never re-paid). X cannot redirect funds, because the payment is bound to R's Lightning pubkey. |
+| X lies "R is online" (STATUS) | S tries to pay | **Relay slice — BLOCKED on Q1 and Q7; not in S3.** Keysend or invoice to an offline R fails before settlement → `released`, and the op goes back to `held` with backoff. An ambiguous result → `payment_unknown` (never re-paid). X cannot redirect funds, because the payment is bound to R's Lightning pubkey. |
 | X withholds `E1` forever | R never sees it | The S→R direct path is independent. X earns nothing from withholding, because rent is already paid. R can unregister (kind 604) and move to another relay. |
 | R comes back briefly, then leaves again | S may pay while R is up and then fail to deliver | Payment settled → `paid`. `E1` is delivered on the next drain or connection. That is the existing paid-but-undelivered path. |
 | S's node is down when R comes back | No payment, so no delivery | Mode A limit. When S comes back, its outbox retries. If the two are never up together, only Mode B helps. |
-| Both nodes up but unable to dial each other (NAT, no tailnet) | No direct session | S keysends using R's known LN pubkey (Lightning connectivity is independent), then deposits `E1` at X. R admits on its next drain. |
+| Both nodes up but unable to dial each other (NAT, no tailnet) | No direct session | **Relay slice — BLOCKED on Q1 and Q7; not in S3.** S keysends using R's known LN pubkey (Lightning connectivity is independent), then deposits `E1` at X. R admits on its next drain. |
 | Price, fee or consent drifts before `held → paying` | Delayed spending may exceed compose consent | Re-quote and revalidate under the operation lock (§3). Cap/reservation/consent failure → terminal unpaid `abandoned`, release reservation, zero payment calls. Unavailable fresh price → remain `held` until retry or expiry. |
 | `held` TTL passes | The message is never paid | `expired_unpaid`, the reservation is released, and the client sees a terminal state. The relay copy expires on its own TTL. |
 | Ratchet skip | R receives `M_k+5` before `M_k` | The Double Ratchet stores skipped keys up to `MAX_SKIP = 1000`. The 100-per-peer `held` cap keeps us well under it. |
@@ -524,7 +524,7 @@ on mainnet, including a held row carried over from another network.
   - Abandon from `held` → `abandoned`, and the reservation is released.
   - Expiry → `expired_unpaid`, and the reservation is released.
   - The 101st held message for a peer → `409 held_queue_full` before debit.
-  - No prior settled, recipient-bound admission at R → refused with the existing F1 message, even with a session, contact entry and LN pubkey. Missing session or LN pubkey also refuses held delivery.
+  - No prior settled, recipient-bound admission at R → refused with the existing F1 message, even with a Double Ratchet session, contact entry and LN pubkey. A missing Double Ratchet session or LN pubkey also refuses held delivery.
   - After a delay of up to 72 h, a fresh price within all compose-time caps → exactly one payment at that price; increased price beyond the recipient cap or price plus routing-fee ceiling beyond the all-in cap → terminal unpaid `abandoned`, zero payment calls, reservation released.
   - Insufficient/released reservation, expired/revoked consent, or an excessive routing-fee ceiling at reconnect → the same unpaid terminal result, including concurrent retries and restart.
   - No fresh authenticated price → still `held`, zero payment calls; original TTL still expires normally.
