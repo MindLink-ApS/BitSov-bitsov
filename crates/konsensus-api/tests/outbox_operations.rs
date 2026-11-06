@@ -1472,10 +1472,22 @@ async fn background_reconcile_commits_a_paid_call_offer_before_resending() {
     // Startup recovery keeps an ambiguous reservation; nobody is rung yet.
     assert_eq!(konsensus_api::calls::recover(f.db.as_ref()).await.unwrap(), (0, 0));
     assert_eq!(f.db.call_get(&peer, &call).await.unwrap().unwrap().phase, Phase::Reserved);
-    // It settles. The app only polls; the background sweep resolves it.
+    // It settles. The app only polls; the background sweep resolves it. A
+    // sweep skips an operation whose lock is still held (here, briefly, by the
+    // cancelled request), so sweep again until it commits, within a deadline.
     f.wallet.mode.store(0, Ordering::SeqCst);
-    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
-    let state = f.op().await.state;
+    let state = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+            let state = f.op().await.state;
+            if state != "paying" {
+                break state;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the background sweep never resolved the paid offer");
     assert!(matches!(state.as_str(), "paid" | "sent" | "acked"), "{state}");
     let entry = f.db.call_get(&peer, &call).await.unwrap().unwrap();
     assert_eq!((entry.phase, entry.pending), (Phase::Ringing, None), "committed by the sweep");
