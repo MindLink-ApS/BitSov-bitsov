@@ -1,6 +1,6 @@
 # Real LDK regtest regression (REGTEST-E2E)
 
-For the Atlas TEST5 robustness lane (three application nodes, remote spend
+For the TEST5 robustness lane (three application nodes, remote spend
 elevation, sender/recipient 429, restart, quote expiry and stale peer pricing), use
 [`scripts/regress/three_node_paid_e2e.sh`](three-node-paid-e2e.md). The existing
 routed scenarios below retain their assertions.
@@ -194,7 +194,7 @@ so asynchronous wallet sync cannot turn the expected refusal into a 503.
 | Inbound anchor channel | An unfunded acceptor refuses an inbound anchor channel (`0/25000 sats` reserve) unless the selected-provider reserve waiver applies. The non-anchor retry is also refused; legacy fixtures must fund the acceptor before opening. |
 | Forwarding | Private-channel forwarding needs LSPS2-service/async-server mode on the router. |
 | Routing fees | Positive (1,000 msat per 2,001-msat payment through C); the mock routes at zero. |
-| Immediate payment result | `Pending`, no preimage/fee yet (`/payments/pay` returns `preimage: ""`); settlement must be polled. |
+| Immediate payment result | In flight, no preimage/fee yet: `/payments/pay` and `/payments/keysend` answer `202` with `status: in_flight` after a short settlement wait; repeat with the same `request_id` or poll `GET /payments/{hash}` until `200 settled` (see `docs/v2/API_PAYMENTS.md`). |
 | Reply liquidity | Needs real outbound liquidity above the channel reserve. |
 | First contact latency | ~16 s for admission + session + first message; later messages ~2 s. |
 | Payment list | `list_payments` includes on-chain funding/receipts as hashless records. |
@@ -289,7 +289,7 @@ No blocks are mined after opening in any scenario. This is a regtest proof for
 the signet-first design, not a signet deployment or an app/message test. Startup
 provider connection (N2), N3 and hub H1–H6 remain out of scope.
 
-**Observed on 2026-10-20 after the Atlas ruling: 4 passed, 0 failed.** All four
+**Observed on 2026-10-20 after the ruling: 4 passed, 0 failed.** All four
 Phase 0 items pass, including all three negative controls' unchanged final
 rejection, no-surviving-channel and no-funding-broadcast assertions. The positive
 scenario has 9,000 sats spendable plus 1,000 sats punishment reserve.

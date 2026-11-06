@@ -276,6 +276,41 @@ pub use outbox::OutboxOperation;
 pub mod channel_open;
 pub use channel_open::ChannelOpenOperation;
 
+/// Column values of the outstanding-reply row a paid web request (kind 500/510)
+/// commits with its envelope.
+pub(crate) struct OutstandingWebRequestRow {
+    pub payment_hash: String,
+    pub request_id: String,
+    pub peer: String,
+    pub expected_reply_kind: i64,
+    pub expires_at_ms: i64,
+}
+
+/// The outstanding-reply row `envelope` commits with itself; `None` for every
+/// kind that is not a paid web request.
+pub(crate) fn outstanding_web_request_row(
+    envelope: &konsensus_core::UkmEnvelope,
+) -> Result<Option<OutstandingWebRequestRow>, StorageError> {
+    let Some(expected) = konsensus_core::expected_reply_kind(envelope.kind) else {
+        return Ok(None);
+    };
+    let konsensus_core::Recipient::Node(peer) = &envelope.recipient else {
+        return Err(StorageError::Conversion(
+            "web request recipient must be a node".into(),
+        ));
+    };
+    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    let expires = i64::try_from(now_ms.saturating_add(konsensus_core::OUTSTANDING_TTL_MS))
+        .map_err(|_| StorageError::Conversion("web request expiry overflow".into()))?;
+    Ok(Some(OutstandingWebRequestRow {
+        payment_hash: hex::encode(envelope.payment_proof.payment_hash),
+        request_id: envelope.id.to_hex(),
+        peer: peer.to_hex(),
+        expected_reply_kind: i64::from(expected),
+        expires_at_ms: expires,
+    }))
+}
+
 pub mod list;
 pub use list::{FileListRow, ListCursor, MessageListQuery, MAX_LIST_SCAN, StorageList, StorageReadHealth};
 

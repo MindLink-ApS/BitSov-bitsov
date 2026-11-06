@@ -90,7 +90,7 @@ pub(crate) async fn run_nonce_cleanup(
 /// Each individual write stays best-effort (never crashes the node), but a
 /// *persistent* failure is a recovery-drill blocker — a node whose sidecar has
 /// gone stale will NOT re-admit invite-onboarded peers after a mnemonic+SCB
-/// restore (Codex #208). So a one-off failure is a `warn!`, while
+/// restore (review #208). So a one-off failure is a `warn!`, while
 /// [`WHITELIST_BACKUP_FAILURE_ALERT_THRESHOLD`] consecutive failures escalate to
 /// a loud `error!` (alertable) that names the recovery impact. Writes once at
 /// startup (so a node that never reaches a tick still has a current sidecar) and

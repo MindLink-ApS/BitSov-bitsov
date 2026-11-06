@@ -6,7 +6,9 @@
 //! proxies do not log bearer tokens in URLs. The legacy query parameter remains
 //! accepted for local tooling only.
 
+use std::future::{poll_fn, Future};
 use std::sync::Arc;
+use std::task::Poll;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -15,6 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
+use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, warn};
 
 use crate::auth;
@@ -28,7 +31,7 @@ pub struct WsParams {
     pub token: Option<String>,
 }
 
-const WS_PROTOCOL: &str = "bitsov.v1";
+pub(crate) const WS_PROTOCOL: &str = "bitsov.v1";
 const WS_JWT_PROTOCOL_PREFIX: &str = "bitsov.jwt.";
 
 /// `GET /api/v1/ws` — WebSocket connection.
@@ -77,7 +80,7 @@ async fn ws_handler(
     }
 }
 
-fn extract_ws_token(query_token: Option<&str>, headers: &HeaderMap) -> Option<String> {
+pub(crate) fn extract_ws_token(query_token: Option<&str>, headers: &HeaderMap) -> Option<String> {
     // Prefer the subprotocol. A `?token=` value must not replace a token the
     // client already sent in a header that proxies are less likely to log.
     let from_protocol = headers
@@ -106,11 +109,23 @@ fn extract_ws_token(query_token: Option<&str>, headers: &HeaderMap) -> Option<St
 /// connections. 45 seconds is safely under most proxy timeouts (60-120s).
 const WS_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(45);
 
+enum WsEvent {
+    Message(Result<Arc<crate::state::WsMessage>, RecvError>),
+    Delivery(Result<Arc<crate::state::WsDeliveryStatus>, RecvError>),
+    Membrane(Result<Arc<crate::membrane::MembraneEvent>, RecvError>),
+    Socket(Option<Result<Message, axum::Error>>),
+    Keepalive,
+}
+
 /// Handle an authenticated WebSocket connection.
 ///
 /// Subscribes to the broadcast channel and forwards messages (with decrypted
 /// plaintext when available) to the client as JSON. Sends periodic keepalive
 /// pings to prevent idle connection timeouts.
+///
+/// Closes the socket when its token expires. Waiting for the next event to
+/// notice would take that event off the feed and drop it, and the client's
+/// next connection subscribes too late to see it.
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Claims) {
     let mut rx = state.ws_broadcast.subscribe();
     let mut delivery_rx = state.ws_delivery_broadcast.subscribe();
@@ -118,11 +133,36 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
     let mut keepalive = tokio::time::interval(WS_KEEPALIVE_INTERVAL);
     // The first tick fires immediately — skip it since we just connected.
     keepalive.tick().await;
+    let token_expired = wait_until_expired(claims.exp, chrono::Utc::now);
+    tokio::pin!(token_expired);
 
     loop {
-        tokio::select! {
+        let event = tokio::select! {
+            // Polled first: once the token has expired, the stream closes
+            // without taking another event off the feed.
+            biased;
+
+            () = &mut token_expired => {
+                debug!("WebSocket token expired; closing the stream");
+                break;
+            }
+
+            // Only expiry has strict priority. Share service among all other
+            // ready sources, even while the message receiver is backlogged.
+            event = async {
+                tokio::select! {
+                    result = rx.recv() => WsEvent::Message(result),
+                    result = delivery_rx.recv() => WsEvent::Delivery(result),
+                    result = membrane_rx.recv() => WsEvent::Membrane(result),
+                    msg = socket.recv() => WsEvent::Socket(msg),
+                    _ = keepalive.tick() => WsEvent::Keepalive,
+                }
+            } => event,
+        };
+
+        match event {
             // Forward new messages from broadcast channel to WebSocket
-            result = rx.recv() => {
+            WsEvent::Message(result) => {
                 match result {
                     Ok(ws_msg) => {
                         if !stream_authorized(&state, &claims) { break; }
@@ -150,7 +190,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
             }
 
             // Forward delivery status updates to WebSocket
-            result = delivery_rx.recv() => {
+            WsEvent::Delivery(result) => {
                 match result {
                     Ok(status) => {
                         if !stream_authorized(&state, &claims) { break; }
@@ -176,7 +216,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
             }
 
             // Forward membrane events (N2): admission decisions at the gate.
-            result = membrane_rx.recv() => {
+            WsEvent::Membrane(result) => {
                 match result {
                     Ok(event) => {
                         if !stream_authorized(&state, &claims) { break; }
@@ -201,7 +241,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
             }
 
             // Handle incoming messages from the client
-            msg = socket.recv() => {
+            WsEvent::Socket(msg) => {
                 match msg {
                     Some(Ok(Message::Ping(data))) => match socket.send(Message::Pong(data)).await {
                         Ok(()) => {}
@@ -233,7 +273,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
             }
 
             // Send keepalive pings to prevent idle connection timeouts
-            _ = keepalive.tick() => {
+            WsEvent::Keepalive => {
                 if !stream_authorized(&state, &claims) { break; }
                 if socket.send(Message::Ping(vec![0x6b, 0x61])).await.is_err() {
                     debug!("WebSocket client disconnected during keepalive");
@@ -252,6 +292,38 @@ fn stream_authorized(state: &Arc<AppState>, claims: &auth::Claims) -> bool {
         && matches!(auth::check_pairing_binding(state, claims), Ok(Some(_)))
 }
 
+// Time left until `stream_authorized` starts refusing on expiry: from the
+// first instant of second `exp`. Milliseconds, so the stream is not left open
+// for up to a second after its token stops being valid.
+fn until_expiry(exp: i64, now: chrono::DateTime<chrono::Utc>) -> std::time::Duration {
+    let left_ms = exp.saturating_mul(1000).saturating_sub(now.timestamp_millis());
+    std::time::Duration::from_millis(u64::try_from(left_ms).unwrap_or(0))
+}
+
+async fn wait_until_expired(exp: i64, now: impl Fn() -> chrono::DateTime<chrono::Utc>) {
+    loop {
+        let remaining = until_expiry(exp, now());
+        if remaining.is_zero() {
+            return;
+        }
+        // Re-read wall time at least once a second while idle, retaining the
+        // exact expiry deadline when it is closer. Monotonic time can diverge
+        // from JWT wall time after a clock adjustment or system suspend.
+        let recheck = tokio::time::sleep(remaining.min(std::time::Duration::from_secs(1)));
+        tokio::pin!(recheck);
+        poll_fn(|cx| {
+            // The biased outer select polls this before the feed on every
+            // wake, even if the periodic recheck timer is still pending.
+            if until_expiry(exp, now()).is_zero() {
+                Poll::Ready(())
+            } else {
+                recheck.as_mut().poll(cx)
+            }
+        })
+        .await;
+    }
+}
+
 /// Registers the WebSocket upgrade route for real-time event streaming.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/api/v1/ws", get(ws_handler))
@@ -260,6 +332,46 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_preempts_ready_event_after_wall_clock_step() {
+        let now = std::cell::Cell::new(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
+        let exp = now.get().timestamp() + 3600;
+        let expired = wait_until_expired(exp, || now.get());
+        tokio::pin!(expired);
+        assert!(futures::poll!(&mut expired).is_pending());
+
+        // Wall time jumps an hour, while the monotonic timer has not advanced.
+        now.set(chrono::DateTime::from_timestamp(exp, 0).unwrap());
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        tx.send("first event after expiry").unwrap();
+        tokio::select! {
+            biased;
+            () = &mut expired => {}
+            _ = rx.recv() => panic!("expired stream consumed the next broadcast event"),
+        }
+        assert_eq!(rx.try_recv(), Ok("first event after expiry"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_expiry_rechecks_wall_clock_after_step() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let now = Arc::new(AtomicI64::new(1_700_000_000));
+        let exp = 1_700_003_600;
+        let clock = Arc::clone(&now);
+        let expired = tokio::spawn(wait_until_expired(exp, move || {
+            chrono::DateTime::from_timestamp(clock.load(Ordering::SeqCst), 0).unwrap()
+        }));
+        tokio::task::yield_now().await;
+        assert!(!expired.is_finished());
+
+        now.store(exp, Ordering::SeqCst);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(expired.is_finished(), "idle stream stayed open after expiry");
+        expired.await.unwrap();
+    }
 
     #[test]
     fn extract_ws_token_prefers_subprotocol_over_query() {

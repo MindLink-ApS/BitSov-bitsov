@@ -208,8 +208,30 @@ fn socket_path(config_path: &Path) -> PathBuf {
     data_dir_of(config_path).join(control::SOCKET_FILE)
 }
 
+/// Refuse early, naming the path, when no node lives at `config_path`.
+///
+/// `--config` defaults to `konsensus.toml` in the current directory, so running
+/// an owner command from the wrong directory lands here. Only the socket is
+/// needed to reach a node, and it sits beside the config: a socket with a
+/// differently named config still works, so both must be absent.
+fn ensure_node_dir(config_path: &Path) -> Result<()> {
+    let config = absolute_config_path(config_path)?;
+    let socket = socket_path(&config);
+    if config.try_exists().unwrap_or(true) || socket.try_exists().unwrap_or(true) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "config file not found: {config:?}\n\
+         There is no owner control socket at {socket:?} either; a node started with \
+         `--owner-control` creates one there.\n\
+         `--config` defaults to konsensus.toml in the current directory. Run this from the \
+         node's data directory or pass --config <path>."
+    )
+}
+
 #[cfg(unix)]
 async fn send(config_path: &Path, req: ControlRequest) -> Result<ControlResponse> {
+    ensure_node_dir(config_path)?;
     let socket = socket_path(config_path);
     control::send(&socket, &req).await.with_context(|| {
         if matches!(req, ControlRequest::LockStatus {}) {
@@ -359,11 +381,12 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             for g in &grants {
                 safe_println!(
                     "SPEND GRANT client={}  {} of {} sats left  per-call<={} sats  \
-                     expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
+                     messages<={} sats  expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
                     g.client_id,
                     spend_budget::sats(g.remaining_msat),
                     spend_budget::sats(g.budget_msat),
                     spend_budget::sats(g.per_call_max_msat),
+                    spend_budget::sats(g.message_per_payment_max_msat),
                     g.expires_at,
                     g.client_id
                 );
@@ -2228,6 +2251,7 @@ pub async fn cmd_approve(command: crate::cli::ApprovalCommand) -> Result<()> {
             )
         }
     };
+    ensure_node_dir(&config)?;
     println!("{summary}");
     std::io::stdout().flush()?;
     report(send(&config, request).await?)
@@ -2236,6 +2260,22 @@ pub async fn cmd_approve(command: crate::cli::ApprovalCommand) -> Result<()> {
 #[cfg(all(test, unix))]
 mod connection_error_tests {
     use super::*;
+
+    #[test]
+    fn ensure_node_dir_names_the_path_only_when_config_and_socket_are_both_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("konsensus.toml");
+        let error = format!("{:#}", ensure_node_dir(&config).unwrap_err());
+        assert!(error.contains("config file not found"), "{error}");
+        assert!(error.contains(&config.display().to_string()), "{error}");
+
+        std::fs::write(dir.path().join(control::SOCKET_FILE), b"").unwrap();
+        ensure_node_dir(&config).unwrap();
+        std::fs::remove_file(dir.path().join(control::SOCKET_FILE)).unwrap();
+
+        std::fs::write(&config, b"").unwrap();
+        ensure_node_dir(&config).unwrap();
+    }
 
     #[tokio::test]
     async fn socket_errors_escape_controls_even_without_approval_parsing() {
@@ -2384,6 +2424,7 @@ pub async fn cmd_peer_add(
         .context("invalid address: IP address and port only (no hostnames)")?;
     konsensus_api::peer_validation::validate_peer_addr(&address)?;
     konsensus_api::peer_validation::validate_peer_label(label.as_deref())?;
+    ensure_node_dir(config_path)?;
     if config_path.try_exists()? {
         let config = NodeConfig::load_before_identity_validation(config_path)?;
         if config

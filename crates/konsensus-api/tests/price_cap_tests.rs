@@ -12,8 +12,14 @@ async fn fixture() -> (Arc<AppState>, NodeId, Arc<CountingLightning>) {
     let lightning = Arc::new(CountingLightning::default());
     let mut state = test_state_with_lightning(lightning.clone());
     let peer = setup_e2ee_session(&state.session_manager).await;
-    Arc::get_mut(&mut state).unwrap().transport = Arc::new(ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
-    state.peer_ln_pubkeys.lock().await.insert(peer, konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)));
+    Arc::get_mut(&mut state).unwrap().transport = Arc::new(ConnectedStubTransport::new(
+        vec![peer],
+        state.invoice_requests.clone(),
+    ));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)),
+    );
     (state, peer, lightning)
 }
 async fn post(state: &Arc<AppState>, path: &str, mut body: Value) -> (StatusCode, Value) {
@@ -284,9 +290,16 @@ async fn one_sat_message_wallet_debit_stays_within_all_in_cap() {
     let before = wallet.get_balance_msat().await.unwrap();
     let mut state = test_state_with_lightning(wallet.clone());
     let peer = setup_e2ee_session(&state.session_manager).await;
-    Arc::get_mut(&mut state).unwrap().transport = Arc::new(ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
-    state.peer_ln_pubkeys.lock().await.insert(peer, konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "aa".repeat(32))));
-    let body = json!({"recipient":peer.to_hex(),"kind":100,"plaintext":"fee bound","max_total_msat":2000});
+    Arc::get_mut(&mut state).unwrap().transport = Arc::new(ConnectedStubTransport::new(
+        vec![peer],
+        state.invoice_requests.clone(),
+    ));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "aa".repeat(32))),
+    );
+    let body =
+        json!({"recipient":peer.to_hex(),"kind":100,"plaintext":"fee bound","max_total_msat":2000});
     let (status, receipt) = post(&state, "/api/v1/messages/compose", body).await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(receipt["max_routing_fee_msat"], 1000);

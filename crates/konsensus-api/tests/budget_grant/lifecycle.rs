@@ -268,8 +268,12 @@ async fn paused_dispatch_is_invalidated(route: &str, how: Invalidation) {
     }
     fx.wallet.pause_dispatch.store(true, Ordering::SeqCst);
     let body = match route {
-        "/api/v1/payments/pay" => json!({"bolt11": create_test_bolt11(1000)}),
-        "/api/v1/payments/keysend" => json!({"dest_pubkey": OTHER_LN, "amount_msat": 1000}),
+        "/api/v1/payments/pay" => {
+            json!({"request_id": uuid::Uuid::new_v4().to_string(), "bolt11": create_test_bolt11(1000)})
+        }
+        "/api/v1/payments/keysend" => {
+            json!({"request_id": uuid::Uuid::new_v4().to_string(), "dest_pubkey": OTHER_LN, "amount_msat": 1000})
+        }
         _ => json!({"recipient": fx.peer.to_hex(), "kind": 100, "plaintext": "paused"}),
     };
     let route = route.to_string();
@@ -321,11 +325,10 @@ async fn suspended_room_members_stop_on_revoke() {
             .initiate_session(&peer, &peer_sm.prekey_bundle().await)
             .await
             .unwrap();
-        fx.state
-            .peer_ln_pubkeys
-            .lock()
-            .await
-            .insert(peer, konsensus_api::state::PeerLightningKey::Verified(PEER_LN.into()));
+        fx.state.peer_ln_pubkeys.lock().await.insert(
+            peer,
+            konsensus_api::state::PeerLightningKey::Verified(PEER_LN.into()),
+        );
         members.push(peer);
     }
     fx.state = Arc::new(AppState {

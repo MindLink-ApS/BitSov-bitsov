@@ -1,5 +1,22 @@
 use super::*;
 
+#[test]
+fn call_outbound_capacity_excludes_reserve_and_unsettled_value() {
+    let channel: LndChannel = serde_json::from_value(serde_json::json!({
+        "local_balance": "100", "local_constraints": {"chan_reserve_sat": "10"},
+        "unsettled_balance": "20"
+    })).unwrap();
+    assert_eq!(channel.outbound_capacity_msat(), Some(70_000));
+    for unknown in [
+        serde_json::json!({"local_balance":"100", "unsettled_balance":"0"}),
+        serde_json::json!({"local_balance":"100", "local_chan_reserve_sat":"10"}),
+        serde_json::json!({"local_balance":"invalid", "local_chan_reserve_sat":"10", "unsettled_balance":"0"}),
+    ] {
+        let channel: LndChannel = serde_json::from_value(unknown).unwrap();
+        assert_eq!(channel.outbound_capacity_msat(), None);
+    }
+}
+
 fn mock_identity_pubkey() -> String {
     format!("02{}", "ab".repeat(32))
 }

@@ -205,11 +205,14 @@ async fn review_fixture(
             })
         });
     Arc::get_mut(&mut state).unwrap().transport = Arc::new(transport);
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer, konsensus_api::state::PeerLightningKey::Verified(if error_kind == 4 { invoice_payee() } else { "02aaaa".repeat(5) }));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified(if error_kind == 4 {
+            invoice_payee()
+        } else {
+            "02aaaa".repeat(5)
+        }),
+    );
     (state, peer, lightning, requests)
 }
 
@@ -339,11 +342,10 @@ async fn room_reserves_unknown_member_alongside_safe_fallback_within_total_cap()
                 })
             }),
     );
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(second, konsensus_api::state::PeerLightningKey::Verified(invoice_payee()));
+    state.peer_ln_pubkeys.lock().await.insert(
+        second,
+        konsensus_api::state::PeerLightningKey::Verified(invoice_payee()),
+    );
     let (_, room) = post(&state, "/api/v1/rooms", json!({"name":"mixed"})).await;
     let room = room["id"].as_str().unwrap();
     for peer in [first, second] {
