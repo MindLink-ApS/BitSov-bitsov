@@ -4716,14 +4716,15 @@ async fn call_block_invoice_stops_at_the_cap_before_the_wallet() {
     let live = calls::commit(pending, "answer", now - 16_000).unwrap();
     storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
     let wallet = konsensus_lightning::MockLightningProvider::new();
+    let sessions = session_with(&peer).await;
     let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
     assert_eq!(
-        prepare_call_block_invoice(&storage, &peer, &purpose, 0, "zero", &wallet).await.unwrap_err(),
+        prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 0, "zero", &wallet).await.unwrap_err(),
         konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE,
     );
     assert_eq!(
         prepare_call_block_invoice(
-            &storage, &peer, &purpose, calls::MAX_CALL_BLOCK_INVOICE_MSAT + 1, "huge", &wallet,
+            &storage, &sessions, &peer, &purpose, calls::MAX_CALL_BLOCK_INVOICE_MSAT + 1, "huge", &wallet,
         )
         .await
         .unwrap_err(),
@@ -4731,13 +4732,13 @@ async fn call_block_invoice_stops_at_the_cap_before_the_wallet() {
     );
     assert!(wallet.list_payments(20).await.unwrap().is_empty());
     for n in 0..calls::MAX_CALL_BLOCK_INVOICES {
-        prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, &format!("block-{n}"), &wallet)
+        prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, &format!("block-{n}"), &wallet)
             .await
             .unwrap();
     }
     assert_eq!(wallet.list_payments(20).await.unwrap().len(), calls::MAX_CALL_BLOCK_INVOICES as usize);
     assert_eq!(
-        prepare_call_block_invoice(&storage, &peer, &purpose, 23_000, "one-past", &wallet).await.unwrap_err(),
+        prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "one-past", &wallet).await.unwrap_err(),
         konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE,
     );
     assert_eq!(
