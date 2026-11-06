@@ -79,6 +79,7 @@ sqlx.workspace = true
 lightning-invoice.workspace = true
 
 [dev-dependencies]
+esplora-client = { version = "0.12", default-features = false, features = ["async-https-rustls", "tokio"] }
 mockito = "1"
 # Decode terminal output in the P1 regression; no image stack.
 quircs = "=0.10.3"
