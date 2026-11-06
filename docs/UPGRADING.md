@@ -98,6 +98,12 @@ the caller's hold consent (`max_hold_msat`); it still counts against the
 grant's budget and available liquidity. A refused closing payment leaves
 the call ended without an owner debit.
 
+PostgreSQL startup now refuses a database whose `_konsensus_migrations`
+rows include a version this binary does not know (`FutureSchema`), before
+it applies anything else or serves. That matches the SQLite
+`VersionMissing` fence. The rc20 binary did not have the check. Do not
+delete migration history to make an older binary start.
+
 Follow the [rc21 signing and beta-node checklist](releases/v0.3.0-rc21.md).
 
 ## rc19 → rc20
@@ -109,8 +115,11 @@ notice and call-block invoice provenance) run on first start. They are
 additive and have no down migration. Keep a consistent database backup
 before upgrading. Do not downgrade; roll forward on the migrated database.
 On SQLite, an older binary refuses startup when the database records a
-migration version the binary does not know (`VersionMissing`). The
-PostgreSQL backend has no such check and starts on the newer schema.
+migration version the binary does not know (`VersionMissing`). The rc20
+PostgreSQL backend had no such check and would start on the newer schema.
+rc21 refuses that case (`FutureSchema`) before applying migrations or
+serving.
+
 Migration **035** ends every in-flight live call;
 restart calls after the upgrade (their replay tombstones are kept and no
 unpaid media interval is granted). The two sections below cover the call
@@ -122,9 +131,10 @@ Migration **037** adds invoice-hash bindings to `(peer, call_id, seq)` on
 SQLite and PostgreSQL. It is additive and idempotent, with no down migration.
 Keep a consistent database backup before upgrading. Do not downgrade; roll
 forward. On SQLite, an older binary that does not know version 037 refuses
-the upgraded database (`VersionMissing`). PostgreSQL has no such check and
-starts on the newer schema. Do not delete migration history or invoice
-bindings to make an older binary start.
+the upgraded database (`VersionMissing`). PostgreSQL refuses an applied
+version this binary does not know (`FutureSchema`) and does not start. Do
+not delete migration history or invoice bindings to make an older binary
+start.
 
 ## Call reservations (#460)
 
@@ -1602,7 +1612,7 @@ selects embedded LDK's chain source; it does not reconfigure an external LND.
 | `[remote_access]` | `listen_addr`, `advertised_endpoint`, `mdns` | Off unless a listener is set; `advertised_endpoint` optionally overrides the first auto-discovered endpoint. `[api] listen_addr` must stay loopback. Optional `mdns` build feature advertises only under `--home`; `mdns = false` opts out. Old apps use `pair-ticket --legacy`. Avoid API/P2P/Lightning TCP port collisions. |
 | `[privacy]` | `peer_exchange = "off"` or `"paid"`, `shareable_peers`, `share_peer_labels` | Off and empty lists. Node-ID allowlists explicitly consent to sharing peers and, separately, their labels. Restart to apply; already issued quotes stay redeemable until expiry. |
 | `[network]` | `advertised_addr`, `stun_server` | Optional; explicit advertised address wins. Discovery uses only owner-set STUN; no default third-party server. |
-| `[calls]` | `stun_listen`, `max_call_minutes` | STUN omitted/off; outgoing paid call cap defaults to 60 minutes, bounded 1–240. |
+| `[calls]` | `stun_listen`, `max_call_minutes`, `media_max_frames_per_second`, `media_max_bytes_per_second`, `media_drop_bulk_over_share` | STUN omitted/off; outgoing paid call cap defaults to 60 minutes, bounded 1–240.; media limits default to 100 packets and 65536 bytes per second, per direction, and the socket closes past them |
 | `[pricing]` | `call_msat` | New, default `10000`, must be positive; offer kind 400 only. |
 | `[pricing]` / `[web]` | Existing `web_content_msat` / `page_price_msat` | Defaults changed from 50 to 1000 msat before rc8 (#167, #173). Retained `web_content_msat < 1000` is rejected at startup, even if web serving is disabled; raise or remove it. `page_price_msat` is legacy, not a separate charge override. Porch floors still apply to advertised and paid prices. |
 | `[identity]` | `hosted` | Default false; true or cloud tier reports hosted custody. Seed encryption does not turn a hosted node into a remote signer. |

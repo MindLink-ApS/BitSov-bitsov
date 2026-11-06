@@ -419,6 +419,7 @@ async fn start_app(
             chain_url: chain_url.to_owned(),
             calls: None,
             readiness_gated: false,
+            owner_approval_key: None,
         }),
     )
     .await
