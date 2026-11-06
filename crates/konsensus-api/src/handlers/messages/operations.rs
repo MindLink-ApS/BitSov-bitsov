@@ -35,6 +35,9 @@ struct Recovery {
     /// A terminal pre-payment refusal, retained for polling and duplicate POSTs.
     #[serde(default)]
     call_price_changed: bool,
+    /// Clear only after durable termination and hold release both succeeded.
+    #[serde(default)]
+    call_cleanup_done: bool,
     caller: Option<String>,
     #[serde(default)]
     execution_id: Option<String>,
@@ -96,7 +99,9 @@ fn encode(op: &mut OutboxOperation, data: &Recovery) -> Result<(), ApiError> {
     op.accounting_pending = data.reservation.is_some()
         || data.admission_reservation.is_some()
         || data.admission_pending
-        || !data.budget_resolutions.is_empty();
+        || !data.budget_resolutions.is_empty()
+        || (op.kind == i64::from(konsensus_core::kind::KIND_CALL_BLOCK)
+            && data.call_price_changed && !data.call_cleanup_done);
     op.recovery = serde_json::to_vec(data).map_err(storage)?;
     Ok(())
 }
@@ -549,14 +554,20 @@ pub(super) async fn compose_call(
     // signal is refused before any reservation. A retry of an operation that
     // already paid is answered from the journal, without reserving.
     let request_hash = request_digest(&peer, &req)?;
-    let journal = state.storage.get_outbox_operation(&id).await.map_err(storage)?;
+    let mut journal = state.storage.get_outbox_operation(&id).await.map_err(storage)?;
     if let Some(op) = journal.as_ref().filter(|op| op.state == "abandoned") {
         return Err(contextual(ApiError::OperationConflict("operation_abandoned"), op));
     }
     if let Some(op) = journal.as_ref().filter(|op| op.request_hash != request_hash) {
         return Err(mismatch(op));
     }
-    if let Some(op) = journal.as_ref().filter(|op| recovery(op).is_ok_and(|data| data.call_price_changed)) {
+    if let Some(op) = journal.as_mut().filter(|op| recovery(op).is_ok_and(|data| data.call_price_changed)) {
+        if caller(&auth).is_some() && caller(&auth) != recovery(op)?.caller {
+            return Err(ApiError::Forbidden("operation belongs to another caller".into()));
+        }
+        if let Err(error) = finish_refused_call(&state, op).await {
+            tracing::warn!(%error, "call refusal cleanup deferred");
+        }
         return Err(contextual(ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::CallPriceChanged), op));
     }
     let paid = journal.as_ref().is_some_and(|op| {
@@ -584,6 +595,11 @@ pub(super) async fn compose_call(
         id.clone(),
         policy,
     ).await;
+    if let Ok(Some(mut op)) = state.storage.get_outbox_operation(&id).await {
+        if let Err(error) = finish_refused_call(&state, &mut op).await {
+            tracing::warn!(%error, "call refusal cleanup deferred");
+        }
+    }
     crate::calls::resolve_outgoing(&state, &peer, &plaintext, &id, &request_hash).await;
     if ends_on_failure && call_payment_failed(&state, &id, result.as_ref().err()).await {
         let owner_price_change = spend_client.is_none() && result.as_ref().err().is_some_and(call_price_changed);
@@ -741,6 +757,11 @@ async fn compose_locked(
     // links and fee evidence now belong to that execution, not the old receipt.
     op.recovery_compacted = false;
     let mut data = recovery(&op)?;
+    if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+        let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        data.call_block = signal.seq.map(|seq| (signal.call_id, seq));
+    }
     data.compacted_fee_paid_msat = None;
     data.dispatched = false;
     data.settlement = None;
@@ -1579,6 +1600,7 @@ async fn compact_terminal_operations(
             let compacted_fee_paid_msat = reported_fee_paid_msat(&state.lightning_backend, &op, &data);
             let receipt = Recovery {
                 call_price_changed: data.call_price_changed,
+                call_cleanup_done: data.call_cleanup_done,
                 ldk_fee_evidence: data.ldk_fee_evidence,
                 compacted_fee_paid_msat,
                 caller: data.caller,
@@ -1608,7 +1630,26 @@ fn settlement_matches(op: &OutboxOperation, data: &Recovery, details: &PaymentDe
         && details.amount_msat == data.expected_msat
 }
 
+/// The refusal receipt is also a durable cleanup intent. `accounting_pending`
+/// keeps it in recovery and out of compaction until every side effect succeeds.
+async fn finish_refused_call(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
+    let mut data = recovery(op)?;
+    if op.kind != i64::from(konsensus_core::kind::KIND_CALL_BLOCK)
+        || !data.call_price_changed || data.call_cleanup_done { return Ok(()); }
+    let call_id = data.call_block.as_ref().map(|(id, _)| id)
+        .ok_or_else(|| storage("refused call binding unavailable"))?;
+    let peer = NodeId::from_hex(&op.recipient).map_err(storage)?;
+    crate::calls::fail_call(state, &peer, call_id, Some((&op.operation_id, &op.request_hash)))
+        .await.map_err(storage)?;
+    crate::calls::reconcile_call_spend(state, chrono::Utc::now().timestamp_millis() as u64)
+        .await.map_err(storage)?;
+    data.call_cleanup_done = true;
+    encode(op, &data)?;
+    save(state, op).await
+}
+
 async fn recover_budget(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
+    finish_refused_call(state, op).await?;
     if !op.accounting_pending { return Ok(()); }
     let mut data = recovery(op)?;
     let before = op.recovery.clone();

@@ -715,6 +715,7 @@ impl PaymentGate {
     /// Verify the payment amount meets the required price.
     ///
     /// Applies plasticity trust discount: `required = base * (1 - discount)`.
+    /// Call minutes keep their undiscounted invoice tariff.
     /// Discount is clamped to \[0.0, 0.5\]; every paid admission requires
     /// at least 1,000 msat after discount (Principle 2, DESIGN-REASONING T18).
     ///
@@ -746,7 +747,10 @@ impl PaymentGate {
         // Apply plasticity trust discount (v2.1): reliable peers pay less.
         // Clamp discount to [0.0, 0.5]; apply the admission floor below.
         // Fail-safe: NaN or infinite discount → no discount (full price).
-        let clamped_discount = if trust_discount.is_finite() {
+        let clamped_discount = if envelope.kind == crate::kind::KIND_CALL_BLOCK {
+            // A paid minute uses the same undiscounted tariff as its invoice.
+            0.0
+        } else if trust_discount.is_finite() {
             trust_discount.clamp(0.0, 0.5)
         } else {
             0.0

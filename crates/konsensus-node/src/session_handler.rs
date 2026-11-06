@@ -392,7 +392,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } => {
                         if purpose.starts_with(konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX) {
                             if privileged {
-                                let result = prepare_call_block_invoice(storage.as_ref(), pricing.as_ref(), &session_manager, &peer_id, &purpose, amount_msat, &request_id, lightning.as_ref()).await;
+                                let result = prepare_call_block_invoice(storage.as_ref(), pricing.as_ref(), &session_manager, &peer_id, &purpose, amount_msat, &request_id, lightning.as_ref(), min_admission_cost_msat).await;
                                 match result {
                                     Ok(invoice) => {
                                         let _ = transport.send_frame(&peer_id, &Frame::InvoiceResponse {
@@ -1558,6 +1558,10 @@ async fn handle_price_query(
                     return;
                 }
             };
+            // A minute quote is the current payable tariff, without a trust discount.
+            let price_msat = if kind == konsensus_core::kind::KIND_CALL_BLOCK {
+                konsensus_core::gate::price_with_floor_msat(price_msat, min_admission_cost_msat)
+            } else { price_msat };
             let frame = Frame::PriceResponse { kind, price_msat, block_height };
             if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage, peer_id, &frame, pricing.as_ref(), min_admission_cost_msat).await {
                 warn!(peer = %peer_id, error = %e, "failed to send price response");
@@ -2343,6 +2347,7 @@ async fn prepare_call_block_invoice(
     session_manager: &SessionManager,
     peer: &NodeId, purpose: &str,
     amount_msat: u64, request_id: &str, lightning: &dyn LightningProvider,
+    min_admission_cost_msat: u64,
 ) -> Result<konsensus_core::traits::lightning::Invoice, &'static str> {
     use konsensus_core::payloads::call as calls;
     const REFUSED: &str = konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE;
@@ -2369,6 +2374,7 @@ async fn prepare_call_block_invoice(
     // authorize a new minute invoice at an old (or caller-selected) price.
     let current_price = pricing.get_price_msat(konsensus_core::kind::KIND_CALL_BLOCK)
         .await.map_err(|_| REFUSED)?;
+    let current_price = konsensus_core::gate::price_with_floor_msat(current_price, min_admission_cost_msat);
     if amount_msat != current_price {
         return Err(konsensus_api::invoice_refusal::CALL_PRICE_CHANGED);
     }

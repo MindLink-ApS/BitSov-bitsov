@@ -373,13 +373,27 @@ async fn awaiting_block_grant(state: &AppState, peer: &NodeId, call_id: &str, se
 
 pub(crate) async fn fail_outgoing(state: &AppState, peer: &NodeId, plaintext: &str) -> Result<(), konsensus_storage::StorageError> {
     let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else { return Ok(()) };
+    fail_call(state, peer, &signal.call_id, None).await
+}
+
+/// Idempotent terminal cleanup uses the durable call binding, even when its
+/// pending reservation has already been released by an earlier attempt.
+pub(crate) async fn fail_call(state: &AppState, peer: &NodeId, call_id: &str,
+    refused_request: Option<(&str, &str)>) -> Result<(), konsensus_storage::StorageError> {
     let _guard = lock().lock().await;
-    if let Some(mut entry) = state.storage.call_get(peer, &signal.call_id).await? {
-        if entry.phase != rules::Phase::Ended {
+    if let Some(mut entry) = state.storage.call_get(peer, call_id).await? {
+        let previous = entry.clone();
+        if entry.phase != rules::Phase::Ended
+            || (refused_request.is_some() && entry.end_reason == Some(rules::HangupReason::Unpaid)) {
             entry.phase = rules::Phase::Ended;
             entry.end_reason = Some(rules::HangupReason::Failed);
             entry.deadline_ms = now_ms().saturating_add(rules::TOMBSTONE_MS);
-            state.storage.call_put(peer, &signal.call_id, &entry).await?;
+        }
+        if refused_request.is_some_and(|(id, hash)| entry.pending.as_ref().is_some_and(|p| p.is(id, hash))) {
+            entry.pending = None;
+        }
+        if entry != previous {
+            state.storage.call_put(peer, call_id, &entry).await?;
         }
     }
     Ok(())
@@ -923,7 +937,8 @@ pub async fn peer_call_kind_price(state: &AppState, peer: &NodeId, kind: u16) ->
     .map_err(|_| unknown())?
     .map_err(|()| unknown())?;
     let height = state.chain.get_block_height().await.unwrap_or(0);
-    // New minute invoices require the callee's exact tariff. A cached table's
+    // New minute invoices require the callee's current payable tariff. Its reply
+    // already includes both floors. A cached table's
     // trust discount applies to ordinary delivery, not to the kind-404 quote.
     if kind == konsensus_core::kind::KIND_CALL_BLOCK {
         return state.peer_prices.get_fresh_peer_price(peer, kind, height, PRICE_ANSWER_MAX_AGE).await.ok_or_else(unknown);
