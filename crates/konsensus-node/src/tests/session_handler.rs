@@ -1,6 +1,9 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use super::*;
 use konsensus_storage::{OnboardingStateRecord, Storage};
 use sha2::Digest;
+use tracing_subscriber::layer::SubscriberExt;
 
 fn test_peer_id() -> NodeId {
     NodeId::from_bytes([1u8; 32])
@@ -4337,6 +4340,36 @@ fn offer_witness_needs_two_spaced_offers_on_one_connection() {
     assert!(!witness.second_spaced_offer(&peer, connection, at(125)), "not the old connection's second");
 }
 
+/// A burst of distinct peers cannot grow the witness past the cooldown-map cap.
+/// A peer that already has a slot can still complete the pair.
+#[test]
+fn offer_witness_stops_at_the_cap() {
+    use std::time::Duration;
+    let connection = std::time::Instant::now() - Duration::from_secs(30);
+    let now = std::time::Instant::now();
+    let mut witness = OfferWitness::default();
+    for n in 0..MAX_COOLDOWN_ENTRIES {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&(n as u32).to_be_bytes());
+        let peer = NodeId::from_bytes(bytes);
+        assert!(!witness.second_spaced_offer(&peer, connection, now), "first offer is recorded");
+    }
+    assert_eq!(witness.len(), MAX_COOLDOWN_ENTRIES);
+    let extra = NodeId::from_bytes([0xff; 32]);
+    assert!(!witness.second_spaced_offer(&extra, connection, now), "no new slot past the cap");
+    assert_eq!(witness.len(), MAX_COOLDOWN_ENTRIES, "the map does not grow");
+    let first = NodeId::from_bytes({
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&0u32.to_be_bytes());
+        bytes
+    });
+    assert!(
+        witness.second_spaced_offer(&first, connection, now + SESSION_SELF_HEAL_INTERVAL),
+        "a recorded peer still completes the pair"
+    );
+    assert_eq!(witness.len(), MAX_COOLDOWN_ENTRIES - 1);
+}
+
 /// An offer counts on the connection it came on, whatever the transport holds by now:
 /// a frame read from a connection already replaced is not credited to its replacement.
 #[tokio::test]
@@ -4420,6 +4453,56 @@ async fn an_unreadable_ratchet_init_keeps_the_session_and_asks_to_renegotiate() 
     assert!(high_mgr.needs_renegotiation(low.node_id()).await);
     assert!(e2ee_needs_self_heal(&high_mgr, low.node_id()).await, "the tick keeps asking");
     assert_session_works(&low, &low_mgr, &high, &high_mgr, "after an unreadable ratchet init").await;
+}
+
+/// Further unreadable inits do not each ask again. One that does decrypt still
+/// retires the request.
+#[tokio::test(flavor = "current_thread")]
+async fn a_second_unreadable_ratchet_init_asks_only_once() {
+    struct Asks(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Asks {
+        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            let mut message = String::new();
+            struct Take<'a>(&'a mut String);
+            impl tracing::field::Visit for Take<'_> {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+            }
+            event.record(&mut Take(&mut message));
+            if message.contains("re-negotiating") {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let transport = Arc::new(make_gossip_test_transport());
+    let foreign = SessionManager::new(Arc::clone(&low));
+    let init = foreign.initiate_session(high.node_id(), &high_mgr.prekey_bundle().await).await.unwrap();
+    drop(init);
+    let unreadable = konsensus_crypto::ratchet_message_to_bytes(
+        &foreign.encrypt(high.node_id(), b"ratchet-init").await.unwrap(),
+    );
+    let asks = Arc::new(AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(Asks(Arc::clone(&asks)));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    handle_ratchet_init(low.node_id(), &unreadable, &high_mgr, &storage, &transport).await;
+    handle_ratchet_init(low.node_id(), &unreadable, &high_mgr, &storage, &transport).await;
+    assert_eq!(asks.load(Ordering::SeqCst), 1, "the second failure does not ask again");
+    assert!(high_mgr.needs_renegotiation(low.node_id()).await);
+
+    let readable = konsensus_crypto::ratchet_message_to_bytes(
+        &low_mgr.encrypt(high.node_id(), b"ratchet-init").await.unwrap(),
+    );
+    handle_ratchet_init(low.node_id(), &readable, &high_mgr, &storage, &transport).await;
+    assert!(!high_mgr.needs_renegotiation(low.node_id()).await, "a readable init clears the request");
+    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the readable ratchet init").await;
 }
 
 /// A malformed SessionInit, or one naming a one-time pre-key this node does

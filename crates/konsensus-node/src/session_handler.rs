@@ -86,6 +86,10 @@ const SESSION_SELF_HEAL_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// the spacing once and the next one to qualify.
 const OFFER_WITNESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(3 * SESSION_SELF_HEAL_INTERVAL.as_secs());
 
+/// Maximum entries in cooldown maps before forced eviction. A burst of distinct
+/// peer identities must not grow these maps without a bound.
+const MAX_COOLDOWN_ENTRIES: usize = 10_000;
+
 /// While set, the higher id does not answer prekey offers: a test's barrier, so a
 /// lost session cannot recover before the test has seen what it is checking.
 #[cfg(test)]
@@ -182,10 +186,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     } = deps;
 
     transport.set_reconnect_sessions(&session_manager);
-
-    /// Maximum entries in cooldown maps before forced eviction to prevent
-    /// memory exhaustion from a burst of unique peer identities.
-    const MAX_COOLDOWN_ENTRIES: usize = 10_000;
 
     let mut last_negotiation: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
@@ -604,6 +604,10 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     last_negotiation.clear();
                 }
                 offer_witness.prune(std::time::Instant::now());
+                if offer_witness.len() > MAX_COOLDOWN_ENTRIES {
+                    warn!(len = offer_witness.len(), cap = MAX_COOLDOWN_ENTRIES, "offer witness exceeded cap, clearing");
+                    offer_witness.clear();
+                }
                 if connections_checked.len() > MAX_COOLDOWN_ENTRIES {
                     connections_checked.clear();
                 }
@@ -937,8 +941,22 @@ impl OfferWitness {
             }
             _ => {}
         }
+        // A peer that is not already recorded does not get a slot once the map is
+        // full, so the burst cannot grow it. Missing a slot only keeps a healthy
+        // session in place.
+        if self.first.len() >= MAX_COOLDOWN_ENTRIES && !self.first.contains_key(peer) {
+            return false;
+        }
         self.first.insert(*peer, (connection, now));
         false
+    }
+
+    fn len(&self) -> usize {
+        self.first.len()
+    }
+
+    fn clear(&mut self) {
+        self.first.clear();
     }
 
     fn forget(&mut self, peer: &NodeId) {
@@ -1139,12 +1157,18 @@ async fn handle_ratchet_init(
                     info!(peer = %peer_id, "ratchet init received, bidirectional E2EE ready");
                 }
                 Err(e) => {
+                    // A failed decrypt changes no ratchet state, so the session stays
+                    // until a new one is confirmed. One failure asks for a replacement.
+                    // The self-heal tick keeps asking; further failures must not each
+                    // send another bundle or another warning.
+                    if session_manager.needs_renegotiation(peer_id).await {
+                        debug!(peer = %peer_id, "ratchet init still unreadable; replacement already requested");
+                        return;
+                    }
                     warn!(
                         peer = %peer_id, error = %e,
                         "failed to decrypt ratchet init; session kept, re-negotiating"
                     );
-                    // A failed decrypt changes no ratchet state, so the session stays
-                    // until a new one is confirmed.
                     session_manager.mark_needs_renegotiation(peer_id).await;
                     // Preserve paid envelopes across ratchet recovery; acceptance ACKs do not require decryption.
                     // Send fresh PrekeyOffer to trigger re-negotiation

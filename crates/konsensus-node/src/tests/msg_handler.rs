@@ -1,6 +1,9 @@
-use super::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+
+use super::*;
+use tracing_subscriber::layer::SubscriberExt;
 
 use konsensus_core::identity::NodeIdentity;
 use konsensus_core::types::{MessageId, NodeId, Nonce, Recipient, Signature};
@@ -1101,6 +1104,59 @@ async fn decrypt_failure_keeps_the_session_and_asks_to_renegotiate() {
     // The session stays, and the node asks for a replacement
     assert!(bob_mgr.has_session(alice.node_id()).await);
     assert!(bob_mgr.needs_renegotiation(alice.node_id()).await);
+}
+
+/// A second envelope that still cannot be read does not ask again. The first
+/// request stands, and the session stays usable.
+#[tokio::test(flavor = "current_thread")]
+async fn a_second_undecryptable_envelope_asks_only_once() {
+    struct Asks(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Asks {
+        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            let mut message = String::new();
+            struct Take<'a>(&'a mut String);
+            impl tracing::field::Visit for Take<'_> {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+            }
+            event.record(&mut Take(&mut message));
+            if message.contains("asking to renegotiate") {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let bob_mgr = SessionManager::new(Arc::clone(&bob));
+    let alice_mgr = SessionManager::new(Arc::clone(&alice));
+    let transport = make_transport(&bob);
+    establish_sessions(&alice_mgr, &bob_mgr, &alice, &bob).await;
+
+    let alice_mgr2 = SessionManager::new(Arc::clone(&alice));
+    let bob_bundle = bob_mgr.prekey_bundle().await;
+    let init = alice_mgr2.initiate_session(bob.node_id(), &bob_bundle).await.unwrap();
+    drop(init);
+    let foreign = alice_mgr2.encrypt(bob.node_id(), b"not this session").await.unwrap();
+    let mut envelope = make_envelope(
+        alice.as_ref(),
+        *bob.node_id(),
+        konsensus_core::kind::KIND_CHAT,
+        konsensus_crypto::ratchet_message_to_bytes(&foreign),
+    );
+    envelope.timestamp += 11_000;
+
+    let asks = Arc::new(AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(Asks(Arc::clone(&asks)));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    note_unreadable_envelope(&envelope, alice.node_id(), &bob_mgr, &transport).await;
+    note_unreadable_envelope(&envelope, alice.node_id(), &bob_mgr, &transport).await;
+    assert_eq!(asks.load(Ordering::SeqCst), 1, "the second envelope does not ask again");
+    assert!(bob_mgr.needs_renegotiation(alice.node_id()).await);
+    assert!(bob_mgr.has_session(alice.node_id()).await);
 }
 
 // ── Non-UTF8 plaintext ──────────────────────────────────────────────
