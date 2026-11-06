@@ -6,7 +6,7 @@
 //! [`ScopedAuth<Read>`] at `GET /api/v1/status`. Exposing identity/topology/funds on an
 //! unauthenticated endpoint links the node's IP to its NodeID, social graph,
 //! and wallet, and is precisely the kind of free, unpaid disclosure the
-//! payment-is-the-connection invariant forbids (see CODEX.md).
+//! payment-is-the-connection invariant forbids.
 
 use std::sync::Arc;
 
@@ -86,6 +86,9 @@ pub struct HealthResponse {
     /// server for calls, never switch to it by itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stun_port: Option<u16>,
+    /// `[calls] max_call_minutes`: the paid-duration cap a new outgoing call
+    /// reserves against, so an app can compute the hold before ringing. Read-only.
+    pub max_call_minutes: u16,
     /// `stun:host:port` for ICE: this node's own STUN responder when it has a
     /// dialable peer host, else the owner's `[network] stun_server` when set and
     /// valid; omitted when neither applies.
@@ -434,6 +437,7 @@ async fn status(
         chain_sync,
         block_height,
         stun_port: state.stun_port,
+        max_call_minutes: state.max_call_minutes,
         stun_url,
         stun_source,
         peer_endpoint: peer.endpoint,

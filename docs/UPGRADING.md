@@ -3,14 +3,138 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## rc21 → rc22
+
+An E2EE send now saves its advanced send chain before the ciphertext leaves the
+session; if the save fails, nothing is sent (#519). Session setup applies
+stricter consistency checks to the keys it receives (#520). File sends report
+the routing fee actually paid (#521). There are no new SQL migrations or pairing-store or peer-store schema version changes since rc21;
+pairing storage remains **v8**, and stored session state keeps its format.
+Retain the latest data directory, config and encrypted seed; do not re-run
+`init` or restore a historical snapshot. Existing rollback constraints still
+apply. This change does not extend to a database restored from an older copy.
+
+Operators stop BitSov, switch its binary and restart with the same config and
+data. No config change or grant re-issue is needed. A node running rc20 follows
+[rc20 → rc21](#rc20--rc21) too.
+
+A send the node cannot save is now refused with `not_dispatched`, reason
+`session_save_failed`, before any payment for it. An admission already settled
+in the same call stays settled and is reported as paid, with the same reason.
+In a room or calendar fan-out, that recipient is skipped and nothing is paid to
+it. When this reason appears, check disk and database health.
+
+An rc22 node refuses a prekey bundle or session init that fails the stricter
+checks. It logs a warning and adds no reply frame, so that peer gets no new
+session from it. If a session with a contact does not form after the upgrade,
+read the node log.
+
+`POST /api/v1/files/:id/send` now returns optional `fee_paid_msat`. It is omitted
+when any component fee is unknown and on backends other than LDK; absence does
+not mean zero.
+
+The diff from rc21 changes no frame, envelope, ratchet message, prekey bundle or
+session init format. One-time prekey id values change; the field and its type do
+not. From the source, the bundles and inits an rc21 node builds pass the stricter
+checks, so rc21 and rc22 should interoperate. The source supports this
+reading, and it was also run on regtest (below); not on real hardware.
+
+Mixed rc21 and rc22 operation: tested on regtest at `9c923c98`. Upgrade in place
+in both id orders, fresh sessions and file sends to and from rc21 passed. Not run
+on real hardware.
+
+Rollback from rc22 to rc21: tested on regtest in both id orders. rc21 started on
+the candidate's data, and chat, calls and files passed. The earlier guidance that
+prefers rolling forward stands.
+
+Not included: call cutoff is not yet verified on real hardware, and this release
+does not fix the other open reports.
+
+Known limit, also present in rc21: If a link drops during a call and both nodes reconnect at nearly the same moment,
+the two nodes can end up on different sessions. Messages and call minutes sent
+then can be paid for and not read. It can clear within about a minute; otherwise
+follow the steps below. This release does not change it, and a fix is planned.
+
+If messages stop being read after a dropped link:
+
+1. Stop sending; a send can be paid for and not read.
+2. Restart one node with its existing config and data, and allow up to about 90
+   seconds; early sends may fail with nothing paid.
+3. In any app that reports a pending result, use Check pending result.
+4. In any app that still shows the call, use End call, or Hang up while the
+   call still shows as live.
+5. Check that messages are read in both directions, then call again.
+
+Amounts already paid for messages or minutes that were not read are not refunded.
+Tested on regtest on this release and on rc21, by calling the app's host
+functions, not on real hardware.
+
+Follow the [rc22 signing and node checklist](releases/v0.3.0-rc22.md).
+
+## rc20 → rc21
+
+rc21 fixes app-grant call spending and closing signals (#493, #498). There
+are no new SQL migrations or pairing-store or peer-store schema version
+changes since rc20; pairing storage remains **v8**. Retain the latest data
+directory, config and encrypted seed; do not re-run `init` or restore a
+historical snapshot. Existing rollback constraints still apply.
+
+Existing app grants bind calls at their stored **6,000 msat per payment**
+until re-granted. Re-issue each app client's grant with
+`konsensus grant --op <op>`. With no `--per-call`, the client's proposed
+per-payment value is signed, capped at the budget; pass `--per-call <sats>`
+to set the limit explicitly, and review the value shown before signing.
+The owner now sees and signs the real per-payment value; paid messages,
+files, rooms and admission still use the lower of that value and 6 sats.
+Calls use the signed value and their pinned per-block ceiling, with the
+offer bounded by its own cap. Every draw re-checks the signed value.
+
+Set `[calls] max_call_minutes` so a call's hold fits typical app budgets.
+For example, use **10 minutes for a 500-sat grant at 10 sat/min**; the
+default 60-minute hold would exceed that budget even before fees. Allow
+room for routing fees, the offer and the closing allowance. The closing
+signal is paid by the call's grant, with its allowance reserved outside
+the caller's hold consent (`max_hold_msat`); it still counts against the
+grant's budget and available liquidity. A refused closing payment leaves
+the call ended without an owner debit.
+
+PostgreSQL startup now refuses a database whose `_konsensus_migrations`
+rows include a version this binary does not know (`FutureSchema`), before
+it applies anything else or serves. That matches the SQLite
+`VersionMissing` fence. The rc20 binary did not have the check. Do not
+delete migration history to make an older binary start.
+
+Follow the [rc21 signing and beta-node checklist](releases/v0.3.0-rc21.md).
+
+## rc19 → rc20
+
+rc20 adds M6 paid calls and the onboarding/pairing work merged since rc19.
+SQL migrations **031** and **032** (starter requests and queries, signet,
+off by default) and **035**, **036** and **037** (call blocks, the Unpaid
+notice and call-block invoice provenance) run on first start. They are
+additive and have no down migration. Keep a consistent database backup
+before upgrading. Do not downgrade; roll forward on the migrated database.
+On SQLite, an older binary refuses startup when the database records a
+migration version the binary does not know (`VersionMissing`). The rc20
+PostgreSQL backend had no such check and would start on the newer schema.
+rc21 refuses that case (`FutureSchema`) before applying migrations or
+serving.
+
+Migration **035** ends every in-flight live call;
+restart calls after the upgrade (their replay tombstones are kept and no
+unpaid media interval is granted). The two sections below cover the call
+ledger and invoice bindings in detail.
+
 ## Call-block invoice provenance (migration 037)
 
 Migration **037** adds invoice-hash bindings to `(peer, call_id, seq)` on
 SQLite and PostgreSQL. It is additive and idempotent, with no down migration.
-Keep a consistent database backup before upgrading: an older SQLite binary
-that does not know version 037 refuses the upgraded database (`VersionMissing`).
-Returning to that binary requires restoring the pre-upgrade database; do not
-delete migration history or invoice bindings to bypass the check.
+Keep a consistent database backup before upgrading. Do not downgrade; roll
+forward. On SQLite, an older binary that does not know version 037 refuses
+the upgraded database (`VersionMissing`). PostgreSQL refuses an applied
+version this binary does not know (`FutureSchema`) and does not start. Do
+not delete migration history or invoice bindings to make an older binary
+start.
 
 ## Call reservations (#460)
 
@@ -234,7 +358,7 @@ There is no intermediate rc15 installation step.
 `fix/ldk-node-late-failure`. The candidate is `main` at
 `3088c53cbb3f6b609545e93844f3d1eec84cbdea` plus the reviewed release/upgrade
 docs and this security update on `docs/rc15-release-notes-security`. This
-update changes documentation only; versions remain rc14. Rasmus will select
+update changes documentation only; versions remain rc14. The release operator will select
 the final rc15 release commit and tag/sign separately. See the
 [signing checklist](releases/v0.3.0-rc15.md).
 For nodes skipping releases, apply the earlier procedures first, then
@@ -1488,7 +1612,7 @@ selects embedded LDK's chain source; it does not reconfigure an external LND.
 | `[remote_access]` | `listen_addr`, `advertised_endpoint`, `mdns` | Off unless a listener is set; `advertised_endpoint` optionally overrides the first auto-discovered endpoint. `[api] listen_addr` must stay loopback. Optional `mdns` build feature advertises only under `--home`; `mdns = false` opts out. Old apps use `pair-ticket --legacy`. Avoid API/P2P/Lightning TCP port collisions. |
 | `[privacy]` | `peer_exchange = "off"` or `"paid"`, `shareable_peers`, `share_peer_labels` | Off and empty lists. Node-ID allowlists explicitly consent to sharing peers and, separately, their labels. Restart to apply; already issued quotes stay redeemable until expiry. |
 | `[network]` | `advertised_addr`, `stun_server` | Optional; explicit advertised address wins. Discovery uses only owner-set STUN; no default third-party server. |
-| `[calls]` | `stun_listen`, `max_call_minutes` | STUN omitted/off; outgoing paid call cap defaults to 60 minutes, bounded 1–240. |
+| `[calls]` | `stun_listen`, `max_call_minutes`, `media_max_frames_per_second`, `media_max_bytes_per_second`, `media_drop_bulk_over_share` | STUN omitted/off; outgoing paid call cap defaults to 60 minutes, bounded 1–240.; media limits default to 100 packets and 65536 bytes per second, per direction, and the socket closes past them |
 | `[pricing]` | `call_msat` | New, default `10000`, must be positive; offer kind 400 only. |
 | `[pricing]` / `[web]` | Existing `web_content_msat` / `page_price_msat` | Defaults changed from 50 to 1000 msat before rc8 (#167, #173). Retained `web_content_msat < 1000` is rejected at startup, even if web serving is disabled; raise or remove it. `page_price_msat` is legacy, not a separate charge override. Porch floors still apply to advertised and paid prices. |
 | `[identity]` | `hosted` | Default false; true or cloud tier reports hosted custody. Seed encryption does not turn a hosted node into a remote signer. |

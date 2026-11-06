@@ -1,6 +1,6 @@
 # Serialized on-chain operations (#189)
 
-Atlas run 2 items 10 and 12 exposed a funding double spend: returning from
+TEST5 run 2 items 10 and 12 exposed a funding double spend: returning from
 `Node::open_channel` only means negotiation started. Neither BDK transaction
 construction nor LDK's asynchronous broadcast queue reserves wallet inputs.
 

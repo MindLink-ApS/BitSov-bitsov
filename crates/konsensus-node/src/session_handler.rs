@@ -30,8 +30,8 @@ use konsensus_pricing::PeerPriceCache;
 use konsensus_api::audit::AuditLog;
 use konsensus_api::membrane::{Membrane, PrePaymentReason};
 use konsensus_api::state::WsDeliveryStatus;
-use konsensus_api::state::{InvoiceRequestOutcome, InvoiceResponseError};
 use konsensus_api::InvoiceResponseData;
+use konsensus_api::state::{InvoiceRequestOutcome, InvoiceResponseError};
 
 use crate::onboarding::auto_channel::AutoChannelEvent;
 use crate::onboarding::funding_poll;
@@ -55,27 +55,19 @@ pub(crate) struct SessionHandlerDeps {
     pub peer_registry: Arc<tokio::sync::RwLock<PeerRegistry>>,
     pub routing: Arc<konsensus_routing::RoutingTable>,
     pub gossip_validator: Arc<konsensus_gossip::GossipValidator>,
-    pub send_timestamps: Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>,
-        >,
-    >,
+    pub send_timestamps: Arc<tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>>>,
     pub lightning: Arc<dyn LightningProvider>,
     pub lightning_addr: Option<String>,
     /// True only for Mock/SharedMock Lightning. Gates the connect-time
     /// profile envelope, which carries a mock payment proof.
     pub mock_lightning: bool,
-    pub invoice_requests: Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
-        >,
-    >,
+    pub invoice_requests: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>>,
     pub peer_ln_pubkeys: Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, String>>>,
     pub ws_broadcast: broadcast::Sender<Arc<konsensus_api::state::WsMessage>>,
     pub ws_delivery_tx: broadcast::Sender<Arc<WsDeliveryStatus>>,
     pub pending_tx: tokio::sync::mpsc::Sender<NodeId>,
     pub starter_newcomer_tx: Option<mpsc::Sender<(NodeId, Frame)>>,
-    pub starter_hub_tx: Option<mpsc::Sender<(NodeId, Frame)>>,
+    pub starter_hub_tx: Option<mpsc::Sender<(NodeId,Frame)>>,
     pub auto_channel_tx: mpsc::Sender<AutoChannelEvent>,
     pub shutdown_rx: watch::Receiver<bool>,
 }
@@ -83,20 +75,25 @@ pub(crate) struct SessionHandlerDeps {
 /// Per-peer session negotiation cooldown to prevent DoS via rapid
 /// PrekeyOffer/SessionInit flooding. A whitelisted peer could otherwise
 /// force expensive X3DH computations + storage churn with no rate limit.
-const SESSION_NEGOTIATION_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Frames whose ratchet advance is durable but whose transport send failed.
-/// Keep one per session and discard it when that session is replaced.
-struct PendingRatchetInit {
-    frame: Frame,
-    ratchet_key: [u8; 32],
-}
-
-type PendingRatchetInits = std::collections::HashMap<NodeId, PendingRatchetInit>;
+pub(crate) const SESSION_NEGOTIATION_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Periodic self-heal cadence for connected peers that have Noise transport
 /// but no bidirectional E2EE sending chain yet.
 const SESSION_SELF_HEAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// An offer that counts towards replacing a healthy session expires after this,
+/// so stale frames far apart never add up. Long enough for a jittered tick to miss
+/// the spacing once and the next one to qualify.
+const OFFER_WITNESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(3 * SESSION_SELF_HEAL_INTERVAL.as_secs());
+
+/// Maximum entries in cooldown maps before forced eviction. A burst of distinct
+/// peer identities must not grow these maps without a bound.
+const MAX_COOLDOWN_ENTRIES: usize = 10_000;
+
+/// While set, the higher id does not answer prekey offers: a test's barrier, so a
+/// lost session cannot recover before the test has seen what it is checking.
+#[cfg(test)]
+pub(crate) static HOLD_PREKEY_ANSWERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Per-peer PeerExchange cooldown — prevents a peer from spamming
 /// PeerExchange requests/responses to trigger expensive registry writes.
@@ -138,9 +135,7 @@ fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
         PeerExchangeReceived { privileged, .. } => {
             (privileged, PrePaymentReason::PeerExchangeBeforePayment)
         }
-        StarterRequestReceived { privileged, .. } | StarterStatusReceived { privileged, .. } => {
-            (privileged, PrePaymentReason::StarterBeforeInvite)
-        }
+        StarterRequestReceived { privileged, .. } | StarterStatusReceived { privileged, .. } => (privileged, PrePaymentReason::StarterBeforeInvite),
         LightningInfoReceived { privileged, .. } => {
             (privileged, PrePaymentReason::LightningInfoBeforePayment)
         }
@@ -159,8 +154,7 @@ fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
 /// Runs the session/control event handler loop.
 pub(crate) async fn run(deps: SessionHandlerDeps) {
     let SessionHandlerDeps {
-        content_server,
-        front_door,
+        content_server, front_door,
         privacy,
         peer_exchange_floor,
         transport,
@@ -192,14 +186,11 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     } = deps;
 
     transport.set_reconnect_sessions(&session_manager);
-    let mut pending_ratchet_inits = PendingRatchetInits::new();
-
-    /// Maximum entries in cooldown maps before forced eviction to prevent
-    /// memory exhaustion from a burst of unique peer identities.
-    const MAX_COOLDOWN_ENTRIES: usize = 10_000;
 
     let mut last_negotiation: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
+    let mut offer_witness = OfferWitness::default();
+    let mut connections_checked = ConnectionsChecked::new();
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
@@ -210,9 +201,9 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let exchange_nonces = konsensus_storage::StorageNonceAdapter::new(storage.clone());
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
     let readiness_height = ReadinessHeightCache::new(chain.clone());
-    // PSI-SPEED: bounds our prekey replies to a paid payee's offer. Separate
-    // from the other two eager limiters on purpose; see `eager_offers` in the
-    // compose handler.
+    // PSI-SPEED: bounds our prekey replies to a paid payee's offer, and our
+    // answers to a peer recovering a lost session. Separate from the other two
+    // eager limiters on purpose; see `eager_offers` in the compose handler.
     let mut eager_offers = konsensus_message::EagerOfferLimiter::new();
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
@@ -267,39 +258,42 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                     }
 
-                    ControlEvent::PrekeyOffer { peer_id, bundle, privileged } => {
+                    ControlEvent::PrekeyOffer { peer_id, bundle, privileged, connection, received_at } => {
                         if !privileged {
                             continue;
                         }
                         reply_prekey_offer_to_paid_payee(
                             &peer_id, our_node_id, &session_manager, &transport, &mut eager_offers,
                         ).await;
+                        answer_prekey_offer_for_recovery(
+                            &peer_id, our_node_id, &session_manager, &transport, &mut eager_offers, &last_negotiation,
+                        ).await;
                         handle_prekey_offer(
                             &peer_id, bundle, our_node_id, &session_manager, &storage,
-                            &transport, &audit_log, &mut last_negotiation, &mut pending_ratchet_inits,
+                            &transport, &audit_log, &mut last_negotiation, &mut offer_witness, &connection, received_at,
                         ).await;
                     }
 
-                    ControlEvent::SessionInit { peer_id, init_data, privileged } => {
+                    ControlEvent::SessionInit { peer_id, init_data, privileged, connection } => {
                         if !privileged {
                             continue;
                         }
                         handle_session_init(
                             &peer_id, init_data, &session_manager, &storage,
-                            &transport, &audit_log, &mut last_negotiation, &mut pending_ratchet_inits,
+                            &transport, &audit_log, &mut last_negotiation, &connection,
                         ).await;
                     }
 
-                    ControlEvent::SessionAck { peer_id, privileged } => {
+                    ControlEvent::SessionAck { peer_id, privileged, .. } => {
                         if !privileged {
                             continue;
                         }
                         handle_session_ack(
-                            &peer_id, &session_manager, &transport, &audit_log, &mut pending_ratchet_inits,
+                            &peer_id, &session_manager, &transport, &audit_log,
                         ).await;
                     }
 
-                    ControlEvent::RatchetInit { peer_id, payload, privileged } => {
+                    ControlEvent::RatchetInit { peer_id, payload, privileged, .. } => {
                         if !privileged {
                             continue;
                         }
@@ -398,7 +392,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } => {
                         if purpose.starts_with(konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX) {
                             if privileged {
-                                let result = prepare_call_block_invoice(storage.as_ref(), &peer_id, &purpose, amount_msat, &request_id, lightning.as_ref()).await;
+                                let result = prepare_call_block_invoice(storage.as_ref(), &session_manager, &peer_id, &purpose, amount_msat, &request_id, lightning.as_ref()).await;
                                 match result {
                                     Ok(invoice) => {
                                         let _ = transport.send_frame(&peer_id, &Frame::InvoiceResponse {
@@ -609,6 +603,14 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     warn!(len = last_negotiation.len(), cap = MAX_COOLDOWN_ENTRIES, "negotiation cooldown map exceeded cap, clearing");
                     last_negotiation.clear();
                 }
+                offer_witness.prune(std::time::Instant::now());
+                if offer_witness.len() > MAX_COOLDOWN_ENTRIES {
+                    warn!(len = offer_witness.len(), cap = MAX_COOLDOWN_ENTRIES, "offer witness exceeded cap, clearing");
+                    offer_witness.clear();
+                }
+                if connections_checked.len() > MAX_COOLDOWN_ENTRIES {
+                    connections_checked.clear();
+                }
                 if last_peer_exchange.len() > MAX_COOLDOWN_ENTRIES {
                     warn!(len = last_peer_exchange.len(), cap = MAX_COOLDOWN_ENTRIES, "peer exchange cooldown map exceeded cap, clearing");
                     last_peer_exchange.clear();
@@ -628,7 +630,8 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     &mut lightning_was_ready, &transport, &lightning, &lightning_addr,
                     &storage, &ws_delivery_tx, our_node_id,
                 ).await;
-                heal_connected_e2ee_sessions(&session_manager, &transport, &mut pending_ratchet_inits).await;
+                heal_connected_e2ee_sessions(&session_manager, &transport).await;
+                check_connected_e2ee_sessions(&session_manager, &transport, &last_negotiation, &mut connections_checked).await;
             }
             _ = shutdown_rx.changed() => {
                 info!("session handler shutting down");
@@ -652,16 +655,7 @@ async fn refresh_recovered_lightning(
     let ready = lightning.money_ready().await;
     if ready && !*was_ready {
         for peer in transport.connected_privileged_peers().await {
-            send_lightning_info(
-                &peer,
-                transport,
-                lightning,
-                lightning_addr,
-                storage,
-                ws_delivery_tx,
-                our_node_id,
-            )
-            .await;
+            send_lightning_info(&peer, transport, lightning, lightning_addr, storage, ws_delivery_tx, our_node_id).await;
         }
     }
     *was_ready = ready;
@@ -705,6 +699,7 @@ async fn send_lightning_info(
             .await;
         }
     }
+
 }
 
 // ── Individual event handlers ─────────────────────────────────────────────
@@ -730,7 +725,10 @@ async fn handle_peer_connected(
     info!(peer = %peer_id, "peer connected, sending prekey offer + price table");
 
     // Notify pending delivery flusher about reconnected peer.
-    match tokio::time::timeout(std::time::Duration::from_secs(5), pending_tx.send(*peer_id)).await {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        pending_tx.send(*peer_id),
+    ).await {
         Ok(Err(e)) => warn!(error = %e, "pending delivery channel closed"),
         Err(_) => warn!(peer = %peer_id, "pending delivery notification timed out (5s)"),
         Ok(Ok(())) => {}
@@ -739,6 +737,7 @@ async fn handle_peer_connected(
     if let Err(e) = send_prekey_offer(session_manager, transport, peer_id).await {
         warn!(peer = %peer_id, error = %e, "failed to send prekey offer");
     }
+    check_session_on_connect(session_manager, transport, peer_id, our_node_id).await;
     if let Err(e) = funding_poll::emit_progress_step(
         storage.as_ref(),
         ws_delivery_tx,
@@ -754,9 +753,10 @@ async fn handle_peer_connected(
     // Send our price table so the peer knows what we charge.
     // Compute the trust discount we offer this peer based on their synaptic weight
     // in our routing table — stronger relationships get lower prices.
-    let meta =
-        konsensus_pricing::peer_prices::build_full_price_table(pricing.as_ref(), chain.as_ref())
-            .await;
+    let meta = konsensus_pricing::peer_prices::build_full_price_table(
+        pricing.as_ref(),
+        chain.as_ref(),
+    ).await;
     match meta {
         Ok(meta) => {
             let peer_discount = routing
@@ -770,16 +770,7 @@ async fn handle_peer_connected(
                 valid_blocks: meta.valid_blocks,
                 trust_discount: peer_discount,
             };
-            if let Err(e) = crate::delivery_prices::send_price_frame(
-                transport,
-                storage.as_ref(),
-                peer_id,
-                &price_frame,
-                pricing.as_ref(),
-                min_admission_cost_msat,
-            )
-            .await
-            {
+            if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage.as_ref(), peer_id, &price_frame, pricing.as_ref(), min_admission_cost_msat).await {
                 warn!(peer = %peer_id, error = %e, "failed to send price table");
             }
         }
@@ -788,16 +779,7 @@ async fn handle_peer_connected(
         }
     }
 
-    send_lightning_info(
-        peer_id,
-        transport,
-        lightning,
-        lightning_addr,
-        storage,
-        ws_delivery_tx,
-        our_node_id,
-    )
-    .await;
+    send_lightning_info(peer_id, transport, lightning, lightning_addr, storage, ws_delivery_tx, our_node_id).await;
 
     // Send our KIND_PROFILE (103) so the peer can display our identity.
     // Mock backends only: a real backend never sends a mock payment proof.
@@ -814,7 +796,9 @@ async fn handle_prekey_offer(
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
     last_negotiation: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
-    pending_ratchet_inits: &mut PendingRatchetInits,
+    offer_witness: &mut OfferWitness,
+    connection: &konsensus_message::ConnectionContext,
+    received_at: std::time::Instant,
 ) {
     // Rate-limit session re-negotiation per peer.
     if let Some(last) = last_negotiation.get(peer_id) {
@@ -837,14 +821,12 @@ async fn handle_prekey_offer(
         return;
     }
 
-    // We are the initiator — perform X3DH with peer's bundle.
-    pending_ratchet_inits.remove(peer_id);
-    if session_manager.has_session(peer_id).await {
-        warn!(peer = %peer_id, "peer sent PrekeyOffer but session exists — replacing stale session");
-        session_manager.remove_session(peer_id).await;
-        // Paid ciphertext remains queued until its recipient ACKs, even after a session reset.
-    }
-
+    // We are the initiator — perform X3DH with peer's bundle. Any session we
+    // already have with this peer stays in place and usable until the peer
+    // confirms the new one with SessionAck (`reinitiate_session`): a valid
+    // bundle does not prove the peer will accept the init, since it can be
+    // stale. A malformed or forged offer changes nothing. Paid ciphertext
+    // remains queued until its recipient ACKs, even across a session replacement.
     let peer_bundle: konsensus_crypto::SerializablePrekeyBundle =
         match serde_json::from_value(bundle).map_err(|_| konsensus_core::wire_json::DecodeError) {
             Ok(b) => b,
@@ -853,13 +835,47 @@ async fn handle_prekey_offer(
                 return;
             }
         };
+    // The bundle must be the offering peer's own: its signed pre-key is
+    // verified against the node id it names, so a bundle naming another node
+    // would bind the session to keys that are not this peer's.
+    if NodeId::from_hex(&peer_bundle.node_id).ok().as_ref() != Some(peer_id) {
+        warn!(peer = %peer_id, "prekey bundle names another node; offer ignored");
+        return;
+    }
+    if !key_is_the_hello_key(&peer_bundle.identity_key, connection) {
+        warn!(peer = %peer_id, "prekey bundle identity key is not this connection's; offer ignored");
+        return;
+    }
+    if konsensus_crypto::same_x25519_point(&peer_bundle.signed_prekey, &peer_bundle.identity_key) {
+        warn!(peer = %peer_id, "prekey bundle reuses its identity key as signed prekey; offer ignored");
+        return;
+    }
 
+    // A bundle says nothing about whether it is fresh, and a healthy session must
+    // not be put at risk by one stale frame. So act at once only with no session, or
+    // one marked or still unconfirmed. Otherwise ask for a second offer on this
+    // connection: a peer that needs a new session offers on every self-heal tick.
+    let healthy = session_manager.has_session(peer_id).await
+        && !session_manager.needs_renegotiation(peer_id).await
+        && !session_manager.awaiting_confirmation(peer_id).await;
+    // Both ages count from when the frame came off its connection: an offer that sat in
+    // the queue while the connection grew old is still the offer it was.
+    if healthy && !offer_witness.second_spaced_offer(peer_id, connection.generation, received_at) {
+        debug!(peer = %peer_id, "prekey offer not acted on; the session is healthy");
+        return;
+    }
+    offer_witness.forget(peer_id);
+
+    let had_session = session_manager.has_session(peer_id).await;
     match session_manager
-        .initiate_session(peer_id, &peer_bundle)
+        .reinitiate_session(peer_id, &peer_bundle)
         .await
     {
         Ok(init_data) => {
             last_negotiation.insert(*peer_id, tokio::time::Instant::now());
+            if had_session {
+                info!(peer = %peer_id, "peer re-offered its prekey; previous session stays until the peer confirms the new one");
+            }
             info!(peer = %peer_id, "X3DH initiated, sending SessionInit");
             let init_json = match serde_json::to_value(&init_data) {
                 Ok(v) => v,
@@ -868,19 +884,88 @@ async fn handle_prekey_offer(
                     return;
                 }
             };
-            let frame = Frame::SessionInit {
-                init_data: init_json,
-            };
+            let frame = Frame::SessionInit { init_data: init_json };
             if let Err(e) = transport.send_frame(peer_id, &frame).await {
                 warn!(peer = %peer_id, error = %e, "failed to send SessionInit");
             }
         }
         Err(e) => {
-            warn!(peer = %peer_id, error = %e, "X3DH initiation failed");
+            warn!(
+                peer = %peer_id, error = %e, session_kept = had_session,
+                "X3DH initiation failed; the prekey offer changed nothing"
+            );
         }
     }
 
     let _ = audit;
+}
+
+/// Whether a hex identity key from a bundle or init is the key this connection's
+/// Hello presented. An honest peer puts its own identity key in both places. This
+/// binds the key to the connection only: it does not show the NodeId has used this
+/// key before.
+fn key_is_the_hello_key(hex_key: &str, connection: &konsensus_message::ConnectionContext) -> bool {
+    match (hex::decode(hex_key), connection.hello_key) {
+        (Ok(key), Some(hello_key)) => key == hello_key,
+        _ => false,
+    }
+}
+
+
+/// Offers seen for peers whose session looks healthy. See [`Self::second_spaced_offer`].
+#[derive(Default)]
+struct OfferWitness {
+    /// peer -> (the connection the offer came on, when it was counted)
+    first: std::collections::HashMap<NodeId, (std::time::Instant, std::time::Instant)>,
+}
+
+impl OfferWitness {
+    /// Whether this offer is the second on `connection`, at least one self-heal tick
+    /// after the first and within [`OFFER_WITNESS_WINDOW`] of it. An offer on a
+    /// connection younger than the negotiation cooldown does not count: both sides
+    /// offer on connect, and that offer plus one stale frame must not add up.
+    fn second_spaced_offer(&mut self, peer: &NodeId, connection: std::time::Instant, now: std::time::Instant) -> bool {
+        if now.saturating_duration_since(connection) < SESSION_NEGOTIATION_COOLDOWN {
+            return false;
+        }
+        match self.first.get(peer) {
+            Some((seen_on, first)) if *seen_on == connection => {
+                let spacing = now.saturating_duration_since(*first);
+                if spacing < SESSION_SELF_HEAL_INTERVAL {
+                    return false;
+                }
+                if spacing <= OFFER_WITNESS_WINDOW {
+                    self.first.remove(peer);
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        // A peer that is not already recorded does not get a slot once the map is
+        // full, so the burst cannot grow it. Missing a slot only keeps a healthy
+        // session in place.
+        if self.first.len() >= MAX_COOLDOWN_ENTRIES && !self.first.contains_key(peer) {
+            return false;
+        }
+        self.first.insert(*peer, (connection, now));
+        false
+    }
+
+    fn len(&self) -> usize {
+        self.first.len()
+    }
+
+    fn clear(&mut self) {
+        self.first.clear();
+    }
+
+    fn forget(&mut self, peer: &NodeId) {
+        self.first.remove(peer);
+    }
+
+    fn prune(&mut self, now: std::time::Instant) {
+        self.first.retain(|_, (_, first)| now.saturating_duration_since(*first) <= OFFER_WITNESS_WINDOW);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -892,7 +977,7 @@ async fn handle_session_init(
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
     last_negotiation: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
-    pending_ratchet_inits: &mut PendingRatchetInits,
+    connection: &konsensus_message::ConnectionContext,
 ) {
     // Rate-limit session re-negotiation per peer.
     if let Some(last) = last_negotiation.get(peer_id) {
@@ -906,27 +991,32 @@ async fn handle_session_init(
         }
     }
 
-    // If a session already exists, replace the stale one.
-    pending_ratchet_inits.remove(peer_id);
-    if session_manager.has_session(peer_id).await {
-        warn!(peer = %peer_id, "peer sent SessionInit but session exists — replacing stale session");
-        session_manager.remove_session(peer_id).await;
-        // Paid ciphertext remains queued until its recipient ACKs, even after a session reset.
+    // Any session we already have with this peer stays in place and usable
+    // until a message decrypts under the new one (`reaccept_session`), which
+    // proves the peer derived the same keys. A malformed init, or one naming a
+    // one-time pre-key we do not hold, changes nothing. Paid ciphertext remains
+    // queued until its recipient ACKs, even across a session replacement.
+    let init: konsensus_crypto::SerializableSessionInit =
+        match serde_json::from_value(init_data).map_err(|_| konsensus_core::wire_json::DecodeError) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(peer = %peer_id, error = %e, "invalid session init data");
+                return;
+            }
+        };
+    // Before anything changes: no session replaced, no one-time pre-key consumed.
+    if !key_is_the_hello_key(&init.identity_key, connection) {
+        warn!(peer = %peer_id, "session init identity key is not this connection's; init refused");
+        return;
     }
 
-    let init: konsensus_crypto::SerializableSessionInit = match serde_json::from_value(init_data)
-        .map_err(|_| konsensus_core::wire_json::DecodeError)
-    {
-        Ok(d) => d,
-        Err(e) => {
-            warn!(peer = %peer_id, error = %e, "invalid session init data");
-            return;
-        }
-    };
-
-    match session_manager.accept_session(peer_id, &init).await {
+    let had_session = session_manager.has_session(peer_id).await;
+    match session_manager.reaccept_session(peer_id, &init).await {
         Ok(()) => {
             last_negotiation.insert(*peer_id, tokio::time::Instant::now());
+            if had_session {
+                info!(peer = %peer_id, "peer re-initiated; previous session stays until the new one is proven");
+            }
             info!(peer = %peer_id, "E2EE session accepted, sending SessionAck");
             let frame = Frame::SessionAck;
             if let Err(e) = transport.send_frame(peer_id, &frame).await {
@@ -939,7 +1029,10 @@ async fn handle_session_init(
             );
         }
         Err(e) => {
-            warn!(peer = %peer_id, error = %e, "session accept failed");
+            warn!(
+                peer = %peer_id, error = %e, session_kept = had_session,
+                "session accept failed; the SessionInit changed nothing"
+            );
         }
     }
 }
@@ -949,8 +1042,13 @@ async fn handle_session_ack(
     session_manager: &SessionManager,
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
-    pending_ratchet_inits: &mut PendingRatchetInits,
 ) {
+    // A confirmation is the only thing that retires the previous session, and one
+    // we did not ask for changes nothing.
+    if !session_manager.confirm_session(peer_id).await {
+        debug!(peer = %peer_id, "unexpected SessionAck ignored");
+        return;
+    }
     info!(peer = %peer_id, "E2EE session established (initiator), sending ratchet init");
     audit.record(
         "e2ee_session_established",
@@ -958,102 +1056,91 @@ async fn handle_session_ack(
         Some(serde_json::json!({ "role": "initiator" })),
     );
 
-    if retry_ratchet_init(peer_id, session_manager, transport, pending_ratchet_inits).await {
-        return;
+    // Send a ratchet init message so the acceptor can initialize their sending chain.
+    if send_ratchet_init(session_manager, transport, peer_id).await {
+        debug!(peer = %peer_id, "ratchet init after the acknowledgement written");
     }
+}
 
-    // Encrypt saves the advanced ratchet before returning. On error the frame
-    // is not built and nothing is sent. A save failure leaves the session in
-    // place so a later attempt can send; other failures still drop it.
-    match session_manager
-        .encrypt_retained(peer_id, konsensus_crypto::RATCHET_INIT_RETENTION_KEY, b"ratchet-init", |message| {
-            Ok(konsensus_crypto::ratchet_message_to_bytes(message))
-        })
-        .await
-    {
-        Ok(payload) => {
-            let ratchet_msg = match konsensus_crypto::ratchet_message_from_bytes(&payload) {
-                Ok(message) => message,
-                Err(_) => return,
-            };
+/// Send a message under the session in use. Each one takes its own send chain
+/// position, saved before it leaves. The peer moves to this session if it was still
+/// on the one before, gets a sending chain if it had none, and finds out if the two
+/// sides disagree: it cannot read this, so it marks its session and offers.
+///
+/// Nothing acknowledges this frame. It can only go missing with its connection, so
+/// the lower id sends it again on each new one, and a failure here is owed to the
+/// next self-heal tick.
+async fn send_ratchet_init(session_manager: &SessionManager, transport: &Arc<NoiseTransport>, peer_id: &NodeId) -> bool {
+    match session_manager.encrypt(peer_id, b"ratchet-init").await {
+        Ok(ratchet_msg) => {
+            let payload = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
             let frame = Frame::RatchetInit { payload };
-            pending_ratchet_inits.insert(
-                *peer_id,
-                PendingRatchetInit {
-                    frame,
-                    ratchet_key: ratchet_msg.header.dh_public,
-                },
-            );
-            retry_ratchet_init(peer_id, session_manager, transport, pending_ratchet_inits).await;
+            if let Err(e) = transport.send_frame(peer_id, &frame).await {
+                warn!(peer = %peer_id, error = %e, "failed to send RatchetInit");
+                session_manager.owe_ratchet_init(peer_id).await;
+                return false;
+            }
+            true
         }
-        Err(konsensus_crypto::SessionError::Persist(error)) => {
-            warn!(
-                peer = %peer_id,
-                error = %error,
-                "ratchet state was not saved; ratchet init was not sent"
-            );
+        // A disk failure says nothing about the session. It stays.
+        Err(konsensus_crypto::SessionError::NotPersisted) => {
+            warn!(peer = %peer_id, "ratchet init not sent: session state could not be saved");
+            session_manager.owe_ratchet_init(peer_id).await;
+            false
         }
         Err(e) => {
-            warn!(
-                peer = %peer_id, error = %e,
-                "failed to encrypt ratchet init — removing corrupt session"
-            );
-            session_manager.remove_session(peer_id).await;
+            warn!(peer = %peer_id, error = %e, "failed to encrypt ratchet init; asking to renegotiate");
+            session_manager.mark_needs_renegotiation(peer_id).await;
+            false
         }
     }
 }
 
-/// Reuse the saved ciphertext; encrypting again would consume another key.
-/// False means no current frame was handled, so a fresh SessionAck can build
-/// the replacement session's init after a stale entry is discarded.
-async fn retry_ratchet_init(
-    peer_id: &NodeId,
+/// A new connection may mean a frame was lost with the old one, and a reconnect no
+/// longer replaces a session, so this is what shows the two sides still agree. The
+/// lower id says so at once, unless it is waiting for the answer to a replacement.
+/// Both sides also check once on the self-heal tick, see [`check_connected_e2ee_sessions`].
+async fn check_session_on_connect(session_manager: &SessionManager, transport: &Arc<NoiseTransport>, peer_id: &NodeId, our_node_id: NodeId) {
+    if our_node_id.as_bytes() < peer_id.as_bytes()
+        && session_manager.can_send(peer_id).await
+        && !session_manager.replacement_pending(peer_id).await
+    {
+        let _ = send_ratchet_init(session_manager, transport, peer_id).await;
+    }
+}
+
+/// Which connection each peer's session was last checked on, as its `generation`.
+type ConnectionsChecked = std::collections::HashMap<NodeId, std::time::Instant>;
+
+/// On the self-heal tick: send what is owed, and check the session once per connection.
+/// Both wait out the negotiation cooldown, from the connection and from the last
+/// negotiation. A lower id on an earlier version runs X3DH on every connect and replaces
+/// its session at once, so until that has settled a message under the session in use
+/// would look to it like a failure, and it would drop the new session. For the same
+/// reason nothing is sent while a replacement is held aside on either side, or while
+/// this side is asking for a new session: the peer may already be on the new one.
+async fn check_connected_e2ee_sessions(
     session_manager: &SessionManager,
-    transport: &NoiseTransport,
-    pending: &mut PendingRatchetInits,
-) -> bool {
-    if !pending.contains_key(peer_id) {
-        if let Some(payload) = session_manager.recovery_data(peer_id, konsensus_crypto::RATCHET_INIT_RETENTION_KEY).await {
-            if let Ok(message) = konsensus_crypto::ratchet_message_from_bytes(&payload) {
-                pending.insert(
-                    *peer_id,
-                    PendingRatchetInit {
-                        frame: Frame::RatchetInit { payload },
-                        ratchet_key: message.header.dh_public,
-                    },
-                );
-            }
-        }
-    }
-    if let Some(init) = pending.get(peer_id) {
-        // Sessions can also be replaced through the API, outside this handler.
-        if !session_manager
-            .is_current_ratchet_key(peer_id, &init.ratchet_key)
-            .await
+    transport: &Arc<NoiseTransport>,
+    last_negotiation: &std::collections::HashMap<NodeId, tokio::time::Instant>,
+    checked: &mut ConnectionsChecked,
+) {
+    session_manager.expire_retired_sessions().await;
+    for peer_id in transport.connected_session_peers().await {
+        let Some(since) = transport.connected_since(&peer_id).await else { continue };
+        if since.elapsed() < SESSION_NEGOTIATION_COOLDOWN
+            || last_negotiation.get(&peer_id).is_some_and(|last| last.elapsed() < SESSION_NEGOTIATION_COOLDOWN)
+            || session_manager.replacement_pending(&peer_id).await
+            || e2ee_needs_self_heal(session_manager, &peer_id).await
         {
-            pending.remove(peer_id);
-            let _ = session_manager
-                .clear_recovery_data(peer_id, konsensus_crypto::RATCHET_INIT_RETENTION_KEY)
-                .await;
-            return false;
+            continue;
         }
-        match transport.send_frame(peer_id, &init.frame).await {
-            Ok(()) => {
-                pending.remove(peer_id);
-                if let Err(error) = session_manager
-                    .clear_recovery_data(peer_id, konsensus_crypto::RATCHET_INIT_RETENTION_KEY)
-                    .await
-                {
-                    warn!(peer = %peer_id, %error, "sent RatchetInit recovery data could not be cleared");
-                }
-            }
-            Err(e) => {
-                warn!(peer = %peer_id, error = %e, "failed to send RatchetInit; retained for self-heal")
-            }
+        let owed = session_manager.take_ratchet_init_owed(&peer_id).await;
+        if owed || checked.get(&peer_id) != Some(&since) {
+            checked.insert(peer_id, since);
+            let _ = send_ratchet_init(session_manager, transport, &peer_id).await;
         }
-        return true;
     }
-    false
 }
 
 async fn handle_ratchet_init(
@@ -1063,37 +1150,29 @@ async fn handle_ratchet_init(
     _storage: &Arc<dyn konsensus_storage::Storage>,
     transport: &Arc<NoiseTransport>,
 ) {
-    // The opener only initializes an acceptor's sending chain. A sender may
-    // retry a frame that reached us before its transport reported failure.
-    // Once ready, replaying that consumed ciphertext must not delete the session.
-    if session_manager.can_send(peer_id).await {
-        debug!(peer = %peer_id, "ratchet init already applied");
-        return;
-    }
     match konsensus_crypto::ratchet_message_from_bytes(payload) {
         Ok(ratchet_msg) => {
             match session_manager.decrypt(peer_id, &ratchet_msg).await {
                 Ok(_) => {
                     info!(peer = %peer_id, "ratchet init received, bidirectional E2EE ready");
                 }
-                Err(konsensus_crypto::SessionError::Persist(error)) => {
-                    warn!(
-                        peer = %peer_id,
-                        error = %error,
-                        "ratchet state was not saved; ratchet init was not accepted"
-                    );
-                }
                 Err(e) => {
+                    // A failed decrypt changes no ratchet state, so the session stays
+                    // until a new one is confirmed. One failure asks for a replacement.
+                    // The self-heal tick keeps asking; further failures must not each
+                    // send another bundle or another warning.
+                    if session_manager.needs_renegotiation(peer_id).await {
+                        debug!(peer = %peer_id, "ratchet init still unreadable; replacement already requested");
+                        return;
+                    }
                     warn!(
                         peer = %peer_id, error = %e,
-                        "failed to decrypt ratchet init — removing broken session and re-negotiating"
+                        "failed to decrypt ratchet init; session kept, re-negotiating"
                     );
-                    session_manager.remove_session(peer_id).await;
+                    session_manager.mark_needs_renegotiation(peer_id).await;
                     // Preserve paid envelopes across ratchet recovery; acceptance ACKs do not require decryption.
                     // Send fresh PrekeyOffer to trigger re-negotiation
-                    if let Err(send_err) =
-                        send_prekey_offer(session_manager, transport, peer_id).await
-                    {
+                    if let Err(send_err) = send_prekey_offer(session_manager, transport, peer_id).await {
                         warn!(peer = %peer_id, error = %send_err, "failed to send PrekeyOffer after ratchet init failure");
                     }
                 }
@@ -1108,7 +1187,6 @@ async fn handle_ratchet_init(
 async fn heal_connected_e2ee_sessions(
     session_manager: &SessionManager,
     transport: &Arc<NoiseTransport>,
-    pending_ratchet_inits: &mut PendingRatchetInits,
 ) {
     // P2 (no prekey before settlement): self-heal sessions ONLY to PRIVILEGED
     // peers. An unprivileged PriceOpen stranger completes Noise transport but must
@@ -1124,13 +1202,6 @@ async fn heal_connected_e2ee_sessions(
     // the payee is the X3DH initiator.
     let connected_peers = transport.connected_session_peers().await;
     for peer_id in connected_peers {
-        if !session_manager.has_session(&peer_id).await {
-            pending_ratchet_inits.remove(&peer_id);
-        } else if retry_ratchet_init(&peer_id, session_manager, transport, pending_ratchet_inits)
-            .await
-        {
-            continue;
-        }
         if !e2ee_needs_self_heal(session_manager, &peer_id).await {
             continue;
         }
@@ -1172,9 +1243,7 @@ async fn reply_prekey_offer_to_paid_payee(
     // The generation is captured once; the reply goes on that connection only,
     // and only if it is still the one we paid on (checked under its lock by
     // `send_raw_frame_on`), never on an unpaid replacement.
-    let Some(since) = transport.connected_since(peer_id).await else {
-        return;
-    };
+    let Some(since) = transport.connected_since(peer_id).await else { return };
     if our_node_id.as_bytes() < peer_id.as_bytes()
         || !transport.admission_paid_on_connection(peer_id).await
         || !e2ee_needs_self_heal(session_manager, peer_id).await
@@ -1187,34 +1256,94 @@ async fn reply_prekey_offer_to_paid_payee(
     }
     let sent = match serde_json::to_value(session_manager.prekey_bundle().await)
         .map_err(|e| format!("serialize prekey bundle: {e}"))
-        .and_then(|bundle| {
-            Frame::PrekeyOffer { bundle }
-                .to_bytes()
-                .map_err(|e| e.to_string())
-        }) {
+        .and_then(|bundle| Frame::PrekeyOffer { bundle }.to_bytes().map_err(|e| e.to_string()))
+    {
         Ok(frame) => transport
-            .send_raw_frame_on(
-                peer_id,
-                since,
-                konsensus_message::Standing::AdmissionPaid,
-                &frame,
-            )
+            .send_raw_frame_on(peer_id, since, konsensus_message::Standing::AdmissionPaid, &frame)
             .await
             .map_err(|e| e.to_string()),
         Err(e) => Err(e),
     };
     match sent {
-        Ok(()) => {
-            info!(peer = %peer_id, "answered the paid payee's PrekeyOffer with ours (PSI-SPEED)")
-        }
-        Err(e) => {
-            warn!(peer = %peer_id, error = %e, "failed to answer the paid payee's PrekeyOffer")
-        }
+        Ok(()) => info!(peer = %peer_id, "answered the paid payee's PrekeyOffer with ours (PSI-SPEED)"),
+        Err(e) => warn!(peer = %peer_id, error = %e, "failed to answer the paid payee's PrekeyOffer"),
+    }
+}
+
+/// Only the lower NodeId runs X3DH, and it needs the higher id's bundle. The
+/// higher id offers its bundle on a new connection and while it has no sending
+/// chain, so a lower id that loses its session while the higher id still has
+/// one would otherwise stay without a session until the next connection: it
+/// offers every self-heal tick and nothing answers.
+///
+/// So the higher id answers an offer with its own. Connection setup needs no
+/// answer: both sides offer on connect, and an offer that arrives while the
+/// connection is younger than the negotiation cooldown is such a connect offer
+/// (an answer would at best be throttled, at worst replace a healthy session
+/// when delayed). Nor does an offer right after a negotiation: the peer's
+/// cooldown would throttle the answer and our own its SessionInit. Either way
+/// the peer's next self-heal tick asks again if it still has no session, so a
+/// lost session recovers within the cooldown plus one tick, on this connection.
+///
+/// The peer's offers are in its hands, so answers pass [`EagerOfferLimiter`]
+/// (one per peer per cooldown, a node-wide cap). The answer is bound to the
+/// connection and standing read here, never a fresh NodeId lookup, so an
+/// unprivileged replacement gets no prekey.
+///
+/// [`EagerOfferLimiter`]: konsensus_message::EagerOfferLimiter
+async fn answer_prekey_offer_for_recovery(
+    peer_id: &NodeId,
+    our_node_id: NodeId,
+    session_manager: &SessionManager,
+    transport: &Arc<NoiseTransport>,
+    limiter: &mut konsensus_message::EagerOfferLimiter,
+    last_negotiation: &std::collections::HashMap<NodeId, tokio::time::Instant>,
+) {
+    if our_node_id.as_bytes() < peer_id.as_bytes() {
+        return;
+    }
+    #[cfg(test)]
+    if HOLD_PREKEY_ANSWERS.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let Some(since) = transport.connected_since(peer_id).await else { return };
+    if since.elapsed() < SESSION_NEGOTIATION_COOLDOWN
+        || last_negotiation.get(peer_id).is_some_and(|last| last.elapsed() < SESSION_NEGOTIATION_COOLDOWN)
+    {
+        return;
+    }
+    if !limiter.allow(peer_id, std::time::Instant::now()) {
+        debug!(peer = %peer_id, "prekey answer rate-limited; the peer's next offer asks again");
+        return;
+    }
+    let standing = if transport.admission_paid_on_connection(peer_id).await {
+        konsensus_message::Standing::AdmissionPaid
+    } else {
+        konsensus_message::Standing::Privileged
+    };
+    let sent = match serde_json::to_value(session_manager.prekey_bundle().await)
+        .map_err(|e| format!("serialize prekey bundle: {e}"))
+        .and_then(|bundle| Frame::PrekeyOffer { bundle }.to_bytes().map_err(|e| e.to_string()))
+    {
+        Ok(frame) => transport
+            .send_raw_frame_on(peer_id, since, standing, &frame)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    match sent {
+        Ok(()) => info!(peer = %peer_id, "answered the peer's PrekeyOffer with ours"),
+        Err(e) => warn!(peer = %peer_id, error = %e, "failed to answer the peer's PrekeyOffer"),
     }
 }
 
 async fn e2ee_needs_self_heal(session_manager: &SessionManager, peer_id: &NodeId) -> bool {
     !session_manager.can_send(peer_id).await
+        || session_manager.needs_renegotiation(peer_id).await
+        || session_manager.awaiting_confirmation(peer_id).await
+        // An accepted session nothing has moved us to since the cooldown: its
+        // `RatchetInit` is gone, and the peer may be using it already.
+        || session_manager.accepted_replacement_older_than(peer_id, SESSION_NEGOTIATION_COOLDOWN).await
 }
 
 async fn send_prekey_offer(
@@ -1223,11 +1352,9 @@ async fn send_prekey_offer(
     peer_id: &NodeId,
 ) -> Result<(), String> {
     let bundle = session_manager.prekey_bundle().await;
-    let bundle_json =
-        serde_json::to_value(&bundle).map_err(|e| format!("serialize prekey bundle: {e}"))?;
-    let frame = Frame::PrekeyOffer {
-        bundle: bundle_json,
-    };
+    let bundle_json = serde_json::to_value(&bundle)
+        .map_err(|e| format!("serialize prekey bundle: {e}"))?;
+    let frame = Frame::PrekeyOffer { bundle: bundle_json };
     transport
         .send_frame(peer_id, &frame)
         .await
@@ -1237,23 +1364,21 @@ async fn send_prekey_offer(
 /// Wire reasons are the gate's stable Display prefixes; unknown reasons stay
 /// retryable so older peers and temporary gate failures cannot burn delivery.
 fn terminal_paid_rejection(reason: &str) -> bool {
-    if matches!(reason, "message withdrawn" | "call signal withdrawn") {
-        return true;
-    }
     if reason == "call_block_overpayment" { return true; }
     [
-        "payment proof already used:",
-        "insufficient payment:",
-        "recipient mismatch:",
-        "invalid signature:",
-        "message plaintext lost:",
-        "message plaintext unavailable",
-        "room_binding_invalid:",
-        "room_sender_not_member:",
-        "room_recipient_not_member:",
+        "payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:",
+        "room_binding_invalid:", "room_sender_not_member:", "room_recipient_not_member:",
+        // The recipient's gate kept the payment but withdrew the envelope
+        // (`crate::msg_handler::ReceiptRefusal`, a refused call or room chat):
+        // a resend of the same bytes can never be accepted, and is answered
+        // with the withdrawal again, so a lost refusal is not a delivery.
+        "undecryptable:",
+        "not_persisted:",
+        "file_corrupted:",
+        "message withdrawn",
+        "call signal withdrawn",
     ]
-    .iter()
-    .any(|prefix| reason.starts_with(prefix))
+    .iter().any(|prefix| reason.starts_with(prefix))
 }
 
 /// Bound storage work before looking up an unprivileged confirmation. A
@@ -1268,24 +1393,15 @@ struct DeliveryConfirmationBudget {
 
 impl DeliveryConfirmationBudget {
     fn allow(&mut self, peer: &NodeId, privileged: bool, now: tokio::time::Instant) -> bool {
-        if privileged {
-            return true;
-        }
-        if self
-            .window
-            .is_none_or(|start| now.duration_since(start) >= std::time::Duration::from_secs(1))
-        {
+        if privileged { return true; }
+        if self.window.is_none_or(|start| now.duration_since(start) >= std::time::Duration::from_secs(1)) {
             self.window = Some(now);
             self.used = 0;
             self.peers.clear();
         }
-        if self.used >= 128 {
-            return false;
-        }
+        if self.used >= 128 { return false; }
         let used = self.peers.entry(*peer).or_default();
-        if *used >= 32 {
-            return false;
-        }
+        if *used >= 32 { return false; }
         *used += 1;
         self.used += 1;
         true
@@ -1295,25 +1411,16 @@ impl DeliveryConfirmationBudget {
 /// Delivery confirmations cannot grant admission or mutate unrelated deliveries.
 #[allow(clippy::too_many_arguments)]
 async fn handle_delivery_confirmation(
-    peer: &NodeId,
-    id: &konsensus_core::MessageId,
-    rejection: Option<&str>,
-    privileged: bool,
-    own_id: &NodeId,
-    storage: &Arc<dyn konsensus_storage::Storage>,
-    timestamps: &tokio::sync::Mutex<
-        std::collections::HashMap<konsensus_core::MessageId, std::time::Instant>,
-    >,
-    routing: &konsensus_routing::RoutingTable,
-    ws: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    peer: &NodeId, id: &konsensus_core::MessageId, rejection: Option<&str>, privileged: bool,
+    own_id: &NodeId, storage: &Arc<dyn konsensus_storage::Storage>,
+    timestamps: &tokio::sync::Mutex<std::collections::HashMap<konsensus_core::MessageId, std::time::Instant>>,
+    routing: &konsensus_routing::RoutingTable, ws: &broadcast::Sender<Arc<WsDeliveryStatus>>,
     audit: &konsensus_api::audit::AuditLog,
     budget: &mut DeliveryConfirmationBudget,
     paid_until_ms: Option<(u64, &konsensus_crypto::PlaintextCacheCipher)>,
 ) {
     if !budget.allow(peer, privileged, tokio::time::Instant::now()) {
-        audit
-            .membrane()
-            .pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
+        audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
         return;
     }
     if let Some((until, cipher)) = paid_until_ms.filter(|_| rejection.is_none()) {
@@ -1323,70 +1430,33 @@ async fn handle_delivery_confirmation(
         }
     }
     let nonce_replay = rejection == Some("replay detected: nonce already used");
-    let hash_replay = rejection
-        .and_then(|reason| reason.strip_prefix("payment proof already used: "))
+    let hash_replay = rejection.and_then(|reason| reason.strip_prefix("payment proof already used: "))
         .filter(|hash| hash.len() == 64)
         .and_then(|hash| hex::decode(hash).ok())
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
     // The hash compatibility exception must consume the row atomically with
     // the exact payment binding; unrelated PaymentReused remains terminal.
     let hash_acked = if let Some(hash) = hash_replay {
-        match storage
-            .acknowledge_pending_payment(id, peer, own_id, &hash)
-            .await
-        {
+        match storage.acknowledge_pending_payment(id, peer, own_id, &hash).await {
             Ok(acked) => acked,
             Err(_) => return,
         }
-    } else {
-        false
-    };
+    } else { false };
     let legacy = nonce_replay || hash_acked;
     if rejection.is_none() || legacy {
-        if !hash_acked
-            && !matches!(
-                storage.acknowledge_pending(id, peer, own_id).await,
-                Ok(true)
-            )
-        {
-            if !privileged {
-                audit
-                    .membrane()
-                    .pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
-            }
+        if !hash_acked && !matches!(storage.acknowledge_pending(id, peer, own_id).await, Ok(true)) {
+            if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
             return;
         }
         if legacy {
-            audit.record(
-                "acked_legacy",
-                &peer.to_hex(),
-                Some(serde_json::json!({"message_id": id.to_hex()})),
-            );
+            audit.record("acked_legacy", &peer.to_hex(), Some(serde_json::json!({"message_id": id.to_hex()})));
         }
-        handle_message_acked(
-            peer,
-            id,
-            timestamps,
-            storage,
-            routing,
-            ws,
-            privileged && !legacy,
-        )
-        .await;
+        handle_message_acked(peer, id, timestamps, storage, routing, ws, privileged && !legacy).await;
     } else {
         let reason = rejection.unwrap_or_default();
         let terminal = terminal_paid_rejection(reason);
-        if !matches!(
-            storage
-                .reject_pending(id, peer, own_id, reason, terminal)
-                .await,
-            Ok(true)
-        ) {
-            if !privileged {
-                audit
-                    .membrane()
-                    .pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
-            }
+        if !matches!(storage.reject_pending(id, peer, own_id, reason, terminal).await, Ok(true)) {
+            if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
             return;
         }
         timestamps.lock().await.remove(id);
@@ -1397,9 +1467,7 @@ async fn handle_delivery_confirmation(
 async fn handle_message_acked(
     peer_id: &NodeId,
     message_id: &konsensus_core::types::MessageId,
-    send_timestamps: &tokio::sync::Mutex<
-        std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>,
-    >,
+    send_timestamps: &tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>>,
     storage: &Arc<dyn konsensus_storage::Storage>,
     routing: &konsensus_routing::RoutingTable,
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
@@ -1408,8 +1476,7 @@ async fn handle_message_acked(
     // Compute STDP latency from send timestamp.
     let latency_ms = {
         let mut timestamps = send_timestamps.lock().await;
-        let latency = timestamps
-            .remove(message_id)
+        let latency = timestamps.remove(message_id)
             .map(|sent_at| sent_at.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
         // Prune stale entries (>5 min) to prevent unbounded growth
@@ -1435,19 +1502,17 @@ async fn handle_message_acked(
     );
 
     // Hebbian learning: successful delivery strengthens routing weight.
-    if update_weights {
-        routing
-            .record_success(peer_id, latency_ms, payment_msat)
-            .await;
-    }
+    if update_weights { routing.record_success(peer_id, latency_ms, payment_msat).await; }
 
     // Broadcast delivery confirmation to WebSocket clients.
-    if let Err(e) = ws_delivery_tx.send(Arc::new(WsDeliveryStatus {
-        event_type: "delivery_status",
-        message_id: message_id.to_hex(),
-        status: "delivered".to_string(),
-        reason: None,
-    })) {
+    if let Err(e) = ws_delivery_tx.send(Arc::new(
+        WsDeliveryStatus {
+            event_type: "delivery_status",
+            message_id: message_id.to_hex(),
+            status: "delivered".to_string(),
+            reason: None,
+        },
+    )) {
         tracing::debug!(error = %e, "no WebSocket clients for delivery status");
     }
 }
@@ -1461,21 +1526,16 @@ async fn handle_message_rejected(
     update_weights: bool,
 ) {
     warn!(peer = %peer_id, msg_id = %message_id, reason = %konsensus_message::wire::sanitized_peer_reason(reason), "message rejected by peer");
-    if update_weights {
-        routing.record_failure(peer_id).await;
-    }
+    if update_weights { routing.record_failure(peer_id).await; }
 
-    if let Err(e) = ws_delivery_tx.send(Arc::new(WsDeliveryStatus {
-        event_type: "delivery_status",
-        message_id: message_id.to_hex(),
-        status: if terminal_paid_rejection(reason) {
-            "failed_paid"
-        } else {
-            "rejected"
-        }
-        .to_string(),
-        reason: Some(reason.to_string()),
-    })) {
+    if let Err(e) = ws_delivery_tx.send(Arc::new(
+        WsDeliveryStatus {
+            event_type: "delivery_status",
+            message_id: message_id.to_hex(),
+            status: if terminal_paid_rejection(reason) { "failed_paid" } else { "rejected" }.to_string(),
+            reason: Some(reason.to_string()),
+        },
+    )) {
         tracing::debug!(error = %e, "no WebSocket clients for delivery rejection");
     }
 }
@@ -1498,21 +1558,8 @@ async fn handle_price_query(
                     return;
                 }
             };
-            let frame = Frame::PriceResponse {
-                kind,
-                price_msat,
-                block_height,
-            };
-            if let Err(e) = crate::delivery_prices::send_price_frame(
-                transport,
-                storage,
-                peer_id,
-                &frame,
-                pricing.as_ref(),
-                min_admission_cost_msat,
-            )
-            .await
-            {
+            let frame = Frame::PriceResponse { kind, price_msat, block_height };
+            if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage, peer_id, &frame, pricing.as_ref(), min_admission_cost_msat).await {
                 warn!(peer = %peer_id, error = %e, "failed to send price response");
             }
         }
@@ -1543,9 +1590,7 @@ async fn handle_price_table_received(
         trust_discount,
         "received peer price table"
     );
-    peer_prices
-        .update(peer_id, prices, block_height, valid_blocks, trust_discount)
-        .await;
+    peer_prices.update(peer_id, prices, block_height, valid_blocks, trust_discount).await;
 }
 
 async fn handle_price_response_received(
@@ -1564,9 +1609,7 @@ async fn handle_price_response_received(
         peer = %peer_id, kind, price_msat, block_height,
         "received price response, updating peer cache"
     );
-    peer_prices
-        .update_kind_price(peer_id, kind, price_msat, block_height)
-        .await;
+    peer_prices.update_kind_price(peer_id, kind, price_msat, block_height).await;
 }
 
 /// Privilege-gated invoice dispatch. Strangers get only the bounded,
@@ -1613,30 +1656,15 @@ async fn handle_invoice_requested_gated(
             unix,
         ) {
             if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
-                send_invoice_refusal(
-                    transport,
-                    peer_id,
-                    request_id,
-                    konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED,
-                )
-                .await;
+                send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED).await;
             }
             return;
         }
         let Some(attempt_end) = admission_quote::expires_at(request_id, recipient, peer_id, unix)
-        else {
-            return;
-        };
+        else { return; };
         let (invoice, admission, description) = match prepare_admission_invoice(
-            pricing.as_ref(),
-            readiness_height,
-            lightning.as_ref(),
-            request_id,
-            attempt_end,
-            min_admission_cost_msat,
-        )
-        .await
-        {
+            pricing.as_ref(), readiness_height, lightning.as_ref(), request_id, attempt_end, min_admission_cost_msat,
+        ).await {
             Ok(invoice) => invoice,
             Err(reason) => {
                 if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
@@ -1680,13 +1708,7 @@ async fn handle_invoice_requested_gated(
         membrane.pre_payment_refused(PrePaymentReason::AdmissionRequired);
         let now = tokio::time::Instant::now();
         if last_admission_refusal.permit(source_ip, now) {
-            send_invoice_refusal(
-                transport,
-                peer_id,
-                request_id,
-                konsensus_api::invoice_refusal::ADMISSION_REQUIRED,
-            )
-            .await;
+            send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::ADMISSION_REQUIRED).await;
         }
         return;
     }
@@ -1727,10 +1749,7 @@ async fn handle_invoice_requested(
         return;
     }
     let description = format!("konsensus:{request_id}");
-    match lightning
-        .create_invoice(amount_msat, &description, 3600)
-        .await
-    {
+    match lightning.create_invoice(amount_msat, &description, 3600).await {
         Ok(invoice) => {
             let response = Frame::InvoiceResponse {
                 request_id: request_id.to_string(),
@@ -1748,9 +1767,7 @@ async fn handle_invoice_requested(
                 peer = %peer_id, %request_id, error = %e,
                 "failed to create invoice for peer request — sending error to peer"
             );
-            if !refusals.permit(source_ip, tokio::time::Instant::now()) {
-                return;
-            }
+            if !refusals.permit(source_ip, tokio::time::Instant::now()) { return; }
             let error_frame = invoice_error_frame(request_id, e);
             if let Err(send_err) = transport.enqueue_control_frame(peer_id, &error_frame).await {
                 warn!(peer = %peer_id, %request_id, error = %send_err, "failed to send invoice error frame");
@@ -1770,9 +1787,7 @@ fn invoice_error_frame(
 }
 
 /// Only fixed protocol codes may leave the node; backend details stay local.
-fn invoice_refusal_reason(
-    error: konsensus_core::traits::lightning::LightningError,
-) -> &'static str {
+fn invoice_refusal_reason(error: konsensus_core::traits::lightning::LightningError) -> &'static str {
     use konsensus_api::invoice_refusal::{CHAIN_UNAVAILABLE, NOT_SYNCED};
     use konsensus_core::traits::lightning::LightningError;
     match error {
@@ -1819,7 +1834,9 @@ impl ReadinessHeightCache {
                 None => true,
                 Some(lookup) => match lookup.peek() {
                     Some(Err(_)) => true,
-                    Some(Ok((_, fetched_at, _))) => fetched_at.elapsed() >= Duration::from_secs(60),
+                    Some(Ok((_, fetched_at, _))) => {
+                        fetched_at.elapsed() >= Duration::from_secs(60)
+                    }
                     // The slot owns one handle; callers clone only under this
                     // lock. With no other handle, every waiter has cancelled.
                     None => lookup.strong_count() == Some(1),
@@ -1831,10 +1848,11 @@ impl ReadinessHeightCache {
                     async move {
                         let observed_at = std::time::Instant::now();
                         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                        let height = tokio::time::timeout_at(deadline, chain.get_block_height())
-                            .await
-                            .map_err(|_| CHAIN_UNAVAILABLE)?
-                            .map_err(|_| CHAIN_UNAVAILABLE)?;
+                        let height =
+                            tokio::time::timeout_at(deadline, chain.get_block_height())
+                                .await
+                                .map_err(|_| CHAIN_UNAVAILABLE)?
+                                .map_err(|_| CHAIN_UNAVAILABLE)?;
                         let fetched_at = tokio::time::Instant::now();
                         // Timeout polls the response first. A delayed poll can
                         // therefore return success even after its deadline.
@@ -1883,8 +1901,7 @@ async fn prepare_admission_invoice(
     })
     .await
     .map_err(|_| CHAIN_UNAVAILABLE)??;
-    let (admission, message) =
-        konsensus_core::introduction::first_contact_prices(price, min_admission_cost_msat);
+    let (admission, message) = konsensus_core::introduction::first_contact_prices(price, min_admission_cost_msat);
     let description = format!("konsensus:{request_id}:message={message}");
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1936,9 +1953,7 @@ async fn handle_invoice_error_received(
     request_id: &str,
     reason: &str,
     privileged: bool,
-    invoice_requests: &tokio::sync::Mutex<
-        std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
-    >,
+    invoice_requests: &tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>,
 ) -> bool {
     let bound_quote = request_id.starts_with(&format!("v1:{peer_id}:"))
         && reason == "stateless_quote_unsupported";
@@ -1957,10 +1972,7 @@ async fn handle_invoice_error_received(
         return false;
     }
     if let Some(sender) = requests.remove(request_id) {
-        let _ = sender.send(Err(InvoiceResponseError {
-            recipient: *peer_id,
-            reason: reason.into(),
-        }));
+        let _ = sender.send(Err(InvoiceResponseError { recipient: *peer_id, reason: reason.into() }));
     }
     false
 }
@@ -1970,18 +1982,12 @@ async fn handle_invoice_response(
     request_id: &str,
     bolt11: String,
     payment_hash: String,
-    invoice_requests: &tokio::sync::Mutex<
-        std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
-    >,
+    invoice_requests: &tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>,
 ) {
     info!(peer = %peer_id, %request_id, "received invoice response from peer");
     let mut requests = invoice_requests.lock().await;
     if let Some(sender) = requests.remove(request_id) {
-        let data = InvoiceResponseData {
-            recipient: *peer_id,
-            bolt11,
-            payment_hash,
-        };
+        let data = InvoiceResponseData { recipient: *peer_id, bolt11, payment_hash };
         if sender.send(Ok(data)).is_err() {
             warn!(%request_id, "invoice response receiver already dropped (timeout?)");
         }
@@ -1991,14 +1997,9 @@ async fn handle_invoice_response(
 }
 
 async fn handle_peer_exchange_request(peer_id: &NodeId, transport: &Arc<NoiseTransport>) {
-    let _ = transport
-        .enqueue_control_frame(
-            peer_id,
-            &Frame::PeerExchangeRefused {
-                reason: "peer_exchange_requires_quote_and_payment".into(),
-            },
-        )
-        .await;
+    let _ = transport.enqueue_control_frame(peer_id, &Frame::PeerExchangeRefused {
+        reason: "peer_exchange_requires_quote_and_payment".into(),
+    }).await;
 }
 
 async fn handle_peer_exchange_received(
@@ -2137,10 +2138,7 @@ async fn handle_lightning_info_received(
         return false;
     }
 
-    peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(*peer_id, ln_pubkey.to_string());
+    peer_ln_pubkeys.lock().await.insert(*peer_id, ln_pubkey.to_string());
     debug!(peer = %peer_id, "stored peer Lightning info for keysend");
     true
 }
@@ -2174,10 +2172,7 @@ async fn handle_gossip_received(
     let kind = envelope.kind;
 
     // 1. Check recipient is Broadcast
-    if !matches!(
-        envelope.recipient,
-        konsensus_core::types::Recipient::Broadcast
-    ) {
+    if !matches!(envelope.recipient, konsensus_core::types::Recipient::Broadcast) {
         warn!(
             from = %from_peer,
             sender = %sender,
@@ -2338,9 +2333,12 @@ async fn handle_gossip_received(
 
 
 /// Refuse before touching the wallet and again after asynchronous creation.
-/// No invoice is returned to the caller when the safety margin is exhausted.
+/// No invoice is returned to the caller when the safety margin is exhausted,
+/// or while this node has no E2EE session with the caller, or one it is waiting
+/// to renegotiate: the block could not be read, so the minute would be paid and
+/// not served. The caller pays nothing and may ask again once the session is back.
 async fn prepare_call_block_invoice(
-    storage: &dyn konsensus_storage::Storage, peer: &NodeId, purpose: &str,
+    storage: &dyn konsensus_storage::Storage, session_manager: &SessionManager, peer: &NodeId, purpose: &str,
     amount_msat: u64, request_id: &str, lightning: &dyn LightningProvider,
 ) -> Result<konsensus_core::traits::lightning::Invoice, &'static str> {
     use konsensus_core::payloads::call as calls;
@@ -2353,6 +2351,10 @@ async fn prepare_call_block_invoice(
     calls::CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK,
         &serde_json::json!({"call_id": call_id, "seq": seq}).to_string()).map_err(|_| REFUSED)?;
     let validate = async || {
+        if !session_manager.has_session(peer).await || session_manager.needs_renegotiation(peer).await {
+            warn!(peer = %peer, "no readable E2EE session with the caller; call block invoice refused");
+            return Err(REFUSED);
+        }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_millis() as u64;
         let entry = storage.call_get(peer, call_id).await.map_err(|_| REFUSED)?.ok_or(REFUSED)?;
@@ -2386,3 +2388,8 @@ mod budgeted_reconnect_two_node;
 #[cfg(test)]
 #[path = "tests/paid_first_contact_two_node.rs"]
 mod paid_first_contact_two_node;
+
+
+#[cfg(test)]
+#[path = "tests/session_race_two_node.rs"]
+mod session_race_two_node;

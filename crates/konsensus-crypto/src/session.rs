@@ -33,14 +33,11 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use x25519_dalek::PublicKey as X25519Public;
-use zeroize::Zeroize;
 
 use konsensus_core::identity::NodeIdentity;
 use konsensus_core::types::NodeId;
 
-use crate::double_ratchet::{
-    DoubleRatchet, MessageHeader, RatchetError, RatchetMessage, RatchetState,
-};
+use crate::double_ratchet::{DoubleRatchet, MessageHeader, RatchetError, RatchetMessage, RatchetState};
 use crate::x3dh::{self, OneTimePreKey, PrekeyBundle, SignedPreKey, X3dhError};
 
 /// Errors from session management.
@@ -62,14 +59,14 @@ pub enum SessionError {
     #[error("ratchet error: {0}")]
     Ratchet(#[from] RatchetError),
 
-    /// The advanced session could not be saved. The in-memory ratchet is
-    /// unchanged, and the caller must not transmit a ciphertext from this call.
-    #[error("failed to persist session state: {0}")]
-    Persist(String),
-
     /// Invalid peer data.
     #[error("invalid peer data: {0}")]
     InvalidPeerData(String),
+
+    /// The advanced send chain could not be saved, so its ciphertext was withheld
+    /// and the chain put back. Nothing left this node for that plaintext.
+    #[error("session state could not be saved; the ciphertext was withheld")]
+    NotPersisted,
 }
 
 /// Data sent from initiator to responder to establish an E2EE session.
@@ -145,69 +142,93 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// List all peer IDs with stored sessions.
-    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn list_sessions(
+        &self,
+    ) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
-/// Retention key for the session's ratchet-init frame. It is exempt from the
-/// recovery caps so a full map can never block session setup.
-pub const RATCHET_INIT_RETENTION_KEY: &str = "ratchet-init";
-
-/// Key prefix of receive receipts. They prove a peer's message was consumed and
-/// outlive a session replacement; retained ciphertext is tied to its ratchet.
-pub const RECEIVE_RECEIPT_PREFIX: &str = "received:";
-
-/// The receipts a replacement session must keep from the one it replaces.
-fn carried_receipts(previous: Option<&PeerSession>) -> HashMap<String, Vec<u8>> {
-    previous
-        .map(|session| {
-            session
-                .recovery_data
-                .iter()
-                .filter(|(key, _)| key.starts_with(RECEIVE_RECEIPT_PREFIX))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Most recovery entries (receive receipts and retained replies) per session.
-pub const MAX_RECOVERY_ENTRIES: usize = 256;
-
-/// Most recovery bytes (keys plus values) per session.
-pub const MAX_RECOVERY_BYTES: usize = 4 * 1024 * 1024;
-
-/// Room for one more recovery entry? Existing entries are never evicted: a
-/// full session refuses new work (backpressure) until replies complete.
-fn recovery_has_room(data: &HashMap<String, Vec<u8>>, key: &str, value_len: usize) -> bool {
-    if key == RATCHET_INIT_RETENTION_KEY || data.contains_key(key) {
-        return true;
-    }
-    let counted = data.iter().filter(|(k, _)| k.as_str() != RATCHET_INIT_RETENTION_KEY);
-    let (entries, used) = counted.fold((0, 0), |(n, bytes), (k, v)| (n + 1, bytes + k.len() + v.len()));
-    entries < MAX_RECOVERY_ENTRIES && used + key.len() + value_len <= MAX_RECOVERY_BYTES
-}
-
-fn recovery_full() -> SessionError {
-    SessionError::Persist("session recovery retention is full; retry after pending replies complete".into())
+/// What to do with a session that already exists when a new one is derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionReplacement {
+    /// Fail with [`SessionError::SessionExists`]; the existing session stays.
+    Keep,
+    /// Hold the new session aside; the existing one stays in use until the peer
+    /// answers for the new one: a SessionAck to the initiator, which names no session
+    /// ([`SessionManager::confirm_session`]) or a message that decrypts under it.
+    AfterConfirmation,
 }
 
 /// An active E2EE session with a peer.
-#[derive(Clone)]
 struct PeerSession {
     /// The Double Ratchet for this session.
     ratchet: DoubleRatchet,
-    /// Pending wire ciphertext and receive receipts saved with their ratchet.
-    recovery_data: HashMap<String, Vec<u8>>,
+    /// When this node derived the session, ms since the epoch. Held in memory
+    /// only: `None` for a session restored from storage.
+    established_at_ms: Option<u64>,
+    /// A newer session the peer has not yet proven it holds. Replaces `ratchet`
+    /// only on that proof; held in memory only, and overwritten by the next one.
+    unconfirmed: Option<DoubleRatchet>,
+    /// `unconfirmed` is one we initiated, so a SessionAck can confirm it. One we
+    /// accepted is proven only by a message that decrypts under it.
+    unconfirmed_initiated: bool,
+    /// When `unconfirmed` was set.
+    unconfirmed_since: Option<std::time::Instant>,
+    /// We initiated this session and the peer has not yet confirmed it.
+    awaiting_confirmation: bool,
+    /// The peer sent something this session could not read, so the two sides may
+    /// disagree. Cleared when a new session is installed or a message decrypts.
+    needs_renegotiation: bool,
+    /// The session this one replaced. It only ever reads, see [`RETIRED_SESSION_READS_FOR`].
+    retired: Option<RetiredSession>,
+    /// The peer may still be on the session before this one, so it should get a
+    /// `RatchetInit` under this one: it moves over on the first message that decrypts.
+    ratchet_init_owed: bool,
 }
 
-/// Keep the original ratchet JSON fields so existing encrypted sessions restore
-/// without a schema migration. Missing recovery data defaults to an empty map.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct StoredSession {
-    #[serde(flatten)]
-    ratchet: RatchetState,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    recovery_data: HashMap<String, Vec<u8>>,
+/// A replaced session, kept in memory only. Never encrypted with and never saved, so
+/// it cannot put a send chain position back in use.
+struct RetiredSession {
+    ratchet: DoubleRatchet,
+    since: std::time::Instant,
+}
+
+/// How long a replaced session can still read. The acceptor moves to a new session
+/// only when a message under it arrives, so until then what it sends is under the
+/// previous one, and a paid envelope is resent as it was encrypted, on a backoff that
+/// grows to an hour. Replacing a session must not make those unreadable.
+const RETIRED_SESSION_READS_FOR: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+impl PeerSession {
+    fn new(ratchet: DoubleRatchet, established_at_ms: Option<u64>, awaiting_confirmation: bool) -> Self {
+        Self {
+            ratchet,
+            established_at_ms,
+            unconfirmed: None,
+            unconfirmed_initiated: false,
+            unconfirmed_since: None,
+            awaiting_confirmation,
+            needs_renegotiation: false,
+            retired: None,
+            ratchet_init_owed: false,
+        }
+    }
+
+    /// A new session the peer has proven takes over; the one in use only reads now.
+    fn switch_to(&mut self, ratchet: DoubleRatchet) {
+        let previous = std::mem::replace(self, Self::new(ratchet, now_ms(), false));
+        self.retired = Some(RetiredSession { ratchet: previous.ratchet, since: std::time::Instant::now() });
+    }
+
+    fn retired_can_read(&self) -> bool {
+        self.retired.as_ref().is_some_and(|retired| retired.since.elapsed() <= RETIRED_SESSION_READS_FOR)
+    }
+}
+
+fn now_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_millis() as u64)
 }
 
 /// Domain-separation context for deriving the session-encryption key from the
@@ -233,11 +254,9 @@ pub struct SessionManager {
     one_time_prekeys: RwLock<Vec<OneTimePreKey>>,
     /// Next OPK ID counter.
     next_opk_id: RwLock<u32>,
-    /// Active sessions keyed by peer NodeId.
-    sessions: RwLock<HashMap<NodeId, PeerSession>>,
-    /// Receive receipts of removed sessions, carried into that peer's next
-    /// session so committed receives stay provable across a replacement.
-    removed_receipts: RwLock<HashMap<NodeId, HashMap<String, Vec<u8>>>>,
+    /// Active sessions keyed by peer NodeId. Shared with the detached tasks that save
+    /// them; see [`Self::encrypt`].
+    sessions: Arc<RwLock<HashMap<NodeId, PeerSession>>>,
     /// Optional persistent session store.
     store: Option<Arc<dyn SessionStore>>,
     /// AES-256-GCM cipher for encrypting session state at rest.
@@ -257,53 +276,41 @@ impl SessionManager {
     ///
     /// Generates an initial signed pre-key and a batch of one-time pre-keys.
     pub fn new(identity: Arc<NodeIdentity>) -> Self {
+        Self::with_optional_store(identity, None)
+    }
+
+    /// One-time pre-keys live in memory, so each boot makes new ones. Their ids start
+    /// at a random point per boot, so an init naming an id not held this boot is refused
+    /// instead of deriving a secret the initiator does not share. This reduces collisions:
+    /// an id can still repeat across boots, and an init naming no id is unaffected. It
+    /// does not show that a bundle is fresh.
+    fn with_optional_store(identity: Arc<NodeIdentity>, store: Option<Arc<dyn SessionStore>>) -> Self {
         let spk = SignedPreKey::generate();
         let session_cipher = Self::derive_session_cipher(&identity);
 
-        // Generate initial batch of one-time pre-keys
-        let mut otpks = Vec::with_capacity(10);
-        for id in 0..10u32 {
-            otpks.push(OneTimePreKey::generate(id));
-        }
+        // Half the id space stays above the base, far more than a boot can use.
+        let base = rand::thread_rng().next_u32() / 2;
+        let otpks = (base..base + 10).map(OneTimePreKey::generate).collect();
 
         Self {
             identity,
             signed_prekey: RwLock::new(spk),
             one_time_prekeys: RwLock::new(otpks),
-            next_opk_id: RwLock::new(10),
-            sessions: RwLock::new(HashMap::new()),
-            removed_receipts: RwLock::new(HashMap::new()),
-            store: None,
+            next_opk_id: RwLock::new(base + 10),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            store,
             session_cipher,
         }
     }
 
     /// Create a session manager with persistent storage.
     ///
-    /// Encrypt saves the advanced ratchet before it returns ciphertext, and
-    /// decrypt commits a copy of the ratchet only after authentication.
-    /// Sessions are loaded from storage on startup via `restore_sessions()`.
+    /// Sessions are persisted after every ratchet operation (encrypt/decrypt)
+    /// and loaded from storage on startup via `restore_sessions()`.
     /// Session state is encrypted at rest using AES-256-GCM with a key
     /// derived from the node identity (Principle 4: no plaintext at any layer).
     pub fn with_store(identity: Arc<NodeIdentity>, store: Arc<dyn SessionStore>) -> Self {
-        let spk = SignedPreKey::generate();
-        let session_cipher = Self::derive_session_cipher(&identity);
-
-        let mut otpks = Vec::with_capacity(10);
-        for id in 0..10u32 {
-            otpks.push(OneTimePreKey::generate(id));
-        }
-
-        Self {
-            identity,
-            signed_prekey: RwLock::new(spk),
-            one_time_prekeys: RwLock::new(otpks),
-            next_opk_id: RwLock::new(10),
-            sessions: RwLock::new(HashMap::new()),
-            removed_receipts: RwLock::new(HashMap::new()),
-            store: Some(store),
-            session_cipher,
-        }
+        Self::with_optional_store(identity, Some(store))
     }
 
     /// Restore sessions from persistent storage.
@@ -382,16 +389,13 @@ impl SessionManager {
                         None => continue,
                     };
 
-                    match serde_json::from_slice::<StoredSession>(&json_bytes) {
+                    match serde_json::from_slice::<RatchetState>(&json_bytes) {
                         Ok(state) => {
-                            let ratchet = DoubleRatchet::from_state(&state.ratchet);
-                            self.sessions.write().await.insert(
-                                *peer_id,
-                                PeerSession {
-                                    ratchet,
-                                    recovery_data: state.recovery_data,
-                                },
-                            );
+                            let ratchet = DoubleRatchet::from_state(&state);
+                            self.sessions
+                                .write()
+                                .await
+                                .insert(*peer_id, PeerSession::new(ratchet, None, false));
                             restored += 1;
                             debug!(peer = %peer_id, "restored E2EE session from storage");
 
@@ -403,9 +407,7 @@ impl SessionManager {
                                 && self.decrypt_session_blob(&blob).is_err()
                             {
                                 debug!(peer = %peer_id, "re-encrypting legacy plaintext session");
-                                if let Err(e) = self.persist_session(peer_id).await {
-                                    warn!(peer = %peer_id, error = %e, "failed to persist session state");
-                                }
+                                self.persist_session(peer_id).await;
                             }
                         }
                         Err(e) => {
@@ -420,11 +422,7 @@ impl SessionManager {
             }
         }
 
-        debug!(
-            count = restored,
-            total = peer_ids.len(),
-            "session restore complete"
-        );
+        debug!(count = restored, total = peer_ids.len(), "session restore complete");
         restored
     }
 
@@ -534,20 +532,31 @@ impl SessionManager {
     ///
     /// Session state is serialized to JSON and then encrypted with AES-256-GCM
     /// before being written to the store (Principle 4: no plaintext at rest).
+    /// Errors are logged but don't fail the operation (session state is still
+    /// in memory). Sending does not use this: see [`Self::encrypt`].
     ///
-    /// Encrypt and decrypt do not use this helper: they save a prepared snapshot
-    /// while holding the session write lock. Establishment still logs a failure
-    /// and continues, because that path has not produced a message ciphertext.
-    async fn persist_session(&self, peer_id: &NodeId) -> Result<(), SessionError> {
-        // Hold the read guard through the save. Otherwise an encrypt/decrypt
-        // can save a newer state while this snapshot is pending, and this save
-        // can overwrite it, reusing a sent key and nonce after restart.
-        let sessions = self.sessions.read().await;
-        let session = match sessions.get(peer_id) {
-            Some(session) => session,
-            None => return Ok(()),
-        };
-        write_session_state(self.store.as_ref(), &self.session_cipher, peer_id, session).await
+    /// Runs like a send: detached, with the session lock held until the store answers.
+    async fn persist_session(&self, peer_id: &NodeId) {
+        let Some(store) = self.store.clone() else { return };
+        let (sessions, cipher, peer) = (Arc::clone(&self.sessions), self.session_cipher.clone(), *peer_id);
+        let saved = tokio::spawn(async move {
+            let sessions = sessions.write().await;
+            let Some(session) = sessions.get(&peer) else { return };
+            match session_blob(&cipher, session) {
+                Ok(encrypted_blob) => {
+                    if let Err(e) = store.save_session(&peer, &encrypted_blob).await {
+                        warn!(peer = %peer, error = %e, "failed to persist session state");
+                    }
+                }
+                Err(e) => {
+                    warn!(peer = %peer, error = %e, "failed to prepare session state for storage");
+                }
+            }
+        })
+        .await;
+        if let Err(e) = saved {
+            warn!(peer = %peer_id, error = %e, "session save task ended early");
+        }
     }
 
     /// Get our prekey bundle for distribution to peers.
@@ -584,6 +593,9 @@ impl SessionManager {
     /// Performs X3DH key agreement and initializes a Double Ratchet session
     /// as the sender. Returns the session init data that must be sent to
     /// the peer so they can derive the same shared secret.
+    ///
+    /// Fails with [`SessionError::SessionExists`] while a session with the
+    /// peer exists; [`Self::reinitiate_session`] replaces one.
     pub async fn initiate_session(
         &self,
         peer_id: &NodeId,
@@ -593,11 +605,37 @@ impl SessionManager {
         if self.sessions.read().await.contains_key(peer_id) {
             return Err(SessionError::SessionExists(*peer_id));
         }
+        self.initiate_with(peer_id, peer_bundle, SessionReplacement::Keep)
+            .await
+    }
 
-        // Deserialize peer's prekey bundle
+    /// Initiate an E2EE session with a peer that may already have one.
+    ///
+    /// The existing session stays in place and usable until the peer confirms
+    /// it holds the new one ([`Self::confirm_session`]): a bundle, even a valid
+    /// one, does not prove the peer will accept the init, since it can be stale.
+    /// With no existing session the new one is installed at once. A malformed or
+    /// forged offer changes nothing either way.
+    pub async fn reinitiate_session(
+        &self,
+        peer_id: &NodeId,
+        peer_bundle: &SerializablePrekeyBundle,
+    ) -> Result<SerializableSessionInit, SessionError> {
+        self.initiate_with(peer_id, peer_bundle, SessionReplacement::AfterConfirmation)
+            .await
+    }
+
+    async fn initiate_with(
+        &self,
+        peer_id: &NodeId,
+        peer_bundle: &SerializablePrekeyBundle,
+        replacement: SessionReplacement,
+    ) -> Result<SerializableSessionInit, SessionError> {
+        // Validate the peer's bundle and derive the whole session before the
+        // session map is touched: nothing below can fail once it is.
         let bundle = deserialize_prekey_bundle(peer_bundle)?;
 
-        // Perform X3DH as initiator (Alice)
+        // Perform X3DH as initiator (Alice); this verifies the signed pre-key.
         let alice_secret = self.identity.x25519_secret();
         let alice_public = self.identity.x25519_public();
 
@@ -612,22 +650,11 @@ impl SessionManager {
 
         let ratchet_key = *ratchet.public_key().as_bytes();
 
-        // Store session. Receive receipts survive the replacement, so a request
-        // whose receive was already committed can still be resolved.
-        {
-            let mut sessions = self.sessions.write().await;
-            let mut recovery_data = carried_receipts(sessions.get(peer_id));
-            if let Some(stashed) = self.removed_receipts.write().await.remove(peer_id) {
-                recovery_data.extend(stashed);
-            }
-            sessions.insert(*peer_id, PeerSession { ratchet, recovery_data });
-        }
+        // Store the session, or hold it aside until the peer confirms it.
+        self.install_session(peer_id, ratchet, replacement, true).await?;
 
-        // Persist to storage. No message ciphertext exists yet; a later send
-        // saves the advanced ratchet before returning ciphertext.
-        if let Err(e) = self.persist_session(peer_id).await {
-            warn!(peer = %peer_id, error = %e, "failed to persist session state");
-        }
+        // Persist to storage
+        self.persist_session(peer_id).await;
 
         Ok(SerializableSessionInit {
             identity_key: hex::encode(initiation.identity_key.as_bytes()),
@@ -641,6 +668,11 @@ impl SessionManager {
     ///
     /// Performs X3DH key agreement as the responder and initializes a
     /// Double Ratchet session as the receiver.
+    ///
+    /// Fails with [`SessionError::SessionExists`] while a session with the
+    /// peer exists; [`Self::reaccept_session`] replaces one. An init that
+    /// names a one-time pre-key this node does not hold is invalid: it could
+    /// only derive a secret the initiator does not share.
     pub async fn accept_session(
         &self,
         peer_id: &NodeId,
@@ -650,21 +682,51 @@ impl SessionManager {
         if self.sessions.read().await.contains_key(peer_id) {
             return Err(SessionError::SessionExists(*peer_id));
         }
+        self.accept_with(peer_id, init_data, SessionReplacement::Keep)
+            .await
+    }
 
-        // Parse init data
+    /// Accept an E2EE session initiated by a peer, replacing any session that
+    /// already exists with it.
+    ///
+    /// The existing session is replaced only after the init has been fully
+    /// validated (key formats, a one-time pre-key id this node holds) and
+    /// X3DH has succeeded, in one write of the session map. Until then, and
+    /// after any failure, the existing session stays in place and usable, and
+    /// no one-time pre-key is consumed.
+    pub async fn reaccept_session(
+        &self,
+        peer_id: &NodeId,
+        init_data: &SerializableSessionInit,
+    ) -> Result<(), SessionError> {
+        self.accept_with(peer_id, init_data, SessionReplacement::AfterConfirmation)
+            .await
+    }
+
+    async fn accept_with(
+        &self,
+        peer_id: &NodeId,
+        init_data: &SerializableSessionInit,
+        replacement: SessionReplacement,
+    ) -> Result<(), SessionError> {
+        // Parse init data. The ratchet key is read from message headers, but
+        // an init whose key is malformed is not one a conforming peer sends.
         let alice_identity_key = parse_x25519_key(&init_data.identity_key)?;
         let alice_ephemeral_key = parse_x25519_key(&init_data.ephemeral_key)?;
+        parse_x25519_key(&init_data.ratchet_key)?;
 
         // Look up our signed pre-key
         let spk = self.signed_prekey.read().await.clone();
 
-        // Look up and consume the one-time pre-key if used
-        let otpk = if let Some(opk_id) = init_data.one_time_prekey_id {
-            let mut otpks = self.one_time_prekeys.write().await;
-            let idx = otpks.iter().position(|k| k.id == opk_id);
-            idx.map(|i| otpks.remove(i))
-        } else {
-            None
+        // Look up the one-time pre-key if one is named. The pool stays locked
+        // across the key agreement so the key is consumed only once the
+        // agreement has succeeded; a failed init consumes nothing.
+        let mut otpks = self.one_time_prekeys.write().await;
+        let otpk_idx = match init_data.one_time_prekey_id {
+            Some(opk_id) => Some(otpks.iter().position(|k| k.id == opk_id).ok_or_else(|| {
+                SessionError::InvalidPeerData(format!("unknown one-time prekey id {opk_id}"))
+            })?),
+            None => None,
         };
 
         // Perform X3DH as responder (Bob)
@@ -675,7 +737,7 @@ impl SessionManager {
             bob_identity_secret,
             bob_identity_public,
             &spk,
-            otpk.as_ref(),
+            otpk_idx.map(|i| &otpks[i]),
             &alice_identity_key,
             &alice_ephemeral_key,
         )?;
@@ -688,27 +750,131 @@ impl SessionManager {
             shared_secret.associated_data.clone(),
         );
 
-        // Store session. Receive receipts survive the replacement, so a request
-        // whose receive was already committed can still be resolved.
-        {
-            let mut sessions = self.sessions.write().await;
-            let mut recovery_data = carried_receipts(sessions.get(peer_id));
-            if let Some(stashed) = self.removed_receipts.write().await.remove(peer_id) {
-                recovery_data.extend(stashed);
-            }
-            sessions.insert(*peer_id, PeerSession { ratchet, recovery_data });
+        // Store (or atomically replace) the session, then consume the key.
+        self.install_session(peer_id, ratchet, replacement, false).await?;
+        if let Some(i) = otpk_idx {
+            otpks.remove(i);
         }
+        drop(otpks);
 
-        // Persist to storage. No message ciphertext exists yet; a later send
-        // saves the advanced ratchet before returning ciphertext.
-        if let Err(e) = self.persist_session(peer_id).await {
-            warn!(peer = %peer_id, error = %e, "failed to persist session state");
-        }
+        // Persist to storage
+        self.persist_session(peer_id).await;
 
         // Replenish one-time pre-keys if running low
         self.replenish_prekeys().await;
 
         Ok(())
+    }
+
+    /// Install a fully derived session under one write of the session map.
+    /// With [`SessionReplacement::Keep`] an existing session is left as it is
+    /// and the new one is dropped. With [`SessionReplacement::AfterConfirmation`]
+    /// an existing session stays in use and the new one is held aside.
+    async fn install_session(
+        &self,
+        peer_id: &NodeId,
+        ratchet: DoubleRatchet,
+        replacement: SessionReplacement,
+        initiator: bool,
+    ) -> Result<(), SessionError> {
+        let mut sessions = self.sessions.write().await;
+        match (replacement, sessions.get_mut(peer_id)) {
+            (SessionReplacement::Keep, Some(_)) => return Err(SessionError::SessionExists(*peer_id)),
+            (SessionReplacement::AfterConfirmation, Some(existing)) => {
+                existing.unconfirmed = Some(ratchet);
+                existing.unconfirmed_initiated = initiator;
+                existing.unconfirmed_since = Some(std::time::Instant::now());
+                return Ok(());
+            }
+            _ => {}
+        }
+        sessions.insert(*peer_id, PeerSession::new(ratchet, now_ms(), initiator));
+        Ok(())
+    }
+
+    /// The peer acknowledged the session we initiated. A session held aside replaces
+    /// the current one now. `true` if one was awaited; an unexpected acknowledgement
+    /// changes nothing.
+    pub async fn confirm_session(&self, peer_id: &NodeId) -> bool {
+        {
+            let mut sessions = self.sessions.write().await;
+            let Some(session) = sessions.get_mut(peer_id) else { return false };
+            match session.unconfirmed.take() {
+                Some(ratchet) if session.unconfirmed_initiated => session.switch_to(ratchet),
+                held => {
+                    session.unconfirmed = held;
+                    if !session.awaiting_confirmation {
+                        return false;
+                    }
+                    session.awaiting_confirmation = false;
+                }
+            }
+        }
+        self.persist_session(peer_id).await;
+        true
+    }
+
+    /// Record that the peer sent something the session could not read. The
+    /// session stays; the caller's recovery negotiates a replacement.
+    pub async fn mark_needs_renegotiation(&self, peer_id: &NodeId) {
+        if let Some(session) = self.sessions.write().await.get_mut(peer_id) {
+            session.needs_renegotiation = true;
+        }
+    }
+
+    /// Whether we started a replacement of the session with a peer and are waiting for
+    /// its answer. Until then the peer may already be on the replacement, so a message
+    /// under the session in use would tell it nothing.
+    pub async fn replacement_in_flight(&self, peer_id: &NodeId) -> bool {
+        self.sessions.read().await.get(peer_id).is_some_and(|session| session.unconfirmed.is_some() && session.unconfirmed_initiated)
+    }
+
+    /// Whether a newer session with a peer is held aside, either side's, until the
+    /// peer proves it holds it. Until then the two sides can each send, and what the
+    /// acceptor sends is under the session before.
+    pub async fn replacement_pending(&self, peer_id: &NodeId) -> bool {
+        self.sessions.read().await.get(peer_id).is_some_and(|session| session.unconfirmed.is_some())
+    }
+
+    /// Whether we accepted a newer session from a peer at least `age` ago and no
+    /// message under it has arrived since.
+    pub async fn accepted_replacement_older_than(&self, peer_id: &NodeId, age: std::time::Duration) -> bool {
+        self.sessions.read().await.get(peer_id).is_some_and(|session| {
+            session.unconfirmed.is_some()
+                && !session.unconfirmed_initiated
+                && session.unconfirmed_since.is_some_and(|since| since.elapsed() >= age)
+        })
+    }
+
+    /// Record that the peer still needs a `RatchetInit`.
+    pub async fn owe_ratchet_init(&self, peer_id: &NodeId) {
+        if let Some(session) = self.sessions.write().await.get_mut(peer_id) {
+            session.ratchet_init_owed = true;
+        }
+    }
+
+    /// Whether the peer needs a `RatchetInit`; asking clears it.
+    pub async fn take_ratchet_init_owed(&self, peer_id: &NodeId) -> bool {
+        self.sessions.write().await.get_mut(peer_id).is_some_and(|session| std::mem::take(&mut session.ratchet_init_owed))
+    }
+
+    /// Drop replaced sessions that have read for as long as they may.
+    pub async fn expire_retired_sessions(&self) {
+        for session in self.sessions.write().await.values_mut() {
+            if !session.retired_can_read() {
+                session.retired = None;
+            }
+        }
+    }
+
+    /// Whether we initiated the session with a peer and it has not confirmed it.
+    pub async fn awaiting_confirmation(&self, peer_id: &NodeId) -> bool {
+        self.sessions.read().await.get(peer_id).is_some_and(|session| session.awaiting_confirmation)
+    }
+
+    /// Whether the session with a peer is waiting to be renegotiated.
+    pub async fn needs_renegotiation(&self, peer_id: &NodeId) -> bool {
+        self.sessions.read().await.get(peer_id).is_some_and(|session| session.needs_renegotiation)
     }
 
     /// Encrypt a plaintext message for a peer.
@@ -717,114 +883,51 @@ impl SessionManager {
     /// Returns the ratchet message (header + ciphertext) which should be
     /// placed in the UKM envelope's `ciphertext` field.
     ///
-    /// The advanced ratchet is saved before this returns. If saving fails the
-    /// in-memory session stays where it was and the ciphertext is not returned,
-    /// so the caller cannot transmit it.
+    /// The advanced send chain is saved before the ciphertext is returned, so a
+    /// restart can never derive the key of a message that already left. If the save
+    /// fails this returns [`SessionError::NotPersisted`], withholds the ciphertext
+    /// and puts the chain back.
+    ///
+    /// The advance, the save and any roll back run in a detached task that holds the
+    /// session lock until the store answers. A store write can still complete after
+    /// the future that asked for it is dropped, so if this ran in the caller's future,
+    /// a dropped send would free the lock with its write outstanding, and that write
+    /// could land on top of a newer chain. Only one save is ever outstanding this way,
+    /// so saves reach the store in order. If the caller goes away, the chain still
+    /// advances and is saved, its ciphertext is dropped, and the peer sees a gap.
     pub async fn encrypt(
         &self,
         peer_id: &NodeId,
         plaintext: &[u8],
     ) -> Result<RatchetMessage, SessionError> {
-        let store = self.store.clone();
-        let cipher = &self.session_cipher;
-        // The sessions write lock is held across the store await below on
-        // purpose. Two sends then cannot clone one ratchet and derive the same
-        // message key: the next key stays invisible until this send has saved
-        // and installed it. The cost is that every other session operation on
-        // this manager waits out that write.
-        let mut sessions = self.sessions.write().await;
-        let (msg, trial) = {
-            let session = sessions
-                .get_mut(peer_id)
-                .ok_or(SessionError::NoSession(*peer_id))?;
-            let mut trial = session.clone();
-            let msg = trial.ratchet.encrypt(plaintext)?;
-            (msg, trial)
+        let Some(store) = self.store.clone() else {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions.get_mut(peer_id).ok_or(SessionError::NoSession(*peer_id))?;
+            return Ok(session.ratchet.encrypt(plaintext)?);
         };
-
-        write_session_state(store.as_ref(), cipher, peer_id, &trial).await?;
-        match sessions.get_mut(peer_id) {
-            Some(session) => *session = trial,
-            None => return Err(SessionError::NoSession(*peer_id)),
-        }
-        Ok(msg)
-    }
-
-    /// Encrypt once and retain the encoded wire message in the same encrypted
-    /// snapshot as its advanced ratchet. Retries, including after restore,
-    /// return the exact saved bytes without consuming another sending key.
-    /// `encode` must only construct the wire message; it must not transmit it.
-    pub async fn encrypt_retained<F>(
-        &self,
-        peer_id: &NodeId,
-        retention_key: &str,
-        plaintext: &[u8],
-        encode: F,
-    ) -> Result<Vec<u8>, SessionError>
-    where
-        F: FnOnce(&RatchetMessage) -> Result<Vec<u8>, SessionError>,
-    {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions
-            .get_mut(peer_id)
-            .ok_or(SessionError::NoSession(*peer_id))?;
-        if let Some(saved) = session.recovery_data.get(retention_key) {
-            return Ok(saved.clone());
-        }
-        let mut trial = session.clone();
-        let message = trial.ratchet.encrypt(plaintext)?;
-        let wire = encode(&message)?;
-        if !recovery_has_room(&trial.recovery_data, retention_key, wire.len()) {
-            return Err(recovery_full());
-        }
-        trial
-            .recovery_data
-            .insert(retention_key.to_owned(), wire.clone());
-        write_session_state(self.store.as_ref(), &self.session_cipher, peer_id, &trial).await?;
-        *session = trial;
-        Ok(wire)
-    }
-
-    /// Read recovery bytes retained with this session.
-    pub async fn recovery_data(&self, peer_id: &NodeId, retention_key: &str) -> Option<Vec<u8>> {
-        self.sessions
-            .read()
-            .await
-            .get(peer_id)?
-            .recovery_data
-            .get(retention_key)
-            .cloned()
-    }
-
-    /// Forget completed recovery data. A failed save preserves its bytes.
-    pub async fn clear_recovery_data(
-        &self,
-        peer_id: &NodeId,
-        retention_key: &str,
-    ) -> Result<(), SessionError> {
-        let mut sessions = self.sessions.write().await;
-        let Some(session) = sessions.get_mut(peer_id) else {
-            return Ok(());
-        };
-        if !session.recovery_data.contains_key(retention_key) {
-            return Ok(());
-        }
-        let mut trial = session.clone();
-        trial.recovery_data.remove(retention_key);
-        write_session_state(self.store.as_ref(), &self.session_cipher, peer_id, &trial).await?;
-        *session = trial;
-        Ok(())
-    }
-
-    /// Prove that the committed receive chain has passed this header and no
-    /// skipped key remains. A different DH generation is unknown, not proof of
-    /// consumption; callers must not mistake an authentication error for replay.
-    pub async fn has_consumed(&self, peer_id: &NodeId, header: &MessageHeader) -> bool {
-        self.sessions
-            .read()
-            .await
-            .get(peer_id)
-            .is_some_and(|session| session.ratchet.has_consumed(header))
+        let (sessions, cipher, peer, plaintext) =
+            (Arc::clone(&self.sessions), self.session_cipher.clone(), *peer_id, plaintext.to_vec());
+        tokio::spawn(async move {
+            let mut sessions = sessions.write().await;
+            let session = sessions.get_mut(&peer).ok_or(SessionError::NoSession(peer))?;
+            let before = session.ratchet.export_state();
+            let msg = session.ratchet.encrypt(&plaintext)?;
+            let saved = match session_blob(&cipher, session) {
+                Ok(blob) => store.save_session(&peer, &blob).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = saved {
+                warn!(peer = %peer, error = %e, "send chain not saved; ciphertext withheld");
+                session.ratchet = DoubleRatchet::from_state(&before);
+                return Err(SessionError::NotPersisted);
+            }
+            Ok(msg)
+        })
+        .await
+        .map_err(|e| {
+            warn!(peer = %peer_id, error = %e, "session save task ended early");
+            SessionError::NotPersisted
+        })?
     }
 
     /// Inspect a payment-validated payload before application admission without
@@ -835,101 +938,72 @@ impl SessionManager {
         peer_id: &NodeId,
         message: &RatchetMessage,
     ) -> Result<Vec<u8>, SessionError> {
-        let mut preview = {
+        let (mut preview, others) = {
             let sessions = self.sessions.read().await;
             let session = sessions.get(peer_id).ok_or(SessionError::NoSession(*peer_id))?;
-            DoubleRatchet::from_state(&session.ratchet.export_state())
+            let retired = session.retired.as_ref().filter(|_| session.retired_can_read()).map(|retired| &retired.ratchet);
+            let others: Vec<_> = session.unconfirmed.iter().chain(retired).map(DoubleRatchet::export_state).collect();
+            (DoubleRatchet::from_state(&session.ratchet.export_state()), others)
         };
-        // Both the snapshot and disposable ratchet zeroize their secrets on drop.
-        Ok(preview.decrypt(message)?)
+        // Both the snapshots and disposable ratchets zeroize their secrets on drop.
+        match preview.decrypt(message) {
+            Ok(plaintext) => Ok(plaintext),
+            Err(error) => others
+                .iter()
+                .find_map(|state| DoubleRatchet::from_state(state).decrypt(message).ok())
+                .ok_or_else(|| error.into()),
+        }
     }
 
     /// Decrypt a ciphertext message from a peer.
     ///
     /// Uses the Double Ratchet to derive the message key and decrypt.
     /// Handles out-of-order delivery transparently.
-    ///
-    /// The ratchet is authenticated on a copy. The copy is saved and then
-    /// installed only after the AEAD tag succeeds. A failed tag or a failed
-    /// save leaves the stored session unchanged.
     pub async fn decrypt(
         &self,
         peer_id: &NodeId,
         message: &RatchetMessage,
     ) -> Result<Vec<u8>, SessionError> {
-        self.decrypt_with_precommit(peer_id, message, |_| async { Ok(()) })
-            .await
-    }
-
-    /// Authenticate a message and persist application recovery data before
-    /// committing its receive ratchet. The callback runs only after successful
-    /// authentication, while competing ratchet operations are excluded. A
-    /// callback error leaves both the live and stored ratchets unchanged.
-    ///
-    /// The callback's write may outlive a failed ratchet save. Callers must
-    /// reconcile that recovery data on retry before acting on the plaintext.
-    /// The callback must not call back into this session manager.
-    pub async fn decrypt_with_precommit<F, Fut>(
-        &self,
-        peer_id: &NodeId,
-        message: &RatchetMessage,
-        before_commit: F,
-    ) -> Result<Vec<u8>, SessionError>
-    where
-        F: FnOnce(Vec<u8>) -> Fut,
-        Fut: std::future::Future<Output = Result<(), SessionError>>,
-    {
-        self.decrypt_with_recovery(peer_id, message, None, before_commit)
-            .await
-    }
-
-    /// Authenticate and save a receive receipt alongside the committed ratchet.
-    /// The receipt contains the authenticated header bytes under the caller's
-    /// envelope-bound recovery key. It proves consumption across later DH
-    /// generations until the caller completes and clears its recovery data.
-    pub async fn decrypt_with_recovery<F, Fut>(
-        &self,
-        peer_id: &NodeId,
-        message: &RatchetMessage,
-        receipt_key: Option<&str>,
-        before_commit: F,
-    ) -> Result<Vec<u8>, SessionError>
-    where
-        F: FnOnce(Vec<u8>) -> Fut,
-        Fut: std::future::Future<Output = Result<(), SessionError>>,
-    {
-        let store = self.store.clone();
-        let cipher = &self.session_cipher;
-        // Same lock as `encrypt`: held across the store await so a concurrent
-        // send cannot derive a key from the ratchet this decrypt is replacing.
-        // Other session operations wait for the write.
-        let mut sessions = self.sessions.write().await;
-        let (plaintext, mut trial) = {
+        let plaintext = {
+            let mut sessions = self.sessions.write().await;
             let session = sessions
                 .get_mut(peer_id)
                 .ok_or(SessionError::NoSession(*peer_id))?;
-            // Refuse before any side effect, so the message stays retriable.
-            if let Some(key) = receipt_key {
-                if !recovery_has_room(&session.recovery_data, key, message.header.to_bytes().len()) {
-                    return Err(recovery_full());
+            match session.ratchet.decrypt(message) {
+                Ok(plaintext) => {
+                    // The peer and this session agree, whatever was unreadable before.
+                    session.needs_renegotiation = false;
+                    plaintext
+                }
+                Err(error) => {
+                    // A message under the newer session proves the peer holds it.
+                    let promoted = session.unconfirmed.as_mut().map(|ratchet| ratchet.decrypt(message));
+                    match promoted {
+                        Some(Ok(plaintext)) => {
+                            if let Some(ratchet) = session.unconfirmed.take() {
+                                session.switch_to(ratchet);
+                            }
+                            plaintext
+                        }
+                        // The peer has not moved to this session yet. Nothing here proves
+                        // the two sides agree, so a mark stays.
+                        _ => {
+                            let can_read = session.retired_can_read();
+                            match session.retired.as_mut().filter(|_| can_read).map(|retired| retired.ratchet.decrypt(message)) {
+                                Some(Ok(plaintext)) => {
+                                    session.ratchet_init_owed = true;
+                                    plaintext
+                                }
+                                _ => return Err(error.into()),
+                            }
+                        }
+                    }
                 }
             }
-            let mut trial = session.clone();
-            let plaintext = trial.ratchet.decrypt(message)?;
-            (plaintext, trial)
         };
 
-        before_commit(plaintext.clone()).await?;
-        if let Some(key) = receipt_key {
-            trial
-                .recovery_data
-                .insert(key.to_owned(), message.header.to_bytes().to_vec());
-        }
-        write_session_state(store.as_ref(), cipher, peer_id, &trial).await?;
-        match sessions.get_mut(peer_id) {
-            Some(session) => *session = trial,
-            None => return Err(SessionError::NoSession(*peer_id)),
-        }
+        // Persist updated ratchet state after chain advancement
+        self.persist_session(peer_id).await;
         Ok(plaintext)
     }
 
@@ -951,15 +1025,15 @@ impl SessionManager {
             .unwrap_or(false)
     }
 
-    /// Whether a retained ciphertext still belongs to the current sending
-    /// ratchet. Control-frame retries use this to discard frames after a session
-    /// replacement or DH rotation instead of sending stale initialization data.
-    pub async fn is_current_ratchet_key(&self, peer_id: &NodeId, key: &[u8; 32]) -> bool {
+    /// Whether the session we hold with a peer was derived after `timestamp_ms`.
+    /// `false` when there is no session, or none whose age this node knows.
+    pub async fn session_newer_than(&self, peer_id: &NodeId, timestamp_ms: u64) -> bool {
         self.sessions
             .read()
             .await
             .get(peer_id)
-            .is_some_and(|session| session.ratchet.public_key().as_bytes() == key)
+            .and_then(|session| session.established_at_ms)
+            .is_some_and(|established| timestamp_ms < established)
     }
 
     /// Count active E2EE sessions.
@@ -973,21 +1047,23 @@ impl SessionManager {
     }
 
     /// Remove a session with a peer (e.g., on disconnect or key rotation).
+    ///
+    /// Runs like a send: detached, with the session lock held until the store answers,
+    /// so a delete can never land on top of a newer session.
     pub async fn remove_session(&self, peer_id: &NodeId) -> bool {
-        let removed = self.sessions.write().await.remove(peer_id);
-        let receipts = carried_receipts(removed.as_ref());
-        if !receipts.is_empty() {
-            self.removed_receipts.write().await.entry(*peer_id).or_default().extend(receipts);
-        }
-        let removed = removed.is_some();
-        if removed {
-            if let Some(store) = &self.store {
-                if let Err(e) = store.delete_session(peer_id).await {
-                    warn!(peer = %peer_id, error = %e, "failed to delete stored session");
+        let (sessions, store, peer) = (Arc::clone(&self.sessions), self.store.clone(), *peer_id);
+        tokio::spawn(async move {
+            let mut sessions = sessions.write().await;
+            let removed = sessions.remove(&peer).is_some();
+            if let (true, Some(store)) = (removed, store) {
+                if let Err(e) = store.delete_session(&peer).await {
+                    warn!(peer = %peer, error = %e, "failed to delete stored session");
                 }
             }
-        }
-        removed
+            removed
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Replenish one-time pre-keys when running low.
@@ -1002,6 +1078,30 @@ impl SessionManager {
             }
         }
     }
+}
+
+/// Encrypt session state for storage: nonce (12 bytes) || ciphertext.
+fn seal_session_blob(cipher: &Aes256Gcm, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = AesNonce::from_slice(&nonce_bytes);
+
+    let encrypted = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| format!("session encrypt: {e}"))?;
+
+    let mut result = Vec::with_capacity(12 + encrypted.len());
+    result.extend_from_slice(&nonce_bytes);
+    result.extend_from_slice(&encrypted);
+    Ok(result)
+}
+
+/// The encrypted blob that stores a session's current state.
+fn session_blob(cipher: &Aes256Gcm, session: &PeerSession) -> Result<Vec<u8>, String> {
+    let state = session.ratchet.export_state();
+    let json_blob = serde_json::to_vec(&state).map_err(|e| format!("serialize session state: {e}"))?;
+    // Encrypt the JSON before persisting (Principle 4)
+    seal_session_blob(cipher, &json_blob).map_err(|e| format!("encrypt session state: {e}"))
 }
 
 /// Serialize a RatchetMessage to bytes for embedding in a UKM envelope's ciphertext field.
@@ -1032,13 +1132,23 @@ pub fn ratchet_message_from_bytes(data: &[u8]) -> Result<RatchetMessage, Session
     Ok(RatchetMessage { header, ciphertext })
 }
 
+/// Whether two hex-encoded X25519 public keys are the same curve point. Comparing the
+/// bytes is not enough: X25519 ignores the top bit, so different bytes can be one point.
+/// `false` if either does not parse.
+pub fn same_x25519_point(first: &str, second: &str) -> bool {
+    match (parse_x25519_key(first), parse_x25519_key(second)) {
+        (Ok(first), Ok(second)) => first == second,
+        _ => false,
+    }
+}
+
 /// Parse an X25519 public key from hex.
 fn parse_x25519_key(hex_str: &str) -> Result<X25519Public, SessionError> {
     let bytes = hex::decode(hex_str)
         .map_err(|e| SessionError::InvalidPeerData(format!("invalid hex: {e}")))?;
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| SessionError::InvalidPeerData("expected 32-byte X25519 key".into()))?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+        SessionError::InvalidPeerData("expected 32-byte X25519 key".into())
+    })?;
     Ok(X25519Public::from(arr))
 }
 
@@ -1074,52 +1184,6 @@ fn deserialize_prekey_bundle(
         one_time_prekey,
         one_time_prekey_id: bundle.one_time_prekey_id,
     })
-}
-
-/// Seal session JSON as nonce (12 bytes) || AES-256-GCM ciphertext.
-fn seal_session_blob(cipher: &Aes256Gcm, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = AesNonce::from_slice(&nonce_bytes);
-
-    let encrypted = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| format!("session encrypt: {e}"))?;
-
-    let mut result = Vec::with_capacity(12 + encrypted.len());
-    result.extend_from_slice(&nonce_bytes);
-    result.extend_from_slice(&encrypted);
-    Ok(result)
-}
-
-/// Save `state` for `peer_id`. With no store this is a no-op success.
-///
-/// The JSON buffer is wiped after sealing. A store error is returned to the
-/// caller; this function does not log and continue.
-async fn write_session_state(
-    store: Option<&Arc<dyn SessionStore>>,
-    cipher: &Aes256Gcm,
-    peer_id: &NodeId,
-    session: &PeerSession,
-) -> Result<(), SessionError> {
-    let Some(store) = store else {
-        return Ok(());
-    };
-
-    let state = StoredSession {
-        ratchet: session.ratchet.export_state(),
-        recovery_data: session.recovery_data.clone(),
-    };
-    let mut json_blob = serde_json::to_vec(&state)
-        .map_err(|e| SessionError::Persist(format!("serialize session state: {e}")))?;
-    let encrypted = seal_session_blob(cipher, &json_blob);
-    json_blob.zeroize();
-    let encrypted_blob = encrypted.map_err(SessionError::Persist)?;
-    store
-        .save_session(peer_id, &encrypted_blob)
-        .await
-        .map_err(|e| SessionError::Persist(e.to_string()))?;
-    Ok(())
 }
 
 /// Whether the legacy plaintext-session migration path is active for this boot.

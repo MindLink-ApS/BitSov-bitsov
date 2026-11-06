@@ -72,6 +72,59 @@ async fn run(args: &[&str], expected: Value, reply: Value, success: bool) {
     }
 }
 
+/// From the wrong directory the owner sees the path that is missing, and is
+/// never shown an approval summary or asked for a code first.
+#[tokio::test]
+async fn owner_commands_name_a_missing_default_config_before_any_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    let missing = cwd.join("konsensus.toml").display().to_string();
+    let commands: &[&[&str]] = &[
+        &["grant", "--op", "op-1", "--budget", "100"],
+        &["approve-replacement", "--op", "op-1"],
+        &[
+            "approve",
+            "first-contact",
+            "--client",
+            "client-1",
+            "--op",
+            "grant-1",
+            "--to",
+            "recipient",
+            "--max-msat",
+            "4000",
+        ],
+        &[
+            "peer",
+            "add",
+            "--node-id",
+            "abababababababababababababababababababababababababababababababab",
+            "--addr",
+            "127.0.0.1:9735",
+        ],
+        &["grant-revoke", "--all"],
+        &["pair-status"],
+        &["device", "list"],
+        &["pair-ticket"],
+        &["rebind-instance"],
+    ];
+    for args in commands {
+        let result = tokio::process::Command::new(env!("CARGO_BIN_EXE_konsensus"))
+            .args(*args)
+            .current_dir(&cwd)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{args:?}: {stdout}");
+        assert!(stdout.is_empty(), "{args:?} printed first: {stdout}");
+        assert!(stderr.contains(&missing), "{args:?}: {stderr}");
+        assert!(stderr.contains("--config"), "{args:?}: {stderr}");
+    }
+}
+
 #[tokio::test]
 async fn first_contact_cli_sends_exact_tuple_after_summary() {
     run(

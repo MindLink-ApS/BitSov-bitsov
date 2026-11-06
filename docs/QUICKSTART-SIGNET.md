@@ -278,7 +278,7 @@ api -X POST -H 'content-type: application/json' $API/messages/compose -d '{
 }' | jq .
 ```
 
-`kind: 0` is a chat message. The node encrypts it end to end (X3DH and the
+`kind: 0` is a chat message. The node encrypts it for the contact's node (X3DH and the
 Double Ratchet), pays the recipient's chat price over the channel, and sends
 it. The default chat price is 10 msat, which the node raises to its 1,000 msat
 invoice minimum; `max_total_msat` caps principal plus routing fee (6,000 msat is
@@ -297,7 +297,7 @@ api "$API/messages?peer=<your node id>" | jq .
 
 lists the message with its decrypted `plaintext`, and their `payments/balance`
 has gone up by the price. That is the whole loop: identity from keys, admission
-by payment, content end to end encrypted.
+by payment, content encrypted between the two nodes. Either node can read it.
 
 ## Stopping, restarting, troubleshooting
 
