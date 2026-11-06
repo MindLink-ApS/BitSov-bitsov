@@ -23,19 +23,23 @@ steps() {
   [ -f "$1" ] || fail "missing $1"
   awk -v s="$START" -v e="$END" '
     $0 == s { on = 1; n++; next }
-    on && $0 == e { on = 0; next }
+    on && $0 == e { on = 0; completed++; next }
     on { print }
-    END { if (n != 1) exit 3 }
-  ' "$1" || fail "expected exactly one steps list in $1"
+    END { if (n != 1 || completed != 1 || on) exit 3 }
+  ' "$1" || fail "expected exactly one completed steps list in $1"
 }
 
 a="$(steps "$NOTES")"
 b="$(steps "$UPGRADING")"
 [ -n "$a" ] || fail "empty steps list in $NOTES"
 [ "$a" = "$b" ] || fail "steps differ between $NOTES and $UPGRADING"
-if printf '%s\n' "$a" | grep -Eq '(^|[^A-Za-z])End\.'; then
+normalized="$(printf '%s\n' "$a" | tr '[:space:]' ' ' | tr -s ' ')"
+# Mask complete labels before looking for any remaining standalone End token.
+if printf '%s\n' "$normalized" | awk '
+  { while (gsub(/(^|[^[:alnum:]_])End call([^[:alnum:]_]|$)/, " button ")) {} print }
+' | grep -Eq '(^|[^[:alnum:]_])End([^[:alnum:]_]|$)'; then
   fail "a step names a bare End; the app's buttons are End call and Hang up"
 fi
-printf '%s\n' "$a" | tr '\n' ' ' | grep -q 'End call' || fail "no step names End call"
-printf '%s\n' "$a" | tr '\n' ' ' | grep -q 'Hang up' || fail "no step names Hang up"
+printf '%s\n' "$normalized" | grep -Eq '(^|[^[:alnum:]_])End call([^[:alnum:]_]|$)' || fail "no step names End call"
+printf '%s\n' "$normalized" | grep -Eq '(^|[^[:alnum:]_])Hang up([^[:alnum:]_]|$)' || fail "no step names Hang up"
 echo "KNOWN-LIMIT-STEPS: OK"
