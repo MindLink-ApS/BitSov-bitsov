@@ -6,13 +6,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use konsensus_api::call_media::{AttachRefusal, CallMediaPort, MediaFrame, MEDIA_QUEUE_FRAMES};
+use konsensus_api::call_media::{
+    AttachRefusal, CallMediaPort, MediaFrame, MediaLimits, BULK_QUEUE_FRAMES, MEDIA_QUEUE_FRAMES, PRIORITY_PACKET_BYTES,
+    RESERVED_PRIORITY_BYTES, RESERVED_PRIORITY_FRAMES,
+};
 use konsensus_core::traits::transport::TransportError;
 use konsensus_core::types::NodeId;
 use konsensus_message::wire::MAX_CALL_MEDIA_BYTES;
 use konsensus_message::{CallMediaEvent, Frame};
 
-use super::{CallMediaAdmission, CallMediaRouter, MediaDrop, MediaLink, RateCap, MAX_BYTES_PER_SECOND, MAX_FRAMES_PER_SECOND};
+use super::{CallMediaAdmission, CallMediaRouter, MediaCap, MediaDrop, MediaLink, RateCap, MAX_BYTES_PER_SECOND, MAX_FRAMES_PER_SECOND};
 
 const CALL: &str = "0123456789abcdef0123456789abcdef";
 const OTHER_CALL: &str = "fedcba9876543210fedcba9876543210";
@@ -246,6 +249,168 @@ fn rate_cap_bounds_frames_and_bytes_per_second() {
     assert!(cap.admit(start, 900));
     assert!(!cap.admit(start, 200));
     assert!(cap.admit(start, 100));
+}
+
+const TIER: MediaLimits = MediaLimits { max_frames_per_second: 160, max_bytes_per_second: 256 * 1024, drop_bulk_over_share: true };
+
+#[test]
+fn media_cap_with_only_audio_is_the_rate_cap_it_always_was() {
+    let start = Instant::now();
+    let mut cap = MediaCap::new(MediaLimits::default(), start);
+    let mut old = RateCap::media(start);
+    // Sizes every audio packet can have, in a pattern that crosses both caps
+    // and a window boundary.
+    for i in 0..1000u64 {
+        let now = start + Duration::from_millis(i * 3);
+        let size = [28, 58, 97, 161, 512][i as usize % 5];
+        assert_eq!(cap.admit(now, size), old.admit(now, size), "packet {i}");
+    }
+}
+
+#[test]
+fn media_cap_keeps_the_reservation_free_whatever_order_packets_arrive_in() {
+    let start = Instant::now();
+    let limits = MediaLimits::default();
+    let mut cap = MediaCap::new(limits, start);
+    let mut bulk = 0u64;
+    while cap.admit(start, MAX_CALL_MEDIA_BYTES) {
+        bulk += 1;
+    }
+    assert_eq!(bulk, limits.bulk_bytes_per_second() / MAX_CALL_MEDIA_BYTES as u64);
+    assert!(bulk * MAX_CALL_MEDIA_BYTES as u64 + RESERVED_PRIORITY_BYTES <= MAX_BYTES_PER_SECOND);
+    // A burst at the start of the window leaves a full second of audio.
+    for packet in 0..50 {
+        assert!(cap.admit(start + Duration::from_millis(packet * 20), 161), "audio packet {packet}");
+    }
+    assert!(!cap.admit(start + Duration::from_millis(999), MAX_CALL_MEDIA_BYTES), "bulk stays refused");
+
+    // Small bulk packets hit the frame share instead of the byte share.
+    let mut cap = MediaCap::new(limits, start);
+    let mut bulk = 0;
+    while cap.admit(start, PRIORITY_PACKET_BYTES + 1) {
+        bulk += 1;
+    }
+    assert_eq!(bulk, MAX_FRAMES_PER_SECOND - RESERVED_PRIORITY_FRAMES);
+    for packet in 0..RESERVED_PRIORITY_FRAMES {
+        assert!(cap.admit(start, 161), "audio packet {packet}");
+    }
+    assert!(!cap.admit(start, 161), "the whole frame cap still holds");
+
+    // A new window gives the bulk share back, and a refusal counted nothing.
+    assert!(cap.admit(start + Duration::from_secs(1), MAX_CALL_MEDIA_BYTES));
+}
+
+#[test]
+fn media_cap_at_the_higher_limits_carries_what_the_default_refuses() {
+    let start = Instant::now();
+    let mut wide = MediaCap::new(TIER, start);
+    let mut narrow = MediaCap::new(MediaLimits::default(), start);
+    let (mut wide_bulk, mut narrow_bulk) = (0, 0);
+    for _ in 0..100 {
+        wide_bulk += u32::from(wide.admit(start, MAX_CALL_MEDIA_BYTES));
+        narrow_bulk += u32::from(narrow.admit(start, MAX_CALL_MEDIA_BYTES));
+    }
+    assert_eq!(wide_bulk, 61, "(256 - 12) KiB in 4 KiB packets");
+    assert_eq!(narrow_bulk, 13, "(64 - 12) KiB in 4 KiB packets");
+    for _ in 0..50 {
+        assert!(wide.admit(start, 161));
+    }
+}
+
+fn sized_event(seq: u32, len: usize) -> CallMediaEvent {
+    CallMediaEvent { peer_id: peer(), call_id: CALL.to_string(), seq, data: vec![seq as u8; len], privileged: true }
+}
+
+#[tokio::test]
+async fn inbound_bulk_cannot_spend_the_budget_audio_needs() {
+    let f = fixture();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
+    let mut refused = 0;
+    for seq in 0..40 {
+        if f.router.inbound(sized_event(seq, MAX_CALL_MEDIA_BYTES)).await == Err(MediaDrop::RateCapped) {
+            refused += 1;
+        }
+    }
+    assert!(refused > 0, "more than the bulk share was offered");
+    // A second of audio, with the socket taking it at the rate it comes.
+    let mut audio = Vec::new();
+    for seq in 100..150 {
+        f.router.inbound(sized_event(seq, 161)).await.unwrap_or_else(|why| panic!("audio {seq}: {why:?}"));
+        audio.push(attachment.from_node.try_pop().unwrap().seq);
+    }
+    // The socket got the audio ahead of the bulk backlog and the queue evicted none of it.
+    assert_eq!(audio, (100..150).collect::<Vec<u32>>());
+    assert_eq!(attachment.from_node.priority_dropped(), 0);
+    let bulk: Vec<u32> = std::iter::from_fn(|| attachment.from_node.try_pop()).map(|p| p.seq).collect();
+    assert!(!bulk.is_empty() && bulk.len() <= BULK_QUEUE_FRAMES);
+}
+
+#[tokio::test]
+async fn outbound_audio_goes_ahead_of_queued_bulk_and_keeps_its_budget() {
+    let f = fixture();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
+    // Hold the pump in one send so a backlog forms behind it.
+    f.link.stalled.store(true, std::sync::atomic::Ordering::SeqCst);
+    let sending = f.link.sending.notified();
+    attachment.to_node.push(MediaFrame { seq: 0, payload: vec![0; 160] }).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), sending).await.expect("pump is sending");
+    for seq in 1000..1040 {
+        attachment.to_node.push(MediaFrame { seq, payload: vec![1; MAX_CALL_MEDIA_BYTES] }).unwrap();
+    }
+    for seq in 1..=(MEDIA_QUEUE_FRAMES as u32) {
+        attachment.to_node.push(MediaFrame { seq, payload: vec![2; 161] }).unwrap();
+    }
+    assert_eq!(attachment.to_node.priority_dropped(), 0, "bulk evicted no audio");
+    assert_eq!(attachment.to_node.len(), MEDIA_QUEUE_FRAMES + BULK_QUEUE_FRAMES);
+    assert!(attachment.to_node.dropped() > 0);
+    // The stalled send itself never returns here, so check the order the
+    // queue will hand out: all audio, then the newest bulk.
+    let order: Vec<u32> = std::iter::from_fn(|| attachment.to_node.try_pop()).map(|p| p.seq).collect();
+    assert_eq!(&order[..MEDIA_QUEUE_FRAMES], (1..=MEDIA_QUEUE_FRAMES as u32).collect::<Vec<_>>().as_slice());
+    assert_eq!(order[MEDIA_QUEUE_FRAMES..].len(), BULK_QUEUE_FRAMES);
+    assert_eq!(*order.last().unwrap(), 1039);
+}
+
+#[tokio::test]
+async fn configured_limits_reach_routes_in_both_directions_and_the_socket() {
+    let link = Arc::new(RecordingLink::default());
+    link.connected.lock().unwrap().insert(peer());
+    let admission = Arc::new(StubAdmission::default());
+    admission.admit(peer(), CALL);
+    let router = CallMediaRouter::with_limits(
+        Arc::clone(&link) as Arc<dyn MediaLink>,
+        Arc::clone(&admission) as Arc<dyn CallMediaAdmission>,
+        TIER,
+    );
+    let attachment = router.attach(&peer(), CALL, None).await.unwrap();
+    assert_eq!(attachment.limits, TIER, "the socket's budget is the route's");
+
+    // Inbound: 150 small packets pass where the default stops at 100.
+    for seq in 0..150 {
+        router.inbound(sized_event(seq, 100)).await.unwrap_or_else(|why| panic!("{seq}: {why:?}"));
+        attachment.from_node.try_pop();
+    }
+    assert_eq!(router.dropped(MediaDrop::RateCapped), 0);
+
+    // Outbound: the same count reaches the peer.
+    for seq in 0..150 {
+        attachment.to_node.push(MediaFrame { seq, payload: vec![3; 100] }).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while link.sent.lock().unwrap().len() <= seq as usize {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("forwarded");
+    }
+    assert_eq!(router.dropped(MediaDrop::RateCapped), 0);
+}
+
+#[tokio::test]
+async fn the_default_router_keeps_the_fixed_limits() {
+    let f = fixture();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
+    assert_eq!(attachment.limits, MediaLimits::default());
 }
 
 #[tokio::test]
