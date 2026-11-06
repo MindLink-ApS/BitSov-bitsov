@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use konsensus_api::call_media::{
-    AttachRefusal, CallMediaPort, MediaAttachment, MediaFrame, MediaQueue, MEDIA_QUEUE_FRAMES,
+    AttachRefusal, CallMediaPort, MediaActivity, MediaAttachment, MediaFrame, MediaQueue, MEDIA_QUEUE_FRAMES,
 };
 use konsensus_core::traits::transport::{MessageTransport, TransportError};
 use konsensus_core::types::NodeId;
@@ -245,6 +245,8 @@ impl DropLog {
 /// One routed call: a socket's two queues and the inbound cap.
 struct Route {
     peer: NodeId,
+    client: Option<konsensus_api::auth::PairingBinding>,
+    activity: Arc<MediaActivity>,
     /// From the peer, to the app's socket.
     to_app: Arc<MediaQueue>,
     /// From the app's socket, to the peer.
@@ -445,7 +447,7 @@ impl CallMediaRouter {
 
 #[async_trait]
 impl CallMediaPort for CallMediaRouter {
-    async fn attach(&self, peer: &NodeId, call_id: &str) -> Result<MediaAttachment, AttachRefusal> {
+    async fn attach(&self, peer: &NodeId, call_id: &str, client: Option<&konsensus_api::auth::PairingBinding>) -> Result<MediaAttachment, AttachRefusal> {
         if !is_call_id(call_id) || !self.admission.call_media_admitted(peer, call_id, now_ms()).await {
             return Err(AttachRefusal::NotAdmitted);
         }
@@ -457,6 +459,8 @@ impl CallMediaPort for CallMediaRouter {
         let now = Instant::now();
         let route = Arc::new(Route {
             peer: *peer,
+            client: client.cloned(),
+            activity: MediaActivity::new(),
             to_app: MediaQueue::new(MEDIA_QUEUE_FRAMES),
             from_app: MediaQueue::new(MEDIA_QUEUE_FRAMES),
             inbound_cap: Mutex::new(RateCap::media(now)),
@@ -466,10 +470,15 @@ impl CallMediaPort for CallMediaRouter {
         {
             let mut routes = self.routes();
             let key = (*peer, call_id.to_string());
-            if routes.contains_key(&key) {
-                return Err(AttachRefusal::AlreadyAttached);
+            if let Some(current) = routes.get(&key) {
+                if current.client.as_ref() != client || !current.activity.is_stale() {
+                    return Err(AttachRefusal::AlreadyAttached);
+                }
+                // Close both queues and abort the old pump before publishing
+                // its replacement. A late old-socket drop cannot remove it.
+                current.end();
             }
-            if routes.len() >= MAX_ROUTED_CALLS {
+            if routes.len() >= MAX_ROUTED_CALLS && !routes.contains_key(&key) {
                 warn!(call_id, max = MAX_ROUTED_CALLS, "call media: too many routed calls");
                 return Err(AttachRefusal::Unavailable);
             }
@@ -489,7 +498,7 @@ impl CallMediaPort for CallMediaRouter {
                 }
             }
         };
-        Ok(MediaAttachment::new(*peer, Arc::clone(&route.from_app), Arc::clone(&route.to_app), release))
+        Ok(MediaAttachment::new(*peer, Arc::clone(&route.from_app), Arc::clone(&route.to_app), Arc::clone(&route.activity), release))
     }
 }
 
