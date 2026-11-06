@@ -2218,8 +2218,8 @@ async fn peer_admission_rejects_self_and_control_labels() {
     let state = test_state();
     for body in [
         serde_json::json!({"node_id": state.identity.node_id().to_hex(), "addr": "127.0.0.1:9735"}),
-        serde_json::json!({"node_id": "ab".repeat(32), "addr": "127.0.0.1:9735", "label": "Dad\nspoof"}),
-        serde_json::json!({"node_id": "ab".repeat(32), "addr": "127.0.0.1:9735", "label": "Dad\u{001b}[2J"}),
+        serde_json::json!({"node_id": "ab".repeat(32), "addr": "127.0.0.1:9735", "label": "Bob\nspoof"}),
+        serde_json::json!({"node_id": "ab".repeat(32), "addr": "127.0.0.1:9735", "label": "Bob\u{001b}[2J"}),
     ] {
         let req = Request::builder()
             .method("POST")
