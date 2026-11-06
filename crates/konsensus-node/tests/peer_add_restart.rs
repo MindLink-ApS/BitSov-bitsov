@@ -24,11 +24,24 @@ struct Node {
     identity: NodeIdentity,
     log: PathBuf,
 }
+/// A free loopback address, never handed out twice in this binary.
+///
+/// The probe listener is dropped before the node binds the port, and this
+/// binary's tests run in parallel. If two nodes were given the same port, the
+/// loser's API would fail to bind while `ready` already saw the winner's
+/// `/health`, so the test would talk to the wrong node (401 on `auth/token`).
 fn address() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+    static HANDED_OUT: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    loop {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        if HANDED_OUT.lock().unwrap().insert(addr.port()) {
+            return addr;
+        }
+    }
 }
 impl Node {
     fn new() -> Self {
@@ -93,8 +106,11 @@ impl Node {
                 .send()
                 .await
             {
+                // Our process must still be running: a node that lost its API
+                // port exits, and the answer came from another process.
                 if resp.status().is_success()
                     && (!owner || self.dir.path().join("control.sock").exists())
+                    && process.0.try_wait().unwrap().is_none()
                 {
                     return;
                 }
