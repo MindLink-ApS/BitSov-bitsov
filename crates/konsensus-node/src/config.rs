@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use konsensus_message::wire::SovereigntyTier;
 use serde::{Deserialize, Serialize};
 
@@ -1653,7 +1654,12 @@ impl NodeConfig {
 
     /// Bootstrap must inspect configured paths before requiring an identity.
     pub(crate) fn load_before_identity_validation(path: &Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+        let content = std::fs::read_to_string(path).with_context(|| {
+            let shown = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+            format!(
+                "could not read config file {shown:?} (--config defaults to konsensus.toml in the current directory)"
+            )
+        })?;
         // TOML errors include the source line, which may contain a rejected
         // inline password. Never attach the raw parser error to startup logs.
         let mut config: Self = toml::from_str(&content).map_err(|_| {
