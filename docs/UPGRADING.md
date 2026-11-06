@@ -11,6 +11,74 @@ first. An older binary refuses a config that has the key set (`[pairing]` reject
 unknown fields); remove the line before downgrading. A config saved with the
 setting off does not contain it.
 
+## rc21 → rc22
+
+An E2EE send now saves its advanced send chain before the ciphertext leaves the
+session; if the save fails, nothing is sent (#519). Session setup applies
+stricter consistency checks to the keys it receives (#520). File sends report
+the routing fee actually paid (#521). There are no new SQL migrations or pairing-store or peer-store schema version changes since rc21;
+pairing storage remains **v8**, and stored session state keeps its format.
+Retain the latest data directory, config and encrypted seed; do not re-run
+`init` or restore a historical snapshot. Existing rollback constraints still
+apply. This change does not extend to a database restored from an older copy.
+
+Operators stop BitSov, switch its binary and restart with the same config and
+data. No config change or grant re-issue is needed. A node running rc20 follows
+[rc20 → rc21](#rc20--rc21) too.
+
+A send the node cannot save is now refused with `not_dispatched`, reason
+`session_save_failed`, before any payment for it. An admission already settled
+in the same call stays settled and is reported as paid, with the same reason.
+In a room or calendar fan-out, that recipient is skipped and nothing is paid to
+it. When this reason appears, check disk and database health.
+
+An rc22 node refuses a prekey bundle or session init that fails the stricter
+checks. It logs a warning and adds no reply frame, so that peer gets no new
+session from it. If a session with a contact does not form after the upgrade,
+read the node log.
+
+`POST /api/v1/files/:id/send` now returns optional `fee_paid_msat`. It is omitted
+when any component fee is unknown and on backends other than LDK; absence does
+not mean zero.
+
+The diff from rc21 changes no frame, envelope, ratchet message, prekey bundle or
+session init format. One-time prekey id values change; the field and its type do
+not. From the source, the bundles and inits an rc21 node builds pass the stricter
+checks, so rc21 and rc22 should interoperate. The source supports this
+reading, and it was also run on regtest (below); not on real hardware.
+
+Mixed rc21 and rc22 operation: tested on regtest at `9c923c98`. Upgrade in place
+in both id orders, fresh sessions and file sends to and from rc21 passed. Not run
+on real hardware.
+
+Rollback from rc22 to rc21: tested on regtest in both id orders. rc21 started on
+the candidate's data, and chat, calls and files passed. The earlier guidance that
+prefers rolling forward stands.
+
+Not included: call cutoff is not yet verified on real hardware, and this release
+does not fix the other open reports.
+
+Known limit, also present in rc21: If a link drops during a call and both nodes reconnect at nearly the same moment,
+the two nodes can end up on different sessions. Messages and call minutes sent
+then can be paid for and not read. It can clear within about a minute; otherwise
+follow the steps below. This release does not change it, and a fix is planned.
+
+If messages stop being read after a dropped link:
+
+1. Stop sending; a send can be paid for and not read.
+2. Restart one node with its existing config and data, and allow up to about 90
+   seconds; early sends may fail with nothing paid.
+3. In any app that reports a pending result, use Check pending result.
+4. In any app that still shows the call, use End call, or Hang up while the
+   call still shows as live.
+5. Check that messages are read in both directions, then call again.
+
+Amounts already paid for messages or minutes that were not read are not refunded.
+Tested on regtest on this release and on rc21, by calling the app's host
+functions, not on real hardware.
+
+Follow the [rc22 signing and node checklist](releases/v0.3.0-rc22.md).
+
 ## rc20 → rc21
 
 rc21 fixes app-grant call spending and closing signals (#493, #498). There
