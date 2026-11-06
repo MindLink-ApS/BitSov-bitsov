@@ -653,7 +653,7 @@ Sender Node                                              Recipient Node
 ### Key Properties
 
 - **Payment before delivery:** Message is rejected if payment verification fails (step 12). This is fail-closed — any error in payment verification results in rejection, not acceptance.
-- **E2EE at composition time:** The sender encrypts before transmission (step 6). Neither node's operator can read the plaintext.
+- **E2EE at composition time:** The sender encrypts before transmission (step 6). Design target only: today the node does this encryption, so the operator of either node can read the plaintext.
 - **Double encryption at rest:** E2EE ciphertext is additionally encrypted with AES-256-GCM using the node's storage key before persistence (steps 14, 16).
 - **Chain-aware message pricing (ADR-027):** The price is computed dynamically from chain state (step 2), not a static configuration value.
 - **Federation signatures on every message:** Even between known peers, every message is signed and verified (steps 8, 10).
@@ -663,7 +663,9 @@ Sender Node                                              Recipient Node
 ## 5. End-to-End Encryption Stack
 
 > Design target. The shipped node uses X3DH and the Double Ratchet
-> (`crates/konsensus-crypto`); PQXDH and MLS are not implemented.
+> (`crates/konsensus-crypto`); PQXDH and MLS are not implemented. The ends of
+> that encryption are the two nodes, not the apps, so both nodes can read
+> messages. Encryption that reaches the app is planned.
 
 ### 1:1 Messages — PQXDH (Post-Quantum Extended Diffie-Hellman)
 

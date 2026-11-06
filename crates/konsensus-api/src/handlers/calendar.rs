@@ -566,7 +566,7 @@ async fn create_event(
                 tracing::warn!(
                     peer = %peer_id,
                     error = %e,
-                    "no E2EE session for attendee, skipping"
+                    "attendee invite not encrypted, skipping"
                 );
                 queued_for.push(peer_id.to_hex());
                 continue;
@@ -762,7 +762,8 @@ async fn update_event(
 
         let ratchet_msg = match state.session_manager.encrypt(peer_id, &payload_bytes).await {
             Ok(msg) => msg,
-            Err(_) => {
+            Err(e) => {
+                tracing::warn!(peer = %peer_id, error = %e, "attendee update not encrypted, skipping");
                 queued_for.push(peer_id.to_hex());
                 continue;
             }
@@ -906,9 +907,9 @@ async fn create_rsvp(
         .encrypt(&organizer_id, &payload_bytes)
         .await
         .map_err(|e| {
-            ApiError::BadRequest(format!(
+            ApiError::from_encrypt_failure(e, |e| ApiError::BadRequest(format!(
                 "E2EE encryption failed (session may not be established): {e}"
-            ))
+            )))
         })?;
     let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
