@@ -397,14 +397,15 @@ async fn paid_call_and_unused_hold_release() {
         .service
         .call_spend_status(&bid.to_hex(), CALL)
         .unwrap();
-    assert_eq!(hold.reserved_msat, 30_000);
-    assert_eq!(hold.remaining_msat, 30_000);
+    // Main reserves the one-sat closing signal with the three media blocks.
+    assert_eq!(hold.reserved_msat, 31_000);
+    assert_eq!(hold.remaining_msat, 31_000);
     assert_eq!(hold.spent_msat, 0);
     assert_eq!(hold.per_block_msat, 10_000);
     assert_eq!(hold.per_block_fee_msat, 0);
     assert_eq!(hold.max_call_minutes, 3);
     assert!(!hold.closed);
-    assert_eq!(pair.caller.used(), before.used[0] + 40_000);
+    assert_eq!(pair.caller.used(), before.used[0] + 41_000);
     let (status, body) = signal(
         &pair.callee,
         &aid,
@@ -483,9 +484,9 @@ async fn paid_call_and_unused_hold_release() {
             .call_spend_status(&bid.to_hex(), CALL)
             .unwrap();
         assert_eq!(hold.spent_msat, u64::from(seq + 1) * 10_000);
-        assert_eq!(hold.remaining_msat, 30_000 - hold.spent_msat);
+        assert_eq!(hold.remaining_msat, 31_000 - hold.spent_msat);
         assert_eq!(hold.released_msat, 0);
-        assert_eq!(pair.caller.used(), before.used[0] + 40_000);
+        assert_eq!(pair.caller.used(), before.used[0] + 41_000);
     }
     let (status, body) = signal(
         &pair.caller,
@@ -514,7 +515,8 @@ async fn paid_call_and_unused_hold_release() {
         .unwrap();
     assert_eq!(hold.spent_msat, 20_000);
     assert_eq!(hold.remaining_msat, 0);
-    assert_eq!(hold.released_msat, 10_000);
+    // The explicit app hangup is paid separately; its unused closing reserve releases.
+    assert_eq!(hold.released_msat, 11_000);
     for (app, peer) in [(&pair.caller, &bid), (&pair.callee, &aid)] {
         let entry = app
             .state
@@ -528,7 +530,7 @@ async fn paid_call_and_unused_hold_release() {
     before
         .reconcile(&pair, &[10_000, 10_000, 10_000, 1_000], &[1_000])
         .await;
-    println!("APP GRANT PASS paid_call paid_blocks=2 block_seconds=60 spent_msat=31000 released_msat=10000 routing_fee_msat=0");
+    println!("APP GRANT PASS paid_call paid_blocks=2 block_seconds=60 spent_msat=31000 released_msat=11000 routing_fee_msat=0");
     stop(pair).await;
 }
 

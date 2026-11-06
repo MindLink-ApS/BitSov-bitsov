@@ -17,6 +17,10 @@ pub const ROOM_CAPABILITY: &str = "room_terminal_outcomes_v1";
 /// longer carries it. Terminal for the call: it ends and its hold is released.
 pub const CALL_DIRECT_CHANNEL_LOST: &str = "call_direct_channel_lost";
 
+/// A call's hold pins a per-block ceiling above what its grant now allows per
+/// payment. Terminal for the call: its hold is closed and nothing more is paid.
+pub const CALL_ABOVE_PAYMENT_LIMIT: &str = "call_above_payment_limit";
+
 pub fn payable(price: u64) -> u64 { if price == 0 { 0 } else { price.max(1000) } }
 
 pub fn check(amount: u64, cap: Option<u64>) -> Result<(), ApiError> {

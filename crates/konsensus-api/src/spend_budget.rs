@@ -43,6 +43,7 @@ use serde::{Deserialize, Serialize};
 
 mod calls;
 pub use calls::{CallSpend, CallSpendStatus, CallSpendTerms};
+pub(crate) use calls::{CallPayment, CALL_CLOSING_MSAT};
 
 /// Capability advertised on `/api/v1/status` once this node meters grants.
 pub const CAPABILITY: &str = "spend_budget_grant_v1";
@@ -933,6 +934,10 @@ pub enum BudgetRefusal {
     CallLiquidity { required_msat: u64, available_msat: u64 },
     #[error("call block price or routing fee exceeds the reserved ceiling; nothing was dispatched")]
     CallPriceChanged,
+    /// The callee's quoted closing signal, with its routing allowance, is
+    /// above what one payment of this call may carry.
+    #[error("the call's closing signal would cost {closing_msat} msat, more than the {max_msat} msat one call payment may carry; nothing was reserved or paid")]
+    CallClosingAboveLimit { closing_msat: u64, max_msat: u64 },
     #[error("grant paused after consecutive failures; owner console reset required")]
     GrantPaused,
     #[error(
@@ -995,6 +1000,7 @@ impl BudgetRefusal {
         match self {
             BudgetRefusal::CallLiquidity { .. } => "call_liquidity_insufficient",
             BudgetRefusal::CallPriceChanged => "call_price_changed",
+            BudgetRefusal::CallClosingAboveLimit { .. } => "call_closing_above_limit",
             BudgetRefusal::GrantPaused => "grant_paused",
             BudgetRefusal::FailuresPending => "failure_limit_pending",
             BudgetRefusal::RateLimitMinute => "rate_limit_minute",

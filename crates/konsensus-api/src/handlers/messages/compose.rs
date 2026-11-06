@@ -468,7 +468,7 @@ pub(crate) struct Readmission {
 }
 
 impl Readmission {
-    fn fee_paid_msat(&self) -> Option<u64> {
+    pub(crate) fn fee_paid_msat(&self) -> Option<u64> {
         if self.paid_msat().is_none() { Some(0) } else { *self.fee_paid_msat.lock().unwrap_or_else(|e| e.into_inner()) }
     }
     pub(crate) fn fee_ceiling_msat(&self) -> u64 {
@@ -597,7 +597,7 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
         Some(invoice_refusal::ADMISSION_REQUIRED) => admission_refusal(peer_id),
         Some("disk_low") => ApiError::NotDispatched("disk_low".into()),
         Some(invoice_refusal::CALL_BLOCK_UNPAYABLE) => ApiError::NotDispatched(
-            "callee refused the call block invoice: deadline margin or call sequence; nothing was paid".into()
+            "callee refused the call block invoice: deadline margin, call sequence or no E2EE session; nothing was paid".into()
         ).with_reason("call_block_unpayable"),
         Some(reason) => ApiError::Lightning(format!(
             "Recipient refused the invoice request: {reason}"
@@ -3075,6 +3075,10 @@ async fn compose_room_member(
     // Encrypt via Double Ratchet for this specific member.
     let ratchet_msg = match state.session_manager.encrypt(&member, ctx.plaintext.as_bytes()).await {
         Ok(msg) => msg,
+        Err(konsensus_crypto::SessionError::NotPersisted) => {
+            tracing::warn!(peer = %member, "skipping room member: session state could not be saved");
+            return RoomMemberOutcome::stopped(member, "refused", 0, "session state could not be saved; nothing paid to this member".into());
+        }
         Err(e) => {
             tracing::warn!(
                 peer = %member,
@@ -3576,6 +3580,7 @@ pub(super) async fn compose_peer(
         // message, and any admission paid before it (`direct_admission_fits`).
         // A call block keeps the fee pinned by its call's hold; an offer's
         // blocks are checked with its hold below.
+        let caller_fee_cap = req.max_routing_fee_msat;
         let direct = req.kind != konsensus_core::kind::KIND_CALL_BLOCK
             && super::caps::direct_channel(&state, &peer_id, &[price_msat]).await
             && direct_admission_fits(&state, &peer_id, first_contact, req.kind).await;
@@ -3596,6 +3601,12 @@ pub(super) async fn compose_peer(
             if existing.as_ref().is_some_and(|hold| hold.closed) {
                 return Err(ApiError::BadRequest("call reservation is closed; start a new call".into())
                     .with_reason("call_reservation_closed"));
+            }
+            // A hold kept from before its grant's current per-payment value
+            // never pays above it: the hold is closed and the call ends.
+            if let (true, Some(service)) = (existing.is_some() && auth.is_metered(), state.pairing.as_ref()) {
+                service.enforce_call_hold_limit(&peer_id.to_hex(), &signal.call_id)
+                    .map_err(|refusal| ApiError::BudgetExceeded(refusal).with_reason(super::caps::CALL_ABOVE_PAYMENT_LIMIT))?;
             }
             if existing.is_none() || offer_consent {
                 let block_price = if req.kind == konsensus_core::kind::KIND_CALL_BLOCK { price_msat }
@@ -3623,8 +3634,12 @@ pub(super) async fn compose_peer(
                     }
                     // Widen before comparing: even a u64 quote whose bundle
                     // overflows must produce the caller's typed consent refusal.
-                    let hold = ((u128::from(block_price) + u128::from(fee)) * u128::from(minutes))
-                        .max(u128::from(existing.as_ref().map_or(0, |hold| hold.reserved_msat)));
+                    // Caller consent covers minutes only. The grant's extra
+                    // closing reserve is outside that consent, also on retry.
+                    let pinned = existing.as_ref().map_or(0, |hold|
+                        (u128::from(hold.per_block_msat) + u128::from(hold.per_block_fee_msat))
+                            * u128::from(hold.max_call_minutes));
+                    let hold = ((u128::from(block_price) + u128::from(fee)) * u128::from(minutes)).max(pinned);
                     if req.max_hold_msat.is_some_and(|cap| hold > u128::from(cap)) {
                         return Err(ApiError::NotDispatched("call reservation exceeds caller consent; nothing was paid".into())
                             .with_reason("call_hold_above_consent"));
@@ -3652,7 +3667,17 @@ pub(super) async fn compose_peer(
                     }
                 }
                 if existing.is_none() {
+                    // Quote closure as an ordinary hangup: the callee's
+                    // payable signal price plus its approved routing ceiling.
+                    let (closing_price, closing_fee) = if auth.is_metered() {
+                        let price = quoted_price(&state, &peer_id, konsensus_core::kind::KIND_CALL_HANGUP, height).await?;
+                        let fee_cap = if caller_fee_cap == Some(0)
+                            || super::caps::direct_channel(&state, &peer_id, &[price]).await { Some(0) }
+                            else { caller_fee_cap };
+                        (price, state.lightning.routing_fee_policy().ceiling(price, fee_cap))
+                    } else { (0, 0) };
                     let terms = crate::spend_budget::CallSpendTerms::new(&peer_id.to_hex(), &signal.call_id, block_price, fee, minutes)
+                        .and_then(|terms| if auth.is_metered() { terms.with_closing_signal(closing_price, closing_fee) } else { Ok(terms) })
                         .map_err(ApiError::BudgetExceeded)?
                         .over_direct_channel(direct && fee == 0);
                     // An offer's hold is reserved with the offer below, in one
@@ -3725,7 +3750,7 @@ pub(super) async fn compose_peer(
             .map_err(|e| e.with_routing_fee(state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat)))?
             .with_fee_limit(req.max_routing_fee_msat)
             .with_direct_channel(direct);
-        let debit = debit.with_operation(operation.clone());
+        let debit = debit.with_operation(operation.clone()).for_call_payment(req.kind);
         let debit = if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
             debit.for_call_block(peer_id, req.plaintext.clone())
         } else if req.kind == konsensus_core::kind::KIND_CALL_INVITE && auth.is_metered() {
@@ -3766,9 +3791,9 @@ pub(super) async fn compose_peer(
                 let no_session = !state.session_manager.has_session(&peer_id).await;
                 let connected = state.transport.is_connected(&peer_id).await;
                 if !(first_contact && no_session && connected) {
-                    return Err(ApiError::BadRequest(format!(
+                    return Err(ApiError::from_encrypt_failure(e, |e| ApiError::BadRequest(format!(
                         "E2EE encryption failed (session may not be established): {e}"
-                    )));
+                    ))));
                 }
 
                 tracing::info!(
@@ -3822,10 +3847,12 @@ pub(super) async fn compose_peer(
                     .encrypt(&peer_id, req.plaintext.as_bytes())
                     .await
                     .map_err(|e| {
-                        ApiError::BadRequest(format!(
+                        // Reported through `admission.error` below, which keeps a
+                        // settled admission as paid.
+                        ApiError::from_encrypt_failure(e, |e| ApiError::BadRequest(format!(
                             "E2EE encryption failed after admission (session may not be \
                              established): {e}"
-                        ))
+                        )))
                     })?
             }
         };
@@ -3841,7 +3868,7 @@ pub(super) async fn compose_peer(
         operation.draft(draft, price_msat,
             debit.fee_limit(&state, price_msat).saturating_add(admission.fee_ceiling_msat),
             admission.settled_msat.saturating_sub(admission.readmission_msat),
-            if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+            if matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK) {
                 let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
                     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
                 Some((signal.call_id, signal.seq.unwrap_or_default()))
@@ -3955,6 +3982,9 @@ pub(super) async fn compose_peer(
             readmission_msat: readmission.paid_msat(),
         }))
         }.await;
+        // Told apart here: `admission.error` turns this into the settled class below,
+        // which the debit handling matches on, so its reason goes back on afterwards.
+        let save_failed = matches!(&result, Err(error) if error.is_session_save_failure());
         let result = result.map_err(|error| admission.error(error));
         match &result {
             Ok(response) => debit.settled(&peer_key, response.0.amount_msat),
@@ -3965,7 +3995,10 @@ pub(super) async fn compose_peer(
             Err(_) => debit.released(&peer_key),
         }
         let message_msat = admission.message_authorized.unwrap_or(price_msat);
-        result.map_err(|e| e.with_routing_fee(debit.fee_limit(&state, message_msat).saturating_add(admission.fee_ceiling_msat)))
+        result.map_err(|e| {
+            let e = if save_failed && !e.is_session_save_failure() { e.with_reason(crate::error::SESSION_SAVE_FAILED) } else { e };
+            e.with_routing_fee(debit.fee_limit(&state, message_msat).saturating_add(admission.fee_ceiling_msat))
+        })
 }
 
 #[cfg(test)]

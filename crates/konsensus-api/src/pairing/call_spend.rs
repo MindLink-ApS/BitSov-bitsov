@@ -3,10 +3,62 @@ use super::*;
 use crate::spend_budget::{CallSpendStatus, CallSpendTerms, OperationReservationLink};
 
 impl PairingService {
+    pub(crate) fn call_spend_grant(&self, peer: &str, call_id: &str) -> Option<String> {
+        let inner = self.lock();
+        inner.file.call_spend_grants.get(&format!("{peer}:{call_id}")).cloned().or_else(|| {
+            // Also recognize holds admitted before provenance was separate.
+            inner.file.grants.iter().find(|g| g.budget.as_ref().is_some_and(|b|
+                b.call_reservations.values().any(|c| c.terms.peer == peer && c.terms.call_id == call_id)))
+                .map(|g| g.op_id.clone())
+        })
+    }
+
+    pub(crate) fn call_spend_grant_keys(&self) -> Vec<String> {
+        self.lock().file.call_spend_grants.keys().cloned().collect()
+    }
+
+    pub(crate) fn call_closing_limits(&self, peer: &str, call_id: &str) -> Option<(u64, u64)> {
+        let inner = self.lock();
+        inner.file.grants.iter().filter_map(|g| g.budget.as_ref())
+            .flat_map(|b| b.call_reservations.values())
+            .find(|call| call.terms.peer == peer && call.terms.call_id == call_id)
+            .map(|call| (call.terms.closing_allowance_msat(), call.terms.closing_fee_msat))
+    }
+
+    pub(crate) fn forget_call_spend_grants(&self, keys: &[String]) -> Result<(), PairingError> {
+        if keys.is_empty() { return Ok(()) }
+        let mut inner = self.lock();
+        let before = inner.file.clone();
+        for key in keys { inner.file.call_spend_grants.remove(key); }
+        if let Err(error) = self.persist(&mut inner.file) {
+            inner.file = before;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Transfer the prepaid allowance to a journaled child of the original
+    /// hold. Neither budget nor breaker velocity is reserved a second time.
+    pub(crate) fn reserve_call_closing_spend(&self, grant_op_id: &str, peer: &str, call_id: &str, charges: Vec<Charge>,
+        link: OperationReservationLink) -> Result<Reservation, BudgetRefusal> {
+        let (client, epoch) = {
+            let inner = self.lock();
+            let grant = inner.file.grants.iter().find(|g| g.op_id == grant_op_id).ok_or(BudgetRefusal::NoGrant)?;
+            (grant.client_id.clone(), grant.epoch)
+        };
+        let [charge] = charges.as_slice() else { return Err(BudgetRefusal::NoGrant) };
+        if charge.recipient != peer {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        self.draw_call_spend_for_grant(&client, epoch, peer, call_id, u32::MAX, charge.amount_msat, 0, link, Some(grant_op_id))
+    }
+
     pub(crate) fn prune_call_spend(&self, now: i64) -> Result<(), PairingError> {
         let mut inner = self.lock();
         let before = inner.file.clone();
         for budget in inner.file.grants.iter_mut().filter_map(|g| g.budget.as_mut()) {
+            // A hold above what its grant now allows per payment never pays.
+            budget.close_holds_over_limit(None);
             budget.prune_call_tombstones(now);
         }
         if inner.file.grants.iter().zip(&before.grants).any(|(a, b)| a.budget != b.budget) {
@@ -16,6 +68,24 @@ impl PairingService {
             }
         }
         Ok(())
+    }
+
+    /// Before a call draws on its existing hold: if the hold's per-block
+    /// ceiling no longer fits its grant (`GrantBudget::check_call_hold`),
+    /// close it, releasing what it has not paid, and refuse.
+    pub(crate) fn enforce_call_hold_limit(&self, peer: &str, call_id: &str) -> Result<(), BudgetRefusal> {
+        let mut inner = self.lock();
+        let before = inner.file.clone();
+        let mut refused = None;
+        for budget in inner.file.grants.iter_mut().filter_map(|g| g.budget.as_mut()) {
+            refused = budget.close_holds_over_limit(Some((peer, call_id))).or(refused);
+        }
+        let Some(refusal) = refused else { return Ok(()) };
+        if let Err(error) = self.persist(&mut inner.file) {
+            inner.file = before;
+            return Err(BudgetRefusal::Ledger(error.to_string()));
+        }
+        Err(refusal)
     }
 
     fn call_grant_index(
@@ -168,6 +238,13 @@ impl PairingService {
         capacity_msat: u64,
     ) -> Result<Option<Reservation>, BudgetRefusal> {
         let idx = self.call_grant_index(inner, client, epoch)?;
+        let key = format!("{}:{}", terms.peer, terms.call_id);
+        if inner.file.call_spend_grants.get(&key).is_some_and(|grant| *grant != inner.file.grants[idx].op_id) {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        if !inner.file.call_spend_grants.contains_key(&key) && inner.file.call_spend_grants.len() >= 4096 {
+            return Err(BudgetRefusal::Ledger("call funding ledger is full; wait for call cleanup".into()));
+        }
         for (grant_idx, grant) in inner.file.grants.iter().enumerate() {
             if let Some(budget) = &grant.budget {
                 for (id, call) in &budget.call_reservations {
@@ -252,13 +329,27 @@ impl PairingService {
         fee: u64,
         link: OperationReservationLink,
     ) -> Result<Reservation, BudgetRefusal> {
+        self.draw_call_spend_for_grant(client, epoch, peer, call_id, seq, price, fee, link, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_call_spend_for_grant(&self, client: &str, epoch: u64, peer: &str, call_id: &str,
+        seq: u32, price: u64, fee: u64, link: OperationReservationLink, closing_grant: Option<&str>) -> Result<Reservation, BudgetRefusal> {
         let mut inner = self.lock();
         let idx = self.call_grant_index(&inner, client, epoch)?;
+        if closing_grant.is_some_and(|id| inner.file.grants[idx].op_id != id) { return Err(BudgetRefusal::NoGrant); }
         let before = inner.file.clone();
         let grant = &mut inner.file.grants[idx];
         let budget = grant.budget.as_mut().ok_or(BudgetRefusal::NoGrant)?;
         if budget.is_paused() {
             return Err(BudgetRefusal::GrantPaused);
+        }
+        if let Some(refusal) = budget.close_holds_over_limit(Some((peer, call_id))) {
+            if let Err(error) = self.persist(&mut inner.file) {
+                inner.file = before;
+                return Err(BudgetRefusal::Ledger(error.to_string()));
+            }
+            return Err(refusal);
         }
         if !budget.envelopes_live(
             std::iter::once(&peer.to_owned()),
@@ -266,19 +357,23 @@ impl PairingService {
         ) {
             return Err(BudgetRefusal::NoGrant);
         }
+        let closing_limit = budget.call_debit_limit(peer, crate::spend_budget::CallPayment::Signal);
+        if closing_grant.is_some() && price > closing_limit {
+            return Err(BudgetRefusal::PerCall { max_msat: closing_limit });
+        }
         let (parent, call) = budget
             .call_reservations
             .iter_mut()
             .find(|(_, call)| call.terms.peer == peer && call.terms.call_id == call_id)
             .ok_or_else(|| BudgetRefusal::Unpriced("call has no spend reservation".into()))?;
         if call.closed
-            || seq >= u32::from(call.terms.max_call_minutes)
+            || (closing_grant.is_none() && seq >= u32::from(call.terms.max_call_minutes))
         {
             return Err(BudgetRefusal::Unpriced(
                 "call reservation is closed or duration cap reached".into(),
             ));
         }
-        if price > call.terms.per_block_msat || fee > call.terms.per_block_fee_msat {
+        if closing_grant.is_none() && (price > call.terms.per_block_msat || fee > call.terms.per_block_fee_msat) {
             return Err(BudgetRefusal::CallPriceChanged);
         }
         if call.paid_sequences.contains(&seq) || call.draws.values().any(|s| *s == seq) {
@@ -287,6 +382,9 @@ impl PairingService {
         let amount = price
             .checked_add(fee)
             .ok_or(BudgetRefusal::CallPriceChanged)?;
+        if closing_grant.is_some() && amount > call.terms.closing_allowance_msat() {
+            return Err(BudgetRefusal::CallPriceChanged);
+        }
         let remaining = budget
             .pending
             .get_mut(parent)

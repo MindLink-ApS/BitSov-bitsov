@@ -948,3 +948,206 @@ fn call_terms_keep_legacy_duration_and_bound_new_reservations() {
     assert!(CallSpendTerms::new("peer", "call", u64::MAX, 1, 60).is_err());
     assert!(CallSpendTerms::new("peer", "call", u64::MAX / 2, 0, 60).is_err());
 }
+
+/// Store a lower per-payment value on the grant, as a grant stored under an
+/// earlier rule would read after an upgrade.
+fn lower_signed_value(service: &PairingService, max_msat: u64) {
+    let mut inner = service.lock();
+    inner.file.grants[0].budget.as_mut().unwrap().per_call_max_msat = max_msat;
+    service.persist(&mut inner.file).unwrap();
+}
+
+#[test]
+fn a_hold_above_the_grants_per_payment_value_never_pays_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 4_000, 0, 2).unwrap();
+    service.reserve_call_spend(&client, 1, terms, 10_000).unwrap();
+    let link = |op: &str| crate::spend_budget::OperationReservationLink {
+        operation_id: op.into(), execution_id: "attempt".into(), readmission: false,
+    };
+    // Within the signed value, a block pays.
+    let paid = service.draw_call_spend(&client, 1, &peer, "call", 0, 4_000, 0, link("block-0")).unwrap();
+    assert!(service.with_call_spend_authority(&paid, Some((&peer, "call")), || ()).is_ok());
+    service.try_resolve_spend(&paid, &peer, 4_000).unwrap();
+    // A block drawn but not yet dispatched when the stored value drops.
+    let pending = service.draw_call_spend(&client, 1, &peer, "call", 1, 4_000, 0, link("block-1")).unwrap();
+    lower_signed_value(&service, 3_000);
+    // Its dispatch or recovery is refused before any payment.
+    assert!(matches!(
+        service.with_call_spend_authority(&pending, Some((&peer, "call")), || ()),
+        Err(BudgetRefusal::NoGrant)
+    ));
+    assert!(matches!(
+        service.enforce_call_hold_limit(&peer, "call"),
+        Err(BudgetRefusal::PerCall { max_msat: 3_000 })
+    ));
+    assert!(service.call_spend_status(&peer, "call").unwrap().closed);
+    service.try_resolve_spend(&pending, &peer, 0).unwrap();
+    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert_eq!(budget.used_msat, 4_000, "only the paid block remains charged");
+    assert!(budget.pending.is_empty());
+}
+
+#[test]
+fn a_hold_above_the_grants_per_payment_value_is_closed_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 4_000, 0, 2).unwrap();
+    service.reserve_call_spend(&client, 1, terms, 10_000).unwrap();
+    lower_signed_value(&service, 3_000);
+    drop(service);
+    let service = PairingService::open(dir.path(), "identity".into(), true).unwrap();
+    let link = crate::spend_budget::OperationReservationLink {
+        operation_id: "block-0".into(), execution_id: "attempt".into(), readmission: false,
+    };
+    assert!(matches!(
+        service.draw_call_spend(&client, 1, &peer, "call", 0, 4_000, 0, link),
+        Err(BudgetRefusal::PerCall { max_msat: 3_000 })
+    ));
+    assert!(service.call_spend_status(&peer, "call").unwrap().closed);
+    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert_eq!(budget.used_msat, 0);
+    assert!(budget.pending.is_empty());
+}
+
+#[test]
+fn the_call_sweep_closes_a_hold_above_the_grants_per_payment_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    for (call, price) in [("over", 4_000), ("within", 3_000)] {
+        let terms = crate::spend_budget::CallSpendTerms::new(&peer, call, price, 0, 1).unwrap();
+        service.reserve_call_spend(&client, 1, terms, 10_000).unwrap();
+    }
+    lower_signed_value(&service, 3_000);
+    service.prune_call_spend(chrono::Utc::now().timestamp()).unwrap();
+    assert!(service.call_spend_status(&peer, "over").unwrap().closed);
+    assert!(!service.call_spend_status(&peer, "within").unwrap().closed);
+    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert_eq!(budget.used_msat, 3_000, "only the compatible hold stays reserved");
+}
+
+#[test]
+fn a_closing_payment_is_held_to_a_renewed_envelopes_lower_limit_at_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    let envelope = |per_act: u64| {
+        let mut inner = service.lock();
+        let budget = inner.file.grants[0].budget.as_mut().unwrap();
+        if !budget.recipients_only {
+            *budget = GrantBudget::relations();
+        }
+        budget.open_envelope(&peer, 100_000, per_act, chrono::Utc::now().timestamp() + 600);
+        service.persist(&mut inner.file).unwrap();
+    };
+    // A relation grant of 3 sat per act: 1 sat blocks and a 3 sat closing.
+    envelope(3_000);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 1_000, 0, 1)
+        .unwrap()
+        .with_closing_signal(3_000, 0)
+        .unwrap();
+    let hold = service.reserve_call_spend(&client, 1, terms, 100_000).unwrap();
+    let link = crate::spend_budget::OperationReservationLink {
+        operation_id: "closing".into(), execution_id: "attempt".into(), readmission: false,
+    };
+    let closing = service
+        .reserve_call_closing_spend("grant", &peer, "call", vec![Charge { recipient: peer.clone(), amount_msat: 3_000 }], link)
+        .unwrap();
+    assert!(service.with_call_payment_authority(&closing, Some((&peer, "call")), Some(crate::spend_budget::CallPayment::Signal), || ()).is_ok());
+    // The envelope is renewed at 1 sat per act before the closing is paid.
+    envelope(1_000);
+    let mut paid = false;
+    assert!(matches!(
+        service.with_call_payment_authority(&closing, Some((&peer, "call")), Some(crate::spend_budget::CallPayment::Signal), || paid = true),
+        Err(BudgetRefusal::NoGrant)
+    ));
+    assert!(!paid, "nothing is dispatched");
+    // Not dispatched: the child goes back to its hold, and closing it
+    // returns everything to the grant.
+    // A replayed resolution changes nothing, before or after the hold closes.
+    for _ in 0..2 {
+        service.try_resolve_spend(&closing, &peer, 0).unwrap();
+        let view = service.call_spend_status(&peer, "call").unwrap();
+        assert_eq!((view.spent_msat, view.remaining_msat), (0, 4_000));
+    }
+    service.close_call_spend(&hold).unwrap();
+    service.try_resolve_spend(&closing, &peer, 0).unwrap();
+    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert_eq!(budget.used_msat, 0);
+    assert!(budget.pending.is_empty());
+}
+
+#[test]
+fn a_closing_quote_above_the_grant_limit_reserves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].client_id.clone();
+    let peer = "aa".repeat(32);
+    {
+        let mut inner = service.lock();
+        let budget = inner.file.grants[0].budget.as_mut().unwrap();
+        *budget = GrantBudget::from_terms(&GrantTerms::new(200_000).per_call(1_000));
+        service.persist(&mut inner.file).unwrap();
+    }
+    let terms = |closing| crate::spend_budget::CallSpendTerms::new(&peer, "call", 1_000, 0, 1)
+        .unwrap()
+        .with_closing_signal(closing, 0)
+        .unwrap();
+    assert!(matches!(
+        service.reserve_call_spend(&client, 1, terms(99_000), 200_000),
+        Err(BudgetRefusal::CallClosingAboveLimit { closing_msat: 99_000, max_msat: 1_000 })
+    ));
+    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    assert_eq!(budget.used_msat, 0);
+    assert!(budget.call_reservations.is_empty());
+    assert_eq!(budget.breaker_status(chrono::Utc::now().timestamp()).payments_last_hour, 0);
+    assert_eq!(budget.breaker_status(chrono::Utc::now().timestamp()).reserved_msat_last_10_minutes, 0);
+    // A closing within the limit is reserved with the call.
+    service.reserve_call_spend(&client, 1, terms(1_000), 200_000).unwrap();
+}
+
+#[test]
+fn a_closing_quote_is_held_to_the_message_cap() {
+    let budget = GrantBudget::from_terms(&GrantTerms::new(1_000_000));
+    let terms = |block: u64, closing: u64, fee: u64| crate::spend_budget::CallSpendTerms::new(&"aa".repeat(32), "call", block, 0, 1)
+        .unwrap()
+        .with_closing_signal(closing, fee)
+        .unwrap();
+    // The routing allowance counts: 5,500 + 500 fits, 5,500 + 501 does not.
+    budget.check_call_closing(&terms(1_000, 5_500, 500)).unwrap();
+    assert!(matches!(
+        budget.check_call_closing(&terms(1_000, 5_500, 501)),
+        Err(BudgetRefusal::CallClosingAboveLimit { closing_msat: 6_001, max_msat: 6_000 })
+    ));
+    // A large block does not widen what the closing signal may cost.
+    assert!(budget.check_call_closing(&terms(20_000, 20_000, 0)).is_err());
+}
+
+#[test]
+fn a_call_signal_is_held_to_the_message_cap_and_media_to_the_call_limit() {
+    use crate::spend_budget::CallPayment;
+    let peer = "aa".repeat(32);
+    let charge = |amount_msat| [Charge { recipient: peer.clone(), amount_msat }];
+    let budget = GrantBudget::from_terms(&GrantTerms::new(1_000_000).per_call(20_000));
+    assert_eq!(CallPayment::of_kind(403), Some(CallPayment::Signal));
+    assert_eq!(CallPayment::of_kind(404), Some(CallPayment::Media));
+    assert_eq!(CallPayment::of_kind(100), None);
+    budget.check_call_debit(&charge(6_000), CallPayment::Signal).unwrap();
+    assert!(matches!(budget.check_call_debit(&charge(6_001), CallPayment::Signal), Err(BudgetRefusal::PerCall { max_msat: 6_000 })));
+    budget.check_call_debit(&charge(20_000), CallPayment::Media).unwrap();
+    assert!(matches!(budget.check_call_debit(&charge(20_001), CallPayment::Media), Err(BudgetRefusal::PerCall { max_msat: 20_000 })));
+    // A relation envelope's per-act maximum bounds both.
+    let mut relation = GrantBudget::relations();
+    relation.open_envelope(&peer, 100_000, 3_000, chrono::Utc::now().timestamp() + 600);
+    relation.check_call_debit(&charge(3_000), CallPayment::Signal).unwrap();
+    assert!(relation.check_call_debit(&charge(3_001), CallPayment::Signal).is_err());
+    assert!(relation.check_call_debit(&charge(3_001), CallPayment::Media).is_err());
+}
