@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Atlas runs 1–4: one offline, CI-runnable entry point; no downloads.
+# TEST5 runs 1–4: one offline, CI-runnable entry point; no downloads.
 set -euo pipefail
 export REGTEST_TEST=regtest_e2e::three_node::
 export REGTEST_ALLOW_MISSING=1

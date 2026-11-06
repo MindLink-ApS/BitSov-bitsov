@@ -235,7 +235,7 @@ async fn owner_added_peer_survives_restart_and_config_still_wins() {
             "--addr",
             &b.peer.to_string(),
             "--label",
-            "Dad",
+            "Bob",
             "--yes",
             "--config",
         ])
@@ -269,7 +269,7 @@ async fn owner_added_peer_survives_restart_and_config_still_wins() {
     b.connected(&http, &token_b, &a).await;
     let peers = a.get(&http, &token_a, "peers").await;
     assert_eq!(peers[0]["addr"], b.peer.to_string());
-    assert_eq!(peers[0]["label"], "Dad");
+    assert_eq!(peers[0]["label"], "Bob");
     assert_eq!(std::fs::read(&a.config).unwrap(), unchanged);
     a.stop(pa).await;
     // Stop B too: an inbound reconnect cannot rewrite A's configured address.
