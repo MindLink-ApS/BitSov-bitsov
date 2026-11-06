@@ -10,17 +10,22 @@ Paid admission follows the [2026-07-01 keystone](v2/F1-CAPPED-FIRST-CONTACT.md)
 (the target re-prices and the requester pays its invoice), and **mainnet is not
 supported for the public beta**: this guide never uses it and nothing here
 funds a mainnet wallet. Signet coins have no value. There is no final signed
-release yet (only pre-release candidates); this guide builds from source. Every
-step below was run in the session that produced this guide, except the two
-marked **untested in CI**, and some ran under different conditions (a debug
-build on another compiler, mock Lightning instead of a live signet node); the
-[appendix](#appendix-what-was-tested) says exactly what ran how.
+release yet (only pre-release candidates); this guide builds from source. The
+[appendix](#appendix-what-was-tested) records the original validation session,
+which used an earlier Esplora setup and mock Lightning. The current owned-Core
+signet setup below has not been exercised against a live signet node.
 
 You need two nodes to exchange a paid message: yours and a contact's. "Contact"
 below can be a second machine of your own or a second person following the
 same steps. The nodes must reach each other's IP address and ports (same LAN, a
 tailnet, or two VPS hosts; see [reachability](operations/reachability.md)).
 Both nodes need some signet sats from a faucet (amounts in step 5).
+
+For the default Full path, run your own synchronized Bitcoin Core on signet
+with RPC enabled (`signet=1`, `server=1`). Keep RPC on loopback and grant the
+BitSov process read access to Core's cookie. A pruned Core is supported; see
+[chain source](CHAIN-SOURCE.md#own-bitcoin-core) for retention and authentication
+requirements. `init` does not install or start Core.
 
 Doctrine, so the steps make sense: **payment is the connection**, so there is
 no free first message, even to a contact you listed. **Keys are identity**: your
@@ -75,32 +80,42 @@ encrypt it at rest instead, add `--encrypt` and type a password when asked
 (then `start` prompts for it, or read [password input](operations/password-input.md)
 for launchers).
 
-`init` writes a **mainnet** Lightning network and mainnet chain URLs into a fresh
-config today. Switch them to signet before the first start. Open
-`~/bitsov-signet/konsensus.toml` and change these keys in place, leaving
-everything else as written (do not paste a second `[lightning]` or `[chain]`
-table; TOML rejects duplicates):
+Fresh Full `init` defaults to owned Bitcoin Core: `[chain] backend = "bitcoind"`,
+loopback RPC at `127.0.0.1:8332`, and an expanded `$HOME/.bitcoin/.cookie` path.
+Embedded LDK uses that same source; no public Esplora URLs or fallbacks are
+written. The Lightning network is still **mainnet** (`network = "bitcoin"`),
+as the init network notice warns. Before the first start, switch the Lightning
+network, Core RPC port and cookie path to signet. Open
+`~/bitsov-signet/konsensus.toml` and change these keys in the existing tables,
+leaving everything else as written (do not paste a second `[lightning]` or
+`[chain]` table; TOML rejects duplicates):
 
 ```toml
 [lightning]
 backend = "ldk"
 network = "signet"
-esplora_url = "https://mempool.space/signet/api"
-esplora_url_fallback = "https://blockstream.info/signet/api"
+esplora_url = ""
 hub_only_channels = false
 
 [chain]
-backend = "esplora"
-api_url = "https://mempool.space/signet"
-esplora_url_fallback = "https://blockstream.info/signet"
+backend = "bitcoind"
+rpc_host = "127.0.0.1"
+rpc_port = 38332
+cookie_file = "/home/bitsov/.bitcoin/signet/.cookie"
 ```
 
-The URLs are the signet endpoints of the same two public Esplora operators
-`init` already wrote; any Esplora-compatible signet server works. Your own
-Bitcoin Core or an Electrum server are different backends, configured as
-described in [chain source](CHAIN-SOURCE.md) instead of these URLs. A public
-Esplora can link the addresses your wallet watches to your IP; that is the
-trade-off of not running your own chain source.
+Replace `/home/bitsov` with the absolute home directory of the account running
+Core, or use its custom data directory: the signet cookie is under
+`.bitcoin/signet/.cookie` for the default data directory. Do not put a literal
+`~` or `$HOME` in `cookie_file`; use the expanded absolute path. Keep
+`esplora_url = ""` as generated and do not add Esplora fallback keys.
+
+Electrum is an explicit alternative (`--chain electrum`, with a server URL and
+ownership declaration); align it with signet as described in
+[chain source](CHAIN-SOURCE.md#electrum-server). The explicit third-party
+Esplora path requires `--chain esplora --accept-third-party-tip` at init and
+signet URLs before starting. It reports `third_party` and lets the provider
+link watched addresses to your IP; it is not the Full default.
 
 `hub_only_channels = false` is new in this file. By default an embedded LDK
 node opens channels only to a configured hub or LSP, because nothing watches a
@@ -139,7 +154,7 @@ without the node running:
 konsensus node-id --config ~/bitsov-signet/konsensus.toml
 ```
 
-Startup on signet first syncs the LDK wallets against the Esplora server. Until
+Startup on signet first syncs the LDK wallets against your configured Core. Until
 both wallets have synced, money routes answer HTTP 503 `not_ready` and status
 reports `money_ready: false`. Wait for `money_ready: true` before step 5.
 
@@ -179,8 +194,9 @@ api $API/status | jq .
 
 Fields to watch in `status`: `node_id`, `money_ready`, `block_height`,
 `lightning_backend` (`ldk`), `lightning_node_pubkey` (your contact needs this
-in step 7) and `chain_view` (`backend: esplora`, `trust_level: third_party`
-with the public servers above).
+in step 7) and `chain_view` (`backend: bitcoind`, `trust_level: own_node`,
+`host: 127.0.0.1` with the Core setup above). The trust label describes the
+configured source; it does not prove that Core is synchronized.
 
 ## 5. Fund it from a signet faucet
 
@@ -306,8 +322,9 @@ by payment, content encrypted between the two nodes. Either node can read it.
   `init` on a directory that has one (it refuses) and never run two processes
   on one data directory.
 - **503 `not_ready`** on money routes: wallets are still syncing, or the
-  Esplora server is unreachable. `status` shows `chain_sync` when a sync has
-  failed.
+  configured chain source is unavailable. For the Core setup above, check
+  signet RPC at `127.0.0.1:38332` and access to the signet cookie. `status` shows
+  `chain_sync` when a sync has failed.
 - **`peer add` says the node must be running with `--owner-control`**: start
   it with that flag (step 3).
 - **`open-channel` refused with `not_dispatched`**: the reason is in the body,
@@ -326,21 +343,22 @@ by payment, content encrypted between the two nodes. Either node can read it.
 
 ## Appendix: what was tested
 
-Every command above was run in the session that wrote this guide, against a
-`konsensus` binary built from this tree with stable Rust 1.97.0, except where
-marked **untested in CI**. The session had no outbound access to signet Esplora
-servers and no Bitcoin Core, so the steps that need a chain were exercised on
-two local nodes on one machine with the node's mock Lightning backend
-(`shared_mock`, a local settlement ledger with no real funds), and the
-signet-specific steps are marked.
+The original guide-validation session used a `konsensus` binary built with
+stable Rust 1.97.0 and predated the owned-Core Full default. It had no outbound
+access to signet Esplora servers and no Bitcoin Core, so the steps that need a
+chain were exercised on two local nodes on one machine with mock Lightning
+(`shared_mock`, a local settlement ledger with no real funds). The table records
+those historical observations, not a live validation of the current Core
+recipe. The revised Core configuration in steps 2–3 has not been run against
+a live signet Core.
 
 | Step | Ran | Notes |
 | --- | --- | --- |
 | 1. Build | partly | A debug build (`cargo build -p konsensus-node`, not `--release`) on stable 1.97.0, before `rust-toolchain.toml` (1.99.1) landed on main; neither pinned toolchain was installed in the session |
-| 2. `init --tier full`, config edit | yes | Fresh config confirmed to contain `network = "bitcoin"` and mainnet URLs; after the edit the node starts, logs `network=signet`, and reports `money_ready: false` because the Esplora servers were unreachable from the session |
-| 3. `start --owner-control` | yes | Signet config above, and two mock nodes on loopback ports |
+| 2. `init --tier full`, config edit | historical only | Earlier Esplora setup started with `network=signet` after editing, but could not sync from that session. The current owned-Core signet edits have not been exercised live |
+| 3. `start --owner-control` | historical only | Earlier signet Esplora config, and two mock nodes on loopback ports; current Core startup has not been exercised live |
 | 4. Owner token, `status` | yes | `docs/ops/owner-token.sh` on both nodes; the `api` helper checked for GET and POST, and `ps` showed no process carrying the token |
-| 5. Faucet, `funding-address`, one confirmation | **untested in CI** | Needs a reachable signet Esplora and a faucet; the route and its `network` field were read from source, and on a mock node it answers 400 as expected |
+| 5. Faucet, `funding-address`, one confirmation | **untested in CI** | Needs a synchronized signet chain source and a faucet; the route and its `network` field were read from source, and on a mock node it answers 400 as expected |
 | 6. `peer add` both ways, `peers/connected` | yes | First side reports `not reachable yet (… not in whitelist)` until the second side lists it; the contact survived a restart of the node |
 | 7. `open-channel`, `payments/channels` | **untested in CI** | Needs signet funds; request shape, the hub-only default and refusal codes were read from source and [funding fees](ops/funding-fees.md) |
 | 8. `compose`, recipient `messages?peer=`, reply | yes | `state: acked`, `accepted` and `delivered` true, `amount_msat: 1000`; sender balance down 1,000 msat, recipient up 1,000 msat; plaintext readable on the recipient; the reply paid the same way |

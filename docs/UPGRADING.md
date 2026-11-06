@@ -1325,11 +1325,13 @@ must not reopen or show the phrase again. See the
    required by [release policy](ops/RELEASE_POLICY.md). These notes alone are not
    a release artifact or permission to publish. For source builds use Rust 1.89+
    and the release lockfile.
-3. Review the config inventory below. **Esplora remains the default unless the
-   owner explicitly configures `[chain] backend = "bitcoind"` or `"electrum"`.**
+3. Review the config inventory below. **In rc8, Esplora was the default unless the
+   owner explicitly configured `[chain] backend = "bitcoind"` or `"electrum"`.**
    Keep the selected server on the same Bitcoin network as Lightning. Neither
-   backend silently falls back to Esplora. There is no automatic onboarding
-   chain-source selection in this cut.
+   backend silently falls back to Esplora. Retained configs keep their selected
+   source. Current fresh `init --tier full` defaults to owned Core; Electrum is
+   explicit and Esplora requires `--accept-third-party-tip`. Follow
+   [chain source](CHAIN-SOURCE.md) and the init network notice for fresh setups.
 4. Remove stale `KONSENSUS_SQLITE_MIGRATIONS_DIR`, or supply the complete embedded
    SQLite set **001–028**. Check free space against the new 2 GiB default reserve.
    Keep the existing mnemonic, wallet, config, and pairing files in place. For
@@ -1597,7 +1599,7 @@ selects embedded LDK's chain source; it does not reconfigure an external LND.
 | Section | Keys / values | Default and compatibility |
 | --- | --- | --- |
 | Top level | `disk_free_floor_bytes` | `2147483648` (2 GiB); place before any TOML section. Zero removes the reserve, not probe-failure refusal. |
-| `[chain]` Bitcoin Core | `backend = "bitcoind"`, `rpc_host`, `rpc_port`, `cookie_file`; alternatively `rpc_user` + `rpc_password_file` | Explicit opt-in; bare host + port and exactly one file-based auth mode. No inline password or credential URL. Replace the Esplora stanza rather than mixing backend keys. |
+| `[chain]` Bitcoin Core | `backend = "bitcoind"`, `rpc_host`, `rpc_port`, `cookie_file`; alternatively `rpc_user` + `rpc_password_file` | Opt-in for rc8 and retained Esplora configs; the default for current fresh Full init. Bare host + port and exactly one file-based auth mode. No inline password or credential URL. When switching a retained config, replace the Esplora stanza rather than mixing backend keys. |
 | `[chain]` Electrum | `backend = "electrum"`, `server_url`, `operator = "own"` or `"third_party"` | Server URL required; no default/discovery. `operator` defaults to `third_party`, even on loopback/LAN. `own` is the owner's declaration, not proof of validation. |
 | `[remote_access]` | `listen_addr`, `advertised_endpoint`, `mdns` | Off unless a listener is set; `advertised_endpoint` optionally overrides the first auto-discovered endpoint. `[api] listen_addr` must stay loopback. Optional `mdns` build feature advertises only under `--home`; `mdns = false` opts out. Old apps use `pair-ticket --legacy`. Avoid API/P2P/Lightning TCP port collisions. |
 | `[privacy]` | `peer_exchange = "off"` or `"paid"`, `shareable_peers`, `share_peer_labels` | Off and empty lists. Node-ID allowlists explicitly consent to sharing peers and, separately, their labels. Restart to apply; already issued quotes stay redeemable until expiry. |
