@@ -80,7 +80,18 @@ grep -q 'KEY_FPR=B299274C200301714DC6F51A7C2D6F8AC842EF6E' "$HERE/release-sign.s
   || fail 'signer pin missing'
 ! grep -E 'curl |wget |gh release' "$HERE/verify-release.sh" >/dev/null \
   || fail 'verifier fetches something'
-ok 'production pin is unchanged and the verifier does not fetch'
+found=0
+while IFS= read -r cmd; do
+  found=1
+  case "$cmd" in
+    *--no-auto-key-retrieve*) ;;
+    *) fail "verifier gpg invocation lacks --no-auto-key-retrieve: $cmd" ;;
+  esac
+done < <(grep -E '^[[:space:]]*(if ! )?gpg ' "$HERE/verify-release.sh" || true)
+[ "$found" -eq 1 ] || fail 'verifier has no gpg invocation'
+grep -F -- '--status-fd 1 --no-auto-key-retrieve --verify SHA256SUMS.asc SHA256SUMS' "$HERE/release-sign.sh" >/dev/null \
+  || fail 'signer verify lacks --no-auto-key-retrieve'
+ok 'production pin is unchanged and GnuPG is not asked to fetch a key'
 
 # Integration uses a copy pinned to the throwaway key.
 sed "s/B299274C200301714DC6F51A7C2D6F8AC842EF6E/$TEST_KEY/g" "$HERE/verify-release.sh" > "$WORK/verify-release.sh"
@@ -91,13 +102,16 @@ sign_tree() {
   : > "$dir/SHA256SUMS"
   for name in "${ASSETS[@]}"; do
     printf 'payload %s\n' "$name" > "$dir/$name"
-    shasum -a 256 -- "$name" >> "$dir/SHA256SUMS"
+    printf '%s\n' "$name" > "$dir/$name.sha256"
+    printf '{"sbom":"%s"}\n' "$name" > "$dir/$name.sbom.spdx.json"
+    shasum -a 256 -- "$name" "$name.sha256" "$name.sbom.spdx.json" >> "$dir/SHA256SUMS"
+    case "$name" in
+      bitsov-darwin-*)
+        printf 'xcode=test %s\n' "$name" > "$dir/$name.toolchain.txt"
+        shasum -a 256 -- "$name.toolchain.txt" >> "$dir/SHA256SUMS"
+        ;;
+    esac
   done
-  # One optional sibling, so the allowlist is not only the five binaries.
-  printf '{"sbom":true}\n' > "$dir/bitsov-linux-x86_64.sbom.spdx.json"
-  shasum -a 256 -- bitsov-linux-x86_64.sbom.spdx.json >> "$dir/SHA256SUMS"
-  printf 'xcode=test\n' > "$dir/bitsov-darwin-aarch64.toolchain.txt"
-  shasum -a 256 -- bitsov-darwin-aarch64.toolchain.txt >> "$dir/SHA256SUMS"
   gpg --batch --local-user "$key" --armor --detach-sign --output "$dir/SHA256SUMS.asc" "$dir/SHA256SUMS"
 }
 
@@ -117,8 +131,20 @@ GOOD="$WORK/good"
 mkdir -p "$GOOD"
 ( cd "$GOOD" && sign_tree "$GOOD" "$TEST_KEY" )
 bash "$WORK/verify-release.sh" "$GOOD" "$WORK/release.asc" >"$WORK/good.out"
-grep -q '7 files match a signature' "$WORK/good.out" || fail "good path: $(cat "$WORK/good.out")"
-ok 'accepts five binaries plus sbom and toolchain record'
+grep -q '17 files match a signature' "$WORK/good.out" || fail "good path: $(cat "$WORK/good.out")"
+ok 'accepts the seventeen signer artifacts'
+
+PARTIAL="$WORK/partial"
+mkdir -p "$PARTIAL"
+cp -a "$GOOD/." "$PARTIAL/"
+(
+  cd "$PARTIAL"
+  rm -f bitsov-linux-x86_64.sbom.spdx.json SHA256SUMS.asc
+  grep -v -F 'bitsov-linux-x86_64.sbom.spdx.json' SHA256SUMS > SHA256SUMS.new
+  mv SHA256SUMS.new SHA256SUMS
+  gpg --batch --local-user "$TEST_KEY" --armor --detach-sign --output SHA256SUMS.asc SHA256SUMS
+)
+expect_fail 'incomplete artifact set' "$PARTIAL" "$WORK/release.asc" 'not exactly the five binaries'
 
 # The shipped script must refuse this throwaway key even though the sums are well formed.
 rc=0

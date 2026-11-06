@@ -13,9 +13,11 @@
 # that contains the fingerprint text is not that field. This is the same
 # predicate as scripts/release-sign.sh; keep the two copies identical.
 #
-# SHA256SUMS may name only the published CLI artifacts. Every named file must
-# be a regular non-symlink and match its hash. Any other file in the directory
-# (a disk image, a nested archive, a second binary) is refused.
+# SHA256SUMS must name exactly the seventeen assets release-sign.sh publishes:
+# the five CLI binaries, their .sha256 files, their SBOMs, and the two Darwin
+# toolchain records. Every named file must be a regular non-symlink and match
+# its hash. A shorter list, or any other file in the directory, is refused.
+# GnuPG is invoked with --no-auto-key-retrieve inside a temporary GNUPGHOME.
 set -euo pipefail
 
 KEY_FPR=B299274C200301714DC6F51A7C2D6F8AC842EF6E
@@ -50,18 +52,28 @@ signed_by_key() {
   return 1
 }
 
+# Same seventeen names as require_release_assets in scripts/release-sign.sh.
+expected_release_names() {
+  local asset
+  for asset in "${ASSETS[@]}"; do
+    printf '%s\n' "$asset" "$asset.sha256" "$asset.sbom.spdx.json"
+    case "$asset" in
+      bitsov-darwin-*) printf '%s\n' "$asset.toolchain.txt" ;;
+    esac
+  done
+}
+
 allowed_name() {
-  case "$1" in
-    bitsov-darwin-aarch64|bitsov-darwin-x86_64|bitsov-linux-aarch64|bitsov-linux-x86_64|bitsov-windows-x86_64) return 0 ;;
-    bitsov-darwin-aarch64.sha256|bitsov-darwin-x86_64.sha256|bitsov-linux-aarch64.sha256|bitsov-linux-x86_64.sha256|bitsov-windows-x86_64.sha256) return 0 ;;
-    bitsov-darwin-aarch64.sbom.spdx.json|bitsov-darwin-x86_64.sbom.spdx.json|bitsov-linux-aarch64.sbom.spdx.json|bitsov-linux-x86_64.sbom.spdx.json|bitsov-windows-x86_64.sbom.spdx.json) return 0 ;;
-    bitsov-darwin-aarch64.toolchain.txt|bitsov-darwin-x86_64.toolchain.txt) return 0 ;;
-    *) return 1 ;;
-  esac
+  expected_release_names | grep -Fxq -- "$1"
+}
+
+# The temporary home holds only the pinned key. Do not retrieve another one.
+gpg_offline() {
+  gpg --no-auto-key-retrieve "$@"
 }
 
 main() {
-  local dir key line hash name rest got listed pub_count primary rel
+  local dir key line hash name rest got listed pub_count primary rel expected present
   [ $# -eq 2 ] || die "usage: $0 <download-dir> <release-public-key.asc>"
   dir=$1
   key=$2
@@ -85,7 +97,7 @@ main() {
   # Count primary keys and read the first primary fingerprint from gpg, not
   # from text in the file. A second key in the armor is refused. --show-keys
   # does not import.
-  if ! gpg --batch --with-colons --show-keys "$key" >"$WORK/key.colon" 2>"$WORK/show-keys.err"; then
+  if ! gpg_offline --batch --with-colons --show-keys "$key" >"$WORK/key.colon" 2>"$WORK/show-keys.err"; then
     cat "$WORK/show-keys.err" >&2
     die "release public key could not be read"
   fi
@@ -93,7 +105,7 @@ main() {
   [ "$pub_count" -eq 1 ] || die "release public key file must contain exactly one primary key"
   primary=$(awk -F: '$1 == "pub" { seen = 1; next } seen && $1 == "fpr" { print $10; exit }' "$WORK/key.colon")
   [ "$primary" = "$KEY_FPR" ] || die "release public key fingerprint is $primary, not $KEY_FPR"
-  gpg --batch --import "$key" >/dev/null 2>&1
+  gpg_offline --batch --import "$key" >/dev/null 2>&1
 
   cd "$dir"
   if [ ! -f SHA256SUMS ] || [ -L SHA256SUMS ]; then
@@ -123,9 +135,9 @@ main() {
     printf '%s %s\n' "$hash" "$name" >> "$WORK/expected"
   done < SHA256SUMS
   [ -s "$WORK/names" ] || die "SHA256SUMS is empty"
-  for name in "${ASSETS[@]}"; do
-    grep -Fxq "$name" "$WORK/names" || die "SHA256SUMS does not cover $name"
-  done
+  expected=$(expected_release_names | LC_ALL=C sort)
+  present=$(LC_ALL=C sort "$WORK/names")
+  [ "$present" = "$expected" ] || die "SHA256SUMS is not exactly the five binaries, their .sha256 files, their SBOMs, and Darwin toolchain evidence"
 
   find . -mindepth 1 -print0 > "$WORK/entries"
   while IFS= read -r -d '' rel; do
@@ -146,7 +158,7 @@ main() {
     esac
   done < "$WORK/entries"
 
-  gpg --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>"$WORK/gpg.err" | signed_by_key \
+  gpg_offline --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>"$WORK/gpg.err" | signed_by_key \
     || die "signature is not a valid signature by release key $KEY_FPR"
 
   while read -r hash name; do
