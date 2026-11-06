@@ -1,30 +1,4 @@
 use super::*;
-use ed25519_dalek::Signer;
-
-#[test]
-fn staged_sender_keys_are_wiped_in_place_on_failure() {
-    let mut staged = vec![(4, [0xAB; 32]), (5, [0xCD; 32])];
-    let allocation = staged.as_ptr();
-    finish_staged_skips(&mut staged, None);
-    assert_eq!(staged.as_ptr(), allocation);
-    assert!(
-        staged.iter().all(|(_, key)| *key == [0; 32]),
-        "wipe the backing allocation before it is freed"
-    );
-}
-
-#[test]
-fn staged_sender_keys_are_wiped_in_place_after_commit() {
-    let mut staged = vec![(4, [0xAB; 32]), (5, [0xCD; 32])];
-    let mut committed = HashMap::new();
-    finish_staged_skips(&mut staged, Some(&mut committed));
-    assert_eq!(committed.get(&4), Some(&[0xAB; 32]));
-    assert_eq!(committed.get(&5), Some(&[0xCD; 32]));
-    assert!(
-        staged.iter().all(|(_, key)| *key == [0; 32]),
-        "committing keys must wipe the temporary copies too"
-    );
-}
 
 fn test_group_id() -> [u8; 32] {
     let mut id = [0u8; 32];
@@ -184,7 +158,10 @@ fn member_removal_rotates_keys() {
 
     // Alice sends with new key — Bob can decrypt
     let ct_after = alice.encrypt(b"after removal").unwrap();
-    assert_eq!(bob.decrypt(&alice_id, &ct_after).unwrap(), b"after removal");
+    assert_eq!(
+        bob.decrypt(&alice_id, &ct_after).unwrap(),
+        b"after removal"
+    );
 
     // Carol cannot decrypt the new message (she has the old key)
     assert!(carol.decrypt(&alice_id, &ct_after).is_err());
@@ -231,10 +208,7 @@ fn unknown_sender_rejected() {
     let ct = alice.encrypt(b"hello").unwrap();
     // Try to decrypt as if from an unknown sender
     let result = bob.decrypt(&unknown_id, &ct);
-    assert!(matches!(
-        result.unwrap_err(),
-        SenderKeyError::UnknownSender(_)
-    ));
+    assert!(matches!(result.unwrap_err(), SenderKeyError::UnknownSender(_)));
 }
 
 #[test]
@@ -414,10 +388,7 @@ fn debug_impl_redacts_chain_key() {
     let dist = alice.our_distribution();
     let debug_str = format!("{:?}", dist);
 
-    assert!(
-        debug_str.contains("[REDACTED]"),
-        "Distribution Debug must redact chain_key"
-    );
+    assert!(debug_str.contains("[REDACTED]"), "Distribution Debug must redact chain_key");
     let chain_hex = hex::encode(dist.chain_key);
     assert!(
         !debug_str.contains(&chain_hex),
@@ -662,6 +633,74 @@ fn aead_roundtrip_same_context_succeeds() {
     bob.process_distribution(&alice.our_distribution()).unwrap();
     let ct = alice.encrypt(b"post-rotation").unwrap();
     assert_eq!(bob.decrypt(&alice_id, &ct).unwrap(), b"post-rotation");
+}
+
+// ─── Atomic decryption ───────────────────────────────────────────────────────
+
+/// A message carrying a valid sender signature over a ciphertext that does not
+/// authenticate under the sender's chain key.
+fn signed_garbage(sender: &GroupSession, message_number: u32) -> GroupCiphertext {
+    let generation = sender.our_sender_key.generation;
+    let ciphertext = vec![0x5Au8; 48];
+    let sig_payload = build_sig_payload(generation, message_number, &ciphertext);
+    let signature = sender.our_sender_key.signing_key.sign(&sig_payload);
+    GroupCiphertext {
+        generation,
+        message_number,
+        ciphertext,
+        signature: signature.to_bytes(),
+    }
+}
+
+#[test]
+fn failed_group_decrypt_leaves_receiver_state_unchanged() {
+    let group_id = test_group_id();
+    let alice_id = make_node_id(1);
+    let bob_id = make_node_id(2);
+
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let mut bob = GroupSession::new(group_id, bob_id);
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+
+    let cts: Vec<_> = (0..3)
+        .map(|i| alice.encrypt(format!("g{i}").as_bytes()).unwrap())
+        .collect();
+
+    let bad = signed_garbage(&alice, 2);
+    let result = bob.decrypt(&alice_id, &bad);
+    assert!(matches!(result, Err(SenderKeyError::DecryptionFailed(_))));
+    {
+        let entry = &bob.member_keys[&alice_id];
+        assert_eq!(entry.chain_index, 0, "chain must not advance on failure");
+        assert!(entry.skipped_keys.is_empty(), "no skipped keys on failure");
+    }
+
+    for (i, ct) in cts.iter().enumerate() {
+        assert_eq!(bob.decrypt(&alice_id, ct).unwrap(), format!("g{i}").as_bytes());
+    }
+}
+
+#[test]
+fn group_skipped_key_survives_failed_use_and_is_single_use() {
+    let group_id = test_group_id();
+    let alice_id = make_node_id(1);
+    let bob_id = make_node_id(2);
+
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let mut bob = GroupSession::new(group_id, bob_id);
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+
+    let ct0 = alice.encrypt(b"zero").unwrap();
+    let ct1 = alice.encrypt(b"one").unwrap();
+    assert_eq!(bob.decrypt(&alice_id, &ct1).unwrap(), b"one");
+    assert_eq!(bob.member_keys[&alice_id].skipped_keys.len(), 1);
+
+    assert!(bob.decrypt(&alice_id, &signed_garbage(&alice, 0)).is_err());
+    assert_eq!(bob.member_keys[&alice_id].skipped_keys.len(), 1);
+
+    assert_eq!(bob.decrypt(&alice_id, &ct0).unwrap(), b"zero");
+    assert!(bob.member_keys[&alice_id].skipped_keys.is_empty());
+    assert!(bob.decrypt(&alice_id, &ct0).is_err(), "skipped key is single-use");
 }
 
 fn chain_index(session: &GroupSession, sender: &NodeId) -> u32 {

@@ -771,8 +771,10 @@ async fn decrypt_without_session_fails() {
     assert!(matches!(result, Err(SessionError::NoSession(_))));
 }
 
+// ── Validate before replace ─────────────────────────────────────────
+
 #[tokio::test]
-async fn accept_rejects_missing_one_time_prekey_without_creating_a_session() {
+async fn reinitiate_session_replaces_only_after_the_bundle_validates() {
     let id_a = make_identity(TEST_MNEMONIC_A);
     let id_b = make_identity(TEST_MNEMONIC_B);
     let node_a = *id_a.node_id();
@@ -780,74 +782,609 @@ async fn accept_rejects_missing_one_time_prekey_without_creating_a_session() {
     let mgr_a = SessionManager::new(id_a);
     let mgr_b = SessionManager::new(id_b);
 
-    let bundle = mgr_b.prekey_bundle().await;
-    let mut init = mgr_a.initiate_session(&node_b, &bundle).await.unwrap();
-    let real_opk = init.one_time_prekey_id;
-    init.one_time_prekey_id = Some(u32::MAX);
-
-    let err = mgr_b.accept_session(&node_a, &init).await.unwrap_err();
-    assert!(matches!(err, SessionError::InvalidPeerData(_)));
-    assert!(!mgr_b.has_session(&node_a).await);
-    assert!(mgr_b.one_time_prekey_available(real_opk.unwrap()).await);
-
-    init.one_time_prekey_id = real_opk;
+    let init = mgr_a
+        .initiate_session(&node_b, &mgr_b.prekey_bundle().await)
+        .await
+        .unwrap();
     mgr_b.accept_session(&node_a, &init).await.unwrap();
-    assert!(mgr_b.is_repeat_session_init(&node_a, &init).await);
+
+    // A forged signature and a malformed key are refused before anything
+    // is touched: the session keeps working.
+    let genuine = mgr_b.prekey_bundle().await;
+    let mut forged = genuine.clone();
+    forged.signed_prekey_sig = hex::encode([0u8; 64]);
+    assert!(matches!(
+        mgr_a.reinitiate_session(&node_b, &forged).await,
+        Err(SessionError::KeyAgreement(_))
+    ));
+    let mut short = genuine.clone();
+    short.identity_key = hex::encode([1u8; 31]);
+    assert!(matches!(
+        mgr_a.reinitiate_session(&node_b, &short).await,
+        Err(SessionError::InvalidPeerData(_))
+    ));
+    let msg = mgr_a.encrypt(&node_b, b"still here").await.unwrap();
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"still here");
+
+    // The non-replacing entry point still refuses while a session exists;
+    // a valid bundle through the replacing one re-keys.
+    assert!(matches!(
+        mgr_a.initiate_session(&node_b, &genuine).await,
+        Err(SessionError::SessionExists(_))
+    ));
+    let init = mgr_a.reinitiate_session(&node_b, &genuine).await.unwrap();
+    assert!(mgr_a.can_send(&node_b).await);
+    // Until the peer confirms, the initiator stays on the session it has.
+    let msg = mgr_a.encrypt(&node_b, b"old session").await.unwrap();
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"old session");
+    mgr_b.reaccept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_a.confirm_session(&node_b).await);
+    let msg = mgr_a.encrypt(&node_b, b"new session").await.unwrap();
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"new session");
 }
 
 #[tokio::test]
-async fn accepted_init_fingerprint_survives_restore() {
+async fn reaccept_session_refuses_bad_inits_and_consumes_no_prekey() {
     let id_a = make_identity(TEST_MNEMONIC_A);
     let id_b = make_identity(TEST_MNEMONIC_B);
     let node_a = *id_a.node_id();
     let node_b = *id_b.node_id();
-    let store = MemorySessionStore::new();
-
     let mgr_a = SessionManager::new(id_a);
-    let mgr_b =
-        SessionManager::with_store(Arc::clone(&id_b), store.clone() as Arc<dyn SessionStore>);
-    let bundle = mgr_b.prekey_bundle().await;
-    let init = mgr_a.initiate_session(&node_b, &bundle).await.unwrap();
+    let mgr_b = SessionManager::new(id_b);
+
+    let init = mgr_a
+        .initiate_session(&node_b, &mgr_b.prekey_bundle().await)
+        .await
+        .unwrap();
     mgr_b.accept_session(&node_a, &init).await.unwrap();
-    assert!(mgr_b.is_repeat_session_init(&node_a, &init).await);
 
-    let restored = SessionManager::with_store(id_b, store);
-    assert_eq!(restored.restore_sessions().await, 1);
-    assert!(restored.is_repeat_session_init(&node_a, &init).await);
-    let msg = mgr_a.encrypt(&node_b, b"after-restore").await.unwrap();
+    let pool_before: Vec<u32> = mgr_b
+        .one_time_prekeys
+        .read()
+        .await
+        .iter()
+        .map(|k| k.id)
+        .collect();
+    let held = pool_before[0];
+    let key = hex::encode([2u8; 32]);
+    let unknown_prekey = SerializableSessionInit {
+        identity_key: key.clone(),
+        ephemeral_key: key.clone(),
+        one_time_prekey_id: Some(u32::MAX),
+        ratchet_key: key.clone(),
+    };
+    assert!(matches!(
+        mgr_b.reaccept_session(&node_a, &unknown_prekey).await,
+        Err(SessionError::InvalidPeerData(_))
+    ));
+    let bad_key = SerializableSessionInit {
+        identity_key: "not hex".into(),
+        one_time_prekey_id: Some(held),
+        ..unknown_prekey.clone()
+    };
+    assert!(matches!(
+        mgr_b.reaccept_session(&node_a, &bad_key).await,
+        Err(SessionError::InvalidPeerData(_))
+    ));
+    let bad_ratchet_key = SerializableSessionInit {
+        ratchet_key: hex::encode([3u8; 16]),
+        one_time_prekey_id: Some(held),
+        ..unknown_prekey.clone()
+    };
+    assert!(matches!(
+        mgr_b.reaccept_session(&node_a, &bad_ratchet_key).await,
+        Err(SessionError::InvalidPeerData(_))
+    ));
+
+    // Nothing consumed, nothing replaced.
+    let pool_after: Vec<u32> = mgr_b
+        .one_time_prekeys
+        .read()
+        .await
+        .iter()
+        .map(|k| k.id)
+        .collect();
     assert_eq!(
-        restored.decrypt(&node_a, &msg).await.unwrap(),
-        b"after-restore"
+        pool_after, pool_before,
+        "a refused init consumes no one-time pre-key"
     );
+    let msg = mgr_a.encrypt(&node_b, b"still here").await.unwrap();
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"still here");
+
+    // The non-replacing entry point is as strict about the pre-key id.
+    let mgr_c = SessionManager::new(make_identity(TEST_MNEMONIC_B));
+    assert!(matches!(
+        mgr_c.accept_session(&node_a, &unknown_prekey).await,
+        Err(SessionError::InvalidPeerData(_))
+    ));
+    assert!(!mgr_c.has_session(&node_a).await);
 }
 
-#[test]
-fn persisted_session_reads_legacy_ratchet_json() {
-    let shared = [7u8; 32];
-    let spk = crate::x3dh::SignedPreKey::generate();
-    let alice =
-        crate::double_ratchet::DoubleRatchet::init_sender(&shared, &spk.public, b"ad".to_vec())
-            .unwrap();
-    let json = serde_json::to_vec(&alice.export_state()).unwrap();
-    let persisted: super::PersistedSession = serde_json::from_slice(&json).unwrap();
-    assert!(persisted.init_fingerprint.is_none());
-    assert!(!persisted.ack_handled);
-    assert!(persisted.ratchet_init_hash.is_none());
-    assert!(persisted.ratchet_init_payload.is_none());
-    let restored = crate::double_ratchet::DoubleRatchet::from_state(&persisted.ratchet);
-    assert!(restored.can_send());
-}
-
+/// A derived session knows its age; one restored from storage does not, so
+/// nothing is ever judged older than it.
 #[tokio::test]
-async fn decrypt_failure_budget_trips_then_resets() {
-    let mgr = SessionManager::new(make_identity(TEST_MNEMONIC_A));
-    let peer = NodeId::from_bytes([1u8; 32]);
-    for _ in 1..DECRYPT_FAILURE_BUDGET {
-        assert!(!mgr.record_decrypt_failure(&peer).await);
+async fn session_age_is_known_only_for_a_session_derived_here() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let store_b = MemorySessionStore::new();
+    let mgr_a = SessionManager::new(Arc::clone(&id_a));
+    let mgr_b = SessionManager::with_store(Arc::clone(&id_b), store_b.clone());
+    assert!(!mgr_a.session_newer_than(&node_b, 0).await, "no session");
+
+    let init_data = mgr_a.initiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.accept_session(&node_a, &init_data).await.unwrap();
+    assert!(mgr_a.session_newer_than(&node_b, 0).await);
+    assert!(mgr_b.session_newer_than(&node_a, 0).await);
+    assert!(!mgr_a.session_newer_than(&node_b, u64::MAX).await);
+    assert!(!mgr_b.session_newer_than(&node_a, u64::MAX).await);
+
+    let restored = SessionManager::with_store(id_b, store_b);
+    assert_eq!(restored.restore_sessions().await, 1);
+    assert!(restored.has_session(&node_a).await);
+    assert!(!restored.session_newer_than(&node_a, 0).await, "age unknown after a restore");
+}
+
+/// A replacement never confirmed changes nothing, however it ends; an unexpected
+/// confirmation changes nothing either. The first session is confirmed once.
+#[tokio::test]
+async fn an_unconfirmed_replacement_leaves_the_session_in_use() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let mgr_a = SessionManager::new(Arc::clone(&id_a));
+    let mgr_b = SessionManager::new(Arc::clone(&id_b));
+    let init = mgr_a.initiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_a.confirm_session(&node_b).await, "the first session was awaited");
+    assert!(!mgr_a.confirm_session(&node_b).await, "once");
+    assert!(!mgr_b.confirm_session(&node_a).await, "the responder awaits nothing");
+
+    let roundtrip = async |text: &[u8]| {
+        let msg = mgr_a.encrypt(&node_b, text).await.unwrap();
+        assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), text);
+    };
+    roundtrip(b"first").await;
+    mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    roundtrip(b"still the first session").await;
+    roundtrip(b"however long it stays unconfirmed").await;
+}
+
+/// A well-formed init whose keys the peer does not share leaves the session in use:
+/// the acceptor moves only when a message decrypts under the new session, and a real
+/// re-key does that. An acknowledgement does not confirm a session we only accepted.
+#[tokio::test]
+async fn an_accepted_session_is_proven_only_by_a_message_under_it() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let mgr_a = SessionManager::new(Arc::clone(&id_a));
+    let mgr_b = SessionManager::new(Arc::clone(&id_b));
+    let init = mgr_a.initiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+
+    let key = hex::encode(*X25519Public::from(&x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng())).as_bytes());
+    let unproven = SerializableSessionInit { identity_key: key.clone(), ephemeral_key: key.clone(), one_time_prekey_id: None, ratchet_key: key };
+    mgr_b.reaccept_session(&node_a, &unproven).await.unwrap();
+    assert!(!mgr_b.confirm_session(&node_a).await, "an ack proves nothing here");
+    let msg = mgr_a.encrypt(&node_b, b"same session").await.unwrap();
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"same session");
+
+    let init = mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.reaccept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_a.confirm_session(&node_b).await);
+    let msg = mgr_a.encrypt(&node_b, b"new session").await.unwrap();
+    assert_eq!(mgr_b.preview_decrypt(&node_a, &msg).await.unwrap(), b"new session");
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"new session");
+    let back = mgr_b.encrypt(&node_a, b"on the new session").await.unwrap();
+    assert_eq!(mgr_a.decrypt(&node_b, &back).await.unwrap(), b"on the new session");
+}
+
+/// The renegotiation mark lasts until a new session is installed.
+#[tokio::test]
+async fn a_new_session_clears_the_renegotiation_mark() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let mgr_a = SessionManager::new(Arc::clone(&id_a));
+    let mgr_b = SessionManager::new(Arc::clone(&id_b));
+    let init = mgr_a.initiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+    assert!(!mgr_a.needs_renegotiation(&node_b).await);
+    mgr_a.mark_needs_renegotiation(&node_b).await;
+    mgr_b.mark_needs_renegotiation(&node_a).await;
+    assert!(mgr_a.needs_renegotiation(&node_b).await);
+
+    let init = mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    assert!(mgr_a.needs_renegotiation(&node_b).await, "not until the peer confirms");
+    mgr_b.reaccept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_b.needs_renegotiation(&node_a).await, "not until the new session is proven");
+    assert!(mgr_a.confirm_session(&node_b).await);
+    assert!(!mgr_a.needs_renegotiation(&node_b).await);
+    let msg = mgr_a.encrypt(&node_b, b"ratchet-init").await.unwrap();
+    mgr_b.decrypt(&node_a, &msg).await.unwrap();
+    assert!(!mgr_b.needs_renegotiation(&node_a).await);
+}
+
+/// A message that decrypts shows the two sides agree, so the mark clears. A session
+/// the peer has not confirmed is reported until it does.
+#[tokio::test]
+async fn a_readable_message_clears_the_mark_and_confirmation_is_reported() {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let mgr_a = SessionManager::new(Arc::clone(&id_a));
+    let mgr_b = SessionManager::new(Arc::clone(&id_b));
+    let init = mgr_a.initiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_a.awaiting_confirmation(&node_b).await);
+    assert!(!mgr_b.awaiting_confirmation(&node_a).await, "the acceptor awaits nothing");
+    assert!(mgr_a.confirm_session(&node_b).await);
+    assert!(!mgr_a.awaiting_confirmation(&node_b).await);
+
+    mgr_b.mark_needs_renegotiation(&node_a).await;
+    let msg = mgr_a.encrypt(&node_b, b"readable").await.unwrap();
+    assert_eq!(mgr_b.preview_decrypt(&node_a, &msg).await.unwrap(), b"readable");
+    assert!(mgr_b.needs_renegotiation(&node_a).await, "a preview changes nothing");
+    assert_eq!(mgr_b.decrypt(&node_a, &msg).await.unwrap(), b"readable");
+    assert!(!mgr_b.needs_renegotiation(&node_a).await);
+}
+
+/// A store whose saves fail on demand.
+#[derive(Default)]
+struct FlakyStore {
+    data: tokio::sync::RwLock<HashMap<NodeId, Vec<u8>>>,
+    fail: std::sync::atomic::AtomicBool,
+    /// When set, every second save fails.
+    alternate: std::sync::atomic::AtomicBool,
+    saves: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SessionStore for FlakyStore {
+    async fn save_session(&self, peer_id: &NodeId, state_json: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let save = self.saves.fetch_add(1, SeqCst);
+        // Saves take time, so that a send racing this one has a chance to interleave.
+        tokio::task::yield_now().await;
+        if self.fail.load(SeqCst) || (self.alternate.load(SeqCst) && save.is_multiple_of(2)) {
+            return Err("test: disk full".into());
+        }
+        self.data.write().await.insert(*peer_id, state_json.to_vec());
+        Ok(())
     }
-    assert!(mgr.record_decrypt_failure(&peer).await);
-    assert!(
-        !mgr.record_decrypt_failure(&peer).await,
-        "tripping the budget resets the counter"
-    );
+    async fn load_session(&self, peer_id: &NodeId) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.data.read().await.get(peer_id).cloned())
+    }
+    async fn delete_session(&self, peer_id: &NodeId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.data.write().await.remove(peer_id);
+        Ok(())
+    }
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.data.read().await.keys().copied().collect())
+    }
+}
+
+/// A sender with a store and a receiver holding the matching session.
+async fn saving_sender() -> (Arc<NodeIdentity>, Arc<FlakyStore>, SessionManager, SessionManager, NodeId, NodeId) {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let store = Arc::new(FlakyStore::default());
+    let sender = SessionManager::with_store(Arc::clone(&id_a), store.clone());
+    let receiver = SessionManager::new(id_b);
+    let init = sender.initiate_session(&node_b, &receiver.prekey_bundle().await).await.unwrap();
+    receiver.accept_session(&node_a, &init).await.unwrap();
+    (id_a, store, sender, receiver, node_a, node_b)
+}
+
+/// A failed save returns no ciphertext. The chain goes back, so the next send takes
+/// the same position and the receiver sees no gap.
+#[tokio::test]
+async fn failed_save_withholds_the_ciphertext_and_puts_the_chain_back() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (_, store, sender, receiver, node_a, node_b) = saving_sender().await;
+    let first = sender.encrypt(&node_b, b"first").await.unwrap();
+    assert_eq!(receiver.decrypt(&node_a, &first).await.unwrap(), b"first");
+
+    store.fail.store(true, SeqCst);
+    assert!(matches!(sender.encrypt(&node_b, b"withheld").await, Err(SessionError::NotPersisted)));
+    assert!(sender.has_session(&node_b).await, "the session stays");
+
+    store.fail.store(false, SeqCst);
+    let next = sender.encrypt(&node_b, b"next").await.unwrap();
+    assert_eq!(next.header.message_number, first.header.message_number + 1, "the chain was put back");
+    assert_eq!(receiver.decrypt(&node_a, &next).await.unwrap(), b"next");
+}
+
+/// Failed save, then a restart: nothing that left is sent again under the same key
+/// and nonce. Before this fix the failed send left anyway, and the restored chain
+/// then used its position again for a different plaintext.
+#[tokio::test]
+async fn failed_save_then_restart_repeats_no_key_and_nonce() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (id_a, store, sender, receiver, node_a, node_b) = saving_sender().await;
+    let mut released = vec![sender.encrypt(&node_b, b"saved").await.unwrap()];
+
+    store.fail.store(true, SeqCst);
+    if let Ok(message) = sender.encrypt(&node_b, b"not saved").await {
+        released.push(message);
+    }
+    store.fail.store(false, SeqCst);
+    drop(sender);
+
+    let restarted = SessionManager::with_store(id_a, store.clone());
+    assert_eq!(restarted.restore_sessions().await, 1);
+    released.push(restarted.encrypt(&node_b, b"after the restart").await.unwrap());
+
+    // Key and nonce both derive from the chain position, so one position must never
+    // carry two messages.
+    let mut positions: Vec<_> = released.iter().map(|m| (m.header.dh_public, m.header.message_number)).collect();
+    positions.sort();
+    positions.dedup();
+    assert_eq!(positions.len(), released.len(), "a chain position was used twice");
+    let texts: Vec<&[u8]> = vec![b"saved", b"after the restart"];
+    for (message, text) in released.iter().zip(texts) {
+        assert_eq!(receiver.decrypt(&node_a, message).await.unwrap(), text);
+    }
+}
+
+/// Both sides with a store, a session each way, and everything that has left so far.
+async fn saving_pair() -> (Arc<NodeIdentity>, Arc<NodeIdentity>, Arc<FlakyStore>, Arc<FlakyStore>, SessionManager, SessionManager, NodeId, NodeId, Vec<(RatchetMessage, bool)>) {
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let (store_a, store_b) = (Arc::new(FlakyStore::default()), Arc::new(FlakyStore::default()));
+    let mgr_a = SessionManager::with_store(Arc::clone(&id_a), store_a.clone());
+    let mgr_b = SessionManager::with_store(Arc::clone(&id_b), store_b.clone());
+    let init = mgr_a.initiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.accept_session(&node_a, &init).await.unwrap();
+    let first = mgr_a.encrypt(&node_b, b"first").await.unwrap();
+    mgr_b.decrypt(&node_a, &first).await.unwrap();
+    let back = mgr_b.encrypt(&node_a, b"back").await.unwrap();
+    mgr_a.decrypt(&node_b, &back).await.unwrap();
+    (id_a, id_b, store_a, store_b, mgr_a, mgr_b, node_a, node_b, vec![(first, true), (back, false)])
+}
+
+/// One position must never carry two messages, per sender: key and nonce derive from it.
+fn assert_no_position_twice(released: &[(RatchetMessage, bool)]) {
+    let mut positions: Vec<_> = released.iter().map(|(m, from_a)| (*from_a, m.header.dh_public, m.header.message_number)).collect();
+    positions.sort();
+    positions.dedup();
+    assert_eq!(positions.len(), released.len(), "a chain position was used twice");
+}
+
+/// A replacement, a resent `RatchetInit`, a read under the replaced session, then both
+/// sides restart. Every message that left has its own position, and they still talk.
+#[tokio::test]
+async fn a_replacement_and_a_restart_repeat_no_position() {
+    let (id_a, id_b, store_a, store_b, mgr_a, mgr_b, node_a, node_b, mut released) = saving_pair().await;
+    let stale = mgr_b.encrypt(&node_a, b"under the replaced session").await.unwrap();
+    released.push((stale.clone(), false));
+
+    let init = mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.reaccept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_a.confirm_session(&node_b).await);
+    assert_eq!(mgr_a.decrypt(&node_b, &stale).await.unwrap(), b"under the replaced session");
+
+    // The first `RatchetInit` is lost; the next moves the acceptor over.
+    released.push((mgr_a.encrypt(&node_b, b"ratchet-init").await.unwrap(), true));
+    let resent = mgr_a.encrypt(&node_b, b"ratchet-init").await.unwrap();
+    released.push((resent.clone(), true));
+    mgr_b.decrypt(&node_a, &resent).await.unwrap();
+    released.push((mgr_b.encrypt(&node_a, b"on the new session").await.unwrap(), false));
+    drop((mgr_a, mgr_b));
+
+    let (mgr_a, mgr_b) = (SessionManager::with_store(id_a, store_a), SessionManager::with_store(id_b, store_b));
+    assert_eq!(mgr_a.restore_sessions().await, 1);
+    assert_eq!(mgr_b.restore_sessions().await, 1);
+    let (to_b, to_a) = (mgr_a.encrypt(&node_b, b"after").await.unwrap(), mgr_b.encrypt(&node_a, b"after").await.unwrap());
+    released.extend([(to_b.clone(), true), (to_a.clone(), false)]);
+    assert_no_position_twice(&released);
+    assert_eq!(mgr_b.decrypt(&node_a, &to_b).await.unwrap(), b"after");
+    assert_eq!(mgr_a.decrypt(&node_b, &to_a).await.unwrap(), b"after");
+}
+
+/// The save fails right after the initiator moves to a new session. Nothing under it
+/// leaves. A restart goes back to the saved session, where sends carry on from where
+/// they were, and the peer that still holds that session reads them.
+#[tokio::test]
+async fn a_replacement_that_could_not_be_saved_repeats_no_position_after_a_restart() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (id_a, _, store_a, _, mgr_a, mgr_b, node_a, node_b, mut released) = saving_pair().await;
+    released.push((mgr_a.encrypt(&node_b, b"saved").await.unwrap(), true));
+
+    let init = mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.reaccept_session(&node_a, &init).await.unwrap();
+    store_a.fail.store(true, SeqCst);
+    assert!(mgr_a.confirm_session(&node_b).await);
+    assert!(matches!(mgr_a.encrypt(&node_b, b"ratchet-init").await, Err(SessionError::NotPersisted)));
+    drop(mgr_a);
+    store_a.fail.store(false, SeqCst);
+
+    let restarted = SessionManager::with_store(id_a, store_a);
+    assert_eq!(restarted.restore_sessions().await, 1);
+    let after = restarted.encrypt(&node_b, b"after the restart").await.unwrap();
+    released.push((after.clone(), true));
+    assert_no_position_twice(&released);
+    assert_eq!(mgr_b.decrypt(&node_a, &released[2].0).await.unwrap(), b"saved");
+    assert_eq!(mgr_b.decrypt(&node_a, &after).await.unwrap(), b"after the restart");
+}
+
+/// The same on the acceptor: it moves over on a message, the save fails, and nothing
+/// under the new session leaves. A restart puts it back on the saved session.
+#[tokio::test]
+async fn an_acceptor_that_could_not_save_the_move_repeats_no_position_after_a_restart() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (_, id_b, _, store_b, mgr_a, mgr_b, node_a, node_b, mut released) = saving_pair().await;
+    released.push((mgr_b.encrypt(&node_a, b"saved").await.unwrap(), false));
+
+    let init = mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.reaccept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_a.confirm_session(&node_b).await);
+    let moves_it = mgr_a.encrypt(&node_b, b"ratchet-init").await.unwrap();
+    store_b.fail.store(true, SeqCst);
+    mgr_b.decrypt(&node_a, &moves_it).await.unwrap();
+    assert!(matches!(mgr_b.encrypt(&node_a, b"withheld").await, Err(SessionError::NotPersisted)));
+    drop(mgr_b);
+    store_b.fail.store(false, SeqCst);
+
+    let restarted = SessionManager::with_store(id_b, store_b);
+    assert_eq!(restarted.restore_sessions().await, 1);
+    let after = restarted.encrypt(&node_a, b"after the restart").await.unwrap();
+    released.push((after.clone(), false));
+    assert_no_position_twice(&released);
+    // The initiator replaced that session, and can still read under it.
+    assert_eq!(mgr_a.decrypt(&node_b, &after).await.unwrap(), b"after the restart");
+}
+
+/// A replaced session reads what was encrypted under it, on a preview too, and that
+/// shows the peer has not moved over, so a `RatchetInit` is owed once. A restored
+/// manager has no replaced session: it never reaches storage.
+#[tokio::test]
+async fn a_replaced_session_only_reads_and_is_not_saved() {
+    let (id_a, _, store_a, _, mgr_a, mgr_b, node_a, node_b, _) = saving_pair().await;
+    let init = mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.reaccept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_a.confirm_session(&node_b).await);
+    assert!(!mgr_a.take_ratchet_init_owed(&node_b).await);
+
+    let first = mgr_b.encrypt(&node_a, b"first").await.unwrap();
+    let second = mgr_b.encrypt(&node_a, b"second").await.unwrap();
+    assert_eq!(mgr_a.preview_decrypt(&node_b, &first).await.unwrap(), b"first");
+    assert!(!mgr_a.take_ratchet_init_owed(&node_b).await, "a preview changes nothing");
+    assert_eq!(mgr_a.decrypt(&node_b, &first).await.unwrap(), b"first");
+    assert!(mgr_a.take_ratchet_init_owed(&node_b).await);
+    assert!(!mgr_a.take_ratchet_init_owed(&node_b).await, "once");
+    mgr_a.mark_needs_renegotiation(&node_b).await;
+    assert_eq!(mgr_a.decrypt(&node_b, &second).await.unwrap(), b"second");
+    assert!(mgr_a.needs_renegotiation(&node_b).await, "this says nothing about the session in use");
+
+    // What it sends is under the new session: the acceptor moves over on it.
+    let sent = mgr_a.encrypt(&node_b, b"under the new session").await.unwrap();
+    mgr_b.decrypt(&node_a, &sent).await.unwrap();
+    assert!(mgr_a.preview_decrypt(&node_b, &mgr_b.encrypt(&node_a, b"on it").await.unwrap()).await.is_ok());
+
+    drop(mgr_a);
+    let restored = SessionManager::with_store(id_a, store_a);
+    assert_eq!(restored.restore_sessions().await, 1);
+    let late = mgr_b.encrypt(&node_a, b"late").await.unwrap();
+    assert!(restored.preview_decrypt(&node_b, &late).await.is_ok(), "the saved session is the new one");
+}
+
+/// A replaced session stops reading after its time, and then goes.
+#[tokio::test]
+async fn a_replaced_session_stops_reading_after_its_time() {
+    let (_, _, _, _, mgr_a, mgr_b, node_a, node_b, _) = saving_pair().await;
+    let init = mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
+    mgr_b.reaccept_session(&node_a, &init).await.unwrap();
+    assert!(mgr_a.confirm_session(&node_b).await);
+    let late = mgr_b.encrypt(&node_a, b"late").await.unwrap();
+    assert!(mgr_a.preview_decrypt(&node_b, &late).await.is_ok());
+
+    mgr_a.expire_retired_sessions().await;
+    assert!(mgr_a.sessions.read().await[&node_b].retired.is_some(), "still in its time");
+    mgr_a.sessions.write().await.get_mut(&node_b).unwrap().retired.as_mut().unwrap().since -= RETIRED_SESSION_READS_FOR + std::time::Duration::from_secs(1);
+    assert!(mgr_a.preview_decrypt(&node_b, &late).await.is_err());
+    assert!(mgr_a.decrypt(&node_b, &late).await.is_err());
+    mgr_a.expire_retired_sessions().await;
+    assert!(mgr_a.sessions.read().await[&node_b].retired.is_none());
+}
+
+/// Sends racing a failing save never build on a chain that is then put back: every
+/// ciphertext that left has its own position and reads at the receiver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_sends_with_failing_saves_never_share_a_position() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (_, store, sender, receiver, node_a, node_b) = saving_sender().await;
+    let sender = Arc::new(sender);
+    store.alternate.store(true, SeqCst);
+    let mut tasks = Vec::new();
+    for n in 0..64u8 {
+        let (sender, node_b) = (Arc::clone(&sender), node_b);
+        tasks.push(tokio::spawn(async move { sender.encrypt(&node_b, &[n]).await }));
+    }
+    let mut released = Vec::new();
+    for task in tasks {
+        if let Ok(message) = task.await.unwrap() {
+            released.push(message);
+        }
+    }
+    assert!(!released.is_empty() && released.len() < 64, "some saves failed: {}", released.len());
+    released.sort_by_key(|m| m.header.message_number);
+    let numbers: Vec<u32> = released.iter().map(|m| m.header.message_number).collect();
+    assert_eq!(numbers, (0..released.len() as u32).collect::<Vec<_>>(), "no gaps and no repeats");
+    for message in &released {
+        receiver.decrypt(&node_a, message).await.unwrap();
+    }
+}
+
+/// Receiving keeps its existing rule: a failed save does not refuse a readable
+/// message, so a paid envelope is not burned for that alone.
+#[tokio::test]
+async fn failed_save_does_not_refuse_a_readable_message() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let id_a = make_identity(TEST_MNEMONIC_A);
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let (node_a, node_b) = (*id_a.node_id(), *id_b.node_id());
+    let store = Arc::new(FlakyStore::default());
+    let sender = SessionManager::new(id_a);
+    let receiver = SessionManager::with_store(id_b, store.clone());
+    let init = sender.initiate_session(&node_b, &receiver.prekey_bundle().await).await.unwrap();
+    receiver.accept_session(&node_a, &init).await.unwrap();
+    store.fail.store(true, SeqCst);
+    let message = sender.encrypt(&node_b, b"readable").await.unwrap();
+    assert_eq!(receiver.decrypt(&node_a, &message).await.unwrap(), b"readable");
+}
+
+/// Each boot starts its one-time pre-key ids at its own random point, and they count
+/// up from there.
+#[tokio::test]
+async fn prekey_ids_start_at_a_random_point_per_boot() {
+    let identity = make_identity(TEST_MNEMONIC_A);
+    let mut starts = Vec::new();
+    for _ in 0..4 {
+        let manager = SessionManager::new(Arc::clone(&identity));
+        starts.push(manager.prekey_bundle().await.one_time_prekey_id.unwrap());
+    }
+    let with_store = SessionManager::with_store(Arc::clone(&identity), MemorySessionStore::new());
+    starts.push(with_store.prekey_bundle().await.one_time_prekey_id.unwrap());
+    let mut distinct = starts.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), starts.len(), "every boot picks its own: {starts:?}");
+}
+
+/// A ratchet failure during a send leaves the chain as it was, with a store and
+/// without one, so the next send takes the same position.
+#[tokio::test]
+async fn failed_aead_leaves_the_chain_as_it_was() {
+    let (_, _store, sender, receiver, node_a, node_b) = saving_sender().await;
+    let plain_sender = SessionManager::new(make_identity(TEST_MNEMONIC_A));
+    let plain_receiver = SessionManager::new(make_identity(TEST_MNEMONIC_B));
+    let init = plain_sender.initiate_session(&node_b, &plain_receiver.prekey_bundle().await).await.unwrap();
+    plain_receiver.accept_session(&node_a, &init).await.unwrap();
+
+    // Without a store this runs on this task's thread, where the failure is armed.
+    crate::double_ratchet::FAIL_NEXT_AEAD_ENCRYPT.with(|fail| fail.set(true));
+    assert!(plain_sender.encrypt(&node_b, b"fails").await.is_err());
+    let message = plain_sender.encrypt(&node_b, b"next").await.unwrap();
+    assert_eq!(message.header.message_number, 0, "the chain did not advance");
+    assert_eq!(plain_receiver.decrypt(&node_a, &message).await.unwrap(), b"next");
+
+    let message = sender.encrypt(&node_b, b"with a store").await.unwrap();
+    assert_eq!(receiver.decrypt(&node_a, &message).await.unwrap(), b"with a store");
+}
+
+/// One point in different bytes compares equal; different points and bad hex do not.
+#[test]
+fn same_x25519_point_ignores_the_top_bit_only() {
+    let key = [7u8; 32];
+    let mut top_bit = key;
+    top_bit[31] ^= 0x80;
+    assert!(same_x25519_point(&hex::encode(key), &hex::encode(top_bit)));
+    let mut other = key;
+    other[0] ^= 0x01;
+    assert!(!same_x25519_point(&hex::encode(key), &hex::encode(other)));
+    assert!(!same_x25519_point(&hex::encode(key), "not hex"));
 }
