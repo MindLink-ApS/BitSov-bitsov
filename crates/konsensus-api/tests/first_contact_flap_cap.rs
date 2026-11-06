@@ -1,4 +1,4 @@
-//! Codex #111 finding 4: one capped first-contact call must not spend its
+//! Review #111 finding 4: one capped first-contact call must not spend its
 //! original cap again after a mid-call reconnect.
 mod common;
 

@@ -105,6 +105,17 @@ jobs:
       - name: Exercise the release-signing command offline
         run: bash scripts/test-release-sign.sh
 
+  docs-consistency:
+    name: Docs Consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Dropped-link recovery steps match and name the app's buttons
+        run: bash scripts/test-known-limit-steps.sh
+
   frontend:
     name: Frontend Build
     # Always-on sentinel. Docs-only and `pm/` pulls skip the heavy jobs, and a
