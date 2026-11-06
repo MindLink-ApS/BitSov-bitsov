@@ -148,7 +148,7 @@ The candidate remains an estimate, not proof of replacement funding confirmation
 
 ## Chain-sync retry resilience (2026-10-03)
 
-Investigation of test #5 (Atlas run 2 item 13, and the repeat around 04:14 on
+Investigation of test #5 (review run 2 item 13, and the repeat around 04:14 on
 3 October), against ldk-node 0.7.0, esplora-client 0.12.3 and
 lightning-transaction-sync 0.2.1:
 
@@ -261,8 +261,8 @@ incident-resolution claims remain explicitly unverified. Lines 3 and 4 unchanged
 
 ## Shared Esplora rate limiting and rebroadcast eligibility (2026-10-03)
 
-Incident evidence: `TEST5-SANITY-LOG.md`, Atlas run 4 step 1, and the supplied
-redacted `beta-ldk-sync-0403.txt`. The 1,385-line excerpt contains 252 broadcast
+Incident evidence: a test #5 sanity log, review run 4 step 1, and a supplied
+redacted sync excerpt. The 1,385-line excerpt contains 252 broadcast
 failures, 254 Lightning wallet sync timeouts, 96 on-chain failures, and 350 lines
 mentioning 429. Broadcast errors recur about every 30 seconds. The excerpt does
 **not** identify the transaction: the ghost commitment is a plausible driver,
@@ -668,7 +668,7 @@ TODO(W2b). No production acknowledgements are generated in W2a.
 Enabling after earlier channel use cannot recover historical commitments missed
 while disabled. Quarantining corruption can leave historical states unguarded;
 this recovery policy avoids a permanent startup loop and does not claim repair of
-lost tower data. Fable + Grok PASS on the same SHA remains the money-path merge gate.
+lost tower data. A passing review on the same SHA remains the money-path merge gate.
 
 ## Offline safety diagnostics (2026-10-07)
 

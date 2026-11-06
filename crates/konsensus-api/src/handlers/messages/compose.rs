@@ -650,7 +650,7 @@ async fn readmit_then_pay(
         .ok_or_else(|| ApiError::PriceCapExceeded("message all-in overflow".into()))?;
     // One call-wide ceiling: admissions already settled in this compose consume
     // the confirmed cap and must not be re-authorized for a mid-call reconnect
-    // (Codex #111 finding 4).
+    // (review #111 finding 4).
     let already_spent_all_in = charge
         .settled_msat
         .saturating_add(charge.fee_ceiling_msat);
@@ -859,6 +859,15 @@ async fn try_keysend(
 ///
 /// This is the original flow: send RequestInvoice to peer, wait for their
 /// InvoiceResponse, pay their invoice, extract preimage.
+/// Compressed Lightning keys. The peer chooses the hex case in `LightningInfo`;
+/// BOLT11 display is lowercase. Case does not name a different payee.
+fn invoice_payee_is(invoice: &lightning_invoice::Bolt11Invoice, expected: &str) -> bool {
+    invoice
+        .recover_payee_pub_key()
+        .to_string()
+        .eq_ignore_ascii_case(expected)
+}
+
 async fn create_payment_proof_via_invoice(
     state: &AppState,
     invoice_amount_msat: u64,
@@ -980,7 +989,7 @@ async fn create_payment_proof_via_invoice(
     }
 
     if let Some(expected) = state.peer_ln_pubkeys.lock().await.get(peer_id) {
-        if invoice.recover_payee_pub_key().to_string() != *expected {
+        if !invoice_payee_is(&invoice, expected) {
             return Err(ApiError::Lightning(
                 "invoice payee does not match recipient".into(),
             ));
@@ -2133,7 +2142,7 @@ async fn validate_admission_invoice(
         ));
     }
     if let Some(expected) = state.peer_ln_pubkeys.lock().await.get(peer_id) {
-        if invoice.recover_payee_pub_key().to_string() != *expected {
+        if !invoice_payee_is(&invoice, expected) {
             return Err(ApiError::Lightning(
                 "admission invoice payee does not match recipient".into(),
             ));
@@ -2167,7 +2176,7 @@ async fn validate_admission_invoice(
 /// it is valid, so confirming never makes the target issue a second one (it
 /// rate-limits strangers). Memory only; one per peer; validated again on use.
 /// Bound to the connection generation that obtained the quote — a reconnect
-/// must fetch a fresh one (Codex #111 finding 5).
+/// must fetch a fresh one (review #111 finding 5).
 struct CachedQuote {
     request_id: String,
     response: InvoiceResponseData,
@@ -2833,7 +2842,7 @@ async fn first_contact_admission_at(
     // A re-admission reserves the fresh message all-in (replacing the prior
     // message reservation) plus admission+fee against the grant before anything
     // is dispatched; the owner's key is not metered. A refusal here leaves
-    // nothing requested on our wallet or paid (Codex #111 finding 3).
+    // nothing requested on our wallet or paid (review #111 finding 3).
     let readmission_event = readmit.as_ref().map(|r| super::admission_journal::ReadmissionSettlement {
         budget_msat: r.parent.contact_budget(&peer_id.to_hex()), reported: false,
     });
@@ -3761,6 +3770,21 @@ pub(super) async fn compose_peer(
             debit.released(&peer_key);
             return Err(error);
         }
+        if matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_ANSWER) {
+            if let Some(service) = state.pairing.as_ref() {
+                let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                let request_hash = super::operations::request_digest(&peer_id, &req)?;
+                // This follows the operation's caller check and precedes every
+                // payment dispatch. Recovery may promote only this exact proof.
+                if let Err(error) = service.remember_call_client(auth.user.pairing.as_ref(), &peer_key,
+                    &signal.call_id, &operation.id, &request_hash)
+                {
+                    debit.released(&peer_key);
+                    return Err(ApiError::Storage(error.to_string()));
+                }
+            }
+        }
         let result = async {
 
         // Encrypt via Double Ratchet.
@@ -3905,7 +3929,7 @@ pub(super) async fn compose_peer(
         if crate::calls::is_call_kind(req.kind) {
             // Paid: publish the call transition before the envelope goes out.
             let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
-            crate::calls::commit_outgoing(state.storage.as_ref(), &peer_id, &req.plaintext, &operation.id, &request_hash).await
+            crate::calls::commit_outgoing_for(&state, &auth.user, &peer_id, &req.plaintext, &operation.id, &request_hash).await
                 .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("paid call transition failed: {e}") })?;
         }
         let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
@@ -4823,7 +4847,7 @@ mod admission_tests {
         );
     }
 
-    /// Regression for Codex review finding after ae36b69: first attempt
+    /// Regression for a review finding after ae36b69: first attempt
     /// dispatches a trackable admission payment, settlement polling times out,
     /// and a second compose retries. The second attempt must observe the
     /// in-flight ledger state and poll/resume the original payment hash instead
