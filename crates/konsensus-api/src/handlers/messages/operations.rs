@@ -556,7 +556,7 @@ pub(super) async fn compose_call(
         konsensus_core::payloads::call::settlement(Some(&op.state)) == konsensus_core::payloads::call::Settlement::Paid
     });
     let plaintext = req.plaintext.clone();
-    let spend_client = auth.user.pairing.as_ref().map(|p| p.client_id.clone());
+    let spend_client = auth.user.pairing.clone();
     let ends_on_failure = matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK);
     if !paid {
         if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
@@ -577,7 +577,7 @@ pub(super) async fn compose_call(
         id.clone(),
         policy,
     ).await;
-    crate::calls::resolve_outgoing(state.storage.as_ref(), &peer, &plaintext, &id, &request_hash).await;
+    crate::calls::resolve_outgoing(&state, &peer, &plaintext, &id, &request_hash).await;
     if ends_on_failure && call_payment_failed(&state, &id, result.as_ref().err()).await {
         if let (Some(client), Some(service), Ok(signal)) = (spend_client, state.pairing.as_ref(),
             konsensus_core::wire_json::from_str::<konsensus_core::payloads::call::CallSignal>(&plaintext)) {
@@ -687,7 +687,7 @@ async fn compose_locked(
         // A call signal this retry found paid is committed before the resend,
         // so the callee's immediate answer finds a ringing call (review
         // delta2 #3). Never a release here: an unpaid one is paid again below.
-        crate::calls::settle_operation(state.storage.as_ref(), &op, false).await;
+        crate::calls::settle_operation(&state, &op, false).await;
         // Call-state cleanup is best effort. Its storage failure must never
         // turn a confirmed failed call payment into permission to pay again.
         if definite_call_payment_failure(&op) {
@@ -1340,7 +1340,7 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             recover_budget(state, &mut op).await?;
             // A call signal's reservation follows its operation here too, and
             // before any resend (review N1).
-            crate::calls::settle_operation(state.storage.as_ref(), &op, true).await;
+            crate::calls::settle_operation(state, &op, true).await;
             if op.state == "paid" {
                 recover_paid(state, &mut op).await?;
             }
