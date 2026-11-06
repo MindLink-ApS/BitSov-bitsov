@@ -55,7 +55,7 @@ see [password input](docs/operations/password-input.md).
 
 Key settings:
 - **Lightning backend**: LDK (embedded) or LND (direct REST) for production; Mock for development. LNbits cannot enforce per-payment routing-fee ceilings: fee-limited payments fail closed, and selecting LNbits is rejected at configuration/startup (see [all-in fee caps](docs/v2/ALL-IN-FEE-CAPS.md)).
-- **Chain view**: your own Bitcoin Core (pruned or full) or an Electrum server; public Esplora is still the default for a fresh `init` and is a third-party view of the chain (see [choose your chain source](docs/CHAIN-SOURCE.md)).
+- **Chain view**: `init --tier light` (default) writes `ChainConfig::Mock`; `init --tier full` uses the public Esplora pair (a third-party chain view; see [choose your chain source](docs/CHAIN-SOURCE.md)). After init you can use your own Bitcoin Core (pruned or full) or an Electrum server instead.
 - **Storage**: SQLite (single node) or PostgreSQL (production)
 - **Pricing**: Per-message-kind sat costs
 - **Peers**: Opt-in peers. Node IDs are the protocol identity; network addresses are reachability hints obtained out-of-band.
