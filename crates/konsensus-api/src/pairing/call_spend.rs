@@ -2,11 +2,69 @@
 use super::*;
 use crate::spend_budget::{CallSpendStatus, CallSpendTerms, OperationReservationLink};
 
+pub(super) struct PendingMediaClient {
+    operation_id: String,
+    request_hash: String,
+    client: Option<auth::PairingBinding>,
+}
+
 impl PairingService {
+    pub(crate) fn call_spend_grant(&self, peer: &str, call_id: &str) -> Option<String> {
+        let inner = self.lock();
+        inner.file.call_spend_grants.get(&format!("{peer}:{call_id}")).cloned().or_else(|| {
+            // Also recognize holds admitted before provenance was separate.
+            inner.file.grants.iter().find(|g| g.budget.as_ref().is_some_and(|b|
+                b.call_reservations.values().any(|c| c.terms.peer == peer && c.terms.call_id == call_id)))
+                .map(|g| g.op_id.clone())
+        })
+    }
+
+    pub(crate) fn call_spend_grant_keys(&self) -> Vec<String> {
+        self.lock().file.call_spend_grants.keys().cloned().collect()
+    }
+
+    pub(crate) fn call_closing_limits(&self, peer: &str, call_id: &str) -> Option<(u64, u64)> {
+        let inner = self.lock();
+        inner.file.grants.iter().filter_map(|g| g.budget.as_ref())
+            .flat_map(|b| b.call_reservations.values())
+            .find(|call| call.terms.peer == peer && call.terms.call_id == call_id)
+            .map(|call| (call.terms.closing_allowance_msat(), call.terms.closing_fee_msat))
+    }
+
+    pub(crate) fn forget_call_spend_grants(&self, keys: &[String]) -> Result<(), PairingError> {
+        if keys.is_empty() { return Ok(()) }
+        let mut inner = self.lock();
+        let before = inner.file.clone();
+        for key in keys { inner.file.call_spend_grants.remove(key); }
+        if let Err(error) = self.persist(&mut inner.file) {
+            inner.file = before;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Transfer the prepaid allowance to a journaled child of the original
+    /// hold. Neither budget nor breaker velocity is reserved a second time.
+    pub(crate) fn reserve_call_closing_spend(&self, grant_op_id: &str, peer: &str, call_id: &str, charges: Vec<Charge>,
+        link: OperationReservationLink) -> Result<Reservation, BudgetRefusal> {
+        let (client, epoch) = {
+            let inner = self.lock();
+            let grant = inner.file.grants.iter().find(|g| g.op_id == grant_op_id).ok_or(BudgetRefusal::NoGrant)?;
+            (grant.client_id.clone(), grant.epoch)
+        };
+        let [charge] = charges.as_slice() else { return Err(BudgetRefusal::NoGrant) };
+        if charge.recipient != peer {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        self.draw_call_spend_for_grant(&client, epoch, peer, call_id, u32::MAX, charge.amount_msat, 0, link, Some(grant_op_id))
+    }
+
     pub(crate) fn prune_call_spend(&self, now: i64) -> Result<(), PairingError> {
         let mut inner = self.lock();
         let before = inner.file.clone();
         for budget in inner.file.grants.iter_mut().filter_map(|g| g.budget.as_mut()) {
+            // A hold above what its grant now allows per payment never pays.
+            budget.close_holds_over_limit(None);
             budget.prune_call_tombstones(now);
         }
         if inner.file.grants.iter().zip(&before.grants).any(|(a, b)| a.budget != b.budget) {
@@ -16,6 +74,24 @@ impl PairingService {
             }
         }
         Ok(())
+    }
+
+    /// Before a call draws on its existing hold: if the hold's per-block
+    /// ceiling no longer fits its grant (`GrantBudget::check_call_hold`),
+    /// close it, releasing what it has not paid, and refuse.
+    pub(crate) fn enforce_call_hold_limit(&self, peer: &str, call_id: &str) -> Result<(), BudgetRefusal> {
+        let mut inner = self.lock();
+        let before = inner.file.clone();
+        let mut refused = None;
+        for budget in inner.file.grants.iter_mut().filter_map(|g| g.budget.as_mut()) {
+            refused = budget.close_holds_over_limit(Some((peer, call_id))).or(refused);
+        }
+        let Some(refusal) = refused else { return Ok(()) };
+        if let Err(error) = self.persist(&mut inner.file) {
+            inner.file = before;
+            return Err(BudgetRefusal::Ledger(error.to_string()));
+        }
+        Err(refusal)
     }
 
     fn call_grant_index(
@@ -60,17 +136,131 @@ impl PairingService {
         self.prune_call_spend(chrono::Utc::now().timestamp())
             .map_err(|e| BudgetRefusal::Ledger(e.to_string()))?;
         let mut inner = self.lock();
-        let idx = self.call_grant_index(&inner, client, epoch)?;
+        if let Some(existing) = self.check_call_hold(&inner, client, epoch, &terms, capacity_msat)? {
+            return Ok(existing);
+        }
+        self.reserve_spend_locked(
+            &mut inner,
+            client,
+            epoch,
+            vec![Charge {
+                recipient: terms.peer.clone(),
+                amount_msat: terms.reserved_msat,
+            }],
+            ReservationAuthority {
+                call: Some(terms),
+                ..Default::default()
+            },
+            || chrono::Utc::now().timestamp(),
+        )
+    }
+
+    /// Reserve a new call's hold and its offer together. Every check of both
+    /// runs before anything is kept: a refusal of either leaves no hold and
+    /// no breaker count, only the refusal observation. Both are persisted in
+    /// one write. Returns the offer's reservation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_call_with_offer(
+        &self,
+        client: &str,
+        epoch: u64,
+        terms: CallSpendTerms,
+        capacity_msat: u64,
+        offer: Vec<Charge>,
+        offer_cap: Option<u64>,
+        link: OperationReservationLink,
+    ) -> Result<Reservation, BudgetRefusal> {
+        self.prune_call_spend(chrono::Utc::now().timestamp())
+            .map_err(|e| BudgetRefusal::Ledger(e.to_string()))?;
+        let mut inner = self.lock();
+        if self.check_call_hold(&inner, client, epoch, &terms, capacity_msat)?.is_some() {
+            return Err(BudgetRefusal::Unpriced(
+                "call already reserved; send its offer again".into(),
+            ));
+        }
+        let before = inner.file.clone();
+        let call_id = terms.call_id.clone();
+        let hold = vec![Charge {
+            recipient: terms.peer.clone(),
+            amount_msat: terms.reserved_msat,
+        }];
+        let clock = || chrono::Utc::now().timestamp();
+        let reserved = self
+            .reserve_spend_locked(&mut inner, client, epoch, hold, ReservationAuthority {
+                call: Some(terms),
+                in_memory: true,
+                ..Default::default()
+            }, clock)
+            .and_then(|_| {
+                self.reserve_spend_locked(&mut inner, client, epoch, offer, ReservationAuthority {
+                    operation: Some(link),
+                    call_offer: Some((call_id.as_str(), offer_cap)),
+                    in_memory: true,
+                    ..Default::default()
+                }, clock)
+            });
+        let reservation = match reserved {
+            Ok(reservation) => reservation,
+            Err(refusal) => {
+                // Undo the hold and every count it made; keep only what the
+                // refusal observed, as a lone refusal would.
+                let refused = std::mem::replace(&mut inner.file, before);
+                let mut changed = false;
+                for (grant, seen) in inner.file.grants.iter_mut().zip(&refused.grants) {
+                    if let (Some(budget), Some(seen)) = (grant.budget.as_mut(), seen.budget.as_ref()) {
+                        let kept = budget.clone();
+                        budget.keep_refusal_observation(seen);
+                        changed |= *budget != kept;
+                    }
+                }
+                if changed {
+                    if let Err(error) = self.persist(&mut inner.file) {
+                        return Err(BudgetRefusal::Ledger(error.to_string()));
+                    }
+                }
+                return Err(refusal);
+            }
+        };
+        if let Err(error) = self.persist(&mut inner.file) {
+            inner.file = before;
+            return Err(BudgetRefusal::Ledger(error.to_string()));
+        }
+        // Persistence may have pruned this grant at the expiry boundary.
+        let now = chrono::Utc::now().timestamp();
+        if !inner.file.grants.iter().any(|g| g.op_id == reservation.op_id && g.is_live(now)) {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        Ok(reservation)
+    }
+
+    /// Checks before a new hold, under the ledger lock: the grant, the call's
+    /// existing hold (returned when identical), liquidity and ledger room.
+    fn check_call_hold(
+        &self,
+        inner: &Inner,
+        client: &str,
+        epoch: u64,
+        terms: &CallSpendTerms,
+        capacity_msat: u64,
+    ) -> Result<Option<Reservation>, BudgetRefusal> {
+        let idx = self.call_grant_index(inner, client, epoch)?;
+        let key = format!("{}:{}", terms.peer, terms.call_id);
+        if inner.file.call_spend_grants.get(&key).is_some_and(|grant| *grant != inner.file.grants[idx].op_id) {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        if !inner.file.call_spend_grants.contains_key(&key) && inner.file.call_spend_grants.len() >= 4096 {
+            return Err(BudgetRefusal::Ledger("call funding ledger is full; wait for call cleanup".into()));
+        }
         for (grant_idx, grant) in inner.file.grants.iter().enumerate() {
             if let Some(budget) = &grant.budget {
                 for (id, call) in &budget.call_reservations {
                     if call.terms.peer == terms.peer && call.terms.call_id == terms.call_id {
-                        if grant_idx != idx || call.closed || call.terms != terms {
+                        if grant_idx != idx || call.closed || call.terms != *terms {
                             return Err(BudgetRefusal::Unpriced(
                                 "call already reserved with different authority or terms".into(),
                             ));
                         }
-                        return Ok(call_reference(grant, id, &call.terms));
+                        return Ok(Some(call_reference(grant, id, &call.terms)));
                     }
                 }
             }
@@ -100,16 +290,31 @@ impl PairingService {
                 "call reservation ledger is full; ask the owner for a new grant".into(),
             ));
         }
+        Ok(None)
+    }
+
+    /// Reserve a call offer under the call's existing hold: bounded by `cap`,
+    /// the caller's consented all-in cap for it, or without one by the hold's
+    /// pinned per-block ceiling, and by the owner's per-payment limit.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_call_offer_spend(
+        &self,
+        client: &str,
+        epoch: u64,
+        charges: Vec<Charge>,
+        call_id: &str,
+        cap: Option<u64>,
+        link: OperationReservationLink,
+    ) -> Result<Reservation, BudgetRefusal> {
+        let mut inner = self.lock();
         self.reserve_spend_locked(
             &mut inner,
             client,
             epoch,
-            vec![Charge {
-                recipient: terms.peer.clone(),
-                amount_msat: terms.reserved_msat,
-            }],
+            charges,
             ReservationAuthority {
-                call: Some(terms),
+                operation: Some(link),
+                call_offer: Some((call_id, cap)),
                 ..Default::default()
             },
             || chrono::Utc::now().timestamp(),
@@ -130,13 +335,27 @@ impl PairingService {
         fee: u64,
         link: OperationReservationLink,
     ) -> Result<Reservation, BudgetRefusal> {
+        self.draw_call_spend_for_grant(client, epoch, peer, call_id, seq, price, fee, link, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_call_spend_for_grant(&self, client: &str, epoch: u64, peer: &str, call_id: &str,
+        seq: u32, price: u64, fee: u64, link: OperationReservationLink, closing_grant: Option<&str>) -> Result<Reservation, BudgetRefusal> {
         let mut inner = self.lock();
         let idx = self.call_grant_index(&inner, client, epoch)?;
+        if closing_grant.is_some_and(|id| inner.file.grants[idx].op_id != id) { return Err(BudgetRefusal::NoGrant); }
         let before = inner.file.clone();
         let grant = &mut inner.file.grants[idx];
         let budget = grant.budget.as_mut().ok_or(BudgetRefusal::NoGrant)?;
         if budget.is_paused() {
             return Err(BudgetRefusal::GrantPaused);
+        }
+        if let Some(refusal) = budget.close_holds_over_limit(Some((peer, call_id))) {
+            if let Err(error) = self.persist(&mut inner.file) {
+                inner.file = before;
+                return Err(BudgetRefusal::Ledger(error.to_string()));
+            }
+            return Err(refusal);
         }
         if !budget.envelopes_live(
             std::iter::once(&peer.to_owned()),
@@ -144,19 +363,23 @@ impl PairingService {
         ) {
             return Err(BudgetRefusal::NoGrant);
         }
+        let closing_limit = budget.call_debit_limit(peer, crate::spend_budget::CallPayment::Signal);
+        if closing_grant.is_some() && price > closing_limit {
+            return Err(BudgetRefusal::PerCall { max_msat: closing_limit });
+        }
         let (parent, call) = budget
             .call_reservations
             .iter_mut()
             .find(|(_, call)| call.terms.peer == peer && call.terms.call_id == call_id)
             .ok_or_else(|| BudgetRefusal::Unpriced("call has no spend reservation".into()))?;
         if call.closed
-            || seq >= u32::from(call.terms.max_call_minutes)
+            || (closing_grant.is_none() && seq >= u32::from(call.terms.max_call_minutes))
         {
             return Err(BudgetRefusal::Unpriced(
                 "call reservation is closed or duration cap reached".into(),
             ));
         }
-        if price > call.terms.per_block_msat || fee > call.terms.per_block_fee_msat {
+        if closing_grant.is_none() && (price > call.terms.per_block_msat || fee > call.terms.per_block_fee_msat) {
             return Err(BudgetRefusal::CallPriceChanged);
         }
         if call.paid_sequences.contains(&seq) || call.draws.values().any(|s| *s == seq) {
@@ -165,6 +388,9 @@ impl PairingService {
         let amount = price
             .checked_add(fee)
             .ok_or(BudgetRefusal::CallPriceChanged)?;
+        if closing_grant.is_some() && amount > call.terms.closing_allowance_msat() {
+            return Err(BudgetRefusal::CallPriceChanged);
+        }
         let remaining = budget
             .pending
             .get_mut(parent)
@@ -257,12 +483,99 @@ impl PairingService {
             .map(|call| call.status())
     }
 
-    pub(crate) fn owns_call_spend(&self, client: &str, peer: &str, call_id: &str) -> bool {
+    /// Preserve authenticated authority before dispatch. An ambiguous payment
+    /// can settle later in this process, but a restart loses this proof.
+    pub(crate) fn remember_call_client(&self, client: Option<&auth::PairingBinding>, peer: &str,
+        call_id: &str, operation_id: &str, request_hash: &str) -> Result<(), konsensus_storage::StorageError>
+    {
+        let mut inner = self.lock();
+        let key = (peer.to_owned(), call_id.to_owned());
+        if inner.pending_call_media_clients.len() >= konsensus_core::payloads::call::MAX_OPEN_CALLS as usize
+            && !inner.pending_call_media_clients.contains_key(&key)
+        {
+            return Err(konsensus_storage::StorageError::Conversion("call media ownership capacity reached".into()));
+        }
+        let reserved = inner.pending_call_media_clients.iter().filter(|(key, pending)|
+            pending.client.is_some() && !inner.call_media_clients.contains_key(*key)).count();
+        let already_reserved = inner.call_media_clients.contains_key(&key)
+            || inner.pending_call_media_clients.get(&key).is_some_and(|pending| pending.client.is_some());
+        if client.is_some() && !already_reserved
+            && inner.call_media_clients.len() + reserved >= konsensus_core::payloads::call::MAX_OPEN_CALLS as usize
+        {
+            return Err(konsensus_storage::StorageError::Conversion("call media ownership capacity reached".into()));
+        }
+        inner.pending_call_media_clients.insert(key, PendingMediaClient {
+            operation_id: operation_id.into(), request_hash: request_hash.into(), client: client.cloned(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn commit_call_client(&self, fallback: Option<&auth::PairingBinding>, peer: &str,
+        call_id: &str, operation_id: &str, request_hash: &str) -> Result<(), konsensus_storage::StorageError>
+    {
+        let mut inner = self.lock();
+        let key = (peer.to_owned(), call_id.to_owned());
+        let client = match inner.pending_call_media_clients.get(&key) {
+            Some(pending) if pending.operation_id == operation_id && pending.request_hash == request_hash => pending.client.clone(),
+            Some(_) => return Err(konsensus_storage::StorageError::Conversion("call media operation mismatch".into())),
+            None => match fallback {
+                Some(client) => Some(client.clone()),
+                None => return Ok(()),
+            },
+        };
+        if let Some(client) = client {
+            if inner.call_media_clients.len() >= konsensus_core::payloads::call::MAX_OPEN_CALLS as usize
+                && !inner.call_media_clients.contains_key(&key)
+            {
+                return Err(konsensus_storage::StorageError::Conversion("call media ownership capacity reached".into()));
+            }
+            inner.call_media_clients.insert(key, client);
+        } else {
+            inner.call_media_clients.remove(&key);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_call_client(&self, peer: &str, call_id: &str, operation_id: &str, request_hash: &str) {
+        let mut inner = self.lock();
+        let key = (peer.to_owned(), call_id.to_owned());
+        if inner.pending_call_media_clients.get(&key).is_some_and(|p|
+            p.operation_id == operation_id && p.request_hash == request_hash)
+        {
+            inner.pending_call_media_clients.remove(&key);
+        }
+    }
+
+    pub(crate) fn call_media_clients(&self) -> Vec<(String, String)> {
+        let inner = self.lock();
+        inner.call_media_clients.keys().chain(inner.pending_call_media_clients.keys())
+            .cloned().collect::<HashSet<_>>().into_iter().collect()
+    }
+
+    pub(crate) fn forget_call_client(&self, peer: &str, call_id: &str) {
+        let mut inner = self.lock();
+        let key = (peer.to_owned(), call_id.to_owned());
+        inner.call_media_clients.remove(&key);
+        inner.pending_call_media_clients.remove(&key);
+    }
+
+    /// Only a committed invite/answer establishes paired media ownership.
+    /// Spend holds alone never grant media; all bindings fail closed on restart.
+    /// Live token/grant checks and paid call admission are still required.
+    pub fn owns_call_media(&self, binding: &auth::PairingBinding, peer: &str, call_id: &str) -> bool {
+        if self.lock().call_media_clients.get(&(peer.to_owned(), call_id.to_owned())) != Some(binding) {
+            return false;
+        }
+        self.call_spend_status(peer, call_id).is_none() || self.owns_call_spend(binding, peer, call_id)
+    }
+
+    pub(crate) fn owns_call_spend(&self, binding: &auth::PairingBinding, peer: &str, call_id: &str) -> bool {
         self.lock()
             .file
             .grants
             .iter()
-            .filter(|g| g.client_id == client)
+            .filter(|g| g.client_id == binding.client_id && g.epoch == binding.epoch
+                && g.identity_fingerprint == binding.fingerprint)
             .filter_map(|g| g.budget.as_ref())
             .flat_map(|b| b.call_reservations.values())
             .any(|call| call.terms.peer == peer && call.terms.call_id == call_id)

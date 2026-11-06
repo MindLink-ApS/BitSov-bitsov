@@ -102,8 +102,43 @@ impl PostgresStorage {
         self.apply_pending_migrations(&applied).await
     }
 
+    /// Applied versions this binary's migration list does not contain.
+    ///
+    /// The result is sorted and de-duplicated. Versions this binary knows,
+    /// including numbers it has not applied yet, are not returned.
+    pub(crate) fn unknown_applied_migrations(applied: &[i32], known: &[i32]) -> Vec<i32> {
+        let mut unknown: Vec<i32> = applied
+            .iter()
+            .copied()
+            .filter(|version| !known.contains(version))
+            .collect();
+        unknown.sort_unstable();
+        unknown.dedup();
+        unknown
+    }
+
+    fn refuse_future_schema(applied: &[i32]) -> Result<(), StorageError> {
+        let known: Vec<i32> = Self::pg_migrations()
+            .iter()
+            .map(|(version, _, _)| *version)
+            .collect();
+        let versions = Self::unknown_applied_migrations(applied, &known);
+        if versions.is_empty() {
+            return Ok(());
+        }
+        let max_known = known.iter().copied().max().unwrap_or(0);
+        Err(StorageError::FutureSchema {
+            versions,
+            max_known,
+        })
+    }
+
     /// Apply any migrations not yet in the applied list.
+    ///
+    /// A version recorded by a newer binary is refused before any statement
+    /// runs. SQLite already fails that case with `VersionMissing`.
     async fn apply_pending_migrations(&self, applied: &[i32]) -> Result<(), StorageError> {
+        Self::refuse_future_schema(applied)?;
         for (version, name, sql) in Self::pg_migrations() {
             if applied.contains(&version) {
                 continue;
@@ -1123,6 +1158,12 @@ impl Storage for PostgresStorage {
                 tx.rollback().await?;
                 return Ok(PaymentReused);
             }
+            // The same envelope, refused and withdrawn by the application: its
+            // sender is told so again, never that its proof belongs to another.
+            if binding.2 == -1 {
+                tx.rollback().await?;
+                return Ok(Withdrawn);
+            }
             // Receipt metadata is independent of retained message content and
             // excludes only the timestamp/signature wrapper refreshed on retry.
             let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = 1 AND kind = $4 AND recipient_type = $5 AND recipient_id = $6 AND preimage = $7 AND amount_msat = $8 AND nonce = $9 AND references_json = $10")
@@ -1744,20 +1785,17 @@ impl Storage for PostgresStorage {
     }
 
     async fn call_put(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
-        let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
-        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
-            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, paid_until_ms = excluded.paid_until_ms, next_block_seq = excluded.next_block_seq, end_reason = excluded.end_reason, unpaid_notice_used = excluded.unpaid_notice_used")
-            .bind(peer.to_hex()).bind(call_id)
-            .bind(entry.side.as_str()).bind(entry.phase.as_str())
-            .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
-            .bind(entry.pending.as_ref().map(|p| p.operation_id.clone()))
-            .bind(entry.pending.as_ref().map(|p| i64::from(p.kind)))
-            .bind(entry.pending.as_ref().map(|p| p.request_hash.clone()))
-            .bind(entry.paid_until_ms.map(ms).transpose()?)
-            .bind(i64::from(entry.next_block_seq))
-            .bind(entry.end_reason.map(|reason| reason.as_str()))
-            .bind(i64::from(entry.unpaid_notice_used))
-            .execute(&self.pool).await?;
+        call_upsert(peer, call_id, entry)?.execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn call_commit_admitted(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry, id: &MessageId) -> Result<(), StorageError> {
+        // One transaction: the grant and the release stand or fall together.
+        let mut tx = self.pool.begin().await?;
+        call_upsert(peer, call_id, entry)?.execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
+            .bind(id.to_hex()).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3655,6 +3693,52 @@ mod accepted_invites_guard {
 mod migration_recovery_tests {
     use super::*;
 
+    #[test]
+    fn postgres_refuses_a_schema_newer_than_this_binary() {
+        let known: Vec<i32> = PostgresStorage::pg_migrations()
+            .iter()
+            .map(|(version, _, _)| *version)
+            .collect();
+        let max_known = known.iter().copied().max().unwrap();
+        for version in [35, 36, 37] {
+            assert!(
+                known.contains(&version),
+                "call-block migration {version} must be inside the downgrade fence"
+            );
+        }
+        assert!(PostgresStorage::unknown_applied_migrations(&known, &known).is_empty());
+        let alien = (1..=max_known + 1)
+            .find(|version| !known.contains(version))
+            .unwrap();
+        let mut expected = vec![alien, max_known + 1];
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(
+            PostgresStorage::unknown_applied_migrations(
+                &[known[0], alien, max_known + 1, alien],
+                &known
+            ),
+            expected
+        );
+
+        let err = PostgresStorage::refuse_future_schema(&[1, max_known + 1]).unwrap_err();
+        let text = err.to_string();
+        match err {
+            StorageError::FutureSchema {
+                versions,
+                max_known: reported,
+            } => {
+                assert_eq!(versions, vec![max_known + 1]);
+                assert_eq!(reported, max_known);
+            }
+            other => panic!("expected FutureSchema, got {other}"),
+        }
+        assert!(text.contains(&format!("{max_known}")));
+        assert!(text.contains("Refusing to start"));
+        assert!(!text.contains("postgres://"));
+        assert!(!text.contains("password"));
+    }
+
     #[tokio::test]
     #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
     async fn call_notice_upgrade_and_all_readers_survive_reconnect() {
@@ -3899,6 +3983,23 @@ fn outstanding_from_row(
         expected_reply_kind: u16::try_from(kind).map_err(|_| bad("reply kind"))?,
         expires_at_ms: u64::try_from(expires).map_err(|_| bad("expiry"))?,
     })
+}
+
+/// Insert or replace one call row, on the pool or inside a transaction.
+fn call_upsert<'q>(peer: &konsensus_core::NodeId, call_id: &'q str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>, StorageError> {
+    let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
+    Ok(sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, paid_until_ms = excluded.paid_until_ms, next_block_seq = excluded.next_block_seq, end_reason = excluded.end_reason, unpaid_notice_used = excluded.unpaid_notice_used")
+        .bind(peer.to_hex()).bind(call_id)
+        .bind(entry.side.as_str()).bind(entry.phase.as_str())
+        .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
+        .bind(entry.pending.as_ref().map(|p| p.operation_id.clone()))
+        .bind(entry.pending.as_ref().map(|p| i64::from(p.kind)))
+        .bind(entry.pending.as_ref().map(|p| p.request_hash.clone()))
+        .bind(entry.paid_until_ms.map(ms).transpose()?)
+        .bind(i64::from(entry.next_block_seq))
+        .bind(entry.end_reason.map(|reason| reason.as_str()))
+        .bind(i64::from(entry.unpaid_notice_used)))
 }
 
 /// `(side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash)` of `call_state`.
