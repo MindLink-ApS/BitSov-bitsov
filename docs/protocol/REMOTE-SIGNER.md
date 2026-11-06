@@ -272,7 +272,7 @@ to use one:
   the exit bundle. The operator still has the phrase, so the owner should
   sweep funds to a new seed once they are home. The app's move-home flow must
   say this. **GAP**: the flow is not built.
-- Pilot VMs (Maya, Josh) are hosted custody today. They must set
+- Pilot VMs (Carol, Dave) are hosted custody today. They must set
   `[identity] hosted = true` at the next upgrade. Until then, the app's
   unverified-connection rule (§2) labels them anyway.
 

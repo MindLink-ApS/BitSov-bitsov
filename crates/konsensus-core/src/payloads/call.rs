@@ -299,7 +299,7 @@ impl Phase {
 /// One of our own signals, reserved under its operation id and not yet paid.
 /// Bound to the exact request (`request_hash`, the operation journal's
 /// digest), so a concurrent request sharing the operation id but carrying
-/// another payload never shares, commits or releases it (Codex delta2 #2).
+/// another payload never shares, commits or releases it (review delta2 #2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
     pub operation_id: String,
@@ -764,7 +764,7 @@ mod tests {
         // Same operation retrying: idempotent. Another operation: the id is taken.
         assert_eq!(reserve(Some(r.clone()), 400, "op1", "h", 1).unwrap(), r);
         assert_eq!(reserve(Some(r.clone()), 400, "op2", "h", 1), Err(CallRefusal::Replayed));
-        // Codex P1: an answer cannot be accepted for an offer that was never paid.
+        // Review P1: an answer cannot be accepted for an offer that was never paid.
         assert_eq!(receive(Some(r.clone()), 401, None, 1), Err(CallRefusal::UnknownCall));
         // Definite nonpayment: forgotten, so the same id can be offered again.
         assert_eq!(release(r.clone(), "op1"), None);
@@ -785,7 +785,7 @@ mod tests {
         let pending = reserve(Some(ringing.clone()), 401, "a", "h", 1).unwrap();
         // A second signal while the answer is being paid waits.
         assert_eq!(reserve(Some(pending.clone()), 403, "h", "h", 1), Err(CallRefusal::InFlight));
-        // Codex P1: an unpaid answer leaves the call ringing, so it can be retried.
+        // Review P1: an unpaid answer leaves the call ringing, so it can be retried.
         let back = release(pending.clone(), "a").unwrap();
         assert_eq!(back, ringing);
         assert!(reserve(Some(back), 401, "a2", "h", 2).is_ok());
@@ -831,7 +831,7 @@ mod tests {
         assert!(has_room(&c(0, 0, 0, 0)).is_ok());
         assert_eq!(has_room(&c(MAX_OPEN_CALLS_PER_PEER, 0, 0, 0)), Err(CallRefusal::Full));
         assert_eq!(has_room(&c(0, MAX_OPEN_CALLS, 0, 0)), Err(CallRefusal::Full));
-        // Burned ids never count against open calls (Fable N3).
+        // Burned ids never count against open calls (review N3).
         assert!(has_room(&c(MAX_OPEN_CALLS_PER_PEER - 1, MAX_OPEN_CALLS - 1, u64::MAX, u64::MAX)).is_ok());
         assert_eq!(burned_excess(MAX_BURNED_PER_PEER - 1, MAX_BURNED_PER_PEER), 0);
         assert_eq!(burned_excess(MAX_BURNED_PER_PEER, MAX_BURNED_PER_PEER), 1);

@@ -52,6 +52,6 @@ Run `CARGO_TARGET_DIR=/tmp/bitsov-target-a13 cargo test --workspace --locked` an
 
 Existing synthetic profile and content-response sends are outside the durable API outbox. Operation IDs, idempotent repeated POSTs, crash recovery between Lightning dispatch and envelope creation, new operation-status APIs and app changes belong to subsequent slices. They are not provided by this delivery retry mechanism.
 
-Rework validation results are recorded in `pm/_verdicts/exactly-once-s1-fix.txt` in the local PM library. The real-wallet regtest is optional and is not part of the required workspace command.
+Rework validation is the matrix and commands in this document. The real-wallet regtest is optional and is not part of the required workspace command.
 
 File and calendar dispatch-preparation failures after settlement return `payment_settled_send_incomplete` with the settled amount and saved envelope ID in the reason. The stored paid envelope remains available for reconciliation without creating another payment. The reported principal includes every re-admission and earlier calendar-recipient payment settled in the same request; each envelope proof still contains only its own message principal. Tests inject queue INSERT and dispatch UPDATE faults across file/create/update/RSVP and calendar fanout, reopen storage and prepare the same envelope again without another payment.
