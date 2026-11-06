@@ -128,8 +128,8 @@ lnd::tests::verify_payment_settled_returns_ok
 
 An independent read-only review found and prompted fixes for startup 429 retry
 classification, reservation-lookup cooldown sharing, and aborted broadcast worker
-retention. Subsequent Grok and Fable verdicts rejected the unbounded shared
-cooldown; Grok also identified the incorrect funding-status endpoint. The fix
+retention. Subsequent review verdicts rejected the unbounded shared
+cooldown; one review also identified the incorrect funding-status endpoint. The fix
 round below supersedes the initial review outcome.
 
 Doctrine: 1, 2, 5 and 6 hold; 3 and 4 unchanged. No readiness or settlement rule

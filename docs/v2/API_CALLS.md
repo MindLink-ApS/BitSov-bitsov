@@ -6,7 +6,8 @@ node's durable call state. It requires a valid owner-subject bearer token with
 invalid authentication returns 401; a different subject or missing scope
 returns 403.
 
-`peer` is required and must decode as a 32-byte hex node id. Missing, duplicate,
+`peer` is required and must decode as a 32-byte hex node id; uppercase and
+lowercase hex are accepted. Missing, duplicate,
 or malformed peer parameters return HTTP 400 with fixed JSON error text:
 `{"error":"invalid peer id","code":400}` (the numeric `code` is the generic
 bad-request marker; typed refusals such as `not_dispatched` carry a string
@@ -60,6 +61,12 @@ Open means an unexpired reserved/ringing/live call **or any call with a pending
 signal**, including calls whose ringing/live deadline and replay tombstone
 have expired. Ended/expired calls without a pending signal are omitted.
 
+An offer committed as paid remains an open outgoing call (initially `ringing`)
+with `unresolved_paid_admission=false`: its pending reservation has been cleared,
+but the call is still open. Clients must not pay for a second offer to that peer
+while this outgoing call remains open. A false flag does not mean a new offer
+is safe to pay for.
+
 **The client must fail closed per peer when `unresolved_paid_admission` is
 true:** keep blocking re-admission/new paid admission to that peer, even if
 `state` is `ended` or metadata is `null`. Expiry does not prove nonpayment.
@@ -86,6 +93,9 @@ Restart the node to apply a config change. A paired-app reservation pins its
 cap when created, so a config change never resizes an existing hold. Holds
 created before this setting existed retain their original 240-minute cap.
 Owner-authorized calls without a grant use the current node setting.
+`GET /api/v1/status` reports the current value read-only as `max_call_minutes`,
+so an app can compute the hold before ringing. It is absent from the public
+`/api/v1/health`.
 
 Before a caller's offer is dispatched, the node reserves `max_call_minutes`
 60-second blocks at the callee's current kind-404 price, plus the enforced
@@ -230,7 +240,7 @@ on either side fails there and here before it reaches a user.
 
 | Fixture | Request | Status | Contract |
 |---|---|---|---|
-| `status_stun_own.json` | `GET /api/v1/status` | 200 | Own STUN responder (`[calls] stun_listen`) at a dialable advertised host: `stun_port`, `stun_url` (`stun:<peer host>:<stun_port>`), `stun_source` `own`, `peer_endpoint`, `peer_endpoint_source` `advertised`. |
+| `status_stun_own.json` | `GET /api/v1/status` | 200 | Own STUN responder (`[calls] stun_listen`) at a dialable advertised host: `stun_port`, `stun_url` (`stun:<peer host>:<stun_port>`), `stun_source` `own`, `peer_endpoint`, `peer_endpoint_source` `advertised`. All three `status_stun_*` fixtures also pin `max_call_minutes`, at the default of 60. |
 | `status_stun_configured.json` | `GET /api/v1/status` | 200 | Own responder without a dialable host but a valid `[network] stun_server`: `stun_port`, `stun_url` from the configured server, `stun_source` `configured`, `peer_endpoint_reason` `no_dialable_endpoint`. |
 | `status_stun_absent.json` | `GET /api/v1/status` | 200 | No responder, no dialable host, no configured server: `stun_port`, `stun_url`, `stun_source`, `peer_endpoint` and `peer_endpoint_source` are absent; `peer_endpoint_reason` `no_dialable_endpoint`. |
 | `peer_call_price.json` | `GET /api/v1/pricing/peers/:id/call` | 200 | The callee's live call price: `peer_id`, `offer_msat` (kind 400, asked of the callee), `signal_msat` (kind 401). |

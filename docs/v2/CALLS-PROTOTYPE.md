@@ -67,7 +67,9 @@ next sequence is served, beginning at zero. Replays cannot grant it twice.
 New invoice requests carry `konsensus:call_block:<call_id>:<seq>`; the callee
 checks its own call state before issuing an invoice and again before returning
 it. Less than `CALL_BLOCK_INVOICE_MARGIN_MS` (15 seconds) before `deadline_ms`
-is a clear `call_block_unpayable` refusal with no invoice returned and no payment.
+is a clear `call_block_unpayable` refusal with no invoice returned and no payment,
+and so is a callee holding no E2EE session with the caller: it could not read the
+block, so that minute is never paid for.
 The deadline already includes the 10-second grace (or the 30-second initial
 window). The caller retains its independent 5-second pre-dispatch check.
 
@@ -133,10 +135,49 @@ unknown call, ringing, ended, unpaid first block and storage errors all fail
 closed. The pure `CallEntry::media_admitted(now_ms)` uses the same rule. No
 unpaid timeout notification or outstanding reservation can authorize media.
 
+## Media limits
+
+Each direction of each routed call is capped per second, at the router and at
+the owner's media socket. The defaults are the limits every node has always
+applied; an operator can raise them under `[calls]`. Both nodes of a call must
+allow a rate for the call to reach it, because each caps both directions.
+
+| Key | Default | Range |
+|---|---|---|
+| `media_max_frames_per_second` | 100 | 100 to 1000 |
+| `media_max_bytes_per_second` | 65536 | 65536 to 1048576 |
+| `media_drop_bulk_over_share` | `false` | |
+
+Packets of 512 bytes or less ride a priority lane; larger ones ride a bulk lane.
+The node reads no payload to do this, only the size it already sees. A bulk packet
+can evict only another bulk packet, leaves only after queued priority packets, and
+may use only what the cap leaves after 60 packets and 12 KiB per second, so bulk
+data cannot push out or outspend audio. Every audio packet is under the line, so
+a call with only audio behaves exactly as if the bulk lane did not exist. At the
+socket, going past the budget closes it. With `media_drop_bulk_over_share` on, bulk
+packets count against their own share and are dropped past it, so audio catching up
+after a stall has the whole budget to itself. The socket then closes for bulk only if
+it passes the whole budget again on top.
+
+A node with raised limits says so in the socket's handshake answer, in the header
+`x-bitsov-media-limits: <packets> <bytes>`, so the owner's app can pace to them. A
+node at the default rates sends no such header and answers as it always did.
+
+Nothing here changes a price or admission: a call is admitted and paid the same
+whatever it carries and whatever these limits are.
+
 ## Persistence, recovery and bounds
 
 `call_state` stores side, phase, effective deadline, replay deadline,
 `paid_until_ms`, next sequence, end reason, the Unpaid notice flag and any outgoing reservation.
+Migration 037 adds `call_block_invoices` for SQLite and PostgreSQL. Before
+publishing a short-lived block invoice, the callee durably binds its payment
+hash to the peer, call id and sequence. A generic invoice or keysend cannot
+admit a 404: its settled proof is consumed and audited as an overpayment.
+Bindings survive restarts and are swept after the call's resume window.
+Invoices issued before this upgrade have no binding and likewise become
+an audited overpayment if delivered after the upgrade.
+
 Migration 036 adds the notice flag for SQLite and PostgreSQL.
 Migration 035 adds paid intervals in SQLite and PostgreSQL; versions 033/034
 are reserved by the schema-parity and call-invite changes. Existing live
@@ -167,7 +208,10 @@ unsettled reservations; none are evicted. Burned ids have separate bounds
 of 256 per peer and 65 536 globally. Pressure may evict the oldest ids only
 after at least one hour of replay protection; otherwise tombstones remain
 for 24 hours after ending. Expired tombstones are swept in bounded batches;
-pending payment evidence is never swept as unpaid.
+ended caller reservations are released after explicit hangup or the bounded
+Unpaid resume window. The independent outbox journal retains payment evidence
+and drives delivery to the unchanged callee overpayment audit. Callee ACKs
+more than one block beyond the caller's expected boundary are ignored.
 
 Mesh meetings remain sets of ordinary pairwise calls with at most four
 participants. The earlier participant in the fixed roster places and pays

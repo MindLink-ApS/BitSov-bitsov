@@ -197,6 +197,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (32, "starter queries", include_str!("../migrations/032_starter_queries.sql")),
     (35, "call blocks", include_str!("../migrations/035_call_blocks.sql")),
     (36, "call unpaid notice", include_str!("../migrations/036_call_unpaid_notice.sql")),
+    (37, "call block invoices", include_str!("../migrations/037_call_block_invoices.sql")),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -506,7 +507,7 @@ const ROOM_MEMBERS_SELECT: &str =
 
 // ── HARD-4 complete-set query constants (SQLite) ─────────────────────────
 //
-// Each query below was flagged (HARD-4, Codex red-team on #225) as
+// Each query below was flagged (HARD-4, red-team review on #225) as
 // "untruncated". STEP 0 of HARD-4 is to classify each as AUTHORITY (used by the
 // gate / recovery / fan-out / money-path) vs READ-SURFACE, then enforce: an
 // AUTHORITY query MUST return the COMPLETE set. Adding a bare `LIMIT` to any of
@@ -1020,6 +1021,12 @@ impl Storage for SqliteStorage {
             if binding.0 != id || binding.1 != sender {
                 tx.rollback().await?;
                 return Ok(PaymentReused);
+            }
+            // The same envelope, refused and withdrawn by the application: its
+            // sender is told so again, never that its proof belongs to another.
+            if binding.2 == -1 {
+                tx.rollback().await?;
+                return Ok(Withdrawn);
             }
             // Receipt metadata is independent of retained message content and
             // excludes only the timestamp/signature wrapper refreshed on retry.
@@ -1661,20 +1668,17 @@ impl Storage for SqliteStorage {
     }
 
     async fn call_put(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
-        let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
-        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, paid_until_ms = excluded.paid_until_ms, next_block_seq = excluded.next_block_seq, end_reason = excluded.end_reason, unpaid_notice_used = excluded.unpaid_notice_used")
-            .bind(peer.to_hex()).bind(call_id)
-            .bind(entry.side.as_str()).bind(entry.phase.as_str())
-            .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
-            .bind(entry.pending.as_ref().map(|p| p.operation_id.clone()))
-            .bind(entry.pending.as_ref().map(|p| i64::from(p.kind)))
-            .bind(entry.pending.as_ref().map(|p| p.request_hash.clone()))
-            .bind(entry.paid_until_ms.map(ms).transpose()?)
-            .bind(i64::from(entry.next_block_seq))
-            .bind(entry.end_reason.map(|reason| reason.as_str()))
-            .bind(i64::from(entry.unpaid_notice_used))
-            .execute(&self.pool).await?;
+        call_upsert(peer, call_id, entry)?.execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn call_commit_admitted(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry, id: &MessageId) -> Result<(), StorageError> {
+        // One transaction: the grant and the release stand or fall together.
+        let mut tx = self.pool.begin().await?;
+        call_upsert(peer, call_id, entry)?.execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
+            .bind(id.to_hex()).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1732,9 +1736,38 @@ impl Storage for SqliteStorage {
         }).collect()
     }
 
+    async fn record_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32], retain_until_ms: u64) -> Result<(), StorageError> {
+        let until = i64::try_from(retain_until_ms).map_err(|_| StorageError::Conversion("call invoice time overflow".into()))?;
+        // One write statement keeps the count and insertion atomic across connections.
+        let inserted = sqlx::query("INSERT INTO call_block_invoices (payment_hash, peer, call_id, seq, retain_until_ms) SELECT ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM call_block_invoices WHERE peer = ? AND call_id = ? AND seq = ?) < ?")
+            .bind(hex::encode(payment_hash)).bind(peer.to_hex()).bind(call_id).bind(i64::from(seq)).bind(until)
+            .bind(peer.to_hex()).bind(call_id).bind(i64::from(seq))
+            .bind(i64::from(konsensus_core::payloads::call::MAX_CALL_BLOCK_INVOICES))
+            .execute(&self.pool).await?;
+        if inserted.rows_affected() == 0 {
+            return Err(StorageError::Conversion("call block invoice capacity reached".into()));
+        }
+        Ok(())
+    }
+
+    async fn has_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32]) -> Result<bool, StorageError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_block_invoices WHERE payment_hash = ? AND peer = ? AND call_id = ? AND seq = ?")
+            .bind(hex::encode(payment_hash)).bind(peer.to_hex()).bind(call_id).bind(i64::from(seq))
+            .fetch_one(&self.pool).await?;
+        Ok(count == 1)
+    }
+
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
-        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= ? AND pending_operation_id IS NULL ORDER BY replay_until_ms LIMIT ?)")
+        // Reclaim legacy caller reservations once no interval can be resumed.
+        // The independent outbox operation retains all payment evidence.
+        sqlx::query("UPDATE call_state SET pending_operation_id = NULL, pending_kind = NULL, pending_request_hash = NULL WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE phase = 'ended' AND side = 'caller' AND pending_kind = 404 AND pending_operation_id IS NOT NULL AND (end_reason IS NULL OR end_reason <> 'unpaid' OR deadline_ms - ? + ? < ?) ORDER BY deadline_ms LIMIT ?)")
+            .bind(konsensus_core::payloads::call::TOMBSTONE_MS as i64)
+            .bind(konsensus_core::payloads::call::CALL_BLOCK_RESUME_MS as i64)
+            .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
+        sqlx::query("DELETE FROM call_block_invoices WHERE payment_hash IN (SELECT payment_hash FROM call_block_invoices WHERE retain_until_ms < ? ORDER BY retain_until_ms LIMIT ?)")
+            .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
+        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= ? AND (pending_operation_id IS NULL OR (phase = 'ended' AND side = 'caller' AND pending_kind = 404)) ORDER BY replay_until_ms LIMIT ?)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
         Ok(done.rows_affected())
     }
@@ -3661,6 +3694,23 @@ fn outstanding_from_row(
         expected_reply_kind: u16::try_from(kind).map_err(|_| bad("reply kind"))?,
         expires_at_ms: u64::try_from(expires).map_err(|_| bad("expiry"))?,
     })
+}
+
+/// Insert or replace one call row, on the pool or inside a transaction.
+fn call_upsert<'q>(peer: &konsensus_core::NodeId, call_id: &'q str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>, StorageError> {
+    let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
+    Ok(sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, paid_until_ms = excluded.paid_until_ms, next_block_seq = excluded.next_block_seq, end_reason = excluded.end_reason, unpaid_notice_used = excluded.unpaid_notice_used")
+        .bind(peer.to_hex()).bind(call_id)
+        .bind(entry.side.as_str()).bind(entry.phase.as_str())
+        .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
+        .bind(entry.pending.as_ref().map(|p| p.operation_id.clone()))
+        .bind(entry.pending.as_ref().map(|p| i64::from(p.kind)))
+        .bind(entry.pending.as_ref().map(|p| p.request_hash.clone()))
+        .bind(entry.paid_until_ms.map(ms).transpose()?)
+        .bind(i64::from(entry.next_block_seq))
+        .bind(entry.end_reason.map(|reason| reason.as_str()))
+        .bind(i64::from(entry.unpaid_notice_used)))
 }
 
 /// `(side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash)` of `call_state`.

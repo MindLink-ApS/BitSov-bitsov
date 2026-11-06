@@ -54,10 +54,15 @@ const FAILED: u8 = 3;
 #[derive(Default)]
 struct Wallet {
     call_capacity: AtomicU64,
+    other_channel_capacity: AtomicU64,
+    /// Lightning key at the far end of the one channel; `PEER_LN` when unset.
+    channel_peer: std::sync::Mutex<Option<String>>,
     pause_capacity: AtomicBool,
     capacity_entered: tokio::sync::Notify,
     capacity_resume: tokio::sync::Notify,
     fee: AtomicU64,
+    /// Every routing-fee limit a payment was dispatched under, in order.
+    fee_limits: std::sync::Mutex<Vec<u64>>,
     unknown_fee: AtomicBool,
     recover_preimage: AtomicBool,
     outgoing: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
@@ -132,13 +137,25 @@ impl LightningProvider for Wallet {
             self.capacity_resume.notified().await;
         }
         let capacity = self.call_capacity.load(Ordering::SeqCst);
-        Ok(vec![konsensus_core::traits::lightning::ChannelInfo {
+        let peer_pubkey = self.channel_peer.lock().unwrap().clone().unwrap_or_else(|| PEER_LN.into());
+        let mut channels = vec![konsensus_core::traits::lightning::ChannelInfo {
             is_outbound: Some(true), is_announced: Some(false), is_channel_ready: Some(true),
             local_reserve_msat: Some(0), initial_push_msat: None, channel_id: "test-channel".into(),
-            user_channel_id: None, funding_txo: None, peer_pubkey: PEER_LN.into(),
+            user_channel_id: None, funding_txo: None, peer_pubkey,
             capacity_msat: capacity, local_balance_msat: capacity, outbound_capacity_msat: Some(capacity),
             remote_balance_msat: 0, active: true, short_channel_id: None,
-        }])
+        }];
+        let other_capacity = self.other_channel_capacity.load(Ordering::SeqCst);
+        if other_capacity > 0 {
+            let mut other = channels[0].clone();
+            other.channel_id = "other-channel".into();
+            other.peer_pubkey = OTHER_LN.into();
+            other.capacity_msat = other_capacity;
+            other.local_balance_msat = other_capacity;
+            other.outbound_capacity_msat = Some(other_capacity);
+            channels.push(other);
+        }
+        Ok(channels)
     }
     async fn keysend_with_fee_limit(
         &self,
@@ -150,6 +167,7 @@ impl LightningProvider for Wallet {
         konsensus_core::traits::lightning::PaymentDetails,
         konsensus_core::traits::lightning::LightningError,
     > {
+        self.fee_limits.lock().unwrap().push(_cap);
         if self.fee.load(Ordering::SeqCst) > _cap {
             return Err(LightningError::PaymentNotDispatched(
                 "route exceeds fee ceiling".into(),
@@ -203,6 +221,7 @@ impl LightningProvider for Wallet {
         bolt11: &str,
         _max_fee_msat: u64,
     ) -> Result<PaymentDetails, LightningError> {
+        self.fee_limits.lock().unwrap().push(_max_fee_msat);
         if self.fee.load(Ordering::SeqCst) > _max_fee_msat {
             return Err(LightningError::PaymentNotDispatched(
                 "route exceeds fee ceiling".into(),
@@ -211,6 +230,14 @@ impl LightningProvider for Wallet {
         let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
         let mut paid = self.pay_invoice(bolt11).await?;
         paid.payment_hash = invoice.payment_hash().to_string();
+        if paid.preimage.is_some() {
+            // Invoice fixtures use these preimages; keysend has its own proof.
+            paid.preimage = [0xcc, 0xdd].into_iter().find_map(|byte| {
+                let preimage = [byte; 32];
+                (hex::encode(<sha2::Sha256 as sha2::Digest>::digest(preimage))
+                    == paid.payment_hash).then(|| hex::encode(preimage))
+            });
+        }
         Ok(paid)
     }
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
@@ -1586,6 +1613,43 @@ async fn all_in_reservation_settles_actual_fee_and_holds_unknown_fee() {
         2000,
         "unknown fee retains full durable liability"
     );
+}
+
+/// A file send resolves its grant debit as a message does: the ceiling is held
+/// until the payment settles, then the principal plus the actual fee stays
+/// spent and the rest comes back. An unknown fee keeps the whole ceiling held.
+#[tokio::test]
+async fn file_send_settles_actual_fee_and_holds_unknown_fee() {
+    let fx = fixture().await;
+    fx.wallet.fee.store(400, Ordering::SeqCst);
+    let body = json!({"recipient": fx.peer.to_hex(), "max_total_msat": 2000, "max_routing_fee_msat": 1000});
+    let token = fx.grant(None, GrantTerms::new(2000)).await;
+    let path = upload_file(&fx, &token).await;
+    let (status, receipt) = fx.call("POST", &path, Some(body.clone()), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["max_routing_fee_msat"], 1000, "{receipt}");
+    assert_eq!(fx.used(), 1400, "principal plus the actual fee; the rest of the ceiling is released");
+
+    fx.wallet.unknown_fee.store(true, Ordering::SeqCst);
+    let token = fx.grant(None, GrantTerms::new(2000)).await;
+    let path = upload_file(&fx, &token).await;
+    let (status, receipt) = fx.call("POST", &path, Some(body), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(fx.used(), 2000, "unknown fee retains full durable liability");
+    assert!(receipt.get("fee_paid_msat").is_none(), "{receipt}");
+}
+
+async fn upload_file(fx: &Fx, token: &str) -> String {
+    let (status, file) = fx
+        .call(
+            "POST",
+            "/api/v1/files",
+            Some(json!({"filename":"fee.txt","mime_type":"text/plain","data_b64":"aGk="})),
+            Some(token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{file}");
+    format!("/api/v1/files/{}/send", file["file_id"].as_str().unwrap())
 }
 
 #[tokio::test]

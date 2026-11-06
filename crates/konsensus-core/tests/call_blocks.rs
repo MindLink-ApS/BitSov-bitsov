@@ -136,6 +136,26 @@ fn call_blocks_outgoing_reservations_settle_once_and_honour_late_payment() {
 }
 
 #[test]
+fn live_block_commit_not_due_retains_the_reservation() {
+    let caller = CallEntry { side: calls::Side::Caller, ..answered() };
+    let first = calls::commit(
+        calls::reserve_block(Some(caller), 0, "first", "hash", 1_000).unwrap(),
+        "first", 1_000,
+    ).unwrap();
+    let pending = calls::reserve_block(Some(first), 1, "renewal", "hash", 41_000).unwrap();
+    // A delayed grant for block zero moves its boundary while block one is
+    // paying. A backwards clock step can make the same reservation NotDue.
+    for (paid_until_ms, deadline_ms, now) in [(Some(91_000), 101_000, 41_001), (Some(61_000), 71_000, 40_999)] {
+        let pending = CallEntry { paid_until_ms, deadline_ms, ..pending.clone() };
+        assert_eq!(calls::commit(pending.clone(), "renewal", now), Err(CallRefusal::NotDue));
+        assert_eq!(calls::reserve_block(Some(pending.clone()), 1, "second-payment", "hash", 71_000), Err(CallRefusal::InFlight));
+        let committed = calls::commit(pending, "renewal", 71_000).unwrap();
+        assert_eq!(committed.next_block_seq, 2);
+        assert!(committed.pending.is_none());
+    }
+}
+
+#[test]
 fn unpaid_hangup_notification_never_reopens_an_ended_call() {
     let ended = answered().at(31_001).unwrap();
     let pending = calls::reserve_unpaid_hangup(Some(ended), "timeout", "hash").unwrap();
@@ -242,7 +262,11 @@ fn very_late_outgoing_settlement_still_delivers_for_callee_reconciliation() {
     let caller = CallEntry { side: calls::Side::Caller, ..answered() };
     let pending = calls::reserve_block(Some(caller), 0, "block", "hash", 1_000).unwrap();
     let now = 31_000 + calls::TOMBSTONE_MS + 1;
-    let paid = calls::commit(pending.at(now).unwrap(), "block", now).unwrap();
+    // The replay sweep may reclaim the row; the independent outbox journal
+    // still delivers its settled envelope for callee reconciliation.
+    assert!(pending.clone().at(now).is_none());
+    // A commit racing the sweep also clears the reservation without service.
+    let paid = calls::commit(pending, "block", now).unwrap();
     assert!(paid.pending.is_none(), "paid envelope can leave for reconciliation");
     assert_eq!(paid.next_block_seq, 0);
     assert!(!paid.media_admitted(now));
