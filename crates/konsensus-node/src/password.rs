@@ -59,17 +59,17 @@ pub fn read_password_fd(fd: i32) -> Result<Zeroizing<String>> {
     }
 }
 
-/// Whether a password descriptor is free of a file another OS user can read.
+/// Whether a password descriptor is protected from other OS users.
 ///
-/// A descriptor can be a redirected file (`--password-fd 3 3<pw`), and that file
-/// must pass the same owner-only rule as `--password-file`. A pipe or socket has
-/// no such file; its launcher protects the password. False when it cannot be
-/// checked: an invalid descriptor, or a platform without Unix modes.
+/// A redirected file (`--password-fd 3 3<pw`) or FIFO must pass the same
+/// ownership/mode rule as `--password-file`. A socket's launcher protects the
+/// password. Unsupported types, invalid descriptors, and platforms without
+/// Unix modes return false.
 pub fn descriptor_is_owner_only(fd: i32) -> bool {
     #[cfg(unix)]
     {
         use std::os::fd::FromRawFd;
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
         if fd < 0 {
             return false;
         }
@@ -84,8 +84,12 @@ pub fn descriptor_is_owner_only(fd: i32) -> bool {
         let Ok(meta) = file.metadata() else {
             return false;
         };
-        // SAFETY: getuid has no preconditions and cannot fail.
-        !meta.is_file() || (meta.mode() & 0o077 == 0 && meta.uid() == unsafe { libc::getuid() })
+        let file_type = meta.file_type();
+        file_type.is_socket()
+            || ((file_type.is_file() || file_type.is_fifo())
+                && meta.mode() & 0o077 == 0
+                // SAFETY: getuid has no preconditions and cannot fail.
+                && meta.uid() == unsafe { libc::getuid() })
     }
     #[cfg(not(unix))]
     {
@@ -119,6 +123,34 @@ mod tests {
         assert!(descriptor_is_owner_only(reader.as_raw_fd()));
         assert!(!descriptor_is_owner_only(2147483647));
         assert!(!descriptor_is_owner_only(-1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_descriptor_must_be_owner_only() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pw-fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        for (mode, owner_only) in [(0o600, true), (0o666, false)] {
+            // Set the exact mode independently of the process umask.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                descriptor_is_owner_only(reader.as_raw_fd()),
+                owner_only,
+                "{mode:o}"
+            );
+        }
     }
 
     #[test]

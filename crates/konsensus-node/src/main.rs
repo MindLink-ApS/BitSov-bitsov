@@ -3226,6 +3226,47 @@ mod owner_key_startup_tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unattended_device_approvals_refuse_a_fifo_other_users_can_read() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let (dir, enc) = unattended(Some("correct horse"));
+        let path = dir.path().join("pw-fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.write_all(b"correct horse\n").unwrap();
+        drop(writer);
+
+        let source = PasswordSource::Descriptor(InputAccess::of(
+            password::descriptor_is_owner_only(reader.as_raw_fd()),
+        ));
+        let password = password::read_password_fd(reader.as_raw_fd()).unwrap();
+        assert_eq!(
+            owner_approval_key(&enc, Some(password.as_str()), source, false).unwrap_err(),
+            SEED_PASSWORD_NOT_TYPED
+        );
+        assert_eq!(
+            source,
+            PasswordSource::Descriptor(InputAccess::NotOwnerOnly)
+        );
+        assert_eq!(
+            unattended_password_allowed(&enc, source).unwrap_err(),
+            UnattendedRefusal::PasswordNotOwnerOnly
+        );
+    }
+
     #[test]
     fn unattended_device_approvals_refuse_a_password_on_the_command_line() {
         let (_dir, enc) = unattended(Some("correct horse"));
