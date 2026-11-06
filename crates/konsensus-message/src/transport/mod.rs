@@ -104,6 +104,8 @@ pub enum ControlEvent {
         privileged: bool,
         /// The connection this frame arrived on.
         connection: Arc<ConnectionContext>,
+        /// When the reader took the frame off that connection, before any queueing.
+        received_at: Instant,
     },
 
     /// Peer initiated an E2EE session (X3DH initiator → responder).
