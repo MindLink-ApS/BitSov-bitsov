@@ -56,4 +56,18 @@ pub enum StorageError {
         /// Highest embedded migration version.
         max_embedded: i64,
     },
+
+    /// PostgreSQL recorded a migration this binary does not know.
+    ///
+    /// SQLite's migrator returns `VersionMissing` for the same case. Starting
+    /// would run this binary against a newer schema.
+    #[error(
+        "database schema version(s) {versions:?} are newer than this binary (known through version {max_known}). Refusing to start. Do not downgrade; roll forward on the migrated database."
+    )]
+    FutureSchema {
+        /// Applied versions absent from this binary's migration list.
+        versions: Vec<i32>,
+        /// Highest migration version this binary can apply.
+        max_known: i32,
+    },
 }
