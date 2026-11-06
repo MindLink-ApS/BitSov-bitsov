@@ -57,6 +57,7 @@ struct RecordingLink {
     sent: Mutex<Vec<(NodeId, Vec<u8>)>>,
     busy: std::sync::atomic::AtomicBool,
     stalled: std::sync::atomic::AtomicBool,
+    send_delay_ms: std::sync::atomic::AtomicU64,
     sending: tokio::sync::Notify,
     inbound: Mutex<Option<tokio::sync::mpsc::Receiver<CallMediaEvent>>>,
 }
@@ -81,6 +82,10 @@ impl MediaLink for RecordingLink {
         if self.stalled.load(std::sync::atomic::Ordering::SeqCst) {
             self.sending.notify_one();
             return std::future::pending().await;
+        }
+        let delay = self.send_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
         if self.busy.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(TransportError::Timeout("call media writer busy".into()));
@@ -576,6 +581,145 @@ async fn idle_paid_route_expires_after_grace_without_media() {
         while router.routed_calls() != 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
     }).await.expect("paid expiry was not rechecked without media");
     assert!(attachment.from_node.is_closed() && attachment.to_node.is_closed());
+}
+
+/// Captures this thread's log output; the runtime in these tests is
+/// single-threaded, so the router's tasks log into it too.
+#[derive(Clone, Default)]
+struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+    let buf = LogBuf::default();
+    let sub = tracing_subscriber::fmt().with_writer(buf.clone()).with_ansi(false).with_max_level(tracing::Level::INFO).finish();
+    let guard = tracing::subscriber::set_default(sub);
+    (buf, guard)
+}
+
+fn summaries(buf: &LogBuf) -> Vec<String> {
+    let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    text.lines().filter(|l| l.contains("call media route summary")).map(str::to_string).collect()
+}
+
+fn field(line: &str, name: &str) -> String {
+    let key = format!(" {name}=");
+    let rest = &line[line.find(&key).unwrap_or_else(|| panic!("{name} in {line}")) + key.len()..];
+    rest.split(' ').next().unwrap().trim_matches('"').to_string()
+}
+
+#[tokio::test]
+async fn route_summary_counts_inbound_and_ends_detached() {
+    let (logs, _guard) = capture_logs();
+    let f = fixture();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
+    let total = MAX_FRAMES_PER_SECOND + 3;
+    for seq in 0..total {
+        let _ = f.router.inbound(event(peer(), CALL, seq, true)).await;
+    }
+    assert!(summaries(&logs).is_empty(), "nothing is logged until the route ends");
+    drop(attachment);
+
+    let lines = summaries(&logs);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert_eq!(field(line, "call_id"), CALL);
+    assert_eq!(field(line, "in_forwarded"), MAX_FRAMES_PER_SECOND.to_string());
+    assert_eq!(field(line, "in_rate_capped"), "3");
+    assert_eq!(field(line, "in_evicted"), (MAX_FRAMES_PER_SECOND as usize - MEDIA_QUEUE_FRAMES).to_string());
+    assert_eq!(field(line, "in_not_admitted"), "0");
+    assert_eq!(field(line, "out_forwarded"), "0");
+    assert_eq!(field(line, "out_evicted"), "0");
+    assert_eq!(field(line, "end_reason"), "detached");
+    // Counts only: no packet bytes in the line.
+    assert!(!line.contains("payload") && !line.contains("data="));
+}
+
+#[tokio::test]
+async fn route_summary_counts_outbound_and_writer_wait() {
+    let (logs, _guard) = capture_logs();
+    let f = fixture();
+    f.link.send_delay_ms.store(25, std::sync::atomic::Ordering::SeqCst);
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
+    for seq in 0..4u32 {
+        attachment.to_node.push(MediaFrame { seq, payload: vec![0xAB; 50] }).unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while f.link.sent.lock().unwrap().len() < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("four frames forwarded");
+    drop(attachment);
+
+    let lines = summaries(&logs);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert_eq!(field(line, "out_forwarded"), "4");
+    assert_eq!(field(line, "out_rate_capped"), "0");
+    assert_eq!(field(line, "in_forwarded"), "0");
+    let wait_us: u64 = field(line, "longest_writer_wait_us").parse().unwrap();
+    assert!(wait_us >= 25_000, "{wait_us}");
+}
+
+#[tokio::test]
+async fn route_summary_counts_outbound_rate_cap() {
+    let (logs, _guard) = capture_logs();
+    let f = fixture();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
+    let total = MAX_FRAMES_PER_SECOND + 5;
+    for seq in 0..total {
+        attachment.to_node.push(MediaFrame { seq, payload: vec![1; 10] }).unwrap();
+        // Let the pump take each packet so the queue never evicts.
+        while !attachment.to_node.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    }
+    drop(attachment);
+    let lines = summaries(&logs);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(field(&lines[0], "out_forwarded"), MAX_FRAMES_PER_SECOND.to_string());
+    assert_eq!(field(&lines[0], "out_rate_capped"), "5");
+    assert_eq!(field(&lines[0], "out_evicted"), "0");
+}
+
+#[tokio::test]
+async fn route_summary_is_logged_once_and_names_admission_end() {
+    let (logs, _guard) = capture_logs();
+    let f = fixture();
+    let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
+    f.router.inbound(event(peer(), CALL, 1, true)).await.unwrap();
+    f.admission.revoke(peer(), CALL);
+    tokio::time::timeout(Duration::from_millis(1600), async {
+        while f.router.routed_calls() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("route released");
+    // Detaching afterwards ends nothing new and logs nothing more.
+    drop(attachment);
+
+    let lines = summaries(&logs);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(field(&lines[0], "end_reason"), "not_admitted");
+    assert_eq!(field(&lines[0], "in_forwarded"), "1");
 }
 
 #[tokio::test(start_paused = true)]
