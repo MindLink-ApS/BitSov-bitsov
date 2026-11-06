@@ -414,7 +414,7 @@ mod tests {
     /// through the zeroizing helper and must NOT contain a raw
     /// `read_to_string(&plain_path)` on the reveal seam. This is a code-shape
     /// assertion that survives even if the runtime behaviour looks identical —
-    /// the exact regression Codex flagged on PR #238.
+    /// the exact regression a review flagged on PR #238.
     #[test]
     fn reveal_seam_uses_zeroizing_read_not_raw_string() {
         let src = include_str!("identity.rs");

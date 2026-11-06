@@ -86,7 +86,7 @@ async fn block_invoice_binding_survives_restart_is_exact_and_is_swept() {
 }
 
 /// A paid block's grant and the release of its admission hold stand or fall
-/// together (Codex P1 on #441): a failing hold delete rolls the grant back,
+/// together (review P1 on #441): a failing hold delete rolls the grant back,
 /// so no committed grant can stay behind a hold the sweep would withdraw;
 /// once committed, the sweep finds nothing of it to withdraw.
 async fn assert_block_commit_is_atomic(
