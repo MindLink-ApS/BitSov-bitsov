@@ -232,7 +232,7 @@ fn hosted_by_is_bounded_trimmed_and_printable() {
     );
     for label in [
         None,
-        Some("Rasmus's Pi".to_string()),
+        Some("Alice's Pi".to_string()),
         Some("Øresund-boks 🟠".to_string()),
         Some("𝔅".repeat(64)),
     ] {
@@ -246,8 +246,8 @@ fn hosted_by_is_bounded_trimmed_and_printable() {
         ("   ", "empty"),
         (" Pi", "whitespace"),
         ("Pi\n", "whitespace"),
-        ("Rasmus\u{7}Pi", "printable"),
-        ("Rasmus\u{1b}[31mPi", "printable"),
+        ("Alice\u{7}Pi", "printable"),
+        ("Alice\u{1b}[31mPi", "printable"),
         ("Pi\u{202E}kcab", "printable"),
         ("Pi\u{200B}", "printable"),
         ("Pi\u{2066}x\u{2069}", "printable"),
@@ -616,7 +616,7 @@ backend = "sqlite"
 
 #[test]
 fn admission_mode_unknown_token_errors_not_silent_whitelist() {
-    // Doctrine (CODEX.md §Renames fail loud, never silent-default): `NodeConfig`
+    // Doctrine (renames fail loud, never silent-default): `NodeConfig`
     // carries `deny_unknown_fields` and `admission_mode` carries `#[serde(default)]`.
     // `#[serde(default)]` only fills an ABSENT field — a PRESENT-but-unknown token
     // must FAIL the whole parse, never fall back to the Whitelist default, which
@@ -2313,7 +2313,7 @@ esplora_url_fallback = "https://fallback.example.com"
     }
 }
 
-/// genome #66 round 2 (Codex R2): an EXISTING config that omits the primary URL
+/// genome #66 round 2 (review R2): an EXISTING config that omits the primary URL
 /// must keep resolving to the provider it resolved to before. The first attempt
 /// at #66 changed the `#[serde(default = ...)]` helpers, which would have moved
 /// every such config from mempool.space to Blockstream on upgrade — the same
@@ -2529,7 +2529,7 @@ fn validate_allows_settlement_off_on_mock_backend() {
     );
 }
 
-// 2d (Codex #3): relay/price-open admission is settlement-gated, so it must fail
+// 2d (review #3): relay/price-open admission is settlement-gated, so it must fail
 // closed on a Mock backend (settlement resolves off by default) unless the
 // operator explicitly opts in. A Mock relay/price-open node that silently ran
 // would admit unsettled/forged proofs.
@@ -2819,6 +2819,44 @@ backend = "sqlite"
         "{base}\n[calls]\nstun_listen = \"not-an-addr\"\n"
     ))
     .is_err());
+}
+
+#[test]
+fn call_media_limits_default_to_the_fixed_limits_and_stay_in_bounds() {
+    let base = r#"
+[identity]
+mnemonic_file = "/tmp/m.txt"
+[network]
+[lightning]
+backend = "mock"
+[chain]
+backend = "mock"
+[storage]
+backend = "sqlite"
+"#;
+    let unset: NodeConfig = toml::from_str(base).unwrap();
+    assert_eq!(unset.calls.media_limits(), konsensus_api::call_media::MediaLimits::default());
+    assert_eq!(unset.calls.media_max_frames_per_second, 100);
+    assert_eq!(unset.calls.media_max_bytes_per_second, 65536);
+    assert!(!unset.calls.media_drop_bulk_over_share);
+    assert_eq!(crate::config::CallsConfig::default().media_limits(), unset.calls.media_limits());
+
+    let tier: NodeConfig = toml::from_str(&format!(
+        "{base}\n[calls]\nmedia_max_frames_per_second = 160\nmedia_max_bytes_per_second = 262144\nmedia_drop_bulk_over_share = true\n"
+    ))
+    .unwrap();
+    assert!(tier.calls.media_limits().drop_bulk_over_share);
+    assert_eq!(tier.calls.media_limits().max_frames_per_second, 160);
+    assert_eq!(tier.calls.media_limits().max_bytes_per_second, 262_144);
+
+    for bad in [
+        "media_max_frames_per_second = 99",
+        "media_max_frames_per_second = 1001",
+        "media_max_bytes_per_second = 65535",
+        "media_max_bytes_per_second = 1048577",
+    ] {
+        assert!(toml::from_str::<NodeConfig>(&format!("{base}\n[calls]\n{bad}\n")).is_err(), "{bad} must be refused");
+    }
 }
 
 #[test]

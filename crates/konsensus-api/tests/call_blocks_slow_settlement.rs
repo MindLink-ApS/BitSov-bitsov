@@ -186,7 +186,7 @@ async fn settlement_after_first_poll_never_charges_an_ungranted_interval() {
     let received = payee.list_payments(1).await.unwrap();
     let hash = hex::decode(&received[0].payment_hash).unwrap().try_into().unwrap();
     let admitted = calls::prepare_incoming_block(callee_store.as_ref(), state.identity.node_id(),
-        Some(&plaintext), &hash).await.unwrap().commit().await.is_ok();
+        Some(&plaintext), &hash).await.unwrap().commit(&konsensus_core::MessageId::from_bytes([0; 32])).await.is_ok();
     let granted = admitted
         && calls::call_media_admitted(
             callee_store.as_ref(),

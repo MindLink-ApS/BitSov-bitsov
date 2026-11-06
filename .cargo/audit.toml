@@ -104,6 +104,13 @@ ignore = [
   "RUSTSEC-2026-0367",
   "RUSTSEC-2026-0368",
   "RUSTSEC-2026-0369",
+  # Triage 2026-11-03, review by 2027-02-03. Same test-only zip 0.6.6 as above:
+  # `cargo tree -p konsensus-node -e normal,build --target all --locked` has no
+  # zip. Neither build script calls ZipArchive::extract, and inputs are SHA-256
+  # pinned downloads. Remove when zip is dropped or >=9.0.0.
+  # -0429 (alias GHSA-q7v9-x93c-xqv3): symlink-entry allocation abort in extract;
+  # 0.6.6's extract has no symlink branch.
+  "RUSTSEC-2026-0429",
   # In Cargo.lock but NEVER COMPILED (the `mysql` feature is off, and neither rsa
   # nor sqlx-mysql appears in `cargo tree -e normal`). The ignore is still needed
   # because cargo-audit reads Cargo.lock and performs no feature resolution.

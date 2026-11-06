@@ -12,7 +12,7 @@
 //! What this file does NOT do: spin up a real LDK node + bitcoind +
 //! electrsd to observe real events flowing through the drainer
 //! end-to-end. That is gated on the `ldk-integration-test` feature
-//! suite. Source-level review (codex) is the merge gate per the L0
+//! suite. Source-level review is the merge gate per the L0
 //! freeze policy.
 
 use std::sync::atomic::{AtomicUsize, Ordering};

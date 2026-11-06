@@ -1542,7 +1542,7 @@ async fn retention_also_removes_plaintext_cache() -> Result<(), Box<dyn std::err
 
 // ── HARD-4: complete-set query contract guards ───────────────────────────
 //
-// Each flagged query (HARD-4, Codex red-team on #225) must return the COMPLETE
+// Each flagged query (HARD-4, red-team review on #225) must return the COMPLETE
 // set. The behavioral test below proves it for `list_invites_issued` — an
 // AUTHORITY query (duplicate-pending-invite gate + acceptance lookup) — with a
 // >1000-row round-trip (the same shape DBH1 used for `list_peers`). The
