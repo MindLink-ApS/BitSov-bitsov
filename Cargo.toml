@@ -100,7 +100,7 @@ clap = { version = "4", features = ["derive"] }
 rpassword = "7"
 
 # Config
-toml = "0.8"
+toml = "1.1"
 
 # JWT: no third-party JWT crate. jsonwebtoken 9 carried GHSA-h395-gr6q-cpjc (no 9.x
 # fix); 10's rust_crypto feature force-pulls rsa 0.9.10 (unfixed RUSTSEC-2023-0071
