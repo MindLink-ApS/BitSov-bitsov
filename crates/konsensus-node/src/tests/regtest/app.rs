@@ -102,7 +102,7 @@ fn paired_client(
     (service, client.client_id, token)
 }
 
-/// New Atlas fixture options; legacy tests keep their original setup.
+/// New TEST5 fixture options; legacy tests keep their original setup.
 pub struct Options {
     pub identity: Arc<NodeIdentity>,
     pub chain_url: String,
@@ -563,7 +563,7 @@ impl App {
             .unwrap();
         let status = response.status();
         // Scope extractors return text/plain; keep their exact refusal body so
-        // the Atlas scenario can assert it. JSON endpoints remain strict.
+        // the TEST5 scenario can assert it. JSON endpoints remain strict.
         let plain = response
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
@@ -591,7 +591,7 @@ impl App {
         assert_eq!(
             status,
             StatusCode::OK,
-            "Atlas run 4 relaunch: remote challenge {body}"
+            "TEST5 run 4 relaunch: remote challenge {body}"
         );
         let challenge = body["challenge"].as_str().unwrap();
         let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
@@ -608,7 +608,7 @@ impl App {
         assert_eq!(
             status,
             StatusCode::OK,
-            "Atlas run 4 relaunch: remote token {body}"
+            "TEST5 run 4 relaunch: remote token {body}"
         );
         self.token = body["token"].as_str().unwrap().to_owned();
         body["scopes"].clone()
