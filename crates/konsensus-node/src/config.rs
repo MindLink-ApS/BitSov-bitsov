@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use konsensus_message::wire::SovereigntyTier;
 use serde::{Deserialize, Serialize};
 
@@ -1328,6 +1329,53 @@ pub struct CallsConfig {
     /// Outgoing paid minutes reserved per call; one minute per block.
     #[serde(default = "default_max_call_minutes", deserialize_with = "deserialize_max_call_minutes")]
     pub max_call_minutes: u16,
+    /// Media packets per second one direction of one routed call may carry,
+    /// from 100 (the default) to 1000. Both nodes of a call must allow a rate
+    /// for a call to reach it. No effect on price or admission.
+    #[serde(default = "default_media_max_frames_per_second", deserialize_with = "deserialize_media_max_frames_per_second")]
+    pub media_max_frames_per_second: u32,
+    /// Media payload bytes per second one direction of one routed call may
+    /// carry, from 65536 (the default) to 1048576. Both nodes of a call must
+    /// allow a rate for a call to reach it. No effect on price or admission.
+    #[serde(default = "default_media_max_bytes_per_second", deserialize_with = "deserialize_media_max_bytes_per_second")]
+    pub media_max_bytes_per_second: u64,
+    /// At the owner's socket, count packets larger than audio against their own
+    /// share and drop them past it, so neither a burst of them nor audio catching
+    /// up beside them closes the socket. Off by default: every packet counts
+    /// against one budget and the socket closes past it, as it always has.
+    #[serde(default)]
+    pub media_drop_bulk_over_share: bool,
+}
+
+fn default_media_max_frames_per_second() -> u32 { konsensus_api::call_media::DEFAULT_MAX_FRAMES_PER_SECOND }
+
+fn default_media_max_bytes_per_second() -> u64 { konsensus_api::call_media::DEFAULT_MAX_BYTES_PER_SECOND }
+
+fn deserialize_media_max_frames_per_second<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    let value = u32::deserialize(deserializer)?;
+    if !(default_media_max_frames_per_second()..=1000).contains(&value) {
+        return Err(serde::de::Error::custom("calls.media_max_frames_per_second must be between 100 and 1000"));
+    }
+    Ok(value)
+}
+
+fn deserialize_media_max_bytes_per_second<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let value = u64::deserialize(deserializer)?;
+    if !(default_media_max_bytes_per_second()..=1_048_576).contains(&value) {
+        return Err(serde::de::Error::custom("calls.media_max_bytes_per_second must be between 65536 and 1048576"));
+    }
+    Ok(value)
+}
+
+impl CallsConfig {
+    /// What each direction of each routed call may carry.
+    pub fn media_limits(&self) -> konsensus_api::call_media::MediaLimits {
+        konsensus_api::call_media::MediaLimits {
+            max_frames_per_second: self.media_max_frames_per_second,
+            max_bytes_per_second: self.media_max_bytes_per_second,
+            drop_bulk_over_share: self.media_drop_bulk_over_share,
+        }
+    }
 }
 
 fn default_max_call_minutes() -> u16 { 60 }
@@ -1342,7 +1390,13 @@ fn deserialize_max_call_minutes<'de, D: serde::Deserializer<'de>>(deserializer: 
 
 impl Default for CallsConfig {
     fn default() -> Self {
-        Self { stun_listen: None, max_call_minutes: default_max_call_minutes() }
+        Self {
+            stun_listen: None,
+            max_call_minutes: default_max_call_minutes(),
+            media_max_frames_per_second: default_media_max_frames_per_second(),
+            media_max_bytes_per_second: default_media_max_bytes_per_second(),
+            media_drop_bulk_over_share: false,
+        }
     }
 }
 
@@ -1653,7 +1707,12 @@ impl NodeConfig {
 
     /// Bootstrap must inspect configured paths before requiring an identity.
     pub(crate) fn load_before_identity_validation(path: &Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+        let content = std::fs::read_to_string(path).with_context(|| {
+            let shown = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+            format!(
+                "could not read config file {shown:?} (--config defaults to konsensus.toml in the current directory)"
+            )
+        })?;
         // TOML errors include the source line, which may contain a rejected
         // inline password. Never attach the raw parser error to startup logs.
         let mut config: Self = toml::from_str(&content).map_err(|_| {
@@ -1944,7 +2003,7 @@ impl NodeConfig {
             );
         }
 
-        // 2d (Codex #3): the ciphertext relay and price-open admission are
+        // 2d (review #3): the ciphertext relay and price-open admission are
         // SETTLEMENT-GATED — they admit strangers (price_open) or hold paid
         // deposits (relay) on the strength of a settled, recipient-bound payment.
         // With settlement verification resolving OFF (the default for a Mock

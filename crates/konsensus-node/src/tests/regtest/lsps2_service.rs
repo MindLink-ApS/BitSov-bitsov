@@ -30,8 +30,7 @@ async fn fee_source(upstream: String) -> (String, FeeSource) {
                     let client = client.clone();
                     let url = format!("{upstream}/{path}");
                     async move {
-                        let response = client.request(method, url).body(body).send().await.unwrap();
-                        (response.status(), response.bytes().await.unwrap())
+                        infra::forward(&client, method, url, body).await
                     }
                 },
             ),
