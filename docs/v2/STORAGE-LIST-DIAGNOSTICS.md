@@ -90,7 +90,7 @@ time bound, and staged-file merging happen after the scan. Consequently their
 final body can be shorter than the requested limit independently of corruption;
 unreadable counts describe source rows, not only matches of the final filter.
 
-### Continuing bounded scans (#188 / Fable F1)
+### Continuing bounded scans (#188 / review F1)
 
 For messages and search, pass `X-BitSov-Next-Before` as `before` and
 `X-BitSov-Next-Before-Id` as `before_id`, preserving other filters. Timestamps are

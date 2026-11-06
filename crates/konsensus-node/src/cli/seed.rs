@@ -615,7 +615,7 @@ mod tests {
         mnemonic_crypto::read_mnemonic(path, password).is_ok_and(|m| *m == PHRASE)
     }
 
-    /// Codex #150 P1 repro: the plaintext sits at the config writer's temp
+    /// Review #150 P1 repro: the plaintext sits at the config writer's temp
     /// path, and the config directory sync fails after the rename. It must be
     /// refused before anything changes, and the phrase must survive.
     #[test]
