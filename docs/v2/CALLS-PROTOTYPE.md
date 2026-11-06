@@ -67,7 +67,9 @@ next sequence is served, beginning at zero. Replays cannot grant it twice.
 New invoice requests carry `konsensus:call_block:<call_id>:<seq>`; the callee
 checks its own call state before issuing an invoice and again before returning
 it. Less than `CALL_BLOCK_INVOICE_MARGIN_MS` (15 seconds) before `deadline_ms`
-is a clear `call_block_unpayable` refusal with no invoice returned and no payment.
+is a clear `call_block_unpayable` refusal with no invoice returned and no payment,
+and so is a callee holding no E2EE session with the caller: it could not read the
+block, so that minute is never paid for.
 The deadline already includes the 10-second grace (or the 30-second initial
 window). The caller retains its independent 5-second pre-dispatch check.
 
