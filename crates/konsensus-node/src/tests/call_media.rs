@@ -15,7 +15,8 @@ use konsensus_core::types::NodeId;
 use konsensus_message::wire::MAX_CALL_MEDIA_BYTES;
 use konsensus_message::{CallMediaEvent, Frame};
 
-use super::{CallMediaAdmission, CallMediaRouter, MediaCap, MediaDrop, MediaLink, RateCap, MAX_BYTES_PER_SECOND, MAX_FRAMES_PER_SECOND};
+use super::{CallMediaAdmission, CallMediaRouter, MediaCap, MediaDrop, MediaLink, RateCap, MAX_BYTES_PER_SECOND, MAX_FRAMES_PER_SECOND,
+    MEDIA_BURST_BYTES, MEDIA_BURST_FRAMES};
 
 const CALL: &str = "0123456789abcdef0123456789abcdef";
 const OTHER_CALL: &str = "fedcba9876543210fedcba9876543210";
@@ -222,33 +223,113 @@ async fn media_stops_once_the_call_is_no_longer_admitted() {
     assert_eq!(f.router.inbound(event(peer(), CALL, 4, true)).await, Err(MediaDrop::UnknownCall));
 }
 
+/// 20 ms audio: one packet every 20 ms.
+const AUDIO_TICK: Duration = Duration::from_millis(20);
+/// A typical encoded 20 ms audio packet.
+const AUDIO_BYTES: usize = 160;
+
+/// Offer `count` packets of `bytes` spaced `every` apart from `*now`; returns
+/// how many were admitted and leaves `*now` after the last one.
+fn offer(cap: &mut RateCap, now: &mut Instant, count: u32, every: Duration, bytes: usize) -> u32 {
+    let mut admitted = 0;
+    for _ in 0..count {
+        if cap.admit(*now, bytes) {
+            admitted += 1;
+        }
+        *now += every;
+    }
+    admitted
+}
+
 #[test]
-fn rate_cap_bounds_frames_and_bytes_per_second() {
+fn rate_cap_steady_audio_never_drops() {
     let start = Instant::now();
     let mut cap = RateCap::media(start);
-    for _ in 0..MAX_FRAMES_PER_SECOND {
-        assert!(cap.admit(start, 160));
-    }
-    assert!(!cap.admit(start, 160), "frame cap");
-    assert!(!cap.admit(start + Duration::from_millis(999), 160), "still the same window");
-    assert!(cap.admit(start + Duration::from_secs(1), 160), "a new window");
+    let mut now = start;
+    let packets = 50 * 600; // ten minutes at 50 packets per second
+    assert_eq!(offer(&mut cap, &mut now, packets, AUDIO_TICK, AUDIO_BYTES), packets);
+}
 
+#[test]
+fn rate_cap_passes_a_catch_up_burst_after_a_path_stall() {
+    let start = Instant::now();
     let mut cap = RateCap::media(start);
+    let mut now = start;
+    assert_eq!(offer(&mut cap, &mut now, 100, AUDIO_TICK, AUDIO_BYTES), 100, "two seconds of steady audio");
+    // The path stalls for 1.5 s; the backlog (75 packets) then arrives at
+    // once, and live audio carries on at 50 packets per second.
+    now += Duration::from_millis(1500);
+    assert_eq!(offer(&mut cap, &mut now, 75, Duration::ZERO, AUDIO_BYTES), 75, "the catch-up burst");
+    assert_eq!(offer(&mut cap, &mut now, 100, AUDIO_TICK, AUDIO_BYTES), 100, "live audio after the burst");
+}
+
+#[test]
+fn rate_cap_holds_a_sustained_overrun_to_the_frame_rate() {
+    let start = Instant::now();
+    let mut cap = RateCap::media(start);
+    let mut now = start;
+    let seconds = 60;
+    let admitted = offer(&mut cap, &mut now, 150 * seconds, Duration::from_secs(1) / 150, AUDIO_BYTES);
+    let sustained = MAX_FRAMES_PER_SECOND * seconds;
+    assert!(admitted >= sustained, "admitted {admitted}, sustained {sustained}");
+    assert!(admitted <= sustained + MEDIA_BURST_FRAMES, "admitted {admitted} exceeds rate plus burst");
+
+    // At once, never more than the burst.
+    let mut cap = RateCap::media(start);
+    let mut now = start;
+    assert_eq!(offer(&mut cap, &mut now, MEDIA_BURST_FRAMES + 50, Duration::ZERO, AUDIO_BYTES), MEDIA_BURST_FRAMES);
+    assert!(!cap.admit(now, AUDIO_BYTES), "frame budget spent");
+    assert!(cap.admit(now + Duration::from_millis(10), AUDIO_BYTES), "one frame refills in 10 ms");
+    assert!(!cap.admit(now + Duration::from_millis(10), AUDIO_BYTES));
+}
+
+#[test]
+fn rate_cap_bounds_bytes_the_same_way() {
+    let start = Instant::now();
     let per_frame = MAX_CALL_MEDIA_BYTES;
-    let fits = (MAX_BYTES_PER_SECOND as usize) / per_frame;
+
+    // At once: the byte burst passes, to the byte, and nothing more.
+    let mut cap = RateCap::media(start);
+    let fits = (MEDIA_BURST_BYTES as usize) / per_frame;
     for _ in 0..fits {
         assert!(cap.admit(start, per_frame));
     }
-    assert!(!cap.admit(start, per_frame), "byte cap");
+    assert!(!cap.admit(start, per_frame), "byte burst spent");
     assert!(!cap.admit(start, 1), "the byte budget is spent to the byte");
-    assert!(cap.admit(start + Duration::from_secs(1), per_frame));
+    assert!(cap.admit(start + Duration::from_secs(1), MAX_BYTES_PER_SECOND as usize), "one second refills the sustained rate");
+    assert!(!cap.admit(start + Duration::from_secs(1), 1));
 
-    // Under the byte cap, a packet that would cross it is refused but a
-    // smaller one still fits; the refusal counted nothing.
-    let mut cap = RateCap::new(10, 1000, start);
+    // Sustained: 40 full packets per second (160 KiB/s) is held to 64 KiB/s.
+    let mut cap = RateCap::media(start);
+    let mut now = start;
+    let seconds = 60u64;
+    let admitted = offer(&mut cap, &mut now, 40 * seconds as u32, Duration::from_secs(1) / 40, per_frame) as u64;
+    let bytes = admitted * per_frame as u64;
+    let sustained = MAX_BYTES_PER_SECOND * seconds;
+    assert!(bytes + per_frame as u64 >= sustained, "admitted {bytes} bytes, sustained {sustained}");
+    assert!(bytes <= sustained + MEDIA_BURST_BYTES, "admitted {bytes} bytes exceeds rate plus burst");
+}
+
+#[test]
+fn rate_cap_refusal_consumes_nothing() {
+    let start = Instant::now();
+    // A packet that would cross the byte budget is refused, but a smaller
+    // one still fits: the refusal took neither bytes nor a frame.
+    let mut cap = RateCap::new(2, 1000, 2, 1000, start);
     assert!(cap.admit(start, 900));
     assert!(!cap.admit(start, 200));
     assert!(cap.admit(start, 100));
+    assert!(!cap.admit(start, 0), "frame budget spent");
+
+    // A refusal for frames takes no bytes either.
+    // Bytes refill at 1 byte per second here, so any byte credit a refused
+    // packet took would still be missing a second later.
+    let mut cap = RateCap::new(1, 1, 1, 1000, start);
+    assert!(cap.admit(start, 0));
+    for _ in 0..10 {
+        assert!(!cap.admit(start, 100));
+    }
+    assert!(cap.admit(start + Duration::from_secs(1), 1000), "the refused packets took no bytes");
 }
 
 const TIER: MediaLimits = MediaLimits { max_frames_per_second: 160, max_bytes_per_second: 256 * 1024, drop_bulk_over_share: true };
@@ -259,7 +340,7 @@ fn media_cap_with_only_audio_is_the_rate_cap_it_always_was() {
     let mut cap = MediaCap::new(MediaLimits::default(), start);
     let mut old = RateCap::media(start);
     // Sizes every audio packet can have, in a pattern that crosses both caps
-    // and a window boundary.
+    // and repeated credit refills.
     for i in 0..1000u64 {
         let now = start + Duration::from_millis(i * 3);
         let size = [28, 58, 97, 161, 512][i as usize % 5];
@@ -276,13 +357,14 @@ fn media_cap_keeps_the_reservation_free_whatever_order_packets_arrive_in() {
     while cap.admit(start, MAX_CALL_MEDIA_BYTES) {
         bulk += 1;
     }
-    assert_eq!(bulk, limits.bulk_bytes_per_second() / MAX_CALL_MEDIA_BYTES as u64);
-    assert!(bulk * MAX_CALL_MEDIA_BYTES as u64 + RESERVED_PRIORITY_BYTES <= MAX_BYTES_PER_SECOND);
-    // A burst at the start of the window leaves a full second of audio.
+    assert_eq!(bulk, 2 * limits.bulk_bytes_per_second() / MAX_CALL_MEDIA_BYTES as u64);
+    assert!(bulk * MAX_CALL_MEDIA_BYTES as u64 + 2 * RESERVED_PRIORITY_BYTES <= MEDIA_BURST_BYTES);
+    assert!(!cap.admit(start, MAX_CALL_MEDIA_BYTES), "bulk burst spent");
+    // A full bulk burst leaves the audio reservation free.
     for packet in 0..50 {
         assert!(cap.admit(start + Duration::from_millis(packet * 20), 161), "audio packet {packet}");
     }
-    assert!(!cap.admit(start + Duration::from_millis(999), MAX_CALL_MEDIA_BYTES), "bulk stays refused");
+    assert!(cap.admit(start + Duration::from_millis(999), MAX_CALL_MEDIA_BYTES), "bulk credit refills");
 
     // Small bulk packets hit the frame share instead of the byte share.
     let mut cap = MediaCap::new(limits, start);
@@ -290,13 +372,13 @@ fn media_cap_keeps_the_reservation_free_whatever_order_packets_arrive_in() {
     while cap.admit(start, PRIORITY_PACKET_BYTES + 1) {
         bulk += 1;
     }
-    assert_eq!(bulk, MAX_FRAMES_PER_SECOND - RESERVED_PRIORITY_FRAMES);
-    for packet in 0..RESERVED_PRIORITY_FRAMES {
+    assert_eq!(bulk, 2 * (MAX_FRAMES_PER_SECOND - RESERVED_PRIORITY_FRAMES));
+    for packet in 0..2 * RESERVED_PRIORITY_FRAMES {
         assert!(cap.admit(start, 161), "audio packet {packet}");
     }
     assert!(!cap.admit(start, 161), "the whole frame cap still holds");
 
-    // A new window gives the bulk share back, and a refusal counted nothing.
+    // Refill gives the bulk share back, and a refusal spent nothing.
     assert!(cap.admit(start + Duration::from_secs(1), MAX_CALL_MEDIA_BYTES));
 }
 
@@ -306,12 +388,12 @@ fn media_cap_at_the_higher_limits_carries_what_the_default_refuses() {
     let mut wide = MediaCap::new(TIER, start);
     let mut narrow = MediaCap::new(MediaLimits::default(), start);
     let (mut wide_bulk, mut narrow_bulk) = (0, 0);
-    for _ in 0..100 {
+    for _ in 0..200 {
         wide_bulk += u32::from(wide.admit(start, MAX_CALL_MEDIA_BYTES));
         narrow_bulk += u32::from(narrow.admit(start, MAX_CALL_MEDIA_BYTES));
     }
-    assert_eq!(wide_bulk, 61, "(256 - 12) KiB in 4 KiB packets");
-    assert_eq!(narrow_bulk, 13, "(64 - 12) KiB in 4 KiB packets");
+    assert_eq!(wide_bulk, 122, "two seconds of (256 - 12) KiB in 4 KiB packets");
+    assert_eq!(narrow_bulk, 26, "two seconds of (64 - 12) KiB in 4 KiB packets");
     for _ in 0..50 {
         assert!(wide.admit(start, 161));
     }
@@ -385,15 +467,15 @@ async fn configured_limits_reach_routes_in_both_directions_and_the_socket() {
     let attachment = router.attach(&peer(), CALL, None).await.unwrap();
     assert_eq!(attachment.limits, TIER, "the socket's budget is the route's");
 
-    // Inbound: 150 small packets pass where the default stops at 100.
-    for seq in 0..150 {
+    // Inbound: 250 small packets pass where the default burst stops at 200.
+    for seq in 0..250 {
         router.inbound(sized_event(seq, 100)).await.unwrap_or_else(|why| panic!("{seq}: {why:?}"));
         attachment.from_node.try_pop();
     }
     assert_eq!(router.dropped(MediaDrop::RateCapped), 0);
 
     // Outbound: the same count reaches the peer.
-    for seq in 0..150 {
+    for seq in 0..250 {
         attachment.to_node.push(MediaFrame { seq, payload: vec![3; 100] }).unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             while link.sent.lock().unwrap().len() <= seq as usize {
@@ -417,14 +499,26 @@ async fn the_default_router_keeps_the_fixed_limits() {
 async fn inbound_frames_over_the_cap_are_dropped() {
     let f = fixture();
     let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
-    for seq in 0..MAX_FRAMES_PER_SECOND {
-        f.router.inbound(event(peer(), CALL, seq, true)).await.unwrap();
+    // The burst passes at once; credit refills in real time meanwhile, so
+    // the cap may bite a little past the burst but never before it.
+    let mut last_ok = None;
+    let mut capped_at = None;
+    for seq in 0..2 * MEDIA_BURST_FRAMES {
+        match f.router.inbound(event(peer(), CALL, seq, true)).await {
+            Ok(()) => last_ok = Some(seq),
+            Err(reason) => {
+                assert_eq!(reason, MediaDrop::RateCapped);
+                capped_at = Some(seq);
+                break;
+            }
+        }
     }
-    assert_eq!(f.router.inbound(event(peer(), CALL, 999, true)).await, Err(MediaDrop::RateCapped));
+    let capped_at = capped_at.expect("a burst well past the cap is capped");
+    assert!(capped_at >= MEDIA_BURST_FRAMES, "capped at {capped_at}, inside the burst");
     assert_eq!(f.router.dropped(MediaDrop::RateCapped), 1);
     // The queue kept the newest of what was admitted, never the capped one.
     let newest = std::iter::from_fn(|| attachment.from_node.try_pop()).last().unwrap();
-    assert_eq!(newest.seq, MAX_FRAMES_PER_SECOND - 1);
+    assert_eq!(Some(newest.seq), last_ok);
 }
 
 #[tokio::test]
@@ -628,7 +722,7 @@ async fn route_summary_counts_inbound_and_ends_detached() {
     let (logs, _guard) = capture_logs();
     let f = fixture();
     let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
-    let total = MAX_FRAMES_PER_SECOND + 3;
+    let total = MEDIA_BURST_FRAMES + 3;
     for seq in 0..total {
         let _ = f.router.inbound(event(peer(), CALL, seq, true)).await;
     }
@@ -639,9 +733,9 @@ async fn route_summary_counts_inbound_and_ends_detached() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     let line = &lines[0];
     assert_eq!(field(line, "call_id"), CALL);
-    assert_eq!(field(line, "in_forwarded"), MAX_FRAMES_PER_SECOND.to_string());
+    assert_eq!(field(line, "in_forwarded"), MEDIA_BURST_FRAMES.to_string());
     assert_eq!(field(line, "in_rate_capped"), "3");
-    assert_eq!(field(line, "in_evicted"), (MAX_FRAMES_PER_SECOND as usize - MEDIA_QUEUE_FRAMES).to_string());
+    assert_eq!(field(line, "in_evicted"), (MEDIA_BURST_FRAMES as usize - MEDIA_QUEUE_FRAMES).to_string());
     assert_eq!(field(line, "in_not_admitted"), "0");
     assert_eq!(field(line, "out_forwarded"), "0");
     assert_eq!(field(line, "out_evicted"), "0");
@@ -683,7 +777,7 @@ async fn route_summary_counts_outbound_rate_cap() {
     let (logs, _guard) = capture_logs();
     let f = fixture();
     let attachment = f.router.attach(&peer(), CALL, None).await.unwrap();
-    let total = MAX_FRAMES_PER_SECOND + 5;
+    let total = MEDIA_BURST_FRAMES + 5;
     for seq in 0..total {
         attachment.to_node.push(MediaFrame { seq, payload: vec![1; 10] }).unwrap();
         // Let the pump take each packet so the queue never evicts.
@@ -694,7 +788,7 @@ async fn route_summary_counts_outbound_rate_cap() {
     drop(attachment);
     let lines = summaries(&logs);
     assert_eq!(lines.len(), 1, "{lines:?}");
-    assert_eq!(field(&lines[0], "out_forwarded"), MAX_FRAMES_PER_SECOND.to_string());
+    assert_eq!(field(&lines[0], "out_forwarded"), MEDIA_BURST_FRAMES.to_string());
     assert_eq!(field(&lines[0], "out_rate_capped"), "5");
     assert_eq!(field(&lines[0], "out_evicted"), "0");
 }
