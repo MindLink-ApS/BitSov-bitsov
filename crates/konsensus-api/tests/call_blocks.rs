@@ -83,7 +83,10 @@ async fn known_ln_peer_call_block_uses_bound_invoice_and_is_admitted() {
     mutable.transport = transport.clone();
     mutable.storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
     // LightningInfo fills this map in a money-ready connection.
-    state.peer_ln_pubkeys.lock().await.insert(peer, ln_pubkey);
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified(ln_pubkey),
+    );
     let target = konsensus_crypto::SessionManager::new(Arc::new(identity));
     state.session_manager.initiate_session(&peer, &target.prekey_bundle().await).await.unwrap();
     let now = chrono::Utc::now().timestamp_millis() as u64;

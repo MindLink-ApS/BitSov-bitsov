@@ -1,4 +1,5 @@
 use super::*;
+use konsensus_core::lightning_binding::PeerLightningKey;
 use konsensus_core::types::{MessageId, NodeId, Nonce};
 use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
 use konsensus_storage::{SqliteStorage, Storage};
@@ -516,8 +517,11 @@ async fn peer_ln_pubkeys_cleanup_removes_disconnected() {
     let map = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     {
         let mut m = map.lock().await;
-        m.insert(connected_peer, "02aabb".to_string());
-        m.insert(disconnected_peer, "02ccdd".to_string());
+        m.insert(
+            connected_peer,
+            PeerLightningKey::Verified("02aabb".to_string()),
+        );
+        m.insert(disconnected_peer, PeerLightningKey::Unsigned);
     }
 
     // Simulate: only connected_peer is connected
@@ -536,7 +540,7 @@ async fn peer_ln_pubkeys_cleanup_removes_disconnected() {
 /// Empty map: cleanup is a no-op.
 #[tokio::test]
 async fn peer_ln_pubkeys_cleanup_empty_is_noop() {
-    let map: HashMap<NodeId, String> = HashMap::new();
+    let map: HashMap<NodeId, PeerLightningKey> = HashMap::new();
     let connected: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
     let before = map.len();
     // retain on empty does nothing
@@ -551,8 +555,8 @@ async fn peer_ln_pubkeys_cleanup_all_connected_retains_all() {
     let peer_b = NodeId::from_bytes([2u8; 32]);
 
     let mut map = HashMap::new();
-    map.insert(peer_a, "02aa".to_string());
-    map.insert(peer_b, "02bb".to_string());
+    map.insert(peer_a, PeerLightningKey::Verified("02aa".to_string()));
+    map.insert(peer_b, PeerLightningKey::Verified("02bb".to_string()));
 
     let connected: std::collections::HashSet<_> = [peer_a, peer_b].into_iter().collect();
     map.retain(|peer_id, _| connected.contains(peer_id));

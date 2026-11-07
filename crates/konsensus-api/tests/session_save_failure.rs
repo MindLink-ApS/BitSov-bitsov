@@ -43,8 +43,14 @@ async fn fixture() -> Fx {
         calendar_msat: 1000,
         ..Default::default()
     }));
-    state.peer_ln_pubkeys.lock().await.insert(peer, "02aaaa".repeat(5));
-    state.peer_ln_pubkeys.lock().await.insert(other, "02bbbb".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)),
+    );
+    state.peer_ln_pubkeys.lock().await.insert(
+        other,
+        konsensus_api::state::PeerLightningKey::Verified("02bbbb".repeat(5)),
+    );
     Fx { state, store, peer, other, lightning, transport, _dir: dir }
 }
 

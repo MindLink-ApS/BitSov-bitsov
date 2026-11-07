@@ -325,11 +325,10 @@ async fn suspended_room_members_stop_on_revoke() {
             .initiate_session(&peer, &peer_sm.prekey_bundle().await)
             .await
             .unwrap();
-        fx.state
-            .peer_ln_pubkeys
-            .lock()
-            .await
-            .insert(peer, PEER_LN.into());
+        fx.state.peer_ln_pubkeys.lock().await.insert(
+            peer,
+            konsensus_api::state::PeerLightningKey::Verified(PEER_LN.into()),
+        );
         members.push(peer);
     }
     fx.state = Arc::new(AppState {

@@ -5,6 +5,16 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Pay a contact by keysend only at a Lightning key their identity signed. A
+  `LightningInfo` announcement now carries an Ed25519 signature by the node's
+  identity key over a domain-separated binding of its Lightning pubkey; the
+  receiver verifies it and stores only verified bindings. Message payments
+  refuse, before any dispatch, when a contact's advertised key is unsigned or
+  the keysend destination differs from the verified key (a contact that never
+  advertised a key is still paid through the invoice round-trip). A contact on
+  an older version that advertises an unsigned key is refused with the fixed
+  reason "contact must update"; the payment never falls back to an invoice to
+  the unbound node.
 - A node that lost its E2EE session with a connected peer gets it back on the
   same connection. When the lower-id node lost it, about 25 seconds: the higher-id
   peer now answers a PrekeyOffer with its own, at most once per ten seconds per

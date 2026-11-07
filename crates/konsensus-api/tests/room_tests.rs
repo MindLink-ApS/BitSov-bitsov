@@ -30,11 +30,10 @@ async fn porch_room_compose_refuses_page_and_manifest_kinds_before_payment() {
         state.invoice_requests.clone(),
     ));
     Arc::get_mut(&mut state).unwrap().transport = transport.clone();
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(member, "02aaaa".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(
+        member,
+        konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)),
+    );
     let room = Room::new("porch-refusal".into(), *state.identity.node_id());
     state.storage.create_room(&room).await.unwrap();
     state
@@ -963,8 +962,14 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
     // is taken for both members.
     {
         let mut pks = state.peer_ln_pubkeys.lock().await;
-        pks.insert(member_a, "02aaaa".repeat(5));
-        pks.insert(member_b, "02bbbb".repeat(5));
+        pks.insert(
+            member_a,
+            konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)),
+        );
+        pks.insert(
+            member_b,
+            konsensus_api::state::PeerLightningKey::Verified("02bbbb".repeat(5)),
+        );
     }
 
     // ── Announce per-member price tables with distinct base + discount ──

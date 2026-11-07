@@ -406,7 +406,14 @@ pub(crate) async fn run_price_refresh(
 /// that are no longer connected. Without this, the map grows unbounded over
 /// the node's lifetime as unique peers connect and disconnect.
 pub(crate) async fn run_peer_ln_pubkeys_cleanup(
-    peer_ln_pubkeys: Arc<tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::NodeId, String>>>,
+    peer_ln_pubkeys: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                konsensus_core::types::NodeId,
+                konsensus_core::lightning_binding::PeerLightningKey,
+            >,
+        >,
+    >,
     transport: Arc<NoiseTransport>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
