@@ -1842,9 +1842,10 @@ async fn start_node_services<'a>(
 
     // M6 N2: node-routed call media, admitted by N1's settled-block
     // coverage and paid-until grace check.
-    let call_media = call_media::CallMediaRouter::new(
+    let call_media = call_media::CallMediaRouter::with_limits(
         Arc::clone(node.transport()) as Arc<dyn call_media::MediaLink>,
         Arc::new(call_media::PaidCallAdmission::new(Arc::clone(node.storage()))),
+        config.calls.media_limits(),
     );
     let call_media_handle = call_media.spawn(node.shutdown_rx());
 

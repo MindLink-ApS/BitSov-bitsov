@@ -1964,6 +1964,34 @@ async fn auth_user_rejection_body_is_uniform_across_failure_classes() {
     }
 }
 
+/// `[calls] max_call_minutes`: the owner's `/status` reports the node's value so
+/// an app can compute the hold before ringing; the public `/health` never does.
+#[tokio::test]
+async fn status_reports_max_call_minutes_to_the_owner_only() {
+    async fn get(state: &Arc<AppState>, uri: &str, auth: bool) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder().uri(uri);
+        if auth {
+            req = req.header("authorization", auth_header(state));
+        }
+        let resp = build_router(Arc::clone(state)).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+    let state = Arc::new(AppState { max_call_minutes: 45, ..(*test_state()).clone() });
+    let (status, body) = get(&state, "/api/v1/status", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["max_call_minutes"], 45);
+
+    let (status, body) = get(&state, "/api/v1/status", false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.get("max_call_minutes").is_none());
+
+    let (status, body) = get(&state, "/api/v1/health", false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.get("max_call_minutes").is_none());
+}
+
 /// `[calls] stun_listen`: the owner's `/status` reports the STUN port only when
 /// the responder runs; the public `/health` never does.
 #[tokio::test]
