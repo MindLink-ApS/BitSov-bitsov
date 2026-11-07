@@ -51,6 +51,7 @@
       "reservations": [],
       "unreadable_rows": 0
     },
+    "max_call_minutes": 60,
     "money_ready": true,
     "network": "regtest",
     "node_id": "<hex64>",
