@@ -1,0 +1,67 @@
+# Deadlines for every advisory waived in .cargo/audit.toml, deny.toml and
+# osv-scanner.toml. This file is the one source of the dates: each [[waiver]]
+# groups an advisory with its aliases, so they cannot drift apart.
+#
+# cargo-audit and cargo-deny have no expiry field for an ignore, so
+# scripts/check-waiver-deadlines.py enforces these dates for them in CI. The OSV
+# entries repeat the date as `ignoreUntil`, which osv-scanner enforces itself, and
+# the check requires it to match.
+#
+# A waiver stops on its deadline day (UTC). To keep one past that date, recheck the
+# advisory and change the date in a reviewed PR. No advisory here has a specific
+# reason for an earlier date today.
+
+# rsa through sqlx-mysql, which is not compiled.
+[[waiver]]
+ids = ["RUSTSEC-2023-0071"]
+deadline = 2027-02-03
+
+# sqlx 0.8.0.
+[[waiver]]
+ids = ["RUSTSEC-2024-0363", "GHSA-xmrp-424f-vfpx"]
+deadline = 2027-02-03
+
+# Unmaintained crates through sqlx-core 0.8.0.
+[[waiver]]
+ids = ["RUSTSEC-2024-0436"]
+deadline = 2027-02-03
+
+[[waiver]]
+ids = ["RUSTSEC-2025-0134"]
+deadline = 2027-02-03
+
+# rustls-webpki 0.101.7 through rustls 0.21.12.
+[[waiver]]
+ids = ["RUSTSEC-2026-0098", "GHSA-965h-392x-2mh5"]
+deadline = 2027-02-03
+
+[[waiver]]
+ids = ["RUSTSEC-2026-0099", "GHSA-xgp8-3hg3-c2mh"]
+deadline = 2027-02-03
+
+[[waiver]]
+ids = ["RUSTSEC-2026-0104", "GHSA-82j2-j2ch-gfr8"]
+deadline = 2027-02-03
+
+# rustls 0.21.12.
+[[waiver]]
+ids = ["RUSTSEC-2026-0346", "GHSA-c8m5-c952-6cm4"]
+deadline = 2027-02-03
+
+[[waiver]]
+ids = ["RUSTSEC-2026-0349", "GHSA-w44r-93j7-qv28"]
+deadline = 2027-02-03
+
+[[waiver]]
+ids = ["GHSA-h2v8-394m-p7vv"]
+deadline = 2027-02-03
+
+# rustls-webpki 0.101.7 and webpki-roots 0.25.4. CVE-2026-111943 is an alias of both.
+[[waiver]]
+ids = ["RUSTSEC-2026-0382", "RUSTSEC-2026-0381", "CVE-2026-111943"]
+deadline = 2027-02-03
+
+# OSV-only block-buffer advisory; the locked 0.10.4 is outside the affected range.
+[[waiver]]
+ids = ["GHSA-qwgh-2vcv-g2f7"]
+deadline = 2027-02-03

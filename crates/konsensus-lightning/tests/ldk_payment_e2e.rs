@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bitcoin::Amount;
-use electrsd::corepc_node::{self, Node as BitcoinD};
+use electrsd::bitcoind::{self, BitcoinD};
 use electrsd::ElectrsD;
 use konsensus_core::traits::lightning::{LightningProvider, PaymentDirection, PaymentStatus};
 use konsensus_lightning::LdkProvider;
@@ -39,10 +39,10 @@ use sha2::{Digest, Sha256};
 fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
     let bitcoind_exe = std::env::var("BITCOIND_EXE")
         .ok()
-        .or_else(|| corepc_node::downloaded_exe_path().ok())
+        .or_else(|| bitcoind::downloaded_exe_path().ok())
         .expect("Set BITCOIND_EXE env var or enable corepc-node download feature");
 
-    let mut bitcoind_conf = corepc_node::Conf::default();
+    let mut bitcoind_conf = bitcoind::Conf::default();
     bitcoind_conf.network = "regtest";
     bitcoind_conf.args.push("-rest");
     let bitcoind =
