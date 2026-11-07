@@ -6276,12 +6276,13 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     let sessions = session_with(&peer).await;
     let balance = wallet.get_balance_msat().await.unwrap();
     let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
-    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "block", &wallet).await;
+    let mut invoices = ready_invoice_book().await;
+    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "block", &wallet, &mut invoices).await;
     assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert!(wallet.list_payments(10).await.unwrap().is_empty(), "no invoice or payment should be created");
     assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
     storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
-    let issued = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "block-ok", &wallet).await.unwrap();
+    let issued = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "block-ok", &wallet, &mut invoices).await.unwrap();
     assert_eq!(issued.expiry_secs, 5);
     let hash = hex::decode(&issued.payment_hash).unwrap().try_into().unwrap();
     assert!(storage.has_call_block_invoice(&peer, id, 0, &hash).await.unwrap());
@@ -6289,7 +6290,7 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     // An unavailable provenance store withholds the invoice before any payment.
     sqlx::query("CREATE TRIGGER fail_block_invoice BEFORE INSERT ON call_block_invoices BEGIN SELECT RAISE(FAIL, 'test'); END")
         .execute(storage.pool()).await.unwrap();
-    assert_eq!(prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "write-fails", &wallet).await.unwrap_err(),
+    assert_eq!(prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "write-fails", &wallet, &mut invoices).await.unwrap_err(),
         konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
 }
@@ -6322,22 +6323,360 @@ async fn call_block_invoice_is_refused_without_a_session() {
     let wallet = konsensus_lightning::MockLightningProvider::new();
     let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
     let sessions = session_with(&peer).await;
+    let mut invoices = ready_invoice_book().await;
 
     assert!(sessions.remove_session(&peer).await);
-    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "no-session", &wallet).await;
+    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "no-session", &wallet, &mut invoices).await;
     assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert!(wallet.list_payments(10).await.unwrap().is_empty(), "the wallet was not asked for an invoice");
 
     let sessions = session_with(&peer).await;
     sessions.mark_needs_renegotiation(&peer).await;
-    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "disputed", &wallet).await;
+    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "disputed", &wallet, &mut invoices).await;
     assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert!(wallet.list_payments(10).await.unwrap().is_empty(), "nor for a session being renegotiated");
 
     let sessions = session_with(&peer).await;
-    let issued = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "session-back", &wallet).await.unwrap();
+    let issued = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "session-back", &wallet, &mut invoices).await.unwrap();
     let hash = hex::decode(&issued.payment_hash).unwrap().try_into().unwrap();
     assert!(storage.has_call_block_invoice(&peer, id, 0, &hash).await.unwrap());
+}
+
+const CALL_WALLET_ISSUE: usize = 0;
+const CALL_WALLET_DEFINITE: usize = 1;
+const CALL_WALLET_AMBIGUOUS: usize = 2;
+const CALL_WALLET_ZERO_EXPIRY: usize = 3;
+
+struct CallBlockWallet {
+    inner: konsensus_lightning::MockLightningProvider,
+    creates: AtomicUsize,
+    asked_expiry: AtomicUsize,
+    mode: AtomicUsize,
+}
+
+impl CallBlockWallet {
+    fn new(mode: usize) -> Self {
+        Self {
+            inner: konsensus_lightning::MockLightningProvider::new(),
+            creates: AtomicUsize::new(0),
+            asked_expiry: AtomicUsize::new(0),
+            mode: AtomicUsize::new(mode),
+        }
+    }
+
+    fn creates(&self) -> usize {
+        self.creates.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl LightningProvider for CallBlockWallet {
+    async fn create_invoice(
+        &self,
+        amount_msat: u64,
+        description: &str,
+        expiry_secs: u32,
+    ) -> Result<
+        konsensus_core::traits::lightning::Invoice,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        self.asked_expiry
+            .store(expiry_secs as usize, Ordering::SeqCst);
+        match self.mode.load(Ordering::SeqCst) {
+            CALL_WALLET_DEFINITE => Err(
+                konsensus_core::traits::lightning::LightningError::InvoiceCreation(
+                    "rejected".into(),
+                ),
+            ),
+            CALL_WALLET_AMBIGUOUS => Err(
+                konsensus_core::traits::lightning::LightningError::Backend("timeout".into()),
+            ),
+            CALL_WALLET_ZERO_EXPIRY => {
+                let mut invoice = self
+                    .inner
+                    .create_invoice(amount_msat, description, expiry_secs)
+                    .await?;
+                invoice.expiry_secs = 0;
+                Ok(invoice)
+            }
+            CALL_WALLET_ISSUE => {
+                self.inner
+                    .create_invoice(amount_msat, description, expiry_secs)
+                    .await
+            }
+            _ => Err(
+                konsensus_core::traits::lightning::LightningError::InvoiceCreation(
+                    "unknown test mode".into(),
+                ),
+            ),
+        }
+    }
+
+    async fn pay_invoice(
+        &self,
+        bolt11: &str,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.inner.pay_invoice(bolt11).await
+    }
+
+    async fn get_payment_status(
+        &self,
+        hash: &str,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.inner.get_payment_status(hash).await
+    }
+
+    async fn get_balance_msat(
+        &self,
+    ) -> Result<u64, konsensus_core::traits::lightning::LightningError> {
+        self.inner.get_balance_msat().await
+    }
+
+    async fn list_payments(
+        &self,
+        limit: u32,
+    ) -> Result<
+        Vec<konsensus_core::traits::lightning::PaymentDetails>,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.inner.list_payments(limit).await
+    }
+
+    async fn is_available(&self) -> bool {
+        true
+    }
+}
+
+struct DueCallBlock {
+    storage: konsensus_storage::SqliteStorage,
+    peer: NodeId,
+    call_id: String,
+    purpose: String,
+    sessions: SessionManager,
+}
+
+impl DueCallBlock {
+    async fn open() -> Self {
+        use konsensus_core::payloads::call as calls;
+        let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+        let peer = test_peer_id();
+        let call_id = "0123456789abcdef0123456789abcdef".to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let ringing = calls::receive(None, 400, None, now - 16_000).unwrap();
+        let pending = calls::reserve(Some(ringing), 401, "answer", "hash", now - 16_000).unwrap();
+        let live = calls::commit(pending, "answer", now - 16_000).unwrap();
+        storage
+            .call_put(
+                &peer,
+                &call_id,
+                &calls::CallEntry {
+                    deadline_ms: now + 30_000,
+                    ..live
+                },
+            )
+            .await
+            .unwrap();
+        let sessions = session_with(&peer).await;
+        let purpose = format!("{}{call_id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
+        Self {
+            storage,
+            peer,
+            call_id,
+            purpose,
+            sessions,
+        }
+    }
+}
+
+async fn dispatch_call_block(
+    due: &DueCallBlock,
+    request_id: &str,
+    wallet: &CallBlockWallet,
+    transport: &Arc<NoiseTransport>,
+    invoices: &mut crate::peer_invoices::PeerInvoiceBook,
+) {
+    handle_call_block_invoice_requested(
+        &due.peer,
+        request_id,
+        23_000,
+        &due.purpose,
+        true,
+        &due.storage,
+        &due.sessions,
+        wallet,
+        transport,
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::invoice_refusals::RefusalLimits::default(),
+        invoices,
+    )
+    .await;
+}
+
+async fn repeat_call_dispatch(
+    count: usize,
+    prefix: &str,
+    due: &DueCallBlock,
+    wallet: &CallBlockWallet,
+    transport: &Arc<NoiseTransport>,
+    invoices: &mut crate::peer_invoices::PeerInvoiceBook,
+) {
+    for n in 0..count {
+        dispatch_call_block(due, &format!("{prefix}-{n}"), wallet, transport, invoices).await;
+    }
+}
+
+#[tokio::test]
+async fn call_block_fifth_unpaid_invoice_is_refused_before_wallet_creation() {
+    let due = DueCallBlock::open().await;
+    let wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    let transport = make_gossip_test_transport();
+    let mut invoices = ready_invoice_book().await;
+    let cap = crate::peer_invoices::PEER_OUTSTANDING_CAP;
+    repeat_call_dispatch(cap, "unpaid", &due, &wallet, &transport, &mut invoices).await;
+    assert_eq!(wallet.creates(), cap);
+    assert_eq!(
+        wallet.asked_expiry.load(Ordering::SeqCst),
+        konsensus_core::payloads::call::CALL_BLOCK_INVOICE_EXPIRY_SECS as usize
+    );
+    dispatch_call_block(&due, "unpaid-over", &wallet, &transport, &mut invoices).await;
+    assert_eq!(
+        wallet.creates(),
+        cap,
+        "the fifth unpaid call invoice must be refused before wallet creation"
+    );
+    let payments = wallet.list_payments(10).await.unwrap();
+    assert_eq!(payments.len(), cap);
+    for payment in &payments {
+        let hash = hex::decode(&payment.payment_hash)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(due
+            .storage
+            .has_call_block_invoice(&due.peer, &due.call_id, 0, &hash)
+            .await
+            .unwrap());
+    }
+}
+
+#[tokio::test]
+async fn call_block_attempt_rate_limit_is_refused_before_wallet_creation() {
+    let due = DueCallBlock::open().await;
+    let wallet = CallBlockWallet::new(CALL_WALLET_DEFINITE);
+    let transport = make_gossip_test_transport();
+    let mut invoices = ready_invoice_book().await;
+    let burst = crate::peer_invoices::PEER_RATE_BURST;
+    // A definite creation failure consumes a rate slot and leaves no outstanding
+    // row, so this stops on the attempt limit rather than the unpaid cap.
+    repeat_call_dispatch(burst, "rate", &due, &wallet, &transport, &mut invoices).await;
+    assert_eq!(wallet.creates(), burst);
+    dispatch_call_block(&due, "rate-over", &wallet, &transport, &mut invoices).await;
+    assert_eq!(
+        wallet.creates(),
+        burst,
+        "an excessive call attempt must be refused before wallet creation"
+    );
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn call_block_invoice_before_reconciliation_is_refused_before_wallet_creation() {
+    let due = DueCallBlock::open().await;
+    let wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    let transport = make_gossip_test_transport();
+    let mut cold = crate::peer_invoices::PeerInvoiceBook::default();
+    dispatch_call_block(&due, "before-reconcile", &wallet, &transport, &mut cold).await;
+    assert_eq!(
+        wallet.creates(),
+        0,
+        "call issuance before reconciliation must be refused before wallet creation"
+    );
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+
+    let mut ready = ready_invoice_book().await;
+    dispatch_call_block(&due, "after-reconcile", &wallet, &transport, &mut ready).await;
+    assert_eq!(wallet.creates(), 1);
+    assert_eq!(wallet.list_payments(10).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn call_block_bind_failure_still_occupies_an_invoice_slot() {
+    let due = DueCallBlock::open().await;
+    sqlx::query(
+        "CREATE TRIGGER fail_block_invoice BEFORE INSERT ON call_block_invoices BEGIN SELECT RAISE(FAIL, 'test'); END",
+    )
+    .execute(due.storage.pool())
+    .await
+    .unwrap();
+    let wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    let transport = make_gossip_test_transport();
+    let mut invoices = ready_invoice_book().await;
+    let cap = crate::peer_invoices::PEER_OUTSTANDING_CAP;
+    repeat_call_dispatch(cap, "unbindable", &due, &wallet, &transport, &mut invoices).await;
+    assert_eq!(wallet.creates(), cap);
+    let bound: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_block_invoices")
+        .fetch_one(due.storage.pool())
+        .await
+        .unwrap();
+    assert_eq!(bound, 0);
+    dispatch_call_block(&due, "unbindable-over", &wallet, &transport, &mut invoices).await;
+    assert_eq!(
+        wallet.creates(),
+        cap,
+        "a stored wallet invoice must count even when call binding fails"
+    );
+    assert_eq!(wallet.list_payments(10).await.unwrap().len(), cap);
+}
+
+#[tokio::test]
+async fn call_block_ambiguous_creation_occupies_an_invoice_slot() {
+    let due = DueCallBlock::open().await;
+    let wallet = CallBlockWallet::new(CALL_WALLET_AMBIGUOUS);
+    let transport = make_gossip_test_transport();
+    let mut invoices = ready_invoice_book().await;
+    let cap = crate::peer_invoices::PEER_OUTSTANDING_CAP;
+    repeat_call_dispatch(cap, "ambiguous", &due, &wallet, &transport, &mut invoices).await;
+    assert_eq!(wallet.creates(), cap);
+    dispatch_call_block(&due, "ambiguous-over", &wallet, &transport, &mut invoices).await;
+    assert_eq!(
+        wallet.creates(),
+        cap,
+        "an ambiguous call create must hold a slot before another wallet attempt"
+    );
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn call_block_book_commits_the_invoice_expiry() {
+    let due = DueCallBlock::open().await;
+    let wallet = CallBlockWallet::new(CALL_WALLET_ZERO_EXPIRY);
+    let transport = make_gossip_test_transport();
+    let mut invoices = ready_invoice_book().await;
+    let past_cap = crate::peer_invoices::PEER_OUTSTANDING_CAP + 1;
+    repeat_call_dispatch(
+        past_cap,
+        "expired",
+        &due,
+        &wallet,
+        &transport,
+        &mut invoices,
+    )
+    .await;
+    assert_eq!(
+        wallet.creates(),
+        past_cap,
+        "a call invoice occupies the book only until its own expiry"
+    );
 }
 
 #[tokio::test]

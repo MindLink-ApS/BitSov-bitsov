@@ -20,8 +20,9 @@ use tracing::{debug, error, info, warn};
 use konsensus_core::admission_quote;
 use konsensus_core::identity::NodeIdentity;
 use konsensus_core::kind::KindCategory;
+use konsensus_core::payloads::call as calls;
 use konsensus_core::traits::chain::ChainProvider;
-use konsensus_core::traits::lightning::LightningProvider;
+use konsensus_core::traits::lightning::{LightningError, LightningProvider};
 use konsensus_core::traits::pricing::PricingEngine;
 use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::types::NodeId;
@@ -411,23 +412,21 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } => {
                         if purpose.starts_with(konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX) {
-                            if privileged {
-                                let result = prepare_call_block_invoice(storage.as_ref(), &session_manager, &peer_id, &purpose, amount_msat, &request_id, lightning.as_ref()).await;
-                                match result {
-                                    Ok(invoice) => {
-                                        let _ = transport.send_frame(&peer_id, &Frame::InvoiceResponse {
-                                            request_id, bolt11: invoice.bolt11, payment_hash: invoice.payment_hash,
-                                        }).await;
-                                    },
-                                    Err(reason) => {
-                                        if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
-                                            send_invoice_refusal(&transport, &peer_id, &request_id, reason).await;
-                                        }
-                                    },
-                                }
-                            } else if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
-                                send_invoice_refusal(&transport, &peer_id, &request_id, konsensus_api::invoice_refusal::ADMISSION_REQUIRED).await;
-                            }
+                            handle_call_block_invoice_requested(
+                                &peer_id,
+                                &request_id,
+                                amount_msat,
+                                &purpose,
+                                privileged,
+                                storage.as_ref(),
+                                &session_manager,
+                                lightning.as_ref(),
+                                &transport,
+                                source_ip,
+                                &mut last_admission_refusal,
+                                &mut peer_invoices,
+                            )
+                            .await;
                             continue;
                         }
                         handle_invoice_requested_gated(
@@ -2768,42 +2767,181 @@ async fn handle_gossip_received(
 }
 
 
+/// Call-block requests share the service-invoice book with every other
+/// admitted peer request. Strangers still get only the admission refusal.
+#[allow(clippy::too_many_arguments)]
+async fn handle_call_block_invoice_requested(
+    peer_id: &NodeId,
+    request_id: &str,
+    amount_msat: u64,
+    purpose: &str,
+    privileged: bool,
+    storage: &dyn konsensus_storage::Storage,
+    session_manager: &SessionManager,
+    lightning: &dyn LightningProvider,
+    transport: &Arc<NoiseTransport>,
+    source_ip: std::net::IpAddr,
+    refusals: &mut crate::invoice_refusals::RefusalLimits,
+    invoices: &mut crate::peer_invoices::PeerInvoiceBook,
+) {
+    if !privileged {
+        if refusals.permit(source_ip, tokio::time::Instant::now()) {
+            send_invoice_refusal(
+                transport,
+                peer_id,
+                request_id,
+                konsensus_api::invoice_refusal::ADMISSION_REQUIRED,
+            )
+            .await;
+        }
+        return;
+    }
+    match prepare_call_block_invoice(
+        storage,
+        session_manager,
+        peer_id,
+        purpose,
+        amount_msat,
+        request_id,
+        lightning,
+        invoices,
+    )
+    .await
+    {
+        Ok(invoice) => {
+            let response = Frame::InvoiceResponse {
+                request_id: request_id.to_string(),
+                bolt11: invoice.bolt11,
+                payment_hash: invoice.payment_hash,
+            };
+            let _ = transport.send_frame(peer_id, &response).await;
+        }
+        Err(reason) => {
+            if refusals.permit(source_ip, tokio::time::Instant::now()) {
+                send_invoice_refusal(transport, peer_id, request_id, reason).await;
+            }
+        }
+    }
+}
+
 /// Refuse before touching the wallet and again after asynchronous creation.
 /// No invoice is returned to the caller when the safety margin is exhausted,
 /// or while this node has no E2EE session with the caller, or one it is waiting
 /// to renegotiate: the block could not be read, so the minute would be paid and
 /// not served. The caller pays nothing and may ask again once the session is back.
+///
+/// The shared invoice book admits the request after those call checks and
+/// before the wallet. A successful create is committed with that invoice's own
+/// expiry even when a later recheck or binding fails. An ambiguous create keeps
+/// a hold for the call-invoice window; only a definite creation failure leaves
+/// no outstanding row.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_call_block_invoice(
-    storage: &dyn konsensus_storage::Storage, session_manager: &SessionManager, peer: &NodeId, purpose: &str,
-    amount_msat: u64, request_id: &str, lightning: &dyn LightningProvider,
+    storage: &dyn konsensus_storage::Storage,
+    session_manager: &SessionManager,
+    peer: &NodeId,
+    purpose: &str,
+    amount_msat: u64,
+    request_id: &str,
+    lightning: &dyn LightningProvider,
+    invoices: &mut crate::peer_invoices::PeerInvoiceBook,
 ) -> Result<konsensus_core::traits::lightning::Invoice, &'static str> {
-    use konsensus_core::payloads::call as calls;
     const REFUSED: &str = konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE;
-    if lightning.disk_status().is_some_and(|status| status.disk_low) { return Err("disk_low"); }
-    let (call_id, seq) = purpose.strip_prefix(calls::CALL_BLOCK_INVOICE_PREFIX)
-        .and_then(|s| s.split_once(':')).ok_or(REFUSED)?;
+    if lightning
+        .disk_status()
+        .is_some_and(|status| status.disk_low)
+    {
+        return Err("disk_low");
+    }
+    let (call_id, seq) = purpose
+        .strip_prefix(calls::CALL_BLOCK_INVOICE_PREFIX)
+        .and_then(|s| s.split_once(':'))
+        .ok_or(REFUSED)?;
     let seq: u32 = seq.parse().map_err(|_| REFUSED)?;
     // Parse the bounded schema as well as the numeric sequence.
-    calls::CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK,
-        &serde_json::json!({"call_id": call_id, "seq": seq}).to_string()).map_err(|_| REFUSED)?;
+    calls::CallSignal::parse(
+        konsensus_core::kind::KIND_CALL_BLOCK,
+        &serde_json::json!({"call_id": call_id, "seq": seq}).to_string(),
+    )
+    .map_err(|_| REFUSED)?;
     let validate = async || {
-        if !session_manager.has_session(peer).await || session_manager.needs_renegotiation(peer).await {
-            warn!(peer = %peer, "no readable E2EE session with the caller; call block invoice refused");
+        if !session_manager.has_session(peer).await
+            || session_manager.needs_renegotiation(peer).await
+        {
+            warn!(
+                peer = %peer,
+                "no readable E2EE session with the caller; call block invoice refused"
+            );
             return Err(REFUSED);
         }
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default().as_millis() as u64;
-        let entry = storage.call_get(peer, call_id).await.map_err(|_| REFUSED)?.ok_or(REFUSED)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let entry = storage
+            .call_get(peer, call_id)
+            .await
+            .map_err(|_| REFUSED)?
+            .ok_or(REFUSED)?;
         calls::validate_block_invoice(&entry, seq, now).map_err(|_| REFUSED)?;
-        Ok::<_, &'static str>(entry.deadline_ms.saturating_add(calls::CALL_BLOCK_RESUME_MS))
+        Ok::<_, &'static str>(
+            entry
+                .deadline_ms
+                .saturating_add(calls::CALL_BLOCK_RESUME_MS),
+        )
     };
     validate().await?;
-    let invoice = lightning.create_invoice(amount_msat, &format!("konsensus:{request_id}"),
-        calls::CALL_BLOCK_INVOICE_EXPIRY_SECS).await.map_err(invoice_refusal_reason)?;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Err(limit) = invoices.try_issue(peer, std::time::Instant::now(), now_unix) {
+        debug!(
+            peer = %peer,
+            %request_id,
+            ?limit,
+            "refusing call-block invoice request"
+        );
+        return Err(limit.reason());
+    }
+    let invoice = match lightning
+        .create_invoice(
+            amount_msat,
+            &format!("konsensus:{request_id}"),
+            calls::CALL_BLOCK_INVOICE_EXPIRY_SECS,
+        )
+        .await
+    {
+        Ok(invoice) => {
+            // Account before binding. A later validation or storage failure
+            // must not drop a wallet invoice that already exists.
+            let expires_at = invoice
+                .created_at
+                .saturating_add(u64::from(invoice.expiry_secs));
+            invoices.commit(*peer, invoice.payment_hash.clone(), expires_at);
+            invoice
+        }
+        Err(error) => {
+            // Only InvoiceCreation proves the wallet stored nothing.
+            if !matches!(error, LightningError::InvoiceCreation(_)) {
+                invoices.hold_unconfirmed(
+                    *peer,
+                    request_id,
+                    now_unix.saturating_add(u64::from(calls::CALL_BLOCK_INVOICE_EXPIRY_SECS)),
+                );
+            }
+            return Err(invoice_refusal_reason(error));
+        }
+    };
     let retain_until = validate().await?;
-    let hash: [u8; 32] = hex::decode(&invoice.payment_hash).map_err(|_| REFUSED)?
-        .try_into().map_err(|_| REFUSED)?;
-    storage.record_call_block_invoice(peer, call_id, seq, &hash, retain_until).await.map_err(|_| REFUSED)?;
+    let hash: [u8; 32] = hex::decode(&invoice.payment_hash)
+        .map_err(|_| REFUSED)?
+        .try_into()
+        .map_err(|_| REFUSED)?;
+    storage
+        .record_call_block_invoice(peer, call_id, seq, &hash, retain_until)
+        .await
+        .map_err(|_| REFUSED)?;
     // Storage can take time too. Never publish after the stop-early margin.
     validate().await?;
     Ok(invoice)
