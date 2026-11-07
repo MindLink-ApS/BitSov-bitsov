@@ -607,7 +607,10 @@ only on the owner-local API router (`build_router`), never on the remote tunnel
 router, the bootstrap router, the LAN box page or any peer surface. The handler
 additionally refuses any request that carries a tunnel identity and any source
 that is not loopback, so a bridged or LAN request is refused even if a future
-deployment mounted the route elsewhere.
+deployment mounted the route elsewhere. The route also uses the same Host and
+Origin allowlist as `POST /api/v1/auth/local`: a missing, duplicate, or foreign
+Host, or a foreign Origin, is `403` with `local_host_forbidden` or
+`local_origin_forbidden` and does not spend the per-actor display budget.
 
 Callers must hold a live token (`read`) and be either a local console session
 (a token without a pairing binding: `POST /api/v1/auth/local` or the node-key
@@ -615,7 +618,8 @@ challenge) or a paired client that holds an enrolled owner device key for its
 current epoch (the same chain `pair/ticket` and `/delegate` verify). A plain
 read/receive pairing, a provisional enrollment, a bootstrap token or a retired
 key is refused with `403 owner_device_required`; a tunnel or LAN source with
-`403 owner_console_only`. Reads are limited to five per minute per actor (the
+`403 owner_console_only`; a foreign Host or Origin with the local-admission
+codes above. Reads are limited to five per minute per actor (the
 console session or the pairing) with `429`; refused requests do not consume
 the budget of another actor.
 
