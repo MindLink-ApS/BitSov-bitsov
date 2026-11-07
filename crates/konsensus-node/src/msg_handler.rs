@@ -1275,11 +1275,13 @@ async fn process_file_message(
         ));
     }
 
+    let size_bytes = u64::try_from(file_data.len())
+        .map_err(|_| ReceiptRefusal::NotPersisted("the file could not be stored"))?;
     let file = konsensus_storage::FileRecord {
         id: uuid::Uuid::new_v4().to_string(),
         filename: payload.filename.clone(),
         mime_type: payload.mime_type.clone(),
-        size_bytes: payload.size_bytes,
+        size_bytes,
         blake3_hash: hash,
         sender: sender.to_hex(),
         message_id: Some(envelope.id.to_hex()),
@@ -1295,7 +1297,7 @@ async fn process_file_message(
         sender = %sender,
         file_id = %file_id,
         filename = %payload.filename,
-        size = payload.size_bytes,
+        size = size_bytes,
         "stored received file"
     );
     audit.record(
@@ -1304,7 +1306,7 @@ async fn process_file_message(
         Some(serde_json::json!({
             "file_id": file_id,
             "filename": payload.filename,
-            "size_bytes": payload.size_bytes,
+            "size_bytes": size_bytes,
             "message_id": envelope.id.to_hex(),
         })),
     );

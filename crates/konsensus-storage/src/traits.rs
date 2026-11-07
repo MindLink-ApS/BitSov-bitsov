@@ -1185,6 +1185,12 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("call state".into()))
     }
 
+    /// How many invoice bindings are stored for this peer, call and sequence.
+    /// Callers check this before asking the wallet for another invoice.
+    async fn call_block_invoice_count(&self, _peer: &NodeId, _call_id: &str, _seq: u32) -> Result<u32, StorageError> {
+        Err(StorageError::Unsupported("call block invoice provenance".into()))
+    }
+
     /// Bind an invoice hash to the peer and block before publishing it.
     /// Stored separately from replay receipts; duplicates cannot rebind a hash.
     /// Refuse past MAX_CALL_BLOCK_INVOICES per (peer, call_id, seq), retaining
