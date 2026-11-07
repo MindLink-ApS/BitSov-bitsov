@@ -27,7 +27,6 @@ struct Fx {
 async fn fixture() -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(konsensus_storage::SqliteStorage::open(dir.path().join("node.sqlite").to_str().unwrap()).await.unwrap());
-    sqlx::raw_sql("CREATE TABLE calendar_events (id TEXT PRIMARY KEY, message_id TEXT, organizer TEXT NOT NULL, title TEXT NOT NULL, description TEXT, start_ms BIGINT, end_ms BIGINT, tz TEXT, location TEXT, attendees_json TEXT, recurrence_json TEXT, color TEXT, created_at TEXT NOT NULL DEFAULT '', parent_id TEXT)").execute(db.pool()).await.unwrap();
     let lightning = Arc::new(CountingLightning::default());
     let mut state = test_state_with_lightning(lightning.clone());
     let store = Arc::new(FlakySessionStore::default());
