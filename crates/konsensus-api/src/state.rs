@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
-use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, oneshot, RwLock};
 
 use konsensus_core::gate::PaymentGate;
 use konsensus_core::identity::NodeIdentity;
@@ -98,15 +98,16 @@ pub struct AppState {
     /// JWT signing secret.
     pub jwt_secret: String,
 
+    /// Volatile, quota-limited uploads; never persisted before send.
+    pub file_staging: Arc<std::sync::Mutex<crate::file_staging::FileStaging>>,
+
     /// Single-use authentication challenges.
     ///
     /// `/api/v1/auth/token` must not verify a replayable static string. The
     /// challenge endpoint writes short-lived challenge strings here and token
-    /// issuance consumes them exactly once.
-    /// Volatile, quota-limited uploads; never persisted before send.
-    pub file_staging: Arc<std::sync::Mutex<crate::file_staging::FileStaging>>,
-
-    pub auth_challenges: Arc<Mutex<HashMap<String, Instant>>>,
+    /// issuance consumes them exactly once. Each source has a rate limit and a
+    /// cap; at the cap that source's oldest challenge is replaced.
+    pub auth_challenges: Arc<crate::auth_challenge::AuthChallenges>,
 
     /// Client pairing and owner-approved elevation (#76).
     ///

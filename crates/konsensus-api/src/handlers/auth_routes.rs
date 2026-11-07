@@ -1,9 +1,12 @@
 //! Authentication endpoints — token issuance.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, Extension, State};
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rand::RngCore;
@@ -11,11 +14,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::events;
 use crate::auth;
+use crate::auth_challenge;
 use crate::error::ApiError;
 use crate::state::AppState;
 
 const AUTH_CHALLENGE_TTL: Duration = Duration::from_secs(120);
-const AUTH_CHALLENGE_MAX_LIVE: usize = 128;
 
 /// Authentication challenge response.
 #[derive(Serialize)]
@@ -45,10 +48,54 @@ pub struct TokenResponse {
     pub expires_at: i64,
 }
 
+enum ChallengeRejection {
+    Api(ApiError),
+    Local(crate::local_request::LocalRequestRejection),
+}
+
+impl From<ApiError> for ChallengeRejection {
+    fn from(error: ApiError) -> Self {
+        Self::Api(error)
+    }
+}
+
+impl IntoResponse for ChallengeRejection {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Api(error) => error.into_response(),
+            Self::Local(error) => error.into_response(),
+        }
+    }
+}
+
 /// `GET /api/v1/auth/challenge` — issue a short-lived single-use challenge.
+///
+/// The local listener uses the same Host and Origin admission as local token
+/// minting: Host must name this API, and Origin, when the caller sends one,
+/// must name this API or a configured local app origin. The remote router has
+/// no local policy and skips that check. Admission runs before the per-source
+/// rate limit, so a rejected header does not spend a source's budget.
 async fn issue_challenge(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ChallengeResponse>, ApiError> {
+    policy: Option<Extension<crate::local_request::LocalRequestPolicy>>,
+    headers: HeaderMap,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    remote_client: Option<Extension<crate::rate_limit::RemotePairingRateLimitKey>>,
+) -> Result<Json<ChallengeResponse>, ChallengeRejection> {
+    if let Some(Extension(policy)) = policy {
+        policy
+            .validate(&headers)
+            .map_err(ChallengeRejection::Local)?;
+    }
+
+    let source = if let Some(Extension(client)) = remote_client {
+        auth_challenge::pairing_source(&client.0)
+    } else {
+        let peer =
+            connect_info.ok_or_else(|| ApiError::Internal("client address unavailable".into()))?;
+        auth_challenge::peer_source(peer.0.ip())
+    };
+
     let mut nonce = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
 
@@ -67,15 +114,14 @@ async fn issue_challenge(
         expires_at.timestamp()
     );
 
-    let mut challenges = state.auth_challenges.lock().await;
-    let now_instant = Instant::now();
-    challenges.retain(|_, expires| *expires > now_instant);
-    if challenges.len() >= AUTH_CHALLENGE_MAX_LIVE {
-        return Err(ApiError::TooManyRequests(
-            "too many outstanding auth challenges".into(),
-        ));
-    }
-    challenges.insert(challenge.clone(), now_instant + AUTH_CHALLENGE_TTL);
+    state
+        .auth_challenges
+        .insert(
+            &source,
+            challenge.clone(),
+            Instant::now() + AUTH_CHALLENGE_TTL,
+        )
+        .await?;
 
     Ok(Json(ChallengeResponse {
         challenge,
@@ -96,15 +142,7 @@ async fn issue_token(
         return Err(ApiError::BadRequest("challenge is required".into()));
     }
 
-    let now = Instant::now();
-    let mut challenges = state.auth_challenges.lock().await;
-    let expires_at = challenges.remove(challenge).ok_or_else(|| {
-        ApiError::Unauthorized("auth challenge is unknown or already used".into())
-    })?;
-    if expires_at <= now {
-        return Err(ApiError::Unauthorized("auth challenge expired".into()));
-    }
-    drop(challenges);
+    state.auth_challenges.consume(challenge).await?;
 
     // Decode the signature
     let sig_bytes = hex::decode(&req.signature)
@@ -201,8 +239,12 @@ async fn issue_local_token(
 
     let node_id_hex = state.identity.node_id().to_hex();
 
-    let token = auth::create_token(&node_id_hex, &state.jwt_secret, auth::Scope::loopback_only())
-        .map_err(|e| ApiError::Internal(format!("token creation failed: {e}")))?;
+    let token = auth::create_token(
+        &node_id_hex,
+        &state.jwt_secret,
+        auth::Scope::loopback_only(),
+    )
+    .map_err(|e| ApiError::Internal(format!("token creation failed: {e}")))?;
 
     let claims = auth::validate_token(&token, &state.jwt_secret)
         .map_err(|e| ApiError::Internal(format!("token validation failed: {e}")))?;

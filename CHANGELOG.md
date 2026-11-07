@@ -5,6 +5,11 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Count a home-setup cancel only when a pairing is in progress, cap pending
+  pairing requests per client key and in a shared pool, and refuse further
+  requests at either cap without evicting an existing ceremony.
+- Limit local sign-in challenges per source, rate-limit issuance, and apply
+  the local token route's Host and Origin admission to challenge issuance.
 - A node that lost its E2EE session with a connected peer gets it back on the
   same connection. When the lower-id node lost it, about 25 seconds: the higher-id
   peer now answers a PrekeyOffer with its own, at most once per ten seconds per

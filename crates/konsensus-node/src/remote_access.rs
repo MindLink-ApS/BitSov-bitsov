@@ -87,7 +87,7 @@ impl konsensus_api::bootstrap::setup::SetupTickets for HomeTickets {
         });
         Ok(uri)
     }
-    fn cancel(&self) -> Result<(), SetupTicketError> {
+    fn cancel(&self) -> Result<bool, SetupTicketError> {
         // Same lock as consumption: no in-flight ticket can claim after revocation.
         // Match mailbox import lock order. Drain tickets published before this action.
         let _file =
@@ -99,13 +99,18 @@ impl konsensus_api::bootstrap::setup::SetupTickets for HomeTickets {
         if !self.pairing.bound_fingerprint().is_empty() {
             return Err(SetupTicketError);
         }
+        let had_code = active
+            .as_ref()
+            .is_some_and(|code| code.expires_at > tokio::time::Instant::now());
         *active = None;
-        for client in self.pairing.list_clients() {
+        let clients = self.pairing.list_clients();
+        let had_clients = !clients.is_empty();
+        for client in clients {
             self.pairing
                 .revoke(&client.client_id)
                 .map_err(|_| SetupTicketError)?;
         }
-        Ok(())
+        Ok(had_code || had_clients)
     }
 }
 
@@ -808,7 +813,8 @@ async fn handle_connection(
         let ciphertext = wire::read_frame(&mut remote_reader, wire::MAX_TRANSPORT_FRAME).await?;
         let plaintext = wire::decode_transport(&mut noise, &ciphertext, wire::MAX_AUTH_PLAINTEXT)
             .map_err(anyhow::Error::msg)?;
-        konsensus_core::wire_json::from_slice::<AuthRequest>(&plaintext).context("invalid remote auth request")
+        konsensus_core::wire_json::from_slice::<AuthRequest>(&plaintext)
+            .context("invalid remote auth request")
     };
     let request = tokio::select! {
         _ = shutdown.changed() => return Ok(()),
@@ -1587,6 +1593,47 @@ mod tests {
             ),
             Err(konsensus_api::pairing::PairingError::Closed)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn home_ticket_cancel_counts_only_live_tickets_or_paired_clients() {
+        use konsensus_api::bootstrap::{setup::SetupTickets, BootstrapState, DataDirLayout};
+        let dir = tempfile::tempdir().unwrap();
+        let pairing = Arc::new(
+            PairingService::open(dir.path(), String::new(), false)
+                .unwrap()
+                .without_stdout_code(),
+        );
+        let bootstrap = Arc::new(BootstrapState::new(
+            DataDirLayout::new(dir.path()),
+            pairing.clone(),
+        ));
+        let tickets = HomeTickets {
+            active: Arc::new(Mutex::new(None)),
+            pairing: pairing.clone(),
+            endpoints: vec!["192.168.1.2:9737".into()],
+            bootstrap,
+        };
+        assert!(!tickets.cancel().unwrap());
+        tickets.mint(Duration::from_secs(1)).unwrap();
+        assert!(tickets.cancel().unwrap());
+        assert!(!tickets.cancel().unwrap());
+        // Include the exact expiry boundary, with the real cached authority.
+        for elapsed in [1, 2] {
+            tickets.mint(Duration::from_secs(1)).unwrap();
+            tokio::time::advance(Duration::from_secs(elapsed)).await;
+            assert!(!tickets.cancel().unwrap(), "expired tickets are not live");
+            assert!(tickets.active.lock().unwrap().is_none());
+        }
+        tickets.mint(Duration::from_secs(1)).unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let public = hex::encode(SigningKey::from_bytes(&[71; 32]).verifying_key().to_bytes());
+        pairing
+            .create_bootstrap_ticket_pairing("bootstrap client", &public, &[72; 32])
+            .unwrap();
+        assert!(tickets.cancel().unwrap(), "revoking a client still counts");
+        assert!(pairing.list_clients().is_empty());
+        assert!(!tickets.cancel().unwrap());
     }
 
     #[tokio::test]

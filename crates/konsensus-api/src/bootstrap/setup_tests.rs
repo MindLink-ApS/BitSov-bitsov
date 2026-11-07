@@ -1,4 +1,6 @@
 use super::*;
+use std::sync::atomic::AtomicBool;
+
 use axum::{
     body::{to_bytes, Body},
     http::Request,
@@ -301,13 +303,14 @@ async fn body_read_has_an_absolute_deadline() {
     assert_eq!(response.headers()["connection"], "close");
 }
 
-struct Tickets;
+struct Tickets(AtomicBool);
 impl SetupTickets for Tickets {
     fn mint(&self, _: Duration) -> Result<String, SetupTicketError> {
+        self.0.store(true, Ordering::SeqCst);
         Ok("bitsov://pair/test".into())
     }
-    fn cancel(&self) -> Result<(), SetupTicketError> {
-        Ok(())
+    fn cancel(&self) -> Result<bool, SetupTicketError> {
+        Ok(self.0.swap(false, Ordering::SeqCst))
     }
 }
 fn fixture() -> (tempfile::TempDir, Arc<BootstrapState>, Arc<SetupPage>) {
@@ -320,7 +323,7 @@ fn fixture() -> (tempfile::TempDir, Arc<BootstrapState>, Arc<SetupPage>) {
     ));
     let page = Arc::new(SetupPage::new(
         Some(bootstrap.clone()),
-        Some(Arc::new(Tickets)),
+        Some(Arc::new(Tickets(AtomicBool::new(false)))),
         vec!["bitsov.local:8080".into()],
         "Box".into(),
         "setup".into(),
@@ -513,9 +516,179 @@ async fn window_and_three_cancels_close_setup_and_restart_reopens() {
         )
         .await
         .status(),
+        StatusCode::OK,
+        "cancel with nothing in progress leaves setup open"
+    );
+    // One live ticket, then two cancels of the already-cleared pairing.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(
+        request(
+            &page2,
+            "POST",
+            "/setup/cancel",
+            "192.168.1.2:1",
+            "bitsov.local:8080",
+            Some((&cookie, &csrf)),
+            serde_json::json!({})
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    tokio::time::advance(Duration::from_secs(10)).await;
+    for _ in 0..2 {
+        assert_eq!(
+            request(
+                &page2,
+                "POST",
+                "/setup/cancel",
+                "192.168.1.2:1",
+                "bitsov.local:8080",
+                Some((&cookie, &csrf)),
+                serde_json::json!({})
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(
+        request(
+            &page2,
+            "POST",
+            "/setup/start",
+            "192.168.1.2:1",
+            "bitsov.local:8080",
+            Some((&cookie, &csrf)),
+            serde_json::json!({})
+        )
+        .await
+        .status(),
+        StatusCode::OK,
+        "a repeated cancel of a cleared pairing does not close setup"
+    );
+
+    let (_dir3, _bootstrap3, page3) = fixture();
+    let (cookie, csrf) = session(&page3).await;
+    for n in 0..3 {
+        if n == 2 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+        }
+        assert_eq!(
+            request(
+                &page3,
+                "POST",
+                "/setup/start",
+                "192.168.1.2:1",
+                "bitsov.local:8080",
+                Some((&cookie, &csrf)),
+                serde_json::json!({})
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                &page3,
+                "POST",
+                "/setup/cancel",
+                "192.168.1.2:1",
+                "bitsov.local:8080",
+                Some((&cookie, &csrf)),
+                serde_json::json!({})
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(
+        request(
+            &page3,
+            "POST",
+            "/setup/start",
+            "192.168.1.2:1",
+            "bitsov.local:8080",
+            Some((&cookie, &csrf)),
+            serde_json::json!({})
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let (_dir4, _bootstrap4, page4) = fixture();
+    let (cookie, csrf) = session(&page4).await;
+    assert_eq!(
+        request(
+            &page4,
+            "POST",
+            "/setup/start",
+            "192.168.1.2:1",
+            "bitsov.local:8080",
+            Some((&cookie, &csrf)),
+            serde_json::json!({})
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_ceremony_cancel_counts_and_a_cleared_ceremony_does_not() {
+    let (_dir, bootstrap, page) = fixture();
+    let (cookie, csrf) = session(&page).await;
+    for n in 0..3 {
+        if n == 2 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+        }
+        *bootstrap.pending.lock().unwrap() = Some(super::super::PendingIdentity {
+            ceremony_id: "ceremony".into(),
+            mnemonic: zeroize::Zeroizing::new("secret recovery phrase".into()),
+            node_id: "pending-id".into(),
+            fingerprint: "pending-fp".into(),
+            client_id: "client".into(),
+            created_at: tokio::time::Instant::now(),
+            backup_check: [0, 1, 2],
+            failed_backup_attempts: 0,
+            password_commitment: None,
+            sas: None,
+        });
+        assert_eq!(
+            request(
+                &page,
+                "POST",
+                "/setup/cancel",
+                "192.168.1.2:1",
+                "bitsov.local:8080",
+                Some((&cookie, &csrf)),
+                serde_json::json!({})
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(bootstrap.pending.lock().unwrap().is_none());
+    }
+    assert_eq!(
+        request(
+            &page,
+            "POST",
+            "/setup/start",
+            "192.168.1.2:1",
+            "bitsov.local:8080",
+            Some((&cookie, &csrf)),
+            serde_json::json!({})
+        )
+        .await
+        .status(),
         StatusCode::FORBIDDEN
     );
 }
+
 #[tokio::test]
 async fn approval_only_sets_flag_for_exact_pending_digest_and_status_hides_secrets() {
     let (dir, bootstrap, page) = fixture();
