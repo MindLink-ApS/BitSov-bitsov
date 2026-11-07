@@ -13,7 +13,11 @@ struct Offline;
 #[async_trait]
 impl LightningProvider for Offline {
     fn disk_status(&self) -> Option<DiskStatus> {
-        Some(DiskStatus { disk_low: true, disk_free_bytes: Some(123), disk_free_floor_bytes: 2147483648 })
+        Some(DiskStatus {
+            disk_low: true,
+            disk_free_bytes: Some(123),
+            disk_free_floor_bytes: 2147483648,
+        })
     }
     async fn create_invoice(&self, _: u64, _: &str, _: u32) -> Result<Invoice, LightningError> {
         panic!("offline invoice dispatched")
@@ -44,11 +48,11 @@ async fn offline_money_routes_return_not_ready() {
         ),
         (
             "pay",
-            serde_json::json!({"bolt11":"unparsed-while-offline"}),
+            serde_json::json!({"request_id":"offline-pay","bolt11":"unparsed-while-offline"}),
         ),
         (
             "keysend",
-            serde_json::json!({"dest_pubkey":"02".to_string()+&"11".repeat(32),"amount_msat":1000}),
+            serde_json::json!({"request_id":"offline-keysend","dest_pubkey":"02".to_string()+&"11".repeat(32),"amount_msat":1000}),
         ),
         (
             "open-channel",

@@ -355,11 +355,17 @@ async fn previous_sqlite_version_upgrades_without_data_loss() {
     let db = SqliteStorage::open(db_path.to_str().unwrap())
         .await
         .expect("upgrade to current schema");
-    let applied: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
-        .fetch_one(db.pool())
+    let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+        .fetch_all(db.pool())
         .await
         .unwrap();
-    assert_eq!(applied, 33);
+    assert_eq!(
+        applied,
+        super::embedded_migration_versions(),
+        "a version-32 database must apply 033 and the later call migrations, and must not apply 034"
+    );
+    assert!(applied.contains(&33));
+    assert!(!applied.contains(&34));
 
     let loaded_peer = db.get_peer(&peer).await.unwrap().expect("peer survived");
     assert_eq!(loaded_peer.node_id, peer);

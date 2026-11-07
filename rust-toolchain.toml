@@ -1,0 +1,20 @@
+# Pinned Rust toolchain for CI and local builds (see docs/ci/RUST-TOOLCHAIN.md).
+#
+# CI used to run floating `stable` while contributors built on older local
+# toolchains, so a new clippy lint could break CI after a PR was reviewed
+# (#388, `result_large_err`). Every workflow reads this file and installs
+# exactly this version; `cargo` picks it up locally through rustup.
+#
+# This is the development and CI toolchain, not the minimum supported one
+# (`rust-version` in Cargo.toml) and not the release-binary toolchain
+# (`scripts/release-toolchain`, which fixes the reproducible build inputs).
+#
+# To bump: change `channel` to the new exact `x.y.z`, then run
+# `cargo clippy --workspace --all-targets -- -D warnings` and
+# `cargo test --workspace --no-fail-fast` on that version and fix whatever
+# the new lints flag in the same PR. Keep an exact version, never a channel
+# name such as `stable`, so CI and local runs cannot drift apart.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

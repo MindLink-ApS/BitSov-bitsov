@@ -23,8 +23,7 @@ impl OwnerConsole {
     fn confirmation(&self, label: &str) -> String {
         let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
         text.lines()
-            .filter(|line| line.starts_with(&format!("{label} CODE ")))
-            .next_back()
+            .rfind(|line| line.starts_with(&format!("{label} CODE ")))
             .unwrap_or_else(|| panic!("owner console has no confirmation for {label}"))
             .to_owned()
     }
@@ -103,10 +102,20 @@ fn paired_client(
     (service, client.client_id, token)
 }
 
-/// New Atlas fixture options; legacy tests keep their original setup.
+/// New TEST5 fixture options; legacy tests keep their original setup.
 pub struct Options {
     pub identity: Arc<NodeIdentity>,
     pub chain_url: String,
+    pub calls: Option<CallOptions>,
+    pub owner_approval_key: Option<ed25519_dalek::VerifyingKey>,
+}
+
+/// Production call settings; the block clock is never shortened by the fixture.
+pub struct CallOptions {
+    pub block_msat: u64,
+    pub max_minutes: u16,
+    pub offer_msat: u64,
+    pub chat_msat: u64,
 }
 
 struct NoTerminal;
@@ -122,19 +131,22 @@ impl std::io::Write for NoTerminal {
 fn read_only_client(
     dir: &std::path::Path,
     node: &NodeIdentity,
+    owner_approval_key: Option<ed25519_dalek::VerifyingKey>,
 ) -> (Arc<konsensus_api::pairing::PairingService>, String, String) {
     use ed25519_dalek::Signer;
     use konsensus_api::pairing::{self, PairingService};
-    let service = Arc::new(
-        PairingService::open(
-            dir,
-            pairing::identity_fingerprint(&node.node_id().to_hex()),
-            true,
-        )
-        .unwrap()
-        .with_owner_console(Box::new(NoTerminal))
-        .without_stdout_code(),
-    );
+    let service = PairingService::open(
+        dir,
+        pairing::identity_fingerprint(&node.node_id().to_hex()),
+        true,
+    )
+    .unwrap()
+    .with_owner_console(Box::new(NoTerminal))
+    .without_stdout_code();
+    let service = Arc::new(match owner_approval_key {
+        Some(key) => service.with_owner_approval_key(key),
+        None => service,
+    });
     let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
     let pubkey = hex::encode(key.verifying_key().to_bytes());
     let clients = service.list_clients();
@@ -180,7 +192,8 @@ pub struct App {
     pub received: tokio::sync::broadcast::Receiver<Arc<konsensus_api::state::WsMessage>>,
     router: axum::Router,
     remote_router: Option<axum::Router>,
-    token: String,
+    pub(super) token: String,
+    pub(super) media_addr: Option<SocketAddr>,
     pub service: Arc<konsensus_api::pairing::PairingService>,
     pub client: String,
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -247,7 +260,11 @@ impl App {
         });
         sessions.restore_sessions().await;
         let pairing = if options.is_some() {
-            read_only_client(&dir.join("pairing"), identity)
+            read_only_client(
+                &dir.join("pairing"),
+                identity,
+                options.as_ref().and_then(|o| o.owner_approval_key),
+            )
         } else {
             paired_client(
                 &dir.join("pairing"),
@@ -265,6 +282,13 @@ impl App {
             }
         }
         let invoice_requests: InvoiceRequests = Default::default();
+        let calls = options.as_ref().and_then(|o| o.calls.as_ref());
+        let media = calls.map(|_| {
+            crate::call_media::CallMediaRouter::new(
+                transport.clone(),
+                Arc::new(crate::call_media::PaidCallAdmission::new(storage.clone())),
+            )
+        });
         let state = Arc::new(konsensus_api::AppState {
             starter: Default::default(),
             identity: Arc::clone(identity),
@@ -282,7 +306,10 @@ impl App {
             ),
             pricing: Arc::new(konsensus_pricing::StaticPricingEngine::new(
                 konsensus_pricing::StaticPricingConfig {
-                    chat_msat: 2_001,
+                    chat_msat: calls.map_or(2_001, |c| c.chat_msat),
+                    call_block_msat: calls.map_or(10_000, |c| c.block_msat),
+                    // Tests choose offer and block tariffs independently.
+                    call_msat: calls.map_or(10_000, |c| c.offer_msat),
                     ..Default::default()
                 },
             )),
@@ -332,7 +359,12 @@ impl App {
             front_door: Default::default(),
             sponsor: Default::default(),
             stun_port: None,
+            max_call_minutes: calls.map_or(60, |c| c.max_minutes),
+            configured_stun_server: None,
             custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+            call_media: media
+                .clone()
+                .map(|m| m as Arc<dyn konsensus_api::call_media::CallMediaPort>),
             recovery_dir: None,
             gossip_validator: None,
             file_staging: Default::default(),
@@ -381,7 +413,7 @@ impl App {
                 ws_delivery_tx: state.ws_delivery_broadcast.clone(),
                 pending_tx,
                 starter_hub_tx: None,
-        starter_newcomer_tx: None,
+                starter_newcomer_tx: None,
                 auto_channel_tx,
                 shutdown_rx: shutdown_rx.clone(),
             },
@@ -435,6 +467,26 @@ impl App {
                 ))
         });
         let mut tasks = vec![session, messages];
+        let media_addr = if let Some(media) = media {
+            tasks.push(media.spawn(shutdown.subscribe()));
+            let addr = infra::loopback().parse::<SocketAddr>().unwrap();
+            let api_state = state.clone();
+            let api_shutdown = shutdown.subscribe();
+            // Use production serve, including its real one-second expiry and
+            // reservation maintenance timers, not a test-driven expiry loop.
+            tasks.push(tokio::spawn(async move {
+                konsensus_api::serve(addr, api_state, api_shutdown)
+                    .await
+                    .unwrap();
+            }));
+            wait("owner media API listening", || async {
+                tokio::net::TcpStream::connect(addr).await.is_ok()
+            })
+            .await;
+            Some(addr)
+        } else {
+            None
+        };
         #[cfg(unix)]
         if options.is_some() {
             use konsensus_api::control::{ControlContext, ControlServer, ReplacementGuard};
@@ -468,6 +520,7 @@ impl App {
             service,
             client,
             token,
+            media_addr,
             shutdown,
             tasks,
         }
@@ -519,7 +572,7 @@ impl App {
             .unwrap();
         let status = response.status();
         // Scope extractors return text/plain; keep their exact refusal body so
-        // the Atlas scenario can assert it. JSON endpoints remain strict.
+        // the TEST5 scenario can assert it. JSON endpoints remain strict.
         let plain = response
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
@@ -547,7 +600,7 @@ impl App {
         assert_eq!(
             status,
             StatusCode::OK,
-            "Atlas run 4 relaunch: remote challenge {body}"
+            "TEST5 run 4 relaunch: remote challenge {body}"
         );
         let challenge = body["challenge"].as_str().unwrap();
         let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
@@ -564,7 +617,7 @@ impl App {
         assert_eq!(
             status,
             StatusCode::OK,
-            "Atlas run 4 relaunch: remote token {body}"
+            "TEST5 run 4 relaunch: remote token {body}"
         );
         self.token = body["token"].as_str().unwrap().to_owned();
         body["scopes"].clone()

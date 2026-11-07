@@ -1,5 +1,8 @@
 # Home node: unlock after a restart
 
+For a first developer node on signet without remote unlock, start with the
+[signet quickstart](../QUICKSTART-SIGNET.md) instead.
+
 Run one process, data directory, identity and password per person. Use one
 command throughout setup and later reboots:
 
@@ -97,8 +100,33 @@ user, starts at boot, and restarts after failures and setup exit 75. The older
 [konsensus.service user unit](konsensus.service) remains available for existing
 installations. Run only one service against a data directory.
 
-On a Linux system with systemd, from the repository root, install the verified
-binary at `/usr/bin/konsensus` and create the account and data directory:
+On a Linux system with systemd, from the repository root, verify the release
+directory and install the Linux binary at `/usr/bin/konsensus`. The install
+runs only when the verifier exits 0. The verifier checks the detached
+signature's primary-key fingerprint and every hash in `SHA256SUMS`. It copies
+`SHA256SUMS`, `SHA256SUMS.asc`, and each of the seventeen payloads into a
+private mode-0700 seal directory and hashes those copies. Copying the manifest
+does not seal the payloads. Install from the seal path the script prints.
+Mode 0700 stops a different user from writing the seal. It does not stop a
+process running as the same user. The script does not install and does not
+download the key or the binaries. `RELEASE_KEY.asc` is the reviewed copy, not
+a file fetched from `main`.
+
+```sh
+out=$(bash scripts/verify-release.sh /path/to/download RELEASE_KEY.asc) &&
+  printf '%s\n' "$out" &&
+  seal=$(printf '%s\n' "$out" | sed -n 's/^verify-release: sealed //p') &&
+  test -n "$seal" &&
+  test -f "$seal/bitsov-linux-x86_64" &&
+  test ! -L "$seal/bitsov-linux-x86_64" &&
+  sudo install -m 0755 "$seal/bitsov-linux-x86_64" /usr/bin/konsensus &&
+  bash scripts/verify-release.sh --cleanup "$seal"
+```
+
+On `aarch64`, install `bitsov-linux-aarch64` from that same seal in place of
+`bitsov-linux-x86_64`.
+
+Then create the account and data directory:
 
 ```sh
 sudo useradd --system --user-group --home-dir /var/lib/bitsov --shell /usr/sbin/nologin bitsov
@@ -288,7 +316,7 @@ Unlock promptly after every restart; do not treat these estimates as guarantees.
 The local watchtower client core cannot yet send to a guard. There is no active
 keyless watch-only protection in W2a. Started with `--remote-unlock`,
 the node therefore opens and accepts new channels only with the configured
-hub/LSPs (see [hub-only channels](#hub-only-channels-hub_only_while_lockable)).
+hub/LSPs (see [channel capacity and hub-only admission](#channel-capacity-and-hub-only-admission)).
 A longer breach window (below) gives more time to unlock but does not lift that
 rule.
 
@@ -552,7 +580,7 @@ Set a human-readable box label independently of custody:
 
 ```toml
 [node]
-hosted_by = "Rasmus's Pi"
+hosted_by = "Alice's Pi"
 ```
 
 The label appears in tickets, `/api/v1/node/lock` and `/api/v1/health` (`null` when
@@ -860,9 +888,14 @@ konsensus claim-code --show --config /var/lib/bitsov/konsensus.toml
 
 Run as the data-directory owner from a console (including the existing owner SSH
 console). Redirection will not capture the code: the command requires and writes
-to the terminal itself. It is never available via the app, API, pairing link or
-tunnel. Do not delete or edit the file; it is stable across restarts and stored
-with `0600` permissions. A damaged code file fails closed.
+to the terminal itself. On a live node the app can also show it to the owner
+through the loopback-only, owner-authenticated `GET /api/v1/owner/claim-code`
+(a local console session or an already enrolled owner device), and only while a
+new device's claim-bound enrollment is waiting for it. It is never available via
+the pairing link, the tunnel, the LAN box page or an ordinary pairing. Do not
+delete or edit the file; it is stable across restarts and stored with `0600`
+permissions. A damaged code file fails closed. See
+[owner claim-code display](../security/pairing.md#owner-claim-code-display).
 
 SAS-capable clients opt into four BIP-39 comparison words bound to the completed
 Noise session, device key, fresh box nonce and this physical code. Enter only the
@@ -885,7 +918,7 @@ On an owner-managed node started with `--owner-control`, run this in another
 terminal under the same OS account (use the running node's config path):
 
 ```sh
-konsensus peer add --node-id <64hex> --addr 203.0.113.7:9735 --label Dad --config /path/to/konsensus.toml
+konsensus peer add --node-id <64hex> --addr 203.0.113.7:9735 --label Bob --config /path/to/konsensus.toml
 ```
 
 Review the node ID, fingerprint, address and label, then press Enter. Use `--yes`

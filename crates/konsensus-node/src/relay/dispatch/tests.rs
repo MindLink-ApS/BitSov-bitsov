@@ -127,7 +127,7 @@ async fn ack_is_idempotent_within_own_binding() {
 
 // An ack carrying more than MAX_RELAY_ACK_IDS message_ids fails DURING parse
 // (the bounded_ack_ids streaming visitor aborts at cap + 1, never materializing
-// an attacker-sized Vec — Codex #2 / HARD-1 doctrine). The boundary value
+// an attacker-sized Vec — review #2 / HARD-1 doctrine). The boundary value
 // (exactly the cap) parses and is accepted.
 #[tokio::test]
 async fn ack_rejects_oversized_message_ids_t_cap() {

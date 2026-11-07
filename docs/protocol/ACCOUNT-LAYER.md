@@ -1,7 +1,7 @@
 # Account layer (normative)
 
 Status: normative for M1. Source of direction: identity model v2
-(`MindLink-Private/pm/projects/bitsov/research/RELATION-LADDER-AND-DEVICE-KEYS.md`).
+(an internal design note).
 Every **GAP** marks where the code does not yet meet this spec.
 
 BitSov has no accounts and no passwords. There is one seed per person-node,

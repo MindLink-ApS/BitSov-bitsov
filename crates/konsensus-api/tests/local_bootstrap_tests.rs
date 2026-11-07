@@ -1626,7 +1626,15 @@ async fn approve_on_box(r: &Remote, body: &Value) {
         .header("x-csrf-token", csrf)
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({"ceremony_id":body["ceremony_id"],"sas_digest":body["sas_digest"]}).to_string(),
+            json!({
+                "ceremony_id": body["ceremony_id"],
+                // The owner approves the four words the box page showed, which the
+                // phone derives from the same digest; the page never sees the digest.
+                "words": konsensus_api::sas::words(
+                    &blake3::Hash::from_hex(body["sas_digest"].as_str().unwrap()).unwrap()
+                ),
+            })
+            .to_string(),
         ))
         .unwrap();
     req.extensions_mut().insert(peer);

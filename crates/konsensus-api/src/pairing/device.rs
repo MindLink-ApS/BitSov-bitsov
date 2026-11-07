@@ -153,6 +153,20 @@ impl std::fmt::Debug for DeviceSas {
         f.write_str("DeviceSas([REDACTED])")
     }
 }
+/// What an owner-authenticated claim-code display may show. Carries no secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimWindow {
+    /// A claim-bound enrollment awaits the code until `expires_at` (Unix seconds).
+    Open {
+        expires_at: i64,
+        device_name: String,
+    },
+    /// The box is claimed and no claim-bound enrollment is pending.
+    Claimed,
+    /// Three SAS mismatches closed claim-bound enrollment until restart.
+    Closed,
+}
+
 impl PendingDeviceKey {
     pub(super) fn sas_ttl_secs(&self) -> i64 {
         if self.sas_version == Some(2) {
@@ -1465,6 +1479,57 @@ impl PairingService {
         })
     }
 
+    /// An enrolled owner device: any registered key of this pairing at its
+    /// current epoch whose owner approval still verifies. A plain read/receive
+    /// pairing, a provisional enrollment or a retired key has no such key.
+    pub fn owner_device_for(&self, client_id: &str, epoch: u64) -> Result<DeviceKey, PairingError> {
+        let inner = self.lock();
+        let key_ids: Vec<String> = inner
+            .file
+            .device_keys
+            .iter()
+            .filter(|k| k.client_id == client_id && k.epoch == epoch)
+            .map(|k| k.key_id.clone())
+            .collect();
+        let mut refusal =
+            PairingError::NotGrantable("no enrolled owner device for this pairing".into());
+        for key_id in key_ids {
+            match self.intent_key(&inner, client_id, epoch, &key_id) {
+                Ok(key) => return Ok(key),
+                Err(e) => refusal = e,
+            }
+        }
+        Err(refusal)
+    }
+
+    /// Whether a claim-bound (SAS v1) enrollment is waiting for the box claim
+    /// code. Owner-only callers use this to decide whether to display the code;
+    /// it never returns the code, its commitment, the nonce or the digest.
+    pub fn claim_window(&self) -> ClaimWindow {
+        let inner = self.lock();
+        if inner.sas_failures >= 3 {
+            return ClaimWindow::Closed;
+        }
+        let now = chrono::Utc::now().timestamp();
+        inner
+            .file
+            .pending_device_keys
+            .iter()
+            .filter(|op| op.sas_version == Some(1) && op.expires_at > now)
+            .find_map(|op| {
+                let sas = op.sas.as_ref().filter(|s| !s.confirmed)?;
+                let remaining = op.sas_ttl_secs().saturating_sub(
+                    i64::try_from(sas.created_at.elapsed().as_secs()).unwrap_or(i64::MAX),
+                );
+                let expires_at = op.expires_at.min(now.saturating_add(remaining));
+                (expires_at > now).then(|| ClaimWindow::Open {
+                    expires_at,
+                    device_name: op.name.clone(),
+                })
+            })
+            .unwrap_or(ClaimWindow::Claimed)
+    }
+
     /// The registered key an intent names, for this client at its current
     /// epoch, or why not.
     /// Fail closed while device authority is off node-wide.
@@ -1597,7 +1662,7 @@ mod tests {
     use crate::spend_budget::{BudgetRefusal, Charge};
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
-    /// Codex #146 P1: A has a 60 s envelope, B a 3600 s one. A payment to A
+    /// Review #146 P1: A has a 60 s envelope, B a 3600 s one. A payment to A
     /// reserved inside A's window must not dispatch after it, even though B
     /// keeps the shared grant alive.
     #[test]
@@ -1732,7 +1797,7 @@ mod clock_tests {
     use super::*;
     use crate::spend_budget::{BudgetRefusal, Charge};
 
-    /// Codex #146 delta: the dispatch deadline is judged at the moment the
+    /// Review #146 delta: the dispatch deadline is judged at the moment the
     /// lock is held, not when the caller arrived. The clock runs only after
     /// the lock is acquired (it would deadlock re-locking otherwise), and a
     /// clock read then that is past the deadline refuses.

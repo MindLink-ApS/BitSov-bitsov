@@ -951,7 +951,10 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
+        configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });

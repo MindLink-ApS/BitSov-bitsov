@@ -311,6 +311,7 @@ mod tests {
             peer_pubkey: peer_pubkey.to_string(),
             capacity_msat: 50_000_000,
             local_balance_msat: 50_000_000,
+            outbound_capacity_msat: None,
             remote_balance_msat: 0,
             active,
             short_channel_id: None,
