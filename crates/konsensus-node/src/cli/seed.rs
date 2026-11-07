@@ -363,12 +363,30 @@ fn shred(path: &Path) -> std::io::Result<()> {
 /// from a file the owner opted into. Only a regular file (not a symlink) with
 /// no group or other permissions (0600 or 0400) is accepted.
 pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
+    let mut file = open_password_file(path)?;
+    let mut raw = Zeroizing::new(String::new());
+    std::io::Read::read_to_string(&mut file, &mut raw).with_context(|| format!("cannot read {}", path.display()))?;
+    let pw = Zeroizing::new(raw.trim_end_matches(['\n', '\r']).to_string());
+    if pw.is_empty() {
+        anyhow::bail!("the password file {} is empty", path.display());
+    }
+    Ok(pw)
+}
+
+/// Whether the node can verify that only this OS user can read `path`. False
+/// on a platform without Unix modes: there is nothing to check there, so an
+/// owner setting that depends on it stays refused.
+pub fn password_file_is_owner_only(path: &Path) -> bool {
+    cfg!(unix) && open_password_file(path).is_ok()
+}
+
+fn open_password_file(path: &Path) -> Result<std::fs::File> {
     let before = std::fs::symlink_metadata(path)
         .with_context(|| format!("cannot read the password file {}", path.display()))?;
     if !before.is_file() {
         anyhow::bail!("{} is not a regular file (symlinks are refused)", path.display());
     }
-    let mut file = std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     // Check the file actually opened, not just the name: a swap between the
     // check and the open is refused.
     let meta = file.metadata()?;
@@ -391,13 +409,7 @@ pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
             anyhow::bail!("{} is owned by another user; refusing it", path.display());
         }
     }
-    let mut raw = Zeroizing::new(String::new());
-    std::io::Read::read_to_string(&mut file, &mut raw).with_context(|| format!("cannot read {}", path.display()))?;
-    let pw = Zeroizing::new(raw.trim_end_matches(['\n', '\r']).to_string());
-    if pw.is_empty() {
-        anyhow::bail!("the password file {} is empty", path.display());
-    }
-    Ok(pw)
+    Ok(file)
 }
 
 #[cfg(test)]

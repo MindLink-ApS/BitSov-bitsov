@@ -108,13 +108,15 @@ pub enum Command {
         /// Read that password from a file instead of prompting. Opt-in: only a
         /// regular file readable by its owner alone (chmod 600) is accepted.
         /// Any program running as you can read it, including a paired app, so
-        /// it protects the seed from other OS users only.
+        /// it protects the seed from other OS users only. Touch ID stays off unless
+        /// the owner sets [pairing] unattended_device_approvals.
         #[arg(long)]
         password_file: Option<PathBuf>,
 
         /// Read the password once to EOF from an inherited descriptor (0 = stdin).
         /// UTF-8, at most 4096 bytes; trailing CR/LF is removed. Touch ID requires
-        /// --local-owner-device too. Nonzero descriptors require Unix.
+        /// --local-owner-device too, or the owner's [pairing] unattended_device_approvals.
+        /// Nonzero descriptors require Unix.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..), conflicts_with_all = ["password", "password_file"], group = "owner_password")]
         password_fd: Option<i32>,
 

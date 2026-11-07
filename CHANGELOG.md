@@ -5,6 +5,14 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- New owner setting `[pairing] unattended_device_approvals` (default off): a box
+  with an encrypted seed and its password in an owner-only file or a descriptor
+  can load the owner's approval verifier, so device approvals work while nobody
+  is at the keyboard. Whoever gets the disk and the password file can then
+  approve as the owner; the node says so at start. Refused for a plaintext seed,
+  a password on the command line, and a machine declared as run for someone else.
+  What an approval can authorize and all spending limits are unchanged.
+
 - A node that lost its E2EE session with a connected peer gets it back on the
   same connection. When the lower-id node lost it, about 25 seconds: the higher-id
   peer now answers a PrekeyOffer with its own, at most once per ten seconds per

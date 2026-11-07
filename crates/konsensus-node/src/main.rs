@@ -161,10 +161,10 @@ async fn main() -> Result<()> {
             let local_owner_device = local_owner_device || home;
             let password_source = if remote_unlock || home {
                 PasswordSource::RemoteUnlock
-            } else if password_fd.is_some() {
-                PasswordSource::Descriptor
-            } else if password_file.is_some() {
-                PasswordSource::File
+            } else if let Some(fd) = password_fd {
+                PasswordSource::Descriptor(InputAccess::of(password::descriptor_is_owner_only(fd)))
+            } else if let Some(path) = &password_file {
+                PasswordSource::File(InputAccess::of(seed_cmd::password_file_is_owner_only(path)))
             } else if password.is_some() {
                 PasswordSource::Flag
             } else {
@@ -1056,15 +1056,33 @@ fn sign_auth_challenge(
 }
 
 /// Provenance is authority: descriptor input is trusted only with the explicit
-/// local owner device flag. It never enables console authority.
+/// local owner device flag, or the owner's `[pairing]
+/// unattended_device_approvals` setting. It never enables console authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PasswordSource {
     Typed,
-    Descriptor,
+    Descriptor(InputAccess),
     RemoteUnlock,
     Flag,
-    File,
+    File(InputAccess),
     None,
+}
+
+/// What start could verify about who else can read an unattended password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputAccess {
+    OwnerOnly,
+    NotOwnerOnly,
+}
+
+impl InputAccess {
+    fn of(owner_only: bool) -> Self {
+        if owner_only {
+            Self::OwnerOnly
+        } else {
+            Self::NotOwnerOnly
+        }
+    }
 }
 
 /// Lockable starts are always hub-only, regardless of the configured opt-out.
@@ -1091,9 +1109,13 @@ fn is_home_profile(source: PasswordSource, local_owner_device: bool) -> bool {
     source == PasswordSource::RemoteUnlock || local_owner_device
 }
 
-/// Authority selected for this invocation, never loaded from configuration.
+/// Authority selected for this invocation. Console and local-owner authority are
+/// never loaded from configuration. Device approvals are selected by the password
+/// source, which `[pairing] unattended_device_approvals` can only widen for a
+/// verifier: it holds no signing key and opens no console.
 struct StartAuthority {
     device_authority: std::result::Result<OwnerDeviceAuthority, &'static str>,
+    password_source: PasswordSource,
     owner_control: bool,
     local_owner_device: bool,
     lock_status_socket: bool,
@@ -1113,12 +1135,79 @@ impl std::fmt::Debug for OwnerDeviceAuthority {
     }
 }
 
+/// Stated at startup and in the docs whenever the owner's setting is in effect.
+const UNATTENDED_DEVICE_APPROVALS_TRADE: &str =
+    "whoever gets this disk and the password can approve as the owner, and so can any \
+     program running as this OS user. Keep the password file owner-only and out of backups, \
+     and do not use this setting on a machine someone else runs for you.";
+
+/// Why `[pairing] unattended_device_approvals` does not apply to this start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnattendedRefusal {
+    SettingOff,
+    HostedCustody,
+    PasswordOnCommandLine,
+    PasswordNotOwnerOnly,
+    NotAnUnattendedSource,
+}
+
+impl UnattendedRefusal {
+    fn explain(self) -> &'static str {
+        match self {
+            Self::SettingOff => "the setting is off",
+            Self::HostedCustody => {
+                "this machine is run for someone else (tier = \"cloud\" or [identity] hosted): the \
+                 person running it must not hold a decryptable owner key for another person"
+            }
+            Self::PasswordOnCommandLine => {
+                "--password puts the password on the command line, where other OS users can read \
+                 it; use --password-file or --password-fd"
+            }
+            Self::PasswordNotOwnerOnly => {
+                "other OS users can read the password's file, or this platform cannot check that; \
+                 it must be a regular file owned by this user with no group or other permissions \
+                 (chmod 600)"
+            }
+            Self::NotAnUnattendedSource => "the password does not come from a file or descriptor",
+        }
+    }
+}
+
+/// The owner's setting applies only to their own box, and only to a password no
+/// other OS user can read.
+fn unattended_password_allowed(
+    config: &NodeConfig,
+    source: PasswordSource,
+) -> std::result::Result<(), UnattendedRefusal> {
+    if !config.pairing.unattended_device_approvals {
+        return Err(UnattendedRefusal::SettingOff);
+    }
+    if is_hosted_custody(config) {
+        return Err(UnattendedRefusal::HostedCustody);
+    }
+    match source {
+        PasswordSource::File(InputAccess::OwnerOnly)
+        | PasswordSource::Descriptor(InputAccess::OwnerOnly) => Ok(()),
+        PasswordSource::File(InputAccess::NotOwnerOnly)
+        | PasswordSource::Descriptor(InputAccess::NotOwnerOnly) => {
+            Err(UnattendedRefusal::PasswordNotOwnerOnly)
+        }
+        PasswordSource::Flag => Err(UnattendedRefusal::PasswordOnCommandLine),
+        PasswordSource::Typed | PasswordSource::RemoteUnlock | PasswordSource::None => {
+            Err(UnattendedRefusal::NotAnUnattendedSource)
+        }
+    }
+}
+
 /// The owner authority, or why device approvals stay off.
 ///
-/// Only an encrypted recovery phrase, with no plaintext copy beside it, whose
-/// password was typed, supplied by descriptor, or remotely unlocked with explicit
-/// local owner authority, yields a key. The local launcher must protect the password:
-/// seed plus password derives the key (see `mnemonic_crypto::owner_secret`).
+/// Only an encrypted recovery phrase, with no plaintext copy beside it, yields a
+/// key, and only if its password was typed, supplied by descriptor or remotely
+/// unlocked with explicit local owner authority, or came from an owner-only file
+/// or descriptor with the owner's `[pairing] unattended_device_approvals` setting.
+/// Whoever holds the password protects the key: seed plus password derives it (see
+/// `mnemonic_crypto::owner_secret`). All refusals keep the stable reason codes
+/// apps already handle; the startup log says which rule applied.
 fn owner_approval_key(
     config: &NodeConfig,
     password: Option<&str>,
@@ -1135,8 +1224,11 @@ fn owner_approval_key(
     if source != PasswordSource::Typed
         && !(matches!(
             source,
-            PasswordSource::Descriptor | PasswordSource::RemoteUnlock
+            PasswordSource::Descriptor(_) | PasswordSource::RemoteUnlock
         ) && local_owner_device)
+        // The setting loads a verifier only. It never reaches a start that would
+        // retain the signing key.
+        && (local_owner_device || unattended_password_allowed(config, source).is_err())
     {
         return Err(SEED_PASSWORD_NOT_TYPED);
     }
@@ -1156,6 +1248,44 @@ fn owner_approval_key(
         .map_err(|_| OWNER_KEY_UNAVAILABLE)
 }
 
+/// The machine this node runs on is declared as operated for the owner.
+fn is_hosted_custody(config: &NodeConfig) -> bool {
+    config.identity.hosted || matches!(config.tier, NodeTier::Cloud)
+}
+
+/// Which rule turned device approvals on, for the startup log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceApprovalsMode {
+    TypedPassword,
+    LocalOwner,
+    OwnerSetting,
+}
+
+fn device_approvals_mode(source: PasswordSource, local_owner_device: bool) -> DeviceApprovalsMode {
+    if local_owner_device {
+        DeviceApprovalsMode::LocalOwner
+    } else if source == PasswordSource::Typed {
+        DeviceApprovalsMode::TypedPassword
+    } else {
+        DeviceApprovalsMode::OwnerSetting
+    }
+}
+
+/// Why the owner's setting did not turn approvals on.
+fn unattended_setting_note(
+    config: &NodeConfig,
+    source: PasswordSource,
+    reason: &str,
+) -> &'static str {
+    if reason == konsensus_api::pairing::device::SEED_NOT_ENCRYPTED {
+        return "the recovery phrase is not encrypted, or a plaintext copy is beside it";
+    }
+    match unattended_password_allowed(config, source) {
+        Err(refusal) => refusal.explain(),
+        Ok(()) => "no owner key could be derived with this password",
+    }
+}
+
 /// Where this node's seed lives, for the owner's badge
 /// (`docs/protocol/REMOTE-SIGNER.md` §2). A hosted node holding its seed is
 /// `hosted_custody` even when the seed is encrypted: it decrypts into the
@@ -1164,7 +1294,7 @@ fn owner_approval_key(
 fn custody_mode(config: &NodeConfig) -> konsensus_api::custody::CustodyMode {
     use konsensus_api::custody::CustodyMode;
     let path = &config.identity.mnemonic_file;
-    if config.identity.hosted || matches!(config.tier, NodeTier::Cloud) {
+    if is_hosted_custody(config) {
         CustodyMode::HostedCustody
     } else if mnemonic_crypto::is_encrypted_path(path) && !path.with_extension("txt").exists() {
         CustodyMode::EncryptedSeed
@@ -1238,7 +1368,7 @@ async fn cmd_start(
             });
             if local_owner_device
                 && !remote
-                && (password_source != PasswordSource::Descriptor || local.is_none())
+                && (!matches!(password_source, PasswordSource::Descriptor(_)) || local.is_none())
             {
                 anyhow::bail!("--local-owner-device requires --password-fd");
             }
@@ -1400,6 +1530,7 @@ async fn cmd_start(
         data_dir,
         StartAuthority {
             device_authority,
+            password_source,
             owner_control,
             local_owner_device,
             lock_status_socket: password_source == PasswordSource::RemoteUnlock,
@@ -1431,6 +1562,7 @@ async fn start_node_services<'a>(
 )> {
     let StartAuthority {
         device_authority,
+        password_source,
         owner_control,
         local_owner_device,
         lock_status_socket,
@@ -1587,7 +1719,8 @@ async fn start_node_services<'a>(
     // downgraded. `owner_control` decides whether elevation can EVER be
     // written on this node: with the flag off there is no control socket, and
     // console grant-writing calls refuse. Local device envelopes have their
-    // own explicit flag; neither authority can be enabled through config.
+    // own explicit flag; neither authority can be enabled through config. The
+    // config can only let an unattended password load the owner's verifier.
     let identity_fingerprint =
         konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
     let pairing_service = Arc::new({
@@ -1610,7 +1743,24 @@ async fn start_node_services<'a>(
         };
         match device_authority {
             Ok(key) => {
-                info!("device approvals (Touch ID) enabled: owner key from the encrypted seed");
+                match device_approvals_mode(password_source, local_owner_device) {
+                    DeviceApprovalsMode::OwnerSetting => warn!(
+                        mode = "owner_setting",
+                        "device approvals (Touch ID) enabled by [pairing] \
+                         unattended_device_approvals, with the password from a file or \
+                         descriptor: {UNATTENDED_DEVICE_APPROVALS_TRADE}"
+                    ),
+                    DeviceApprovalsMode::LocalOwner => info!(
+                        mode = "local_owner",
+                        "device approvals (Touch ID) enabled: owner key from the encrypted \
+                         seed, with explicit local owner authority"
+                    ),
+                    DeviceApprovalsMode::TypedPassword => info!(
+                        mode = "typed_password",
+                        "device approvals (Touch ID) enabled: owner key from the encrypted \
+                         seed, with the password typed at start"
+                    ),
+                }
                 if let Some(signer) = key.signing_key {
                     service.with_owner_signing_key(signer)
                 } else {
@@ -1623,6 +1773,13 @@ async fn start_node_services<'a>(
                     "device approvals (Touch ID) are OFF: {}",
                     konsensus_api::pairing::device::device_approvals_off_message(reason)
                 );
+                if config.pairing.unattended_device_approvals {
+                    warn!(
+                        reason,
+                        "[pairing] unattended_device_approvals is set but does not apply: {}",
+                        unattended_setting_note(config, password_source, reason)
+                    );
+                }
                 service.with_device_authority_disabled(reason)
             }
         }
@@ -2816,7 +2973,12 @@ mod tests;
 #[cfg(test)]
 mod owner_key_startup_tests {
     use super::*;
-    use konsensus_api::pairing::device::{SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED};
+    use konsensus_api::pairing::device::{
+        OWNER_KEY_UNAVAILABLE, SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED,
+    };
+
+    const DESCRIPTOR: PasswordSource = PasswordSource::Descriptor(InputAccess::OwnerOnly);
+    const FILE: PasswordSource = PasswordSource::File(InputAccess::OwnerOnly);
 
     #[test]
     fn home_channels_are_hub_only_and_only_non_lockable_starts_can_opt_out() {
@@ -2825,10 +2987,10 @@ mod owner_key_startup_tests {
             toml::from_str("backend = 'ldk'\nhub_only_channels = false").unwrap();
         for source in [
             PasswordSource::Typed,
-            PasswordSource::Descriptor,
+            DESCRIPTOR,
             PasswordSource::RemoteUnlock,
             PasswordSource::Flag,
-            PasswordSource::File,
+            FILE,
             PasswordSource::None,
         ] {
             assert_eq!(
@@ -2856,10 +3018,10 @@ mod owner_key_startup_tests {
     fn home_profile_all_password_sources() {
         for (source, without_local_owner) in [
             (PasswordSource::Typed, false),
-            (PasswordSource::Descriptor, false),
+            (DESCRIPTOR, false),
             (PasswordSource::RemoteUnlock, true),
             (PasswordSource::Flag, false),
-            (PasswordSource::File, false),
+            (FILE, false),
             (PasswordSource::None, false),
         ] {
             assert_eq!(
@@ -2909,13 +3071,7 @@ mod owner_key_startup_tests {
         std::fs::remove_file(dir.path().join("mnemonic.txt")).unwrap();
         // Encrypted, password from a flag or file: off.
         assert_eq!(
-            owner_approval_key(
-                &enc,
-                Some("correct horse"),
-                PasswordSource::Descriptor,
-                false
-            )
-            .unwrap_err(),
+            owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, false).unwrap_err(),
             SEED_PASSWORD_NOT_TYPED
         );
         // Encrypted and typed: on, and it is exactly the key the owner CLI signs with.
@@ -2930,19 +3086,303 @@ mod owner_key_startup_tests {
         assert!(owner_approval_key(&enc, Some("wrong"), PasswordSource::Typed, false).is_err());
     }
 
+    fn unattended(password: Option<&str>) -> (tempfile::TempDir, NodeConfig) {
+        let (dir, mut config) = config(password);
+        config.pairing.unattended_device_approvals = true;
+        (dir, config)
+    }
+
+    /// What `start --password-file` records for a real file of this mode.
+    #[cfg(unix)]
+    fn file_source(dir: &Path, mode: u32) -> PasswordSource {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("pw");
+        std::fs::write(&path, "correct horse").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        PasswordSource::File(InputAccess::of(seed_cmd::password_file_is_owner_only(
+            &path,
+        )))
+    }
+
+    #[test]
+    fn unattended_device_approvals_default_off_with_a_file_password() {
+        assert!(!crate::config::PairingConfig::default().unattended_device_approvals);
+        let parsed: crate::config::PairingConfig = toml::from_str("").unwrap();
+        assert!(!parsed.unattended_device_approvals);
+        let (_dir, enc) = config(Some("correct horse"));
+        assert!(!enc.pairing.unattended_device_approvals);
+        assert!(
+            !toml::to_string(&enc)
+                .unwrap()
+                .contains("unattended_device_approvals"),
+            "off is absence, so a saved config still loads on an older binary"
+        );
+        for source in [FILE, DESCRIPTOR] {
+            assert_eq!(
+                owner_approval_key(&enc, Some("correct horse"), source, false).unwrap_err(),
+                SEED_PASSWORD_NOT_TYPED,
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            unattended_password_allowed(&enc, FILE).unwrap_err(),
+            UnattendedRefusal::SettingOff
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unattended_device_approvals_load_the_owner_verifier_from_an_owner_only_file() {
+        let (dir, enc) = unattended(Some("correct horse"));
+        for mode in [0o600, 0o400] {
+            let source = file_source(dir.path(), mode);
+            assert_eq!(source, FILE, "{mode:o}");
+            let key = owner_approval_key(&enc, Some("correct horse"), source, false).unwrap();
+            // Exactly the key the owner CLI signs with, so existing device records
+            // stay valid, and only its public half is kept.
+            let secret = mnemonic_crypto::owner_secret("correct horse", &node_id()).unwrap();
+            let cli_key = konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &secret)
+                .unwrap()
+                .verifying_key();
+            assert_eq!(key.verifying_key, cli_key);
+            assert!(key.signing_key.is_none());
+            assert_eq!(
+                device_approvals_mode(source, false),
+                DeviceApprovalsMode::OwnerSetting
+            );
+        }
+        // A descriptor is the same choice, and also retains no signer.
+        let key = owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, false).unwrap();
+        assert!(key.signing_key.is_none());
+    }
+
+    #[test]
+    fn unattended_device_approvals_never_retain_the_signing_key() {
+        // The CLI already refuses --local-owner-device with --password-file; the
+        // setting must not open that door if the CLI ever changes.
+        let (_dir, enc) = unattended(Some("correct horse"));
+        assert_eq!(
+            owner_approval_key(&enc, Some("correct horse"), FILE, true).unwrap_err(),
+            SEED_PASSWORD_NOT_TYPED
+        );
+    }
+
+    #[test]
+    fn unattended_device_approvals_stay_refused_for_a_plaintext_seed() {
+        let (_dir, plain) = unattended(None);
+        for source in [FILE, DESCRIPTOR, PasswordSource::Typed] {
+            assert_eq!(
+                owner_approval_key(&plain, Some("correct horse"), source, false).unwrap_err(),
+                SEED_NOT_ENCRYPTED,
+                "{source:?}"
+            );
+        }
+        // An encrypted seed with a plaintext copy beside it counts as plaintext.
+        let (dir, enc) = unattended(Some("correct horse"));
+        std::fs::write(dir.path().join("mnemonic.txt"), PHRASE).unwrap();
+        assert_eq!(
+            owner_approval_key(&enc, Some("correct horse"), FILE, false).unwrap_err(),
+            SEED_NOT_ENCRYPTED
+        );
+        assert!(unattended_setting_note(&enc, FILE, SEED_NOT_ENCRYPTED).contains("not encrypted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unattended_device_approvals_refuse_a_file_other_users_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, enc) = unattended(Some("correct horse"));
+        for mode in [0o640, 0o604, 0o644, 0o660, 0o606, 0o666] {
+            let source = file_source(dir.path(), mode);
+            assert_eq!(
+                source,
+                PasswordSource::File(InputAccess::NotOwnerOnly),
+                "{mode:o}"
+            );
+            assert_eq!(
+                owner_approval_key(&enc, Some("correct horse"), source, false).unwrap_err(),
+                SEED_PASSWORD_NOT_TYPED,
+                "{mode:o}"
+            );
+            assert_eq!(
+                unattended_password_allowed(&enc, source).unwrap_err(),
+                UnattendedRefusal::PasswordNotOwnerOnly
+            );
+            assert!(seed_cmd::read_password_file(&dir.path().join("pw")).is_err());
+        }
+        // A symlink and a missing file are not verified as owner-only either.
+        let target = dir.path().join("pw");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("pw-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!seed_cmd::password_file_is_owner_only(&link));
+        assert!(!seed_cmd::password_file_is_owner_only(
+            &dir.path().join("missing")
+        ));
+        // A descriptor over such a file is refused the same way.
+        let source = PasswordSource::Descriptor(InputAccess::NotOwnerOnly);
+        assert_eq!(
+            owner_approval_key(&enc, Some("correct horse"), source, false).unwrap_err(),
+            SEED_PASSWORD_NOT_TYPED
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unattended_device_approvals_refuse_a_fifo_other_users_can_read() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let (dir, enc) = unattended(Some("correct horse"));
+        let path = dir.path().join("pw-fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.write_all(b"correct horse\n").unwrap();
+        drop(writer);
+
+        let source = PasswordSource::Descriptor(InputAccess::of(
+            password::descriptor_is_owner_only(reader.as_raw_fd()),
+        ));
+        let password = password::read_password_fd(reader.as_raw_fd()).unwrap();
+        assert_eq!(
+            owner_approval_key(&enc, Some(password.as_str()), source, false).unwrap_err(),
+            SEED_PASSWORD_NOT_TYPED
+        );
+        assert_eq!(
+            source,
+            PasswordSource::Descriptor(InputAccess::NotOwnerOnly)
+        );
+        assert_eq!(
+            unattended_password_allowed(&enc, source).unwrap_err(),
+            UnattendedRefusal::PasswordNotOwnerOnly
+        );
+    }
+
+    #[test]
+    fn unattended_device_approvals_refuse_a_password_on_the_command_line() {
+        let (_dir, enc) = unattended(Some("correct horse"));
+        assert_eq!(
+            owner_approval_key(&enc, Some("correct horse"), PasswordSource::Flag, false)
+                .unwrap_err(),
+            SEED_PASSWORD_NOT_TYPED
+        );
+        assert_eq!(
+            unattended_password_allowed(&enc, PasswordSource::Flag).unwrap_err(),
+            UnattendedRefusal::PasswordOnCommandLine
+        );
+    }
+
+    #[test]
+    fn unattended_device_approvals_refuse_a_machine_run_for_someone_else() {
+        let (_d, mut hosted) = unattended(Some("correct horse"));
+        hosted.identity.hosted = true;
+        let (_d2, mut cloud) = unattended(Some("correct horse"));
+        cloud.tier = crate::config::NodeTier::Cloud;
+        for config in [&hosted, &cloud] {
+            for source in [FILE, DESCRIPTOR] {
+                assert_eq!(
+                    owner_approval_key(config, Some("correct horse"), source, false).unwrap_err(),
+                    SEED_PASSWORD_NOT_TYPED,
+                    "{source:?}"
+                );
+                assert_eq!(
+                    unattended_password_allowed(config, source).unwrap_err(),
+                    UnattendedRefusal::HostedCustody
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unattended_device_approvals_do_not_cover_remote_unlock_without_local_owner() {
+        let (_dir, enc) = unattended(Some("correct horse"));
+        assert_eq!(
+            owner_approval_key(
+                &enc,
+                Some("correct horse"),
+                PasswordSource::RemoteUnlock,
+                false
+            )
+            .unwrap_err(),
+            SEED_PASSWORD_NOT_TYPED
+        );
+    }
+
+    #[test]
+    fn unattended_device_approvals_wrong_password_yields_no_key() {
+        let (_dir, enc) = unattended(Some("correct horse"));
+        for source in [FILE, DESCRIPTOR] {
+            assert_eq!(
+                owner_approval_key(&enc, Some("wrong"), source, false).unwrap_err(),
+                OWNER_KEY_UNAVAILABLE,
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            owner_approval_key(&enc, None, FILE, false).unwrap_err(),
+            OWNER_KEY_UNAVAILABLE
+        );
+        assert!(unattended_setting_note(&enc, FILE, OWNER_KEY_UNAVAILABLE).contains("no owner key"));
+    }
+
+    #[test]
+    fn a_typed_password_behaves_the_same_with_the_setting_on_or_off() {
+        let (_d, off) = config(Some("correct horse"));
+        let (_d2, on) = unattended(Some("correct horse"));
+        let off_key =
+            owner_approval_key(&off, Some("correct horse"), PasswordSource::Typed, false).unwrap();
+        let on_key =
+            owner_approval_key(&on, Some("correct horse"), PasswordSource::Typed, false).unwrap();
+        assert_eq!(off_key.verifying_key, on_key.verifying_key);
+        assert!(off_key.signing_key.is_none() && on_key.signing_key.is_none());
+        assert_eq!(
+            device_approvals_mode(PasswordSource::Typed, false),
+            DeviceApprovalsMode::TypedPassword
+        );
+        for config in [&off, &on] {
+            assert!(
+                owner_approval_key(config, Some("wrong"), PasswordSource::Typed, false).is_err()
+            );
+        }
+        // A hosted machine's typed start is not this setting's concern: unchanged.
+        let (_d3, mut hosted) = unattended(Some("correct horse"));
+        hosted.identity.hosted = true;
+        assert!(
+            owner_approval_key(&hosted, Some("correct horse"), PasswordSource::Typed, false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_startup_trade_is_stated_plainly() {
+        for words in [
+            "whoever gets this disk and the password can approve as the owner",
+            "any program running as this OS user",
+            "owner-only",
+            "out of backups",
+            "a machine someone else runs",
+        ] {
+            assert!(UNATTENDED_DEVICE_APPROVALS_TRADE.contains(words), "{words}");
+        }
+    }
+
     #[test]
     fn only_local_owner_start_retains_the_delegation_signer() {
         let (_dir, enc) = config(Some("correct horse"));
         let typed =
             owner_approval_key(&enc, Some("correct horse"), PasswordSource::Typed, false).unwrap();
         assert!(typed.signing_key.is_none());
-        let local = owner_approval_key(
-            &enc,
-            Some("correct horse"),
-            PasswordSource::Descriptor,
-            true,
-        )
-        .unwrap();
+        let local = owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, true).unwrap();
         let signer = local
             .signing_key
             .as_ref()
@@ -2979,58 +3419,32 @@ mod owner_key_startup_tests {
         let typed =
             owner_approval_key(&enc, Some("correct horse"), PasswordSource::Typed, false).unwrap();
         assert_eq!(
-            owner_approval_key(
-                &enc,
-                Some("correct horse"),
-                PasswordSource::Descriptor,
-                true
-            )
-            .unwrap()
-            .verifying_key,
+            owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, true)
+                .unwrap()
+                .verifying_key,
             typed.verifying_key
         );
-        for source in [
-            PasswordSource::Descriptor,
-            PasswordSource::Flag,
-            PasswordSource::File,
-            PasswordSource::None,
-        ] {
+        for source in [DESCRIPTOR, PasswordSource::Flag, FILE, PasswordSource::None] {
             assert_eq!(
                 owner_approval_key(&enc, Some("correct horse"), source, false).unwrap_err(),
                 SEED_PASSWORD_NOT_TYPED
             );
         }
-        for source in [
-            PasswordSource::Flag,
-            PasswordSource::File,
-            PasswordSource::None,
-        ] {
+        for source in [PasswordSource::Flag, FILE, PasswordSource::None] {
             assert_eq!(
                 owner_approval_key(&enc, Some("correct horse"), source, true).unwrap_err(),
                 SEED_PASSWORD_NOT_TYPED
             );
         }
-        assert!(owner_approval_key(&enc, Some("wrong"), PasswordSource::Descriptor, true).is_err());
+        assert!(owner_approval_key(&enc, Some("wrong"), DESCRIPTOR, true).is_err());
         std::fs::write(dir.path().join("mnemonic.txt"), PHRASE).unwrap();
         assert_eq!(
-            owner_approval_key(
-                &enc,
-                Some("correct horse"),
-                PasswordSource::Descriptor,
-                true
-            )
-            .unwrap_err(),
+            owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, true).unwrap_err(),
             SEED_NOT_ENCRYPTED
         );
         let (_dir, plain) = config(None);
         assert_eq!(
-            owner_approval_key(
-                &plain,
-                Some("correct horse"),
-                PasswordSource::Descriptor,
-                true
-            )
-            .unwrap_err(),
+            owner_approval_key(&plain, Some("correct horse"), DESCRIPTOR, true).unwrap_err(),
             SEED_NOT_ENCRYPTED
         );
     }

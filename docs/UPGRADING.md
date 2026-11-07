@@ -3,6 +3,14 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## Unreleased
+
+`[pairing] unattended_device_approvals` is new and off by default, so nothing
+changes unless you set it. Read [the trade](operations/password-input.md#unattended-box-device-approvals-from-a-stored-password)
+first. An older binary refuses a config that has the key set (`[pairing]` rejects
+unknown fields); remove the line before downgrading. A config saved with the
+setting off does not contain it.
+
 ## rc21 → rc22
 
 An E2EE send now saves its advanced send chain before the ciphertext leaves the
