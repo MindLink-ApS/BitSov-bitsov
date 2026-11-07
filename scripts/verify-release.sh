@@ -17,7 +17,12 @@
 # the five CLI binaries, their .sha256 files, their SBOMs, and the two Darwin
 # toolchain records. Every named file must be a regular non-symlink and match
 # its hash. A shorter list, or any other file in the directory, is refused.
-# GnuPG is invoked with --no-auto-key-retrieve inside a temporary GNUPGHOME.
+# SHA256SUMS and SHA256SUMS.asc are copied into a private 0700 work directory
+# as regular files before they are parsed or checked. Parse and GnuPG read
+# only those copies, so replacing the live paths afterwards does not change
+# the signed bytes. The named payloads are still hashed from the download
+# directory. GnuPG is invoked with --no-auto-key-retrieve inside a temporary
+# GNUPGHOME under that work directory.
 set -euo pipefail
 
 KEY_FPR=B299274C200301714DC6F51A7C2D6F8AC842EF6E
@@ -67,6 +72,21 @@ allowed_name() {
   expected_release_names | grep -Fxq -- "$1"
 }
 
+# Copy one download-directory path into the private work directory.
+# cp -P keeps a symlink as a symlink; the check below then refuses it
+# instead of reading the target. chmod runs only after that check.
+snapshot_regular() {
+  local src=$1 dest=$2 label=$3
+  if [ -L "$src" ] || [ ! -f "$src" ]; then
+    die "$label is not a regular file"
+  fi
+  cp -P -- "$src" "$dest"
+  if [ -L "$dest" ] || [ ! -f "$dest" ]; then
+    die "$label is not a regular file"
+  fi
+  chmod 600 -- "$dest"
+}
+
 # The temporary home holds only the pinned key. Do not retrieve another one.
 gpg_offline() {
   gpg --no-auto-key-retrieve "$@"
@@ -108,12 +128,9 @@ main() {
   gpg_offline --batch --import "$key" >/dev/null 2>&1
 
   cd "$dir"
-  if [ ! -f SHA256SUMS ] || [ -L SHA256SUMS ]; then
-    die "SHA256SUMS is not a regular file"
-  fi
-  if [ ! -f SHA256SUMS.asc ] || [ -L SHA256SUMS.asc ]; then
-    die "SHA256SUMS.asc is not a regular file"
-  fi
+  # Freeze both files before parse, the directory walk, or GnuPG.
+  snapshot_regular SHA256SUMS "$WORK/SHA256SUMS" SHA256SUMS
+  snapshot_regular SHA256SUMS.asc "$WORK/SHA256SUMS.asc" SHA256SUMS.asc
   : > "$WORK/names"
   while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || die "SHA256SUMS contains a blank line"
@@ -133,7 +150,7 @@ main() {
     grep -Fxq "$name" "$WORK/names" && die "SHA256SUMS lists $name more than once"
     printf '%s\n' "$name" >> "$WORK/names"
     printf '%s %s\n' "$hash" "$name" >> "$WORK/expected"
-  done < SHA256SUMS
+  done < "$WORK/SHA256SUMS"
   [ -s "$WORK/names" ] || die "SHA256SUMS is empty"
   expected=$(expected_release_names | LC_ALL=C sort)
   present=$(LC_ALL=C sort "$WORK/names")
@@ -150,15 +167,15 @@ main() {
           die "unexpected path in download directory: $rel"
         fi
         if [ -L "$rel" ]; then
-          grep -Fxq "$rel" "$WORK/names" || die "unexpected path in download directory: $rel"
+          grep -Fxq -- "$rel" "$WORK/names" || die "unexpected path in download directory: $rel"
         else
-          grep -Fxq "$rel" "$WORK/names" || die "unexpected file in download directory: $rel"
+          grep -Fxq -- "$rel" "$WORK/names" || die "unexpected file in download directory: $rel"
         fi
         ;;
     esac
   done < "$WORK/entries"
 
-  gpg_offline --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>"$WORK/gpg.err" | signed_by_key \
+  gpg_offline --status-fd 1 --verify "$WORK/SHA256SUMS.asc" "$WORK/SHA256SUMS" 2>"$WORK/gpg.err" | signed_by_key \
     || die "signature is not a valid signature by release key $KEY_FPR"
 
   while read -r hash name; do

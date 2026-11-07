@@ -120,7 +120,7 @@ expect_fail() {
   rc=0
   out=$(bash "$WORK/verify-release.sh" "$dir" "$key" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "$name: accepted"
-  printf '%s\n' "$out" | grep -F "$needle" >/dev/null || fail "$name: output was: $out"
+  printf '%s\n' "$out" | grep -F -- "$needle" >/dev/null || fail "$name: output was: $out"
   if printf '%s\n' "$out" | grep -q 'files match a signature'; then
     fail "$name: printed success"
   fi
@@ -172,6 +172,77 @@ cp -a "$GOOD/." "$LINK/"
 rm "$LINK/bitsov-linux-x86_64"
 ln -s "$GOOD/bitsov-linux-x86_64" "$LINK/bitsov-linux-x86_64"
 expect_fail 'symlink binary' "$LINK" "$WORK/release.asc" 'not a regular file'
+
+# Names that look like grep options must still be ordinary filenames.
+# Without "--", grep -Fxq --help exits 0 and grep -Fxq --regexp=<allowed>
+# matches that allowed name, so the extra entry is admitted.
+OPT_HELP="$WORK/opt-help"
+mkdir -p "$OPT_HELP"
+cp -a "$GOOD/." "$OPT_HELP/"
+printf 'option-like\n' > "$OPT_HELP/--help"
+expect_fail 'option-like extra file --help' "$OPT_HELP" "$WORK/release.asc" \
+  'unexpected file in download directory: --help'
+
+OPT_REGEXP="$WORK/opt-regexp"
+mkdir -p "$OPT_REGEXP"
+cp -a "$GOOD/." "$OPT_REGEXP/"
+printf 'option-like\n' > "$OPT_REGEXP/--regexp=bitsov-linux-x86_64"
+expect_fail 'option-like extra file --regexp' "$OPT_REGEXP" "$WORK/release.asc" \
+  'unexpected file in download directory: --regexp=bitsov-linux-x86_64'
+
+OPT_LINK="$WORK/opt-symlink"
+mkdir -p "$OPT_LINK"
+cp -a "$GOOD/." "$OPT_LINK/"
+ln -s /etc/passwd "$OPT_LINK/--help"
+expect_fail 'option-like symlink' "$OPT_LINK" "$WORK/release.asc" \
+  'unexpected path in download directory: --help'
+
+# Replace the live manifest while the directory walk is in progress, after
+# the script has had a chance to snapshot it. Success must still be the
+# signed bytes. Hashing a payload from the download directory is unchanged.
+SWAPDIR="$WORK/swap-manifest"
+mkdir -p "$SWAPDIR" "$WORK/bin"
+cp -a "$GOOD/." "$SWAPDIR/"
+cp -P -- "$SWAPDIR/SHA256SUMS" "$WORK/signed-sums"
+cp -P -- "$SWAPDIR/SHA256SUMS.asc" "$WORK/signed-sums.asc"
+printf '%s\n' '0000000000000000000000000000000000000000000000000000000000000000  bitsov-linux-x86_64' \
+  > "$WORK/swapped-sums"
+real_find=$(command -v find)
+cat > "$WORK/bin/find" << EOF
+#!/bin/bash
+set -euo pipefail
+$(printf '%q' "$real_find") "\$@"
+rc=\$?
+if [ "\${1:-}" = . ] && [ -n "\${VERIFY_RELEASE_SWAP_TO:-}" ]; then
+  cp -f -- "\$VERIFY_RELEASE_SWAP_TO" SHA256SUMS
+fi
+exit "\$rc"
+EOF
+chmod 755 "$WORK/bin/find"
+rc=0
+out=$(VERIFY_RELEASE_SWAP_TO="$WORK/swapped-sums" PATH="$WORK/bin:$PATH" \
+  bash "$WORK/verify-release.sh" "$SWAPDIR" "$WORK/release.asc" 2>&1) || rc=$?
+[ "$rc" -eq 0 ] || fail "manifest swap: verifier failed: $out"
+printf '%s\n' "$out" | grep -F -- '17 files match a signature' >/dev/null \
+  || fail "manifest swap: output was: $out"
+if cmp -s "$WORK/signed-sums" "$SWAPDIR/SHA256SUMS"; then
+  fail 'manifest swap: live SHA256SUMS was not replaced'
+fi
+cmp -s "$WORK/swapped-sums" "$SWAPDIR/SHA256SUMS" \
+  || fail 'manifest swap: live SHA256SUMS is not the replacement'
+if ! gpg --batch --status-fd 1 --no-auto-key-retrieve --verify \
+    "$WORK/signed-sums.asc" "$WORK/signed-sums" 2>"$WORK/signed-gpg.err" \
+    | signed_by_key
+then
+  fail 'manifest swap: signed bytes no longer verify'
+fi
+if gpg --batch --status-fd 1 --no-auto-key-retrieve --verify \
+    "$SWAPDIR/SHA256SUMS.asc" "$SWAPDIR/SHA256SUMS" 2>"$WORK/swap-gpg.err" \
+    | signed_by_key
+then
+  fail 'manifest swap: swapped live SHA256SUMS verified'
+fi
+ok 'signed snapshot survives a live SHA256SUMS replacement'
 
 NESTED="$WORK/nested"
 mkdir -p "$NESTED/hidden"
