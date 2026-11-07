@@ -3149,7 +3149,7 @@ async fn compose_room_member(
 
     // Cache plaintext (encrypted at rest) for API retrieval.
     if let Some(ref cipher) = state.plaintext_cipher {
-        match cipher.encrypt(ctx.plaintext.as_bytes()) {
+        match cipher.encrypt(&envelope.id.to_hex(), ctx.plaintext.as_bytes()) {
             Ok(encrypted) => {
                 if let Err(e) = state
                     .storage
@@ -3940,7 +3940,7 @@ pub(super) async fn compose_peer(
 
         // Cache plaintext (encrypted at rest) for API retrieval
         if let Some(ref cipher) = state.plaintext_cipher {
-            match cipher.encrypt(req.plaintext.as_bytes()) {
+            match cipher.encrypt(&envelope.id.to_hex(), req.plaintext.as_bytes()) {
                 Ok(encrypted) => {
                     if let Err(e) = state
                         .storage

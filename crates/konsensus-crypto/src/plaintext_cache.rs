@@ -11,14 +11,7 @@
 //! the cached plaintext. It follows the same pattern as session-at-rest
 //! encryption (ADR-019) but with a separate domain context.
 
-use aes_gcm::{
-    aead::{Aead, OsRng},
-    AeadCore, Aes256Gcm, KeyInit,
-};
-
-/// Domain-separation context for deriving the plaintext-cache encryption key.
-/// Independent of the session-at-rest key and the EncryptedStorage key.
-const PLAINTEXT_CACHE_CTX: &str = "konsensus-v2 plaintext-cache encryption key";
+use crate::record_cipher::{RecordCipher, LegacyReadPolicy, CACHE_KEY_CONTEXT};
 
 /// Cipher for encrypting/decrypting cached message plaintext at rest.
 ///
@@ -26,7 +19,7 @@ const PLAINTEXT_CACHE_CTX: &str = "konsensus-v2 plaintext-cache encryption key";
 /// via blake3 KDF with domain separation. Clone is intentionally NOT
 /// implemented — there should be one instance per node.
 pub struct PlaintextCacheCipher {
-    cipher: Aes256Gcm,
+    cipher: RecordCipher,
 }
 
 impl PlaintextCacheCipher {
@@ -36,42 +29,26 @@ impl PlaintextCacheCipher {
     /// (session encryption, storage encryption) thanks to the unique context
     /// string.
     pub fn new(aes_master_key: &[u8; 32]) -> Self {
-        let derived = blake3::derive_key(PLAINTEXT_CACHE_CTX, aes_master_key);
-        Self {
-            cipher: Aes256Gcm::new_from_slice(&derived)
-                .expect("32-byte key is always valid for AES-256"),
-        }
+        Self::with_policy(aes_master_key, LegacyReadPolicy::default())
     }
 
-    /// Encrypt plaintext bytes for at-rest storage.
-    ///
-    /// Returns `[12-byte nonce || AES-GCM ciphertext]`. The nonce is
-    /// randomly generated per call — every encryption produces unique output.
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, PlaintextCacheError> {
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-        let ciphertext = self
-            .cipher
-            .encrypt(&nonce, plaintext)
-            .map_err(|_| PlaintextCacheError::EncryptionFailed)?;
-        let mut result = Vec::with_capacity(12 + ciphertext.len());
-        result.extend_from_slice(&nonce);
-        result.extend_from_slice(&ciphertext);
-        Ok(result)
+    pub fn with_policy(aes_master_key: &[u8; 32], policy: LegacyReadPolicy) -> Self {
+        Self { cipher: RecordCipher::derived(aes_master_key, CACHE_KEY_CONTEXT, policy.for_crypto()) }
     }
 
-    /// Decrypt previously cached plaintext.
-    ///
-    /// Input format: `[12-byte nonce || AES-GCM ciphertext]`.
-    pub fn decrypt(&self, encrypted: &[u8]) -> Result<Vec<u8>, PlaintextCacheError> {
-        if encrypted.len() < 12 {
-            return Err(PlaintextCacheError::TruncatedData);
-        }
-        let (nonce_bytes, ciphertext) = encrypted.split_at(12);
-        let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
-        self.cipher
-            .decrypt(nonce, ciphertext)
+    /// Encrypt a cache field bound to its message row ID.
+    pub fn encrypt(&self, message_id: &str, plaintext: &[u8]) -> Result<Vec<u8>, PlaintextCacheError> {
+        self.cipher.encrypt("messages", "plaintext_enc", message_id, plaintext)
+            .map_err(|_| PlaintextCacheError::EncryptionFailed)
+    }
+
+    /// Read v2 or, before the local cutoff, v1 cache data.
+    pub fn decrypt(&self, message_id: &str, encrypted: &[u8]) -> Result<Vec<u8>, PlaintextCacheError> {
+        if encrypted.len() < 12 { return Err(PlaintextCacheError::TruncatedData); }
+        self.cipher.decrypt("messages", "plaintext_enc", message_id, encrypted)
             .map_err(|_| PlaintextCacheError::DecryptionFailed)
     }
+
 }
 
 /// Errors from plaintext cache encryption/decryption.
@@ -100,8 +77,8 @@ mod tests {
     fn roundtrip() {
         let cipher = PlaintextCacheCipher::new(&test_key());
         let plaintext = b"hello sovereign world";
-        let encrypted = cipher.encrypt(plaintext).unwrap();
-        let decrypted = cipher.decrypt(&encrypted).unwrap();
+        let encrypted = cipher.encrypt("message-a", plaintext).unwrap();
+        let decrypted = cipher.decrypt("message-a", &encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -109,28 +86,28 @@ mod tests {
     fn different_nonces() {
         let cipher = PlaintextCacheCipher::new(&test_key());
         let plaintext = b"same data";
-        let enc1 = cipher.encrypt(plaintext).unwrap();
-        let enc2 = cipher.encrypt(plaintext).unwrap();
+        let enc1 = cipher.encrypt("message-a", plaintext).unwrap();
+        let enc2 = cipher.encrypt("message-a", plaintext).unwrap();
         // Different nonces → different ciphertext
         assert_ne!(enc1, enc2);
         // Both decrypt to the same plaintext
-        assert_eq!(cipher.decrypt(&enc1).unwrap(), plaintext);
-        assert_eq!(cipher.decrypt(&enc2).unwrap(), plaintext);
+        assert_eq!(cipher.decrypt("message-a", &enc1).unwrap(), plaintext);
+        assert_eq!(cipher.decrypt("message-a", &enc2).unwrap(), plaintext);
     }
 
     #[test]
     fn wrong_key_fails() {
         let cipher1 = PlaintextCacheCipher::new(&test_key());
         let cipher2 = PlaintextCacheCipher::new(&[0x99u8; 32]);
-        let encrypted = cipher1.encrypt(b"secret").unwrap();
-        assert!(cipher2.decrypt(&encrypted).is_err());
+        let encrypted = cipher1.encrypt("message-a", b"secret").unwrap();
+        assert!(cipher2.decrypt("message-a", &encrypted).is_err());
     }
 
     #[test]
     fn truncated_data_fails() {
         let cipher = PlaintextCacheCipher::new(&test_key());
         assert!(matches!(
-            cipher.decrypt(&[1, 2, 3]),
+            cipher.decrypt("message-a", &[1, 2, 3]),
             Err(PlaintextCacheError::TruncatedData)
         ));
     }
@@ -138,12 +115,12 @@ mod tests {
     #[test]
     fn corrupted_data_fails() {
         let cipher = PlaintextCacheCipher::new(&test_key());
-        let mut encrypted = cipher.encrypt(b"data").unwrap();
+        let mut encrypted = cipher.encrypt("message-a", b"data").unwrap();
         // Flip a byte in the ciphertext
         let last = encrypted.len() - 1;
         encrypted[last] ^= 0xFF;
         assert!(matches!(
-            cipher.decrypt(&encrypted),
+            cipher.decrypt("message-a", &encrypted),
             Err(PlaintextCacheError::DecryptionFailed)
         ));
     }
@@ -151,8 +128,16 @@ mod tests {
     #[test]
     fn empty_plaintext() {
         let cipher = PlaintextCacheCipher::new(&test_key());
-        let encrypted = cipher.encrypt(b"").unwrap();
-        let decrypted = cipher.decrypt(&encrypted).unwrap();
+        let encrypted = cipher.encrypt("message-a", b"").unwrap();
+        let decrypted = cipher.decrypt("message-a", &encrypted).unwrap();
         assert_eq!(decrypted, b"");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn cached_plaintext_cannot_move_to_another_message() {
+    let cipher = PlaintextCacheCipher::new(&[7; 32]);
+    let blob = cipher.encrypt("message-a", b"text").unwrap();
+    assert!(cipher.decrypt("message-b", &blob).is_err());
 }

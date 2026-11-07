@@ -320,7 +320,7 @@ async fn a_refused_signal_is_not_delivered_by_resync_or_counted_accepted() {
     let env = UkmEnvelopeBuilder::new(402, peer, Recipient::Node(*state.identity.node_id()), vec![], PaymentProof::new([2; 32], [3; 32], 1000)).build();
     // As the receive path leaves it: paid acceptance stored, plaintext cached.
     assert!(matches!(state.storage.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::Accepted));
-    state.storage.store_message_plaintext(&env.id, &cipher.encrypt(text.as_bytes()).unwrap()).await.unwrap();
+    state.storage.store_message_plaintext(&env.id, &cipher.encrypt(&env.id.to_hex(), text.as_bytes()).unwrap()).await.unwrap();
     assert!(calls::admit_incoming(state.storage.as_ref(), &own(), &peer, 402, Some(&text)).await.is_err());
     state.storage.reject_accepted_envelope(&env).await.unwrap();
     assert!(state.storage.get_message(&env.id).await.unwrap().is_none());
