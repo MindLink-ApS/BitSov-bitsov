@@ -18,6 +18,26 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// Fresh Full chain selection; existing config files are never migrated.
+#[derive(clap::Args, Default)]
+pub struct InitChainArgs {
+    /// Full chain source (default: bitcoind). Esplora requires explicit acceptance.
+    #[arg(long, value_parser = ["bitcoind", "electrum", "esplora"])]
+    pub chain: Option<String>,
+
+    /// Electrum server you selected, including ssl:// or tcp:// and an explicit port.
+    #[arg(long)]
+    pub electrum_server_url: Option<String>,
+
+    /// Declare whether you control the Electrum server; required with --chain electrum.
+    #[arg(long, value_parser = ["own", "third_party"])]
+    pub electrum_operator: Option<String>,
+
+    /// Accept public Esplora operators as a third_party tip for Full.
+    #[arg(long)]
+    pub accept_third_party_tip: bool,
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// Show this box's claim code on the owner console (never stdout).
@@ -78,6 +98,9 @@ pub enum Command {
         /// Implies --non-interactive for tier selection.
         #[arg(long)]
         tier: Option<String>,
+
+        #[command(flatten)]
+        chain: InitChainArgs,
 
         /// A password value on argv is deprecated and requires --insecure-argv.
         /// Encrypt the mnemonic file; empty or whitespace-only passwords are rejected.

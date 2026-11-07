@@ -12,12 +12,12 @@ mod contracts;
 mod data_dir_hygiene;
 mod delivery_prices;
 mod endpoints;
-mod guarded_lightning;
-mod housekeeping;
-mod invoice_refusals;
 #[cfg(test)]
 #[path = "tests/fixtures/flaky_session_store.rs"]
 mod flaky_session_store;
+mod guarded_lightning;
+mod housekeeping;
+mod invoice_refusals;
 #[path = "cli/locked.rs"]
 mod locked_cmd;
 mod logging;
@@ -137,11 +137,19 @@ async fn main() -> Result<()> {
             dir,
             non_interactive,
             tier,
+            chain,
             encrypt,
             password_fd,
         } => {
             let password = password_fd.map(password::read_password_fd).transpose()?;
-            cmd_init(&dir, non_interactive, tier.as_deref(), encrypt, password)?;
+            cmd_init(
+                &dir,
+                non_interactive,
+                tier.as_deref(),
+                encrypt,
+                password,
+                chain,
+            )?;
         }
         Command::Start {
             config,
@@ -453,6 +461,56 @@ fn mnemonic_encryption_password(
     Ok(password)
 }
 
+/// Validate fresh Full chain choices without writing state.
+fn init_chain_config(
+    tier: NodeTier,
+    args: &cli::InitChainArgs,
+) -> Result<Option<config::ChainConfig>> {
+    let has_electrum_details =
+        args.electrum_server_url.is_some() || args.electrum_operator.is_some();
+    if tier != NodeTier::Full {
+        anyhow::ensure!(
+            args.chain.is_none() && !has_electrum_details && !args.accept_third_party_tip,
+            "chain options require --tier full; Light and Cloud keep Mock backends"
+        );
+        return Ok(None);
+    }
+    let backend = args.chain.as_deref().unwrap_or("bitcoind");
+    anyhow::ensure!(
+        backend == "electrum" || !has_electrum_details,
+        "Electrum options require --chain electrum"
+    );
+    match backend {
+        "bitcoind" => Ok(None), // NodeConfig::default_for_tier owns the default.
+        "electrum" => {
+            let server_url = args.electrum_server_url.clone().context(
+                "--chain electrum requires --electrum-server-url; no public server is selected by default"
+            )?;
+            let operator = match args.electrum_operator.as_deref() {
+                Some("own") => konsensus_chain::ElectrumOperator::Own,
+                Some("third_party") => konsensus_chain::ElectrumOperator::ThirdParty,
+                _ => anyhow::bail!(
+                    "--chain electrum requires --electrum-operator own or third_party"
+                ),
+            };
+            let config = konsensus_chain::ElectrumConfig {
+                server_url,
+                operator,
+            };
+            config.validate().map_err(anyhow::Error::msg)?;
+            Ok(Some(config::ChainConfig::Electrum(config)))
+        }
+        "esplora" => {
+            anyhow::ensure!(
+                args.accept_third_party_tip,
+                "Full Esplora uses a third_party tip; pass --accept-third-party-tip to accept public explorer queries"
+            );
+            Ok(Some(config::ChainConfig::default()))
+        }
+        _ => anyhow::bail!("unknown chain backend; choose bitcoind, electrum or esplora"),
+    }
+}
+
 /// `konsensus init` — generate identity and create config file.
 fn cmd_init(
     dir: &Path,
@@ -460,9 +518,28 @@ fn cmd_init(
     tier_arg: Option<&str>,
     encrypt: Option<Option<String>>,
     password: Option<Zeroizing<String>>,
+    chain_args: cli::InitChainArgs,
 ) -> Result<()> {
     let password = mnemonic_encryption_password(encrypt, password, non_interactive)?;
     use crate::config::NodeTier;
+
+    // Resolve operator choices before creating any state or identity files.
+    let tier = if let Some(t) = tier_arg {
+        match t {
+            "cloud" => NodeTier::Cloud,
+            "light" => NodeTier::Light,
+            "full" => NodeTier::Full,
+            other => anyhow::bail!(
+                "unknown tier '{}'. Valid options: cloud, light, full",
+                other
+            ),
+        }
+    } else if non_interactive {
+        NodeTier::Light
+    } else {
+        prompt_tier_selection()?
+    };
+    let selected_chain = init_chain_config(tier, &chain_args)?;
 
     // Create directory if needed, then drop group/other traversal before any secret is written.
     std::fs::create_dir_all(dir)
@@ -488,23 +565,6 @@ fn cmd_init(
 
     claim_code::initialize(dir)?;
 
-    // Select tier: CLI flag > interactive prompt > default
-    let tier = if let Some(t) = tier_arg {
-        match t {
-            "cloud" => NodeTier::Cloud,
-            "light" => NodeTier::Light,
-            "full" => NodeTier::Full,
-            other => anyhow::bail!(
-                "unknown tier '{}'. Valid options: cloud, light, full",
-                other
-            ),
-        }
-    } else if non_interactive {
-        NodeTier::Light
-    } else {
-        prompt_tier_selection()?
-    };
-
     // Generate new identity
     let (mnemonic, identity) =
         konsensus_core::NodeIdentity::generate().context("failed to generate identity")?;
@@ -524,7 +584,28 @@ fn cmd_init(
     drop(password); // Last use: do not retain the password during config I/O.
 
     // Generate tier-specific config
-    let config = NodeConfig::default_for_tier(tier, final_mnemonic_path.clone(), dir);
+    let mut config = NodeConfig::default_for_tier(tier, final_mnemonic_path.clone(), dir);
+    if let Some(chain) = selected_chain {
+        if let (
+            config::ChainConfig::Esplora {
+                api_url,
+                esplora_url_fallback: fallback,
+                ..
+            },
+            LightningConfig::Ldk {
+                esplora_url,
+                esplora_url_fallback,
+                ..
+            },
+        ) = (&chain, &mut config.lightning)
+        {
+            *esplora_url = format!("{}/api", api_url.trim_end_matches('/'));
+            *esplora_url_fallback = fallback
+                .as_ref()
+                .map(|url| format!("{}/api", url.trim_end_matches('/')));
+        }
+        config.chain = chain;
+    }
     config
         .save(&config_path)
         .with_context(|| format!("failed to write config to {}", config_path.display()))?;
@@ -566,13 +647,40 @@ fn cmd_init(
             println!("     - Add peer entries for nodes you want to connect to");
         }
         NodeTier::Full => {
+            match &config.chain {
+                config::ChainConfig::Bitcoind(rpc) => {
+                    println!(
+                        "Full starts on an owned tip: Bitcoin Core, shared with embedded LDK."
+                    );
+                    println!(
+                        "  Configure your Core RPC at {}:{} and grant this process cookie access.",
+                        rpc.rpc_host, rpc.rpc_port
+                    );
+                    if let Some(path) = &rpc.cookie_file {
+                        println!("  Cookie path: {}", path.display());
+                        println!("  Replace any literal $HOME placeholder with your home directory before starting.");
+                    }
+                }
+                config::ChainConfig::Electrum(server) => {
+                    if server.operator == konsensus_chain::ElectrumOperator::Own {
+                        println!("Full starts on an owned tip: your declared Electrum server, shared with embedded LDK.");
+                    } else {
+                        println!("Full uses your selected Electrum server as a third_party tip, shared with embedded LDK.");
+                    }
+                }
+                config::ChainConfig::Esplora { .. } => {
+                    println!("Full uses an explicitly accepted third_party tip: public Esplora, shared with embedded LDK.");
+                }
+                config::ChainConfig::Mock => unreachable!("Full init selects a real chain source"),
+            }
+            println!("  Public Esplora is a third_party opt-in (--chain esplora --accept-third-party-tip).");
             println!("Next steps:");
             println!("  1. Use embedded LDK or set up your own LND for Lightning payments");
             println!("  2. Edit {} to configure:", config_path.display());
             println!(
                 "     - Keep lightning backend 'ldk', or use 'lnd' for direct LND REST access"
             );
-            println!("     - Chain backend is set to 'esplora'; use your own provider for full sovereignty");
+            println!("     - Keep the chain source and Lightning network aligned with the server you selected");
             println!("     - Storage encryption is ON by default");
             println!("  3. Run: konsensus start -c {}", config_path.display());
         }
@@ -592,7 +700,7 @@ fn network_notice(config: &NodeConfig) -> Vec<String> {
     vec![
         "NOTE: This config uses the Bitcoin mainnet ([lightning] network = \"bitcoin\").".into(),
         "      Mainnet is not supported in this beta. Before the first start, switch".into(),
-        "      [lightning] network and the [lightning] and [chain] server URLs to signet:".into(),
+        "      [lightning] network and your chain source's RPC port/cookie or server URLs to signet:".into(),
         "      see docs/QUICKSTART-SIGNET.md, step 2.".into(),
     ]
 }
@@ -782,8 +890,8 @@ fn prompt_tier_selection() -> Result<crate::config::NodeTier> {
     println!("  [2] Light    — Your device, user-selected Lightning.");
     println!("                 Your keys, your data. Recommended for most users.");
     println!();
-    println!("  [3] Full     — Maximum sovereignty.");
-    println!("                 Your keys, your channels, your chain data.");
+    println!("  [3] Full     — Own Lightning + owned chain tip by default.");
+    println!("                 Bring your own Bitcoin Core or explicitly select Electrum.");
     println!();
     println!("  You can change this later in Settings.");
     println!();
