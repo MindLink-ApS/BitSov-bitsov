@@ -84,6 +84,63 @@ fn remote_access_requires_loopback_api_but_allows_auto_endpoints() {
 }
 
 #[test]
+fn network_tier_must_match_node_tier() {
+    for tier in [NodeTier::Cloud, NodeTier::Light, NodeTier::Full] {
+        let mut config =
+            NodeConfig::default_for_tier(tier, PathBuf::from("/dev/null"), Path::new("/tmp"));
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("fresh {tier} config should validate: {error}"));
+
+        config.network.tier = match tier.to_sovereignty_tier() {
+            SovereigntyTier::T1 => SovereigntyTier::T2,
+            _ => SovereigntyTier::T1,
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("[network].tier") && error.contains(&format!("tier = \"{tier}\"")),
+            "{tier}: {error}"
+        );
+    }
+}
+
+#[test]
+fn mismatched_tier_fixture_is_rejected() {
+    let fixture = r#"
+tier = "full"
+
+[identity]
+mnemonic_file = "/dev/null"
+
+[network]
+listen_addr = "0.0.0.0:9736"
+tier = "T1"
+
+[lightning]
+backend = "lnbits"
+api_url = "http://localhost:5000"
+admin_key = "test-key"
+
+[chain]
+backend = "esplora"
+
+[storage]
+backend = "sqlite"
+"#;
+    let config: NodeConfig = toml::from_str(fixture).unwrap();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("disagrees") && error.contains("set [network].tier = \"T2\""),
+        "{error}"
+    );
+
+    // An omitted [network].tier defaults to T1, which a full node contradicts.
+    let config: NodeConfig = toml::from_str(&fixture.replace("tier = \"T1\"\n", "")).unwrap();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("disagrees"), "{error}");
+}
+
+#[test]
 fn hosted_by_is_bounded_trimmed_and_printable() {
     let mut config = NodeConfig::default_for_tier(
         NodeTier::Light,
