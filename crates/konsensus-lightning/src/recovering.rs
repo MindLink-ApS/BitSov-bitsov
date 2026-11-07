@@ -73,7 +73,10 @@ impl RecoveringLightning {
             Err(LightningError::ChainSourceUnavailable { .. }) => None,
             Err(e) => return Err(e),
         };
-        let offline_safety = backend.as_ref().and_then(|p| p.offline_safety()).unwrap_or_default();
+        let offline_safety = backend
+            .as_ref()
+            .and_then(|p| p.offline_safety())
+            .unwrap_or_default();
         let state = Arc::new(RwLock::new(State {
             backend,
             readiness: LightningReadiness {
@@ -204,7 +207,12 @@ impl LightningProvider for RecoveringLightning {
     }
 
     fn tower_status(&self) -> konsensus_core::tower::TowerStatus {
-        self.state.read().unwrap().backend.as_ref().map(|p| p.tower_status())
+        self.state
+            .read()
+            .unwrap()
+            .backend
+            .as_ref()
+            .map(|p| p.tower_status())
             .unwrap_or_else(|| konsensus_core::tower::TowerStatus {
                 error: Some("Lightning backend unavailable; tower coverage unknown".into()),
                 ..Default::default()
@@ -216,12 +224,22 @@ impl LightningProvider for RecoveringLightning {
     }
 
     fn offline_chain_state(&self) -> Option<konsensus_core::offline_safety::OfflineChainState> {
-        self.state.read().unwrap().backend.as_ref().and_then(|p| p.offline_chain_state())
+        self.state
+            .read()
+            .unwrap()
+            .backend
+            .as_ref()
+            .and_then(|p| p.offline_chain_state())
     }
 
     fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {
         // Diagnostics must bypass backend(), which deliberately gates money work.
-        self.state.read().unwrap().backend.as_ref().and_then(|p| p.chain_sync_status())
+        self.state
+            .read()
+            .unwrap()
+            .backend
+            .as_ref()
+            .and_then(|p| p.chain_sync_status())
     }
 
     async fn readiness(&self) -> LightningReadiness {
@@ -229,6 +247,12 @@ impl LightningProvider for RecoveringLightning {
     }
     async fn money_ready(&self) -> bool {
         !*self.stop.borrow() && self.state.read().unwrap().readiness.money_ready
+    }
+    async fn receive_invoice_capable(&self) -> bool {
+        match self.backend() {
+            Ok(p) => p.receive_invoice_capable().await,
+            Err(_) => false,
+        }
     }
     async fn is_available(&self) -> bool {
         self.money_ready().await
@@ -324,6 +348,23 @@ impl LightningProvider for RecoveringLightning {
         let p = self.backend()?;
         p.create_invoice(amount_msat, description, expiry_secs)
             .await
+    }
+    async fn forget_pending_invoice(&self, payment_hash: &str) -> Result<bool, LightningError> {
+        let p = self.backend()?;
+        p.forget_pending_invoice(payment_hash).await
+    }
+    async fn purge_expired_pending_invoices(&self, now_unix: u64) -> Result<u32, LightningError> {
+        let p = self.backend()?;
+        p.purge_expired_pending_invoices(now_unix).await
+    }
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        // Listing recorded expiries does not spend. Do it even while the
+        // backend is still synchronizing, so a restart still counts them.
+        let backend = self.state.read().unwrap().backend.clone();
+        match backend {
+            Some(backend) => backend.pending_invoice_expiries().await,
+            None => Err(LightningError::NotReady),
+        }
     }
     async fn create_stateless_invoice(
         &self,
@@ -471,10 +512,22 @@ impl LightningProvider for RecoveringLightning {
         .await
     }
     async fn open_channel_with_status(
-        &self, peer_pubkey: &str, peer_addr: &str, amount_sats: u64,
-        announce: bool, fee_rate_sat_per_vb: Option<f32>,
+        &self,
+        peer_pubkey: &str,
+        peer_addr: &str,
+        amount_sats: u64,
+        announce: bool,
+        fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<konsensus_core::traits::lightning::ChannelOpenResult, LightningError> {
-        self.backend()?.open_channel_with_status(peer_pubkey, peer_addr, amount_sats, announce, fee_rate_sat_per_vb).await
+        self.backend()?
+            .open_channel_with_status(
+                peer_pubkey,
+                peer_addr,
+                amount_sats,
+                announce,
+                fee_rate_sat_per_vb,
+            )
+            .await
     }
 
     async fn funding_fee_quote(
@@ -517,7 +570,12 @@ impl LightningProvider for RecoveringLightning {
 
     async fn release_local_spend(&self, txid: &str) -> Result<(), LightningError> {
         // Owner recovery remains available even when money readiness is false.
-        let backend = self.state.read().unwrap().backend.clone()
+        let backend = self
+            .state
+            .read()
+            .unwrap()
+            .backend
+            .clone()
             .ok_or_else(|| LightningError::Backend("wallet backend unavailable".into()))?;
         backend.release_local_spend(txid).await
     }
