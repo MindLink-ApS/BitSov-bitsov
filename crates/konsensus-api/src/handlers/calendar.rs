@@ -241,6 +241,8 @@ pub struct EventActionResponse {
     pub message_id: Option<String>,
     pub delivered_to: Vec<String>,
     pub queued_for: Vec<String>,
+    /// Attendees whose encryption failed; no payment or delivery was attempted.
+    pub failed_for: Vec<String>,
     pub amount_msat: u64,
 }
 
@@ -540,6 +542,7 @@ async fn create_event(
     let result = async {
     let mut delivered_to = Vec::new();
     let mut queued_for = Vec::new();
+    let mut failed_for = Vec::new();
     let mut total_msat: u64 = 0;
     let mut last_message_id: Option<String> = None;
 
@@ -568,7 +571,9 @@ async fn create_event(
                     error = %e,
                     "attendee invite not encrypted, skipping"
                 );
-                queued_for.push(peer_id.to_hex());
+                // Earlier attendees keep their receipts. This attendee was not
+                // charged and has no envelope queued for delivery.
+                failed_for.push(peer_id.to_hex());
                 continue;
             }
         };
@@ -639,6 +644,7 @@ async fn create_event(
             "title": req.title,
             "delivered_to": delivered_to,
             "queued_for": queued_for,
+            "failed_for": failed_for,
             "amount_msat": total_msat,
         })),
     );
@@ -649,6 +655,7 @@ async fn create_event(
         message_id: last_message_id,
         delivered_to,
         queued_for,
+        failed_for,
         amount_msat: total_msat,
     }))
     }.await;
@@ -740,6 +747,7 @@ async fn update_event(
     let result = async {
     let mut delivered_to = Vec::new();
     let mut queued_for = Vec::new();
+    let mut failed_for = Vec::new();
     let mut total_msat: u64 = 0;
     let mut last_message_id: Option<String> = None;
 
@@ -764,7 +772,9 @@ async fn update_event(
             Ok(msg) => msg,
             Err(e) => {
                 tracing::warn!(peer = %peer_id, error = %e, "attendee update not encrypted, skipping");
-                queued_for.push(peer_id.to_hex());
+                // Earlier attendees keep their receipts. This attendee was not
+                // charged and has no envelope queued for delivery.
+                failed_for.push(peer_id.to_hex());
                 continue;
             }
         };
@@ -831,6 +841,7 @@ async fn update_event(
         message_id: last_message_id,
         delivered_to,
         queued_for,
+        failed_for,
         amount_msat: total_msat,
     }))
     }.await;
