@@ -1,0 +1,62 @@
+# Installed by install.sh, which fills in the node's konsensus.toml path below.
+[Unit]
+Description=BitSov front display
+Documentation=file:///opt/bitsov-display/README.md
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=bitsov-display
+Group=bitsov-display
+SupplementaryGroups=gpio spi i2c video
+ExecStart=/opt/bitsov-display/venv/bin/python /opt/bitsov-display/bitsov_display.py --config /etc/bitsov-display/display.toml
+Restart=always
+RestartSec=10
+# Exit 2 is an invalid display.toml: stay failed and visible instead of looping.
+RestartPreventExitStatus=2
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 LG_WD=/run/bitsov-display
+RuntimeDirectory=bitsov-display
+RuntimeDirectoryMode=0700
+WorkingDirectory=/run/bitsov-display
+UMask=0077
+
+# Filesystem: everything read-only, /home and /var/lib emptied, and only the
+# node's konsensus.toml mapped back in, read-only. The rest of the node's data
+# directory (seed, pairing, tickets, wallet) does not exist in this namespace.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+TemporaryFileSystem=/var/lib:ro
+BindReadOnlyPaths=-@NODE_CONFIG@
+ReadOnlyPaths=/etc/bitsov-display /opt/bitsov-display
+PrivateTmp=yes
+
+# Network: loopback only, enforced by the kernel, not just by the code.
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictAddressFamilies=AF_UNIX AF_INET
+
+# Process and kernel surface. PrivateDevices stays off: the panel needs
+# /dev/i2c-*, /dev/spidev*, /dev/gpiochip* or /dev/fb*, gated by the groups above.
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+KeyringMode=private
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target
