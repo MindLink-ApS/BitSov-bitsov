@@ -312,7 +312,7 @@ async fn suspended_compose_keysend_stops_on_revoke() {
 async fn suspended_room_members_stop_on_revoke() {
     let mut fx = fixture().await;
     let mut members = Vec::new();
-    for n in 0..6 {
+    for n in 0..10 {
         let identity = konsensus_core::NodeIdentity::from_mnemonic(
             "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
             &format!("room-peer-{n}"),
@@ -380,10 +380,10 @@ async fn suspended_room_members_stop_on_revoke() {
         )
         .await
     });
-    wait_for_dispatches(&fx.wallet, 6).await;
+    wait_for_dispatches(&fx.wallet, 8).await;
     assert_eq!(
         fx.used(),
-        6_000,
+        10_000,
         "entire fanout must be reserved before the first dispatch"
     );
     fx.service.revoke_grants(Some(&fx.client_id)).unwrap();
@@ -391,7 +391,7 @@ async fn suspended_room_members_stop_on_revoke() {
     fx.wallet.resume.notify_waiters();
     let (status, receipt) = task.await.unwrap();
     assert_eq!(status, StatusCode::OK, "{receipt}");
-    assert_eq!(receipt["member_outcomes"].as_array().unwrap().len(), 6);
+    assert_eq!(receipt["member_outcomes"].as_array().unwrap().len(), 10);
     assert_eq!(
         fx.wallet.money(),
         0,

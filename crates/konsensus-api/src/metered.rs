@@ -25,7 +25,7 @@ use axum::response::{IntoResponse, Response};
 use crate::auth::{AuthUser, Scope};
 use crate::error::ApiError;
 use crate::pairing::{FirstContactAuthorization, PairingService};
-use crate::spend_budget::{BudgetRefusal, Charge, Reservation};
+use crate::spend_budget::{BudgetRefusal, CallReservationTotals, Charge, Reservation};
 use crate::state::AppState;
 
 /// An authenticated caller holding `spend`, with the meter that applies to it.
@@ -42,7 +42,11 @@ enum Meter {
     Grant { client_id: String, epoch: u64 },
     /// Maintenance can charge only the grant that funded this call. This
     /// identity remains metered even after that grant has been removed.
-    CallClosing { grant_op_id: Option<String>, peer: String, call_id: String },
+    CallClosing {
+        grant_op_id: Option<String>,
+        peer: String,
+        call_id: String,
+    },
 }
 
 impl std::ops::Deref for MeteredSpend {
@@ -82,15 +86,36 @@ impl FromRequestParts<Arc<AppState>> for MeteredSpend {
 impl MeteredSpend {
     /// Internal authority only for a bounded protocol hangup after durable
     /// expiry. A grant-funded call never gains owner authority at termination.
-    pub(crate) async fn call_timeout(state: &AppState, peer: &konsensus_core::NodeId, call_id: &str,
-        reason: konsensus_core::payloads::call::HangupReason) -> Self {
-        let grant_op_id = state.pairing.as_ref().and_then(|s| s.call_spend_grant(&peer.to_hex(), call_id));
+    pub(crate) async fn call_timeout(
+        state: &AppState,
+        peer: &konsensus_core::NodeId,
+        call_id: &str,
+        reason: konsensus_core::payloads::call::HangupReason,
+    ) -> Self {
+        let grant_op_id = state
+            .pairing
+            .as_ref()
+            .and_then(|s| s.call_spend_grant(&peer.to_hex(), call_id));
         let meter = if reason == konsensus_core::payloads::call::HangupReason::Unpaid
-            || (grant_op_id.is_none() && crate::calls::owner_funded_call(state, peer, call_id).await.unwrap_or(false)) {
+            || (grant_op_id.is_none()
+                && crate::calls::owner_funded_call(state, peer, call_id)
+                    .await
+                    .unwrap_or(false))
+        {
             Meter::Owner
-        } else { Meter::CallClosing { grant_op_id, peer: peer.to_hex(), call_id: call_id.into() } };
+        } else {
+            Meter::CallClosing {
+                grant_op_id,
+                peer: peer.to_hex(),
+                call_id: call_id.into(),
+            }
+        };
         Self {
-            user: AuthUser { node_id: state.identity.node_id().to_hex(), scopes: vec![Scope::Spend], pairing: None },
+            user: AuthUser {
+                node_id: state.identity.node_id().to_hex(),
+                scopes: vec![Scope::Spend],
+                pairing: None,
+            },
             meter,
         }
     }
@@ -99,7 +124,11 @@ impl MeteredSpend {
     #[cfg(unix)]
     pub(crate) fn owner_control(state: &AppState) -> Self {
         Self {
-            user: AuthUser { node_id: state.identity.node_id().to_hex(), scopes: vec![Scope::Spend], pairing: None },
+            user: AuthUser {
+                node_id: state.identity.node_id().to_hex(),
+                scopes: vec![Scope::Spend],
+                pairing: None,
+            },
             meter: Meter::Owner,
         }
     }
@@ -109,11 +138,21 @@ impl MeteredSpend {
         !matches!(self.meter, Meter::Owner)
     }
 
-    pub(crate) fn reserve_call(&self, state: &AppState, terms: crate::spend_budget::CallSpendTerms,
-        capacity: u64) -> Result<(), ApiError> {
-        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(()) };
-        state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?
-            .reserve_call_spend(client_id, *epoch, terms, capacity).map_err(ApiError::BudgetExceeded)?;
+    pub(crate) fn reserve_call(
+        &self,
+        state: &AppState,
+        terms: crate::spend_budget::CallSpendTerms,
+        capacity: u64,
+    ) -> Result<(), ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else {
+            return Ok(());
+        };
+        state
+            .pairing
+            .as_ref()
+            .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?
+            .reserve_call_spend(client_id, *epoch, terms, capacity)
+            .map_err(ApiError::BudgetExceeded)?;
         Ok(())
     }
 
@@ -121,23 +160,66 @@ impl MeteredSpend {
     /// transaction: a refusal of either keeps neither (see
     /// `PairingService::reserve_call_with_offer`).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn debit_call_with_offer(&self, state: &AppState, terms: crate::spend_budget::CallSpendTerms,
-        capacity: u64, charges: Vec<Charge>, cap: Option<u64>,
-        operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
-        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()) };
-        let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
-        let reservation = service.reserve_call_with_offer(client_id, *epoch, terms, capacity, charges, cap,
-            operation.reservation_link(false)).map_err(ApiError::BudgetExceeded)?;
+    pub(crate) fn debit_call_with_offer(
+        &self,
+        state: &AppState,
+        terms: crate::spend_budget::CallSpendTerms,
+        capacity: u64,
+        charges: Vec<Charge>,
+        cap: Option<u64>,
+        operation: &crate::handlers::messages::operations::Operation,
+    ) -> Result<Debit, ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else {
+            return Ok(Debit::unmetered());
+        };
+        let service = state
+            .pairing
+            .as_ref()
+            .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        let reservation = service
+            .reserve_call_with_offer(
+                client_id,
+                *epoch,
+                terms,
+                capacity,
+                charges,
+                cap,
+                operation.reservation_link(false),
+            )
+            .map_err(ApiError::BudgetExceeded)?;
         Ok(Debit::reserved(Arc::clone(service), reservation))
     }
 
-    pub(crate) fn debit_call_block(&self, state: &AppState, signal: &konsensus_core::payloads::call::CallSignal,
-        peer: &str, price: u64, fee: u64, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
-        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()) };
-        let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
-        let reservation = service.draw_call_spend(client_id, *epoch, peer, &signal.call_id,
-            signal.seq.ok_or_else(|| ApiError::BadRequest("missing call block sequence".into()))?,
-            price, fee, operation.reservation_link(false)).map_err(ApiError::BudgetExceeded)?;
+    pub(crate) fn debit_call_block(
+        &self,
+        state: &AppState,
+        signal: &konsensus_core::payloads::call::CallSignal,
+        peer: &str,
+        price: u64,
+        fee: u64,
+        operation: &crate::handlers::messages::operations::Operation,
+    ) -> Result<Debit, ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else {
+            return Ok(Debit::unmetered());
+        };
+        let service = state
+            .pairing
+            .as_ref()
+            .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        let reservation = service
+            .draw_call_spend(
+                client_id,
+                *epoch,
+                peer,
+                &signal.call_id,
+                signal
+                    .seq
+                    .ok_or_else(|| ApiError::BadRequest("missing call block sequence".into()))?,
+                price,
+                fee,
+                operation.reservation_link(false),
+            )
+            .map_err(ApiError::BudgetExceeded)?;
         Ok(Debit::reserved(service.clone(), reservation))
     }
 
@@ -157,8 +239,12 @@ impl MeteredSpend {
     pub fn has_live_grant(&self, state: &AppState) -> bool {
         match &self.meter {
             Meter::Owner => true,
-            Meter::CallClosing { grant_op_id, .. } => state.pairing.as_ref().is_some_and(|s|
-                s.snapshot().grants.iter().any(|g| Some(&g.op_id) == grant_op_id.as_ref())),
+            Meter::CallClosing { grant_op_id, .. } => state.pairing.as_ref().is_some_and(|s| {
+                s.snapshot()
+                    .grants
+                    .iter()
+                    .any(|g| Some(&g.op_id) == grant_op_id.as_ref())
+            }),
             Meter::Grant { client_id, .. } => state
                 .pairing
                 .as_ref()
@@ -171,8 +257,12 @@ impl MeteredSpend {
     /// grant, if any (see `GrantBudget::call_per_payment_max_msat`). `None`
     /// for the owner's own key. The ledger enforces it again at reservation.
     pub(crate) fn call_per_payment_max_msat(&self, state: &AppState) -> Option<u64> {
-        let Meter::Grant { client_id, .. } = &self.meter else { return None };
-        state.pairing.as_ref()
+        let Meter::Grant { client_id, .. } = &self.meter else {
+            return None;
+        };
+        state
+            .pairing
+            .as_ref()
             .and_then(|service| service.grant_view_for(client_id))
             .and_then(|view| view.call_per_payment_max_msat)
     }
@@ -181,7 +271,11 @@ impl MeteredSpend {
     /// once and still bound to its original budget until reservation. `Ok(None)` for the owner's own key, which is not
     /// metered. A paired client without a live matching first-contact grant is
     /// refused before anything is requested or paid.
-    pub fn take_first_contact(&self, state: &AppState, recipient: &str) -> Result<Option<FirstContactAuthorization>, ApiError> {
+    pub fn take_first_contact(
+        &self,
+        state: &AppState,
+        recipient: &str,
+    ) -> Result<Option<FirstContactAuthorization>, ApiError> {
         let Meter::Grant { client_id, epoch } = &self.meter else {
             return Ok(None);
         };
@@ -199,33 +293,83 @@ impl MeteredSpend {
             })
     }
 
-    pub(crate) fn debit_operation(&self, state: &AppState, charges: Vec<Charge>, approval: Option<FirstContactAuthorization>, cap: Option<u64>, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
-        if let Meter::CallClosing { grant_op_id, peer, call_id } = &self.meter {
-            let grant_op_id = grant_op_id.as_deref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
-            let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
-            let reservation = service.reserve_call_closing_spend(grant_op_id, peer, call_id, charges, operation.reservation_link(false))
+    pub(crate) fn debit_operation(
+        &self,
+        state: &AppState,
+        charges: Vec<Charge>,
+        approval: Option<FirstContactAuthorization>,
+        cap: Option<u64>,
+        operation: &crate::handlers::messages::operations::Operation,
+    ) -> Result<Debit, ApiError> {
+        if let Meter::CallClosing {
+            grant_op_id,
+            peer,
+            call_id,
+        } = &self.meter
+        {
+            let grant_op_id = grant_op_id
+                .as_deref()
+                .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+            let service = state
+                .pairing
+                .as_ref()
+                .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+            let reservation = service
+                .reserve_call_closing_spend(
+                    grant_op_id,
+                    peer,
+                    call_id,
+                    charges,
+                    operation.reservation_link(false),
+                )
                 .map_err(ApiError::BudgetExceeded)?;
             let mut debit = Debit::reserved(Arc::clone(service), reservation);
             debit.call_spend = Some((peer.clone(), call_id.clone()));
             debit.call_payment = Some(crate::spend_budget::CallPayment::Signal);
             return Ok(debit);
         }
-        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()); };
-        let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        let Meter::Grant { client_id, epoch } = &self.meter else {
+            return Ok(Debit::unmetered());
+        };
+        let service = state
+            .pairing
+            .as_ref()
+            .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
         let link = operation.reservation_link(false);
         let reservation = match approval {
             Some(approval) => service.reserve_first_contact_operation(approval, cap, Some(link)),
             None => service.reserve_operation_spend(client_id, *epoch, charges, link),
-        }.map_err(ApiError::BudgetExceeded)?;
+        }
+        .map_err(ApiError::BudgetExceeded)?;
         Ok(Debit::reserved(Arc::clone(service), reservation))
     }
 
     /// Debit a call offer under its call's hold, bounded by the caller's
     /// consented `cap` (or the hold's per-block ceiling) and the owner's limit.
-    pub(crate) fn debit_call_offer(&self, state: &AppState, charges: Vec<Charge>, call_id: &str, cap: Option<u64>, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
-        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()); };
-        let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
-        let reservation = service.reserve_call_offer_spend(client_id, *epoch, charges, call_id, cap, operation.reservation_link(false))
+    pub(crate) fn debit_call_offer(
+        &self,
+        state: &AppState,
+        charges: Vec<Charge>,
+        call_id: &str,
+        cap: Option<u64>,
+        operation: &crate::handlers::messages::operations::Operation,
+    ) -> Result<Debit, ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else {
+            return Ok(Debit::unmetered());
+        };
+        let service = state
+            .pairing
+            .as_ref()
+            .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        let reservation = service
+            .reserve_call_offer_spend(
+                client_id,
+                *epoch,
+                charges,
+                call_id,
+                cap,
+                operation.reservation_link(false),
+            )
             .map_err(ApiError::BudgetExceeded)?;
         Ok(Debit::reserved(Arc::clone(service), reservation))
     }
@@ -274,15 +418,21 @@ impl MeteredSpend {
     /// Link an operation's durable journal before committing its G1 debit.
     /// The callback is synchronous and cannot call the pairing service.
     pub(crate) fn debit_linked(
-        &self, state: &AppState, charges: Vec<Charge>,
+        &self,
+        state: &AppState,
+        charges: Vec<Charge>,
         persist_link: impl FnOnce(Option<&Reservation>) -> Result<(), BudgetRefusal>,
     ) -> Result<Debit, ApiError> {
         let Meter::Grant { client_id, epoch } = &self.meter else {
             persist_link(None).map_err(ApiError::BudgetExceeded)?;
             return Ok(Debit::unmetered());
         };
-        let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
-        let reservation = service.reserve_spend_linked(client_id, *epoch, charges, |r| persist_link(Some(r)))
+        let service = state
+            .pairing
+            .as_ref()
+            .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        let reservation = service
+            .reserve_spend_linked(client_id, *epoch, charges, |r| persist_link(Some(r)))
             .map_err(ApiError::BudgetExceeded)?;
         Ok(Debit::reserved(Arc::clone(service), reservation))
     }
@@ -292,7 +442,12 @@ impl MeteredSpend {
         self.debit_purpose(state, vec![charge], true)
     }
 
-    fn debit_purpose(&self, state: &AppState, charges: Vec<Charge>, liquidity: bool) -> Result<Debit, ApiError> {
+    fn debit_purpose(
+        &self,
+        state: &AppState,
+        charges: Vec<Charge>,
+        liquidity: bool,
+    ) -> Result<Debit, ApiError> {
         let Meter::Grant { client_id, epoch } = &self.meter else {
             return Ok(Debit::unmetered());
         };
@@ -304,7 +459,8 @@ impl MeteredSpend {
             service.reserve_liquidity_fee(client_id, *epoch, charges)
         } else {
             service.reserve_spend(client_id, *epoch, charges)
-        }.map_err(ApiError::BudgetExceeded)?;
+        }
+        .map_err(ApiError::BudgetExceeded)?;
         tracing::debug!(
             client = %client_id,
             reserved_msat = reservation.charges.iter().map(|c| c.amount_msat).sum::<u64>(),
@@ -324,6 +480,7 @@ pub struct Debit {
     operation: Option<crate::handlers::messages::operations::Operation>,
     held: Option<(Arc<PairingService>, Reservation)>,
     max_routing_fee_msat: Option<u64>,
+    message_caps: crate::handlers::messages::caps::MessageCaps,
     /// The zero routing ceiling was pinned because the payee is a direct
     /// channel peer: every payment under it must fit that channel.
     direct: bool,
@@ -336,22 +493,37 @@ pub struct Debit {
     fees: std::sync::Mutex<std::collections::BTreeMap<String, Option<u64>>>,
     // Shared by every member of a room fan-out. Reservations consume this
     // call's allowance even when a sibling finishes before another starts.
-    call_reserved_msat: std::sync::Mutex<u64>,
+    call_reservations: std::sync::Mutex<CallReservationTotals>,
 }
 
 impl Debit {
-    pub(crate) fn with_operation(mut self, operation: crate::handlers::messages::operations::Operation) -> Self {
-        self.operation = Some(operation); self
+    pub(crate) fn with_operation(
+        mut self,
+        operation: crate::handlers::messages::operations::Operation,
+    ) -> Self {
+        self.operation = Some(operation);
+        self
     }
-    pub(crate) fn operation(&self) -> Option<&crate::handlers::messages::operations::Operation> { self.operation.as_ref() }
-    pub(crate) fn for_call_block(mut self, peer: konsensus_core::NodeId, plaintext: String) -> Self {
-        self.call_spend = konsensus_core::wire_json::from_str::<konsensus_core::payloads::call::CallSignal>(&plaintext)
-            .ok().map(|signal| (peer.to_hex(), signal.call_id));
+    pub(crate) fn operation(&self) -> Option<&crate::handlers::messages::operations::Operation> {
+        self.operation.as_ref()
+    }
+    pub(crate) fn for_call_block(
+        mut self,
+        peer: konsensus_core::NodeId,
+        plaintext: String,
+    ) -> Self {
+        self.call_spend = konsensus_core::wire_json::from_str::<
+            konsensus_core::payloads::call::CallSignal,
+        >(&plaintext)
+        .ok()
+        .map(|signal| (peer.to_hex(), signal.call_id));
         self.call_block = Some((peer, plaintext));
         self
     }
 
-    pub(crate) fn is_call_block(&self) -> bool { self.call_block.is_some() }
+    pub(crate) fn is_call_block(&self) -> bool {
+        self.call_block.is_some()
+    }
 
     /// Mark a paid call signal of `kind` (400 to 404), whether or not it
     /// draws on a hold; any other kind is left unmarked.
@@ -360,23 +532,56 @@ impl Debit {
         self
     }
 
-    pub(crate) fn for_call_offer(mut self, peer: konsensus_core::NodeId, plaintext: String) -> Self {
-        self.call_spend = konsensus_core::wire_json::from_str::<konsensus_core::payloads::call::CallSignal>(&plaintext)
-            .ok().map(|signal| (peer.to_hex(), signal.call_id));
+    pub(crate) fn for_call_offer(
+        mut self,
+        peer: konsensus_core::NodeId,
+        plaintext: String,
+    ) -> Self {
+        self.call_spend = konsensus_core::wire_json::from_str::<
+            konsensus_core::payloads::call::CallSignal,
+        >(&plaintext)
+        .ok()
+        .map(|signal| (peer.to_hex(), signal.call_id));
         self.call_offer = Some((peer, plaintext));
         self
     }
 
     pub(crate) fn invoice_purpose(&self) -> String {
-        self.call_block.as_ref().and_then(|(_, plaintext)|
-            konsensus_core::payloads::call::CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, plaintext).ok()
-        ).map(|signal| format!("{}{}:{}", konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX,
-            signal.call_id, signal.seq.unwrap_or_default()))
-        .unwrap_or_else(|| "konsensus message".into())
+        self.call_block
+            .as_ref()
+            .and_then(|(_, plaintext)| {
+                konsensus_core::payloads::call::CallSignal::parse(
+                    konsensus_core::kind::KIND_CALL_BLOCK,
+                    plaintext,
+                )
+                .ok()
+            })
+            .map(|signal| {
+                format!(
+                    "{}{}:{}",
+                    konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX,
+                    signal.call_id,
+                    signal.seq.unwrap_or_default()
+                )
+            })
+            .unwrap_or_else(|| "konsensus message".into())
     }
 
-    pub(crate) async fn dispatch_message<F>(&self, state: &AppState, hash: Option<String>, amount: u64, future: F) -> Result<F::Output, ApiError>
-    where F: Future<Output=Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>> {
+    pub(crate) async fn dispatch_message<F>(
+        &self,
+        state: &AppState,
+        hash: Option<String>,
+        amount: u64,
+        future: F,
+    ) -> Result<F::Output, ApiError>
+    where
+        F: Future<
+            Output = Result<
+                konsensus_core::traits::lightning::PaymentDetails,
+                konsensus_core::traits::lightning::LightningError,
+            >,
+        >,
+    {
         match &self.operation {
             Some(op) => op.dispatch(self, hash, amount, future).await,
             None => self.dispatch_message_payment(state, future).await,
@@ -385,30 +590,62 @@ impl Debit {
 
     /// Called after dispatch intent is durable. Fresh call validation and spend
     /// authority both remain serialized through the first wallet poll.
-    pub(crate) async fn dispatch_message_payment<F>(&self, state: &AppState, future: F) -> Result<F::Output, ApiError>
-    where F: Future<Output=Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>> {
+    pub(crate) async fn dispatch_message_payment<F>(
+        &self,
+        state: &AppState,
+        future: F,
+    ) -> Result<F::Output, ApiError>
+    where
+        F: Future<
+            Output = Result<
+                konsensus_core::traits::lightning::PaymentDetails,
+                konsensus_core::traits::lightning::LightningError,
+            >,
+        >,
+    {
         let (mut call_guard, deadline) = if let Some((peer, plaintext)) = &self.call_block {
             match crate::calls::block_dispatch_guard(state, peer, plaintext).await {
                 Ok((guard, deadline)) => (Some(guard), Some(deadline)),
-                Err(error) => return Ok(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(error.to_string()))),
+                Err(error) => {
+                    return Ok(Err(
+                        konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(
+                            error.to_string(),
+                        ),
+                    ))
+                }
             }
         } else if let Some((peer, plaintext)) = &self.call_offer {
-            match crate::calls::offer_dispatch_guard(state.storage.as_ref(), peer, plaintext).await {
+            match crate::calls::offer_dispatch_guard(state.storage.as_ref(), peer, plaintext).await
+            {
                 Ok((guard, deadline)) => (Some(guard), Some(deadline)),
-                Err(error) => return Ok(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(error.to_string()))),
+                Err(error) => {
+                    return Ok(Err(
+                        konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(
+                            error.to_string(),
+                        ),
+                    ))
+                }
             }
-        } else { (None, None) };
+        } else {
+            (None, None)
+        };
         let mut future = std::pin::pin!(future);
         let mut polled = false;
         let guarded = futures::future::poll_fn(|cx| {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64).unwrap_or(u64::MAX);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(u64::MAX);
             // Recheck after journal awaits, immediately before the first wallet
             // poll. Once polled, money may be in flight: preserve reconciliation.
             // The caller observes the answer after the callee committed it.
             // Leave five seconds for that skew and payment/delivery latency.
             if !polled && deadline.is_some_and(|until| now.saturating_add(5_000) > until) {
-                return Poll::Ready(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched("call block too close to expiry before payment dispatch".into())));
+                return Poll::Ready(Err(
+                    konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(
+                        "call block too close to expiry before payment dispatch".into(),
+                    ),
+                ));
             }
             polled = true;
             let result = future.as_mut().poll(cx);
@@ -422,36 +659,105 @@ impl Debit {
         self.max_routing_fee_msat = limit;
         self
     }
+    pub(crate) fn with_message_caps(
+        mut self,
+        caps: crate::handlers::messages::caps::MessageCaps,
+    ) -> Self {
+        self.message_caps.tighten(caps);
+        self
+    }
     pub(crate) fn with_direct_channel(mut self, direct: bool) -> Self {
         self.direct = direct;
         self
     }
     /// Whether the zero routing ceiling relies on a direct channel.
-    pub(crate) fn is_direct(&self) -> bool { self.direct }
-    pub(crate) fn fee_limit(&self, state: &AppState, principal: u64) -> u64 {
-        state.lightning.routing_fee_policy().ceiling(principal, self.max_routing_fee_msat)
+    pub(crate) fn is_direct(&self) -> bool {
+        self.direct
     }
-    pub(crate) fn record_payment(&self, recipient: &str, details: &konsensus_core::traits::lightning::PaymentDetails) {
+    pub(crate) fn message_fee_limit(&self, state: &AppState, peer: &str, principal: u64) -> u64 {
+        if self.call_block.is_some() || self.call_offer.is_some() {
+            self.fee_limit(state, principal)
+        } else {
+            self.message_caps
+                .fee(state, peer, principal, self.max_routing_fee_msat)
+        }
+    }
+    pub(crate) fn message_all_in(
+        &self,
+        state: &AppState,
+        peer: &str,
+        principal: u64,
+    ) -> Result<u64, ApiError> {
+        if self.call_block.is_some() || self.call_offer.is_some() {
+            crate::handlers::messages::caps::all_in(state, principal, self.max_routing_fee_msat)
+        } else {
+            self.message_caps
+                .all_in(state, peer, principal, self.max_routing_fee_msat)
+        }
+    }
+    pub(crate) fn fee_limit(&self, state: &AppState, principal: u64) -> u64 {
+        state
+            .lightning
+            .routing_fee_policy()
+            .ceiling(principal, self.max_routing_fee_msat)
+    }
+    pub(crate) fn record_payment(
+        &self,
+        recipient: &str,
+        details: &konsensus_core::traits::lightning::PaymentDetails,
+    ) {
         let mut fees = self.fees.lock().unwrap_or_else(|e| e.into_inner());
         let previous = fees.entry(recipient.to_owned()).or_insert(Some(0));
-        *previous = previous.and_then(|total| details.fee_msat.and_then(|fee| total.checked_add(fee)));
+        *previous =
+            previous.and_then(|total| details.fee_msat.and_then(|fee| total.checked_add(fee)));
     }
 
     /// Reporting only. No recorded payments, unknown fees, or overflow are not zero.
     pub(crate) fn recorded_fee_paid_msat(&self) -> Option<u64> {
         let fees = self.fees.lock().unwrap_or_else(|e| e.into_inner());
-        if fees.is_empty() { return None; }
-        fees.values().try_fold(0u64, |sum, fee| sum.checked_add((*fee)?))
+        if fees.is_empty() {
+            return None;
+        }
+        fees.values()
+            .try_fold(0u64, |sum, fee| sum.checked_add((*fee)?))
     }
 
     /// Owner-only paths have no grant to revalidate.
     pub(crate) fn unmetered() -> Self {
-        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_spend: None, call_payment: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
+        Self {
+            operation: None,
+            direct: false,
+            call_block: None,
+            call_offer: None,
+            call_spend: None,
+            call_payment: None,
+            message_caps: Default::default(),
+            max_routing_fee_msat: None,
+            fees: Default::default(),
+            held: None,
+            call_reservations: Default::default(),
+        }
     }
 
     fn reserved(service: Arc<PairingService>, reservation: Reservation) -> Self {
         let total = reservation.charges.iter().map(|c| c.amount_msat).sum();
-        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_spend: None, call_payment: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
+        // Bind message authority to the grant actually reserved, including when
+        // a first-contact approval was consumed after a grant replacement.
+        let message_caps =
+            crate::handlers::messages::caps::MessageCaps::for_reservation(&service, &reservation);
+        Self {
+            operation: None,
+            direct: false,
+            call_block: None,
+            call_offer: None,
+            call_spend: None,
+            call_payment: None,
+            message_caps,
+            max_routing_fee_msat: None,
+            fees: Default::default(),
+            held: Some((service, reservation)),
+            call_reservations: std::sync::Mutex::new(CallReservationTotals::messages(total)),
+        }
     }
 
     /// Whether this debit is held against a budget grant.
@@ -487,9 +793,14 @@ impl Debit {
         admission_all_in: u64,
     ) -> Result<Debit, ApiError> {
         let Some((service, reservation)) = &self.held else {
-            return Ok(Debit::unmetered().with_fee_limit(self.max_routing_fee_msat).with_direct_channel(self.direct));
+            return Ok(Debit::unmetered()
+                .with_fee_limit(self.max_routing_fee_msat)
+                .with_direct_channel(self.direct));
         };
-        let mut call_total = self.call_reserved_msat.lock().unwrap_or_else(|e| e.into_inner());
+        let mut call_total = self
+            .call_reservations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (new_total, admission) = service
             .reserve_quoted_readmission(
                 reservation,
@@ -501,12 +812,16 @@ impl Debit {
             )
             .map_err(ApiError::BudgetExceeded)?;
         *call_total = new_total; // checked against the grant limit under its ledger lock
-        Ok(Debit::reserved(Arc::clone(service), admission).with_fee_limit(self.max_routing_fee_msat).with_direct_channel(self.direct))
+        Ok(Debit::reserved(Arc::clone(service), admission)
+            .with_fee_limit(self.max_routing_fee_msat)
+            .with_direct_channel(self.direct))
     }
 
     /// Reconciliation reference only; never restores dispatch authority.
     pub(crate) fn reservation(&self) -> Option<Reservation> {
-        self.held.as_ref().map(|(_, reservation)| reservation.clone())
+        self.held
+            .as_ref()
+            .map(|(_, reservation)| reservation.clone())
     }
 
     /// Guard each poll of an operation that can dispatch value. A separate
@@ -525,10 +840,17 @@ impl Debit {
         let mut operation = std::pin::pin!(operation);
         let mut polled = false;
         futures::future::poll_fn(|cx| {
-            match service.with_call_payment_authority(reservation, self.call_spend.as_ref().map(|(peer, id)| (peer.as_str(), id.as_str())), self.call_payment, || {
-                polled = true;
-                operation.as_mut().poll(cx)
-            }) {
+            match service.with_call_payment_authority(
+                reservation,
+                self.call_spend
+                    .as_ref()
+                    .map(|(peer, id)| (peer.as_str(), id.as_str())),
+                self.call_payment,
+                || {
+                    polled = true;
+                    operation.as_mut().poll(cx)
+                },
+            ) {
                 Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
                 Ok(Poll::Pending) => Poll::Pending,
                 Err(e) if !polled => Poll::Ready(Err(ApiError::BudgetExceeded(e))),
@@ -555,9 +877,16 @@ impl Debit {
         };
         let mut operation = std::pin::pin!(operation);
         let first = futures::future::poll_fn(|cx| {
-            Poll::Ready(service.with_call_payment_authority(reservation,
-                self.call_spend.as_ref().map(|(peer, id)| (peer.as_str(), id.as_str())), self.call_payment,
-                || operation.as_mut().poll(cx)))
+            Poll::Ready(
+                service.with_call_payment_authority(
+                    reservation,
+                    self.call_spend
+                        .as_ref()
+                        .map(|(peer, id)| (peer.as_str(), id.as_str())),
+                    self.call_payment,
+                    || operation.as_mut().poll(cx),
+                ),
+            )
         })
         .await
         .map_err(ApiError::BudgetExceeded)?;
@@ -585,7 +914,9 @@ impl Debit {
 
     pub(crate) fn released_with_outcome(&self, recipient: &str, payment_failed: bool) {
         if let Some((service, reservation)) = &self.held {
-            if let Err(error) = service.try_resolve_spend_outcome(reservation, recipient, 0, payment_failed) {
+            if let Err(error) =
+                service.try_resolve_spend_outcome(reservation, recipient, 0, payment_failed)
+            {
                 tracing::warn!(%error, "spend release deferred; reservation retained");
             }
         }
@@ -610,7 +941,8 @@ impl Debit {
 /// No record is safe only when no principal was paid. An explicit unknown fee
 /// always retains liability; absence never invents a zero fee for paid value.
 fn settled_total(principal: u64, recorded_fee: Option<Option<u64>>) -> Option<u64> {
-    recorded_fee.unwrap_or_else(|| (principal == 0).then_some(0))
+    recorded_fee
+        .unwrap_or_else(|| (principal == 0).then_some(0))
         .and_then(|fee| principal.checked_add(fee))
 }
 

@@ -61,6 +61,7 @@ struct Wallet {
     capacity_entered: tokio::sync::Notify,
     capacity_resume: tokio::sync::Notify,
     fee: AtomicU64,
+    ldk_route_refusal: AtomicBool,
     /// Every routing-fee limit a payment was dispatched under, in order.
     fee_limits: std::sync::Mutex<Vec<u64>>,
     unknown_fee: AtomicBool,
@@ -131,19 +132,36 @@ impl Wallet {
 
 #[async_trait]
 impl LightningProvider for Wallet {
-    async fn list_channels(&self) -> Result<Vec<konsensus_core::traits::lightning::ChannelInfo>, LightningError> {
+    async fn list_channels(
+        &self,
+    ) -> Result<Vec<konsensus_core::traits::lightning::ChannelInfo>, LightningError> {
         if self.pause_capacity.load(Ordering::SeqCst) {
             self.capacity_entered.notify_one();
             self.capacity_resume.notified().await;
         }
         let capacity = self.call_capacity.load(Ordering::SeqCst);
-        let peer_pubkey = self.channel_peer.lock().unwrap().clone().unwrap_or_else(|| PEER_LN.into());
+        let peer_pubkey = self
+            .channel_peer
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| PEER_LN.into());
         let mut channels = vec![konsensus_core::traits::lightning::ChannelInfo {
-            is_outbound: Some(true), is_announced: Some(false), is_channel_ready: Some(true),
-            local_reserve_msat: Some(0), initial_push_msat: None, channel_id: "test-channel".into(),
-            user_channel_id: None, funding_txo: None, peer_pubkey,
-            capacity_msat: capacity, local_balance_msat: capacity, outbound_capacity_msat: Some(capacity),
-            remote_balance_msat: 0, active: true, short_channel_id: None,
+            is_outbound: Some(true),
+            is_announced: Some(false),
+            is_channel_ready: Some(true),
+            local_reserve_msat: Some(0),
+            initial_push_msat: None,
+            channel_id: "test-channel".into(),
+            user_channel_id: None,
+            funding_txo: None,
+            peer_pubkey,
+            capacity_msat: capacity,
+            local_balance_msat: capacity,
+            outbound_capacity_msat: Some(capacity),
+            remote_balance_msat: 0,
+            active: true,
+            short_channel_id: None,
         }];
         let other_capacity = self.other_channel_capacity.load(Ordering::SeqCst);
         if other_capacity > 0 {
@@ -170,7 +188,12 @@ impl LightningProvider for Wallet {
         self.fee_limits.lock().unwrap().push(_cap);
         if self.fee.load(Ordering::SeqCst) > _cap {
             return Err(LightningError::PaymentNotDispatched(
-                "route exceeds fee ceiling".into(),
+                if self.ldk_route_refusal.load(Ordering::SeqCst) {
+                    "Failed to send the given payment."
+                } else {
+                    "route exceeds fee ceiling"
+                }
+                .into(),
             ));
         }
         self.keysend(dest, amount, memo).await
@@ -224,7 +247,12 @@ impl LightningProvider for Wallet {
         self.fee_limits.lock().unwrap().push(_max_fee_msat);
         if self.fee.load(Ordering::SeqCst) > _max_fee_msat {
             return Err(LightningError::PaymentNotDispatched(
-                "route exceeds fee ceiling".into(),
+                if self.ldk_route_refusal.load(Ordering::SeqCst) {
+                    "Failed to send the given payment."
+                } else {
+                    "route exceeds fee ceiling"
+                }
+                .into(),
             ));
         }
         let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
@@ -234,8 +262,8 @@ impl LightningProvider for Wallet {
             // Invoice fixtures use these preimages; keysend has its own proof.
             paid.preimage = [0xcc, 0xdd].into_iter().find_map(|byte| {
                 let preimage = [byte; 32];
-                (hex::encode(<sha2::Sha256 as sha2::Digest>::digest(preimage))
-                    == paid.payment_hash).then(|| hex::encode(preimage))
+                (hex::encode(<sha2::Sha256 as sha2::Digest>::digest(preimage)) == paid.payment_hash)
+                    .then(|| hex::encode(preimage))
             });
         }
         Ok(paid)
@@ -260,7 +288,10 @@ impl LightningProvider for Wallet {
         if let Some(amount_msat) = amount {
             return Ok(PaymentDetails {
                 payment_hash: hash.into(),
-                preimage: self.recover_preimage.load(Ordering::SeqCst).then(|| "cc".repeat(32)),
+                preimage: self
+                    .recover_preimage
+                    .load(Ordering::SeqCst)
+                    .then(|| "cc".repeat(32)),
                 amount_msat,
                 status: match self.mode.load(Ordering::SeqCst) {
                     FAILED => PaymentStatus::Failed,
@@ -976,11 +1007,9 @@ async fn room_fanout_is_one_debited_call_and_refused_members_are_released() {
     }
     let body = json!({"recipient": id, "is_room": true, "kind": 100, "plaintext": "room"});
 
-    // The whole fan-out is one call: 2 × 1000 exceeds a 1999 per-call max,
-    // so no member is paid.
-    let token = fx
-        .grant(None, GrantTerms::new(10_000).per_call(1_999))
-        .await;
+    // A member price above its all-in cap refuses the entire fan-out
+    // before any member is paid.
+    let token = fx.grant(None, GrantTerms::new(10_000).per_call(999)).await;
     let (status, err) = fx
         .call(
             "POST",
@@ -1625,17 +1654,27 @@ async fn file_send_settles_actual_fee_and_holds_unknown_fee() {
     let body = json!({"recipient": fx.peer.to_hex(), "max_total_msat": 2000, "max_routing_fee_msat": 1000});
     let token = fx.grant(None, GrantTerms::new(2000)).await;
     let path = upload_file(&fx, &token).await;
-    let (status, receipt) = fx.call("POST", &path, Some(body.clone()), Some(&token)).await;
+    let (status, receipt) = fx
+        .call("POST", &path, Some(body.clone()), Some(&token))
+        .await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(receipt["max_routing_fee_msat"], 1000, "{receipt}");
-    assert_eq!(fx.used(), 1400, "principal plus the actual fee; the rest of the ceiling is released");
+    assert_eq!(
+        fx.used(),
+        1400,
+        "principal plus the actual fee; the rest of the ceiling is released"
+    );
 
     fx.wallet.unknown_fee.store(true, Ordering::SeqCst);
     let token = fx.grant(None, GrantTerms::new(2000)).await;
     let path = upload_file(&fx, &token).await;
     let (status, receipt) = fx.call("POST", &path, Some(body), Some(&token)).await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
-    assert_eq!(fx.used(), 2000, "unknown fee retains full durable liability");
+    assert_eq!(
+        fx.used(),
+        2000,
+        "unknown fee retains full durable liability"
+    );
     assert!(receipt.get("fee_paid_msat").is_none(), "{receipt}");
 }
 

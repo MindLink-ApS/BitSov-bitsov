@@ -42,8 +42,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 mod calls;
-pub use calls::{CallSpend, CallSpendStatus, CallSpendTerms};
 pub(crate) use calls::{CallPayment, CALL_CLOSING_MSAT};
+pub use calls::{CallSpend, CallSpendStatus, CallSpendTerms};
 
 /// Capability advertised on `/api/v1/status` once this node meters grants.
 pub const CAPABILITY: &str = "spend_budget_grant_v1";
@@ -109,7 +109,7 @@ pub struct FirstContactApprovalStatus {
     pub approval: Option<FirstContactGrant>,
 }
 
-/// Ceiling for every non-payment call (including fan-out and routing fees).
+/// All-in ceiling per paid message/member, excluding separately authorized admission.
 pub const MESSAGING_PER_CALL_MAX_MSAT: u64 = 6_000;
 
 /// Longest a spend grant may live: 24 hours. Also the default.
@@ -213,8 +213,8 @@ pub struct GrantTerms {
     pub allow_liquidity_fees: bool,
     /// Total the client may spend inside the window, in millisatoshis.
     pub budget_msat: u64,
-    /// Most one API call may reserve, in millisatoshis. A room message is one
-    /// call, so this bounds the whole fan-out, not each member.
+    /// Owner payment limit in millisatoshis. Messaging derives its per-member
+    /// all-in cap from this value, at most 6,000 msat.
     pub per_call_max_msat: u64,
     /// Optional per-recipient budgets, keyed by lowercase hex: a node id for
     /// messages and files, a Lightning pubkey for pay and keysend. A recipient
@@ -336,6 +336,11 @@ pub fn canonical_recipient(key: &str) -> Option<String> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GrantBudget {
+    /// The owner approved per-member room totals and a separate admission cap.
+    /// Missing on older grants, which retain their whole-call ceiling regardless
+    /// of their circuit-breaker settings. Only a fresh grant opts in.
+    #[serde(default)]
+    pub(crate) per_act_limits: bool,
     #[serde(default = "BreakerLimits::legacy")]
     pub breakers: BreakerLimits,
     #[serde(default)]
@@ -411,6 +416,7 @@ impl GrantBudget {
     /// A fresh meter for approved terms.
     pub fn from_terms(terms: &GrantTerms) -> Self {
         Self {
+            per_act_limits: true,
             breakers: terms.breakers.clone(),
             breaker_state: BreakerState::default(),
             device_breaker_resets: Vec::new(),
@@ -523,9 +529,19 @@ impl GrantBudget {
             || recipients.all(|r| self.recipient_expires_at.get(r).is_some_and(|at| *at > now))
     }
 
-    /// [`Self::reserve`], first holding a relation grant to its envelopes.
+    /// Reserve under the stored limit, first checking live relation envelopes.
     pub fn reserve_at(&mut self, charges: &[Charge], now: i64) -> Result<(), BudgetRefusal> {
-        self.reserve_bounded(charges, None, now)
+        self.reserve_act_at(charges, now, self.per_call_max_msat)
+    }
+
+    /// Transient act limits never rewrite stored owner terms or signed receipts.
+    pub(crate) fn reserve_act_at(
+        &mut self,
+        charges: &[Charge],
+        now: i64,
+        max_msat: u64,
+    ) -> Result<(), BudgetRefusal> {
+        self.reserve_bounded(charges, None, now, max_msat)
     }
 
     /// [`Self::reserve_at`] for a call's hold or offer. `per_payment_msat` is
@@ -541,7 +557,7 @@ impl GrantBudget {
         per_payment_msat: u64,
         now: i64,
     ) -> Result<(), BudgetRefusal> {
-        self.reserve_bounded(charges, Some(per_payment_msat), now)
+        self.reserve_bounded(charges, Some(per_payment_msat), now, self.per_call_max_msat)
     }
 
     /// The most one call payment (a hold's block or an offer) may carry, msat:
@@ -576,6 +592,7 @@ impl GrantBudget {
         charges: &[Charge],
         per_payment_msat: Option<u64>,
         now: i64,
+        max_msat: u64,
     ) -> Result<(), BudgetRefusal> {
         if let Some(largest) = per_payment_msat {
             self.check_call_payment(largest)?;
@@ -637,8 +654,8 @@ impl GrantBudget {
             return Err(BudgetRefusal::VelocityLimit);
         }
         match per_payment_msat {
-            None => self.reserve(charges)?,
-            Some(_) => self.reserve_within(charges, false)?,
+            None => self.reserve_with_limit(charges, max_msat)?,
+            Some(_) => self.reserve_with_limit(charges, u64::MAX)?,
         }
         if count > 0 {
             self.breaker_state
@@ -667,13 +684,22 @@ impl GrantBudget {
             unresolved_payments: self
                 .pending
                 .iter()
-                .filter(|(id, _)| !self.call_reservations.contains_key(*id)
-                    && !self.call_reservations.values().any(|call| call.draws.contains_key(*id)))
+                .filter(|(id, _)| {
+                    !self.call_reservations.contains_key(*id)
+                        && !self
+                            .call_reservations
+                            .values()
+                            .any(|call| call.draws.contains_key(*id))
+                })
                 .map(|(_, recipients)| recipients)
                 .flat_map(|r| r.values())
                 .filter(|v| **v > 0)
-                .count() as u64 + self.call_reservations.values()
-                    .filter(|call| !call.outcome_recorded && call.terms.reserved_msat > 0).count() as u64,
+                .count() as u64
+                + self
+                    .call_reservations
+                    .values()
+                    .filter(|call| !call.outcome_recorded && call.terms.reserved_msat > 0)
+                    .count() as u64,
             paused: self.breaker_state.paused,
         };
         for (at, bucket) in &self.breaker_state.buckets {
@@ -789,10 +815,27 @@ impl GrantBudget {
         self.breaker_state = BreakerState::default();
     }
 
-    /// Effective non-payment limit, including grants issued before this cap.
+    /// Effective message/member limit, including grants issued before this cap.
     /// Keep stored terms intact: payment authority and signed receipts use them.
     pub(crate) fn messaging_per_call_max_msat(&self) -> u64 {
         self.per_call_max_msat.min(MESSAGING_PER_CALL_MAX_MSAT)
+    }
+
+    pub(crate) fn admission_max_msat(&self) -> u64 {
+        if self.per_act_limits {
+            FIRST_CONTACT_MAX_MSAT
+        } else {
+            self.messaging_per_call_max_msat()
+        }
+    }
+
+    pub(crate) fn act_caps(&self) -> ActCaps {
+        let mut caps = ActCaps::new(self.per_call_max_msat);
+        caps.first_contact_max_all_in_msat = self.admission_max_msat();
+        caps.readmission_max_all_in_msat = self.admission_max_msat();
+        caps.whole_call_max_all_in_msat =
+            (!self.per_act_limits).then(|| self.messaging_per_call_max_msat());
+        caps
     }
 
     /// Budget left, msat.
@@ -802,11 +845,16 @@ impl GrantBudget {
 
     /// Check a call's charges against every bound and, only if all pass,
     /// reserve them. Either every charge is reserved or none is.
+    #[cfg(test)]
     fn reserve(&mut self, charges: &[Charge]) -> Result<(), BudgetRefusal> {
-        self.reserve_within(charges, true)
+        self.reserve_with_limit(charges, self.per_call_max_msat)
     }
 
-    fn reserve_within(&mut self, charges: &[Charge], per_call_bound: bool) -> Result<(), BudgetRefusal> {
+    fn reserve_with_limit(
+        &mut self,
+        charges: &[Charge],
+        max_msat: u64,
+    ) -> Result<(), BudgetRefusal> {
         let mut call_total: u64 = 0;
         let mut per_recipient: BTreeMap<&str, u64> = BTreeMap::new();
         for charge in charges {
@@ -819,23 +867,16 @@ impl GrantBudget {
                     recipient: charge.recipient.clone(),
                 });
             }
-            call_total =
-                call_total
-                    .checked_add(charge.amount_msat)
-                    .ok_or(BudgetRefusal::PerCall {
-                        max_msat: self.per_call_max_msat,
-                    })?;
+            call_total = call_total
+                .checked_add(charge.amount_msat)
+                .ok_or(BudgetRefusal::PerCall { max_msat })?;
             let entry = per_recipient.entry(charge.recipient.as_str()).or_insert(0);
             *entry = entry
                 .checked_add(charge.amount_msat)
-                .ok_or(BudgetRefusal::PerCall {
-                    max_msat: self.per_call_max_msat,
-                })?;
+                .ok_or(BudgetRefusal::PerCall { max_msat })?;
         }
-        if per_call_bound && call_total > self.per_call_max_msat {
-            return Err(BudgetRefusal::PerCall {
-                max_msat: self.per_call_max_msat,
-            });
+        if call_total > max_msat {
+            return Err(BudgetRefusal::PerCall { max_msat });
         }
         if call_total > self.remaining_msat() {
             return Err(BudgetRefusal::Total {
@@ -893,6 +934,25 @@ impl GrantBudget {
     }
 }
 
+/// Call-wide reservations, retained after individual room members settle.
+/// Admission is included in the total, but has its own ceiling independently
+/// of the legacy whole-call message ceiling. These counters are transient;
+/// each underlying reservation remains in the durable grant ledger.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CallReservationTotals {
+    pub all_in_msat: u64,
+    pub message_all_in_msat: u64,
+}
+
+impl CallReservationTotals {
+    pub(crate) fn messages(amount_msat: u64) -> Self {
+        Self {
+            all_in_msat: amount_msat,
+            message_all_in_msat: amount_msat,
+        }
+    }
+}
+
 /// One payment a call intends to make.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Charge {
@@ -931,8 +991,13 @@ impl Reservation {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BudgetRefusal {
     #[error("call reservation requires {required_msat} msat but outbound liquidity has {available_msat} msat available; nothing was dispatched")]
-    CallLiquidity { required_msat: u64, available_msat: u64 },
-    #[error("call block price or routing fee exceeds the reserved ceiling; nothing was dispatched")]
+    CallLiquidity {
+        required_msat: u64,
+        available_msat: u64,
+    },
+    #[error(
+        "call block price or routing fee exceeds the reserved ceiling; nothing was dispatched"
+    )]
     CallPriceChanged,
     /// The callee's quoted closing signal, with its routing allowance, is
     /// above what one payment of this call may carry.
@@ -1020,6 +1085,34 @@ impl BudgetRefusal {
     }
 }
 
+/// Derived display contract; amounts include maximum routing fees.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActCaps {
+    pub message_all_in_msat: u64,
+    pub room_member_all_in_msat: u64,
+    /// Combined admission/message safety ceiling; the quote shows separate lines.
+    pub first_contact_max_all_in_msat: u64,
+    pub readmission_max_all_in_msat: u64,
+    pub payment_all_in_msat: u64,
+    /// Older approvals share this ceiling across every non-payment act in a call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_call_max_all_in_msat: Option<u64>,
+}
+
+impl ActCaps {
+    pub fn new(payment_limit: u64) -> Self {
+        let message = payment_limit.min(MESSAGING_PER_CALL_MAX_MSAT);
+        Self {
+            message_all_in_msat: message,
+            room_member_all_in_msat: message,
+            first_contact_max_all_in_msat: FIRST_CONTACT_MAX_MSAT,
+            readmission_max_all_in_msat: FIRST_CONTACT_MAX_MSAT,
+            payment_all_in_msat: payment_limit,
+            whole_call_max_all_in_msat: None,
+        }
+    }
+}
+
 /// A grant as reported to the client that holds it and to the owner.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GrantView {
@@ -1057,6 +1150,10 @@ pub struct GrantView {
     /// maxima apply instead.
     #[serde(default)]
     pub call_per_payment_max_msat: Option<u64>,
+    /// Stored owner payment limit, independent of messaging authority.
+    pub payment_per_call_max_msat: u64,
+    pub payment_authorized: bool,
+    pub act_caps: ActCaps,
     /// Per-recipient budgets, msat.
     pub per_recipient_msat: BTreeMap<String, u64>,
     /// Per-recipient usage, msat.
@@ -1078,9 +1175,11 @@ pub struct GrantView {
 
 /// Render terms for a human before they approve them.
 pub fn describe_terms(terms: &GrantTerms) -> String {
+    let room = "N paid members x their message all-in cap, one total";
     let mut out = format!(
-        "  budget:        {} sats in total\n  per call:      at most {} sats\n  window:        {}",
+        "  budget:        {} sats in total\n  message:       at most {} sats all-in\n  room post:     {room}\n  admission:     quoted price + maximum fee, separate from message (100-sat safety ceiling)\n  payment:       at most {} sats all-in\n  window:        {}",
         sats(terms.budget_msat),
+        sats(terms.per_call_max_msat.min(MESSAGING_PER_CALL_MAX_MSAT)),
         sats(terms.per_call_max_msat),
         human_duration(terms.ttl_secs)
     );
@@ -1410,12 +1509,15 @@ mod envelope_tests {
         let mut b = GrantBudget::from_terms(&terms);
         assert_eq!(b.messaging_per_call_max_msat(), 6_000);
         assert_eq!(b.call_per_payment_max_msat(), Some(20_000));
-        b.reserve_call_at(&[charge("aa", 150_000)], 15_000, 0).unwrap();
+        b.reserve_call_at(&[charge("aa", 150_000)], 15_000, 0)
+            .unwrap();
         assert_eq!(b.used_msat, 150_000);
         // The total budget still applies, and refusal reserves nothing.
         assert!(matches!(
             b.reserve_call_at(&[charge("aa", 50_001)], 15_000, 0),
-            Err(BudgetRefusal::Total { remaining_msat: 50_000 })
+            Err(BudgetRefusal::Total {
+                remaining_msat: 50_000
+            })
         ));
         assert_eq!(b.used_msat, 150_000);
         // A relation envelope's per-act maximum bounds each call payment.
@@ -1425,7 +1527,8 @@ mod envelope_tests {
             r.reserve_call_at(&[charge("aa", 100_000)], 15_000, 50),
             Err(BudgetRefusal::PerCall { max_msat: 10_000 })
         ));
-        r.reserve_call_at(&[charge("aa", 100_000)], 10_000, 50).unwrap();
+        r.reserve_call_at(&[charge("aa", 100_000)], 10_000, 50)
+            .unwrap();
         assert_eq!(r.used_msat, 100_000);
     }
 
@@ -1442,7 +1545,9 @@ mod envelope_tests {
         ));
         assert_eq!(tight.used_msat, 0);
         assert_eq!(tight.breaker_status(0).payments_last_hour, 0);
-        tight.reserve_call_at(&[charge("aa", 10_000)], 1_000, 0).unwrap();
+        tight
+            .reserve_call_at(&[charge("aa", 10_000)], 1_000, 0)
+            .unwrap();
         // Exactly the messaging cap binds calls too.
         let mut six = GrantBudget::from_terms(
             &GrantTerms::new(200_000).per_call(MESSAGING_PER_CALL_MAX_MSAT),
@@ -1457,9 +1562,11 @@ mod envelope_tests {
         let mut open = GrantBudget::from_terms(&GrantTerms::new(500_000));
         assert_eq!(open.call_per_payment_max_msat(), Some(500_000));
         assert_eq!(open.messaging_per_call_max_msat(), 6_000);
-        open.reserve_call_at(&[charge("aa", 100_000)], 10_000, 0).unwrap();
+        open.reserve_call_at(&[charge("aa", 100_000)], 10_000, 0)
+            .unwrap();
         // An offer is bounded by its own amount.
-        open.reserve_call_at(&[charge("aa", 11_000)], 11_000, 0).unwrap();
+        open.reserve_call_at(&[charge("aa", 11_000)], 11_000, 0)
+            .unwrap();
         // A relation grant is bounded by its envelope's per-act maximum.
         let mut r = GrantBudget::relations();
         r.open_envelope("aa", 5_000, 4_000, 100);
@@ -1469,7 +1576,8 @@ mod envelope_tests {
             Err(BudgetRefusal::PerCall { max_msat: 4_000 })
         ));
         assert_eq!(r.used_msat, 0);
-        r.reserve_call_at(&[charge("aa", 4_000)], 4_000, 50).unwrap();
+        r.reserve_call_at(&[charge("aa", 4_000)], 4_000, 50)
+            .unwrap();
         assert_eq!(r.used_msat, 4_000);
     }
 
@@ -1489,10 +1597,17 @@ mod envelope_tests {
             Err(BudgetRefusal::PerCall { max_msat: 6_000 })
         ));
         assert_eq!(legacy.used_msat, 0);
-        legacy.reserve_call_at(&[charge("aa", 60_000)], 6_000, 0).unwrap();
+        legacy
+            .reserve_call_at(&[charge("aa", 60_000)], 6_000, 0)
+            .unwrap();
         let json = serde_json::to_string(&legacy).unwrap();
         assert!(!json.contains("owner_per_payment"), "{json}");
-        assert_eq!(serde_json::from_str::<GrantBudget>(&json).unwrap().per_call_max_msat, 6_000);
+        assert_eq!(
+            serde_json::from_str::<GrantBudget>(&json)
+                .unwrap()
+                .per_call_max_msat,
+            6_000
+        );
     }
 }
 
