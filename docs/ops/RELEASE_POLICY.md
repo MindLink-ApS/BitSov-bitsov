@@ -272,9 +272,14 @@ A signature counts only when GnuPG reports `[GNUPG:] VALIDSIG` with field 10
 equal to that fingerprint. This is the same predicate as `scripts/release-sign.sh`.
 `SHA256SUMS` must name exactly the seventeen source assets the signer publishes:
 the five CLI binaries, their `.sha256` files, their `.sbom.spdx.json` files,
-and the two Darwin `.toolchain.txt` files. Every named file must be a regular
-file in that directory and match its hash. A shorter list, another file, a
-nested path, or a symlink is refused.
+and the two Darwin `.toolchain.txt` files. Every directory entry must be exactly
+one of those names or the two sums files. The comparison is the whole filename;
+a directory entry is not a grep pattern. The script copies each of those files
+into a mode-0700 seal directory and hashes the copies.
+Copying `SHA256SUMS` does not seal the payloads. Install from the seal path
+the script prints, then remove it with `--cleanup`. Mode 0700 stops a different
+uid from writing the seal. It does not stop the same uid. The script does not
+install. A shorter list, another file, a nested path, or a symlink is refused.
 
 The script does not verify the git tag. Check `git verify-tag` separately
 against the same key. It also does not record whether a target was rebuilt on

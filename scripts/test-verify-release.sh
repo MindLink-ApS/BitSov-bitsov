@@ -93,6 +93,19 @@ grep -F -- '--status-fd 1 --no-auto-key-retrieve --verify SHA256SUMS.asc SHA256S
   || fail 'signer verify lacks --no-auto-key-retrieve'
 ok 'production pin is unchanged and GnuPG is not asked to fetch a key'
 
+load_allowed_names
+[ "${#ALLOWED[@]}" -eq 17 ] || fail 'allow-list length'
+allowed_name bitsov-linux-x86_64 || fail 'exact payload name was rejected'
+if allowed_name $'\nbitsov-linux-x86_64' \
+  || allowed_name $'bitsov-linux-x86_64\n' \
+  || allowed_name $'evil\nbitsov-linux-x86_64' \
+  || allowed_name --help \
+  || allowed_name '--regexp=bitsov-linux-x86_64'
+then
+  fail 'allow-list equality accepted a non-payload name'
+fi
+ok 'allow-list equality rejects newline and option-like names'
+
 # Integration uses a copy pinned to the throwaway key.
 sed "s/B299274C200301714DC6F51A7C2D6F8AC842EF6E/$TEST_KEY/g" "$HERE/verify-release.sh" > "$WORK/verify-release.sh"
 ASSETS=(bitsov-darwin-aarch64 bitsov-darwin-x86_64 bitsov-linux-aarch64 bitsov-linux-x86_64 bitsov-windows-x86_64)
@@ -131,8 +144,24 @@ GOOD="$WORK/good"
 mkdir -p "$GOOD"
 ( cd "$GOOD" && sign_tree "$GOOD" "$TEST_KEY" )
 bash "$WORK/verify-release.sh" "$GOOD" "$WORK/release.asc" >"$WORK/good.out"
-grep -q '17 files match a signature' "$WORK/good.out" || fail "good path: $(cat "$WORK/good.out")"
-ok 'accepts the seventeen signer artifacts'
+grep -q '17 sealed files match a signature' "$WORK/good.out" || fail "good path: $(cat "$WORK/good.out")"
+GOOD_SEAL=$(sed -n 's/^verify-release: sealed //p' "$WORK/good.out")
+if [ -z "$GOOD_SEAL" ] || [ ! -d "$GOOD_SEAL" ] || [ -L "$GOOD_SEAL" ]; then
+  fail "good path: no seal: $(cat "$WORK/good.out")"
+fi
+cmp -s "$GOOD/bitsov-linux-x86_64" "$GOOD_SEAL/bitsov-linux-x86_64" || fail 'good path: seal payload differs'
+[ "$(find "$GOOD_SEAL" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" -eq 20 ] \
+  || fail 'good path: seal file count'
+if find "$GOOD_SEAL" -mindepth 1 -type l -print | grep -q .; then
+  fail 'good path: symlink in seal'
+fi
+case "$(seal_type_mode "$GOOD_SEAL")" in
+  drwx------*) ;;
+  *) fail 'good path: seal is not mode 0700' ;;
+esac
+bash "$WORK/verify-release.sh" --cleanup "$GOOD_SEAL"
+[ ! -e "$GOOD_SEAL" ] || fail 'good path: cleanup left the seal'
+ok 'accepts the seventeen signer artifacts and cleans the seal'
 
 PARTIAL="$WORK/partial"
 mkdir -p "$PARTIAL"
@@ -197,9 +226,41 @@ ln -s /etc/passwd "$OPT_LINK/--help"
 expect_fail 'option-like symlink' "$OPT_LINK" "$WORK/release.asc" \
   'unexpected path in download directory: --help'
 
+# A newline inside a filename is still one directory entry. It must not be
+# split into grep patterns that include an allowed payload name.
+NL_LEAD="$WORK/nl-lead"
+mkdir -p "$NL_LEAD"
+cp -a "$GOOD/." "$NL_LEAD/"
+printf 'UNSIGNED-EXTRA\n' > "$NL_LEAD/$'\nbitsov-linux-x86_64'"
+expect_fail 'leading newline extra file' "$NL_LEAD" "$WORK/release.asc" \
+  'unexpected file in download directory:'
+
+NL_TRAIL="$WORK/nl-trail"
+mkdir -p "$NL_TRAIL"
+cp -a "$GOOD/." "$NL_TRAIL/"
+printf 'TWIN\n' > "$NL_TRAIL/$'bitsov-linux-x86_64\n'"
+expect_fail 'trailing newline extra file' "$NL_TRAIL" "$WORK/release.asc" \
+  'unexpected file in download directory:'
+
+NL_LINK="$WORK/nl-link"
+mkdir -p "$NL_LINK"
+cp -a "$GOOD/." "$NL_LINK/"
+printf 'outside-secret\n' > "$WORK/outside-secret"
+ln -s "$WORK/outside-secret" "$NL_LINK/$'evil\nbitsov-linux-x86_64'"
+expect_fail 'multiline-name symlink' "$NL_LINK" "$WORK/release.asc" \
+  'unexpected path in download directory:'
+
+assert_no_seals() {
+  local leftover
+  leftover=$(find "$TMPDIR" -maxdepth 1 -type d -name 'verify-release-seal.*' -print)
+  [ -z "$leftover" ] || fail "seal left behind: $leftover"
+}
+assert_no_seals
+ok 'rejected names leave no seal directory'
+
 # Replace the live manifest while the directory walk is in progress, after
-# the script has had a chance to snapshot it. Success must still be the
-# signed bytes. Hashing a payload from the download directory is unchanged.
+# the script has snapshotted it. Success must still be the signed bytes.
+# Payload hashes are of the seal, not of the download paths.
 SWAPDIR="$WORK/swap-manifest"
 mkdir -p "$SWAPDIR" "$WORK/bin"
 cp -a "$GOOD/." "$SWAPDIR/"
@@ -223,8 +284,17 @@ rc=0
 out=$(VERIFY_RELEASE_SWAP_TO="$WORK/swapped-sums" PATH="$WORK/bin:$PATH" \
   bash "$WORK/verify-release.sh" "$SWAPDIR" "$WORK/release.asc" 2>&1) || rc=$?
 [ "$rc" -eq 0 ] || fail "manifest swap: verifier failed: $out"
-printf '%s\n' "$out" | grep -F -- '17 files match a signature' >/dev/null \
+printf '%s\n' "$out" | grep -F -- '17 sealed files match a signature' >/dev/null \
   || fail "manifest swap: output was: $out"
+SWAP_SEAL=$(printf '%s\n' "$out" | sed -n 's/^verify-release: sealed //p')
+[ -n "$SWAP_SEAL" ] || fail 'manifest swap: no seal path'
+cmp -s "$WORK/signed-sums" "$SWAP_SEAL/SHA256SUMS" \
+  || fail 'manifest swap: seal sums are not the signed bytes'
+cmp -s "$WORK/signed-sums.asc" "$SWAP_SEAL/SHA256SUMS.asc" \
+  || fail 'manifest swap: seal signature is not the signed bytes'
+if cmp -s "$WORK/swapped-sums" "$SWAP_SEAL/SHA256SUMS"; then
+  fail 'manifest swap: seal took the live replacement'
+fi
 if cmp -s "$WORK/signed-sums" "$SWAPDIR/SHA256SUMS"; then
   fail 'manifest swap: live SHA256SUMS was not replaced'
 fi
@@ -242,7 +312,96 @@ if gpg --batch --status-fd 1 --no-auto-key-retrieve --verify \
 then
   fail 'manifest swap: swapped live SHA256SUMS verified'
 fi
+bash "$WORK/verify-release.sh" --cleanup "$SWAP_SEAL"
+[ ! -e "$SWAP_SEAL" ] || fail 'manifest swap: cleanup left the seal'
 ok 'signed snapshot survives a live SHA256SUMS replacement'
+
+# cp closes the live payload, then a writer replaces that live file before
+# shasum. The hash and the bytes that remain to be installed are the seal.
+RACE="$WORK/race"
+mkdir -p "$RACE" "$WORK/race-bin"
+cp -a "$GOOD/." "$RACE/"
+cp -P -- "$RACE/bitsov-linux-x86_64" "$WORK/race-original"
+REAL_CP=$(command -v cp)
+REAL_SHASUM=$(command -v shasum)
+cat > "$WORK/race-bin/cp" << EOF
+#!/bin/bash
+$(printf '%q' "$REAL_CP") "\$@"
+rc=\$?
+if [ "\$rc" -eq 0 ] && [ "\${1:-}" = -P ] && [ "\${3:-}" = bitsov-linux-x86_64 ]; then
+  printf 'MALWARE\n' > bitsov-linux-x86_64
+fi
+exit "\$rc"
+EOF
+cat > "$WORK/race-bin/shasum" << EOF
+#!/bin/bash
+printf '%s\n' "\$*" >> $(printf '%q' "$WORK/shasum.log")
+exec $(printf '%q' "$REAL_SHASUM") "\$@"
+EOF
+chmod 755 "$WORK/race-bin/cp" "$WORK/race-bin/shasum"
+: > "$WORK/shasum.log"
+rc=0
+out=$(PATH="$WORK/race-bin:$PATH" bash "$WORK/verify-release.sh" "$RACE" "$WORK/release.asc" 2>&1) || rc=$?
+[ "$rc" -eq 0 ] || fail "payload swap: verifier failed: $out"
+printf '%s\n' "$out" | grep -F -- '17 sealed files match a signature' >/dev/null \
+  || fail "payload swap: output was: $out"
+RACE_SEAL=$(printf '%s\n' "$out" | sed -n 's/^verify-release: sealed //p')
+if [ -z "$RACE_SEAL" ] || [ ! -d "$RACE_SEAL" ]; then
+  fail 'payload swap: no seal'
+fi
+cmp -s "$WORK/race-original" "$RACE_SEAL/bitsov-linux-x86_64" \
+  || fail 'payload swap: seal does not hold the signed bytes'
+printf 'MALWARE\n' | cmp -s - "$RACE/bitsov-linux-x86_64" \
+  || fail 'payload swap: live file was not replaced'
+if cmp -s "$RACE/bitsov-linux-x86_64" "$RACE_SEAL/bitsov-linux-x86_64"; then
+  fail 'payload swap: seal and the live file are the same bytes'
+fi
+race_hash=$(awk '$2 == "bitsov-linux-x86_64" { print $1; exit }' "$RACE_SEAL/SHA256SUMS")
+race_got=$(shasum -a 256 -- "$RACE_SEAL/bitsov-linux-x86_64" | awk '{ print $1; exit }')
+[ "$race_got" = "$race_hash" ] || fail 'payload swap: sealed payload does not match the signed hash'
+[ "$(wc -l < "$WORK/shasum.log" | tr -d ' ')" -eq 17 ] || fail 'payload swap: shasum count'
+while IFS= read -r line; do
+  case "$line" in
+    *"$RACE_SEAL"/*) ;;
+    *) fail "payload swap: shasum read outside the seal: $line" ;;
+  esac
+done < "$WORK/shasum.log"
+grep -F -- "$RACE_SEAL/bitsov-linux-x86_64" "$WORK/shasum.log" >/dev/null \
+  || fail 'payload swap: linux payload was not hashed from the seal'
+if grep -F -- "$RACE/bitsov-linux-x86_64" "$WORK/shasum.log" >/dev/null; then
+  fail 'payload swap: shasum read the live payload'
+fi
+ok 'sealed payload survives replacement of the live file'
+
+ln -s "$RACE_SEAL" "$WORK/seal-link"
+rc=0
+out=$(bash "$WORK/verify-release.sh" --cleanup "$WORK/seal-link" 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail 'cleanup followed a symlink'
+[ -d "$RACE_SEAL" ] || fail 'cleanup symlink removed the seal'
+rc=0
+out=$(bash "$WORK/verify-release.sh" --cleanup "$GOOD" 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail 'cleanup accepted the download directory'
+[ -f "$GOOD/bitsov-linux-x86_64" ] || fail 'cleanup removed a download payload'
+cp -a "$RACE_SEAL" "$WORK/copied-seal"
+rc=0
+out=$(bash "$WORK/verify-release.sh" --cleanup "$WORK/copied-seal" 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail 'cleanup accepted a copied seal with a foreign marker'
+[ -d "$RACE_SEAL" ] || fail 'foreign-marker cleanup removed the real seal'
+rm -rf "$WORK/copied-seal"
+chmod 755 "$RACE_SEAL"
+rc=0
+out=$(bash "$WORK/verify-release.sh" --cleanup "$RACE_SEAL" 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail 'cleanup accepted a seal that is not mode 0700'
+chmod 700 "$RACE_SEAL"
+printf 'extra\n' > "$RACE_SEAL/extra"
+rc=0
+out=$(bash "$WORK/verify-release.sh" --cleanup "$RACE_SEAL" 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail 'cleanup deleted a seal that contains an unexpected file'
+[ -f "$RACE_SEAL/bitsov-linux-x86_64" ] || fail 'unexpected-file cleanup removed a payload'
+rm -f -- "$RACE_SEAL/extra"
+bash "$WORK/verify-release.sh" --cleanup "$RACE_SEAL"
+[ ! -e "$RACE_SEAL" ] || fail 'cleanup left the race seal'
+ok 'cleanup removes only an intact seal this script published'
 
 NESTED="$WORK/nested"
 mkdir -p "$NESTED/hidden"
@@ -277,5 +436,47 @@ grep -q '^UMask=0077$' "$HERE/../docs/operations/konsensus.service" \
 grep -q '^UMask=0077$' "$HERE/../docs/operations/bitsov.service" \
   || fail 'system unit lost UMask=0077'
 ok 'both service units set UMask=0077'
+
+grep -F 'does not seal the payloads' "$HERE/verify-release.sh" >/dev/null \
+  || fail 'verifier omits the payload-seal limit'
+grep -F 'different uid' "$HERE/verify-release.sh" >/dev/null \
+  || fail 'verifier omits the different-uid limit'
+grep -F 'same uid' "$HERE/verify-release.sh" >/dev/null \
+  || fail 'verifier omits the same-uid limit'
+# shellcheck disable=SC2016
+grep -F -- 'shasum -a 256 -- "$SEAL/$name"' "$HERE/verify-release.sh" >/dev/null \
+  || fail 'payload hash does not read the seal'
+# shellcheck disable=SC2016
+if grep -F -- 'shasum -a 256 -- "$name"' "$HERE/verify-release.sh" >/dev/null; then
+  fail 'payload hash still reads the download path'
+fi
+if grep -n 'grep -Fxq' "$HERE/verify-release.sh" >/dev/null; then
+  fail 'membership still uses grep -Fxq'
+fi
+# shellcheck disable=SC2016
+if grep -nE 'grep .*\$rel|grep .*\$name' "$HERE/verify-release.sh" >/dev/null; then
+  fail 'a filename is still a grep pattern'
+fi
+if grep -nE 'sudo[[:space:]]' "$HERE/verify-release.sh" >/dev/null; then
+  fail 'verifier runs sudo'
+fi
+grep -F 'does not seal the payloads' "$HERE/../docs/operations/home-node.md" >/dev/null \
+  || fail 'home-node omits the payload-seal limit'
+grep -F 'same user' "$HERE/../docs/operations/home-node.md" >/dev/null \
+  || fail 'home-node omits the same-user limit'
+# shellcheck disable=SC2016
+grep -F 'sudo install -m 0755 "$seal/bitsov-linux-x86_64"' "$HERE/../docs/operations/home-node.md" >/dev/null \
+  || fail 'home-node does not install from the seal'
+if grep -F 'sudo install -m 0755 /path/to/download/bitsov-linux-x86_64' "$HERE/../docs/operations/home-node.md" >/dev/null; then
+  fail 'home-node still installs the live download path'
+fi
+grep -F 'does not seal the payloads' "$HERE/../docs/ops/RELEASE_POLICY.md" >/dev/null \
+  || fail 'release policy omits the payload-seal limit'
+grep -F 'same uid' "$HERE/../docs/ops/RELEASE_POLICY.md" >/dev/null \
+  || fail 'release policy omits the same-uid limit'
+ok 'threat model says the seal, not the manifest snapshot, is what gets installed'
+
+assert_no_seals
+ok 'no seal directory remains'
 
 echo "verify-release: $pass checks passed"
