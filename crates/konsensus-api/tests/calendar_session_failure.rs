@@ -66,7 +66,6 @@ async fn calendar_encryption_failure_case(mixed: bool) {
     for update in [false, true] {
         for missing_session in [false, true] {
             let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
-            sqlx::raw_sql("CREATE TABLE calendar_events (id TEXT PRIMARY KEY, message_id TEXT, organizer TEXT NOT NULL, title TEXT NOT NULL, description TEXT, start_ms BIGINT, end_ms BIGINT, tz TEXT, location TEXT, attendees_json TEXT, recurrence_json TEXT, color TEXT, created_at TEXT NOT NULL DEFAULT '', parent_id TEXT)").execute(db.pool()).await.unwrap();
             let store = Arc::new(FailingSessionStore::default());
             let wallet = Arc::new(
                 konsensus_lightning::MockLightningProvider::new().with_routing_fee_msat(400),
