@@ -73,10 +73,13 @@ impl PeerPriceEntry {
     ///
     /// Applies the peer's trust discount to the base price:
     /// `discounted = base * (1 - trust_discount)`, then the gate's paid-admission floor.
+    /// Call minutes use the undiscounted tariff with the same floors.
     /// Returns `None` if the kind's category isn't in the peer's table.
     pub fn get_discounted_price_for_kind(&self, kind: u16) -> Option<u64> {
         self.get_price_for_kind(kind).map(|base| {
-            let discounted = apply_trust_discount(base, self.trust_discount);
+            let discounted = if kind == konsensus_core::kind::KIND_CALL_BLOCK {
+                base
+            } else { apply_trust_discount(base, self.trust_discount) };
             konsensus_core::gate::price_with_floor_msat(
                 discounted,
                 self.prices.get(ADMISSION_FLOOR_KEY).copied().unwrap_or(0),

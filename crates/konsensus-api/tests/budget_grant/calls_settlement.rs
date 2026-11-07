@@ -552,6 +552,73 @@ async fn failed_save_of_a_block_returns_the_draw_and_the_same_block_can_be_paid(
 }
 
 #[tokio::test]
+async fn invoice_price_change_ends_the_call_and_releases_the_unpaid_reservation() {
+    let (mut fx, token) = prepared().await;
+    assert_eq!(send(&fx, &token, 400, 7000, 0).await.0, StatusCode::OK);
+    answer(&fx).await;
+    let peer = fx.peer;
+    let requests = fx.state.invoice_requests.clone();
+    let transport = Arc::new(
+        ConnectedStubTransport::new(vec![peer], requests.clone()).with_invoice_responder(
+            move |id, amount| {
+                assert_eq!(amount, 7000);
+                let requests = requests.clone();
+                tokio::spawn(async move {
+                    if let Some(tx) = requests.lock().await.remove(&id) {
+                        let _ = tx.send(Err(konsensus_api::state::InvoiceResponseError {
+                            recipient: peer,
+                            reason: "konsensus:call_price_changed".into(),
+                        }));
+                    }
+                });
+                None
+            },
+        ),
+    );
+    fx.state = Arc::new(AppState { transport: transport.clone(), ..(*fx.state).clone() });
+    let operation_id = uuid::Uuid::new_v4().to_string();
+
+    let (status, body) = send_operation(&fx, &token, 404, 7000, 0, CALL, &operation_id).await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["reason"], "call_price_changed", "{body}");
+    assert_eq!(body["retry_allowed"], false, "{body}");
+    assert_eq!((fx.wallet.money(), fx.wallet.left(), fx.used()), (1, 1000, 1000));
+    let hold = fx.service.call_spend_status(&peer.to_hex(), CALL).unwrap();
+    assert_eq!((hold.spent_msat, hold.remaining_msat, hold.closed), (0, 0, true));
+    let entry = fx.state.storage.call_get(&peer, CALL).await.unwrap().unwrap();
+    assert_eq!(entry.phase, Phase::Ended);
+    assert_eq!(entry.end_reason, Some(HangupReason::Failed));
+    assert!(entry.pending.is_none());
+    let op = fx.state.storage.get_outbox_operation(&operation_id).await.unwrap().unwrap();
+    assert_eq!(op.settled_msat, 0);
+    assert!(op.payment_hash.is_none());
+    assert!(transport.sent_envelopes.lock().unwrap().is_empty());
+    // The terminal refusal also survives ordinary recovery and receipt retention.
+    konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+    let mut aged = fx.state.storage.get_outbox_operation(&operation_id).await.unwrap().unwrap();
+    assert!(!aged.accounting_pending);
+    aged.updated_at = chrono::Utc::now().timestamp_millis() - 31 * 24 * 60 * 60 * 1000;
+    assert!(fx.state.storage.update_outbox_operation(&aged).await.unwrap());
+    konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+    assert!(fx.state.storage.get_outbox_operation(&operation_id).await.unwrap().unwrap().recovery_compacted);
+    // A caller that missed the POST response gets the same terminal guidance on GET.
+    let (status, receipt) = fx.call("GET", &format!("/api/v1/messages/operations/{operation_id}"), None, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["retry_allowed"], false, "{receipt}");
+    // Retrying the refused operation cannot keep requesting invoices for this call.
+    let (status, refusal) = send_operation(&fx, &token, 404, 7000, 0, CALL, &operation_id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+    assert_eq!(refusal["reason"], "call_price_changed", "{refusal}");
+    assert_eq!(refusal["retry_allowed"], false, "{refusal}");
+    let invoices = transport.raw_frames.lock().unwrap().iter().filter(|frame| matches!(
+        konsensus_message::wire::Frame::from_bytes(frame),
+        Ok(konsensus_message::wire::Frame::RequestInvoice { .. })
+    )).count();
+    assert_eq!(invoices, 1);
+}
+
+#[tokio::test]
 async fn invoice_refused_near_deadline_returns_the_draw_without_spending() {
     let (mut fx, token) = prepared().await;
     assert_eq!(send(&fx, &token, 400, 7000, 0).await.0, StatusCode::OK);

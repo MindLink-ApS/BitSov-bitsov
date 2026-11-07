@@ -29,6 +29,9 @@ pub const ADMISSION_RATE_LIMITED: &str = "konsensus:admission_rate_limited";
 /// No block invoice was issued: wrong call/sequence or too close to its deadline.
 pub const CALL_BLOCK_UNPAYABLE: &str = "konsensus:call_block_unpayable";
 
+/// No block invoice was created: the amount differs from the current kind-404 price.
+pub const CALL_PRICE_CHANGED: &str = "konsensus:call_price_changed";
+
 /// Readiness refusals use the existing authenticated InvoiceError frame.
 pub const CHAIN_UNAVAILABLE: &str = "konsensus:not_ready:chain_unavailable";
 pub const NOT_SYNCED: &str = "konsensus:not_ready:not_synced";
