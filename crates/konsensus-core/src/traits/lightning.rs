@@ -619,6 +619,32 @@ pub trait LightningProvider: Send + Sync {
         payment_hash: &str,
     ) -> Result<PaymentDetails, LightningError>;
 
+    /// The payment gate's settlement read. Nothing else may call it.
+    ///
+    /// Answers like [`Self::get_payment_status`], except that a backend gated
+    /// on chain sync may still confirm an inbound settlement in its local
+    /// payment store, if it was recorded no later than
+    /// [`Self::gate_settlement_cutoff`]. A brief sync lapse must not decide
+    /// whether a payment already received counts. Every other answer while not
+    /// ready stays [`LightningError::NotReady`], and the gate still runs all of
+    /// its checks.
+    ///
+    /// A decorator that does not forward this falls back to its own
+    /// `get_payment_status`, which fails closed while not ready.
+    async fn gate_payment_status(
+        &self,
+        payment_hash: &str,
+    ) -> Result<PaymentDetails, LightningError> {
+        self.get_payment_status(payment_hash).await
+    }
+
+    /// Latest settlement time (unix seconds) the gate's read may confirm while
+    /// not ready, derived from the last good Lightning chain sync. `None` means
+    /// it confirms none. Only a backend answers this; it needs no chain I/O.
+    fn gate_settlement_cutoff(&self) -> Option<u64> {
+        None
+    }
+
     /// Wake-up hints for outgoing payments: each item is the hex payment hash
     /// of an outgoing payment that may just have reached a terminal state, or
     /// an empty string when hints were dropped (re-check every payment).

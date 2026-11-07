@@ -183,6 +183,17 @@ impl RecoveringLightning {
         }
         state.backend.clone().ok_or(LightningError::NotReady)
     }
+
+    /// The backend for the gate's local store reads, plus whether money work is
+    /// allowed. Sync state does not close these; stopping or no backend does.
+    fn store_reader(&self) -> Result<(Arc<dyn LightningProvider>, bool), LightningError> {
+        let state = self.state.read().unwrap();
+        if *self.stop.borrow() {
+            return Err(LightningError::NotReady);
+        }
+        let backend = state.backend.clone().ok_or(LightningError::NotReady)?;
+        Ok((backend, state.readiness.money_ready))
+    }
 }
 
 impl Drop for RecoveringLightning {
@@ -304,9 +315,14 @@ impl LightningProvider for RecoveringLightning {
         let p = self.backend()?;
         p.accept_liquidity(owner, id).await
     }
+    /// Only the payment gate calls this. It reads the local store, so a known
+    /// record answers while not ready. An unknown hash stays `NotReady` there.
     async fn is_funding_payment(&self, hash: &str) -> Result<bool, LightningError> {
-        let p = self.backend()?;
-        p.is_funding_payment(hash).await
+        let (p, ready) = self.store_reader()?;
+        match p.is_funding_payment(hash).await {
+            Err(LightningError::PaymentNotFound(_)) if !ready => Err(LightningError::NotReady),
+            result => result,
+        }
     }
     async fn liquidity_receipt(
         &self,
@@ -364,6 +380,28 @@ impl LightningProvider for RecoveringLightning {
     ) -> Result<PaymentDetails, LightningError> {
         let p = self.backend()?;
         p.get_payment_status(payment_hash).await
+    }
+    async fn gate_payment_status(
+        &self,
+        payment_hash: &str,
+    ) -> Result<PaymentDetails, LightningError> {
+        let (p, ready) = self.store_reader()?;
+        if ready {
+            return p.gate_payment_status(payment_hash).await;
+        }
+        // While not ready this can only confirm an inbound settlement recorded
+        // while the chain view was recent. Anything else keeps the refusal it
+        // has always had.
+        match p.gate_payment_status(payment_hash).await {
+            Ok(details)
+                if details.status == PaymentStatus::Settled
+                    && details.direction == PaymentDirection::Incoming
+                    && p.gate_settlement_cutoff().is_some_and(|cutoff| details.timestamp <= cutoff) =>
+            {
+                Ok(details)
+            }
+            _ => Err(LightningError::NotReady),
+        }
     }
     async fn verify_payment(&self, payment_hash: &str) -> Result<PaymentDetails, LightningError> {
         let p = self.backend()?;

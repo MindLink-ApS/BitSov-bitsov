@@ -23,7 +23,7 @@ pub(super) fn direct_channel_fee_policy() -> RoutingFeePolicy {
 }
 
 #[path = "fault_proxy.rs"]
-mod fault_proxy;
+pub(super) mod fault_proxy;
 
 #[path = "lsps2_service.rs"]
 mod lsps2_service;
@@ -418,6 +418,7 @@ async fn start_app(
             identity: Arc::new(NodeIdentity::from_mnemonic(&config.mnemonic, "").unwrap()),
             chain_url: chain_url.to_owned(),
             calls: None,
+            readiness_gated: false,
             owner_approval_key: None,
         }),
     )

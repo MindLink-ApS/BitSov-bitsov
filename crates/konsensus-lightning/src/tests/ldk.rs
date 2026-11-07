@@ -1713,3 +1713,21 @@ fn starter_open_and_ready_info_logs_exclude_lightning_identity_and_socket() {
     assert!(!log.contains(CHANNEL_PEER));
     assert!(!log.contains("192.0.2.23"));
 }
+
+#[test]
+fn gate_settlement_cutoff_follows_the_last_good_lightning_sync() {
+    assert_eq!(gate_settlement_cutoff(None, 60), None, "never synced: confirms nothing");
+    assert_eq!(gate_settlement_cutoff(Some(1_000), 60), Some(1_000 + 120 + GATE_SETTLEMENT_GRACE_SECS));
+    assert_eq!(gate_settlement_cutoff(Some(u64::MAX), 60), Some(u64::MAX));
+}
+
+/// The window has to stay short against the time a channel's to_self_delay gives
+/// this node to act on what it sees once sync returns.
+#[test]
+fn gate_settlement_cutoff_stays_far_inside_the_shortest_to_self_delay() {
+    const LONGEST_SYNC_INTERVAL_SECS: u64 = 3_600; // `to_sync_config` refuses more.
+    const SECS_PER_BLOCK: u64 = 600;
+    let window = gate_settlement_cutoff(Some(0), LONGEST_SYNC_INTERVAL_SECS).unwrap();
+    let shortest_delay = u64::from(*OUR_TO_SELF_DELAY_BLOCKS.start()) * SECS_PER_BLOCK;
+    assert!(window * 10 < shortest_delay, "window {window}s, delay {shortest_delay}s");
+}

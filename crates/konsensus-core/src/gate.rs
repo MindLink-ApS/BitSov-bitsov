@@ -839,7 +839,7 @@ impl PaymentGate {
         }
 
         let details = lightning
-            .get_payment_status(&payment_hash)
+            .gate_payment_status(&payment_hash)
             .await
             .map_err(|e| GateRejection::LightningUnavailable(e.to_string()))?;
 
@@ -3489,5 +3489,102 @@ mod tests {
         assert!(
             matches!(result, Err(GateRejection::PaymentSettlementMismatch(s)) if s.contains("funding"))
         );
+    }
+
+    /// A backend gated on chain sync: every ordinary read refuses, and only the
+    /// gate's own read reaches the local payment record, if there is one.
+    struct NotReadyBackend {
+        record: Option<PaymentDetails>,
+        funding: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LightningProvider for NotReadyBackend {
+        async fn is_funding_payment(&self, _hash: &str) -> Result<bool, LightningError> {
+            Ok(self.funding)
+        }
+        async fn gate_payment_status(&self, _hash: &str) -> Result<PaymentDetails, LightningError> {
+            self.record.clone().ok_or(LightningError::NotReady)
+        }
+        async fn get_payment_status(&self, _hash: &str) -> Result<PaymentDetails, LightningError> {
+            Err(LightningError::NotReady)
+        }
+        async fn create_invoice(&self, _: u64, _: &str, _: u32) -> Result<Invoice, LightningError> {
+            Err(LightningError::NotReady)
+        }
+        async fn pay_invoice(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+            Err(LightningError::NotReady)
+        }
+        async fn get_balance_msat(&self) -> Result<u64, LightningError> {
+            Err(LightningError::NotReady)
+        }
+        async fn is_available(&self) -> bool {
+            false
+        }
+    }
+
+    fn stored(status: PaymentStatus, direction: PaymentDirection) -> PaymentDetails {
+        let proof = make_proof(10_000);
+        PaymentDetails {
+            payment_hash: hex::encode(proof.payment_hash),
+            preimage: (status == PaymentStatus::Settled).then(|| hex::encode(proof.preimage)),
+            amount_msat: 10_000,
+            status,
+            direction,
+            timestamp: 0,
+            memo: None,
+            fee_msat: None,
+        }
+    }
+
+    async fn gate_with(backend: NotReadyBackend) -> Result<(), GateRejection> {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let envelope = make_signed_envelope(&identity, 10_000);
+        let gate = PaymentGate::with_config(GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        });
+        gate.verify(
+            &envelope,
+            &MockNonceStore::new(),
+            &MockPricing { price_msat: 1_000 },
+            None,
+            Some(&backend),
+            0.0,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn not_ready_backend_with_a_settled_inbound_payment_is_admitted() {
+        let record = stored(PaymentStatus::Settled, PaymentDirection::Incoming);
+        let result = gate_with(NotReadyBackend { record: Some(record), funding: false }).await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn not_ready_backend_refuses_every_other_record() {
+        for status in [
+            PaymentStatus::Pending,
+            PaymentStatus::InFlight,
+            PaymentStatus::Failed,
+            PaymentStatus::Expired,
+        ] {
+            let record = stored(status, PaymentDirection::Incoming);
+            let result = gate_with(NotReadyBackend { record: Some(record), funding: false }).await;
+            assert!(matches!(result, Err(GateRejection::PaymentNotSettled(_))), "{status:?}: {result:?}");
+        }
+        // An unknown hash has no record to confirm.
+        let result = gate_with(NotReadyBackend { record: None, funding: false }).await;
+        assert!(matches!(result, Err(GateRejection::LightningUnavailable(_))), "{result:?}");
+        // The same hash settled the other way is not a payment to this node.
+        let record = stored(PaymentStatus::Settled, PaymentDirection::Outgoing);
+        let result = gate_with(NotReadyBackend { record: Some(record), funding: false }).await;
+        assert!(matches!(result, Err(GateRejection::PaymentSettlementMismatch(_))), "{result:?}");
+        // Settled funding never admits.
+        let record = stored(PaymentStatus::Settled, PaymentDirection::Incoming);
+        let result = gate_with(NotReadyBackend { record: Some(record), funding: true }).await;
+        assert!(matches!(result, Err(GateRejection::PaymentSettlementMismatch(_))), "{result:?}");
     }
 }
