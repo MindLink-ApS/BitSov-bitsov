@@ -173,7 +173,8 @@ async fn calendar_create_skips_the_attendee_whose_save_failed_unpaid() {
         "title": "save", "start": 1000, "end": 2000, "attendees": [fx.peer.to_hex(), fx.other.to_hex()],
     })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["queued_for"], json!([fx.other.to_hex()]), "{body}");
+    assert_eq!(body["failed_for"], json!([fx.other.to_hex()]), "{body}");
+    assert_eq!(body["queued_for"], json!([]), "{body}");
     assert_eq!(fx.lightning.money(), 1, "only the other attendee was paid");
     let sent = fx.transport.sent_envelopes.lock().unwrap();
     assert!(sent.iter().all(|(to, _)| *to == fx.peer), "nothing left for the attendee whose save failed");
@@ -186,7 +187,8 @@ async fn calendar_update_skips_the_attendee_whose_save_failed_unpaid() {
     fx.store.fail_peer(Some(fx.other));
     let (status, body) = fx.call("PUT", "/api/v1/calendar/events/event", json!({"title": "after"})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["queued_for"], json!([fx.other.to_hex()]), "{body}");
+    assert_eq!(body["failed_for"], json!([fx.other.to_hex()]), "{body}");
+    assert_eq!(body["queued_for"], json!([]), "{body}");
     assert_eq!(fx.lightning.money(), 1, "only the other attendee was paid");
 }
 
