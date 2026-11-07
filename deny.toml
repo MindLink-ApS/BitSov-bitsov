@@ -5,6 +5,14 @@
 # dependency graph. This closes the prior fail-open gate where cargo-audit ran
 # with `continue-on-error: true` / `|| true` and never gated anything.
 #
+# CI: the `Cargo Audit` job in `.github/workflows/ci.yml` runs
+# `cargo deny --locked check advisories bans sources` on pushes to main, on
+# `v*` tags, in the merge queue, and on pull requests that change `Cargo.lock`,
+# `deny.toml`, or `.cargo/audit.toml` (and the other advisory inputs listed in
+# that workflow). `cargo deny check licenses` is not part of that job. `bans`
+# and `sources` are included because they pass on the current lockfile.
+# Tool versions are pinned in the workflow.
+#
 # SCOPE NOTE: This wires *automated advisory blocking* only. It is NOT a manual
 # third-party security audit. ldk-node and snow (and the rest of the crypto /
 # Lightning surface) still require a paid external audit before any GA claim.

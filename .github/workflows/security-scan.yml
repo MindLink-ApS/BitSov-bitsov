@@ -21,6 +21,9 @@ concurrency:
 env:
   OSV_VERSION: v1.8.5
   GITLEAKS_VERSION: v8.21.2
+  # Same pin as ci.yml. The cache key includes this version so a restored
+  # cargo-audit binary cannot be an older scanner.
+  CARGO_AUDIT_VERSION: "0.22.2"
 
 jobs:
   security-scan:
@@ -48,19 +51,34 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
-            ~/.cargo/bin/
+            ~/.cargo/bin/cargo-audit
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-audit-
+          key: ${{ runner.os }}-cargo-audit-${{ env.CARGO_AUDIT_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-audit-${{ env.CARGO_AUDIT_VERSION }}-
 
       # ── Install tools ──────────────────────────────────────────────────────
 
-      - name: Install cargo-audit
+      - name: Install cargo-audit ${{ env.CARGO_AUDIT_VERSION }}
+        env:
+          CARGO_BUILD_JOBS: "2"
         run: |
-          if ! command -v cargo-audit &>/dev/null; then
-            cargo install cargo-audit --locked
+          set -euo pipefail
+          # `cargo audit --version` prints `cargo-audit-audit <ver>` (clap
+          # names the audit subcommand). A direct binary prints
+          # `cargo-audit <ver>`. Accept either. Anything else is reinstalled,
+          # including a scanner restored from cache.
+          got="$(cargo audit --version 2>/dev/null || true)"
+          want_sub="cargo-audit-audit ${CARGO_AUDIT_VERSION}"
+          want_bin="cargo-audit ${CARGO_AUDIT_VERSION}"
+          if [ "$got" != "$want_sub" ] && [ "$got" != "$want_bin" ]; then
+            cargo install cargo-audit --version "${CARGO_AUDIT_VERSION}" --locked --force
+            got="$(cargo audit --version 2>/dev/null || true)"
+            if [ "$got" != "$want_sub" ] && [ "$got" != "$want_bin" ]; then
+              echo "cargo-audit resolved to '${got}', want ${CARGO_AUDIT_VERSION}" >&2
+              exit 1
+            fi
           fi
 
       - name: Install osv-scanner
