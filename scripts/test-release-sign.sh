@@ -732,7 +732,7 @@ run_case() (
     [ "$(grep -c '^release upload ' "$CASE_DIR/gh.log")" -eq "$runs" ]
     [ "$(wc -l < "$CASE_DIR/upload/SHA256SUMS")" -eq 17 ]
     grep -qx "run watch 123 --repo $TEST_REPO --exit-status" "$CASE_DIR/gh.log"
-    grep -qx -- '--status-fd 1 --verify SHA256SUMS.asc SHA256SUMS' "$CASE_DIR/gpg.log"
+    grep -qx -- '--status-fd 1 --no-auto-key-retrieve --verify SHA256SUMS.asc SHA256SUMS' "$CASE_DIR/gpg.log"
     grep -q '^Not published\.' "$CASE_DIR/output"
     [ -e "$CASE_DIR/verified-tag" ]
   else
