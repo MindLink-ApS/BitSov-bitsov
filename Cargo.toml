@@ -75,7 +75,7 @@ aes-gcm = { version = "0.10", features = ["zeroize"] }
 aes = { version = "0.8", features = ["zeroize"] }
 # Enable GHASH temporaries and POLYVAL state wiping separately: neither
 # aes-gcm nor ghash forwards zeroize to its authentication backend.
-ghash = { version = "0.5", features = ["zeroize"] }
+ghash = { version = "0.6", features = ["zeroize"] }
 polyval = { version = "0.6", features = ["zeroize"] }
 argon2 = { version = "0.5", features = ["zeroize"] }
 snow = "0.9"
