@@ -476,6 +476,24 @@ grep -F 'same uid' "$HERE/../docs/ops/RELEASE_POLICY.md" >/dev/null \
   || fail 'release policy omits the same-uid limit'
 ok 'threat model says the seal, not the manifest snapshot, is what gets installed'
 
+# shellcheck disable=SC2016
+note='Do not treat `gpg --verify` success, or the text `GOODSIG` or `VALIDSIG` plus'
+cmd='bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc'
+for notes in rc15 rc16 rc17 rc18 rc19 rc20 rc21 rc22; do
+  file="$HERE/../docs/releases/v0.3.0-$notes.md"
+  grep -F "$note" "$file" >/dev/null || fail "$notes still treats status text as proof"
+  grep -F "$cmd" "$file" >/dev/null || fail "$notes does not name verify-release.sh"
+done
+ok 'rc15 through rc22 point independent verification at verify-release.sh'
+
+# shellcheck disable=SC2016
+grep -F 'Do not run the block below. It makes `./bitsov-linux-aarch64` executable' \
+  "$HERE/../docs/UPGRADING.md" >/dev/null \
+  || fail 'rc14 upgrade still runs the download-directory binary'
+grep -F "$cmd" "$HERE/../docs/UPGRADING.md" >/dev/null \
+  || fail 'rc14 upgrade does not name verify-release.sh'
+ok 'rc14 upgrade note does not run the download-directory binary'
+
 assert_no_seals
 ok 'no seal directory remains'
 
