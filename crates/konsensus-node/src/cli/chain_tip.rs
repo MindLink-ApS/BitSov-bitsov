@@ -484,21 +484,124 @@ fn accept_text(original: &str) -> Result<(String, NodeConfig)> {
     Ok((edited, new))
 }
 
-/// `konsensus.toml.before-chain-tip-20261108T170000Z`, mode 0600, never
-/// overwritten. Written to a temporary name and fsynced first, then linked
-/// into place, so a failed write never leaves a partial file under that name.
-fn write_backup(config_path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+/// The files this command creates next to the config: the backup, its
+/// temporary, and the config's temporary. The temporaries carry a random part.
+struct WriteFiles {
+    config: PathBuf,
+    /// `konsensus.toml.before-chain-tip-20261108T170000Z`.
+    backup: PathBuf,
+    backup_temp: PathBuf,
+    config_temp: PathBuf,
+}
+
+impl WriteFiles {
+    fn new(config_path: &Path) -> Result<Self> {
+        let name = config_path
+            .file_name()
+            .context("config path has no file name")?
+            .to_string_lossy()
+            .into_owned();
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let unique = || uuid::Uuid::new_v4().simple().to_string();
+        Ok(Self {
+            config: config_path.to_path_buf(),
+            backup: config_path.with_file_name(format!("{name}.before-chain-tip-{stamp}")),
+            backup_temp: config_path
+                .with_file_name(format!(".{name}.before-chain-tip-{}.tmp", unique())),
+            config_temp: config_path.with_file_name(format!(".{name}.chain-tip-{}.tmp", unique())),
+        })
+    }
+
+    fn all(&self) -> [&Path; 4] {
+        [
+            &self.config,
+            &self.backup,
+            &self.backup_temp,
+            &self.config_temp,
+        ]
+    }
+}
+
+/// The same file, by inode, by path (`same_location`), or through a symlink.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if crate::seed_cmd::same_location(a, b) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            if (ma.dev(), ma.ino()) == (mb.dev(), mb.ino()) {
+                return true;
+            }
+        }
+    }
+    matches!(
+        (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+        (Ok(x), Ok(y)) if x == y
+    )
+}
+
+/// Files the node reads that this command must never write or replace: the
+/// recovery phrase and every credential named before or after the edit.
+fn input_files(old: &NodeConfig, new: &NodeConfig) -> Vec<PathBuf> {
+    let mut files = vec![old.identity.mnemonic_file.clone()];
+    for config in [old, new] {
+        match &config.chain {
+            ChainConfig::Esplora {
+                credentials_file: Some(file),
+                ..
+            } => files.push(file.clone()),
+            ChainConfig::Bitcoind(rpc) => {
+                files.extend(rpc.cookie_file.iter().cloned());
+                files.extend(rpc.rpc_password_file.iter().cloned());
+            }
+            _ => {}
+        }
+        if let LightningConfig::Ldk {
+            credentials_file: Some(file),
+            ..
+        } = &config.lightning
+        {
+            files.push(file.clone());
+        }
+    }
+    files
+}
+
+fn refuse_if_input_is_written(
+    old: &NodeConfig,
+    new: &NodeConfig,
+    files: &WriteFiles,
+) -> Result<()> {
+    for input in input_files(old, new) {
+        for written in files.all() {
+            if same_file(&input, written) {
+                return Err(refuse(format!(
+                    "{} is the same file as {}, which this command writes or replaces; \
+                     give it its own file first",
+                    input.display(),
+                    written.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fail the backup after its file was created and partly written (tests only).
+    pub(crate) static FAIL_BACKUP_AFTER_WRITE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Mode 0600, never overwritten. Written to a fresh temporary (create_new)
+/// and fsynced first, then linked to the backup name, so a failed write never
+/// leaves a partial file under that name. Only a temporary this call created
+/// is removed.
+fn write_backup(files: &WriteFiles, bytes: &[u8]) -> Result<PathBuf> {
     use std::io::Write;
-    let name = config_path
-        .file_name()
-        .context("config path has no file name")?
-        .to_string_lossy();
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let backup = config_path.with_file_name(format!("{name}.before-chain-tip-{stamp}"));
-    let temp = config_path.with_file_name(format!(
-        ".{name}.before-chain-tip-{stamp}.{}.tmp",
-        std::process::id()
-    ));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -506,20 +609,70 @@ fn write_backup(config_path: &Path, bytes: &[u8]) -> Result<PathBuf> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let written = options.open(&temp).and_then(|mut file| {
+    let mut created = false;
+    let written = options.open(&files.backup_temp).and_then(|mut file| {
+        created = true;
         file.write_all(bytes)?;
+        #[cfg(test)]
+        if FAIL_BACKUP_AFTER_WRITE.replace(false) {
+            return Err(std::io::Error::other("injected backup failure"));
+        }
         file.sync_all()?;
         // A hard link fails if the name exists: an earlier backup is never replaced.
-        std::fs::hard_link(&temp, &backup)
+        std::fs::hard_link(&files.backup_temp, &files.backup)
     });
-    let _ = std::fs::remove_file(&temp);
+    if created {
+        let _ = std::fs::remove_file(&files.backup_temp);
+    }
     written.map_err(|e| {
         refuse(format!(
             "could not write the backup {} ({e}); try again in a second",
-            backup.display()
+            files.backup.display()
         ))
     })?;
-    Ok(backup)
+    Ok(files.backup.clone())
+}
+
+/// Replace the config through `temp`, a fresh sibling created with
+/// create_new: write, fsync, rename over the config, fsync the directory.
+/// Unlike the shared config writer's fixed temporary name, it can never be
+/// an existing file. On failure only that temporary is removed.
+fn replace_config(path: &Path, temp: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(temp)
+        .map_err(|e| refuse(format!("could not create {} ({e})", temp.display())))?;
+    let staged = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(temp, path));
+    drop(file);
+    if let Err(e) = staged {
+        let _ = std::fs::remove_file(temp);
+        return Err(refuse(format!(
+            "could not replace {} ({e})",
+            path.display()
+        )));
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{} was replaced but its directory could not be synced ({e})",
+                path.display()
+            )
+        })
 }
 
 fn had_esplora_credentials(config: &NodeConfig) -> bool {
@@ -596,8 +749,15 @@ fn hold_state_lock(config: &NodeConfig) -> Result<Option<std::fs::File>> {
         .open(&path)
     {
         Ok(file) => file,
-        // Never started from this directory: nothing holds it.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // Never started from this directory (or an older layout): create it,
+        // so a start during the source check waits for this command.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| refuse(format!("could not create {} ({e})", path.display())))?,
         Err(e) => return Err(refuse(format!("could not open {} ({e})", path.display()))),
     };
     match file.try_lock() {
@@ -721,7 +881,7 @@ pub async fn run(args: ChainTipArgs) -> Result<()> {
     let _state_lock = hold_state_lock(&config)?;
     refuse_if_listening(&config).await?;
 
-    let (edited, summary) = match request {
+    let (edited, summary, new) = match request {
         Request::Show => unreachable!("handled above"),
         Request::Accept => {
             let ChainConfig::Esplora {
@@ -741,7 +901,7 @@ pub async fn run(args: ChainTipArgs) -> Result<()> {
                 );
                 return Ok(());
             }
-            let (edited, _) = accept_text(&original)?;
+            let (edited, new) = accept_text(&original)?;
             let host = public_explorer_host(api_url).unwrap_or("your Esplora");
             (
                 edited,
@@ -749,6 +909,7 @@ pub async fn run(args: ChainTipArgs) -> Result<()> {
                     "Recorded accept_third_party_tip = true in [chain]. The node keeps reading {host} \
                      as a third_party tip and no longer warns at start."
                 ),
+                new,
             )
         }
         Request::Switch(source) => {
@@ -795,6 +956,7 @@ pub async fn run(args: ChainTipArgs) -> Result<()> {
                      Embedded Lightning uses the same source; its Esplora URLs were cleared.{credentials_note}",
                     network_name(network)
                 ),
+                new,
             )
         }
     };
@@ -808,8 +970,13 @@ pub async fn run(args: ChainTipArgs) -> Result<()> {
             path.display()
         )));
     }
-    let backup = write_backup(&path, &current)?;
-    NodeConfig::write_atomic(&path, edited.as_bytes()).map_err(|e| {
+    // Every file this command creates gets a fresh name made with create_new,
+    // so none of them can be (or replace) the recovery phrase or a credential.
+    // Refuse anyway if an input file is one of them or the config itself.
+    let files = WriteFiles::new(&path)?;
+    refuse_if_input_is_written(&config, &new, &files)?;
+    let backup = write_backup(&files, &current)?;
+    replace_config(&path, &files.config_temp, edited.as_bytes()).map_err(|e| {
         anyhow::anyhow!("{e:#}. The previous config is kept at {}", backup.display())
     })?;
     println!("{summary}");

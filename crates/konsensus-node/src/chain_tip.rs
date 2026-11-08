@@ -32,6 +32,10 @@ pub struct ExplorerSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplorerDefault {
     pub sources: Vec<ExplorerSource>,
+    /// `--accept-third-party-tip` can record acceptance: `[chain]` is Esplora.
+    /// With `[chain] backend = "mock"` only embedded LDK reads the explorer and
+    /// there is no `[chain]` Esplora table to record it in.
+    pub acceptable: bool,
 }
 
 /// The public explorer host of `url`, if it is one.
@@ -94,7 +98,11 @@ pub fn explorer_default(config: &NodeConfig) -> Option<ExplorerDefault> {
             push(&mut sources, "lightning", url);
         }
     }
-    (!sources.is_empty()).then_some(ExplorerDefault { sources })
+    let acceptable = matches!(config.chain, ChainConfig::Esplora { .. });
+    (!sources.is_empty()).then_some(ExplorerDefault {
+        sources,
+        acceptable,
+    })
 }
 
 fn push(sources: &mut Vec<ExplorerSource>, stanza: &'static str, url: &str) {
@@ -116,16 +124,24 @@ impl ExplorerDefault {
             .join(", ")
     }
 
-    /// The one start-time warning: names the source and both ways out.
+    /// The one start-time warning: names the source and only commands that
+    /// work for this config.
     pub fn warning(&self) -> String {
+        let keep = if self.acceptable {
+            "To keep this explorer and silence this warning, run `konsensus chain-tip \
+             --config <config> --accept-third-party-tip`."
+        } else {
+            "[chain] is mock, so only embedded Lightning reads this explorer and \
+             acceptance cannot be recorded; moving to a tip you own is the way to \
+             clear this warning."
+        };
         format!(
             "chain tip is a public explorer this node never explicitly accepted \
              (third_party): {}. Nothing was changed. To move to a tip you own, stop \
              the node and run `konsensus chain-tip --config <config> --chain bitcoind` \
              (your Bitcoin Core) or `--chain electrum --electrum-server-url <url> \
-             --electrum-operator own` (your Electrum server). To keep this explorer \
-             and silence this warning, run `konsensus chain-tip --config <config> \
-             --accept-third-party-tip`. See docs/CHAIN-SOURCE.md.",
+             --electrum-operator own` (your Electrum server). {keep} \
+             See docs/CHAIN-SOURCE.md.",
             self.describe()
         )
     }

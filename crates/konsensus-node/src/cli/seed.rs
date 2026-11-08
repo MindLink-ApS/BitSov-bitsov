@@ -274,7 +274,7 @@ fn keep_or_remove_encrypted(config_path: &Path, node_id: &str, encrypted: &Path,
 /// Whether two paths name the same file, including through symlinked or
 /// differently spelled parent directories. Conservative: case-insensitive
 /// (APFS default), and the same inode when both exist.
-fn same_location(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_location(a: &Path, b: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

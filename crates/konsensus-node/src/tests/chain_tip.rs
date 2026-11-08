@@ -199,6 +199,7 @@ fn the_warning_names_the_source_and_both_ways_out() {
                 host: "blockstream.info",
             },
         ],
+        acceptable: true,
     };
     let warning = found.warning();
     for needle in [
@@ -215,6 +216,22 @@ fn the_warning_names_the_source_and_both_ways_out() {
     }
 }
 
+/// With `[chain] backend = "mock"` there is nowhere to record acceptance:
+/// the warning offers only the switch, which works for that config.
+#[test]
+fn an_ldk_only_explorer_is_not_offered_acceptance() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with(dir.path(), "backend = \"mock\"", LDK_OMITTED_URLS);
+    let found = explorer_default(&config).unwrap();
+    assert!(!found.acceptable);
+    let warning = found.warning();
+    assert!(!warning.contains("--accept-third-party-tip"), "{warning}");
+    assert!(warning.contains("--chain bitcoind"), "{warning}");
+    assert!(warning.contains("[chain] is mock"), "{warning}");
+    let esplora = config_with(dir.path(), "backend = \"esplora\"", LDK_OMITTED_URLS);
+    assert!(explorer_default(&esplora).unwrap().acceptable);
+}
+
 #[tokio::test]
 async fn the_label_marks_owner_status_and_passes_reads_through() {
     let found = ExplorerDefault {
@@ -222,6 +239,7 @@ async fn the_label_marks_owner_status_and_passes_reads_through() {
             stanza: "lightning",
             host: "mempool.space",
         }],
+        acceptable: false,
     };
     let inner: Arc<dyn ChainProvider> = Arc::new(MockChainProvider::new());
     let labelled = label(Arc::clone(&inner), Some(&found));

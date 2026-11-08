@@ -121,28 +121,45 @@ fn genesis_hash(network: Network) -> String {
 
 /// Loopback Bitcoin Core JSON-RPC on `network`; `ibd` keeps it syncing.
 async fn core_fixture(network: Network, ibd: bool) -> (u16, tokio::task::JoinHandle<()>) {
-    core_fixture_editing(network, ibd, None).await
+    core_fixture_hooked(network, ibd, None).await
 }
 
-/// As [`core_fixture`]; when `edit` is set, appends to that file on the first
-/// RPC, like an owner editing the config while the source is checked.
+/// One action run on the fixture's first RPC, while the command checks the source.
+type Hook = Box<dyn FnOnce() + Send>;
+
 async fn core_fixture_editing(
     network: Network,
     ibd: bool,
     edit: Option<PathBuf>,
 ) -> (u16, tokio::task::JoinHandle<()>) {
+    let hook = edit.map(|path| -> Hook {
+        Box::new(move || {
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            text.push_str("# edited meanwhile\n");
+            std::fs::write(&path, text).unwrap();
+        })
+    });
+    core_fixture_hooked(network, ibd, hook).await
+}
+
+/// As [`core_fixture`]; when `edit` is set, appends to that file on the first
+/// RPC, like an owner editing the config while the source is checked.
+async fn core_fixture_hooked(
+    network: Network,
+    ibd: bool,
+    hook: Option<Hook>,
+) -> (u16, tokio::task::JoinHandle<()>) {
     let genesis = genesis_hash(network);
-    let edit = Arc::new(std::sync::Mutex::new(edit));
+    let edit = Arc::new(std::sync::Mutex::new(hook));
     let app = axum::Router::new().route(
         "/",
         axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
             let genesis = genesis.clone();
             let edit = Arc::clone(&edit);
             async move {
-                if let Some(path) = edit.lock().unwrap().take() {
-                    let mut text = std::fs::read_to_string(&path).unwrap();
-                    text.push_str("# edited meanwhile\n");
-                    std::fs::write(&path, text).unwrap();
+                let hook = edit.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
                 }
                 let result = match request["method"].as_str().unwrap() {
                     "getblockhash" => json!(genesis),
@@ -795,4 +812,176 @@ async fn a_failed_backup_leaves_nothing_behind() {
         .filter(|n| n.contains("before-chain-tip"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+fn switch_args(path: &Path, extra: Vec<String>) -> Vec<String> {
+    let mut args = vec![
+        "chain-tip".to_string(),
+        "--config".into(),
+        path.to_str().unwrap().into(),
+    ];
+    args.extend(extra);
+    args
+}
+
+async fn run_args(dir: &Path, args: Vec<String>) -> Output {
+    let d = dir.to_path_buf();
+    run_in_blocking(move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        konsensus(&args, &d)
+    })
+    .await
+}
+
+/// The shared config writer's fixed temporary is `<config>.toml.tmp`. A
+/// recovery phrase or credential kept under that name must survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn files_at_the_old_temporary_name_survive() {
+    // Recovery phrase there: accept still works and never touches it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = existing_full_node(dir.path());
+    let old_temp = dir.path().join("konsensus.toml.tmp");
+    let mut table: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let phrase_path = PathBuf::from(table["identity"]["mnemonic_file"].as_str().unwrap());
+    std::fs::rename(&phrase_path, &old_temp).unwrap();
+    table["identity"]
+        .as_table_mut()
+        .unwrap()
+        .insert("mnemonic_file".into(), old_temp.to_str().unwrap().into());
+    std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+    let phrase = std::fs::read(&old_temp).unwrap();
+    let output = run_args(
+        dir.path(),
+        switch_args(&path, vec!["--accept-third-party-tip".into()]),
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        std::fs::read(&old_temp).unwrap(),
+        phrase,
+        "recovery phrase changed"
+    );
+
+    // A cookie, and a password file, there: the switch works and keeps them.
+    let (port, _core) = core_fixture(Network::Signet, false).await;
+    for extra in [
+        vec!["--cookie-file".to_string()],
+        vec![
+            "--rpc-user".to_string(),
+            "bitsov".into(),
+            "--rpc-password-file".into(),
+        ],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = existing_full_node(dir.path());
+        let secret = dir.path().join("konsensus.toml.tmp");
+        std::fs::write(&secret, "__cookie__:fixture\n").unwrap();
+        let mut args = vec![
+            "--chain".to_string(),
+            "bitcoind".into(),
+            "--rpc-port".into(),
+            port.to_string(),
+        ];
+        args.extend(extra);
+        args.push(secret.to_str().unwrap().into());
+        let output = run_args(dir.path(), switch_args(&path, args)).await;
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            "__cookie__:fixture\n"
+        );
+        let table: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(table["chain"]["backend"].as_str(), Some("bitcoind"));
+    }
+}
+
+/// An input that is the config itself, directly or through a symlink, is refused.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_input_that_is_the_config_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = existing_full_node(dir.path());
+    let (port, _core) = core_fixture(Network::Signet, false).await;
+    let link = dir.path().join("cookie-link");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    for cookie in [path.clone(), link] {
+        assert_refused(
+            dir.path(),
+            &path,
+            core_args(port, &cookie),
+            "which this command writes or replaces",
+        )
+        .await;
+    }
+}
+
+/// A start during the source check waits: the command holds the state lock,
+/// creating it when an older directory has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_during_the_check_cannot_take_the_state_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = existing_full_node(dir.path());
+    let lock_path = dir.path().join("STATE_GENERATION.lock");
+    let _ = std::fs::remove_file(&lock_path);
+    let blocked = Arc::new(std::sync::Mutex::new(None));
+    let seen = Arc::clone(&blocked);
+    let probe = lock_path.clone();
+    let hook: Hook = Box::new(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&probe)
+            .unwrap();
+        *seen.lock().unwrap() = Some(matches!(
+            file.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+    });
+    let (port, _core) = core_fixture_hooked(Network::Signet, false, Some(hook)).await;
+    let cookie = cookie(dir.path());
+    let output = run_args(dir.path(), switch_args(&path, core_args(port, &cookie))).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        *blocked.lock().unwrap(),
+        Some(true),
+        "a start could take the lock mid-check"
+    );
+}
+
+/// `[chain] backend = "mock"` with embedded LDK on an explorer: the warning
+/// offers only the switch, acceptance is refused, and the switch works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ldk_only_explorer_is_offered_only_the_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = existing_full_node(dir.path());
+    let mut table: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    table.insert(
+        "chain".into(),
+        toml::Value::Table(toml::from_str("backend = \"mock\"").unwrap()),
+    );
+    std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+    let show = konsensus(
+        &["chain-tip", "--config", path.to_str().unwrap()],
+        dir.path(),
+    );
+    assert!(show.status.success(), "{}", stderr(&show));
+    let out = stdout(&show);
+    assert!(out.contains("[lightning] mempool.space"), "{out}");
+    assert!(out.contains("--chain bitcoind"), "{out}");
+    assert!(!out.contains("--accept-third-party-tip"), "{out}");
+    assert_refused(
+        dir.path(),
+        &path,
+        vec!["--accept-third-party-tip".into()],
+        "not esplora",
+    )
+    .await;
+    let (port, _core) = core_fixture(Network::Signet, false).await;
+    let cookie = cookie(dir.path());
+    let output = run_args(dir.path(), switch_args(&path, core_args(port, &cookie))).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let table: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(table["chain"]["backend"].as_str(), Some("bitcoind"));
+    assert_eq!(table["lightning"]["esplora_url"].as_str(), Some(""));
 }

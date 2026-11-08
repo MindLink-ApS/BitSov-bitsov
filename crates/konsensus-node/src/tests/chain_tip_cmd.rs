@@ -441,3 +441,72 @@ fn credentials_are_noticed_in_either_stanza() {
         );
     }
 }
+
+/// A backup that fails after its file was created and partly written leaves
+/// neither a published backup nor a temporary, and the config is untouched.
+#[test]
+fn a_backup_failing_after_its_file_was_written_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("konsensus.toml");
+    std::fs::write(&config, "tier = \"full\"\n").unwrap();
+    let files = WriteFiles::new(&config).unwrap();
+    FAIL_BACKUP_AFTER_WRITE.set(true);
+    let error = write_backup(&files, b"tier = \"full\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !FAIL_BACKUP_AFTER_WRITE.get(),
+        "the failure was not injected"
+    );
+    assert!(error.contains("could not write the backup"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        "tier = \"full\"\n"
+    );
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["konsensus.toml"], "left behind: {names:?}");
+}
+
+#[test]
+fn the_config_is_replaced_through_a_fresh_temporary() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("konsensus.toml");
+    std::fs::write(&config, "old\n").unwrap();
+    // A file at the shared writer's fixed temporary name is not touched.
+    let fixed = dir.path().join("konsensus.toml.tmp");
+    std::fs::write(&fixed, "keep\n").unwrap();
+    let files = WriteFiles::new(&config).unwrap();
+    assert_ne!(files.config_temp, fixed);
+    assert_ne!(files.backup_temp, fixed);
+    replace_config(&config, &files.config_temp, b"new\n").unwrap();
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "new\n");
+    assert_eq!(std::fs::read_to_string(&fixed).unwrap(), "keep\n");
+    assert!(!files.config_temp.exists());
+    // An existing file at the temporary name is never replaced or removed.
+    std::fs::write(&files.config_temp, "someone else's\n").unwrap();
+    assert!(replace_config(&config, &files.config_temp, b"newer\n").is_err());
+    assert_eq!(
+        std::fs::read_to_string(&files.config_temp).unwrap(),
+        "someone else's\n"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "new\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn same_file_sees_symlinks_and_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("konsensus.toml");
+    std::fs::write(&file, "x\n").unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    assert!(same_file(&link, &file));
+    assert!(same_file(
+        &dir.path().join(".").join("konsensus.toml"),
+        &file
+    ));
+    assert!(!same_file(&dir.path().join("other"), &file));
+}
