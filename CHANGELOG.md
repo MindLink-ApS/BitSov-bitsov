@@ -51,11 +51,14 @@ also live on the corresponding GitHub pre-release pages.
   Two stale offers, or a late `SessionAck`, can still retire a working session
   until key confirmation lands. No frame or message format changes.
 - A normal start no longer logs `lightning health check FAILED — payments will
-  not work` and a `Fix:` hint while the wallet is still syncing. It logs at INFO
-  that the wallet is syncing and payments start when it is ready. A real
-  Lightning failure still warns with the hint, and a wallet still not ready
-  after ten minutes now warns once. Payments are refused until Lightning is
-  ready, as before.
+  not work` and a `Fix:` hint while the wallet is still syncing. The startup
+  check reads the Lightning readiness phase: a sync is INFO ("payments start
+  when it is ready"); an unreachable chain service is one WARN naming the
+  service kind (`LIGHTNING_CHAIN_SOURCE_UNAVAILABLE`), not repeated on each
+  retry; a failed or stopped Lightning, or a backend error, still warns with
+  the `Fix:` hint, as soon as it is seen. A sync still running after ten minutes
+  warns once, and the node says at INFO when payments are on. Payments are
+  refused until Lightning is ready, as before.
 
 ## [0.3.0-rc22] — 2026-11-05
 

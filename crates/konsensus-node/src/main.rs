@@ -1439,12 +1439,16 @@ async fn start_node_services<'a>(
     } = authority;
     // ── Lightning health check ─────────────────────────────────────
     // A wallet still syncing is normal on every start and is said at INFO;
-    // a real failure, or no readiness after the sync window, is a WARN.
+    // an unreachable chain service, a failure, or a sync still running after
+    // the sync window is a WARN. See `lightning_health`.
     lightning_health::check_and_watch(
         node.lightning(),
-        config.lightning.backend_name(),
-        config.tier,
-        config.lightning.is_mock(),
+        lightning_health::Context {
+            backend: config.lightning.backend_name(),
+            chain_source: config.chain.backend_name(),
+            tier: config.tier,
+            is_mock: config.lightning.is_mock(),
+        },
         node.shutdown_rx(),
     )
     .await;
