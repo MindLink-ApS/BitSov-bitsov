@@ -81,6 +81,9 @@ async fn open_storage(
     config: &NodeConfig,
     identity: &konsensus_core::NodeIdentity,
 ) -> Result<Arc<dyn Storage>> {
+    let data_dir = config.identity.mnemonic_file.parent()
+        .filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let policy = konsensus_crypto::record_cipher::LegacyReadPolicy::in_data_dir(data_dir);
     let storage: Arc<dyn Storage> = match &config.storage {
         StorageConfig::Sqlite {
             path, encrypted, ..
@@ -89,9 +92,10 @@ async fn open_storage(
                 .await
                 .with_context(|| format!("failed to open SQLite at {path}"))?;
             if *encrypted {
-                Arc::new(konsensus_storage::EncryptedStorage::new(
+                Arc::new(konsensus_storage::EncryptedStorage::with_policy(
                     sqlite,
                     identity.aes_key(),
+                    policy.clone(),
                 ))
             } else {
                 Arc::new(sqlite)
@@ -102,9 +106,10 @@ async fn open_storage(
                 .await
                 .context("failed to connect to PostgreSQL")?;
             if *encrypted {
-                Arc::new(konsensus_storage::EncryptedStorage::new(
+                Arc::new(konsensus_storage::EncryptedStorage::with_policy(
                     pg,
                     identity.aes_key(),
+                    policy.clone(),
                 ))
             } else {
                 Arc::new(pg)
