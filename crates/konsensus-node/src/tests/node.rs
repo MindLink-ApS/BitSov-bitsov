@@ -736,9 +736,14 @@ async fn from_config_refuses_a_chain_source_on_another_network_before_node_state
         err.contains("bitcoind chain source is on bitcoin (mainnet)"),
         "{err}"
     );
-    // Refused before opening storage or Lightning state.
-    assert!(!dir.path().join("konsensus.db").exists());
-    assert!(!dir.path().join("ldk").exists());
+    // Refused before any node state: no generation lock, storage, record
+    // policy marker or Lightning state; only the files this test wrote.
+    let mut written: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    written.sort();
+    assert_eq!(written, [".cookie", "mnemonic.txt"]);
     server.abort();
 }
 
