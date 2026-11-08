@@ -943,6 +943,55 @@ mod tests {
         }
     }
 
+    // Tracing caches each callsite's interest for the whole process. While one
+    // capture is the only registered subscriber, a concurrent test thread with no
+    // subscriber that first reaches a `run` log line computes that interest from
+    // its own empty default, caches "never", and the line is then dropped for the
+    // capture too. This global default enables nothing itself, but keeps every
+    // callsite at "sometimes", so each event asks the emitting thread's own
+    // subscriber. Its OFF level hint keeps callsites unregistered until a
+    // capture exists, so no interest is ever computed without it.
+    struct KeepCallsitesOpen;
+    impl tracing::Subscriber for KeepCallsitesOpen {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::OFF)
+        }
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Capture this thread's log lines. Hold the guard until the asserted call returns.
+    fn capture_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+        static KEEP_OPEN: std::sync::Once = std::sync::Once::new();
+        KEEP_OPEN.call_once(|| {
+            tracing::subscriber::set_global_default(KeepCallsitesOpen)
+                .expect("no other global subscriber in storage unit tests");
+        });
+        let capture = LogCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        (capture, tracing::subscriber::set_default(subscriber))
+    }
+
     async fn bad_row_does_not_block_cutoff(table: RecordTable) {
         let dir = tempfile::tempdir().unwrap();
         let policy = LegacyReadPolicy::in_data_dir(dir.path());
@@ -1041,14 +1090,7 @@ mod tests {
             .await
             .unwrap());
         let upgrade = RecordUpgrade::new(&[7; 32], policy.clone(), true);
-        let capture = LogCapture::default();
-        let writer = capture.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (capture, _guard) = capture_logs();
         let result = upgrade.run(&store).await;
         let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert!(
@@ -1270,14 +1312,7 @@ mod tests {
         .await
         .unwrap();
         let upgrade = RecordUpgrade::new(&[7; 32], policy.clone(), true);
-        let capture = LogCapture::default();
-        let writer = capture.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (capture, _guard) = capture_logs();
         assert!(upgrade.run(&store).await.is_ok());
         assert!(!policy.allows_v1());
         let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
