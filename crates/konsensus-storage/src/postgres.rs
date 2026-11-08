@@ -816,11 +816,17 @@ const OPERATOR_HOSTING_PAYMENTS_SELECT: &str =
      FROM operator_hosting_payments
      WHERE contract_id = $1
      ORDER BY paid_at DESC";
-/// `peers.last_seen` is `TIMESTAMPTZ` while `Peer::last_seen` is an ISO 8601
-/// string. Reads format it in UTC, the same way `files.created_at` is read.
-macro_rules! peer_last_seen_text {
-    () => {
-        "to_char(last_seen AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')"
+/// Read a `TIMESTAMPTZ` column into an RFC 3339 string field (`Peer::last_seen`,
+/// `Room::created_at`): UTC with microseconds, the full precision Postgres
+/// stores. NULL stays NULL. Writes to these columns cast the bound text with
+/// `::timestamptz`.
+macro_rules! utc_rfc3339 {
+    ($column:literal) => {
+        concat!(
+            "to_char(",
+            $column,
+            " AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
+        )
     };
 }
 
@@ -832,7 +838,7 @@ macro_rules! peer_last_seen_text {
 /// SQLite plus the `dbh1_guard` string-assertion test below — not a live query.
 const PEERS_SELECT: &str = concat!(
     "SELECT node_id, address, ",
-    peer_last_seen_text!(),
+    utc_rfc3339!("last_seen"),
     ", display_name, metadata_json FROM peers ORDER BY node_id"
 );
 
@@ -1478,9 +1484,11 @@ impl Storage for PostgresStorage {
         let metadata = serde_json::to_string(&room.metadata)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
+        // `created_at` is TIMESTAMPTZ and `$4` is sent as text: cast it, as in
+        // `upsert_peer`.
         sqlx::query(
             "INSERT INTO rooms (id, name, created_by, created_at, metadata_json) \
-             VALUES ($1, $2, $3, $4, $5)",
+             VALUES ($1, $2, $3, $4::timestamptz, $5)",
         )
         .bind(&id)
         .bind(&room.name)
@@ -1496,9 +1504,11 @@ impl Storage for PostgresStorage {
     async fn get_room(&self, id: &RoomId) -> Result<Option<Room>, StorageError> {
         let id_str = id.to_string();
 
-        let row = sqlx::query_as::<_, (String, String, String, String, String)>(
-            "SELECT id, name, created_by, created_at, metadata_json FROM rooms WHERE id = $1",
-        )
+        let row = sqlx::query_as::<_, (String, String, String, String, String)>(concat!(
+            "SELECT id, name, created_by, ",
+            utc_rfc3339!("created_at"),
+            ", metadata_json FROM rooms WHERE id = $1"
+        ))
         .bind(&id_str)
         .fetch_optional(&self.pool)
         .await?;
@@ -1524,9 +1534,11 @@ impl Storage for PostgresStorage {
     }
 
     async fn list_rooms(&self) -> Result<Vec<Room>, StorageError> {
-        let rows = sqlx::query_as::<_, (String, String, String, String, String)>(
-            "SELECT id, name, created_by, created_at, metadata_json FROM rooms ORDER BY created_at DESC LIMIT 1000",
-        )
+        let rows = sqlx::query_as::<_, (String, String, String, String, String)>(concat!(
+            "SELECT id, name, created_by, ",
+            utc_rfc3339!("created_at"),
+            ", metadata_json FROM rooms ORDER BY created_at DESC LIMIT 1000"
+        ))
         .fetch_all(&self.pool)
         .await?;
 
@@ -1675,7 +1687,7 @@ impl Storage for PostgresStorage {
         let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, String)>(
             concat!(
                 "SELECT node_id, address, ",
-                peer_last_seen_text!(),
+                utc_rfc3339!("last_seen"),
                 ", display_name, metadata_json FROM peers WHERE node_id = $1"
             ),
         )
@@ -4154,14 +4166,19 @@ mod schema_parity_tests {
         let name = disposable_name("peer_last_seen");
         let db_url = create_database(&admin, &url, &name).await;
         let result = async {
-            const SEEN: &str = "2026-11-08T16:44:13.250Z";
+            // Sub-millisecond on purpose: Postgres keeps microseconds.
+            const SEEN: &str = "2026-11-08T16:44:13.250123Z";
             let db = PostgresStorage::connect(&db_url).await.unwrap();
             let id = NodeId::from_bytes([5u8; 32]);
             let last_seen = |peer: Option<Peer>| peer.expect("peer stored").last_seen;
 
-            // A peer without `last_seen` is stored and reads back as None.
+            // A peer without `last_seen` is stored and reads back as None,
+            // through both readers.
             db.upsert_peer(&Peer::new(id)).await.unwrap();
             assert_eq!(last_seen(db.get_peer(&id).await.unwrap()), None);
+            let listed = db.list_peers().await.unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].last_seen, None);
 
             let mut peer = Peer::new(id);
             peer.address = Some("peer.example:9735".into());
@@ -4174,6 +4191,11 @@ mod schema_parity_tests {
             assert_eq!(listed.len(), 1);
             assert_eq!(listed[0].last_seen.as_deref(), Some(SEEN));
 
+            // Writing back what was read keeps the same value.
+            db.upsert_peer(&loaded).await.unwrap();
+            let rewritten = last_seen(db.get_peer(&id).await.unwrap());
+            assert_eq!(rewritten.as_deref(), Some(SEEN));
+
             // An update without `last_seen` keeps the stored value.
             db.upsert_peer(&Peer::new(id)).await.unwrap();
             let kept = last_seen(db.get_peer(&id).await.unwrap());
@@ -4183,7 +4205,62 @@ mod schema_parity_tests {
             peer.last_seen = Some("2026-11-09T01:00:00+02:00".into());
             db.upsert_peer(&peer).await.unwrap();
             let utc = last_seen(db.get_peer(&id).await.unwrap());
-            assert_eq!(utc.as_deref(), Some("2026-11-08T23:00:00.000Z"));
+            assert_eq!(utc.as_deref(), Some("2026-11-08T23:00:00.000000Z"));
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn postgres_room_round_trips_created_at() {
+        let (admin, url) = admin_pool().await;
+        let name = disposable_name("room_created_at");
+        let db_url = create_database(&admin, &url, &name).await;
+        let result = async {
+            let db = PostgresStorage::connect(&db_url).await.unwrap();
+            let creator = NodeId::from_bytes([6u8; 32]);
+            let micros = |text: &str| {
+                chrono::DateTime::parse_from_rfc3339(text)
+                    .expect("RFC 3339 created_at")
+                    .timestamp_micros()
+            };
+
+            // `Room::new` writes the current time with nanoseconds and a
+            // `+00:00` offset. It reads back in UTC as the same instant,
+            // rounded to the microsecond.
+            let fresh = Room::new("fresh".into(), creator);
+            db.create_room(&fresh).await.unwrap();
+            let loaded = db.get_room(&fresh.id).await.unwrap().expect("room stored");
+            let loaded_fresh = loaded.created_at.clone();
+            assert_eq!(loaded.name, "fresh");
+            assert_eq!(loaded.created_by, creator);
+            assert!(loaded.created_at.ends_with('Z'), "{}", loaded.created_at);
+            let drift = micros(&loaded.created_at) - micros(&fresh.created_at);
+            let fresh_at = &fresh.created_at;
+            assert!(drift.abs() <= 1, "{loaded_fresh} vs {fresh_at}");
+
+            // An earlier room with an offset and sub-millisecond time.
+            let older = Room {
+                id: RoomId::new(),
+                name: "older".into(),
+                created_by: creator,
+                created_at: "2020-01-02T03:04:05.250123+02:00".into(),
+                metadata: serde_json::json!({}),
+            };
+            db.create_room(&older).await.unwrap();
+            let loaded = db.get_room(&older.id).await.unwrap().expect("room stored");
+            assert_eq!(loaded.created_at, "2020-01-02T01:04:05.250123Z");
+
+            // The list uses the same format, newest first.
+            let listed = db.list_rooms().await.unwrap();
+            let names: Vec<&str> = listed.iter().map(|room| room.name.as_str()).collect();
+            assert_eq!(names, ["fresh", "older"]);
+            assert_eq!(listed[1].created_at, "2020-01-02T01:04:05.250123Z");
+            assert_eq!(listed[0].created_at, loaded_fresh);
             db.pool.close().await;
         }
         .await;
