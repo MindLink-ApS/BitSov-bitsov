@@ -69,6 +69,11 @@ Amounts already paid for messages or minutes that were not read are not refunded
 Tested on regtest on this release and on rc21, by calling the app's host
 functions, not on real hardware.
 
+Also present in rc21 and rc22: after a reconnect, one node can be left without
+an E2EE session. If that node holds the lower id, it stays stuck until a new
+connection. The fix is on main (#514) and not in either signed release; see
+[recovering a stuck E2EE session](operations/e2ee-session-recovery.md).
+
 Follow the [rc22 signing and node checklist](releases/v0.3.0-rc22.md).
 
 ## rc20 → rc21
