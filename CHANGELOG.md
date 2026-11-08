@@ -12,6 +12,14 @@ also live on the corresponding GitHub pre-release pages.
   binds the API off-loopback refuses to start with an error naming the flag; add
   it to keep that bind. `[remote_access]` still requires a loopback API, and the
   flag does not lift that rule.
+- A node whose chain tip is a public explorer it never explicitly accepted
+  (earlier generated Full configs or omitted Esplora URLs) now logs one warning
+  at start and reports `chain_view.explorer_default: true` in owner status. Its
+  config is not changed. `konsensus chain-tip` shows the source; with
+  `--chain bitcoind|electrum` it checks the new source (reachable, synchronized,
+  same network) and moves the config to it, keeping a backup; with
+  `--accept-third-party-tip` it records the choice in `[chain]` and the warning
+  stops. See `docs/CHAIN-SOURCE.md`.
 - A node that lost its E2EE session with a connected peer gets it back on the
   same connection. When the lower-id node lost it, about 25 seconds: the higher-id
   peer now answers a PrekeyOffer with its own, at most once per ten seconds per

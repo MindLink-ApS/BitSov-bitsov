@@ -292,6 +292,7 @@ impl ChainProvider for EsploraProvider {
             host: reqwest::Url::parse(&self.endpoints[self.active.load(Ordering::Relaxed)].0)
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_owned)),
+            explorer_default: false,
         }
     }
 

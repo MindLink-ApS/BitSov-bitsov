@@ -58,6 +58,7 @@ fn chain(config: &ChainConfig) -> Result<Box<dyn RecoveryChain>> {
             api_url,
             esplora_url_fallback,
             credentials_file,
+            ..
         } => {
             let mut provider = konsensus_chain::EsploraProvider::with_fallbacks(
                 konsensus_chain::EsploraConfig::custom(api_url.clone(), TrustLevel::ServerTrust),

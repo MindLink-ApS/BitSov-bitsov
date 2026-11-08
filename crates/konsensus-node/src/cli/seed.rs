@@ -75,7 +75,7 @@ fn prompt_new_password() -> Result<Zeroizing<String>> {
 
 /// Encrypting under a running node would leave it on a config it no longer
 /// matches until restart; ask for it to be stopped first.
-fn refuse_if_node_running(config_path: &Path) -> Result<()> {
+pub(crate) fn refuse_if_node_running(config_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         let socket = crate::owner_cmd::data_dir_of(config_path).join(konsensus_api::control::SOCKET_FILE);

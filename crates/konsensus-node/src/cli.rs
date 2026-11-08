@@ -301,6 +301,11 @@ pub enum Command {
         command: SeedCommand,
     },
 
+    /// Show the chain tip source, or explicitly move it to a tip you own
+    /// (`--chain bitcoind|electrum`) or accept a public explorer
+    /// (`--accept-third-party-tip`). Keeps a backup; the node must be stopped.
+    ChainTip(crate::chain_tip_cmd::ChainTipArgs),
+
     /// Paired device keys: approve one once, list, or revoke.
     ///
     /// A device key lets the paired app open per-contact spend envelopes by
