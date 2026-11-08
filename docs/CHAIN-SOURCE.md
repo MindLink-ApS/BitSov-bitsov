@@ -238,9 +238,11 @@ its configured API or peer address); when `[chain]` is already Core or
 Electrum; when `[lightning]` states no known network; when credential files are
 not absolute paths; when the file layout is not one it can edit safely (for
 example `[chain]` as an inline table); when the edited config would not start
-embedded Lightning; or when the file changed while the source was checked. It
-holds the state lock until the new file is in place, so the node cannot start
-in between.
+embedded Lightning; when the recovery phrase or a credential file is the config,
+the backup or a temporary file this command writes (also through a symlink); or
+when the file changed while the source was checked. It holds the state lock
+until the new file is in place (creating `STATE_GENERATION.lock` if an older
+directory has none), so the node cannot start in between.
 
 On success it replaces the `[chain]` table and, for embedded LDK, sets
 `esplora_url = ""` and removes `esplora_url_fallback` and `credentials_file`, as
@@ -248,7 +250,9 @@ a fresh owned-tip config has them. A paid Esplora's `credentials_file` belongs
 to the Esplora being left; the credentials file itself is not touched. Other
 lines and comments stay as they were. The previous file is kept next to it as
 `konsensus.toml.before-chain-tip-<UTC time>` (mode 0600, written in full before
-it gets that name). To undo, stop the node and copy that file back. After the
+it gets that name). The backup and the new config are written through fresh
+hidden temporary files with a random part, created so that they can never be an
+existing file; a failure removes only those. To undo, stop the node and copy that file back. After the
 restart, embedded LDK syncs from the new source and `money_ready` follows the
 usual wallet sync rules.
 
@@ -265,7 +269,9 @@ konsensus chain-tip --config /path/to/konsensus.toml --accept-third-party-tip
 ```
 
 This records `accept_third_party_tip = true` in `[chain]` (with the same backup)
-and changes nothing else. The node keeps the same explorer, reports
+and changes nothing else. It needs `[chain] backend = "esplora"`: when `[chain]`
+is `mock` and only embedded LDK reads the explorer, there is no Esplora table to
+record it in, so the warning offers only the switch above. The node keeps the same explorer, reports
 `third_party`, and no longer warns. Delete the line to return to the warning.
 Releases before this key reject configs that contain it: restore the backup
 before running an older binary.
