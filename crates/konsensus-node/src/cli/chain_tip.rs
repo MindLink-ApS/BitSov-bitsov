@@ -445,10 +445,12 @@ fn switch_text(
     let mut edited = replace_chain(original, chain)?;
     let ldk = matches!(config.lightning, LightningConfig::Ldk { .. });
     if ldk {
+        // The credentials belong to the paid Esplora being left: LDK builds
+        // its authenticated transport from them before it looks at [chain].
         edited = edit_table(
             &edited,
             "lightning",
-            &["esplora_url", "esplora_url_fallback"],
+            &["esplora_url", "esplora_url_fallback", "credentials_file"],
             &["esplora_url = \"\"".to_string()],
         )?;
     }
@@ -460,6 +462,7 @@ fn switch_text(
             if let Some(toml::Value::Table(lightning)) = table.get_mut("lightning") {
                 lightning.insert("esplora_url".into(), toml::Value::String(String::new()));
                 lightning.remove("esplora_url_fallback");
+                lightning.remove("credentials_file");
             }
         }
     })?;
@@ -481,7 +484,9 @@ fn accept_text(original: &str) -> Result<(String, NodeConfig)> {
     Ok((edited, new))
 }
 
-/// `konsensus.toml.before-chain-tip-20261108T170000Z`, mode 0600, never overwritten.
+/// `konsensus.toml.before-chain-tip-20261108T170000Z`, mode 0600, never
+/// overwritten. Written to a temporary name and fsynced first, then linked
+/// into place, so a failed write never leaves a partial file under that name.
 fn write_backup(config_path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     use std::io::Write;
     let name = config_path
@@ -490,6 +495,10 @@ fn write_backup(config_path: &Path, bytes: &[u8]) -> Result<PathBuf> {
         .to_string_lossy();
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let backup = config_path.with_file_name(format!("{name}.before-chain-tip-{stamp}"));
+    let temp = config_path.with_file_name(format!(
+        ".{name}.before-chain-tip-{stamp}.{}.tmp",
+        std::process::id()
+    ));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -497,21 +506,136 @@ fn write_backup(config_path: &Path, bytes: &[u8]) -> Result<PathBuf> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&backup).map_err(|e| {
+    let written = options.open(&temp).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        // A hard link fails if the name exists: an earlier backup is never replaced.
+        std::fs::hard_link(&temp, &backup)
+    });
+    let _ = std::fs::remove_file(&temp);
+    written.map_err(|e| {
         refuse(format!(
-            "could not create the backup {} ({e}); try again in a second",
+            "could not write the backup {} ({e}); try again in a second",
             backup.display()
         ))
     })?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| {
-            refuse(format!(
-                "could not write the backup {} ({e})",
-                backup.display()
-            ))
-        })?;
     Ok(backup)
+}
+
+fn had_esplora_credentials(config: &NodeConfig) -> bool {
+    matches!(
+        config.lightning,
+        LightningConfig::Ldk {
+            credentials_file: Some(_),
+            ..
+        }
+    ) || matches!(
+        config.chain,
+        ChainConfig::Esplora {
+            credentials_file: Some(_),
+            ..
+        }
+    )
+}
+
+/// The chain-source settings embedded LDK checks at start before any network
+/// use, with the same constructors in the same order: an Esplora credentials
+/// file builds the authenticated transport from `esplora_url` first, then
+/// Core or Electrum is built from `[chain]`. A config that fails here would
+/// not start, so it is never written.
+fn ldk_chain_source_preflight(config: &NodeConfig) -> Result<()> {
+    let LightningConfig::Ldk {
+        esplora_url,
+        esplora_url_fallback,
+        credentials_file,
+        ..
+    } = &config.lightning
+    else {
+        return Ok(());
+    };
+    let unusable = |e: &dyn std::fmt::Display| {
+        refuse(format!(
+            "embedded Lightning could not start from the edited config ({e})"
+        ))
+    };
+    if let Some(file) = credentials_file {
+        let auth =
+            konsensus_chain::bearer::BearerAuth::from_file(file).map_err(|e| unusable(&e))?;
+        konsensus_chain::bearer::BearerFailover::new(
+            auth,
+            esplora_url,
+            esplora_url_fallback.iter().cloned().collect(),
+        )
+        .map_err(|e| unusable(&e))?;
+    }
+    match &config.chain {
+        ChainConfig::Bitcoind(rpc) => {
+            konsensus_chain::BitcoindProvider::new(rpc.clone()).map_err(|e| unusable(&e))?;
+        }
+        ChainConfig::Electrum(server) => {
+            konsensus_chain::ElectrumProvider::new(server.clone()).map_err(|e| unusable(&e))?;
+        }
+        _ => return Err(refuse("the edited config does not select Core or Electrum")),
+    }
+    Ok(())
+}
+
+/// Take the node's state lock (`STATE_GENERATION.lock` beside the recovery
+/// phrase) without waiting. A running node holds it for its whole life.
+fn hold_state_lock(config: &NodeConfig) -> Result<Option<std::fs::File>> {
+    let data_dir = config
+        .identity
+        .mnemonic_file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let path = data_dir.join("STATE_GENERATION.lock");
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        // Never started from this directory: nothing holds it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(refuse(format!("could not open {} ({e})", path.display()))),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(refuse(
+            "the node is running (its state lock is held). Stop it first",
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(refuse(format!(
+            "could not check the node's state lock ({e})"
+        ))),
+    }
+}
+
+/// Refuse when something answers on the node's own API or peer address.
+async fn refuse_if_listening(config: &NodeConfig) -> Result<()> {
+    for (what, addr) in [
+        ("API", config.api.listen_addr),
+        ("peer", config.network.listen_addr),
+    ] {
+        let mut target = addr;
+        if target.ip().is_unspecified() {
+            target.set_ip(match target {
+                std::net::SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                std::net::SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+            });
+        }
+        let probe = tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::net::TcpStream::connect(target),
+        )
+        .await;
+        if matches!(probe, Ok(Ok(_))) {
+            return Err(refuse(format!(
+                "something answers on the node's {what} address {target}; stop the node first"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// One line on where the tip comes from, for `chain-tip` without an action.
@@ -593,6 +717,9 @@ pub async fn run(args: ChainTipArgs) -> Result<()> {
         .with_context(|| format!("could not read {}", path.display()))?;
     let config =
         NodeConfig::load(&path).map_err(|e| refuse(format!("the config does not load ({e})")))?;
+    // Held until the new file is in place, so the node cannot start meanwhile.
+    let _state_lock = hold_state_lock(&config)?;
+    refuse_if_listening(&config).await?;
 
     let (edited, summary) = match request {
         Request::Show => unreachable!("handled above"),
@@ -646,25 +773,42 @@ pub async fn run(args: ChainTipArgs) -> Result<()> {
                     "the edited config would still read a public explorer",
                 ));
             }
+            ldk_chain_source_preflight(&new)?;
             let what = describe(&new);
-            let electrum_note = if matches!(chain, ChainConfig::Electrum(_)) {
-                "\nYour Electrum server should itself be backed by a Bitcoin Core you control; \
-                 this is not checked."
+            let credentials_note = if had_esplora_credentials(&config) {
+                "\nThe paid Esplora `credentials_file` setting was removed with it; \
+                 the credentials file itself was not touched."
             } else {
                 ""
+            };
+            let source_note = if matches!(chain, ChainConfig::Electrum(_)) {
+                "\nElectrum reported a tip; whether that tip is current is not checked. \
+                 Your Electrum server should itself be backed by a Bitcoin Core you control; \
+                 this is not checked either."
+            } else {
+                "\nBitcoin Core reported initial block download finished and blocks equal to headers."
             };
             (
                 edited,
                 format!(
-                    "Chain tip is now {what}. The source answered on {} at height {height}.\n\
-                     Embedded Lightning uses the same source; its Esplora URLs were cleared.{electrum_note}",
+                    "Chain tip is now {what}. The source answered on {} at height {height}.{source_note}\n\
+                     Embedded Lightning uses the same source; its Esplora URLs were cleared.{credentials_note}",
                     network_name(network)
                 ),
             )
         }
     };
 
-    let backup = write_backup(&path, original.as_bytes())?;
+    // The source check can take a while: replace only the bytes that were checked.
+    let current = std::fs::read(&path)
+        .map_err(|e| refuse(format!("could not re-read {} ({e})", path.display())))?;
+    if current != original.as_bytes() {
+        return Err(refuse(format!(
+            "{} changed while the source was checked; run the command again",
+            path.display()
+        )));
+    }
+    let backup = write_backup(&path, &current)?;
     NodeConfig::write_atomic(&path, edited.as_bytes()).map_err(|e| {
         anyhow::anyhow!("{e:#}. The previous config is kept at {}", backup.display())
     })?;

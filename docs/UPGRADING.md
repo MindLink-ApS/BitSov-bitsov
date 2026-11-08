@@ -18,9 +18,10 @@ Nothing changes until you run one of these with the node stopped:
 2. `konsensus chain-tip --config <path> --chain bitcoind` (your Core, pruned is
    fine) or `--chain electrum --electrum-server-url <url> --electrum-operator own`
    (your Electrum server, itself backed by a Core you control) checks the new
-   source (reachable, synchronized, same network as `[lightning] network`), keeps
+   source (reachable, synchronized, same network as `[lightning] network`; for
+   Electrum, only that it reports a tip), keeps
    `konsensus.toml.before-chain-tip-<UTC time>`, and rewrites only `[chain]` and
-   LDK's two Esplora URL keys.
+   LDK's Esplora URL and `credentials_file` keys.
 3. `konsensus chain-tip --config <path> --accept-third-party-tip` keeps the
    explorer, records `accept_third_party_tip = true` in `[chain]`, and silences
    the warning. Earlier releases reject that key: restore the backup before a

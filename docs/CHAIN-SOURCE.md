@@ -222,23 +222,35 @@ konsensus chain-tip --config /path/to/konsensus.toml --chain electrum \
   --electrum-server-url tcp://10.0.0.20:50001 --electrum-operator own
 ```
 
-Before writing anything, the command checks the new source within 20 seconds:
+Before writing anything, the command checks the new source within 20 seconds
+(a source that accepts the connection but stays silent counts as unreachable):
 it must answer, its genesis block must be the `[lightning] network`'s, and it
-must report itself synchronized (Core out of initial block download with blocks
-equal to headers; Electrum must report a tip). It refuses, and changes nothing,
-when the source is unreachable, on another network or still syncing, when the
-node is running, when `[chain]` is already Core or Electrum, when
-`[lightning]` states no known network, or when the file layout is not one it can
-edit safely (for example `[chain]` as an inline table). Credential files must be
-absolute paths. Every signet shares one genesis block, so a custom signet passes
-as `signet`.
+must report itself synchronized. For Core that means out of initial block
+download with blocks equal to headers. For Electrum it only means the server
+reported a tip: whether that tip is current is **not** checked, so make sure
+your server has caught up. All signets share one genesis block, so a custom
+signet passes as `signet`; the signet challenge is not compared.
 
-On success it replaces the `[chain]` table, sets LDK's `esplora_url = ""` and
-removes `esplora_url_fallback`, as a fresh owned-tip config has them. Other
+It refuses, and changes nothing, when the source is unreachable, on another
+network or still syncing; when the node is running (its owner control socket
+answers, its state lock `STATE_GENERATION.lock` is held, or something answers on
+its configured API or peer address); when `[chain]` is already Core or
+Electrum; when `[lightning]` states no known network; when credential files are
+not absolute paths; when the file layout is not one it can edit safely (for
+example `[chain]` as an inline table); when the edited config would not start
+embedded Lightning; or when the file changed while the source was checked. It
+holds the state lock until the new file is in place, so the node cannot start
+in between.
+
+On success it replaces the `[chain]` table and, for embedded LDK, sets
+`esplora_url = ""` and removes `esplora_url_fallback` and `credentials_file`, as
+a fresh owned-tip config has them. A paid Esplora's `credentials_file` belongs
+to the Esplora being left; the credentials file itself is not touched. Other
 lines and comments stay as they were. The previous file is kept next to it as
-`konsensus.toml.before-chain-tip-<UTC time>` (mode 0600). To undo, stop the node
-and copy that file back. After the restart, embedded LDK syncs from the new
-source and `money_ready` follows the usual wallet sync rules.
+`konsensus.toml.before-chain-tip-<UTC time>` (mode 0600, written in full before
+it gets that name). To undo, stop the node and copy that file back. After the
+restart, embedded LDK syncs from the new source and `money_ready` follows the
+usual wallet sync rules.
 
 A pruned Core works (see [own Bitcoin Core](#own-bitcoin-core)). An Electrum
 server is an owned tip only if it is itself backed by a Bitcoin Core you control

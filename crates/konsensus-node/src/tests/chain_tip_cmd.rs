@@ -343,3 +343,101 @@ fn genesis_hashes_name_their_network() {
         None
     );
 }
+
+/// A generated config with `[chain]` and `[lightning]` replaced.
+fn node_config(dir: &Path, chain: &str, lightning: &str) -> NodeConfig {
+    let base = NodeConfig::default_for_tier(
+        crate::config::NodeTier::Light,
+        dir.join("mnemonic.txt"),
+        dir,
+    );
+    let mut table = toml::Table::try_from(&base).unwrap();
+    table.insert(
+        "chain".into(),
+        toml::Value::Table(toml::from_str(chain).unwrap()),
+    );
+    table.insert(
+        "lightning".into(),
+        toml::Value::Table(toml::from_str(lightning).unwrap()),
+    );
+    toml::from_str(&toml::to_string(&table).unwrap()).unwrap()
+}
+
+#[cfg(unix)]
+fn private_file(path: &Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, contents).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// The preflight builds what embedded LDK builds at start: a leftover paid
+/// Esplora `credentials_file` with an empty `esplora_url` cannot start.
+#[cfg(unix)]
+#[test]
+fn ldk_preflight_refuses_leftover_esplora_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let credentials = dir.path().join("chain-api.toml");
+    private_file(
+        &credentials,
+        "token_url = \"https://login.example/token\"\nclient_id = \"fixture\"\nclient_secret = \"fixture-only\"\n",
+    );
+    let cookie = dir.path().join("core.cookie");
+    std::fs::write(&cookie, "__cookie__:fixture\n").unwrap();
+    let chain = format!(
+        "backend = \"bitcoind\"\nrpc_host = \"127.0.0.1\"\nrpc_port = 38332\ncookie_file = {:?}",
+        cookie
+    );
+    let leftover = node_config(
+        dir.path(),
+        &chain,
+        &format!(
+            "backend = \"ldk\"\nnetwork = \"signet\"\nesplora_url = \"\"\ncredentials_file = {:?}",
+            credentials
+        ),
+    );
+    let error = ldk_chain_source_preflight(&leftover)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("embedded Lightning could not start"),
+        "{error}"
+    );
+    let clean = node_config(
+        dir.path(),
+        &chain,
+        "backend = \"ldk\"\nnetwork = \"signet\"\nesplora_url = \"\"",
+    );
+    ldk_chain_source_preflight(&clean).unwrap();
+    // A missing cookie is caught the same way start would.
+    std::fs::remove_file(&cookie).unwrap();
+    assert!(ldk_chain_source_preflight(&clean).is_err());
+}
+
+#[test]
+fn credentials_are_noticed_in_either_stanza() {
+    let dir = tempfile::tempdir().unwrap();
+    for (chain, lightning, expected) in [
+        (
+            "backend = \"esplora\"",
+            "backend = \"ldk\"\nnetwork = \"signet\"\ncredentials_file = \"/s/c.toml\"",
+            true,
+        ),
+        (
+            "backend = \"esplora\"\ncredentials_file = \"/s/c.toml\"",
+            "backend = \"ldk\"\nnetwork = \"signet\"",
+            true,
+        ),
+        (
+            "backend = \"esplora\"",
+            "backend = \"ldk\"\nnetwork = \"signet\"",
+            false,
+        ),
+    ] {
+        let config = node_config(dir.path(), chain, lightning);
+        assert_eq!(
+            had_esplora_credentials(&config),
+            expected,
+            "{chain} / {lightning}"
+        );
+    }
+}

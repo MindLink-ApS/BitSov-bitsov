@@ -59,10 +59,35 @@ fn existing_full_node(dir: &Path) -> PathBuf {
         "esplora_url_fallback".into(),
         "https://blockstream.info/signet".into(),
     );
+    // Test ports only: the running-node probe connects to these.
+    for (stanza, port) in [("api", free_port()), ("network", free_port())] {
+        table
+            .entry(stanza)
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .unwrap()
+            .insert("listen_addr".into(), format!("127.0.0.1:{port}").into());
+    }
     let mut text = toml::to_string(&table).unwrap();
     text.insert_str(0, "# owner note: kept across the switch\n");
     std::fs::write(&path, text).unwrap();
     path
+}
+
+/// A loopback port nothing listens on (bound, then released).
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+fn listen_port(path: &Path, stanza: &str) -> u16 {
+    let table: toml::Table = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let addr: std::net::SocketAddr = table[stanza]["listen_addr"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    addr.port()
 }
 
 fn stdout(output: &Output) -> String {
@@ -96,12 +121,29 @@ fn genesis_hash(network: Network) -> String {
 
 /// Loopback Bitcoin Core JSON-RPC on `network`; `ibd` keeps it syncing.
 async fn core_fixture(network: Network, ibd: bool) -> (u16, tokio::task::JoinHandle<()>) {
+    core_fixture_editing(network, ibd, None).await
+}
+
+/// As [`core_fixture`]; when `edit` is set, appends to that file on the first
+/// RPC, like an owner editing the config while the source is checked.
+async fn core_fixture_editing(
+    network: Network,
+    ibd: bool,
+    edit: Option<PathBuf>,
+) -> (u16, tokio::task::JoinHandle<()>) {
     let genesis = genesis_hash(network);
+    let edit = Arc::new(std::sync::Mutex::new(edit));
     let app = axum::Router::new().route(
         "/",
         axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
             let genesis = genesis.clone();
+            let edit = Arc::clone(&edit);
             async move {
+                if let Some(path) = edit.lock().unwrap().take() {
+                    let mut text = std::fs::read_to_string(&path).unwrap();
+                    text.push_str("# edited meanwhile\n");
+                    std::fs::write(&path, text).unwrap();
+                }
                 let result = match request["method"].as_str().unwrap() {
                     "getblockhash" => json!(genesis),
                     "getblockheader" => {
@@ -534,4 +576,217 @@ fn accept_records_the_choice_and_clears_the_flag() {
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     assert_eq!(backups(dir.path()).len(), 1);
+}
+
+/// A paid Esplora's credentials belong to the Esplora being left. Left in
+/// `[lightning]`, embedded LDK would build its authenticated transport from
+/// the now empty `esplora_url` and refuse to start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switch_removes_paid_esplora_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = existing_full_node(dir.path());
+    let credentials = dir.path().join("chain-api.toml");
+    std::fs::write(
+        &credentials,
+        "token_url = \"https://login.example/token\"\nclient_id = \"fixture\"\nclient_secret = \"fixture-only\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut table: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for stanza in ["lightning", "chain"] {
+        table[stanza].as_table_mut().unwrap().insert(
+            "credentials_file".into(),
+            credentials.to_str().unwrap().into(),
+        );
+    }
+    table["lightning"].as_table_mut().unwrap().insert(
+        "esplora_url".into(),
+        "https://enterprise.example/api".into(),
+    );
+    table["chain"]
+        .as_table_mut()
+        .unwrap()
+        .insert("api_url".into(), "https://enterprise.example/api".into());
+    std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+    let (port, _core) = core_fixture(Network::Signet, false).await;
+    let cookie = cookie(dir.path());
+    let (p, d) = (path.clone(), dir.path().to_path_buf());
+    let output = run_in_blocking(move || {
+        let mut args = vec![
+            "chain-tip".to_string(),
+            "--config".into(),
+            p.to_str().unwrap().into(),
+        ];
+        args.extend(core_args(port, &cookie));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        konsensus(&args, &d)
+    })
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("`credentials_file` setting was removed"),
+        "{}",
+        stdout(&output)
+    );
+    let table: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        table["lightning"].get("credentials_file").is_none(),
+        "{table:?}"
+    );
+    assert!(
+        table["chain"].get("credentials_file").is_none(),
+        "{table:?}"
+    );
+    assert_eq!(table["lightning"]["esplora_url"].as_str(), Some(""));
+    // The credentials file itself is left alone.
+    assert!(credentials.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_holding_its_lock_or_ports_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = existing_full_node(dir.path());
+    let cookie = cookie(dir.path());
+    let (port, _core) = core_fixture(Network::Signet, false).await;
+    // A running node holds its state lock for its whole life.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.path().join("STATE_GENERATION.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    assert_refused(
+        dir.path(),
+        &path,
+        core_args(port, &cookie),
+        "state lock is held",
+    )
+    .await;
+    assert_refused(
+        dir.path(),
+        &path,
+        vec!["--accept-third-party-tip".into()],
+        "state lock is held",
+    )
+    .await;
+    lock.unlock().unwrap();
+    drop(lock);
+    // Or answers on its own configured API or peer address (test ports).
+    for stanza in ["api", "network"] {
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", listen_port(&path, stanza))).unwrap();
+        assert_refused(
+            dir.path(),
+            &path,
+            core_args(port, &cookie),
+            "something answers on the node's",
+        )
+        .await;
+        drop(listener);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_source_times_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = existing_full_node(dir.path());
+    let cookie = cookie(dir.path());
+    // Accepts connections and never answers.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _silent = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            held.push(socket);
+        }
+    });
+    let started = std::time::Instant::now();
+    assert_refused(
+        dir.path(),
+        &path,
+        core_args(port, &cookie),
+        "did not answer within 20 seconds",
+    )
+    .await;
+    assert!(started.elapsed() >= std::time::Duration::from_secs(19));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_config_edited_during_the_check_is_not_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = existing_full_node(dir.path());
+    let cookie = cookie(dir.path());
+    let (port, _core) = core_fixture_editing(Network::Signet, false, Some(path.clone())).await;
+    let (p, d) = (path.clone(), dir.path().to_path_buf());
+    let output = run_in_blocking(move || {
+        let mut args = vec![
+            "chain-tip".to_string(),
+            "--config".into(),
+            p.to_str().unwrap().into(),
+        ];
+        args.extend(core_args(port, &cookie));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        konsensus(&args, &d)
+    })
+    .await;
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("changed while the source was checked"),
+        "{}",
+        stderr(&output)
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.ends_with("# edited meanwhile\n"),
+        "the owner's edit must survive"
+    );
+    assert!(text.contains("mempool.space"), "the old source must stay");
+    assert!(backups(dir.path()).is_empty());
+}
+
+/// A backup that cannot be written leaves no file under a backup name and no change.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_backup_leaves_nothing_behind() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let node = dir.path().join("node");
+    std::fs::create_dir(&node).unwrap();
+    let path = existing_full_node(&node);
+    let cookie = cookie(dir.path());
+    let (port, _core) = core_fixture(Network::Signet, false).await;
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let (p, d) = (path.clone(), node.clone());
+    let output = run_in_blocking(move || {
+        let mut args = vec![
+            "chain-tip".to_string(),
+            "--config".into(),
+            p.to_str().unwrap().into(),
+        ];
+        args.extend(core_args(port, &cookie));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        konsensus(&args, &d)
+    })
+    .await;
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("could not write the backup"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let leftovers: Vec<_> = std::fs::read_dir(&node)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("before-chain-tip"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }
