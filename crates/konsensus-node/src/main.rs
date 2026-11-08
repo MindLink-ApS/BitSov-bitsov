@@ -15,6 +15,7 @@ mod endpoints;
 mod guarded_lightning;
 mod housekeeping;
 mod invoice_refusals;
+mod lightning_health;
 #[cfg(test)]
 #[path = "tests/fixtures/flaky_session_store.rs"]
 mod flaky_session_store;
@@ -1437,48 +1438,16 @@ async fn start_node_services<'a>(
         lock_status_socket,
     } = authority;
     // ── Lightning health check ─────────────────────────────────────
-    // Verify Lightning connectivity at startup so users get a clear
-    // error message if their wallet is misconfigured.
-    let lightning_backend = config.lightning.backend_name();
-    match node.lightning().get_balance_msat().await {
-        Ok(balance_msat) => {
-            info!(
-                backend = lightning_backend,
-                balance_msat, "lightning health check passed"
-            );
-        }
-        Err(e) => {
-            if config.lightning.is_mock() {
-                // Mock should never fail, but log just in case
-                warn!(error = %e, "mock lightning health check failed (unexpected)");
-            } else {
-                // Real backend failure — give a helpful error message per tier
-                let fix_hint = match config.tier {
-                    crate::config::NodeTier::Cloud => {
-                        "Cloud tier: check your hosted node URL and ensure the service is running."
-                    }
-                    crate::config::NodeTier::Light => {
-                        "Light tier: check your LDK or LND settings in konsensus.toml.\n  \
-                         If using hosted Lightning, ensure your configured provider is reachable.\n  \
-                         You can switch to mock Lightning for testing: set [lightning] backend = \"mock\"."
-                    }
-                    crate::config::NodeTier::Full => {
-                        "Full tier: LDK embedded Lightning is enabled by default. Your node IS its own Lightning node.\n  \
-                         Keys are derived from your mnemonic. Fund the on-chain wallet to open channels.\n  \
-                         To use your own LND instead, set [lightning] backend = \"lnd\" and configure its REST credentials."
-                    }
-                };
-                warn!(
-                    backend = lightning_backend,
-                    error = %e,
-                    "lightning health check FAILED — payments will not work"
-                );
-                warn!("Fix: {}", fix_hint);
-                // Don't abort — the node can still operate for non-payment tasks,
-                // but the payment gate will reject all messages.
-            }
-        }
-    }
+    // A wallet still syncing is normal on every start and is said at INFO;
+    // a real failure, or no readiness after the sync window, is a WARN.
+    lightning_health::check_and_watch(
+        node.lightning(),
+        config.lightning.backend_name(),
+        config.tier,
+        config.lightning.is_mock(),
+        node.shutdown_rx(),
+    )
+    .await;
 
     // Replay invite-derived whitelist entries before the listener accepts
     // inbound traffic. `transport.add_to_whitelist` is dynamic in-memory

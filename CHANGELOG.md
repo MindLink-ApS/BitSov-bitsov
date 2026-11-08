@@ -50,6 +50,12 @@ also live on the corresponding GitHub pre-release pages.
   offer the peer refuses, or a well-formed init with other keys, changes nothing.
   Two stale offers, or a late `SessionAck`, can still retire a working session
   until key confirmation lands. No frame or message format changes.
+- A normal start no longer logs `lightning health check FAILED — payments will
+  not work` and a `Fix:` hint while the wallet is still syncing. It logs at INFO
+  that the wallet is syncing and payments start when it is ready. A real
+  Lightning failure still warns with the hint, and a wallet still not ready
+  after ten minutes now warns once. Payments are refused until Lightning is
+  ready, as before.
 
 ## [0.3.0-rc22] — 2026-11-05
 
