@@ -514,6 +514,8 @@ pub struct LdkProvider {
     /// without keeping the BOLT11 string.
     invoice_expiries: std::sync::Mutex<std::collections::HashMap<String, u64>>,
     invoice_expiry_path: Option<PathBuf>,
+    /// Re-checks the chain source's network while LDK runs.
+    network_watch: Option<Arc<NetworkWatch>>,
 }
 
 impl std::fmt::Debug for LdkProvider {
@@ -778,7 +780,7 @@ impl LdkProvider {
             .map(konsensus_chain::bearer::BearerAuth::from_file)
             .transpose()
             .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
-        let auth_transport = auth
+        let mut auth_transport = auth
             .as_ref()
             .map(|auth| {
                 konsensus_chain::bearer::BearerFailover::new(
@@ -806,7 +808,7 @@ impl LdkProvider {
             .map(konsensus_chain::BitcoindProvider::new)
             .transpose()
             .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?
-            .map(|provider| provider.with_network(network));
+            .map(|provider| Arc::new(provider.with_network(network)));
         let electrum = config
             .electrum
             .clone()
@@ -919,16 +921,46 @@ impl LdkProvider {
                 })?;
         }
 
-        // Local settings are valid. Before LDK reads any chain data, the source
-        // must not be on another network.
-        check_chain_source_network(
-            network,
-            bitcoind.as_ref(),
-            electrum.as_deref(),
-            &config,
-            auth_transport.as_deref(),
-        )
-        .await?;
+        // Local settings are valid. LDK is built only after its chain source
+        // has answered on the configured network.
+        let source = if let Some(provider) = &bitcoind {
+            SourceProbe::Bitcoind(Arc::clone(provider))
+        } else if let Some(provider) = &electrum {
+            SourceProbe::Electrum(Arc::clone(provider))
+        } else {
+            let urls_before = (
+                config.esplora_url.clone(),
+                config.esplora_url_fallback.clone(),
+            );
+            select_verified_esplora_urls(network, &mut config, auth.as_ref()).await?;
+            if (
+                config.esplora_url.clone(),
+                config.esplora_url_fallback.clone(),
+            ) != urls_before
+            {
+                auth_transport = auth
+                    .as_ref()
+                    .map(|auth| {
+                        konsensus_chain::bearer::BearerFailover::new(
+                            auth.clone(),
+                            &config.esplora_url,
+                            config.esplora_url_fallback.iter().cloned().collect(),
+                        )
+                    })
+                    .transpose()
+                    .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
+            }
+            let mut urls = vec![config.esplora_url.clone()];
+            urls.extend(config.esplora_url_fallback.clone());
+            SourceProbe::Esplora {
+                urls,
+                auth: auth_transport.clone(),
+            }
+        };
+        if !matches!(source, SourceProbe::Esplora { .. }) {
+            check_chain_source_network(network, &source, &config.network).await?;
+        }
+        let network_watch = Arc::new(NetworkWatch::new(network, source, NETWORK_RECHECK_INTERVAL));
 
         // Validate all local settings before the first network request. The budget
         // includes preflight; only the two Esplora fee-barrier errors are retried.
@@ -1033,7 +1065,6 @@ impl LdkProvider {
                 Arc::new(LdkJitBackend(Arc::clone(&node))),
             )
         });
-        let bitcoind = bitcoind.map(Arc::new);
         if bitcoind.is_some() || electrum.is_some() {
             let rpc = bitcoind.clone();
             let server = electrum.clone();
@@ -1095,6 +1126,7 @@ impl LdkProvider {
             outgoing_tx,
             invoice_expiry_path: Some(invoice_expiry_path),
             invoice_expiries,
+            network_watch: Some(network_watch),
         };
         // Reconcile durable reservations against the selected chain source on
         // startup, then retry periodically. Source failure never unlocks coins.
@@ -1146,6 +1178,7 @@ impl LdkProvider {
             outgoing_tx,
             invoice_expiries: std::sync::Mutex::new(std::collections::HashMap::new()),
             invoice_expiry_path: None,
+            network_watch: None,
         }
     }
 
@@ -1733,6 +1766,11 @@ impl LightningProvider for LdkProvider {
     }
 
     async fn money_ready(&self) -> bool {
+        // Never ready on a source seen on another network, or one not
+        // re-checked recently.
+        if !self.network_watch.as_ref().is_none_or(|watch| watch.poll()) {
+            return false;
+        }
         let status = self.node.status();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2648,50 +2686,234 @@ fn derive_ldk_entropy(bip39_seed: &[u8]) -> [u8; 64] {
     output
 }
 
-/// Parse a network string into a bitcoin::Network.
-/// Bound on the start-time network check. A slow source counts as unreachable.
+/// Bound on one network check. A slow source counts as unreachable.
 const CHAIN_NETWORK_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Refuse to start when the chain source is on another network. An
-/// unreachable source changes nothing: startup goes on to fail and retry, or
-/// to wait for sync, exactly as before, and each start attempt checks again.
+/// How often a running node asks its chain source for its network again.
+const NETWORK_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The embedded node's chain source, as it is asked for its network.
+#[derive(Clone)]
+pub(crate) enum SourceProbe {
+    Bitcoind(Arc<konsensus_chain::BitcoindProvider>),
+    Electrum(Arc<konsensus_chain::ElectrumProvider>),
+    /// LDK's Esplora API URLs in use, primary first.
+    Esplora {
+        urls: Vec<String>,
+        auth: Option<Arc<konsensus_chain::bearer::BearerFailover>>,
+    },
+}
+
+impl SourceProbe {
+    fn service(&self) -> &'static str {
+        match self {
+            Self::Bitcoind(_) => "bitcoind",
+            Self::Electrum(_) => "electrum",
+            Self::Esplora { .. } => "esplora",
+        }
+    }
+
+    /// Ask the source now. Esplora passes only when every URL in use answers.
+    async fn check(&self, network: bitcoin::Network) -> konsensus_chain::NetworkCheck {
+        let check = async {
+            match self {
+                Self::Bitcoind(provider) => provider.verify_network().await,
+                Self::Electrum(provider) => provider.verify_network().await,
+                Self::Esplora { urls, auth } => {
+                    let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+                    konsensus_chain::network::verify_esplora_api_urls(
+                        network,
+                        &urls,
+                        auth.as_deref(),
+                    )
+                    .await
+                    .check
+                }
+            }
+        };
+        tokio::time::timeout(CHAIN_NETWORK_CHECK_TIMEOUT, check)
+            .await
+            .unwrap_or(konsensus_chain::NetworkCheck::Unavailable)
+    }
+}
+
+/// An unverified source is unavailable: the caller retries, and LDK is not
+/// built, reads nothing and syncs nothing in the meantime.
+fn network_not_verified(network: &str, service: &str) -> LightningError {
+    LightningError::ChainSourceUnavailable {
+        network: network.into(),
+        service: service.into(),
+        attempts: 1,
+        elapsed_ms: 0,
+        cause: "chain source has not yet answered on the configured network".into(),
+    }
+}
+
+/// Start only on a source verified on the configured network. Another
+/// network refuses the start; no answer is unavailable (retry, not ready).
 async fn check_chain_source_network(
     network: bitcoin::Network,
-    bitcoind: Option<&konsensus_chain::BitcoindProvider>,
-    electrum: Option<&konsensus_chain::ElectrumProvider>,
-    config: &LdkConfig,
-    auth: Option<&konsensus_chain::bearer::BearerFailover>,
+    source: &SourceProbe,
+    configured: &str,
 ) -> Result<(), LightningError> {
     use konsensus_chain::NetworkCheck;
-    let check = async {
-        if let Some(provider) = bitcoind {
-            provider.verify_network().await
-        } else if let Some(provider) = electrum {
-            provider.verify_network().await
-        } else {
-            let mut urls = vec![config.esplora_url.as_str()];
-            urls.extend(config.esplora_url_fallback.as_deref());
-            konsensus_chain::network::verify_esplora_api_urls(network, &urls, auth).await
+    match source.check(network).await {
+        NetworkCheck::Verified => {
+            info!(network = %configured, "chain source network verified");
+            Ok(())
         }
-    };
-    match tokio::time::timeout(CHAIN_NETWORK_CHECK_TIMEOUT, check).await {
-        Ok(NetworkCheck::Mismatch(mismatch)) => {
+        NetworkCheck::Mismatch(mismatch) => {
             Err(LightningError::InvalidStartupConfig(mismatch.to_string()))
         }
-        Ok(NetworkCheck::Verified) => {
-            info!(network = %config.network, "chain source network verified");
-            Ok(())
-        }
-        Ok(NetworkCheck::Unavailable | NetworkCheck::NotConfigured) | Err(_) => {
-            warn!(
-                network = %config.network,
-                "chain source network not verified at startup: source unreachable"
-            );
-            Ok(())
+        NetworkCheck::Unavailable | NetworkCheck::NotConfigured => {
+            warn!(network = %configured, "chain source network not verified yet; not starting LDK");
+            Err(network_not_verified(configured, source.service()))
         }
     }
 }
 
+/// Check LDK's Esplora URLs and keep only verified ones for this start. Any
+/// URL on another network refuses the start. A primary that does not answer
+/// is replaced by a verified fallback, as an unreachable primary already is,
+/// except with credentials, which belong to the primary.
+async fn select_verified_esplora_urls(
+    network: bitcoin::Network,
+    config: &mut LdkConfig,
+    auth: Option<&Arc<konsensus_chain::bearer::BearerAuth>>,
+) -> Result<(), LightningError> {
+    use konsensus_chain::NetworkCheck;
+    let primary_transport = auth
+        .map(|auth| {
+            konsensus_chain::bearer::BearerFailover::new(
+                auth.clone(),
+                &config.esplora_url,
+                Vec::new(),
+            )
+        })
+        .transpose()
+        .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
+    let mut urls = vec![config.esplora_url.as_str()];
+    urls.extend(config.esplora_url_fallback.as_deref());
+    let result = tokio::time::timeout(
+        CHAIN_NETWORK_CHECK_TIMEOUT,
+        konsensus_chain::network::verify_esplora_api_urls(
+            network,
+            &urls,
+            primary_transport.as_deref(),
+        ),
+    )
+    .await;
+    let unavailable = || network_not_verified(&config.network, "esplora");
+    let Ok(result) = result else {
+        return Err(unavailable());
+    };
+    if let NetworkCheck::Mismatch(mismatch) = result.check {
+        return Err(LightningError::InvalidStartupConfig(mismatch.to_string()));
+    }
+    match (
+        result.verified.as_slice(),
+        config.esplora_url_fallback.is_some(),
+    ) {
+        ([true], _) | ([true, true], _) => {}
+        ([true, false], _) => {
+            warn!(
+                "esplora fallback has not answered on the configured network; starting without it"
+            );
+            config.esplora_url_fallback = None;
+        }
+        ([false, true], true) if auth.is_none() => {
+            warn!("esplora primary has not answered on the configured network; starting on the fallback");
+            config.esplora_url = config
+                .esplora_url_fallback
+                .take()
+                .expect("fallback present");
+        }
+        _ => {
+            warn!(network = %config.network, "chain source network not verified yet; not starting LDK");
+            return Err(unavailable());
+        }
+    }
+    info!(network = %config.network, "chain source network verified");
+    Ok(())
+}
+
+/// Re-checks a running node's chain source. A source seen on another
+/// network is refused for good; one not verified for three intervals keeps
+/// money not ready until it answers again.
+pub(crate) struct NetworkWatch {
+    network: bitcoin::Network,
+    source: SourceProbe,
+    interval: Duration,
+    last_asked: std::sync::Mutex<Instant>,
+    last_verified: std::sync::Mutex<Instant>,
+    running: AtomicBool,
+    refused: AtomicBool,
+}
+
+impl NetworkWatch {
+    /// Built right after a successful check.
+    pub(crate) fn new(network: bitcoin::Network, source: SourceProbe, interval: Duration) -> Self {
+        Self {
+            network,
+            source,
+            interval,
+            last_asked: std::sync::Mutex::new(Instant::now()),
+            last_verified: std::sync::Mutex::new(Instant::now()),
+            running: AtomicBool::new(false),
+            refused: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether money may be ready; starts a re-check when one is due.
+    pub(crate) fn poll(self: &Arc<Self>) -> bool {
+        if self.refused.load(Ordering::Acquire) {
+            return false;
+        }
+        let due = self
+            .last_asked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .elapsed()
+            >= self.interval;
+        if due && !self.running.swap(true, Ordering::AcqRel) {
+            let watch = Arc::clone(self);
+            tokio::spawn(async move {
+                let check = watch.source.check(watch.network).await;
+                let now = Instant::now();
+                *watch
+                    .last_asked
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = now;
+                match check {
+                    konsensus_chain::NetworkCheck::Verified => {
+                        *watch
+                            .last_verified
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = now;
+                    }
+                    konsensus_chain::NetworkCheck::Mismatch(mismatch) => {
+                        error!("{mismatch}");
+                        watch.refused.store(true, Ordering::Release);
+                    }
+                    _ => {}
+                }
+                watch.running.store(false, Ordering::Release);
+            });
+        }
+        self.last_verified
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .elapsed()
+            < self.interval.saturating_mul(3)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refused(&self) -> bool {
+        self.refused.load(Ordering::Acquire)
+    }
+}
+
+/// Parse a network string into a bitcoin::Network.
 fn parse_network(network: &str) -> Result<bitcoin::Network, LightningError> {
     match network.to_lowercase().as_str() {
         "bitcoin" | "mainnet" => Ok(bitcoin::Network::Bitcoin),

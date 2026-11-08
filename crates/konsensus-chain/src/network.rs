@@ -4,13 +4,20 @@
 //! network's chain. Each provider can carry the configured network; until the
 //! source has shown which chain it serves, the provider serves no chain data.
 //! A source on a different network is refused for the life of the provider,
-//! with no fallback to another source.
+//! with no fallback to another source. An unverified source is not a pass:
+//! a missing or malformed answer leaves the provider serving nothing.
 //!
 //! How each source identifies its network:
 //! - Bitcoin Core: `getblockchaininfo.chain` (`main`, `test`, `testnet4`,
 //!   `signet`, `regtest`).
 //! - Electrum: the hash of the server's block header at height 0.
-//! - Esplora: the block hash at height 0 (`/block-height/0`).
+//! - Esplora: the hash of the header at height 0, computed locally
+//!   (`/block-height/0`, then `/block/<hash>/header`).
+//!
+//! A successful check lasts until the connection to that source fails (a
+//! reconnect) and at most `VERIFICATION_TTL`; the source is then asked again
+//! before its next use. Electrum opens a new connection for every query, so
+//! it is asked on every query.
 //!
 //! Signet: every signet, including one with a custom challenge, shares the
 //! same genesis block, and Core reports `signet` for all of them. A custom
@@ -18,8 +25,8 @@
 //! embedded Lightning node sees, since it identifies chains by genesis hash.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use bitcoin::{BlockHash, Network};
 use konsensus_core::traits::chain::ChainError;
@@ -134,23 +141,36 @@ pub enum NetworkCheck {
     NotConfigured,
 }
 
+/// How long one successful identity check lasts. A failed request to the
+/// source ends it sooner (see each provider for what counts as a reconnect).
+pub const VERIFICATION_TTL: Duration = Duration::from_secs(60);
+
 /// Per-provider verification state: one slot per configured endpoint, and a
 /// mismatch that, once seen, refuses the whole provider.
 pub(crate) struct NetworkGate {
     expected: Network,
     source: &'static str,
-    verified: Vec<AtomicBool>,
+    ttl: Duration,
+    verified_at: Vec<Mutex<Option<Instant>>>,
     mismatch: OnceLock<NetworkMismatch>,
 }
 
 impl NetworkGate {
     pub(crate) fn new(expected: Network, source: &'static str, endpoints: usize) -> Self {
+        Self::with_ttl(expected, source, endpoints, VERIFICATION_TTL)
+    }
+
+    pub(crate) fn with_ttl(
+        expected: Network,
+        source: &'static str,
+        endpoints: usize,
+        ttl: Duration,
+    ) -> Self {
         Self {
             expected,
             source,
-            verified: (0..endpoints.max(1))
-                .map(|_| AtomicBool::new(false))
-                .collect(),
+            ttl,
+            verified_at: (0..endpoints.max(1)).map(|_| Mutex::new(None)).collect(),
             mismatch: OnceLock::new(),
         }
     }
@@ -164,7 +184,23 @@ impl NetworkGate {
     }
 
     pub(crate) fn is_verified(&self, endpoint: usize) -> bool {
-        self.verified[endpoint].load(Ordering::Acquire)
+        self.verified_at[endpoint]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some_and(|at| at.elapsed() < self.ttl)
+    }
+
+    /// The endpoint must show its network again before its next use.
+    pub(crate) fn invalidate(&self, endpoint: usize) {
+        *self.verified_at[endpoint]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    pub(crate) fn invalidate_all(&self) {
+        for endpoint in 0..self.verified_at.len() {
+            self.invalidate(endpoint);
+        }
     }
 
     /// Record an endpoint's answer. A different or unrecognised network
@@ -175,9 +211,12 @@ impl NetworkGate {
         reported: ReportedNetwork,
     ) -> Result<(), ChainError> {
         if reported == ReportedNetwork::Known(self.expected) {
-            self.verified[endpoint].store(true, Ordering::Release);
+            *self.verified_at[endpoint]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
             return self.refusal();
         }
+        self.invalidate(endpoint);
         let mismatch = NetworkMismatch {
             configured: self.expected,
             source: self.source,
@@ -195,16 +234,44 @@ impl NetworkGate {
         if let Some(mismatch) = self.mismatch.get() {
             return NetworkCheck::Mismatch(mismatch.clone());
         }
-        if self
-            .verified
-            .iter()
-            .all(|verified| verified.load(Ordering::Acquire))
-        {
+        if (0..self.verified_at.len()).all(|endpoint| self.is_verified(endpoint)) {
             NetworkCheck::Verified
         } else {
             NetworkCheck::Unavailable
         }
     }
+}
+
+/// An Esplora source's genesis hash, computed here from the height-0 header
+/// it serves (`/block-height/0`, then `/block/<hash>/header`). A header that
+/// does not hash to the hash the server named is not an answer.
+pub(crate) async fn esplora_genesis<F, Fut>(get: F) -> Result<BlockHash, ChainError>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, ChainError>>,
+{
+    let invalid = || ChainError::Backend("invalid Esplora genesis block".into());
+    let named: BlockHash = get("/block-height/0".into())
+        .await?
+        .trim()
+        .parse()
+        .map_err(|_| invalid())?;
+    let header = get(format!("/block/{named}/header")).await?;
+    let header: bitcoin::block::Header =
+        bitcoin::consensus::encode::deserialize_hex(header.trim()).map_err(|_| invalid())?;
+    let hash = header.block_hash();
+    if hash != named {
+        return Err(invalid());
+    }
+    Ok(hash)
+}
+
+/// Result of checking a list of Esplora API URLs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EsploraUrlsCheck {
+    pub check: NetworkCheck,
+    /// Per URL, in order: answered on the configured network.
+    pub verified: Vec<bool>,
 }
 
 /// One-off check of Esplora API URLs used as given (the embedded Lightning
@@ -215,42 +282,55 @@ pub async fn verify_esplora_api_urls<T>(
     expected: Network,
     urls: &[&str],
     primary_transport: Option<&T>,
-) -> NetworkCheck
+) -> EsploraUrlsCheck
 where
     T: esplora_client::r#async::HttpTransport + ?Sized,
 {
     let gate = NetworkGate::new(expected, "esplora", urls.len());
+    let unavailable = || EsploraUrlsCheck {
+        check: NetworkCheck::Unavailable,
+        verified: vec![false; urls.len()],
+    };
     let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(4))
+        .timeout(Duration::from_secs(4))
         .build()
     else {
-        return NetworkCheck::Unavailable;
+        return unavailable();
     };
     for (index, url) in urls.iter().enumerate() {
-        let request = client.get(format!("{}/block-height/0", url.trim_end_matches('/')));
-        let response = match primary_transport.filter(|_| index == 0) {
-            Some(transport) => transport.execute(request).await.ok(),
-            None => request.send().await.ok(),
-        };
-        let Some(response) = response.filter(|r| r.status().is_success()) else {
-            continue;
-        };
-        let Some(hash) = response
-            .text()
-            .await
-            .ok()
-            .and_then(|text| text.trim().parse::<BlockHash>().ok())
-        else {
-            continue;
-        };
-        if gate
-            .record(index, ReportedNetwork::from_genesis_hash(hash))
-            .is_err()
-        {
-            break;
+        let base = url.trim_end_matches('/');
+        let transport = primary_transport.filter(|_| index == 0);
+        let genesis = esplora_genesis(|path| {
+            let request = client.get(format!("{base}{path}"));
+            async move {
+                let response = match transport {
+                    Some(transport) => transport.execute(request).await.ok(),
+                    None => request.send().await.ok(),
+                }
+                .filter(|response| response.status().is_success())
+                .ok_or_else(|| ChainError::Connection("Esplora unavailable".into()))?;
+                response
+                    .text()
+                    .await
+                    .map_err(|_| ChainError::Connection("Esplora unavailable".into()))
+            }
+        })
+        .await;
+        if let Ok(hash) = genesis {
+            if gate
+                .record(index, ReportedNetwork::from_genesis_hash(hash))
+                .is_err()
+            {
+                break;
+            }
         }
     }
-    gate.check()
+    EsploraUrlsCheck {
+        check: gate.check(),
+        verified: (0..urls.len())
+            .map(|index| gate.is_verified(index))
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -340,5 +420,58 @@ mod tests {
         assert_eq!(gate.check(), NetworkCheck::Verified);
         assert!(gate.record(1, ReportedNetwork::Unrecognised).is_err());
         assert!(gate.refusal().is_err());
+    }
+
+    #[test]
+    fn a_check_ends_on_failure_or_after_its_lifetime() {
+        let gate = NetworkGate::new(Network::Signet, "bitcoind", 1);
+        gate.record(0, ReportedNetwork::Known(Network::Signet))
+            .unwrap();
+        assert!(gate.is_verified(0));
+        gate.invalidate(0);
+        assert!(!gate.is_verified(0));
+        assert_eq!(gate.check(), NetworkCheck::Unavailable);
+
+        let gate = NetworkGate::with_ttl(Network::Signet, "bitcoind", 1, Duration::ZERO);
+        gate.record(0, ReportedNetwork::Known(Network::Signet))
+            .unwrap();
+        assert!(!gate.is_verified(0), "expired at once");
+    }
+
+    #[tokio::test]
+    async fn esplora_identity_is_the_hash_of_the_served_header() {
+        let block = bitcoin::blockdata::constants::genesis_block(Network::Signet);
+        let hash = block.block_hash().to_string();
+        let header = bitcoin::consensus::encode::serialize_hex(&block.header);
+        let serve = |named: String, header: Option<String>| {
+            move |path: String| {
+                let reply = if path == "/block-height/0" {
+                    Ok(named.clone())
+                } else if path == format!("/block/{named}/header") {
+                    header.clone().ok_or(ChainError::Backend("404".into()))
+                } else {
+                    Err(ChainError::Backend("404".into()))
+                };
+                std::future::ready(reply)
+            }
+        };
+        assert_eq!(
+            esplora_genesis(serve(hash.clone(), Some(header.clone())))
+                .await
+                .unwrap(),
+            block.block_hash()
+        );
+        // The right hash string alone is not an answer.
+        assert!(esplora_genesis(serve(hash.clone(), None)).await.is_err());
+        // A header that does not hash to the named hash is not an answer.
+        let other = bitcoin::consensus::encode::serialize_hex(
+            &bitcoin::blockdata::constants::genesis_block(Network::Bitcoin).header,
+        );
+        assert!(esplora_genesis(serve(hash.clone(), Some(other)))
+            .await
+            .is_err());
+        assert!(esplora_genesis(serve("not a hash".into(), Some(header)))
+            .await
+            .is_err());
     }
 }

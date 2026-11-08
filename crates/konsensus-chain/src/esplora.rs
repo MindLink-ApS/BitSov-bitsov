@@ -177,17 +177,22 @@ impl EsploraProvider {
     /// Use no endpoint until its genesis block is this network's. One
     /// endpoint on another network refuses the provider for good, with no
     /// fallback to the others.
+    ///
+    /// Reconnect: a lost connection or timeout on an endpoint ends its check,
+    /// and the endpoint is asked again before its next use, including a
+    /// failover. HTTP answers such as "not found" do not.
     pub fn with_network(mut self, network: bitcoin::Network) -> Self {
         self.network = Some(NetworkGate::new(network, "esplora", self.endpoints.len()));
         self
     }
 
-    /// Check every configured endpoint not yet verified. `Verified` needs all
-    /// of them; an unreachable one leaves the result `Unavailable`, as before.
+    /// Check every configured endpoint now. `Verified` needs all of them;
+    /// an unreachable one leaves the result `Unavailable`.
     pub async fn verify_network(&self) -> NetworkCheck {
         let Some(gate) = &self.network else {
             return NetworkCheck::NotConfigured;
         };
+        gate.invalidate_all();
         for index in 0..self.endpoints.len() {
             let timeout = std::time::Duration::from_secs(self.config.timeout_secs);
             if self.ensure_network(gate, index, timeout).await.is_err() && gate.refusal().is_err() {
@@ -207,14 +212,18 @@ impl EsploraProvider {
         if gate.is_verified(index) {
             return Ok(());
         }
-        let genesis = self
-            .fetch(index, "/block-height/0", timeout, &|text: &str| {
-                text.trim()
-                    .parse::<bitcoin::BlockHash>()
-                    .map_err(|_| ChainError::Backend("invalid Esplora block hash".into()))
-            })
-            .await?;
-        gate.record(index, ReportedNetwork::from_genesis_hash(genesis))
+        let genesis = crate::network::esplora_genesis(|path| async move {
+            self.fetch(index, &path, timeout, &|text: &str| Ok(text.to_owned()))
+                .await
+        })
+        .await;
+        match genesis {
+            Ok(hash) => gate.record(index, ReportedNetwork::from_genesis_hash(hash)),
+            Err(error) => {
+                gate.invalidate(index);
+                Err(error)
+            }
+        }
     }
 
     /// Authenticate only the primary; fallbacks retain their existing unauthenticated policy.
@@ -289,7 +298,16 @@ impl EsploraProvider {
                     self.active.store(index, Ordering::Relaxed);
                     return Ok(value);
                 }
-                Err(error) => last_error = error,
+                Err(error) => {
+                    // A lost connection or timeout, not an HTTP answer such
+                    // as "not found": ask the endpoint again before reuse.
+                    if let (Some(gate), ChainError::Connection(_) | ChainError::NotAvailable(_)) =
+                        (&self.network, &error)
+                    {
+                        gate.invalidate(index);
+                    }
+                    last_error = error
+                }
             }
         }
         Err(last_error)

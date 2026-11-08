@@ -751,10 +751,15 @@ async fn from_config_refuses_a_chain_source_on_another_network_before_node_state
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn from_config_refuses_an_esplora_source_on_another_network() {
     use axum::{routing::get, Router};
-    let hash = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Testnet4)
-        .block_hash()
-        .to_string();
-    let app = Router::new().route("/api/block-height/0", get(move || async move { hash }));
+    let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Testnet4);
+    let hash = block.block_hash().to_string();
+    let header = bitcoin::consensus::encode::serialize_hex(&block.header);
+    let app = Router::new()
+        .route("/api/block-height/0", get(move || async move { hash }))
+        .route(
+            "/api/block/:hash/header",
+            get(move || async move { header }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -780,7 +785,15 @@ async fn from_config_refuses_an_esplora_source_on_another_network() {
         "{err}"
     );
     assert!(err.contains("esplora chain source is on testnet4"), "{err}");
-    assert!(!dir.path().join("konsensus.db").exists());
+    let written: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(
+        written,
+        ["mnemonic.txt"],
+        "no node state before the refusal"
+    );
     server.abort();
 }
 

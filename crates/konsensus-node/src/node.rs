@@ -36,7 +36,7 @@ const CHAIN_NETWORK_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// configured one. An unreachable source starts as before: the provider
 /// serves no chain data, so the node is not ready, until the source answers
 /// on the configured network.
-async fn verify_chain_network(
+pub(crate) async fn verify_chain_network(
     check: impl std::future::Future<Output = konsensus_chain::NetworkCheck>,
 ) -> Result<()> {
     use konsensus_chain::NetworkCheck;
@@ -135,6 +135,10 @@ impl KonsensusNode {
         // Before any node state or Lightning: a source on another network
         // refuses startup.
         let network = config.lightning.chain_source_network();
+        if network.is_none() && !matches!(config.chain, ChainConfig::Mock) {
+            // [chain] has no network of its own; only the Lightning backend sets one.
+            warn!("chain source network not checked: the Lightning backend sets no network");
+        }
         let chain: Arc<dyn ChainProvider> = match &config.chain {
             ChainConfig::Esplora { api_url, .. } => {
                 let esplora_config = EsploraConfig::custom(

@@ -156,17 +156,22 @@ impl BitcoindProvider {
 
     /// Serve no chain data until Core reports this network; refuse it for
     /// good if Core reports another one.
+    ///
+    /// Reconnect: any failed request (transport error or HTTP failure) ends
+    /// the check, and Core is asked again before the next call. Every
+    /// `getblockchaininfo` reply is also compared, at no extra cost.
     pub fn with_network(mut self, network: bitcoin::Network) -> Self {
         self.network = Some(NetworkGate::new(network, "bitcoind", 1));
         self
     }
 
-    /// Ask Core which chain it is on, if not yet known. No retry here: an
-    /// unreachable Core is reported as `Unavailable`, as before.
+    /// Ask Core now which chain it is on. No retry here: an unreachable Core
+    /// is reported as `Unavailable`.
     pub async fn verify_network(&self) -> NetworkCheck {
         let Some(gate) = &self.network else {
             return NetworkCheck::NotConfigured;
         };
+        gate.invalidate_all();
         let _ = self.ensure_network().await;
         gate.check()
     }
@@ -179,16 +184,22 @@ impl BitcoindProvider {
         if gate.is_verified(0) {
             return Ok(());
         }
-        let info = self
-            .send("getblockchaininfo", json!([]))
-            .await?
-            .map_err(|code| {
-                ChainError::Backend(format!("bitcoind getblockchaininfo failed (RPC {code})"))
-            })?;
-        let chain = info["chain"]
-            .as_str()
-            .ok_or_else(|| ChainError::Backend("invalid bitcoind chain".into()))?;
-        gate.record(0, ReportedNetwork::from_core_chain(chain))
+        let info = self.send_checked("getblockchaininfo", json!([])).await?;
+        let info = info.map_err(|code| {
+            ChainError::Backend(format!("bitcoind getblockchaininfo failed (RPC {code})"))
+        })?;
+        Self::record_chain(gate, &info)
+    }
+
+    /// A reply without a `chain` string is not an answer: Core stays unverified.
+    fn record_chain(gate: &NetworkGate, info: &Value) -> Result<(), ChainError> {
+        match info["chain"].as_str() {
+            Some(chain) => gate.record(0, ReportedNetwork::from_core_chain(chain)),
+            None => {
+                gate.invalidate(0);
+                Err(ChainError::Backend("invalid bitcoind chain".into()))
+            }
+        }
     }
 
     pub(crate) async fn rpc(
@@ -197,7 +208,24 @@ impl BitcoindProvider {
         params: Value,
     ) -> Result<Result<Value, i64>, ChainError> {
         self.ensure_network().await?;
-        self.send(method, params).await
+        let result = self.send_checked(method, params).await?;
+        if let (Some(gate), "getblockchaininfo", Ok(info)) = (&self.network, method, &result) {
+            Self::record_chain(gate, info)?;
+        }
+        Ok(result)
+    }
+
+    /// `send`, ending the network check on any failed request.
+    async fn send_checked(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Result<Value, i64>, ChainError> {
+        let result = self.send(method, params).await;
+        if let (Some(gate), Err(_)) = (&self.network, &result) {
+            gate.invalidate(0);
+        }
+        result
     }
 
     async fn send(&self, method: &str, params: Value) -> Result<Result<Value, i64>, ChainError> {

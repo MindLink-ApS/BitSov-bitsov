@@ -13,19 +13,34 @@ Neutrino are later steps.
 
 ## Network check
 
-The chain source must be on the network set in `[lightning] network`. At start
-the node asks it: Bitcoin Core through `getblockchaininfo` (`chain`), Electrum
-for its block header at height 0, Esplora for `/block-height/0` on every
-configured endpoint. If any answers with another network, the node refuses to
-start and names both networks; it does not try another source. If the source
-does not answer, startup goes on as before. BitSov's own chain reads (height,
-fees, confirmations) then stay unavailable until the source answers on the
-configured network, and a source that answers on another network is refused for
-the rest of the run. The embedded LDK node checks again on each start attempt.
+The chain source must be on the network set in `[lightning] network`. Nothing
+reads or syncs chain data from a source until it has answered on that network:
+Bitcoin Core through `getblockchaininfo` (`chain`); Electrum and Esplora with
+their height-0 header, hashed by the node (Esplora: `/block-height/0`, then
+`/block/<hash>/header`). A hash string alone, or a Core reply without `chain`,
+is not an answer.
+
+- **Another network:** the node refuses to start and names both networks; it
+  tries no other source. Every configured Esplora endpoint is checked. A source
+  found on another network later is refused for the rest of the run, and
+  Lightning money stays not ready.
+- **No answer yet:** the node starts, not ready. The embedded LDK node is not
+  built and syncs nothing; it retries, and starts once the source answers on
+  the configured network. With an Esplora fallback, LDK starts on the endpoints
+  that have answered.
+- **Asked again:** after a lost connection or timeout, before the next use; at
+  least every 60 seconds otherwise. Electrum opens a new connection per query
+  and is asked on each one. Every `getblockchaininfo` reply from Core is also
+  compared. The running LDK node asks its source every 60 seconds and is not
+  money-ready while it has not answered for three minutes.
+- **Recovery:** `konsensus recover` checks its chain source the same way.
 
 All signets share one genesis block, and Bitcoin Core reports `signet` for each
-of them, so a custom signet passes as `signet`. Mock, LND and LNbits backends
-set no network, and the check does not run for them.
+of them, so a custom signet passes as `signet`.
+
+Limit: `[chain]` has no network setting of its own. With LND, LNbits or mock
+Lightning, which set no network, a real `[chain]` source is not checked; the
+node logs a warning at start.
 
 ## Esplora fallbacks
 

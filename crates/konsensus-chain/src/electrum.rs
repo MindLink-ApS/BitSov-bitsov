@@ -135,17 +135,21 @@ impl ElectrumProvider {
 
     /// Serve no chain data until the server's genesis block is this
     /// network's; refuse the server for good if it is another network's.
+    ///
+    /// Reconnect: every query opens a new connection, so every query first
+    /// asks the server for its height-0 header on that connection.
     pub fn with_network(mut self, network: bitcoin::Network) -> Self {
         self.network = Some(Arc::new(NetworkGate::new(network, "electrum", 1)));
         self
     }
 
-    /// Check the server's genesis hash, if not yet known. An unreachable
-    /// server is reported as `Unavailable`, as before.
+    /// Check the server's genesis hash now. An unreachable server is
+    /// reported as `Unavailable`.
     pub async fn verify_network(&self) -> NetworkCheck {
         let Some(gate) = &self.network else {
             return NetworkCheck::NotConfigured;
         };
+        gate.invalidate_all();
         let _ = self.query(|_| Ok(())).await;
         gate.check()
     }
@@ -161,11 +165,18 @@ impl ElectrumProvider {
                 gate.refusal()?;
             }
             let config = ConfigBuilder::new().timeout(Some(10)).retry(0).build();
-            let client = Client::from_config(&url, config)
-                .map_err(|_| ChainError::Connection("Electrum connection failed".into()))?;
-            if let Some(gate) = gate.filter(|gate| !gate.is_verified(0)) {
+            let client = Client::from_config(&url, config).map_err(|_| {
+                if let Some(gate) = &gate {
+                    gate.invalidate(0);
+                }
+                ChainError::Connection("Electrum connection failed".into())
+            })?;
+            if let Some(gate) = &gate {
                 // Hash the header here rather than trust a reported hash.
-                let genesis = client.block_header(0).map_err(rpc_error)?;
+                let genesis = client.block_header(0).map_err(|error| {
+                    gate.invalidate(0);
+                    rpc_error(error)
+                })?;
                 gate.record(0, ReportedNetwork::from_genesis_hash(genesis.block_hash()))?;
             }
             operation(client)

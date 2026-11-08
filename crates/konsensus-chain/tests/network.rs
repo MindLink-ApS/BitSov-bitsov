@@ -81,10 +81,17 @@ impl Core {
                         let method = request["method"].as_str().unwrap().to_owned();
                         methods.lock().unwrap().push(method.clone());
                         let result = match method.as_str() {
-                            "getblockchaininfo" => json!({
-                                "chain": chain, "blocks": 101, "headers": 101,
-                                "initialblockdownload": false,
-                            }),
+                            "getblockchaininfo" => {
+                                let mut info = json!({
+                                    "chain": chain, "blocks": 101, "headers": 101,
+                                    "initialblockdownload": false,
+                                });
+                                if chain.is_empty() {
+                                    // A reply that names no chain.
+                                    info.as_object_mut().unwrap().remove("chain");
+                                }
+                                info
+                            }
                             "getblockcount" => json!(101),
                             _ => panic!("unexpected RPC {method}"),
                         };
@@ -232,14 +239,22 @@ async fn bitcoind_without_a_configured_network_is_unchanged() {
 // ── Electrum ────────────────────────────────────────────────────────────
 
 async fn electrum(network: Network) -> electrum_fixture::Fixture {
-    let header = bitcoin::consensus::encode::serialize_hex(&genesis(network).header);
-    electrum_fixture::Fixture::new(move |request| match request["method"].as_str().unwrap() {
-        "blockchain.block.header" => {
-            assert_eq!(request["params"][0], 0);
-            json!({"result": header})
+    electrum_on(Arc::new(Mutex::new(network))).await
+}
+
+/// An Electrum server whose chain can be swapped between connections.
+async fn electrum_on(network: Arc<Mutex<Network>>) -> electrum_fixture::Fixture {
+    electrum_fixture::Fixture::new(move |request| {
+        let header =
+            bitcoin::consensus::encode::serialize_hex(&genesis(*network.lock().unwrap()).header);
+        match request["method"].as_str().unwrap() {
+            "blockchain.block.header" => {
+                assert_eq!(request["params"][0], 0);
+                json!({"result": header})
+            }
+            "blockchain.headers.subscribe" => json!({"result": {"height": 101, "hex": header}}),
+            method => panic!("unexpected Electrum method {method}"),
         }
-        "blockchain.headers.subscribe" => json!({"result": {"height": 101, "hex": header}}),
-        method => panic!("unexpected Electrum method {method}"),
     })
     .await
 }
@@ -277,11 +292,14 @@ async fn electrum_on_the_configured_network_is_verified_and_serves_data() {
         assert_eq!(provider.verify_network().await, NetworkCheck::Verified);
         assert_eq!(provider.get_block_height().await.unwrap(), 101);
         assert!(provider.is_synced().await);
+        // Every query is a new connection, and each one is checked first.
         assert_eq!(
             methods(&server),
             [
                 "blockchain.block.header",
+                "blockchain.block.header",
                 "blockchain.headers.subscribe",
+                "blockchain.block.header",
                 "blockchain.headers.subscribe"
             ]
         );
@@ -335,67 +353,133 @@ async fn electrum_unreachable_is_not_ready() {
 
 // ── Esplora ─────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
+struct ExplorerState {
+    network: Arc<Mutex<Network>>,
+    up: Arc<AtomicBool>,
+    serves_header: Arc<AtomicBool>,
+    tip_requests: Arc<AtomicUsize>,
+}
+
 struct Explorer {
     url: String,
+    port: u16,
+    state: ExplorerState,
     up: Arc<AtomicBool>,
     tip_requests: Arc<AtomicUsize>,
-    task: tokio::task::JoinHandle<()>,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+fn explorer_app(state: ExplorerState) -> Router {
+    fn available(state: &ExplorerState) -> Result<(), StatusCode> {
+        if state.up.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
+    Router::new()
+        .route(
+            "/api/block-height/0",
+            get(|State(state): State<ExplorerState>| async move {
+                available(&state)?;
+                Ok::<_, StatusCode>(
+                    genesis(*state.network.lock().unwrap())
+                        .block_hash()
+                        .to_string(),
+                )
+            }),
+        )
+        .route(
+            "/api/block/:hash/header",
+            get(
+                |State(state): State<ExplorerState>,
+                 axum::extract::Path(hash): axum::extract::Path<String>| async move {
+                    available(&state)?;
+                    let block = genesis(*state.network.lock().unwrap());
+                    if !state.serves_header.load(Ordering::SeqCst)
+                        || hash != block.block_hash().to_string()
+                    {
+                        return Err(StatusCode::NOT_FOUND);
+                    }
+                    Ok(bitcoin::consensus::encode::serialize_hex(&block.header))
+                },
+            ),
+        )
+        .route(
+            "/api/blocks/tip/height",
+            get(|State(state): State<ExplorerState>| async move {
+                state.tip_requests.fetch_add(1, Ordering::SeqCst);
+                available(&state)?;
+                Ok::<_, StatusCode>("101")
+            }),
+        )
+        .route(
+            "/api/fee-estimates",
+            get(|State(state): State<ExplorerState>| async move {
+                available(&state)?;
+                Ok::<_, StatusCode>(r#"{"6":2.0}"#)
+            }),
+        )
+        .with_state(state)
+        // No keep-alive, so stopping the fixture really drops the connection.
+        .layer(axum::middleware::map_response(
+            |mut response: axum::response::Response| async move {
+                response.headers_mut().insert(
+                    axum::http::header::CONNECTION,
+                    axum::http::HeaderValue::from_static("close"),
+                );
+                response
+            },
+        ))
 }
 
 impl Explorer {
     async fn new(network: Network) -> Self {
-        let up = Arc::new(AtomicBool::new(true));
-        let tip_requests = Arc::new(AtomicUsize::new(0));
-        let hash = genesis(network).block_hash().to_string();
-        let app =
-            Router::new()
-                .route(
-                    "/api/block-height/0",
-                    get(
-                        |State((up, _, hash)): State<(
-                            Arc<AtomicBool>,
-                            Arc<AtomicUsize>,
-                            String,
-                        )>| async move {
-                            if up.load(Ordering::SeqCst) {
-                                Ok(hash)
-                            } else {
-                                Err(StatusCode::SERVICE_UNAVAILABLE)
-                            }
-                        },
-                    ),
-                )
-                .route(
-                    "/api/blocks/tip/height",
-                    get(
-                        |State((up, tips, _)): State<(
-                            Arc<AtomicBool>,
-                            Arc<AtomicUsize>,
-                            String,
-                        )>| async move {
-                            tips.fetch_add(1, Ordering::SeqCst);
-                            if up.load(Ordering::SeqCst) {
-                                Ok("101")
-                            } else {
-                                Err(StatusCode::SERVICE_UNAVAILABLE)
-                            }
-                        },
-                    ),
-                )
-                .with_state((Arc::clone(&up), Arc::clone(&tip_requests), hash));
-        let (port, task) = serve(app).await;
+        let state = ExplorerState {
+            network: Arc::new(Mutex::new(network)),
+            up: Arc::new(AtomicBool::new(true)),
+            serves_header: Arc::new(AtomicBool::new(true)),
+            tip_requests: Arc::new(AtomicUsize::new(0)),
+        };
+        let (port, task) = serve(explorer_app(state.clone())).await;
         Self {
             url: format!("http://127.0.0.1:{port}"),
-            up,
-            tip_requests,
-            task,
+            port,
+            up: Arc::clone(&state.up),
+            tip_requests: Arc::clone(&state.tip_requests),
+            state,
+            task: Mutex::new(Some(task)),
         }
+    }
+
+    /// Close the listener and every open connection.
+    async fn stop(&self) {
+        let task = self.task.lock().unwrap().take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    /// Listen again on the same port, serving `network`.
+    async fn restart_on(&self, network: Network) {
+        *self.state.network.lock().unwrap() = network;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", self.port))
+            .await
+            .unwrap();
+        let app = explorer_app(self.state.clone());
+        *self.task.lock().unwrap() = Some(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
     }
 }
 
 impl Drop for Explorer {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = self.task.lock().unwrap().take() {
+            task.abort();
+        }
     }
 }
 
@@ -490,4 +574,86 @@ async fn esplora_unreachable_is_not_ready_and_checked_before_failover() {
         provider.verify_network().await,
         NetworkCheck::Mismatch(_)
     ));
+}
+
+// ── Unverified is never a pass, and checks end on reconnect ────────────
+
+#[tokio::test]
+async fn bitcoind_reply_without_a_chain_is_never_a_pass() {
+    let core = Core::new(Some("")).await;
+    let provider = core.provider(core.port, Network::Signet);
+    assert_eq!(provider.verify_network().await, NetworkCheck::Unavailable);
+    assert!(provider.get_block_height().await.is_err());
+    assert!(!provider.is_synced().await);
+    assert!(!core
+        .methods
+        .lock()
+        .unwrap()
+        .contains(&"getblockcount".to_string()));
+}
+
+#[tokio::test]
+async fn bitcoind_is_checked_on_every_chain_reply_and_after_a_failure() {
+    // Core changes chain without any failure: the next chain reply catches it.
+    let core = Core::new(Some("signet")).await;
+    let provider = core.provider(core.port, Network::Signet);
+    assert_eq!(provider.verify_network().await, NetworkCheck::Verified);
+    *core.chain.lock().unwrap() = Some("main");
+    assert!(!provider.is_synced().await);
+    assert!(provider.get_block_height().await.is_err());
+
+    // Core fails a request, then answers on another chain: asked again first.
+    let core = Core::new(Some("signet")).await;
+    let provider = core.provider(core.port, Network::Signet);
+    assert_eq!(provider.get_block_height().await.unwrap(), 101);
+    *core.chain.lock().unwrap() = None;
+    assert!(provider.get_block_height().await.is_err());
+    *core.chain.lock().unwrap() = Some("main");
+    let error = provider.get_block_height().await.unwrap_err().to_string();
+    assert!(error.contains("network mismatch"), "{error}");
+    // Only the height read before the failure reached Core; afterwards Core
+    // was asked for its chain and refused before any data call.
+    assert_eq!(
+        core.methods.lock().unwrap().as_slice(),
+        ["getblockchaininfo", "getblockcount", "getblockchaininfo"]
+    );
+}
+
+#[tokio::test]
+async fn electrum_server_swapped_between_connections_is_refused() {
+    let network = Arc::new(Mutex::new(Network::Signet));
+    let server = electrum_on(Arc::clone(&network)).await;
+    let provider = electrum_provider(&server.url, Network::Signet);
+    assert_eq!(provider.get_block_height().await.unwrap(), 101);
+    *network.lock().unwrap() = Network::Bitcoin;
+    let error = provider.get_block_height().await.unwrap_err().to_string();
+    assert!(error.contains("network mismatch"), "{error}");
+    assert!(matches!(
+        provider.verify_network().await,
+        NetworkCheck::Mismatch(_)
+    ));
+}
+
+#[tokio::test]
+async fn esplora_hash_string_alone_is_never_a_pass() {
+    let explorer = Explorer::new(Network::Signet).await;
+    explorer.state.serves_header.store(false, Ordering::SeqCst);
+    let provider = esplora_provider(&explorer.url, &[], Network::Signet);
+    assert_eq!(provider.verify_network().await, NetworkCheck::Unavailable);
+    assert!(provider.get_block_height().await.is_err());
+    assert!(!provider.is_synced().await);
+    assert_eq!(explorer.tip_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn esplora_is_checked_again_after_a_lost_connection() {
+    let explorer = Explorer::new(Network::Signet).await;
+    let provider = esplora_provider(&explorer.url, &[], Network::Signet);
+    assert_eq!(provider.verify_network().await, NetworkCheck::Verified);
+    assert_eq!(provider.estimate_fee(6).await.unwrap().sat_per_vbyte, 2.0);
+    explorer.stop().await;
+    assert!(provider.estimate_fee(6).await.is_err());
+    explorer.restart_on(Network::Bitcoin).await;
+    let error = provider.estimate_fee(6).await.unwrap_err().to_string();
+    assert!(error.contains("network mismatch"), "{error}");
 }

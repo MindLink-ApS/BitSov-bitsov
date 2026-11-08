@@ -1,7 +1,7 @@
 //! Exercise the real LDK startup fee barrier with disposable mainnet wallets
 //! and loopback HTTP only. No bitcoind, public endpoint, or funds are needed.
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -12,6 +12,8 @@ use konsensus_lightning::{LdkConfig, LdkProvider};
 
 struct Fixture {
     url: String,
+    /// Whether the network identity endpoints answer.
+    genesis_live: Arc<AtomicBool>,
     requests: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
     background_requests: Arc<AtomicUsize>,
@@ -32,6 +34,51 @@ impl Fixture {
         Self::build(0, false, Duration::ZERO, genesis).await
     }
 
+    /// A loopback Bitcoin Core RPC endpoint that reports `chain` to the first
+    /// `getblockchaininfo` (the start-time network check); every later call
+    /// fails and counts as background traffic.
+    async fn core(chain: &'static str) -> Self {
+        let asked = Arc::new(AtomicBool::new(false));
+        Self::custom(move |background| {
+            Router::new().route(
+                "/",
+                axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                    let background = Arc::clone(&background);
+                    let first = !asked.swap(true, Ordering::SeqCst);
+                    async move {
+                        if request["method"] == "getblockchaininfo" && first {
+                            return Ok(axum::Json(serde_json::json!({
+                                "result": {"chain": chain}, "error": null, "id": 1,
+                            })));
+                        }
+                        background.fetch_add(1, Ordering::SeqCst);
+                        // Nonempty, as in the explorer fixture: a transport
+                        // failure to LDK, not invalid data.
+                        Err((StatusCode::NOT_FOUND, "unavailable"))
+                    }
+                }),
+            )
+        })
+        .await
+    }
+
+    /// Serve `make(background_requests)` instead of the explorer routes.
+    async fn custom(make: impl FnOnce(Arc<AtomicUsize>) -> Router) -> Self {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let background_requests = Arc::new(AtomicUsize::new(0));
+        let app = make(Arc::clone(&background_requests));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self {
+            url,
+            genesis_live: Arc::new(AtomicBool::new(true)),
+            requests,
+            task,
+            background_requests,
+        }
+    }
+
     async fn build(
         failures: usize,
         empty: bool,
@@ -41,13 +88,42 @@ impl Fixture {
         let requests = Arc::new(AtomicUsize::new(0));
         let background_requests = Arc::new(AtomicUsize::new(0));
         let background = Arc::clone(&background_requests);
+        let genesis_live = Arc::new(AtomicBool::new(true));
         let mut app = Router::new();
         if let Some(network) = genesis {
-            // The start-time network check; not wallet or background traffic.
-            let hash = bitcoin::blockdata::constants::genesis_block(network)
-                .block_hash()
-                .to_string();
-            app = app.route("/block-height/0", get(move || async move { hash }));
+            // The network check: height-0 hash, then that header. Not wallet
+            // or background traffic; any other header is.
+            let block = bitcoin::blockdata::constants::genesis_block(network);
+            let hash = block.block_hash().to_string();
+            let header = bitcoin::consensus::encode::serialize_hex(&block.header);
+            let (live, named) = (Arc::clone(&genesis_live), hash.clone());
+            app = app.route(
+                "/block-height/0",
+                get(move || async move {
+                    if live.load(Ordering::SeqCst) {
+                        Ok(named)
+                    } else {
+                        Err(StatusCode::BAD_GATEWAY)
+                    }
+                }),
+            );
+            let (live, background) = (Arc::clone(&genesis_live), Arc::clone(&background));
+            app = app.route(
+                "/block/:hash/header",
+                get(
+                    move |axum::extract::Path(asked): axum::extract::Path<String>| async move {
+                        if asked != hash {
+                            background.fetch_add(1, Ordering::SeqCst);
+                            return Err(StatusCode::NOT_FOUND);
+                        }
+                        if live.load(Ordering::SeqCst) {
+                            Ok(header)
+                        } else {
+                            Err(StatusCode::BAD_GATEWAY)
+                        }
+                    },
+                ),
+            );
         }
         let app = app
             .route(
@@ -78,6 +154,7 @@ impl Fixture {
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Self {
             url,
+            genesis_live,
             requests,
             task,
             background_requests,
@@ -368,6 +445,9 @@ async fn offline_boot_recovers_after_sync_without_duplicate_ldk_tasks() {
                 return if fees { (StatusCode::OK, "{\"1\":10.0,\"6\":5.0,\"144\":2.0}".into()) }
                     else { (StatusCode::BAD_GATEWAY, "offline".into()) };
             }
+            // The network check answers throughout; only wallet data goes offline.
+            if path == "/block-height/0" { return (StatusCode::OK, hash); }
+            if path == format!("/block/{hash}/header") { return (StatusCode::OK, header); }
             if !chain { return (StatusCode::BAD_GATEWAY, "offline".into()); }
             let body = if path == "/blocks/tip/hash" || path == "/block-height/0" { hash }
                 else if path == "/blocks/tip/height" { "0".into() }
@@ -450,7 +530,8 @@ mod outbound_guard;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bitcoind_sync_failure_is_visible_and_never_contacts_esplora_or_fallback() {
     let Ok(core_url) = std::env::var("BITSOV_GUARD_CORE") else {
-        let core = Fixture::new(0, false).await; // RPC POST returns 404.
+        // Core answers its chain; every other RPC POST returns 404.
+        let core = Fixture::core("regtest").await;
         let primary = Fixture::new(0, false).await;
         let fallback = Fixture::new(0, false).await;
         let guard_dir = tempfile::tempdir().unwrap();
@@ -509,6 +590,12 @@ async fn bitcoind_sync_failure_is_visible_and_never_contacts_esplora_or_fallback
 #[path = "../../konsensus-chain/tests/support/electrum_fixture.rs"]
 mod electrum_fixture;
 
+fn genesis_header(network: bitcoin::Network) -> String {
+    bitcoin::consensus::encode::serialize_hex(
+        &bitcoin::blockdata::constants::genesis_block(network).header,
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn electrum_sync_failure_is_visible_and_never_contacts_esplora_or_fallback() {
     let Ok(endpoint) = std::env::var("BITSOV_GUARD_ENDPOINT") else {
@@ -516,6 +603,9 @@ async fn electrum_sync_failure_is_visible_and_never_contacts_esplora_or_fallback
             electrum_fixture::Fixture::new(|request| match request["method"].as_str().unwrap() {
                 "server.version" => serde_json::json!({"result":["bitsov-fixture", "1.4"]}),
                 "blockchain.estimatefee" => serde_json::json!({"result":0.00002}),
+                "blockchain.block.header" if request["params"][0] == 0 => {
+                    serde_json::json!({"result": genesis_header(bitcoin::Network::Regtest)})
+                }
                 _ => serde_json::json!({"error":{"code":-1,"message":"ELECTRUM_REMOTE_SECRET"}}),
             })
             .await;
@@ -590,6 +680,9 @@ async fn electrum_startup_failure_never_contacts_esplora_or_fallback() {
         let electrum = electrum_fixture::Fixture::new(|request| {
             if request["method"] == "server.version" {
                 serde_json::json!({"result":["bitsov-fixture", "1.4"]})
+            } else if request["method"] == "blockchain.block.header" && request["params"][0] == 0 {
+                // On the configured network, so startup reaches the fee barrier.
+                serde_json::json!({"result": genesis_header(bitcoin::Network::Bitcoin)})
             } else {
                 serde_json::json!({"error":{"code":-1,"message":"ELECTRUM_REMOTE_SECRET"}})
             }
@@ -695,13 +788,73 @@ async fn esplora_on_another_network_refuses_startup_before_ldk_runs() {
     }
 }
 
-/// An explorer that cannot report its genesis block changes nothing.
+/// An explorer that has not answered on the configured network is
+/// unavailable: LDK is not built, reads and syncs nothing, and is not ready.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn esplora_without_a_network_answer_starts_as_before() {
-    let server = Fixture::on(None).await;
+async fn esplora_without_a_network_answer_does_not_start_ldk() {
+    for server in [
+        Fixture::on(None).await,
+        // The right hash string alone, without its header, is not an answer.
+        Fixture::custom(|_| {
+            let hash = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin)
+                .block_hash()
+                .to_string();
+            Router::new().route("/block-height/0", get(move || async move { hash }))
+        })
+        .await,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(&dir, &server.url);
+        let err = LdkProvider::new(cfg.clone()).await.err().unwrap();
+        assert!(
+            matches!(&err, LightningError::ChainSourceUnavailable { service, .. } if service == "esplora"),
+            "{err}"
+        );
+        assert_eq!(server.requests.load(Ordering::SeqCst), 0, "no fee probe");
+        let log = std::fs::read_to_string(cfg.storage_dir.join("ldk_node.log")).unwrap_or_default();
+        assert!(!log.contains("Starting up LDK Node"), "LDK must not start");
+    }
+}
+
+/// The node starts with LDK offline and not ready, and builds LDK only once
+/// the source answers on the configured network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unverified_source_keeps_ldk_offline_until_it_answers() {
+    use konsensus_lightning::RecoveringLightning;
+    let server = Fixture::on(Some(bitcoin::Network::Bitcoin)).await;
+    server.genesis_live.store(false, Ordering::SeqCst);
     let dir = tempfile::tempdir().unwrap();
-    let provider = LdkProvider::new(config(&dir, &server.url)).await.unwrap();
-    assert!(provider.node().status().is_running);
+    let cfg = config(&dir, &server.url);
+    let log_path = cfg.storage_dir.join("ldk_node.log");
+    let provider = RecoveringLightning::new(
+        move || {
+            let cfg = cfg.clone();
+            async move { Ok(Arc::new(LdkProvider::new(cfg).await?) as Arc<dyn LightningProvider>) }
+        },
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(provider.readiness().await.state, "offline");
+    assert!(!provider.money_ready().await);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 0, "no fee probe");
+    assert_eq!(
+        server.background_requests.load(Ordering::SeqCst),
+        0,
+        "no sync"
+    );
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!log.contains("Starting up LDK Node"), "LDK must not start");
+
+    server.genesis_live.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while provider.readiness().await.state != "synchronizing" {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(server.requests.load(Ordering::SeqCst) >= 1);
     provider.shutdown().await.unwrap();
 }
 
@@ -784,4 +937,46 @@ async fn electrum_on_another_network_refuses_startup() {
     );
     let log = std::fs::read_to_string(cfg.storage_dir.join("ldk_node.log")).unwrap_or_default();
     assert!(!log.contains("Starting up LDK Node"), "LDK must not start");
+}
+
+/// Core that does not answer: LDK is not built, even on regtest where LDK
+/// itself would start without fee data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bitcoind_without_a_network_answer_does_not_start_ldk() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let dir = tempfile::tempdir().unwrap();
+    let cookie = dir.path().join("cookie");
+    std::fs::write(&cookie, "user:pass").unwrap();
+    let mut cfg = config(&dir, "http://127.0.0.1:9");
+    cfg.network = "regtest".into();
+    cfg.bitcoind = Some(
+        serde_json::from_value(serde_json::json!({
+            "rpc_host": "127.0.0.1", "rpc_port": port, "cookie_file": cookie,
+        }))
+        .unwrap(),
+    );
+    let err = LdkProvider::new(cfg.clone()).await.err().unwrap();
+    assert!(
+        matches!(&err, LightningError::ChainSourceUnavailable { service, .. } if service == "bitcoind"),
+        "{err}"
+    );
+    let log = std::fs::read_to_string(cfg.storage_dir.join("ldk_node.log")).unwrap_or_default();
+    assert!(!log.contains("Starting up LDK Node"), "LDK must not start");
+}
+
+/// A primary that has not answered is replaced by a fallback that has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unverified_esplora_primary_starts_on_the_verified_fallback() {
+    let primary = Fixture::on(None).await;
+    let fallback = Fixture::on(Some(bitcoin::Network::Bitcoin)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(&dir, &primary.url);
+    cfg.esplora_url_fallback = Some(fallback.url.clone());
+    let provider = LdkProvider::new(cfg).await.unwrap();
+    assert!(provider.node().status().is_running);
+    assert_eq!(primary.requests.load(Ordering::SeqCst), 0, "primary unused");
+    assert!(fallback.requests.load(Ordering::SeqCst) >= 1);
+    provider.shutdown().await.unwrap();
 }
