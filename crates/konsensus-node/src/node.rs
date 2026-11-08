@@ -72,6 +72,8 @@ pub struct KonsensusNode {
     /// Storage backend (type-erased).
     storage: Arc<dyn Storage>,
 
+    record_policy: konsensus_crypto::record_cipher::LegacyReadPolicy,
+
     /// Lightning provider (type-erased).
     lightning: Arc<dyn LightningProvider>,
 
@@ -218,6 +220,10 @@ impl KonsensusNode {
         info!(node_id = %identity.node_id(), "identity loaded");
 
         // ── 3. Initialize storage ───────────────────────────────────────
+        let encrypted_storage = match &config.storage {
+            StorageConfig::Sqlite { encrypted, .. } | StorageConfig::Postgres { encrypted, .. } => *encrypted,
+        };
+        let record_policy = konsensus_crypto::record_cipher::LegacyReadPolicy::for_storage(data_dir, encrypted_storage);
         let storage: Arc<dyn Storage> = match &config.storage {
             StorageConfig::Sqlite {
                 path, encrypted, ..
@@ -226,9 +232,10 @@ impl KonsensusNode {
                     .await
                     .with_context(|| format!("failed to open SQLite at {path}"))?;
                 if *encrypted {
-                    Arc::new(konsensus_storage::EncryptedStorage::new(
+                    Arc::new(konsensus_storage::EncryptedStorage::with_policy(
                         sqlite,
                         identity.aes_key(),
+                        record_policy.clone(),
                     ))
                 } else {
                     Arc::new(sqlite)
@@ -239,9 +246,10 @@ impl KonsensusNode {
                     .await
                     .with_context(|| "failed to connect to PostgreSQL")?;
                 if *encrypted {
-                    Arc::new(konsensus_storage::EncryptedStorage::new(
+                    Arc::new(konsensus_storage::EncryptedStorage::with_policy(
                         pg,
                         identity.aes_key(),
+                        record_policy.clone(),
                     ))
                 } else {
                     Arc::new(pg)
@@ -552,6 +560,7 @@ impl KonsensusNode {
             identity,
             config,
             storage,
+            record_policy,
             lightning,
             chain,
             pricing,
@@ -597,6 +606,43 @@ impl KonsensusNode {
 
         tokio::spawn(self.disk.clone().monitor(self.shutdown_rx()));
 
+        let storage = self.storage.clone();
+        let encrypted_storage = match &self.config.storage {
+            StorageConfig::Sqlite { encrypted, .. }
+            | StorageConfig::Postgres { encrypted, .. } => *encrypted,
+        };
+        let upgrade = konsensus_storage::record_upgrade::RecordUpgrade::new(
+            self.identity.aes_key(),
+            self.record_policy.clone(),
+            encrypted_storage,
+        );
+        let mut shutdown = self.shutdown_rx();
+        tokio::spawn(async move {
+            let mut retry_attempt = 0u32;
+            loop {
+                let retry_delay =
+                    konsensus_storage::record_upgrade::RecordUpgrade::retry_delay(retry_attempt);
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    result = upgrade.run(storage.as_ref()) => match result {
+                        Ok(changed) => {
+                            info!(changed, "storage record format cutoff is active");
+                            return;
+                        }
+                        Err(_) => tracing::warn!(
+                            retry_after_seconds = retry_delay.as_secs(),
+                            "storage record format upgrade deferred; will retry",
+                        ),
+                    }
+                }
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tokio::time::sleep(retry_delay) => {}
+                }
+                retry_attempt = retry_attempt.saturating_add(1);
+            }
+        });
+
         // Start routing table maintenance (periodic decay + pruning)
         self.routing.spawn_maintenance();
         info!("routing table maintenance tasks started");
@@ -629,6 +675,8 @@ impl KonsensusNode {
     }
 
     /// The storage backend.
+    pub fn record_policy(&self) -> konsensus_crypto::record_cipher::LegacyReadPolicy { self.record_policy.clone() }
+
     pub fn storage(&self) -> &Arc<dyn Storage> {
         &self.storage
     }
@@ -757,6 +805,9 @@ pub(crate) fn merge_persisted_peers(
     peers: Vec<konsensus_storage::Peer>,
 ) {
     for peer in peers {
+        if peer.metadata.get("storage_legacy_untrusted").and_then(serde_json::Value::as_bool) == Some(true) {
+            continue;
+        }
         if registry.get(&peer.node_id).is_some() {
             continue;
         }
@@ -940,4 +991,20 @@ mod p3_2_whitelist_tests {
             Some("198.51.100.7:9735".parse().unwrap())
         );
     }
+}
+
+#[tokio::test]
+async fn plaintext_peer_does_not_enter_registry_before_or_after_upgrade() {
+    use konsensus_storage::{EncryptedStorage, Peer, SqliteStorage, Storage};
+    let dir = tempfile::tempdir().unwrap();
+    let policy = konsensus_crypto::record_cipher::LegacyReadPolicy::in_data_dir(dir.path());
+    let storage = EncryptedStorage::with_policy(SqliteStorage::in_memory().await.unwrap(), &[7; 32], policy.clone());
+    let peer = Peer::new(konsensus_core::NodeId::from_bytes([1; 32]));
+    storage.inner().upsert_peer(&peer).await.unwrap();
+    let mut registry = PeerRegistry::new();
+    merge_persisted_peers(&mut registry, storage.list_peers().await.unwrap());
+    assert!(registry.get(&peer.node_id).is_none());
+    konsensus_storage::record_upgrade::RecordUpgrade::new(&[7; 32], policy, true).run(&storage).await.unwrap();
+    merge_persisted_peers(&mut registry, storage.list_peers().await.unwrap());
+    assert!(registry.get(&peer.node_id).is_none());
 }
