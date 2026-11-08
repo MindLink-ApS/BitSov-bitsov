@@ -27,6 +27,38 @@ pub struct PostgresStorage {
 }
 
 impl PostgresStorage {
+    async fn load_message_record(
+        &self,
+        id: &MessageId,
+        include_held: bool,
+    ) -> Result<Option<UkmEnvelope>, StorageError> {
+        let id_hex = id.to_hex();
+
+        let row = sqlx::query_as::<_, (
+            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String,
+            String, String,
+        )>(
+            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
+             FROM messages WHERE id = $1 AND ($2 OR id NOT IN (SELECT message_id FROM call_admission_hold))",
+        )
+        .bind(&id_hex)
+        .bind(include_held)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => {
+                let envelope = row_to_envelope(
+                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
+                    &r.12,
+                )?;
+                Ok(Some(envelope))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Connect to a PostgreSQL database and run migrations.
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
         let pool = PgPoolOptions::new()
@@ -1323,30 +1355,11 @@ impl Storage for PostgresStorage {
     }
 
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
-        let id_hex = id.to_hex();
+        self.load_message_record(id, false).await
+    }
 
-        let row = sqlx::query_as::<_, (
-            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String,
-            String, String,
-        )>(
-            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
-             FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND id = $1",
-        )
-        .bind(&id_hex)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match row {
-            Some(r) => {
-                let envelope = row_to_envelope(
-                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
-                    &r.12,
-                )?;
-                Ok(Some(envelope))
-            }
-            None => Ok(None),
-        }
+    async fn record_upgrade_envelope(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
+        self.load_message_record(id, true).await
     }
 
     async fn get_messages_for_recipient(&self, recipient: &Recipient, limit: u32, before_timestamp: Option<u64>) -> Result<Vec<UkmEnvelope>, StorageError> {

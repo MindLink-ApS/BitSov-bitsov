@@ -23,7 +23,8 @@ pub struct PlaintextCacheCipher {
 }
 
 impl PlaintextCacheCipher {
-    /// Create a new cipher from the node's AES master key.
+    /// Create a v2-only cipher from the node's AES master key.
+    /// Use with_policy with a local data directory for a v1 upgrade.
     ///
     /// The derived key is independent of all other domain-separated keys
     /// (session encryption, storage encryption) thanks to the unique context

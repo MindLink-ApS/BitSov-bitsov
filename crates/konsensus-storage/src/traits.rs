@@ -35,6 +35,7 @@ pub trait Storage: Send + Sync {
         self.get_message(id).await
     }
 
+    /// after is the previous RecordRow::scan_after opaque cursor, not its ID.
     async fn record_upgrade_rows(&self, _table: crate::record_upgrade::RecordTable, _after: Option<&str>, _limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {
         Err(StorageError::Unsupported("record format upgrade".into()))
     }

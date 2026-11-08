@@ -451,7 +451,9 @@ async fn restore_migrates_plaintext_to_encrypted() {
     //   * migration build (feature on): the plaintext blob migrates to
     //     encrypted, as the legacy one-shot path intends.
     std::env::set_var("KONSENSUS_LEGACY_SESSION_MIGRATION", "1");
-    let mgr_a2 = SessionManager::with_store(Arc::clone(&id_a), store.clone());
+    let migration_dir = tempfile::tempdir().unwrap();
+    let mgr_a2 = SessionManager::with_store(Arc::clone(&id_a), store.clone())
+        .with_record_policy(crate::record_cipher::LegacyReadPolicy::in_data_dir(migration_dir.path()));
     let restored = mgr_a2.restore_sessions().await;
     std::env::remove_var("KONSENSUS_LEGACY_SESSION_MIGRATION");
 

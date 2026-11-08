@@ -3,6 +3,44 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## Location-bound storage records (after rc22)
+
+The encrypted record format is **forward-only**. New writes bind encrypted
+fields in messages, peers, rooms, files, outbox operations and channel/payment
+operations to their table, column and row ID. Cached message plaintext and
+persisted sessions use the same location binding. The background pass converts existing usable records before
+persisting a local completion marker. After that marker exists, unbound v1
+records are refused, including after a restart. The cache and session cutoff
+also remains effective across storage-mode changes.
+
+Unreadable rows are preserved unchanged and counted per table in the node log;
+they cannot keep legacy reads enabled indefinitely. Such rows may require
+recovery and remain unreadable after the cutoff. The log reports table names and
+counts, without record IDs, contents or decryption errors. Database failures or
+concurrent writes defer completion and retry with exponential backoff, from one
+minute to at most one hour. Held call messages are included in maintenance while
+remaining hidden from ordinary message reads.
+
+Retain the latest complete data directory, including the completion markers.
+Do not delete a marker or restore an older database beneath it to re-enable old
+records. Do not run rc22 or an older binary on this data: migration 033 is a
+separate schema fence that those binaries refuse; the encrypted record wrapper
+alone is not a binary-version fence. Recover by rolling forward using consistent
+state, following the existing channel and ratchet rollback constraints.
+
+Only the encrypted fields are bound. Plain sibling columns (for example file
+associations and hashes, room creators, and operation state) are outside this
+binding, except for message-envelope fields checked through the message ID.
+Recovery shards and whitelist backups retain their separate existing formats.
+The format version is authenticated in the AAD; no trusted per-record generation
+counter is included. Replaying an older valid ciphertext at the same location
+can still succeed, so this change does not prevent same-record or whole-database
+rollback by an attacker with write access.
+
+Library defaults accept v2 only. Embedders migrating v1 data must explicitly
+supply a data-directory policy to storage, cache and session constructors, run
+the format upgrade, and retain its marker across restarts.
+
 ## rc21 → rc22
 
 An E2EE send now saves its advanced send chain before the ciphertext leaves the

@@ -53,6 +53,49 @@ pub fn sqlite_file_path(connection: &str) -> Option<std::path::PathBuf> {
 }
 
 impl SqliteStorage {
+    async fn load_message_record(
+        &self,
+        id: &MessageId,
+        include_held: bool,
+    ) -> Result<Option<UkmEnvelope>, StorageError> {
+        let id_hex = id.to_hex();
+
+        let row = sqlx::query_as::<_, (
+            String,  // id
+            i64,     // kind
+            String,  // sender
+            String,  // recipient_type
+            String,  // recipient_id
+            i64,     // timestamp_ms
+            Vec<u8>, // ciphertext
+            String,  // payment_hash
+            String,  // preimage
+            i64,     // amount_msat
+            String,  // signature
+            String,  // nonce
+            String,  // references_json
+        )>(
+            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
+             FROM messages WHERE id = ? AND (? OR id NOT IN (SELECT message_id FROM call_admission_hold))",
+        )
+        .bind(&id_hex)
+        .bind(include_held)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => {
+                let envelope = row_to_envelope(
+                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
+                    &r.12,
+                )?;
+                Ok(Some(envelope))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Open (or create) a SQLite database at the given path.
     ///
     /// When `KONSENSUS_SQLITE_MIGRATIONS_DIR` is set, migrations are loaded from that
@@ -1162,41 +1205,11 @@ impl Storage for SqliteStorage {
     }
 
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
-        let id_hex = id.to_hex();
+        self.load_message_record(id, false).await
+    }
 
-        let row = sqlx::query_as::<_, (
-            String,  // id
-            i64,     // kind
-            String,  // sender
-            String,  // recipient_type
-            String,  // recipient_id
-            i64,     // timestamp_ms
-            Vec<u8>, // ciphertext
-            String,  // payment_hash
-            String,  // preimage
-            i64,     // amount_msat
-            String,  // signature
-            String,  // nonce
-            String,  // references_json
-        )>(
-            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
-             FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND id = ?",
-        )
-        .bind(&id_hex)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match row {
-            Some(r) => {
-                let envelope = row_to_envelope(
-                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
-                    &r.12,
-                )?;
-                Ok(Some(envelope))
-            }
-            None => Ok(None),
-        }
+    async fn record_upgrade_envelope(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
+        self.load_message_record(id, true).await
     }
 
     async fn get_messages_for_recipient(&self, recipient: &Recipient, limit: u32, before_timestamp: Option<u64>) -> Result<Vec<UkmEnvelope>, StorageError> {

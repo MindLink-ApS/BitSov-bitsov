@@ -164,7 +164,8 @@ fn encrypt_decrypt_raw() {
 fn decrypt_truncated_data_too_short() {
     // Data shorter than 12 bytes (nonce size) — should fail
     let key = [42u8; 32];
-    let cipher = RecordCipher::new(&key, LegacyReadPolicy::default());
+    let dir = tempfile::tempdir().unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::in_data_dir(dir.path()));
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -182,7 +183,8 @@ fn decrypt_truncated_data_too_short() {
 fn decrypt_exactly_12_bytes_nonce_only() {
     // Exactly 12 bytes = nonce but zero ciphertext — AEAD decryption fails
     let key = [42u8; 32];
-    let cipher = RecordCipher::new(&key, LegacyReadPolicy::default());
+    let dir = tempfile::tempdir().unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::in_data_dir(dir.path()));
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -1579,3 +1581,113 @@ async fn record_binding_rejects_peer_row_relocation() {
     assert!(store.get_peer(&moved.node_id).await.is_err());
     assert!(store.get_peer(&original.node_id).await.unwrap().is_some());
 }
+
+
+#[tokio::test]
+async fn default_encrypted_storage_refuses_v1_records() {
+    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let nonce = [3u8; 12];
+    let mut v1 = nonce.to_vec();
+    v1.extend(
+        Aes256Gcm::new_from_slice(&[7; 32])
+            .unwrap()
+            .encrypt((&nonce).into(), b"{}".as_slice())
+            .unwrap(),
+    );
+    let mut peer = Peer::new(NodeId::from_bytes([5; 32]));
+    peer.metadata = hex::encode(v1).into();
+    store.inner().upsert_peer(&peer).await.unwrap();
+    assert!(store.get_peer(&peer.node_id).await.is_err());
+}
+
+async fn read_path_rejects_relocated_fields(table: crate::record_upgrade::RecordTable) {
+    use crate::record_upgrade::RecordTable;
+    use crate::{ChannelOpenOperation, OutboxOperation};
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let peer = NodeId::from_bytes([5; 32]);
+    for id in ["a", "b"] {
+        match table {
+            RecordTable::Rooms => {
+                let room = Room::new(format!("room-{id}"), peer);
+                store.create_room(&room).await.unwrap();
+            }
+            RecordTable::Files => {
+                let file = FileRecord {
+                    id: id.into(),
+                    filename: format!("file-{id}"),
+                    mime_type: "text/plain".into(),
+                    size_bytes: 4,
+                    blake3_hash: "hash".into(),
+                    sender: peer.to_hex(),
+                    message_id: None,
+                    data: b"file".to_vec(),
+                    created_at: String::new(),
+                };
+                store.store_file(&file).await.unwrap();
+            }
+            RecordTable::Outbox => {
+                let mut op =
+                    OutboxOperation::prepared(id.into(), peer.to_hex(), 100, "hash".into());
+                op.recovery = b"recovery".to_vec();
+                store.insert_outbox_operation(&op).await.unwrap();
+            }
+            RecordTable::Channel => {
+                let mut op =
+                    ChannelOpenOperation::pending(id.into(), "hash".into(), b"request".to_vec());
+                op.result = Some(b"result".to_vec());
+                store.insert_channel_open_operation(&op).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+    }
+    let rows = store.record_upgrade_rows(table, None, 10).await.unwrap();
+    let mut moved = rows[1].clone();
+    moved.values = rows[0].values.clone();
+    assert!(store
+        .record_upgrade_replace(table, &rows[1], &moved)
+        .await
+        .unwrap());
+    match table {
+        RecordTable::Rooms => {
+            let original: RoomId = RoomId::parse(&rows[0].id).unwrap();
+            let target: RoomId = RoomId::parse(&rows[1].id).unwrap();
+            assert!(store.get_room(&original).await.unwrap().is_some());
+            assert!(store.get_room(&target).await.is_err());
+        }
+        RecordTable::Files => {
+            assert!(store.get_file(&rows[0].id).await.unwrap().is_some());
+            assert!(store.get_file(&rows[1].id).await.is_err());
+        }
+        RecordTable::Outbox => {
+            assert!(store
+                .get_outbox_operation(&rows[0].id)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(store.get_outbox_operation(&rows[1].id).await.is_err());
+        }
+        RecordTable::Channel => {
+            assert!(store
+                .get_channel_open_operation(&rows[0].id)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(store.get_channel_open_operation(&rows[1].id).await.is_err());
+        }
+        _ => unreachable!(),
+    }
+}
+
+macro_rules! relocation_read_test {
+    ($name:ident, $table:ident) => {
+        #[tokio::test]
+        async fn $name() {
+            read_path_rejects_relocated_fields(crate::record_upgrade::RecordTable::$table).await;
+        }
+    };
+}
+relocation_read_test!(room_read_rejects_relocated_fields, Rooms);
+relocation_read_test!(file_read_rejects_relocated_fields, Files);
+relocation_read_test!(outbox_read_rejects_relocated_fields, Outbox);
+relocation_read_test!(channel_read_rejects_relocated_fields, Channel);

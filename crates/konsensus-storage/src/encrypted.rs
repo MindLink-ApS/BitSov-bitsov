@@ -37,7 +37,8 @@ use crate::traits::Storage;
 /// AES-256-GCM at-rest encryption wrapper over any `Storage` backend.
 ///
 /// Sensitive message, peer, room, file, and operation fields use v2 records.
-/// Legacy encrypted records remain readable until the local upgrade completes.
+/// Legacy encrypted records require an explicit local upgrade policy.
+/// The default constructor accepts only location-bound v2 records.
 pub struct EncryptedStorage<S: Storage> {
     inner: S,
     cipher: RecordCipher,
@@ -52,7 +53,7 @@ pub struct EncryptedStorage<S: Storage> {
 }
 
 impl<S: Storage> EncryptedStorage<S> {
-    /// Create a new encrypted storage wrapper.
+    /// Create a v2-only encrypted storage wrapper. Use with_policy for a local v1 upgrade.
     ///
     /// The `key` should be the 32-byte AES key from `NodeIdentity::aes_key()`.
     pub fn new(inner: S, key: &[u8; 32]) -> Self {
@@ -415,7 +416,7 @@ impl<S: Storage> EncryptedStorage<S> {
 #[async_trait]
 impl<S: Storage> Storage for EncryptedStorage<S> {
     async fn record_upgrade_envelope(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
-        self.inner.get_message(id).await
+        self.inner.record_upgrade_envelope(id).await
     }
 
     async fn record_upgrade_rows(&self, table: crate::record_upgrade::RecordTable, after: Option<&str>, limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {

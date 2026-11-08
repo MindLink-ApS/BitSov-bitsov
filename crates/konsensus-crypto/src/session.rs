@@ -277,7 +277,8 @@ impl SessionManager {
         self
     }
 
-    /// Create a new session manager for the given identity.
+    /// Create a v2-only session manager for the given identity.
+    /// Use with_record_policy with a local data directory for a v1 upgrade.
     ///
     /// Generates an initial signed pre-key and a batch of one-time pre-keys.
     pub fn new(identity: Arc<NodeIdentity>) -> Self {

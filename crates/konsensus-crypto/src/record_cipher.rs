@@ -18,6 +18,7 @@ pub const SESSION_KEY_CONTEXT: &str = "konsensus-v2 session-at-rest encryption k
 pub const CACHE_KEY_CONTEXT: &str = "konsensus-v2 plaintext-cache encryption key";
 
 /// Shared cutoff for v1 reads. A local marker also applies across restarts.
+/// Default is v2-only. Legacy migration requires an explicit data-directory policy.
 #[derive(Clone)]
 pub struct LegacyReadPolicy(Arc<LegacyState>);
 struct LegacyState {
@@ -31,7 +32,7 @@ impl Default for LegacyReadPolicy {
         Self(Arc::new(LegacyState {
             marker: None,
             other_marker: None,
-            disabled: AtomicBool::new(false),
+            disabled: AtomicBool::new(true),
         }))
     }
 }
@@ -241,6 +242,35 @@ mod tests {
             let cipher = crate::PlaintextCacheCipher::with_policy(&[7; 32], next);
             assert!(cipher.decrypt("message", &v1).is_err());
         }
+    }
+
+    #[test]
+    fn default_policy_refuses_unbound_records() {
+        let raw = Aes256Gcm::new_from_slice(&[7; 32]).unwrap();
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let mut v1 = nonce.to_vec();
+        v1.extend(raw.encrypt(&nonce, b"legacy".as_slice()).unwrap());
+        let cipher = RecordCipher::new(&[7; 32], LegacyReadPolicy::default());
+        assert!(cipher
+            .decrypt("peers", "metadata_json", "row", &v1)
+            .is_err());
+        let current = cipher
+            .encrypt("peers", "metadata_json", "row", b"current")
+            .unwrap();
+        assert_eq!(
+            cipher
+                .decrypt("peers", "metadata_json", "row", &current)
+                .unwrap(),
+            b"current"
+        );
+        let identity = std::sync::Arc::new(
+            konsensus_core::identity::NodeIdentity::generate()
+                .unwrap()
+                .1,
+        );
+        assert!(!crate::session::SessionManager::new(identity)
+            .record_policy()
+            .allows_v1());
     }
 
     #[test]

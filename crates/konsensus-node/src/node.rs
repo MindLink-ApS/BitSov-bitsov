@@ -563,24 +563,36 @@ impl KonsensusNode {
 
         let storage = self.storage.clone();
         let encrypted_storage = match &self.config.storage {
-            StorageConfig::Sqlite { encrypted, .. } | StorageConfig::Postgres { encrypted, .. } => *encrypted,
+            StorageConfig::Sqlite { encrypted, .. }
+            | StorageConfig::Postgres { encrypted, .. } => *encrypted,
         };
         let upgrade = konsensus_storage::record_upgrade::RecordUpgrade::new(
-            self.identity.aes_key(), self.record_policy.clone(), encrypted_storage);
+            self.identity.aes_key(),
+            self.record_policy.clone(),
+            encrypted_storage,
+        );
         let mut shutdown = self.shutdown_rx();
         tokio::spawn(async move {
+            let mut retry_delay = std::time::Duration::from_secs(60);
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => return,
                     result = upgrade.run(storage.as_ref()) => match result {
-                        Ok(changed) => { info!(changed, "storage record format is current"); return; }
-                        Err(_) => tracing::warn!("storage record format upgrade deferred; will retry"),
+                        Ok(changed) => {
+                            info!(changed, "storage record format cutoff is active");
+                            return;
+                        }
+                        Err(_) => tracing::warn!(
+                            retry_after_seconds = retry_delay.as_secs(),
+                            "storage record format upgrade deferred; will retry",
+                        ),
                     }
                 }
                 tokio::select! {
                     _ = shutdown.changed() => return,
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                    _ = tokio::time::sleep(retry_delay) => {}
                 }
+                retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(3600));
             }
         });
 
