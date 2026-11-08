@@ -300,9 +300,15 @@ async fn switch_to_owned_core_writes_the_owned_tip_and_keeps_a_backup() {
     }
     assert_eq!(old, new);
 
-    // The backup is the old file, private to the owner.
+    // The backup is the old file, private to the owner; no temporary is left.
     let found = backups(dir.path());
     assert_eq!(found.len(), 1);
+    let named: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("before-chain-tip"))
+        .collect();
+    assert_eq!(named.len(), 1, "{named:?}");
     assert_eq!(std::fs::read(&found[0]).unwrap(), before);
     #[cfg(unix)]
     {
