@@ -922,7 +922,7 @@ pub async fn peer_call_kind_price(state: &AppState, peer: &NodeId, kind: u16) ->
     .await
     .map_err(|_| unknown())?
     .map_err(|()| unknown())?;
-    let height = state.chain.get_block_height().await.unwrap_or(0);
+    let height = crate::error::chain_tip(state).await?;
     state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, PRICE_ANSWER_MAX_AGE).await.ok_or_else(unknown)
 }
 

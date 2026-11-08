@@ -1961,7 +1961,7 @@ async fn request_admission_invoice(
     if kind != konsensus_core::kind::KIND_CHAT {
         return Err(ApiError::BadRequest("first contact must be a chat message".into()));
     }
-    let current_block_height = state.chain.get_block_height().await.unwrap_or(0);
+    let current_block_height = crate::error::chain_tip(state).await?;
     let peer_announced = state
         .peer_prices
         .get_fresh_discounted_peer_price(
@@ -3345,13 +3345,9 @@ pub(super) async fn compose_message_with_policy(
             None => admin_room_members(&state, &req).await?,
         };
 
-        let current_block_height = if !state.lightning.money_ready().await { 0 } else { match state.chain.get_block_height().await {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to get block height for room compose, using fallback 0");
-                0
-            }
-        }};
+        // Not money-ready: no chain read; only an established zero price can
+        // go out (`quoted_price`). Money-ready: a failed tip read refuses.
+        let current_block_height = if !state.lightning.money_ready().await { 0 } else { crate::error::chain_tip(&state).await? };
 
         let mut prices = Vec::new();
         for member in members.iter().filter(|m| *m != state.identity.node_id()) {
@@ -3547,7 +3543,7 @@ pub(super) async fn compose_peer(
         let mut admission = FirstContactCharge { operation: Some(operation.clone()), ..Default::default() };
         let recipient = Recipient::Node(peer_id);
 
-        let height = if state.lightning.money_ready().await { state.chain.get_block_height().await.unwrap_or(0) } else { 0 };
+        let height = if state.lightning.money_ready().await { crate::error::chain_tip(&state).await? } else { 0 };
         let mut price_msat = if req.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
             crate::handlers::browse::page_price(&state, peer_id, &req.plaintext, req.max_routing_fee_msat).await?
         } else {

@@ -2563,3 +2563,31 @@ fn funding_priority_and_preview_are_accepted() {
         assert!(result.is_ok(), "{priority}: {}", result.err().unwrap());
     }
 }
+
+/// T2: a peer table's block validity is checked against the local tip. A tip
+/// that cannot be read leaves every table stale (unknown), never fresh by
+/// comparison with height 0.
+#[tokio::test]
+async fn peer_tables_are_stale_without_a_chain_tip() {
+    let base = test_state();
+    let chain = Arc::new(TipDownChain::down());
+    let state = Arc::new(AppState { chain: chain.clone(), ..(*base).clone() });
+    let auth = auth_header(&state);
+    let peer_id = NodeId::from_bytes([0xCD; 32]);
+    let mut prices = std::collections::HashMap::new();
+    prices.insert("communication".to_string(), 20u64);
+    // Fresh against StubChain's tip (850 000), as `pricing_peers_list` shows.
+    state.peer_prices.update(peer_id, prices, 886_000, 144, 0.0).await;
+
+    for uri in ["/api/v1/pricing/peers".to_string(), format!("/api/v1/pricing/peers/{}", peer_id.to_hex())] {
+        let req = Request::builder().uri(&uri).header("authorization", &auth).body(Body::empty()).unwrap();
+        let resp = build_router(Arc::clone(&state)).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entry = if json.is_array() { json[0].clone() } else { json };
+        assert_eq!(entry["stale"], true, "{uri}: {entry}");
+        assert_eq!(entry["prices"]["communication"], 20, "{uri}: the table is still listed");
+    }
+    assert_eq!(chain.reads(), 2);
+}

@@ -447,7 +447,7 @@ async fn put_front_door(
         .map_err(|e| ApiError::Internal(format!("price unavailable: {e}")))?;
     let (default_admission, default_message) = first_contact_prices(chat, state.gate.min_admission_cost_msat());
     let page_msat = porch_page_price(state.pricing.as_ref(), &state.gate).await?;
-    let height = state.chain.get_block_height().await.unwrap_or(0);
+    let height = crate::error::chain_tip(&state).await?;
 
     let mut store = state.front_door.card.lock().await;
     let mut floor = state.front_door.seq_floor.lock().await;

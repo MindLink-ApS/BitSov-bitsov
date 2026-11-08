@@ -209,6 +209,42 @@ transactions return an error rather than an assertion that they are unconfirmed.
 An available server tip is not proof that it is current. No keys are sent to the
 server, and chain selection does not change custody.
 
+## Tip readiness
+
+Prices, signed cards, admission quotes, peer price tables and paid sends are
+checked against the chain tip. With Bitcoin Core, Electrum or Esplora, the node
+reads the tip as the source's best block header (height and timestamp of the
+same block), and treats it as not ready when:
+
+- the read fails or times out;
+- the best block is height 0;
+- the best block is older than the limit for `[lightning] network`:
+
+| Network | Oldest best block |
+|---|---|
+| `bitcoin` | 3 hours |
+| `testnet`, `signet`, or no network named (LND, LNbits) | 24 hours |
+| `regtest` | no limit |
+
+A not-ready tip refuses rather than going on with height 0: paid sends, call
+quotes, admission quotes and card publishing answer `503` with
+`"code":"not_ready","reason":"chain_unavailable"` before anything is paid or
+signed; a stranger's admission request gets the fixed
+`konsensus:not_ready:chain_unavailable` refusal; no price answer, price table or
+web manifest is sent; peer price tables are listed as `stale`. Chain-aware pricing
+refuses a price when a synced source's tip cannot be read; its existing static
+fallback when the source is not synced or has no fee estimate is unchanged.
+
+Where the timestamp comes from: Bitcoin Core's `getblockheader` `time` for the
+block at `getblockcount`; Electrum's raw 80-byte header for that height, read
+and hashed by the node; Esplora's `/block/{hash}` `timestamp` for the hash at the
+tip height, as the server reports it. A header read is reused for at most 30
+seconds and is judged by its own timestamp. Block timestamps may lag real time
+by up to about an hour, so the mainnet limit leaves about two hours without a
+block. The mock chain (Light and Cloud tiers) is synthetic and has no limit.
+The source's own sync check is unchanged. Which network the source is on is
+checked separately.
+
 ## Privacy and status
 
 Authenticated `GET /api/v1/status` includes:

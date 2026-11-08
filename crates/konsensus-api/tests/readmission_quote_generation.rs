@@ -390,3 +390,31 @@ async fn read_scope_quote_moves_no_money_and_does_not_authorize_send() {
     assert_eq!(status, 403, "{body}");
     assert_eq!(net.spent().await, 0);
 }
+
+/// T2: an admission quote and a paid send are both checked against the local
+/// tip. A tip that cannot be read refuses before any quote is asked or any
+/// payment made; nothing goes on with height 0.
+#[tokio::test]
+async fn no_quote_or_payment_without_a_chain_tip() {
+    let mut net = net().await;
+    let chain = Arc::new(common::TipDownChain::down());
+    net.state = Arc::new(AppState { chain: chain.clone(), ..(*net.state).clone() });
+
+    let quote = serde_json::json!({"recipient": net.contact.peer.to_hex()});
+    let (status, body) = net.post("/api/v1/messages/first-contact/quote", quote).await;
+    common::assert_chain_not_ready(status, &body);
+    assert_eq!(chain.reads(), 1);
+
+    let (status, body) = net.compose(&uuid::Uuid::new_v4().to_string(), 4_000).await;
+    common::assert_chain_not_ready(status, &body);
+    assert_eq!(chain.reads(), 2);
+
+    assert_eq!(net.contact.quotes.load(Ordering::SeqCst), 0, "no admission quote was asked");
+    assert_eq!(net.spent().await, 0);
+
+    // The tip back: the same send pays admission once and the message once.
+    net.state = Arc::new(AppState { chain: Arc::new(common::StubChain), ..(*net.state).clone() });
+    let (status, body) = net.compose(&uuid::Uuid::new_v4().to_string(), 4_000).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(net.spent().await, 4_000);
+}

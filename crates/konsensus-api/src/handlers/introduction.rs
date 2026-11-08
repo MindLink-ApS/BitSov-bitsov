@@ -288,7 +288,7 @@ pub(crate) async fn issue_card(state: &AppState) -> Result<Introduction, ApiErro
         .await
         .map_err(|e| ApiError::Internal(format!("price unavailable: {e}")))?;
     let (admission_msat, message_msat) = first_contact_prices(chat, state.gate.min_admission_cost_msat());
-    let height = state.chain.get_block_height().await.unwrap_or(0);
+    let height = crate::error::chain_tip(state).await?;
     let mut intro_id = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut intro_id);
     let card = Introduction::issue(

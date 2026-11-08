@@ -6920,3 +6920,56 @@ async fn restored_responder_refuses_an_init_from_an_older_boot() {
     assert!(!init_accepted(&low, &restored, serde_json::to_value(&init).unwrap(), &connection_of(&low)).await);
     assert_session_works(&low, &low_mgr, &high, &restored, "after the older init").await;
 }
+
+/// T2: admission is ready only on a recent tip. Through the node's tip bound
+/// (mainnet: three hours), a source four hours behind refuses the stranger
+/// with a fixed not-ready code before any invoice; a recent one quotes.
+#[tokio::test]
+async fn admission_needs_a_recent_chain_tip() {
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = konsensus_lightning::shared_mock::SharedMockProvider::new(
+        &dir.path().join("wallet.sqlite"),
+        "recipient",
+        0,
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Mock headers are ten minutes apart from the genesis time, so this
+    // height's block is under ten minutes old, and 24 blocks less is four hours.
+    let recent = (now - 1_231_006_505) / 600;
+    let bounded = |height| {
+        konsensus_chain::FreshTip::wrap(
+            Arc::new(konsensus_chain::MockChainProvider::with_config(
+                konsensus_chain::MockChainConfig {
+                    initial_height: height,
+                    ..Default::default()
+                },
+            )),
+            Some("bitcoin"),
+        )
+    };
+    let quote = |chain: Arc<dyn ChainProvider>, request: &'static str| {
+        let wallet = &wallet;
+        async move {
+            prepare_admission_invoice(
+                admission_pricing().as_ref(),
+                &ReadinessHeightCache::new(chain),
+                wallet,
+                request,
+                now + u64::from(konsensus_core::admission_quote::FIRST_CONTACT_QUOTE_VALIDITY_SECS),
+                0,
+            )
+            .await
+        }
+    };
+    assert_eq!(
+        quote(bounded(recent - 24), "stale").await.unwrap_err(),
+        "konsensus:not_ready:chain_unavailable"
+    );
+    let (invoice, amount, _) = quote(bounded(recent), "recent").await.unwrap();
+    assert!(amount > 0 && !invoice.bolt11.is_empty());
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+}

@@ -1116,6 +1116,81 @@ impl ChainProvider for StubChain {
     }
 }
 
+/// A chain source at height 850 000 that answers `ok_reads` tip reads and
+/// then fails every one. Counts all tip reads. Other reads work as
+/// [`StubChain`]'s.
+pub struct TipDownChain {
+    pub ok_reads: std::sync::atomic::AtomicUsize,
+    pub reads: std::sync::atomic::AtomicUsize,
+    /// When down, answer height 0 instead of an error.
+    pub zero: bool,
+}
+
+impl TipDownChain {
+    /// Down from the first read.
+    pub fn down() -> Self {
+        Self::after(0)
+    }
+    /// Up for `ok_reads` tip reads, then down.
+    pub fn after(ok_reads: usize) -> Self {
+        Self {
+            ok_reads: std::sync::atomic::AtomicUsize::new(ok_reads),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            zero: false,
+        }
+    }
+    /// Answers height 0 from the first read: an unknown tip, not a height.
+    pub fn zero() -> Self {
+        Self { zero: true, ..Self::down() }
+    }
+    pub fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ChainProvider for TipDownChain {
+    fn trust_level(&self) -> TrustLevel {
+        TrustLevel::FullValidation
+    }
+    async fn get_block_height(&self) -> Result<u64, ChainError> {
+        use std::sync::atomic::Ordering;
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        // Tests read the tip from one task at a time.
+        let left = self.ok_reads.load(Ordering::SeqCst);
+        let up = left > 0;
+        if up {
+            self.ok_reads.store(left - 1, Ordering::SeqCst);
+        }
+        if up {
+            Ok(850_000)
+        } else if self.zero {
+            Ok(0)
+        } else {
+            Err(ChainError::Connection("chain source unreachable".into()))
+        }
+    }
+    async fn get_block_header(&self, height: u64) -> Result<BlockHeader, ChainError> {
+        StubChain.get_block_header(height).await
+    }
+    async fn estimate_fee(&self, target_blocks: u32) -> Result<FeeEstimate, ChainError> {
+        StubChain.estimate_fee(target_blocks).await
+    }
+    async fn is_tx_confirmed(&self, txid: &str, min_confirmations: u32) -> Result<bool, ChainError> {
+        StubChain.is_tx_confirmed(txid, min_confirmations).await
+    }
+    async fn is_synced(&self) -> bool {
+        true
+    }
+}
+
+/// A `not_ready` refusal because the local chain tip could not be read.
+pub fn assert_chain_not_ready(status: u16, body: &serde_json::Value) {
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["code"], "not_ready", "{body}");
+    assert_eq!(body["reason"], "chain_unavailable", "{body}");
+}
+
 // ─── Stub: Pricing Engine ───────────────────────────────────────────
 
 pub struct StubPricing;

@@ -439,3 +439,62 @@ async fn unknown_call_signals_never_evict_burned_ids() {
 fn own() -> konsensus_core::types::NodeId {
     konsensus_core::types::NodeId::from_bytes([0xee; 32])
 }
+
+/// T2: a call price is checked against the local tip. A tip that cannot be
+/// read refuses the quote; it is never checked against height 0 (which skips
+/// the answer's block validity).
+#[tokio::test]
+async fn a_call_quote_without_a_chain_tip_is_not_ready() {
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let mut state = common::test_state_with_lightning(wallet.clone());
+    let peer = NodeId::from_bytes([71; 32]);
+    let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
+    let chain = Arc::new(common::TipDownChain::down());
+    {
+        let state = Arc::get_mut(&mut state).unwrap();
+        state.transport = transport;
+        state.chain = chain.clone();
+    }
+    let answer = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        state.peer_prices.update_kind_price(peer, 400, 10_000, 850_000).await;
+    };
+    let (price, ()) = tokio::join!(calls::peer_call_price(&state, &peer), answer);
+    let err = price.unwrap_err();
+    assert!(format!("{err:?}").contains("NotReady") && format!("{err:?}").contains("chain_unavailable"), "{err:?}");
+    assert_eq!(chain.reads(), 1);
+    assert!(wallet.list_payments(100).await.unwrap().is_empty());
+}
+
+/// T2: the call page's signal price reads the tip again; that read failing
+/// refuses the whole answer rather than pricing signals at height 0.
+#[tokio::test]
+async fn the_call_price_route_refuses_when_the_second_tip_read_fails() {
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let mut state = common::test_state_with_lightning(wallet.clone());
+    let peer = NodeId::from_bytes([72; 32]);
+    let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
+    let chain = Arc::new(common::TipDownChain::after(1));
+    {
+        let state = Arc::get_mut(&mut state).unwrap();
+        state.transport = transport;
+        state.chain = chain.clone();
+    }
+    let request = Request::builder()
+        .uri(format!("/api/v1/pricing/peers/{}/call", peer.to_hex()))
+        .header("authorization", common::auth_header(&state))
+        .body(Body::empty())
+        .unwrap();
+    let answer = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        state.peer_prices.update_kind_price(peer, 400, 10_000, 850_000).await;
+    };
+    let (response, ()) = tokio::join!(common::test_router(state.clone()).oneshot(request), answer);
+    let response = response.unwrap();
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 65_536).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    common::assert_chain_not_ready(status, &body);
+    assert_eq!(chain.reads(), 2, "the offer read the tip, then the signal price did");
+    assert!(wallet.list_payments(100).await.unwrap().is_empty());
+}

@@ -1429,7 +1429,15 @@ async fn process_web_manifest(
         return Some("[web manifest request]".to_string());
     };
 
-    let block_height = chain.get_block_height().await.unwrap_or(0);
+    // A priced answer is anchored to a real tip; without one, none is sent
+    // (the same as a price that cannot be read), never one stamped height 0.
+    let block_height = match chain.get_block_height().await {
+        Ok(height) if height > 0 => height,
+        _ => {
+            warn!(sender = %sender, "not_ready: chain unavailable for web manifest");
+            return None;
+        }
+    };
     let manifest = priced_manifest(cs, block_height, pricing.as_ref(), gate, trust_discount).await?;
     info!(sender = %sender, pages = manifest.pages.len(), "served web manifest");
 

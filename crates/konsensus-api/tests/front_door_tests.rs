@@ -847,3 +847,24 @@ async fn porch_manifest_preview_uses_gate_price() {
         assert_eq!(body["default_price_msat"], 2000);
     }
 }
+
+#[tokio::test]
+async fn no_front_door_is_published_without_a_chain_tip() {
+    let chain = Arc::new(TipDownChain::down());
+    let base = state_with(settings(Some("node.example.org:9000")));
+    let state = Arc::new(AppState { chain: chain.clone(), ..(*base).clone() });
+    let card = json!({"display_name": "Alice", "tagline": "BitSov", "about": "Mesh doorstep"});
+    let (status, body, _) = call(&state, "PUT", "/api/v1/front-door", bearer(&state, vec![auth::Scope::Admin]), Some(card.clone())).await;
+    assert_chain_not_ready(status.as_u16(), &body);
+    assert_eq!(chain.reads(), 1);
+    // Nothing was signed or stored, and the sequence did not move.
+    let (status, _, _) = call(&state, "GET", "/api/v1/front-door", bearer(&state, vec![auth::Scope::Read]), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // With a tip, the card carries its difficulty epoch and the first sequence.
+    let state = Arc::new(AppState { chain: Arc::new(StubChain), ..(*state).clone() });
+    let (status, body, _) = call(&state, "PUT", "/api/v1/front-door", bearer(&state, vec![auth::Scope::Admin]), Some(card)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["seq"], 1);
+    assert_eq!(body["card"]["prices"]["price_epoch"], 850_000 / 2016);
+}

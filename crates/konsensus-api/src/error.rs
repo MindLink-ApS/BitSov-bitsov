@@ -311,6 +311,24 @@ pub(crate) async fn require_money_ready(state: &crate::state::AppState) -> Resul
     if state.lightning.money_ready().await { Ok(()) } else { Err(ApiError::NotReady) }
 }
 
+/// The local chain tip a price, a signed card or a payment is checked against.
+/// A failed read (or a zero tip) is refused as `not_ready` with reason
+/// `chain_unavailable`, before anything is paid or signed: no caller goes on
+/// with height 0 in its place.
+pub(crate) async fn chain_tip(state: &crate::state::AppState) -> Result<u64, ApiError> {
+    match state.chain.get_block_height().await {
+        Ok(height) if height > 0 => Ok(height),
+        Ok(_) => {
+            tracing::warn!("not_ready: chain tip is height zero");
+            Err(ApiError::NotReady.with_reason("chain_unavailable"))
+        }
+        Err(error) => {
+            tracing::warn!(%error, "not_ready: chain tip unavailable");
+            Err(ApiError::NotReady.with_reason("chain_unavailable"))
+        }
+    }
+}
+
 impl From<konsensus_core::traits::lightning::LightningError> for ApiError {
     fn from(error: konsensus_core::traits::lightning::LightningError) -> Self {
         match error {
