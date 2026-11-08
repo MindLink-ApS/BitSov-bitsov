@@ -46,13 +46,23 @@ pub struct RecoverArgs {
     pub self_test_max_fee_sats: u64,
 }
 
-fn chain(config: &ChainConfig) -> Result<Box<dyn RecoveryChain>> {
+/// The sweep's chain source, checked like a node start: another network
+/// refuses recovery; one that has not answered yet serves nothing until it
+/// answers on `network`.
+async fn chain(config: &ChainConfig, network: Network) -> Result<Box<dyn RecoveryChain>> {
+    use crate::node::verify_chain_network;
     Ok(match config {
         ChainConfig::Bitcoind(rpc) => {
-            Box::new(konsensus_chain::BitcoindProvider::new(rpc.clone())?)
+            let provider =
+                konsensus_chain::BitcoindProvider::new(rpc.clone())?.with_network(network);
+            verify_chain_network(provider.verify_network()).await?;
+            Box::new(provider)
         }
         ChainConfig::Electrum(server) => {
-            Box::new(konsensus_chain::ElectrumProvider::new(server.clone())?)
+            let provider =
+                konsensus_chain::ElectrumProvider::new(server.clone())?.with_network(network);
+            verify_chain_network(provider.verify_network()).await?;
+            Box::new(provider)
         }
         ChainConfig::Esplora {
             api_url,
@@ -68,6 +78,8 @@ fn chain(config: &ChainConfig) -> Result<Box<dyn RecoveryChain>> {
                 provider =
                     provider.with_bearer(konsensus_chain::bearer::BearerAuth::from_file(file)?)?;
             }
+            let provider = provider.with_network(network);
+            verify_chain_network(provider.verify_network()).await?;
             Box::new(provider)
         }
         ChainConfig::Mock => anyhow::bail!("recovery requires bitcoind, Electrum or Esplora"),
@@ -219,7 +231,7 @@ pub async fn run(args: RecoverArgs) -> Result<()> {
         println!("Recovery already completed. Normal start is available.");
         return Ok(());
     }
-    let chain = chain(&config.chain)?;
+    let chain = chain(&config.chain, Network::from_str(network)?).await?;
     let session = storage.join(format!("recover-session-{}", uuid::Uuid::new_v4()));
     let ldk_config = LdkConfig {
         tower: Default::default(),
@@ -315,6 +327,93 @@ pub async fn run(args: RecoverArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+
+    /// A loopback Core that reports `chain`.
+    async fn core_on(chain: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/",
+            post(move |Json(_): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({"result": {"chain": chain}, "error": null, "id": 1}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (
+            port,
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+        )
+    }
+
+    fn core_config(dir: &std::path::Path, port: u16) -> super::ChainConfig {
+        let cookie = dir.join(".cookie");
+        std::fs::write(&cookie, "user:pass").unwrap();
+        super::ChainConfig::Bitcoind(
+            serde_json::from_value(serde_json::json!({
+                "rpc_host": "127.0.0.1", "rpc_port": port, "cookie_file": cookie,
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_a_chain_source_on_another_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let (port, server) = core_on("main").await;
+        let err = super::chain(&core_config(dir.path(), port), bitcoin::Network::Signet)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("configured network is signet"), "{err}");
+        assert!(
+            err.contains("bitcoind chain source is on bitcoin (mainnet)"),
+            "{err}"
+        );
+        server.abort();
+        let (port, server) = core_on("signet").await;
+        assert!(
+            super::chain(&core_config(dir.path(), port), bitcoin::Network::Signet)
+                .await
+                .is_ok()
+        );
+        server.abort();
+    }
+
+    /// A reachable Core that names no chain (unverified) and counts every
+    /// other call, which an ungated provider would make.
+    #[tokio::test]
+    async fn recovery_on_an_unverified_source_reads_nothing() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&reads);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let counted = std::sync::Arc::clone(&counted);
+                async move {
+                    if request["method"] != "getblockchaininfo" {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Json(serde_json::json!({"result": {"blocks": 1}, "error": null, "id": 1}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let chain = super::chain(&core_config(dir.path(), port), bitcoin::Network::Signet)
+            .await
+            .unwrap();
+        assert!(chain
+            .transaction("ab".repeat(32).parse().unwrap())
+            .await
+            .is_err());
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "only the network question");
+        server.abort();
+    }
     #[test]
     fn esplora_warning_states_the_seed_only_and_backup_read_bounds() {
         let seed_only = super::esplora_request_warning(2000, false);

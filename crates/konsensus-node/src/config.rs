@@ -895,6 +895,20 @@ impl LightningConfig {
         }
     }
 
+    /// Network the chain source must be on: `[lightning] network` for the
+    /// backends that set one. Mock, LND and LNbits state none.
+    pub fn chain_source_network(&self) -> Option<bitcoin::Network> {
+        match self {
+            Self::Ldk { network, .. } | Self::Cln { network, .. } => {
+                konsensus_chain::network::parse_configured_network(network)
+            }
+            Self::Lnbits { .. }
+            | Self::Lnd { .. }
+            | Self::Mock { .. }
+            | Self::SharedMock { .. } => None,
+        }
+    }
+
     /// Both addresses can be advertised to peers, so reject values they cannot decode.
     fn validate_address_lengths(&self) -> anyhow::Result<()> {
         if let Self::Ldk {
