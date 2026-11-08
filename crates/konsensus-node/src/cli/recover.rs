@@ -379,12 +379,30 @@ mod tests {
         server.abort();
     }
 
+    /// A reachable Core that names no chain (unverified) and counts every
+    /// other call, which an ungated provider would make.
     #[tokio::test]
     async fn recovery_on_an_unverified_source_reads_nothing() {
-        let dir = tempfile::tempdir().unwrap();
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&reads);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let counted = std::sync::Arc::clone(&counted);
+                async move {
+                    if request["method"] != "getblockchaininfo" {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Json(serde_json::json!({"result": {"blocks": 1}, "error": null, "id": 1}))
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
         let chain = super::chain(&core_config(dir.path(), port), bitcoin::Network::Signet)
             .await
             .unwrap();
@@ -392,6 +410,8 @@ mod tests {
             .transaction("ab".repeat(32).parse().unwrap())
             .await
             .is_err());
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "only the network question");
+        server.abort();
     }
     #[test]
     fn esplora_warning_states_the_seed_only_and_backup_read_bounds() {

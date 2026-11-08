@@ -980,3 +980,93 @@ async fn unverified_esplora_primary_starts_on_the_verified_fallback() {
     assert!(fallback.requests.load(Ordering::SeqCst) >= 1);
     provider.shutdown().await.unwrap();
 }
+
+/// A paid primary whose token request fails, with a verified fallback: LDK
+/// starts on the fallback, the primary is never contacted, and no request to
+/// the fallback carries credentials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn credentialed_start_uses_a_verified_fallback_without_credentials() {
+    use std::os::unix::fs::PermissionsExt;
+    // Token endpoint: a plain HTTP server answering 503. Token URLs must be
+    // HTTPS, so the token request fails promptly at the TLS handshake.
+    let token = Fixture::custom(|_| {
+        Router::new().fallback(|| async { (StatusCode::SERVICE_UNAVAILABLE, "unavailable") })
+    })
+    .await;
+    // Primary: counts every connection; it must see none.
+    let primary_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary_port = primary_listener.local_addr().unwrap().port();
+    let primary_connections = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&primary_connections);
+    let primary_task = tokio::spawn(async move {
+        while let Ok((socket, _)) = primary_listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(socket);
+        }
+    });
+    // Fallback on the configured network; records any Authorization header.
+    let authorized = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&authorized);
+    let fallback = Fixture::custom(move |background| {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin);
+        let hash = block.block_hash().to_string();
+        let header = bitcoin::consensus::encode::serialize_hex(&block.header);
+        Router::new()
+            .route("/block-height/0", get(move || async move { hash }))
+            .route("/block/:hash/header", get(move || async move { header }))
+            .route(
+                "/fee-estimates",
+                get(|| async { "{\"1\":10.0,\"6\":5.0,\"144\":2.0}" }),
+            )
+            .fallback(move || {
+                background.fetch_add(1, Ordering::SeqCst);
+                async { (StatusCode::NOT_FOUND, "unavailable") }
+            })
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    if request
+                        .headers()
+                        .contains_key(axum::http::header::AUTHORIZATION)
+                    {
+                        seen.store(true, Ordering::SeqCst);
+                    }
+                    next.run(request)
+                },
+            ))
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let credentials = dir.path().join("credentials.toml");
+    std::fs::write(
+        &credentials,
+        format!(
+            "token_url = \"https://{}/token\"\nclient_id = \"fixture\"\nclient_secret = \"FIXTURE_ONLY\"\n",
+            token.url.trim_start_matches("http://")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut cfg = config(&dir, &format!("https://127.0.0.1:{primary_port}"));
+    cfg.esplora_url_fallback = Some(fallback.url.clone());
+    cfg.credentials_file = Some(credentials);
+    let provider = tokio::time::timeout(Duration::from_secs(30), LdkProvider::new(cfg))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(provider.node().status().is_running);
+    assert_eq!(
+        primary_connections.load(Ordering::SeqCst),
+        0,
+        "primary unused"
+    );
+    assert!(
+        !authorized.load(Ordering::SeqCst),
+        "no credentials to the fallback"
+    );
+    provider.shutdown().await.unwrap();
+    assert!(
+        !authorized.load(Ordering::SeqCst),
+        "no credentials to the fallback"
+    );
+    primary_task.abort();
+}

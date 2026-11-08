@@ -257,14 +257,25 @@ impl EsploraProvider {
                 }
             })
             .await
-            .map_err(|_| ChainError::Connection("recovery broadcast unavailable".into()))?;
+            .map_err(|_| {
+                self.lost_connection(index);
+                ChainError::Connection("recovery broadcast unavailable".into())
+            })?;
         if !response.status().is_success() {
             return Err(ChainError::Backend("recovery broadcast rejected".into()));
         }
-        response
-            .text()
-            .await
-            .map_err(|_| ChainError::Backend("recovery broadcast response unavailable".into()))
+        response.text().await.map_err(|_| {
+            self.lost_connection(index);
+            ChainError::Connection("recovery broadcast response unavailable".into())
+        })
+    }
+
+    /// The connection to an endpoint failed: it must show its network again
+    /// before its next use.
+    fn lost_connection(&self, index: usize) {
+        if let Some(gate) = &self.network {
+            gate.invalidate(index);
+        }
     }
 
     async fn get_parsed<T>(
@@ -350,7 +361,8 @@ impl EsploraProvider {
             let text = response
                 .text()
                 .await
-                .map_err(|_| ChainError::Backend("Esplora body unavailable".into()))?;
+                // Headers arrived but the body did not: a lost connection.
+                .map_err(|_| ChainError::Connection("Esplora body unavailable".into()))?;
             parse(&text)
         })
         .await
@@ -394,8 +406,20 @@ impl ChainProvider for EsploraProvider {
         // Hold the async lock through refresh so concurrent callers share its
         // result. Check freshness after locking; never fall back to stale data.
         let mut cached = self.tip_height.lock().await;
+        if let Some(gate) = &self.network {
+            // A refused source serves no height, cached or not.
+            if let Err(error) = gate.refusal() {
+                *cached = None;
+                return Err(error);
+            }
+        }
         if let Some((height, fetched_at)) = *cached {
-            if fetched_at.elapsed() < TIP_HEIGHT_CACHE_TTL {
+            // Serve the cache only while the endpoint it came from is verified.
+            let verified = self
+                .network
+                .as_ref()
+                .is_none_or(|gate| gate.is_verified(self.active.load(Ordering::Relaxed)));
+            if verified && fetched_at.elapsed() < TIP_HEIGHT_CACHE_TTL {
                 return Ok(height);
             }
         }
@@ -519,8 +543,11 @@ impl ChainProvider for EsploraProvider {
 
     async fn is_synced_with_height(&self, _height: u64) -> bool {
         // This backend defines sync as availability of a tip. The caller's
-        // successful bounded-age height read already established that.
-        true
+        // successful bounded-age height read already established that,
+        // unless the source has since been refused.
+        self.network
+            .as_ref()
+            .is_none_or(|gate| gate.refusal().is_ok())
     }
 }
 

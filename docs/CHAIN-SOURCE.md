@@ -21,18 +21,24 @@ their height-0 header, hashed by the node (Esplora: `/block-height/0`, then
 is not an answer.
 
 - **Another network:** the node refuses to start and names both networks; it
-  tries no other source. Every configured Esplora endpoint is checked. A source
+  tries no other source. Every configured Esplora endpoint is checked, LDK's
+  own `esplora_url` and fallback included, before any node file is written. A source
   found on another network later is refused for the rest of the run, and
   Lightning money stays not ready.
 - **No answer yet:** the node starts, not ready. The embedded LDK node is not
   built and syncs nothing; it retries, and starts once the source answers on
   the configured network. With an Esplora fallback, LDK starts on the endpoints
-  that have answered.
-- **Asked again:** after a lost connection or timeout, before the next use; at
-  least every 60 seconds otherwise. Electrum opens a new connection per query
-  and is asked on each one. Every `getblockchaininfo` reply from Core is also
-  compared. The running LDK node asks its source every 60 seconds and is not
-  money-ready while it has not answered for three minutes.
+  that have answered. With `credentials_file`, a primary that has not answered
+  (for example because its token request failed) is skipped for that start:
+  LDK uses the verified fallback, which never receives credentials, and no
+  token is requested.
+- **Asked again:** after a lost connection, a timeout or a reply cut short,
+  before the next use; at least every 60 seconds otherwise. A cached Esplora
+  height is served only while its endpoint's check holds, and never after a
+  refusal. Electrum opens a new connection per query and is asked on each one.
+  Every `getblockchaininfo` reply from Core is also compared. The running LDK
+  node asks the endpoints its client uses every 60 seconds and is not
+  money-ready while none has answered for three minutes.
 - **Recovery:** `konsensus recover` checks its chain source the same way.
 
 All signets share one genesis block, and Bitcoin Core reports `signet` for each

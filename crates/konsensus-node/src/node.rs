@@ -56,6 +56,44 @@ pub(crate) async fn verify_chain_network(
     }
 }
 
+/// LDK's own Esplora URLs can differ from `[chain]`. Refuse one on another
+/// network here too, before any node file exists. No answer is left to LDK's
+/// own start, which then stays offline until the source answers.
+async fn verify_ldk_esplora_network(config: &NodeConfig, network: bitcoin::Network) -> Result<()> {
+    let LightningConfig::Ldk {
+        esplora_url,
+        esplora_url_fallback,
+        credentials_file,
+        ..
+    } = &config.lightning
+    else {
+        return Ok(());
+    };
+    if matches!(
+        config.chain,
+        ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_)
+    ) {
+        // LDK then uses the [chain] source, checked above.
+        return Ok(());
+    }
+    let primary = credentials_file
+        .as_deref()
+        .map(konsensus_chain::bearer::BearerAuth::from_file)
+        .transpose()?
+        .map(|auth| konsensus_chain::bearer::BearerFailover::new(auth, esplora_url, Vec::new()))
+        .transpose()?;
+    let mut urls = vec![esplora_url.as_str()];
+    urls.extend(esplora_url_fallback.as_deref());
+    let check =
+        konsensus_chain::network::verify_esplora_api_urls(network, &urls, primary.as_deref());
+    if let Ok(result) = tokio::time::timeout(CHAIN_NETWORK_CHECK_TIMEOUT, check).await {
+        if let konsensus_chain::NetworkCheck::Mismatch(mismatch) = result.check {
+            return Err(anyhow::Error::new(mismatch));
+        }
+    }
+    Ok(())
+}
+
 /// A running BitSov v2 node.
 ///
 /// Owns all components and manages their lifecycle. Created via
@@ -185,6 +223,9 @@ impl KonsensusNode {
         };
 
         info!("chain provider initialized");
+        if let Some(network) = network {
+            verify_ldk_esplora_network(&config, network).await?;
+        }
 
         // Same directory as the embedded LDK state. Check before opening either store.
         let data_dir = config

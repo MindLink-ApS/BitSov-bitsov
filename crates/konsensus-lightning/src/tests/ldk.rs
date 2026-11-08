@@ -2042,7 +2042,7 @@ async fn running_node_rechecks_its_source_and_refuses_another_network() {
         bitcoin::Network::Signet,
         SourceProbe::Esplora {
             urls: vec![url],
-            auth: None,
+            primary: None,
         },
         interval,
     ));
@@ -2074,7 +2074,7 @@ async fn running_node_is_not_ready_while_its_source_stays_unverified() {
         bitcoin::Network::Signet,
         SourceProbe::Esplora {
             urls: vec![url],
-            auth: None,
+            primary: None,
         },
         interval,
     ));
@@ -2091,4 +2091,48 @@ async fn running_node_is_not_ready_while_its_source_stays_unverified() {
     settle(&watch).await;
     assert!(watch.poll());
     server.abort();
+}
+
+/// Without credentials, the watch asks only the URL startup selected. The
+/// unused configured endpoint is never asked, so its outages or changes do
+/// not touch readiness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn running_node_watches_only_the_selected_esplora_url() {
+    use std::sync::atomic::AtomicUsize;
+    let network = Arc::new(std::sync::Mutex::new(Some(bitcoin::Network::Signet)));
+    let (selected, server) = switchable_explorer(Arc::clone(&network)).await;
+    let unused_requests = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&unused_requests);
+    let app = axum::Router::new().fallback(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { (axum::http::StatusCode::BAD_GATEWAY, "down") }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unused = format!("http://{}", listener.local_addr().unwrap());
+    let unused_server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let install = EsploraInstall {
+        transport: None,
+        urls: vec![selected.clone(), unused.clone()],
+        primary_in_use: false,
+    };
+    let source = esplora_watch_source(install, None, &selected, selected.clone()).unwrap();
+    let interval = Duration::from_millis(100);
+    let watch = Arc::new(NetworkWatch::new(
+        bitcoin::Network::Signet,
+        source,
+        interval,
+    ));
+    for _ in 0..2 {
+        tokio::time::sleep(interval + Duration::from_millis(20)).await;
+        watch.poll();
+        settle(&watch).await;
+    }
+    assert!(watch.poll(), "the selected URL answers");
+    assert_eq!(
+        unused_requests.load(Ordering::SeqCst),
+        0,
+        "unused URL never asked"
+    );
+    server.abort();
+    unused_server.abort();
 }

@@ -10,7 +10,9 @@ also live on the corresponding GitHub pre-release pages.
   Core is checked through `getblockchaininfo`; Electrum and Esplora through their
   height-0 header, hashed by the node. Until a source has answered on the
   configured network, nothing reads or syncs from it: the node starts not ready
-  and the embedded LDK node retries without starting. Sources are asked again
+  and the embedded LDK node retries without starting. With `credentials_file`,
+  an unanswered primary is skipped and LDK uses the verified fallback without
+  credentials. Sources are asked again
   after a lost connection and at least every 60 seconds, and `konsensus recover`
   checks its source too. A custom signet passes as `signet`. With LND, LNbits or
   mock Lightning a real `[chain]` source is not checked.

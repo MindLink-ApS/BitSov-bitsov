@@ -797,6 +797,68 @@ async fn from_config_refuses_an_esplora_source_on_another_network() {
     server.abort();
 }
 
+/// An explorer on `network`, serving the network check only.
+async fn explorer_on(network: bitcoin::Network) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{routing::get, Router};
+    let block = bitcoin::blockdata::constants::genesis_block(network);
+    let hash = block.block_hash().to_string();
+    let header = bitcoin::consensus::encode::serialize_hex(&block.header);
+    let app = Router::new()
+        .route("/api/block-height/0", get(move || async move { hash }))
+        .route(
+            "/api/block/:hash/header",
+            get(move || async move { header }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    (
+        url,
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+    )
+}
+
+// Multi-threaded so that, were the check missing, LDK fails the test cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn from_config_refuses_an_ldk_esplora_url_on_another_network_before_node_state() {
+    // [chain] matches; only LDK's own Esplora URL is on another network.
+    let (chain_url, chain_server) = explorer_on(bitcoin::Network::Testnet).await;
+    let (ldk_url, ldk_server) = explorer_on(bitcoin::Network::Testnet4).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.lightning = toml::from_str(&format!(
+        "backend = \"ldk\"\nnetwork = \"testnet\"\nesplora_url = \"{ldk_url}/api\"\n"
+    ))
+    .unwrap();
+    // An explicit [chain] fallback keeps LDK's URL out of the [chain] provider,
+    // so only the LDK check can refuse it.
+    config.chain = ChainConfig::Esplora {
+        api_url: chain_url.clone(),
+        esplora_url_fallback: Some(chain_url),
+        credentials_file: None,
+    };
+    let err = KonsensusNode::from_config(config, None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        err.contains("configured network is testnet (testnet3)"),
+        "{err}"
+    );
+    assert!(err.contains("esplora chain source is on testnet4"), "{err}");
+    let written: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(
+        written,
+        ["mnemonic.txt"],
+        "no node state before the refusal"
+    );
+    chain_server.abort();
+    ldk_server.abort();
+}
+
 #[tokio::test(start_paused = true)]
 async fn unverified_chain_network_starts_as_before() {
     use konsensus_chain::NetworkCheck;

@@ -657,3 +657,141 @@ async fn esplora_is_checked_again_after_a_lost_connection() {
     let error = provider.estimate_fee(6).await.unwrap_err().to_string();
     assert!(error.contains("network mismatch"), "{error}");
 }
+
+// ── Cached height and failed bodies ─────────────────────────────────────
+
+#[tokio::test]
+async fn esplora_cached_height_is_refused_after_a_mismatch() {
+    let explorer = Explorer::new(Network::Signet).await;
+    let provider = esplora_provider(&explorer.url, &[], Network::Signet);
+    assert_eq!(provider.get_block_height().await.unwrap(), 101);
+    assert!(provider.is_synced_with_height(101).await);
+    *explorer.state.network.lock().unwrap() = Network::Bitcoin;
+    assert!(matches!(
+        provider.verify_network().await,
+        NetworkCheck::Mismatch(_)
+    ));
+    let error = provider.get_block_height().await.unwrap_err().to_string();
+    assert!(error.contains("network mismatch"), "{error}");
+    assert!(!provider.is_synced().await);
+    assert!(!provider.is_synced_with_height(101).await);
+}
+
+#[tokio::test]
+async fn esplora_cached_height_needs_a_current_check() {
+    let explorer = Explorer::new(Network::Signet).await;
+    let provider = esplora_provider(&explorer.url, &[], Network::Signet);
+    assert_eq!(provider.get_block_height().await.unwrap(), 101);
+    // The connection drops (the check ends) and the endpoint returns on mainnet.
+    explorer.stop().await;
+    assert!(provider.estimate_fee(6).await.is_err());
+    explorer.restart_on(Network::Bitcoin).await;
+    let error = provider.get_block_height().await.unwrap_err().to_string();
+    assert!(error.contains("network mismatch"), "{error}");
+    assert!(!provider.is_synced().await);
+}
+
+/// A loopback Esplora speaking raw HTTP/1.1, so a response can stop after
+/// its headers. Serves `network`; with `truncate`, fee and broadcast replies
+/// promise a body and close the connection early.
+struct RawExplorer {
+    url: String,
+    network: Arc<Mutex<Network>>,
+    truncate: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RawExplorer {
+    async fn new(network: Network) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let network = Arc::new(Mutex::new(network));
+        let truncate = Arc::new(AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (served, cut) = (Arc::clone(&network), Arc::clone(&truncate));
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (served, cut) = (Arc::clone(&served), Arc::clone(&cut));
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    let path = text.split_whitespace().nth(1).unwrap_or("").to_owned();
+                    let block = genesis(*served.lock().unwrap());
+                    let hash = block.block_hash().to_string();
+                    let body = if path == "/api/block-height/0" {
+                        Some(hash.clone())
+                    } else if path == format!("/api/block/{hash}/header") {
+                        Some(bitcoin::consensus::encode::serialize_hex(&block.header))
+                    } else if path == "/api/fee-estimates" || path == "/api/tx" {
+                        if cut.load(Ordering::SeqCst) {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{\"6\"")
+                                .await;
+                            return;
+                        }
+                        Some(r#"{"6":2.0}"#.to_owned())
+                    } else {
+                        None
+                    };
+                    let reply = match body {
+                        Some(body) => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ),
+                        None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                    };
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        Self {
+            url,
+            network,
+            truncate,
+            task,
+        }
+    }
+}
+
+impl Drop for RawExplorer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn esplora_truncated_body_is_a_lost_connection() {
+    let explorer = RawExplorer::new(Network::Signet).await;
+    let provider = esplora_provider(&explorer.url, &[], Network::Signet);
+    assert_eq!(provider.verify_network().await, NetworkCheck::Verified);
+    assert_eq!(provider.estimate_fee(6).await.unwrap().sat_per_vbyte, 2.0);
+    explorer.truncate.store(true, Ordering::SeqCst);
+    assert!(provider.estimate_fee(6).await.is_err());
+    explorer.truncate.store(false, Ordering::SeqCst);
+    *explorer.network.lock().unwrap() = Network::Bitcoin;
+    let error = provider.estimate_fee(6).await.unwrap_err().to_string();
+    assert!(error.contains("network mismatch"), "{error}");
+}
+
+#[tokio::test]
+async fn esplora_failed_recovery_broadcast_is_a_lost_connection() {
+    use konsensus_chain::recovery::RecoveryChain;
+    let explorer = RawExplorer::new(Network::Signet).await;
+    let provider = esplora_provider(&explorer.url, &[], Network::Signet);
+    assert_eq!(provider.verify_network().await, NetworkCheck::Verified);
+    explorer.truncate.store(true, Ordering::SeqCst);
+    let tx = genesis(Network::Signet).txdata[0].clone();
+    assert!(provider.broadcast(&tx).await.is_err());
+    explorer.truncate.store(false, Ordering::SeqCst);
+    *explorer.network.lock().unwrap() = Network::Bitcoin;
+    let error = provider.estimate_fee(6).await.unwrap_err().to_string();
+    assert!(error.contains("network mismatch"), "{error}");
+}
