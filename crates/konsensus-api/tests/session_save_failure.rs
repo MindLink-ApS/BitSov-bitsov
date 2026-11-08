@@ -27,7 +27,6 @@ struct Fx {
 async fn fixture() -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(konsensus_storage::SqliteStorage::open(dir.path().join("node.sqlite").to_str().unwrap()).await.unwrap());
-    sqlx::raw_sql("CREATE TABLE calendar_events (id TEXT PRIMARY KEY, message_id TEXT, organizer TEXT NOT NULL, title TEXT NOT NULL, description TEXT, start_ms BIGINT, end_ms BIGINT, tz TEXT, location TEXT, attendees_json TEXT, recurrence_json TEXT, color TEXT, created_at TEXT NOT NULL DEFAULT '', parent_id TEXT)").execute(db.pool()).await.unwrap();
     let lightning = Arc::new(CountingLightning::default());
     let mut state = test_state_with_lightning(lightning.clone());
     let store = Arc::new(FlakySessionStore::default());
@@ -174,7 +173,8 @@ async fn calendar_create_skips_the_attendee_whose_save_failed_unpaid() {
         "title": "save", "start": 1000, "end": 2000, "attendees": [fx.peer.to_hex(), fx.other.to_hex()],
     })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["queued_for"], json!([fx.other.to_hex()]), "{body}");
+    assert_eq!(body["failed_for"], json!([fx.other.to_hex()]), "{body}");
+    assert_eq!(body["queued_for"], json!([]), "{body}");
     assert_eq!(fx.lightning.money(), 1, "only the other attendee was paid");
     let sent = fx.transport.sent_envelopes.lock().unwrap();
     assert!(sent.iter().all(|(to, _)| *to == fx.peer), "nothing left for the attendee whose save failed");
@@ -187,7 +187,8 @@ async fn calendar_update_skips_the_attendee_whose_save_failed_unpaid() {
     fx.store.fail_peer(Some(fx.other));
     let (status, body) = fx.call("PUT", "/api/v1/calendar/events/event", json!({"title": "after"})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["queued_for"], json!([fx.other.to_hex()]), "{body}");
+    assert_eq!(body["failed_for"], json!([fx.other.to_hex()]), "{body}");
+    assert_eq!(body["queued_for"], json!([]), "{body}");
     assert_eq!(fx.lightning.money(), 1, "only the other attendee was paid");
 }
 

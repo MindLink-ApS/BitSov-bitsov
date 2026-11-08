@@ -69,6 +69,11 @@ Amounts already paid for messages or minutes that were not read are not refunded
 Tested on regtest on this release and on rc21, by calling the app's host
 functions, not on real hardware.
 
+Also present in rc21 and rc22: after a reconnect, one node can be left without
+an E2EE session. If that node holds the lower id, it stays stuck until a new
+connection. The fix is on main (#514) and not in either signed release; see
+[recovering a stuck E2EE session](operations/e2ee-session-recovery.md).
+
 Follow the [rc22 signing and node checklist](releases/v0.3.0-rc22.md).
 
 ## rc20 → rc21
@@ -704,8 +709,14 @@ confirm `uname -m` is `aarch64`, the service uses `/usr/bin/konsensus` and the
 config is `/var/lib/bitsov/konsensus.toml`. If the Pi still uses a user unit or
 other paths, use that unit's actual account and paths; do not run both services.
 
-After downloading and independently verifying the **published** rc14 Linux
-aarch64 artifact and signed checksums, from its download directory:
+After downloading the **published** rc14 Linux aarch64 artifact, verify it
+before it runs.
+
+Do not run the block below. It makes `./bitsov-linux-aarch64` executable,
+runs that download-directory path, and installs the same path. Verify with
+`bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc` and install
+`bitsov-linux-aarch64` from the seal path the script prints. The home-node
+guide shows that command. The block stays as the record of this rc14 note.
 
 ```sh
 uname -m

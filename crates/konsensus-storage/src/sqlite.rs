@@ -195,6 +195,12 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (30, "channel open operations", include_str!("../migrations/030_channel_open_operations.sql")),
     (31, "starter requests", include_str!("../migrations/031_starter_requests.sql")),
     (32, "starter queries", include_str!("../migrations/032_starter_queries.sql")),
+    (
+        33,
+        "calendar and schema parity",
+        include_str!("../migrations/033_calendar_and_schema_parity.sql"),
+    ),
+    // 034 stays unused. Main reserved it for the call-invite work and shipped 035–037 around that gap.
     (35, "call blocks", include_str!("../migrations/035_call_blocks.sql")),
     (36, "call unpaid notice", include_str!("../migrations/036_call_unpaid_notice.sql")),
     (37, "call block invoices", include_str!("../migrations/037_call_block_invoices.sql")),
@@ -3541,6 +3547,10 @@ impl konsensus_core::gate::NonceStore for SqliteStorage {
 #[cfg(test)]
 #[path = "tests/sqlite.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/schema_parity.rs"]
+mod schema_parity_tests;
 
 #[cfg(test)]
 mod dbh2_guard {
