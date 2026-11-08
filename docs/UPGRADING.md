@@ -704,8 +704,14 @@ confirm `uname -m` is `aarch64`, the service uses `/usr/bin/konsensus` and the
 config is `/var/lib/bitsov/konsensus.toml`. If the Pi still uses a user unit or
 other paths, use that unit's actual account and paths; do not run both services.
 
-After downloading and independently verifying the **published** rc14 Linux
-aarch64 artifact and signed checksums, from its download directory:
+After downloading the **published** rc14 Linux aarch64 artifact, verify it
+before it runs.
+
+Do not run the block below. It makes `./bitsov-linux-aarch64` executable,
+runs that download-directory path, and installs the same path. Verify with
+`bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc` and install
+`bitsov-linux-aarch64` from the seal path the script prints. The home-node
+guide shows that command. The block stays as the record of this rc14 note.
 
 ```sh
 uname -m
