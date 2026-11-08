@@ -275,7 +275,12 @@ mod tests {
 
     #[test]
     fn location_is_required_for_v2() {
-        let cipher = RecordCipher::new(&[7; 32], LegacyReadPolicy::default());
+        let dir = tempfile::tempdir().unwrap();
+        let cipher = RecordCipher::new(&[7; 32], LegacyReadPolicy::in_data_dir(dir.path()));
+        assert!(
+            cipher.allows_v1(),
+            "header stripping must be tested before cutoff"
+        );
         let blob = cipher
             .encrypt("peers", "metadata_json", "row-a", b"{}")
             .unwrap();
