@@ -12,10 +12,12 @@ also live on the corresponding GitHub pre-release pages.
   configured network, nothing reads or syncs from it: the node starts not ready
   and the embedded LDK node retries without starting. With `credentials_file`,
   an unanswered primary is skipped and LDK uses the verified fallback without
-  credentials. Sources are asked again
-  after a lost connection and at least every 60 seconds, and `konsensus recover`
-  checks its source too. A custom signet passes as `signet`. With LND, LNbits or
-  mock Lightning a real `[chain]` source is not checked.
+  credentials. Each Esplora endpoint is checked within its own ten seconds, so
+  a slow or silent endpoint never discards another one's answer. Sources are
+  asked again after a lost connection and at least every 60 seconds, and
+  `konsensus recover` checks its source too. A custom signet passes as
+  `signet`. With LND, LNbits or mock Lightning a real `[chain]` source is not
+  checked.
 - **Breaking for exposed APIs:** a non-loopback `[api].listen_addr` (`0.0.0.0`,
   `::`, a LAN address) now fails config validation unless
   `[api].allow_non_loopback_bind = true` is set, because the owner API is

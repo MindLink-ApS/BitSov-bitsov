@@ -31,6 +31,10 @@ struct Token {
 
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(4);
 
+/// Bound on a request sent without its own timeout. The authentication
+/// client sets none, so this keeps every request bounded.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Default)]
 struct TokenCache {
     token: Option<Token>,
@@ -125,7 +129,8 @@ impl BearerAuth {
     }
 
     async fn send(&self, request: RequestBuilder) -> Result<Response, esplora_client::Error> {
-        let request = request.build().map_err(|_| unavailable())?;
+        let mut request = request.build().map_err(|_| unavailable())?;
+        request.timeout_mut().get_or_insert(DEFAULT_REQUEST_TIMEOUT);
         // Always use OUR no-redirect client, including requests built by LDK.
         #[cfg(test)]
         if let Some(wire) = &self.wire {

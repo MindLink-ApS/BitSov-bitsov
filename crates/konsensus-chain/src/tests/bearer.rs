@@ -806,3 +806,53 @@ async fn bearer_request_timeout_survives_401_retry_and_fallback() {
     );
     assert_eq!(wire.api_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
 }
+
+#[tokio::test]
+async fn bearer_request_without_its_own_timeout_is_bounded() {
+    #[derive(Debug, Default)]
+    struct Timeouts(std::sync::Mutex<Vec<(String, Option<Duration>)>>);
+    impl HttpTransport for Timeouts {
+        fn execute(
+            &self,
+            request: RequestBuilder,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Response, esplora_client::Error>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                let request = request.build().unwrap();
+                let path = request.url().path().to_owned();
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((path.clone(), request.timeout().copied()));
+                let body = if path == "/token" { TOKEN } else { "900000" };
+                Ok(http::Response::builder().body(body).unwrap().into())
+            })
+        }
+    }
+    let wire = Arc::new(Timeouts::default());
+    let transport = auth_with_wire(wire.clone())
+        .transport("https://unbounded.invalid/api")
+        .unwrap();
+    // Built with no timeout of its own, like a client without one.
+    let response = transport
+        .execute(Client::new().get("https://unbounded.invalid/api/blocks/tip/height"))
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), "900000");
+    // A request's own timeout is kept; one without gets the default bound.
+    assert_eq!(
+        wire.0.lock().unwrap().as_slice(),
+        [
+            ("/token".to_owned(), Some(TOKEN_TIMEOUT)),
+            (
+                "/api/blocks/tip/height".to_owned(),
+                Some(DEFAULT_REQUEST_TIMEOUT)
+            ),
+        ]
+    );
+}
