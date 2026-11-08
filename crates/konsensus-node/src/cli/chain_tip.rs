@@ -544,10 +544,10 @@ fn same_file(a: &Path, b: &Path) -> bool {
 
 /// Files the node reads that this command must never write or replace: the
 /// recovery phrase and every credential named before or after the edit.
-fn input_files(old: &NodeConfig, new: &NodeConfig) -> Vec<PathBuf> {
+fn input_files(old: &NodeConfig, new_chain: Option<&ChainConfig>) -> Vec<PathBuf> {
     let mut files = vec![old.identity.mnemonic_file.clone()];
-    for config in [old, new] {
-        match &config.chain {
+    for chain in std::iter::once(&old.chain).chain(new_chain) {
+        match chain {
             ChainConfig::Esplora {
                 credentials_file: Some(file),
                 ..
@@ -558,23 +558,23 @@ fn input_files(old: &NodeConfig, new: &NodeConfig) -> Vec<PathBuf> {
             }
             _ => {}
         }
-        if let LightningConfig::Ldk {
-            credentials_file: Some(file),
-            ..
-        } = &config.lightning
-        {
-            files.push(file.clone());
-        }
+    }
+    if let LightningConfig::Ldk {
+        credentials_file: Some(file),
+        ..
+    } = &old.lightning
+    {
+        files.push(file.clone());
     }
     files
 }
 
 fn refuse_if_input_is_written(
     old: &NodeConfig,
-    new: &NodeConfig,
+    new_chain: Option<&ChainConfig>,
     files: &WriteFiles,
 ) -> Result<()> {
-    for input in input_files(old, new) {
+    for input in input_files(old, new_chain) {
         for written in files.all() {
             if same_file(&input, written) {
                 return Err(refuse(format!(
@@ -880,6 +880,12 @@ pub async fn run(args: ChainTipArgs) -> Result<()> {
     // Held until the new file is in place, so the node cannot start meanwhile.
     let _state_lock = hold_state_lock(&config)?;
     refuse_if_listening(&config).await?;
+    // Every file this command creates gets a fresh name made with create_new,
+    // so none of them can be (or replace) the recovery phrase or a credential.
+    // Refuse anyway, before any check or write, if an input file is one of
+    // them or the config itself.
+    let files = WriteFiles::new(&path)?;
+    refuse_if_input_is_written(&config, None, &files)?;
 
     let (edited, summary, new) = match request {
         Request::Show => unreachable!("handled above"),
@@ -927,6 +933,7 @@ pub async fn run(args: ChainTipArgs) -> Result<()> {
             })?;
             let home = std::env::var_os("HOME").map(PathBuf::from);
             let chain = owned_chain(source, network, home)?;
+            refuse_if_input_is_written(&config, Some(&chain), &files)?;
             let height = check_source(&chain, network).await?;
             let (edited, new) = switch_text(&original, &config, &chain)?;
             if explorer_default(&new).is_some() {
@@ -970,11 +977,7 @@ pub async fn run(args: ChainTipArgs) -> Result<()> {
             path.display()
         )));
     }
-    // Every file this command creates gets a fresh name made with create_new,
-    // so none of them can be (or replace) the recovery phrase or a credential.
-    // Refuse anyway if an input file is one of them or the config itself.
-    let files = WriteFiles::new(&path)?;
-    refuse_if_input_is_written(&config, &new, &files)?;
+    refuse_if_input_is_written(&config, Some(&new.chain), &files)?;
     let backup = write_backup(&files, &current)?;
     replace_config(&path, &files.config_temp, edited.as_bytes()).map_err(|e| {
         anyhow::anyhow!("{e:#}. The previous config is kept at {}", backup.display())
