@@ -5,6 +5,17 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- The node refuses to start when its chain source is on another network than
+  `[lightning] network`, naming both networks, and tries no other source. Bitcoin
+  Core is checked through `getblockchaininfo`; Electrum and Esplora through their
+  height-0 header, hashed by the node. Until a source has answered on the
+  configured network, nothing reads or syncs from it: the node starts not ready
+  and the embedded LDK node retries without starting. With `credentials_file`,
+  an unanswered primary is skipped and LDK uses the verified fallback without
+  credentials. Sources are asked again
+  after a lost connection and at least every 60 seconds, and `konsensus recover`
+  checks its source too. A custom signet passes as `signet`. With LND, LNbits or
+  mock Lightning a real `[chain]` source is not checked.
 - **Breaking for exposed APIs:** a non-loopback `[api].listen_addr` (`0.0.0.0`,
   `::`, a LAN address) now fails config validation unless
   `[api].allow_non_loopback_bind = true` is set, because the owner API is
