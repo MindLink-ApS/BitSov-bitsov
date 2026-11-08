@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
+use crate::network::{NetworkCheck, NetworkGate, ReportedNetwork};
+
 /// File-backed RPC authentication, shared with the embedded Lightning node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "RawConfig")]
@@ -120,6 +122,7 @@ impl BitcoindConfig {
 pub struct BitcoindProvider {
     config: BitcoindConfig,
     client: reqwest::Client,
+    network: Option<NetworkGate>,
 }
 
 #[derive(Deserialize)]
@@ -144,7 +147,48 @@ impl BitcoindProvider {
             .no_proxy()
             .build()
             .map_err(|_| ChainError::Connection("cannot build bitcoind RPC client".into()))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            network: None,
+        })
+    }
+
+    /// Serve no chain data until Core reports this network; refuse it for
+    /// good if Core reports another one.
+    pub fn with_network(mut self, network: bitcoin::Network) -> Self {
+        self.network = Some(NetworkGate::new(network, "bitcoind", 1));
+        self
+    }
+
+    /// Ask Core which chain it is on, if not yet known. No retry here: an
+    /// unreachable Core is reported as `Unavailable`, as before.
+    pub async fn verify_network(&self) -> NetworkCheck {
+        let Some(gate) = &self.network else {
+            return NetworkCheck::NotConfigured;
+        };
+        let _ = self.ensure_network().await;
+        gate.check()
+    }
+
+    async fn ensure_network(&self) -> Result<(), ChainError> {
+        let Some(gate) = &self.network else {
+            return Ok(());
+        };
+        gate.refusal()?;
+        if gate.is_verified(0) {
+            return Ok(());
+        }
+        let info = self
+            .send("getblockchaininfo", json!([]))
+            .await?
+            .map_err(|code| {
+                ChainError::Backend(format!("bitcoind getblockchaininfo failed (RPC {code})"))
+            })?;
+        let chain = info["chain"]
+            .as_str()
+            .ok_or_else(|| ChainError::Backend("invalid bitcoind chain".into()))?;
+        gate.record(0, ReportedNetwork::from_core_chain(chain))
     }
 
     pub(crate) async fn rpc(
@@ -152,6 +196,11 @@ impl BitcoindProvider {
         method: &str,
         params: Value,
     ) -> Result<Result<Value, i64>, ChainError> {
+        self.ensure_network().await?;
+        self.send(method, params).await
+    }
+
+    async fn send(&self, method: &str, params: Value) -> Result<Result<Value, i64>, ChainError> {
         let (user, password) = self.config.credentials()?;
         let response = self
             .client

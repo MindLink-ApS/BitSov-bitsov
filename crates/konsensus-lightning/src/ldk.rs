@@ -805,14 +805,15 @@ impl LdkProvider {
             .clone()
             .map(konsensus_chain::BitcoindProvider::new)
             .transpose()
-            .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
+            .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?
+            .map(|provider| provider.with_network(network));
         let electrum = config
             .electrum
             .clone()
             .map(konsensus_chain::ElectrumProvider::new)
             .transpose()
             .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?
-            .map(Arc::new);
+            .map(|provider| Arc::new(provider.with_network(network)));
         if let Some(url) = &config.rgs_url {
             validate_startup_url("rgs_url", url)?;
         }
@@ -917,6 +918,17 @@ impl LdkProvider {
                     ))
                 })?;
         }
+
+        // Local settings are valid. Before LDK reads any chain data, the source
+        // must not be on another network.
+        check_chain_source_network(
+            network,
+            bitcoind.as_ref(),
+            electrum.as_deref(),
+            &config,
+            auth_transport.as_deref(),
+        )
+        .await?;
 
         // Validate all local settings before the first network request. The budget
         // includes preflight; only the two Esplora fee-barrier errors are retried.
@@ -2637,6 +2649,49 @@ fn derive_ldk_entropy(bip39_seed: &[u8]) -> [u8; 64] {
 }
 
 /// Parse a network string into a bitcoin::Network.
+/// Bound on the start-time network check. A slow source counts as unreachable.
+const CHAIN_NETWORK_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Refuse to start when the chain source is on another network. An
+/// unreachable source changes nothing: startup goes on to fail and retry, or
+/// to wait for sync, exactly as before, and each start attempt checks again.
+async fn check_chain_source_network(
+    network: bitcoin::Network,
+    bitcoind: Option<&konsensus_chain::BitcoindProvider>,
+    electrum: Option<&konsensus_chain::ElectrumProvider>,
+    config: &LdkConfig,
+    auth: Option<&konsensus_chain::bearer::BearerFailover>,
+) -> Result<(), LightningError> {
+    use konsensus_chain::NetworkCheck;
+    let check = async {
+        if let Some(provider) = bitcoind {
+            provider.verify_network().await
+        } else if let Some(provider) = electrum {
+            provider.verify_network().await
+        } else {
+            let mut urls = vec![config.esplora_url.as_str()];
+            urls.extend(config.esplora_url_fallback.as_deref());
+            konsensus_chain::network::verify_esplora_api_urls(network, &urls, auth).await
+        }
+    };
+    match tokio::time::timeout(CHAIN_NETWORK_CHECK_TIMEOUT, check).await {
+        Ok(NetworkCheck::Mismatch(mismatch)) => {
+            Err(LightningError::InvalidStartupConfig(mismatch.to_string()))
+        }
+        Ok(NetworkCheck::Verified) => {
+            info!(network = %config.network, "chain source network verified");
+            Ok(())
+        }
+        Ok(NetworkCheck::Unavailable | NetworkCheck::NotConfigured) | Err(_) => {
+            warn!(
+                network = %config.network,
+                "chain source network not verified at startup: source unreachable"
+            );
+            Ok(())
+        }
+    }
+}
+
 fn parse_network(network: &str) -> Result<bitcoin::Network, LightningError> {
     match network.to_lowercase().as_str() {
         "bitcoin" | "mainnet" => Ok(bitcoin::Network::Bitcoin),

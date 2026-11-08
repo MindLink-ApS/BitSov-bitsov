@@ -24,10 +24,32 @@ impl Fixture {
     }
 
     async fn with_delay(failures: usize, empty: bool, delay: Duration) -> Self {
+        Self::build(failures, empty, delay, Some(bitcoin::Network::Bitcoin)).await
+    }
+
+    /// An explorer whose genesis block is `genesis`'s; `None` answers 404.
+    async fn on(genesis: Option<bitcoin::Network>) -> Self {
+        Self::build(0, false, Duration::ZERO, genesis).await
+    }
+
+    async fn build(
+        failures: usize,
+        empty: bool,
+        delay: Duration,
+        genesis: Option<bitcoin::Network>,
+    ) -> Self {
         let requests = Arc::new(AtomicUsize::new(0));
         let background_requests = Arc::new(AtomicUsize::new(0));
         let background = Arc::clone(&background_requests);
-        let app = Router::new()
+        let mut app = Router::new();
+        if let Some(network) = genesis {
+            // The start-time network check; not wallet or background traffic.
+            let hash = bitcoin::blockdata::constants::genesis_block(network)
+                .block_hash()
+                .to_string();
+            app = app.route("/block-height/0", get(move || async move { hash }));
+        }
+        let app = app
             .route(
                 "/fee-estimates",
                 get(move |State(requests): State<Arc<AtomicUsize>>| async move {
@@ -634,4 +656,132 @@ async fn electrum_startup_failure_never_contacts_esplora_or_fallback() {
         Err(LightningError::InvalidStartupConfig(_))
     ));
     assert_eq!(outbound_guard::connection_count(), before);
+}
+
+/// A chain source on another network refuses startup before LDK is built.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn esplora_on_another_network_refuses_startup_before_ldk_runs() {
+    use bitcoin::Network;
+    // Primary on signet; and a mainnet primary with a signet fallback.
+    for (primary, fallback) in [
+        (Some(Network::Signet), None),
+        (Some(Network::Bitcoin), Some(Network::Signet)),
+    ] {
+        let primary = Fixture::on(primary).await;
+        let fallback = match fallback {
+            Some(network) => Some(Fixture::on(Some(network)).await),
+            None => None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(&dir, &primary.url);
+        cfg.esplora_url_fallback = fallback.as_ref().map(|f| f.url.clone());
+        let err = LdkProvider::new(cfg.clone()).await.err().unwrap();
+        let text = err.to_string();
+        assert!(
+            matches!(err, LightningError::InvalidStartupConfig(_)),
+            "{text}"
+        );
+        assert!(
+            text.contains("configured network is bitcoin (mainnet)"),
+            "{text}"
+        );
+        assert!(text.contains("esplora chain source is on signet"), "{text}");
+        for explorer in std::iter::once(&primary).chain(fallback.as_ref()) {
+            assert_eq!(explorer.requests.load(Ordering::SeqCst), 0, "no fee probe");
+            assert_eq!(explorer.background_requests.load(Ordering::SeqCst), 0);
+        }
+        let log = std::fs::read_to_string(cfg.storage_dir.join("ldk_node.log")).unwrap_or_default();
+        assert!(!log.contains("Starting up LDK Node"), "LDK must not start");
+    }
+}
+
+/// An explorer that cannot report its genesis block changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn esplora_without_a_network_answer_starts_as_before() {
+    let server = Fixture::on(None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let provider = LdkProvider::new(config(&dir, &server.url)).await.unwrap();
+    assert!(provider.node().status().is_running);
+    provider.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bitcoind_on_another_network_refuses_startup() {
+    use axum::{routing::post, Json};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let app = Router::new().route(
+        "/",
+        post(move |Json(request): Json<serde_json::Value>| {
+            let counted = Arc::clone(&counted);
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(request["method"], "getblockchaininfo");
+                Json(serde_json::json!({
+                    "result": {"chain": "main", "blocks": 1, "headers": 1, "initialblockdownload": false},
+                    "error": null, "id": 1,
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let cookie = dir.path().join("cookie");
+    std::fs::write(&cookie, "user:pass").unwrap();
+    let mut cfg = config(&dir, "http://127.0.0.1:9");
+    cfg.network = "regtest".into();
+    cfg.bitcoind = Some(
+        serde_json::from_value(serde_json::json!({
+            "rpc_host": "127.0.0.1", "rpc_port": port, "cookie_file": cookie,
+        }))
+        .unwrap(),
+    );
+    let err = LdkProvider::new(cfg.clone()).await.err().unwrap();
+    let text = err.to_string();
+    assert!(
+        matches!(err, LightningError::InvalidStartupConfig(_)),
+        "{text}"
+    );
+    assert!(text.contains("configured network is regtest"), "{text}");
+    assert!(
+        text.contains("bitcoind chain source is on bitcoin (mainnet)"),
+        "{text}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "only the network question");
+    let log = std::fs::read_to_string(cfg.storage_dir.join("ldk_node.log")).unwrap_or_default();
+    assert!(!log.contains("Starting up LDK Node"), "LDK must not start");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn electrum_on_another_network_refuses_startup() {
+    let header = bitcoin::consensus::encode::serialize_hex(
+        &bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Signet).header,
+    );
+    let electrum =
+        electrum_fixture::Fixture::new(move |request| match request["method"].as_str().unwrap() {
+            "blockchain.block.header" => serde_json::json!({"result": header}),
+            method => panic!("unexpected Electrum method {method}"),
+        })
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(&dir, "http://127.0.0.1:9");
+    cfg.network = "regtest".into();
+    cfg.electrum =
+        Some(serde_json::from_value(serde_json::json!({"server_url": electrum.url})).unwrap());
+    let err = LdkProvider::new(cfg.clone()).await.err().unwrap();
+    let text = err.to_string();
+    assert!(
+        matches!(err, LightningError::InvalidStartupConfig(_)),
+        "{text}"
+    );
+    assert!(text.contains("configured network is regtest"), "{text}");
+    assert!(
+        text.contains("electrum chain source is on signet"),
+        "{text}"
+    );
+    let log = std::fs::read_to_string(cfg.storage_dir.join("ldk_node.log")).unwrap_or_default();
+    assert!(!log.contains("Starting up LDK Node"), "LDK must not start");
 }

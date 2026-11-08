@@ -687,3 +687,139 @@ async fn upgrade_binds_retained_node_and_preserves_binding_on_restart() {
         .to_string()
         .contains("state_generation_newer"));
 }
+
+// ── chain source network ───────────────────────────────────────────
+
+/// A loopback Bitcoin Core RPC fixture that reports `chain`.
+async fn core_on(chain: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
+    use axum::{routing::post, Json, Router};
+    let app = Router::new().route(
+        "/",
+        post(move |Json(request): Json<serde_json::Value>| async move {
+            assert_eq!(request["method"], "getblockchaininfo");
+            Json(serde_json::json!({
+                "result": {"chain": chain, "blocks": 1, "headers": 1, "initialblockdownload": false},
+                "error": null, "id": 1,
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (
+        port,
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+    )
+}
+
+// Multi-threaded so that, were the check missing, LDK fails the test cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn from_config_refuses_a_chain_source_on_another_network_before_node_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, server) = core_on("main").await;
+    let cookie = dir.path().join(".cookie");
+    std::fs::write(&cookie, "user:pass").unwrap();
+    let mut config = test_config(dir.path());
+    config.lightning = toml::from_str("backend = \"ldk\"\nnetwork = \"signet\"\n").unwrap();
+    config.chain = ChainConfig::Bitcoind(
+        serde_json::from_value(serde_json::json!({
+            "rpc_host": "127.0.0.1", "rpc_port": port, "cookie_file": cookie,
+        }))
+        .unwrap(),
+    );
+    let err = KonsensusNode::from_config(config, None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("configured network is signet"), "{err}");
+    assert!(
+        err.contains("bitcoind chain source is on bitcoin (mainnet)"),
+        "{err}"
+    );
+    // Refused before opening storage or Lightning state.
+    assert!(!dir.path().join("konsensus.db").exists());
+    assert!(!dir.path().join("ldk").exists());
+    server.abort();
+}
+
+// Multi-threaded so that, were the check missing, LDK fails the test cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn from_config_refuses_an_esplora_source_on_another_network() {
+    use axum::{routing::get, Router};
+    let hash = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Testnet4)
+        .block_hash()
+        .to_string();
+    let app = Router::new().route("/api/block-height/0", get(move || async move { hash }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    // Both sources are this loopback fixture; nothing else is contacted.
+    config.lightning = toml::from_str(&format!(
+        "backend = \"ldk\"\nnetwork = \"testnet\"\nesplora_url = \"{url}/api\"\n"
+    ))
+    .unwrap();
+    config.chain = ChainConfig::Esplora {
+        api_url: url,
+        esplora_url_fallback: None,
+        credentials_file: None,
+    };
+    let err = KonsensusNode::from_config(config, None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        err.contains("configured network is testnet (testnet3)"),
+        "{err}"
+    );
+    assert!(err.contains("esplora chain source is on testnet4"), "{err}");
+    assert!(!dir.path().join("konsensus.db").exists());
+    server.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn unverified_chain_network_starts_as_before() {
+    use konsensus_chain::NetworkCheck;
+    assert!(verify_chain_network(async { NetworkCheck::Verified })
+        .await
+        .is_ok());
+    assert!(verify_chain_network(async { NetworkCheck::Unavailable })
+        .await
+        .is_ok());
+    // A source that never answers counts as unreachable, not as a refusal.
+    assert!(verify_chain_network(std::future::pending()).await.is_ok());
+    let mismatch = konsensus_chain::NetworkMismatch {
+        configured: bitcoin::Network::Signet,
+        source: "electrum",
+        reported: konsensus_chain::network::ReportedNetwork::Known(bitcoin::Network::Bitcoin),
+    };
+    let err = verify_chain_network(async move { NetworkCheck::Mismatch(mismatch) })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("configured network is signet"), "{err}");
+    assert!(
+        err.contains("electrum chain source is on bitcoin (mainnet)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn chain_source_network_comes_from_the_lightning_network_setting() {
+    for (name, network) in [
+        ("bitcoin", bitcoin::Network::Bitcoin),
+        ("testnet", bitcoin::Network::Testnet),
+        ("signet", bitcoin::Network::Signet),
+        ("regtest", bitcoin::Network::Regtest),
+    ] {
+        let ldk: LightningConfig =
+            toml::from_str(&format!("backend = \"ldk\"\nnetwork = \"{name}\"\n")).unwrap();
+        assert_eq!(ldk.chain_source_network(), Some(network));
+    }
+    let mock = LightningConfig::Mock {
+        initial_balance_msat: 0,
+    };
+    assert_eq!(mock.chain_source_network(), None);
+}

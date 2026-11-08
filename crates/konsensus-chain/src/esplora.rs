@@ -35,6 +35,8 @@ use konsensus_core::traits::chain::{
     BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel,
 };
 
+use crate::network::{NetworkCheck, NetworkGate, ReportedNetwork};
+
 /// Maximum age of a cached tip height, shared by callers of one provider.
 const TIP_HEIGHT_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -93,6 +95,7 @@ pub struct EsploraProvider {
     transport: Option<Arc<dyn HttpTransport>>,
     bearer: Option<Arc<dyn HttpTransport>>,
     tip_height: Mutex<Option<(u64, Instant)>>,
+    network: Option<NetworkGate>,
 }
 
 /// JSON response from `/api/block/{hash}`.
@@ -167,7 +170,51 @@ impl EsploraProvider {
             transport: None,
             bearer: None,
             tip_height: Mutex::new(None),
+            network: None,
         }
+    }
+
+    /// Use no endpoint until its genesis block is this network's. One
+    /// endpoint on another network refuses the provider for good, with no
+    /// fallback to the others.
+    pub fn with_network(mut self, network: bitcoin::Network) -> Self {
+        self.network = Some(NetworkGate::new(network, "esplora", self.endpoints.len()));
+        self
+    }
+
+    /// Check every configured endpoint not yet verified. `Verified` needs all
+    /// of them; an unreachable one leaves the result `Unavailable`, as before.
+    pub async fn verify_network(&self) -> NetworkCheck {
+        let Some(gate) = &self.network else {
+            return NetworkCheck::NotConfigured;
+        };
+        for index in 0..self.endpoints.len() {
+            let timeout = std::time::Duration::from_secs(self.config.timeout_secs);
+            if self.ensure_network(gate, index, timeout).await.is_err() && gate.refusal().is_err() {
+                break;
+            }
+        }
+        gate.check()
+    }
+
+    async fn ensure_network(
+        &self,
+        gate: &NetworkGate,
+        index: usize,
+        timeout: std::time::Duration,
+    ) -> Result<(), ChainError> {
+        gate.refusal()?;
+        if gate.is_verified(index) {
+            return Ok(());
+        }
+        let genesis = self
+            .fetch(index, "/block-height/0", timeout, &|text: &str| {
+                text.trim()
+                    .parse::<bitcoin::BlockHash>()
+                    .map_err(|_| ChainError::Backend("invalid Esplora block hash".into()))
+            })
+            .await?;
+        gate.record(index, ReportedNetwork::from_genesis_hash(genesis))
     }
 
     /// Authenticate only the primary; fallbacks retain their existing unauthenticated policy.
@@ -183,6 +230,10 @@ impl EsploraProvider {
     /// requests share the same limiter as LDK for each configured API endpoint.
     pub(crate) async fn recovery_broadcast(&self, raw: &str) -> Result<String, ChainError> {
         let index = self.active.load(Ordering::Relaxed);
+        if let Some(gate) = &self.network {
+            let timeout = std::time::Duration::from_secs(self.config.timeout_secs);
+            self.ensure_network(gate, index, timeout).await?;
+        }
         let (base, limiter) = &self.endpoints[index];
         let request = self.client.post(format!("{base}/tx")).body(raw.to_owned());
         let response = limiter
@@ -213,7 +264,7 @@ impl EsploraProvider {
         parse: impl Fn(&str) -> Result<T, ChainError>,
     ) -> Result<T, ChainError> {
         let mut last_error = ChainError::NotAvailable("no usable Esplora endpoint".into());
-        for (index, (base, limiter)) in self.endpoints.iter().enumerate() {
+        for index in 0..self.endpoints.len() {
             // Admission's outer readiness deadline is five seconds. Reserve
             // four for the complete height lookup, divided across endpoints,
             // so even a blackholed primary leaves time to try every fallback.
@@ -222,41 +273,18 @@ impl EsploraProvider {
             } else {
                 std::time::Duration::from_secs(self.config.timeout_secs)
             };
-            let result = tokio::time::timeout(timeout, async {
-                let request = self.client.get(format!("{base}{path}")).timeout(timeout);
-                let response = limiter
-                    .run(false, || async {
-                        match if index == 0 {
-                            self.bearer.as_ref().or(self.transport.as_ref())
-                        } else {
-                            self.transport.as_ref()
-                        } {
-                            Some(transport) => transport.execute(request).await,
-                            None => Ok(request.send().await?),
-                        }
-                    })
-                    .await
-                    .map_err(|error| match error {
-                        esplora_client::Error::Reqwest(_) => {
-                            ChainError::Connection("Esplora connection unavailable".into())
-                        }
-                        _ => ChainError::NotAvailable("Esplora request unavailable".into()),
-                    })?;
-                if !response.status().is_success() {
-                    return Err(ChainError::Backend(format!(
-                        "{path}: {}",
-                        response.status()
-                    )));
+            if let Some(gate) = &self.network {
+                match self.ensure_network(gate, index, timeout).await {
+                    Ok(()) => {}
+                    // A wrong network is never skipped in favour of a fallback.
+                    Err(error) if gate.refusal().is_err() => return Err(error),
+                    Err(error) => {
+                        last_error = error;
+                        continue;
+                    }
                 }
-                let text = response
-                    .text()
-                    .await
-                    .map_err(|_| ChainError::Backend("Esplora body unavailable".into()))?;
-                parse(&text)
-            })
-            .await
-            .unwrap_or_else(|_| Err(ChainError::NotAvailable("Esplora request timed out".into())));
-            match result {
+            }
+            match self.fetch(index, path, timeout, &parse).await {
                 Ok(value) => {
                     self.active.store(index, Ordering::Relaxed);
                     return Ok(value);
@@ -265,6 +293,50 @@ impl EsploraProvider {
             }
         }
         Err(last_error)
+    }
+
+    async fn fetch<T>(
+        &self,
+        index: usize,
+        path: &str,
+        timeout: std::time::Duration,
+        parse: &impl Fn(&str) -> Result<T, ChainError>,
+    ) -> Result<T, ChainError> {
+        let (base, limiter) = &self.endpoints[index];
+        tokio::time::timeout(timeout, async {
+            let request = self.client.get(format!("{base}{path}")).timeout(timeout);
+            let response = limiter
+                .run(false, || async {
+                    match if index == 0 {
+                        self.bearer.as_ref().or(self.transport.as_ref())
+                    } else {
+                        self.transport.as_ref()
+                    } {
+                        Some(transport) => transport.execute(request).await,
+                        None => Ok(request.send().await?),
+                    }
+                })
+                .await
+                .map_err(|error| match error {
+                    esplora_client::Error::Reqwest(_) => {
+                        ChainError::Connection("Esplora connection unavailable".into())
+                    }
+                    _ => ChainError::NotAvailable("Esplora request unavailable".into()),
+                })?;
+            if !response.status().is_success() {
+                return Err(ChainError::Backend(format!(
+                    "{path}: {}",
+                    response.status()
+                )));
+            }
+            let text = response
+                .text()
+                .await
+                .map_err(|_| ChainError::Backend("Esplora body unavailable".into()))?;
+            parse(&text)
+        })
+        .await
+        .unwrap_or_else(|_| Err(ChainError::NotAvailable("Esplora request timed out".into())))
     }
 
     pub(crate) async fn get_text(&self, path: &str) -> Result<String, ChainError> {

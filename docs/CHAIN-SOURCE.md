@@ -11,6 +11,22 @@ does not run a default chain server. Existing Esplora configurations and fresh
 Electrum is also supported with an explicit server. Onboarding selection and
 Neutrino are later steps.
 
+## Network check
+
+The chain source must be on the network set in `[lightning] network`. At start
+the node asks it: Bitcoin Core through `getblockchaininfo` (`chain`), Electrum
+for its block header at height 0, Esplora for `/block-height/0` on every
+configured endpoint. If any answers with another network, the node refuses to
+start and names both networks; it does not try another source. If the source
+does not answer, startup goes on as before. BitSov's own chain reads (height,
+fees, confirmations) then stay unavailable until the source answers on the
+configured network, and a source that answers on another network is refused for
+the rest of the run. The embedded LDK node checks again on each start attempt.
+
+All signets share one genesis block, and Bitcoin Core reports `signet` for each
+of them, so a custom signet passes as `signet`. Mock, LND and LNbits backends
+set no network, and the check does not run for them.
+
 ## Esplora fallbacks
 
 `[chain] api_url` remains the primary chain/pricing source. Set

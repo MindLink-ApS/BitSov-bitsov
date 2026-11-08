@@ -5,6 +5,13 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- The node refuses to start when its chain source is on another network than
+  `[lightning] network`, naming both networks, and tries no other source. Bitcoin
+  Core is checked through `getblockchaininfo`, Electrum and Esplora through their
+  genesis block hash; every configured Esplora endpoint is checked. If the source
+  does not answer at start, startup goes on as before and BitSov's own chain
+  reads stay unavailable until it answers on the configured network. A custom
+  signet passes as `signet`.
 - **Breaking for exposed APIs:** a non-loopback `[api].listen_addr` (`0.0.0.0`,
   `::`, a LAN address) now fails config validation unless
   `[api].allow_non_loopback_bind = true` is set, because the owner API is
