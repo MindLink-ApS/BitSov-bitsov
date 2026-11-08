@@ -80,6 +80,11 @@ pub struct ChainView {
     pub backend: &'static str,
     pub trust_level: &'static str,
     pub host: Option<String>,
+    /// `true` when the source is a public explorer the node reads through
+    /// values it never explicitly accepted (an older generated config or the
+    /// frozen URL defaults). Omitted when `false`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub explorer_default: bool,
 }
 
 /// Abstraction over Bitcoin chain data sources.
@@ -90,7 +95,7 @@ pub struct ChainView {
 pub trait ChainProvider: Send + Sync {
     /// Honest default for test/external providers that do not identify themselves.
     fn chain_view(&self) -> ChainView {
-        ChainView { backend: "unknown", trust_level: "unknown", host: None }
+        ChainView { backend: "unknown", trust_level: "unknown", host: None, explorer_default: false }
     }
 
     /// The trust level of this chain data source.

@@ -75,7 +75,7 @@ fn prompt_new_password() -> Result<Zeroizing<String>> {
 
 /// Encrypting under a running node would leave it on a config it no longer
 /// matches until restart; ask for it to be stopped first.
-fn refuse_if_node_running(config_path: &Path) -> Result<()> {
+pub(crate) fn refuse_if_node_running(config_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         let socket = crate::owner_cmd::data_dir_of(config_path).join(konsensus_api::control::SOCKET_FILE);
@@ -274,7 +274,7 @@ fn keep_or_remove_encrypted(config_path: &Path, node_id: &str, encrypted: &Path,
 /// Whether two paths name the same file, including through symlinked or
 /// differently spelled parent directories. Conservative: case-insensitive
 /// (APFS default), and the same inode when both exist.
-fn same_location(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_location(a: &Path, b: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

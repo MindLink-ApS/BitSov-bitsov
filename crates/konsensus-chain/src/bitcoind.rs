@@ -387,6 +387,7 @@ impl ChainProvider for BitcoindProvider {
             backend: "bitcoind",
             trust_level: "own_node",
             host: Some(self.config.rpc_host.clone()),
+            explorer_default: false,
         }
     }
     async fn get_block_height(&self) -> Result<u64, ChainError> {

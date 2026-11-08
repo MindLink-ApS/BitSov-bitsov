@@ -3,6 +3,32 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## Public explorer warning and owned-tip opt-in
+
+A retained node whose chain tip is a public explorer it never explicitly
+accepted (earlier generated Full configs, the earlier Esplora signet recipe, or
+omitted Esplora URLs) is not migrated. It starts exactly as before, logs one
+warning naming the explorer, and owner status reports `chain_view.trust_level:
+"third_party"` with `explorer_default: true`. Apps can show that flag; it is
+omitted when false.
+
+Nothing changes until you run one of these with the node stopped:
+
+1. `konsensus chain-tip --config <path>` shows the current source.
+2. `konsensus chain-tip --config <path> --chain bitcoind` (your Core, pruned is
+   fine) or `--chain electrum --electrum-server-url <url> --electrum-operator own`
+   (your Electrum server, itself backed by a Core you control) checks the new
+   source (reachable, synchronized, same network as `[lightning] network`; for
+   Electrum, only that it reports a tip), keeps
+   `konsensus.toml.before-chain-tip-<UTC time>`, and rewrites only `[chain]` and
+   LDK's Esplora URL and `credentials_file` keys.
+3. `konsensus chain-tip --config <path> --accept-third-party-tip` keeps the
+   explorer, records `accept_third_party_tip = true` in `[chain]`, and silences
+   the warning. Earlier releases reject that key: restore the backup before a
+   downgrade.
+
+Details and refusal cases: [choose your chain source](CHAIN-SOURCE.md#existing-nodes-on-a-public-explorer).
+
 ## Location-bound storage records (after rc22)
 
 The encrypted record format is **forward-only**. New writes bind encrypted
