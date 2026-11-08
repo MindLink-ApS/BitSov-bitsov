@@ -816,14 +816,25 @@ const OPERATOR_HOSTING_PAYMENTS_SELECT: &str =
      FROM operator_hosting_payments
      WHERE contract_id = $1
      ORDER BY paid_at DESC";
+/// `peers.last_seen` is `TIMESTAMPTZ` while `Peer::last_seen` is an ISO 8601
+/// string. Reads format it in UTC, the same way `files.created_at` is read.
+macro_rules! peer_last_seen_text {
+    () => {
+        "to_char(last_seen AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')"
+    };
+}
+
 /// Peer-listing query for the Postgres backend. Returns ALL peers — deliberately
 /// **no `LIMIT`** (DBH1), mirroring the SQLite backend. The `peers` table is the
 /// durable gate-whitelist authority (boot-loaded via `merge_persisted_peers`) and
 /// the RV-RESTORE backup source; a cap here is a Principle-2 fail-open at scale.
 /// CI has no Postgres service, so this path is guarded by code symmetry with
 /// SQLite plus the `dbh1_guard` string-assertion test below — not a live query.
-const PEERS_SELECT: &str =
-    "SELECT node_id, address, last_seen, display_name, metadata_json FROM peers ORDER BY node_id";
+const PEERS_SELECT: &str = concat!(
+    "SELECT node_id, address, ",
+    peer_last_seen_text!(),
+    ", display_name, metadata_json FROM peers ORDER BY node_id"
+);
 
 #[async_trait]
 impl Storage for PostgresStorage {
@@ -1621,9 +1632,13 @@ impl Storage for PostgresStorage {
         // overwrite wholesale (the wrapper merges plaintext metadata itself
         // before encrypting). `metadata_json` is a TEXT column, so we cast to
         // jsonb for the merge and back to text for storage.
+        //
+        // `$3` is sent as text. `last_seen` is TIMESTAMPTZ, so it needs an
+        // explicit cast; without it Postgres rejects the statement (42804)
+        // even when the value is NULL.
         sqlx::query(
             "INSERT INTO peers (node_id, address, last_seen, display_name, metadata_json) \
-             VALUES ($1, $2, $3, $4, $5) \
+             VALUES ($1, $2, $3::timestamptz, $4, $5) \
              ON CONFLICT(node_id) DO UPDATE SET \
              address = COALESCE(EXCLUDED.address, peers.address), \
              last_seen = COALESCE(EXCLUDED.last_seen, peers.last_seen), \
@@ -1658,7 +1673,11 @@ impl Storage for PostgresStorage {
         let nid = id.to_hex();
 
         let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, String)>(
-            "SELECT node_id, address, last_seen, display_name, metadata_json FROM peers WHERE node_id = $1",
+            concat!(
+                "SELECT node_id, address, ",
+                peer_last_seen_text!(),
+                ", display_name, metadata_json FROM peers WHERE node_id = $1"
+            ),
         )
         .bind(&nid)
         .fetch_optional(&self.pool)
@@ -4126,6 +4145,51 @@ mod schema_parity_tests {
             .execute(admin)
             .await
             .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn postgres_upsert_peer_round_trips_last_seen() {
+        let (admin, url) = admin_pool().await;
+        let name = disposable_name("peer_last_seen");
+        let db_url = create_database(&admin, &url, &name).await;
+        let result = async {
+            const SEEN: &str = "2026-11-08T16:44:13.250Z";
+            let db = PostgresStorage::connect(&db_url).await.unwrap();
+            let id = NodeId::from_bytes([5u8; 32]);
+            let last_seen = |peer: Option<Peer>| peer.expect("peer stored").last_seen;
+
+            // A peer without `last_seen` is stored and reads back as None.
+            db.upsert_peer(&Peer::new(id)).await.unwrap();
+            assert_eq!(last_seen(db.get_peer(&id).await.unwrap()), None);
+
+            let mut peer = Peer::new(id);
+            peer.address = Some("peer.example:9735".into());
+            peer.last_seen = Some(SEEN.into());
+            db.upsert_peer(&peer).await.unwrap();
+            let loaded = db.get_peer(&id).await.unwrap().unwrap();
+            assert_eq!(loaded.last_seen.as_deref(), Some(SEEN));
+            assert_eq!(loaded.address.as_deref(), Some("peer.example:9735"));
+            let listed = db.list_peers().await.unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].last_seen.as_deref(), Some(SEEN));
+
+            // An update without `last_seen` keeps the stored value.
+            db.upsert_peer(&Peer::new(id)).await.unwrap();
+            let kept = last_seen(db.get_peer(&id).await.unwrap());
+            assert_eq!(kept.as_deref(), Some(SEEN));
+
+            // An offset timestamp is stored as the same instant and read in UTC.
+            peer.last_seen = Some("2026-11-09T01:00:00+02:00".into());
+            db.upsert_peer(&peer).await.unwrap();
+            let utc = last_seen(db.get_peer(&id).await.unwrap());
+            assert_eq!(utc.as_deref(), Some("2026-11-08T23:00:00.000Z"));
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
     }
 
     #[tokio::test]
