@@ -774,6 +774,7 @@ async fn from_config_refuses_an_esplora_source_on_another_network() {
         api_url: url,
         esplora_url_fallback: None,
         credentials_file: None,
+        accept_third_party_tip: false,
     };
     let err = KonsensusNode::from_config(config, None)
         .await
@@ -835,6 +836,7 @@ async fn from_config_refuses_an_ldk_esplora_url_on_another_network_before_node_s
         api_url: chain_url.clone(),
         esplora_url_fallback: Some(chain_url),
         credentials_file: None,
+        accept_third_party_tip: false,
     };
     let err = KonsensusNode::from_config(config, None)
         .await
