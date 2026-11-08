@@ -422,6 +422,9 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     async fn record_upgrade_rows(&self, table: crate::record_upgrade::RecordTable, after: Option<&str>, limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {
         self.inner.record_upgrade_rows(table, after, limit).await
     }
+    async fn record_upgrade_row(&self, table: crate::record_upgrade::RecordTable, id: &str) -> Result<Option<crate::record_upgrade::RecordRow>, StorageError> {
+        self.inner.record_upgrade_row(table, id).await
+    }
     async fn record_upgrade_replace(&self, table: crate::record_upgrade::RecordTable, old: &crate::record_upgrade::RecordRow, new: &crate::record_upgrade::RecordRow) -> Result<bool, StorageError> {
         self.inner.record_upgrade_replace(table, old, new).await
     }

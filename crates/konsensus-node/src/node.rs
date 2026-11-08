@@ -573,8 +573,10 @@ impl KonsensusNode {
         );
         let mut shutdown = self.shutdown_rx();
         tokio::spawn(async move {
-            let mut retry_delay = std::time::Duration::from_secs(60);
+            let mut retry_attempt = 0u32;
             loop {
+                let retry_delay =
+                    konsensus_storage::record_upgrade::RecordUpgrade::retry_delay(retry_attempt);
                 tokio::select! {
                     _ = shutdown.changed() => return,
                     result = upgrade.run(storage.as_ref()) => match result {
@@ -592,7 +594,7 @@ impl KonsensusNode {
                     _ = shutdown.changed() => return,
                     _ = tokio::time::sleep(retry_delay) => {}
                 }
-                retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(3600));
+                retry_attempt = retry_attempt.saturating_add(1);
             }
         });
 

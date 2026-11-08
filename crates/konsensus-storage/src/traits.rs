@@ -39,6 +39,9 @@ pub trait Storage: Send + Sync {
     async fn record_upgrade_rows(&self, _table: crate::record_upgrade::RecordTable, _after: Option<&str>, _limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {
         Err(StorageError::Unsupported("record format upgrade".into()))
     }
+    async fn record_upgrade_row(&self, _table: crate::record_upgrade::RecordTable, _id: &str) -> Result<Option<crate::record_upgrade::RecordRow>, StorageError> {
+        Err(StorageError::Unsupported("record format reread".into()))
+    }
     async fn record_upgrade_replace(&self, _table: crate::record_upgrade::RecordTable, _old: &crate::record_upgrade::RecordRow, _new: &crate::record_upgrade::RecordRow) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("record format upgrade".into()))
     }

@@ -8,18 +8,26 @@ retained data directory without re-running `konsensus init`.
 The encrypted record format is **forward-only**. New writes bind encrypted
 fields in messages, peers, rooms, files, outbox operations and channel/payment
 operations to their table, column and row ID. Cached message plaintext and
-persisted sessions use the same location binding. The background pass converts existing usable records before
-persisting a local completion marker. After that marker exists, unbound v1
-records are refused, including after a restart. The cache and session cutoff
-also remains effective across storage-mode changes.
+persisted sessions use the same location binding. The background pass converts
+readable fields before persisting a local completion marker. After that marker
+exists, unbound v1 records are refused, including after a restart. The cache and
+session cutoff also remains effective across storage-mode changes.
 
-Unreadable rows are preserved unchanged and counted per table in the node log;
-they cannot keep legacy reads enabled indefinitely. Such rows may require
-recovery and remain unreadable after the cutoff. The log reports table names and
-counts, without record IDs, contents or decryption errors. Database failures or
-concurrent writes defer completion and retry with exponential backoff, from one
-minute to at most one hour. Held call messages are included in maintenance while
-remaining hidden from ordinary message reads.
+Fields are converted independently. A corrupt optional message cache is cleared
+so it cannot prevent readable message content from upgrading. Invalid file data
+is retained and still rejected; readable file names and MIME types are upgraded
+so metadata reads and listings continue to work. Other unreadable fields are
+retained for recovery. The log reports table names and aggregate unreadable,
+unwritable and discarded-cache counts, without record IDs or field contents.
+
+SQLite snapshot comparisons account for TEXT/BLOB storage classes. After a
+rejected swap, including a row data or constraint rejection, the pass rereads
+that row once: an unchanged snapshot is reported
+as unwritable rather than retried forever. Such blocked rows are retained and
+may require recovery after cutoff. A changed snapshot or an operational database error
+still defers completion and retries with exponential backoff, from one minute
+to at most one hour; ongoing writes can therefore delay completion. Held call
+messages are included in maintenance while hidden from ordinary message reads.
 
 Retain the latest complete data directory, including the completion markers.
 Do not delete a marker or restore an older database beneath it to re-enable old

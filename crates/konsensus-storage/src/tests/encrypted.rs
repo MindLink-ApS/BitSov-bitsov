@@ -1691,3 +1691,43 @@ relocation_read_test!(room_read_rejects_relocated_fields, Rooms);
 relocation_read_test!(file_read_rejects_relocated_fields, Files);
 relocation_read_test!(outbox_read_rejects_relocated_fields, Outbox);
 relocation_read_test!(channel_read_rejects_relocated_fields, Channel);
+
+
+#[tokio::test]
+async fn untrusted_peer_flag_is_sticky_until_explicit_invite() {
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let node = NodeId::from_bytes([8; 32]);
+    let mut peer = Peer::new(node);
+    peer.metadata = serde_json::json!({"storage_legacy_untrusted": true});
+    store.upsert_peer(&peer).await.unwrap();
+    for metadata in [
+        serde_json::json!({"updated": true}),
+        serde_json::json!({"storage_legacy_untrusted": false}),
+        serde_json::Value::Null,
+    ] {
+        let mut update = Peer::new(node);
+        update.metadata = metadata;
+        store.upsert_peer(&update).await.unwrap();
+        assert_eq!(
+            store.get_peer(&node).await.unwrap().unwrap().metadata["storage_legacy_untrusted"],
+            true
+        );
+    }
+    let invite = uuid::Uuid::new_v4();
+    store
+        .add_whitelisted_peer_with_invite_ref(*node.as_bytes(), invite)
+        .await
+        .unwrap();
+    let trusted = store.get_peer(&node).await.unwrap().unwrap();
+    assert!(trusted.metadata.get("storage_legacy_untrusted").is_none());
+    assert_eq!(trusted.metadata["whitelist_source"], "invite");
+    store.upsert_peer(&Peer::new(node)).await.unwrap();
+    assert!(store
+        .get_peer(&node)
+        .await
+        .unwrap()
+        .unwrap()
+        .metadata
+        .get("storage_legacy_untrusted")
+        .is_none());
+}
