@@ -16,6 +16,20 @@ also live on the corresponding GitHub pre-release pages.
   after a lost connection and at least every 60 seconds, and `konsensus recover`
   checks its source too. A custom signet passes as `signet`. With LND, LNbits or
   mock Lightning a real `[chain]` source is not checked.
+- The owner's `GET /api/v1/status` reports the running release as
+  `node_version` (for example `0.3.0-rc22`). `version` stays the API version,
+  `2`. The public `/api/v1/health` is unchanged and does not name the release.
+- Console times for grants, pending requests and the pairing window print as
+  ISO-8601 UTC next to the Unix time, for example
+  `until 2026-11-09T16:01:22Z (unix 1794240082)`; `pair-status` keeps
+  `expires_at=<unix>` and adds the UTC time after it.
+- The console log has no colour codes when stdout is not a terminal (a launcher
+  or service writing to a file or pipe), and none when `NO_COLOR` is set. A
+  terminal keeps colour. The `node.log` file already had none.
+- Docs: installing a signed pre-release binary (rename to `konsensus`,
+  `chmod +x`, macOS download mark), checking one platform with
+  `--ignore-missing`, the signature check with the pinned fingerprint, and
+  rollback steps from rc22 to rc21.
 - **Breaking for exposed APIs:** a non-loopback `[api].listen_addr` (`0.0.0.0`,
   `::`, a LAN address) now fails config validation unless
   `[api].allow_non_loopback_bind = true` is set, because the owner API is

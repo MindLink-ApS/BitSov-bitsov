@@ -10,7 +10,9 @@ Paid admission follows the [2026-07-01 keystone](v2/F1-CAPPED-FIRST-CONTACT.md)
 (the target re-prices and the requester pays its invoice), and **mainnet is not
 supported for the public beta**: this guide never uses it and nothing here
 funds a mainnet wallet. Signet coins have no value. There is no final signed
-release yet (only pre-release candidates); this guide builds from source. Every
+release yet, only signed pre-release binaries for signet testing; this guide
+builds from source, or installs a pre-release binary
+([step 1b](#1b-or-install-a-signed-pre-release-binary)). Every
 step below was run in the session that produced this guide, except the two
 marked **untested in CI**, and some ran under different conditions (a debug
 build on another compiler, mock Lightning instead of a live signet node); the
@@ -53,6 +55,69 @@ guide assumes it is on your `PATH`:
 ```sh
 export PATH="$PWD/target/release:$PATH"
 ```
+
+## 1b. Or install a signed pre-release binary
+
+Signed pre-release binaries are on the
+[releases page](https://github.com/MindLink-ApS/BitSov-bitsov/releases), for
+signet testing only. These steps are for macOS and Linux. Each binary is named
+for its platform, `bitsov-<os>-<arch>`: `bitsov-darwin-aarch64` (Apple silicon),
+`bitsov-darwin-x86_64` (Intel Mac), `bitsov-linux-aarch64` or
+`bitsov-linux-x86_64`. This guide and the node's own messages call it
+`konsensus`.
+
+Into an empty directory, download your platform's binary, `SHA256SUMS` and
+`SHA256SUMS.asc` from the release, and the release key from the repository at
+the same tag:
+
+```sh
+TAG=v0.3.0-rc22   # the release you downloaded
+curl -fLO "https://raw.githubusercontent.com/MindLink-ApS/BitSov-bitsov/$TAG/RELEASE_KEY.asc"
+```
+
+**Check the signature.** A throwaway GnuPG home keeps your own keyring
+untouched:
+
+```sh
+export GNUPGHOME="$(mktemp -d)"
+gpg --quiet --import RELEASE_KEY.asc
+gpg --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>/dev/null > gpg-status.txt; echo "gpg exit $?"
+grep -E '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG) ' gpg-status.txt
+awk '$2 == "VALIDSIG" { print $12 }' gpg-status.txt
+rm -rf "$GNUPGHOME"; unset GNUPGHOME
+```
+
+It passes only if gpg exits 0, the `grep` prints nothing, and the `awk` line
+prints exactly `B299274C200301714DC6F51A7C2D6F8AC842EF6E`, the release key's
+primary fingerprint (also in [`SECURITY.md`](../SECURITY.md)). "Good signature"
+alone is not enough: that fingerprint field is what ties the signature to the
+release key.
+
+**Check the file.** `SHA256SUMS` lists every platform's files, so tell the
+check to skip the ones you didn't download:
+
+```sh
+shasum -a 256 -c SHA256SUMS --ignore-missing   # macOS
+sha256sum -c --ignore-missing SHA256SUMS       # Linux
+```
+
+Look for `OK` after your binary's name. Without `--ignore-missing` the command
+fails on the files that aren't there, even when yours is fine.
+
+**Install it as `konsensus`.** The download isn't executable, and on macOS a
+browser marks it as downloaded. The macOS binary is not notarized, so
+Gatekeeper refuses to open a marked copy; after the checks above pass, remove
+the mark (`curl` and `gh` downloads have none):
+
+```sh
+mv bitsov-darwin-aarch64 konsensus   # your platform's file; or: ln -s bitsov-darwin-aarch64 konsensus
+chmod +x konsensus
+xattr -d com.apple.quarantine konsensus 2>/dev/null   # macOS only
+./konsensus --version                # konsensus 0.3.0-rc22
+export PATH="$PWD:$PATH"
+```
+
+Then continue at step 2.
 
 ## 2. Initialize a node on signet
 

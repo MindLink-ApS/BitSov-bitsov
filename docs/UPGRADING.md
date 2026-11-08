@@ -3,6 +3,23 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## Installing a release binary
+
+Release binaries are named `bitsov-<os>-<arch>` (for example
+`bitsov-darwin-aarch64`); this note calls the binary `konsensus`. Verify the
+download, rename it to the path your service runs, make it executable and, on
+macOS, remove the browser's download mark, as in
+[install a signed pre-release binary](QUICKSTART-SIGNET.md#1b-or-install-a-signed-pre-release-binary).
+Use `shasum -a 256 -c SHA256SUMS --ignore-missing` (Linux:
+`sha256sum -c --ignore-missing SHA256SUMS`): without `--ignore-missing` the
+check fails on the other platforms' files. Stage the new binary beside the old
+one and check `./konsensus --version` before you switch.
+
+A running node does not print its release on start. Builds after rc22 report it
+as `node_version` in the owner's `GET /api/v1/status`; `version` there and in
+`/api/v1/health` stays the API version, `2`. On rc22 and earlier, check the
+binary with `--version`.
+
 ## Location-bound storage records (after rc22)
 
 The encrypted record format is **forward-only**. New writes bind encrypted
@@ -92,6 +109,31 @@ on real hardware.
 Rollback from rc22 to rc21: tested on regtest in both id orders. rc21 started on
 the candidate's data, and chat, calls and files passed. The earlier guidance that
 prefers rolling forward stands.
+
+To roll back rc22 → rc21:
+
+1. Get rc21's binary and verify it the same way, against the `SHA256SUMS` of
+   release `v0.3.0-rc21` (same release key). `--version` prints
+   `konsensus 0.3.0-rc21`.
+2. Let calls end. Stop only BitSov.
+3. Keep the data directory, config and encrypted seed as they are. rc22 adds
+   no SQL migration, config key or storage format since rc21, so rc21 reads
+   what rc22 wrote. Do not re-run `init` or restore an older snapshot.
+4. rc21 refuses a `konsensus.toml` key it does not know. If the config was
+   changed after the upgrade, for example for a later build, put back the copy
+   you kept before upgrading first.
+5. Put rc21 at the path your service runs and start it with the same config,
+   data and options.
+6. If you run two nodes that talk to each other, roll back one at a time and
+   let the first reconnect before restarting the second: two nodes that
+   reconnect at nearly the same moment can end up on different sessions (known
+   limit below).
+7. Check as after an upgrade: `/api/v1/health`, contacts and channels, and a
+   message in each direction.
+
+This applies only to data that rc22 or rc21 last ran on. A node that ran a
+build after rc22 has the location-bound record format and migration 033, which
+rc22 and older refuse ([above](#location-bound-storage-records-after-rc22)).
 
 Not included: call cutoff is not yet verified on real hardware, and this release
 does not fix the other open reports.
