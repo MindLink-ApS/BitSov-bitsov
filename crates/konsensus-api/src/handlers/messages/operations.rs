@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 
@@ -166,6 +166,40 @@ pub(crate) struct Operation {
     pub(crate) id: String,
     execution_id: String,
 }
+// Cancellation before the first wallet poll proves non-dispatch. Complete
+// that rollback under the operation lock, fenced to the same execution.
+struct DispatchRollback {
+    operation: Operation,
+    polled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for DispatchRollback {
+    fn drop(&mut self) {
+        if !self.armed || self.polled.load(Ordering::Acquire) {
+            return;
+        }
+        let operation = self.operation.clone();
+        tokio::spawn(async move {
+            let result: Result<(), ApiError> = async {
+                let _guard = lock(&operation.state, &operation.id).await?;
+                let mut op = operation.load().await?;
+                let mut data = recovery(&op)?;
+                if !data.dispatched {
+                    return Ok(());
+                }
+                data.dispatched = false;
+                op.payment_hash = None;
+                encode(&mut op, &data)?;
+                save(&operation.state, &mut op).await
+            }.await;
+            if let Err(error) = result {
+                tracing::warn!(%error, "unsubmitted payment rollback failed");
+            }
+        });
+    }
+}
+
 impl Operation {
     pub(crate) fn reservation_link(&self, readmission: bool) -> crate::spend_budget::OperationReservationLink {
         crate::spend_budget::OperationReservationLink {
@@ -311,6 +345,7 @@ impl Operation {
         debit: &Debit,
         hash: Option<String>,
         amount: u64,
+        tip: &crate::error::ObservedTip,
         future: F,
     ) -> Result<Result<PaymentDetails, LightningError>, ApiError>
     where
@@ -330,7 +365,15 @@ impl Operation {
         op.state = "paying".into();
         encode(&mut op, &data)?;
         save(&self.state, &mut op).await?;
-        let mut result = debit.dispatch_message_payment(&self.state, future).await;
+        let mut rollback = DispatchRollback {
+            operation: self.clone(), polled: Arc::new(AtomicBool::new(false)), armed: true,
+        };
+        let polled = rollback.polled.clone();
+        let wallet = async move {
+            polled.store(true, Ordering::Release);
+            future.await
+        };
+        let mut result = debit.dispatch_message_payment(&self.state, tip, wallet).await;
         match &mut result {
             Ok(Ok(details)) => {
                 if details.payment_hash.is_empty() {
@@ -343,7 +386,7 @@ impl Operation {
                 })?;
             }
             Ok(Err(LightningError::NotReady | LightningError::PaymentNotDispatched(_)))
-            | Err(ApiError::BudgetExceeded(_)) => {
+            | Err(ApiError::BudgetExceeded(_) | ApiError::ChainNotReady) => {
                 let mut op = self.load().await?;
                 let mut data = recovery(&op)?;
                 data.dispatched = false;
@@ -353,6 +396,7 @@ impl Operation {
             }
             _ => {} // durable dispatch intent remains unresolved
         }
+        rollback.armed = false;
         result
     }
     pub(crate) async fn release_call_debit(&self, debit: &Debit, recipient: &str) {

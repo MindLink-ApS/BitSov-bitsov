@@ -340,6 +340,7 @@ pub(crate) async fn chain_tip(state: &crate::state::AppState) -> Result<u64, Api
 #[derive(Debug)]
 pub(crate) struct ObservedTip {
     height: u64,
+    observed_at: tokio::time::Instant,
 }
 
 // Compile-time check that `ObservedTip` is not `Clone` (so not `Copy`): if it
@@ -358,11 +359,21 @@ impl ObservedTip {
     pub(crate) fn height(&self) -> u64 {
         self.height
     }
+
+    /// Reuse a send's observation for at most 30 seconds, including any wait
+    /// for its recipient. A longer preparation needs another usable tip.
+    pub(crate) async fn recheck(&self, state: &crate::state::AppState) -> Result<(), ApiError> {
+        if self.observed_at.elapsed() >= std::time::Duration::from_secs(30) {
+            chain_tip(state).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Read the tip for a payment about to be dispatched ([`chain_tip`]).
 pub(crate) async fn observe_tip(state: &crate::state::AppState) -> Result<ObservedTip, ApiError> {
-    chain_tip(state).await.map(|height| ObservedTip { height })
+    let observed_at = tokio::time::Instant::now();
+    chain_tip(state).await.map(|height| ObservedTip { height, observed_at })
 }
 
 /// [`chain_tip`] for a caller holding only the chain source.

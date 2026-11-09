@@ -2376,6 +2376,7 @@ dependencies = [
  "sha2",
  "socket2",
  "sqlx",
+ "syn 2.0.117",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -2509,6 +2510,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "vss-client-ng",
  "winapi",
 ]
@@ -4753,6 +4755,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
