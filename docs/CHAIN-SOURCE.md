@@ -31,11 +31,15 @@ is not an answer.
   that have answered. With `credentials_file`, a primary that has not answered
   (for example because its token request failed) is skipped for that start:
   LDK uses the verified fallback, which never receives credentials, and no
-  token is requested.
+  token is requested. Each Esplora endpoint is checked on its own, within ten
+  seconds (four per request), so a slow or silent endpoint never discards
+  another endpoint's answer.
 - **Asked again:** after a lost connection, a timeout or a reply cut short,
   before the next use; at least every 60 seconds otherwise. A cached Esplora
-  height is served only while its endpoint's check holds, and never after a
-  refusal. Electrum opens a new connection per query and is asked on each one.
+  height is served only while the check of the endpoint that served it holds,
+  and never after a refusal; after a refusal neither Esplora nor Electrum
+  counts as synced on an earlier height. Electrum opens a new connection per
+  query and is asked on each one.
   Every `getblockchaininfo` reply from Core is also compared. The running LDK
   node asks the endpoints its client uses every 60 seconds and is not
   money-ready while none has answered for three minutes.
@@ -209,6 +213,59 @@ transactions return an error rather than an assertion that they are unconfirmed.
 An available server tip is not proof that it is current. No keys are sent to the
 server, and chain selection does not change custody.
 
+## Tip readiness
+
+Prices, signed cards, admission quotes, peer price tables and paid sends are
+checked against the chain tip. With Bitcoin Core, Electrum or Esplora, the node
+reads the tip as the source's best block header (height and timestamp of the
+same block), and treats it as not ready when:
+
+- the read fails or times out;
+- the best block is height 0;
+- the best block is older than the limit for `[lightning] network`:
+
+| Network | Oldest best block |
+|---|---|
+| `bitcoin` | 3 hours |
+| `testnet`, `signet`, or no network named (LND, LNbits) | 24 hours |
+| `regtest` | no limit |
+
+A not-ready tip refuses rather than going on with height 0: paid sends, call
+quotes, admission quotes and card publishing answer `503` with
+`"code":"not_ready","reason":"chain_unavailable"` before anything is paid or
+signed (a call quote also before its price query is sent); a stranger's
+admission request gets the fixed `konsensus:not_ready:chain_unavailable`
+refusal; no price answer, price table or web manifest is sent; peer price
+tables are listed as `stale`. A send that starts while the wallet is not
+money-ready reads no tip, so it can only go out at an established zero price;
+if the wallet becomes ready meanwhile, a price to pay is quoted again against a
+real tip. A published front door card whose page price changed is re-signed
+only against a usable tip (with that tip's epoch); an unchanged card is still
+served without one. Chain-aware pricing refuses a price when a synced source's
+tip cannot be read (also `not_ready`/`chain_unavailable` on these routes); its
+existing static fallback when the source is not synced or has no fee estimate is
+unchanged. Admission reuses a tip height for up to a minute, but not past the
+tip's age limit.
+
+Every payment of a peer's price (messages, rooms, porch pages, files,
+calendar, call minutes, admission) reads the tip once more at the payment
+itself, whatever priced it: with no usable tip, nothing is paid. Payments the
+owner directs (paying an invoice, keysend, on-chain sends, channel opens,
+liquidity, sponsor gifts) are not priced against the tip and do not read it.
+
+A wrapped source that has refused itself for good (another network) serves
+no kept tip either.
+
+Where the timestamp comes from: Bitcoin Core's `getblockheader` `time` for the
+block at `getblockcount`; Electrum's raw 80-byte header for that height, read
+and hashed by the node; Esplora's `/block/{hash}` `timestamp` for the hash at the
+tip height, as the server reports it. A usable header is reused for at most 30
+seconds and is judged by its own timestamp; a refused one is not kept. Block timestamps may lag real time
+by up to about an hour, so the mainnet limit leaves about two hours without a
+block. The mock chain (Light and Cloud tiers) is synthetic and has no limit.
+The source's own sync check is unchanged. Which network the source is on is
+checked separately.
+
 ## Privacy and status
 
 Authenticated `GET /api/v1/status` includes:
@@ -304,8 +361,9 @@ LDK transport applies live headers to wallet sync, fees, funding checks and
 broadcasts, including client clones; it does not require a restart every five
 minutes. Token POSTs have a four-second timeout; API requests retain the caller's
 budget (ten seconds for LDK and the configured timeout for the chain provider,
-with the existing shorter height/readiness deadline). Authentication errors and
-HTTP error bodies are redacted. If all endpoints fail, LDK retains the primary's
+with the existing shorter height/readiness deadline, and the configured timeout
+for a recovery broadcast); a request without its own budget gets 30 seconds. Authentication errors and HTTP error bodies are
+redacted. If all endpoints fail, LDK retains the primary's
 HTTP status when available; rate-limit failures keep their existing 429 policy.
 
 Chain requests use the existing ordered fallback list when token acquisition,

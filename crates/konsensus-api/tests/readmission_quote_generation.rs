@@ -390,3 +390,151 @@ async fn read_scope_quote_moves_no_money_and_does_not_authorize_send() {
     assert_eq!(status, 403, "{body}");
     assert_eq!(net.spent().await, 0);
 }
+
+/// T2: an admission quote and a paid send are both checked against the local
+/// tip. A tip that cannot be read refuses before any quote is asked or any
+/// payment made; nothing goes on with height 0.
+#[tokio::test]
+async fn no_quote_or_payment_without_a_chain_tip() {
+    let mut net = net().await;
+    let chain = Arc::new(common::TipDownChain::down());
+    net.state = Arc::new(AppState { chain: chain.clone(), ..(*net.state).clone() });
+
+    let quote = serde_json::json!({"recipient": net.contact.peer.to_hex()});
+    let (status, body) = net.post("/api/v1/messages/first-contact/quote", quote).await;
+    common::assert_chain_not_ready(status, &body);
+    assert_eq!(chain.reads(), 1);
+
+    let (status, body) = net.compose(&uuid::Uuid::new_v4().to_string(), 4_000).await;
+    common::assert_chain_not_ready(status, &body);
+    assert_eq!(chain.reads(), 2);
+
+    assert_eq!(net.contact.quotes.load(Ordering::SeqCst), 0, "no admission quote was asked");
+    assert_eq!(net.spent().await, 0);
+
+    // The tip back: the same send pays admission once and the message once.
+    net.state = Arc::new(AppState { chain: Arc::new(common::StubChain), ..(*net.state).clone() });
+    let (status, body) = net.compose(&uuid::Uuid::new_v4().to_string(), 4_000).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(net.spent().await, 4_000);
+}
+
+/// The payer's wallet, not money-ready on its first readiness poll.
+struct FirstPollNotReady {
+    inner: Arc<SharedMockProvider>,
+    polls: AtomicUsize,
+}
+
+#[async_trait]
+impl LightningProvider for FirstPollNotReady {
+    async fn money_ready(&self) -> bool {
+        self.polls.fetch_add(1, Ordering::SeqCst) != 0
+    }
+    async fn is_available(&self) -> bool {
+        self.inner.is_available().await
+    }
+    async fn create_invoice(&self, amount: u64, description: &str, expiry: u32) -> Result<konsensus_core::traits::lightning::Invoice, konsensus_core::traits::lightning::LightningError> {
+        self.inner.create_invoice(amount, description, expiry).await
+    }
+    async fn pay_invoice(&self, bolt11: &str) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.inner.pay_invoice(bolt11).await
+    }
+    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.inner.pay_invoice_with_fee_limit(bolt11, cap).await
+    }
+    async fn get_payment_status(&self, hash: &str) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.inner.get_payment_status(hash).await
+    }
+    async fn get_balance_msat(&self) -> Result<u64, konsensus_core::traits::lightning::LightningError> {
+        self.inner.get_balance_msat().await
+    }
+    async fn list_payments(&self, limit: u32) -> Result<Vec<konsensus_core::traits::lightning::PaymentDetails>, konsensus_core::traits::lightning::LightningError> {
+        self.inner.list_payments(limit).await
+    }
+    async fn get_node_pubkey(&self) -> Option<String> {
+        self.inner.get_node_pubkey().await
+    }
+}
+
+/// Own price 0 for every kind.
+struct FreePricing;
+
+#[async_trait]
+impl konsensus_core::traits::pricing::PricingEngine for FreePricing {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get_price_msat(&self, _: u16) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        Ok(0)
+    }
+    async fn get_category_price_msat(&self, _: konsensus_core::kind::KindCategory) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        Ok(0)
+    }
+}
+
+/// The admission payment chokepoint: a stranger's admission quote fetched
+/// earlier (with a tip) and kept by the quote route is not paid by a send that
+/// read no tip (its wallet was not ready when it began) while the tip is gone.
+#[tokio::test]
+async fn a_kept_admission_quote_is_not_paid_without_a_chain_tip() {
+    let dir = tempfile::tempdir().unwrap();
+    let payer = Arc::new(SharedMockProvider::new(&dir.path().join("ledger.db"), "payer", START_MSAT).unwrap());
+    let payee = Arc::new(SharedMockProvider::new(&dir.path().join("ledger.db"), "payee", 0).unwrap());
+    let mut state = common::test_state_with_lightning(payer.clone());
+    let (_, identity) = NodeIdentity::generate().unwrap();
+    let peer = *identity.node_id();
+    // A stranger: no E2EE session.
+    let contact = Arc::new(ReconnectingContact {
+        peer,
+        requests: state.invoice_requests.clone(),
+        recipient_wallet: payee,
+        generation: Mutex::new(Instant::now()),
+        paid: AtomicBool::new(false),
+        flap_on_quote: AtomicBool::new(false),
+        quotes: AtomicUsize::new(0),
+        no_generation: AtomicBool::new(false),
+        reconnect_after_connected_since: AtomicUsize::new(0),
+        connected_since_calls: AtomicUsize::new(0),
+    });
+    Arc::get_mut(&mut state).unwrap().transport = contact.clone();
+    let token = auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, auth::Scope::all()).unwrap();
+    let post = |state: Arc<AppState>, uri: &'static str, body: serde_json::Value| {
+        let token = token.clone();
+        async move {
+            let response = common::test_router(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or(serde_json::Value::Null))
+        }
+    };
+    // The owner looks at the stranger's admission quote while the tip is there.
+    let (status, body) = post(state.clone(), "/api/v1/messages/first-contact/quote", serde_json::json!({"recipient": peer.to_hex()})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(contact.quotes.load(Ordering::SeqCst), 1);
+
+    // Then the tip is gone, and a send begins with the wallet not ready.
+    let chain = Arc::new(common::TipDownChain::down());
+    let wallet = Arc::new(FirstPollNotReady { inner: payer.clone(), polls: AtomicUsize::new(0) });
+    let state = Arc::new(AppState { chain: chain.clone(), lightning: wallet.clone(), pricing: Arc::new(FreePricing), ..(*state).clone() });
+    let (status, body) = post(state.clone(), "/api/v1/messages/compose", serde_json::json!({
+        "recipient": peer.to_hex(), "kind": konsensus_core::kind::KIND_CHAT, "plaintext": "hello stranger",
+        "max_total_msat": 10_000, "operation_id": uuid::Uuid::new_v4().to_string(),
+    })).await;
+    assert!(wallet.polls.load(Ordering::SeqCst) >= 2, "readiness changed mid-send");
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["reason"], "chain_unavailable", "{body}");
+    assert_eq!(chain.reads(), 1, "the admission payment asked for a tip");
+    assert_eq!(contact.quotes.load(Ordering::SeqCst), 1, "the kept quote was used, no new one asked");
+    assert_eq!(START_MSAT - payer.get_balance_msat().await.unwrap(), 0, "nothing paid");
+}

@@ -535,6 +535,8 @@ pub(crate) async fn page_price(
             "porch supports GET only; nothing paid".into(),
         ));
     }
+    // A porch page is always paid: no quote is asked without a usable tip.
+    crate::error::chain_tip(state).await?;
     let quote = peer_quote(state, peer, &request.path, fee_cap).await?;
     match quote.status {
         PageStatus::Ok => {

@@ -22,9 +22,9 @@ Node IDs and public keys are the protocol identity layer. IP addresses and DNS n
 
 ### Developer Preview: Build the CLI from Source
 
-The public protocol/core repository is source-first until the signed release is published. Signed binaries and desktop app packages are release artifacts; they are published only after the final launch go/no-go.
+The public protocol/core repository is source-first until the signed release is published. Signed pre-release node binaries are published on the [releases page](https://github.com/MindLink-ApS/BitSov-bitsov/releases), for signet testing only; desktop app packages are published only after the final launch go/no-go.
 
-Verifying a release: artifacts are signed with the release key described under [Reporting a Vulnerability in `SECURITY.md`](SECURITY.md#reporting-a-vulnerability); the release policy has the [pinned build recipe](docs/ops/RELEASE_POLICY.md#reproducibility-inputs) and the [independent rebuild gate](docs/ops/RELEASE_POLICY.md#independent-rebuild-gate-h3), and the per-release checklists live under [`docs/releases/`](docs/releases/).
+Verifying a release: artifacts are signed with the release key described under [Reporting a Vulnerability in `SECURITY.md`](SECURITY.md#reporting-a-vulnerability). The commands to verify and install one binary are in [install a signed pre-release binary](docs/QUICKSTART-SIGNET.md#1b-or-install-a-signed-pre-release-binary). The release policy has the [pinned build recipe](docs/ops/RELEASE_POLICY.md#reproducibility-inputs) and the [independent rebuild gate](docs/ops/RELEASE_POLICY.md#independent-rebuild-gate-h3), and the per-release checklists live under [`docs/releases/`](docs/releases/).
 
 ```bash
 # Prerequisite: rustup. The toolchain is pinned in rust-toolchain.toml (1.99.1)
@@ -72,7 +72,7 @@ See the [CLN configuration reference](docs/CLN.md).
 | Profile | Setup | Identity | Lightning | Storage |
 |------|-------|----------|-----------|---------|
 | **Relay** | Paired remote access | User-held keys | User-authorized payments | Relay-held ciphertext |
-| **Light** | Build from source (signed binaries after the launch go/no-go) | Local mnemonic | User-selected Lightning | Local SQLite |
+| **Light** | Build from source, or a signed pre-release binary (signet only) | Local mnemonic | User-selected Lightning | Local SQLite |
 | **Full** | Self-hosted | HSM-ready | Own LDK/LND node | Encrypted SQLite/PostgreSQL |
 
 `init --tier light|full` selects the onboarding mode (see the [glossary](docs/DESIGN-REASONING.md#7-glossary-the-five-meanings-of-tier)). All profiles use node identity as the canonical endpoint identifier. Reachability hints are secondary.

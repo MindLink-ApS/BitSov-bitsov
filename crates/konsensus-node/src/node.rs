@@ -84,12 +84,11 @@ async fn verify_ldk_esplora_network(config: &NodeConfig, network: bitcoin::Netwo
         .transpose()?;
     let mut urls = vec![esplora_url.as_str()];
     urls.extend(esplora_url_fallback.as_deref());
-    let check =
-        konsensus_chain::network::verify_esplora_api_urls(network, &urls, primary.as_deref());
-    if let Ok(result) = tokio::time::timeout(CHAIN_NETWORK_CHECK_TIMEOUT, check).await {
-        if let konsensus_chain::NetworkCheck::Mismatch(mismatch) = result.check {
-            return Err(anyhow::Error::new(mismatch));
-        }
+    // Bounded per endpoint inside the check.
+    let result =
+        konsensus_chain::network::verify_esplora_api_urls(network, &urls, primary.as_deref()).await;
+    if let konsensus_chain::NetworkCheck::Mismatch(mismatch) = result.check {
+        return Err(anyhow::Error::new(mismatch));
     }
     Ok(())
 }
@@ -507,6 +506,9 @@ impl KonsensusNode {
             // config exposes it (relay is dormant/default-off — ADR-034).
             ..Default::default()
         };
+        // From here on the chain tip is a recent best block or an error, for
+        // pricing, admission, price tables and paid sends alike.
+        let chain = bounded_tip(chain, &config);
         let pricing: Arc<dyn PricingEngine> = match config.pricing.mode {
             PricingMode::Static => {
                 info!(mode = "static", "pricing engine");
@@ -845,6 +847,21 @@ impl KonsensusNode {
 /// invitee connects inbound) is admitted by `node_id` with a non-routable
 /// sentinel address and `auto_connect = false` — it is accepted inbound, never
 /// dialed.
+/// A real chain source's tip, bounded by the configured network's age limit
+/// (`[lightning] network`; see `konsensus_chain::tip::max_tip_age`). Mock
+/// chain data is synthetic and stays as it is.
+pub(crate) fn bounded_tip(
+    chain: Arc<dyn ChainProvider>,
+    config: &NodeConfig,
+) -> Arc<dyn ChainProvider> {
+    match config.chain {
+        ChainConfig::Mock => chain,
+        ChainConfig::Esplora { .. } | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => {
+            konsensus_chain::FreshTip::wrap(chain, config.lightning.bitcoin_network().as_deref())
+        }
+    }
+}
+
 pub(crate) fn merge_persisted_peers(
     registry: &mut PeerRegistry,
     peers: Vec<konsensus_storage::Peer>,

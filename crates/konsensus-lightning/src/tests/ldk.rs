@@ -2136,3 +2136,87 @@ async fn running_node_watches_only_the_selected_esplora_url() {
     server.abort();
     unused_server.abort();
 }
+
+/// One Esplora endpoint answers slowly (within each request's bound) and the
+/// other accepts connections and never replies. Together they take longer
+/// than one check's bound, but the answer that came in is kept: the start
+/// and the running watch both use the endpoint that answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_answer_is_kept_while_another_esplora_endpoint_is_silent() {
+    use axum::{routing::get, Router};
+    let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Signet);
+    let hash = block.block_hash().to_string();
+    let header = bitcoin::consensus::encode::serialize_hex(&block.header);
+    // Below the four-second request bound; two of these, plus a silent
+    // endpoint's four seconds, are more than ten seconds in all.
+    let delay = Duration::from_millis(3_300);
+    let app = Router::new()
+        .route(
+            "/block-height/0",
+            get(move || async move {
+                tokio::time::sleep(delay).await;
+                hash
+            }),
+        )
+        .route(
+            "/block/:hash/header",
+            get(move || async move {
+                tokio::time::sleep(delay).await;
+                header
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let slow = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent = format!("http://{}", listener.local_addr().unwrap());
+    let hold = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+
+    let mut config = LdkConfig {
+        tower: Default::default(),
+        forward_to_private_channels: false,
+        our_to_self_delay_blocks: None,
+        lsps2_service: Default::default(),
+        channel_peers: None,
+        channel_capacity_limits: Default::default(),
+        esplora_sync_intervals: Default::default(),
+        logging: Default::default(),
+        electrum: None,
+        bitcoind: None,
+        liquidity: Default::default(),
+        storage_dir: PathBuf::from("/tmp/ldk_test"),
+        scb_backup_dir: None,
+        scb_rotation_count: 24,
+        mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
+        passphrase: None,
+        network: "signet".to_string(),
+        esplora_url: slow.clone(),
+        esplora_url_fallback: Some(silent.clone()),
+        credentials_file: None,
+        rgs_url: None,
+        lsp_node_id: None,
+        lsp_address: None,
+        lsp_token: None,
+        listening_address: None,
+    };
+    let probe = SourceProbe::Esplora {
+        urls: vec![slow.clone(), silent.clone()],
+        primary: None,
+    };
+    let (install, check) = tokio::join!(
+        select_verified_esplora_urls(bitcoin::Network::Signet, &mut config, None),
+        probe.check(bitcoin::Network::Signet),
+    );
+    let install = install.expect("the endpoint that answered is used");
+    assert_eq!(install.urls, std::slice::from_ref(&slow));
+    assert_eq!(config.esplora_url, slow);
+    assert_eq!(config.esplora_url_fallback, None);
+    assert_eq!(check, konsensus_chain::NetworkCheck::Verified);
+    server.abort();
+    hold.abort();
+}

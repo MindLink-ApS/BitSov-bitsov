@@ -127,6 +127,21 @@ pub trait ChainProvider: Send + Sync {
     async fn is_synced_with_height(&self, _height: u64) -> bool {
         self.is_synced().await
     }
+
+    /// Whether the tip this source last served is still recent enough to use.
+    /// A caller that keeps a height read for a while asks this before reusing
+    /// it. Sources without a tip-age bound always answer `true`.
+    async fn tip_is_fresh(&self) -> bool {
+        true
+    }
+
+    /// A refusal this source has latched for good (for example, it answered
+    /// on another network than the configured one). Anything that keeps chain
+    /// data from this source checks it before reusing that data. Sources
+    /// without such a check never refuse.
+    fn refusal(&self) -> Result<(), ChainError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

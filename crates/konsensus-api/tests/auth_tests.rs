@@ -1992,6 +1992,37 @@ async fn status_reports_max_call_minutes_to_the_owner_only() {
     assert!(body.get("max_call_minutes").is_none());
 }
 
+/// The owner's `/status` names the running release next to the unchanged API
+/// `version`; the public `/health` keeps only the API `version`.
+#[tokio::test]
+async fn status_reports_release_version_to_the_owner_only() {
+    async fn get(state: &Arc<AppState>, uri: &str, auth: bool) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder().uri(uri);
+        if auth {
+            req = req.header("authorization", auth_header(state));
+        }
+        let resp = build_router(Arc::clone(state)).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+    let state = test_state();
+    let (status, body) = get(&state, "/api/v1/status", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["node_version"], env!("CARGO_PKG_VERSION"));
+    assert!(!env!("CARGO_PKG_VERSION").is_empty());
+    assert_eq!(body["version"], 2, "API version is unchanged");
+
+    let (status, body) = get(&state, "/api/v1/status", false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.get("node_version").is_none());
+
+    let (status, body) = get(&state, "/api/v1/health", false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.get("node_version").is_none(), "public /health must not name the release");
+    assert_eq!(body["version"], 2);
+}
+
 /// `[calls] stun_listen`: the owner's `/status` reports the STUN port only when
 /// the responder runs; the public `/health` never does.
 #[tokio::test]

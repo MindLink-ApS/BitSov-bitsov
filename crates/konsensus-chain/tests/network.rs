@@ -833,3 +833,132 @@ async fn esplora_failed_recovery_broadcast_is_a_lost_connection() {
     let error = provider.estimate_fee(6).await.unwrap_err().to_string();
     assert!(error.contains("network mismatch"), "{error}");
 }
+
+/// A tip kept by `FreshTip` is not served once its source has refused itself
+/// for being on another network: the refusal is latched, the kept header too
+/// old a witness.
+#[tokio::test]
+async fn a_kept_tip_is_dropped_when_its_source_refuses_its_network() {
+    let network = Arc::new(Mutex::new(Network::Signet));
+    let served = network.clone();
+    let fixture = electrum_fixture::Fixture::new(move |request| {
+        let network = *served.lock().unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(network).header;
+        let mut tip = genesis;
+        tip.time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        let header = if request["params"][0] == 0 { genesis } else { tip };
+        let result = match request["method"].as_str().unwrap() {
+            "blockchain.block.header" => json!(bitcoin::consensus::encode::serialize_hex(&header)),
+            "blockchain.headers.subscribe" => {
+                json!({"height": 101, "hex": bitcoin::consensus::encode::serialize_hex(&tip)})
+            }
+            "blockchain.estimatefee" => json!(0.00002),
+            method => panic!("unexpected method {method}"),
+        };
+        json!({ "result": result })
+    })
+    .await;
+    let source = Arc::new(
+        ElectrumProvider::new(ElectrumConfig {
+            server_url: fixture.url.clone(),
+            operator: Default::default(),
+        })
+        .unwrap()
+        .with_network(Network::Signet),
+    );
+    let tip = konsensus_chain::FreshTip::new(
+        source.clone(),
+        Some(konsensus_chain::tip::TEST_NETWORK_MAX_TIP_AGE),
+    );
+    assert_eq!(tip.get_block_height().await.unwrap(), 101);
+    // The server moves to another network; the next read through the wrapper
+    // (a fee estimate, which bypasses the kept tip) latches the refusal.
+    *network.lock().unwrap() = Network::Bitcoin;
+    assert!(tip.estimate_fee(6).await.unwrap_err().to_string().contains("network mismatch"));
+    assert!(source.get_block_height().await.is_err());
+    assert!(tip.refusal().is_err());
+    assert!(tip.get_block_height().await.is_err(), "the kept tip is not served");
+    assert!(!tip.tip_is_fresh().await);
+}
+
+// ── Follow-ups: per-endpoint bounds, cache provenance, Electrum latch ───
+
+#[tokio::test]
+async fn esplora_cached_height_is_tied_to_the_endpoint_that_served_it() {
+    let primary = Explorer::new(Network::Signet).await;
+    let fallback = Explorer::new(Network::Signet).await;
+    let provider = esplora_provider(&primary.url, &[&fallback.url], Network::Signet);
+    // The height comes from the primary.
+    assert_eq!(provider.get_block_height().await.unwrap(), 101);
+    assert_eq!(primary.tip_requests.load(Ordering::SeqCst), 1);
+    // The primary's connection drops (its check ends) and the verified
+    // fallback serves the next request, so it is now the endpoint in use.
+    primary.stop().await;
+    assert_eq!(provider.estimate_fee(6).await.unwrap().sat_per_vbyte, 2.0);
+    // The primary returns on mainnet. Its cached height is not served on the
+    // strength of the fallback's check: the primary is asked again first.
+    primary.restart_on(Network::Bitcoin).await;
+    let error = provider.get_block_height().await.unwrap_err().to_string();
+    assert!(error.contains("network mismatch"), "{error}");
+    assert!(!provider.is_synced_with_height(101).await);
+}
+
+#[tokio::test]
+async fn electrum_height_check_honours_a_refusal() {
+    let network = Arc::new(Mutex::new(Network::Signet));
+    let server = electrum_on(Arc::clone(&network)).await;
+    let provider = electrum_provider(&server.url, Network::Signet);
+    assert_eq!(provider.get_block_height().await.unwrap(), 101);
+    assert!(provider.is_synced_with_height(101).await);
+    *network.lock().unwrap() = Network::Bitcoin;
+    assert!(provider.get_block_height().await.is_err());
+    // A height read before the refusal never makes the source synced again.
+    assert!(!provider.is_synced_with_height(101).await);
+    *network.lock().unwrap() = Network::Signet;
+    assert!(!provider.is_synced_with_height(101).await);
+}
+
+/// An authenticated transport that never answers.
+#[derive(Debug)]
+struct SilentTransport;
+
+impl esplora_client::r#async::HttpTransport for SilentTransport {
+    fn execute(
+        &self,
+        _request: reqwest::RequestBuilder,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<reqwest::Response, esplora_client::Error>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+async fn esplora_silent_endpoint_leaves_the_other_answer_in_place() {
+    use konsensus_chain::network::{verify_esplora_api_urls, ESPLORA_ENDPOINT_CHECK_TIMEOUT};
+    let fallback = Explorer::new(Network::Signet).await;
+    let fallback_api = format!("{}/api", fallback.url);
+    let urls = ["https://silent-primary.invalid/api", fallback_api.as_str()];
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        ESPLORA_ENDPOINT_CHECK_TIMEOUT + std::time::Duration::from_secs(5),
+        verify_esplora_api_urls(Network::Signet, &urls, Some(&SilentTransport)),
+    )
+    .await
+    .expect("a silent endpoint is bounded on its own");
+    assert_eq!(result.verified, [false, true]);
+    assert_eq!(result.check, NetworkCheck::Unavailable);
+    // Endpoints are checked side by side: one bound, not one per endpoint.
+    assert!(
+        started.elapsed() < ESPLORA_ENDPOINT_CHECK_TIMEOUT + std::time::Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
