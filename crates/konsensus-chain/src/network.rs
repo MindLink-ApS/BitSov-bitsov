@@ -552,7 +552,14 @@ mod tests {
 
     #[tokio::test]
     async fn an_oversized_genesis_answer_is_not_parsed() {
+        // "ab" repeated is hex, and longer than the cap. Trim does not shorten
+        // it. Without the length check this still fails hash parsing, so the
+        // cap itself is what `genesis_answer` must reject.
         let huge = "ab".repeat(MAX_GENESIS_ANSWER_BYTES);
+        assert!(
+            genesis_answer(&huge).is_err(),
+            "an answer over the cap must be refused before it is parsed"
+        );
         let result = esplora_genesis(|_path| {
             let huge = huge.clone();
             async move { Ok(huge) }
@@ -629,6 +636,99 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("invalid Esplora genesis block"));
         serve.abort();
+    }
+
+    /// Startup checks every Esplora URL before use. An oversized genesis body
+    /// is unverified and must not latch a mismatch onto a good endpoint.
+    /// The body is not sent, so dropping the cap on this path waits out the
+    /// request timeout instead of returning.
+    #[tokio::test]
+    async fn an_oversized_url_check_does_not_latch_a_mismatch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let block = bitcoin::blockdata::constants::genesis_block(Network::Signet);
+        let hash = block.block_hash().to_string();
+        let header = bitcoin::consensus::encode::serialize_hex(&block.header);
+
+        let oversized = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let oversized_url = format!("http://{}/api", oversized.local_addr().unwrap());
+        let oversized_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = oversized.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 10000000\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = socket.read(&mut buf).await;
+                });
+            }
+        });
+
+        let good = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_url = format!("http://{}/api", good.local_addr().unwrap());
+        let good_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = good.accept().await else {
+                    return;
+                };
+                let hash = hash.clone();
+                let header = header.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&request);
+                    let line = text.lines().next().unwrap_or("");
+                    let body = if line.contains("block-height/0") {
+                        hash
+                    } else if line.contains("/header") {
+                        header
+                    } else {
+                        return;
+                    };
+                    let mut response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(body.as_bytes());
+                    let _ = socket.write_all(&response).await;
+                });
+            }
+        });
+
+        let started = Instant::now();
+        let result = verify_esplora_api_urls::<crate::bearer::BearerTransport>(
+            Network::Signet,
+            &[&oversized_url, &good_url],
+            None,
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "oversized genesis answer was not refused before its body was read: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.verified, [false, true]);
+        assert_eq!(result.check, NetworkCheck::Unavailable);
+        oversized_task.abort();
+        good_task.abort();
     }
 
     /// Records each request's timeout and serves the signet identity.
