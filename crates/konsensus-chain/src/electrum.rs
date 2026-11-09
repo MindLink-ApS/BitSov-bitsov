@@ -252,6 +252,7 @@ impl ChainProvider for ElectrumProvider {
                 ElectrumOperator::ThirdParty => "third_party",
             },
             host: self.config.host().ok().map(str::to_owned),
+            explorer_default: false,
         }
     }
 

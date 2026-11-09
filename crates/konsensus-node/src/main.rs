@@ -4,6 +4,9 @@
 
 mod admission_quotes;
 mod call_media;
+mod chain_tip;
+#[path = "cli/chain_tip.rs"]
+mod chain_tip_cmd;
 mod claim_code;
 mod cli;
 mod config;
@@ -193,6 +196,7 @@ async fn main() -> Result<()> {
         } => {
             seed_cmd::cmd_seed_encrypt(&config)?;
         }
+        Command::ChainTip(args) => chain_tip_cmd::run(args)?,
         Command::Device { command } => {
             owner_cmd::cmd_device(command).await?;
         }

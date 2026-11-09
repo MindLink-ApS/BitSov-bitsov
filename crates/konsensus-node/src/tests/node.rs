@@ -174,6 +174,7 @@ fn esplora_chain() -> ChainConfig {
         api_url: "http://127.0.0.1:1".into(),
         esplora_url_fallback: None,
         credentials_file: None,
+        accept_third_party_tip: false,
     }
 }
 
@@ -215,6 +216,7 @@ async fn from_config_reads_a_real_source_tip_through_the_bound() {
         api_url: format!("http://{addr}"),
         esplora_url_fallback: None,
         credentials_file: None,
+        accept_third_party_tip: false,
     };
     let node = KonsensusNode::from_config(config, None).await.unwrap();
     assert!(node.chain().get_block_height().await.is_err());
@@ -892,6 +894,7 @@ async fn from_config_refuses_an_esplora_source_on_another_network() {
         api_url: url,
         esplora_url_fallback: None,
         credentials_file: None,
+        accept_third_party_tip: false,
     };
     let err = KonsensusNode::from_config(config, None)
         .await
@@ -953,6 +956,7 @@ async fn from_config_refuses_an_ldk_esplora_url_on_another_network_before_node_s
         api_url: chain_url.clone(),
         esplora_url_fallback: Some(chain_url),
         credentials_file: None,
+        accept_third_party_tip: false,
     };
     let err = KonsensusNode::from_config(config, None)
         .await
