@@ -333,10 +333,23 @@ pub(crate) async fn chain_tip(state: &crate::state::AppState) -> Result<u64, Api
 /// Evidence that this send read a usable chain tip. Only [`observe_tip`]
 /// makes one, and every function that dispatches a peer payment takes one:
 /// a path that never read a usable tip cannot pay.
-#[derive(Debug, Clone, Copy)]
+/// Deliberately neither `Clone` nor `Copy`: the evidence cannot be duplicated.
+#[derive(Debug)]
 pub(crate) struct ObservedTip {
     height: u64,
 }
+
+// Compile-time check that `ObservedTip` is not `Clone` (so not `Copy`): if it
+// were, both impls below would apply and the item path would be ambiguous.
+const _: () = {
+    trait AmbiguousIfClone<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    struct IsClone;
+    impl<T: Clone> AmbiguousIfClone<IsClone> for T {}
+    let _ = <ObservedTip as AmbiguousIfClone<_>>::some_item;
+};
 
 impl ObservedTip {
     pub(crate) fn height(&self) -> u64 {
