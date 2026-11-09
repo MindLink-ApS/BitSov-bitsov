@@ -478,3 +478,178 @@ fn a_distinct_public_fallback_next_to_an_authenticated_primary_counts() {
         [("chain", "mempool.space"), ("lightning", "mempool.space")]
     );
 }
+
+/// A chain source with a best block of a chosen age and a refusal latch.
+struct TipSource {
+    age_secs: std::sync::atomic::AtomicU64,
+    refused: std::sync::atomic::AtomicBool,
+}
+
+impl TipSource {
+    fn new(age_secs: u64) -> Arc<Self> {
+        Arc::new(Self {
+            age_secs: age_secs.into(),
+            refused: false.into(),
+        })
+    }
+}
+
+#[async_trait]
+impl ChainProvider for TipSource {
+    fn chain_view(&self) -> ChainView {
+        ChainView {
+            backend: "esplora",
+            trust_level: "third_party",
+            host: Some("mempool.space".into()),
+            explorer_default: false,
+        }
+    }
+    fn trust_level(&self) -> TrustLevel {
+        TrustLevel::ServerTrust
+    }
+    async fn get_block_height(&self) -> Result<u64, ChainError> {
+        Ok(800_000)
+    }
+    async fn get_block_header(&self, height: u64) -> Result<BlockHeader, ChainError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Ok(BlockHeader {
+            height,
+            hash: format!("{height:064x}"),
+            timestamp: now - self.age_secs.load(std::sync::atomic::Ordering::SeqCst),
+            bits: 0x1d00_ffff,
+        })
+    }
+    async fn estimate_fee(&self, target_blocks: u32) -> Result<FeeEstimate, ChainError> {
+        Ok(FeeEstimate {
+            target_blocks,
+            sat_per_vbyte: 1.0,
+        })
+    }
+    async fn is_tx_confirmed(&self, _txid: &str, _min: u32) -> Result<bool, ChainError> {
+        Ok(false)
+    }
+    async fn is_synced(&self) -> bool {
+        true
+    }
+    fn refusal(&self) -> Result<(), ChainError> {
+        if self.refused.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(ChainError::NotAvailable("source is on another network".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn labelled_fresh_tip(source: &Arc<TipSource>) -> Arc<dyn ChainProvider> {
+    let found = ExplorerDefault {
+        sources: vec![ExplorerSource {
+            stanza: "chain",
+            host: "mempool.space",
+        }],
+        acceptable: true,
+    };
+    let bounded = konsensus_chain::FreshTip::wrap(
+        Arc::clone(source) as Arc<dyn ChainProvider>,
+        Some("bitcoin"),
+    );
+    label(bounded, Some(&found))
+}
+
+/// Through the label, the bounded tip's age check still refuses a stale tip.
+#[tokio::test]
+async fn the_label_keeps_the_tip_age_check() {
+    let fresh = TipSource::new(60);
+    let chain = labelled_fresh_tip(&fresh);
+    assert!(chain.chain_view().explorer_default);
+    assert!(chain.tip_is_fresh().await);
+    assert_eq!(chain.get_block_height().await.unwrap(), 800_000);
+
+    let stale = TipSource::new(4 * 3600);
+    let chain = labelled_fresh_tip(&stale);
+    assert!(chain.chain_view().explorer_default);
+    assert!(!chain.tip_is_fresh().await, "a stale tip must not count as fresh");
+    assert!(chain.get_block_height().await.is_err());
+    assert!(chain.get_best_block_header().await.is_err());
+}
+
+/// Through the label, a source's latched network refusal still refuses.
+#[tokio::test]
+async fn the_label_keeps_the_refusal_latch() {
+    let source = TipSource::new(60);
+    let chain = labelled_fresh_tip(&source);
+    assert!(chain.refusal().is_ok());
+    assert!(chain.tip_is_fresh().await);
+    source
+        .refused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(chain.refusal().is_err(), "the latch must reach the caller");
+    assert!(!chain.tip_is_fresh().await, "a refused source has no fresh tip");
+    assert!(chain.get_block_height().await.is_err());
+}
+
+/// The trait's methods as declared in its source, and those the label names.
+fn method_names(source: &str, start: &str) -> Vec<String> {
+    let body = source
+        .split(start)
+        .nth(1)
+        .unwrap_or_else(|| panic!("{start} not found"));
+    let body = &body[..body.find("\n}\n").expect("end of block")];
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let rest = line
+                .strip_prefix("async fn ")
+                .or_else(|| line.strip_prefix("fn "))?;
+            Some(rest.split(['(', '<']).next()?.trim().to_owned())
+        })
+        .collect()
+}
+
+/// Fails when `ChainProvider` gains a method the label does not forward:
+/// a default there would silently replace the inner source's answer.
+#[test]
+fn the_label_forwards_every_chain_provider_method() {
+    let declared = method_names(
+        include_str!("../../../konsensus-core/src/traits/chain.rs"),
+        "pub trait ChainProvider",
+    );
+    for expected in ["chain_view", "get_block_height", "tip_is_fresh", "refusal"] {
+        assert!(declared.iter().any(|m| m == expected), "{expected}: {declared:?}");
+    }
+    let forwarded = method_names(
+        include_str!("../chain_tip.rs"),
+        "impl ChainProvider for ExplorerDefaultLabel",
+    );
+    let missing: Vec<&String> = declared.iter().filter(|m| !forwarded.contains(m)).collect();
+    assert!(missing.is_empty(), "not forwarded by the label: {missing:?}");
+}
+
+/// Embedded LDK's authenticated transport merges a fallback equal to its paid
+/// primary (trailing slash aside): that fallback is not a public explorer.
+#[test]
+fn an_ldk_fallback_repeating_the_paid_primary_is_not_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    for (primary, fallback, expected) in [
+        ("https://blockstream.info/api", "https://blockstream.info/api/", vec![]),
+        ("https://blockstream.info/api/", "https://blockstream.info/api", vec![]),
+        (
+            "https://blockstream.info/api",
+            "https://mempool.space/api",
+            vec![("lightning", "mempool.space")],
+        ),
+    ] {
+        let config = config_with(
+            dir.path(),
+            "backend = \"mock\"",
+            &format!(
+                "backend = \"ldk\"\nnetwork = \"bitcoin\"\nesplora_url = \"{primary}\"\n\
+                 credentials_file = \"/secrets/chain-api.toml\"\n\
+                 esplora_url_fallback = \"{fallback}\""
+            ),
+        );
+        assert_eq!(sources(explorer_default(&config)), expected, "{primary} / {fallback}");
+    }
+}

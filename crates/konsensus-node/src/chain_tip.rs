@@ -102,8 +102,20 @@ pub fn explorer_default(config: &NodeConfig) -> Option<ExplorerDefault> {
         ..
     } = &config.lightning
     {
+        // With credentials, the authenticated transport merges a fallback
+        // that is the primary again (its duplicate rule), so that fallback is
+        // the paid primary too.
+        let paid = credentials_file
+            .as_ref()
+            .map(|_| authenticated_endpoint(esplora_url));
         let primary = credentials_file.is_none().then_some(esplora_url.as_str());
-        for url in primary.into_iter().chain(esplora_url_fallback.as_deref()) {
+        let fallback = esplora_url_fallback
+            .as_deref()
+            .filter(|url| match &paid {
+                Some(key) => authenticated_endpoint(url) != *key,
+                None => true,
+            });
+        for url in primary.into_iter().chain(fallback) {
             push(&mut sources, "lightning", url);
         }
     }
@@ -120,6 +132,14 @@ fn esplora_endpoint(url: &str) -> String {
     let base = url.trim_end_matches('/');
     let base = base.strip_suffix("/api").unwrap_or(base);
     format!("{base}/api")
+}
+
+/// The endpoint key embedded LDK's authenticated transport deduplicates on:
+/// the parsed URL without a trailing slash.
+fn authenticated_endpoint(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .map(|url| url.as_str().trim_end_matches('/').to_owned())
 }
 
 fn push(sources: &mut Vec<ExplorerSource>, stanza: &'static str, url: &str) {
@@ -188,8 +208,11 @@ pub fn label(
     }
 }
 
-/// Reports `third_party` with `explorer_default: true`; every read is the
-/// inner provider's.
+/// Reports `third_party` with `explorer_default: true`; every other method is
+/// the inner provider's. Every `ChainProvider` method is forwarded explicitly,
+/// including those with defaults, so the inner source's tip-age and refusal
+/// checks are never replaced by a permissive default. A test fails when the
+/// trait gains a method this impl does not name.
 pub struct ExplorerDefaultLabel {
     inner: Arc<dyn ChainProvider>,
 }
@@ -230,6 +253,12 @@ impl ChainProvider for ExplorerDefaultLabel {
     }
     async fn is_synced_with_height(&self, height: u64) -> bool {
         self.inner.is_synced_with_height(height).await
+    }
+    async fn tip_is_fresh(&self) -> bool {
+        self.inner.tip_is_fresh().await
+    }
+    fn refusal(&self) -> Result<(), ChainError> {
+        self.inner.refusal()
     }
 }
 
