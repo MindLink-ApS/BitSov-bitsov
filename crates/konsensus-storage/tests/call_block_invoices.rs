@@ -19,6 +19,7 @@ async fn assert_binding_cap(db: std::sync::Arc<dyn Storage>) {
         if ok { accepted.push(i); } else { refused.push(i); }
     }
     assert_eq!(accepted.len(), 8, "concurrent issuance must respect the per-block cap");
+    assert_eq!(db.call_block_invoice_count(&peer, call_id, 0).await.unwrap(), 8);
     for i in &accepted {
         assert!(db.has_call_block_invoice(&peer, call_id, 0, &[*i; 32]).await.unwrap(), "never evict a possibly paid invoice");
     }
@@ -69,6 +70,7 @@ async fn block_invoice_binding_survives_restart_is_exact_and_is_swept() {
     }
     let db = EncryptedStorage::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap(), &[7; 32]);
     assert!(db.has_call_block_invoice(&peer, call_id, 0, &[3; 32]).await.unwrap());
+    assert_eq!(db.call_block_invoice_count(&peer, call_id, 0).await.unwrap(), 1);
     for (p, id, seq, hash) in [
         (other, call_id, 0, [3; 32]), (peer, "different", 0, [3; 32]),
         (peer, call_id, 1, [3; 32]), (peer, call_id, 0, [4; 32]),

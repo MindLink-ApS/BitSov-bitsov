@@ -34,6 +34,10 @@ impl TestStorage {
         self.files.lock().unwrap().len()
     }
 
+    fn only_file_size(&self) -> Option<u64> {
+        self.files.lock().unwrap().values().next().map(|file| file.size_bytes)
+    }
+
     fn has_plaintext(&self, id: &MessageId) -> bool {
         self.plaintexts.lock().unwrap().contains_key(&id.to_hex())
     }
@@ -352,6 +356,42 @@ async fn process_file_valid_stores_file() {
     let result = process_file_message(&bytes, &sender, &envelope, &storage, &audit).await;
 
     assert_eq!(result, Ok("[file: test.txt]".to_string()));
+}
+
+#[tokio::test]
+async fn process_file_records_decoded_length_not_the_claimed_size() {
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let storage = Arc::new(TestStorage::new());
+    let audit = make_audit_log();
+
+    let file_data = b"hi";
+    let hash = blake3::hash(file_data).to_hex().to_string();
+    let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, file_data);
+    let payload = serde_json::json!({
+        "filename": "short.bin",
+        "mime_type": "application/octet-stream",
+        "size_bytes": u64::MAX,
+        "blake3_hash": hash,
+        "data_b64": data_b64,
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap();
+    let envelope = make_envelope(
+        alice.as_ref(),
+        *bob.node_id(),
+        konsensus_core::kind::KIND_FILE_REF,
+        b"encrypted".to_vec(),
+    );
+    let stored = process_file_message(
+        &bytes,
+        alice.node_id(),
+        &envelope,
+        &(Arc::clone(&storage) as Arc<dyn Storage>),
+        &audit,
+    )
+    .await;
+    assert_eq!(stored, Ok("[file: short.bin]".to_string()));
+    assert_eq!(storage.only_file_size(), Some(u64::try_from(file_data.len()).unwrap()));
 }
 
 #[tokio::test]
