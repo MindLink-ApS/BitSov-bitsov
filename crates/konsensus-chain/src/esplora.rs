@@ -248,12 +248,18 @@ impl EsploraProvider {
     /// requests share the same limiter as LDK for each configured API endpoint.
     pub(crate) async fn recovery_broadcast(&self, raw: &str) -> Result<String, ChainError> {
         let index = self.active.load(Ordering::Relaxed);
+        let timeout = std::time::Duration::from_secs(self.config.timeout_secs);
         if let Some(gate) = &self.network {
-            let timeout = std::time::Duration::from_secs(self.config.timeout_secs);
             self.ensure_network(gate, index, timeout).await?;
         }
         let (base, limiter) = &self.endpoints[index];
-        let request = self.client.post(format!("{base}/tx")).body(raw.to_owned());
+        // Set on the request, so the configured budget also holds through
+        // the authenticated transport, whose client has none of its own.
+        let request = self
+            .client
+            .post(format!("{base}/tx"))
+            .timeout(timeout)
+            .body(raw.to_owned());
         let response = limiter
             .run(false, || async {
                 match if index == 0 {

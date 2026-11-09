@@ -856,3 +856,60 @@ async fn bearer_request_without_its_own_timeout_is_bounded() {
         ]
     );
 }
+
+/// A recovery broadcast keeps the provider's configured budget through the
+/// authenticated transport: with 60 seconds configured, an answer after 35
+/// seconds arrives.
+#[tokio::test(start_paused = true)]
+async fn bearer_recovery_broadcast_keeps_the_configured_timeout() {
+    use konsensus_core::traits::chain::TrustLevel;
+    const ANSWER_AFTER: Duration = Duration::from_secs(35);
+    /// Answers the broadcast after `ANSWER_AFTER`, unless the request's own
+    /// timeout ends first, as the HTTP client would.
+    #[derive(Debug, Default)]
+    struct SlowBroadcast(std::sync::Mutex<Vec<Option<Duration>>>);
+    impl HttpTransport for SlowBroadcast {
+        fn execute(
+            &self,
+            request: RequestBuilder,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Response, esplora_client::Error>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                let request = request.build().unwrap();
+                if request.url().path() == "/token" {
+                    return Ok(http::Response::builder().body(TOKEN).unwrap().into());
+                }
+                assert_eq!(request.url().path(), "/api/tx");
+                assert_eq!(request.method(), reqwest::Method::POST);
+                let timeout = request.timeout().copied();
+                self.0.lock().unwrap().push(timeout);
+                if timeout.is_some_and(|timeout| timeout < ANSWER_AFTER) {
+                    tokio::time::sleep(timeout.unwrap()).await;
+                    return Err(unavailable());
+                }
+                tokio::time::sleep(ANSWER_AFTER).await;
+                Ok(http::Response::builder().body("txid").unwrap().into())
+            })
+        }
+    }
+    let wire = Arc::new(SlowBroadcast::default());
+    let mut config = crate::EsploraConfig::custom(
+        "https://slow-broadcast.invalid/api".into(),
+        TrustLevel::ServerTrust,
+    );
+    config.timeout_secs = 60;
+    let provider = crate::EsploraProvider::new(config)
+        .unwrap()
+        .with_bearer(auth_with_wire(wire.clone()))
+        .unwrap();
+    assert_eq!(provider.recovery_broadcast("00").await.unwrap(), "txid");
+    assert_eq!(
+        wire.0.lock().unwrap().as_slice(),
+        [Some(Duration::from_secs(60))]
+    );
+}

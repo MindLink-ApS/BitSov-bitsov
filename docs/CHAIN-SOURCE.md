@@ -308,8 +308,8 @@ LDK transport applies live headers to wallet sync, fees, funding checks and
 broadcasts, including client clones; it does not require a restart every five
 minutes. Token POSTs have a four-second timeout; API requests retain the caller's
 budget (ten seconds for LDK and the configured timeout for the chain provider,
-with the existing shorter height/readiness deadline); a request without its own
-budget gets 30 seconds. Authentication errors and HTTP error bodies are
+with the existing shorter height/readiness deadline, and the configured timeout
+for a recovery broadcast); a request without its own budget gets 30 seconds. Authentication errors and HTTP error bodies are
 redacted. If all endpoints fail, LDK retains the primary's
 HTTP status when available; rate-limit failures keep their existing 429 policy.
 
