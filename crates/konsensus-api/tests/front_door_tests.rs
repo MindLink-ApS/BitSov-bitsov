@@ -927,3 +927,16 @@ async fn a_changed_tariff_is_not_re_signed_without_a_chain_tip() {
     assert_eq!(got["card"]["prices"]["page_msat"], 2_000);
     assert_eq!(got["card"]["prices"]["price_epoch"], 886_000 / 2016);
 }
+
+#[tokio::test]
+async fn a_porch_price_without_a_chain_tip_is_not_ready() {
+    // A published card; then a chain-aware engine that cannot read its tip.
+    let state = state_with(settings(Some("node.example.org:9000")));
+    let (status, body, _) = call(&state, "PUT", "/api/v1/front-door", bearer(&state, vec![auth::Scope::Admin]), Some(json!({"display_name": "Alice"}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let chainless = Arc::new(AppState { pricing: Arc::new(ChainlessPricing), ..(*state).clone() });
+    // Reading the card re-derives its page price: typed readiness, not a 500.
+    let (status, got, _) = call(&chainless, "GET", "/api/v1/front-door", bearer(&chainless, vec![auth::Scope::Read]), None).await;
+    assert_chain_not_ready(status.as_u16(), &got);
+    assert_eq!(state.front_door.card.lock().await.as_ref().unwrap().seq, 1);
+}

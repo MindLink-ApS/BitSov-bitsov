@@ -119,3 +119,129 @@ async fn with_a_tip_the_expired_peer_table_is_not_paid() {
         let _ = wallet;
     }
 }
+
+/// Own price 0 for every kind.
+struct FreePricing;
+
+#[async_trait]
+impl konsensus_core::traits::pricing::PricingEngine for FreePricing {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get_price_msat(&self, _: u16) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        Ok(0)
+    }
+    async fn get_category_price_msat(
+        &self,
+        _: konsensus_core::kind::KindCategory,
+    ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        Ok(0)
+    }
+}
+
+/// The connected stub, plus: the peer's price table arrives while the paid
+/// admission proof is being re-sent. Valid for one block from height 1.
+struct AnsweringTransport {
+    inner: Arc<common::ConnectedStubTransport>,
+    prices: Arc<konsensus_pricing::PeerPriceCache>,
+}
+
+#[async_trait]
+impl konsensus_core::traits::transport::MessageTransport for AnsweringTransport {
+    async fn send(&self, peer: &konsensus_core::NodeId, envelope: &konsensus_core::UkmEnvelope) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.prices
+            .update(*peer, std::collections::HashMap::from([("communication".to_string(), 2_000)]), 1, 1, 0.0)
+            .await;
+        self.inner.send(peer, envelope).await
+    }
+    async fn recv(&self) -> Result<konsensus_core::UkmEnvelope, konsensus_core::traits::transport::TransportError> {
+        self.inner.recv().await
+    }
+    async fn connect(&self, peer: &konsensus_core::NodeId, addr: &str) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.inner.connect(peer, addr).await
+    }
+    async fn disconnect(&self, peer: &konsensus_core::NodeId) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.inner.disconnect(peer).await
+    }
+    async fn is_connected(&self, peer: &konsensus_core::NodeId) -> bool {
+        self.inner.is_connected(peer).await
+    }
+    async fn connected_since(&self, peer: &konsensus_core::NodeId) -> Option<std::time::Instant> {
+        self.inner.connected_since(peer).await
+    }
+    async fn connected_peers(&self) -> Vec<konsensus_core::NodeId> {
+        self.inner.connected_peers().await
+    }
+    async fn send_raw_frame(&self, peer: &konsensus_core::NodeId, frame: &[u8]) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.inner.send_raw_frame(peer, frame).await
+    }
+}
+
+/// A send resuming an admission paid before (journaled, without the target's
+/// quote) looks up the target's price for this message. The send began with
+/// the wallet not money-ready, so it read no tip: the lookup reads one, and
+/// without one it is refused, never checked against height 0 (which would
+/// accept the table that arrived meanwhile, expired at any real tip).
+#[tokio::test]
+async fn a_resumed_admission_checks_the_target_price_against_a_real_tip() {
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = Arc::new(RecoveringWallet::default());
+    let base = common::test_state_with_data_dir(dir.path().to_path_buf());
+    let peer = konsensus_core::NodeId::from_bytes([0x5a; 32]);
+    let stub = Arc::new(common::ConnectedStubTransport::new(vec![peer], base.invoice_requests.clone()));
+    let transport = Arc::new(AnsweringTransport { inner: stub.clone(), prices: base.peer_prices.clone() });
+    let chain = Arc::new(common::TipDownChain::down());
+    let state = Arc::new(AppState {
+        lightning: wallet.clone(),
+        transport,
+        chain: chain.clone(),
+        pricing: Arc::new(FreePricing),
+        ..(*base).clone()
+    });
+    // The admission paid before: settled, its proof not yet sent, no quote kept.
+    let envelope = konsensus_core::UkmEnvelopeBuilder::new(
+        konsensus_core::kind::KIND_CHAT,
+        *state.identity.node_id(),
+        konsensus_core::Recipient::Node(peer),
+        vec![],
+        konsensus_core::PaymentProof::new([0x11; 32], [0x22; 32], 1_000),
+    )
+    .build();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let journal = dir.path().join("admission-attempts");
+    std::fs::create_dir_all(&journal).unwrap();
+    std::fs::write(
+        journal.join(peer.to_hex()),
+        serde_json::to_vec(&serde_json::json!({
+            "dispatch_started": true, "payment_hash": "11".repeat(32), "amount_msat": 1_000,
+            "quote": null, "envelope": envelope, "settled_at_unix": now, "proof_delivered": false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/messages/compose")
+        .header("authorization", common::auth_header(&state))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"recipient": peer.to_hex(), "kind": konsensus_core::kind::KIND_CHAT, "plaintext": "resumed", "wait_ack_ms": 0}).to_string(),
+        ))
+        .unwrap();
+    let response = common::test_router(state.clone()).oneshot(request).await.unwrap();
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 65_536).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // The earlier admission stays paid; this send stops at the missing tip,
+    // reported through the existing settled-but-not-sent outcome.
+    assert_eq!((status, body["code"].as_str()), (502, Some("payment_settled_send_incomplete")), "{body}");
+    assert!(body["error"].as_str().unwrap().contains("the chain source has no current tip"), "{body}");
+    assert_eq!(body["amount_msat"], 0, "{body}");
+    // It got as far as the resumed admission (the paid proof went out again)
+    // and then asked for the tip, once.
+    assert_eq!(stub.sent_envelopes.lock().unwrap().len(), 1, "{body}");
+    assert_eq!(chain.reads(), 1);
+    assert_eq!(wallet.inner.money(), 0);
+    assert_eq!(wallet.inner.invoices(), 0);
+}
