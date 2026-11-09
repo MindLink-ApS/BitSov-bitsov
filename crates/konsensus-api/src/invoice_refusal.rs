@@ -26,6 +26,22 @@ pub const ADMISSION_REQUIRED: &str = "konsensus:admission_required";
 /// too recently (the unpaid admission path has source and global limits).
 pub const ADMISSION_RATE_LIMITED: &str = "konsensus:admission_rate_limited";
 
+/// A paid peer asked for more service invoices than this node will issue or
+/// hold unpaid.
+pub const INVOICE_LIMITED: &str = "konsensus:invoice_limited";
+
+/// The node will not issue an invoice for this request.
+pub const INVOICE_UNAVAILABLE: &str = "konsensus:invoice_unavailable";
+
+/// A paid peer asked for a service invoice below this node's admission floor.
+/// The request is refused; the amount is not raised to the floor.
+pub const BELOW_ADMISSION_FLOOR: &str = "konsensus:below_admission_floor";
+
+/// The requested amount is above every price this node now charges (its
+/// tariff was lowered). Nothing was issued; the sender should refresh this
+/// peer's prices and ask again rather than pay a different amount.
+pub const PRICE_CHANGED: &str = "konsensus:price_changed";
+
 /// No block invoice was issued: wrong call/sequence or too close to its deadline.
 pub const CALL_BLOCK_UNPAYABLE: &str = "konsensus:call_block_unpayable";
 
@@ -65,7 +81,13 @@ pub fn bind(request_id: &str, peer: NodeId) -> RequestBinding {
     let mut map = bindings();
     let bound = map.len() < MAX_BOUND_REQUESTS;
     if bound {
-        map.insert(request_id.to_string(), Binding { peer, refusal: None });
+        map.insert(
+            request_id.to_string(),
+            Binding {
+                peer,
+                refusal: None,
+            },
+        );
     }
     RequestBinding {
         request_id: request_id.to_string(),
@@ -124,10 +146,16 @@ mod tests {
     fn refusal_reaches_the_request_only_from_its_own_peer() {
         let request = uuid::Uuid::new_v4().to_string();
         let binding = bind(&request, node(1));
-        assert!(!record(&request, &node(2), ADMISSION_REQUIRED), "another peer cannot refuse it");
+        assert!(
+            !record(&request, &node(2), ADMISSION_REQUIRED),
+            "another peer cannot refuse it"
+        );
         assert!(record(&request, &node(1), ADMISSION_REQUIRED));
         assert_eq!(binding.finish().as_deref(), Some(ADMISSION_REQUIRED));
-        assert!(!record(&request, &node(1), ADMISSION_REQUIRED), "finished requests are unbound");
+        assert!(
+            !record(&request, &node(1), ADMISSION_REQUIRED),
+            "finished requests are unbound"
+        );
     }
 
     #[test]

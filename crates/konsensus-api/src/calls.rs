@@ -231,7 +231,7 @@ pub(crate) async fn owner_funded_call(state: &AppState, peer: &NodeId, call_id: 
                     None => {
                         let Some(cipher) = &state.plaintext_cipher else { return Ok(false) };
                         let Some(cached) = state.storage.get_message_plaintext(&envelope.id).await? else { return Ok(false) };
-                        let plaintext = cipher.decrypt(&cached).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+                        let plaintext = cipher.decrypt(&envelope.id.to_hex(), &cached).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
                         let signal = CallSignal::parse(kind, std::str::from_utf8(&plaintext)
                             .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?)
                             .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
@@ -931,7 +931,7 @@ pub async fn peer_call_kind_price(state: &AppState, peer: &NodeId, kind: u16) ->
 pub async fn block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextCacheCipher, peer: &NodeId, id: &konsensus_core::MessageId) -> Result<Option<u64>, konsensus_storage::StorageError> {
     let unavailable = || konsensus_storage::StorageError::Conversion("paid call grant metadata unavailable".into());
     let cached = store.get_message_plaintext(id).await?.ok_or_else(unavailable)?;
-    let plaintext = cipher.decrypt(&cached).map_err(|_| unavailable())?;
+    let plaintext = cipher.decrypt(&id.to_hex(), &cached).map_err(|_| unavailable())?;
     let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, std::str::from_utf8(&plaintext).map_err(|_| unavailable())?).map_err(|_| unavailable())?;
     let entry = store.call_get(peer, &signal.call_id).await?.ok_or_else(unavailable)?;
     if entry.side != rules::Side::Callee || entry.next_block_seq != signal.seq.ok_or_else(unavailable)?.saturating_add(1)
@@ -1003,7 +1003,7 @@ async fn cached_call_block_binding(store: Store<'_>, cipher: &konsensus_crypto::
 ) -> Result<(String, u32), konsensus_storage::StorageError> {
     let unavailable = || konsensus_storage::StorageError::Conversion("legacy paid block binding unavailable".into());
     let cached = store.get_message_plaintext(id).await?.ok_or_else(unavailable)?;
-    let plaintext = cipher.decrypt(&cached).map_err(|_| unavailable())?;
+    let plaintext = cipher.decrypt(&id.to_hex(), &cached).map_err(|_| unavailable())?;
     let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK,
         std::str::from_utf8(&plaintext).map_err(|_| unavailable())?).map_err(|_| unavailable())?;
     Ok((signal.call_id, signal.seq.ok_or_else(unavailable)?))

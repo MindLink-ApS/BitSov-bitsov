@@ -324,6 +324,9 @@ pub struct BearerFailover {
     )>,
     active: std::sync::atomic::AtomicUsize,
     failed: std::sync::atomic::AtomicBool,
+    /// False when the primary has not shown its network: it is never used,
+    /// and no token is requested, until a later start.
+    use_primary: bool,
 }
 impl fmt::Debug for BearerFailover {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -336,6 +339,26 @@ impl BearerFailover {
         auth: Arc<BearerAuth>,
         primary: &str,
         fallbacks: Vec<String>,
+    ) -> Result<Arc<Self>, CredentialsError> {
+        Self::build(auth, primary, fallbacks, true)
+    }
+
+    /// Requests keep the primary's URL as their routing prefix but go only to
+    /// the fallbacks, without credentials. For a start where the primary has
+    /// not shown its network and the fallbacks have.
+    pub fn fallbacks_only(
+        auth: Arc<BearerAuth>,
+        primary: &str,
+        fallbacks: Vec<String>,
+    ) -> Result<Arc<Self>, CredentialsError> {
+        Self::build(auth, primary, fallbacks, false)
+    }
+
+    fn build(
+        auth: Arc<BearerAuth>,
+        primary: &str,
+        fallbacks: Vec<String>,
+        use_primary: bool,
     ) -> Result<Arc<Self>, CredentialsError> {
         let primary = auth.transport(primary)?;
         let mut endpoints = Vec::new();
@@ -359,9 +382,10 @@ impl BearerFailover {
         }
         Ok(Arc::new(Self {
             primary,
+            active: usize::from(!use_primary && endpoints.len() > 1).into(),
             endpoints,
-            active: 0.into(),
             failed: false.into(),
+            use_primary,
         }))
     }
 
@@ -419,6 +443,9 @@ impl HttpTransport for BearerFailover {
             // response bodies or transport errors, which may contain credentials.
             let mut upstream_status = None;
             for (index, (endpoint, limiter)) in self.endpoints.iter().enumerate() {
+                if index == 0 && !self.use_primary {
+                    continue;
+                }
                 if broadcast
                     && !limiter.retry_delay().is_zero()
                     && self
@@ -426,7 +453,9 @@ impl HttpTransport for BearerFailover {
                         .iter()
                         .enumerate()
                         .any(|(other, (_, limiter))| {
-                            other != index && limiter.retry_delay().is_zero()
+                            other != index
+                                && (other != 0 || self.use_primary)
+                                && limiter.retry_delay().is_zero()
                         })
                 {
                     rate_limited = true;

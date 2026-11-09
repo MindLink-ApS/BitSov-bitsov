@@ -10,6 +10,24 @@ also live on the corresponding GitHub pre-release pages.
   requests at either cap without evicting an existing ceremony.
 - Limit local sign-in challenges per source, rate-limit issuance, and apply
   the local token route's Host and Origin admission to challenge issuance.
+- The node refuses to start when its chain source is on another network than
+  `[lightning] network`, naming both networks, and tries no other source. Bitcoin
+  Core is checked through `getblockchaininfo`; Electrum and Esplora through their
+  height-0 header, hashed by the node. Until a source has answered on the
+  configured network, nothing reads or syncs from it: the node starts not ready
+  and the embedded LDK node retries without starting. With `credentials_file`,
+  an unanswered primary is skipped and LDK uses the verified fallback without
+  credentials. Sources are asked again
+  after a lost connection and at least every 60 seconds, and `konsensus recover`
+  checks its source too. A custom signet passes as `signet`. With LND, LNbits or
+  mock Lightning a real `[chain]` source is not checked.
+- **Breaking for exposed APIs:** a non-loopback `[api].listen_addr` (`0.0.0.0`,
+  `::`, a LAN address) now fails config validation unless
+  `[api].allow_non_loopback_bind = true` is set, because the owner API is
+  plaintext HTTP (#412). The default stays `127.0.0.1:3141`. A node that already
+  binds the API off-loopback refuses to start with an error naming the flag; add
+  it to keep that bind. `[remote_access]` still requires a loopback API, and the
+  flag does not lift that rule.
 - A node that lost its E2EE session with a connected peer gets it back on the
   same connection. When the lower-id node lost it, about 25 seconds: the higher-id
   peer now answers a PrekeyOffer with its own, at most once per ten seconds per
@@ -48,6 +66,15 @@ also live on the corresponding GitHub pre-release pages.
   offer the peer refuses, or a well-formed init with other keys, changes nothing.
   Two stale offers, or a late `SessionAck`, can still retire a working session
   until key confirmation lands. No frame or message format changes.
+- A normal start no longer logs `lightning health check FAILED — payments will
+  not work` and a `Fix:` hint while the wallet is still syncing. The startup
+  check reads the Lightning readiness phase: a sync is INFO ("payments start
+  when it is ready"); an unreachable chain service is one WARN naming the
+  service kind (`LIGHTNING_CHAIN_SOURCE_UNAVAILABLE`), not repeated on each
+  retry; a failed or stopped Lightning, or a backend error, still warns with
+  the `Fix:` hint, as soon as it is seen. A sync still running after ten minutes
+  warns once, and the node says at INFO when payments are on. Payments are
+  refused until Lightning is ready, as before.
 
 ## [0.3.0-rc22] — 2026-11-05
 

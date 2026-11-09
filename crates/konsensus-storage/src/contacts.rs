@@ -348,8 +348,8 @@ impl ContactRepo for PostgresContactRepo {
         .bind(&row.profile_json)
         .bind(&row.avatar_blake3)
         .bind(&row.verified_identities_json)
-        .bind(row.muted)
-        .bind(row.blocked)
+        .bind(i32::from(row.muted))
+        .bind(i32::from(row.blocked))
         .bind(&row.tags_json)
         .bind(&row.notes)
         .bind(&row.created_at)
@@ -368,8 +368,8 @@ impl ContactRepo for PostgresContactRepo {
             String,
             Option<String>,
             String,
-            bool,
-            bool,
+            i32,
+            i32,
             String,
             Option<String>,
             String,
@@ -405,8 +405,8 @@ impl ContactRepo for PostgresContactRepo {
                 profile_json,
                 avatar_blake3,
                 verified_identities_json,
-                muted,
-                blocked,
+                muted: muted != 0,
+                blocked: blocked != 0,
                 tags_json,
                 notes,
                 created_at,
@@ -429,8 +429,8 @@ impl ContactRepo for PostgresContactRepo {
             String,
             Option<String>,
             String,
-            bool,
-            bool,
+            i32,
+            i32,
             String,
             Option<String>,
             String,
@@ -443,7 +443,7 @@ impl ContactRepo for PostgresContactRepo {
                  FROM contacts WHERE blocked = $1
                  ORDER BY updated_at DESC LIMIT $2",
             )
-            .bind(b)
+            .bind(i32::from(b))
             .bind(lim)
             .fetch_all(&self.pool)
             .await?,
@@ -483,8 +483,8 @@ impl ContactRepo for PostgresContactRepo {
                     profile_json,
                     avatar_blake3,
                     verified_identities_json,
-                    muted,
-                    blocked,
+                    muted: muted != 0,
+                    blocked: blocked != 0,
                     tags_json,
                     notes,
                     created_at,

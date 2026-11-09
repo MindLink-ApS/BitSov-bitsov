@@ -5,12 +5,15 @@
 pub mod calendar;
 pub mod contacts;
 pub mod encrypted;
+pub mod record_upgrade;
 pub mod error;
 pub mod fiat_snapshots;
 pub mod models;
 pub mod postgres;
 pub mod reactions;
 pub mod recovery;
+#[cfg(test)]
+mod schema_catalog;
 pub mod sqlite;
 pub mod traits;
 pub mod whitelist_backup;
