@@ -782,6 +782,44 @@ async fn esplora_truncated_body_is_a_lost_connection() {
 }
 
 #[tokio::test]
+async fn esplora_oversized_genesis_answer_is_not_verified() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                // The length is far above a hash or a header. The body is not sent.
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 10000000\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = socket.read(&mut buf).await;
+            });
+        }
+    });
+    let provider = esplora_provider(&url, &[], Network::Signet);
+    let check = tokio::time::timeout(std::time::Duration::from_secs(5), provider.verify_network())
+        .await
+        .expect("an oversized genesis answer must be refused before its body is read");
+    assert_eq!(check, NetworkCheck::Unavailable);
+    assert!(!provider.is_synced().await);
+    task.abort();
+}
+
+#[tokio::test]
 async fn esplora_failed_recovery_broadcast_is_a_lost_connection() {
     use konsensus_chain::recovery::RecoveryChain;
     let explorer = RawExplorer::new(Network::Signet).await;

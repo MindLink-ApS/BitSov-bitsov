@@ -145,6 +145,13 @@ pub enum NetworkCheck {
 /// source ends it sooner (see each provider for what counts as a reconnect).
 pub const VERIFICATION_TTL: Duration = Duration::from_secs(60);
 
+/// Largest body accepted as an Esplora genesis answer.
+///
+/// `/block-height/0` is a 64-character block hash. `/block/<hash>/header` is
+/// 160 hex characters (an 80-byte header). Either may have surrounding
+/// whitespace. A longer body is not that answer, and it is not buffered.
+pub const MAX_GENESIS_ANSWER_BYTES: usize = 1024;
+
 /// Per-provider verification state: one slot per configured endpoint, and a
 /// mismatch that, once seen, refuses the whole provider.
 pub(crate) struct NetworkGate {
@@ -242,23 +249,64 @@ impl NetworkGate {
     }
 }
 
+/// Read a response body that is only useful up to `max` bytes.
+///
+/// A `Content-Length` above `max` is refused before the body is read. A body
+/// with no length is still stopped once `max` bytes have arrived, so a chunked
+/// reply cannot grow the buffer past that.
+pub(crate) async fn read_limited_text(
+    mut response: reqwest::Response,
+    max: usize,
+) -> Result<String, ChainError> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > max as u64)
+    {
+        return Err(ChainError::Backend("invalid Esplora genesis block".into()));
+    }
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len().saturating_add(chunk.len()) > max {
+                    return Err(ChainError::Backend("invalid Esplora genesis block".into()));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => {
+                return Err(ChainError::Connection("Esplora body unavailable".into()));
+            }
+        }
+    }
+    String::from_utf8(body).map_err(|_| ChainError::Backend("invalid Esplora genesis block".into()))
+}
+
+fn genesis_answer(text: &str) -> Result<&str, ChainError> {
+    let text = text.trim();
+    if text.len() > MAX_GENESIS_ANSWER_BYTES {
+        return Err(ChainError::Backend("invalid Esplora genesis block".into()));
+    }
+    Ok(text)
+}
+
 /// An Esplora source's genesis hash, computed here from the height-0 header
 /// it serves (`/block-height/0`, then `/block/<hash>/header`). A header that
-/// does not hash to the hash the server named is not an answer.
+/// does not hash to the hash the server named is not an answer. An answer
+/// longer than [`MAX_GENESIS_ANSWER_BYTES`] is not parsed.
 pub(crate) async fn esplora_genesis<F, Fut>(get: F) -> Result<BlockHash, ChainError>
 where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Result<String, ChainError>>,
 {
     let invalid = || ChainError::Backend("invalid Esplora genesis block".into());
-    let named: BlockHash = get("/block-height/0".into())
-        .await?
-        .trim()
+    let named: BlockHash = genesis_answer(&get("/block-height/0".into()).await?)?
         .parse()
         .map_err(|_| invalid())?;
     let header = get(format!("/block/{named}/header")).await?;
     let header: bitcoin::block::Header =
-        bitcoin::consensus::encode::deserialize_hex(header.trim()).map_err(|_| invalid())?;
+        bitcoin::consensus::encode::deserialize_hex(genesis_answer(&header)?)
+            .map_err(|_| invalid())?;
     let hash = header.block_hash();
     if hash != named {
         return Err(invalid());
@@ -340,10 +388,7 @@ where
                     }
                     .filter(|response| response.status().is_success())
                     .ok_or_else(|| ChainError::Connection("Esplora unavailable".into()))?;
-                    response
-                        .text()
-                        .await
-                        .map_err(|_| ChainError::Connection("Esplora unavailable".into()))
+                    read_limited_text(response, MAX_GENESIS_ANSWER_BYTES).await
                 }
             });
             // An endpoint that does not answer in time is unverified; it
@@ -503,6 +548,187 @@ mod tests {
         assert!(esplora_genesis(serve("not a hash".into(), Some(header)))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_genesis_answer_is_not_parsed() {
+        // "ab" repeated is hex, and longer than the cap. Trim does not shorten
+        // it. Without the length check this still fails hash parsing, so the
+        // cap itself is what `genesis_answer` must reject.
+        let huge = "ab".repeat(MAX_GENESIS_ANSWER_BYTES);
+        assert!(
+            genesis_answer(&huge).is_err(),
+            "an answer over the cap must be refused before it is parsed"
+        );
+        let result = esplora_genesis(|_path| {
+            let huge = huge.clone();
+            async move { Ok(huge) }
+        })
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_declared_oversized_body_is_refused_before_it_is_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api", listener.local_addr().unwrap());
+        let serve = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 10000000\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            // Stay open. A reader that honors Content-Length would block here.
+            let _ = socket.read(&mut buf).await;
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(4))
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("{url}/block-height/0"))
+            .send()
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let error = read_limited_text(response, MAX_GENESIS_ANSWER_BYTES)
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "refused only after waiting for the body"
+        );
+        assert!(error.to_string().contains("invalid Esplora genesis block"));
+        serve.abort();
+    }
+
+    #[tokio::test]
+    async fn a_chunked_genesis_body_stops_at_the_cap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api", listener.local_addr().unwrap());
+        let serve = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let chunk = "a".repeat(512);
+            let mut body =
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+            for _ in 0..8 {
+                body.extend(format!("{:x}\r\n{chunk}\r\n", chunk.len()).into_bytes());
+            }
+            body.extend(b"0\r\n\r\n");
+            let _ = socket.write_all(&body).await;
+        });
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("{url}/block-height/0"))
+            .send()
+            .await
+            .unwrap();
+        let error = read_limited_text(response, MAX_GENESIS_ANSWER_BYTES)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid Esplora genesis block"));
+        serve.abort();
+    }
+
+    /// Startup checks every Esplora URL before use. An oversized genesis body
+    /// is unverified and must not latch a mismatch onto a good endpoint.
+    /// The body is not sent, so dropping the cap on this path waits out the
+    /// request timeout instead of returning.
+    #[tokio::test]
+    async fn an_oversized_url_check_does_not_latch_a_mismatch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let block = bitcoin::blockdata::constants::genesis_block(Network::Signet);
+        let hash = block.block_hash().to_string();
+        let header = bitcoin::consensus::encode::serialize_hex(&block.header);
+
+        let oversized = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let oversized_url = format!("http://{}/api", oversized.local_addr().unwrap());
+        let oversized_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = oversized.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 10000000\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = socket.read(&mut buf).await;
+                });
+            }
+        });
+
+        let good = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_url = format!("http://{}/api", good.local_addr().unwrap());
+        let good_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = good.accept().await else {
+                    return;
+                };
+                let hash = hash.clone();
+                let header = header.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&request);
+                    let line = text.lines().next().unwrap_or("");
+                    let body = if line.contains("block-height/0") {
+                        hash
+                    } else if line.contains("/header") {
+                        header
+                    } else {
+                        return;
+                    };
+                    let mut response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(body.as_bytes());
+                    let _ = socket.write_all(&response).await;
+                });
+            }
+        });
+
+        let started = Instant::now();
+        let result = verify_esplora_api_urls::<crate::bearer::BearerTransport>(
+            Network::Signet,
+            &[&oversized_url, &good_url],
+            None,
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "oversized genesis answer was not refused before its body was read: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.verified, [false, true]);
+        assert_eq!(result.check, NetworkCheck::Unavailable);
+        oversized_task.abort();
+        good_task.abort();
     }
 
     /// Records each request's timeout and serves the signet identity.
