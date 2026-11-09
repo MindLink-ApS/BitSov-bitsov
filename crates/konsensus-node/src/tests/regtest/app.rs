@@ -650,6 +650,7 @@ impl App {
             .await;
         assert_eq!(status, StatusCode::OK, "compose: {body}");
         assert_eq!(body["delivered"], true, "{body}");
+        assert_eq!(body["accepted"], true, "{body}");
         let message = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let message = receiver.received.recv().await.unwrap();

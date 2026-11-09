@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use futures::{SinkExt, StreamExt};
 use konsensus_core::payloads::call::{CallEntry, HangupReason, Phase};
 use konsensus_core::NodeId;
+use konsensus_crypto::SessionManager;
 use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, Message},
     MaybeTlsStream, WebSocketStream,
@@ -132,6 +133,14 @@ async fn compose(
     app.post("/api/v1/messages/compose", request, false).await
 }
 
+/// A sending chain can still belong to the session being replaced. Wait for
+/// confirmation and handover before sending traffic under the recovered session.
+async fn session_recovered(sessions: &SessionManager, peer: &NodeId) -> bool {
+    sessions.can_send(peer).await
+        && !sessions.awaiting_confirmation(peer).await
+        && !sessions.replacement_pending(peer).await
+}
+
 /// Shared production pair: callers choose tariffs, limits and approval roots.
 pub(super) struct Pair {
     pub caller: app::App,
@@ -248,8 +257,8 @@ impl Pair {
         // Listing contacts can race the first supervised handshake. A transport
         // connection alone does not prove the prekey exchange has completed.
         wait("both signaling sessions established", || async {
-            caller.state.session_manager.can_send(&bid).await
-                && callee.state.session_manager.can_send(&aid).await
+            session_recovered(&caller.state.session_manager, &bid).await
+                && session_recovered(&callee.state.session_manager, &aid).await
         })
         .await;
 
@@ -730,10 +739,10 @@ async fn lost_session_recovers_on_the_connection_and_the_next_call_works() {
     assert_eq!((hold.spent_msat, hold.closed), (spent, false), "the hold is untouched");
     lane.steps.pass("the block for a lost session is refused before payment");
 
-    wait("the callee has a session again", || async {
+    wait("both recovered sessions have settled", || async {
         assert!(lost_at.elapsed() < RECOVERY_BOUND, "not recovered within the bound");
-        callee.state.session_manager.can_send(&aid).await
-            && caller.state.session_manager.can_send(&bid).await
+        session_recovered(&callee.state.session_manager, &aid).await
+            && session_recovered(&caller.state.session_manager, &bid).await
     })
     .await;
     println!("SESSION RECOVERED after {:?}", lost_at.elapsed());
@@ -770,6 +779,40 @@ async fn lost_session_recovers_on_the_connection_and_the_next_call_works() {
 #[ignore = "real Bitcoin Core + electrs; scripts/regress/two_node_paid_call_e2e.sh"]
 async fn unpaid_after_three_paid_blocks() {
     scenario(5, 3, HangupReason::Unpaid).await;
+}
+
+#[tokio::test]
+async fn recovery_waits_until_both_sessions_have_switched() {
+    let (_, initiator) = NodeIdentity::generate().unwrap();
+    let (_, responder) = NodeIdentity::generate().unwrap();
+    let (aid, bid) = (*initiator.node_id(), *responder.node_id());
+    let a = SessionManager::new(Arc::new(initiator));
+    let b = SessionManager::new(Arc::new(responder));
+    assert!(!session_recovered(&a, &bid).await);
+
+    let init = a.initiate_session(&bid, &b.prekey_bundle().await).await.unwrap();
+    b.accept_session(&aid, &init).await.unwrap();
+    assert!(!session_recovered(&b, &aid).await, "no sending chain yet");
+    assert!(a.confirm_session(&bid).await);
+    let first = a.encrypt(&bid, b"initial session").await.unwrap();
+    assert_eq!(b.decrypt(&aid, &first).await.unwrap(), b"initial session");
+    assert!(session_recovered(&a, &bid).await);
+    assert!(session_recovered(&b, &aid).await);
+
+    assert!(a.remove_session(&bid).await);
+    let init = a.reinitiate_session(&bid, &b.prekey_bundle().await).await.unwrap();
+    b.reaccept_session(&aid, &init).await.unwrap();
+    assert!(a.can_send(&bid).await && b.can_send(&aid).await);
+    assert!(!session_recovered(&a, &bid).await, "SessionAck is still outstanding");
+    assert!(a.confirm_session(&bid).await);
+    assert!(session_recovered(&a, &bid).await);
+    assert!(!session_recovered(&b, &aid).await, "the responder still sends on the previous session");
+
+    let init = a.encrypt(&bid, b"ratchet-init").await.unwrap();
+    assert_eq!(b.decrypt(&aid, &init).await.unwrap(), b"ratchet-init");
+    assert!(session_recovered(&a, &bid).await && session_recovered(&b, &aid).await);
+    let reply = b.encrypt(&aid, b"after recovery").await.unwrap();
+    assert_eq!(a.decrypt(&bid, &reply).await.unwrap(), b"after recovery");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
