@@ -28,6 +28,20 @@ pub enum PaidAcceptance {
     Withdrawn,
 }
 
+/// Active receiver deferrals retained for one payment proof.
+pub const MAX_DEFERRALS_PER_PROOF: i64 = 3;
+/// Active receiver deferrals retained for one sender across payment proofs.
+pub const MAX_DEFERRALS_PER_SENDER: i64 = 12;
+/// Local retention window, matching the default envelope freshness window.
+pub const ENVELOPE_DEFERRAL_TTL_MS: i64 = 5 * 60 * 1000;
+/// Maximum expired rows reclaimed by one maintenance or insertion sweep.
+pub const DEFERRAL_CLEANUP_BATCH: u32 = 256;
+
+pub(crate) fn deferral_now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64).unwrap_or(0)
+}
+
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
@@ -208,7 +222,8 @@ pub trait Storage: Send + Sync {
 
     /// Durably fence unreadable bytes before authorizing replacement ciphertext.
     /// False authorizes nothing: the payment is already consumed or a binding
-    /// conflicts. Deferrals live until durable acceptance consumes the proof.
+    /// conflicts, or an active deferral limit is reached. Exact retries do not
+    /// extend the bounded lifetime. Acceptance removes deferrals for that proof.
     async fn defer_unreadable_envelope(&self, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("envelope deferral".into()))
     }
@@ -218,10 +233,21 @@ pub trait Storage: Send + Sync {
     }
 
     /// An unfinished paid direct-message recovery obligation with this peer.
-    /// Requires an unconsumed positive inbound deferral or an exact positive paid
+    /// Requires an active unconsumed positive inbound deferral or an exact positive paid
     /// outbound operation, modern recipient deferral and active dispatch binding.
-    async fn session_repair_pending(&self, _own: &NodeId, _peer: &NodeId) -> Result<bool, StorageError> {
+    async fn session_repair_pending(&self, own: &NodeId, peer: &NodeId) -> Result<bool, StorageError> {
+        Ok(self.session_repair_expires_at(own, peer).await?.is_some())
+    }
+
+    /// Latest active repair deadline in Unix milliseconds. Inbound permission
+    /// ends at row expiry; a bound outbound operation grants at most one TTL.
+    async fn session_repair_expires_at(&self, _own: &NodeId, _peer: &NodeId) -> Result<Option<i64>, StorageError> {
         Err(StorageError::Unsupported("session repair obligation".into()))
+    }
+
+    /// Reclaim at most `max` expired deferrals. Expiry checks do not depend on cleanup.
+    async fn cleanup_expired_deferrals(&self, _now_ms: i64, _max: u32) -> Result<u64, StorageError> {
+        Err(StorageError::Unsupported("envelope deferral cleanup".into()))
     }
 
     /// Insert once. A duplicate never overwrites the request binding.

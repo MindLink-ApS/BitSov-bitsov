@@ -485,8 +485,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.is_envelope_deferred(envelope).await
     }
 
-    async fn session_repair_pending(&self, own: &NodeId, peer: &NodeId) -> Result<bool, StorageError> {
-        self.inner.session_repair_pending(own, peer).await
+    async fn session_repair_expires_at(&self, own: &NodeId, peer: &NodeId) -> Result<Option<i64>, StorageError> {
+        self.inner.session_repair_expires_at(own, peer).await
+    }
+
+    async fn cleanup_expired_deferrals(&self, now_ms: i64, max: u32) -> Result<u64, StorageError> {
+        self.inner.cleanup_expired_deferrals(now_ms, max).await
     }
 
     async fn insert_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {

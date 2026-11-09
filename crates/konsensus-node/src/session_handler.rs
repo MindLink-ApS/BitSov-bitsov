@@ -132,6 +132,24 @@ const ADMISSION_INVOICE_KIND: u16 = konsensus_core::kind::KIND_CHAT;
 
 /// Refuse state-changing control frames before dispatch. This consumes no
 /// identity or payload into telemetry: only a fixed reason counter is updated.
+/// Revalidate the durable basis and carry its remaining lifetime onto the
+/// captured connection. Lookup failures and elapsed deadlines grant nothing.
+pub(crate) async fn allow_paid_session_repair(
+    storage: &dyn konsensus_storage::Storage,
+    own: &NodeId,
+    peer: &NodeId,
+    transport: &NoiseTransport,
+    since: std::time::Instant,
+) -> bool {
+    let Ok(Some(expires)) = storage.session_repair_expires_at(own, peer).await else { return false; };
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else { return false; };
+    let remaining = i128::from(expires) - now.as_millis() as i128;
+    if remaining <= 0 { return false; }
+    let ttl = remaining.min(i128::from(konsensus_storage::ENVELOPE_DEFERRAL_TTL_MS)) as u64;
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(ttl);
+    transport.allow_session_repair(peer, since, until).await
+}
+
 fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
     use ControlEvent::*;
     let (privileged, reason) = match event {
@@ -270,11 +288,9 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             // Only the unfinished paid act survives a reconnect;
                             // the transport flag itself always starts clear.
                             let generation = transport.connected_since(&peer_id).await;
-                            if matches!(storage.session_repair_pending(&our_node_id, &peer_id).await, Ok(true)) {
-                                if let Some(since) = generation {
-                                    if transport.allow_session_repair(&peer_id, since).await {
-                                        let _ = send_repair_prekey_offer(&session_manager, &transport, &peer_id, since).await;
-                                    }
+                            if let Some(since) = generation {
+                                if allow_paid_session_repair(storage.as_ref(), &our_node_id, &peer_id, &transport, since).await {
+                                    let _ = send_repair_prekey_offer(&session_manager, &transport, &peer_id, since).await;
                                 }
                             }
                             debug!(peer = %peer_id, "PriceOpen: unprivileged peer connected — withholding prekey/onboarding until payment");
@@ -347,7 +363,11 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget, None).await;
                         if recover {
                             let repair_generation = if let Some(since) = generation {
-                                transport.allow_session_repair(&peer_id, since).await.then_some(since)
+                                // The authenticated live rejection also covers cached
+                                // deliveries without an outbox journal. Reconnects still
+                                // require the durable obligation lookup above.
+                                let until = std::time::Instant::now() + std::time::Duration::from_millis(konsensus_storage::ENVELOPE_DEFERRAL_TTL_MS as u64);
+                                transport.allow_session_repair(&peer_id, since, until).await.then_some(since)
                             } else { None };
                             session_manager.mark_needs_renegotiation(&peer_id).await;
                             if let Some(since) = repair_generation {

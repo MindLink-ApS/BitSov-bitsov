@@ -5925,7 +5925,7 @@ async fn recovery_reconnect_pending_paid_act_reauthorizes_repair_after_drop_befo
     // The loop is held here so the drop deterministically precedes X3DH.
     assert!(source_db.reject_pending(&env.id, net.bob.node_id(), net.alice.node_id(), &reason, false).await.unwrap());
     let old_source = net.source.connected_since(net.bob.node_id()).await.unwrap();
-    assert!(net.source.allow_session_repair(net.bob.node_id(), old_source).await);
+    assert!(net.source.allow_session_repair(net.bob.node_id(), old_source, std::time::Instant::now() + std::time::Duration::from_secs(60)).await);
     net.sessions_a.mark_needs_renegotiation(net.bob.node_id()).await;
     assert!(source_db.session_repair_pending(net.alice.node_id(), net.bob.node_id()).await.unwrap());
     assert!(net.db.session_repair_pending(net.bob.node_id(), net.alice.node_id()).await.unwrap());
@@ -6062,7 +6062,35 @@ async fn recovery_reconnect_outgoing_repair_standing_checks_generation_and_frame
     let metadata = Frame::PriceQuery { kind: 1 }.to_bytes().unwrap();
     assert!(net.target.send_raw_frame_on(net.alice.node_id(), since, Standing::SessionRepair, &metadata).await.is_err());
     recovery_reconnect_reconnect(&net).await;
-    assert!(!net.target.allow_session_repair(net.alice.node_id(), since).await);
+    assert!(!net.target.allow_session_repair(net.alice.node_id(), since, std::time::Instant::now() + std::time::Duration::from_secs(60)).await);
     assert!(net.target.send_raw_frame_on(net.alice.node_id(), since, Standing::SessionRepair, &control).await.is_err());
+    net.stop().await;
+}
+
+#[tokio::test]
+async fn recovery_reconnect_deferral_expiry_ends_live_and_reconnected_standing() {
+    use konsensus_message::{ControlEvent, Frame, Standing};
+    let net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
+    let env = recovery_reconnect_lost_session_envelope(&net).await;
+    assert!(matches!(net.verdict(&env).await, ControlEvent::MessageRejected { reason, .. } if reason.starts_with("session_handover:")));
+    let since = net.target.connected_since(net.alice.node_id()).await.unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    sqlx::query("UPDATE envelope_deferrals SET expires_at_ms = ?")
+        .bind(now + 500).execute(net.db.pool()).await.unwrap();
+    assert!(crate::session_handler::allow_paid_session_repair(net.db.as_ref(), net.bob.node_id(), net.alice.node_id(), &net.target, since).await);
+    assert!(net.target.session_repair_on_connection(net.alice.node_id()).await);
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(!net.db.session_repair_pending(net.bob.node_id(), net.alice.node_id()).await.unwrap());
+    assert!(!net.target.session_repair_on_connection(net.alice.node_id()).await, "live connection must lose expired permission");
+    assert!(net.target.connected_session_peers().await.is_empty());
+    let control = Frame::SessionAck.to_bytes().unwrap();
+    assert!(net.target.send_raw_frame_on(net.alice.node_id(), since, Standing::SessionRepair, &control).await.is_err());
+    net.source.send_frame(net.bob.node_id(), &Frame::SessionAck).await.unwrap();
+    assert!(!recovery_reconnect_next_stamp(&net.target).await, "expired repair cannot authorize incoming controls");
+    recovery_reconnect_reconnect(&net).await;
+    let since = net.target.connected_since(net.alice.node_id()).await.unwrap();
+    assert!(!crate::session_handler::allow_paid_session_repair(net.db.as_ref(), net.bob.node_id(), net.alice.node_id(), &net.target, since).await);
+    assert!(net.target.connected_session_peers().await.is_empty());
+    assert!(!net.db.has_nonce(&env.nonce).await.unwrap());
     net.stop().await;
 }

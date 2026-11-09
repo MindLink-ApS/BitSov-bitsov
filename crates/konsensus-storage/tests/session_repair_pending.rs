@@ -14,7 +14,6 @@ fn envelope(sender: NodeId, recipient: Recipient, amount: u64) -> UkmEnvelope {
         b"unreadable ciphertext".to_vec(),
         PaymentProof::new(Sha256::digest([4; 32]).into(), [4; 32], amount),
     )
-    .timestamp(1)
     .nonce(Nonce::from_bytes([5; 24]))
     .signature(Signature::from_bytes([0; 64]))
     .build()
@@ -240,4 +239,180 @@ async fn session_repair_pending_outgoing_binding_mutations_fail_closed() {
             );
         }
     }
+}
+
+
+#[tokio::test]
+async fn deferral_limits_fifty_envelopes_per_proof_and_sender() {
+    let own = NodeId::from_bytes([2; 32]);
+    let peer = NodeId::from_bytes([1; 32]);
+    for encrypted in [false, true] {
+        let wrapper = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+        let store: &dyn Storage = if encrypted { &wrapper } else { wrapper.inner() };
+        let original = envelope(peer, Recipient::Node(own), 1_000);
+        for n in 0..50 {
+            let mut env = original.clone();
+            env.ciphertext = vec![n];
+            env.id = MessageId::compute(&env.ciphertext, &env.nonce);
+            let admitted = store.defer_unreadable_envelope(&env).await.unwrap();
+            assert_eq!(admitted, n < 3, "proof slot {n}");
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM envelope_deferrals")
+            .fetch_one(wrapper.inner().pool()).await.unwrap();
+        assert_eq!(count, 3);
+        // More proofs from this sender share a separate bound.
+        for n in 1..50 {
+            let mut env = original.clone();
+            env.ciphertext = vec![n];
+            env.id = MessageId::compute(&env.ciphertext, &env.nonce);
+            env.payment_proof = PaymentProof::new(Sha256::digest([n; 32]).into(), [n; 32], 1_000);
+            let _ = store.defer_unreadable_envelope(&env).await.unwrap();
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM envelope_deferrals")
+            .fetch_one(wrapper.inner().pool()).await.unwrap();
+        assert_eq!(count, 12);
+        assert!(store.session_repair_pending(&own, &peer).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn deferral_expiry_ends_standing_without_cleanup_or_retry_extension() {
+    let own = NodeId::from_bytes([2; 32]);
+    let peer = NodeId::from_bytes([1; 32]);
+    for encrypted in [false, true] {
+        let wrapper = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+        let store: &dyn Storage = if encrypted { &wrapper } else { wrapper.inner() };
+        let env = envelope(peer, Recipient::Node(own), 1_000);
+        assert!(store.defer_unreadable_envelope(&env).await.unwrap());
+        sqlx::query("UPDATE envelope_deferrals SET expires_at_ms = 1")
+            .execute(wrapper.inner().pool()).await.unwrap();
+        assert!(!store.session_repair_pending(&own, &peer).await.unwrap());
+        assert!(!store.is_envelope_deferred(&env).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn deferral_deadline_is_bounded_by_freshness_and_exact_retries_keep_it() {
+    let wrapper = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let store: &dyn Storage = &wrapper;
+    let own = NodeId::from_bytes([2; 32]);
+    let peer = NodeId::from_bytes([1; 32]);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let mut env = envelope(peer, Recipient::Node(own), 1_000);
+    env.timestamp = (now - 290_000) as u64;
+    assert!(store.defer_unreadable_envelope(&env).await.unwrap());
+    let first = store.session_repair_expires_at(&own, &peer).await.unwrap().unwrap();
+    assert_eq!(first, now + 10_000);
+    // Renewing the signed wrapper of an existing ID cannot renew its deadline.
+    env.timestamp = (now + 300_000) as u64;
+    assert!(store.defer_unreadable_envelope(&env).await.unwrap());
+    assert_eq!(store.session_repair_expires_at(&own, &peer).await.unwrap(), Some(first));
+    let mut future = env.clone();
+    future.ciphertext = b"future wrapper".to_vec();
+    future.id = MessageId::compute(&future.ciphertext, &future.nonce);
+    future.timestamp = u64::MAX;
+    assert!(store.defer_unreadable_envelope(&future).await.unwrap());
+    let deadline = store.session_repair_expires_at(&own, &peer).await.unwrap().unwrap();
+    let after = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    assert!(deadline <= after + 300_000);
+    let mut stale = env.clone();
+    stale.timestamp = (now - 300_001) as u64;
+    stale.ciphertext = b"stale wrapper".to_vec();
+    stale.id = MessageId::compute(&stale.ciphertext, &stale.nonce);
+    assert!(!store.defer_unreadable_envelope(&stale).await.unwrap());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM envelope_deferrals")
+        .fetch_one(wrapper.inner().pool()).await.unwrap();
+    assert_eq!(count, 2, "stale input cannot allocate a deferral row");
+}
+
+#[tokio::test]
+async fn deferral_cleanup_is_bounded_preserves_live_rows_and_releases_slots() {
+    for encrypted in [false, true] {
+        let wrapper = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+        let store: &dyn Storage = if encrypted { &wrapper } else { wrapper.inner() };
+        let own = NodeId::from_bytes([2; 32]);
+        let peer = NodeId::from_bytes([1; 32]);
+        let original = envelope(peer, Recipient::Node(own), 1_000);
+        for n in 0..3 {
+            let mut env = original.clone();
+            env.ciphertext = vec![n];
+            env.id = MessageId::compute(&env.ciphertext, &env.nonce);
+            assert!(store.defer_unreadable_envelope(&env).await.unwrap());
+        }
+        sqlx::query("UPDATE envelope_deferrals SET expires_at_ms = 1")
+            .execute(wrapper.inner().pool()).await.unwrap();
+        assert_eq!(store.cleanup_expired_deferrals(1, 0).await.unwrap(), 0);
+        assert_eq!(store.cleanup_expired_deferrals(1, 2).await.unwrap(), 2);
+        // The last expired slot is reclaimed by the insertion path.
+        assert!(store.defer_unreadable_envelope(&original).await.unwrap());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM envelope_deferrals")
+            .fetch_one(wrapper.inner().pool()).await.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(store.cleanup_expired_deferrals(1, u32::MAX).await.unwrap(), 0);
+        assert!(store.is_envelope_deferred(&original).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn deferral_caps_hold_for_concurrent_writers() {
+    for same_proof in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = format!("sqlite:{}", dir.path().join("deferrals.db").display());
+        let store = std::sync::Arc::new(SqliteStorage::open(&path).await.unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        for n in 0..50 {
+            let store = store.clone();
+            tasks.spawn(async move {
+                let mut env = envelope(NodeId::from_bytes([1; 32]), Recipient::Node(NodeId::from_bytes([2; 32])), 1_000);
+                env.ciphertext = vec![n];
+                env.id = MessageId::compute(&env.ciphertext, &env.nonce);
+                if !same_proof {
+                    env.payment_proof = PaymentProof::new(Sha256::digest([n; 32]).into(), [n; 32], 1_000);
+                }
+                store.defer_unreadable_envelope(&env).await.unwrap()
+            });
+        }
+        let mut admitted = 0;
+        while let Some(result) = tasks.join_next().await { admitted += i64::from(result.unwrap()); }
+        assert_eq!(admitted, if same_proof { 3 } else { 12 });
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM envelope_deferrals")
+            .fetch_one(store.pool()).await.unwrap();
+        assert_eq!(count, admitted);
+    }
+}
+
+#[tokio::test]
+async fn deferral_expired_fence_does_not_block_readable_acceptance() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let env = envelope(NodeId::from_bytes([1; 32]), Recipient::Node(NodeId::from_bytes([2; 32])), 1_000);
+    assert!(store.defer_unreadable_envelope(&env).await.unwrap());
+    sqlx::query("UPDATE envelope_deferrals SET expires_at_ms = 0").execute(store.pool()).await.unwrap();
+    assert!(matches!(store.paid_envelope_status(&env).await, Ok(None)), "expired fence must not block status lookup");
+    assert_eq!(store.accept_paid_envelope(&env).await.unwrap(), PaidAcceptance::Accepted);
+}
+
+#[tokio::test]
+async fn deferral_cleanup_clamps_a_large_requested_batch() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    sqlx::query("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 513) INSERT INTO envelope_deferrals (message_id, sender, payment_hash, recipient_type, recipient_id, amount_msat) SELECT CAST(i AS TEXT), 'sender', 'proof', 'node', 'recipient', 1 FROM n")
+        .execute(store.pool()).await.unwrap();
+    assert_eq!(store.cleanup_expired_deferrals(0, u32::MAX).await.unwrap(), 256);
+    assert_eq!(store.cleanup_expired_deferrals(0, u32::MAX).await.unwrap(), 256);
+    assert_eq!(store.cleanup_expired_deferrals(0, u32::MAX).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn deferral_expired_backlog_does_not_take_active_slots() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let own = NodeId::from_bytes([2; 32]);
+    let peer = NodeId::from_bytes([1; 32]);
+    let env = envelope(peer, Recipient::Node(own), 1_000);
+    sqlx::query("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 513) INSERT INTO envelope_deferrals (message_id, sender, payment_hash, recipient_type, recipient_id, amount_msat) SELECT CAST(i AS TEXT), ?1, ?2, 'node', ?3, 1000 FROM n")
+        .bind(peer.to_hex()).bind(hex::encode(env.payment_proof.payment_hash)).bind(own.to_hex())
+        .execute(store.pool()).await.unwrap();
+    assert!(store.defer_unreadable_envelope(&env).await.unwrap());
+    assert!(store.session_repair_pending(&own, &peer).await.unwrap());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM envelope_deferrals")
+        .fetch_one(store.pool()).await.unwrap();
+    assert_eq!(count, 258, "one insertion reclaims at most 256 expired rows");
 }

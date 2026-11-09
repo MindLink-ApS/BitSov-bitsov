@@ -398,8 +398,8 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         }
 
                         // A durable deferral authorizes proof-preserving re-encryption.
-                        // Once deferred, this exact envelope cannot later be admitted,
-                        // even if an earlier ratchet frame makes it readable meanwhile.
+                        // During its bounded lifetime, this exact envelope cannot be
+                        // admitted even if an earlier ratchet frame makes it readable.
                         let handover_reason = "session_handover: session recovery is pending; retry the existing operation";
                         let mut known_acceptance = None;
                         let preview_plaintext = if gate_result.is_ok() && !is_relay_control && !is_admission_proof(&envelope) {
@@ -408,7 +408,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 deferred => {
                                     let repair_allowed = if matches!(deferred, Ok(true)) {
                                         match repair_generation {
-                                            Some(since) => transport_for_recv.allow_session_repair(&sender, since).await,
+                                            Some(since) => crate::session_handler::allow_paid_session_repair(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, &transport_for_recv, since).await,
                                             None => false,
                                         }
                                     } else { false };
@@ -454,7 +454,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     let deferred = storage_for_recv.defer_unreadable_envelope(&envelope).await;
                                     let repair_allowed = if matches!(deferred, Ok(true)) {
                                         match repair_generation {
-                                            Some(since) => transport_for_recv.allow_session_repair(&sender, since).await,
+                                            Some(since) => crate::session_handler::allow_paid_session_repair(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, &transport_for_recv, since).await,
                                             None => false,
                                         }
                                     } else { false };

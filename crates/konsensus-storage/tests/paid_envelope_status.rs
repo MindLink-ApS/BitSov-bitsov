@@ -13,7 +13,6 @@ fn envelope(seed: u8) -> UkmEnvelope {
         vec![seed; 16],
         PaymentProof::new(Sha256::digest([seed; 32]).into(), [seed; 32], 1_000),
     )
-    .timestamp(1)
     .nonce(Nonce::from_bytes([seed; 24]))
     .signature(Signature::from_bytes([0; 64]))
     .build()

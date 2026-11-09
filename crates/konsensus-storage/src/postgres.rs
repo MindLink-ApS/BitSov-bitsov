@@ -531,6 +531,7 @@ impl PostgresStorage {
     (36, "call unpaid notice", include_str!("../migrations/036_call_unpaid_notice.sql")),
     (37, "call block invoices", include_str!("../migrations/037_call_block_invoices.sql")),
     (38, "envelope deferrals", include_str!("../migrations/038_envelope_deferrals.sql")),
+    (39, "envelope deferral expiry", include_str!("../migrations/039_envelope_deferral_expiry.sql")),
         ]
     }
 
@@ -976,8 +977,8 @@ impl PostgresStorage {
             .bind(&ph).execute(&mut *tx).await?;
         let receipt = sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
             .bind(&ph).bind(&id).bind(&sender).execute(&mut *tx).await?;
-        let deferred: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = $1 AND sender = $2 AND payment_hash = $3)")
-            .bind(&id).bind(&sender).bind(&ph).fetch_one(&mut *tx).await?;
+        let deferred: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = $1 AND sender = $2 AND payment_hash = $3 AND expires_at_ms > $4)")
+            .bind(&id).bind(&sender).bind(&ph).bind(crate::traits::deferral_now_ms()).fetch_one(&mut *tx).await?;
         if deferred {
             tx.rollback().await?;
             return Err(StorageError::Conversion("envelope deferred for session recovery".into()));
@@ -1378,22 +1379,40 @@ impl Storage for PostgresStorage {
     }
 
     async fn defer_unreadable_envelope(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        use crate::traits::{deferral_now_ms, DEFERRAL_CLEANUP_BATCH, ENVELOPE_DEFERRAL_TTL_MS, MAX_DEFERRALS_PER_PROOF, MAX_DEFERRALS_PER_SENDER};
         let id = envelope.id.to_hex();
         let sender = envelope.sender.to_hex();
         let ph = hex::encode(envelope.payment_proof.payment_hash);
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
         let amount = i64::try_from(envelope.payment_proof.amount_msat)
             .map_err(|_| StorageError::Conversion("deferral amount overflows i64".into()))?;
+        let now = deferral_now_ms();
+        let expires = now.saturating_add(ENVELOPE_DEFERRAL_TTL_MS).min(
+            i64::try_from(envelope.timestamp).unwrap_or(i64::MAX).saturating_add(ENVELOPE_DEFERRAL_TTL_MS));
+        if expires <= now { return Ok(false); }
         let mut tx = self.pool.begin().await?;
-        // Acceptance and deferral serialize on the same paid identity.
+        // Serialize proof acceptance and both deferral limits, including
+        // concurrent distinct proofs submitted by the same sender.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&ph).execute(&mut *tx).await?;
-        // Signed recipient/amount terms are immutable even though MessageId
-        // itself binds only ciphertext and nonce. Conflicts never widen repair.
-        sqlx::query("INSERT INTO envelope_deferrals (message_id, sender, payment_hash, recipient_type, recipient_id, amount_msat) SELECT $1, $2, $3, $4, $5, $6 WHERE NOT EXISTS (SELECT 1 FROM payment_receipts WHERE payment_hash = $7) ON CONFLICT(message_id) DO NOTHING")
-            .bind(&id).bind(&sender).bind(&ph).bind(rtype).bind(&rid).bind(amount).bind(&ph).execute(&mut *tx).await?;
-        let deferred: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = $1 AND sender = $2 AND payment_hash = $3 AND recipient_type = $4 AND recipient_id = $5 AND amount_msat = $6)")
-            .bind(&id).bind(&sender).bind(&ph).bind(rtype).bind(&rid).bind(amount).fetch_one(&mut *tx).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))")
+            .bind(&sender).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM envelope_deferrals WHERE message_id IN (SELECT message_id FROM envelope_deferrals WHERE expires_at_ms <= $1 ORDER BY expires_at_ms, message_id LIMIT $2)")
+            .bind(now).bind(i64::from(DEFERRAL_CLEANUP_BATCH)).execute(&mut *tx).await?;
+        // Exact retries keep their original deadline and signed terms.
+        sqlx::query("INSERT INTO envelope_deferrals (message_id, sender, payment_hash, recipient_type, recipient_id, amount_msat, expires_at_ms)
+                SELECT $1, $2, $3, $4, $5, $6, $7
+                WHERE NOT EXISTS (SELECT 1 FROM payment_receipts WHERE payment_hash = $3)
+                  AND (SELECT COUNT(*) FROM envelope_deferrals WHERE payment_hash = $3 AND expires_at_ms > $8) < $9
+                  AND (SELECT COUNT(*) FROM envelope_deferrals WHERE sender = $2 AND expires_at_ms > $8) < $10
+                ON CONFLICT(message_id) DO NOTHING")
+            .bind(&id).bind(&sender).bind(&ph).bind(rtype).bind(&rid).bind(amount)
+            .bind(expires).bind(now)
+            .bind(MAX_DEFERRALS_PER_PROOF).bind(MAX_DEFERRALS_PER_SENDER)
+            .execute(&mut *tx).await?;
+        let deferred: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = $1 AND sender = $2 AND payment_hash = $3 AND recipient_type = $4 AND recipient_id = $5 AND amount_msat = $6 AND expires_at_ms > $7)")
+            .bind(&id).bind(&sender).bind(&ph).bind(rtype).bind(&rid).bind(amount).bind(now)
+            .fetch_one(&mut *tx).await?;
         tx.commit().await?;
         Ok(deferred)
     }
@@ -1402,15 +1421,25 @@ impl Storage for PostgresStorage {
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
         let amount = i64::try_from(envelope.payment_proof.amount_msat)
             .map_err(|_| StorageError::Conversion("deferral amount overflows i64".into()))?;
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = $1 AND sender = $2 AND payment_hash = $3 AND recipient_type = $4 AND recipient_id = $5 AND amount_msat = $6)")
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = $1 AND sender = $2 AND payment_hash = $3 AND recipient_type = $4 AND recipient_id = $5 AND amount_msat = $6 AND expires_at_ms > $7)")
             .bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
             .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(rtype).bind(&rid).bind(amount)
+            .bind(crate::traits::deferral_now_ms())
             .fetch_one(&self.pool).await.map_err(Into::into)
     }
 
-    async fn session_repair_pending(&self, own: &NodeId, peer: &NodeId) -> Result<bool, StorageError> {
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals d WHERE d.sender = $2 AND d.recipient_type = 'node' AND d.recipient_id = $1 AND d.amount_msat > 0 AND NOT EXISTS (SELECT 1 FROM payment_receipts r WHERE r.payment_hash = d.payment_hash)) OR EXISTS (SELECT 1 FROM outbox_operations o JOIN pending_deliveries p ON p.message_id = o.message_id AND p.recipient_id = o.recipient JOIN messages m ON m.id = o.message_id WHERE o.recipient = $2 AND o.state IN ('paid', 'sent', 'rejected_retryable') AND substr(o.last_error, 1, 17) = 'session_handover:' AND p.state IN ('pending', 'stalled') AND p.dispatched = 1 AND p.rejection_reason = o.last_error AND m.sender = $1 AND m.recipient_type = 'node' AND m.recipient_id = $2 AND m.kind = o.kind AND m.amount_msat > 0 AND o.settled_msat = m.amount_msat AND o.payment_hash = m.payment_hash)")
-            .bind(own.to_hex()).bind(peer.to_hex()).fetch_one(&self.pool).await.map_err(Into::into)
+    async fn session_repair_expires_at(&self, own: &NodeId, peer: &NodeId) -> Result<Option<i64>, StorageError> {
+        let now = crate::traits::deferral_now_ms();
+        sqlx::query_scalar("SELECT MAX(expires_at_ms) FROM (SELECT d.expires_at_ms FROM envelope_deferrals d WHERE d.sender = $2 AND d.recipient_type = 'node' AND d.recipient_id = $1 AND d.amount_msat > 0 AND d.expires_at_ms > $3 AND NOT EXISTS (SELECT 1 FROM payment_receipts r WHERE r.payment_hash = d.payment_hash) UNION ALL SELECT $4 WHERE EXISTS (SELECT 1 FROM outbox_operations o JOIN pending_deliveries p ON p.message_id = o.message_id AND p.recipient_id = o.recipient JOIN messages m ON m.id = o.message_id WHERE o.recipient = $2 AND o.state IN ('paid', 'sent', 'rejected_retryable') AND substr(o.last_error, 1, 17) = 'session_handover:' AND p.state IN ('pending', 'stalled') AND p.dispatched = 1 AND p.rejection_reason = o.last_error AND m.sender = $1 AND m.recipient_type = 'node' AND m.recipient_id = $2 AND m.kind = o.kind AND m.amount_msat > 0 AND o.settled_msat = m.amount_msat AND o.payment_hash = m.payment_hash) ) repair")
+            .bind(own.to_hex()).bind(peer.to_hex()).bind(now)
+            .bind(now.saturating_add(crate::ENVELOPE_DEFERRAL_TTL_MS))
+            .fetch_one(&self.pool).await.map_err(Into::into)
+    }
+
+    async fn cleanup_expired_deferrals(&self, now_ms: i64, max: u32) -> Result<u64, StorageError> {
+        Ok(sqlx::query("DELETE FROM envelope_deferrals WHERE message_id IN (SELECT message_id FROM envelope_deferrals WHERE expires_at_ms <= $1 ORDER BY expires_at_ms, message_id LIMIT $2)")
+            .bind(now_ms).bind(i64::from(max.min(crate::DEFERRAL_CLEANUP_BATCH)))
+            .execute(&self.pool).await?.rows_affected())
     }
 
     async fn paid_envelope_status(&self, envelope: &UkmEnvelope) -> Result<Option<crate::PaidAcceptance>, StorageError> {
@@ -4246,7 +4275,7 @@ mod schema_parity_tests {
             .collect();
         assert_eq!(
             versions,
-            (1..=38).filter(|v| !matches!(v, 7..=9 | 34)).collect::<Vec<_>>()
+            (1..=39).filter(|v| !matches!(v, 7..=9 | 34)).collect::<Vec<_>>()
         );
         let sql = include_str!("../migrations/postgres/033_calendar_and_schema_parity.sql");
         assert!(

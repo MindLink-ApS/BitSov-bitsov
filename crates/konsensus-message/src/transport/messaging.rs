@@ -195,7 +195,7 @@ impl NoiseTransport {
         let mut state = conn.lock().await;
         let holds = match standing {
             Standing::AdmissionPaid => conn.admission_paid.load(std::sync::atomic::Ordering::Acquire),
-            Standing::SessionRepair => conn.session_repair.load(std::sync::atomic::Ordering::Acquire),
+            Standing::SessionRepair => conn.session_repair_active(),
             Standing::Privileged => state.privileged,
         };
         if conn.is_closed() || !holds {
@@ -333,21 +333,20 @@ impl NoiseTransport {
         privileged
     }
 
-    /// Permit only E2EE repair on this exact live connection. Callers must
+    /// Permit only E2EE repair on this exact live connection until its deadline. Callers must
     /// have durably deferred a verified paid envelope, or matched a paid
     /// outbound delivery to an authenticated recovery refusal.
-    pub async fn allow_session_repair(&self, peer: &NodeId, since: Instant) -> bool {
+    pub async fn allow_session_repair(&self, peer: &NodeId, since: Instant, until: Instant) -> bool {
         let peers = self.peers.read().await;
         let Some(conn) = peers.get(peer).filter(|conn| conn.connected_at == since && !conn.is_closed()) else {
             return false;
         };
-        conn.session_repair.store(true, std::sync::atomic::Ordering::Release);
-        true
+        conn.allow_session_repair_until(until)
     }
 
     pub async fn session_repair_on_connection(&self, peer: &NodeId) -> bool {
         self.peers.read().await.get(peer).is_some_and(|conn|
-            !conn.is_closed() && conn.session_repair.load(std::sync::atomic::Ordering::Acquire))
+            !conn.is_closed() && conn.session_repair_active())
     }
 
     /// Connected peers eligible for E2EE session setup: privileged ones, plus
@@ -369,7 +368,7 @@ impl NoiseTransport {
         let mut eligible = Vec::with_capacity(conns.len());
         for (id, conn) in conns {
             if conn.admission_paid.load(std::sync::atomic::Ordering::Acquire)
-                || conn.session_repair.load(std::sync::atomic::Ordering::Acquire)
+                || conn.session_repair_active()
                 || conn.lock().await.privileged {
                 eligible.push(id);
             }
@@ -546,7 +545,7 @@ pub(super) fn spawn_reader_task(
                 state.last_recv = Instant::now();
                 let paid = conn.admission_paid.load(std::sync::atomic::Ordering::Acquire);
                 let bought = state.privileged || paid;
-                let session_control = bought || conn.session_repair.load(std::sync::atomic::Ordering::Acquire);
+                let session_control = bought || conn.session_repair_active();
                 (state.privileged, bought, session_control, state.source_ip)
             };
 

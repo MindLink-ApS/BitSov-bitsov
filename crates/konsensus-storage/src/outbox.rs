@@ -307,7 +307,7 @@ mod handover_tests {
     async fn handover_deferral_remains_retryable_until_acceptance_and_is_exactly_bound() {
         for store in stores().await {
             let old = incoming();
-            for n in 0..64 {
+            for n in 0..3 {
                 let mut env = old.clone();
                 env.id = MessageId::from_bytes([n; 32]);
                 assert!(store.defer_unreadable_envelope(&env).await.unwrap());
