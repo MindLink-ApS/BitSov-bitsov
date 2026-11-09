@@ -213,8 +213,14 @@ impl EsploraProvider {
             return Ok(());
         }
         let genesis = crate::network::esplora_genesis(|path| async move {
-            self.fetch(index, &path, timeout, &|text: &str| Ok(text.to_owned()))
-                .await
+            self.fetch(
+                index,
+                &path,
+                timeout,
+                Some(crate::network::MAX_GENESIS_ANSWER_BYTES),
+                &|text: &str| Ok(text.to_owned()),
+            )
+            .await
         })
         .await;
         match genesis {
@@ -304,7 +310,7 @@ impl EsploraProvider {
                     }
                 }
             }
-            match self.fetch(index, path, timeout, &parse).await {
+            match self.fetch(index, path, timeout, None, &parse).await {
                 Ok(value) => {
                     self.active.store(index, Ordering::Relaxed);
                     return Ok(value);
@@ -329,6 +335,9 @@ impl EsploraProvider {
         index: usize,
         path: &str,
         timeout: std::time::Duration,
+        // `Some` stops the body at that many bytes. Genesis checks pass the
+        // small answer cap. Other reads stay uncapped, as they were.
+        max_body: Option<usize>,
         parse: &impl Fn(&str) -> Result<T, ChainError>,
     ) -> Result<T, ChainError> {
         let (base, limiter) = &self.endpoints[index];
@@ -358,11 +367,14 @@ impl EsploraProvider {
                     response.status()
                 )));
             }
-            let text = response
-                .text()
-                .await
-                // Headers arrived but the body did not: a lost connection.
-                .map_err(|_| ChainError::Connection("Esplora body unavailable".into()))?;
+            let text = match max_body {
+                Some(max) => crate::network::read_limited_text(response, max).await?,
+                None => response
+                    .text()
+                    .await
+                    // Headers arrived but the body did not: a lost connection.
+                    .map_err(|_| ChainError::Connection("Esplora body unavailable".into()))?,
+            };
             parse(&text)
         })
         .await
