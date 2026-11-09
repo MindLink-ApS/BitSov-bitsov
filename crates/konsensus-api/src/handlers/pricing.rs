@@ -96,8 +96,7 @@ async fn get_own_pricing(
     State(state): State<Arc<AppState>>,
 ) -> Result<(DataFreshness, Json<OwnPricingResponse>), ApiError> {
     let read_at = SystemTime::now();
-    let block_height = state.chain.get_block_height().await.map_err(|_| ApiError::NotReady)?;
-    if block_height == 0 { return Err(ApiError::NotReady); }
+    let block_height = crate::error::chain_tip(&state).await?;
 
     // Build price table from our own pricing engine
     let categories = [
@@ -115,6 +114,11 @@ async fn get_own_pricing(
         match state.pricing.get_category_price_msat(cat).await {
             Ok(price) => {
                 prices.insert(category_to_string(cat), price);
+            }
+            // No table without a tip: the typed readiness refusal, never a
+            // partial or empty one.
+            Err(konsensus_core::traits::pricing::PricingError::ChainUnavailable(_)) => {
+                return Err(ApiError::ChainNotReady);
             }
             Err(e) => {
                 tracing::warn!(category = %category_to_string(cat), error = %e, "failed to get price for category");
@@ -243,7 +247,9 @@ async fn list_peer_pricing(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<PeerPriceResponse>>, ApiError> {
-    let block_height = state.chain.get_block_height().await.unwrap_or(0);
+    // Without a tip, no table's block validity can be checked: list them all
+    // as stale rather than compare against height 0.
+    let block_height = state.chain.get_block_height().await.ok().filter(|h| *h > 0);
     let max_age = std::time::Duration::from_secs(3600);
     let entries = state.peer_prices.all_entries().await;
 
@@ -255,7 +261,7 @@ async fn list_peer_pricing(
             block_height: entry.block_height,
             valid_blocks: entry.valid_blocks,
             age_secs: entry.received_at.elapsed().as_secs(),
-            stale: entry.is_stale(block_height, max_age),
+            stale: block_height.is_none_or(|tip| entry.is_stale(tip, max_age)),
         })
         .collect();
 
@@ -274,7 +280,7 @@ async fn get_peer_pricing(
     let peer_id = konsensus_core::types::NodeId::from_hex(&peer_id_hex)
         .map_err(|e| ApiError::BadRequest(format!("invalid peer ID: {e}")))?;
 
-    let block_height = state.chain.get_block_height().await.unwrap_or(0);
+    let block_height = state.chain.get_block_height().await.ok().filter(|h| *h > 0);
     let max_age = std::time::Duration::from_secs(3600);
 
     let entry = state
@@ -283,7 +289,7 @@ async fn get_peer_pricing(
         .await
         .ok_or_else(|| ApiError::NotFound(format!("no price table cached for peer {peer_id_hex}")))?;
 
-    let stale = entry.is_stale(block_height, max_age);
+    let stale = block_height.is_none_or(|tip| entry.is_stale(tip, max_age));
     Ok(Json(PeerPriceResponse {
         peer_id: peer_id_hex,
         prices: entry.prices,
@@ -312,11 +318,11 @@ async fn get_peer_call_pricing(
 ) -> Result<Json<PeerCallPriceResponse>, ApiError> {
     let peer = konsensus_core::NodeId::from_hex(&peer_id).map_err(|e| ApiError::BadRequest(format!("invalid peer id: {e}")))?;
     let offer_msat = crate::calls::peer_call_price(&state, &peer).await?;
-    let height = state.chain.get_block_height().await.unwrap_or(0);
+    let height = crate::error::chain_tip(&state).await?;
     let answer = konsensus_core::kind::KIND_CALL_ANSWER;
     let signal_msat = match state.peer_prices.get_fresh_discounted_peer_price(&peer, answer, height, std::time::Duration::from_secs(3600)).await {
         Some(p) => p,
-        None => state.pricing.get_price_msat(answer).await.map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?,
+        None => state.pricing.get_price_msat(answer).await.map_err(crate::error::pricing_error)?,
     };
     Ok(Json(PeerCallPriceResponse { peer_id: peer.to_hex(), offer_msat, signal_msat }))
 }

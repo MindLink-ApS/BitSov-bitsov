@@ -782,6 +782,44 @@ async fn esplora_truncated_body_is_a_lost_connection() {
 }
 
 #[tokio::test]
+async fn esplora_oversized_genesis_answer_is_not_verified() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                // The length is far above a hash or a header. The body is not sent.
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 10000000\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = socket.read(&mut buf).await;
+            });
+        }
+    });
+    let provider = esplora_provider(&url, &[], Network::Signet);
+    let check = tokio::time::timeout(std::time::Duration::from_secs(5), provider.verify_network())
+        .await
+        .expect("an oversized genesis answer must be refused before its body is read");
+    assert_eq!(check, NetworkCheck::Unavailable);
+    assert!(!provider.is_synced().await);
+    task.abort();
+}
+
+#[tokio::test]
 async fn esplora_failed_recovery_broadcast_is_a_lost_connection() {
     use konsensus_chain::recovery::RecoveryChain;
     let explorer = RawExplorer::new(Network::Signet).await;
@@ -794,6 +832,56 @@ async fn esplora_failed_recovery_broadcast_is_a_lost_connection() {
     *explorer.network.lock().unwrap() = Network::Bitcoin;
     let error = provider.estimate_fee(6).await.unwrap_err().to_string();
     assert!(error.contains("network mismatch"), "{error}");
+}
+
+/// A tip kept by `FreshTip` is not served once its source has refused itself
+/// for being on another network: the refusal is latched, the kept header too
+/// old a witness.
+#[tokio::test]
+async fn a_kept_tip_is_dropped_when_its_source_refuses_its_network() {
+    let network = Arc::new(Mutex::new(Network::Signet));
+    let served = network.clone();
+    let fixture = electrum_fixture::Fixture::new(move |request| {
+        let network = *served.lock().unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(network).header;
+        let mut tip = genesis;
+        tip.time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        let header = if request["params"][0] == 0 { genesis } else { tip };
+        let result = match request["method"].as_str().unwrap() {
+            "blockchain.block.header" => json!(bitcoin::consensus::encode::serialize_hex(&header)),
+            "blockchain.headers.subscribe" => {
+                json!({"height": 101, "hex": bitcoin::consensus::encode::serialize_hex(&tip)})
+            }
+            "blockchain.estimatefee" => json!(0.00002),
+            method => panic!("unexpected method {method}"),
+        };
+        json!({ "result": result })
+    })
+    .await;
+    let source = Arc::new(
+        ElectrumProvider::new(ElectrumConfig {
+            server_url: fixture.url.clone(),
+            operator: Default::default(),
+        })
+        .unwrap()
+        .with_network(Network::Signet),
+    );
+    let tip = konsensus_chain::FreshTip::new(
+        source.clone(),
+        Some(konsensus_chain::tip::TEST_NETWORK_MAX_TIP_AGE),
+    );
+    assert_eq!(tip.get_block_height().await.unwrap(), 101);
+    // The server moves to another network; the next read through the wrapper
+    // (a fee estimate, which bypasses the kept tip) latches the refusal.
+    *network.lock().unwrap() = Network::Bitcoin;
+    assert!(tip.estimate_fee(6).await.unwrap_err().to_string().contains("network mismatch"));
+    assert!(source.get_block_height().await.is_err());
+    assert!(tip.refusal().is_err());
+    assert!(tip.get_block_height().await.is_err(), "the kept tip is not served");
+    assert!(!tip.tip_is_fresh().await);
 }
 
 // ── Follow-ups: per-endpoint bounds, cache provenance, Electrum latch ───
