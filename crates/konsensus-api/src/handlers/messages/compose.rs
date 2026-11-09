@@ -136,24 +136,26 @@ async fn peer_or_own_price(state: &AppState, peer: &NodeId, kind: u16, height: u
     }
 }
 
-/// Share the send's tip with every quote, including a zero price. An
-/// established free conversation does not need a money-ready wallet.
+/// An established zero-price conversation needs no tip or money-ready wallet.
+/// Any price to pay is quoted again against this send's observed tip.
 async fn quoted_price(state: &AppState, peer: &NodeId, kind: u16, tip: &mut Option<ObservedTip>) -> Result<u64, ApiError> {
     let ready = state.lightning.money_ready().await;
     if !ready && !state.session_manager.has_session(peer).await {
         return Err(ApiError::NotReady);
     }
-    if tip.is_none() {
-        *tip = Some(crate::error::observe_tip(state).await?);
-    }
     // A wallet that is not ready still needs an established local free price;
     // do not wait on dynamic pricing or assume that a conversation is free.
-    let quote = peer_or_own_price(state, peer, kind, tip.as_ref().expect("observed tip").height());
-    let price = if ready { quote.await? } else {
+    // Height zero is only a check for a free send, never a price to pay.
+    let quote = peer_or_own_price(state, peer, kind, tip.as_ref().map_or(0, ObservedTip::height));
+    let mut price = if ready { quote.await? } else {
         tokio::time::timeout(Duration::from_millis(100), quote).await.map_err(|_| ApiError::NotReady)??
     };
     if super::caps::payable(price) > 0 || !state.session_manager.has_session(peer).await {
         crate::error::require_money_ready(state).await?;
+        if tip.is_none() {
+            *tip = Some(crate::error::observe_tip(state).await?);
+            price = peer_or_own_price(state, peer, kind, tip.as_ref().expect("observed tip").height()).await?;
+        }
     }
     Ok(super::caps::payable(price))
 }
@@ -504,10 +506,12 @@ pub(crate) async fn create_metered_payment_proof(
     charge: &mut FirstContactCharge,
     tip: Option<&ObservedTip>,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
-    // Recheck after quoting: readiness may have changed before dispatch.
-    if price_msat > 0 {
-        crate::error::require_money_ready(state).await?;
+    // A zero-amount proof never reaches the wallet and needs no chain tip.
+    if price_msat == 0 {
+        return Ok(generate_valid_proof(0));
     }
+    // Recheck after quoting: readiness may have changed before dispatch.
+    crate::error::require_money_ready(state).await?;
     // Reuse the quote's observation where available. Every dispatcher checks
     // it again after a long preparation before polling the wallet.
     let observed;
@@ -518,11 +522,6 @@ pub(crate) async fn create_metered_payment_proof(
             &observed
         }
     };
-    // A zero price sends a zero-amount proof and pays nothing, but still
-    // requires a usable tip observation.
-    if price_msat == 0 {
-        return Ok(generate_valid_proof(0));
-    }
     let _reconnect = state.transport.retain_peer(peer_id).await;
     tracing::debug!(peer = %peer_id, tip = tip.height(), "paying a peer against the chain tip");
 
@@ -3389,9 +3388,8 @@ pub(super) async fn compose_message_with_policy(
             None => admin_room_members(&state, &req).await?,
         };
 
-        // Observe before quoting. An unready wallet can still send at an
-        // established zero price once quoted_price has checked the tip.
-        let mut tip = if !state.lightning.money_ready().await { None } else { Some(crate::error::observe_tip(&state).await?) };
+        // Observe only when a member needs a positive price or a new session.
+        let mut tip = None;
 
         let mut prices = Vec::new();
         for member in members.iter().filter(|m| *m != state.identity.node_id()) {
@@ -3588,7 +3586,9 @@ pub(super) async fn compose_peer(
         let mut admission = FirstContactCharge { operation: Some(operation.clone()), ..Default::default() };
         let recipient = Recipient::Node(peer_id);
 
-        let mut tip = if state.lightning.money_ready().await { Some(crate::error::observe_tip(&state).await?) } else { None };
+        let mut tip = if state.lightning.money_ready().await && !state.session_manager.has_session(&peer_id).await {
+            Some(crate::error::observe_tip(&state).await?)
+        } else { None };
         let mut price_msat = if req.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
             crate::handlers::browse::page_price(&state, peer_id, &req.plaintext, req.max_routing_fee_msat, &mut tip).await?
         } else {

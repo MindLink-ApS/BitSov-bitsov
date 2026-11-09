@@ -64,8 +64,9 @@ also live on the corresponding GitHub pre-release pages.
   refusals say the chain source has no current tip. Every payment of a peer's
   price needs a usable tip observation, shared between quoting and payment
   where possible for up to 30 seconds and refreshed before dispatch after a
-  longer wait. Even a zero quote requires a real tip, including while the
-  wallet is not money-ready. A kept tip is dropped once its source refuses its
+  longer wait. Established free conversations need no tip or wallet payment
+  and can still send when the chain source is unavailable or the wallet is
+  not money-ready. A kept tip is dropped once its source refuses its
   network. Direct invoice and keysend payments, including those under paired
   spend grants, remain outside this peer-price check; grant limits still apply.
   On-chain sends, channel opens, liquidity, sponsor gifts, the dormant daily

@@ -1,6 +1,6 @@
-//! Every send quote, including a zero price, needs an observed chain tip.
-//! Reuse that observation through payment preparation, refreshing after waits;
-//! never compare a peer's block validity with height zero.
+//! Established free sends need no chain tip or wallet payment. Positive prices
+//! need an observation shared through payment preparation and refreshed after
+//! waits; never pay a peer's price checked only against height zero.
 mod common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -107,6 +107,19 @@ async fn a_wallet_that_becomes_ready_mid_send_still_needs_a_chain_tip() {
         assert!(wallet.polls.load(Ordering::SeqCst) >= 2, "room={is_room}: readiness changed mid-send");
         assert_eq!(chain.reads(), 1, "room={is_room}: the price to pay asked for a tip");
         assert_eq!(wallet.inner.money(), 0, "room={is_room}: nothing paid");
+        assert_eq!(wallet.inner.invoices(), 0);
+    }
+}
+
+#[tokio::test]
+async fn an_established_paid_chat_refuses_without_a_tip() {
+    for is_room in [false, true] {
+        let wallet = Arc::new(RecoveringWallet { polls: AtomicUsize::new(1), ..Default::default() });
+        let chain = Arc::new(common::TipDownChain::down());
+        let (wallet, status, body) = send_with_wallet(is_room, chain.clone(), 2_000, wallet).await;
+        common::assert_chain_not_ready(status, &body);
+        assert_eq!(chain.reads(), 1);
+        assert_eq!(wallet.inner.money(), 0);
         assert_eq!(wallet.inner.invoices(), 0);
     }
 }
@@ -464,27 +477,33 @@ async fn the_payment_path_itself_needs_a_chain_tip() {
 
 
 #[tokio::test]
-async fn a_recovered_wallet_checks_even_a_zero_price_against_the_tip() {
+async fn an_established_free_chat_delivers_without_a_tip() {
     for is_room in [false, true] {
-        for chain in [common::TipDownChain::down(), common::TipDownChain::zero()] {
-            let chain = Arc::new(chain);
-            let (wallet, status, body) = send(is_room, chain.clone(), 0).await;
-            common::assert_chain_not_ready(status, &body);
-            assert_eq!(chain.reads(), 1);
-            assert_eq!(wallet.inner.money(), 0);
+        for initially_ready in [false, true] {
+            for chain in [common::TipDownChain::down(), common::TipDownChain::zero()] {
+                let wallet = Arc::new(RecoveringWallet { polls: AtomicUsize::new(usize::from(initially_ready)), ..Default::default() });
+                let chain = Arc::new(chain);
+                let (wallet, status, body) = send_with_wallet(is_room, chain.clone(), 0, wallet).await;
+                assert_eq!(status, 200, "room={is_room}, ready={initially_ready}: {body}");
+                assert_eq!(body["delivered"], true, "{body}");
+                assert_eq!(body["amount_msat"], 0, "{body}");
+                assert_eq!(chain.reads(), 0);
+                assert_eq!(wallet.inner.money(), 0);
+                assert_eq!(wallet.inner.invoices(), 0);
+            }
         }
     }
 }
 
 #[tokio::test]
-async fn a_recovered_wallet_observes_the_tip_for_a_free_quote() {
+async fn a_free_quote_does_not_read_a_usable_tip_either() {
     for is_room in [false, true] {
         let chain = Arc::new(common::TipDownChain::after(usize::MAX));
         let (wallet, status, body) = send(is_room, chain.clone(), 0).await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["amount_msat"], 0, "{body}");
         assert_eq!(wallet.inner.money(), 0);
-        assert_eq!(chain.reads(), 1);
+        assert_eq!(chain.reads(), 0);
     }
 }
 
@@ -635,35 +654,33 @@ async fn cancelling_a_pending_tip_refresh_keeps_the_operation_retryable() {
 
 
 #[tokio::test]
-async fn a_zero_price_quote_needs_a_tip_while_the_wallet_is_unready() {
+async fn an_unready_wallet_can_deliver_an_established_free_chat_without_a_tip() {
     for is_room in [false, true] {
         for available in [false, true] {
             let wallet = Arc::new(RecoveringWallet { remain_unready: true, ..Default::default() });
             let chain = Arc::new(common::TipDownChain::after(if available { usize::MAX } else { 0 }));
             let (wallet, status, body) = send_with_wallet(is_room, chain.clone(), 0, wallet).await;
-            if available {
-                assert_eq!(status, 200, "{body}");
-                assert_eq!(body["amount_msat"], 0);
-            } else {
-                common::assert_chain_not_ready(status, &body);
-            }
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(body["delivered"], true, "{body}");
+            assert_eq!(body["amount_msat"], 0);
             assert_eq!(wallet.inner.money(), 0);
-            assert_eq!(chain.reads(), 1);
+            assert_eq!(wallet.inner.invoices(), 0);
+            assert_eq!(chain.reads(), 0);
         }
     }
 }
 
 
 #[tokio::test]
-async fn a_free_payment_proof_requires_a_tip() {
-    let base = common::test_state();
+async fn a_free_payment_proof_needs_no_tip_or_wallet_payment() {
+    let wallet = Arc::new(common::CountingLightning::default());
+    let base = common::test_state_with_lightning(wallet.clone());
     let chain = Arc::new(common::TipDownChain::down());
     let state = Arc::new(AppState { chain: chain.clone(), ..(*base).clone() });
     let peer = konsensus_core::NodeId::from_bytes([0x6d; 32]);
-    let error = konsensus_api::handlers::messages::create_payment_proof(&state, 0, &peer).await.unwrap_err();
-    let response = error.into_response();
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), 65_536).await.unwrap();
-    common::assert_chain_not_ready(status, &serde_json::from_slice(&bytes).unwrap());
-    assert_eq!(chain.reads(), 1);
+    let (_, _, amount) = konsensus_api::handlers::messages::create_payment_proof(&state, 0, &peer).await.unwrap();
+    assert_eq!(amount, 0);
+    assert_eq!(chain.reads(), 0);
+    assert_eq!(wallet.money(), 0);
+    assert_eq!(wallet.invoices(), 0);
 }

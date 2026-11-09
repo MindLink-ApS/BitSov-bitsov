@@ -349,12 +349,13 @@ quotes, admission quotes and card publishing answer `503` with
 signed (a call quote also before its price query is sent); a stranger's
 admission request gets the fixed `konsensus:not_ready:chain_unavailable`
 refusal; no price answer, price table or web manifest is sent; peer price
-tables are listed as `stale`. Every quote, including a zero price, is checked
-against a real tip. An established free conversation can still send while the
-wallet is not money-ready, provided the tip is usable. A published front door
+tables are listed as `stale`. Positive send prices are checked against a real
+tip. An established free conversation can still send when the chain source is
+unavailable or the wallet is not money-ready; its zero-amount proof makes no
+wallet payment and needs no tip. A published front door
 card whose page price changed is re-signed
 only against a usable tip (with that tip's epoch); an unchanged card is still
-served without one. Chain-aware pricing refuses a price when a synced source's
+served without one. Chain-aware pricing refuses a positive price when a synced source's
 tip cannot be read (also `not_ready`/`chain_unavailable` on these routes); its
 existing static fallback when the source is not synced or has no fee estimate is
 unchanged. Admission reuses a tip height for up to a minute, but not past the
