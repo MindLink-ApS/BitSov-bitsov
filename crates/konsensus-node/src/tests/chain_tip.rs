@@ -597,15 +597,55 @@ fn method_names(source: &str, start: &str) -> Vec<String> {
         .nth(1)
         .unwrap_or_else(|| panic!("{start} not found"));
     let body = &body[..body.find("\n}\n").expect("end of block")];
-    body.lines()
-        .filter_map(|line| {
-            let line = line.trim_start();
-            let rest = line
-                .strip_prefix("async fn ")
-                .or_else(|| line.strip_prefix("fn "))?;
-            Some(rest.split(['(', '<']).next()?.trim().to_owned())
-        })
-        .collect()
+    let item = syn::parse_str::<syn::Item>(&format!("{start}{body}\n}}"))
+        .expect("trait or implementation syntax");
+    match item {
+        syn::Item::Trait(item) => item
+            .items
+            .into_iter()
+            .filter_map(|item| match item {
+                syn::TraitItem::Fn(method) => Some(method.sig.ident.to_string()),
+                _ => None,
+            })
+            .collect(),
+        syn::Item::Impl(item) => item
+            .items
+            .into_iter()
+            .filter_map(|item| match item {
+                syn::ImplItem::Fn(method) => Some(method.sig.ident.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => panic!("expected trait or implementation"),
+    }
+}
+
+#[test]
+fn method_names_include_attribute_prefixed_methods() {
+    let source = r#"
+pub trait Example {
+    fn plain(&self);
+    #[must_use] fn attributed(&self) -> [u8; 32];
+    #[allow(dead_code)] #[must_use] async fn multiple(&self);
+    #[doc = "A closing bracket: ]"] fn documented<T>(&self, value: T);
+    #[cfg_attr(any(), allow(dead_code))]
+    async fn separate(&self);
+}
+"#;
+    assert_eq!(
+        method_names(source, "pub trait Example"),
+        ["plain", "attributed", "multiple", "documented", "separate"]
+    );
+    let source = r#"
+impl Example for Source {
+    #[must_use] fn attributed(&self) -> [u8; 32] { [0; 32] }
+    #[allow(dead_code)] async fn multiple(&self) {}
+}
+"#;
+    assert_eq!(
+        method_names(source, "impl Example for Source"),
+        ["attributed", "multiple"]
+    );
 }
 
 /// Fails when `ChainProvider` gains a method the label does not forward:
