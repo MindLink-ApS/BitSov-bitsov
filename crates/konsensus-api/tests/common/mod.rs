@@ -321,28 +321,14 @@ impl Storage for MemStorage {
         &self,
         op: &konsensus_storage::OutboxOperation,
     ) -> Result<bool, StorageError> {
-        let dispatched = op.kind == 404
-            && serde_json::from_slice::<serde_json::Value>(&op.recovery)
-                .is_ok_and(|data| data["dispatched"] == true);
-        let gate = if dispatched {
-            self.call_block_dispatch_gate.lock().unwrap().take()
-        } else {
-            None
-        };
-        if let Some(gate) = gate {
-            gate.run().await?;
-        }
-        let offer_dispatched = op.kind == 400
-            && serde_json::from_slice::<serde_json::Value>(&op.recovery)
-                .is_ok_and(|data| data["dispatched"] == true);
-        let gate = if offer_dispatched {
-            self.call_offer_dispatch_gate.lock().unwrap().take()
-        } else {
-            None
-        };
-        if let Some(gate) = gate {
-            gate.run().await?;
-        }
+        let dispatched = op.kind == 404 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
+            .is_ok_and(|data| data["dispatched"] == true);
+        let gate = if dispatched { self.call_block_dispatch_gate.lock().unwrap().take() } else { None };
+        if let Some(gate) = gate { gate.run().await?; }
+        let offer_dispatched = op.kind == 400 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
+            .is_ok_and(|data| data["dispatched"] == true);
+        let gate = if offer_dispatched { self.call_offer_dispatch_gate.lock().unwrap().take() } else { None };
+        if let Some(gate) = gate { gate.run().await?; }
         let mut rows = self.outbox.lock().unwrap();
         if rows
             .get(&op.operation_id)
