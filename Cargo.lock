@@ -2134,6 +2134,7 @@ dependencies = [
  "bitcoin",
  "electrum-client",
  "esplora-client",
+ "futures",
  "hex",
  "http",
  "konsensus-core",

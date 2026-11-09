@@ -337,8 +337,11 @@ impl ChainProvider for ElectrumProvider {
 
     async fn is_synced_with_height(&self, _height: u64) -> bool {
         // This backend defines sync as availability of a tip. The caller's
-        // successful bounded-age height read already established that.
-        true
+        // successful bounded-age height read already established that,
+        // unless the source has since been refused.
+        self.network
+            .as_ref()
+            .is_none_or(|gate| gate.refusal().is_ok())
     }
 }
 
