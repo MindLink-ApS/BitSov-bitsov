@@ -983,6 +983,12 @@ pub enum ChainConfig {
         /// Owner-only OAuth client credentials for the primary Esplora source.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credentials_file: Option<PathBuf>,
+        /// The owner accepted a public explorer as this node's tip by adding
+        /// `accept_third_party_tip = true` to `[chain]` by hand. Only silences
+        /// the start-time warning; the source stays `third_party`. Defaults to
+        /// false, is never written by the node, and is omitted when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        accept_third_party_tip: bool,
     },
     /// Mock provider — static block data, no network calls.
     /// For testnet, development, and offline operation.
@@ -1004,6 +1010,7 @@ impl std::fmt::Debug for ChainConfig {
                 api_url,
                 esplora_url_fallback,
                 credentials_file,
+                accept_third_party_tip,
             } => f
                 .debug_struct("Esplora")
                 .field(
@@ -1017,6 +1024,7 @@ impl std::fmt::Debug for ChainConfig {
                         .map(konsensus_core::logging::redact_url_for_debug),
                 )
                 .field("credentials_file", credentials_file)
+                .field("accept_third_party_tip", accept_third_party_tip)
                 .finish(),
             Self::Mock => f.write_str("Mock"),
             Self::Bitcoind(config) => f.debug_tuple("Bitcoind").field(config).finish(),
@@ -1067,6 +1075,7 @@ impl Default for ChainConfig {
             api_url: FRESH_CHAIN_PRIMARY.to_string(),
             esplora_url_fallback: Some(FRESH_CHAIN_FALLBACK.to_string()),
             credentials_file: None,
+            accept_third_party_tip: false,
         }
     }
 }

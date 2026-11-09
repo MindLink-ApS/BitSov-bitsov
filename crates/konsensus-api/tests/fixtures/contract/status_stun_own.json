@@ -55,6 +55,7 @@
     "money_ready": true,
     "network": "regtest",
     "node_id": "<hex64>",
+    "node_version": "<pkg_version>",
     "offline_safety": null,
     "peer_endpoint": "node.example.org:9000",
     "peer_endpoint_source": "advertised",

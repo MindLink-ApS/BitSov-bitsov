@@ -94,8 +94,17 @@ pub struct EsploraProvider {
     active: AtomicUsize,
     transport: Option<Arc<dyn HttpTransport>>,
     bearer: Option<Arc<dyn HttpTransport>>,
-    tip_height: Mutex<Option<(u64, Instant)>>,
+    /// Cached tip height, when it was fetched, and the endpoint it came from.
+    tip_height: Mutex<Option<CachedHeight>>,
     network: Option<NetworkGate>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedHeight {
+    height: u64,
+    fetched_at: Instant,
+    /// Index of the endpoint that served `height`.
+    endpoint: usize,
 }
 
 /// JSON response from `/api/block/{hash}`.
@@ -213,8 +222,14 @@ impl EsploraProvider {
             return Ok(());
         }
         let genesis = crate::network::esplora_genesis(|path| async move {
-            self.fetch(index, &path, timeout, &|text: &str| Ok(text.to_owned()))
-                .await
+            self.fetch(
+                index,
+                &path,
+                timeout,
+                Some(crate::network::MAX_GENESIS_ANSWER_BYTES),
+                &|text: &str| Ok(text.to_owned()),
+            )
+            .await
         })
         .await;
         match genesis {
@@ -239,12 +254,18 @@ impl EsploraProvider {
     /// requests share the same limiter as LDK for each configured API endpoint.
     pub(crate) async fn recovery_broadcast(&self, raw: &str) -> Result<String, ChainError> {
         let index = self.active.load(Ordering::Relaxed);
+        let timeout = std::time::Duration::from_secs(self.config.timeout_secs);
         if let Some(gate) = &self.network {
-            let timeout = std::time::Duration::from_secs(self.config.timeout_secs);
             self.ensure_network(gate, index, timeout).await?;
         }
         let (base, limiter) = &self.endpoints[index];
-        let request = self.client.post(format!("{base}/tx")).body(raw.to_owned());
+        // Set on the request, so the configured budget also holds through
+        // the authenticated transport, whose client has none of its own.
+        let request = self
+            .client
+            .post(format!("{base}/tx"))
+            .timeout(timeout)
+            .body(raw.to_owned());
         let response = limiter
             .run(false, || async {
                 match if index == 0 {
@@ -283,6 +304,17 @@ impl EsploraProvider {
         path: &str,
         parse: impl Fn(&str) -> Result<T, ChainError>,
     ) -> Result<T, ChainError> {
+        self.get_parsed_from(path, parse)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// Like `get_parsed`, also naming the endpoint that answered.
+    async fn get_parsed_from<T>(
+        &self,
+        path: &str,
+        parse: impl Fn(&str) -> Result<T, ChainError>,
+    ) -> Result<(T, usize), ChainError> {
         let mut last_error = ChainError::NotAvailable("no usable Esplora endpoint".into());
         for index in 0..self.endpoints.len() {
             // Admission's outer readiness deadline is five seconds. Reserve
@@ -304,10 +336,10 @@ impl EsploraProvider {
                     }
                 }
             }
-            match self.fetch(index, path, timeout, &parse).await {
+            match self.fetch(index, path, timeout, None, &parse).await {
                 Ok(value) => {
                     self.active.store(index, Ordering::Relaxed);
-                    return Ok(value);
+                    return Ok((value, index));
                 }
                 Err(error) => {
                     // A lost connection or timeout, not an HTTP answer such
@@ -329,6 +361,9 @@ impl EsploraProvider {
         index: usize,
         path: &str,
         timeout: std::time::Duration,
+        // `Some` stops the body at that many bytes. Genesis checks pass the
+        // small answer cap. Other reads stay uncapped, as they were.
+        max_body: Option<usize>,
         parse: &impl Fn(&str) -> Result<T, ChainError>,
     ) -> Result<T, ChainError> {
         let (base, limiter) = &self.endpoints[index];
@@ -358,11 +393,14 @@ impl EsploraProvider {
                     response.status()
                 )));
             }
-            let text = response
-                .text()
-                .await
-                // Headers arrived but the body did not: a lost connection.
-                .map_err(|_| ChainError::Connection("Esplora body unavailable".into()))?;
+            let text = match max_body {
+                Some(max) => crate::network::read_limited_text(response, max).await?,
+                None => response
+                    .text()
+                    .await
+                    // Headers arrived but the body did not: a lost connection.
+                    .map_err(|_| ChainError::Connection("Esplora body unavailable".into()))?,
+            };
             parse(&text)
         })
         .await
@@ -387,6 +425,9 @@ impl EsploraProvider {
 
 #[async_trait]
 impl ChainProvider for EsploraProvider {
+    fn refusal(&self) -> Result<(), ChainError> {
+        self.network.as_ref().map_or(Ok(()), |gate| gate.refusal())
+    }
     fn chain_view(&self) -> konsensus_core::traits::chain::ChainView {
         konsensus_core::traits::chain::ChainView {
             backend: "esplora",
@@ -394,6 +435,7 @@ impl ChainProvider for EsploraProvider {
             host: reqwest::Url::parse(&self.endpoints[self.active.load(Ordering::Relaxed)].0)
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_owned)),
+            explorer_default: false,
         }
     }
 
@@ -413,19 +455,21 @@ impl ChainProvider for EsploraProvider {
                 return Err(error);
             }
         }
-        if let Some((height, fetched_at)) = *cached {
-            // Serve the cache only while the endpoint it came from is verified.
+        if let Some(entry) = *cached {
+            // Serve the cache only while the endpoint it came from is still
+            // verified. Another endpoint in use since then proves nothing
+            // about this height.
             let verified = self
                 .network
                 .as_ref()
-                .is_none_or(|gate| gate.is_verified(self.active.load(Ordering::Relaxed)));
-            if verified && fetched_at.elapsed() < TIP_HEIGHT_CACHE_TTL {
-                return Ok(height);
+                .is_none_or(|gate| gate.is_verified(entry.endpoint));
+            if verified && entry.fetched_at.elapsed() < TIP_HEIGHT_CACHE_TTL {
+                return Ok(entry.height);
             }
         }
 
-        let height = self
-            .get_parsed("/blocks/tip/height", |text| {
+        let (height, endpoint) = self
+            .get_parsed_from("/blocks/tip/height", |text| {
                 let height = text
                     .trim()
                     .parse::<u64>()
@@ -437,7 +481,11 @@ impl ChainProvider for EsploraProvider {
             })
             .await?;
 
-        *cached = Some((height, Instant::now()));
+        *cached = Some(CachedHeight {
+            height,
+            fetched_at: Instant::now(),
+            endpoint,
+        });
         debug!(height, "got block height");
         Ok(height)
     }

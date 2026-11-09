@@ -379,6 +379,9 @@ fn number(value: &Value, field: &str) -> Result<u64, ChainError> {
 
 #[async_trait]
 impl ChainProvider for BitcoindProvider {
+    fn refusal(&self) -> Result<(), ChainError> {
+        self.network.as_ref().map_or(Ok(()), |gate| gate.refusal())
+    }
     fn trust_level(&self) -> TrustLevel {
         TrustLevel::FullValidation
     }
@@ -387,6 +390,7 @@ impl ChainProvider for BitcoindProvider {
             backend: "bitcoind",
             trust_level: "own_node",
             host: Some(self.config.rpc_host.clone()),
+            explorer_default: false,
         }
     }
     async fn get_block_height(&self) -> Result<u64, ChainError> {

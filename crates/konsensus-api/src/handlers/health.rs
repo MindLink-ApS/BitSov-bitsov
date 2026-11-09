@@ -19,6 +19,9 @@ use crate::auth::scoped::{Read, ScopedAuth};
 use crate::freshness::DataFreshness;
 use crate::state::AppState;
 
+/// Workspace release version, shared by every crate and the `konsensus` binary.
+pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
 #[derive(Serialize)]
 pub struct HealthResponse {
@@ -68,6 +71,10 @@ pub struct HealthResponse {
     pub uptime_secs: u64,
     /// Protocol version.
     pub version: u16,
+    /// Release version of the running binary, as `konsensus --version` prints it
+    /// (e.g. `0.3.0-rc22`). Owner-only: the public `/health` leaves it out so an
+    /// unauthenticated caller can't pick nodes by release.
+    pub node_version: &'static str,
     /// Lightning backend name (e.g. "lnbits", "mock", "void").
     pub lightning_backend: String,
     /// Lightning node public key (hex, compressed secp256k1). Used for channel opening.
@@ -430,6 +437,7 @@ async fn status(
         lightning_balance_msat: ln_balance,
         uptime_secs: uptime,
         version: 2,
+        node_version: NODE_VERSION,
         lightning_backend: state.lightning_backend.clone(),
         lightning_node_pubkey: state.lightning.get_node_pubkey().await,
         chain_backend: state.chain_backend.clone(),

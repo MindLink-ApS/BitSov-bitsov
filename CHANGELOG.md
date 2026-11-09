@@ -20,10 +20,26 @@ also live on the corresponding GitHub pre-release pages.
   configured network, nothing reads or syncs from it: the node starts not ready
   and the embedded LDK node retries without starting. With `credentials_file`,
   an unanswered primary is skipped and LDK uses the verified fallback without
-  credentials. Sources are asked again
-  after a lost connection and at least every 60 seconds, and `konsensus recover`
-  checks its source too. A custom signet passes as `signet`. With LND, LNbits or
-  mock Lightning a real `[chain]` source is not checked.
+  credentials. Each Esplora endpoint is checked within its own ten seconds, so
+  a slow or silent endpoint never discards another one's answer. Sources are
+  asked again after a lost connection and at least every 60 seconds, and
+  `konsensus recover` checks its source too. A custom signet passes as
+  `signet`. With LND, LNbits or mock Lightning a real `[chain]` source is not
+  checked.
+- The owner's `GET /api/v1/status` reports the running release as
+  `node_version` (for example `0.3.0-rc22`). `version` stays the API version,
+  `2`. The public `/api/v1/health` is unchanged and does not name the release.
+- Console times for grants, pending requests and the pairing window print as
+  ISO-8601 UTC next to the Unix time, for example
+  `until 2026-11-09T16:01:22Z (unix 1794240082)`; `pair-status` keeps
+  `expires_at=<unix>` and adds the UTC time after it.
+- The console log has no colour codes when stdout is not a terminal (a launcher
+  or service writing to a file or pipe), and none when `NO_COLOR` is set. A
+  terminal keeps colour. The `node.log` file already had none.
+- Docs: installing a signed pre-release binary (rename to `konsensus`,
+  `chmod +x`, macOS download mark), checking one platform with
+  `--ignore-missing`, the signature check with the pinned fingerprint, and
+  rollback steps from rc22 to rc21.
 - **Breaking for exposed APIs:** a non-loopback `[api].listen_addr` (`0.0.0.0`,
   `::`, a LAN address) now fails config validation unless
   `[api].allow_non_loopback_bind = true` is set, because the owner API is
@@ -31,6 +47,32 @@ also live on the corresponding GitHub pre-release pages.
   binds the API off-loopback refuses to start with an error naming the flag; add
   it to keep that bind. `[remote_access]` still requires a loopback API, and the
   flag does not lift that rule.
+- A node whose chain tip is a public explorer it never explicitly accepted
+  (earlier generated Full configs or omitted Esplora URLs) now logs one warning
+  at start naming the explorer hosts, and owner status reports
+  `chain_view.explorer_default: true` with `trust_level: "third_party"`. The
+  field is omitted otherwise. The node starts as before and its config is not
+  changed. `konsensus chain-tip --config <path>` shows the source and changes
+  nothing. To move to your own Bitcoin Core or Electrum server, or to keep the
+  explorer by adding `accept_third_party_tip = true` to `[chain]`, edit the
+  config by hand; see `docs/CHAIN-SOURCE.md`. A fresh explorer tip is still
+  someone else's view of the chain. Releases before this key reject configs
+  that contain it.
+- A chain tip that cannot be read is no longer treated as height 0. Paid sends
+  (single and room), admission and call quotes, the introduction card and front
+  door publishing now refuse with `503` `not_ready` (`reason: chain_unavailable`)
+  before anything is paid or signed; web manifests are not sent; peer price
+  tables are listed as stale; chain-aware pricing refuses a price instead of
+  pricing at height 0. With Bitcoin Core, Electrum or Esplora, the tip is also
+  not ready when its best block is older than 3 hours on `bitcoin` or 24 hours on
+  test networks (no limit on regtest). See `docs/CHAIN-SOURCE.md`, "Tip
+  readiness". A call quote checks the tip before it sends a price query; a send
+  begun while the wallet was not ready re-quotes any price to pay against a real
+  tip; a changed front door page price is re-signed only with a tip. These
+  refusals say the chain source has no current tip. Every payment of a peer's
+  price also reads the tip at the payment itself and is refused without one,
+  and a kept tip is dropped once its source refuses its network. Prices are
+  unchanged.
 - A node that lost its E2EE session with a connected peer gets it back on the
   same connection. When the lower-id node lost it, about 25 seconds: the higher-id
   peer now answers a PrekeyOffer with its own, at most once per ten seconds per
