@@ -909,12 +909,13 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
                         format!("approve with: konsensus device approve --op {}", p.op_id)
                     };
                     safe_println!(
-                        "PENDING DEVICE KEY {}  {:?}  client={} ({})  expires_at={}\n  {next}",
+                        "PENDING DEVICE KEY {}  {:?}  client={} ({})  expires_at={} ({})\n  {next}",
                         p.fingerprint,
                         p.name,
                         p.client_name,
                         p.client_id,
-                        p.expires_at
+                        p.expires_at,
+                        utc_iso8601(p.expires_at)
                     );
                 }
                 Ok(())
