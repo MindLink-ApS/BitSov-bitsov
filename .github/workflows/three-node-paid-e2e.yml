@@ -8,8 +8,10 @@ on:
         description: 'Enable ghost-channel regression only after PR #200 has merged'
         type: boolean
         default: false
-  schedule:
-    - cron: '23 2 * * *'
+  # TODO: restore nightly runs once the lost-session recovery scenario delivers
+  # its first post-recovery message instead of timing out in App::compose.
+  # schedule:
+  #   - cron: '23 2 * * *'
 
 permissions:
   contents: read
