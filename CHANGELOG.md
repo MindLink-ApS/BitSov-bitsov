@@ -5,11 +5,14 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
-- Count a home-setup cancel only when a pairing is in progress, cap pending
+- Setup cancellation leaves the comparison-attempt budget unchanged. Setup
+  requests keep a per-source backoff that refills automatically. Cap pending
   pairing requests per client key and in a shared pool, and refuse further
   requests at either cap without evicting an existing ceremony.
 - Limit local sign-in challenges per source, rate-limit issuance, and apply
-  the local token route's Host and Origin admission to challenge issuance.
+  Host admission to challenge issuance. Local authentication endpoints refuse
+  cross-site and same-site browser fetches; Origin, when present, must name
+  this API's loopback origin. Clients without browser headers remain supported.
 - The node refuses to start when its chain source is on another network than
   `[lightning] network`, naming both networks, and tries no other source. Bitcoin
   Core is checked through `getblockchaininfo`; Electrum and Esplora through their

@@ -429,25 +429,14 @@ async fn cancel(State(page): State<Arc<SetupPage>>) -> Result<StatusCode, Status
     let b = page.open()?;
     let _transition = b.transition.lock().unwrap();
     page.open()?;
-    // Count only a ceremony, a paired client, or a live ticket. Repeating
-    // cancel after those are gone must not close the setup window.
-    let had_pending = b
-        .pending
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|pending| !pending.expired());
-    let had_clients = !b.pairing.list_clients().is_empty();
-    let cleared_ticket = page
-        .tickets
+    // Cancellation leaves the comparison-attempt budget unchanged. The
+    // per-source POST bucket bounds retries and refills without a restart.
+    page.tickets
         .as_ref()
         .ok_or(StatusCode::CONFLICT)?
         .cancel()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     *b.pending.lock().unwrap() = None;
-    if had_pending || had_clients || cleared_ticket {
-        b.sas_failures.fetch_add(1, Ordering::SeqCst);
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 /// No CORS middleware and no API routes, owner grants, registration or signing routes.

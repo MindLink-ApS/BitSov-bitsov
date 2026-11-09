@@ -1611,7 +1611,7 @@ mod tests {
         let tickets = HomeTickets {
             active: Arc::new(Mutex::new(None)),
             pairing: pairing.clone(),
-            endpoints: vec!["192.168.1.2:9737".into()],
+            endpoints: vec!["10.0.0.1:9737".into()],
             bootstrap,
         };
         assert!(!tickets.cancel().unwrap());

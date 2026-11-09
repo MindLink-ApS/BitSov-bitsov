@@ -70,9 +70,9 @@ impl IntoResponse for ChallengeRejection {
 
 /// `GET /api/v1/auth/challenge` — issue a short-lived single-use challenge.
 ///
-/// The local listener uses the same Host and Origin admission as local token
-/// minting: Host must name this API, and Origin, when the caller sends one,
-/// must name this API or a configured local app origin. The remote router has
+/// The local listener requires Host to name this API. Browser fetches must be
+/// same-origin or direct navigations, and Origin, when present, must name this
+/// API's loopback origin. The remote router has
 /// no local policy and skips that check. Admission runs before the per-source
 /// rate limit, so a rejected header does not spend a source's budget.
 async fn issue_challenge(
@@ -266,12 +266,19 @@ async fn issue_local_token(
 pub fn routes(local_auth_enabled: bool) -> Router<Arc<AppState>> {
     let router = Router::new()
         .route("/api/v1/auth/challenge", get(issue_challenge))
-        .route("/api/v1/auth/token", post(issue_token));
+        .route("/api/v1/auth/token", post(issue_token))
+        .layer(axum::middleware::from_fn(
+            crate::local_request::auth_browser_guard,
+        ));
 
     if local_auth_enabled {
         router.route(
             "/api/v1/auth/local",
-            post(issue_local_token).layer(axum::middleware::from_fn(crate::local_request::guard)),
+            post(issue_local_token)
+                .layer(axum::middleware::from_fn(crate::local_request::guard))
+                .layer(axum::middleware::from_fn(
+                    crate::local_request::auth_browser_guard,
+                )),
         )
     } else {
         router

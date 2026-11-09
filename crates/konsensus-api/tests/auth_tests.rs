@@ -2316,3 +2316,165 @@ async fn auth_challenge_rate_limit_is_per_source() {
     .await;
     assert_eq!(redeem(&app, &state, &other).await, StatusCode::OK);
 }
+
+async fn assert_local_auth_browser_headers(headers: &[(&str, &str)], expected: StatusCode) {
+    for (method, path) in [
+        ("GET", "/api/v1/auth/challenge"),
+        ("POST", "/api/v1/auth/token"),
+        ("POST", "/api/v1/auth/local"),
+    ] {
+        let state = Arc::new(AppState {
+            cors_enabled: true,
+            ..(*test_state()).clone()
+        });
+        let app = build_router(Arc::clone(&state));
+        let body = if path.ends_with("/token") {
+            signed_auth_body(&state, app.clone()).await
+        } else {
+            String::new()
+        };
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "localhost:3141")
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let expected = if path.ends_with("/local") && expected == StatusCode::OK {
+            // Check header admission without spending the shared local mint budget.
+            request = request.extension(ConnectInfo(SocketAddr::from(([203, 0, 113, 7], 1))));
+            StatusCode::UNAUTHORIZED
+        } else {
+            expected
+        };
+        let response = app
+            .oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{path}: {headers:?}");
+    }
+}
+
+#[tokio::test]
+async fn auth_browser_cross_site_without_origin_is_refused() {
+    assert_local_auth_browser_headers(
+        &[
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "no-cors"),
+        ],
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn auth_browser_same_site_without_origin_is_refused() {
+    assert_local_auth_browser_headers(&[("sec-fetch-site", "same-site")], StatusCode::FORBIDDEN)
+        .await;
+}
+
+#[tokio::test]
+async fn auth_browser_foreign_origins_are_refused() {
+    for origin in [
+        "https://attacker.example",
+        "null",
+        "http://localhost:1420",
+        "http://localhost:4173",
+        "https://localhost:3141",
+        "http://localhost:3142",
+    ] {
+        assert_local_auth_browser_headers(&[("origin", origin)], StatusCode::FORBIDDEN).await;
+    }
+}
+
+#[tokio::test]
+async fn auth_browser_own_loopback_origins_are_allowed() {
+    for origin in [
+        "http://localhost:3141",
+        "http://127.0.0.1:3141",
+        "http://[::1]:3141",
+    ] {
+        assert_local_auth_browser_headers(
+            &[("origin", origin), ("sec-fetch-site", "same-origin")],
+            StatusCode::OK,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn auth_browser_same_origin_and_navigation_are_allowed() {
+    for site in ["same-origin", "none"] {
+        assert_local_auth_browser_headers(&[("sec-fetch-site", site)], StatusCode::OK).await;
+    }
+}
+
+#[tokio::test]
+async fn auth_browser_headers_are_optional_for_cli() {
+    assert_local_auth_browser_headers(&[], StatusCode::OK).await;
+}
+
+#[tokio::test]
+async fn auth_browser_duplicate_admission_headers_are_refused() {
+    for headers in [
+        [
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-site", "cross-site"),
+        ],
+        [
+            ("origin", "http://localhost:3141"),
+            ("origin", "http://localhost:3141"),
+        ],
+    ] {
+        assert_local_auth_browser_headers(&headers, StatusCode::FORBIDDEN).await;
+    }
+}
+
+#[tokio::test]
+async fn auth_browser_rejections_do_not_spend_challenge_budget() {
+    let state = test_state();
+    let app = build_router(Arc::clone(&state));
+    for _ in 0..=konsensus_api::auth_challenge::AUTH_CHALLENGE_RATE_PER_MINUTE {
+        let request = Request::builder()
+            .uri("/api/v1/auth/challenge")
+            .header("host", "localhost:3141")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+        );
+    }
+    let challenge = fetch_auth_challenge(app.clone()).await;
+    assert_eq!(redeem(&app, &state, &challenge).await, StatusCode::OK);
+}
+#[tokio::test]
+async fn auth_browser_token_rejection_preserves_challenge() {
+    let state = test_state();
+    let app = build_router(Arc::clone(&state));
+    let body = signed_auth_body(&state, app.clone()).await;
+    for cross_site in [true, false] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/token")
+            .header("host", "localhost:3141")
+            .header("content-type", "application/json");
+        if cross_site {
+            request = request.header("sec-fetch-site", "cross-site");
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(request.body(Body::from(body.clone())).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            if cross_site {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::OK
+            },
+        );
+    }
+}

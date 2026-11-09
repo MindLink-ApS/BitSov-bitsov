@@ -468,7 +468,7 @@ async fn source_host_csrf_are_required_on_every_setup_action() {
         .is_none());
 }
 #[tokio::test(start_paused = true)]
-async fn window_and_three_cancels_close_setup_and_restart_reopens() {
+async fn setup_window_expires_but_ticket_cancels_leave_it_open() {
     let (_dir, _bootstrap, page) = fixture();
     let (cookie, csrf) = session(&page).await;
     tokio::time::advance(Duration::from_secs(900)).await;
@@ -526,7 +526,7 @@ async fn window_and_three_cancels_close_setup_and_restart_reopens() {
             &page2,
             "POST",
             "/setup/cancel",
-            "192.168.1.2:1",
+            "10.0.0.1:1",
             "bitsov.local:8080",
             Some((&cookie, &csrf)),
             serde_json::json!({})
@@ -542,7 +542,7 @@ async fn window_and_three_cancels_close_setup_and_restart_reopens() {
                 &page2,
                 "POST",
                 "/setup/cancel",
-                "192.168.1.2:1",
+                "10.0.0.1:1",
                 "bitsov.local:8080",
                 Some((&cookie, &csrf)),
                 serde_json::json!({})
@@ -558,7 +558,7 @@ async fn window_and_three_cancels_close_setup_and_restart_reopens() {
             &page2,
             "POST",
             "/setup/start",
-            "192.168.1.2:1",
+            "10.0.0.1:1",
             "bitsov.local:8080",
             Some((&cookie, &csrf)),
             serde_json::json!({})
@@ -580,7 +580,7 @@ async fn window_and_three_cancels_close_setup_and_restart_reopens() {
                 &page3,
                 "POST",
                 "/setup/start",
-                "192.168.1.2:1",
+                "10.0.0.1:1",
                 "bitsov.local:8080",
                 Some((&cookie, &csrf)),
                 serde_json::json!({})
@@ -594,7 +594,7 @@ async fn window_and_three_cancels_close_setup_and_restart_reopens() {
                 &page3,
                 "POST",
                 "/setup/cancel",
-                "192.168.1.2:1",
+                "10.0.0.1:1",
                 "bitsov.local:8080",
                 Some((&cookie, &csrf)),
                 serde_json::json!({})
@@ -610,14 +610,14 @@ async fn window_and_three_cancels_close_setup_and_restart_reopens() {
             &page3,
             "POST",
             "/setup/start",
-            "192.168.1.2:1",
+            "10.0.0.1:1",
             "bitsov.local:8080",
             Some((&cookie, &csrf)),
             serde_json::json!({})
         )
         .await
         .status(),
-        StatusCode::FORBIDDEN
+        StatusCode::OK
     );
     let (_dir4, _bootstrap4, page4) = fixture();
     let (cookie, csrf) = session(&page4).await;
@@ -626,7 +626,7 @@ async fn window_and_three_cancels_close_setup_and_restart_reopens() {
             &page4,
             "POST",
             "/setup/start",
-            "192.168.1.2:1",
+            "10.0.0.1:1",
             "bitsov.local:8080",
             Some((&cookie, &csrf)),
             serde_json::json!({})
@@ -638,7 +638,7 @@ async fn window_and_three_cancels_close_setup_and_restart_reopens() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn pending_ceremony_cancel_counts_and_a_cleared_ceremony_does_not() {
+async fn pending_ceremony_cancels_leave_setup_open() {
     let (_dir, bootstrap, page) = fixture();
     let (cookie, csrf) = session(&page).await;
     for n in 0..3 {
@@ -662,7 +662,7 @@ async fn pending_ceremony_cancel_counts_and_a_cleared_ceremony_does_not() {
                 &page,
                 "POST",
                 "/setup/cancel",
-                "192.168.1.2:1",
+                "10.0.0.1:1",
                 "bitsov.local:8080",
                 Some((&cookie, &csrf)),
                 serde_json::json!({})
@@ -673,20 +673,107 @@ async fn pending_ceremony_cancel_counts_and_a_cleared_ceremony_does_not() {
         );
         assert!(bootstrap.pending.lock().unwrap().is_none());
     }
+    assert_eq!(bootstrap.sas_failures.load(Ordering::SeqCst), 0);
     assert_eq!(
         request(
             &page,
             "POST",
             "/setup/start",
-            "192.168.1.2:1",
+            "10.0.0.1:1",
             "bitsov.local:8080",
             Some((&cookie, &csrf)),
             serde_json::json!({})
         )
         .await
         .status(),
-        StatusCode::FORBIDDEN
+        StatusCode::OK
     );
+}
+
+async fn three_ticket_cancels(page: &Arc<SetupPage>, cookie: &str, csrf: &str, source: &str) {
+    for n in 0..3 {
+        if n == 2 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+        }
+        for (path, expected) in [
+            ("/setup/start", StatusCode::OK),
+            ("/setup/cancel", StatusCode::NO_CONTENT),
+        ] {
+            assert_eq!(
+                request(
+                    page,
+                    "POST",
+                    path,
+                    source,
+                    "bitsov.local:8080",
+                    Some((cookie, csrf)),
+                    serde_json::json!({}),
+                )
+                .await
+                .status(),
+                expected,
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn lan_ticket_cancels_do_not_block_another_source() {
+    let (_dir, _bootstrap, page) = fixture();
+    let (cookie, csrf) = session(&page).await;
+    let source = SocketAddr::from(([10, 0, 0, 1], 1)).to_string();
+    three_ticket_cancels(&page, &cookie, &csrf, &source).await;
+    let (owner_cookie, owner_csrf) = session(&page).await;
+    let other = SocketAddr::from(([10, 0, 0, 2], 1)).to_string();
+    assert_eq!(
+        request(
+            &page,
+            "POST",
+            "/setup/start",
+            &other,
+            "bitsov.local:8080",
+            Some((&owner_cookie, &owner_csrf)),
+            serde_json::json!({}),
+        )
+        .await
+        .status(),
+        StatusCode::OK,
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn owner_ticket_cancels_recover_after_source_backoff_without_restart() {
+    let (_dir, bootstrap, page) = fixture();
+    let (cookie, csrf) = session(&page).await;
+    let source = SocketAddr::from(([10, 0, 0, 1], 1)).to_string();
+    three_ticket_cancels(&page, &cookie, &csrf, &source).await;
+    for wait in [false, true] {
+        if wait {
+            tokio::time::advance(Duration::from_secs(5)).await;
+        }
+        let response = request(
+            &page,
+            "POST",
+            "/setup/start",
+            &source,
+            "bitsov.local:8080",
+            Some((&cookie, &csrf)),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            if wait {
+                StatusCode::OK
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            },
+        );
+        if !wait {
+            assert_eq!(response.headers()["retry-after"], "5");
+        }
+    }
+    assert_eq!(bootstrap.sas_failures.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
