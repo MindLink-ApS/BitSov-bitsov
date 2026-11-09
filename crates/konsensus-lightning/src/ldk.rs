@@ -2683,7 +2683,9 @@ fn derive_ldk_entropy(bip39_seed: &[u8]) -> [u8; 64] {
     output
 }
 
-/// Bound on one network check. A slow source counts as unreachable.
+/// Bound on one Core or Electrum network check. A slow source counts as
+/// unreachable. Esplora endpoints are bounded one by one instead, so a slow
+/// endpoint never discards another endpoint's answer.
 const CHAIN_NETWORK_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often a running node asks its chain source for its network again.
@@ -2716,33 +2718,34 @@ impl SourceProbe {
     /// Ask the source now. For Esplora, any URL on another network is a
     /// mismatch, and one URL in use answering is enough to pass.
     async fn check(&self, network: bitcoin::Network) -> konsensus_chain::NetworkCheck {
-        let check = async {
-            match self {
-                Self::Bitcoind(provider) => provider.verify_network().await,
-                Self::Electrum(provider) => provider.verify_network().await,
-                Self::Esplora { urls, primary } => {
-                    let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
-                    let result = konsensus_chain::network::verify_esplora_api_urls(
-                        network,
-                        &urls,
-                        primary.as_deref(),
-                    )
-                    .await;
-                    match result.check {
-                        konsensus_chain::NetworkCheck::Mismatch(mismatch) => {
-                            konsensus_chain::NetworkCheck::Mismatch(mismatch)
-                        }
-                        _ if result.verified.contains(&true) => {
-                            konsensus_chain::NetworkCheck::Verified
-                        }
-                        _ => konsensus_chain::NetworkCheck::Unavailable,
+        async fn bounded(
+            check: impl std::future::Future<Output = konsensus_chain::NetworkCheck>,
+        ) -> konsensus_chain::NetworkCheck {
+            tokio::time::timeout(CHAIN_NETWORK_CHECK_TIMEOUT, check)
+                .await
+                .unwrap_or(konsensus_chain::NetworkCheck::Unavailable)
+        }
+        match self {
+            Self::Bitcoind(provider) => bounded(provider.verify_network()).await,
+            Self::Electrum(provider) => bounded(provider.verify_network()).await,
+            // Each endpoint is bounded on its own inside the check.
+            Self::Esplora { urls, primary } => {
+                let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+                let result = konsensus_chain::network::verify_esplora_api_urls(
+                    network,
+                    &urls,
+                    primary.as_deref(),
+                )
+                .await;
+                match result.check {
+                    konsensus_chain::NetworkCheck::Mismatch(mismatch) => {
+                        konsensus_chain::NetworkCheck::Mismatch(mismatch)
                     }
+                    _ if result.verified.contains(&true) => konsensus_chain::NetworkCheck::Verified,
+                    _ => konsensus_chain::NetworkCheck::Unavailable,
                 }
             }
-        };
-        tokio::time::timeout(CHAIN_NETWORK_CHECK_TIMEOUT, check)
-            .await
-            .unwrap_or(konsensus_chain::NetworkCheck::Unavailable)
+        }
     }
 }
 
@@ -2815,19 +2818,15 @@ async fn select_verified_esplora_urls(
         .map_err(config_error)?;
     let mut urls = vec![config.esplora_url.as_str()];
     urls.extend(config.esplora_url_fallback.as_deref());
-    let result = tokio::time::timeout(
-        CHAIN_NETWORK_CHECK_TIMEOUT,
-        konsensus_chain::network::verify_esplora_api_urls(
-            network,
-            &urls,
-            primary_transport.as_deref(),
-        ),
+    // Bounded per endpoint, so an endpoint that answered keeps its answer
+    // while another one is slow or silent.
+    let result = konsensus_chain::network::verify_esplora_api_urls(
+        network,
+        &urls,
+        primary_transport.as_deref(),
     )
     .await;
     let unavailable = || network_not_verified(&config.network, "esplora");
-    let Ok(result) = result else {
-        return Err(unavailable());
-    };
     if let NetworkCheck::Mismatch(mismatch) = result.check {
         return Err(LightningError::InvalidStartupConfig(mismatch.to_string()));
     }

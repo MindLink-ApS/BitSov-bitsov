@@ -84,12 +84,11 @@ async fn verify_ldk_esplora_network(config: &NodeConfig, network: bitcoin::Netwo
         .transpose()?;
     let mut urls = vec![esplora_url.as_str()];
     urls.extend(esplora_url_fallback.as_deref());
-    let check =
-        konsensus_chain::network::verify_esplora_api_urls(network, &urls, primary.as_deref());
-    if let Ok(result) = tokio::time::timeout(CHAIN_NETWORK_CHECK_TIMEOUT, check).await {
-        if let konsensus_chain::NetworkCheck::Mismatch(mismatch) = result.check {
-            return Err(anyhow::Error::new(mismatch));
-        }
+    // Bounded per endpoint inside the check.
+    let result =
+        konsensus_chain::network::verify_esplora_api_urls(network, &urls, primary.as_deref()).await;
+    if let konsensus_chain::NetworkCheck::Mismatch(mismatch) = result.check {
+        return Err(anyhow::Error::new(mismatch));
     }
     Ok(())
 }
