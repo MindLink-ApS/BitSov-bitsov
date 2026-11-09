@@ -50,6 +50,17 @@ fn existing_full_node(dir: &Path, chain: &str) -> PathBuf {
         "chain".into(),
         toml::Value::Table(toml::from_str(chain).unwrap()),
     );
+    let mnemonic = dir.join("test-mnemonic.txt");
+    std::fs::write(&mnemonic, TEST_MNEMONIC).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mnemonic, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    table["identity"]
+        .as_table_mut()
+        .unwrap()
+        .insert("mnemonic_file".into(), mnemonic.to_str().unwrap().into());
     let mut text = toml::to_string(&table).unwrap();
     text.insert_str(0, "# owner note: must survive untouched\n");
     std::fs::write(&path, text).unwrap();
@@ -68,23 +79,45 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// Content hash, length and modification time of the config, and the names
-/// of every file in its directory.
-fn snapshot(path: &Path) -> (Vec<u8>, u64, std::time::SystemTime, Vec<String>) {
+/// Content hash, length, modification time and mode of one file.
+type FileState = (Vec<u8>, u64, std::time::SystemTime, u32);
+
+fn file_state(path: &Path) -> FileState {
     let bytes = std::fs::read(path).unwrap();
-    let meta = std::fs::metadata(path).unwrap();
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o7777
+    };
+    #[cfg(not(unix))]
+    let mode = u32::from(meta.permissions().readonly());
+    (
+        Sha256::digest(&bytes).to_vec(),
+        meta.len(),
+        meta.modified().unwrap(),
+        mode,
+    )
+}
+
+/// The state of the config and of the recovery phrase file it names, and the
+/// names of every file in the config's directory.
+fn snapshot(path: &Path) -> (FileState, FileState, Vec<String>) {
+    let table: toml::Table = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let mnemonic = PathBuf::from(table["identity"]["mnemonic_file"].as_str().unwrap());
     let mut names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    (
-        Sha256::digest(&bytes).to_vec(),
-        meta.len(),
-        meta.modified().unwrap(),
-        names,
-    )
+    (file_state(path), file_state(&mnemonic), names)
 }
+
+/// A synthetic recovery phrase (the public BIP-39 test vector, never a real
+/// seed) that the config is pointed at.
+const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+     abandon abandon abandon abandon abandon abandon abandon abandon \
+     abandon abandon abandon abandon abandon abandon abandon art\n";
 
 #[test]
 fn show_reports_the_explorer_default_and_changes_nothing() {
@@ -178,4 +211,27 @@ fn an_ldk_only_explorer_is_offered_only_the_move() {
     assert!(out.contains("backend = \"bitcoind\""), "{out}");
     assert!(!out.contains("accept_third_party_tip"), "{out}");
     assert_eq!(snapshot(&path), before);
+}
+
+/// Inspecting a config never changes the recovery phrase file it names, not
+/// even its permissions: a 0400 or 0644 file keeps its mode, bytes and mtime.
+#[cfg(unix)]
+#[test]
+fn show_keeps_the_recovery_phrase_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    for mode in [0o400, 0o644] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = existing_full_node(dir.path(), EXPLORER_CHAIN);
+        let mnemonic = dir.path().join("test-mnemonic.txt");
+        std::fs::set_permissions(&mnemonic, std::fs::Permissions::from_mode(mode)).unwrap();
+        let before = snapshot(&path);
+        assert_eq!(before.1 .3, mode);
+        let output = konsensus(
+            &["chain-tip", "--config", path.to_str().unwrap()],
+            dir.path(),
+        );
+        assert!(output.status.success(), "{mode:o}: {}", stderr(&output));
+        assert!(stdout(&output).contains("explorer_default"), "{mode:o}");
+        assert_eq!(snapshot(&path), before, "mode {mode:o} must be kept");
+    }
 }

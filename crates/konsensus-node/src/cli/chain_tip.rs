@@ -1,8 +1,8 @@
 //! `konsensus chain-tip`: show where the chain tip comes from and whether it
 //! is a public explorer the node never explicitly accepted.
 //!
-//! Read-only. It loads the config and prints; it never writes the config or
-//! any other file. Moving to an owned tip, or accepting the explorer, is a
+//! Read-only. It parses the config and prints; it never writes the config or
+//! any other file, and never changes a file's permissions. Moving to an owned tip, or accepting the explorer, is a
 //! hand edit described in docs/CHAIN-SOURCE.md.
 
 use std::path::PathBuf;
@@ -80,7 +80,9 @@ pub(crate) fn describe(config: &NodeConfig) -> String {
 /// same guidance the node logs at start. Changes nothing.
 pub fn run(args: ChainTipArgs) -> Result<()> {
     let path = crate::owner_cmd::absolute_config_path(&args.config)?;
-    let config = NodeConfig::load(&path)?;
+    // Parse only: full validation also repairs the recovery phrase file's
+    // permissions, and this command must not change any file.
+    let config = NodeConfig::load_before_identity_validation(&path)?;
     println!("chain tip: {}", describe(&config));
     if let Some(found) = explorer_default(&config) {
         println!("{}", found.warning());

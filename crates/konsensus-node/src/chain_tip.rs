@@ -59,7 +59,9 @@ pub fn public_explorer_host(url: &str) -> Option<&'static str> {
 /// Counts the endpoints the node would actually use: the `[chain]` Esplora
 /// primary and fallbacks, and embedded LDK's Esplora primary and fallback when
 /// `[chain]` does not select Bitcoin Core or Electrum for it. A primary with a
-/// credentials file is a paid source the owner chose, so it is not counted.
+/// credentials file is a paid source the owner chose, so it is not counted,
+/// including when it is also listed as a `[chain]` fallback (the chain
+/// provider merges such duplicates into its authenticated primary).
 /// `accept_third_party_tip = true` in `[chain]` turns detection off.
 pub fn explorer_default(config: &NodeConfig) -> Option<ExplorerDefault> {
     let mut sources = Vec::new();
@@ -73,12 +75,18 @@ pub fn explorer_default(config: &NodeConfig) -> Option<ExplorerDefault> {
             credentials_file,
             ..
         } => {
-            let primary = credentials_file.is_none().then_some(api_url.as_str());
+            // The endpoints the chain provider builds, in its order and with
+            // its duplicate rule; index zero is the primary.
             let fallbacks = config.chain.esplora_fallbacks(&config.lightning);
-            for url in primary
-                .into_iter()
-                .chain(fallbacks.iter().map(String::as_str))
-            {
+            let mut endpoints: Vec<(String, &str)> = Vec::new();
+            for url in std::iter::once(api_url.as_str()).chain(fallbacks.iter().map(String::as_str)) {
+                let key = esplora_endpoint(url);
+                if !endpoints.iter().any(|(seen, _)| *seen == key) {
+                    endpoints.push((key, url));
+                }
+            }
+            let skip = usize::from(credentials_file.is_some());
+            for (_, url) in endpoints.into_iter().skip(skip) {
                 push(&mut sources, "chain", url);
             }
         }
@@ -104,6 +112,14 @@ pub fn explorer_default(config: &NodeConfig) -> Option<ExplorerDefault> {
         sources,
         acceptable,
     })
+}
+
+/// The endpoint key the chain provider deduplicates on: without a trailing
+/// slash or `/api`, then with `/api` appended.
+fn esplora_endpoint(url: &str) -> String {
+    let base = url.trim_end_matches('/');
+    let base = base.strip_suffix("/api").unwrap_or(base);
+    format!("{base}/api")
 }
 
 fn push(sources: &mut Vec<ExplorerSource>, stanza: &'static str, url: &str) {

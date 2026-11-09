@@ -433,3 +433,48 @@ async fn start_does_not_warn_without_an_explorer_default() {
     assert!(!text.contains("explorer_default"), "{text}");
     assert!(!text.contains("never explicitly accepted"), "{text}");
 }
+
+/// The same paid public endpoint as the authenticated `[chain]` primary and
+/// LDK primary, with no fallback: the chain provider merges LDK's URL into its
+/// authenticated primary, so nothing is counted.
+#[test]
+fn an_authenticated_primary_repeated_by_ldk_is_not_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    for (chain_url, ldk_url) in [
+        ("https://blockstream.info", "https://blockstream.info/api"),
+        ("https://blockstream.info/api/", "https://blockstream.info"),
+        ("https://mempool.space/signet", "https://mempool.space/signet/api"),
+    ] {
+        let config = config_with(
+            dir.path(),
+            &format!(
+                "backend = \"esplora\"\napi_url = \"{chain_url}\"\n\
+                 credentials_file = \"/secrets/chain-api.toml\""
+            ),
+            &format!(
+                "backend = \"ldk\"\nnetwork = \"bitcoin\"\nesplora_url = \"{ldk_url}\"\n\
+                 credentials_file = \"/secrets/chain-api.toml\""
+            ),
+        );
+        assert_eq!(explorer_default(&config), None, "{chain_url} / {ldk_url}");
+    }
+}
+
+/// A distinct unauthenticated public fallback is still counted next to an
+/// authenticated primary on the same host.
+#[test]
+fn a_distinct_public_fallback_next_to_an_authenticated_primary_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with(
+        dir.path(),
+        "backend = \"esplora\"\napi_url = \"https://blockstream.info\"\n\
+         credentials_file = \"/secrets/chain-api.toml\"",
+        "backend = \"ldk\"\nnetwork = \"bitcoin\"\nesplora_url = \"https://blockstream.info/api\"\n\
+         credentials_file = \"/secrets/chain-api.toml\"\n\
+         esplora_url_fallback = \"https://mempool.space/api\"",
+    );
+    assert_eq!(
+        sources(explorer_default(&config)),
+        [("chain", "mempool.space"), ("lightning", "mempool.space")]
+    );
+}
