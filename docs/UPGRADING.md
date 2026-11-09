@@ -132,8 +132,11 @@ To roll back rc22 → rc21:
    message in each direction.
 
 This applies only to data that rc22 or rc21 last ran on. A node that ran a
-build after rc22 has the location-bound record format and migration 033, which
-rc22 and older refuse ([above](#location-bound-storage-records-after-rc22)).
+build after rc22 has the location-bound record format and migration 033
+([above](#location-bound-storage-records-after-rc22)). On SQLite, rc22 and
+older refuse that database at start. Released PostgreSQL binaries (rc22 and
+older) do not: they skip migration versions they don't know and start anyway.
+Never run them on a PostgreSQL database that a build after rc22 has used.
 
 Not included: call cutoff is not yet verified on real hardware, and this release
 does not fix the other open reports.

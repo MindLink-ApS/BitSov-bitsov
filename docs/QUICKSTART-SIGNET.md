@@ -117,7 +117,15 @@ xattr -d com.apple.quarantine konsensus 2>/dev/null   # macOS only
 export PATH="$PWD:$PATH"
 ```
 
-Then continue at step 2.
+Step 4 needs the owner-token helper, which is not a release asset. Fetch it
+from the same tag into this directory and read it before you source it; it is
+not covered by `SHA256SUMS`:
+
+```sh
+curl -fLO "https://raw.githubusercontent.com/MindLink-ApS/BitSov-bitsov/$TAG/docs/ops/owner-token.sh"
+```
+
+Keep this directory; step 4 comes back to it. Then continue at step 2.
 
 ## 2. Initialize a node on signet
 
@@ -216,6 +224,14 @@ In the second terminal, enter the checkout and put the binary on `PATH` again
 ```sh
 cd BitSov-bitsov
 export PATH="$PWD/target/release:$PATH"
+```
+
+With a release binary from step 1b, enter that directory instead, and below
+source `./owner-token.sh` where it says `docs/ops/owner-token.sh`:
+
+```sh
+cd <the step 1b directory>
+export PATH="$PWD:$PATH"
 ```
 
 The HTTP API is loopback only and every owner route needs a bearer token. The
