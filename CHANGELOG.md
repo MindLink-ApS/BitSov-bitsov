@@ -39,6 +39,17 @@ also live on the corresponding GitHub pre-release pages.
   binds the API off-loopback refuses to start with an error naming the flag; add
   it to keep that bind. `[remote_access]` still requires a loopback API, and the
   flag does not lift that rule.
+- A node whose chain tip is a public explorer it never explicitly accepted
+  (earlier generated Full configs or omitted Esplora URLs) now logs one warning
+  at start naming the explorer hosts, and owner status reports
+  `chain_view.explorer_default: true` with `trust_level: "third_party"`. The
+  field is omitted otherwise. The node starts as before and its config is not
+  changed. `konsensus chain-tip --config <path>` shows the source and changes
+  nothing. To move to your own Bitcoin Core or Electrum server, or to keep the
+  explorer by adding `accept_third_party_tip = true` to `[chain]`, edit the
+  config by hand; see `docs/CHAIN-SOURCE.md`. A fresh explorer tip is still
+  someone else's view of the chain. Releases before this key reject configs
+  that contain it.
 - A chain tip that cannot be read is no longer treated as height 0. Paid sends
   (single and room), admission and call quotes, the introduction card and front
   door publishing now refuse with `503` `not_ready` (`reason: chain_unavailable`)
