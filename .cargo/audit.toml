@@ -60,6 +60,28 @@
 # remaining island, and assess the SQL encoded-size argument. This file records
 # what is known; it does not stand in for those decisions.
 ignore = [
+  # RUSTSEC-2026-0459 (CVE-2026-119375), reviewed 2026-11-09; expires
+  # 2026-12-09 (also enforced by the matching OSV waiver in the daily scan).
+  # Bundled SQLite in libsqlite3-sys 0.28.0 IS vulnerable: opening a crafted
+  # database plus a sibling WAL with a different page size can disclose process
+  # memory. This waiver assumes exclusively trusted local DB/WAL provenance for
+  # every SQLx, LDK, tower and optional durable-relay store. Peers supply records,
+  # not raw database files. Mnemonic restore creates fresh state; whitelist
+  # restore authenticates record JSON. Neither is a raw DB/WAL import path.
+  #
+  # Custom storage paths, operator-prepared relay databases and manually copied
+  # or restored backups MUST satisfy the same trust assumption. Startup's 0700
+  # directory restriction/header probe does not authenticate pre-existing files;
+  # record encryption does not patch SQLite. An untrusted or externally writable
+  # database/WAL pair remains exposed and is NOT covered by this applicability
+  # waiver. Do not infer safety for such deployments from a clean scan.
+  #
+  # A lockfile-only fix is unavailable: SQLx SQLite 0.8.0 and rusqlite 0.31 both
+  # require libsqlite3-sys 0.28, while the fix starts at 0.39 (rusqlite 0.41).
+  # Recheck DB import/restore, storage path/permission and dependency changes;
+  # remove after the coordinated SQLite dependency upgrade or sooner if the
+  # trusted-file assumption no longer holds.
+  "RUSTSEC-2026-0459",
   # Applicability triage 2026-10-17, rechecked 2026-10-21 when konsensus-node
   # moved its optional corepc-node pin from 0.10.1 to 0.12.0. zip 0.6.6 remains
   # a build-dependency ONLY of corepc-node 0.10.1 and electrsd 0.36.1.
