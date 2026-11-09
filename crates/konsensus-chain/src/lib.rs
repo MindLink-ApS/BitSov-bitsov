@@ -28,3 +28,6 @@ pub use mock::{MockChainConfig, MockChainProvider};
 pub use network::{NetworkCheck, NetworkMismatch};
 
 pub mod recovery;
+
+pub mod tip;
+pub use tip::FreshTip;

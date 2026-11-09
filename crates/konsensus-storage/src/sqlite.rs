@@ -1758,6 +1758,12 @@ impl Storage for SqliteStorage {
         }).collect()
     }
 
+    async fn call_block_invoice_count(&self, peer: &NodeId, call_id: &str, seq: u32) -> Result<u32, StorageError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_block_invoices WHERE peer = ? AND call_id = ? AND seq = ?")
+            .bind(peer.to_hex()).bind(call_id).bind(i64::from(seq)).fetch_one(&self.pool).await?;
+        u32::try_from(count).map_err(|_| StorageError::Conversion("call block invoice count overflow".into()))
+    }
+
     async fn record_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32], retain_until_ms: u64) -> Result<(), StorageError> {
         let until = i64::try_from(retain_until_ms).map_err(|_| StorageError::Conversion("call invoice time overflow".into()))?;
         // One write statement keeps the count and insertion atomic across connections.

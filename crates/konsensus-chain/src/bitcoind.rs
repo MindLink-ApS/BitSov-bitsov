@@ -379,6 +379,9 @@ fn number(value: &Value, field: &str) -> Result<u64, ChainError> {
 
 #[async_trait]
 impl ChainProvider for BitcoindProvider {
+    fn refusal(&self) -> Result<(), ChainError> {
+        self.network.as_ref().map_or(Ok(()), |gate| gate.refusal())
+    }
     fn trust_level(&self) -> TrustLevel {
         TrustLevel::FullValidation
     }

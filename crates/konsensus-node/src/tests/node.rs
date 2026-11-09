@@ -103,6 +103,126 @@ fn snapshot_config(storage: StorageConfig) -> NodeConfig {
     }
 }
 
+// ── chain tip bound ────────────────────────────────────────────────
+
+/// A source at height 900 000 whose best block is `age_secs` old.
+struct AgedTip(u64);
+
+#[async_trait::async_trait]
+impl ChainProvider for AgedTip {
+    fn trust_level(&self) -> konsensus_core::traits::chain::TrustLevel {
+        konsensus_core::traits::chain::TrustLevel::FullValidation
+    }
+    async fn get_block_height(&self) -> Result<u64, konsensus_core::traits::chain::ChainError> {
+        Ok(900_000)
+    }
+    async fn get_block_header(
+        &self,
+        height: u64,
+    ) -> Result<konsensus_core::traits::chain::BlockHeader, konsensus_core::traits::chain::ChainError>
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Ok(konsensus_core::traits::chain::BlockHeader {
+            height,
+            hash: "11".repeat(32),
+            timestamp: now - self.0,
+            bits: 0x1703_2e3b,
+        })
+    }
+    async fn estimate_fee(
+        &self,
+        target_blocks: u32,
+    ) -> Result<konsensus_core::traits::chain::FeeEstimate, konsensus_core::traits::chain::ChainError>
+    {
+        Ok(konsensus_core::traits::chain::FeeEstimate { target_blocks, sat_per_vbyte: 2.0 })
+    }
+    async fn is_tx_confirmed(
+        &self,
+        _txid: &str,
+        _min_confirmations: u32,
+    ) -> Result<bool, konsensus_core::traits::chain::ChainError> {
+        Ok(true)
+    }
+    async fn is_synced(&self) -> bool {
+        true
+    }
+}
+
+fn tip_config(chain: ChainConfig, network: &str) -> NodeConfig {
+    let mut config = snapshot_config(StorageConfig::Sqlite {
+        path: ":memory:".into(),
+        encrypted: false,
+        retention_days: 0,
+    });
+    config.chain = chain;
+    config.lightning = LightningConfig::Cln {
+        rest_url: "https://127.0.0.1:3010".into(),
+        resolve_ip: None,
+        ca_cert_path: PathBuf::from("/tmp/ca.pem"),
+        rune_file: PathBuf::from("/tmp/rune"),
+        network: network.into(),
+        minimum_version: "v24.08".into(),
+    };
+    config
+}
+
+fn esplora_chain() -> ChainConfig {
+    ChainConfig::Esplora {
+        api_url: "http://127.0.0.1:1".into(),
+        esplora_url_fallback: None,
+        credentials_file: None,
+        accept_third_party_tip: false,
+    }
+}
+
+#[tokio::test]
+async fn real_chain_source_tip_is_bounded_by_its_network() {
+    let four_hours = 4 * 3600;
+    // Mainnet: four hours without a newer block is not ready.
+    let chain = bounded_tip(Arc::new(AgedTip(four_hours)), &tip_config(esplora_chain(), "bitcoin"));
+    assert!(chain.get_block_height().await.is_err());
+    // A recent tip is ready.
+    let chain = bounded_tip(Arc::new(AgedTip(600)), &tip_config(esplora_chain(), "bitcoin"));
+    assert_eq!(chain.get_block_height().await.unwrap(), 900_000);
+    // Signet allows a day; regtest has no bound.
+    let chain = bounded_tip(Arc::new(AgedTip(four_hours)), &tip_config(esplora_chain(), "signet"));
+    assert_eq!(chain.get_block_height().await.unwrap(), 900_000);
+    let chain = bounded_tip(Arc::new(AgedTip(30 * 86_400)), &tip_config(esplora_chain(), "regtest"));
+    assert_eq!(chain.get_block_height().await.unwrap(), 900_000);
+    // Mock chain data is synthetic: never wrapped.
+    let chain = bounded_tip(Arc::new(AgedTip(four_hours)), &tip_config(ChainConfig::Mock, "bitcoin"));
+    assert_eq!(chain.get_block_height().await.unwrap(), 900_000);
+}
+
+#[tokio::test]
+async fn from_config_reads_a_real_source_tip_through_the_bound() {
+    use axum::routing::get;
+    // The source reports a height but no readable best block.
+    let app = axum::Router::new()
+        .route("/api/blocks/tip/height", get(|| async { "150" }))
+        .route(
+            "/api/block-height/150",
+            get(|| async { (axum::http::StatusCode::SERVICE_UNAVAILABLE, "") }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.chain = ChainConfig::Esplora {
+        api_url: format!("http://{addr}"),
+        esplora_url_fallback: None,
+        credentials_file: None,
+        accept_third_party_tip: false,
+    };
+    let node = KonsensusNode::from_config(config, None).await.unwrap();
+    assert!(node.chain().get_block_height().await.is_err());
+    server.abort();
+}
+
 // ── from_config tests ──────────────────────────────────────────────
 
 #[tokio::test]

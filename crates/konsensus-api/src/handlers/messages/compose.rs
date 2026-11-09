@@ -128,25 +128,40 @@ pub struct MemberPaymentOutcome {
     pub code: Option<&'static str>,
 }
 
-async fn quoted_price(state: &AppState, peer: &NodeId, kind: u16, height: u64) -> Result<u64, ApiError> {
+/// The peer's fresh price for `kind` at `height`, else this node's own.
+async fn peer_or_own_price(state: &AppState, peer: &NodeId, kind: u16, height: u64) -> Result<u64, ApiError> {
+    match state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, MAX_PRICE_AGE).await {
+        Some(price) => Ok(price),
+        None => state.pricing.get_price_msat(kind).await.map_err(crate::error::pricing_error),
+    }
+}
+
+/// `tip` is the chain tip read when the send began, or `None` when the wallet
+/// was not money-ready then and no tip was read. A price without a tip is only
+/// a check for an established zero-price conversation: any price to pay is
+/// quoted again against a real tip (refused while there is none), even if the
+/// wallet became ready in between.
+async fn quoted_price(state: &AppState, peer: &NodeId, kind: u16, tip: Option<u64>) -> Result<u64, ApiError> {
     let ready = state.lightning.money_ready().await;
     if !ready && !state.session_manager.has_session(peer).await {
         return Err(ApiError::NotReady);
     }
-    let quote = async {
-        match state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, MAX_PRICE_AGE).await {
-            Some(price) => Ok(price),
-            None => state.pricing.get_price_msat(kind).await.map_err(|e| ApiError::Internal(format!("pricing error: {e}"))),
-        }
-    };
     // Preserve established zero-price conversations when a local quote is
     // available. Never wait on dynamic chain pricing or assume a free price.
+    let quote = peer_or_own_price(state, peer, kind, tip.unwrap_or(0));
     let price = if ready { quote.await? } else {
         tokio::time::timeout(Duration::from_millis(100), quote).await.map_err(|_| ApiError::NotReady)??
     };
     if super::caps::payable(price) > 0 || !state.session_manager.has_session(peer).await {
         crate::error::require_money_ready(state).await?;
     }
+    let price = match tip {
+        None if super::caps::payable(price) > 0 => {
+            let tip = crate::error::chain_tip(state).await?;
+            peer_or_own_price(state, peer, kind, tip).await?
+        }
+        _ => price,
+    };
     Ok(super::caps::payable(price))
 }
 
@@ -504,6 +519,10 @@ pub(crate) async fn create_metered_payment_proof(
 
     // Recheck after quoting: readiness may have changed before dispatch.
     crate::error::require_money_ready(state).await?;
+    // The payment chokepoint: no positive peer payment without a usable chain
+    // tip read for it, whatever path priced it. Every dispatcher below takes it.
+    let tip = crate::error::observe_tip(state).await?;
+    tracing::debug!(peer = %peer_id, tip = tip.height(), "paying a peer against the chain tip");
 
     // Peer must be connected to receive the invoice request.
     if !state.transport.is_connected(peer_id).await {
@@ -523,7 +542,7 @@ pub(crate) async fn create_metered_payment_proof(
     let peer_ln_pubkey = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
     if !debit.is_call_block() && !readmission.forbidden {
         if let Some(ln_pubkey) = peer_ln_pubkey {
-            match try_keysend(state, &ln_pubkey, payment_amount_msat, peer_id, debit).await {
+            match try_keysend(state, &ln_pubkey, payment_amount_msat, peer_id, debit, &tip).await {
                 Ok(KeysendOutcome::Settled(proof)) => return Ok(proof),
                 Ok(KeysendOutcome::NotDispatched) => {
                     tracing::warn!(
@@ -548,12 +567,22 @@ pub(crate) async fn create_metered_payment_proof(
     }
 
     // Invoice-request fallback (only reached when keysend was not dispatched).
-    match create_payment_proof_via_invoice(state, payment_amount_msat, peer_id, debit, kind, None).await {
+    match create_payment_proof_via_invoice(state, payment_amount_msat, peer_id, debit, kind, None, &tip).await {
         Err(e) if is_admission_refusal(&e) => {
-            readmit_then_pay(state, payment_amount_msat, peer_id, debit, readmission, kind, charge).await
+            readmit_then_pay(state, payment_amount_msat, peer_id, debit, readmission, kind, charge, &tip).await
         }
         other => other,
     }
+}
+
+/// The admission payment itself; it takes the tip this send read.
+fn pay_admission_invoice<'a>(
+    state: &'a AppState,
+    bolt11: &'a str,
+    fee_ceiling_msat: u64,
+    _tip: &crate::error::ObservedTip,
+) -> impl std::future::Future<Output = Result<PaymentDetails, LightningError>> + 'a {
+    state.lightning.pay_invoice_with_fee_limit(bolt11, fee_ceiling_msat)
 }
 
 /// A target issues at most one admission quote per source address per this
@@ -630,6 +659,7 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
 /// is refused before payment. An uncapped request may use existing admission
 /// authority under the same G1 contact/call/grant limits. Mark and proof send
 /// stay generation-bound (#100).
+#[allow(clippy::too_many_arguments)]
 async fn readmit_then_pay(
     state: &AppState,
     amount_msat: u64,
@@ -638,6 +668,7 @@ async fn readmit_then_pay(
     readmission: &Readmission,
     kind: Option<u16>,
     charge: &mut FirstContactCharge,
+    tip: &crate::error::ObservedTip,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
     let peer_key = peer_id.to_hex();
     if readmission.forbidden {
@@ -776,7 +807,7 @@ async fn readmit_then_pay(
         if tokio::time::Instant::now() >= deadline {
             return Err(admission_refusal(peer_id));
         }
-        match create_payment_proof_via_invoice(state, amount_msat, peer_id, debit, kind, Some(deadline)).await {
+        match create_payment_proof_via_invoice(state, amount_msat, peer_id, debit, kind, Some(deadline), tip).await {
             // One wall-clock budget includes every prepayment request/response
             // and retry sleep. A payment already dispatched is never cancelled.
             Err(e) if is_admission_refusal(&e) => {
@@ -804,6 +835,7 @@ async fn try_keysend(
     amount_msat: u64,
     peer_id: &NodeId,
     debit: &Debit,
+    _tip: &crate::error::ObservedTip,
 ) -> Result<KeysendOutcome, ApiError> {
     let updates = SettlementUpdates::subscribe(state.lightning.as_ref());
     let details = match debit.dispatch_message(state, None, amount_msat, state
@@ -878,6 +910,7 @@ async fn create_payment_proof_via_invoice(
     debit: &Debit,
     kind: Option<u16>,
     promotion_deadline: Option<tokio::time::Instant>,
+    _tip: &crate::error::ObservedTip,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
     // Generate a unique request ID for correlating request/response.
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -1961,7 +1994,7 @@ async fn request_admission_invoice(
     if kind != konsensus_core::kind::KIND_CHAT {
         return Err(ApiError::BadRequest("first contact must be a chat message".into()));
     }
-    let current_block_height = state.chain.get_block_height().await.unwrap_or(0);
+    let current_block_height = crate::error::chain_tip(state).await?;
     let peer_announced = state
         .peer_prices
         .get_fresh_discounted_peer_price(
@@ -1975,7 +2008,7 @@ async fn request_admission_invoice(
         .pricing
         .get_price_msat(konsensus_core::kind::KIND_CHAT)
         .await
-        .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
+        .map_err(crate::error::pricing_error)?;
     let requested_msat = derive_admission_msat(peer_announced, own_price);
     let request_id = konsensus_core::admission_quote::request_id(
         peer_id, state.identity.node_id(), std::time::SystemTime::now()
@@ -2753,6 +2786,10 @@ async fn first_contact_admission_at(
         }
     }
 
+    // The payment chokepoint for admission: a usable chain tip for this send,
+    // read before anything is reserved, journaled or paid.
+    let tip = crate::error::observe_tip(state).await?;
+
     // 0c. ATOMIC capacity reservation (fail closed): we reached the paid path, so
     //     this peer has NO live guard. Reserve a slot in ONE locked operation so
     //     two concurrent NEW peers cannot both pass at MAX-1 and overrun the cap
@@ -2944,7 +2981,7 @@ async fn first_contact_admission_at(
         counter.fetch_add(admission_fee_ceiling, std::sync::atomic::Ordering::Relaxed);
     }
     let updates = SettlementUpdates::subscribe(state.lightning.as_ref());
-    let dispatched = match debit.dispatch(state.lightning.pay_invoice_with_fee_limit(&response.bolt11, admission_fee_ceiling)).await {
+    let dispatched = match debit.dispatch(pay_admission_invoice(state, &response.bolt11, admission_fee_ceiling, &tip)).await {
         Ok(result) => result,
         Err(error @ ApiError::BudgetExceeded(_)) => {
             super::admission_journal::mark_undispatched(state, peer_id, &bolt11_payment_hash)?;
@@ -3345,13 +3382,9 @@ pub(super) async fn compose_message_with_policy(
             None => admin_room_members(&state, &req).await?,
         };
 
-        let current_block_height = if !state.lightning.money_ready().await { 0 } else { match state.chain.get_block_height().await {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to get block height for room compose, using fallback 0");
-                0
-            }
-        }};
+        // Not money-ready: no chain read; only an established zero price can
+        // go out (`quoted_price`). Money-ready: a failed tip read refuses.
+        let current_block_height = if !state.lightning.money_ready().await { None } else { Some(crate::error::chain_tip(&state).await?) };
 
         let mut prices = Vec::new();
         for member in members.iter().filter(|m| *m != state.identity.node_id()) {
@@ -3547,7 +3580,7 @@ pub(super) async fn compose_peer(
         let mut admission = FirstContactCharge { operation: Some(operation.clone()), ..Default::default() };
         let recipient = Recipient::Node(peer_id);
 
-        let height = if state.lightning.money_ready().await { state.chain.get_block_height().await.unwrap_or(0) } else { 0 };
+        let height = if state.lightning.money_ready().await { Some(crate::error::chain_tip(&state).await?) } else { None };
         let mut price_msat = if req.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
             crate::handlers::browse::page_price(&state, peer_id, &req.plaintext, req.max_routing_fee_msat).await?
         } else {
@@ -3836,12 +3869,20 @@ pub(super) async fn compose_peer(
                 }
                 reconcile_admission_budget(&state, &peer_id, debit.reservation().as_ref()).await?;
                 if let Some(target_price) = admission.message_price {
+                    // A kept quote is the target's price, but this payment
+                    // still needs a usable tip (none was read if the wallet
+                    // was not ready when the send began).
+                    if target_price > 0 && height.is_none() {
+                        crate::error::chain_tip(&state).await?;
+                    }
                     price_msat = target_price;
                 } else {
                     // A resumed admission may belong to another kind. Never
-                    // substitute this node's own price for the target's quote.
+                    // substitute this node's own price for the target's quote,
+                    // and never check that quote against a missing tip.
+                    let tip = match height { Some(tip) => tip, None => crate::error::chain_tip(&state).await? };
                     price_msat = state.peer_prices.get_fresh_discounted_peer_price(
-                        &peer_id, req.kind, height, MAX_PRICE_AGE,
+                        &peer_id, req.kind, tip, MAX_PRICE_AGE,
                     ).await.map(super::caps::payable).ok_or_else(|| ApiError::Lightning(
                         "prior admission is paid, but the target quote for this kind is unknown".into()
                     ))?;

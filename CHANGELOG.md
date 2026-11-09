@@ -50,6 +50,21 @@ also live on the corresponding GitHub pre-release pages.
   config by hand; see `docs/CHAIN-SOURCE.md`. A fresh explorer tip is still
   someone else's view of the chain. Releases before this key reject configs
   that contain it.
+- A chain tip that cannot be read is no longer treated as height 0. Paid sends
+  (single and room), admission and call quotes, the introduction card and front
+  door publishing now refuse with `503` `not_ready` (`reason: chain_unavailable`)
+  before anything is paid or signed; web manifests are not sent; peer price
+  tables are listed as stale; chain-aware pricing refuses a price instead of
+  pricing at height 0. With Bitcoin Core, Electrum or Esplora, the tip is also
+  not ready when its best block is older than 3 hours on `bitcoin` or 24 hours on
+  test networks (no limit on regtest). See `docs/CHAIN-SOURCE.md`, "Tip
+  readiness". A call quote checks the tip before it sends a price query; a send
+  begun while the wallet was not ready re-quotes any price to pay against a real
+  tip; a changed front door page price is re-signed only with a tip. These
+  refusals say the chain source has no current tip. Every payment of a peer's
+  price also reads the tip at the payment itself and is refused without one,
+  and a kept tip is dropped once its source refuses its network. Prices are
+  unchanged.
 - A node that lost its E2EE session with a connected peer gets it back on the
   same connection. When the lower-id node lost it, about 25 seconds: the higher-id
   peer now answers a PrekeyOffer with its own, at most once per ten seconds per
