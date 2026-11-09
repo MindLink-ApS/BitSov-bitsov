@@ -1,14 +1,13 @@
-//! A send that starts while the wallet is not money-ready reads no chain tip.
-//! If the wallet becomes ready before payment, a price to pay must still be
-//! checked against a real tip: never against height 0, which skips the block
-//! validity of a peer's price table.
+//! Every send quote, including a zero price, needs an observed chain tip.
+//! Reuse that observation through payment preparation, refreshing after waits;
+//! never compare a peer's block validity with height zero.
 mod common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::{body::Body, http::Request};
+use axum::{body::Body, http::Request, response::IntoResponse};
 use konsensus_api::state::AppState;
 use konsensus_core::traits::chain::ChainProvider;
 use konsensus_core::traits::lightning::*;
@@ -19,6 +18,7 @@ use tower::ServiceExt;
 #[derive(Default)]
 struct RecoveringWallet {
     polls: AtomicUsize,
+    remain_unready: bool,
     inner: common::CountingLightning,
 }
 
@@ -28,7 +28,8 @@ impl LightningProvider for RecoveringWallet {
         self.inner.pay_invoice_with_fee_limit(invoice, cap).await
     }
     async fn money_ready(&self) -> bool {
-        self.polls.fetch_add(1, Ordering::SeqCst) != 0
+        let recovered = self.polls.fetch_add(1, Ordering::SeqCst) != 0;
+        recovered && !self.remain_unready
     }
     async fn is_available(&self) -> bool {
         true
@@ -50,8 +51,11 @@ impl LightningProvider for RecoveringWallet {
     }
 }
 
-async fn send(is_room: bool, chain: Arc<dyn ChainProvider>) -> (Arc<RecoveringWallet>, u16, serde_json::Value) {
-    let wallet = Arc::new(RecoveringWallet::default());
+async fn send(is_room: bool, chain: Arc<dyn ChainProvider>, peer_price: u64) -> (Arc<RecoveringWallet>, u16, serde_json::Value) {
+    send_with_wallet(is_room, chain, peer_price, Arc::new(RecoveringWallet::default())).await
+}
+
+async fn send_with_wallet(is_room: bool, chain: Arc<dyn ChainProvider>, peer_price: u64, wallet: Arc<RecoveringWallet>) -> (Arc<RecoveringWallet>, u16, serde_json::Value) {
     let base = common::test_state_with_lightning(wallet.clone());
     let peer = common::setup_e2ee_session_with_mnemonic(
         &base.session_manager,
@@ -59,14 +63,14 @@ async fn send(is_room: bool, chain: Arc<dyn ChainProvider>) -> (Arc<RecoveringWa
     )
     .await;
     let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], base.invoice_requests.clone()));
-    let state = Arc::new(AppState { transport, chain, ..(*base).clone() });
+    let pricing = if peer_price == 0 { Arc::new(FreePricing) as Arc<dyn konsensus_core::traits::pricing::PricingEngine> } else { base.pricing.clone() };
+    let state = Arc::new(AppState { transport, chain, pricing, ..(*base).clone() });
     state.peer_ln_pubkeys.lock().await.insert(peer, "02aaaa".repeat(5));
     // Valid for one block from height 1: expired by any real tip, still
     // within its wall-clock age, and "valid" against height 0.
-    state
-        .peer_prices
-        .update(peer, std::collections::HashMap::from([("communication".to_string(), 2_000)]), 1, 1, 0.0)
-        .await;
+    if peer_price > 0 {
+        state.peer_prices.update(peer, std::collections::HashMap::from([("communication".to_string(), peer_price)]), 1, 1, 0.0).await;
+    }
     let recipient = if is_room {
         let room = Room::new("recovering wallet".into(), *state.identity.node_id());
         state.storage.create_room(&room).await.unwrap();
@@ -98,7 +102,7 @@ async fn send(is_room: bool, chain: Arc<dyn ChainProvider>) -> (Arc<RecoveringWa
 async fn a_wallet_that_becomes_ready_mid_send_still_needs_a_chain_tip() {
     for is_room in [false, true] {
         let chain = Arc::new(common::TipDownChain::down());
-        let (wallet, status, body) = send(is_room, chain.clone()).await;
+        let (wallet, status, body) = send(is_room, chain.clone(), 2_000).await;
         common::assert_chain_not_ready(status, &body);
         assert!(wallet.polls.load(Ordering::SeqCst) >= 2, "room={is_room}: readiness changed mid-send");
         assert_eq!(chain.reads(), 1, "room={is_room}: the price to pay asked for a tip");
@@ -111,9 +115,9 @@ async fn a_wallet_that_becomes_ready_mid_send_still_needs_a_chain_tip() {
 async fn with_a_tip_the_expired_peer_table_is_not_paid() {
     for is_room in [false, true] {
         let chain = Arc::new(common::TipDownChain::after(usize::MAX));
-        let (wallet, _, body) = send(is_room, chain.clone()).await;
-        // Once to re-quote the price, once more at the payment itself.
-        assert_eq!(chain.reads(), 2, "room={is_room}");
+        let (wallet, _, body) = send(is_room, chain.clone(), 2_000).await;
+        // The quote and payment share one observation.
+        assert_eq!(chain.reads(), 1, "room={is_room}");
         // Re-quoted at the real tip, the peer's expired 2 000 msat table is
         // no longer its price.
         assert_ne!(body["amount_msat"], 2_000, "room={is_room}: {body}");
@@ -237,14 +241,11 @@ async fn a_resumed_admission_checks_the_target_price_against_a_real_tip() {
     let status = response.status().as_u16();
     let bytes = axum::body::to_bytes(response.into_body(), 65_536).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    // The earlier admission stays paid; this send stops at the missing tip,
-    // reported through the existing settled-but-not-sent outcome.
-    assert_eq!((status, body["code"].as_str()), (502, Some("payment_settled_send_incomplete")), "{body}");
-    assert!(body["error"].as_str().unwrap().contains("the chain source has no current tip"), "{body}");
-    assert_eq!(body["amount_msat"], 0, "{body}");
-    // It got as far as the resumed admission (the paid proof went out again)
-    // and then asked for the tip, once.
-    assert_eq!(stub.sent_envelopes.lock().unwrap().len(), 1, "{body}");
+    // A ready wallet checks the initial quote, even when its own price is
+    // zero. The earlier admission journal is left for a later retry.
+    common::assert_chain_not_ready(status, &body);
+    assert!(stub.sent_envelopes.lock().unwrap().is_empty(), "{body}");
+    assert!(journal.join(peer.to_hex()).exists());
     assert_eq!(chain.reads(), 1);
     assert_eq!(wallet.inner.money(), 0);
     assert_eq!(wallet.inner.invoices(), 0);
@@ -376,9 +377,8 @@ impl konsensus_core::traits::transport::MessageTransport for PromotingTransport 
 }
 
 /// A send resuming a paid admission whose journal kept the target's quote
-/// (2 000 msat for chat): begun with no tip and own price 0, it re-sends the
-/// paid proof (the session appears), but the new message is not paid without
-/// a usable tip.
+/// (2 000 msat for chat): once its wallet is ready, even the initial own
+/// price of 0 requires a tip before resuming the earlier admission.
 #[tokio::test]
 async fn a_resumed_admission_with_a_kept_quote_pays_nothing_without_a_tip() {
     let dir = tempfile::tempdir().unwrap();
@@ -430,11 +430,10 @@ async fn a_resumed_admission_with_a_kept_quote_pays_nothing_without_a_tip() {
     let status = response.status().as_u16();
     let bytes = axum::body::to_bytes(response.into_body(), 65_536).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!((status, body["code"].as_str()), (502, Some("payment_settled_send_incomplete")), "{body}");
-    assert!(body["error"].as_str().unwrap().contains("the chain source has no current tip"), "{body}");
-    assert_eq!(body["amount_msat"], 0, "{body}");
-    assert_eq!(stub.sent_envelopes.lock().unwrap().len(), 1, "only the paid proof went out: {body}");
-    assert!(chain.reads() >= 1);
+    common::assert_chain_not_ready(status, &body);
+    assert!(stub.sent_envelopes.lock().unwrap().is_empty(), "{body}");
+    assert!(journal.join(peer.to_hex()).exists());
+    assert_eq!(chain.reads(), 1);
     assert_eq!(wallet.inner.money(), 0, "the new message was not paid");
     assert_eq!(wallet.inner.invoices(), 0);
 }
@@ -461,4 +460,210 @@ async fn the_payment_path_itself_needs_a_chain_tip() {
     let state = Arc::new(AppState { chain: Arc::new(common::StubChain), ..(*state).clone() });
     konsensus_api::handlers::messages::create_payment_proof(&state, 2_000, &peer).await.unwrap();
     assert_eq!(wallet.money(), 1);
+}
+
+
+#[tokio::test]
+async fn a_recovered_wallet_checks_even_a_zero_price_against_the_tip() {
+    for is_room in [false, true] {
+        for chain in [common::TipDownChain::down(), common::TipDownChain::zero()] {
+            let chain = Arc::new(chain);
+            let (wallet, status, body) = send(is_room, chain.clone(), 0).await;
+            common::assert_chain_not_ready(status, &body);
+            assert_eq!(chain.reads(), 1);
+            assert_eq!(wallet.inner.money(), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_recovered_wallet_observes_the_tip_for_a_free_quote() {
+    for is_room in [false, true] {
+        let chain = Arc::new(common::TipDownChain::after(usize::MAX));
+        let (wallet, status, body) = send(is_room, chain.clone(), 0).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["amount_msat"], 0, "{body}");
+        assert_eq!(wallet.inner.money(), 0);
+        assert_eq!(chain.reads(), 1);
+    }
+}
+
+struct WaitingTransport {
+    inner: Arc<common::ConnectedStubTransport>,
+    delay_invoice: bool,
+    delay: std::time::Duration,
+}
+
+#[async_trait]
+impl konsensus_core::traits::transport::MessageTransport for WaitingTransport {
+    async fn send(&self, p: &konsensus_core::NodeId, e: &konsensus_core::UkmEnvelope) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.inner.send(p, e).await
+    }
+    async fn recv(&self) -> Result<konsensus_core::UkmEnvelope, konsensus_core::traits::transport::TransportError> {
+        self.inner.recv().await
+    }
+    async fn connect(&self, p: &konsensus_core::NodeId, a: &str) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.inner.connect(p, a).await
+    }
+    async fn disconnect(&self, p: &konsensus_core::NodeId) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.inner.disconnect(p).await
+    }
+    async fn is_connected(&self, p: &konsensus_core::NodeId) -> bool {
+        if !self.delay_invoice {
+            tokio::time::advance(self.delay).await;
+        }
+        self.inner.is_connected(p).await
+    }
+    async fn connected_peers(&self) -> Vec<konsensus_core::NodeId> {
+        self.inner.connected_peers().await
+    }
+    async fn send_raw_frame(&self, p: &konsensus_core::NodeId, bytes: &[u8]) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        if self.delay_invoice {
+            tokio::time::advance(self.delay).await;
+        }
+        self.inner.send_raw_frame(p, bytes).await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_payment_refreshes_its_tip_after_waiting() {
+    for delay_invoice in [false, true] {
+        for (seconds, good_reads, pays, reads) in [(1, 1, true, 1), (31, 1, false, 2), (31, 2, true, 2)] {
+            let wallet = Arc::new(common::CountingLightning::default());
+            let base = common::test_state_with_lightning(wallet.clone());
+            let peer = konsensus_core::NodeId::from_bytes([0x6c; 32]);
+            let stub = Arc::new(common::ConnectedStubTransport::new(vec![peer], base.invoice_requests.clone())
+                .with_invoice_responder(move |_, amount| {
+                    let bolt11 = common::create_test_bolt11(amount);
+                    let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse().unwrap();
+                    Some(konsensus_api::state::InvoiceResponseData { recipient: peer, payment_hash: invoice.payment_hash().to_string(), bolt11 })
+                }));
+            let transport = Arc::new(WaitingTransport { inner: stub, delay_invoice, delay: std::time::Duration::from_secs(seconds) });
+            let chain = Arc::new(common::TipDownChain::after(good_reads));
+            let state = Arc::new(AppState { transport, chain: chain.clone(), ..(*base).clone() });
+            if !delay_invoice {
+                state.peer_ln_pubkeys.lock().await.insert(peer, "02aaaa".repeat(5));
+            }
+            let result = konsensus_api::handlers::messages::create_payment_proof(&state, 2_000, &peer).await;
+            assert_eq!(result.is_ok(), pays, "invoice={delay_invoice}, delay={seconds}: {:?}", result.as_ref().err());
+            if !pays {
+                let response = result.unwrap_err().into_response();
+                let status = response.status().as_u16();
+                let bytes = axum::body::to_bytes(response.into_body(), 65_536).await.unwrap();
+                common::assert_chain_not_ready(status, &serde_json::from_slice(&bytes).unwrap());
+            }
+            assert_eq!(wallet.money(), usize::from(pays));
+            assert_eq!(chain.reads(), reads);
+        }
+    }
+}
+
+
+async fn journal_wait(cancel_refresh: bool) {
+    for keysend in [false, true] {
+        let wallet = Arc::new(common::CountingLightning::default());
+        let storage = Arc::new(common::MemStorage::new());
+        let base = common::test_state_with_lightning_and_storage(wallet.clone(), storage.clone());
+        let peer = common::setup_e2ee_session(&base.session_manager).await;
+        let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], base.invoice_requests.clone())
+            .with_invoice_responder(move |_, amount| {
+                let bolt11 = common::create_test_bolt11(amount);
+                let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse().unwrap();
+                Some(konsensus_api::state::InvoiceResponseData { recipient: peer, payment_hash: invoice.payment_hash().to_string(), bolt11 })
+            }));
+        let chain = Arc::new(common::TipDownChain::after(usize::MAX));
+        let state = Arc::new(AppState { transport, chain: chain.clone(), ..(*base).clone() });
+        if keysend {
+            state.peer_ln_pubkeys.lock().await.insert(peer, "02aaaa".repeat(5));
+        }
+        let gate = Arc::new(common::PeerWriteGate::default());
+        *storage.outbox_dispatch_gate.lock().unwrap() = Some(gate.clone());
+        let operation = uuid::Uuid::new_v4().to_string();
+        let post = |state: Arc<AppState>| {
+            let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
+                .header("authorization", common::auth_header(&state)).header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"operation_id": operation, "recipient": peer.to_hex(), "kind": 0,
+                    "plaintext": "journal wait", "wait_ack_ms": 0}).to_string())).unwrap();
+            async move { common::test_router(state).oneshot(request).await.unwrap() }
+        };
+        let sending = tokio::spawn(post(state.clone()));
+        gate.entered.notified().await;
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        chain.ok_reads.store(0, Ordering::SeqCst);
+        let read_gate = Arc::new(common::PeerWriteGate::default());
+        if cancel_refresh {
+            *chain.read_gate.lock().unwrap() = Some(read_gate.clone());
+        }
+        gate.release.notify_one();
+        if cancel_refresh {
+            read_gate.entered.notified().await;
+            sending.abort();
+            assert!(sending.await.unwrap_err().is_cancelled());
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let op = state.storage.get_outbox_operation(&operation).await.unwrap().unwrap();
+                    let data: serde_json::Value = serde_json::from_slice(&op.recovery).unwrap();
+                    if data["dispatched"] == false { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }).await.expect("cancelled preparation clears dispatch intent");
+        } else {
+            let response = sending.await.unwrap();
+            let status = response.status().as_u16();
+            let bytes = axum::body::to_bytes(response.into_body(), 65_536).await.unwrap();
+            common::assert_chain_not_ready(status, &serde_json::from_slice(&bytes).unwrap());
+        }
+        assert_eq!(wallet.money(), 0);
+        assert_eq!(chain.reads(), 2);
+        chain.ok_reads.store(usize::MAX, Ordering::SeqCst);
+        let response = post(state).await;
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(wallet.money(), 1, "the same operation can pay after recovery");
+    }
+}
+
+
+#[tokio::test(start_paused = true)]
+async fn a_journal_wait_refreshes_the_tip_and_keeps_the_operation_retryable() {
+    journal_wait(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_a_pending_tip_refresh_keeps_the_operation_retryable() {
+    journal_wait(true).await;
+}
+
+
+#[tokio::test]
+async fn a_zero_price_quote_needs_a_tip_while_the_wallet_is_unready() {
+    for is_room in [false, true] {
+        for available in [false, true] {
+            let wallet = Arc::new(RecoveringWallet { remain_unready: true, ..Default::default() });
+            let chain = Arc::new(common::TipDownChain::after(if available { usize::MAX } else { 0 }));
+            let (wallet, status, body) = send_with_wallet(is_room, chain.clone(), 0, wallet).await;
+            if available {
+                assert_eq!(status, 200, "{body}");
+                assert_eq!(body["amount_msat"], 0);
+            } else {
+                common::assert_chain_not_ready(status, &body);
+            }
+            assert_eq!(wallet.inner.money(), 0);
+            assert_eq!(chain.reads(), 1);
+        }
+    }
+}
+
+
+#[tokio::test]
+async fn a_free_payment_proof_requires_a_tip() {
+    let base = common::test_state();
+    let chain = Arc::new(common::TipDownChain::down());
+    let state = Arc::new(AppState { chain: chain.clone(), ..(*base).clone() });
+    let peer = konsensus_core::NodeId::from_bytes([0x6d; 32]);
+    let error = konsensus_api::handlers::messages::create_payment_proof(&state, 0, &peer).await.unwrap_err();
+    let response = error.into_response();
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 65_536).await.unwrap();
+    common::assert_chain_not_ready(status, &serde_json::from_slice(&bytes).unwrap());
+    assert_eq!(chain.reads(), 1);
 }

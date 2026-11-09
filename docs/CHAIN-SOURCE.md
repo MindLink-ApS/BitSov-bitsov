@@ -349,10 +349,10 @@ quotes, admission quotes and card publishing answer `503` with
 signed (a call quote also before its price query is sent); a stranger's
 admission request gets the fixed `konsensus:not_ready:chain_unavailable`
 refusal; no price answer, price table or web manifest is sent; peer price
-tables are listed as `stale`. A send that starts while the wallet is not
-money-ready reads no tip, so it can only go out at an established zero price;
-if the wallet becomes ready meanwhile, a price to pay is quoted again against a
-real tip. A published front door card whose page price changed is re-signed
+tables are listed as `stale`. Every quote, including a zero price, is checked
+against a real tip. An established free conversation can still send while the
+wallet is not money-ready, provided the tip is usable. A published front door
+card whose page price changed is re-signed
 only against a usable tip (with that tip's epoch); an unchanged card is still
 served without one. Chain-aware pricing refuses a price when a synced source's
 tip cannot be read (also `not_ready`/`chain_unavailable` on these routes); its
@@ -361,10 +361,17 @@ unchanged. Admission reuses a tip height for up to a minute, but not past the
 tip's age limit.
 
 Every payment of a peer's price (messages, rooms, porch pages, files,
-calendar, call minutes, admission) reads the tip once more at the payment
-itself, whatever priced it: with no usable tip, nothing is paid. Payments the
-owner directs (paying an invoice, keysend, on-chain sends, channel opens,
-liquidity, sponsor gifts) are not priced against the tip and do not read it.
+calendar, call minutes, admission) needs a usable tip observation. A send
+shares its observation between quoting and payment where possible, for at
+most 30 seconds; a longer wait for an invoice or admission refreshes it before
+dispatch. Without a usable observation, nothing is paid.
+
+Direct invoice and keysend payments are outside this peer-price check, both
+with the owner's credential and with a paired spend grant. Paired payments
+still enforce the grant's payee, amount and routing-fee limits. On-chain sends,
+channel opens, liquidity and sponsor gifts are also outside this check, as
+are the dormant daily hosting keysend and opt-in invite auto-channel opens.
+These payment classes are not priced against this tip.
 
 A wrapped source that has refused itself for good (another network) serves
 no kept tip either.
