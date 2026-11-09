@@ -80,22 +80,28 @@ untouched, and `--no-auto-key-retrieve` stops gpg from fetching any key from
 the network; only the downloaded `RELEASE_KEY.asc` is used:
 
 ```sh
-export GNUPGHOME="$(mktemp -d)"
-gpg --batch --quiet --import RELEASE_KEY.asc
-gpg --batch --no-auto-key-retrieve --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>/dev/null > gpg-status.txt
-gpg_exit=$?
-rm -rf "$GNUPGHOME"; unset GNUPGHOME
-if [ "$gpg_exit" -eq 0 ] &&
-   ! grep -qE '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG) ' gpg-status.txt &&
-   [ "$(awk '$2 == "VALIDSIG" { print $12 }' gpg-status.txt)" = B299274C200301714DC6F51A7C2D6F8AC842EF6E ]
-then echo "signature OK"; else echo "SIGNATURE CHECK FAILED: do not use these files"; fi
+(
+  export GNUPGHOME="$(mktemp -d)"
+  gpg --batch --quiet --import RELEASE_KEY.asc
+  gpg --batch --no-auto-key-retrieve --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>/dev/null > gpg-status.txt
+  gpg_exit=$?
+  rm -rf "$GNUPGHOME"
+  if [ "$gpg_exit" -eq 0 ] &&
+     ! grep -qE '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG) ' gpg-status.txt &&
+     [ "$(awk '$2 == "VALIDSIG" { print $12 }' gpg-status.txt)" = B299274C200301714DC6F51A7C2D6F8AC842EF6E ]
+  then echo "signature OK"
+  else echo "SIGNATURE CHECK FAILED: do not use these files"; exit 1
+  fi
+)
 ```
 
-It prints `signature OK` only if gpg exits 0, no bad-signature status appears,
-and the primary-key fingerprint in the `VALIDSIG` line is exactly
-`B299274C200301714DC6F51A7C2D6F8AC842EF6E`, the release key (also in
-[`SECURITY.md`](../SECURITY.md)). "Good signature" alone is not enough: that
-fingerprint field is what ties the signature to the release key.
+It prints `signature OK` and exits 0 only if gpg exits 0, no bad-signature
+status appears, and the primary-key fingerprint in the `VALIDSIG` line is
+exactly `B299274C200301714DC6F51A7C2D6F8AC842EF6E`, the release key (also in
+[`SECURITY.md`](../SECURITY.md)). Any non-zero status means stop: do not use
+the files. The parentheses keep the `exit` from closing your shell. "Good
+signature" alone is not enough: that fingerprint field is what ties the
+signature to the release key.
 
 If you download every asset of the release instead, a source checkout's
 `bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc` makes the same
