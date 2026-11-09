@@ -2864,6 +2864,11 @@ async fn prepare_call_block_invoice(
         &serde_json::json!({"call_id": call_id, "seq": seq}).to_string(),
     )
     .map_err(|_| REFUSED)?;
+    // The peer names the amount. Refuse an empty or absurd one before the
+    // wallet sees it. A block is still only admitted later, at this node's price.
+    if amount_msat == 0 || amount_msat > calls::MAX_CALL_BLOCK_INVOICE_MSAT {
+        return Err(REFUSED);
+    }
     let validate = async || {
         if !session_manager.has_session(peer).await
             || session_manager.needs_renegotiation(peer).await
@@ -2891,6 +2896,15 @@ async fn prepare_call_block_invoice(
         )
     };
     validate().await?;
+    // The binding cap is what stops a repeat from filling the wallet. Check it
+    // before create_invoice: recording the hash afterwards cannot un-mint one.
+    let outstanding = storage
+        .call_block_invoice_count(peer, call_id, seq)
+        .await
+        .map_err(|_| REFUSED)?;
+    if outstanding >= calls::MAX_CALL_BLOCK_INVOICES {
+        return Err(REFUSED);
+    }
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
