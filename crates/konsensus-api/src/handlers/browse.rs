@@ -527,6 +527,7 @@ pub(crate) async fn page_price(
     peer: NodeId,
     plaintext: &str,
     fee_cap: Option<u64>,
+    tip: &mut Option<crate::error::ObservedTip>,
 ) -> Result<u64, ApiError> {
     let request: PageRequest = serde_json::from_str(plaintext)
         .map_err(|e| ApiError::BadRequest(format!("invalid page request: {e}")))?;
@@ -536,7 +537,9 @@ pub(crate) async fn page_price(
         ));
     }
     // A porch page is always paid: no quote is asked without a usable tip.
-    crate::error::chain_tip(state).await?;
+    if tip.is_none() {
+        *tip = Some(crate::error::observe_tip(state).await?);
+    }
     let quote = peer_quote(state, peer, &request.path, fee_cap).await?;
     match quote.status {
         PageStatus::Ok => {

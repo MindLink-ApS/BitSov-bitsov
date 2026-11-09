@@ -378,17 +378,17 @@ impl Debit {
         .unwrap_or_else(|| "konsensus message".into())
     }
 
-    pub(crate) async fn dispatch_message<F>(&self, state: &AppState, hash: Option<String>, amount: u64, future: F) -> Result<F::Output, ApiError>
+    pub(crate) async fn dispatch_message<F>(&self, state: &AppState, hash: Option<String>, amount: u64, tip: &crate::error::ObservedTip, future: F) -> Result<F::Output, ApiError>
     where F: Future<Output=Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>> {
         match &self.operation {
-            Some(op) => op.dispatch(self, hash, amount, future).await,
-            None => self.dispatch_message_payment(state, future).await,
+            Some(op) => op.dispatch(self, hash, amount, tip, future).await,
+            None => self.dispatch_message_payment(state, tip, future).await,
         }
     }
 
     /// Called after dispatch intent is durable. Fresh call validation and spend
     /// authority both remain serialized through the first wallet poll.
-    pub(crate) async fn dispatch_message_payment<F>(&self, state: &AppState, future: F) -> Result<F::Output, ApiError>
+    pub(crate) async fn dispatch_message_payment<F>(&self, state: &AppState, tip: &crate::error::ObservedTip, future: F) -> Result<F::Output, ApiError>
     where F: Future<Output=Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>> {
         let (mut call_guard, deadline) = if let Some((peer, plaintext)) = &self.call_block {
             match crate::calls::block_dispatch_guard(state, peer, plaintext).await {
@@ -401,6 +401,9 @@ impl Debit {
                 Err(error) => return Ok(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(error.to_string()))),
             }
         } else { (None, None) };
+        // Journal writes and call guards can wait before the wallet is polled.
+        // A refusal here proves that this payment was never submitted.
+        tip.recheck(state).await?;
         let mut future = std::pin::pin!(future);
         let mut polled = false;
         let guarded = futures::future::poll_fn(|cx| {

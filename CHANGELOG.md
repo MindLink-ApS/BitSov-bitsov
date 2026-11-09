@@ -62,9 +62,16 @@ also live on the corresponding GitHub pre-release pages.
   begun while the wallet was not ready re-quotes any price to pay against a real
   tip; a changed front door page price is re-signed only with a tip. These
   refusals say the chain source has no current tip. Every payment of a peer's
-  price also reads the tip at the payment itself and is refused without one,
-  and a kept tip is dropped once its source refuses its network. Prices are
-  unchanged.
+  price needs a usable tip observation, shared between quoting and payment
+  where possible for up to 30 seconds and refreshed before dispatch after a
+  longer wait. Established free conversations need no tip or wallet payment
+  and can still send when the chain source is unavailable or the wallet is
+  not money-ready. A kept tip is dropped once its source refuses its
+  network. Direct invoice and keysend payments, including those under paired
+  spend grants, remain outside this peer-price check; grant limits still apply.
+  On-chain sends, channel opens, liquidity, sponsor gifts, the dormant daily
+  hosting keysend and opt-in invite auto-channel opens are also outside it.
+  Prices are unchanged.
 - A node that lost its E2EE session with a connected peer gets it back on the
   same connection. When the lower-id node lost it, about 25 seconds: the higher-id
   peer now answers a PrekeyOffer with its own, at most once per ten seconds per
