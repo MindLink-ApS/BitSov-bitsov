@@ -95,6 +95,7 @@ mod ffi;
 mod gossip;
 pub mod graph;
 mod hex_utils;
+mod inbound;
 pub mod io;
 pub mod liquidity;
 pub mod logger;
@@ -125,7 +126,8 @@ pub use chain::sync_health::ChainSyncFailure;
 use chain::ChainSource;
 use config::{
 	default_user_config, may_announce_channel, AsyncPaymentsRole, ChannelConfig, Config,
-	NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
+	MAX_CONCURRENT_INBOUND_CONNECTIONS, NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL,
+	RGS_SYNC_INTERVAL,
 };
 use connection::ConnectionManager;
 pub use error::Error as NodeError;
@@ -479,35 +481,33 @@ impl Node {
 				Ok(listeners)
 			})?;
 
+			// Shared by all listeners, so the limit holds across listening addresses.
+			let connection_slots =
+				Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INBOUND_CONNECTIONS));
 			for listener in listeners {
-				let logger = Arc::clone(&listening_logger);
 				let peer_mgr = Arc::clone(&peer_manager_connection_handler);
-				let mut stop_listen = self.stop_sender.subscribe();
-				let runtime = Arc::clone(&self.runtime);
-				self.runtime.spawn_cancellable_background_task(async move {
-					loop {
-						tokio::select! {
-							_ = stop_listen.changed() => {
-								log_debug!(
-									logger,
-									"Stopping listening to inbound connections."
-								);
-								break;
-							}
-							res = listener.accept() => {
-								let tcp_stream = res.unwrap().0;
-								let peer_mgr = Arc::clone(&peer_mgr);
-								runtime.spawn_cancellable_background_task(async move {
-									lightning_net_tokio::setup_inbound(
-										Arc::clone(&peer_mgr),
-										tcp_stream.into_std().unwrap(),
-										)
-										.await;
-								});
-							}
+				let logger = Arc::clone(&listening_logger);
+				inbound::spawn_inbound_listener(
+					&self.runtime,
+					listener,
+					Arc::clone(&connection_slots),
+					self.stop_sender.subscribe(),
+					Arc::clone(&listening_logger),
+					move |tcp_stream| {
+						let peer_mgr = Arc::clone(&peer_mgr);
+						let logger = Arc::clone(&logger);
+						async move {
+							let tcp_stream = match tcp_stream.into_std() {
+								Ok(tcp_stream) => tcp_stream,
+								Err(e) => {
+									log_error!(logger, "Failed to convert inbound connection: {}", e);
+									return;
+								},
+							};
+							lightning_net_tokio::setup_inbound(peer_mgr, tcp_stream).await;
 						}
-					}
-				});
+					},
+				);
 			}
 		}
 

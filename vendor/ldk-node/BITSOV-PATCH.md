@@ -822,3 +822,33 @@ real channel messages and production admission/accounting without bitcoind.
 Validation:
 
     cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib
+
+## Inbound connection task lifecycle (2026-11-09)
+
+- `runtime.rs`: cancellable tasks are tracked with `tokio_util::task::TaskTracker`
+  and stopped through a `CancellationToken`, instead of a `JoinSet` that was only
+  drained at shutdown. A finished task is released when it ends. This follows
+  upstream ldk-node's "Release completed cancellable tasks" (lightningdevkit/ldk-node#997,
+  on `main` after 0.7.1). Stop still cancels every live cancellable task and waits
+  for it; dropping the runtime still cancels them. As before, a task spawned
+  after a stop starts a fresh set, so restart is unchanged. The debug assertion
+  that the set is non-empty at stop is dropped: finished tasks no longer count.
+- `inbound.rs` (new): the inbound accept loop moved out of `Node::start`. At most
+  `MAX_CONCURRENT_INBOUND_CONNECTIONS` (512, `config.rs`) accepted connections
+  are handled at a time across all listening addresses; a socket accepted beyond
+  that is closed at once. The limit only applies to newly accepted sockets:
+  established connections and outbound connections (including reconnects to
+  persisted peers) are unaffected. 512 is above LDK's 250 connected peers
+  without a channel. A failed `accept` is logged and retried after 100 ms
+  instead of ending the listener; a failed socket conversion ends only that
+  connection.
+- `Cargo.toml`: adds `tokio-util` (`rt` feature), already in the root lock at
+  0.7.18; the vendor lock pins the same version.
+
+Tests: `inbound::tests` run 200 short loopback connections on an ephemeral port
+and check that only the accept loop remains tracked, that sockets beyond the
+limit are closed while held ones stay open and freed slots are reused, and that
+stop closes open connections. `runtime::tests` cover release of finished tasks,
+cancellation on stop and on drop, and spawning after a stop.
+
+    cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib -- inbound:: runtime::
