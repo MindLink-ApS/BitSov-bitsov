@@ -34,7 +34,7 @@ pub use recovery::{
     RecoveryTrustee, SqliteRecoveryStore,
 };
 pub use sqlite::SqliteStorage;
-pub use traits::{PaidAcceptance, Storage};
+pub use traits::{PaidAcceptance, Storage, MAX_DEFERRALS_PER_PROOF, MAX_DEFERRALS_PER_SENDER, ENVELOPE_DEFERRAL_TTL_MS, DEFERRAL_CLEANUP_BATCH};
 pub use whitelist_backup::WhitelistBackup;
 
 pub mod invites {

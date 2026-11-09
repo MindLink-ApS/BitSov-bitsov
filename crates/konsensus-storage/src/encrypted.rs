@@ -471,6 +471,28 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.commit_outbox_envelope(&encrypted, &self.encrypt_envelope(envelope)?).await
     }
 
+    async fn replace_outbox_envelope(&self, op: &crate::OutboxOperation, previous: &MessageId, envelope: &UkmEnvelope, plaintext_enc: Option<&[u8]>) -> Result<bool, StorageError> {
+        let mut encrypted = op.clone();
+        encrypted.recovery = self.encrypt("outbox_operations", "recovery", &op.operation_id, &op.recovery)?;
+        self.inner.replace_outbox_envelope(&encrypted, previous, &self.encrypt_envelope(envelope)?, plaintext_enc).await
+    }
+
+    async fn defer_unreadable_envelope(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        self.inner.defer_unreadable_envelope(envelope).await
+    }
+
+    async fn is_envelope_deferred(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        self.inner.is_envelope_deferred(envelope).await
+    }
+
+    async fn session_repair_expires_at(&self, own: &NodeId, peer: &NodeId) -> Result<Option<i64>, StorageError> {
+        self.inner.session_repair_expires_at(own, peer).await
+    }
+
+    async fn cleanup_expired_deferrals(&self, now_ms: i64, max: u32) -> Result<u64, StorageError> {
+        self.inner.cleanup_expired_deferrals(now_ms, max).await
+    }
+
     async fn insert_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
         let mut encrypted = op.clone();
         encrypted.recovery = self.encrypt("outbox_operations", "recovery", &op.operation_id, &op.recovery)?;
@@ -591,6 +613,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.is_paid_envelope_accepted(envelope).await
     }
 
+    async fn paid_envelope_status(&self, envelope: &UkmEnvelope) -> Result<Option<crate::PaidAcceptance>, StorageError> {
+        self.inner.paid_envelope_status(&self.encrypt_envelope(envelope)?).await
+    }
+
     async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
         self.inner.accept_paid_envelope(&self.encrypt_envelope(envelope)?).await
     }
@@ -605,6 +631,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn is_pending_dispatched(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
         self.inner.is_pending_dispatched(id, peer, sender).await
+    }
+
+    async fn pending_was_undecryptable(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        self.inner.pending_was_undecryptable(id, peer, sender).await
     }
 
     async fn reject_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, reason: &str, terminal: bool) -> Result<bool, StorageError> {

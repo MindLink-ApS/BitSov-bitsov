@@ -107,6 +107,9 @@ const MAX_COOLDOWN_ENTRIES: usize = 10_000;
 #[cfg(test)]
 pub(crate) static HOLD_PREKEY_ANSWERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+pub(crate) static HOLD_RECOVERY_RATCHET_INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Per-peer PeerExchange cooldown — prevents a peer from spamming
 /// PeerExchange requests/responses to trigger expensive registry writes.
 const PEER_EXCHANGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
@@ -126,6 +129,78 @@ const ADMISSION_INVOICE_PURPOSE: &str = "konsensus:admission";
 /// message is a chat (`KIND_CHAT`), so the admission invoice is priced at the
 /// chat floor — the minimum energy required to be admitted and promoted.
 const ADMISSION_INVOICE_KIND: u16 = konsensus_core::kind::KIND_CHAT;
+
+/// Revalidate the durable basis and carry its remaining lifetime onto the
+/// captured connection. Lookup failures and elapsed deadlines grant nothing.
+pub(crate) async fn allow_paid_session_repair(
+    storage: &dyn konsensus_storage::Storage,
+    own: &NodeId,
+    peer: &NodeId,
+    transport: &NoiseTransport,
+    since: std::time::Instant,
+) -> bool {
+    let Ok(Some(until)) = paid_session_repair_deadline(storage, own, peer).await else { return false; };
+    transport.allow_session_repair(peer, since, until).await
+}
+
+async fn paid_session_repair_deadline(
+    storage: &dyn konsensus_storage::Storage,
+    own: &NodeId,
+    peer: &NodeId,
+) -> Result<Option<std::time::Instant>, konsensus_storage::StorageError> {
+    let Some(expires) = storage.session_repair_expires_at(own, peer).await? else { return Ok(None); };
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else { return Ok(None); };
+    let remaining = i128::from(expires) - now.as_millis() as i128;
+    if remaining <= 0 { return Ok(None); }
+    let ttl = remaining.min(i128::from(konsensus_storage::ENVELOPE_DEFERRAL_TTL_MS)) as u64;
+    Ok(Some(std::time::Instant::now() + std::time::Duration::from_millis(ttl)))
+}
+
+/// One owned worker handles reconnect repair. Notifications coalesce instead of
+/// allocating a task or queue entry for each unpaid connection. Only eight
+/// pipelines run at once, and storage, session locks and socket writes never
+/// run on the control dispatcher. Failed lookups retry on the maintenance tick.
+async fn restore_paid_session_repairs(
+    storage: Arc<dyn konsensus_storage::Storage>,
+    own: NodeId,
+    sessions: Arc<SessionManager>,
+    transport: Arc<NoiseTransport>,
+    wake: Arc<tokio::sync::Notify>,
+) {
+    use futures::{stream, StreamExt};
+    const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut checked = std::collections::HashMap::new();
+    let mut retry = tokio::time::interval(SESSION_SELF_HEAL_INTERVAL);
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! { _ = wake.notified() => {}, _ = retry.tick() => {} }
+        let peers = transport.connected_peers().await;
+        let live: std::collections::HashSet<_> = peers.iter().copied().collect();
+        // Retain at most one generation for each currently connected peer.
+        checked.retain(|peer, _| live.contains(peer));
+        let checks = stream::iter(peers).map(|peer| {
+            let (storage, sessions, transport, checked) = (&storage, &sessions, &transport, &checked);
+            async move {
+                let since = transport.connected_since(&peer).await?;
+                if checked.get(&peer) == Some(&since) { return None; }
+                let until = tokio::time::timeout(CHECK_TIMEOUT,
+                    paid_session_repair_deadline(storage.as_ref(), &own, &peer)).await.ok()?.ok()?;
+                if let Some(until) = until {
+                    let _ = tokio::time::timeout(CHECK_TIMEOUT, async {
+                        if transport.allow_session_repair(&peer, since, until).await {
+                            let _ = send_repair_prekey_offer(sessions, transport, &peer, since).await;
+                        }
+                    }).await;
+                }
+                // A completed lookup, including no obligation, is checked once
+                // per generation. A timed-out offer must not refresh standing.
+                Some((peer, since))
+            }
+        }).buffer_unordered(8);
+        let results: Vec<_> = checks.filter_map(|result| async move { result }).collect().await;
+        checked.extend(results);
+    }
+}
 
 /// Refuse state-changing control frames before dispatch. This consumes no
 /// identity or payload into telemetry: only a fixed reason counter is updated.
@@ -165,6 +240,16 @@ fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
     true
 }
 
+struct DeliveryControl {
+    peer: NodeId,
+    id: konsensus_core::MessageId,
+    rejection: Option<String>,
+    privileged: bool,
+    paid_until_ms: Option<u64>,
+    generation: Option<std::time::Instant>,
+    queued_at: std::time::Instant,
+}
+
 /// Runs the session/control event handler loop.
 pub(crate) async fn run(deps: SessionHandlerDeps) {
     let SessionHandlerDeps {
@@ -202,6 +287,49 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
     transport.set_reconnect_sessions(&session_manager);
 
+    let repair_wake = Arc::new(tokio::sync::Notify::new());
+    // Dropping the JoinSet on shutdown cancels even a blocked storage/lock wait.
+    let mut control_workers = tokio::task::JoinSet::new();
+    control_workers.spawn(restore_paid_session_repairs(
+        storage.clone(), our_node_id, session_manager.clone(), transport.clone(), repair_wake.clone(),
+    ));
+    // Unmatched confirmations are unpaid input too. Keep their durable match,
+    // session locks and recovery writes off the dispatcher. One FIFO worker
+    // preserves confirmation order; overflow leaves the durable delivery
+    // pending for its ordinary same-proof retry, just like a lost wire reply.
+    let (delivery_tx, mut delivery_rx) = mpsc::channel::<DeliveryControl>(128);
+    {
+        let (storage, transport, session_manager, identity) =
+            (storage.clone(), transport.clone(), session_manager.clone(), identity.clone());
+        let (send_timestamps, routing, ws_delivery_tx, audit_log) =
+            (send_timestamps.clone(), routing.clone(), ws_delivery_tx.clone(), audit_log.clone());
+        control_workers.spawn(async move {
+            let mut budget = DeliveryConfirmationBudget::default();
+            while let Some(delivery) = delivery_rx.recv().await {
+                let cipher = konsensus_crypto::PlaintextCacheCipher::with_policy(identity.aes_key(), session_manager.record_policy());
+                let recover = handle_delivery_confirmation(&delivery.peer, &delivery.id,
+                    delivery.rejection.as_deref(), delivery.privileged, identity.node_id(),
+                    &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut budget,
+                    delivery.paid_until_ms.map(|until| (until, &cipher))).await;
+                if recover {
+                    if !session_manager.mark_needs_renegotiation_before(&delivery.peer, delivery.queued_at).await {
+                        continue;
+                    }
+                    let repair_generation = if let Some(since) = delivery.generation {
+                        // A matched live rejection also covers cached deliveries
+                        // without an outbox journal. Reconnects require storage.
+                        let until = std::time::Instant::now() + std::time::Duration::from_millis(konsensus_storage::ENVELOPE_DEFERRAL_TTL_MS as u64);
+                        transport.allow_session_repair(&delivery.peer, since, until).await.then_some(since)
+                    } else { None };
+                    if let Some(since) = repair_generation {
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(5),
+                            send_repair_prekey_offer(&session_manager, &transport, &delivery.peer, since)).await;
+                    }
+                }
+            }
+        });
+    }
+
     let mut last_negotiation: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
     let mut offer_witness = OfferWitness::default();
@@ -209,7 +337,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
-    let mut delivery_budget = DeliveryConfirmationBudget::default();
     let mut porch_refusals = crate::invoice_refusals::RefusalLimits::default();
     let mut porch_quotes = std::collections::HashMap::<NodeId, (tokio::time::Instant, u32)>::new();
     let mut exchange_quotes = std::collections::HashMap::<NodeId, tokio::time::Instant>::new();
@@ -234,6 +361,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let mut lightning_was_ready = lightning.money_ready().await;
     let mut session_self_heal_interval = tokio::time::interval(SESSION_SELF_HEAL_INTERVAL);
     session_self_heal_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut session_maintenance = tokio::task::JoinSet::new();
     let mut invoice_cleanup_interval =
         tokio::time::interval(crate::peer_invoices::CLEANUP_INTERVAL);
     invoice_cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -264,6 +392,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     // this is byte-identical to pre-M1b.
                     ControlEvent::PeerConnected { peer_id, privileged } => {
                         if !privileged {
+                            repair_wake.notify_one();
                             debug!(peer = %peer_id, "PriceOpen: unprivileged peer connected — withholding prekey/onboarding until payment");
                             continue;
                         }
@@ -324,13 +453,13 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     }
 
                     ControlEvent::MessageAcked { peer_id, message_id, privileged, paid_until_ms, .. } => {
-                        let cipher = konsensus_crypto::PlaintextCacheCipher::with_policy(identity.aes_key(), session_manager.record_policy());
-                        handle_delivery_confirmation(&peer_id, &message_id, None, privileged,
-                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget, paid_until_ms.map(|until| (until, &cipher))).await;
+                        let _ = delivery_tx.try_send(DeliveryControl { peer: peer_id, id: message_id,
+                            rejection: None, privileged, paid_until_ms, generation: None, queued_at: std::time::Instant::now() });
                     }
                     ControlEvent::MessageRejected { peer_id, message_id, reason, privileged } => {
-                        handle_delivery_confirmation(&peer_id, &message_id, Some(&reason), privileged,
-                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget, None).await;
+                        let generation = transport.connected_since(&peer_id).await;
+                        let _ = delivery_tx.try_send(DeliveryControl { peer: peer_id, id: message_id,
+                            rejection: Some(reason), privileged, paid_until_ms: None, generation, queued_at: std::time::Instant::now() });
                     }
 
                     ControlEvent::PriceTableReceived { peer_id, prices, block_height, valid_blocks, trust_discount, privileged } => {
@@ -434,6 +563,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             &pricing, &readiness_height, &price_ceiling, &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
                             audit_log.membrane(), &mut last_admission_refusal, min_admission_cost_msat,
                             &mut peer_invoices,
+                            &session_manager,
                         ).await;
                     }
 
@@ -655,13 +785,29 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     peer_invoices.clone(), lightning.clone(), now_unix,
                 ));
             }
-            _ = session_self_heal_interval.tick() => {
-                refresh_recovered_lightning(
-                    &mut lightning_was_ready, &transport, &lightning, &lightning_addr,
-                    &storage, &ws_delivery_tx, our_node_id,
-                ).await;
-                heal_connected_e2ee_sessions(&session_manager, &transport).await;
-                check_connected_e2ee_sessions(&session_manager, &transport, &last_negotiation, &mut connections_checked).await;
+            Some(result) = session_maintenance.join_next(), if !session_maintenance.is_empty() => {
+                match result {
+                    Ok((ready, checked)) => { lightning_was_ready = ready; connections_checked = checked; }
+                    Err(error) => warn!(%error, "session maintenance task failed"),
+                }
+            }
+            _ = session_self_heal_interval.tick(), if session_maintenance.is_empty() => {
+                // Even enumerating session-eligible peers can wait for an unpaid
+                // connection's write lock. Maintenance owns that wait, never the
+                // dispatcher, and only one pass can be outstanding.
+                let (transport, session_manager, storage, lightning) =
+                    (transport.clone(), session_manager.clone(), storage.clone(), lightning.clone());
+                let (lightning_addr, ws_delivery_tx, negotiation) =
+                    (lightning_addr.clone(), ws_delivery_tx.clone(), last_negotiation.clone());
+                let mut checked = std::mem::take(&mut connections_checked);
+                let mut ready = lightning_was_ready;
+                session_maintenance.spawn(async move {
+                    refresh_recovered_lightning(&mut ready, &transport, &lightning, &lightning_addr,
+                        &storage, &ws_delivery_tx, our_node_id).await;
+                    heal_connected_e2ee_sessions(&session_manager, &transport).await;
+                    check_connected_e2ee_sessions(&session_manager, &transport, &negotiation, &mut checked).await;
+                    (ready, checked)
+                });
             }
             _ = shutdown_rx.changed() => {
                 info!("session handler shutting down");
@@ -1125,7 +1271,11 @@ async fn handle_session_ack(
 /// the lower id sends it again on each new one, and a failure here is owed to the
 /// next self-heal tick.
 async fn send_ratchet_init(session_manager: &SessionManager, transport: &Arc<NoiseTransport>, peer_id: &NodeId) -> bool {
-    match session_manager.encrypt(peer_id, b"ratchet-init").await {
+    #[cfg(test)]
+    while HOLD_RECOVERY_RATCHET_INIT.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    match session_manager.encrypt_recovery_probe(peer_id).await {
         Ok(ratchet_msg) => {
             let payload = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
             let frame = Frame::RatchetInit { payload };
@@ -1388,6 +1538,8 @@ async fn answer_prekey_offer_for_recovery(
     }
     let standing = if transport.admission_paid_on_connection(peer_id).await {
         konsensus_message::Standing::AdmissionPaid
+    } else if transport.session_repair_on_connection(peer_id).await {
+        konsensus_message::Standing::SessionRepair
     } else {
         konsensus_message::Standing::Privileged
     };
@@ -1414,6 +1566,19 @@ async fn e2ee_needs_self_heal(session_manager: &SessionManager, peer_id: &NodeId
         // An accepted session nothing has moved us to since the cooldown: its
         // `RatchetInit` is gone, and the peer may be using it already.
         || session_manager.accepted_replacement_older_than(peer_id, SESSION_NEGOTIATION_COOLDOWN).await
+}
+
+/// A matched paid refusal opens repair on one generation only.
+async fn send_repair_prekey_offer(
+    sessions: &SessionManager,
+    transport: &Arc<NoiseTransport>,
+    peer: &NodeId,
+    since: std::time::Instant,
+) -> Result<(), String> {
+    let bundle = serde_json::to_value(sessions.prekey_bundle().await).map_err(|e| e.to_string())?;
+    let bytes = Frame::PrekeyOffer { bundle }.to_bytes().map_err(|e| e.to_string())?;
+    transport.send_raw_frame_on(peer, since, konsensus_message::Standing::SessionRepair, &bytes)
+        .await.map_err(|e| e.to_string())
 }
 
 async fn send_prekey_offer(
@@ -1444,7 +1609,6 @@ fn terminal_paid_rejection(reason: &str) -> bool {
         // (`crate::msg_handler::ReceiptRefusal`, a refused call or room chat):
         // a resend of the same bytes can never be accepted, and is answered
         // with the withdrawal again, so a lost refusal is not a delivery.
-        "undecryptable:",
         "not_persisted:",
         "file_corrupted:",
         "message withdrawn",
@@ -1507,19 +1671,34 @@ async fn handle_delivery_confirmation(
     audit: &konsensus_api::audit::AuditLog,
     budget: &mut DeliveryConfirmationBudget,
     paid_until_ms: Option<(u64, &konsensus_crypto::PlaintextCacheCipher)>,
-) {
+) -> bool {
     if !budget.allow(peer, privileged, tokio::time::Instant::now()) {
         audit
             .membrane()
             .pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
-        return;
+        return false;
     }
     if let Some((until, cipher)) = paid_until_ms.filter(|_| rejection.is_none()) {
         if let Err(e) = konsensus_api::calls::receive_block_grant(storage.as_ref(), cipher, own_id, peer, id, until).await {
             warn!(error = %e, "call grant not durable; withholding ACK completion for retry");
-            return;
+            return false;
         }
     }
+    // An older recipient may have consumed the proof without producing the
+    // plaintext. Its later withdrawal or replay reply is not delivery evidence.
+    // Keep this provenance through every rejection; only an actual ACK resolves
+    // the old paid act. The original latest peer reason remains visible.
+    let unresolved_legacy = if let Some(reason) = rejection {
+        match storage.pending_was_undecryptable(id, peer, own_id).await {
+            Ok(true) => Some(format!("undecryptable: paid delivery remains unresolved; recipient reported: {reason}")),
+            Ok(false) => None,
+            Err(error) => {
+                warn!(peer = %peer, msg_id = %id, error = %error, "delivery provenance unavailable; retaining paid state");
+                return false;
+            }
+        }
+    } else { None };
+    let rejection = unresolved_legacy.as_deref().or(rejection);
     let nonce_replay = rejection == Some("replay detected: nonce already used");
     let hash_replay = rejection
         .and_then(|reason| reason.strip_prefix("payment proof already used: "))
@@ -1534,7 +1713,7 @@ async fn handle_delivery_confirmation(
             .await
         {
             Ok(acked) => acked,
-            Err(_) => return,
+            Err(_) => return false,
         }
     } else {
         false
@@ -1552,7 +1731,7 @@ async fn handle_delivery_confirmation(
                     .membrane()
                     .pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
             }
-            return;
+            return false;
         }
         if legacy {
             audit.record(
@@ -1585,11 +1764,13 @@ async fn handle_delivery_confirmation(
                     .membrane()
                     .pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
             }
-            return;
+            return false;
         }
         timestamps.lock().await.remove(id);
         handle_message_rejected(peer, id, reason, routing, ws, privileged).await;
+        return reason.starts_with("session_handover:");
     }
+    false
 }
 
 async fn handle_message_acked(
@@ -1793,6 +1974,7 @@ async fn handle_invoice_requested_gated(
     last_admission_refusal: &mut crate::invoice_refusals::RefusalLimits,
     min_admission_cost_msat: u64,
     invoices: &mut crate::peer_invoices::PeerInvoiceBook,
+    session_manager: &SessionManager,
 ) {
     if lightning.disk_status().is_some_and(|s| s.disk_low) {
         if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
@@ -1918,8 +2100,17 @@ async fn handle_invoice_requested_gated(
         last_admission_refusal,
         min_admission_cost_msat,
         invoices,
+        session_manager,
     )
     .await;
+}
+
+/// Service invoices wait for the receiver's recovery acknowledgement. Admission
+/// quotes use their separate path and do not require a session yet.
+async fn service_session_ready(sessions: &SessionManager, peer: &NodeId) -> bool {
+    sessions.has_session(peer).await
+        && !sessions.awaiting_confirmation(peer).await
+        && !sessions.needs_renegotiation(peer).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1936,10 +2127,17 @@ async fn handle_invoice_requested(
     refusals: &mut crate::invoice_refusals::RefusalLimits,
     min_admission_cost_msat: u64,
     invoices: &mut crate::peer_invoices::PeerInvoiceBook,
+    session_manager: &SessionManager,
 ) {
     // Only the dedicated path may issue call-block-purpose invoices.
     if purpose.starts_with(konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX) {
         send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE).await;
+        return;
+    }
+    if !service_session_ready(session_manager, peer_id).await {
+        if refusals.permit(source_ip, tokio::time::Instant::now()) {
+            send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::SESSION_HANDOVER).await;
+        }
         return;
     }
     let now_unix = std::time::SystemTime::now()
@@ -2036,6 +2234,12 @@ async fn handle_invoice_requested(
                 .created_at
                 .saturating_add(u64::from(crate::peer_invoices::INVOICE_EXPIRY_SECS));
             invoices.commit(*peer_id, invoice.payment_hash.clone(), expires_at);
+            // Creation can await the wallet while the session changes. Keep its
+            // inventory slot, but withhold the invoice until a fresh request.
+            if !service_session_ready(session_manager, peer_id).await {
+                send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::SESSION_HANDOVER).await;
+                return;
+            }
             let response = Frame::InvoiceResponse {
                 request_id: request_id.to_string(),
                 bolt11: invoice.bolt11,
@@ -2875,9 +3079,7 @@ async fn prepare_call_block_invoice(
         return Err(REFUSED);
     }
     let validate = async || {
-        if !session_manager.has_session(peer).await
-            || session_manager.needs_renegotiation(peer).await
-        {
+        if !service_session_ready(session_manager, peer).await {
             warn!(
                 peer = %peer,
                 "no readable E2EE session with the caller; call block invoice refused"

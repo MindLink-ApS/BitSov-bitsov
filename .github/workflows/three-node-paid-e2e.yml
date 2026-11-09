@@ -8,10 +8,9 @@ on:
         description: 'Enable ghost-channel regression only after PR #200 has merged'
         type: boolean
         default: false
-  # TODO: restore nightly runs once the lost-session recovery scenario delivers
-  # its first post-recovery message instead of timing out in App::compose.
-  # schedule:
-  #   - cron: '23 2 * * *'
+  schedule:
+    # Nightly paid-call coverage includes live-connection session recovery.
+    - cron: '23 2 * * *'
 
 permissions:
   contents: read
@@ -89,7 +88,11 @@ jobs:
         run: cargo fetch --locked
       - name: Runner lifecycle tests
         run: python3 scripts/regress/test_regtest_e2e_runner.py -v
-      - name: M6 two-node paid call (real 60-second blocks)
+      - name: Session recovery handover
+        run: |
+          cargo test --offline --locked -p konsensus-api --test recovery_handover
+          cargo test --offline --locked -p konsensus-node --features regtest-e2e --bin konsensus recovery_handover
+      - name: Two-node paid calls and live-connection session recovery
         shell: bash
         env:
           REGTEST_TIMEOUT_SECONDS: '1200'
@@ -100,6 +103,8 @@ jobs:
             git log -1 --format='M6 NODE SHA %H'
             scripts/regress/two_node_paid_call_e2e.sh
           } 2>&1 | tee paid-call.log
+          grep -q '^SESSION RECOVERED after ' paid-call.log
+          grep -q '^RECOVERY HANDOVER FIRST SEND deferred' paid-call.log
           grep -q '^M6 CALL PASS reason=unpaid paid_blocks=3 ' paid-call.log
           grep -q '^M6 CALL PASS reason=duration_cap paid_blocks=1 ' paid-call.log
       - name: Two-node approved app grants (messages and real call blocks)

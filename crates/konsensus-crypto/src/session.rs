@@ -50,6 +50,10 @@ pub enum SessionError {
     #[error("session already exists with peer {0}")]
     SessionExists(NodeId),
 
+    /// An accepted replacement needs the initiator's ratchet frame before sending.
+    #[error("session recovery handover is pending; retry after confirmation")]
+    HandoverPending,
+
     /// X3DH key agreement failed.
     #[error("key agreement failed: {0}")]
     KeyAgreement(#[from] X3dhError),
@@ -164,6 +168,8 @@ struct PeerSession {
     /// When this node derived the session, ms since the epoch. Held in memory
     /// only: `None` for a session restored from storage.
     established_at_ms: Option<u64>,
+    /// Local installation or proven session progress. Never persisted.
+    progressed_at: std::time::Instant,
     /// A newer session the peer has not yet proven it holds. Replaces `ratchet`
     /// only on that proof; held in memory only, and overwritten by the next one.
     unconfirmed: Option<DoubleRatchet>,
@@ -202,6 +208,7 @@ impl PeerSession {
         Self {
             ratchet,
             established_at_ms,
+            progressed_at: std::time::Instant::now(),
             unconfirmed: None,
             unconfirmed_initiated: false,
             unconfirmed_since: None,
@@ -757,6 +764,7 @@ impl SessionManager {
                     session.awaiting_confirmation = false;
                 }
             }
+            session.progressed_at = std::time::Instant::now();
         }
         self.persist_session(peer_id).await;
         true
@@ -770,6 +778,18 @@ impl SessionManager {
         }
     }
 
+    /// Mark recovery requested before `boundary` without invalidating a session
+    /// installed, confirmed or proven readable since then. The comparison and
+    /// mark share one write lock, so a queued rejection cannot race recovery. No session
+    /// also needs repair. A newer session returns false and stays usable.
+    pub async fn mark_needs_renegotiation_before(&self, peer_id: &NodeId, boundary: std::time::Instant) -> bool {
+        let mut sessions = self.sessions.write().await;
+        let Some(session) = sessions.get_mut(peer_id) else { return true; };
+        if session.progressed_at > boundary { return false; }
+        session.needs_renegotiation = true;
+        true
+    }
+
     /// Whether we started a replacement of the session with a peer and are waiting for
     /// its answer. Until then the peer may already be on the replacement, so a message
     /// under the session in use would tell it nothing.
@@ -779,7 +799,8 @@ impl SessionManager {
 
     /// Whether a newer session with a peer is held aside, either side's, until the
     /// peer proves it holds it. Until then the two sides can each send, and what the
-    /// acceptor sends is under the session before.
+    /// acceptor would otherwise send is under the session before; application
+    /// encryption is deferred until the replacement is proven.
     pub async fn replacement_pending(&self, peer_id: &NodeId) -> bool {
         self.sessions.read().await.get(peer_id).is_some_and(|session| session.unconfirmed.is_some())
     }
@@ -829,7 +850,9 @@ impl SessionManager {
     ///
     /// Uses the Double Ratchet to derive a per-message key and encrypt.
     /// Returns the ratchet message (header + ciphertext) which should be
-    /// placed in the UKM envelope's `ciphertext` field.
+    /// placed in the UKM envelope's `ciphertext` field. An accepted replacement
+    /// withholds application ciphertext until the initiator proves its new session,
+    /// so callers cannot start payment for a send under the previous session.
     ///
     /// The advanced send chain is saved before the ciphertext is returned, so a
     /// restart can never derive the key of a message that already left. If the save
@@ -848,9 +871,27 @@ impl SessionManager {
         peer_id: &NodeId,
         plaintext: &[u8],
     ) -> Result<RatchetMessage, SessionError> {
+        self.encrypt_for(peer_id, plaintext, false).await
+    }
+
+    /// Recovery probes may test the active session while renegotiation is marked.
+    /// Application sends use `encrypt` and wait for that mark to clear.
+    pub async fn encrypt_recovery_probe(
+        &self, peer_id: &NodeId,
+    ) -> Result<RatchetMessage, SessionError> {
+        self.encrypt_for(peer_id, b"ratchet-init", true).await
+    }
+
+    async fn encrypt_for(
+        &self, peer_id: &NodeId, plaintext: &[u8], recovery_probe: bool,
+    ) -> Result<RatchetMessage, SessionError> {
         let Some(store) = self.store.clone() else {
             let mut sessions = self.sessions.write().await;
             let session = sessions.get_mut(peer_id).ok_or(SessionError::NoSession(*peer_id))?;
+            if (!recovery_probe && session.needs_renegotiation)
+                || (session.unconfirmed.is_some() && !session.unconfirmed_initiated) {
+                return Err(SessionError::HandoverPending);
+            }
             return Ok(session.ratchet.encrypt(plaintext)?);
         };
         let (sessions, cipher, peer, plaintext) =
@@ -858,6 +899,10 @@ impl SessionManager {
         tokio::spawn(async move {
             let mut sessions = sessions.write().await;
             let session = sessions.get_mut(&peer).ok_or(SessionError::NoSession(peer))?;
+            if (!recovery_probe && session.needs_renegotiation)
+                || (session.unconfirmed.is_some() && !session.unconfirmed_initiated) {
+                return Err(SessionError::HandoverPending);
+            }
             let before = session.ratchet.export_state();
             let msg = session.ratchet.encrypt(&plaintext)?;
             let saved = match session_blob(&cipher, &peer, session) {
@@ -921,6 +966,7 @@ impl SessionManager {
                 Ok(plaintext) => {
                     // The peer and this session agree, whatever was unreadable before.
                     session.needs_renegotiation = false;
+                    session.progressed_at = std::time::Instant::now();
                     plaintext
                 }
                 Err(error) => {

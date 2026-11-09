@@ -461,6 +461,7 @@ async fn start_recipient(
         let lightning = Arc::clone(&lightning);
         let pricing = Arc::clone(&pricing);
         let recipient = *identity.node_id();
+        let sessions = Arc::clone(sessions);
         tokio::spawn(async move {
             let mut last_refusal = crate::invoice_refusals::RefusalLimits::default();
             let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
@@ -507,6 +508,7 @@ async fn start_recipient(
                         &mut last_refusal,
                         0,
                         &mut peer_invoices,
+                        &sessions,
                     )
                     .await;
                 }

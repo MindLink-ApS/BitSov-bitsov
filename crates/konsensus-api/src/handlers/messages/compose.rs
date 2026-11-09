@@ -626,6 +626,9 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
     match refusal.as_deref() {
         Some(invoice_refusal::ADMISSION_REQUIRED) => admission_refusal(peer_id),
         Some("disk_low") => ApiError::NotDispatched("disk_low".into()),
+        Some(invoice_refusal::SESSION_HANDOVER) => ApiError::NotDispatched(
+            "recipient session recovery handover is pending; retry shortly".into()
+        ).with_reason("session_handover"),
         Some(invoice_refusal::PRICE_CHANGED) => ApiError::NotDispatched(
             "recipient lowered its prices since they were quoted; refresh its prices and retry; nothing was paid".into()
         ).with_reason("price_changed"),
