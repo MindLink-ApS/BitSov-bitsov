@@ -546,7 +546,7 @@ async fn send_file_inner(
 
     // Create real payment proof — requests invoice from recipient (Principle 2).
     let mut admission = super::messages::FirstContactCharge::default();
-    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit, readmission, Some(KIND_FILE_REF), &mut admission).await.map_err(|error| admission.error(error));
+    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit, readmission, Some(KIND_FILE_REF), &mut admission, None).await.map_err(|error| admission.error(error));
     if matches!(&paid, Err(ApiError::PaymentUnresolved(_))) && admission.readmission_blocks_message {
         debit.settled(&peer_key, admission.settled_msat.saturating_sub(admission.readmission_msat));
     } else if let Err(ApiError::PaymentProofUnavailable { amount_msat, .. }) = &paid {

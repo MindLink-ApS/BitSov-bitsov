@@ -62,6 +62,7 @@ pub struct MemStorage {
     pub peer_upsert_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub peer_delete_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub call_block_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub outbox_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub call_offer_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub fail_call_get_for: Mutex<Option<String>>,
     pub fail_call_put_for: Mutex<Option<String>>,
@@ -91,6 +92,7 @@ impl MemStorage {
             peer_upsert_gate: Mutex::new(None),
             peer_delete_gate: Mutex::new(None),
             call_block_dispatch_gate: Mutex::new(None),
+            outbox_dispatch_gate: Mutex::new(None),
             call_offer_dispatch_gate: Mutex::new(None),
             fail_call_get_for: Mutex::new(None),
             fail_call_put_for: Mutex::new(None),
@@ -267,6 +269,10 @@ impl Storage for MemStorage {
         &self,
         op: &konsensus_storage::OutboxOperation,
     ) -> Result<bool, StorageError> {
+        let dispatching = op.state == "paying" && serde_json::from_slice::<serde_json::Value>(&op.recovery)
+            .is_ok_and(|data| data["dispatched"] == true);
+        let gate = if dispatching { self.outbox_dispatch_gate.lock().unwrap().take() } else { None };
+        if let Some(gate) = gate { gate.run().await?; }
         let dispatched = op.kind == 404 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
             .is_ok_and(|data| data["dispatched"] == true);
         let gate = if dispatched { self.call_block_dispatch_gate.lock().unwrap().take() } else { None };
@@ -1120,6 +1126,7 @@ impl ChainProvider for StubChain {
 /// then fails every one. Counts all tip reads. Other reads work as
 /// [`StubChain`]'s.
 pub struct TipDownChain {
+    pub read_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub ok_reads: std::sync::atomic::AtomicUsize,
     pub reads: std::sync::atomic::AtomicUsize,
     /// When down, answer height 0 instead of an error.
@@ -1134,6 +1141,7 @@ impl TipDownChain {
     /// Up for `ok_reads` tip reads, then down.
     pub fn after(ok_reads: usize) -> Self {
         Self {
+            read_gate: Mutex::new(None),
             ok_reads: std::sync::atomic::AtomicUsize::new(ok_reads),
             reads: std::sync::atomic::AtomicUsize::new(0),
             zero: false,
@@ -1156,6 +1164,10 @@ impl ChainProvider for TipDownChain {
     async fn get_block_height(&self) -> Result<u64, ChainError> {
         use std::sync::atomic::Ordering;
         self.reads.fetch_add(1, Ordering::SeqCst);
+        let gate = self.read_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.run().await.map_err(|e| ChainError::Connection(e.to_string()))?;
+        }
         // Tests read the tip from one task at a time.
         let left = self.ok_reads.load(Ordering::SeqCst);
         let up = left > 0;
