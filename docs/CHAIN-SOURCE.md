@@ -31,11 +31,15 @@ is not an answer.
   that have answered. With `credentials_file`, a primary that has not answered
   (for example because its token request failed) is skipped for that start:
   LDK uses the verified fallback, which never receives credentials, and no
-  token is requested.
+  token is requested. Each Esplora endpoint is checked on its own, within ten
+  seconds (four per request), so a slow or silent endpoint never discards
+  another endpoint's answer.
 - **Asked again:** after a lost connection, a timeout or a reply cut short,
   before the next use; at least every 60 seconds otherwise. A cached Esplora
-  height is served only while its endpoint's check holds, and never after a
-  refusal. Electrum opens a new connection per query and is asked on each one.
+  height is served only while the check of the endpoint that served it holds,
+  and never after a refusal; after a refusal neither Esplora nor Electrum
+  counts as synced on an earlier height. Electrum opens a new connection per
+  query and is asked on each one.
   Every `getblockchaininfo` reply from Core is also compared. The running LDK
   node asks the endpoints its client uses every 60 seconds and is not
   money-ready while none has answered for three minutes.
@@ -357,8 +361,9 @@ LDK transport applies live headers to wallet sync, fees, funding checks and
 broadcasts, including client clones; it does not require a restart every five
 minutes. Token POSTs have a four-second timeout; API requests retain the caller's
 budget (ten seconds for LDK and the configured timeout for the chain provider,
-with the existing shorter height/readiness deadline). Authentication errors and
-HTTP error bodies are redacted. If all endpoints fail, LDK retains the primary's
+with the existing shorter height/readiness deadline, and the configured timeout
+for a recovery broadcast); a request without its own budget gets 30 seconds. Authentication errors and HTTP error bodies are
+redacted. If all endpoints fail, LDK retains the primary's
 HTTP status when available; rate-limit failures keep their existing 429 policy.
 
 Chain requests use the existing ordered fallback list when token acquisition,
