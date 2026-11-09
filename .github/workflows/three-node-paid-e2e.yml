@@ -89,10 +89,9 @@ jobs:
       - name: Runner lifecycle tests
         run: python3 scripts/regress/test_regtest_e2e_runner.py -v
       - name: Session recovery handover
-        run: >-
-          cargo test --offline --locked -p konsensus-node --features regtest-e2e
-          --bin konsensus regtest_e2e::paid_call::recovery_waits_until_both_sessions_have_switched
-          -- --exact
+        run: |
+          cargo test --offline --locked -p konsensus-api --test recovery_handover
+          cargo test --offline --locked -p konsensus-node --features regtest-e2e --bin konsensus recovery_handover
       - name: Two-node paid calls and live-connection session recovery
         shell: bash
         env:
@@ -105,6 +104,7 @@ jobs:
             scripts/regress/two_node_paid_call_e2e.sh
           } 2>&1 | tee paid-call.log
           grep -q '^SESSION RECOVERED after ' paid-call.log
+          grep -q '^RECOVERY HANDOVER FIRST SEND deferred' paid-call.log
           grep -q '^M6 CALL PASS reason=unpaid paid_blocks=3 ' paid-call.log
           grep -q '^M6 CALL PASS reason=duration_cap paid_blocks=1 ' paid-call.log
       - name: Two-node approved app grants (messages and real call blocks)

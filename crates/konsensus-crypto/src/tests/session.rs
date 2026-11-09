@@ -1286,13 +1286,13 @@ async fn an_acceptor_that_could_not_save_the_move_repeats_no_position_after_a_re
 #[tokio::test]
 async fn a_replaced_session_only_reads_and_is_not_saved() {
     let (id_a, _, store_a, _, mgr_a, mgr_b, node_a, node_b, _) = saving_pair().await;
+    let first = mgr_b.encrypt(&node_a, b"first").await.unwrap();
+    let second = mgr_b.encrypt(&node_a, b"second").await.unwrap();
     let init = mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
     mgr_b.reaccept_session(&node_a, &init).await.unwrap();
     assert!(mgr_a.confirm_session(&node_b).await);
     assert!(!mgr_a.take_ratchet_init_owed(&node_b).await);
 
-    let first = mgr_b.encrypt(&node_a, b"first").await.unwrap();
-    let second = mgr_b.encrypt(&node_a, b"second").await.unwrap();
     assert_eq!(mgr_a.preview_decrypt(&node_b, &first).await.unwrap(), b"first");
     assert!(!mgr_a.take_ratchet_init_owed(&node_b).await, "a preview changes nothing");
     assert_eq!(mgr_a.decrypt(&node_b, &first).await.unwrap(), b"first");
@@ -1303,7 +1303,7 @@ async fn a_replaced_session_only_reads_and_is_not_saved() {
     assert!(mgr_a.needs_renegotiation(&node_b).await, "this says nothing about the session in use");
 
     // What it sends is under the new session: the acceptor moves over on it.
-    let sent = mgr_a.encrypt(&node_b, b"under the new session").await.unwrap();
+    let sent = mgr_a.encrypt_recovery_probe(&node_b).await.unwrap();
     mgr_b.decrypt(&node_a, &sent).await.unwrap();
     assert!(mgr_a.preview_decrypt(&node_b, &mgr_b.encrypt(&node_a, b"on it").await.unwrap()).await.is_ok());
 
@@ -1318,10 +1318,10 @@ async fn a_replaced_session_only_reads_and_is_not_saved() {
 #[tokio::test]
 async fn a_replaced_session_stops_reading_after_its_time() {
     let (_, _, _, _, mgr_a, mgr_b, node_a, node_b, _) = saving_pair().await;
+    let late = mgr_b.encrypt(&node_a, b"late").await.unwrap();
     let init = mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
     mgr_b.reaccept_session(&node_a, &init).await.unwrap();
     assert!(mgr_a.confirm_session(&node_b).await);
-    let late = mgr_b.encrypt(&node_a, b"late").await.unwrap();
     assert!(mgr_a.preview_decrypt(&node_b, &late).await.is_ok());
 
     mgr_a.expire_retired_sessions().await;
@@ -1429,4 +1429,26 @@ fn same_x25519_point_ignores_the_top_bit_only() {
     other[0] ^= 0x01;
     assert!(!same_x25519_point(&hex::encode(key), &hex::encode(other)));
     assert!(!same_x25519_point(&hex::encode(key), "not hex"));
+}
+
+#[tokio::test]
+async fn recovery_handover_holds_marked_sends_but_allows_recovery_probes() {
+    for stored in [false, true] {
+        let a_id = make_identity(TEST_MNEMONIC_A);
+        let b_id = make_identity(TEST_MNEMONIC_B);
+        let (aid, bid) = (*a_id.node_id(), *b_id.node_id());
+        let a = if stored { SessionManager::with_store(a_id, Arc::new(FlakyStore::default())) } else { SessionManager::new(a_id) };
+        let b = SessionManager::new(b_id);
+        let init = a.initiate_session(&bid, &b.prekey_bundle().await).await.unwrap();
+        b.accept_session(&aid, &init).await.unwrap();
+        a.confirm_session(&bid).await;
+        a.mark_needs_renegotiation(&bid).await;
+        assert!(matches!(a.encrypt(&bid, b"application").await, Err(SessionError::HandoverPending)));
+        let probe = a.encrypt_recovery_probe(&bid).await.unwrap();
+        b.decrypt(&aid, &probe).await.unwrap();
+        let reply = b.encrypt(&aid, b"reply").await.unwrap();
+        a.decrypt(&bid, &reply).await.unwrap();
+        let sent = a.encrypt(&bid, b"application").await.unwrap();
+        assert_eq!(b.decrypt(&aid, &sent).await.unwrap(), b"application");
+    }
 }

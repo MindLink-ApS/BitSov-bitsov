@@ -729,6 +729,7 @@ async fn lost_session_recovers_on_the_connection_and_the_next_call_works() {
     assert!(callee.state.session_manager.remove_session(&aid).await);
     let (status, body) = compose(caller, &bid, 404, block(1), PRICE).await;
     let lost_throughout = !callee.state.session_manager.has_session(&aid).await;
+    crate::session_handler::HOLD_RECOVERY_RATCHET_INIT.store(true, Ordering::SeqCst);
     crate::session_handler::HOLD_PREKEY_ANSWERS.store(false, Ordering::SeqCst);
     let lost_at = std::time::Instant::now();
     assert!(lost_throughout, "the barrier held");
@@ -739,12 +740,35 @@ async fn lost_session_recovers_on_the_connection_and_the_next_call_works() {
     assert_eq!((hold.spent_msat, hold.closed), (spent, false), "the hold is untouched");
     lane.steps.pass("the block for a lost session is refused before payment");
 
-    wait("both recovered sessions have settled", || async {
+    // Start B's first message while handover is still pending. The test barrier
+    // holds A's RatchetInit, so scheduler speed cannot skip this state.
+    wait("the recovered initiator has a sending chain", || async {
         assert!(lost_at.elapsed() < RECOVERY_BOUND, "not recovered within the bound");
-        session_recovered(&callee.state.session_manager, &aid).await
-            && session_recovered(&caller.state.session_manager, &bid).await
-    })
-    .await;
+        callee.state.session_manager.can_send(&aid).await
+            && caller.state.session_manager.replacement_pending(&bid).await
+    }).await;
+    let first = json!({"operation_id": uuid::Uuid::new_v4().to_string(),
+        "recipient": bid.to_hex(), "kind": 0, "plaintext": "first message during recovery"});
+    let (status, body) = caller.post("/api/v1/messages/compose", first.clone(), false).await;
+    crate::session_handler::HOLD_RECOVERY_RATCHET_INIT.store(false, Ordering::SeqCst);
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["reason"], "session_handover", "{body}");
+    assert_eq!(body["retry_allowed"], true, "{body}");
+    assert_eq!(a.list_payments(100).await.unwrap().len(), payments, "handover defers payment");
+    println!("RECOVERY HANDOVER FIRST SEND deferred");
+    // Retry the same operation immediately; production owns session readiness.
+    // No test handover predicate is used to authorize this first message.
+    loop {
+        assert!(lost_at.elapsed() < RECOVERY_BOUND, "first recovery message: {body}");
+        let (status, body) = caller.post("/api/v1/messages/compose", first.clone(), false).await;
+        if status == StatusCode::OK {
+            assert_eq!(body["accepted"], true, "{body}");
+            recv_kind(callee, &aid, 0).await;
+            break;
+        }
+        assert_eq!(body["reason"], "session_handover", "{body}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     println!("SESSION RECOVERED after {:?}", lost_at.elapsed());
     assert_eq!(
         (connection(caller, bid).await, connection(callee, aid).await),

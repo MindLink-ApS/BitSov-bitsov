@@ -50,6 +50,10 @@ pub enum SessionError {
     #[error("session already exists with peer {0}")]
     SessionExists(NodeId),
 
+    /// An accepted replacement needs the initiator's ratchet frame before sending.
+    #[error("session recovery handover is pending; retry after confirmation")]
+    HandoverPending,
+
     /// X3DH key agreement failed.
     #[error("key agreement failed: {0}")]
     KeyAgreement(#[from] X3dhError),
@@ -779,7 +783,8 @@ impl SessionManager {
 
     /// Whether a newer session with a peer is held aside, either side's, until the
     /// peer proves it holds it. Until then the two sides can each send, and what the
-    /// acceptor sends is under the session before.
+    /// acceptor would otherwise send is under the session before; application
+    /// encryption is deferred until the replacement is proven.
     pub async fn replacement_pending(&self, peer_id: &NodeId) -> bool {
         self.sessions.read().await.get(peer_id).is_some_and(|session| session.unconfirmed.is_some())
     }
@@ -829,7 +834,9 @@ impl SessionManager {
     ///
     /// Uses the Double Ratchet to derive a per-message key and encrypt.
     /// Returns the ratchet message (header + ciphertext) which should be
-    /// placed in the UKM envelope's `ciphertext` field.
+    /// placed in the UKM envelope's `ciphertext` field. An accepted replacement
+    /// withholds application ciphertext until the initiator proves its new session,
+    /// so callers cannot start payment for a send under the previous session.
     ///
     /// The advanced send chain is saved before the ciphertext is returned, so a
     /// restart can never derive the key of a message that already left. If the save
@@ -848,9 +855,27 @@ impl SessionManager {
         peer_id: &NodeId,
         plaintext: &[u8],
     ) -> Result<RatchetMessage, SessionError> {
+        self.encrypt_for(peer_id, plaintext, false).await
+    }
+
+    /// Recovery probes may test the active session while renegotiation is marked.
+    /// Application sends use `encrypt` and wait for that mark to clear.
+    pub async fn encrypt_recovery_probe(
+        &self, peer_id: &NodeId,
+    ) -> Result<RatchetMessage, SessionError> {
+        self.encrypt_for(peer_id, b"ratchet-init", true).await
+    }
+
+    async fn encrypt_for(
+        &self, peer_id: &NodeId, plaintext: &[u8], recovery_probe: bool,
+    ) -> Result<RatchetMessage, SessionError> {
         let Some(store) = self.store.clone() else {
             let mut sessions = self.sessions.write().await;
             let session = sessions.get_mut(peer_id).ok_or(SessionError::NoSession(*peer_id))?;
+            if (!recovery_probe && session.needs_renegotiation)
+                || (session.unconfirmed.is_some() && !session.unconfirmed_initiated) {
+                return Err(SessionError::HandoverPending);
+            }
             return Ok(session.ratchet.encrypt(plaintext)?);
         };
         let (sessions, cipher, peer, plaintext) =
@@ -858,6 +883,10 @@ impl SessionManager {
         tokio::spawn(async move {
             let mut sessions = sessions.write().await;
             let session = sessions.get_mut(&peer).ok_or(SessionError::NoSession(peer))?;
+            if (!recovery_probe && session.needs_renegotiation)
+                || (session.unconfirmed.is_some() && !session.unconfirmed_initiated) {
+                return Err(SessionError::HandoverPending);
+            }
             let before = session.ratchet.export_state();
             let msg = session.ratchet.encrypt(&plaintext)?;
             let saved = match session_blob(&cipher, &peer, session) {

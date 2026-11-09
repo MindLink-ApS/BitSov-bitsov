@@ -17,6 +17,8 @@ pub(super) struct Connection {
     socket: socket2::Socket,
     closed: AtomicBool,
     pub(super) admission_paid: AtomicBool,
+    /// Only E2EE repair after a verified paid deferral on this connection.
+    pub(super) session_repair: AtomicBool,
     pub(super) connected_at: Instant,
 }
 
@@ -35,6 +37,7 @@ impl Connection {
         let conn = Arc::new(Self {
             outbound,
             admission_paid: AtomicBool::new(false),
+            session_repair: AtomicBool::new(false),
             connected_at,
             state: Mutex::new(state),
             replies,

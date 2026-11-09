@@ -247,6 +247,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (35, "call blocks", include_str!("../migrations/035_call_blocks.sql")),
     (36, "call unpaid notice", include_str!("../migrations/036_call_unpaid_notice.sql")),
     (37, "call block invoices", include_str!("../migrations/037_call_block_invoices.sql")),
+    (38, "envelope deferrals", include_str!("../migrations/038_envelope_deferrals.sql")),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -671,6 +672,235 @@ const OPERATOR_HOSTING_PAYMENTS_SELECT: &str =
 const PEERS_SELECT: &str =
     "SELECT node_id, address, last_seen, display_name, metadata_json FROM peers ORDER BY node_id";
 
+impl SqliteStorage {
+    async fn commit_outbox_envelope_inner(&self, op: &crate::OutboxOperation, envelope: &UkmEnvelope, previous: Option<&MessageId>, plaintext_enc: Option<&[u8]>) -> Result<bool, StorageError> {
+        if op.state != "paid" || op.message_id.as_deref() != Some(envelope.id.to_hex().as_str()) || envelope.recipient != Recipient::Node(NodeId::from_hex(&op.recipient).map_err(|e| StorageError::Conversion(e.to_string()))?) {
+            return Err(StorageError::Conversion("invalid paid operation binding".into()));
+        }
+        let mut tx = self.pool.begin().await?;
+
+        if let Some(previous) = previous {
+            let current: Option<crate::OutboxOperation> = sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = ?")
+                .bind(&op.operation_id).fetch_optional(&mut *tx).await?;
+            let Some(current) = current else { tx.rollback().await?; return Ok(false); };
+            if !crate::outbox::validate_handover_replacement(&current, op, previous, envelope)? {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+            let refs: Vec<String> = envelope.references.iter().map(|id| id.to_hex()).collect();
+            let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages m JOIN pending_deliveries p ON p.message_id = m.id WHERE m.id = ? AND m.sender = ? AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = ? AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ? AND p.recipient_id = ? AND p.dispatched = 1 AND p.state != 'failed_paid' AND p.rejection_reason = ?")
+                .bind(previous.to_hex()).bind(envelope.sender.to_hex()).bind(i64::from(envelope.kind))
+                .bind(rtype).bind(&rid).bind(hex::encode(envelope.payment_proof.payment_hash))
+                .bind(hex::encode(envelope.payment_proof.preimage)).bind(op.settled_msat)
+                .bind(hex::encode(envelope.nonce.as_bytes()))
+                .bind(serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?)
+                .bind(&op.recipient).bind(&current.last_error).fetch_one(&mut *tx).await?;
+            if matches != 1 {
+                return Err(StorageError::Conversion("deferred envelope binding changed".into()));
+            }
+            // Remove the old dispatch authority before publishing a new ID. A
+            // concurrent old ACK either wins the operation CAS or has no row.
+            sqlx::query("DELETE FROM pending_deliveries WHERE message_id = ? AND recipient_id = ?")
+                .bind(previous.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
+        }
+        let changed = sqlx::query("UPDATE outbox_operations SET state = ?, payment_hash = ?, admission_payment_hash = ?, message_id = ?, settled_msat = ?, readmission_msat = ?, updated_at = ?, last_sent_at = ?, attempts = ?, last_error = ?, recovery = ?, accounting_pending = ?, recovery_compacted = ?, version = version + 1 WHERE operation_id = ? AND version = ?")
+            .bind(&op.state)
+            .bind(&op.payment_hash)
+            .bind(&op.admission_payment_hash)
+            .bind(&op.message_id)
+            .bind(op.settled_msat)
+            .bind(op.readmission_msat)
+            .bind(op.updated_at)
+            .bind(op.last_sent_at)
+            .bind(op.attempts)
+            .bind(&op.last_error)
+            .bind(&op.recovery)
+            .bind(op.accounting_pending)
+            .bind(op.recovery_compacted)
+            .bind(&op.operation_id).bind(op.version)
+            .execute(&mut *tx).await?.rows_affected() == 1;
+        if !changed { tx.rollback().await?; return Ok(false); }
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ts = i64::try_from(envelope.timestamp)
+            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
+        let ciphertext = &envelope.ciphertext;
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let sig = hex::encode(envelope.signature.as_bytes());
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        sqlx::query(
+            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, plaintext_enc) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(&sender)
+        .bind(rtype)
+        .bind(&rid)
+        .bind(ts)
+        .bind(ciphertext)
+        .bind(&ph)
+        .bind(&pi)
+        .bind(amt)
+        .bind(&sig)
+        .bind(&nonce)
+        .bind(&refs_json)
+        .bind(plaintext_enc)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("INSERT INTO pending_deliveries (message_id, recipient_id) VALUES (?, ?) ON CONFLICT DO NOTHING")
+            .bind(envelope.id.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
+        if let Some(previous) = previous {
+            sqlx::query("DELETE FROM messages WHERE id = ? AND sender = ?")
+                .bind(previous.to_hex()).bind(&sender).execute(&mut *tx).await?;
+        }
+        // A paid web request binds its reply in the same transaction as its
+        // envelope: no crash window between "paid and queued" and "reply bindable".
+        if let Some(row) = crate::outstanding_web_request_row(envelope)? {
+            sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
+                .bind(row.payment_hash).bind(row.request_id).bind(row.peer).bind(row.expected_reply_kind).bind(row.expires_at_ms)
+                .execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+}
+
+impl SqliteStorage {
+    async fn accept_paid_envelope_inner(&self, envelope: &UkmEnvelope, readable: bool) -> Result<Option<crate::PaidAcceptance>, StorageError> {
+        use crate::PaidAcceptance::*;
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ts = i64::try_from(envelope.timestamp)
+            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
+        let ciphertext = &envelope.ciphertext;
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let sig = hex::encode(envelope.signature.as_bytes());
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let mut tx = self.pool.begin().await?;
+        let receipt = sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
+            .bind(&ph).bind(&id).bind(&sender).execute(&mut *tx).await?;
+        let deferred: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = ? AND sender = ? AND payment_hash = ?)")
+            .bind(&id).bind(&sender).bind(&ph).fetch_one(&mut *tx).await?;
+        if deferred {
+            tx.rollback().await?;
+            return Err(StorageError::Conversion("envelope deferred for session recovery".into()));
+        }
+        let healing = receipt.rows_affected() == 0;
+        if healing {
+            // Serialize legacy healers on the receipt binding (SQLite already
+            // holds the writer lock from the INSERT above).
+            let binding: (String, String, i32) = sqlx::query_as("SELECT message_id, sender, accepted FROM payment_receipts WHERE payment_hash = ?")
+                .bind(&ph).fetch_one(&mut *tx).await?;
+            if binding.0 != id || binding.1 != sender {
+                tx.rollback().await?;
+                return Ok(Some(PaymentReused));
+            }
+            // The same envelope, refused and withdrawn by the application: its
+            // sender is told so again, never that its proof belongs to another.
+            if binding.2 == -1 {
+                tx.rollback().await?;
+                return Ok(Some(Withdrawn));
+            }
+            // Receipt metadata is independent of retained message content and
+            // excludes only the timestamp/signature wrapper refreshed on retry.
+            let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = ? AND message_id = ? AND sender = ? AND accepted = 1 AND kind = ? AND recipient_type = ? AND recipient_id = ? AND preimage = ? AND amount_msat = ? AND nonce = ? AND references_json = ?")
+                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+                .fetch_one(&mut *tx).await?;
+            if durable == 1 {
+                tx.rollback().await?;
+                return Ok(Some(AlreadyAccepted));
+            }
+            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
+                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+                .fetch_one(&mut *tx).await?;
+            if matched == 1 {
+                sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = ?, recipient_type = ?, recipient_id = ?, preimage = ?, amount_msat = ?, nonce = ?, references_json = ? WHERE payment_hash = ?")
+                    .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+                tx.commit().await?;
+                return Ok(Some(AlreadyAccepted));
+            }
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+                .bind(&id).fetch_one(&mut *tx).await?;
+            if exists != 0 || binding.2 != 0 {
+                tx.rollback().await?;
+                return Ok(Some(PaymentReused));
+            }
+            // Full gate validation precedes this transaction. The receipt
+            // binds this paid identity; repair only its missing message row.
+        }
+        let inserted = sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES (?, ?) ON CONFLICT DO NOTHING")
+            .bind(&nonce).bind(&sender).execute(&mut *tx).await?;
+        if inserted.rows_affected() == 0 {
+            let owner: String = sqlx::query_scalar("SELECT sender FROM nonces WHERE nonce_hex = ?")
+                .bind(&nonce).fetch_one(&mut *tx).await?;
+            if !healing || owner != sender {
+                tx.rollback().await?;
+                return Ok(Some(NonceReused));
+            }
+        }
+        if !readable {
+            // Classify the existing receipt/nonce using the same transaction as
+            // acceptance, but leave fresh and resumable legacy proofs untouched.
+            // This also rolls back speculative receipt and nonce inserts.
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        sqlx::query(
+            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(&sender)
+        .bind(rtype)
+        .bind(&rid)
+        .bind(ts)
+        .bind(ciphertext)
+        .bind(&ph)
+        .bind(&pi)
+        .bind(amt)
+        .bind(&sig)
+        .bind(&nonce)
+        .bind(&refs_json)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = ?, recipient_type = ?, recipient_id = ?, preimage = ?, amount_msat = ?, nonce = ?, references_json = ? WHERE payment_hash = ?")
+            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM envelope_deferrals WHERE payment_hash = ?")
+            .bind(&ph).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Some(Accepted))
+    }
+
+}
+
 #[async_trait]
 impl Storage for SqliteStorage {
     async fn record_upgrade_rows(&self, table: crate::record_upgrade::RecordTable, after: Option<&str>, limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {
@@ -839,76 +1069,11 @@ impl Storage for SqliteStorage {
     // ── Messages ───────────────────────────────────────────────────────
 
     async fn commit_outbox_envelope(&self, op: &crate::OutboxOperation, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
-        if op.state != "paid" || op.message_id.as_deref() != Some(envelope.id.to_hex().as_str()) || envelope.recipient != Recipient::Node(NodeId::from_hex(&op.recipient).map_err(|e| StorageError::Conversion(e.to_string()))?) {
-            return Err(StorageError::Conversion("invalid paid operation binding".into()));
-        }
-        let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE outbox_operations SET state = ?, payment_hash = ?, admission_payment_hash = ?, message_id = ?, settled_msat = ?, readmission_msat = ?, updated_at = ?, last_sent_at = ?, attempts = ?, last_error = ?, recovery = ?, accounting_pending = ?, recovery_compacted = ?, version = version + 1 WHERE operation_id = ? AND version = ?")
-            .bind(&op.state)
-            .bind(&op.payment_hash)
-            .bind(&op.admission_payment_hash)
-            .bind(&op.message_id)
-            .bind(op.settled_msat)
-            .bind(op.readmission_msat)
-            .bind(op.updated_at)
-            .bind(op.last_sent_at)
-            .bind(op.attempts)
-            .bind(&op.last_error)
-            .bind(&op.recovery)
-            .bind(op.accounting_pending)
-            .bind(op.recovery_compacted)
-            .bind(&op.operation_id).bind(op.version)
-            .execute(&mut *tx).await?.rows_affected() == 1;
-        if !changed { tx.rollback().await?; return Ok(false); }
-        let id = envelope.id.to_hex();
-        let kind = i64::from(envelope.kind);
-        let sender = envelope.sender.to_hex();
-        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ts = i64::try_from(envelope.timestamp)
-            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
-        let ciphertext = &envelope.ciphertext;
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
-        let sig = hex::encode(envelope.signature.as_bytes());
-        let nonce = hex::encode(envelope.nonce.as_bytes());
-        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
-        let refs_json =
-            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.commit_outbox_envelope_inner(op, envelope, None, None).await
+    }
 
-        sqlx::query(
-            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(kind)
-        .bind(&sender)
-        .bind(rtype)
-        .bind(&rid)
-        .bind(ts)
-        .bind(ciphertext)
-        .bind(&ph)
-        .bind(&pi)
-        .bind(amt)
-        .bind(&sig)
-        .bind(&nonce)
-        .bind(&refs_json)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("INSERT INTO pending_deliveries (message_id, recipient_id) VALUES (?, ?) ON CONFLICT DO NOTHING")
-            .bind(envelope.id.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
-        // A paid web request binds its reply in the same transaction as its
-        // envelope: no crash window between "paid and queued" and "reply bindable".
-        if let Some(row) = crate::outstanding_web_request_row(envelope)? {
-            sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
-                .bind(row.payment_hash).bind(row.request_id).bind(row.peer).bind(row.expected_reply_kind).bind(row.expires_at_ms)
-                .execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
-        Ok(true)
+    async fn replace_outbox_envelope(&self, op: &crate::OutboxOperation, previous: &MessageId, envelope: &UkmEnvelope, plaintext_enc: Option<&[u8]>) -> Result<bool, StorageError> {
+        self.commit_outbox_envelope_inner(op, envelope, Some(previous), plaintext_enc).await
     }
 
     async fn store_message(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
@@ -1042,108 +1207,46 @@ impl Storage for SqliteStorage {
         Ok(true)
     }
 
-    async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
-        use crate::PaidAcceptance::*;
+    async fn defer_unreadable_envelope(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
         let id = envelope.id.to_hex();
-        let kind = i64::from(envelope.kind);
         let sender = envelope.sender.to_hex();
-        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ts = i64::try_from(envelope.timestamp)
-            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
-        let ciphertext = &envelope.ciphertext;
         let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
-        let sig = hex::encode(envelope.signature.as_bytes());
-        let nonce = hex::encode(envelope.nonce.as_bytes());
-        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
-        let refs_json =
-            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
-
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let amount = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion("deferral amount overflows i64".into()))?;
         let mut tx = self.pool.begin().await?;
-        let receipt = sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
-            .bind(&ph).bind(&id).bind(&sender).execute(&mut *tx).await?;
-        let healing = receipt.rows_affected() == 0;
-        if healing {
-            // Serialize legacy healers on the receipt binding (SQLite already
-            // holds the writer lock from the INSERT above).
-            let binding: (String, String, i32) = sqlx::query_as("SELECT message_id, sender, accepted FROM payment_receipts WHERE payment_hash = ?")
-                .bind(&ph).fetch_one(&mut *tx).await?;
-            if binding.0 != id || binding.1 != sender {
-                tx.rollback().await?;
-                return Ok(PaymentReused);
-            }
-            // The same envelope, refused and withdrawn by the application: its
-            // sender is told so again, never that its proof belongs to another.
-            if binding.2 == -1 {
-                tx.rollback().await?;
-                return Ok(Withdrawn);
-            }
-            // Receipt metadata is independent of retained message content and
-            // excludes only the timestamp/signature wrapper refreshed on retry.
-            let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = ? AND message_id = ? AND sender = ? AND accepted = 1 AND kind = ? AND recipient_type = ? AND recipient_id = ? AND preimage = ? AND amount_msat = ? AND nonce = ? AND references_json = ?")
-                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
-                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
-                .fetch_one(&mut *tx).await?;
-            if durable == 1 {
-                tx.rollback().await?;
-                return Ok(AlreadyAccepted);
-            }
-            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
-                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
-                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
-                .fetch_one(&mut *tx).await?;
-            if matched == 1 {
-                sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = ?, recipient_type = ?, recipient_id = ?, preimage = ?, amount_msat = ?, nonce = ?, references_json = ? WHERE payment_hash = ?")
-                    .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
-                tx.commit().await?;
-                return Ok(AlreadyAccepted);
-            }
-            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
-                .bind(&id).fetch_one(&mut *tx).await?;
-            if exists != 0 || binding.2 != 0 {
-                tx.rollback().await?;
-                return Ok(PaymentReused);
-            }
-            // Full gate validation precedes this transaction. The receipt
-            // binds this paid identity; repair only its missing message row.
-        }
-        let inserted = sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES (?, ?) ON CONFLICT DO NOTHING")
-            .bind(&nonce).bind(&sender).execute(&mut *tx).await?;
-        if inserted.rows_affected() == 0 {
-            let owner: String = sqlx::query_scalar("SELECT sender FROM nonces WHERE nonce_hex = ?")
-                .bind(&nonce).fetch_one(&mut *tx).await?;
-            if !healing || owner != sender {
-                tx.rollback().await?;
-                return Ok(NonceReused);
-            }
-        }
-        sqlx::query(
-            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(kind)
-        .bind(&sender)
-        .bind(rtype)
-        .bind(&rid)
-        .bind(ts)
-        .bind(ciphertext)
-        .bind(&ph)
-        .bind(&pi)
-        .bind(amt)
-        .bind(&sig)
-        .bind(&nonce)
-        .bind(&refs_json)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = ?, recipient_type = ?, recipient_id = ?, preimage = ?, amount_msat = ?, nonce = ?, references_json = ? WHERE payment_hash = ?")
-            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+        // Signed recipient/amount terms are immutable even though MessageId
+        // itself binds only ciphertext and nonce. Conflicts never widen repair.
+        sqlx::query("INSERT INTO envelope_deferrals (message_id, sender, payment_hash, recipient_type, recipient_id, amount_msat) SELECT ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM payment_receipts WHERE payment_hash = ?) ON CONFLICT(message_id) DO NOTHING")
+            .bind(&id).bind(&sender).bind(&ph).bind(rtype).bind(&rid).bind(amount).bind(&ph).execute(&mut *tx).await?;
+        let deferred: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = ? AND sender = ? AND payment_hash = ? AND recipient_type = ? AND recipient_id = ? AND amount_msat = ?)")
+            .bind(&id).bind(&sender).bind(&ph).bind(rtype).bind(&rid).bind(amount).fetch_one(&mut *tx).await?;
         tx.commit().await?;
-        Ok(Accepted)
+        Ok(deferred)
+    }
+
+    async fn is_envelope_deferred(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let amount = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion("deferral amount overflows i64".into()))?;
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = ? AND sender = ? AND payment_hash = ? AND recipient_type = ? AND recipient_id = ? AND amount_msat = ?)")
+            .bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
+            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(rtype).bind(&rid).bind(amount)
+            .fetch_one(&self.pool).await.map_err(Into::into)
+    }
+
+    async fn session_repair_pending(&self, own: &NodeId, peer: &NodeId) -> Result<bool, StorageError> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals d WHERE d.sender = ?2 AND d.recipient_type = 'node' AND d.recipient_id = ?1 AND d.amount_msat > 0 AND NOT EXISTS (SELECT 1 FROM payment_receipts r WHERE r.payment_hash = d.payment_hash)) OR EXISTS (SELECT 1 FROM outbox_operations o JOIN pending_deliveries p ON p.message_id = o.message_id AND p.recipient_id = o.recipient JOIN messages m ON m.id = o.message_id WHERE o.recipient = ?2 AND o.state IN ('paid', 'sent', 'rejected_retryable') AND substr(o.last_error, 1, 17) = 'session_handover:' AND p.state IN ('pending', 'stalled') AND p.dispatched = 1 AND p.rejection_reason = o.last_error AND m.sender = ?1 AND m.recipient_type = 'node' AND m.recipient_id = ?2 AND m.kind = o.kind AND m.amount_msat > 0 AND o.settled_msat = m.amount_msat AND o.payment_hash = m.payment_hash)")
+            .bind(own.to_hex()).bind(peer.to_hex()).fetch_one(&self.pool).await.map_err(Into::into)
+    }
+
+    async fn paid_envelope_status(&self, envelope: &UkmEnvelope) -> Result<Option<crate::PaidAcceptance>, StorageError> {
+        self.accept_paid_envelope_inner(envelope, false).await
+    }
+
+    async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.accept_paid_envelope_inner(envelope, true).await?
+            .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
     }
 
     async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
@@ -1170,6 +1273,12 @@ impl Storage for SqliteStorage {
 
     async fn is_pending_dispatched(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
         Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pending_deliveries p JOIN messages m ON m.id = p.message_id WHERE p.message_id = ? AND p.recipient_id = ? AND p.dispatched = 1 AND p.state != 'failed_paid' AND m.sender = ?)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex()).fetch_one(&self.pool).await?)
+    }
+
+    async fn pending_was_undecryptable(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pending_deliveries p JOIN messages m ON m.id = p.message_id WHERE p.message_id = ? AND p.recipient_id = ? AND m.sender = ? AND p.dispatched = 1 AND p.state != 'failed_paid' AND substr(p.rejection_reason, 1, 14) = 'undecryptable:')")
+            .bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
+            .fetch_one(&self.pool).await.map_err(Into::into)
     }
 
     async fn reject_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, reason: &str, terminal: bool) -> Result<bool, StorageError> {

@@ -132,36 +132,72 @@ impl MemStorage {
 
 #[async_trait]
 impl Storage for MemStorage {
-    async fn call_get(&self, peer: &NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+    async fn call_get(
+        &self,
+        peer: &NodeId,
+        call_id: &str,
+    ) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
         if self.fail_call_get_for.lock().unwrap().as_deref() == Some(call_id) {
-            return Err(StorageError::Serialization("injected call read failure".into()));
+            return Err(StorageError::Serialization(
+                "injected call read failure".into(),
+            ));
         }
-        Ok(self.calls.lock().unwrap().get(&(*peer, call_id.to_owned())).cloned())
+        Ok(self
+            .calls
+            .lock()
+            .unwrap()
+            .get(&(*peer, call_id.to_owned()))
+            .cloned())
     }
 
-    async fn call_put(&self, peer: &NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+    async fn call_put(
+        &self,
+        peer: &NodeId,
+        call_id: &str,
+        entry: &konsensus_core::payloads::call::CallEntry,
+    ) -> Result<(), StorageError> {
         if self.fail_call_put_for.lock().unwrap().as_deref() == Some(call_id) {
-            return Err(StorageError::Serialization("injected call write failure".into()));
+            return Err(StorageError::Serialization(
+                "injected call write failure".into(),
+            ));
         }
-        self.calls.lock().unwrap().insert((*peer, call_id.to_owned()), entry.clone());
+        self.calls
+            .lock()
+            .unwrap()
+            .insert((*peer, call_id.to_owned()), entry.clone());
         Ok(())
     }
 
     /// No admission holds in memory: the grant alone, with the same fault hook.
-    async fn call_commit_admitted(&self, peer: &NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry, _id: &MessageId) -> Result<(), StorageError> {
+    async fn call_commit_admitted(
+        &self,
+        peer: &NodeId,
+        call_id: &str,
+        entry: &konsensus_core::payloads::call::CallEntry,
+        _id: &MessageId,
+    ) -> Result<(), StorageError> {
         self.call_put(peer, call_id, entry).await
     }
 
     async fn call_delete(&self, peer: &NodeId, call_id: &str) -> Result<(), StorageError> {
-        self.calls.lock().unwrap().remove(&(*peer, call_id.to_owned()));
+        self.calls
+            .lock()
+            .unwrap()
+            .remove(&(*peer, call_id.to_owned()));
         Ok(())
     }
 
-    async fn call_counts(&self, peer: &NodeId, now: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
+    async fn call_counts(
+        &self,
+        peer: &NodeId,
+        now: u64,
+    ) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
         use konsensus_core::payloads::call::{CallCounts, Phase};
         let mut counts = CallCounts::default();
         for ((p, _), entry) in self.calls.lock().unwrap().iter() {
-            let Some(entry) = entry.clone().at(now) else { continue };
+            let Some(entry) = entry.clone().at(now) else {
+                continue;
+            };
             if entry.pending.is_some() || entry.phase != Phase::Ended {
                 counts.open_total += 1;
                 counts.open_peer += u64::from(p == peer);
@@ -173,14 +209,32 @@ impl Storage for MemStorage {
         Ok(counts)
     }
 
-    async fn call_live(&self) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        Ok(self.calls.lock().unwrap().iter().filter(|(_, e)| e.phase != konsensus_core::payloads::call::Phase::Ended)
-            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone())).collect())
+    async fn call_live(
+        &self,
+    ) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError>
+    {
+        Ok(self
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| e.phase != konsensus_core::payloads::call::Phase::Ended)
+            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone()))
+            .collect())
     }
 
-    async fn call_pending(&self) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        Ok(self.calls.lock().unwrap().iter().filter(|(_, e)| e.pending.is_some())
-            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone())).collect())
+    async fn call_pending(
+        &self,
+    ) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError>
+    {
+        Ok(self
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| e.pending.is_some())
+            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone()))
+            .collect())
     }
 
     async fn insert_channel_open_operation(
@@ -267,14 +321,28 @@ impl Storage for MemStorage {
         &self,
         op: &konsensus_storage::OutboxOperation,
     ) -> Result<bool, StorageError> {
-        let dispatched = op.kind == 404 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
-            .is_ok_and(|data| data["dispatched"] == true);
-        let gate = if dispatched { self.call_block_dispatch_gate.lock().unwrap().take() } else { None };
-        if let Some(gate) = gate { gate.run().await?; }
-        let offer_dispatched = op.kind == 400 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
-            .is_ok_and(|data| data["dispatched"] == true);
-        let gate = if offer_dispatched { self.call_offer_dispatch_gate.lock().unwrap().take() } else { None };
-        if let Some(gate) = gate { gate.run().await?; }
+        let dispatched = op.kind == 404
+            && serde_json::from_slice::<serde_json::Value>(&op.recovery)
+                .is_ok_and(|data| data["dispatched"] == true);
+        let gate = if dispatched {
+            self.call_block_dispatch_gate.lock().unwrap().take()
+        } else {
+            None
+        };
+        if let Some(gate) = gate {
+            gate.run().await?;
+        }
+        let offer_dispatched = op.kind == 400
+            && serde_json::from_slice::<serde_json::Value>(&op.recovery)
+                .is_ok_and(|data| data["dispatched"] == true);
+        let gate = if offer_dispatched {
+            self.call_offer_dispatch_gate.lock().unwrap().take()
+        } else {
+            None
+        };
+        if let Some(gate) = gate {
+            gate.run().await?;
+        }
         let mut rows = self.outbox.lock().unwrap();
         if rows
             .get(&op.operation_id)
@@ -1141,7 +1209,10 @@ impl TipDownChain {
     }
     /// Answers height 0 from the first read: an unknown tip, not a height.
     pub fn zero() -> Self {
-        Self { zero: true, ..Self::down() }
+        Self {
+            zero: true,
+            ..Self::down()
+        }
     }
     pub fn reads(&self) -> usize {
         self.reads.load(std::sync::atomic::Ordering::SeqCst)
@@ -1176,7 +1247,11 @@ impl ChainProvider for TipDownChain {
     async fn estimate_fee(&self, target_blocks: u32) -> Result<FeeEstimate, ChainError> {
         StubChain.estimate_fee(target_blocks).await
     }
-    async fn is_tx_confirmed(&self, txid: &str, min_confirmations: u32) -> Result<bool, ChainError> {
+    async fn is_tx_confirmed(
+        &self,
+        txid: &str,
+        min_confirmations: u32,
+    ) -> Result<bool, ChainError> {
         StubChain.is_tx_confirmed(txid, min_confirmations).await
     }
     async fn is_synced(&self) -> bool {
@@ -1191,7 +1266,10 @@ pub fn assert_chain_not_ready(status: u16, body: &serde_json::Value) {
     assert_eq!(body["reason"], "chain_unavailable", "{body}");
     assert_eq!(body["retry_allowed"], true, "{body}");
     // About the chain source, not the wallet.
-    assert!(body["error"].as_str().unwrap().contains("chain source"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("chain source"),
+        "{body}"
+    );
     assert!(body.get("money_ready").is_none(), "{body}");
 }
 
@@ -1205,13 +1283,17 @@ impl PricingEngine for ChainlessPricing {
         self
     }
     async fn get_price_msat(&self, _kind: u16) -> Result<u64, PricingError> {
-        Err(PricingError::ChainUnavailable("chain tip unavailable".into()))
+        Err(PricingError::ChainUnavailable(
+            "chain tip unavailable".into(),
+        ))
     }
     async fn get_category_price_msat(
         &self,
         _category: konsensus_core::kind::KindCategory,
     ) -> Result<u64, PricingError> {
-        Err(PricingError::ChainUnavailable("chain tip unavailable".into()))
+        Err(PricingError::ChainUnavailable(
+            "chain tip unavailable".into(),
+        ))
     }
 }
 
@@ -2167,7 +2249,8 @@ pub struct FlakySessionStore {
 
 impl FlakySessionStore {
     pub fn fail_all(&self, fail: bool) {
-        self.fail_all.store(fail, std::sync::atomic::Ordering::SeqCst);
+        self.fail_all
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
     pub fn fail_peer(&self, peer: Option<NodeId>) {
         *self.fail_peer.lock().unwrap() = peer;
@@ -2176,17 +2259,29 @@ impl FlakySessionStore {
 
 #[async_trait]
 impl konsensus_crypto::SessionStore for FlakySessionStore {
-    async fn save_session(&self, peer: &NodeId, state: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.fail_all.load(std::sync::atomic::Ordering::SeqCst) || *self.fail_peer.lock().unwrap() == Some(*peer) {
+    async fn save_session(
+        &self,
+        peer: &NodeId,
+        state: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.fail_all.load(std::sync::atomic::Ordering::SeqCst)
+            || *self.fail_peer.lock().unwrap() == Some(*peer)
+        {
             return Err("test: disk full".into());
         }
         self.data.lock().unwrap().insert(*peer, state.to_vec());
         Ok(())
     }
-    async fn load_session(&self, peer: &NodeId) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn load_session(
+        &self,
+        peer: &NodeId,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.data.lock().unwrap().get(peer).cloned())
     }
-    async fn delete_session(&self, peer: &NodeId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_session(
+        &self,
+        peer: &NodeId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.data.lock().unwrap().remove(peer);
         Ok(())
     }

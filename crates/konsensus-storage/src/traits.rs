@@ -193,6 +193,37 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
 
+    /// Replace a paid envelope explicitly deferred before recipient acceptance.
+    /// Atomically changes its operation, queue and cached plaintext; payment
+    /// identity and accounting stay unchanged. A stale version writes nothing.
+    async fn replace_outbox_envelope(
+        &self,
+        _op: &crate::OutboxOperation,
+        _previous: &MessageId,
+        _envelope: &UkmEnvelope,
+        _plaintext_enc: Option<&[u8]>,
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("outbox envelope replacement".into()))
+    }
+
+    /// Durably fence unreadable bytes before authorizing replacement ciphertext.
+    /// False authorizes nothing: the payment is already consumed or a binding
+    /// conflicts. Deferrals live until durable acceptance consumes the proof.
+    async fn defer_unreadable_envelope(&self, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("envelope deferral".into()))
+    }
+
+    async fn is_envelope_deferred(&self, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("envelope deferral".into()))
+    }
+
+    /// An unfinished paid direct-message recovery obligation with this peer.
+    /// Requires an unconsumed positive inbound deferral or an exact positive paid
+    /// outbound operation, modern recipient deferral and active dispatch binding.
+    async fn session_repair_pending(&self, _own: &NodeId, _peer: &NodeId) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("session repair obligation".into()))
+    }
+
     /// Insert once. A duplicate never overwrites the request binding.
     async fn insert_outbox_operation(&self, _op: &crate::OutboxOperation) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
@@ -277,6 +308,14 @@ pub trait Storage: Send + Sync {
     /// Store a UKM envelope.
     async fn store_message(&self, envelope: &UkmEnvelope) -> Result<(), StorageError>;
 
+    /// Classify existing paid replay/receipt state before attempting decryption.
+    /// Call only after full gate validation. `None` requires a readable envelope
+    /// before acceptance; it consumes no new proof or nonce and stores no message.
+    /// Legacy full-message evidence may heal its durable receipt metadata.
+    async fn paid_envelope_status(&self, _envelope: &UkmEnvelope) -> Result<Option<PaidAcceptance>, StorageError> {
+        Err(StorageError::Unsupported("paid_envelope_status".into()))
+    }
+
     /// Commit replay keys and the validated envelope together, or write nothing.
     /// Call only after full payment-gate validation. At-rest wrappers may encrypt
     /// ciphertext; backends compare the validated ID and immutable metadata.
@@ -318,6 +357,13 @@ pub trait Storage: Send + Sync {
     /// Match a non-destructive rejection to an already dispatched outbox entry.
     async fn is_pending_dispatched(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("is_pending_dispatched".into()))
+    }
+
+    /// A dispatched delivery to this peer already reported unreadability.
+    /// This provenance retains the paid liability across later legacy replies;
+    /// it grants neither delivery confirmation nor ciphertext replacement.
+    async fn pending_was_undecryptable(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("pending unreadable delivery".into()))
     }
 
     /// Record one rejection per dispatch, retaining the paid envelope. Terminal

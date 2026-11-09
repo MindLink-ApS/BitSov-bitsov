@@ -448,6 +448,7 @@ async fn start_recipient(
         let audit = Arc::clone(&audit);
         let lightning = Arc::clone(&lightning);
         let pricing = Arc::clone(&pricing);
+        let sessions = Arc::clone(sessions);
         let us = *identity.node_id();
         // These scenarios start after restart quarantine. Construct the gate
         // before spawning; a delayed task start cannot restart the quarantine.
@@ -516,6 +517,7 @@ async fn start_recipient(
                         &mut last_refusal,
                         0,
                         &mut peer_invoices,
+                        &sessions,
                     )
                     .await;
                 }

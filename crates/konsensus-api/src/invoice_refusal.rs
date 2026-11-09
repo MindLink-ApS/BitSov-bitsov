@@ -45,6 +45,9 @@ pub const PRICE_CHANGED: &str = "konsensus:price_changed";
 /// No block invoice was issued: wrong call/sequence or too close to its deadline.
 pub const CALL_BLOCK_UNPAYABLE: &str = "konsensus:call_block_unpayable";
 
+/// The recipient is completing its E2EE recovery handover. No invoice was issued.
+pub const SESSION_HANDOVER: &str = "konsensus:session_handover";
+
 /// Readiness refusals use the existing authenticated InvoiceError frame.
 pub const CHAIN_UNAVAILABLE: &str = "konsensus:not_ready:chain_unavailable";
 pub const NOT_SYNCED: &str = "konsensus:not_ready:not_synced";

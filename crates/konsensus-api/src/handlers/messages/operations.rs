@@ -192,7 +192,7 @@ impl Operation {
         if op.state == "acked" {
             return Ok(true);
         }
-        resend(&self.state, &op).await
+        resend(&self.state, &op, None).await
     }
     pub(crate) async fn attach_debit(&self, debit: &Debit) -> Result<(), ApiError> {
         let mut op = self.load().await?;
@@ -696,7 +696,7 @@ async fn compose_locked(
         match op.state.as_str() {
             "acked" => return Ok(Json(response(&state.lightning_backend, &op, true)?)),
             "paid" | "sent" | "rejected_retryable" => {
-                let delivered = resend(&state, &op).await?;
+                let delivered = resend(&state, &op, Some(req.plaintext.as_bytes())).await?;
                 return wait_response(&state, &id, req.wait_ack_ms, delivered).await;
             }
             "prepared" | "released" => {}
@@ -793,8 +793,35 @@ pub(crate) async fn restore_outstanding_web_request(
         .map_err(storage)
 }
 
-async fn resend(state: &AppState, op: &OutboxOperation) -> Result<bool, ApiError> {
-    let id = MessageId::from_hex(
+fn handover_deferred(op: &OutboxOperation) -> bool {
+    matches!(op.state.as_str(), "paid" | "sent" | "rejected_retryable")
+        && op.last_error.as_deref().is_some_and(|reason| reason.starts_with("session_handover:"))
+}
+
+async fn reencrypt_paid_envelope(
+    sessions: &konsensus_crypto::SessionManager,
+    identity: &konsensus_core::NodeIdentity,
+    env: &UkmEnvelope,
+    plaintext: &[u8],
+) -> Result<UkmEnvelope, ApiError> {
+    let konsensus_core::Recipient::Node(peer) = env.recipient else {
+        return Err(storage("deferred envelope is not a direct message"));
+    };
+    let message = sessions.encrypt(&peer, plaintext).await.map_err(|error| {
+        ApiError::Conflict(format!("the existing payment is retained while the E2EE session recovers; retry this operation: {error}"))
+            .with_reason("session_handover")
+    })?;
+    let mut replacement = env.clone();
+    replacement.ciphertext = konsensus_crypto::ratchet_message_to_bytes(&message);
+    replacement.id = MessageId::compute(&replacement.ciphertext, &replacement.nonce);
+    replacement.timestamp = chrono::Utc::now().timestamp_millis() as u64;
+    replacement.signature = konsensus_core::Signature::from_ed25519(&identity.sign(&replacement.signable_bytes()));
+    Ok(replacement)
+}
+
+async fn resend(state: &AppState, op: &OutboxOperation, retry_plaintext: Option<&[u8]>) -> Result<bool, ApiError> {
+    let mut op = op.clone();
+    let mut id = MessageId::from_hex(
         op.message_id
             .as_deref()
             .ok_or_else(|| storage("missing message id"))?,
@@ -818,6 +845,41 @@ async fn resend(state: &AppState, op: &OutboxOperation) -> Result<bool, ApiError
         save(state, &mut terminal).await?;
         state.storage.delete_message(&id).await.map_err(storage)?;
         return Ok(false);
+    }
+    // Only the recipient's explicit pre-acceptance deferral permits a new
+    // ciphertext under the same proof. Legacy refusals keep their original ID.
+    if handover_deferred(&op) {
+        let cached = match (&state.plaintext_cipher, state.storage.get_message_plaintext(&id).await.map_err(storage)?) {
+            (Some(cipher), Some(cached)) => Some(cipher.decrypt(&id.to_hex(), &cached).map_err(storage)?),
+            _ => None,
+        };
+        let plaintext = match cached {
+            Some(bytes) => Some(bytes),
+            // Explicit compose retries already matched the original request digest.
+            // The direct compose path encrypts these exact bytes for every kind.
+            None => retry_plaintext.map(<[u8]>::to_vec),
+        };
+        let Some(plaintext) = plaintext else { return Ok(false); };
+        let replacement = reencrypt_paid_envelope(&state.session_manager, &state.identity, &env, &plaintext)
+            .await.map_err(|error| contextual(error, &op))?;
+        let cached = state.plaintext_cipher.as_ref()
+            .map(|cipher| cipher.encrypt(&replacement.id.to_hex(), &plaintext))
+            .transpose().map_err(storage)?;
+        let mut data = recovery(&op)?;
+        data.draft = Some(replacement.clone());
+        data.envelope_ready = true;
+        op.message_id = Some(replacement.id.to_hex());
+        op.state = "paid".into();
+        op.last_error = None;
+        op.last_sent_at = None;
+        op.updated_at = chrono::Utc::now().timestamp_millis();
+        encode(&mut op, &data)?;
+        if !state.storage.replace_outbox_envelope(&op, &id, &replacement, cached.as_deref()).await.map_err(storage)? {
+            return Err(contextual(ApiError::Conflict("operation changed during session recovery; retry this operation".into()), &op));
+        }
+        op.version += 1;
+        id = replacement.id;
+        env = replacement;
     }
     if env
         .refresh_for_resend(
@@ -1341,7 +1403,7 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             // A call signal's reservation follows its operation here too, and
             // before any resend (review N1).
             crate::calls::settle_operation(state, &op, true).await;
-            if op.state == "paid" {
+            if op.state == "paid" || handover_deferred(&op) {
                 recover_paid(state, &mut op).await?;
             }
             Ok(())
@@ -1709,7 +1771,7 @@ async fn recover_paid(state: &AppState, op: &mut OutboxOperation) -> Result<(), 
             return Ok(());
         }
     }
-    let result = resend(state, op).await;
+    let result = resend(state, op, None).await;
     let mut paces = paces();
     if matches!(result, Ok(true)) {
         paces.remove(&key);
@@ -1856,5 +1918,67 @@ mod actual_fee_tests {
         let compacted = Recovery { ldk_fee_evidence: true, compacted_fee_paid_msat: fee, fee_ceiling_msat: 5000, ..Default::default() };
         assert_eq!(wire("ldk", op.clone(), compacted)["fee_paid_msat"], 400);
         assert!(wire("ldk", op, Recovery::default()).get("fee_paid_msat").is_none());
+    }
+}
+
+#[cfg(test)]
+mod handover_retry_tests {
+    use super::*;
+    use konsensus_core::{NodeIdentity, Recipient, UkmEnvelopeBuilder};
+    use konsensus_crypto::{ratchet_message_from_bytes, ratchet_message_to_bytes, SessionManager};
+
+    #[test]
+    fn only_live_preacceptance_handover_deferrals_allow_reencryption() {
+        let mut op = OutboxOperation::prepared("operation".into(), "peer".into(), 0, "request".into());
+        for (state, reason, allowed) in [
+            ("rejected_retryable", "session_handover: unavailable", true),
+            ("paid", "session_handover: unavailable", true),
+            ("sent", "session_handover: unavailable", true),
+            ("rejected_retryable", "undecryptable: unavailable", false),
+            ("rejected_retryable", "session_pending: unavailable", false),
+            ("acked", "session_handover: unavailable", false),
+            ("failed_paid", "session_handover: unavailable", false),
+        ] {
+            op.state = state.into();
+            op.last_error = Some(reason.into());
+            assert_eq!(handover_deferred(&op), allowed, "{state}: {reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn handover_retry_reencrypts_with_the_same_paid_proof() {
+        let (_, a_identity) = NodeIdentity::generate().unwrap();
+        let (_, b_identity) = NodeIdentity::generate().unwrap();
+        let a_identity = Arc::new(a_identity);
+        let b_identity = Arc::new(b_identity);
+        let (aid, bid) = (*a_identity.node_id(), *b_identity.node_id());
+        let a = SessionManager::new(a_identity);
+        let b = SessionManager::new(Arc::clone(&b_identity));
+        let init = a.initiate_session(&bid, &b.prekey_bundle().await).await.unwrap();
+        b.accept_session(&aid, &init).await.unwrap();
+        a.confirm_session(&bid).await;
+        let init = a.encrypt(&bid, b"ready").await.unwrap();
+        b.decrypt(&aid, &init).await.unwrap();
+        let old = b.encrypt(&aid, b"first user message").await.unwrap();
+        let mut env = UkmEnvelopeBuilder::new(1, bid, Recipient::Node(aid), ratchet_message_to_bytes(&old),
+            PaymentProof::new(Sha256::digest([4; 32]).into(), [4; 32], 10)).build();
+        env.signature = konsensus_core::Signature::from_ed25519(&b_identity.sign(&env.signable_bytes()));
+        a.remove_session(&bid).await;
+        let init = a.reinitiate_session(&bid, &b.prekey_bundle().await).await.unwrap();
+        b.reaccept_session(&aid, &init).await.unwrap();
+        a.confirm_session(&bid).await;
+        let init = a.encrypt(&bid, b"recovered").await.unwrap();
+        b.decrypt(&aid, &init).await.unwrap();
+        assert!(a.preview_decrypt(&bid, &old).await.is_err());
+
+        let retry = reencrypt_paid_envelope(&b, &b_identity, &env, b"first user message").await.unwrap();
+        assert_eq!(a.decrypt(&bid, &ratchet_message_from_bytes(&retry.ciphertext).unwrap()).await.unwrap(), b"first user message");
+        assert_ne!(retry.id, env.id);
+        assert_eq!(retry.payment_proof.payment_hash, env.payment_proof.payment_hash);
+        assert_eq!(retry.payment_proof.preimage, env.payment_proof.preimage);
+        assert_eq!(retry.payment_proof.amount_msat, 10);
+        assert_eq!(retry.nonce, env.nonce);
+        retry.validate().unwrap();
+        b_identity.verify(&retry.signable_bytes(), &retry.signature.to_ed25519()).unwrap();
     }
 }

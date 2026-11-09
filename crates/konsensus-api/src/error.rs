@@ -136,6 +136,9 @@ impl ApiError {
                 "the session state could not be saved, so this was not sent or paid for".into(),
             )
             .with_reason(SESSION_SAVE_FAILED),
+            konsensus_crypto::SessionError::HandoverPending => ApiError::NotDispatched(
+                "session recovery handover is pending; retry shortly".into(),
+            ).with_reason("session_handover"),
             other => otherwise(other),
         }
     }

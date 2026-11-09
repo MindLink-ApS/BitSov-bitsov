@@ -107,6 +107,9 @@ const MAX_COOLDOWN_ENTRIES: usize = 10_000;
 #[cfg(test)]
 pub(crate) static HOLD_PREKEY_ANSWERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+pub(crate) static HOLD_RECOVERY_RATCHET_INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Per-peer PeerExchange cooldown — prevents a peer from spamming
 /// PeerExchange requests/responses to trigger expensive registry writes.
 const PEER_EXCHANGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
@@ -264,6 +267,16 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     // this is byte-identical to pre-M1b.
                     ControlEvent::PeerConnected { peer_id, privileged } => {
                         if !privileged {
+                            // Only the unfinished paid act survives a reconnect;
+                            // the transport flag itself always starts clear.
+                            let generation = transport.connected_since(&peer_id).await;
+                            if matches!(storage.session_repair_pending(&our_node_id, &peer_id).await, Ok(true)) {
+                                if let Some(since) = generation {
+                                    if transport.allow_session_repair(&peer_id, since).await {
+                                        let _ = send_repair_prekey_offer(&session_manager, &transport, &peer_id, since).await;
+                                    }
+                                }
+                            }
                             debug!(peer = %peer_id, "PriceOpen: unprivileged peer connected — withholding prekey/onboarding until payment");
                             continue;
                         }
@@ -329,8 +342,18 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget, paid_until_ms.map(|until| (until, &cipher))).await;
                     }
                     ControlEvent::MessageRejected { peer_id, message_id, reason, privileged } => {
-                        handle_delivery_confirmation(&peer_id, &message_id, Some(&reason), privileged,
+                        let generation = transport.connected_since(&peer_id).await;
+                        let recover = handle_delivery_confirmation(&peer_id, &message_id, Some(&reason), privileged,
                             identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget, None).await;
+                        if recover {
+                            let repair_generation = if let Some(since) = generation {
+                                transport.allow_session_repair(&peer_id, since).await.then_some(since)
+                            } else { None };
+                            session_manager.mark_needs_renegotiation(&peer_id).await;
+                            if let Some(since) = repair_generation {
+                                let _ = send_repair_prekey_offer(&session_manager, &transport, &peer_id, since).await;
+                            }
+                        }
                     }
 
                     ControlEvent::PriceTableReceived { peer_id, prices, block_height, valid_blocks, trust_discount, privileged } => {
@@ -434,6 +457,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             &pricing, &readiness_height, &price_ceiling, &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
                             audit_log.membrane(), &mut last_admission_refusal, min_admission_cost_msat,
                             &mut peer_invoices,
+                            &session_manager,
                         ).await;
                     }
 
@@ -1125,7 +1149,11 @@ async fn handle_session_ack(
 /// the lower id sends it again on each new one, and a failure here is owed to the
 /// next self-heal tick.
 async fn send_ratchet_init(session_manager: &SessionManager, transport: &Arc<NoiseTransport>, peer_id: &NodeId) -> bool {
-    match session_manager.encrypt(peer_id, b"ratchet-init").await {
+    #[cfg(test)]
+    while HOLD_RECOVERY_RATCHET_INIT.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    match session_manager.encrypt_recovery_probe(peer_id).await {
         Ok(ratchet_msg) => {
             let payload = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
             let frame = Frame::RatchetInit { payload };
@@ -1388,6 +1416,8 @@ async fn answer_prekey_offer_for_recovery(
     }
     let standing = if transport.admission_paid_on_connection(peer_id).await {
         konsensus_message::Standing::AdmissionPaid
+    } else if transport.session_repair_on_connection(peer_id).await {
+        konsensus_message::Standing::SessionRepair
     } else {
         konsensus_message::Standing::Privileged
     };
@@ -1414,6 +1444,19 @@ async fn e2ee_needs_self_heal(session_manager: &SessionManager, peer_id: &NodeId
         // An accepted session nothing has moved us to since the cooldown: its
         // `RatchetInit` is gone, and the peer may be using it already.
         || session_manager.accepted_replacement_older_than(peer_id, SESSION_NEGOTIATION_COOLDOWN).await
+}
+
+/// A matched paid refusal opens repair on one generation only.
+async fn send_repair_prekey_offer(
+    sessions: &SessionManager,
+    transport: &Arc<NoiseTransport>,
+    peer: &NodeId,
+    since: std::time::Instant,
+) -> Result<(), String> {
+    let bundle = serde_json::to_value(sessions.prekey_bundle().await).map_err(|e| e.to_string())?;
+    let bytes = Frame::PrekeyOffer { bundle }.to_bytes().map_err(|e| e.to_string())?;
+    transport.send_raw_frame_on(peer, since, konsensus_message::Standing::SessionRepair, &bytes)
+        .await.map_err(|e| e.to_string())
 }
 
 async fn send_prekey_offer(
@@ -1444,7 +1487,6 @@ fn terminal_paid_rejection(reason: &str) -> bool {
         // (`crate::msg_handler::ReceiptRefusal`, a refused call or room chat):
         // a resend of the same bytes can never be accepted, and is answered
         // with the withdrawal again, so a lost refusal is not a delivery.
-        "undecryptable:",
         "not_persisted:",
         "file_corrupted:",
         "message withdrawn",
@@ -1507,19 +1549,34 @@ async fn handle_delivery_confirmation(
     audit: &konsensus_api::audit::AuditLog,
     budget: &mut DeliveryConfirmationBudget,
     paid_until_ms: Option<(u64, &konsensus_crypto::PlaintextCacheCipher)>,
-) {
+) -> bool {
     if !budget.allow(peer, privileged, tokio::time::Instant::now()) {
         audit
             .membrane()
             .pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
-        return;
+        return false;
     }
     if let Some((until, cipher)) = paid_until_ms.filter(|_| rejection.is_none()) {
         if let Err(e) = konsensus_api::calls::receive_block_grant(storage.as_ref(), cipher, own_id, peer, id, until).await {
             warn!(error = %e, "call grant not durable; withholding ACK completion for retry");
-            return;
+            return false;
         }
     }
+    // An older recipient may have consumed the proof without producing the
+    // plaintext. Its later withdrawal or replay reply is not delivery evidence.
+    // Keep this provenance through every rejection; only an actual ACK resolves
+    // the old paid act. The original latest peer reason remains visible.
+    let unresolved_legacy = if let Some(reason) = rejection {
+        match storage.pending_was_undecryptable(id, peer, own_id).await {
+            Ok(true) => Some(format!("undecryptable: paid delivery remains unresolved; recipient reported: {reason}")),
+            Ok(false) => None,
+            Err(error) => {
+                warn!(peer = %peer, msg_id = %id, error = %error, "delivery provenance unavailable; retaining paid state");
+                return false;
+            }
+        }
+    } else { None };
+    let rejection = unresolved_legacy.as_deref().or(rejection);
     let nonce_replay = rejection == Some("replay detected: nonce already used");
     let hash_replay = rejection
         .and_then(|reason| reason.strip_prefix("payment proof already used: "))
@@ -1534,7 +1591,7 @@ async fn handle_delivery_confirmation(
             .await
         {
             Ok(acked) => acked,
-            Err(_) => return,
+            Err(_) => return false,
         }
     } else {
         false
@@ -1552,7 +1609,7 @@ async fn handle_delivery_confirmation(
                     .membrane()
                     .pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
             }
-            return;
+            return false;
         }
         if legacy {
             audit.record(
@@ -1585,11 +1642,13 @@ async fn handle_delivery_confirmation(
                     .membrane()
                     .pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
             }
-            return;
+            return false;
         }
         timestamps.lock().await.remove(id);
         handle_message_rejected(peer, id, reason, routing, ws, privileged).await;
+        return reason.starts_with("session_handover:");
     }
+    false
 }
 
 async fn handle_message_acked(
@@ -1793,6 +1852,7 @@ async fn handle_invoice_requested_gated(
     last_admission_refusal: &mut crate::invoice_refusals::RefusalLimits,
     min_admission_cost_msat: u64,
     invoices: &mut crate::peer_invoices::PeerInvoiceBook,
+    session_manager: &SessionManager,
 ) {
     if lightning.disk_status().is_some_and(|s| s.disk_low) {
         if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
@@ -1918,8 +1978,17 @@ async fn handle_invoice_requested_gated(
         last_admission_refusal,
         min_admission_cost_msat,
         invoices,
+        session_manager,
     )
     .await;
+}
+
+/// Service invoices wait for the receiver's recovery acknowledgement. Admission
+/// quotes use their separate path and do not require a session yet.
+async fn service_session_ready(sessions: &SessionManager, peer: &NodeId) -> bool {
+    sessions.has_session(peer).await
+        && !sessions.awaiting_confirmation(peer).await
+        && !sessions.needs_renegotiation(peer).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1936,10 +2005,17 @@ async fn handle_invoice_requested(
     refusals: &mut crate::invoice_refusals::RefusalLimits,
     min_admission_cost_msat: u64,
     invoices: &mut crate::peer_invoices::PeerInvoiceBook,
+    session_manager: &SessionManager,
 ) {
     // Only the dedicated path may issue call-block-purpose invoices.
     if purpose.starts_with(konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX) {
         send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE).await;
+        return;
+    }
+    if !service_session_ready(session_manager, peer_id).await {
+        if refusals.permit(source_ip, tokio::time::Instant::now()) {
+            send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::SESSION_HANDOVER).await;
+        }
         return;
     }
     let now_unix = std::time::SystemTime::now()
@@ -2036,6 +2112,12 @@ async fn handle_invoice_requested(
                 .created_at
                 .saturating_add(u64::from(crate::peer_invoices::INVOICE_EXPIRY_SECS));
             invoices.commit(*peer_id, invoice.payment_hash.clone(), expires_at);
+            // Creation can await the wallet while the session changes. Keep its
+            // inventory slot, but withhold the invoice until a fresh request.
+            if !service_session_ready(session_manager, peer_id).await {
+                send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::SESSION_HANDOVER).await;
+                return;
+            }
             let response = Frame::InvoiceResponse {
                 request_id: request_id.to_string(),
                 bolt11: invoice.bolt11,
@@ -2875,9 +2957,7 @@ async fn prepare_call_block_invoice(
         return Err(REFUSED);
     }
     let validate = async || {
-        if !session_manager.has_session(peer).await
-            || session_manager.needs_renegotiation(peer).await
-        {
+        if !service_session_ready(session_manager, peer).await {
             warn!(
                 peer = %peer,
                 "no readable E2EE session with the caller; call block invoice refused"

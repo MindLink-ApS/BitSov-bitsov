@@ -326,6 +326,14 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // Fail-closed: any verification failure = message rejected.
                         let sender = envelope.sender;
                         let msg_id = envelope.id;
+                        // Settlement verification may await a wallet or storage.
+                        // Its result can open repair only on this same generation.
+                        let repair_eligible = envelope.payment_proof.amount_msat > 0
+                            && envelope.recipient == konsensus_core::Recipient::Node(*identity_for_recv.node_id())
+                            && !konsensus_core::is_web_service_reply(&envelope);
+                        let repair_generation = if repair_eligible {
+                            transport_for_recv.connected_since(&sender).await
+                        } else { None };
 
                         // Compute plasticity trust discount from sender's synaptic weight.
                         // Trusted peers (high weight) get lower required payment.
@@ -389,34 +397,90 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             continue;
                         }
 
+                        // A durable deferral authorizes proof-preserving re-encryption.
+                        // Once deferred, this exact envelope cannot later be admitted,
+                        // even if an earlier ratchet frame makes it readable meanwhile.
+                        let handover_reason = "session_handover: session recovery is pending; retry the existing operation";
+                        let mut known_acceptance = None;
+                        let preview_plaintext = if gate_result.is_ok() && !is_relay_control && !is_admission_proof(&envelope) {
+                            match storage_for_recv.is_envelope_deferred(&envelope).await {
+                                Ok(false) => {},
+                                deferred => {
+                                    let repair_allowed = if matches!(deferred, Ok(true)) {
+                                        match repair_generation {
+                                            Some(since) => transport_for_recv.allow_session_repair(&sender, since).await,
+                                            None => false,
+                                        }
+                                    } else { false };
+                                    let reason = if repair_allowed { handover_reason } else { "storage error" };
+                                    let reject = Frame::MessageReject { id: msg_id, reason: reason.into() };
+                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    continue;
+                                }
+                            }
+                            known_acceptance = match storage_for_recv.paid_envelope_status(&envelope).await {
+                                Ok(status) => status,
+                                Err(error) => {
+                                    error!(error = %error, "paid receipt classification failed");
+                                    let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    continue;
+                                }
+                            };
+                            if known_acceptance.is_some() {
+                                None
+                            } else {
+                            // Retain the authenticated plaintext through admission:
+                            // a concurrent handover cannot invalidate what we read.
+                            let preview = match konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext) {
+                                Ok(message) => session_mgr_for_recv.preview_decrypt(&sender, &message).await,
+                                Err(error) => Err(error),
+                            };
+                            match preview {
+                                Ok(bytes) => Some(bytes),
+                                Err(_) => {
+                                    note_unreadable_envelope(&envelope, &sender, &session_mgr_for_recv, &transport_for_ack).await;
+                                    if !repair_eligible {
+                                        // These senders retain the original envelope;
+                                        // they receive no permission to replace its
+                                        // ciphertext or open session control frames.
+                                        let reject = Frame::MessageReject { id: msg_id, reason: "session_pending: session recovery is pending; retry the existing envelope".into() };
+                                        let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                        continue;
+                                    }
+                                    // Persist before granting permission to change the
+                                    // ciphertext. A storage failure keeps the original
+                                    // attempt retryable and consumes no replay keys.
+                                    let deferred = storage_for_recv.defer_unreadable_envelope(&envelope).await;
+                                    let repair_allowed = if matches!(deferred, Ok(true)) {
+                                        match repair_generation {
+                                            Some(since) => transport_for_recv.allow_session_repair(&sender, since).await,
+                                            None => false,
+                                        }
+                                    } else { false };
+                                    let reason = if repair_allowed { handover_reason } else { "storage error" };
+                                    audit_for_recv.record(konsensus_api::audit::events::MESSAGE_REJECTED, &sender.to_hex(),
+                                        Some(serde_json::json!({"reason":reason,"kind":envelope.kind,"message_id":msg_id.to_hex()})));
+                                    let reject = Frame::MessageReject { id: msg_id, reason: reason.into() };
+                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    continue;
+                                }
+                            }
+                            }
+                        } else { None };
+
                         // Validate the block against call state before consuming its
                         // proof. Keep the call lock through acceptance so a timer or
                         // hangup cannot turn an admitted payment into a late refusal.
                         let mut incoming_block = None;
-                        if gate_result.is_ok() && envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
-                            // A refusal or storage failure must leave ratchet keys
-                            // available for a retransmission of this paid envelope.
-                            let preview = match konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext) {
-                                Ok(message) => Some(session_mgr_for_recv.preview_decrypt(&sender, &message).await),
-                                Err(_) => None,
-                            };
-                            // A later delivery can bring a block back within the skip limit;
-                            // any other failure means these bytes never decrypt under this session.
-                            let unreadable = match &preview {
-                                Some(Err(konsensus_crypto::SessionError::Ratchet(konsensus_crypto::RatchetError::TooManySkipped(..)))) => false,
-                                Some(Err(_)) | None => true,
-                                Some(Ok(_)) => false,
-                            };
-                            if unreadable {
-                                note_unreadable_envelope(&envelope, &sender, &session_mgr_for_recv, &transport_for_ack).await;
-                            }
-                            let block_plaintext = preview.and_then(Result::ok).and_then(|bytes| String::from_utf8(bytes).ok());
+                        if gate_result.is_ok() && known_acceptance.is_none() && envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+                            let block_plaintext = preview_plaintext.as_ref().and_then(|bytes| std::str::from_utf8(bytes).ok());
                             match konsensus_api::calls::prepare_incoming_block(
-                                storage_for_recv.as_ref(), &sender, block_plaintext.as_deref(), &envelope.payment_proof.payment_hash,
+                                storage_for_recv.as_ref(), &sender, block_plaintext, &envelope.payment_proof.payment_hash,
                             ).await {
                                 Ok(block) => incoming_block = Some(block),
                                 Err(refusal) => {
-                                    let reason = refused_block_reason(&refusal, unreadable, &sender, identity_for_recv.node_id());
+                                    let reason = refusal.to_string();
                                     audit_for_recv.record(
                                         konsensus_api::audit::events::MESSAGE_REJECTED,
                                         &sender.to_hex(),
@@ -459,7 +523,11 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
 
                         if gate_result.is_ok() && !is_relay_control {
                             use konsensus_storage::PaidAcceptance;
-                            match storage_for_recv.accept_paid_envelope(&envelope).await {
+                            let acceptance = match known_acceptance {
+                                Some(status) => Ok(status),
+                                None => storage_for_recv.accept_paid_envelope(&envelope).await,
+                            };
+                            match acceptance {
                                 // A web reply the gate accepted is bound to OUR paid
                                 // request: the sender paid nothing, so it is no admission.
                                 Ok(PaidAcceptance::Accepted) if konsensus_core::is_web_service_reply(&envelope) => {}
@@ -818,6 +886,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             &gate_for_recv,
                             trust_discount,
                             !committed_block,
+                            preview_plaintext,
                         ).await {
                             Ok(plaintext) => plaintext,
                             Err(refusal) if committed_block => {
@@ -984,26 +1053,6 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
     }
 }
 
-/// The reason a refused paid block goes back with. An unreadable block from the
-/// higher id is final: as the X3DH responder it only encrypts on a session we, the
-/// initiator, already hold, so if we cannot read it now that session is gone here
-/// and a new X3DH never brings it back. `undecryptable:` is terminal for every
-/// sender version. From the lower id the legacy reason stands, which senders keep
-/// retrying: it encrypts on a new session at once, so its block can overtake the
-/// SessionInit it needs, and it cannot be told apart from a stale one here.
-fn refused_block_reason(
-    refusal: &konsensus_core::payloads::call::CallRefusal,
-    unreadable: bool,
-    sender: &konsensus_core::NodeId,
-    own_id: &konsensus_core::NodeId,
-) -> String {
-    if unreadable && sender.as_bytes() > own_id.as_bytes() {
-        ReceiptRefusal::Undecryptable("the call block cannot be read under any session").to_string()
-    } else {
-        refusal.to_string()
-    }
-}
-
 /// A paid envelope could not be decrypted. That never costs the session: a failed
 /// decrypt changes no ratchet state, and one envelope cannot prove the session bad.
 ///
@@ -1068,6 +1117,7 @@ async fn decrypt_and_process(
     gate: &PaymentGate,
     trust_discount: f64,
     cache_plaintext: bool,
+    preview_plaintext: Option<Vec<u8>>,
 ) -> Result<Option<String>, ReceiptRefusal> {
     // A first-contact admission proof carries nothing to read; it is
     // acknowledged as received whether or not a session exists yet.
@@ -1076,32 +1126,45 @@ async fn decrypt_and_process(
         return Ok(None);
     }
 
-    if !session_mgr.has_session(sender).await {
-        debug!(sender = %sender, "no E2EE session, cannot decrypt");
-        return Err(ReceiptRefusal::Undecryptable(
-            "no E2EE session with the sender",
-        ));
-    }
-
-    let ratchet_msg = match konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext) {
-        Ok(msg) => msg,
-        Err(e) => {
-            debug!(sender = %sender, error = %e, "ciphertext is not a valid ratchet message");
+    let bytes = if let Some(bytes) = preview_plaintext {
+        // This exact envelope was authenticated and previewed before acceptance.
+        // Advance the live ratchet when it still holds the matching session. A
+        // concurrent replacement cannot revoke the already verified plaintext.
+        if let Ok(message) = konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext) {
+            if let Err(error) = session_mgr.decrypt(sender, &message).await {
+                debug!(sender = %sender, error = %error, "using the authenticated recovery preview after handover");
+            }
+        }
+        bytes
+    } else {
+        if !session_mgr.has_session(sender).await {
+            debug!(sender = %sender, "no E2EE session, cannot decrypt");
             return Err(ReceiptRefusal::Undecryptable(
-                "ciphertext is not a ratchet message",
+                "no E2EE session with the sender",
             ));
         }
-    };
 
-    let bytes = match session_mgr.decrypt(sender, &ratchet_msg).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            debug!(sender = %sender, error = %e, "envelope could not be decrypted");
-            note_unreadable_envelope(envelope, sender, session_mgr, transport).await;
-            return Err(ReceiptRefusal::Undecryptable(
-                "the session could not decrypt the ciphertext",
-            ));
-        }
+        let ratchet_msg = match konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext) {
+            Ok(msg) => msg,
+            Err(e) => {
+                debug!(sender = %sender, error = %e, "ciphertext is not a valid ratchet message");
+                return Err(ReceiptRefusal::Undecryptable(
+                    "ciphertext is not a ratchet message",
+                ));
+            }
+        };
+
+        let bytes = match session_mgr.decrypt(sender, &ratchet_msg).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                debug!(sender = %sender, error = %e, "envelope could not be decrypted");
+                note_unreadable_envelope(envelope, sender, session_mgr, transport).await;
+                return Err(ReceiptRefusal::Undecryptable(
+                    "the session could not decrypt the ciphertext",
+                ));
+            }
+        };
+        bytes
     };
 
     // Cache decrypted plaintext (encrypted at rest) for API access. A paid

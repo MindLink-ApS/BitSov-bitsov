@@ -1321,6 +1321,7 @@ async fn invoice_requested_creates_invoice_on_local_wallet() {
         &mut crate::invoice_refusals::RefusalLimits::default(),
         0,
         &mut ready_invoice_book().await,
+        &session_with(&peer_id).await,
     )
     .await;
 
@@ -1340,7 +1341,9 @@ async fn generic_invoice_handler_cannot_issue_block_purpose_invoices() {
         &crate::session_handler::ConfiguredPriceCeilingCache::new(), &lightning,
         &make_gossip_test_transport(), "127.0.0.1".parse().unwrap(),
         &mut crate::invoice_refusals::RefusalLimits::default(), 0,
-        &mut ready_invoice_book().await).await;
+        &mut ready_invoice_book().await,
+        &session_with(&test_peer_id()).await,
+    ).await;
     assert!(lightning.list_payments(10).await.unwrap().is_empty());
 }
 
@@ -1390,6 +1393,7 @@ async fn invoice_requested_sends_error_on_lightning_failure() {
         &mut crate::invoice_refusals::RefusalLimits::default(),
         0,
         &mut ready_invoice_book().await,
+        &session_with(&peer_id).await,
     )
     .await;
     // No panic = success
@@ -1444,7 +1448,8 @@ async fn service_invoice_is_priced_for_its_own_kind() {
             &mut crate::invoice_refusals::RefusalLimits::default(),
             0,
             &mut invoices,
-        )
+        &session_with(&peer_id).await,
+    )
         .await;
     }
     let mut amounts: Vec<u64> = lightning
@@ -1488,6 +1493,7 @@ async fn privileged_invoice_above_configured_price_is_refused_not_clamped() {
         &mut crate::invoice_refusals::RefusalLimits::default(),
         0,
         &mut invoices,
+        &session_with(&peer_id).await,
     )
     .await;
     handle_invoice_requested_gated(
@@ -1508,6 +1514,7 @@ async fn privileged_invoice_above_configured_price_is_refused_not_clamped() {
         &mut crate::invoice_refusals::RefusalLimits::default(),
         0,
         &mut invoices,
+        &session_with(&peer_id).await,
     )
     .await;
 
@@ -1553,6 +1560,7 @@ async fn issue_privileged_invoice(
         &mut crate::invoice_refusals::RefusalLimits::default(),
         0,
         invoices,
+        &session_with(peer).await,
     )
     .await;
 }
@@ -1890,6 +1898,7 @@ async fn below_admission_floor_service_invoice_is_refused_and_releases_its_rate_
         &mut crate::invoice_refusals::RefusalLimits::default(),
         floor,
         &mut invoices,
+        &session_with(&peer).await,
     )
     .await;
     let refusal = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1937,7 +1946,8 @@ async fn below_admission_floor_service_invoice_is_refused_and_releases_its_rate_
             &mut refusals,
             floor,
             &mut invoices,
-        )
+        &session_with(&peer).await,
+    )
         .await;
     }
     assert!(
@@ -1963,6 +1973,7 @@ async fn below_admission_floor_service_invoice_is_refused_and_releases_its_rate_
         &mut refusals,
         ceiling.saturating_add(1),
         &mut invoices,
+        &session_with(&peer).await,
     )
     .await;
     let payments = lightning.list_payments(10).await.unwrap();
@@ -1987,6 +1998,7 @@ async fn below_admission_floor_service_invoice_is_refused_and_releases_its_rate_
         &mut refusals,
         floor,
         &mut invoices,
+        &session_with(&peer).await,
     )
     .await;
     let payments = lightning.list_payments(10).await.unwrap();
@@ -2055,6 +2067,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
         &mut last_refusal,
         0,
         &mut invoices,
+        &session_with(&peer_id).await,
     )
     .await;
 
@@ -2096,7 +2109,8 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
             &mut last_refusal,
             0,
             &mut invoices,
-        )
+        &session_with(&peer_id).await,
+    )
         .await;
     }
     assert_eq!(
@@ -2305,7 +2319,8 @@ async fn stranger_cannot_quote_file_or_other_service_kinds() {
             &mut crate::invoice_refusals::RefusalLimits::default(),
             0,
             &mut ready_invoice_book().await,
-        )
+        &session_with(&peer_id).await,
+    )
         .await;
     }
     assert!(
@@ -2572,6 +2587,7 @@ async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
         &mut crate::invoice_refusals::RefusalLimits::default(),
         0,
         &mut ready_invoice_book().await,
+        &session_with(&peer).await,
     )
     .await;
     let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control())
@@ -2664,7 +2680,8 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
                         &mut limits,
                         0,
                         &mut peer_invoices,
-                    )
+        &session_with(&peer_id).await,
+    )
                     .await;
                     max_handling_time = max_handling_time.max(started.elapsed());
                     if handled.fetch_add(1, Ordering::Release) + 1 == FLOOD_REQUESTS + 1 {
@@ -3061,6 +3078,8 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
         "invalid signature: bad signature",
         "storage error",
         "lightning verification failed: offline",
+        "session_handover: retry the existing operation",
+        "undecryptable: recovery pending",
     ] {
         let mut limits = DeliveryConfirmationBudget::default();
         let own = make_peer_id(61);
@@ -3082,7 +3101,7 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
         .build();
         db.store_message(&env).await.unwrap();
         db.prepare_delivery(&env.id, &peer).await.unwrap();
-        handle_delivery_confirmation(
+        let recover = handle_delivery_confirmation(
             &peer,
             &env.id,
             Some(reason),
@@ -3095,9 +3114,10 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
             &audit,
             &mut limits, None)
         .await;
+        assert_eq!(recover, reason.starts_with("session_handover:"));
         let terminal = !matches!(
             reason,
-            "storage error" | "lightning verification failed: offline"
+            "storage error" | "lightning verification failed: offline" | "session_handover: retry the existing operation" | "undecryptable: recovery pending"
         );
         assert_eq!(
             updates.try_recv().unwrap().status,
@@ -5060,7 +5080,8 @@ async fn review_regression_service_invoice_respects_advertised_admission_floors(
             &mut crate::invoice_refusals::RefusalLimits::default(),
             floor,
             &mut ready_invoice_book().await,
-        )
+        &session_with(&test_peer_id()).await,
+    )
         .await;
         let payments = lightning.list_payments(10).await.unwrap();
         assert_eq!(payments.len(), 1);
@@ -5097,7 +5118,8 @@ async fn review_regression_service_invoice_tracks_price_changes_with_one_cache()
             &mut crate::invoice_refusals::RefusalLimits::default(),
             0,
             &mut book,
-        )
+        &session_with(&test_peer_id()).await,
+    )
         .await;
     }
     let mut amounts: Vec<_> = lightning
@@ -5226,7 +5248,8 @@ async fn unknown_deadline_wallet_invoices_neither_hold_the_cap_nor_are_deleted()
             &mut crate::invoice_refusals::RefusalLimits::default(),
             0,
             book,
-        )
+        &session_with(peer).await,
+    )
         .await;
     }
 
@@ -5388,7 +5411,8 @@ async fn failed_price_lookup_and_invoice_creation_count_toward_the_rate_limit() 
             &mut crate::invoice_refusals::RefusalLimits::default(),
             0,
             book,
-        )
+        &session_with(who).await,
+    )
         .await;
     }
 
@@ -5725,6 +5749,8 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
 
     // A genuine re-offer (the peer restarted with fresh keys) still re-keys once
     // the session is marked for it.
+    let old_to_high = low_mgr.encrypt(high.node_id(), b"before the re-key").await.unwrap();
+    let old_to_low = high_mgr.encrypt(low.node_id(), b"old reply").await.unwrap();
     low_mgr.mark_needs_renegotiation(high.node_id()).await;
     let restarted = SessionManager::new(Arc::clone(&high));
     let offer = serde_json::to_value(restarted.prekey_bundle().await).unwrap();
@@ -5745,7 +5771,10 @@ async fn malformed_prekey_offer_leaves_the_working_session_alone() {
         negotiations.contains_key(high.node_id()),
         "a valid offer is a negotiation"
     );
-    assert_session_works(&low, &low_mgr, &high, &high_mgr, "unconfirmed re-key").await;
+    assert!(matches!(low_mgr.encrypt(high.node_id(), b"application").await,
+        Err(konsensus_crypto::SessionError::HandoverPending)));
+    assert_eq!(high_mgr.decrypt(low.node_id(), &old_to_high).await.unwrap(), b"before the re-key");
+    assert_eq!(low_mgr.decrypt(high.node_id(), &old_to_low).await.unwrap(), b"old reply");
     assert!(low_mgr.confirm_session(high.node_id()).await);
     let msg = low_mgr
         .encrypt(high.node_id(), b"after the re-key")
@@ -5947,6 +5976,8 @@ async fn an_offer_counts_on_the_connection_it_came_on() {
 #[tokio::test]
 async fn a_well_formed_session_init_alone_does_not_replace_the_session() {
     let (low, low_mgr, high, high_mgr) = established_pair().await;
+    let old_to_high = low_mgr.encrypt(high.node_id(), b"before the init").await.unwrap();
+    let old_to_low = high_mgr.encrypt(low.node_id(), b"old reply").await.unwrap();
     let storage: Arc<dyn Storage> =
         Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
     let transport = make_gossip_test_transport();
@@ -5962,7 +5993,10 @@ async fn a_well_formed_session_init_alone_does_not_replace_the_session() {
         &storage, &transport, &audit, &mut negotiations, &connection_of(&other_identity),
     ).await;
     assert!(negotiations.contains_key(low.node_id()), "the init was accepted");
-    assert_session_works(&low, &low_mgr, &high, &high_mgr, "after the init").await;
+    assert!(matches!(high_mgr.encrypt(low.node_id(), b"application").await,
+        Err(konsensus_crypto::SessionError::HandoverPending)));
+    assert_eq!(high_mgr.decrypt(low.node_id(), &old_to_high).await.unwrap(), b"before the init");
+    assert_eq!(low_mgr.decrypt(high.node_id(), &old_to_low).await.unwrap(), b"old reply");
 }
 
 /// A SessionAck nobody asked for changes nothing: no session is promoted and no
@@ -6149,7 +6183,6 @@ async fn malformed_session_init_leaves_the_working_session_alone() {
 fn receipt_refusals_are_terminal_for_the_sender() {
     use crate::msg_handler::ReceiptRefusal;
     for refusal in [
-        ReceiptRefusal::Undecryptable("x"),
         ReceiptRefusal::NotPersisted("x"),
         ReceiptRefusal::FileCorrupted("x"),
     ] {
@@ -6166,6 +6199,7 @@ fn receipt_refusals_are_terminal_for_the_sender() {
 /// a recipient that knows the block is final says so with `undecryptable:`.
 #[test]
 fn legacy_unreadable_block_refusal_stays_retryable() {
+    assert!(!terminal_paid_rejection("undecryptable: recovery handover"));
     let legacy = konsensus_core::payloads::call::CallRefusal::Invalid("undecryptable").to_string();
     assert_eq!(legacy, "invalid call signal: undecryptable");
     assert!(!terminal_paid_rejection(&legacy));
@@ -6348,6 +6382,7 @@ const CALL_WALLET_AMBIGUOUS: usize = 2;
 const CALL_WALLET_ZERO_EXPIRY: usize = 3;
 
 struct CallBlockWallet {
+    remove_session: Option<(Arc<SessionManager>, NodeId)>,
     inner: konsensus_lightning::MockLightningProvider,
     creates: AtomicUsize,
     asked_expiry: AtomicUsize,
@@ -6357,6 +6392,7 @@ struct CallBlockWallet {
 impl CallBlockWallet {
     fn new(mode: usize) -> Self {
         Self {
+            remove_session: None,
             inner: konsensus_lightning::MockLightningProvider::new(),
             creates: AtomicUsize::new(0),
             asked_expiry: AtomicUsize::new(0),
@@ -6380,6 +6416,9 @@ impl LightningProvider for CallBlockWallet {
         konsensus_core::traits::lightning::Invoice,
         konsensus_core::traits::lightning::LightningError,
     > {
+        if let Some((sessions, peer)) = &self.remove_session {
+            sessions.remove_session(peer).await;
+        }
         self.creates.fetch_add(1, Ordering::SeqCst);
         self.asked_expiry
             .store(expiry_secs as usize, Ordering::SeqCst);
@@ -7133,4 +7172,230 @@ async fn admission_height_is_not_reused_past_the_tip_bound() {
     // The next request asks the source; its current block is recent again.
     assert_eq!(cache.get().await.unwrap().0, 900_000);
     assert_eq!(source.header_reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn recovery_handover_refuses_block_invoice_until_ack() {
+    use konsensus_core::payloads::call as calls;
+    let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let identity = Arc::new(NodeIdentity::generate().unwrap().1);
+    let ours = SessionManager::new(identity);
+    let theirs = SessionManager::new(Arc::new(NodeIdentity::generate().unwrap().1));
+    let peer = NodeId::from_bytes([7; 32]);
+    let init = ours.initiate_session(&peer, &theirs.prekey_bundle().await).await.unwrap();
+    theirs.accept_session(&NodeId::from_bytes([8; 32]), &init).await.unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let ringing = calls::receive(None, 400, None, now).unwrap();
+    let live = calls::commit(calls::reserve(Some(ringing), 401, "answer", "hash", now).unwrap(), "answer", now).unwrap();
+    storage.call_put(&peer, id, &live).await.unwrap();
+    let wallet = konsensus_lightning::MockLightningProvider::new();
+    let mut invoices = ready_invoice_book().await;
+    let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
+    for _ in 0..2 {
+        assert!(prepare_call_block_invoice(&storage, &ours, &peer, &purpose, 23_000, "handover", &wallet, &mut invoices).await.is_err());
+        assert!(wallet.list_payments(10).await.unwrap().is_empty());
+    }
+    assert!(ours.confirm_session(&peer).await);
+    assert!(prepare_call_block_invoice(&storage, &ours, &peer, &purpose, 23_000, "ready", &wallet, &mut invoices).await.is_ok());
+}
+
+#[tokio::test]
+async fn recovery_handover_refuses_chat_invoices_before_wallet() {
+    let identity = Arc::new(NodeIdentity::generate().unwrap().1);
+    let ours = SessionManager::new(identity);
+    let theirs = SessionManager::new(Arc::new(NodeIdentity::generate().unwrap().1));
+    let peer = test_peer_id();
+    let wallet: Arc<dyn LightningProvider> = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let transport = make_gossip_test_transport();
+    let mut invoices = ready_invoice_book().await;
+    for stage in ["missing", "ack-lost", "confirmed"] {
+        if stage == "ack-lost" {
+            ours.initiate_session(&peer, &theirs.prekey_bundle().await).await.unwrap();
+        }
+        if stage == "confirmed" { assert!(ours.confirm_session(&peer).await); }
+        handle_invoice_requested(&peer, stage, 1000, "konsensus message", &admission_pricing(),
+            &ConfiguredPriceCeilingCache::new(), &wallet, &transport, "127.0.0.1".parse().unwrap(),
+            &mut crate::invoice_refusals::RefusalLimits::default(), 0, &mut invoices, &ours).await;
+        let count = wallet.list_payments(10).await.unwrap().len();
+        assert_eq!(count, usize::from(stage == "confirmed"), "{stage}");
+    }
+    ours.mark_needs_renegotiation(&peer).await;
+    handle_invoice_requested(&peer, "renegotiating", 1000, "konsensus message", &admission_pricing(),
+        &ConfiguredPriceCeilingCache::new(), &wallet, &transport, "127.0.0.1".parse().unwrap(),
+        &mut crate::invoice_refusals::RefusalLimits::default(), 0, &mut invoices, &ours).await;
+    assert_eq!(wallet.list_payments(10).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn recovery_handover_rechecks_block_session_after_wallet_await() {
+    let due = DueCallBlock::open().await;
+    let sessions = Arc::new(due.sessions);
+    let mut wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    wallet.remove_session = Some((sessions.clone(), due.peer));
+    let result = prepare_call_block_invoice(&due.storage, &sessions, &due.peer, &due.purpose,
+        23_000, "session-changed", &wallet, &mut ready_invoice_book().await).await;
+    assert!(result.is_err(), "a session change withholds the invoice");
+    assert_eq!(wallet.creates(), 1);
+    assert_eq!(due.storage.call_block_invoice_count(&due.peer, &due.call_id, 0).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn recovery_handover_rechecks_chat_session_after_wallet_await() {
+    let source_identity = Arc::new(NodeIdentity::generate().unwrap().1);
+    let target_identity = Arc::new(NodeIdentity::generate().unwrap().1);
+    let peer = *source_identity.node_id();
+    let target_id = *target_identity.node_id();
+    let sessions = Arc::new(session_with(&peer).await);
+    let make = |identity: Arc<NodeIdentity>, other| Arc::new(NoiseTransport::new(identity, konsensus_message::TransportConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(), whitelist: vec![other], ..Default::default()
+    }));
+    let source = make(source_identity, target_id);
+    let target = make(target_identity, peer);
+    target.start_listener().await.unwrap();
+    source.connect(&target_id, &target.listen_addr().unwrap().to_string()).await.unwrap();
+    let mut wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    wallet.remove_session = Some((sessions.clone(), peer));
+    let wallet: Arc<dyn LightningProvider> = Arc::new(wallet);
+    handle_invoice_requested(&peer, "session-changed", 1000, "konsensus message", &admission_pricing(),
+        &ConfiguredPriceCeilingCache::new(), &wallet, &target, "127.0.0.1".parse().unwrap(),
+        &mut crate::invoice_refusals::RefusalLimits::default(), 0, &mut ready_invoice_book().await, &sessions).await;
+    let event = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = source.recv_control().await.unwrap();
+            if matches!(event, ControlEvent::InvoiceErrorReceived { .. } | ControlEvent::InvoiceResponseReceived { .. }) { break event; }
+        }
+    }).await.unwrap();
+    assert!(matches!(&event, ControlEvent::InvoiceErrorReceived { reason, .. } if reason == konsensus_api::invoice_refusal::SESSION_HANDOVER), "{event:?}");
+    source.shutdown();
+    target.shutdown();
+}
+
+
+async fn legacy_unreadable_recovery_fixture(
+    db: konsensus_storage::SqliteStorage,
+    encrypted: bool,
+) -> (Arc<dyn Storage>, sqlx::SqlitePool, konsensus_core::UkmEnvelope, String) {
+    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
+    let pool = db.pool().clone();
+    let storage: Arc<dyn Storage> = if encrypted {
+        Arc::new(konsensus_storage::EncryptedStorage::new(db, &[7; 32]))
+    } else { Arc::new(db) };
+    let env = UkmEnvelopeBuilder::new(0, make_peer_id(91), Recipient::Node(make_peer_id(92)),
+        b"original paid ciphertext".to_vec(),
+        PaymentProof::new(sha2::Sha256::digest([8u8; 32]).into(), [8; 32], 1000)).build();
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut op = konsensus_storage::OutboxOperation::prepared(id.clone(), make_peer_id(92).to_hex(), 0, "request".into());
+    op.state = "paid".into();
+    op.message_id = Some(env.id.to_hex());
+    op.payment_hash = Some(hex::encode(env.payment_proof.payment_hash));
+    op.settled_msat = 1000;
+    op.accounting_pending = false;
+    assert!(storage.insert_outbox_operation(&op).await.unwrap());
+    assert!(storage.commit_outbox_envelope(&op, &env).await.unwrap());
+    storage.mark_pending_sent(&env.id, &make_peer_id(92)).await.unwrap();
+    (storage, pool, env, id)
+}
+
+async fn legacy_unreadable_recovery_redispatch(store: &dyn Storage, pool: &sqlx::SqlitePool, env: &konsensus_core::UkmEnvelope) {
+    // Advance the existing retry, without sleeping or making another payment.
+    sqlx::query("UPDATE pending_deliveries SET retry_after_ms = 0 WHERE message_id = ?")
+        .bind(env.id.to_hex()).execute(pool).await.unwrap();
+    store.mark_pending_sent(&env.id, &make_peer_id(92)).await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_unreadable_paid_rejections_never_terminalize_or_become_compatibility_acks() {
+    for encrypted in [false, true] {
+        let (storage, pool, env, operation) = legacy_unreadable_recovery_fixture(
+            konsensus_storage::SqliteStorage::in_memory().await.unwrap(), encrypted).await;
+        let own = env.sender;
+        let peer = make_peer_id(92);
+        let routing = konsensus_routing::RoutingTable::new(Default::default());
+        let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (ws, mut updates) = broadcast::channel(16);
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+        let mut budget = DeliveryConfirmationBudget::default();
+        let initial = "undecryptable: recipient could not read this paid envelope";
+        assert!(!handle_delivery_confirmation(&peer, &env.id, Some(initial), false, &own,
+            &storage, &timestamps, &routing, &ws, &audit, &mut budget, None).await);
+        assert_eq!(updates.try_recv().unwrap().status, "rejected");
+        let hash_replay = format!("payment proof already used: {}", hex::encode(env.payment_proof.payment_hash));
+        for reason in ["storage error", "message withdrawn", "call signal withdrawn", hash_replay.as_str(),
+            "replay detected: nonce already used", "session_handover: retry with new ciphertext", "invalid signature: refused"] {
+            legacy_unreadable_recovery_redispatch(storage.as_ref(), &pool, &env).await;
+            let recover = handle_delivery_confirmation(&peer, &env.id, Some(reason), false, &own,
+                &storage, &timestamps, &routing, &ws, &audit, &mut budget, None).await;
+            assert!(!recover, "legacy provenance never grants modern session repair: {reason}");
+            let update = updates.try_recv().unwrap();
+            assert_eq!(update.status, "rejected", "{reason}");
+            let reported = update.reason.as_deref().unwrap();
+            assert!(reported.starts_with("undecryptable:"), "provenance lost: {reported}");
+            assert!(reported.contains(reason), "latest recipient reason remains visible: {reported}");
+            let op = storage.get_outbox_operation(&operation).await.unwrap().unwrap();
+            assert_eq!(op.state, "rejected_retryable", "{reason}");
+            assert_eq!(op.settled_msat, 1000);
+            assert_eq!(op.payment_hash, Some(hex::encode(env.payment_proof.payment_hash)));
+            assert_eq!(op.message_id, Some(env.id.to_hex()));
+            assert_eq!(storage.count_pending_deliveries().await.unwrap(), 1);
+            assert_eq!(storage.get_message(&env.id).await.unwrap().unwrap().ciphertext, env.ciphertext);
+            assert!(storage.pending_was_undecryptable(&env.id, &peer, &own).await.unwrap());
+            assert!(!storage.pending_was_undecryptable(&env.id, &make_peer_id(93), &own).await.unwrap());
+            assert!(!storage.pending_was_undecryptable(&env.id, &peer, &make_peer_id(93)).await.unwrap());
+            assert!(!storage.session_repair_pending(&own, &peer).await.unwrap());
+        }
+        // Genuine acknowledgement is stronger evidence than any earlier reject.
+        legacy_unreadable_recovery_redispatch(storage.as_ref(), &pool, &env).await;
+        assert!(!handle_delivery_confirmation(&peer, &env.id, None, false, &own,
+            &storage, &timestamps, &routing, &ws, &audit, &mut budget, None).await);
+        assert_eq!(updates.try_recv().unwrap().status, "delivered");
+        assert_eq!(storage.get_outbox_operation(&operation).await.unwrap().unwrap().state, "acked");
+        assert_eq!(storage.count_pending_deliveries().await.unwrap(), 0);
+    }
+}
+
+#[tokio::test]
+async fn legacy_unreadable_lookup_does_not_change_an_ordinary_terminal_withdrawal() {
+    for encrypted in [false, true] {
+        let (storage, _, env, operation) = legacy_unreadable_recovery_fixture(
+            konsensus_storage::SqliteStorage::in_memory().await.unwrap(), encrypted).await;
+        let routing = konsensus_routing::RoutingTable::new(Default::default());
+        let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (ws, mut updates) = broadcast::channel(8);
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+        assert!(!handle_delivery_confirmation(&make_peer_id(92), &env.id, Some("message withdrawn"), false, &env.sender,
+            &storage, &timestamps, &routing, &ws, &audit, &mut DeliveryConfirmationBudget::default(), None).await);
+        assert_eq!(updates.try_recv().unwrap().status, "failed_paid");
+        assert_eq!(storage.get_outbox_operation(&operation).await.unwrap().unwrap().state, "failed_paid");
+        assert!(!storage.pending_was_undecryptable(&env.id, &make_peer_id(92), &env.sender).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn legacy_unreadable_lookup_failure_retains_paid_state_and_withholds_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("outbox.sqlite");
+    let (storage, pool, env, operation) = legacy_unreadable_recovery_fixture(
+        konsensus_storage::SqliteStorage::open(path.to_str().unwrap()).await.unwrap(), false).await;
+    let routing = konsensus_routing::RoutingTable::new(Default::default());
+    let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
+    let (ws, mut updates) = broadcast::channel(8);
+    let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+    let mut budget = DeliveryConfirmationBudget::default();
+    let initial = "undecryptable: recipient could not read this paid envelope";
+    handle_delivery_confirmation(&make_peer_id(92), &env.id, Some(initial), false, &env.sender,
+        &storage, &timestamps, &routing, &ws, &audit, &mut budget, None).await;
+    assert_eq!(updates.try_recv().unwrap().status, "rejected");
+    pool.close().await;
+    assert!(!handle_delivery_confirmation(&make_peer_id(92), &env.id, Some("message withdrawn"), false, &env.sender,
+        &storage, &timestamps, &routing, &ws, &audit, &mut budget, None).await);
+    assert!(updates.try_recv().is_err(), "no false delivery or terminal update on lookup failure");
+    let reopened = konsensus_storage::SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+    let op = reopened.get_outbox_operation(&operation).await.unwrap().unwrap();
+    assert_eq!(op.state, "rejected_retryable");
+    assert_eq!(op.settled_msat, 1000);
+    assert_eq!(op.last_error.as_deref(), Some(initial));
+    assert_eq!(reopened.count_pending_deliveries().await.unwrap(), 1);
 }
