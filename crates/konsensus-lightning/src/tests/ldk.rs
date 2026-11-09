@@ -1985,3 +1985,154 @@ async fn review_regression_known_invoice_expiry_is_preserved_exactly() {
         1
     );
 }
+
+/// A loopback explorer whose genesis network can be swapped or taken down.
+async fn switchable_explorer(
+    network: Arc<std::sync::Mutex<Option<bitcoin::Network>>>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{http::StatusCode, routing::get, Router};
+    let current = move || {
+        network
+            .lock()
+            .unwrap()
+            .map(bitcoin::blockdata::constants::genesis_block)
+    };
+    let header_of = current.clone();
+    let app = Router::new()
+        .route(
+            "/block-height/0",
+            get(move || async move {
+                current()
+                    .map(|block| block.block_hash().to_string())
+                    .ok_or(StatusCode::BAD_GATEWAY)
+            }),
+        )
+        .route(
+            "/block/:hash/header",
+            get(move || async move {
+                header_of()
+                    .map(|block| bitcoin::consensus::encode::serialize_hex(&block.header))
+                    .ok_or(StatusCode::BAD_GATEWAY)
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    (
+        url,
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+    )
+}
+
+async fn settle(watch: &Arc<NetworkWatch>) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while watch.running.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn running_node_rechecks_its_source_and_refuses_another_network() {
+    let network = Arc::new(std::sync::Mutex::new(Some(bitcoin::Network::Signet)));
+    let (url, server) = switchable_explorer(Arc::clone(&network)).await;
+    let interval = Duration::from_millis(100);
+    let watch = Arc::new(NetworkWatch::new(
+        bitcoin::Network::Signet,
+        SourceProbe::Esplora {
+            urls: vec![url],
+            primary: None,
+        },
+        interval,
+    ));
+    let recheck = || async {
+        tokio::time::sleep(interval + Duration::from_millis(20)).await;
+        watch.poll();
+        settle(&watch).await;
+    };
+    assert!(watch.poll());
+    recheck().await;
+    assert!(watch.poll() && !watch.refused());
+    // The source now answers on mainnet: refused for good.
+    *network.lock().unwrap() = Some(bitcoin::Network::Bitcoin);
+    recheck().await;
+    assert!(watch.refused());
+    assert!(!watch.poll());
+    *network.lock().unwrap() = Some(bitcoin::Network::Signet);
+    recheck().await;
+    assert!(!watch.poll(), "a refusal never clears");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn running_node_is_not_ready_while_its_source_stays_unverified() {
+    let network = Arc::new(std::sync::Mutex::new(None));
+    let (url, server) = switchable_explorer(Arc::clone(&network)).await;
+    let interval = Duration::from_millis(50);
+    let watch = Arc::new(NetworkWatch::new(
+        bitcoin::Network::Signet,
+        SourceProbe::Esplora {
+            urls: vec![url],
+            primary: None,
+        },
+        interval,
+    ));
+    assert!(watch.poll(), "verified at start");
+    tokio::time::sleep(interval * 4).await;
+    watch.poll();
+    settle(&watch).await;
+    assert!(!watch.poll(), "no answer for three intervals");
+    assert!(!watch.refused());
+    // It answers on the configured network again: ready again.
+    *network.lock().unwrap() = Some(bitcoin::Network::Signet);
+    tokio::time::sleep(interval).await;
+    watch.poll();
+    settle(&watch).await;
+    assert!(watch.poll());
+    server.abort();
+}
+
+/// Without credentials, the watch asks only the URL startup selected. The
+/// unused configured endpoint is never asked, so its outages or changes do
+/// not touch readiness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn running_node_watches_only_the_selected_esplora_url() {
+    use std::sync::atomic::AtomicUsize;
+    let network = Arc::new(std::sync::Mutex::new(Some(bitcoin::Network::Signet)));
+    let (selected, server) = switchable_explorer(Arc::clone(&network)).await;
+    let unused_requests = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&unused_requests);
+    let app = axum::Router::new().fallback(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { (axum::http::StatusCode::BAD_GATEWAY, "down") }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unused = format!("http://{}", listener.local_addr().unwrap());
+    let unused_server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let install = EsploraInstall {
+        transport: None,
+        urls: vec![selected.clone(), unused.clone()],
+        primary_in_use: false,
+    };
+    let source = esplora_watch_source(install, None, &selected, selected.clone()).unwrap();
+    let interval = Duration::from_millis(100);
+    let watch = Arc::new(NetworkWatch::new(
+        bitcoin::Network::Signet,
+        source,
+        interval,
+    ));
+    for _ in 0..2 {
+        tokio::time::sleep(interval + Duration::from_millis(20)).await;
+        watch.poll();
+        settle(&watch).await;
+    }
+    assert!(watch.poll(), "the selected URL answers");
+    assert_eq!(
+        unused_requests.load(Ordering::SeqCst),
+        0,
+        "unused URL never asked"
+    );
+    server.abort();
+    unused_server.abort();
+}

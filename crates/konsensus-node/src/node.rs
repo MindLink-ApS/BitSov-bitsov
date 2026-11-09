@@ -29,6 +29,71 @@ use konsensus_storage::Storage;
 
 use crate::config::{ChainConfig, LightningConfig, NodeConfig, PricingMode, StorageConfig};
 
+/// Bound on the start-time network check. A slow source counts as unreachable.
+const CHAIN_NETWORK_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Refuse to start when the chain source is on another network than the
+/// configured one. An unreachable source starts as before: the provider
+/// serves no chain data, so the node is not ready, until the source answers
+/// on the configured network.
+pub(crate) async fn verify_chain_network(
+    check: impl std::future::Future<Output = konsensus_chain::NetworkCheck>,
+) -> Result<()> {
+    use konsensus_chain::NetworkCheck;
+    match tokio::time::timeout(CHAIN_NETWORK_CHECK_TIMEOUT, check).await {
+        Ok(NetworkCheck::Mismatch(mismatch)) => Err(anyhow::Error::new(mismatch)),
+        Ok(NetworkCheck::Verified) => {
+            info!("chain source network verified");
+            Ok(())
+        }
+        Ok(NetworkCheck::Unavailable | NetworkCheck::NotConfigured) | Err(_) => {
+            warn!(
+                "chain source network not verified yet: source unreachable; \
+                 chain data stays unavailable until it answers on the configured network"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// LDK's own Esplora URLs can differ from `[chain]`. Refuse one on another
+/// network here too, before any node file exists. No answer is left to LDK's
+/// own start, which then stays offline until the source answers.
+async fn verify_ldk_esplora_network(config: &NodeConfig, network: bitcoin::Network) -> Result<()> {
+    let LightningConfig::Ldk {
+        esplora_url,
+        esplora_url_fallback,
+        credentials_file,
+        ..
+    } = &config.lightning
+    else {
+        return Ok(());
+    };
+    if matches!(
+        config.chain,
+        ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_)
+    ) {
+        // LDK then uses the [chain] source, checked above.
+        return Ok(());
+    }
+    let primary = credentials_file
+        .as_deref()
+        .map(konsensus_chain::bearer::BearerAuth::from_file)
+        .transpose()?
+        .map(|auth| konsensus_chain::bearer::BearerFailover::new(auth, esplora_url, Vec::new()))
+        .transpose()?;
+    let mut urls = vec![esplora_url.as_str()];
+    urls.extend(esplora_url_fallback.as_deref());
+    let check =
+        konsensus_chain::network::verify_esplora_api_urls(network, &urls, primary.as_deref());
+    if let Ok(result) = tokio::time::timeout(CHAIN_NETWORK_CHECK_TIMEOUT, check).await {
+        if let konsensus_chain::NetworkCheck::Mismatch(mismatch) = result.check {
+            return Err(anyhow::Error::new(mismatch));
+        }
+    }
+    Ok(())
+}
+
 /// A running BitSov v2 node.
 ///
 /// Owns all components and manages their lifecycle. Created via
@@ -104,6 +169,64 @@ impl KonsensusNode {
             } => Some(konsensus_chain::bearer::BearerAuth::from_file(path)?),
             _ => None,
         };
+        // ── 1. Initialize Chain provider ────────────────────────────────
+        // Before any node state or Lightning: a source on another network
+        // refuses startup.
+        let network = config.lightning.chain_source_network();
+        if network.is_none() && !matches!(config.chain, ChainConfig::Mock) {
+            // [chain] has no network of its own; only the Lightning backend sets one.
+            warn!("chain source network not checked: the Lightning backend sets no network");
+        }
+        let chain: Arc<dyn ChainProvider> = match &config.chain {
+            ChainConfig::Esplora { api_url, .. } => {
+                let esplora_config = EsploraConfig::custom(
+                    api_url.clone(),
+                    konsensus_core::traits::chain::TrustLevel::ServerTrust,
+                );
+                info!(backend = "esplora", "chain provider");
+                let provider = EsploraProvider::with_fallbacks(
+                    esplora_config,
+                    config.chain.esplora_fallbacks(&config.lightning),
+                )?;
+                let mut provider = match chain_auth {
+                    Some(auth) => provider.with_bearer(auth)?,
+                    None => provider,
+                };
+                if let Some(network) = network {
+                    provider = provider.with_network(network);
+                    verify_chain_network(provider.verify_network()).await?;
+                }
+                Arc::new(provider)
+            }
+            ChainConfig::Bitcoind(rpc) => {
+                info!(backend = "bitcoind", "chain provider (own node)");
+                let mut provider = konsensus_chain::BitcoindProvider::new(rpc.clone())?;
+                if let Some(network) = network {
+                    provider = provider.with_network(network);
+                    verify_chain_network(provider.verify_network()).await?;
+                }
+                Arc::new(provider)
+            }
+            ChainConfig::Electrum(server) => {
+                info!(backend = "electrum", "chain provider (server-trusting)");
+                let mut provider = konsensus_chain::ElectrumProvider::new(server.clone())?;
+                if let Some(network) = network {
+                    provider = provider.with_network(network);
+                    verify_chain_network(provider.verify_network()).await?;
+                }
+                Arc::new(provider)
+            }
+            ChainConfig::Mock => {
+                info!(backend = "mock", "chain provider (testnet)");
+                Arc::new(MockChainProvider::new())
+            }
+        };
+
+        info!("chain provider initialized");
+        if let Some(network) = network {
+            verify_ldk_esplora_network(&config, network).await?;
+        }
+
         // Same directory as the embedded LDK state. Check before opening either store.
         let data_dir = config
             .identity
@@ -121,7 +244,7 @@ impl KonsensusNode {
             data_dir.to_path_buf(),
             config.disk_free_floor_bytes,
         ));
-        // ── 1. Load identity ────────────────────────────────────────────
+        // ── 2. Load identity ────────────────────────────────────────────
         let mnemonic = crate::mnemonic_crypto::read_mnemonic(
             &config.identity.mnemonic_file,
             mnemonic_password,
@@ -141,7 +264,7 @@ impl KonsensusNode {
 
         info!(node_id = %identity.node_id(), "identity loaded");
 
-        // ── 2. Initialize storage ───────────────────────────────────────
+        // ── 3. Initialize storage ───────────────────────────────────────
         let encrypted_storage = match &config.storage {
             StorageConfig::Sqlite { encrypted, .. } | StorageConfig::Postgres { encrypted, .. } => *encrypted,
         };
@@ -181,7 +304,7 @@ impl KonsensusNode {
 
         info!("storage initialized");
 
-        // ── 3. Initialize Lightning provider ────────────────────────────
+        // ── 4. Initialize Lightning provider ────────────────────────────
         let lightning: Arc<dyn LightningProvider> = match &config.lightning {
             LightningConfig::Lnbits { .. } => {
                 anyhow::bail!("not_supported: LNbits routing fee ceilings")
@@ -366,39 +489,6 @@ impl KonsensusNode {
                 _state_guard: state_guard.clone(),
             });
         info!("lightning provider initialized");
-
-        // ── 4. Initialize Chain provider ────────────────────────────────
-        let chain: Arc<dyn ChainProvider> = match &config.chain {
-            ChainConfig::Esplora { api_url, .. } => {
-                let esplora_config = EsploraConfig::custom(
-                    api_url.clone(),
-                    konsensus_core::traits::chain::TrustLevel::ServerTrust,
-                );
-                info!(backend = "esplora", "chain provider");
-                let provider = EsploraProvider::with_fallbacks(
-                    esplora_config,
-                    config.chain.esplora_fallbacks(&config.lightning),
-                )?;
-                Arc::new(match chain_auth {
-                    Some(auth) => provider.with_bearer(auth)?,
-                    None => provider,
-                })
-            }
-            ChainConfig::Bitcoind(rpc) => {
-                info!(backend = "bitcoind", "chain provider (own node)");
-                Arc::new(konsensus_chain::BitcoindProvider::new(rpc.clone())?)
-            }
-            ChainConfig::Electrum(server) => {
-                info!(backend = "electrum", "chain provider (server-trusting)");
-                Arc::new(konsensus_chain::ElectrumProvider::new(server.clone())?)
-            }
-            ChainConfig::Mock => {
-                info!(backend = "mock", "chain provider (testnet)");
-                Arc::new(MockChainProvider::new())
-            }
-        };
-
-        info!("chain provider initialized");
 
         // ── 5. Initialize Pricing engine ────────────────────────────────
         let base_pricing_config = konsensus_pricing::StaticPricingConfig {

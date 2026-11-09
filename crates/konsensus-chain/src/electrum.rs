@@ -1,5 +1,6 @@
 //! Explicit Electrum endpoint; no discovery, default server, or fallback.
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use electrum_client::{Client, ConfigBuilder, ElectrumApi};
@@ -7,6 +8,8 @@ use konsensus_core::traits::chain::{
     BlockHeader, ChainError, ChainProvider, ChainView, FeeEstimate, TrustLevel,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::network::{NetworkCheck, NetworkGate, ReportedNetwork};
 
 /// An owner declaration, not verification of server ownership or validation.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,6 +118,7 @@ impl ElectrumConfig {
 
 pub struct ElectrumProvider {
     config: ElectrumConfig,
+    network: Option<Arc<NetworkGate>>,
 }
 
 impl ElectrumProvider {
@@ -123,7 +127,31 @@ impl ElectrumProvider {
         config
             .validate()
             .map_err(|e| ChainError::Backend(e.into()))?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            network: None,
+        })
+    }
+
+    /// Serve no chain data until the server's genesis block is this
+    /// network's; refuse the server for good if it is another network's.
+    ///
+    /// Reconnect: every query opens a new connection, so every query first
+    /// asks the server for its height-0 header on that connection.
+    pub fn with_network(mut self, network: bitcoin::Network) -> Self {
+        self.network = Some(Arc::new(NetworkGate::new(network, "electrum", 1)));
+        self
+    }
+
+    /// Check the server's genesis hash now. An unreachable server is
+    /// reported as `Unavailable`.
+    pub async fn verify_network(&self) -> NetworkCheck {
+        let Some(gate) = &self.network else {
+            return NetworkCheck::NotConfigured;
+        };
+        gate.invalidate_all();
+        let _ = self.query(|_| Ok(())).await;
+        gate.check()
     }
 
     pub(crate) async fn query<T: Send + 'static>(
@@ -131,10 +159,26 @@ impl ElectrumProvider {
         operation: impl FnOnce(Client) -> Result<T, ChainError> + Send + 'static,
     ) -> Result<T, ChainError> {
         let url = self.config.server_url.clone();
+        let gate = self.network.clone();
         tokio::task::spawn_blocking(move || {
+            if let Some(gate) = &gate {
+                gate.refusal()?;
+            }
             let config = ConfigBuilder::new().timeout(Some(10)).retry(0).build();
-            let client = Client::from_config(&url, config)
-                .map_err(|_| ChainError::Connection("Electrum connection failed".into()))?;
+            let client = Client::from_config(&url, config).map_err(|_| {
+                if let Some(gate) = &gate {
+                    gate.invalidate(0);
+                }
+                ChainError::Connection("Electrum connection failed".into())
+            })?;
+            if let Some(gate) = &gate {
+                // Hash the header here rather than trust a reported hash.
+                let genesis = client.block_header(0).map_err(|error| {
+                    gate.invalidate(0);
+                    rpc_error(error)
+                })?;
+                gate.record(0, ReportedNetwork::from_genesis_hash(genesis.block_hash()))?;
+            }
             operation(client)
         })
         .await
@@ -311,6 +355,7 @@ mod funding_tests {
                 server_url: "unsupported://no-network".into(),
                 operator: ElectrumOperator::ThirdParty,
             },
+            network: None,
         };
         assert!(provider.is_synced_with_height(900_000).await);
     }
