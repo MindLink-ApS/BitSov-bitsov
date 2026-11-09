@@ -101,6 +101,16 @@ impl Runtime {
 		F: Future<Output = ()> + Send + 'static,
 	{
 		let cancellable_background_tasks = self.cancellable_background_tasks.lock().unwrap();
+		if cancellable_background_tasks.tasks.is_closed() {
+			// The node is stopping or stopped. A task spawned now would escape the cancellation
+			// already in progress, so it is dropped without being polled.
+			drop(cancellable_background_tasks);
+			log_trace!(
+				self.logger,
+				"Ignoring cancellable background task spawned during shutdown."
+			);
+			return;
+		}
 		let runtime_handle = self.handle();
 		let cancellation_token = cancellable_background_tasks.cancellation_token.clone();
 		// Since it seems to make a difference to `tokio` (see
@@ -119,9 +129,24 @@ impl Runtime {
 		));
 	}
 
+	/// Accepts cancellable tasks again after a stop, in a fresh set. Called when the node starts.
+	pub fn allow_cancellable_background_task_spawns(&self) {
+		let mut cancellable_background_tasks = self.cancellable_background_tasks.lock().unwrap();
+		if cancellable_background_tasks.tasks.is_closed() {
+			// A stop may still be waiting on the previous tracker, so start a new set rather than
+			// reopening that one.
+			*cancellable_background_tasks = CancellableBackgroundTasks::new();
+		}
+	}
+
 	#[cfg(test)]
 	pub(crate) fn cancellable_background_task_count(&self) -> usize {
 		self.cancellable_background_tasks.lock().unwrap().tasks.len()
+	}
+
+	#[cfg(test)]
+	fn current_cancellable_tracker(&self) -> TaskTracker {
+		self.cancellable_background_tasks.lock().unwrap().tasks.clone()
 	}
 
 	pub fn spawn_background_processor_task<F>(&self, future: F)
@@ -159,15 +184,14 @@ impl Runtime {
 	}
 
 	pub fn abort_cancellable_background_tasks(&self) {
-		// Tasks spawned after this point belong to a fresh set, as before.
-		let tasks = core::mem::replace(
-			&mut *self.cancellable_background_tasks.lock().unwrap(),
-			CancellableBackgroundTasks::new(),
-		);
-		tasks.tasks.close();
-		tasks.cancellation_token.cancel();
-		let tracker = tasks.tasks.clone();
-		drop(tasks);
+		// Closing the tracker refuses further spawns until the node starts again, so a task that
+		// spawns while this stop is in progress cannot outlive it.
+		let tracker = {
+			let cancellable_background_tasks = self.cancellable_background_tasks.lock().unwrap();
+			cancellable_background_tasks.tasks.close();
+			cancellable_background_tasks.cancellation_token.cancel();
+			cancellable_background_tasks.tasks.clone()
+		};
 		self.block_on(tracker.wait())
 	}
 
@@ -315,7 +339,7 @@ mod tests {
 	}
 
 	#[test]
-	fn abort_cancels_running_tasks_and_later_spawns_still_run() {
+	fn abort_cancels_running_tasks_and_restart_accepts_spawns() {
 		let runtime = test_runtime();
 		let (started_sender, started_receiver) = oneshot::channel();
 		let (dropped_sender, dropped_receiver) = oneshot::channel();
@@ -332,7 +356,22 @@ mod tests {
 			dropped_receiver.await.expect("aborted task should be dropped before abort returns");
 		});
 
-		// As before, a task spawned after an abort (e.g. on restart) runs normally.
+		// A task spawned after the stop is never polled.
+		let (late_sender, late_receiver) = oneshot::channel::<()>();
+		runtime.spawn_cancellable_background_task(async move {
+			let _ = late_sender.send(());
+		});
+		assert_eq!(runtime.cancellable_background_task_count(), 0);
+		let late_was_polled = runtime.block_on(async {
+			matches!(
+				tokio::time::timeout(Duration::from_millis(200), late_receiver).await,
+				Ok(Ok(()))
+			)
+		});
+		assert!(!late_was_polled, "a task spawned after stop should not be polled");
+
+		// After a restart, spawned tasks run normally.
+		runtime.allow_cancellable_background_task_spawns();
 		let (ran_sender, ran_receiver) = oneshot::channel();
 		runtime.spawn_cancellable_background_task(async move {
 			let _ = ran_sender.send(());
@@ -344,6 +383,49 @@ mod tests {
 				.expect("later task should send");
 		});
 		runtime.abort_cancellable_background_tasks();
+	}
+
+	#[test]
+	fn task_spawned_while_stopping_does_not_outlive_the_stop() {
+		let runtime = Arc::new(test_runtime());
+		let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
+		let (release_sender, release_receiver) = std::sync::mpsc::sync_channel::<()>(1);
+		let (child_polled_sender, mut child_polled_receiver) = oneshot::channel::<()>();
+		let parent_runtime = Arc::clone(&runtime);
+		runtime.spawn_cancellable_background_task(async move {
+			started_sender.send(()).expect("test should still be running");
+			// Stay inside this poll until the stop has begun, then spawn a child that would run
+			// forever.
+			release_receiver.recv().expect("test should release the parent");
+			parent_runtime.spawn_cancellable_background_task(async move {
+				let _ = child_polled_sender.send(());
+				std::future::pending::<()>().await;
+			});
+			std::future::pending::<()>().await;
+		});
+		started_receiver.recv_timeout(Duration::from_secs(5)).expect("parent should start");
+
+		let stopping_tracker = runtime.current_cancellable_tracker();
+		let abort_runtime = Arc::clone(&runtime);
+		let abort_thread =
+			std::thread::spawn(move || abort_runtime.abort_cancellable_background_tasks());
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		while !stopping_tracker.is_closed() {
+			assert!(std::time::Instant::now() < deadline, "stop should close the tracker");
+			std::thread::yield_now();
+		}
+		release_sender.send(()).expect("parent should be waiting");
+		abort_thread.join().expect("stop should finish");
+
+		assert_eq!(
+			runtime.cancellable_background_task_count(),
+			0,
+			"no cancellable task should remain tracked after stop"
+		);
+		assert!(
+			child_polled_receiver.try_recv().is_err(),
+			"a task spawned while stopping should not be polled"
+		);
 	}
 
 	#[test]

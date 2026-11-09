@@ -129,6 +129,14 @@ mod tests {
 		}
 	}
 
+	impl Drop for Fixture {
+		fn drop(&mut self) {
+			// Cancel and drain the listener and connection tasks here, on the test thread, so the
+			// last handle to the runtime is released here and not on one of its workers.
+			self.runtime.abort_cancellable_background_tasks();
+		}
+	}
+
 	// Reads until the remote side closes, like a peer connection does.
 	async fn read_to_eof(mut tcp_stream: tokio::net::TcpStream) {
 		let mut buf = [0u8; 64];
