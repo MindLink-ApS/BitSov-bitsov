@@ -318,7 +318,7 @@ async fn get_peer_call_pricing(
     let answer = konsensus_core::kind::KIND_CALL_ANSWER;
     let signal_msat = match state.peer_prices.get_fresh_discounted_peer_price(&peer, answer, height, std::time::Duration::from_secs(3600)).await {
         Some(p) => p,
-        None => state.pricing.get_price_msat(answer).await.map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?,
+        None => state.pricing.get_price_msat(answer).await.map_err(crate::error::pricing_error)?,
     };
     Ok(Json(PeerCallPriceResponse { peer_id: peer.to_hex(), offer_msat, signal_msat }))
 }

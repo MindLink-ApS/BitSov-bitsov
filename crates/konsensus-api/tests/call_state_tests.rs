@@ -440,9 +440,8 @@ fn own() -> konsensus_core::types::NodeId {
     konsensus_core::types::NodeId::from_bytes([0xee; 32])
 }
 
-/// T2: a call price is checked against the local tip. A tip that cannot be
-/// read refuses the quote; it is never checked against height 0 (which skips
-/// the answer's block validity).
+/// T2: a call price is checked against the local tip. Without one, nothing
+/// is asked: no price query is claimed or sent, and the quote is not ready.
 #[tokio::test]
 async fn a_call_quote_without_a_chain_tip_is_not_ready() {
     let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
@@ -452,18 +451,28 @@ async fn a_call_quote_without_a_chain_tip_is_not_ready() {
     let chain = Arc::new(common::TipDownChain::down());
     {
         let state = Arc::get_mut(&mut state).unwrap();
-        state.transport = transport;
+        state.transport = transport.clone();
         state.chain = chain.clone();
     }
+    let started = std::time::Instant::now();
+    let err = calls::peer_call_price(&state, &peer).await.unwrap_err();
+    assert!(matches!(err, konsensus_api::error::ApiError::ChainNotReady), "{err:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "no wait for an answer");
+    assert!(transport.raw_frames.lock().unwrap().is_empty(), "no price query sent");
+    assert_eq!(chain.reads(), 1);
+    assert!(wallet.list_payments(100).await.unwrap().is_empty());
+
+    // The tip is checked again once the answer is in: lost meanwhile, refused.
+    let chain = Arc::new(common::TipDownChain::after(1));
+    let state = Arc::new(konsensus_api::state::AppState { chain: chain.clone(), ..(*state).clone() });
     let answer = async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         state.peer_prices.update_kind_price(peer, 400, 10_000, 850_000).await;
     };
     let (price, ()) = tokio::join!(calls::peer_call_price(&state, &peer), answer);
-    let err = price.unwrap_err();
-    assert!(format!("{err:?}").contains("NotReady") && format!("{err:?}").contains("chain_unavailable"), "{err:?}");
-    assert_eq!(chain.reads(), 1);
-    assert!(wallet.list_payments(100).await.unwrap().is_empty());
+    assert!(matches!(price.unwrap_err(), konsensus_api::error::ApiError::ChainNotReady));
+    assert_eq!(chain.reads(), 2);
+    assert_eq!(transport.raw_frames.lock().unwrap().len(), 1);
 }
 
 /// T2: the call page's signal price reads the tip again; that read failing
@@ -474,7 +483,8 @@ async fn the_call_price_route_refuses_when_the_second_tip_read_fails() {
     let mut state = common::test_state_with_lightning(wallet.clone());
     let peer = NodeId::from_bytes([72; 32]);
     let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
-    let chain = Arc::new(common::TipDownChain::after(1));
+    // Up for the offer's two reads (before the query, after the answer).
+    let chain = Arc::new(common::TipDownChain::after(2));
     {
         let state = Arc::get_mut(&mut state).unwrap();
         state.transport = transport;
@@ -495,6 +505,6 @@ async fn the_call_price_route_refuses_when_the_second_tip_read_fails() {
     let bytes = axum::body::to_bytes(response.into_body(), 65_536).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     common::assert_chain_not_ready(status, &body);
-    assert_eq!(chain.reads(), 2, "the offer read the tip, then the signal price did");
+    assert_eq!(chain.reads(), 3, "the offer read the tip twice, then the signal price did");
     assert!(wallet.list_payments(100).await.unwrap().is_empty());
 }

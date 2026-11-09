@@ -127,6 +127,13 @@ pub trait ChainProvider: Send + Sync {
     async fn is_synced_with_height(&self, _height: u64) -> bool {
         self.is_synced().await
     }
+
+    /// Whether the tip this source last served is still recent enough to use.
+    /// A caller that keeps a height read for a while asks this before reusing
+    /// it. Sources without a tip-age bound always answer `true`.
+    async fn tip_is_fresh(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

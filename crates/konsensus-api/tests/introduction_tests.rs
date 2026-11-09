@@ -436,3 +436,19 @@ async fn no_card_is_signed_without_a_chain_tip() {
     let (status, body, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
     assert_chain_not_ready(status.as_u16(), &body);
 }
+
+#[tokio::test]
+async fn a_stale_tip_under_chain_aware_pricing_is_not_ready_not_an_error() {
+    // Mock headers are a year old: under the mainnet bound the tip is stale.
+    let chain = konsensus_chain::FreshTip::wrap(Arc::new(konsensus_chain::MockChainProvider::new()), Some("bitcoin"));
+    let pricing = Arc::new(konsensus_pricing::ChainAwarePricingEngine::new(Default::default(), chain.clone()));
+    let base = state_with(Arc::default(), settings(Some("node.example.org:9000")));
+    let state = Arc::new(AppState { chain, pricing, ..(*base).clone() });
+    let (status, body, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
+    assert_chain_not_ready(status.as_u16(), &body);
+
+    // A tip, but a price that needs one the engine could not read: the same.
+    let state = Arc::new(AppState { chain: Arc::new(StubChain), pricing: Arc::new(ChainlessPricing), ..(*base).clone() });
+    let (status, body, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
+    assert_chain_not_ready(status.as_u16(), &body);
+}

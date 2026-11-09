@@ -31,6 +31,10 @@ pub enum ApiError {
     OperationConflict(&'static str),
     #[error("Lightning is offline or synchronizing; retry when money_ready is true")]
     NotReady,
+    /// The local chain tip could not be read, is height 0, or is older than
+    /// the network's bound. `not_ready` with reason `chain_unavailable`.
+    #[error("the chain source has no current tip (unreachable, height 0 or stale); retry when it is current")]
+    ChainNotReady,
     #[error("recipient is not ready to receive payments: {reason}")]
     PeerNotReady { reason: &'static str },
 
@@ -172,6 +176,12 @@ impl ApiError {
                 "error": self.to_string(), "code": "not_ready", "money_ready": false
             }));
         }
+        if matches!(self, Self::ChainNotReady) {
+            return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+                "error": self.to_string(), "code": "not_ready",
+                "reason": CHAIN_UNAVAILABLE, "retry_allowed": true
+            }));
+        }
         if let Self::RoutingFee { source, max_routing_fee_msat } = self {
             let (status, mut body) = source.response_parts();
             body["max_routing_fee_msat"] = (*max_routing_fee_msat).into();
@@ -269,6 +279,7 @@ impl ApiError {
             | ApiError::Operation { .. }
             | ApiError::OperationConflict(_)
             | ApiError::NotReady
+            | ApiError::ChainNotReady
             | ApiError::PeerNotReady { .. }
             | ApiError::RoutingFee { .. }
             | ApiError::Reasoned { .. }
@@ -316,17 +327,44 @@ pub(crate) async fn require_money_ready(state: &crate::state::AppState) -> Resul
 /// `chain_unavailable`, before anything is paid or signed: no caller goes on
 /// with height 0 in its place.
 pub(crate) async fn chain_tip(state: &crate::state::AppState) -> Result<u64, ApiError> {
-    match state.chain.get_block_height().await {
+    chain_tip_of(state.chain.as_ref()).await
+}
+
+/// [`chain_tip`] for a caller holding only the chain source.
+pub(crate) async fn chain_tip_of(
+    chain: &dyn konsensus_core::traits::chain::ChainProvider,
+) -> Result<u64, ApiError> {
+    match chain.get_block_height().await {
         Ok(height) if height > 0 => Ok(height),
         Ok(_) => {
             tracing::warn!("not_ready: chain tip is height zero");
-            Err(ApiError::NotReady.with_reason("chain_unavailable"))
+            Err(ApiError::ChainNotReady)
         }
         Err(error) => {
             tracing::warn!(%error, "not_ready: chain tip unavailable");
-            Err(ApiError::NotReady.with_reason("chain_unavailable"))
+            Err(ApiError::ChainNotReady)
         }
     }
+}
+
+/// Machine reason of [`ApiError::ChainNotReady`].
+pub(crate) const CHAIN_UNAVAILABLE: &str = "chain_unavailable";
+
+/// A pricing failure: a chain-aware engine without a usable tip is the typed
+/// chain readiness refusal; anything else is `other(error)`.
+pub(crate) fn pricing_error_or(
+    error: konsensus_core::traits::pricing::PricingError,
+    other: impl FnOnce(konsensus_core::traits::pricing::PricingError) -> ApiError,
+) -> ApiError {
+    match error {
+        konsensus_core::traits::pricing::PricingError::ChainUnavailable(_) => ApiError::ChainNotReady,
+        error => other(error),
+    }
+}
+
+/// [`pricing_error_or`] with the usual internal `pricing error: …`.
+pub(crate) fn pricing_error(error: konsensus_core::traits::pricing::PricingError) -> ApiError {
+    pricing_error_or(error, |e| ApiError::Internal(format!("pricing error: {e}")))
 }
 
 impl From<konsensus_core::traits::lightning::LightningError> for ApiError {

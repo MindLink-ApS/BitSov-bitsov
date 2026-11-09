@@ -868,3 +868,62 @@ async fn no_front_door_is_published_without_a_chain_tip() {
     assert_eq!(body["card"]["seq"], 1);
     assert_eq!(body["card"]["prices"]["price_epoch"], 850_000 / 2016);
 }
+
+#[tokio::test]
+async fn a_stale_tip_under_chain_aware_pricing_publishes_nothing() {
+    let chain = konsensus_chain::FreshTip::wrap(Arc::new(konsensus_chain::MockChainProvider::new()), Some("bitcoin"));
+    let pricing = Arc::new(konsensus_pricing::ChainAwarePricingEngine::new(Default::default(), chain.clone()));
+    let base = state_with(settings(Some("node.example.org:9000")));
+    let card = json!({"display_name": "Alice"});
+    for state in [
+        Arc::new(AppState { chain, pricing, ..(*base).clone() }),
+        Arc::new(AppState { chain: Arc::new(StubChain), pricing: Arc::new(ChainlessPricing), ..(*base).clone() }),
+    ] {
+        let (status, body, _) = call(&state, "PUT", "/api/v1/front-door", bearer(&state, vec![auth::Scope::Admin]), Some(card.clone())).await;
+        assert_chain_not_ready(status.as_u16(), &body);
+        assert!(state.front_door.card.lock().await.is_none(), "nothing signed or stored");
+    }
+}
+
+#[tokio::test]
+async fn a_changed_tariff_is_not_re_signed_without_a_chain_tip() {
+    let state = state_with(settings(Some("node.example.org:9000")));
+    let (status, body, _) = call(&state, "PUT", "/api/v1/front-door", bearer(&state, vec![auth::Scope::Admin]), Some(json!({"display_name": "Alice"}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["seq"], 1);
+    let page_msat = body["card"]["prices"]["page_msat"].clone();
+    let read = |state: &Arc<AppState>| {
+        let state = state.clone();
+        async move { call(&state, "GET", "/api/v1/front-door", bearer(&state, vec![auth::Scope::Read]), None).await }
+    };
+
+    // An unchanged signed card is still read without a tip.
+    let chain = Arc::new(TipDownChain::down());
+    let down = Arc::new(AppState { chain: chain.clone(), ..(*state).clone() });
+    let (status, got, _) = read(&down).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!((got["card"]["seq"].clone(), got["card"]["prices"]["page_msat"].clone()), (json!(1), page_msat.clone()));
+    assert_eq!(chain.reads(), 0);
+
+    // A changed tariff is not signed or stored without one.
+    let repriced = konsensus_pricing::StaticPricingConfig { web_content_msat: 2_000, ..Default::default() };
+    let down = Arc::new(AppState {
+        pricing: Arc::new(konsensus_pricing::StaticPricingEngine::new(repriced.clone())),
+        ..(*down).clone()
+    });
+    let (status, got, _) = read(&down).await;
+    assert_chain_not_ready(status.as_u16(), &got);
+    assert_eq!(chain.reads(), 1);
+    let stored = state.front_door.card.lock().await.clone().unwrap();
+    assert_eq!((stored.seq, serde_json::to_value(stored.prices.page_msat).unwrap()), (1, page_msat));
+
+    // With a tip (a later one than at publish), it is re-signed once,
+    // anchored at that tip's epoch.
+    assert_eq!(body["card"]["prices"]["price_epoch"], 850_000 / 2016);
+    let up = Arc::new(AppState { chain: Arc::new(konsensus_chain::MockChainProvider::new()), ..(*down).clone() });
+    let (status, got, _) = read(&up).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["card"]["seq"], 2);
+    assert_eq!(got["card"]["prices"]["page_msat"], 2_000);
+    assert_eq!(got["card"]["prices"]["price_epoch"], 886_000 / 2016);
+}

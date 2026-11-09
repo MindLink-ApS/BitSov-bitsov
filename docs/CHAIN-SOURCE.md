@@ -229,17 +229,25 @@ same block), and treats it as not ready when:
 A not-ready tip refuses rather than going on with height 0: paid sends, call
 quotes, admission quotes and card publishing answer `503` with
 `"code":"not_ready","reason":"chain_unavailable"` before anything is paid or
-signed; a stranger's admission request gets the fixed
-`konsensus:not_ready:chain_unavailable` refusal; no price answer, price table or
-web manifest is sent; peer price tables are listed as `stale`. Chain-aware pricing
-refuses a price when a synced source's tip cannot be read; its existing static
-fallback when the source is not synced or has no fee estimate is unchanged.
+signed (a call quote also before its price query is sent); a stranger's
+admission request gets the fixed `konsensus:not_ready:chain_unavailable`
+refusal; no price answer, price table or web manifest is sent; peer price
+tables are listed as `stale`. A send that starts while the wallet is not
+money-ready reads no tip, so it can only go out at an established zero price;
+if the wallet becomes ready meanwhile, a price to pay is quoted again against a
+real tip. A published front door card whose page price changed is re-signed
+only against a usable tip (with that tip's epoch); an unchanged card is still
+served without one. Chain-aware pricing refuses a price when a synced source's
+tip cannot be read (also `not_ready`/`chain_unavailable` on these routes); its
+existing static fallback when the source is not synced or has no fee estimate is
+unchanged. Admission reuses a tip height for up to a minute, but not past the
+tip's age limit.
 
 Where the timestamp comes from: Bitcoin Core's `getblockheader` `time` for the
 block at `getblockcount`; Electrum's raw 80-byte header for that height, read
 and hashed by the node; Esplora's `/block/{hash}` `timestamp` for the hash at the
-tip height, as the server reports it. A header read is reused for at most 30
-seconds and is judged by its own timestamp. Block timestamps may lag real time
+tip height, as the server reports it. A usable header is reused for at most 30
+seconds and is judged by its own timestamp; a refused one is not kept. Block timestamps may lag real time
 by up to about an hour, so the mainnet limit leaves about two hours without a
 block. The mock chain (Light and Cloud tiers) is synthetic and has no limit.
 The source's own sync check is unchanged. Which network the source is on is

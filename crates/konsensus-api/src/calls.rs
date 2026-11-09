@@ -875,6 +875,8 @@ pub async fn peer_call_kind_price(state: &AppState, peer: &NodeId, kind: u16) ->
         )
         .with_reason("call_price_unknown")
     };
+    // No query is claimed or sent without a tip to check the answer against.
+    crate::error::chain_tip(state).await?;
     let now = Instant::now();
     // A query counts as asked only once it was sent (review N4): the slot is
     // claimed so concurrent callers share one frame, and given back if the

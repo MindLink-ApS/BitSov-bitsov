@@ -583,7 +583,7 @@ async fn create_event(
             .pricing
             .get_price_msat(KIND_CALENDAR_EVENT)
             .await
-            .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
+            .map_err(crate::error::pricing_error)?;
 
         let paid = create_payment_proof_with_fee_report(&state, price_msat, peer_id).await;
         let fee_ceiling = match &paid {
@@ -784,7 +784,7 @@ async fn update_event(
             .pricing
             .get_price_msat(KIND_CALENDAR_UPDATE)
             .await
-            .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
+            .map_err(crate::error::pricing_error)?;
         let paid = create_payment_proof_with_fee_report(&state, price_msat, peer_id).await;
         let fee_ceiling = match &paid {
             Ok((_, fee, _)) => *fee,
@@ -928,7 +928,7 @@ async fn create_rsvp(
         .pricing
         .get_price_msat(KIND_RSVP)
         .await
-        .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
+        .map_err(crate::error::pricing_error)?;
     let ((payment_hash, preimage, amount_msat), max_routing_fee_msat, settled_msat) =
         create_payment_proof_with_fee_report(&state, price_msat, &organizer_id).await?;
     let result = async {

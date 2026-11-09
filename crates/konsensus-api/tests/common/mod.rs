@@ -1189,6 +1189,30 @@ pub fn assert_chain_not_ready(status: u16, body: &serde_json::Value) {
     assert_eq!(status, 503, "{body}");
     assert_eq!(body["code"], "not_ready", "{body}");
     assert_eq!(body["reason"], "chain_unavailable", "{body}");
+    assert_eq!(body["retry_allowed"], true, "{body}");
+    // About the chain source, not the wallet.
+    assert!(body["error"].as_str().unwrap().contains("chain source"), "{body}");
+    assert!(body.get("money_ready").is_none(), "{body}");
+}
+
+/// A pricing engine that always answers like a chain-aware engine without a
+/// usable tip.
+pub struct ChainlessPricing;
+
+#[async_trait]
+impl PricingEngine for ChainlessPricing {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get_price_msat(&self, _kind: u16) -> Result<u64, PricingError> {
+        Err(PricingError::ChainUnavailable("chain tip unavailable".into()))
+    }
+    async fn get_category_price_msat(
+        &self,
+        _category: konsensus_core::kind::KindCategory,
+    ) -> Result<u64, PricingError> {
+        Err(PricingError::ChainUnavailable("chain tip unavailable".into()))
+    }
 }
 
 // ─── Stub: Pricing Engine ───────────────────────────────────────────

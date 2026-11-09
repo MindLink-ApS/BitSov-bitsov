@@ -128,25 +128,40 @@ pub struct MemberPaymentOutcome {
     pub code: Option<&'static str>,
 }
 
-async fn quoted_price(state: &AppState, peer: &NodeId, kind: u16, height: u64) -> Result<u64, ApiError> {
+/// The peer's fresh price for `kind` at `height`, else this node's own.
+async fn peer_or_own_price(state: &AppState, peer: &NodeId, kind: u16, height: u64) -> Result<u64, ApiError> {
+    match state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, MAX_PRICE_AGE).await {
+        Some(price) => Ok(price),
+        None => state.pricing.get_price_msat(kind).await.map_err(crate::error::pricing_error),
+    }
+}
+
+/// `tip` is the chain tip read when the send began, or `None` when the wallet
+/// was not money-ready then and no tip was read. A price without a tip is only
+/// a check for an established zero-price conversation: any price to pay is
+/// quoted again against a real tip (refused while there is none), even if the
+/// wallet became ready in between.
+async fn quoted_price(state: &AppState, peer: &NodeId, kind: u16, tip: Option<u64>) -> Result<u64, ApiError> {
     let ready = state.lightning.money_ready().await;
     if !ready && !state.session_manager.has_session(peer).await {
         return Err(ApiError::NotReady);
     }
-    let quote = async {
-        match state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, MAX_PRICE_AGE).await {
-            Some(price) => Ok(price),
-            None => state.pricing.get_price_msat(kind).await.map_err(|e| ApiError::Internal(format!("pricing error: {e}"))),
-        }
-    };
     // Preserve established zero-price conversations when a local quote is
     // available. Never wait on dynamic chain pricing or assume a free price.
+    let quote = peer_or_own_price(state, peer, kind, tip.unwrap_or(0));
     let price = if ready { quote.await? } else {
         tokio::time::timeout(Duration::from_millis(100), quote).await.map_err(|_| ApiError::NotReady)??
     };
     if super::caps::payable(price) > 0 || !state.session_manager.has_session(peer).await {
         crate::error::require_money_ready(state).await?;
     }
+    let price = match tip {
+        None if super::caps::payable(price) > 0 => {
+            let tip = crate::error::chain_tip(state).await?;
+            peer_or_own_price(state, peer, kind, tip).await?
+        }
+        _ => price,
+    };
     Ok(super::caps::payable(price))
 }
 
@@ -1975,7 +1990,7 @@ async fn request_admission_invoice(
         .pricing
         .get_price_msat(konsensus_core::kind::KIND_CHAT)
         .await
-        .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
+        .map_err(crate::error::pricing_error)?;
     let requested_msat = derive_admission_msat(peer_announced, own_price);
     let request_id = konsensus_core::admission_quote::request_id(
         peer_id, state.identity.node_id(), std::time::SystemTime::now()
@@ -3347,7 +3362,7 @@ pub(super) async fn compose_message_with_policy(
 
         // Not money-ready: no chain read; only an established zero price can
         // go out (`quoted_price`). Money-ready: a failed tip read refuses.
-        let current_block_height = if !state.lightning.money_ready().await { 0 } else { crate::error::chain_tip(&state).await? };
+        let current_block_height = if !state.lightning.money_ready().await { None } else { Some(crate::error::chain_tip(&state).await?) };
 
         let mut prices = Vec::new();
         for member in members.iter().filter(|m| *m != state.identity.node_id()) {
@@ -3543,7 +3558,7 @@ pub(super) async fn compose_peer(
         let mut admission = FirstContactCharge { operation: Some(operation.clone()), ..Default::default() };
         let recipient = Recipient::Node(peer_id);
 
-        let height = if state.lightning.money_ready().await { crate::error::chain_tip(&state).await? } else { 0 };
+        let height = if state.lightning.money_ready().await { Some(crate::error::chain_tip(&state).await?) } else { None };
         let mut price_msat = if req.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
             crate::handlers::browse::page_price(&state, peer_id, &req.plaintext, req.max_routing_fee_msat).await?
         } else {
@@ -3835,9 +3850,11 @@ pub(super) async fn compose_peer(
                     price_msat = target_price;
                 } else {
                     // A resumed admission may belong to another kind. Never
-                    // substitute this node's own price for the target's quote.
+                    // substitute this node's own price for the target's quote,
+                    // and never check that quote against a missing tip.
+                    let tip = match height { Some(tip) => tip, None => crate::error::chain_tip(&state).await? };
                     price_msat = state.peer_prices.get_fresh_discounted_peer_price(
-                        &peer_id, req.kind, height, MAX_PRICE_AGE,
+                        &peer_id, req.kind, tip, MAX_PRICE_AGE,
                     ).await.map(super::caps::payable).ok_or_else(|| ApiError::Lightning(
                         "prior admission is paid, but the target quote for this kind is unknown".into()
                     ))?;

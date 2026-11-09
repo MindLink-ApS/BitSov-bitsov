@@ -282,13 +282,14 @@ pub(crate) async fn issue_card(state: &AppState) -> Result<Introduction, ApiErro
         )
     })?;
     let endpoint = settings.require_endpoint("introduction_unavailable")?;
+    // The tip first: no price is read or signed without one.
+    let height = crate::error::chain_tip(state).await?;
     let chat = state
         .pricing
         .get_price_msat(konsensus_core::kind::KIND_CHAT)
         .await
-        .map_err(|e| ApiError::Internal(format!("price unavailable: {e}")))?;
+        .map_err(|e| crate::error::pricing_error_or(e, |e| ApiError::Internal(format!("price unavailable: {e}"))))?;
     let (admission_msat, message_msat) = first_contact_prices(chat, state.gate.min_admission_cost_msat());
-    let height = crate::error::chain_tip(state).await?;
     let mut intro_id = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut intro_id);
     let card = Introduction::issue(

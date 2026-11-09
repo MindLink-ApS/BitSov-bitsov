@@ -31,7 +31,10 @@ also live on the corresponding GitHub pre-release pages.
   pricing at height 0. With Bitcoin Core, Electrum or Esplora, the tip is also
   not ready when its best block is older than 3 hours on `bitcoin` or 24 hours on
   test networks (no limit on regtest). See `docs/CHAIN-SOURCE.md`, "Tip
-  readiness". Prices are unchanged.
+  readiness". A call quote checks the tip before it sends a price query; a send
+  begun while the wallet was not ready re-quotes any price to pay against a real
+  tip; a changed front door page price is re-signed only with a tip. These
+  refusals say the chain source has no current tip. Prices are unchanged.
 - A node that lost its E2EE session with a connected peer gets it back on the
   same connection. When the lower-id node lost it, about 25 seconds: the higher-id
   peer now answers a PrekeyOffer with its own, at most once per ten seconds per

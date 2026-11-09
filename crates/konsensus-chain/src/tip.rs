@@ -78,20 +78,36 @@ impl FreshTip {
         self.max_age
     }
 
-    /// The best block header, if it is a usable tip.
+    /// The best block header, if it is a usable tip. Only a usable header is
+    /// cached; a refused one (stale or height zero) is dropped, so a source
+    /// that recovers is seen on the next read.
     async fn tip(&self) -> Result<BlockHeader, ChainError> {
-        let header = {
-            let mut cached = self.cached.lock().await;
-            match cached.as_ref() {
-                Some((header, read_at)) if read_at.elapsed() < TIP_CACHE_TTL => header.clone(),
-                _ => {
-                    // A failed read is not cached: the next caller asks again.
-                    let header = self.inner.get_best_block_header().await?;
-                    *cached = Some((header.clone(), Instant::now()));
-                    header
-                }
-            }
+        let mut cached = self.cached.lock().await;
+        let reused = cached
+            .as_ref()
+            .filter(|(_, read_at)| read_at.elapsed() < TIP_CACHE_TTL)
+            .map(|(header, _)| header.clone());
+        let fetched = reused.is_none();
+        let header = match reused {
+            Some(header) => header,
+            // A failed read is not cached: the next caller asks again.
+            None => self.inner.get_best_block_header().await?,
         };
+        match self.usable(&header) {
+            Ok(()) => {
+                if fetched {
+                    *cached = Some((header.clone(), Instant::now()));
+                }
+                Ok(header)
+            }
+            Err(error) => {
+                *cached = None;
+                Err(error)
+            }
+        }
+    }
+
+    fn usable(&self, header: &BlockHeader) -> Result<(), ChainError> {
         if header.height == 0 {
             return Err(ChainError::NotAvailable("chain tip is height zero".into()));
         }
@@ -110,7 +126,7 @@ impl FreshTip {
                 )));
             }
         }
-        Ok(header)
+        Ok(())
     }
 }
 
@@ -154,6 +170,10 @@ impl ChainProvider for FreshTip {
 
     async fn is_synced_with_height(&self, height: u64) -> bool {
         self.inner.is_synced_with_height(height).await
+    }
+
+    async fn tip_is_fresh(&self) -> bool {
+        self.tip().await.is_ok()
     }
 }
 

@@ -828,6 +828,7 @@ async fn page_request_invalid_json_returns_none() {
         &transport,
         &audit,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
     )
     .await;
 
@@ -873,6 +874,7 @@ async fn page_request_no_content_server_returns_label() {
         &transport,
         &audit,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
     )
     .await;
 
@@ -930,6 +932,7 @@ async fn page_request_with_content_server_serves_page() {
         &transport,
         &audit,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
     )
     .await;
 
@@ -986,6 +989,7 @@ async fn page_request_nonexistent_path_returns_label() {
         &transport,
         &audit,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
     )
     .await;
 
@@ -3827,6 +3831,7 @@ async fn porch_card_repricing_failure_returns_correlated_error() {
         &bob,
         &pricing,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
         1001,
     )
     .await;

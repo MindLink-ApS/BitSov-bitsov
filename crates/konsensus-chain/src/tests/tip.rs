@@ -217,3 +217,22 @@ async fn other_reads_pass_through() {
     assert_eq!(tip.trust_level(), TrustLevel::FullValidation);
     assert_eq!(tip.max_age(), Some(MAINNET_MAX_TIP_AGE));
 }
+
+#[tokio::test]
+async fn a_refused_header_is_not_cached() {
+    let source = Source::new(900_000, MAINNET_MAX_TIP_AGE.as_secs() + 60);
+    let tip = FreshTip::new(source.clone(), Some(MAINNET_MAX_TIP_AGE));
+    assert!(tip.get_block_height().await.is_err());
+    assert!(!tip.tip_is_fresh().await);
+    // The source catches up: the next read sees it at once.
+    source.age_secs.store(60, Ordering::SeqCst);
+    assert_eq!(tip.get_block_height().await.unwrap(), 900_000);
+    assert!(tip.tip_is_fresh().await);
+    assert_eq!(source.header_reads.load(Ordering::SeqCst), 3);
+    // Zero, too.
+    let source = Source::new(0, 0);
+    let tip = FreshTip::new(source.clone(), None);
+    assert!(tip.get_block_height().await.is_err());
+    source.height.store(10, Ordering::SeqCst);
+    assert_eq!(tip.get_block_height().await.unwrap(), 10);
+}
