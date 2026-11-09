@@ -134,6 +134,14 @@ pub trait ChainProvider: Send + Sync {
     async fn tip_is_fresh(&self) -> bool {
         true
     }
+
+    /// A refusal this source has latched for good (for example, it answered
+    /// on another network than the configured one). Anything that keeps chain
+    /// data from this source checks it before reusing that data. Sources
+    /// without such a check never refuse.
+    fn refusal(&self) -> Result<(), ChainError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -96,8 +96,7 @@ async fn get_own_pricing(
     State(state): State<Arc<AppState>>,
 ) -> Result<(DataFreshness, Json<OwnPricingResponse>), ApiError> {
     let read_at = SystemTime::now();
-    let block_height = state.chain.get_block_height().await.map_err(|_| ApiError::NotReady)?;
-    if block_height == 0 { return Err(ApiError::NotReady); }
+    let block_height = crate::error::chain_tip(&state).await?;
 
     // Build price table from our own pricing engine
     let categories = [
@@ -115,6 +114,11 @@ async fn get_own_pricing(
         match state.pricing.get_category_price_msat(cat).await {
             Ok(price) => {
                 prices.insert(category_to_string(cat), price);
+            }
+            // No table without a tip: the typed readiness refusal, never a
+            // partial or empty one.
+            Err(konsensus_core::traits::pricing::PricingError::ChainUnavailable(_)) => {
+                return Err(ApiError::ChainNotReady);
             }
             Err(e) => {
                 tracing::warn!(category = %category_to_string(cat), error = %e, "failed to get price for category");

@@ -330,6 +330,25 @@ pub(crate) async fn chain_tip(state: &crate::state::AppState) -> Result<u64, Api
     chain_tip_of(state.chain.as_ref()).await
 }
 
+/// Evidence that this send read a usable chain tip. Only [`observe_tip`]
+/// makes one, and every function that dispatches a peer payment takes one:
+/// a path that never read a usable tip cannot pay.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ObservedTip {
+    height: u64,
+}
+
+impl ObservedTip {
+    pub(crate) fn height(&self) -> u64 {
+        self.height
+    }
+}
+
+/// Read the tip for a payment about to be dispatched ([`chain_tip`]).
+pub(crate) async fn observe_tip(state: &crate::state::AppState) -> Result<ObservedTip, ApiError> {
+    chain_tip(state).await.map(|height| ObservedTip { height })
+}
+
 /// [`chain_tip`] for a caller holding only the chain source.
 pub(crate) async fn chain_tip_of(
     chain: &dyn konsensus_core::traits::chain::ChainProvider,

@@ -2591,3 +2591,39 @@ async fn peer_tables_are_stale_without_a_chain_tip() {
     }
     assert_eq!(chain.reads(), 2);
 }
+
+async fn own_pricing(state: Arc<AppState>) -> (u16, serde_json::Value) {
+    let req = Request::builder()
+        .uri("/api/v1/pricing")
+        .header("authorization", auth_header(&state))
+        .body(Body::empty())
+        .unwrap();
+    let resp = build_router(state).oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let body = axum::body::to_bytes(resp.into_body(), 65_536).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// T2: the own price table needs a tip, with the chain refusal (not the
+/// Lightning one) when there is none.
+#[tokio::test]
+async fn own_pricing_without_a_chain_tip_is_the_chain_refusal() {
+    let base = test_state();
+    let state = Arc::new(AppState { chain: Arc::new(TipDownChain::down()), ..(*base).clone() });
+    let (status, body) = own_pricing(state).await;
+    assert_chain_not_ready(status, &body);
+}
+
+/// T2: a chain-aware engine that loses the tip after the route's own check
+/// refuses the table; it is never served partial or empty.
+#[tokio::test]
+async fn own_pricing_refuses_when_chain_aware_prices_lose_the_tip() {
+    let base = test_state();
+    let chain = Arc::new(TipDownChain::after(1));
+    let pricing = Arc::new(konsensus_pricing::ChainAwarePricingEngine::new(Default::default(), chain.clone()));
+    let state = Arc::new(AppState { chain: chain.clone(), pricing, ..(*base).clone() });
+    let (status, body) = own_pricing(state).await;
+    assert_chain_not_ready(status, &body);
+    assert!(body.get("prices").is_none(), "{body}");
+    assert_eq!(chain.reads(), 2, "the route's check, then the engine's");
+}

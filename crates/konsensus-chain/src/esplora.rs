@@ -387,6 +387,9 @@ impl EsploraProvider {
 
 #[async_trait]
 impl ChainProvider for EsploraProvider {
+    fn refusal(&self) -> Result<(), ChainError> {
+        self.network.as_ref().map_or(Ok(()), |gate| gate.refusal())
+    }
     fn chain_view(&self) -> konsensus_core::traits::chain::ChainView {
         konsensus_core::traits::chain::ChainView {
             backend: "esplora",

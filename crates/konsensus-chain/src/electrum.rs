@@ -237,6 +237,9 @@ fn rpc_error(_: electrum_client::Error) -> ChainError {
 
 #[async_trait]
 impl ChainProvider for ElectrumProvider {
+    fn refusal(&self) -> Result<(), ChainError> {
+        self.network.as_ref().map_or(Ok(()), |gate| gate.refusal())
+    }
     fn trust_level(&self) -> TrustLevel {
         TrustLevel::ServerTrust
     }

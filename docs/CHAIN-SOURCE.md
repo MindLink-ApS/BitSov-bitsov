@@ -243,6 +243,15 @@ existing static fallback when the source is not synced or has no fee estimate is
 unchanged. Admission reuses a tip height for up to a minute, but not past the
 tip's age limit.
 
+Every payment of a peer's price (messages, rooms, porch pages, files,
+calendar, call minutes, admission) reads the tip once more at the payment
+itself, whatever priced it: with no usable tip, nothing is paid. Payments the
+owner directs (paying an invoice, keysend, on-chain sends, channel opens,
+liquidity, sponsor gifts) are not priced against the tip and do not read it.
+
+A wrapped source that has refused itself for good (another network) serves
+no kept tip either.
+
 Where the timestamp comes from: Bitcoin Core's `getblockheader` `time` for the
 block at `getblockcount`; Electrum's raw 80-byte header for that height, read
 and hashed by the node; Esplora's `/block/{hash}` `timestamp` for the hash at the

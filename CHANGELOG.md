@@ -34,7 +34,10 @@ also live on the corresponding GitHub pre-release pages.
   readiness". A call quote checks the tip before it sends a price query; a send
   begun while the wallet was not ready re-quotes any price to pay against a real
   tip; a changed front door page price is re-signed only with a tip. These
-  refusals say the chain source has no current tip. Prices are unchanged.
+  refusals say the chain source has no current tip. Every payment of a peer's
+  price also reads the tip at the payment itself and is refused without one,
+  and a kept tip is dropped once its source refuses its network. Prices are
+  unchanged.
 - A node that lost its E2EE session with a connected peer gets it back on the
   same connection. When the lower-id node lost it, about 25 seconds: the higher-id
   peer now answers a PrekeyOffer with its own, at most once per ten seconds per

@@ -83,6 +83,12 @@ impl FreshTip {
     /// that recovers is seen on the next read.
     async fn tip(&self) -> Result<BlockHeader, ChainError> {
         let mut cached = self.cached.lock().await;
+        // A source that has since refused itself (another network) serves no
+        // tip, kept or new.
+        if let Err(error) = self.inner.refusal() {
+            *cached = None;
+            return Err(error);
+        }
         let reused = cached
             .as_ref()
             .filter(|(_, read_at)| read_at.elapsed() < TIP_CACHE_TTL)
@@ -174,6 +180,10 @@ impl ChainProvider for FreshTip {
 
     async fn tip_is_fresh(&self) -> bool {
         self.tip().await.is_ok()
+    }
+
+    fn refusal(&self) -> Result<(), ChainError> {
+        self.inner.refusal()
     }
 }
 
