@@ -11,6 +11,47 @@ does not run a default chain server. Existing Esplora configurations and fresh
 Electrum is also supported with an explicit server. Onboarding selection and
 Neutrino are later steps.
 
+## Network check
+
+The chain source must be on the network set in `[lightning] network`. Nothing
+reads or syncs chain data from a source until it has answered on that network:
+Bitcoin Core through `getblockchaininfo` (`chain`); Electrum and Esplora with
+their height-0 header, hashed by the node (Esplora: `/block-height/0`, then
+`/block/<hash>/header`). A hash string alone, or a Core reply without `chain`,
+is not an answer.
+
+- **Another network:** the node refuses to start and names both networks; it
+  tries no other source. Every configured Esplora endpoint is checked, LDK's
+  own `esplora_url` and fallback included, before any node file is written. A source
+  found on another network later is refused for the rest of the run, and
+  Lightning money stays not ready.
+- **No answer yet:** the node starts, not ready. The embedded LDK node is not
+  built and syncs nothing; it retries, and starts once the source answers on
+  the configured network. With an Esplora fallback, LDK starts on the endpoints
+  that have answered. With `credentials_file`, a primary that has not answered
+  (for example because its token request failed) is skipped for that start:
+  LDK uses the verified fallback, which never receives credentials, and no
+  token is requested. Each Esplora endpoint is checked on its own, within ten
+  seconds (four per request), so a slow or silent endpoint never discards
+  another endpoint's answer.
+- **Asked again:** after a lost connection, a timeout or a reply cut short,
+  before the next use; at least every 60 seconds otherwise. A cached Esplora
+  height is served only while the check of the endpoint that served it holds,
+  and never after a refusal; after a refusal neither Esplora nor Electrum
+  counts as synced on an earlier height. Electrum opens a new connection per
+  query and is asked on each one.
+  Every `getblockchaininfo` reply from Core is also compared. The running LDK
+  node asks the endpoints its client uses every 60 seconds and is not
+  money-ready while none has answered for three minutes.
+- **Recovery:** `konsensus recover` checks its chain source the same way.
+
+All signets share one genesis block, and Bitcoin Core reports `signet` for each
+of them, so a custom signet passes as `signet`.
+
+Limit: `[chain]` has no network setting of its own. With LND, LNbits or mock
+Lightning, which set no network, a real `[chain]` source is not checked; the
+node logs a warning at start.
+
 ## Esplora fallbacks
 
 `[chain] api_url` remains the primary chain/pricing source. Set
@@ -267,8 +308,9 @@ LDK transport applies live headers to wallet sync, fees, funding checks and
 broadcasts, including client clones; it does not require a restart every five
 minutes. Token POSTs have a four-second timeout; API requests retain the caller's
 budget (ten seconds for LDK and the configured timeout for the chain provider,
-with the existing shorter height/readiness deadline). Authentication errors and
-HTTP error bodies are redacted. If all endpoints fail, LDK retains the primary's
+with the existing shorter height/readiness deadline, and the configured timeout
+for a recovery broadcast); a request without its own budget gets 30 seconds. Authentication errors and HTTP error bodies are
+redacted. If all endpoints fail, LDK retains the primary's
 HTTP status when available; rate-limit failures keep their existing 429 policy.
 
 Chain requests use the existing ordered fallback list when token acquisition,

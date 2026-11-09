@@ -31,6 +31,21 @@ pub enum PaidAcceptance {
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
+    async fn record_upgrade_envelope(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
+        self.get_message(id).await
+    }
+
+    /// after is the previous RecordRow::scan_after opaque cursor, not its ID.
+    async fn record_upgrade_rows(&self, _table: crate::record_upgrade::RecordTable, _after: Option<&str>, _limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {
+        Err(StorageError::Unsupported("record format upgrade".into()))
+    }
+    async fn record_upgrade_row(&self, _table: crate::record_upgrade::RecordTable, _id: &str) -> Result<Option<crate::record_upgrade::RecordRow>, StorageError> {
+        Err(StorageError::Unsupported("record format reread".into()))
+    }
+    async fn record_upgrade_replace(&self, _table: crate::record_upgrade::RecordTable, _old: &crate::record_upgrade::RecordRow, _new: &crate::record_upgrade::RecordRow) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("record format upgrade".into()))
+    }
+
     async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         let _ = id;
         Err(StorageError::Unsupported("starter newcomer".into()))

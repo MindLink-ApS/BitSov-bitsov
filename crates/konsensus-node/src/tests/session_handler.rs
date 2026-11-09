@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::*;
 use konsensus_storage::{OnboardingStateRecord, Storage};
 use sha2::Digest;
+use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 
 fn test_peer_id() -> NodeId {
@@ -1310,12 +1311,16 @@ async fn invoice_requested_creates_invoice_on_local_wallet() {
     handle_invoice_requested(
         &peer_id,
         "req-inv-1",
-        25_000,
+        1_000,
         "konsensus message",
+        &admission_pricing(),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
         &lightning,
         &transport,
         "127.0.0.1".parse().unwrap(),
         &mut crate::invoice_refusals::RefusalLimits::default(),
+        0,
+        &mut ready_invoice_book().await,
     )
     .await;
 
@@ -1331,9 +1336,11 @@ async fn invoice_requested_creates_invoice_on_local_wallet() {
 async fn generic_invoice_handler_cannot_issue_block_purpose_invoices() {
     let lightning: Arc<dyn LightningProvider> = Arc::new(konsensus_lightning::MockLightningProvider::new());
     handle_invoice_requested(&test_peer_id(), "generic-block", 23_000,
-        "konsensus:call_block:0123456789abcdef0123456789abcdef:0", &lightning,
+        "konsensus:call_block:0123456789abcdef0123456789abcdef:0", &admission_pricing(),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(), &lightning,
         &make_gossip_test_transport(), "127.0.0.1".parse().unwrap(),
-        &mut crate::invoice_refusals::RefusalLimits::default()).await;
+        &mut crate::invoice_refusals::RefusalLimits::default(), 0,
+        &mut ready_invoice_book().await).await;
     assert!(lightning.list_payments(10).await.unwrap().is_empty());
 }
 
@@ -1373,12 +1380,16 @@ async fn invoice_requested_sends_error_on_lightning_failure() {
     handle_invoice_requested(
         &peer_id,
         "req-inv-fail",
-        25_000,
+        1_000,
         "konsensus message",
+        &admission_pricing(),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
         &lightning,
         &transport,
         "127.0.0.1".parse().unwrap(),
         &mut crate::invoice_refusals::RefusalLimits::default(),
+        0,
+        &mut ready_invoice_book().await,
     )
     .await;
     // No panic = success
@@ -1392,24 +1403,82 @@ fn admission_pricing() -> Arc<dyn konsensus_core::traits::pricing::PricingEngine
     ))
 }
 
+/// A request naming its service (#403) is priced locally for that kind: an
+/// amount above this node's price for the kind is refused even when it is
+/// under the node's highest price, which a legacy request is still held to.
 #[tokio::test]
-async fn privileged_invoice_request_honours_caller_amount_unchanged() {
-    // Whitelist/promoted peers keep the exact pre-M1b behaviour: the caller's
-    // amount is honoured verbatim. Byte-identical to the legacy path.
+async fn service_invoice_is_priced_for_its_own_kind() {
+    use konsensus_core::gate::{price_with_floor_msat, service_invoice_purpose};
+    use konsensus_core::kind::KIND_CHAT;
     let peer_id = test_peer_id();
     let transport = make_gossip_test_transport();
     let lightning: Arc<dyn LightningProvider> =
         Arc::new(konsensus_lightning::MockLightningProvider::new());
     let pricing = admission_pricing();
+    let ceiling = configured_price_ceiling(pricing.as_ref()).await.unwrap();
+    let chat = price_with_floor_msat(pricing.get_price_msat(KIND_CHAT).await.unwrap(), 0);
+    assert!(chat < ceiling, "fixture needs a kind priced below the node's highest price");
+    let mut invoices = ready_invoice_book().await;
+    let service = service_invoice_purpose(KIND_CHAT);
+    for (request_id, amount, purpose) in [
+        ("svc-over", chat + 1, service.as_str()),
+        ("svc-exact", chat, service.as_str()),
+        ("legacy-over-kind", chat + 1, "konsensus message"),
+        ("svc-unknown-kind", chat, "konsensus:service:"),
+    ] {
+        handle_invoice_requested_gated(
+            &peer_id,
+            request_id,
+            amount,
+            purpose,
+            true,
+            &pricing,
+            &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            &crate::session_handler::ConfiguredPriceCeilingCache::new(),
+            &lightning,
+            &transport,
+            &test_peer_id(),
+            "127.0.0.1".parse().unwrap(),
+            &mut crate::admission_quotes::AdmissionQuotes::default(),
+            &konsensus_api::membrane::Membrane::with_capacity(8),
+            &mut crate::invoice_refusals::RefusalLimits::default(),
+            0,
+            &mut invoices,
+        )
+        .await;
+    }
+    let mut amounts: Vec<u64> = lightning
+        .list_payments(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|payment| payment.amount_msat)
+        .collect();
+    amounts.sort_unstable();
+    // svc-over refused; svc-exact issued; the legacy request keeps the node-wide
+    // ceiling; a malformed service purpose is a legacy request.
+    assert_eq!(amounts, vec![chat, chat, chat + 1]);
+}
+
+#[tokio::test]
+async fn privileged_invoice_above_configured_price_is_refused_not_clamped() {
+    let peer_id = test_peer_id();
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+    let ceiling = configured_price_ceiling(pricing.as_ref()).await.unwrap();
+    let mut invoices = ready_invoice_book().await;
 
     handle_invoice_requested_gated(
         &peer_id,
-        "req-priv",
-        25_000,
+        "req-under",
+        ceiling - 1,
         "konsensus message",
         true,
         &pricing,
         &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
         &lightning,
         &transport,
         &test_peer_id(),
@@ -1418,18 +1487,540 @@ async fn privileged_invoice_request_honours_caller_amount_unchanged() {
         &konsensus_api::membrane::Membrane::with_capacity(8),
         &mut crate::invoice_refusals::RefusalLimits::default(),
         0,
+        &mut invoices,
+    )
+    .await;
+    handle_invoice_requested_gated(
+        &peer_id,
+        "req-over",
+        ceiling.saturating_mul(50),
+        "konsensus message",
+        true,
+        &pricing,
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
+        &lightning,
+        &transport,
+        &test_peer_id(),
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &konsensus_api::membrane::Membrane::with_capacity(8),
+        &mut crate::invoice_refusals::RefusalLimits::default(),
+        0,
+        &mut invoices,
     )
     .await;
 
-    let payments = lightning.list_payments(10).await.unwrap();
-    assert_eq!(
-        payments.len(),
-        1,
-        "privileged request must create exactly one invoice"
+    let mut amounts: Vec<u64> = lightning
+        .list_payments(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|payment| payment.amount_msat)
+        .collect();
+    amounts.sort_unstable();
+    // Over the ceiling: refused (PRICE_CHANGED), never a reduced invoice the
+    // sender would reject anyway.
+    assert_eq!(amounts, vec![ceiling - 1]);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn issue_privileged_invoice(
+    peer: &NodeId,
+    request_id: &str,
+    amount_msat: u64,
+    purpose: &str,
+    lightning: &Arc<dyn LightningProvider>,
+    transport: &Arc<NoiseTransport>,
+    pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
+    invoices: &mut crate::peer_invoices::PeerInvoiceBook,
+) {
+    handle_invoice_requested_gated(
+        peer,
+        request_id,
+        amount_msat,
+        purpose,
+        true,
+        pricing,
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
+        lightning,
+        transport,
+        &test_peer_id(),
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &konsensus_api::membrane::Membrane::with_capacity(8),
+        &mut crate::invoice_refusals::RefusalLimits::default(),
+        0,
+        invoices,
+    )
+    .await;
+}
+
+async fn pending_incoming_count(lightning: &Arc<dyn LightningProvider>) -> usize {
+    use konsensus_core::traits::lightning::{PaymentDirection, PaymentStatus};
+    lightning
+        .list_payments(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|payment| {
+            payment.status == PaymentStatus::Pending
+                && payment.direction == PaymentDirection::Incoming
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn privileged_invoice_flood_holds_peer_and_global_caps() {
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+    let mut invoices = ready_invoice_book().await;
+    let peer_cap = crate::peer_invoices::PEER_OUTSTANDING_CAP;
+    let global_cap = crate::peer_invoices::GLOBAL_OUTSTANDING_CAP;
+
+    for peer_byte in 1..=global_cap / peer_cap {
+        let peer_id = NodeId::from_bytes([u8::try_from(peer_byte).unwrap(); 32]);
+        for n in 0..(peer_cap + 2) {
+            issue_privileged_invoice(
+                &peer_id,
+                &format!("flood-{peer_byte}-{n}"),
+                1_000,
+                "konsensus message",
+                &lightning,
+                &transport,
+                &pricing,
+                &mut invoices,
+            )
+            .await;
+        }
+    }
+    assert_eq!(pending_incoming_count(&lightning).await, global_cap);
+
+    issue_privileged_invoice(
+        &NodeId::from_bytes([255u8; 32]),
+        "flood-extra",
+        1_000,
+        "konsensus message",
+        &lightning,
+        &transport,
+        &pricing,
+        &mut invoices,
+    )
+    .await;
+    assert_eq!(pending_incoming_count(&lightning).await, global_cap);
+}
+
+#[tokio::test]
+async fn expired_unpaid_peer_invoice_is_removed() {
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+    let mut invoices = ready_invoice_book().await;
+    issue_privileged_invoice(
+        &test_peer_id(),
+        "cleanup",
+        1_000,
+        "konsensus message",
+        &lightning,
+        &transport,
+        &pricing,
+        &mut invoices,
+    )
+    .await;
+    let created = lightning.list_payments(10).await.unwrap()[0].timestamp;
+    crate::peer_invoices::purge_expired_peer_invoices(
+        &mut invoices,
+        lightning.as_ref(),
+        created.saturating_add(30),
+    )
+    .await;
+    assert_eq!(pending_incoming_count(&lightning).await, 1);
+    crate::peer_invoices::purge_expired_peer_invoices(
+        &mut invoices,
+        lightning.as_ref(),
+        created.saturating_add(u64::from(crate::peer_invoices::INVOICE_EXPIRY_SECS)),
+    )
+    .await;
+    assert_eq!(pending_incoming_count(&lightning).await, 0);
+}
+
+#[tokio::test]
+async fn settled_peer_invoice_frees_its_slot_and_remains_in_the_wallet() {
+    use konsensus_core::traits::lightning::{PaymentDirection, PaymentStatus};
+    let transport = make_gossip_test_transport();
+    let mock = konsensus_lightning::MockLightningProvider::new();
+    let paid = mock
+        .create_invoice(
+            1_000,
+            "konsensus:paid",
+            crate::peer_invoices::INVOICE_EXPIRY_SECS,
+        )
+        .await
+        .unwrap();
+    let lightning: Arc<dyn LightningProvider> = Arc::new(mock);
+    let pricing = admission_pricing();
+    let mut invoices = ready_invoice_book().await;
+    let peer_id = test_peer_id();
+    invoices.commit(
+        peer_id,
+        paid.payment_hash.clone(),
+        paid.created_at
+            .saturating_add(u64::from(crate::peer_invoices::INVOICE_EXPIRY_SECS)),
     );
+    for n in 0..crate::peer_invoices::PEER_OUTSTANDING_CAP {
+        issue_privileged_invoice(
+            &peer_id,
+            &format!("slot-{n}"),
+            1_000,
+            "konsensus message",
+            &lightning,
+            &transport,
+            &pricing,
+            &mut invoices,
+        )
+        .await;
+    }
     assert_eq!(
-        payments[0].amount_msat, 25_000,
-        "caller amount honoured for privileged peer"
+        pending_incoming_count(&lightning).await,
+        crate::peer_invoices::PEER_OUTSTANDING_CAP
+    );
+    lightning.pay_invoice(&paid.bolt11).await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let result = crate::peer_invoices::reconcile(invoices.clone(), lightning.clone(), now).await;
+    invoices.apply_reconciliation(result);
+    issue_privileged_invoice(
+        &peer_id,
+        "after-payment",
+        1_000,
+        "konsensus message",
+        &lightning,
+        &transport,
+        &pricing,
+        &mut invoices,
+    )
+    .await;
+    assert_eq!(
+        pending_incoming_count(&lightning).await,
+        crate::peer_invoices::PEER_OUTSTANDING_CAP
+    );
+    let settled = lightning
+        .get_payment_status(&paid.payment_hash)
+        .await
+        .unwrap();
+    assert_eq!(settled.status, PaymentStatus::Settled);
+    assert_eq!(settled.direction, PaymentDirection::Incoming);
+}
+
+#[tokio::test]
+async fn zero_amount_service_invoice_is_refused_without_wallet_work() {
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+    let mut invoices = ready_invoice_book().await;
+    issue_privileged_invoice(
+        &test_peer_id(),
+        "zero",
+        0,
+        "konsensus message",
+        &lightning,
+        &transport,
+        &pricing,
+        &mut invoices,
+    )
+    .await;
+    assert!(lightning.list_payments(10).await.unwrap().is_empty());
+}
+
+struct SwitchPricing {
+    fail: std::sync::atomic::AtomicBool,
+    price: u64,
+}
+
+#[async_trait::async_trait]
+impl konsensus_core::traits::pricing::PricingEngine for SwitchPricing {
+    async fn get_price_msat(
+        &self,
+        _: u16,
+    ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        self.quote()
+    }
+
+    async fn get_category_price_msat(
+        &self,
+        _: konsensus_core::kind::KindCategory,
+    ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        self.quote()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl SwitchPricing {
+    fn quote(&self) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(konsensus_core::traits::pricing::PricingError::Other(
+                "unavailable".into(),
+            ))
+        } else {
+            Ok(self.price)
+        }
+    }
+}
+
+struct VariablePricing {
+    price: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl konsensus_core::traits::pricing::PricingEngine for VariablePricing {
+    async fn get_price_msat(
+        &self,
+        _: u16,
+    ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        Ok(self.price.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    async fn get_category_price_msat(
+        &self,
+        _: konsensus_core::kind::KindCategory,
+    ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        Ok(self.price.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[tokio::test]
+async fn failed_price_ceiling_lookups_release_their_in_flight_slot() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let pricing = Arc::new(SwitchPricing {
+        fail: AtomicBool::new(true),
+        price: 4_000,
+    });
+    let cache = ConfiguredPriceCeilingCache::new();
+    let engine: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = pricing.clone();
+    for _ in 0..super::MAX_CONCURRENT_PRICE_CEILING_LOOKUPS {
+        assert_eq!(
+            cache.get(engine.clone()).await,
+            Err("konsensus:price_unavailable")
+        );
+    }
+    pricing.fail.store(false, Ordering::SeqCst);
+    assert_eq!(cache.get(engine).await, Ok(4_000));
+}
+
+#[tokio::test(start_paused = true)]
+async fn configured_price_ceiling_refreshes_after_price_changes() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let pricing = Arc::new(VariablePricing {
+        price: AtomicU64::new(2_000),
+    });
+    let cache = ConfiguredPriceCeilingCache::new();
+    let engine: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = pricing.clone();
+    assert_eq!(cache.get(engine.clone()).await.unwrap(), 2_000);
+    pricing.price.store(7_000, Ordering::SeqCst);
+    assert_eq!(
+        cache.get(engine.clone()).await.unwrap(),
+        7_000,
+        "a changed tariff must not be truncated by a previously successful ceiling"
+    );
+    pricing.price.store(9_000, Ordering::SeqCst);
+    assert_eq!(cache.get(engine).await.unwrap(), 9_000);
+}
+
+#[tokio::test]
+async fn below_admission_floor_service_invoice_is_refused_and_releases_its_rate_slot() {
+    use konsensus_message::{ReachabilityMode, TransportConfig};
+    let (_, requester_id) = NodeIdentity::generate().unwrap();
+    let (_, recipient_id) = NodeIdentity::generate().unwrap();
+    let peer = *requester_id.node_id();
+    let recipient = *recipient_id.node_id();
+    let make = |id: NodeIdentity| {
+        Arc::new(NoiseTransport::new(
+            Arc::new(id),
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                whitelist: vec![],
+                ..Default::default()
+            },
+        ))
+    };
+    let source = make(requester_id);
+    let target = make(recipient_id);
+    target.start_listener().await.unwrap();
+    source
+        .connect(&recipient, &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+    let ceiling = configured_price_ceiling(pricing.as_ref()).await.unwrap();
+    let floor = 8_000u64;
+    assert!(floor > 1_000 && floor < ceiling);
+    let mut invoices = ready_invoice_book().await;
+    handle_invoice_requested_gated(
+        &peer,
+        "below-floor",
+        floor - 1,
+        "konsensus message",
+        true,
+        &pricing,
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &ConfiguredPriceCeilingCache::new(),
+        &lightning,
+        &target,
+        &recipient,
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &konsensus_api::membrane::Membrane::with_capacity(8),
+        &mut crate::invoice_refusals::RefusalLimits::default(),
+        floor,
+        &mut invoices,
+    )
+    .await;
+    let refusal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match source.recv_control().await {
+                Some(ControlEvent::PeerConnected { .. }) => {}
+                Some(event) => break event,
+                None => panic!("control channel closed before the floor refusal"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    match refusal {
+        ControlEvent::InvoiceErrorReceived {
+            request_id, reason, ..
+        } => {
+            assert_eq!(request_id, "below-floor");
+            assert_eq!(
+                reason,
+                konsensus_api::invoice_refusal::BELOW_ADMISSION_FLOOR
+            );
+        }
+        other => panic!("expected an admission-floor refusal, got {other:?}"),
+    }
+    assert!(lightning.list_payments(10).await.unwrap().is_empty());
+
+    let mut refusals = crate::invoice_refusals::RefusalLimits::default();
+    for n in 1..crate::peer_invoices::PEER_RATE_BURST {
+        handle_invoice_requested_gated(
+            &peer,
+            &format!("below-{n}"),
+            floor - 1,
+            "konsensus message",
+            true,
+            &pricing,
+            &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            &ConfiguredPriceCeilingCache::new(),
+            &lightning,
+            &target,
+            &recipient,
+            "127.0.0.1".parse().unwrap(),
+            &mut crate::admission_quotes::AdmissionQuotes::default(),
+            &konsensus_api::membrane::Membrane::with_capacity(8),
+            &mut refusals,
+            floor,
+            &mut invoices,
+        )
+        .await;
+    }
+    assert!(
+        lightning.list_payments(10).await.unwrap().is_empty(),
+        "a burst of below-floor requests must not mint invoices"
+    );
+
+    handle_invoice_requested_gated(
+        &peer,
+        "at-raised-floor",
+        ceiling.saturating_add(1),
+        "konsensus message",
+        true,
+        &pricing,
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &ConfiguredPriceCeilingCache::new(),
+        &lightning,
+        &target,
+        &recipient,
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &konsensus_api::membrane::Membrane::with_capacity(8),
+        &mut refusals,
+        ceiling.saturating_add(1),
+        &mut invoices,
+    )
+    .await;
+    let payments = lightning.list_payments(10).await.unwrap();
+    assert_eq!(payments.len(), 1);
+    assert_eq!(payments[0].amount_msat, ceiling.saturating_add(1));
+
+    handle_invoice_requested_gated(
+        &peer,
+        "at-floor",
+        floor,
+        "konsensus message",
+        true,
+        &pricing,
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &ConfiguredPriceCeilingCache::new(),
+        &lightning,
+        &target,
+        &recipient,
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &konsensus_api::membrane::Membrane::with_capacity(8),
+        &mut refusals,
+        floor,
+        &mut invoices,
+    )
+    .await;
+    let payments = lightning.list_payments(10).await.unwrap();
+    let mut amounts: Vec<_> = payments
+        .into_iter()
+        .map(|payment| payment.amount_msat)
+        .collect();
+    amounts.sort_unstable();
+    assert_eq!(amounts, vec![floor, ceiling.saturating_add(1)]);
+}
+
+#[tokio::test]
+async fn privileged_legacy_admission_requests_create_no_invoice() {
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+    let mut invoices = ready_invoice_book().await;
+    for purpose in ["konsensus:admission", "konsensus:admission:200"] {
+        issue_privileged_invoice(
+            &test_peer_id(),
+            "legacy",
+            50_000,
+            purpose,
+            &lightning,
+            &transport,
+            &pricing,
+            &mut invoices,
+        )
+        .await;
+    }
+    assert!(
+        lightning.list_payments(10).await.unwrap().is_empty(),
+        "legacy admission purposes must not mint a stored invoice"
     );
 }
 
@@ -1444,6 +2035,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
     let pricing = admission_pricing();
     let membrane = konsensus_api::membrane::Membrane::with_capacity(8);
     let mut last_refusal = crate::invoice_refusals::RefusalLimits::default();
+    let mut invoices = ready_invoice_book().await;
 
     handle_invoice_requested_gated(
         &peer_id,
@@ -1453,6 +2045,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
         false,
         &pricing,
         &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
         &lightning,
         &transport,
         &test_peer_id(),
@@ -1461,6 +2054,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
         &membrane,
         &mut last_refusal,
         0,
+        &mut invoices,
     )
     .await;
 
@@ -1492,6 +2086,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
             false,
             &pricing,
             &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            &crate::session_handler::ConfiguredPriceCeilingCache::new(),
             &lightning,
             &transport,
             &test_peer_id(),
@@ -1500,6 +2095,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
             &membrane,
             &mut last_refusal,
             0,
+            &mut invoices,
         )
         .await;
     }
@@ -1699,6 +2295,7 @@ async fn stranger_cannot_quote_file_or_other_service_kinds() {
             false,
             &pricing,
             &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            &crate::session_handler::ConfiguredPriceCeilingCache::new(),
             &lightning,
             &transport,
             &test_peer_id(),
@@ -1707,6 +2304,7 @@ async fn stranger_cannot_quote_file_or_other_service_kinds() {
             &konsensus_api::membrane::Membrane::with_capacity(8),
             &mut crate::invoice_refusals::RefusalLimits::default(),
             0,
+            &mut ready_invoice_book().await,
         )
         .await;
     }
@@ -1964,6 +2562,7 @@ async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
         false,
         &admission_pricing(),
         &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
         &provider,
         &target,
         &recipient,
@@ -1972,6 +2571,7 @@ async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
         &konsensus_api::membrane::Membrane::with_capacity(8),
         &mut crate::invoice_refusals::RefusalLimits::default(),
         0,
+        &mut ready_invoice_book().await,
     )
     .await;
     let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control())
@@ -2031,6 +2631,7 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
         tokio::spawn(async move {
             let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
             let mut limits = crate::invoice_refusals::RefusalLimits::default();
+            let mut peer_invoices = ready_invoice_book().await;
             let mut max_handling_time = Duration::ZERO;
             while let Some(event) = target.recv_control().await {
                 if let ControlEvent::InvoiceRequested {
@@ -2053,6 +2654,7 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
                         &ReadinessHeightCache::new(Arc::new(
                             konsensus_chain::MockChainProvider::new(),
                         )),
+                        &crate::session_handler::ConfiguredPriceCeilingCache::new(),
                         &lightning,
                         &target,
                         &recipient,
@@ -2061,6 +2663,7 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
                         &membrane,
                         &mut limits,
                         0,
+                        &mut peer_invoices,
                     )
                     .await;
                     max_handling_time = max_handling_time.max(started.elapsed());
@@ -3767,10 +4370,18 @@ async fn peer_rejection_logs_strip_controls_at_downstream_handlers() {
     use tracing_subscriber::layer::SubscriberExt;
     struct Reasons(Arc<std::sync::Mutex<Vec<String>>>);
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Reasons {
-        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
             struct Fields<'a>(&'a mut Vec<String>);
             impl tracing::field::Visit for Fields<'_> {
-                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
                     if field.name() == "reason" {
                         self.0.push(format!("{value:?}"));
                     }
@@ -3786,13 +4397,22 @@ async fn peer_rejection_logs_strip_controls_at_downstream_handlers() {
     let (ws_tx, mut ws_rx) = broadcast::channel(4);
     let reason = "peer\n\r\x1b\u{85}\u{2028}\u{2029}reason";
     handle_message_rejected(
-        &test_peer_id(), &konsensus_core::MessageId::from_bytes([0; 32]),
-        reason, &routing, &ws_tx, false,
-    ).await;
+        &test_peer_id(),
+        &konsensus_core::MessageId::from_bytes([0; 32]),
+        reason,
+        &routing,
+        &ws_tx,
+        false,
+    )
+    .await;
     handle_invoice_error_received(
-        &test_peer_id(), "log-test", reason, true,
+        &test_peer_id(),
+        "log-test",
+        reason,
+        true,
         &tokio::sync::Mutex::new(std::collections::HashMap::new()),
-    ).await;
+    )
+    .await;
     assert_eq!(ws_rx.recv().await.unwrap().reason.as_deref(), Some(reason));
     let captured = captured.lock().unwrap();
     assert_eq!(captured.len(), 2);
@@ -4047,6 +4667,939 @@ async fn session_decode_logs_do_not_echo_peer_json() {
         *captured.lock().unwrap(),
         vec!["invalid wire JSON", "invalid wire JSON"],
     );
+}
+
+struct SlowInvoiceStatus(konsensus_lightning::MockLightningProvider, bool);
+#[async_trait::async_trait]
+impl LightningProvider for SlowInvoiceStatus {
+    async fn create_invoice(
+        &self,
+        amount: u64,
+        description: &str,
+        expiry: u32,
+    ) -> Result<
+        konsensus_core::traits::lightning::Invoice,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.0.create_invoice(amount, description, expiry).await
+    }
+    async fn pay_invoice(
+        &self,
+        invoice: &str,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.0.pay_invoice(invoice).await
+    }
+    async fn get_payment_status(
+        &self,
+        hash: &str,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        if hash == "closed" {
+            return Ok(konsensus_core::traits::lightning::PaymentDetails {
+                payment_hash: hash.to_string(),
+                preimage: Some("00".repeat(32)),
+                amount_msat: 1,
+                status: konsensus_core::traits::lightning::PaymentStatus::Settled,
+                direction: konsensus_core::traits::lightning::PaymentDirection::Incoming,
+                timestamp: 0,
+                memo: None,
+                fee_msat: None,
+            });
+        }
+        std::future::pending().await
+    }
+
+    async fn pending_invoice_expiries(
+        &self,
+    ) -> Result<Vec<(String, u64)>, konsensus_core::traits::lightning::LightningError> {
+        if self.1 {
+            std::future::pending().await
+        } else {
+            self.0.pending_invoice_expiries().await
+        }
+    }
+    async fn get_balance_msat(
+        &self,
+    ) -> Result<u64, konsensus_core::traits::lightning::LightningError> {
+        self.0.get_balance_msat().await
+    }
+    async fn is_available(&self) -> bool {
+        true
+    }
+    async fn list_payments(
+        &self,
+        limit: u32,
+    ) -> Result<
+        Vec<konsensus_core::traits::lightning::PaymentDetails>,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.0.list_payments(limit).await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_invoice_status_cannot_delay_refusal_or_unrelated_peer() {
+    let lightning: Arc<dyn LightningProvider> = Arc::new(SlowInvoiceStatus(
+        konsensus_lightning::MockLightningProvider::new(),
+        false,
+    ));
+    let transport = make_gossip_test_transport();
+    let pricing = admission_pricing();
+    let mut invoices = ready_invoice_book().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let peer = test_peer_id();
+    for i in 0..4 {
+        invoices.commit(peer, format!("slow-{i}"), now + 120);
+    }
+    let started = tokio::time::Instant::now();
+    let worker = tokio::spawn(crate::peer_invoices::reconcile(
+        invoices.clone(),
+        lightning.clone(),
+        now,
+    ));
+    tokio::time::timeout(Duration::from_millis(100), async {
+        issue_privileged_invoice(
+            &peer,
+            "refused",
+            1000,
+            "service",
+            &lightning,
+            &transport,
+            &pricing,
+            &mut invoices,
+        )
+        .await;
+        issue_privileged_invoice(
+            &NodeId::from_bytes([99; 32]),
+            "other-peer",
+            1000,
+            "service",
+            &lightning,
+            &transport,
+            &pricing,
+            &mut invoices,
+        )
+        .await;
+    })
+    .await
+    .expect("status reconciliation blocked shared request handler");
+    assert_eq!(pending_incoming_count(&lightning).await, 1);
+    invoices.apply_reconciliation(worker.await.unwrap());
+    assert!(started.elapsed() <= crate::peer_invoices::RECONCILIATION_BUDGET);
+    // Applying an old snapshot must retain the new peer's invoice and its cap.
+    for n in 0..5 {
+        issue_privileged_invoice(
+            &NodeId::from_bytes([99; 32]),
+            &format!("concurrent-{n}"),
+            1000,
+            "service",
+            &lightning,
+            &transport,
+            &pricing,
+            &mut invoices,
+        )
+        .await;
+    }
+    assert_eq!(pending_incoming_count(&lightning).await, 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn delayed_lightning_recovery_imports_invoices_before_issuance() {
+    use konsensus_core::traits::lightning::LightningError;
+    let backend: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    for _ in 0..32 {
+        backend
+            .create_invoice(1000, "before restart", 120)
+            .await
+            .unwrap();
+    }
+    let recovered = backend.clone();
+    let mut first = true;
+    let recovering = konsensus_lightning::RecoveringLightning::new(
+        move || {
+            let fail = std::mem::replace(&mut first, false);
+            let backend = recovered.clone();
+            async move {
+                if fail {
+                    Err(LightningError::ChainSourceUnavailable {
+                        network: "regtest".into(),
+                        service: "test".into(),
+                        attempts: 1,
+                        elapsed_ms: 0,
+                        cause: "offline".into(),
+                    })
+                } else {
+                    Ok(backend)
+                }
+            }
+        },
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let lightning: Arc<dyn LightningProvider> = Arc::new(recovering);
+    let mut book = crate::peer_invoices::PeerInvoiceBook::default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let result = crate::peer_invoices::reconcile(book.clone(), lightning.clone(), now).await;
+    book.apply_reconciliation(result);
+    assert!(book
+        .try_issue(&test_peer_id(), std::time::Instant::now(), now)
+        .is_err());
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+    assert!(lightning.money_ready().await);
+    // Recovery alone must not open the gate before the pending list is imported.
+    assert!(book
+        .try_issue(&test_peer_id(), std::time::Instant::now(), now)
+        .is_err());
+    let result = crate::peer_invoices::reconcile(book.clone(), lightning.clone(), now).await;
+    book.apply_reconciliation(result);
+    assert_eq!(
+        book.try_issue(&test_peer_id(), std::time::Instant::now(), now),
+        Err(crate::peer_invoices::InvoiceLimit::Global)
+    );
+    assert_eq!(pending_incoming_count(&backend).await, 32);
+    lightning.shutdown().await.unwrap();
+}
+
+async fn ready_invoice_book() -> crate::peer_invoices::PeerInvoiceBook {
+    let mut book = crate::peer_invoices::PeerInvoiceBook::default();
+    let result = crate::peer_invoices::reconcile(
+        book.clone(),
+        Arc::new(konsensus_lightning::MockLightningProvider::new()),
+        0,
+    )
+    .await;
+    book.apply_reconciliation(result);
+    book
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_invoice_inventory_has_a_total_budget_and_keeps_issuance_closed() {
+    let lightning: Arc<dyn LightningProvider> = Arc::new(SlowInvoiceStatus(
+        konsensus_lightning::MockLightningProvider::new(),
+        true,
+    ));
+    let mut book = crate::peer_invoices::PeerInvoiceBook::default();
+    let started = tokio::time::Instant::now();
+    let result = crate::peer_invoices::reconcile(book.clone(), lightning, 0).await;
+    assert!(started.elapsed() <= Duration::from_secs(2));
+    book.apply_reconciliation(result);
+    assert!(book
+        .try_issue(&test_peer_id(), std::time::Instant::now(), 0)
+        .is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn invoice_reconciliation_timeout_retains_completed_observations() {
+    let lightning: Arc<dyn LightningProvider> = Arc::new(SlowInvoiceStatus(
+        konsensus_lightning::MockLightningProvider::new(),
+        false,
+    ));
+    let mut book = ready_invoice_book().await;
+    let peer = test_peer_id();
+    book.commit(peer, "closed".into(), 120);
+    for n in 0..3 {
+        book.commit(peer, format!("pending-{n}"), 120);
+    }
+    // A recovered backlog exceeds the worker budget. The already-observed
+    // closed invoice must still release its peer slot when the worker times out.
+    for n in 0..200 {
+        book.commit(NodeId::from_bytes([99; 32]), format!("expired-{n}"), 0);
+    }
+    assert_eq!(
+        book.try_issue(&peer, std::time::Instant::now(), 0),
+        Err(crate::peer_invoices::InvoiceLimit::PeerOutstanding)
+    );
+    let result = crate::peer_invoices::reconcile(book.clone(), lightning, 0).await;
+    book.apply_reconciliation(result);
+    // The closed invoice released the peer slot; the unswept backlog (over
+    // MAX_RETAINED_ROWS) still stops node-wide issuance until it drains.
+    assert_eq!(
+        book.try_issue(&peer, std::time::Instant::now(), 0),
+        Err(crate::peer_invoices::InvoiceLimit::Global)
+    );
+}
+
+/// Pricing failures and cancellation are external inputs; the cache and invoice
+/// handler stay real so these tests catch leaked lookup slots and stale caps.
+struct ReviewPricing {
+    price: std::sync::atomic::AtomicU64,
+    stalled: std::sync::atomic::AtomicBool,
+}
+
+impl ReviewPricing {
+    fn new(price: u64, stalled: bool) -> Self {
+        Self {
+            price: std::sync::atomic::AtomicU64::new(price),
+            stalled: std::sync::atomic::AtomicBool::new(stalled),
+        }
+    }
+
+    async fn read(&self) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        use std::sync::atomic::Ordering;
+        if self.stalled.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        match self.price.load(Ordering::SeqCst) {
+            u64::MAX => Err(
+                konsensus_core::traits::pricing::PricingError::ChainUnavailable("offline".into()),
+            ),
+            price => Ok(price),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl PricingEngine for ReviewPricing {
+    async fn get_price_msat(
+        &self,
+        _: u16,
+    ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        self.read().await
+    }
+
+    async fn get_category_price_msat(
+        &self,
+        _: KindCategory,
+    ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+        self.read().await
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[tokio::test]
+async fn review_regression_price_errors_release_lookup_capacity() {
+    use std::sync::atomic::Ordering;
+    let pricing = Arc::new(ReviewPricing::new(u64::MAX, false));
+    let cache = ConfiguredPriceCeilingCache::new();
+    for _ in 0..16 {
+        assert_eq!(
+            cache.get(pricing.clone()).await,
+            Err("konsensus:price_unavailable")
+        );
+    }
+    pricing.price.store(20_000, Ordering::SeqCst);
+    assert_eq!(cache.get(pricing).await, Ok(20_000));
+}
+
+#[tokio::test(start_paused = true)]
+async fn review_regression_price_timeouts_release_lookup_capacity() {
+    use std::sync::atomic::Ordering;
+    let pricing = Arc::new(ReviewPricing::new(20_000, true));
+    let cache = ConfiguredPriceCeilingCache::new();
+    for _ in 0..16 {
+        assert_eq!(
+            cache.get(pricing.clone()).await,
+            Err("konsensus:price_unavailable")
+        );
+    }
+    pricing.stalled.store(false, Ordering::SeqCst);
+    assert_eq!(cache.get(pricing).await, Ok(20_000));
+}
+
+#[tokio::test(start_paused = true)]
+async fn review_regression_cancelled_price_reads_release_lookup_capacity() {
+    use std::sync::atomic::Ordering;
+    let pricing = Arc::new(ReviewPricing::new(20_000, true));
+    let cache = ConfiguredPriceCeilingCache::new();
+    for _ in 0..16 {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), cache.get(pricing.clone()))
+                .await
+                .is_err()
+        );
+    }
+    pricing.stalled.store(false, Ordering::SeqCst);
+    assert_eq!(cache.get(pricing).await, Ok(20_000));
+}
+
+#[tokio::test]
+async fn review_regression_service_invoice_respects_advertised_admission_floors() {
+    for (pricing, floor, amount) in [
+        (admission_pricing(), 20_000, 20_000),
+        (
+            Arc::new(ReviewPricing::new(0, false)) as Arc<dyn PricingEngine>,
+            0,
+            1_000,
+        ),
+    ] {
+        let lightning: Arc<dyn LightningProvider> =
+            Arc::new(konsensus_lightning::MockLightningProvider::new());
+        handle_invoice_requested_gated(
+            &test_peer_id(),
+            "floor",
+            amount,
+            "service",
+            true,
+            &pricing,
+            &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            &ConfiguredPriceCeilingCache::new(),
+            &lightning,
+            &make_gossip_test_transport(),
+            &test_peer_id(),
+            "127.0.0.1".parse().unwrap(),
+            &mut crate::admission_quotes::AdmissionQuotes::default(),
+            &konsensus_api::membrane::Membrane::with_capacity(8),
+            &mut crate::invoice_refusals::RefusalLimits::default(),
+            floor,
+            &mut ready_invoice_book().await,
+        )
+        .await;
+        let payments = lightning.list_payments(10).await.unwrap();
+        assert_eq!(payments.len(), 1);
+        assert_eq!(payments[0].amount_msat, amount);
+    }
+}
+
+#[tokio::test]
+async fn review_regression_service_invoice_tracks_price_changes_with_one_cache() {
+    use std::sync::atomic::Ordering;
+    let changing = Arc::new(ReviewPricing::new(10_000, false));
+    let pricing: Arc<dyn PricingEngine> = changing.clone();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let cache = ConfiguredPriceCeilingCache::new();
+    let mut book = ready_invoice_book().await;
+    for amount in [10_000, 50_000, 5_000] {
+        changing.price.store(amount, Ordering::SeqCst);
+        handle_invoice_requested_gated(
+            &test_peer_id(),
+            &format!("price-{amount}"),
+            amount,
+            "service",
+            true,
+            &pricing,
+            &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            &cache,
+            &lightning,
+            &make_gossip_test_transport(),
+            &test_peer_id(),
+            "127.0.0.1".parse().unwrap(),
+            &mut crate::admission_quotes::AdmissionQuotes::default(),
+            &konsensus_api::membrane::Membrane::with_capacity(8),
+            &mut crate::invoice_refusals::RefusalLimits::default(),
+            0,
+            &mut book,
+        )
+        .await;
+    }
+    let mut amounts: Vec<_> = lightning
+        .list_payments(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.amount_msat)
+        .collect();
+    amounts.sort_unstable();
+    assert_eq!(amounts, [5_000, 10_000, 50_000]);
+}
+
+#[tokio::test]
+async fn unknown_deadline_wallet_invoices_neither_hold_the_cap_nor_are_deleted() {
+    use std::sync::Mutex;
+
+    struct LegacyPending {
+        inner: konsensus_lightning::MockLightningProvider,
+        pending: Mutex<Vec<(String, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LightningProvider for LegacyPending {
+        async fn create_invoice(
+            &self,
+            amount: u64,
+            description: &str,
+            expiry: u32,
+        ) -> Result<
+            konsensus_core::traits::lightning::Invoice,
+            konsensus_core::traits::lightning::LightningError,
+        > {
+            self.inner.create_invoice(amount, description, expiry).await
+        }
+        async fn pay_invoice(
+            &self,
+            invoice: &str,
+        ) -> Result<
+            konsensus_core::traits::lightning::PaymentDetails,
+            konsensus_core::traits::lightning::LightningError,
+        > {
+            self.inner.pay_invoice(invoice).await
+        }
+        async fn get_payment_status(
+            &self,
+            hash: &str,
+        ) -> Result<
+            konsensus_core::traits::lightning::PaymentDetails,
+            konsensus_core::traits::lightning::LightningError,
+        > {
+            self.inner.get_payment_status(hash).await
+        }
+        async fn get_balance_msat(
+            &self,
+        ) -> Result<u64, konsensus_core::traits::lightning::LightningError> {
+            self.inner.get_balance_msat().await
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn list_payments(
+            &self,
+            limit: u32,
+        ) -> Result<
+            Vec<konsensus_core::traits::lightning::PaymentDetails>,
+            konsensus_core::traits::lightning::LightningError,
+        > {
+            self.inner.list_payments(limit).await
+        }
+        async fn pending_invoice_expiries(
+            &self,
+        ) -> Result<Vec<(String, u64)>, konsensus_core::traits::lightning::LightningError> {
+            Ok(self.pending.lock().expect("pending invoices").clone())
+        }
+        async fn forget_pending_invoice(
+            &self,
+            hash: &str,
+        ) -> Result<bool, konsensus_core::traits::lightning::LightningError> {
+            let mut pending = self.pending.lock().expect("pending invoices");
+            let before = pending.len();
+            pending.retain(|(existing, _)| existing != hash);
+            Ok(pending.len() != before)
+        }
+    }
+
+    let pending = (0..crate::peer_invoices::GLOBAL_OUTSTANDING_CAP + 1)
+        .map(|index| (format!("{index:064x}"), u64::MAX))
+        .collect();
+    let wallet = Arc::new(LegacyPending {
+        inner: konsensus_lightning::MockLightningProvider::new(),
+        pending: Mutex::new(pending),
+    });
+    let lightning: Arc<dyn LightningProvider> = wallet.clone();
+    let mut book = crate::peer_invoices::PeerInvoiceBook::default();
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let pricing = admission_pricing();
+    let transport = make_gossip_test_transport();
+    let peer = test_peer_id();
+    async fn issue(
+        book: &mut crate::peer_invoices::PeerInvoiceBook,
+        request_id: &str,
+        pricing: &Arc<dyn PricingEngine>,
+        lightning: &Arc<dyn LightningProvider>,
+        transport: &Arc<NoiseTransport>,
+        peer: &NodeId,
+    ) {
+        handle_invoice_requested_gated(
+            peer,
+            request_id,
+            1_000,
+            "konsensus message",
+            true,
+            pricing,
+            &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            &ConfiguredPriceCeilingCache::new(),
+            lightning,
+            transport,
+            peer,
+            "127.0.0.1".parse().unwrap(),
+            &mut crate::admission_quotes::AdmissionQuotes::default(),
+            &konsensus_api::membrane::Membrane::with_capacity(8),
+            &mut crate::invoice_refusals::RefusalLimits::default(),
+            0,
+            book,
+        )
+        .await;
+    }
+
+    book.apply_reconciliation(
+        crate::peer_invoices::reconcile(book.clone(), lightning.clone(), started).await,
+    );
+    issue(
+        &mut book,
+        "while-full",
+        &pricing,
+        &lightning,
+        &transport,
+        &peer,
+    )
+    .await;
+    // Codex P1 on #403: invoices with an unknown deadline may be owner
+    // invoices. They neither hold the service cap nor get deleted.
+    assert_eq!(
+        lightning.list_payments(10).await.unwrap().len(),
+        1,
+        "unknown-deadline wallet invoices must not hold the node-wide service cap"
+    );
+    let unknown = crate::peer_invoices::GLOBAL_OUTSTANDING_CAP + 1;
+    book.apply_reconciliation(
+        crate::peer_invoices::reconcile(
+            book.clone(),
+            lightning.clone(),
+            started + 30 * 24 * 3600,
+        )
+        .await,
+    );
+    assert_eq!(
+        wallet.pending.lock().expect("pending invoices").len(),
+        unknown,
+        "an unknown-deadline invoice was deleted"
+    );
+}
+
+#[tokio::test]
+async fn failed_price_lookup_and_invoice_creation_count_toward_the_rate_limit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailPricing {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl PricingEngine for FailPricing {
+        async fn get_price_msat(
+            &self,
+            _: u16,
+        ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(konsensus_core::traits::pricing::PricingError::ChainUnavailable("offline".into()))
+        }
+
+        async fn get_category_price_msat(
+            &self,
+            _: KindCategory,
+        ) -> Result<u64, konsensus_core::traits::pricing::PricingError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(konsensus_core::traits::pricing::PricingError::ChainUnavailable("offline".into()))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct FailCreate {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LightningProvider for FailCreate {
+        async fn create_invoice(
+            &self,
+            _: u64,
+            _: &str,
+            _: u32,
+        ) -> Result<
+            konsensus_core::traits::lightning::Invoice,
+            konsensus_core::traits::lightning::LightningError,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(konsensus_core::traits::lightning::LightningError::Backend(
+                "unavailable".into(),
+            ))
+        }
+        async fn pay_invoice(
+            &self,
+            _: &str,
+        ) -> Result<
+            konsensus_core::traits::lightning::PaymentDetails,
+            konsensus_core::traits::lightning::LightningError,
+        > {
+            Err(konsensus_core::traits::lightning::LightningError::Backend(
+                "unused".into(),
+            ))
+        }
+        async fn get_payment_status(
+            &self,
+            hash: &str,
+        ) -> Result<
+            konsensus_core::traits::lightning::PaymentDetails,
+            konsensus_core::traits::lightning::LightningError,
+        > {
+            Err(
+                konsensus_core::traits::lightning::LightningError::PaymentNotFound(
+                    hash.to_string(),
+                ),
+            )
+        }
+        async fn get_balance_msat(
+            &self,
+        ) -> Result<u64, konsensus_core::traits::lightning::LightningError> {
+            Ok(0)
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    let pricing_calls = Arc::new(FailPricing {
+        calls: AtomicUsize::new(0),
+    });
+    let pricing: Arc<dyn PricingEngine> = pricing_calls.clone();
+    let cache = ConfiguredPriceCeilingCache::new();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let mut book = ready_invoice_book().await;
+    let peer = test_peer_id();
+    let other = NodeId::from_bytes([8; 32]);
+    let transport = make_gossip_test_transport();
+    async fn request(
+        book: &mut crate::peer_invoices::PeerInvoiceBook,
+        who: &NodeId,
+        request_id: &str,
+        pricing: &Arc<dyn PricingEngine>,
+        cache: &ConfiguredPriceCeilingCache,
+        lightning: &Arc<dyn LightningProvider>,
+        transport: &Arc<NoiseTransport>,
+    ) {
+        handle_invoice_requested_gated(
+            who,
+            request_id,
+            1_000,
+            "konsensus message",
+            true,
+            pricing,
+            &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            cache,
+            lightning,
+            transport,
+            who,
+            "127.0.0.1".parse().unwrap(),
+            &mut crate::admission_quotes::AdmissionQuotes::default(),
+            &konsensus_api::membrane::Membrane::with_capacity(8),
+            &mut crate::invoice_refusals::RefusalLimits::default(),
+            0,
+            book,
+        )
+        .await;
+    }
+
+    for n in 0..crate::peer_invoices::PEER_RATE_BURST {
+        request(
+            &mut book,
+            &peer,
+            &format!("price-{n}"),
+            &pricing,
+            &cache,
+            &lightning,
+            &transport,
+        )
+        .await;
+    }
+    let counted = pricing_calls.calls.load(Ordering::SeqCst);
+    assert!(counted > 0);
+    request(
+        &mut book,
+        &peer,
+        "price-over",
+        &pricing,
+        &cache,
+        &lightning,
+        &transport,
+    )
+    .await;
+    assert_eq!(pricing_calls.calls.load(Ordering::SeqCst), counted);
+    request(
+        &mut book,
+        &other,
+        "price-other",
+        &pricing,
+        &cache,
+        &lightning,
+        &transport,
+    )
+    .await;
+    assert!(pricing_calls.calls.load(Ordering::SeqCst) > counted);
+
+    let creates = Arc::new(FailCreate {
+        calls: AtomicUsize::new(0),
+    });
+    let failing: Arc<dyn LightningProvider> = creates.clone();
+    let mut book = ready_invoice_book().await;
+    let pricing = admission_pricing();
+    let cache = ConfiguredPriceCeilingCache::new();
+    for n in 0..crate::peer_invoices::PEER_RATE_BURST {
+        request(
+            &mut book,
+            &peer,
+            &format!("create-{n}"),
+            &pricing,
+            &cache,
+            &failing,
+            &transport,
+        )
+        .await;
+    }
+    // An ambiguous (non-InvoiceCreation) failure may have left an invoice, so
+    // it holds the peer's slot: creation stops at the outstanding cap.
+    assert_eq!(
+        creates.calls.load(Ordering::SeqCst),
+        crate::peer_invoices::PEER_OUTSTANDING_CAP
+    );
+    request(
+        &mut book,
+        &peer,
+        "create-over",
+        &pricing,
+        &cache,
+        &failing,
+        &transport,
+    )
+    .await;
+    assert_eq!(
+        creates.calls.load(Ordering::SeqCst),
+        crate::peer_invoices::PEER_OUTSTANDING_CAP
+    );
+    request(
+        &mut book,
+        &other,
+        "create-other",
+        &pricing,
+        &cache,
+        &failing,
+        &transport,
+    )
+    .await;
+    assert_eq!(
+        creates.calls.load(Ordering::SeqCst),
+        crate::peer_invoices::PEER_OUTSTANDING_CAP + 1
+    );
+}
+
+struct RetryInvoiceDeletion {
+    inner: konsensus_lightning::MockLightningProvider,
+    fail: std::sync::atomic::AtomicBool,
+    slow_status: bool,
+}
+
+#[async_trait::async_trait]
+impl LightningProvider for RetryInvoiceDeletion {
+    async fn create_invoice(
+        &self,
+        amount: u64,
+        description: &str,
+        expiry: u32,
+    ) -> Result<
+        konsensus_core::traits::lightning::Invoice,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.inner.create_invoice(amount, description, expiry).await
+    }
+    async fn pay_invoice(
+        &self,
+        invoice: &str,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.inner.pay_invoice(invoice).await
+    }
+    async fn get_payment_status(
+        &self,
+        hash: &str,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        if self.slow_status {
+            std::future::pending::<()>().await;
+        }
+        self.inner.get_payment_status(hash).await
+    }
+    async fn pending_invoice_expiries(
+        &self,
+    ) -> Result<Vec<(String, u64)>, konsensus_core::traits::lightning::LightningError> {
+        self.inner.pending_invoice_expiries().await
+    }
+    async fn get_balance_msat(
+        &self,
+    ) -> Result<u64, konsensus_core::traits::lightning::LightningError> {
+        self.inner.get_balance_msat().await
+    }
+    async fn is_available(&self) -> bool {
+        true
+    }
+    async fn forget_pending_invoice(
+        &self,
+        hash: &str,
+    ) -> Result<bool, konsensus_core::traits::lightning::LightningError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(konsensus_core::traits::lightning::LightningError::Backend(
+                "retry later".into(),
+            ))
+        } else {
+            self.inner.forget_pending_invoice(hash).await
+        }
+    }
+}
+
+#[tokio::test]
+async fn review_regression_every_failed_invoice_delete_is_retried() {
+    let wallet = RetryInvoiceDeletion {
+        inner: konsensus_lightning::MockLightningProvider::new(),
+        fail: std::sync::atomic::AtomicBool::new(true),
+        slow_status: false,
+    };
+    let mut book = ready_invoice_book().await;
+    for _ in 0..70 {
+        let invoice = wallet
+            .create_invoice(1_000, "konsensus:retry", 0)
+            .await
+            .unwrap();
+        book.commit(test_peer_id(), invoice.payment_hash, invoice.created_at);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    crate::peer_invoices::purge_expired_peer_invoices(&mut book, &wallet, now).await;
+    wallet
+        .fail
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    crate::peer_invoices::purge_expired_peer_invoices(&mut book, &wallet, now).await;
+    assert!(wallet.inner.list_payments(100).await.unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn review_regression_expiry_retries_run_before_slow_status_scan() {
+    let wallet = Arc::new(RetryInvoiceDeletion {
+        inner: konsensus_lightning::MockLightningProvider::new(),
+        fail: std::sync::atomic::AtomicBool::new(false),
+        slow_status: true,
+    });
+    let mut book = ready_invoice_book().await;
+    for _ in 0..256 {
+        let invoice = wallet
+            .create_invoice(1_000, "konsensus:backlog", 0)
+            .await
+            .unwrap();
+        book.commit(test_peer_id(), invoice.payment_hash, invoice.created_at);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let result = crate::peer_invoices::reconcile(book.clone(), wallet.clone(), now).await;
+    book.apply_reconciliation(result);
+    assert!(wallet.inner.list_payments(500).await.unwrap().is_empty());
 }
 
 // ── Validate before replace ─────────────────────────────────────────
@@ -4723,12 +6276,13 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     let sessions = session_with(&peer).await;
     let balance = wallet.get_balance_msat().await.unwrap();
     let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
-    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "block", &wallet).await;
+    let mut invoices = ready_invoice_book().await;
+    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "block", &wallet, &mut invoices).await;
     assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert!(wallet.list_payments(10).await.unwrap().is_empty(), "no invoice or payment should be created");
     assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
     storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
-    let issued = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "block-ok", &wallet).await.unwrap();
+    let issued = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "block-ok", &wallet, &mut invoices).await.unwrap();
     assert_eq!(issued.expiry_secs, 5);
     let hash = hex::decode(&issued.payment_hash).unwrap().try_into().unwrap();
     assert!(storage.has_call_block_invoice(&peer, id, 0, &hash).await.unwrap());
@@ -4736,7 +6290,7 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     // An unavailable provenance store withholds the invoice before any payment.
     sqlx::query("CREATE TRIGGER fail_block_invoice BEFORE INSERT ON call_block_invoices BEGIN SELECT RAISE(FAIL, 'test'); END")
         .execute(storage.pool()).await.unwrap();
-    assert_eq!(prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "write-fails", &wallet).await.unwrap_err(),
+    assert_eq!(prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "write-fails", &wallet, &mut invoices).await.unwrap_err(),
         konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
 }
@@ -4769,22 +6323,360 @@ async fn call_block_invoice_is_refused_without_a_session() {
     let wallet = konsensus_lightning::MockLightningProvider::new();
     let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
     let sessions = session_with(&peer).await;
+    let mut invoices = ready_invoice_book().await;
 
     assert!(sessions.remove_session(&peer).await);
-    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "no-session", &wallet).await;
+    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "no-session", &wallet, &mut invoices).await;
     assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert!(wallet.list_payments(10).await.unwrap().is_empty(), "the wallet was not asked for an invoice");
 
     let sessions = session_with(&peer).await;
     sessions.mark_needs_renegotiation(&peer).await;
-    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "disputed", &wallet).await;
+    let refused = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "disputed", &wallet, &mut invoices).await;
     assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert!(wallet.list_payments(10).await.unwrap().is_empty(), "nor for a session being renegotiated");
 
     let sessions = session_with(&peer).await;
-    let issued = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "session-back", &wallet).await.unwrap();
+    let issued = prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "session-back", &wallet, &mut invoices).await.unwrap();
     let hash = hex::decode(&issued.payment_hash).unwrap().try_into().unwrap();
     assert!(storage.has_call_block_invoice(&peer, id, 0, &hash).await.unwrap());
+}
+
+const CALL_WALLET_ISSUE: usize = 0;
+const CALL_WALLET_DEFINITE: usize = 1;
+const CALL_WALLET_AMBIGUOUS: usize = 2;
+const CALL_WALLET_ZERO_EXPIRY: usize = 3;
+
+struct CallBlockWallet {
+    inner: konsensus_lightning::MockLightningProvider,
+    creates: AtomicUsize,
+    asked_expiry: AtomicUsize,
+    mode: AtomicUsize,
+}
+
+impl CallBlockWallet {
+    fn new(mode: usize) -> Self {
+        Self {
+            inner: konsensus_lightning::MockLightningProvider::new(),
+            creates: AtomicUsize::new(0),
+            asked_expiry: AtomicUsize::new(0),
+            mode: AtomicUsize::new(mode),
+        }
+    }
+
+    fn creates(&self) -> usize {
+        self.creates.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl LightningProvider for CallBlockWallet {
+    async fn create_invoice(
+        &self,
+        amount_msat: u64,
+        description: &str,
+        expiry_secs: u32,
+    ) -> Result<
+        konsensus_core::traits::lightning::Invoice,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        self.asked_expiry
+            .store(expiry_secs as usize, Ordering::SeqCst);
+        match self.mode.load(Ordering::SeqCst) {
+            CALL_WALLET_DEFINITE => Err(
+                konsensus_core::traits::lightning::LightningError::InvoiceCreation(
+                    "rejected".into(),
+                ),
+            ),
+            CALL_WALLET_AMBIGUOUS => Err(
+                konsensus_core::traits::lightning::LightningError::Backend("timeout".into()),
+            ),
+            CALL_WALLET_ZERO_EXPIRY => {
+                let mut invoice = self
+                    .inner
+                    .create_invoice(amount_msat, description, expiry_secs)
+                    .await?;
+                invoice.expiry_secs = 0;
+                Ok(invoice)
+            }
+            CALL_WALLET_ISSUE => {
+                self.inner
+                    .create_invoice(amount_msat, description, expiry_secs)
+                    .await
+            }
+            _ => Err(
+                konsensus_core::traits::lightning::LightningError::InvoiceCreation(
+                    "unknown test mode".into(),
+                ),
+            ),
+        }
+    }
+
+    async fn pay_invoice(
+        &self,
+        bolt11: &str,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.inner.pay_invoice(bolt11).await
+    }
+
+    async fn get_payment_status(
+        &self,
+        hash: &str,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.inner.get_payment_status(hash).await
+    }
+
+    async fn get_balance_msat(
+        &self,
+    ) -> Result<u64, konsensus_core::traits::lightning::LightningError> {
+        self.inner.get_balance_msat().await
+    }
+
+    async fn list_payments(
+        &self,
+        limit: u32,
+    ) -> Result<
+        Vec<konsensus_core::traits::lightning::PaymentDetails>,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        self.inner.list_payments(limit).await
+    }
+
+    async fn is_available(&self) -> bool {
+        true
+    }
+}
+
+struct DueCallBlock {
+    storage: konsensus_storage::SqliteStorage,
+    peer: NodeId,
+    call_id: String,
+    purpose: String,
+    sessions: SessionManager,
+}
+
+impl DueCallBlock {
+    async fn open() -> Self {
+        use konsensus_core::payloads::call as calls;
+        let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+        let peer = test_peer_id();
+        let call_id = "0123456789abcdef0123456789abcdef".to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let ringing = calls::receive(None, 400, None, now - 16_000).unwrap();
+        let pending = calls::reserve(Some(ringing), 401, "answer", "hash", now - 16_000).unwrap();
+        let live = calls::commit(pending, "answer", now - 16_000).unwrap();
+        storage
+            .call_put(
+                &peer,
+                &call_id,
+                &calls::CallEntry {
+                    deadline_ms: now + 30_000,
+                    ..live
+                },
+            )
+            .await
+            .unwrap();
+        let sessions = session_with(&peer).await;
+        let purpose = format!("{}{call_id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
+        Self {
+            storage,
+            peer,
+            call_id,
+            purpose,
+            sessions,
+        }
+    }
+}
+
+async fn dispatch_call_block(
+    due: &DueCallBlock,
+    request_id: &str,
+    wallet: &CallBlockWallet,
+    transport: &Arc<NoiseTransport>,
+    invoices: &mut crate::peer_invoices::PeerInvoiceBook,
+) {
+    handle_call_block_invoice_requested(
+        &due.peer,
+        request_id,
+        23_000,
+        &due.purpose,
+        true,
+        &due.storage,
+        &due.sessions,
+        wallet,
+        transport,
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::invoice_refusals::RefusalLimits::default(),
+        invoices,
+    )
+    .await;
+}
+
+async fn repeat_call_dispatch(
+    count: usize,
+    prefix: &str,
+    due: &DueCallBlock,
+    wallet: &CallBlockWallet,
+    transport: &Arc<NoiseTransport>,
+    invoices: &mut crate::peer_invoices::PeerInvoiceBook,
+) {
+    for n in 0..count {
+        dispatch_call_block(due, &format!("{prefix}-{n}"), wallet, transport, invoices).await;
+    }
+}
+
+#[tokio::test]
+async fn call_block_fifth_unpaid_invoice_is_refused_before_wallet_creation() {
+    let due = DueCallBlock::open().await;
+    let wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    let transport = make_gossip_test_transport();
+    let mut invoices = ready_invoice_book().await;
+    let cap = crate::peer_invoices::PEER_OUTSTANDING_CAP;
+    repeat_call_dispatch(cap, "unpaid", &due, &wallet, &transport, &mut invoices).await;
+    assert_eq!(wallet.creates(), cap);
+    assert_eq!(
+        wallet.asked_expiry.load(Ordering::SeqCst),
+        konsensus_core::payloads::call::CALL_BLOCK_INVOICE_EXPIRY_SECS as usize
+    );
+    dispatch_call_block(&due, "unpaid-over", &wallet, &transport, &mut invoices).await;
+    assert_eq!(
+        wallet.creates(),
+        cap,
+        "the fifth unpaid call invoice must be refused before wallet creation"
+    );
+    let payments = wallet.list_payments(10).await.unwrap();
+    assert_eq!(payments.len(), cap);
+    for payment in &payments {
+        let hash = hex::decode(&payment.payment_hash)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(due
+            .storage
+            .has_call_block_invoice(&due.peer, &due.call_id, 0, &hash)
+            .await
+            .unwrap());
+    }
+}
+
+#[tokio::test]
+async fn call_block_attempt_rate_limit_is_refused_before_wallet_creation() {
+    let due = DueCallBlock::open().await;
+    let wallet = CallBlockWallet::new(CALL_WALLET_DEFINITE);
+    let transport = make_gossip_test_transport();
+    let mut invoices = ready_invoice_book().await;
+    let burst = crate::peer_invoices::PEER_RATE_BURST;
+    // A definite creation failure consumes a rate slot and leaves no outstanding
+    // row, so this stops on the attempt limit rather than the unpaid cap.
+    repeat_call_dispatch(burst, "rate", &due, &wallet, &transport, &mut invoices).await;
+    assert_eq!(wallet.creates(), burst);
+    dispatch_call_block(&due, "rate-over", &wallet, &transport, &mut invoices).await;
+    assert_eq!(
+        wallet.creates(),
+        burst,
+        "an excessive call attempt must be refused before wallet creation"
+    );
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn call_block_invoice_before_reconciliation_is_refused_before_wallet_creation() {
+    let due = DueCallBlock::open().await;
+    let wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    let transport = make_gossip_test_transport();
+    let mut cold = crate::peer_invoices::PeerInvoiceBook::default();
+    dispatch_call_block(&due, "before-reconcile", &wallet, &transport, &mut cold).await;
+    assert_eq!(
+        wallet.creates(),
+        0,
+        "call issuance before reconciliation must be refused before wallet creation"
+    );
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+
+    let mut ready = ready_invoice_book().await;
+    dispatch_call_block(&due, "after-reconcile", &wallet, &transport, &mut ready).await;
+    assert_eq!(wallet.creates(), 1);
+    assert_eq!(wallet.list_payments(10).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn call_block_bind_failure_still_occupies_an_invoice_slot() {
+    let due = DueCallBlock::open().await;
+    sqlx::query(
+        "CREATE TRIGGER fail_block_invoice BEFORE INSERT ON call_block_invoices BEGIN SELECT RAISE(FAIL, 'test'); END",
+    )
+    .execute(due.storage.pool())
+    .await
+    .unwrap();
+    let wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    let transport = make_gossip_test_transport();
+    let mut invoices = ready_invoice_book().await;
+    let cap = crate::peer_invoices::PEER_OUTSTANDING_CAP;
+    repeat_call_dispatch(cap, "unbindable", &due, &wallet, &transport, &mut invoices).await;
+    assert_eq!(wallet.creates(), cap);
+    let bound: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_block_invoices")
+        .fetch_one(due.storage.pool())
+        .await
+        .unwrap();
+    assert_eq!(bound, 0);
+    dispatch_call_block(&due, "unbindable-over", &wallet, &transport, &mut invoices).await;
+    assert_eq!(
+        wallet.creates(),
+        cap,
+        "a stored wallet invoice must count even when call binding fails"
+    );
+    assert_eq!(wallet.list_payments(10).await.unwrap().len(), cap);
+}
+
+#[tokio::test]
+async fn call_block_ambiguous_creation_occupies_an_invoice_slot() {
+    let due = DueCallBlock::open().await;
+    let wallet = CallBlockWallet::new(CALL_WALLET_AMBIGUOUS);
+    let transport = make_gossip_test_transport();
+    let mut invoices = ready_invoice_book().await;
+    let cap = crate::peer_invoices::PEER_OUTSTANDING_CAP;
+    repeat_call_dispatch(cap, "ambiguous", &due, &wallet, &transport, &mut invoices).await;
+    assert_eq!(wallet.creates(), cap);
+    dispatch_call_block(&due, "ambiguous-over", &wallet, &transport, &mut invoices).await;
+    assert_eq!(
+        wallet.creates(),
+        cap,
+        "an ambiguous call create must hold a slot before another wallet attempt"
+    );
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn call_block_book_commits_the_invoice_expiry() {
+    let due = DueCallBlock::open().await;
+    let wallet = CallBlockWallet::new(CALL_WALLET_ZERO_EXPIRY);
+    let transport = make_gossip_test_transport();
+    let mut invoices = ready_invoice_book().await;
+    let past_cap = crate::peer_invoices::PEER_OUTSTANDING_CAP + 1;
+    repeat_call_dispatch(
+        past_cap,
+        "expired",
+        &due,
+        &wallet,
+        &transport,
+        &mut invoices,
+    )
+    .await;
+    assert_eq!(
+        wallet.creates(),
+        past_cap,
+        "a call invoice occupies the book only until its own expiry"
+    );
 }
 
 #[tokio::test]
@@ -4798,16 +6690,37 @@ async fn call_block_invoice_stops_at_the_cap_before_the_wallet() {
     let pending = calls::reserve(Some(ringing), 401, "answer", "hash", now - 16_000).unwrap();
     let live = calls::commit(pending, "answer", now - 16_000).unwrap();
     storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
-    let wallet = konsensus_lightning::MockLightningProvider::new();
+    // Expiry zero keeps these invoices out of the shared outstanding cap, so
+    // this reaches the stored binding cap rather than stopping at four open invoices.
+    let wallet = CallBlockWallet::new(CALL_WALLET_ZERO_EXPIRY);
     let sessions = session_with(&peer).await;
     let purpose = format!("{}{id}:0", calls::CALL_BLOCK_INVOICE_PREFIX);
+    let mut invoices = ready_invoice_book().await;
     assert_eq!(
-        prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 0, "zero", &wallet).await.unwrap_err(),
+        prepare_call_block_invoice(
+            &storage,
+            &sessions,
+            &peer,
+            &purpose,
+            0,
+            "zero",
+            &wallet,
+            &mut invoices
+        )
+        .await
+        .unwrap_err(),
         konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE,
     );
     assert_eq!(
         prepare_call_block_invoice(
-            &storage, &sessions, &peer, &purpose, calls::MAX_CALL_BLOCK_INVOICE_MSAT + 1, "huge", &wallet,
+            &storage,
+            &sessions,
+            &peer,
+            &purpose,
+            calls::MAX_CALL_BLOCK_INVOICE_MSAT + 1,
+            "huge",
+            &wallet,
+            &mut invoices,
         )
         .await
         .unwrap_err(),
@@ -4815,13 +6728,33 @@ async fn call_block_invoice_stops_at_the_cap_before_the_wallet() {
     );
     assert!(wallet.list_payments(20).await.unwrap().is_empty());
     for n in 0..calls::MAX_CALL_BLOCK_INVOICES {
-        prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, &format!("block-{n}"), &wallet)
-            .await
-            .unwrap();
+        prepare_call_block_invoice(
+            &storage,
+            &sessions,
+            &peer,
+            &purpose,
+            23_000,
+            &format!("block-{n}"),
+            &wallet,
+            &mut invoices,
+        )
+        .await
+        .unwrap();
     }
     assert_eq!(wallet.list_payments(20).await.unwrap().len(), calls::MAX_CALL_BLOCK_INVOICES as usize);
     assert_eq!(
-        prepare_call_block_invoice(&storage, &sessions, &peer, &purpose, 23_000, "one-past", &wallet).await.unwrap_err(),
+        prepare_call_block_invoice(
+            &storage,
+            &sessions,
+            &peer,
+            &purpose,
+            23_000,
+            "one-past",
+            &wallet,
+            &mut invoices
+        )
+        .await
+        .unwrap_err(),
         konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE,
     );
     assert_eq!(

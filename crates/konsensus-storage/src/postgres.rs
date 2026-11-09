@@ -27,6 +27,38 @@ pub struct PostgresStorage {
 }
 
 impl PostgresStorage {
+    async fn load_message_record(
+        &self,
+        id: &MessageId,
+        include_held: bool,
+    ) -> Result<Option<UkmEnvelope>, StorageError> {
+        let id_hex = id.to_hex();
+
+        let row = sqlx::query_as::<_, (
+            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String,
+            String, String,
+        )>(
+            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
+             FROM messages WHERE id = $1 AND ($2 OR id NOT IN (SELECT message_id FROM call_admission_hold))",
+        )
+        .bind(&id_hex)
+        .bind(include_held)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => {
+                let envelope = row_to_envelope(
+                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
+                    &r.12,
+                )?;
+                Ok(Some(envelope))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Connect to a PostgreSQL database and run migrations.
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
         let pool = PgPoolOptions::new()
@@ -117,16 +149,26 @@ impl PostgresStorage {
         unknown
     }
 
+    /// Postgres 007–009 were registered only on an unreleased head, then withdrawn.
+    /// Version 033 repairs that catalog. A database that already recorded 007–009
+    /// must still start; those numbers are not a schema from a newer binary.
+    const WITHDRAWN_PG_VERSIONS: [i32; 3] = [7, 8, 9];
+
     fn refuse_future_schema(applied: &[i32]) -> Result<(), StorageError> {
-        let known: Vec<i32> = Self::pg_migrations()
+        let mut known: Vec<i32> = Self::pg_migrations()
             .iter()
             .map(|(version, _, _)| *version)
             .collect();
+        known.extend(Self::WITHDRAWN_PG_VERSIONS);
         let versions = Self::unknown_applied_migrations(applied, &known);
         if versions.is_empty() {
             return Ok(());
         }
-        let max_known = known.iter().copied().max().unwrap_or(0);
+        let max_known = Self::pg_migrations()
+            .iter()
+            .map(|(version, _, _)| *version)
+            .max()
+            .unwrap_or(0);
         Err(StorageError::FutureSchema {
             versions,
             max_known,
@@ -479,6 +521,12 @@ impl PostgresStorage {
     (30, "channel open operations", include_str!("../migrations/postgres/030_channel_open_operations.sql")),
     (31, "starter requests", include_str!("../migrations/postgres/031_starter_requests.sql")),
     (32, "starter queries", include_str!("../migrations/postgres/032_starter_queries.sql")),
+            (
+                33,
+                "calendar and schema parity",
+                include_str!("../migrations/postgres/033_calendar_and_schema_parity.sql"),
+            ),
+    // 034 stays unused. Main reserved it for the call-invite work and shipped 035–037 around that gap.
     (35, "call blocks", include_str!("../migrations/035_call_blocks.sql")),
     (36, "call unpaid notice", include_str!("../migrations/036_call_unpaid_notice.sql")),
     (37, "call block invoices", include_str!("../migrations/037_call_block_invoices.sql")),
@@ -689,8 +737,7 @@ const ROOM_MEMBERS_SELECT: &str =
 // classification (AUTHORITY / correctness-complete / WHERE-scoped read-surface):
 // none of these queries may grow a bare `LIMIT`, which would re-create the
 // DBH1/DBH2 silent fail-open. The `hard4_guard` test below asserts no `LIMIT`
-// regresses in. Postgres has no `list_fiat_rate_snapshots` impl (it falls back
-// to the trait default), so that constant lives only in `sqlite.rs`.
+// regresses in. `list_fiat_rate_snapshots` is range-scoped the same way as SQLite.
 
 /// `get_pending_for_peer` — AUTHORITY. Per-peer outbound delivery queue; the
 /// pending-delivery flusher must see the complete queue. WHERE-scoped to one
@@ -744,6 +791,15 @@ const CALENDAR_EXCEPTIONS_IN_RANGE_SELECT: &str =
      WHERE parent_id IS NOT NULL AND start_ms < $2 AND end_ms > $1
      ORDER BY start_ms ASC";
 
+/// `list_fiat_rate_snapshots` — READ-SURFACE, range-scoped. Bounded by the
+/// caller's `[from_date, to_date]` window. Must return every row inside the
+/// window — no bare `LIMIT`.
+const FIAT_RATE_SNAPSHOTS_SELECT: &str =
+    "SELECT date, currency, rate, source, created_at
+     FROM fiat_rate_snapshots
+     WHERE date >= $1 AND date <= $2
+     ORDER BY date DESC, currency ASC";
+
 /// `list_operator_hosting_contracts` — AUTHORITY (money-path). The daily payment
 /// task iterates every contract; a cap silently skips paying tenants. If a
 /// memory bound is ever needed it MUST be streaming/chunked, never a bare
@@ -760,17 +816,44 @@ const OPERATOR_HOSTING_PAYMENTS_SELECT: &str =
      FROM operator_hosting_payments
      WHERE contract_id = $1
      ORDER BY paid_at DESC";
+/// Read a `TIMESTAMPTZ` column into an RFC 3339 string field (`Peer::last_seen`,
+/// `Room::created_at`): UTC with microseconds, the full precision Postgres
+/// stores. NULL stays NULL. Writes to these columns cast the bound text with
+/// `::timestamptz`.
+macro_rules! utc_rfc3339 {
+    ($column:literal) => {
+        concat!(
+            "to_char(",
+            $column,
+            " AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
+        )
+    };
+}
+
 /// Peer-listing query for the Postgres backend. Returns ALL peers — deliberately
 /// **no `LIMIT`** (DBH1), mirroring the SQLite backend. The `peers` table is the
 /// durable gate-whitelist authority (boot-loaded via `merge_persisted_peers`) and
 /// the RV-RESTORE backup source; a cap here is a Principle-2 fail-open at scale.
 /// CI has no Postgres service, so this path is guarded by code symmetry with
 /// SQLite plus the `dbh1_guard` string-assertion test below — not a live query.
-const PEERS_SELECT: &str =
-    "SELECT node_id, address, last_seen, display_name, metadata_json FROM peers ORDER BY node_id";
+const PEERS_SELECT: &str = concat!(
+    "SELECT node_id, address, ",
+    utc_rfc3339!("last_seen"),
+    ", display_name, metadata_json FROM peers ORDER BY node_id"
+);
 
 #[async_trait]
 impl Storage for PostgresStorage {
+    async fn record_upgrade_rows(&self, table: crate::record_upgrade::RecordTable, after: Option<&str>, limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {
+        crate::record_upgrade::postgres::rows(&self.pool, table, after, limit).await
+    }
+    async fn record_upgrade_row(&self, table: crate::record_upgrade::RecordTable, id: &str) -> Result<Option<crate::record_upgrade::RecordRow>, StorageError> {
+        crate::record_upgrade::postgres::row(&self.pool, table, id).await
+    }
+    async fn record_upgrade_replace(&self, table: crate::record_upgrade::RecordTable, old: &crate::record_upgrade::RecordRow, new: &crate::record_upgrade::RecordRow) -> Result<bool, StorageError> {
+        crate::record_upgrade::postgres::replace(&self.pool, table, old, new).await
+    }
+
     async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         crate::starter_request::postgres::get(&self.pool, id).await
     }
@@ -1292,30 +1375,11 @@ impl Storage for PostgresStorage {
     }
 
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
-        let id_hex = id.to_hex();
+        self.load_message_record(id, false).await
+    }
 
-        let row = sqlx::query_as::<_, (
-            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String,
-            String, String,
-        )>(
-            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
-             FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND id = $1",
-        )
-        .bind(&id_hex)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match row {
-            Some(r) => {
-                let envelope = row_to_envelope(
-                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
-                    &r.12,
-                )?;
-                Ok(Some(envelope))
-            }
-            None => Ok(None),
-        }
+    async fn record_upgrade_envelope(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
+        self.load_message_record(id, true).await
     }
 
     async fn get_messages_for_recipient(&self, recipient: &Recipient, limit: u32, before_timestamp: Option<u64>) -> Result<Vec<UkmEnvelope>, StorageError> {
@@ -1420,9 +1484,11 @@ impl Storage for PostgresStorage {
         let metadata = serde_json::to_string(&room.metadata)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
+        // `created_at` is TIMESTAMPTZ and `$4` is sent as text: cast it, as in
+        // `upsert_peer`.
         sqlx::query(
             "INSERT INTO rooms (id, name, created_by, created_at, metadata_json) \
-             VALUES ($1, $2, $3, $4, $5)",
+             VALUES ($1, $2, $3, $4::timestamptz, $5)",
         )
         .bind(&id)
         .bind(&room.name)
@@ -1438,9 +1504,11 @@ impl Storage for PostgresStorage {
     async fn get_room(&self, id: &RoomId) -> Result<Option<Room>, StorageError> {
         let id_str = id.to_string();
 
-        let row = sqlx::query_as::<_, (String, String, String, String, String)>(
-            "SELECT id, name, created_by, created_at, metadata_json FROM rooms WHERE id = $1",
-        )
+        let row = sqlx::query_as::<_, (String, String, String, String, String)>(concat!(
+            "SELECT id, name, created_by, ",
+            utc_rfc3339!("created_at"),
+            ", metadata_json FROM rooms WHERE id = $1"
+        ))
         .bind(&id_str)
         .fetch_optional(&self.pool)
         .await?;
@@ -1466,9 +1534,11 @@ impl Storage for PostgresStorage {
     }
 
     async fn list_rooms(&self) -> Result<Vec<Room>, StorageError> {
-        let rows = sqlx::query_as::<_, (String, String, String, String, String)>(
-            "SELECT id, name, created_by, created_at, metadata_json FROM rooms ORDER BY created_at DESC LIMIT 1000",
-        )
+        let rows = sqlx::query_as::<_, (String, String, String, String, String)>(concat!(
+            "SELECT id, name, created_by, ",
+            utc_rfc3339!("created_at"),
+            ", metadata_json FROM rooms ORDER BY created_at DESC LIMIT 1000"
+        ))
         .fetch_all(&self.pool)
         .await?;
 
@@ -1574,9 +1644,13 @@ impl Storage for PostgresStorage {
         // overwrite wholesale (the wrapper merges plaintext metadata itself
         // before encrypting). `metadata_json` is a TEXT column, so we cast to
         // jsonb for the merge and back to text for storage.
+        //
+        // `$3` is sent as text. `last_seen` is TIMESTAMPTZ, so it needs an
+        // explicit cast; without it Postgres rejects the statement (42804)
+        // even when the value is NULL.
         sqlx::query(
             "INSERT INTO peers (node_id, address, last_seen, display_name, metadata_json) \
-             VALUES ($1, $2, $3, $4, $5) \
+             VALUES ($1, $2, $3::timestamptz, $4, $5) \
              ON CONFLICT(node_id) DO UPDATE SET \
              address = COALESCE(EXCLUDED.address, peers.address), \
              last_seen = COALESCE(EXCLUDED.last_seen, peers.last_seen), \
@@ -1611,7 +1685,11 @@ impl Storage for PostgresStorage {
         let nid = id.to_hex();
 
         let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, String)>(
-            "SELECT node_id, address, last_seen, display_name, metadata_json FROM peers WHERE node_id = $1",
+            concat!(
+                "SELECT node_id, address, ",
+                utc_rfc3339!("last_seen"),
+                ", display_name, metadata_json FROM peers WHERE node_id = $1"
+            ),
         )
         .bind(&nid)
         .fetch_optional(&self.pool)
@@ -3413,6 +3491,52 @@ impl Storage for PostgresStorage {
         Ok(())
     }
 
+    async fn store_fiat_rate_snapshot(
+        &self,
+        snapshot: &crate::fiat_snapshots::FiatRateSnapshot,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO fiat_rate_snapshots (date, currency, rate, source)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT(date, currency) DO UPDATE SET
+               rate   = EXCLUDED.rate,
+               source = EXCLUDED.source",
+        )
+        .bind(&snapshot.date)
+        .bind(&snapshot.currency)
+        .bind(snapshot.rate)
+        .bind(&snapshot.source)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_fiat_rate_snapshots(
+        &self,
+        from_date: &str,
+        to_date: &str,
+    ) -> Result<Vec<crate::fiat_snapshots::FiatRateSnapshot>, StorageError> {
+        let rows: Vec<(String, String, f64, String, String)> =
+            sqlx::query_as(FIAT_RATE_SNAPSHOTS_SELECT)
+                .bind(from_date)
+                .bind(to_date)
+                .fetch_all(&self.pool)
+                .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(date, currency, rate, source, created_at)| {
+                crate::fiat_snapshots::FiatRateSnapshot {
+                    date,
+                    currency,
+                    rate,
+                    source,
+                    created_at,
+                }
+            })
+            .collect())
+    }
+
     async fn upsert_operator_hosting_contract(
         &self,
         contract: &OperatorHostingContract,
@@ -3642,6 +3766,7 @@ mod hard4_guard {
                 "CALENDAR_EXCEPTIONS_IN_RANGE_SELECT",
                 CALENDAR_EXCEPTIONS_IN_RANGE_SELECT,
             ),
+            ("FIAT_RATE_SNAPSHOTS_SELECT", FIAT_RATE_SNAPSHOTS_SELECT),
             (
                 "OPERATOR_HOSTING_CONTRACTS_SELECT",
                 OPERATOR_HOSTING_CONTRACTS_SELECT,
@@ -3743,6 +3868,19 @@ mod migration_recovery_tests {
         assert!(text.contains("Refusing to start"));
         assert!(!text.contains("postgres://"));
         assert!(!text.contains("password"));
+
+        assert!(
+            PostgresStorage::refuse_future_schema(&[1, 7, 8, 9]).is_ok(),
+            "withdrawn versions 7-9 must not block startup"
+        );
+        let reserved = PostgresStorage::refuse_future_schema(&[1, 34]).unwrap_err();
+        match reserved {
+            StorageError::FutureSchema { versions, max_known: reported } => {
+                assert_eq!(versions, vec![34]);
+                assert_eq!(reported, max_known);
+            }
+            other => panic!("expected FutureSchema, got {other}"),
+        }
     }
 
     #[tokio::test]
@@ -3975,6 +4113,806 @@ mod migration_recovery_tests {
             result.unwrap();
         }
         admin.close().await;
+    }
+}
+
+#[cfg(test)]
+mod schema_parity_tests {
+    use super::*;
+    use crate::contacts::ContactRepo;
+    use crate::models::OnboardingStateRecord;
+    use crate::schema_catalog;
+
+    #[test]
+    fn pg_schema_parity_does_not_backfill_old_migration_numbers() {
+        let versions: Vec<i32> = PostgresStorage::pg_migrations()
+            .iter()
+            .map(|(version, _, _)| *version)
+            .collect();
+        assert_eq!(
+            versions,
+            (1..=37).filter(|v| !matches!(v, 7..=9 | 34)).collect::<Vec<_>>()
+        );
+        let sql = include_str!("../migrations/postgres/033_calendar_and_schema_parity.sql");
+        assert!(
+            !sql.starts_with("-- no-transaction"),
+            "version 33 must roll back as a unit"
+        );
+    }
+
+    fn disposable_name(prefix: &str) -> String {
+        format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
+    }
+
+    async fn admin_pool() -> (sqlx::PgPool, String) {
+        let url = std::env::var("BITSOV_TEST_POSTGRES_URL").expect("BITSOV_TEST_POSTGRES_URL");
+        let admin = sqlx::PgPool::connect(&url).await.unwrap();
+        (admin, url)
+    }
+
+    async fn create_database(admin: &sqlx::PgPool, url: &str, name: &str) -> String {
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(admin)
+            .await
+            .unwrap();
+        format!("{}/{name}", url.rsplit_once('/').unwrap().0)
+    }
+
+    async fn drop_database(admin: &sqlx::PgPool, name: &str) {
+        sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .execute(admin)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn postgres_upsert_peer_round_trips_last_seen() {
+        let (admin, url) = admin_pool().await;
+        let name = disposable_name("peer_last_seen");
+        let db_url = create_database(&admin, &url, &name).await;
+        let result = async {
+            // Sub-millisecond on purpose: Postgres keeps microseconds.
+            const SEEN: &str = "2026-11-08T16:44:13.250123Z";
+            let db = PostgresStorage::connect(&db_url).await.unwrap();
+            let id = NodeId::from_bytes([5u8; 32]);
+            let last_seen = |peer: Option<Peer>| peer.expect("peer stored").last_seen;
+
+            // A peer without `last_seen` is stored and reads back as None,
+            // through both readers.
+            db.upsert_peer(&Peer::new(id)).await.unwrap();
+            assert_eq!(last_seen(db.get_peer(&id).await.unwrap()), None);
+            let listed = db.list_peers().await.unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].last_seen, None);
+
+            let mut peer = Peer::new(id);
+            peer.address = Some("peer.example:9735".into());
+            peer.last_seen = Some(SEEN.into());
+            db.upsert_peer(&peer).await.unwrap();
+            let loaded = db.get_peer(&id).await.unwrap().unwrap();
+            assert_eq!(loaded.last_seen.as_deref(), Some(SEEN));
+            assert_eq!(loaded.address.as_deref(), Some("peer.example:9735"));
+            let listed = db.list_peers().await.unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].last_seen.as_deref(), Some(SEEN));
+
+            // Writing back what was read keeps the same value.
+            db.upsert_peer(&loaded).await.unwrap();
+            let rewritten = last_seen(db.get_peer(&id).await.unwrap());
+            assert_eq!(rewritten.as_deref(), Some(SEEN));
+
+            // An update without `last_seen` keeps the stored value.
+            db.upsert_peer(&Peer::new(id)).await.unwrap();
+            let kept = last_seen(db.get_peer(&id).await.unwrap());
+            assert_eq!(kept.as_deref(), Some(SEEN));
+
+            // An offset timestamp is stored as the same instant and read in UTC.
+            peer.last_seen = Some("2026-11-09T01:00:00+02:00".into());
+            db.upsert_peer(&peer).await.unwrap();
+            let utc = last_seen(db.get_peer(&id).await.unwrap());
+            assert_eq!(utc.as_deref(), Some("2026-11-08T23:00:00.000000Z"));
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn postgres_room_round_trips_created_at() {
+        let (admin, url) = admin_pool().await;
+        let name = disposable_name("room_created_at");
+        let db_url = create_database(&admin, &url, &name).await;
+        let result = async {
+            let db = PostgresStorage::connect(&db_url).await.unwrap();
+            let creator = NodeId::from_bytes([6u8; 32]);
+            let micros = |text: &str| {
+                chrono::DateTime::parse_from_rfc3339(text)
+                    .expect("RFC 3339 created_at")
+                    .timestamp_micros()
+            };
+
+            // `Room::new` writes the current time with nanoseconds and a
+            // `+00:00` offset. It reads back in UTC as the same instant,
+            // rounded to the microsecond.
+            let fresh = Room::new("fresh".into(), creator);
+            db.create_room(&fresh).await.unwrap();
+            let loaded = db.get_room(&fresh.id).await.unwrap().expect("room stored");
+            let loaded_fresh = loaded.created_at.clone();
+            assert_eq!(loaded.name, "fresh");
+            assert_eq!(loaded.created_by, creator);
+            assert!(loaded.created_at.ends_with('Z'), "{}", loaded.created_at);
+            let drift = micros(&loaded.created_at) - micros(&fresh.created_at);
+            let fresh_at = &fresh.created_at;
+            assert!(drift.abs() <= 1, "{loaded_fresh} vs {fresh_at}");
+
+            // An earlier room with an offset and sub-millisecond time.
+            let older = Room {
+                id: RoomId::new(),
+                name: "older".into(),
+                created_by: creator,
+                created_at: "2020-01-02T03:04:05.250123+02:00".into(),
+                metadata: serde_json::json!({}),
+            };
+            db.create_room(&older).await.unwrap();
+            let loaded = db.get_room(&older.id).await.unwrap().expect("room stored");
+            assert_eq!(loaded.created_at, "2020-01-02T01:04:05.250123Z");
+
+            // The list uses the same format, newest first.
+            let listed = db.list_rooms().await.unwrap();
+            let names: Vec<&str> = listed.iter().map(|room| room.name.as_str()).collect();
+            assert_eq!(names, ["fresh", "older"]);
+            assert_eq!(listed[1].created_at, "2020-01-02T01:04:05.250123Z");
+            assert_eq!(listed[0].created_at, loaded_fresh);
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn main_032_postgres_plus_033_matches_fresh_install() {
+        let (admin, url) = admin_pool().await;
+        let upgrade_name = disposable_name("main032");
+        let fresh_name = disposable_name("fresh033");
+        let upgrade_url = create_database(&admin, &url, &upgrade_name).await;
+        let fresh_url = create_database(&admin, &url, &fresh_name).await;
+        let db = PostgresStorage {
+            pool: PgPool::connect(&upgrade_url).await.unwrap(),
+        };
+        sqlx::raw_sql(include_str!("tests/fixtures/main_032/postgres.sql"))
+            .execute(db.pool())
+            .await
+            .expect("apply frozen main migrations through 032");
+        let migration = include_str!("../migrations/postgres/033_calendar_and_schema_parity.sql");
+        sqlx::raw_sql(migration)
+            .execute(db.pool())
+            .await
+            .expect("upgrade main with only migration 033");
+        let upgraded = schema_catalog::load_postgres(db.pool()).await;
+        schema_catalog::assert_parity(&upgraded);
+        let fresh = PostgresStorage::connect(&fresh_url).await.unwrap();
+        assert_eq!(upgraded, schema_catalog::load_postgres(fresh.pool()).await);
+
+        // Even nodes that recorded 007–009 must converge using 033 alone.
+        sqlx::raw_sql(
+            "INSERT INTO _konsensus_migrations (version, name) VALUES
+             (7, 'fiat rate snapshots'), (8, 'recovery'), (9, 'contacts')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.run_migrations().await.unwrap();
+        sqlx::raw_sql(migration)
+            .execute(db.pool())
+            .await
+            .expect("migration 033 must be idempotent");
+        assert_eq!(upgraded, schema_catalog::load_postgres(db.pool()).await);
+        assert_secondary_unique_counts(db.pool()).await;
+        db.pool.close().await;
+        fresh.pool.close().await;
+        drop_database(&admin, &upgrade_name).await;
+        drop_database(&admin, &fresh_name).await;
+        admin.close().await;
+    }
+
+    /// One secondary unique index per column set. A second index on the same
+    /// columns makes `ON CONFLICT` inference fail.
+    async fn assert_secondary_unique_counts(pool: &PgPool) {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT t.relname, COUNT(ix.indexrelid)
+             FROM pg_class t
+             JOIN pg_namespace n ON n.oid = t.relnamespace
+             LEFT JOIN pg_index ix
+               ON ix.indrelid = t.oid
+              AND ix.indisunique
+              AND NOT ix.indisprimary
+              AND ix.indpred IS NULL
+             WHERE n.nspname = current_schema()
+               AND t.relname = ANY($1)
+             GROUP BY t.relname
+             ORDER BY t.relname",
+        )
+        .bind(vec![
+            "calendar_events",
+            "calendar_rsvps",
+            "contacts",
+            "fiat_rate_snapshots",
+            "invites_issued",
+            "onboarding_state",
+            "recovery_schemes",
+            "recovery_shards",
+            "recovery_trustees",
+        ])
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let actual: Vec<(String, i64)> = rows;
+        let expected = [
+            ("calendar_events", 0i64),
+            ("calendar_rsvps", 1),
+            ("contacts", 0),
+            ("fiat_rate_snapshots", 0),
+            ("invites_issued", 1),
+            ("onboarding_state", 0),
+            ("recovery_schemes", 0),
+            ("recovery_shards", 1),
+            ("recovery_trustees", 2),
+        ]
+        .into_iter()
+        .map(|(name, count)| (name.to_string(), count))
+        .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    async fn database_without(skip: &[i32]) -> (sqlx::PgPool, String, PostgresStorage) {
+        let (admin, url) = admin_pool().await;
+        let name = disposable_name("parity");
+        let db_url = create_database(&admin, &url, &name).await;
+        let db = PostgresStorage {
+            pool: sqlx::PgPool::connect(&db_url).await.unwrap(),
+        };
+        sqlx::raw_sql(
+            "CREATE TABLE _konsensus_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (version, migration_name, sql) in PostgresStorage::pg_migrations() {
+            if skip.contains(&version) {
+                continue;
+            }
+            sqlx::raw_sql(sql)
+                .execute(db.pool())
+                .await
+                .unwrap_or_else(|e| panic!("apply old version {version} ({migration_name}): {e}"));
+            sqlx::query("INSERT INTO _konsensus_migrations (version, name) VALUES ($1, $2)")
+                .bind(version)
+                .bind(migration_name)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        (admin, name, db)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn fresh_postgres_matches_sqlite_catalog_and_round_trips() {
+        let (admin, url) = admin_pool().await;
+        let name = disposable_name("parity");
+        let db_url = create_database(&admin, &url, &name).await;
+        let result = async {
+            let db = PostgresStorage::connect(&db_url).await.unwrap();
+            schema_catalog::assert_parity(&schema_catalog::load_postgres(db.pool()).await);
+            assert_secondary_unique_counts(db.pool()).await;
+
+            sqlx::query(
+                "INSERT INTO recovery_schemes (id, scheme_type, threshold, total_shares, created_at, updated_at)
+                 VALUES ('sch', 'shamir', 1, 1, 't', 't')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO recovery_trustees (id, scheme_id, trustee_node_id, share_index, created_at)
+                 VALUES ('tr1', 'sch', 'node-a', 0, 't')
+                 ON CONFLICT (scheme_id, trustee_node_id) DO UPDATE SET created_at = EXCLUDED.created_at",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO recovery_trustees (id, scheme_id, trustee_node_id, share_index, created_at)
+                 VALUES ('tr2', 'sch', 'node-a', 0, 't2')
+                 ON CONFLICT (scheme_id, share_index) DO UPDATE SET created_at = EXCLUDED.created_at",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO recovery_shards (id, owner_node_id, share_index, shard_ciphertext, received_at)
+                 VALUES ('sh1', 'owner', 0, $1, 't')
+                 ON CONFLICT (owner_node_id, share_index)
+                 DO UPDATE SET shard_ciphertext = EXCLUDED.shard_ciphertext",
+            )
+            .bind(vec![1u8])
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO recovery_shards (id, owner_node_id, share_index, shard_ciphertext, received_at)
+                 VALUES ('sh2', 'owner', 0, $1, 't2')
+                 ON CONFLICT (owner_node_id, share_index)
+                 DO UPDATE SET shard_ciphertext = EXCLUDED.shard_ciphertext",
+            )
+            .bind(vec![2u8])
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let shard: Vec<u8> = sqlx::query_scalar(
+                "SELECT shard_ciphertext FROM recovery_shards WHERE owner_node_id = 'owner'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(shard, vec![2u8]);
+
+            let snapshot = crate::fiat_snapshots::FiatRateSnapshot {
+                date: "2026-04-21".into(),
+                currency: "USD".into(),
+                rate: 65_000.5,
+                source: "MempoolSpace".into(),
+                created_at: String::new(),
+            };
+            db.store_fiat_rate_snapshot(&snapshot).await.unwrap();
+            let mut again = snapshot.clone();
+            again.rate = 66_000.0;
+            db.store_fiat_rate_snapshot(&again).await.unwrap();
+            let snaps = db
+                .list_fiat_rate_snapshots("2026-04-01", "2026-04-30")
+                .await
+                .unwrap();
+            assert_eq!(snaps.len(), 1);
+            assert_eq!(snaps[0].rate, 66_000.0);
+            assert!(!snaps[0].created_at.is_empty());
+
+            let event = crate::calendar::CalendarEventRecord {
+                id: "event-1".into(),
+                message_id: None,
+                organizer: "aa".repeat(32),
+                title: "signet standup".into(),
+                description: None,
+                start_ms: 1_700_000_000_000,
+                end_ms: 1_700_000_360_000,
+                tz: "UTC".into(),
+                location: None,
+                attendees_json: "[]".into(),
+                recurrence_json: None,
+                color: None,
+                created_at: String::new(),
+                parent_id: None,
+            };
+            db.store_calendar_event(&event).await.unwrap();
+            let stored = db.get_calendar_event("event-1").await.unwrap().unwrap();
+            assert_eq!(stored.title, "signet standup");
+            assert!(!stored.created_at.is_empty());
+            let mut updated = event.clone();
+            updated.title = "moved".into();
+            db.store_calendar_event(&updated).await.unwrap();
+            let after = db.get_calendar_event("event-1").await.unwrap().unwrap();
+            assert_eq!(after.title, "moved");
+            assert_eq!(after.created_at, stored.created_at);
+
+            let rsvp = crate::calendar::RsvpRecord {
+                id: "rsvp-1".into(),
+                event_id: "event-1".into(),
+                responder: "bb".repeat(32),
+                response: "accepted".into(),
+                comment: None,
+                created_at: String::new(),
+            };
+            db.store_rsvp(&rsvp).await.unwrap();
+            let mut changed = rsvp.clone();
+            changed.id = "rsvp-2".into();
+            changed.response = "declined".into();
+            db.store_rsvp(&changed).await.unwrap();
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM calendar_rsvps WHERE event_id = 'event-1'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(count, 1);
+
+            let state = OnboardingStateRecord {
+                invite_id: None,
+                inviter_pubkey: None,
+                inviter_ln_pubkey: None,
+                current_step: "funding".into(),
+                tier: Some("full".into()),
+                funding_address: Some("bcrt1qexample".into()),
+                funding_amount_sats_required: Some(u32::MAX),
+                funding_amount_sats_received: u32::MAX,
+                last_poll_at: Some(1_700_000_123),
+                funding_evidence: Some("wallet_balance_observed".into()),
+            };
+            db.upsert_onboarding_state(&state).await.unwrap();
+            let loaded = db.get_onboarding_state().await.unwrap().unwrap();
+            assert_eq!(loaded.funding_amount_sats_received, u32::MAX);
+            assert_eq!(loaded.funding_amount_sats_required, Some(u32::MAX));
+
+            let duplicate = sqlx::query(
+                "INSERT INTO invites_issued (id, invitee_pubkey, expiry_unix, nonce, state, created_at)
+                 VALUES ($1, $2, 10, $3, 'pending', 10), ($4, $2, 11, $3, 'pending', 11)",
+            )
+            .bind([1u8; 16].as_slice())
+            .bind([2u8; 32].as_slice())
+            .bind([3u8; 16].as_slice())
+            .bind([4u8; 16].as_slice())
+            .execute(db.pool())
+            .await;
+            assert!(duplicate.is_err(), "nonce must be unique");
+
+            db.run_migrations().await.unwrap();
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn previous_postgres_version_upgrades_without_data_loss() {
+        let (admin, url) = admin_pool().await;
+        let name = disposable_name("upgrade");
+        let db_url = create_database(&admin, &url, &name).await;
+        let result = async {
+            let db = PostgresStorage {
+                pool: sqlx::PgPool::connect(&db_url).await.unwrap(),
+            };
+            sqlx::raw_sql(include_str!("tests/fixtures/main_032/postgres.sql"))
+                .execute(db.pool())
+                .await
+                .expect("apply frozen main migrations through 032");
+            // Simulate nodes that already marked these versions applied. Only
+            // the forward migration may repair the hand-built tables below.
+            sqlx::raw_sql(
+                "INSERT INTO _konsensus_migrations (version, name) VALUES
+                 (7, 'fiat rate snapshots'), (8, 'recovery'), (9, 'contacts')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+            let peer = NodeId::from_bytes([9u8; 32]);
+            sqlx::query("INSERT INTO peers (node_id, metadata_json) VALUES ($1, '{}')")
+                .bind(peer.to_hex())
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let nonce = [0x33u8; 16];
+            sqlx::query(
+                "INSERT INTO invites_issued (
+                    id, invitee_pubkey, expiry_unix, channel_size_hint_sats, addr,
+                    max_fee_rate_sat_per_vb, channel_open_intent_expiry_unix, nonce, state, created_at
+                 ) VALUES ($1, $2, 1700000000, 50000, '127.0.0.1:9735', 5, 1700000100, $3, 'pending', 1700000000)",
+            )
+            .bind([0x11u8; 16].as_slice())
+            .bind([0x22u8; 32].as_slice())
+            .bind(nonce.as_slice())
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE onboarding_state
+                 SET current_step = 'funding',
+                     funding_amount_sats_received = 1000,
+                     funding_amount_sats = 4000,
+                     funding_txid = 'txid-keep',
+                     confirmations = 3
+                 WHERE id = 1",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+            sqlx::raw_sql(
+                "CREATE TABLE fiat_rate_snapshots (
+                    date TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    rate REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (date, currency)
+                 )",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO fiat_rate_snapshots (date, currency, rate, source, created_at)
+                 VALUES ('2026-04-21', 'USD', 1.25, 'hand', '2026-04-21T00:00:00.000Z')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE calendar_events (
+                    id TEXT PRIMARY KEY,
+                    message_id TEXT,
+                    organizer TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    start_ms BIGINT,
+                    end_ms BIGINT,
+                    tz TEXT,
+                    location TEXT,
+                    attendees_json TEXT,
+                    recurrence_json TEXT,
+                    color TEXT,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    parent_id TEXT
+                 )",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO calendar_events (id, organizer, title, start_ms, end_ms, tz, attendees_json, created_at)
+                 VALUES ('hand-event', 'org', 'kept title', 10, 20, 'UTC', '[]', '2026-01-01T00:00:00Z')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+            // A hand-built boolean contact book and recovery tables that already
+            // have their unique keys. Version 33 must keep the rows and must
+            // not add a second unique index.
+            sqlx::raw_sql(
+                "CREATE TABLE contacts (
+                    node_id TEXT PRIMARY KEY,
+                    muted BOOLEAN NOT NULL DEFAULT FALSE,
+                    blocked BOOLEAN NOT NULL DEFAULT FALSE
+                 );
+                 CREATE TABLE recovery_schemes (
+                    id TEXT PRIMARY KEY,
+                    scheme_type TEXT NOT NULL,
+                    threshold INTEGER NOT NULL CHECK (threshold > 0),
+                    total_shares INTEGER NOT NULL CHECK (total_shares >= threshold),
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE recovery_trustees (
+                    id TEXT PRIMARY KEY,
+                    scheme_id TEXT NOT NULL REFERENCES recovery_schemes(id) ON DELETE CASCADE,
+                    trustee_node_id TEXT NOT NULL,
+                    share_index INTEGER NOT NULL,
+                    shard_commitment TEXT,
+                    delivered_at TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (scheme_id, trustee_node_id),
+                    UNIQUE (scheme_id, share_index)
+                 );
+                 CREATE TABLE recovery_shards (
+                    id TEXT PRIMARY KEY,
+                    owner_node_id TEXT NOT NULL,
+                    share_index INTEGER NOT NULL,
+                    shard_ciphertext BYTEA NOT NULL,
+                    scheme_metadata_json TEXT NOT NULL DEFAULT '{}',
+                    received_at TEXT NOT NULL,
+                    UNIQUE (owner_node_id, share_index)
+                 );",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO contacts (node_id, muted, blocked) VALUES ('peer-bool', TRUE, FALSE)",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO recovery_schemes (id, scheme_type, threshold, total_shares, created_at, updated_at)
+                 VALUES ('sch-keep', 'shamir', 2, 3, 'c', 'u')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO recovery_shards (id, owner_node_id, share_index, shard_ciphertext, received_at)
+                 VALUES ('shard-keep', 'owner-keep', 1, $1, 'then')",
+            )
+            .bind(vec![7u8, 7])
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+            db.run_migrations().await.unwrap();
+            db.run_migrations().await.unwrap();
+
+            let loaded_peer = db.get_peer(&peer).await.unwrap().expect("peer survived");
+            assert_eq!(loaded_peer.node_id, peer);
+            let invites = db.list_invites_issued().await.unwrap();
+            assert_eq!(invites.len(), 1);
+            assert_eq!(invites[0].nonce, nonce);
+            assert_eq!(invites[0].addr, "127.0.0.1:9735");
+
+            let state = db.get_onboarding_state().await.unwrap().unwrap();
+            assert_eq!(state.current_step, "funding");
+            assert_eq!(state.funding_amount_sats_received, 1000);
+            let legacy: (i64, String, i32) = sqlx::query_as(
+                "SELECT funding_amount_sats, funding_txid, confirmations
+                 FROM onboarding_state WHERE id = 1",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(legacy, (4000, "txid-keep".into(), 3));
+
+            let mut full = state;
+            full.funding_amount_sats_received = u32::MAX;
+            db.upsert_onboarding_state(&full).await.unwrap();
+            let widened = db.get_onboarding_state().await.unwrap().unwrap();
+            assert_eq!(widened.funding_amount_sats_received, u32::MAX);
+
+            let snaps = db
+                .list_fiat_rate_snapshots("2026-04-21", "2026-04-21")
+                .await
+                .unwrap();
+            assert_eq!(snaps.len(), 1);
+            assert_eq!(snaps[0].rate, 1.25);
+            assert_eq!(snaps[0].source, "hand");
+            let hand = db.get_calendar_event("hand-event").await.unwrap().unwrap();
+            assert_eq!(hand.title, "kept title");
+
+            let duplicate = sqlx::query(
+                "INSERT INTO invites_issued (id, invitee_pubkey, expiry_unix, nonce, state, created_at)
+                 VALUES ($1, $2, 11, $3, 'pending', 11)",
+            )
+            .bind([0x44u8; 16].as_slice())
+            .bind([0x22u8; 32].as_slice())
+            .bind(nonce.as_slice())
+            .execute(db.pool())
+            .await;
+            assert!(duplicate.is_err(), "upgrade must enforce nonce uniqueness");
+
+            let flags: (i32, i32) = sqlx::query_as(
+                "SELECT muted, blocked FROM contacts WHERE node_id = 'peer-bool'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(flags, (1, 0));
+            let contact = crate::contacts::PostgresContactRepo::new(db.pool().clone())
+                .get_contact("peer-bool")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(contact.muted);
+            assert!(!contact.blocked);
+
+            let kept: Vec<u8> = sqlx::query_scalar(
+                "SELECT shard_ciphertext FROM recovery_shards WHERE id = 'shard-keep'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(kept, vec![7u8, 7]);
+            sqlx::query(
+                "INSERT INTO recovery_shards (id, owner_node_id, share_index, shard_ciphertext, received_at)
+                 VALUES ('shard-new', 'owner-keep', 1, $1, 'now')
+                 ON CONFLICT (owner_node_id, share_index)
+                 DO UPDATE SET shard_ciphertext = EXCLUDED.shard_ciphertext",
+            )
+            .bind(vec![8u8])
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let updated: Vec<u8> = sqlx::query_scalar(
+                "SELECT shard_ciphertext FROM recovery_shards WHERE owner_node_id = 'owner-keep'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(updated, vec![8u8]);
+            assert_secondary_unique_counts(db.pool()).await;
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
+    }
+
+    async fn assert_version_33_rolled_back(db: &PostgresStorage) {
+        let err = db.run_migrations().await;
+        assert!(err.is_err(), "migration 33 must refuse and roll back");
+        let recorded: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM _konsensus_migrations WHERE version = 33)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(!recorded, "failed migration must not be recorded");
+        let calendar: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = current_schema() AND table_name = 'calendar_events'
+             )",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            !calendar,
+            "calendar tables created by version 33 must roll back"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn postgres_refuses_to_delete_duplicate_invite_nonces() {
+        let (admin, name, db) = database_without(&[33]).await;
+        let result = async {
+            sqlx::query(
+                "INSERT INTO invites_issued (id, invitee_pubkey, expiry_unix, nonce, state, created_at)
+                 VALUES ($1, $2, 10, $3, 'pending', 10), ($4, $2, 11, $3, 'pending', 11)",
+            )
+            .bind([1u8; 16].as_slice())
+            .bind([2u8; 32].as_slice())
+            .bind([3u8; 16].as_slice())
+            .bind([4u8; 16].as_slice())
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert_version_33_rolled_back(&db).await;
+            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invites_issued")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(rows, 2);
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn postgres_refuses_to_delete_extra_onboarding_rows() {
+        let (admin, name, db) = database_without(&[33]).await;
+        let result = async {
+            sqlx::query(
+                "INSERT INTO onboarding_state (id, current_step) VALUES (2, 'paste-invite')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert_version_33_rolled_back(&db).await;
+            let ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM onboarding_state ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(ids, vec![1, 2]);
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
     }
 }
 

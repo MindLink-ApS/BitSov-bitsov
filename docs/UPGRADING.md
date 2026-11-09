@@ -3,6 +3,52 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## Location-bound storage records (after rc22)
+
+The encrypted record format is **forward-only**. New writes bind encrypted
+fields in messages, peers, rooms, files, outbox operations and channel/payment
+operations to their table, column and row ID. Cached message plaintext and
+persisted sessions use the same location binding. The background pass converts
+readable fields before persisting a local completion marker. After that marker
+exists, unbound v1 records are refused, including after a restart. The cache and
+session cutoff also remains effective across storage-mode changes.
+
+Fields are converted independently. A corrupt optional message cache is cleared
+so it cannot prevent readable message content from upgrading. Invalid file data
+is retained and still rejected; readable file names and MIME types are upgraded
+so metadata reads and listings continue to work. Other unreadable fields are
+retained for recovery. The log reports table names and aggregate unreadable,
+unwritable and discarded-cache counts, without record IDs or field contents.
+
+SQLite snapshot comparisons account for TEXT/BLOB storage classes. After a
+rejected swap, including a row data or constraint rejection, the pass rereads
+that row once: an unchanged snapshot is reported
+as unwritable rather than retried forever. Such blocked rows are retained and
+may require recovery after cutoff. A changed snapshot or an operational database error
+still defers completion and retries with exponential backoff, from one minute
+to at most one hour; ongoing writes can therefore delay completion. Held call
+messages are included in maintenance while hidden from ordinary message reads.
+
+Retain the latest complete data directory, including the completion markers.
+Do not delete a marker or restore an older database beneath it to re-enable old
+records. Do not run rc22 or an older binary on this data: migration 033 is a
+separate schema fence that those binaries refuse; the encrypted record wrapper
+alone is not a binary-version fence. Recover by rolling forward using consistent
+state, following the existing channel and ratchet rollback constraints.
+
+Only the encrypted fields are bound. Plain sibling columns (for example file
+associations and hashes, room creators, and operation state) are outside this
+binding, except for message-envelope fields checked through the message ID.
+Recovery shards and whitelist backups retain their separate existing formats.
+The format version is authenticated in the AAD; no trusted per-record generation
+counter is included. Replaying an older valid ciphertext at the same location
+can still succeed, so this change does not prevent same-record or whole-database
+rollback by an attacker with write access.
+
+Library defaults accept v2 only. Embedders migrating v1 data must explicitly
+supply a data-directory policy to storage, cache and session constructors, run
+the format upgrade, and retain its marker across restarts.
+
 ## rc21 → rc22
 
 An E2EE send now saves its advanced send chain before the ciphertext leaves the
@@ -68,6 +114,11 @@ If messages stop being read after a dropped link:
 Amounts already paid for messages or minutes that were not read are not refunded.
 Tested on regtest on this release and on rc21, by calling the app's host
 functions, not on real hardware.
+
+Also present in rc21 and rc22: after a reconnect, one node can be left without
+an E2EE session. If that node holds the lower id, it stays stuck until a new
+connection. The fix is on main (#514) and not in either signed release; see
+[recovering a stuck E2EE session](operations/e2ee-session-recovery.md).
 
 Follow the [rc22 signing and node checklist](releases/v0.3.0-rc22.md).
 
@@ -704,8 +755,14 @@ confirm `uname -m` is `aarch64`, the service uses `/usr/bin/konsensus` and the
 config is `/var/lib/bitsov/konsensus.toml`. If the Pi still uses a user unit or
 other paths, use that unit's actual account and paths; do not run both services.
 
-After downloading and independently verifying the **published** rc14 Linux
-aarch64 artifact and signed checksums, from its download directory:
+After downloading the **published** rc14 Linux aarch64 artifact, verify it
+before it runs.
+
+Do not run the block below. It makes `./bitsov-linux-aarch64` executable,
+runs that download-directory path, and installs the same path. Verify with
+`bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc` and install
+`bitsov-linux-aarch64` from the seal path the script prints. The home-node
+guide shows that command. The block stays as the record of this rc14 note.
 
 ```sh
 uname -m

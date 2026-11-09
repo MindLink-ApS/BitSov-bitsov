@@ -5,6 +5,19 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- The node refuses to start when its chain source is on another network than
+  `[lightning] network`, naming both networks, and tries no other source. Bitcoin
+  Core is checked through `getblockchaininfo`; Electrum and Esplora through their
+  height-0 header, hashed by the node. Until a source has answered on the
+  configured network, nothing reads or syncs from it: the node starts not ready
+  and the embedded LDK node retries without starting. With `credentials_file`,
+  an unanswered primary is skipped and LDK uses the verified fallback without
+  credentials. Each Esplora endpoint is checked within its own ten seconds, so
+  a slow or silent endpoint never discards another one's answer. Sources are
+  asked again after a lost connection and at least every 60 seconds, and
+  `konsensus recover` checks its source too. A custom signet passes as
+  `signet`. With LND, LNbits or mock Lightning a real `[chain]` source is not
+  checked.
 - **Breaking for exposed APIs:** a non-loopback `[api].listen_addr` (`0.0.0.0`,
   `::`, a LAN address) now fails config validation unless
   `[api].allow_non_loopback_bind = true` is set, because the owner API is
@@ -50,6 +63,15 @@ also live on the corresponding GitHub pre-release pages.
   offer the peer refuses, or a well-formed init with other keys, changes nothing.
   Two stale offers, or a late `SessionAck`, can still retire a working session
   until key confirmation lands. No frame or message format changes.
+- A normal start no longer logs `lightning health check FAILED — payments will
+  not work` and a `Fix:` hint while the wallet is still syncing. The startup
+  check reads the Lightning readiness phase: a sync is INFO ("payments start
+  when it is ready"); an unreachable chain service is one WARN naming the
+  service kind (`LIGHTNING_CHAIN_SOURCE_UNAVAILABLE`), not repeated on each
+  retry; a failed or stopped Lightning, or a backend error, still warns with
+  the `Fix:` hint, as soon as it is seen. A sync still running after ten minutes
+  warns once, and the node says at INFO when payments are on. Payments are
+  refused until Lightning is ready, as before.
 
 ## [0.3.0-rc22] — 2026-11-05
 

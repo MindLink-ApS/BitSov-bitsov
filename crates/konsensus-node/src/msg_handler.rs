@@ -679,7 +679,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 }
                                 let committed = async {
                                     let bytes = serde_json::to_vec(&identity).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
-                                    let cached = plaintext_cipher.encrypt(&bytes).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+                                    let cached = plaintext_cipher.encrypt(&msg_id.to_hex(), &bytes).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
                                     storage_for_recv.store_message_plaintext(&msg_id, &cached).await?;
                                     block.commit(&msg_id).await
                                 }.await;
@@ -1108,7 +1108,7 @@ async fn decrypt_and_process(
     // message this node cannot keep is not delivered. A committed call block
     // (`cache_plaintext == false`) already cached its metadata before commit.
     if cache_plaintext {
-        match plaintext_cipher.encrypt(&bytes) {
+        match plaintext_cipher.encrypt(&envelope.id.to_hex(), &bytes) {
             Ok(encrypted) => {
                 if let Err(e) = storage
                     .store_message_plaintext(&envelope.id, &encrypted)
