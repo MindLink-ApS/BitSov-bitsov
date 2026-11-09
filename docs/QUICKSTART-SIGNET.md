@@ -76,22 +76,37 @@ curl -fLO "https://raw.githubusercontent.com/MindLink-ApS/BitSov-bitsov/$TAG/REL
 ```
 
 **Check the signature.** A throwaway GnuPG home keeps your own keyring
-untouched:
+untouched, and `--no-auto-key-retrieve` stops gpg from fetching any key from
+the network; only the downloaded `RELEASE_KEY.asc` is used:
 
 ```sh
-export GNUPGHOME="$(mktemp -d)"
-gpg --quiet --import RELEASE_KEY.asc
-gpg --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>/dev/null > gpg-status.txt; echo "gpg exit $?"
-grep -E '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG) ' gpg-status.txt
-awk '$2 == "VALIDSIG" { print $12 }' gpg-status.txt
-rm -rf "$GNUPGHOME"; unset GNUPGHOME
+(
+  export GNUPGHOME="$(mktemp -d)"
+  gpg --batch --quiet --import RELEASE_KEY.asc
+  gpg --batch --no-auto-key-retrieve --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>/dev/null > gpg-status.txt
+  gpg_exit=$?
+  rm -rf "$GNUPGHOME"
+  if [ "$gpg_exit" -eq 0 ] &&
+     ! grep -qE '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG) ' gpg-status.txt &&
+     [ "$(awk '$2 == "VALIDSIG" { print $12 }' gpg-status.txt)" = B299274C200301714DC6F51A7C2D6F8AC842EF6E ]
+  then echo "signature OK"
+  else echo "SIGNATURE CHECK FAILED: do not use these files"; exit 1
+  fi
+)
 ```
 
-It passes only if gpg exits 0, the `grep` prints nothing, and the `awk` line
-prints exactly `B299274C200301714DC6F51A7C2D6F8AC842EF6E`, the release key's
-primary fingerprint (also in [`SECURITY.md`](../SECURITY.md)). "Good signature"
-alone is not enough: that fingerprint field is what ties the signature to the
-release key.
+It prints `signature OK` and exits 0 only if gpg exits 0, no bad-signature
+status appears, and the primary-key fingerprint in the `VALIDSIG` line is
+exactly `B299274C200301714DC6F51A7C2D6F8AC842EF6E`, the release key (also in
+[`SECURITY.md`](../SECURITY.md)). Any non-zero status means stop: do not use
+the files. The parentheses keep the `exit` from closing your shell. "Good
+signature" alone is not enough: that fingerprint field is what ties the
+signature to the release key.
+
+If you download every asset of the release instead, a source checkout's
+`bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc` makes the same
+check plus every checksum, and prints a sealed copy to install from. It refuses
+a directory that holds only one platform's binary.
 
 **Check the file.** `SHA256SUMS` lists every platform's files, so tell the
 check to skip the ones you didn't download:
@@ -117,13 +132,23 @@ xattr -d com.apple.quarantine konsensus 2>/dev/null   # macOS only
 export PATH="$PWD:$PATH"
 ```
 
-Step 4 needs the owner-token helper, which is not a release asset. Fetch it
-from the same tag into this directory and read it before you source it; it is
-not covered by `SHA256SUMS`:
+Step 4 needs the owner-token helper. It is not a release asset, so neither
+`SHA256SUMS` nor its signature covers it. Fetch it from the same tag into this
+directory:
 
 ```sh
 curl -fLO "https://raw.githubusercontent.com/MindLink-ApS/BitSov-bitsov/$TAG/docs/ops/owner-token.sh"
+shasum -a 256 owner-token.sh   # Linux: sha256sum owner-token.sh
 ```
+
+For `v0.3.0-rc22` the hash is
+`a23f002e754f91416c5580a3ff6b82ef8447cea7cc6a125e505fef3a5ff95764`, the file at
+that tag (`docs/ops/owner-token.sh` in the tag's tree on GitHub). That value
+comes from the same site as the file, so it catches a damaged or mismatched
+download, not a changed repository. For a check tied to the release key,
+verify the tag in a source checkout (`git verify-tag`, with the fingerprint
+above) and compare the file there with `cmp`. Read the script before you
+source it.
 
 Keep this directory; step 4 comes back to it. Then continue at step 2.
 
@@ -226,12 +251,13 @@ cd BitSov-bitsov
 export PATH="$PWD/target/release:$PATH"
 ```
 
-With a release binary from step 1b, enter that directory instead, and below
-source `./owner-token.sh` where it says `docs/ops/owner-token.sh`:
+With a release binary from step 1b, enter that directory instead, and source
+the helper from there in place of the `docs/ops/owner-token.sh` line below:
 
 ```sh
 cd <the step 1b directory>
 export PATH="$PWD:$PATH"
+KONSENSUS_CONFIG=~/bitsov-signet/konsensus.toml source ./owner-token.sh
 ```
 
 The HTTP API is loopback only and every owner route needs a bearer token. The

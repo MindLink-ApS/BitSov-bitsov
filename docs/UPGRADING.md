@@ -9,15 +9,17 @@ Release binaries are named `bitsov-<os>-<arch>` (for example
 `bitsov-darwin-aarch64`); this note calls the binary `konsensus`. Verify the
 download, rename it to the path your service runs, make it executable and, on
 macOS, remove the browser's download mark, as in
-[install a signed pre-release binary](QUICKSTART-SIGNET.md#1b-or-install-a-signed-pre-release-binary).
-Use `shasum -a 256 -c SHA256SUMS --ignore-missing` (Linux:
+[install a signed pre-release binary](QUICKSTART-SIGNET.md#1b-or-install-a-signed-pre-release-binary),
+including its signature check (or `scripts/verify-release.sh` for a download of
+every asset). Use `shasum -a 256 -c SHA256SUMS --ignore-missing` (Linux:
 `sha256sum -c --ignore-missing SHA256SUMS`): without `--ignore-missing` the
 check fails on the other platforms' files. Stage the new binary beside the old
 one and check `./konsensus --version` before you switch.
 
-A running node does not print its release on start. Builds after rc22 report it
-as `node_version` in the owner's `GET /api/v1/status`; `version` there and in
-`/api/v1/health` stays the API version, `2`. On rc22 and earlier, check the
+A running node does not print its release on start. Builds that include #540
+(none signed yet) report it as `node_version` in the owner's
+`GET /api/v1/status`; `version` there and in `/api/v1/health` stays the API
+version, `2`. On rc22 and earlier, check the
 binary with `--version`.
 
 ## Location-bound storage records (after rc22)
@@ -51,9 +53,10 @@ Do not delete a marker or restore an older database beneath it to re-enable old
 records. Do not run rc22 or an older binary on this data: migration 033 is a
 separate schema fence, and the encrypted record wrapper alone is not a
 binary-version fence. On SQLite, those binaries refuse the database at start
-(`VersionMissing`). Released PostgreSQL binaries (rc22 and older) have no such
-check: they skip migration versions they don't know and start anyway, so never
-run them on this data. Recover by rolling forward using consistent
+with `migration 33 was previously applied but is missing in the resolved
+migrations` (sqlx `VersionMissing`). Released PostgreSQL binaries (rc22 and
+older) have no such check: they skip migration versions they don't know and
+start anyway, so never run them on this data. Recover by rolling forward using consistent
 state, following the existing channel and ratchet rollback constraints.
 
 Only the encrypted fields are bound. Plain sibling columns (for example file
@@ -134,12 +137,13 @@ To roll back rc22 → rc21:
 7. Check as after an upgrade: `/api/v1/health`, contacts and channels, and a
    message in each direction.
 
-This applies only to data that rc22 or rc21 last ran on. A node that ran a
-build after rc22 has the location-bound record format and migration 033
+This applies only to data that rc22 or rc21 last ran on. Data a later build
+has used can carry migration 033 and the location-bound record format
 ([above](#location-bound-storage-records-after-rc22)). On SQLite, rc22 and
-older refuse that database at start. Released PostgreSQL binaries (rc22 and
-older) do not: they skip migration versions they don't know and start anyway.
-Never run them on a PostgreSQL database that a build after rc22 has used.
+older refuse a database with migration 033 at start. Released PostgreSQL
+binaries (rc22 and older) do not: they skip migration versions they don't know
+and start anyway. Never run them on a PostgreSQL database that a later build
+has used.
 
 Not included: call cutoff is not yet verified on real hardware, and this release
 does not fix the other open reports.
@@ -200,9 +204,9 @@ the call ended without an owner debit.
 PostgreSQL in rc21 (and rc22) does not refuse a database whose
 `_konsensus_migrations` rows include a version the binary does not know: it
 skips that version and starts. Only SQLite refuses that case
-(`VersionMissing`). The PostgreSQL check (`FutureSchema`) is on main, after
-rc22, and not in any signed release. Do not run an older binary on a newer
-PostgreSQL schema, and do not delete migration history to make one start.
+(`VersionMissing`). The PostgreSQL check (`FutureSchema`) came with #504, on
+main after rc22, and is not in any signed release. Do not run an older binary
+on a newer PostgreSQL schema, and do not delete migration history to make one start.
 
 Follow the [rc21 signing and beta-node checklist](releases/v0.3.0-rc21.md).
 
@@ -217,7 +221,8 @@ before upgrading. Do not downgrade; roll forward on the migrated database.
 On SQLite, an older binary refuses startup when the database records a
 migration version the binary does not know (`VersionMissing`). The
 PostgreSQL backend in rc20, rc21 and rc22 has no such check and would start
-on the newer schema; the check (`FutureSchema`) is on main, after rc22.
+on the newer schema; the check (`FutureSchema`) came with #504, after rc22,
+and is not in any signed release.
 
 Migration **035** ends every in-flight live call;
 restart calls after the upgrade (their replay tombstones are kept and no
@@ -231,8 +236,9 @@ SQLite and PostgreSQL. It is additive and idempotent, with no down migration.
 Keep a consistent database backup before upgrading. Do not downgrade; roll
 forward. On SQLite, an older binary that does not know version 037 refuses
 the upgraded database (`VersionMissing`). A released PostgreSQL binary
-(rc22 and older) does not refuse it and would start; only builds after rc22
-refuse an applied version they do not know (`FutureSchema`). Do not run an
+(rc22 and older) does not refuse it and would start; only builds that include
+#504 (none signed yet) refuse an applied version they do not know
+(`FutureSchema`). Do not run an
 older binary on the upgraded database, and do not delete migration history
 or invoice bindings to make one start.
 
