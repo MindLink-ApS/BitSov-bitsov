@@ -493,7 +493,7 @@ async fn send_file_inner(
         .pricing
         .get_price_msat(KIND_FILE_REF)
         .await
-        .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
+        .map_err(crate::error::pricing_error)?;
 
     let all_in = super::messages::caps::check_payment(&state, super::messages::caps::payable(price_msat), req.max_routing_fee_msat, req.max_total_msat)?;
     *ceiling.lock().unwrap_or_else(|e| e.into_inner()) = Some(all_in - super::messages::caps::payable(price_msat));

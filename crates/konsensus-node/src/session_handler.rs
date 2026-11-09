@@ -2279,9 +2279,14 @@ impl ReadinessHeightCache {
             }
             slot.as_ref().expect("height lookup initialized").clone()
         };
-        lookup
-            .await
-            .map(|(height, _, observed_at)| (height, observed_at))
+        let (height, _, observed_at) = lookup.await?;
+        // A reused height is only as good as its tip: past the source's age
+        // bound it is dropped, and the next caller reads the tip again.
+        if !self.chain.tip_is_fresh().await {
+            *self.lookup.lock().await = None;
+            return Err(CHAIN_UNAVAILABLE);
+        }
+        Ok((height, observed_at))
     }
 }
 

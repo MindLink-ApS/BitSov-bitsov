@@ -7006,3 +7006,131 @@ async fn restored_responder_refuses_an_init_from_an_older_boot() {
     assert!(!init_accepted(&low, &restored, serde_json::to_value(&init).unwrap(), &connection_of(&low)).await);
     assert_session_works(&low, &low_mgr, &high, &restored, "after the older init").await;
 }
+
+/// T2: admission is ready only on a recent tip. Through the node's tip bound
+/// (mainnet: three hours), a source four hours behind refuses the stranger
+/// with a fixed not-ready code before any invoice; a recent one quotes.
+#[tokio::test]
+async fn admission_needs_a_recent_chain_tip() {
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = konsensus_lightning::shared_mock::SharedMockProvider::new(
+        &dir.path().join("wallet.sqlite"),
+        "recipient",
+        0,
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Mock headers are ten minutes apart from the genesis time, so this
+    // height's block is under ten minutes old, and 24 blocks less is four hours.
+    let recent = (now - 1_231_006_505) / 600;
+    let bounded = |height| {
+        konsensus_chain::FreshTip::wrap(
+            Arc::new(konsensus_chain::MockChainProvider::with_config(
+                konsensus_chain::MockChainConfig {
+                    initial_height: height,
+                    ..Default::default()
+                },
+            )),
+            Some("bitcoin"),
+        )
+    };
+    let quote = |chain: Arc<dyn ChainProvider>, request: &'static str| {
+        let wallet = &wallet;
+        async move {
+            prepare_admission_invoice(
+                admission_pricing().as_ref(),
+                &ReadinessHeightCache::new(chain),
+                wallet,
+                request,
+                now + u64::from(konsensus_core::admission_quote::FIRST_CONTACT_QUOTE_VALIDITY_SECS),
+                0,
+            )
+            .await
+        }
+    };
+    assert_eq!(
+        quote(bounded(recent - 24), "stale").await.unwrap_err(),
+        "konsensus:not_ready:chain_unavailable"
+    );
+    let (invoice, amount, _) = quote(bounded(recent), "recent").await.unwrap();
+    assert!(amount > 0 && !invoice.bolt11.is_empty());
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+}
+
+/// A source whose best block is `age` seconds old when it is read.
+struct AgingTip {
+    age: u64,
+    header_reads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ChainProvider for AgingTip {
+    fn trust_level(&self) -> konsensus_core::traits::chain::TrustLevel {
+        konsensus_core::traits::chain::TrustLevel::FullValidation
+    }
+    async fn get_block_height(&self) -> Result<u64, konsensus_core::traits::chain::ChainError> {
+        Ok(900_000)
+    }
+    async fn get_block_header(
+        &self,
+        height: u64,
+    ) -> Result<konsensus_core::traits::chain::BlockHeader, konsensus_core::traits::chain::ChainError>
+    {
+        self.header_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Ok(konsensus_core::traits::chain::BlockHeader {
+            height,
+            hash: "22".repeat(32),
+            timestamp: now - self.age,
+            bits: 0x1703_2e3b,
+        })
+    }
+    async fn estimate_fee(
+        &self,
+        target_blocks: u32,
+    ) -> Result<konsensus_core::traits::chain::FeeEstimate, konsensus_core::traits::chain::ChainError>
+    {
+        Ok(konsensus_core::traits::chain::FeeEstimate { target_blocks, sat_per_vbyte: 1.0 })
+    }
+    async fn is_tx_confirmed(
+        &self,
+        _: &str,
+        _: u32,
+    ) -> Result<bool, konsensus_core::traits::chain::ChainError> {
+        Ok(true)
+    }
+    async fn is_synced(&self) -> bool {
+        true
+    }
+}
+
+/// T2: admission keeps a tip height for up to a minute, but never past the
+/// tip's age bound: a height read just inside the bound is refused once the
+/// bound has passed, without waiting for the minute, and the next request
+/// reads the source again.
+#[tokio::test]
+async fn admission_height_is_not_reused_past_the_tip_bound() {
+    use std::sync::atomic::Ordering;
+    let source = Arc::new(AgingTip { age: 2, header_reads: Default::default() });
+    let chain: Arc<dyn ChainProvider> = Arc::new(konsensus_chain::FreshTip::new(
+        source.clone(),
+        Some(std::time::Duration::from_secs(4)),
+    ));
+    let cache = ReadinessHeightCache::new(chain);
+    assert_eq!(cache.get().await.unwrap().0, 900_000);
+    assert_eq!(cache.get().await.unwrap().0, 900_000, "reused inside the bound");
+    assert_eq!(source.header_reads.load(Ordering::SeqCst), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(3_100)).await;
+    // The same block is now 5 s old: refused, though the minute has not passed.
+    assert_eq!(cache.get().await.unwrap_err(), "konsensus:not_ready:chain_unavailable");
+    assert_eq!(source.header_reads.load(Ordering::SeqCst), 1, "judged the kept block");
+    // The next request asks the source; its current block is recent again.
+    assert_eq!(cache.get().await.unwrap().0, 900_000);
+    assert_eq!(source.header_reads.load(Ordering::SeqCst), 2);
+}

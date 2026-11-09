@@ -1186,6 +1186,7 @@ async fn decrypt_and_process(
             transport,
             audit,
             gate,
+            chain.as_ref(),
         )
         .await
     } else if konsensus_message::wire::is_realtime_signal(envelope.kind) {
@@ -1431,7 +1432,15 @@ async fn process_web_manifest(
         return Some("[web manifest request]".to_string());
     };
 
-    let block_height = chain.get_block_height().await.unwrap_or(0);
+    // A priced answer is anchored to a real tip; without one, none is sent
+    // (the same as a price that cannot be read), never one stamped height 0.
+    let block_height = match chain.get_block_height().await {
+        Ok(height) if height > 0 => height,
+        _ => {
+            warn!(sender = %sender, "not_ready: chain unavailable for web manifest");
+            return None;
+        }
+    };
     let manifest = priced_manifest(cs, block_height, pricing.as_ref(), gate, trust_discount).await?;
     info!(sender = %sender, pages = manifest.pages.len(), "served web manifest");
 
@@ -1465,6 +1474,7 @@ async fn process_page_request(
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
     gate: &PaymentGate,
+    chain: &dyn ChainProvider,
 ) -> Option<String> {
     let page_req: konsensus_core::payloads::content::PageRequest =
         match konsensus_core::wire_json::from_slice(bytes) {
@@ -1481,7 +1491,7 @@ async fn process_page_request(
             .map(|d| d.as_secs())
             .unwrap_or(0);
         priced_card_response(
-            &page_req.request_id, front_door, identity, pricing.as_ref(), gate, now,
+            &page_req.request_id, front_door, identity, pricing.as_ref(), gate, chain, now,
         ).await
     } else if let Some(cs) = content_server {
         cs.handle_request(&page_req)
@@ -1600,9 +1610,10 @@ async fn priced_card_response(
     identity: &NodeIdentity,
     pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
     gate: &PaymentGate,
+    chain: &dyn ChainProvider,
     now: u64,
 ) -> konsensus_core::payloads::content::PageResponse {
-    match front_door.priced_card(identity, pricing, gate).await {
+    match front_door.priced_card(identity, pricing, gate, chain).await {
         Ok(card) => crate::content_server::card_response(request_id.into(), card.as_ref(), now),
         Err(error) => {
             warn!(%error, "could not derive porch card price");

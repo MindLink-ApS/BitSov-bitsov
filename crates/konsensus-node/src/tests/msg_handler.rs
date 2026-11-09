@@ -868,6 +868,7 @@ async fn page_request_invalid_json_returns_none() {
         &transport,
         &audit,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
     )
     .await;
 
@@ -913,6 +914,7 @@ async fn page_request_no_content_server_returns_label() {
         &transport,
         &audit,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
     )
     .await;
 
@@ -970,6 +972,7 @@ async fn page_request_with_content_server_serves_page() {
         &transport,
         &audit,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
     )
     .await;
 
@@ -1026,6 +1029,7 @@ async fn page_request_nonexistent_path_returns_label() {
         &transport,
         &audit,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
     )
     .await;
 
@@ -3867,6 +3871,7 @@ async fn porch_card_repricing_failure_returns_correlated_error() {
         &bob,
         &pricing,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
         1001,
     )
     .await;
@@ -5061,5 +5066,97 @@ async fn reply_is_not_sent_when_its_save_fails() {
     let message = konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext).unwrap();
     assert_eq!(message.header.message_number, 0, "the withheld reply left no gap");
     assert_eq!(requester.decrypt(net.bob.node_id(), &message).await.unwrap(), b"\"sent\"");
+    net.stop().await;
+}
+
+/// A chain source whose tip cannot be read.
+struct TipDown;
+
+#[async_trait::async_trait]
+impl ChainProvider for TipDown {
+    fn trust_level(&self) -> konsensus_core::traits::chain::TrustLevel {
+        konsensus_core::traits::chain::TrustLevel::FullValidation
+    }
+    async fn get_block_height(&self) -> Result<u64, konsensus_core::traits::chain::ChainError> {
+        Err(konsensus_core::traits::chain::ChainError::Connection("down".into()))
+    }
+    async fn get_block_header(
+        &self,
+        _height: u64,
+    ) -> Result<konsensus_core::traits::chain::BlockHeader, konsensus_core::traits::chain::ChainError>
+    {
+        Err(konsensus_core::traits::chain::ChainError::Connection("down".into()))
+    }
+    async fn estimate_fee(
+        &self,
+        _target_blocks: u32,
+    ) -> Result<konsensus_core::traits::chain::FeeEstimate, konsensus_core::traits::chain::ChainError>
+    {
+        Err(konsensus_core::traits::chain::ChainError::Connection("down".into()))
+    }
+    async fn is_tx_confirmed(
+        &self,
+        _txid: &str,
+        _min_confirmations: u32,
+    ) -> Result<bool, konsensus_core::traits::chain::ChainError> {
+        Err(konsensus_core::traits::chain::ChainError::Connection("down".into()))
+    }
+    async fn is_synced(&self) -> bool {
+        false
+    }
+}
+
+#[tokio::test]
+async fn web_manifest_is_not_sent_without_a_chain_tip() {
+    let net = receive_loop().await;
+    let site = tempfile::tempdir().unwrap();
+    std::fs::write(site.path().join("index.md"), "# Home\n").unwrap();
+    let content = Some(Arc::new(
+        ContentServer::new(crate::content_server::ContentServerConfig {
+            content_dir: site.path().to_path_buf(),
+            max_file_size: 4 * 1024 * 1024,
+            cache_seconds: 3600,
+            site_name: "Test Node".to_string(),
+        })
+        .unwrap(),
+    ));
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
+        konsensus_pricing::StaticPricingEngine::new(Default::default()),
+    );
+    let request = net
+        .paid_envelope(konsensus_core::kind::KIND_WEB_MANIFEST, vec![1])
+        .await;
+    // A session the replier can send on (it initiated it).
+    let replier = SessionManager::new(net.bob.clone());
+    let requester = SessionManager::new(net.alice.clone());
+    establish_sessions(&replier, &requester, &net.bob, &net.alice).await;
+
+    let down: Arc<dyn ChainProvider> = Arc::new(TipDown);
+    let served = process_web_manifest(
+        net.alice.node_id(), &request, &content, &down, &pricing, &net.bob,
+        &replier, &net.target, &PaymentGate::new(), 0.0,
+    )
+    .await;
+    assert_eq!(served, None);
+    let nothing = tokio::time::timeout(std::time::Duration::from_millis(500), net.source.recv()).await;
+    assert!(nothing.is_err(), "no manifest anchored to a made-up height");
+
+    let up: Arc<dyn ChainProvider> = Arc::new(konsensus_chain::MockChainProvider::new());
+    let served = process_web_manifest(
+        net.alice.node_id(), &request, &content, &up, &pricing, &net.bob,
+        &replier, &net.target, &PaymentGate::new(), 0.0,
+    )
+    .await;
+    assert_eq!(served, Some("[web manifest request]".to_string()));
+    let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), net.source.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let message = konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext).unwrap();
+    let plaintext = requester.decrypt(net.bob.node_id(), &message).await.unwrap();
+    let manifest: konsensus_core::payloads::content::WebManifest =
+        serde_json::from_slice(&plaintext).unwrap();
+    assert_eq!(manifest.block_height, 886_000);
+    assert_eq!(manifest.pages.len(), 1);
     net.stop().await;
 }

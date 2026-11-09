@@ -213,6 +213,59 @@ transactions return an error rather than an assertion that they are unconfirmed.
 An available server tip is not proof that it is current. No keys are sent to the
 server, and chain selection does not change custody.
 
+## Tip readiness
+
+Prices, signed cards, admission quotes, peer price tables and paid sends are
+checked against the chain tip. With Bitcoin Core, Electrum or Esplora, the node
+reads the tip as the source's best block header (height and timestamp of the
+same block), and treats it as not ready when:
+
+- the read fails or times out;
+- the best block is height 0;
+- the best block is older than the limit for `[lightning] network`:
+
+| Network | Oldest best block |
+|---|---|
+| `bitcoin` | 3 hours |
+| `testnet`, `signet`, or no network named (LND, LNbits) | 24 hours |
+| `regtest` | no limit |
+
+A not-ready tip refuses rather than going on with height 0: paid sends, call
+quotes, admission quotes and card publishing answer `503` with
+`"code":"not_ready","reason":"chain_unavailable"` before anything is paid or
+signed (a call quote also before its price query is sent); a stranger's
+admission request gets the fixed `konsensus:not_ready:chain_unavailable`
+refusal; no price answer, price table or web manifest is sent; peer price
+tables are listed as `stale`. A send that starts while the wallet is not
+money-ready reads no tip, so it can only go out at an established zero price;
+if the wallet becomes ready meanwhile, a price to pay is quoted again against a
+real tip. A published front door card whose page price changed is re-signed
+only against a usable tip (with that tip's epoch); an unchanged card is still
+served without one. Chain-aware pricing refuses a price when a synced source's
+tip cannot be read (also `not_ready`/`chain_unavailable` on these routes); its
+existing static fallback when the source is not synced or has no fee estimate is
+unchanged. Admission reuses a tip height for up to a minute, but not past the
+tip's age limit.
+
+Every payment of a peer's price (messages, rooms, porch pages, files,
+calendar, call minutes, admission) reads the tip once more at the payment
+itself, whatever priced it: with no usable tip, nothing is paid. Payments the
+owner directs (paying an invoice, keysend, on-chain sends, channel opens,
+liquidity, sponsor gifts) are not priced against the tip and do not read it.
+
+A wrapped source that has refused itself for good (another network) serves
+no kept tip either.
+
+Where the timestamp comes from: Bitcoin Core's `getblockheader` `time` for the
+block at `getblockcount`; Electrum's raw 80-byte header for that height, read
+and hashed by the node; Esplora's `/block/{hash}` `timestamp` for the hash at the
+tip height, as the server reports it. A usable header is reused for at most 30
+seconds and is judged by its own timestamp; a refused one is not kept. Block timestamps may lag real time
+by up to about an hour, so the mainnet limit leaves about two hours without a
+block. The mock chain (Light and Cloud tiers) is synthetic and has no limit.
+The source's own sync check is unchanged. Which network the source is on is
+checked separately.
+
 ## Privacy and status
 
 Authenticated `GET /api/v1/status` includes:
