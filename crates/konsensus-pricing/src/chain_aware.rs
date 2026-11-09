@@ -747,6 +747,10 @@ impl ChainAwarePricingEngine {
     ) -> Result<u64, PricingError> {
         // Get base price first — propagates NotPriceable for deferred kinds.
         let base_price = self.base_engine.get_price_msat(kind).await?;
+        // Multiplying a zero base cannot make it payable; no chain data is needed.
+        if base_price == 0 {
+            return Ok(0);
+        }
 
         // Use the category-specific fee target for this kind.
         let category = KindCategory::from_kind(kind);

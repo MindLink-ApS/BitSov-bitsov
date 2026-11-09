@@ -47,6 +47,7 @@ struct ReconnectingContact {
     /// After this many `connected_since` observations, reconnect once (0 = never).
     reconnect_after_connected_since: AtomicUsize,
     connected_since_calls: AtomicUsize,
+    quote_delay_secs: AtomicUsize,
 }
 
 impl ReconnectingContact {
@@ -123,6 +124,10 @@ impl MessageTransport for ReconnectingContact {
         } else {
             if admission {
                 self.quotes.fetch_add(1, Ordering::SeqCst);
+                let delay = self.quote_delay_secs.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::advance(std::time::Duration::from_secs(delay as u64)).await;
+                }
                 // The quote was made on the connection that asked for it; the
                 // sender reconnects before its response arrives.
                 if self.flap_on_quote.swap(false, Ordering::SeqCst) {
@@ -181,6 +186,7 @@ async fn net() -> Net {
         no_generation: AtomicBool::new(false),
         reconnect_after_connected_since: AtomicUsize::new(0),
         connected_since_calls: AtomicUsize::new(0),
+        quote_delay_secs: AtomicUsize::new(0),
     });
     Arc::get_mut(&mut state).unwrap().transport = contact.clone();
     let token = auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, auth::Scope::all()).unwrap();
@@ -495,6 +501,7 @@ async fn a_kept_admission_quote_is_not_paid_without_a_chain_tip() {
         no_generation: AtomicBool::new(false),
         reconnect_after_connected_since: AtomicUsize::new(0),
         connected_since_calls: AtomicUsize::new(0),
+        quote_delay_secs: AtomicUsize::new(0),
     });
     Arc::get_mut(&mut state).unwrap().transport = contact.clone();
     let token = auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, auth::Scope::all()).unwrap();
@@ -537,4 +544,19 @@ async fn a_kept_admission_quote_is_not_paid_without_a_chain_tip() {
     assert_eq!(chain.reads(), 1, "the admission payment asked for a tip");
     assert_eq!(contact.quotes.load(Ordering::SeqCst), 1, "the kept quote was used, no new one asked");
     assert_eq!(START_MSAT - payer.get_balance_msat().await.unwrap(), 0, "nothing paid");
+}
+
+
+#[tokio::test(start_paused = true)]
+async fn a_delayed_admission_quote_needs_a_current_tip_before_dispatch() {
+    let mut net = net().await;
+    let chain = Arc::new(common::TipDownChain::after(3));
+    net.state = Arc::new(AppState { chain: chain.clone(), ..(*net.state).clone() });
+    net.contact.quote_delay_secs.store(31, Ordering::SeqCst);
+    let (status, body) = net.compose(&uuid::Uuid::new_v4().to_string(), 4_000).await;
+    common::assert_chain_not_ready(status, &body);
+    assert_eq!(net.spent().await, 0);
+    assert_eq!(chain.reads(), 4);
+    assert_eq!(net.contact.quotes.load(Ordering::SeqCst), 1);
+    assert!(!net.contact.paid.load(Ordering::SeqCst));
 }
