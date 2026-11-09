@@ -29,6 +29,44 @@ async fn prekey_bundle_generation() {
 }
 
 #[tokio::test]
+async fn queued_repair_does_not_override_initial_confirmation() {
+    let a = make_identity(TEST_MNEMONIC_A);
+    let b = make_identity(TEST_MNEMONIC_B);
+    let peer = *b.node_id();
+    let ours = SessionManager::new(a);
+    let theirs = SessionManager::new(b);
+    ours.initiate_session(&peer, &theirs.prekey_bundle().await).await.unwrap();
+    let queued = std::time::Instant::now();
+    assert!(ours.confirm_session(&peer).await);
+    assert!(!ours.mark_needs_renegotiation_before(&peer, queued).await,
+        "confirmation after a queued rejection makes that rejection stale");
+    assert!(ours.encrypt(&peer, b"confirmed").await.is_ok());
+    assert!(ours.mark_needs_renegotiation_before(&peer, std::time::Instant::now()).await,
+        "a current rejection still fences the session");
+    assert!(ours.encrypt(&peer, b"wait for repair").await.is_err());
+    let queued = std::time::Instant::now();
+    assert!(!ours.confirm_session(&peer).await, "an unexpected ACK proves no new session progress");
+    assert!(ours.mark_needs_renegotiation_before(&peer, queued).await);
+}
+
+#[tokio::test]
+async fn queued_repair_does_not_override_successful_current_decrypt() {
+    let a = make_identity(TEST_MNEMONIC_A);
+    let b = make_identity(TEST_MNEMONIC_B);
+    let (own, peer) = (*a.node_id(), *b.node_id());
+    let ours = SessionManager::new(a);
+    let theirs = SessionManager::new(b);
+    let init = theirs.initiate_session(&own, &ours.prekey_bundle().await).await.unwrap();
+    ours.accept_session(&peer, &init).await.unwrap();
+    let message = theirs.encrypt(&own, b"current chain is healthy").await.unwrap();
+    let queued = std::time::Instant::now();
+    assert_eq!(ours.decrypt(&peer, &message).await.unwrap(), b"current chain is healthy");
+    assert!(!ours.mark_needs_renegotiation_before(&peer, queued).await,
+        "successful current decryption after a queued rejection makes it stale");
+    assert!(ours.encrypt(&peer, b"readable reply").await.is_ok());
+}
+
+#[tokio::test]
 async fn full_session_establishment() {
     let id_a = make_identity(TEST_MNEMONIC_A);
     let id_b = make_identity(TEST_MNEMONIC_B);

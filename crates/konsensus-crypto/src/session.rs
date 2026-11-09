@@ -168,6 +168,8 @@ struct PeerSession {
     /// When this node derived the session, ms since the epoch. Held in memory
     /// only: `None` for a session restored from storage.
     established_at_ms: Option<u64>,
+    /// Local installation or proven session progress. Never persisted.
+    progressed_at: std::time::Instant,
     /// A newer session the peer has not yet proven it holds. Replaces `ratchet`
     /// only on that proof; held in memory only, and overwritten by the next one.
     unconfirmed: Option<DoubleRatchet>,
@@ -206,6 +208,7 @@ impl PeerSession {
         Self {
             ratchet,
             established_at_ms,
+            progressed_at: std::time::Instant::now(),
             unconfirmed: None,
             unconfirmed_initiated: false,
             unconfirmed_since: None,
@@ -761,6 +764,7 @@ impl SessionManager {
                     session.awaiting_confirmation = false;
                 }
             }
+            session.progressed_at = std::time::Instant::now();
         }
         self.persist_session(peer_id).await;
         true
@@ -772,6 +776,18 @@ impl SessionManager {
         if let Some(session) = self.sessions.write().await.get_mut(peer_id) {
             session.needs_renegotiation = true;
         }
+    }
+
+    /// Mark recovery requested before `boundary` without invalidating a session
+    /// installed, confirmed or proven readable since then. The comparison and
+    /// mark share one write lock, so a queued rejection cannot race recovery. No session
+    /// also needs repair. A newer session returns false and stays usable.
+    pub async fn mark_needs_renegotiation_before(&self, peer_id: &NodeId, boundary: std::time::Instant) -> bool {
+        let mut sessions = self.sessions.write().await;
+        let Some(session) = sessions.get_mut(peer_id) else { return true; };
+        if session.progressed_at > boundary { return false; }
+        session.needs_renegotiation = true;
+        true
     }
 
     /// Whether we started a replacement of the session with a peer and are waiting for
@@ -950,6 +966,7 @@ impl SessionManager {
                 Ok(plaintext) => {
                     // The peer and this session agree, whatever was unreadable before.
                     session.needs_renegotiation = false;
+                    session.progressed_at = std::time::Instant::now();
                     plaintext
                 }
                 Err(error) => {

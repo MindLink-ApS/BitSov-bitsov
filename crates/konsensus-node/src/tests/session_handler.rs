@@ -2630,6 +2630,9 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
     let (recipient, target) = make();
     let (_, attacker) = make();
     let (healthy_id, healthy) = make();
+    // Prepare the healthy peer once, as in the real handler. The attacker has
+    // no session: refusing it must not perform X3DH or inspect session state.
+    let sessions = session_with(&healthy_id).await;
     target.add_to_whitelist(&healthy_id).await;
     target.start_listener().await.unwrap();
     let addr = target.listen_addr().unwrap().to_string();
@@ -2680,8 +2683,8 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
                         &mut limits,
                         0,
                         &mut peer_invoices,
-        &session_with(&peer_id).await,
-    )
+                        &sessions,
+                    )
                     .await;
                     max_handling_time = max_handling_time.max(started.elapsed());
                     if handled.fetch_add(1, Ordering::Release) + 1 == FLOOD_REQUESTS + 1 {
@@ -6338,6 +6341,79 @@ async fn session_with(peer: &NodeId) -> SessionManager {
     let init = theirs.initiate_session(&our_id, &ours.prekey_bundle().await).await.unwrap();
     ours.accept_session(peer, &init).await.unwrap();
     ours
+}
+
+/// A blocked prekey write must neither block the caller nor renew an outgoing
+/// repair grant when another connection wakes the reconnect worker.
+#[tokio::test]
+async fn recovery_reconnect_blocked_offer_does_not_renew_standing() {
+    use konsensus_message::{ReachabilityMode, TransportConfig};
+    let identity = Arc::new(NodeIdentity::generate().unwrap().1);
+    let other = Arc::new(NodeIdentity::generate().unwrap().1);
+    let own = *identity.node_id();
+    let peer = *other.node_id();
+    let make = |identity| Arc::new(NoiseTransport::new(identity, TransportConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(), admission_mode: ReachabilityMode::PriceOpen,
+        ..Default::default()
+    }));
+    let source = make(identity.clone());
+    let target = make(other);
+    target.start_listener().await.unwrap();
+    source.connect(&peer, &target.listen_addr().unwrap().to_string()).await.unwrap();
+    let storage = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let env = konsensus_core::UkmEnvelopeBuilder::new(0, own, konsensus_core::Recipient::Node(peer),
+        b"paid ciphertext".to_vec(), konsensus_core::PaymentProof::new([7; 32], [8; 32], 1000)).build();
+    let mut op = konsensus_storage::OutboxOperation::prepared(uuid::Uuid::new_v4().to_string(), peer.to_hex(), 0, "request".into());
+    op.state = "paid".into();
+    op.message_id = Some(env.id.to_hex());
+    op.payment_hash = Some(hex::encode(env.payment_proof.payment_hash));
+    op.settled_msat = 1000;
+    op.accounting_pending = false;
+    assert!(storage.insert_outbox_operation(&op).await.unwrap());
+    assert!(storage.commit_outbox_envelope(&op, &env).await.unwrap());
+    storage.mark_pending_sent(&env.id, &peer).await.unwrap();
+    assert!(storage.reject_pending(&env.id, &peer, &own, "session_handover: retry", false).await.unwrap());
+    let locked = Arc::new(tokio::sync::Notify::new());
+    let blocked = {
+        let (source, locked) = (source.clone(), locked.clone());
+        tokio::spawn(async move {
+            let frame = Frame::PriceTable { prices: Default::default(), block_height: 0, valid_blocks: 1, trust_discount: 0.0 };
+            source.send_price_frame_with(&peer, &frame, &frame, |_, _| async {
+                locked.notify_one();
+                std::future::pending().await
+            }).await
+        })
+    };
+    locked.notified().await;
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let worker = tokio::spawn(restore_paid_session_repairs(storage, own,
+        Arc::new(SessionManager::new(identity)), source.clone(), wake.clone()));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !source.session_repair_on_connection(&peer).await { tokio::task::yield_now().await; }
+    }).await.expect("lookup grants repair even while the connection write is blocked");
+    let since = source.connected_since(&peer).await.unwrap();
+    assert!(source.allow_session_repair(&peer, since, std::time::Instant::now() + Duration::from_millis(10)).await);
+    // Let the offer deadline elapse with the connection lock still held.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    wake.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let renewed = source.session_repair_on_connection(&peer).await;
+    blocked.abort();
+    let _ = blocked.await;
+    assert!(!worker.is_finished(), "repair worker stopped unexpectedly");
+    source.disconnect(&peer).await.unwrap();
+    source.connect(&peer, &target.listen_addr().unwrap().to_string()).await.unwrap();
+    assert_ne!(source.connected_since(&peer).await, Some(since));
+    wake.notify_one();
+    let reconnected = tokio::time::timeout(Duration::from_secs(2), async {
+        while !source.session_repair_on_connection(&peer).await { tokio::task::yield_now().await; }
+    }).await;
+    worker.abort();
+    let _ = worker.await;
+    source.shutdown();
+    target.shutdown();
+    assert!(!renewed, "a timed-out offer must not refresh the same connection's repair lifetime");
+    reconnected.expect("a replacement connection revalidates the paid obligation");
 }
 
 /// A callee with no session refuses the invoice before any wallet call, so the

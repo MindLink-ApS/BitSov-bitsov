@@ -5847,6 +5847,173 @@ async fn recovery_reconnect_start_session_handler(
     })
 }
 
+/// An unpaid connection must not serialize the dispatcher behind storage.
+#[tokio::test]
+async fn recovery_reconnect_storage_wait_does_not_stall_unpaid_controls() {
+    unpaid_repair_wait_keeps_control_loop_live(false).await;
+}
+
+#[tokio::test]
+async fn recovery_reconnect_connection_lock_does_not_stall_unpaid_controls() {
+    unpaid_repair_wait_keeps_control_loop_live(true).await;
+}
+
+async fn unpaid_repair_wait_keeps_control_loop_live(hold_connection: bool) {
+    use konsensus_message::{ControlEvent, Frame, NoiseTransport, ReachabilityMode, TransportConfig};
+    let net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
+    let pending = if hold_connection { None } else {
+        let env = konsensus_core::UkmEnvelopeBuilder::new(0, *net.bob.node_id(), Recipient::Node(*net.alice.node_id()),
+            b"paid ciphertext".to_vec(), konsensus_core::PaymentProof::new([19; 32], [20; 32], 1000)).build();
+        let operation = recovery_reconnect_journal_paid(&net.db, &env).await;
+        Some((env, operation))
+    };
+    // Hold the selected resource until after the response and shutdown.
+    let held = if hold_connection { None } else { Some(net.db.pool().acquire().await.unwrap()) };
+    let blocked = if hold_connection {
+        let locked = Arc::new(tokio::sync::Notify::new());
+        let (target, peer, ready) = (net.target.clone(), *net.alice.node_id(), locked.clone());
+        let task = tokio::spawn(async move {
+            let frame = Frame::PriceTable { prices: Default::default(), block_height: 0, valid_blocks: 1, trust_discount: 0.0 };
+            target.send_price_frame_with(&peer, &frame, &frame, |_, _| async {
+                ready.notify_one();
+                std::future::pending().await
+            }).await
+        });
+        locked.notified().await;
+        Some(task)
+    } else { None };
+    let worker = recovery_reconnect_start_session_handler(
+        net.bob.clone(), net.sessions_b.clone(), net.target.clone(), net.db.clone(),
+        net.wallet.clone(), net._dir.path().join("control-session.jsonl"), net.shutdown.subscribe(),
+    ).await;
+    // A fabricated confirmation is not bought authority. Fill the bounded
+    // confirmation queue while its first durable lookup cannot complete.
+    for n in 0..if hold_connection { 0 } else { 256u16 } {
+        let mut bytes = [0; 32];
+        bytes[..2].copy_from_slice(&n.to_le_bytes());
+        let id = konsensus_core::MessageId::from_bytes(bytes);
+        let frame = if n % 2 == 0 {
+            Frame::MessageReject { id, reason: "session_handover: unbound".into() }
+        } else {
+            Frame::MessageAck { id, duplicate: false, paid_until_ms: None }
+        };
+        net.source.send_frame(net.bob.node_id(), &frame).await.unwrap();
+    }
+    if let Some((env, _)) = &pending {
+        net.source.send_frame(net.bob.node_id(), &Frame::MessageAck {
+            id: env.id, duplicate: false, paid_until_ms: None,
+        }).await.unwrap();
+    }
+    let healthy = Arc::new(NoiseTransport::new(
+        Arc::new(NodeIdentity::generate().unwrap().1),
+        TransportConfig { admission_mode: ReachabilityMode::PriceOpen, ..Default::default() },
+    ));
+    healthy.connect(net.bob.node_id(), &net.target.listen_addr().unwrap().to_string()).await.unwrap();
+    healthy.send_frame(net.bob.node_id(), &Frame::RequestInvoice {
+        request_id: "other-peer".into(), amount_msat: 1000, purpose: "konsensus message".into(),
+    }).await.unwrap();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(ControlEvent::InvoiceErrorReceived { request_id, reason, .. }) = healthy.recv_control().await {
+                assert_eq!(request_id, "other-peer");
+                assert_eq!(reason, konsensus_api::invoice_refusal::ADMISSION_REQUIRED);
+                break;
+            }
+        }
+    }).await;
+    // Shutdown must also finish with the reconnect query still blocked.
+    net.shutdown.send(true).unwrap();
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
+    drop(held);
+    if let Some(task) = blocked { task.abort(); let _ = task.await; }
+    healthy.shutdown();
+    net.worker.await.unwrap();
+    if response.is_err() { net.source.shutdown(); net.target.shutdown(); }
+    assert!(response.is_ok(), "unpaid reconnect resource wait stalled another peer (connection lock: {hold_connection})");
+    stopped.expect("blocked repair prevented shutdown").unwrap();
+    if let Some((env, operation)) = pending {
+        let before = net.db.get_outbox_operation(&operation).await.unwrap().unwrap();
+        assert_eq!(before.state, "paid", "lost/queued ACK cannot complete a blocked durable match");
+        assert_eq!(before.settled_msat, 1000);
+        let (stop, shutdown_rx) = watch::channel(false);
+        let retry = recovery_reconnect_start_session_handler(net.bob.clone(), net.sessions_b.clone(),
+            net.target.clone(), net.db.clone(), net.wallet.clone(), net._dir.path().join("retry-session.jsonl"), shutdown_rx).await;
+        net.source.send_frame(net.bob.node_id(), &Frame::MessageAck {
+            id: env.id, duplicate: true, paid_until_ms: None,
+        }).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let after = net.db.get_outbox_operation(&operation).await.unwrap().unwrap();
+                if after.state == "acked" {
+                    assert_eq!(after.settled_msat, 1000);
+                    assert_eq!(after.payment_hash, before.payment_hash);
+                    assert_eq!(after.message_id, before.message_id);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("authentic ACK retry completes the original paid operation after queue/shutdown loss");
+        assert_eq!(net.db.count_pending_deliveries().await.unwrap(), 0);
+        assert!(net.wallet.list_payments(100).await.unwrap().is_empty(), "confirmation retries never issue another payment");
+        stop.send(true).unwrap();
+        retry.await.unwrap();
+    }
+    net.source.shutdown();
+    net.target.shutdown();
+}
+
+#[tokio::test]
+async fn recovery_reconnect_queued_rejection_keeps_a_newer_session_usable() {
+    use konsensus_message::{ControlEvent, Frame};
+    let net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
+    let env = konsensus_core::UkmEnvelopeBuilder::new(0, *net.bob.node_id(), Recipient::Node(*net.alice.node_id()),
+        b"old paid ciphertext".to_vec(), konsensus_core::PaymentProof::new([29; 32], [30; 32], 1000)).build();
+    let operation = recovery_reconnect_journal_paid(&net.db, &env).await;
+    let held = net.db.pool().acquire().await.unwrap();
+    let worker = recovery_reconnect_start_session_handler(net.bob.clone(), net.sessions_b.clone(),
+        net.target.clone(), net.db.clone(), net.wallet.clone(), net._dir.path().join("queued-session.jsonl"), net.shutdown.subscribe()).await;
+    net.source.send_frame(net.bob.node_id(), &Frame::MessageReject {
+        id: env.id, reason: "session_handover: old ciphertext".into(),
+    }).await.unwrap();
+    // Same-source wire order makes this response a dispatch barrier: the
+    // rejection is queued, but its storage match is still held above.
+    net.source.send_frame(net.bob.node_id(), &Frame::RequestInvoice {
+        request_id: "queued-barrier".into(), amount_msat: 1000, purpose: "konsensus message".into(),
+    }).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(ControlEvent::InvoiceErrorReceived { request_id, .. }) = net.source.recv_control().await {
+                assert_eq!(request_id, "queued-barrier"); break;
+            }
+        }
+    }).await.expect("rejection storage does not block later controls");
+    let replacement = SessionManager::new(net.alice.clone());
+    let init = replacement.initiate_session(net.bob.node_id(), &net.sessions_b.prekey_bundle().await).await.unwrap();
+    assert!(net.sessions_b.remove_session(net.alice.node_id()).await);
+    net.sessions_b.accept_session(net.alice.node_id(), &init).await.unwrap();
+    assert!(replacement.confirm_session(net.bob.node_id()).await);
+    let ratchet_init = replacement.encrypt(net.bob.node_id(), b"replacement ready").await.unwrap();
+    assert_eq!(net.sessions_b.decrypt(net.alice.node_id(), &ratchet_init).await.unwrap(), b"replacement ready");
+    assert!(net.sessions_b.can_send(net.alice.node_id()).await);
+    drop(held);
+    // A following authentic ACK is a FIFO completion barrier for the delayed
+    // rejection and still completes the original paid operation without repay.
+    net.source.send_frame(net.bob.node_id(), &Frame::MessageAck {
+        id: env.id, duplicate: false, paid_until_ms: None,
+    }).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while net.db.get_outbox_operation(&operation).await.unwrap().unwrap().state != "acked" { tokio::task::yield_now().await; }
+    }).await.expect("following ACK completes after the queued rejection");
+    let marked = net.sessions_b.needs_renegotiation(net.alice.node_id()).await;
+    net.shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    net.worker.await.unwrap();
+    net.source.shutdown();
+    net.target.shutdown();
+    assert!(!marked, "a queued rejection must not invalidate a newer healthy session");
+    assert!(net.sessions_b.encrypt(net.alice.node_id(), b"still usable").await.is_ok());
+}
+
 #[tokio::test]
 async fn recovery_reconnect_both_unprivileged_sides_recover_a_paid_keysend_without_readmission() {
     let mut net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
