@@ -3678,6 +3678,7 @@ fn endpoint_debug_redacts_url_credentials() {
             api_url: url.into(),
             esplora_url_fallback: Some(url.into()),
             credentials_file: None,
+            accept_third_party_tip: false,
         };
         assert_debug_redacted(
             &config,

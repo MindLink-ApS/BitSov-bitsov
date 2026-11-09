@@ -80,6 +80,11 @@ pub struct ChainView {
     pub backend: &'static str,
     pub trust_level: &'static str,
     pub host: Option<String>,
+    /// `true` when the source is a public explorer the node reads through
+    /// values it never explicitly accepted (an older generated config or the
+    /// frozen URL defaults). Omitted when `false`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub explorer_default: bool,
 }
 
 /// Abstraction over Bitcoin chain data sources.
@@ -90,7 +95,7 @@ pub struct ChainView {
 pub trait ChainProvider: Send + Sync {
     /// Honest default for test/external providers that do not identify themselves.
     fn chain_view(&self) -> ChainView {
-        ChainView { backend: "unknown", trust_level: "unknown", host: None }
+        ChainView { backend: "unknown", trust_level: "unknown", host: None, explorer_default: false }
     }
 
     /// The trust level of this chain data source.
@@ -148,6 +153,31 @@ mod tests {
 
         let err = ChainError::NotAvailable("syncing".into());
         assert!(err.to_string().contains("syncing"));
+    }
+
+    /// Owner status JSON is unchanged unless the flag is set.
+    #[test]
+    fn chain_view_omits_explorer_default_when_false() {
+        let view = ChainView {
+            backend: "esplora",
+            trust_level: "third_party",
+            host: Some("mempool.space".into()),
+            explorer_default: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&view).unwrap(),
+            serde_json::json!({"backend": "esplora", "trust_level": "third_party", "host": "mempool.space"})
+        );
+        let flagged = ChainView { explorer_default: true, ..view };
+        assert_eq!(
+            serde_json::to_value(&flagged).unwrap(),
+            serde_json::json!({
+                "backend": "esplora",
+                "trust_level": "third_party",
+                "host": "mempool.space",
+                "explorer_default": true
+            })
+        );
     }
 
     #[test]

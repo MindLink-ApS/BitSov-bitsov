@@ -160,6 +160,9 @@ impl KonsensusNode {
     ) -> Result<Self> {
         config.validate_starter_hub(false)?;
         config.validate_routing_fee_backend()?;
+        // A public explorer tip the owner never accepted: warn and label only.
+        // The config is never changed: the owner edits it by hand.
+        let explorer_default = crate::chain_tip::warn_at_start(&config);
         // Fail closed before starting LDK or opening node state on insecure credentials.
         let chain_auth = match &config.chain {
             ChainConfig::Esplora {
@@ -597,6 +600,7 @@ impl KonsensusNode {
         info!("routing table initialized");
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let chain = crate::chain_tip::label(chain, explorer_default.as_ref());
 
         Ok(Self {
             _state_guard: state_guard,
