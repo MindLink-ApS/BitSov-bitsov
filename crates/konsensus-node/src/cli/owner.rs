@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 
 use crate::config::{NodeConfig, NodeTier, StorageConfig};
 use konsensus_api::bootstrap::{self, DataDirLayout, StartupMode};
-use konsensus_api::control::{self, ControlRequest, ControlResponse};
+use konsensus_api::control::{self, utc_iso8601, ControlRequest, ControlResponse};
 use konsensus_api::pairing::PairingService;
 use konsensus_api::rate_limit::RemoteTunnelClients;
 use konsensus_api::spend_budget::{self, GrantTerms};
@@ -337,9 +337,10 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             if let Some(status) = &enrollment {
                 for provisional in &status.provisional {
                     safe_println!(
-                        "PROVISIONAL client={} deadline={}",
+                        "PROVISIONAL client={} deadline={} ({})",
                         provisional.client_id,
-                        provisional.expires_at
+                        provisional.expires_at,
+                        utc_iso8601(provisional.expires_at)
                     );
                 }
             }
@@ -347,7 +348,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                 safe_println!("This QR was used again after you approved {:?}. Revoke it if it wasn't yours. (client={})",alert.name,alert.client_id);
             }
             for p in pending_owner_approvals {
-                safe_println!("PENDING OWNER APPROVAL {} kind={} client={} expires_at={} (approve on a different enrolled owner device)", p.op_id, p.kind, p.client_id, p.expires_at);
+                safe_println!("PENDING OWNER APPROVAL {} kind={} client={} expires_at={} ({}) (approve on a different enrolled owner device)", p.op_id, p.kind, p.client_id, p.expires_at, utc_iso8601(p.expires_at));
             }
             for k in &device_keys {
                 safe_println!(
@@ -359,7 +360,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             }
             for p in pending_device_keys.iter().filter(|p| !p.lost) {
                 if let Some(words) = enrollment.as_ref().and_then(|e| e.words.get(&p.op_id)) {
-                    safe_println!("SAS v2 {}: {}  expires_at={}", p.op_id, words, p.expires_at);
+                    safe_println!("SAS v2 {}: {}  expires_at={} ({})", p.op_id, words, p.expires_at, utc_iso8601(p.expires_at));
                 }
                 safe_println!(
                     "PENDING DEVICE KEY {}  {:?}  client={}\n  approve with: konsensus device approve --op {}",
@@ -381,13 +382,14 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             for g in &grants {
                 safe_println!(
                     "SPEND GRANT client={}  {} of {} sats left  per-call<={} sats  \
-                     messages<={} sats  expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
+                     messages<={} sats  expires_at={} ({})\n  revoke with: konsensus grant-revoke --client-id {}",
                     g.client_id,
                     spend_budget::sats(g.remaining_msat),
                     spend_budget::sats(g.budget_msat),
                     spend_budget::sats(g.per_call_max_msat),
                     spend_budget::sats(g.message_per_payment_max_msat),
                     g.expires_at,
+                    utc_iso8601(g.expires_at),
                     g.client_id
                 );
             }
@@ -402,9 +404,10 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             for g in &front_door_grants {
                 safe_println!(
                     "FRONT DOOR GRANT client={}  may publish the front-door card only  \
-                     expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
+                     expires_at={} ({})\n  revoke with: konsensus grant-revoke --client-id {}",
                     g.client_id,
                     g.expires_at,
+                    utc_iso8601(g.expires_at),
                     g.client_id
                 );
             }
@@ -415,18 +418,19 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                     format!("approve with: konsensus grant --op {}", e.op_id)
                 };
                 safe_println!(
-                    "PENDING ELEVATION op={}  client={} ({})  scopes={}  expires_at={}\n  {next}",
+                    "PENDING ELEVATION op={}  client={} ({})  scopes={}  expires_at={} ({})\n  {next}",
                     e.op_id,
                     e.client_name,
                     e.client_id,
                     e.scopes.join("+"),
                     e.expires_at,
+                    utc_iso8601(e.expires_at),
                 );
             }
             for r in &pending_replacements {
                 safe_println!(
                     "PENDING IDENTITY REPLACEMENT op={}  client={} ({})  current={}  \
-                     replacement={}  expires_at={}  approved={}\n  \
+                     replacement={}  expires_at={} ({})  approved={}\n  \
                      approve with: konsensus approve-replacement --op {}",
                     r.op_id,
                     r.client_name,
@@ -434,6 +438,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                     r.current_identity_fingerprint,
                     r.replacement_identity_fingerprint,
                     r.expires_at,
+                    utc_iso8601(r.expires_at),
                     r.approved,
                     r.op_id
                 );
