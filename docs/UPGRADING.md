@@ -22,6 +22,53 @@ A running node does not print its release on start. Builds that include #540
 version, `2`. On rc22 and earlier, check the
 binary with `--version`.
 
+## rc22 → rc23
+
+rc23 includes forward-only storage upgrades and session recovery changes. Stop
+BitSov after ending calls and reconciling pending operations by their existing
+IDs. Take a consistent backup of the complete data directory and, when used,
+the PostgreSQL database. Retain config, wallet/channel, pairing, session and
+operation state together. Do not re-run `init` or rewind a live node to an
+older snapshot after it has written new state.
+
+Stage the future verified signed binary beside rc22 and confirm
+`konsensus 0.3.0-rc23` before switching. Start with the retained config and data;
+leave separately managed Lightning services alone. Correct any mismatch between
+`tier` and `[network].tier`. An existing non-loopback API bind now requires
+`[api].allow_non_loopback_bind = true`; remote access still requires a loopback
+API. Review optional call-media limits and `accept_third_party_tip` before
+adding them: older binaries reject unknown keys. Use `chain-tip` to inspect the
+configured source without changing it or accepting a third-party source.
+
+First start applies migrations **033, 038 and 039** on SQLite and PostgreSQL
+and begins the [encrypted record upgrade](#location-bound-storage-records-after-rc22).
+Keep the completion markers. Inspect aggregate migration and record-upgrade
+logs and investigate unreadable or unwritable fields. Pairing storage remains
+**v8**, which does not establish compatibility with an older binary. Check
+`node_version`, health, identity, contacts, channels and `money_ready` before
+priced work. Resolve `chain_unavailable` by restoring source availability and
+freshness; initial wallet sync alone does not establish payment readiness.
+
+Recovery may hold new sends with `session_handover` and defer an unreadable paid
+envelope. Retain and retry the existing operation ID after recovery; do not
+create a new paid operation to resolve an uncertain result. Mixed rc22/rc23
+deferred messages can stall after **10 attempts**. Reconcile payment and delivery
+on both peers; upgrading neither confirms delivery nor refunds earlier payments.
+Mixed-version and retained-node rehearsals for the complete rc23 candidate
+remain outstanding.
+
+Prefer rolling forward. After rc23 first opens the retained data, do not run
+rc22 or older on it. There is no in-place downgrade for the migrations or record
+format. Crossing migrations 038/039 on SQLite requires restoring pre-upgrade
+`konsensus.db` under a separately established consistent-state recovery plan;
+a database-only rewind beneath newer wallet/channel or session state is not
+supported. PostgreSQL also has no down migration. Never delete migration rows
+or completion markers to make an older binary start. Follow the existing
+[rollback constraints](#rollback-constraints) and the
+[rc23 operator checklist](releases/v0.3.0-rc23.md), including its detailed
+[rollback and recovery steps](releases/v0.3.0-rc23.md#5-rollback-and-recovery).
+This preparation records no rc23 → rc22 rollback rehearsal.
+
 ## Location-bound storage records (after rc22)
 
 The encrypted record format is **forward-only**. New writes bind encrypted

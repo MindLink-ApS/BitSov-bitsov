@@ -5,6 +5,8 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+## [0.3.0-rc23] — 2026-11-09
+
 - Setup cancellation leaves the comparison-attempt budget unchanged. Setup
   requests keep a per-source backoff that refills automatically. Cap pending
   pairing requests per client key and in a shared pool, and refuse further
@@ -27,7 +29,7 @@ also live on the corresponding GitHub pre-release pages.
   `signet`. With LND, LNbits or mock Lightning a real `[chain]` source is not
   checked.
 - The owner's `GET /api/v1/status` reports the running release as
-  `node_version` (for example `0.3.0-rc22`). `version` stays the API version,
+  `node_version` (for example `0.3.0-rc23`). `version` stays the API version,
   `2`. The public `/api/v1/health` is unchanged and does not name the release.
 - Console times for grants, pending requests and the pairing window print as
   ISO-8601 UTC next to the Unix time, for example
@@ -40,10 +42,9 @@ also live on the corresponding GitHub pre-release pages.
   `chmod +x`, macOS download mark), checking one platform with
   `--ignore-missing`, the signature check with the pinned fingerprint, and
   rollback steps from rc22 to rc21.
-- **Breaking for exposed APIs:** a non-loopback `[api].listen_addr` (`0.0.0.0`,
-  `::`, a LAN address) now fails config validation unless
+- **Breaking for exposed APIs:** a non-loopback `[api].listen_addr` now fails config validation unless
   `[api].allow_non_loopback_bind = true` is set, because the owner API is
-  plaintext HTTP (#412). The default stays `127.0.0.1:3141`. A node that already
+  plaintext HTTP (#412). The default remains loopback-only. A node that already
   binds the API off-loopback refuses to start with an error naming the flag; add
   it to keep that bind. `[remote_access]` still requires a loopback API, and the
   flag does not lift that rule.
@@ -127,6 +128,16 @@ also live on the corresponding GitHub pre-release pages.
   the `Fix:` hint, as soon as it is seen. A sync still running after ten minutes
   warns once, and the node says at INFO when payments are on. Payments are
   refused until Lightning is ready, as before.
+
+- Storage upgrades are forward-only: migration 033 aligns SQLite and PostgreSQL,
+  migrations 038/039 retain deferred envelopes and their expiry, and encrypted
+  records gain location binding. Preserve the complete current state and its
+  completion markers; follow [rc22 → rc23](docs/UPGRADING.md#rc22--rc23).
+- Session recovery holds new sends and durably defers unreadable paid envelopes.
+  Retry the existing operation after recovery to retain its payment. Mixed
+  rc22/rc23 deferred messages may stall after ten attempts; an upgrade does not
+  confirm delivery or refund. See the [candidate checklist](docs/releases/v0.3.0-rc23.md)
+  for scope, remaining limits and release gates.
 
 ## [0.3.0-rc22] — 2026-11-05
 
