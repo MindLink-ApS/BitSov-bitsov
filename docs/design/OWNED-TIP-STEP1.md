@@ -1,6 +1,6 @@
 # Owned tip onboarding Step 1
 
-Status: design proposal for owner review, 9 November 2026. No implementation or deployment is approved by this document.
+Status: design proposal v3 for owner review, 10 November 2026. No implementation or deployment is approved by this document.
 
 ## Recommendation
 
@@ -35,7 +35,13 @@ The application is the owner's control surface. The owner's BitSov node validate
 
 Connection configuration contains a source type, address, network expectation and a reference to approved authentication material. Secrets must remain outside ordinary configuration previews, telemetry, support exports and error text. Do not copy a remote service's cookie file into chat or use the application to browse seed directories.
 
-The future implementation needs a narrowly scoped owner-authorized connection operation. Existing APIs must be inventoried first. This document does not invent an endpoint or declare a new authorization mechanism implemented.
+Changing the active chain source is an authority change, including switching to a reachable, fresh Core service on the correct network. Such a service could still be attacker-controlled and hide chain events. Network and freshness checks do not authorize the change.
+
+Activation requires an eligible enrolled owner key, with the requester/approver separation required for spending approval. A Read/AI pairing or a mere authenticated session cannot propose and activate its own change. An app install must never hold both the requesting pairing and an approving owner key for the same node; adding a second pairing on that install is the same-device case, not independent approval. The first supported route requires a separately enrolled owner device. Missing owner authority leaves setup incomplete; first-owner enrollment and last-owner recovery are separate designs.
+
+The owner must review and authorize the exact node identity, current configuration revision, source type and endpoint, expected network, transport/trust mode, any certificate fingerprint, approved authentication reference, and affected backends. Bind these non-secret terms, operation identity, nonce and expiry to a narrowly scoped source-change authorization. Recheck eligible owner authority and unchanged terms at activation. A changed endpoint, pin, authentication reference or configuration revision requires fresh review. Returning to an earlier source uses the same rule.
+
+Existing spend approvals do not authorize configuration changes. The implementation needs a separately reviewed typed source-change operation; inventory existing APIs and enrollment capabilities before specifying it. The present node checks distinct pairing client IDs, not distinct physical devices. The implementation plan must specify how role conflicts are refused and what independently verifies the supported separate-device prerequisite. A UI label or another client ID is not proof. This proposal does not declare that stronger enforcement, a source-change endpoint or a new authorization mechanism is implemented.
 
 ### Keep these facts separate
 
@@ -67,8 +73,8 @@ An already-running source may still require secure authentication provisioning. 
 
 1. **Choose the existing source.** Offer an owned Core or owned Electrum connection with a short explanation. Do not scan arbitrary networks or promise automatic discovery. A future discovery method needs its own verified threat model and consent behavior.
 2. **Provide approved connection details.** Use the supported secure local setup mechanism. Present the expected test network and the selected source without displaying secrets. If access is not provisioned, stop with one clear next action.
-3. **Check before saving.** Probe the candidate read-only using bounded requests. Check syntax, allowed destination, transport/authentication policy, network identity, sync state and freshness. Record backing-validation evidence separately. A test probe does not fund, send, create a channel or grant persistent access implicitly.
-4. **Owner confirms activation.** Show the source type, network, control/trust description and whether a restart is required. The owner explicitly approves the exact change. No source switch occurs from pressing Back, Retry or Cancel.
+3. **Check before saving.** Probe the candidate read-only using bounded requests. Check syntax, allowed destination, transport/authentication policy, network identity, sync state and freshness. Record backing-validation evidence separately. Electrum must use CA-valid TLS with hostname validation, an explicitly approved local TCP route, or a reviewed certificate-pinning route using an owner-confirmed fingerprint delivered with the connection material through an independently trusted channel. No silent trust on first use, first-seen pinning, or disabling certificate verification. A fingerprint read only from the candidate connection is not independent evidence. A pinned fingerprint mismatch or change fails closed; replacement needs fresh owner approval from trusted connection material. Local TCP remains limited to the implementation's allowed local destinations and has no TLS server-identity guarantee; disclose that trust assumption. Pinning is a proposed route, not a present capability: until both backends support and enforce the same approved pin, a self-signed server needing that route is unsupported. A test probe does not fund, send, create a channel or grant persistent access implicitly.
+4. **Owner confirms activation.** Show the source type, network, control/trust description and whether a restart is required. Obtain the independent eligible owner-key authorization described above for the exact change. A local confirmation button alone is insufficient. No source switch occurs from pressing Back, Retry or Cancel.
 5. **Activate and report state.** Confirm both backends use the same approved source and apply existing payment gates. Show a precise state such as “Bitcoin source connected; waiting for synchronization” or “Source ready; spending approval still needed.” Never present source success as completed messaging setup.
 
 For a new node without an existing service, offer “Set up a source later” and preserve safe incomplete setup. Do not write public explorer URLs or silently choose mainnet to make progress appear complete. The implementation must reconcile this with the current fresh-init path before it is enabled.
@@ -81,7 +87,7 @@ An existing explorer-backed node first receives an informational warning with th
 2. Validate a candidate using the same read-only checks as a new node. Active operation continues only under its existing policy; candidate checks never assert that the existing source is healthier than it is.
 3. Present a before/after summary, compatibility result, expected interruption and explicit trust changes. Do not silently narrow or enlarge payment permissions.
 4. Before activation, the implementation must determine whether outstanding payment/session operations require deferral. Do not cancel or retry money operations as a source-switch side effect. If quiescence cannot be proved, defer activation and explain why.
-5. On explicit confirmation, recheck the active configuration revision and candidate health. A concurrent edit invalidates the proposal and requires a fresh preview; do not overwrite another writer's changes.
+5. On explicit independent owner-key confirmation, recheck the active configuration revision, candidate health and the complete authorized terms, including transport trust and current key eligibility. A concurrent edit invalidates the proposal and requires a fresh preview and approval; do not overwrite another writer's changes.
 6. Commit only the approved source fields through a separately reviewed, crash-safe configuration transaction. Preserve unrelated fields and all legacy omitted-URL semantics outside the explicitly approved transition. The exact persistence mechanism requires implementation review; do not reuse the parked general switcher without resolving its findings.
 7. Reinitialize or restart only through the approved node lifecycle path if required. Validate the effective source for both backends and persist enough non-secret state to explain an interrupted transition.
 8. Report activated, activation failed, or recovery needed. Fail closed on an invalid/unknown effective source. No automatic explorer fallback, even if the previous source was an explorer.
@@ -91,6 +97,22 @@ An existing explorer-backed node first receives an informational warning with th
 Before the commit boundary, Cancel or validation failure leaves the active configuration unchanged. After a committed but unsuccessful activation, keep spending closed and offer an explicit owner-reviewed recovery action. Restoring a previous source must be separately visible and confirmed, must pass current checks, and must not alter wallet/database versions. Returning to an external source is a disclosed external-dependency choice, never a hidden rollback.
 
 If the application cannot recover unaided after a crash, restart or lockout, mark the journey incomplete. A console helper procedure may be documented as a limitation; it does not satisfy the zero-terminal acceptance bar.
+
+## Current fallback and transport inventory
+
+Source locations below were checked at node revision `d99252f11e7feeca7888d50a232633c589e5f2d7`. Recheck the implementation base before coding. These are existing paths to close for an explicitly selected owned source, not proof that a transition is implemented.
+
+| Existing path | Current behavior | Required Step 1 treatment |
+|---|---|---|
+| `crates/konsensus-lightning/src/ldk.rs:85-89`, with startup handling from `:783` | `[lightning] esplora_url_fallback` can supply another explorer when the primary fails at startup | Owned-source activation must exclude both Esplora primary and fallback from the effective Lightning path, including startup, reinitialization and error handling. Dormant explorer fields and their credential references must not be read or used to select or initialize that backend |
+| `crates/konsensus-node/src/config.rs:1039-1056`, `ChainConfig::esplora_fallbacks` | An Esplora chain reader without an explicit fallback reuses the Lightning primary/fallback URLs | Both backends must select the approved owned-source mode. No chain-reader URL inheritance or fallback to the Lightning explorer URLs after transition |
+| `crates/konsensus-node/src/config.rs:1076`, `:2269`, `:2417-2423` | Fresh construction writes public explorer primary/fallback defaults for chain and Lightning | The new owned-source journey must not invoke these defaults to fill an incomplete selection or after recovery. No source means incomplete setup. Preserve legacy omitted-field interpretation outside an explicitly authorized transition; do not silently rewrite other existing nodes |
+
+After an owned-source transition, no Esplora primary/fallback field is read by either backend for source construction, selection, authentication or recovery, and no request is sent to one. Parsing or retaining inert legacy configuration for compatibility is not permission to use it. A required source field that is absent or incompatible fails closed rather than re-entering a default construction path. Test effective configuration and captured network traffic across restart and failure, not only the selected UI option.
+
+`crates/konsensus-chain/src/electrum.rs` currently accepts `ssl://` or allowed local `tcp://` endpoints and has no owner-confirmed certificate-fingerprint field. The Lightning backend configures its own Electrum client in `crates/konsensus-lightning/src/ldk.rs:973`. A custom pin must be enforced on both actual client connections, not merely on a successful preliminary probe. Never disable verification to fit a self-signed server into the existing interface.
+
+FreshTip in `crates/konsensus-node/src/node.rs:858-866` bounds the BitSov chain reader. It is not evidence that Lightning's own synchronization is healthy. Preserve separate backend health and the acceptance checks below.
 
 ## Proposed state and error presentation
 
@@ -124,7 +146,7 @@ Budget copy must describe the actual grant: a total amount for a specified windo
 |---|---|---|
 | Step 1 audience | Owners with an already-running compatible Core or Electrum service | Smaller scope; users without one need a clearly incomplete path |
 | Installation scope | Defer automated installation | Avoids unmeasured disk, bandwidth and maintenance commitments; does not solve all new households |
-| Existing-node activation | Explicit preview, validation and owner confirmation | Adds an intentional decision; protects against hidden changes |
+| Existing-node activation | Explicit preview, validation and independent owner-key authorization | Requires an enrolled separate owner device; protects against an unauthorized same-network source switch |
 | Remote source access | Use an approved protected route; no new public exposure by default | May require separate authentication/transport setup and owner action |
 | External explorer option | Explicit, labelled exception only if owner retains it | Accepts provider dependency; cannot count as owned-tip completion |
 | Full household completion claim | Block until approvals and recovery work unaided | Source setup may finish before the product journey does |
@@ -145,7 +167,7 @@ No tests were run for this design. These are required future checks, not complet
 | A5 | Unreachable, stale, unknown or synchronizing candidate | No source success claim, invoice or payment caused by setup |
 | A6 | Candidate validation cancelled | Existing config bytes and unrelated file permissions unchanged |
 | A7 | Existing omitted URL fields before explicit transition | Legacy interpretation unchanged; warning does not migrate |
-| A8 | Successful explicit transition | Both backends use selected source; no silent old/public endpoint remains |
+| A8 | Successful explicit transition, then source failure and restart | Both backends use the selected source; no Esplora primary/fallback field is read by either backend for operation. Exercise Lightning startup fallback, chain-reader inheritance and fresh-default recovery paths with trap endpoints; capture zero explorer requests. Missing owned-source fields fail closed |
 | A9 | Concurrent edit after preview | Activation refuses stale revision; new preview required |
 | A10 | Crash before commit, during commit and after commit | Defined recoverable state; no half-written config or fabricated readiness |
 | A11 | Repeated confirmation, Back/Cancel and app restart | One transition at most; UI matches effective state |
@@ -156,6 +178,8 @@ No tests were run for this design. These are required future checks, not complet
 | A16 | Source ready but app approval/recovery missing | “Setup incomplete”; does not pass the household test |
 | A17 | Persistence path substitution, symlink and unsafe backup cases | Reviewed fail-closed behavior; no unrelated or recovery-file writes |
 | A18 | After activation, restart Core and rotate its authentication cookie in an isolated fixture | Show chain-reader and Lightning health separately; retain existing payment gates while either required backend is unavailable; no external fallback, leaked credentials or implicit privilege expansion; recover through the approved app/lifecycle route, then recheck both backends. Terminal/helper recovery means the unaided result fails |
+| A19 | Fresh, correct-network attacker-controlled candidate; Read/AI/session-only caller; same install with second pairing | Candidate health never supplies authority. Activation needs a distinct eligible owner key and the reviewed separate-device/role boundary; refuse self-approval, stale authority, altered terms and stale configuration without source or budget changes |
+| A20 | Electrum TLS and pinning cases | CA-valid matching-host TLS works only through supported clients; invalid CA/hostname and unsupported self-signed routes fail. An independently supplied owner-approved pin, if implemented, must be enforced by both clients. Missing/untrusted first-seen pin, changed pin and probe/runtime certificate substitution fail closed without a fallback or silent verification bypass |
 
 For security/payment-related implementation, include tests that fail against the pre-change behavior and mutation checks of the actual guards. Bound probes, retries and response sizes. Use isolated fixtures; no production-node contact is needed to prove most rejection cases.
 
@@ -163,7 +187,7 @@ For security/payment-related implementation, include tests that fail against the
 
 Run formative sessions with at least three consenting owners aged 65 or older who use everyday phone/computer applications but do not administer Bitcoin services or develop this product. This proposed sample is a minimum usability gate, not a statistical claim about all older adults. Record age band and relevant experience only, without unnecessary personal data. A developer/operator demonstration cannot substitute for these sessions.
 
-Before each session, record the exact app/node build, device and supported test network, and provision a compatible owned source with the selected supported authentication method. Supply only the application, a neutral task card (connect your existing Bitcoin source), and the exact user-facing connection material: source type, owner-chosen service label, network and a supported address/code/QR or secure enrollment handoff. Use only formats the implementation actually supports. Do not supply raw secrets in the test record, custom terminal commands or an unstated preconfigured shortcut. Document what setup the facilitator performed beforehand. If obtaining that material requires an expert or terminal, the result establishes connection of a provisioned source only, not end-to-end household onboarding.
+Before each session, record the exact app/node build, device and supported test network, and provision a compatible owned source with the selected supported authentication method. Supply only the application, a neutral task card (connect your existing Bitcoin source), and the exact user-facing connection material: source type, owner-chosen service label, network and a supported address/code/QR or secure enrollment handoff. Use only formats the implementation actually supports. Do not supply raw secrets in the test record, custom terminal commands or an unstated preconfigured shortcut. Document what setup the facilitator performed beforehand, including separate owner-device enrollment. That enrollment is outside the five-decision connection score only when completed before the scenario and explicitly reported as helper provisioning. If enrollment or reenrollment is needed during the scenario, count its decisions and any help; do not omit them to achieve a pass. Any end-to-end onboarding claim must include enrollment. If obtaining that material requires an expert or terminal, the result establishes connection of a provisioned source only, not end-to-end household onboarding.
 
 Count each user choice that changes configuration, trust, authority or workflow as one decision, including the final activation and any required recovery choice. Repeated attempts at the same choice count again and are also recorded as retries. Reading, typing a supplied value and selecting Continue without another choice are interactions, not additional decisions; log them separately. Record hesitations over ten seconds, errors, elapsed active time and any abandoned or repeated step. Never hide permission prompts or recovery choices from the count.
 
@@ -179,6 +203,6 @@ Measure initial source connection separately from blockchain synchronization. Do
 
 The design can advance to implementation planning when the owner accepts scope and costs, reviewers agree on the trust/readiness distinctions, and current APIs plus lifecycle constraints are inventoried. Implementation work must have an isolated ownership claim and preserve other active work.
 
-Reject this design or its implementation if it silently adds a public chain dependency, treats Electrum selection as proof of validation, changes existing source configuration without explicit approval, claims terminal-free success with a helper step, or uses source readiness to bypass payment gates.
+Reject this design or its implementation if it silently adds a public chain dependency, treats Electrum selection as proof of validation, changes a source without independent owner-key authorization, accepts a self-signed server through first-seen trust or disabled verification, claims terminal-free success with a helper step, or uses source readiness to bypass payment gates.
 
 Phase and entrainment remain a later design stage built on this floor. Their success criteria are not invented or declared achieved here.

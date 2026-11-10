@@ -1,6 +1,6 @@
 # In-app spend approval and unaided recovery
 
-Q10 design-only draft v2 · 9 November 2026
+Design proposal v3 · 10 November 2026
 
 **Status:** Proposed design, not implementation or release approval. Current-source findings and remaining runtime uncertainties are distinguished below. Existing implementation is not evidence of a completed unaided recovery journey. No live node, credential, payment, signing, deployment, or recovery action has been performed. This document does not authorize those actions.
 
@@ -8,13 +8,13 @@ Q10 design-only draft v2 · 9 November 2026
 
 An ordinary older owner should be able to understand and approve a bounded spending request in the app, and recover from routine node restart, pairing loss, and app lockout without a terminal or a hidden helper. The interface must distinguish authority, connectivity, chain readiness, backend readiness, and payment outcome. A healthy connection does not establish permission to spend. A current chain tip does not establish a usable payment backend.
 
-Start with an already-enrolled second owner device approving a different requesting client. This follows the inspected implementation's separation between requester and approver. Do not enable a one-device journey by deleting the same-pairing prohibition. First-owner enrollment, same-device approval, and loss of the last owner authority require separate reviewed security designs.
+Start with an already-enrolled second owner device approving a different requesting client. The inspected node enforces separation between pairing client IDs, not between physical devices or people. An app install must never hold both the requesting pairing and an approving owner key for the same node. A second pairing on that install is the same-device case (Option B), not independent approval. This includes an AI requester pairing on the approver's device. Do not enable a one-device journey by deleting the same-pairing prohibition or relabeling a second pairing as a second device. First-owner enrollment, same-device approval, and loss of the last owner authority require separate reviewed security designs.
 
 The first slice is intentionally narrower than complete empty-hardware onboarding. It must disclose its enrolled-owner prerequisite. Successful testing with provisioned devices does not prove that a new owner can provision the system unaided.
 
 ## 2. Current-source evidence and uncertainty
 
-Node source inspected at fac9245b01fecb4f1dea24cfc95184a1d040a034. The relevant pairing, approval and metered-dispatch files are unchanged at candidate d89c9cfa4d8a57c99b29f67d0d1985d418a37a5c. This is source evidence, not installed-box or released-binary verification. The current protocol reference is docs/v2/OWNER-APPROVALS.md.
+Node source originally inspected at `fac9245b01fecb4f1dea24cfc95184a1d040a034`; the relevant pairing, approval and spend-budget files were rechecked as unchanged through `d99252f11e7feeca7888d50a232633c589e5f2d7`. This is source evidence, not installed-box or released-binary verification. The protocol reference is `docs/v2/OWNER-APPROVALS.md`.
 
 - Approval requests expire after 300 seconds. Approved first-contact authority lasts at most 120 seconds from approval and never beyond its underlying spend grant (pairing/approval.rs:19,482,681; OWNER-APPROVALS.md:196,204,238).
 - Pending requests and attempt limits are process-local. Signed spend-grant receipts persist; first-contact authority and its receipt are memory-only. An approval receipt is not proof of payment settlement.
@@ -24,7 +24,7 @@ Node source inspected at fac9245b01fecb4f1dea24cfc95184a1d040a034. The relevant 
 - Breaker reset IS implemented as the additive owner_device_approval_breaker_reset_v1 capability, separate from owner_device_approval_v1. It requires another enrolled owner pairing, a current live grant and unchanged signed accounting snapshot, preserves the grant's accounting, and allows at most three successful device resets per rolling day per grant (pairing/approval.rs:16,596-630; OWNER-APPROVALS.md:275).
 - These capability strings do not prove enabled owner mode, available keys or successful enrollment. The actual service mode and transport still gate access.
 
-Approval UI and host commands already exist in the inspected app snapshot 16f38a2fa488efe5cb543d08858255ceae41cfb1 from November 6 (src/control/OwnerApprovals.tsx, ownerApproval.ts; src-tauri/src/owner_approval.rs). That snapshot is not asserted to be the latest app or installed build. This proposal concerns integration, recovery and acceptance gaps, not rebuilding absent endpoints.
+Approval UI and host commands already exist in the previously inspected application snapshot from November 6. That snapshot is not asserted to be the latest app or installed build. This proposal concerns integration, recovery and acceptance gaps, not rebuilding absent endpoints. Revalidate application behavior against the selected implementation build.
 
 Older same-device/biometric designs must not override the implemented separate-owner rule. Current spend-grant approval is messaging authority, not blanket explicit-payment authorization. Explicit payments require their own authorization path.
 
@@ -58,10 +58,18 @@ No currency amounts, implementation duration, or hardware requirements are asser
 
 ## 4. Approval journey and authority invariants
 
+### Separate-device requirement
+
+For the same node, the supported app must refuse creation, import or restoration of a requesting pairing alongside an approving owner key. On enrollment, role change, restore and before signing, reconcile all locally held pairings and owner keys for that node. A conflicting second pairing, including a Read/AI requester, blocks approval; hiding it in another account or screen does not make it independent. Do not silently delete or revoke an existing key to resolve the conflict. Show an explicit owner-reviewed role or separate-device setup path. The approver role must not create a spending request that it can approve through another local pairing.
+
+The current node's distinct-client-ID check is necessary but insufficient. The implementation plan must specify enforceable enrollment/role controls, migration of existing mixed-role installs, and the evidence supporting the distinct-device prerequisite. Local checks alone cannot prove that another install or a modified client is on different hardware. Do not claim cryptographic device separation from a device label, a local-only check or a new client ID. If the selected platform cannot meet the reviewed boundary, keep that journey unavailable and retain Option B as a separate design. No new device-attestation field or endpoint is asserted here.
+
+### Request and approval
+
 1. The requesting client creates a bounded request. Creating a request is not payment and is not grant approval.
 2. An eligible owner app obtains the request through an authenticated, pinned-node connection. A notification or link is a navigation hint, not authority.
 3. The app displays the requesting device, intended recipient or action, total limit, time window, and consequences. Device and recipient labels require a verified mapping; attractive names alone are not identity evidence. A time-window budget must not be described as a recurring daily allowance unless that is the actual contract.
-4. The owner signs the exact bound terms using an eligible owner key. Local biometric success does not replace node-side authorization, key eligibility, current epoch, or requester separation checks.
+4. The owner signs the exact bound terms using an eligible owner key after the separate-device/role checks above. Local biometric success does not replace node-side authorization, key eligibility, current epoch, or requester separation checks.
 5. The node validates and consumes the approval atomically, persists the outcome, and returns an authoritative result. Concurrent submissions and retries must not create duplicate grants or reset a budget.
 6. The app obtains any required updated authorization and resumes only the original operation within the approved limits. It must not silently expand the recipient, duration, or scope.
 
@@ -111,12 +119,16 @@ Do not promise that a wallet seed restores channel state, operation history, pen
 
 ## 7. Decisions required before implementation
 
-1. Approve the already-enrolled second-device subset as the initial deliverable, or require a separately designed one-device ceremony first.
-2. Select the intended first-owner and last-authority-loss recovery model, including who holds recovery authority and what remains unrecoverable.
-3. Define grant defaults, maximum scope, expiry, replacement semantics, and treatment of pending liabilities. Do not invent numerical limits in the UI.
-4. Decide required cancel, decline and revocation behavior, and integrate the existing independently approved breaker-reset sub-capability. Do not invent approval cancellation where no API exists.
-5. Select supported app/device platforms and confirm the available key-protection and user-presence capabilities on each.
-6. Approve explicit release failure gates: no false paid/unpaid result, no false readiness, no hidden helper, no same-requester self-approval, and no bypass through recovery or replacement.
+| Decision | Recommended choice | Cost or consequence |
+|---|---|---|
+| 1. Initial approval subset | Start with an already-enrolled separate owner device, with the enforceable role boundary in section 4. Keep the one-device ceremony separate | Requires another available device and verified enrollment. A second pairing on one install does not qualify |
+| 2. First owner and last authority lost | Keep existing enrollment as an explicit prerequisite for the first slice. Design owner-held, non-hosted recovery separately before promising empty-hardware onboarding or last-authority recovery | First-owner provisioning may still need help, and losing the last authority remains unsupported. A recovery design must identify who holds authority and what cannot be recovered |
+| 3. Grant policy and replacement | Use the actual node-enforced, owner-selected bounded terms and expiry. Retain the current explicit fresh-grant model for the initial slice, with independent approval and disclosure of unresolved older payments; defer cross-grant carryover to a separate design | A deliberately approved replacement creates a new meter, not recovery of the old allowance. Unknown liabilities remain visible and must be reconciled. Owner approval of this policy and actual defaults is still required; do not invent numerical UI limits |
+| 4. Cancel, decline, revocation and breakers | Make dismissal local-only and expiry truthful while no decline/cancel API exists. Expose revocation only with verified target and in-flight semantics. Integrate breaker reset only with its advertised sub-capability and independent approval | The first slice cannot promise immediate server-side cancellation. Unsupported revoke paths remain unavailable. Reset quota and budget accounting stay unchanged |
+| 5. Platforms and key protection | Support only platform pairs whose enrolled-owner key protection, user-presence behavior, role controls and recovery route are verified on the exact app/node build. Publish that tested support matrix before release | Narrows initial reach and requires platform-specific tests. No platform is approved or declared supported merely by this proposal |
+| 6. Release failure gates | Make every listed safety and unaided-use gate mandatory: no false paid/unpaid result, no false readiness, no hidden helper, no same-requester or same-install self-approval, and no authority/budget bypass through recovery or replacement | A failed or untested gate blocks the corresponding completion claim and release slice; accurate unavailable states are preferable to apparent success |
+
+Each row is a recommendation for owner and security review, not a recorded decision or risk acceptance.
 
 These are product and security choices, not permission for live financial or credential actions.
 
@@ -125,7 +137,7 @@ These are product and security choices, not permission for live financial or cre
 Run future engineering tests on isolated approved regtest/signet fixtures, not live funds. Record exact versions, feature flags, initial state, action, persisted result, and visible result. No test execution is claimed by this document.
 
 - **B1 Eligible owner:** A different enrolled owner can approve an unchanged bounded request; only its intended operation receives the resulting authority.
-- **B2 Ineligible approver:** Same-pairing, Read/AI-only, and revoked-owner attempts fail without grant creation or budget change.
+- **B2 Ineligible approver and device-role conflict:** Same-pairing, Read/AI-only and revoked-owner attempts fail without grant creation or budget change. Also refuse same install with a second pairing and an AI requester pairing on the approver's device, including import, restore and role-change paths. Test direct requests that bypass the UI against the reviewed enforcement boundary. A different client ID alone is not acceptance evidence; unsupported physical-device separation remains a release blocker for that claim.
 - **B3 Bound terms:** Mutating node, requester, epoch, recipient, amount, window, nonce, or operation invalidates the approval. Displayed and signed terms agree.
 - **B4 Replay and concurrency:** Duplicate signatures, retries, and racing submissions produce at most one effective grant/outcome, without budget reset.
 - **B5 Restart:** Lost pending requests are shown as requiring reconciliation, not as evidence that no payment occurred. Persisted receipts remain authoritative within their documented scope.
@@ -156,7 +168,9 @@ Require exact-head review and regression tests for the authority boundaries. Mut
 
 Recruit at least three consenting ordinary device users aged 65 or older, not developers or administrators of this system. Collect only minimal necessary demographic information. This small acceptance exercise is not a statistical claim about all older users.
 
-Freeze and record the exact build, setup, supplied materials, supported platforms, and enrolled-device prerequisites. Disclose all helper provisioning. Participants perform approval, node restart recovery, pairing-loss recovery with surviving authority, and app-lockout scenarios using only the stated materials.
+Freeze and record the exact build, setup, supplied materials, supported platforms, and enrolled-device prerequisites. Second-device enrollment is outside the five-decision count only for a scenario explicitly starting with that device already enrolled. Record it separately as helper provisioning, including all preparation and any terminal or expert work. That result is approval or recovery with provisioned devices, not unaided onboarding.
+
+If enrollment, reenrollment or a role change is required during a scored scenario, its authority and recovery decisions count toward the same five-decision limit, and any helper intervention fails the unaided score. An end-to-end onboarding test must include second-device enrollment and cannot reuse the provisioned-device exemption. Participants perform approval, node restart recovery, pairing-loss recovery with surviving authority, and app-lockout scenarios using only the stated materials.
 
 For each supported scenario, require no more than five user decisions, zero hints, no terminal, and no hidden settings or off-screen helper actions. Count every authority choice, recovery choice, and retry rather than excluding inconvenient steps from the total. Report each participant and each scenario separately, not only an average.
 
