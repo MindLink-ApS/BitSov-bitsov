@@ -753,3 +753,146 @@ async fn received_pong_or_read_keeps_an_attachment_live() {
     tokio::time::advance(Duration::from_secs(10)).await;
     assert!(f.router.attach(&peer(), CALL, None).await.is_ok());
 }
+
+
+#[tokio::test]
+async fn callee_detach_ends_the_call_and_preserves_paid_evidence() {
+    use konsensus_core::payloads::call::{self as rules, CallEntry, HangupReason, Pending, Phase, Side};
+    use konsensus_storage::{SqliteStorage, Storage};
+    let store = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let now = super::now_ms();
+    let paid = CallEntry {
+        side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
+        pending: Some(Pending { operation_id: "pending-signal".into(), kind: 402, request_hash: "request".into() }),
+        paid_until_ms: Some(now + 60_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    };
+    store.call_put(&peer(), CALL, &paid).await.unwrap();
+    let f = fixture();
+    let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store.clone())));
+    let attachment = router.attach(&peer(), CALL, None).await.unwrap();
+    drop(attachment);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if store.call_get(&peer(), CALL).await.unwrap().unwrap().phase == Phase::Ended { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("callee detach must end durable admission");
+    let ended = store.call_get(&peer(), CALL).await.unwrap().unwrap();
+    assert_eq!(ended.end_reason, Some(HangupReason::Hangup));
+    assert_eq!(ended.pending, paid.pending, "pending settlement evidence remains");
+    assert_eq!(ended.paid_until_ms, paid.paid_until_ms);
+    assert_eq!(ended.next_block_seq, 1);
+    assert!(ended.deadline_ms >= now + rules::TOMBSTONE_MS);
+    assert!(rules::validate_block_invoice(&ended, 1, now + 40_000).is_err());
+    assert!(rules::receive_block(Some(ended), 1, now + 40_000).is_err(), "late payment cannot reopen media");
+    assert_eq!(router.attach(&peer(), CALL, None).await.err(), Some(AttachRefusal::NotAdmitted));
+}
+
+#[tokio::test]
+async fn caller_detach_keeps_the_existing_paid_deadline() {
+    use konsensus_core::payloads::call::{CallEntry, Phase, Side};
+    use konsensus_storage::{SqliteStorage, Storage};
+    let store = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let now = super::now_ms();
+    let paid = CallEntry {
+        side: Side::Caller, phase: Phase::Live, deadline_ms: now + 70_000,
+        pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    };
+    store.call_put(&peer(), CALL, &paid).await.unwrap();
+    let f = fixture();
+    let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store.clone())));
+    drop(router.attach(&peer(), CALL, None).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(store.call_get(&peer(), CALL).await.unwrap().unwrap(), paid);
+}
+
+
+#[tokio::test]
+async fn callee_detach_after_unpaid_expiry_prevents_late_resume() {
+    use konsensus_core::payloads::call::{self as rules, CallEntry, HangupReason, Phase, Side};
+    use konsensus_storage::{SqliteStorage, Storage};
+    let store = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let now = super::now_ms();
+    let paid = CallEntry {
+        side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
+        pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    };
+    store.call_put(&peer(), CALL, &paid).await.unwrap();
+    let f = fixture();
+    let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store.clone())));
+    let attachment = router.attach(&peer(), CALL, None).await.unwrap();
+    konsensus_api::calls::expire_calls(store.as_ref(), paid.deadline_ms + 1).await.unwrap();
+    let expired = store.call_get(&peer(), CALL).await.unwrap().unwrap();
+    assert_eq!(expired.end_reason, Some(HangupReason::Unpaid));
+    drop(attachment);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let ended = store.call_get(&peer(), CALL).await.unwrap().unwrap();
+            if rules::receive_block(Some(ended), 1, paid.deadline_ms + 2).is_err() { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("a detached expired callee must not resume on late settlement");
+    let ended = store.call_get(&peer(), CALL).await.unwrap().unwrap();
+    assert_eq!(ended.deadline_ms, expired.deadline_ms, "retain the longer tombstone");
+    assert_eq!(ended.paid_until_ms, paid.paid_until_ms);
+}
+
+#[tokio::test]
+async fn old_callee_attachment_drop_keeps_its_replacement_live() {
+    use konsensus_core::payloads::call::{CallEntry, Phase, Side};
+    use konsensus_storage::{SqliteStorage, Storage};
+    let store = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let now = super::now_ms();
+    let paid = CallEntry {
+        side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
+        pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    };
+    store.call_put(&peer(), CALL, &paid).await.unwrap();
+    let f = fixture();
+    let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store.clone())));
+    let old = router.attach(&peer(), CALL, None).await.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(16)).await;
+    tokio::time::resume();
+    let replacement = router.attach(&peer(), CALL, None).await.unwrap();
+    drop(old);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(store.call_get(&peer(), CALL).await.unwrap().unwrap(), paid);
+    assert!(!replacement.to_node.is_closed());
+    assert_eq!(router.routed_calls(), 1);
+}
+
+
+#[tokio::test]
+async fn callee_detach_retries_a_failed_state_write() {
+    use konsensus_core::payloads::call::{CallEntry, Phase, Side};
+    use konsensus_storage::{SqliteStorage, Storage};
+    let (logs, _guard) = capture_logs();
+    let store = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let now = super::now_ms();
+    store.call_put(&peer(), CALL, &CallEntry {
+        side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
+        pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    }).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_detach BEFORE UPDATE ON call_state BEGIN SELECT RAISE(ABORT, 'temporary write failure'); END")
+        .execute(store.pool()).await.unwrap();
+    let f = fixture();
+    let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store.clone())));
+    drop(router.attach(&peer(), CALL, None).await.unwrap());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !String::from_utf8_lossy(&logs.0.lock().unwrap()).contains("call media detachment state update failed") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the injected write failure was reached");
+    sqlx::query("DROP TRIGGER fail_detach").execute(store.pool()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while store.call_get(&peer(), CALL).await.unwrap().unwrap().phase != Phase::Ended {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("detachment must survive a temporary storage failure");
+}

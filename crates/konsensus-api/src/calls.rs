@@ -84,6 +84,19 @@ pub async fn call_media_admitted(store: Store<'_>, peer: &NodeId, call_id: &str,
     store.call_get(peer, call_id).await.ok().flatten().is_some_and(|entry| entry.media_admitted(now))
 }
 
+/// End a callee call when its current local media attachment closes.
+/// Preserve paid boundaries and pending evidence for ordinary reconciliation.
+pub async fn detach_callee_media(store: Store<'_>, peer: &NodeId, call_id: &str, now: u64) -> Result<(), konsensus_storage::StorageError> {
+    let _guard = lock().lock().await;
+    let Some(mut entry) = store.call_get(peer, call_id).await? else { return Ok(()) };
+    if entry.side != rules::Side::Callee || !(entry.phase == rules::Phase::Live
+        || (entry.phase == rules::Phase::Ended && entry.end_reason == Some(rules::HangupReason::Unpaid))) { return Ok(()); }
+    entry.phase = rules::Phase::Ended;
+    entry.end_reason = Some(rules::HangupReason::Hangup);
+    entry.deadline_ms = entry.deadline_ms.max(now.saturating_add(rules::TOMBSTONE_MS));
+    store.call_put(peer, call_id, &entry).await
+}
+
 /// End expired calls durably, retaining pending evidence and tombstones.
 /// Only callee entries are returned for a best-effort 403 Unpaid notification.
 pub async fn expire_calls(store: Store<'_>, now: u64) -> Result<Vec<(NodeId, String)>, konsensus_storage::StorageError> {

@@ -73,6 +73,8 @@ const DROP_LOG_INTERVAL: Duration = Duration::from_secs(10);
 #[async_trait]
 pub trait CallMediaAdmission: Send + Sync {
     async fn call_media_admitted(&self, peer: &NodeId, call_id: &str, now_ms: u64) -> bool;
+    /// Notify admission when the current local attachment has closed.
+    async fn media_detached(&self, _peer: &NodeId, _call_id: &str) {}
 }
 
 /// Production admission: N1's live call and settled paid-block boundary.
@@ -91,6 +93,16 @@ impl PaidCallAdmission {
 impl CallMediaAdmission for PaidCallAdmission {
     async fn call_media_admitted(&self, peer: &NodeId, call_id: &str, now_ms: u64) -> bool {
         konsensus_api::calls::call_media_admitted(self.storage.as_ref(), peer, call_id, now_ms).await
+    }
+
+    async fn media_detached(&self, peer: &NodeId, call_id: &str) {
+        loop {
+            match konsensus_api::calls::detach_callee_media(self.storage.as_ref(), peer, call_id, now_ms()).await {
+                Ok(()) => return,
+                Err(error) => warn!(%error, "call media detachment state update failed; retrying"),
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 }
 
@@ -540,6 +552,12 @@ impl CallMediaRouter {
         route.end(reason);
         if removed {
             debug!(peer = %route.peer, call_id, "call media route ended");
+            if reason == EndReason::Detached {
+                let admission = Arc::clone(&self.admission);
+                let peer = route.peer;
+                let call_id = call_id.to_string();
+                tokio::spawn(async move { admission.media_detached(&peer, &call_id).await; });
+            }
         }
     }
 
