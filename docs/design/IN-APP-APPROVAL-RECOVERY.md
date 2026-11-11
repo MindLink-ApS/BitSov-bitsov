@@ -178,6 +178,27 @@ Afterward, verify comprehension of four points: whose authority was used; what l
 
 An unsupported last-authority-loss scenario must be described honestly and must not be scored as successful recovery. Provisioned-device success does not establish complete unaided onboarding from empty hardware.
 
+### 9.1 Proposed amendment: two claims, scored separately (draft, not yet adopted)
+
+Owner direction for the next releases: the product promises **approval and recovery from a device that is already set up**. It does not yet promise unaided setup from empty hardware, and no same-device setup ceremony (option B) is funded now. This amendment makes §9 match that promise without weakening any scenario that is scored.
+
+**Claim 1: provisioned-device use (the claim we make).**
+- Scope: spend approval, node restart recovery, pairing-loss recovery with surviving authority, and app lockout, each starting from a home node and at least one owner device that are already set up and enrolled.
+- Gate: unchanged from §9. At most five user decisions per scenario, zero hints, no terminal, no hidden settings, every retry counted, each participant and scenario reported, and the comprehension check.
+- Public wording must name the precondition, for example "once your devices are set up". It may not say or imply that setup itself is unaided.
+
+**Claim 2: setup (measured, not claimed as unaided).**
+- Scope: first launch through to the first scored scenario. This covers install, connecting the app to the home node, first-owner setup and second-device enrollment.
+- It is measured on every release with the same counting rules: every decision, OS or biometric prompt, wait, terminal step and helper action, recorded per participant.
+- A helper is **allowed** and recorded. The result is published as "setup with help: N decisions, M helper actions, 0 terminal steps required of the user".
+- Target after the next release: no terminal step required of the user, and five user decisions or fewer for connecting the app to an already-provisioned home node. Enrollment of a second device is reported separately until option B or C is designed.
+
+**Unchanged:** an end-to-end "unaided onboarding from empty hardware" claim still requires the full rule in §9 above (enrollment counted, no provisioned-device exemption). It stays unclaimed until a setup ceremony is designed and passes that gate. The last-authority-loss scenario is still described honestly and not scored as recovery.
+
+**Why this split:** source inspection of the current desktop app counts more than five decisions for the whole fresh journey once OS prompts, enrollment and a role change are included. Folding setup into each scored scenario would either fail every scenario or invite quietly leaving steps out. Two separate, honest numbers are more useful than one misleading one.
+
+**Decision needed:** adopt 9.1 as written, or with changes, before the next older-user acceptance run.
+
 ## 10. Handoff and implementation boundary
 
 The next engineering step is a version-specific contract inventory and owner decision record, followed by a reviewed implementation plan for the selected subset. Do not duplicate held work, silently broaden recovery authority, add a public fallback, or change live node configuration.
