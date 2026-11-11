@@ -33,12 +33,14 @@
 //!   peer IDs, wallet balance, and LN pubkey are owner-only at `/api/v1/status`.
 //! - `GET  /api/v1/status` — owner-only full node status (behind `AuthUser`).
 //! - `GET  /api/v1/owner/claim-code` — authenticated, and additionally bound to
-//!   a loopback source and an owner actor; absent from the remote router.
+//!   a loopback source, the local Host/Origin allowlist, and an owner actor;
+//!   absent from the remote router.
 //! - `GET  /api/v1/preflight` and `GET /livez` — cheap operator liveness
 //!   probes mounted only when `AppState::operator_probes_enabled` is true.
 //!   They do not query Lightning, chain, storage, peers, or user state.
 //! - `GET  /api/v1/auth/challenge` — emits a short-lived single-use
-//!   Ed25519 challenge. Cannot require a JWT to issue one.
+//!   Ed25519 challenge. Cannot require a JWT to issue one. On the local
+//!   listener, Host and Origin use the same admission as local token minting.
 //! - `POST /api/v1/auth/token` — JWT bootstrap via Ed25519 signature over
 //!   that challenge. Cannot require a JWT to issue one.
 //! - `POST /api/v1/auth/local` — JWT bootstrap restricted to loopback
@@ -61,6 +63,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod auth_challenge;
 pub mod bootstrap;
 pub mod call_media;
 pub mod calls;
@@ -88,6 +91,7 @@ mod local_request;
 pub mod membrane;
 
 pub use audit::AuditLog;
+pub use auth_challenge::AuthChallenges;
 pub use rate_limit::RateLimiter;
 pub use state::{AppState, InvoiceResponseData, WsMessage};
 
@@ -262,7 +266,8 @@ fn build_router_with_options(
                 Router::new()
                     .route(
                         "/api/v1/owner/claim-code",
-                        get(handlers::owner_claim_code::show),
+                        get(handlers::owner_claim_code::show)
+                            .layer(middleware::from_fn(local_request::guard)),
                     )
                     .layer(middleware::map_response(
                         |mut response: axum::response::Response| async move {

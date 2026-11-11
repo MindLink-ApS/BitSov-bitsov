@@ -379,7 +379,7 @@ async fn start_node(identity: Arc<NodeIdentity>, peer: NodeId, ledger: &Path, na
         transport: Arc::clone(&transport) as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&sessions),
         jwt_secret: JWT_SECRET.into(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
@@ -835,6 +835,7 @@ enum Side {
 #[allow(dead_code)] // Read through Debug.
 struct Delivery {
     attempts: usize,
+    unpaid_deferrals: usize,
     delivered_after: Option<Duration>,
     last_refusal: Option<String>,
 }
@@ -870,8 +871,17 @@ async fn messages_each_way(pair: &Pair, first: Side) -> (Delivery, Delivery, usi
             }
             let text = format!("after the race, round {round}, from the {name} id");
             delivery.attempts += 1;
+            let paid_before_attempt = node.paid_out().await;
             match tokio::time::timeout(left, node.compose(&peer.id, &text)).await {
                 Ok((status, body)) => {
+                    if status != StatusCode::OK {
+                        assert_eq!(body["code"], "not_dispatched", "{body}");
+                        assert_eq!(body["reason"], "session_handover", "{body}");
+                        assert_eq!(body["state"], "released", "{body}");
+                        assert_eq!(body["retry_allowed"], true, "{body}");
+                        assert_eq!(node.paid_out().await, paid_before_attempt, "a deferred attempt is unpaid");
+                        delivery.unpaid_deferrals += 1;
+                    }
                     let answer = format!("{status}: {}", refusal_of(&body));
                     eprintln!(
                         "SESSION-RACE attempt t={:?} from={name} status={status} delivered={} accepted={} amount_msat={} code={} reason={}",
@@ -939,8 +949,9 @@ async fn race_then_messages(test: &str, order: Order, first: Side) {
 async fn run_and_assert(test: &str, pair: &Pair, order: Order, first: Side) {
     let (from_higher, from_lower, paid, facts) = run_race(test, pair, order, first).await;
     assert!(
-        from_higher.attempts == 1 && from_lower.attempts == 1 && paid == 2,
-        "the first message each way is read, and nothing else is paid for. paid {paid}; \
+        from_higher.attempts == from_higher.unpaid_deferrals + 1
+            && from_lower.attempts == from_lower.unpaid_deferrals + 1 && paid == 2,
+        "each paid attempt is read and deferred attempts are unpaid. paid {paid}; \
          from the higher id: {from_higher:?}; from the lower id: {from_lower:?}; {facts:?}"
     );
 }
@@ -994,12 +1005,21 @@ async fn only_the_higher_id_speaks(test: &str, pair: &Pair, order: Order) {
     let (higher, lower) = (&pair.higher, &pair.lower);
     let started = tokio::time::Instant::now();
     let paid_before = higher.paid_out().await;
-    let (mut attempts, mut delivered_after) = (0, None);
+    let (mut attempts, mut unpaid_deferrals, mut delivered_after) = (0, 0, None);
     while started.elapsed() < RECOVERY_BOUND && delivered_after.is_none() {
         attempts += 1;
         let text = format!("after the race, attempt {attempts}, from the higher id");
         let left = RECOVERY_BOUND.saturating_sub(started.elapsed());
+        let before_attempt = higher.paid_out().await;
         if let Ok((status, body)) = tokio::time::timeout(left, higher.compose(&lower.id, &text)).await {
+            if status != StatusCode::OK {
+                assert_eq!(body["code"], "not_dispatched", "{body}");
+                assert_eq!(body["reason"], "session_handover", "{body}");
+                assert_eq!(body["state"], "released", "{body}");
+                assert_eq!(body["retry_allowed"], true, "{body}");
+                assert_eq!(higher.paid_out().await, before_attempt, "a deferred attempt is unpaid");
+                unpaid_deferrals += 1;
+            }
             eprintln!(
                 "SESSION-RACE attempt t={:?} from=higher status={status} accepted={} amount_msat={}",
                 started.elapsed(), body["accepted"], body["amount_msat"],
@@ -1017,7 +1037,7 @@ async fn only_the_higher_id_speaks(test: &str, pair: &Pair, order: Order) {
     eprintln!("SESSION-RACE {test}: attempts={attempts} delivered_after={delivered_after:?} paid_by_higher={paid}");
     pair.stop();
     assert!(delivered_after.is_some(), "the higher id never got through: {facts:?}");
-    assert!(attempts == 1 && paid == 1, "its first message is read: {attempts} attempts, {paid} paid: {facts:?}");
+    assert!(attempts == unpaid_deferrals + 1 && paid == 1, "one paid attempt is read and every deferral is unpaid: {attempts} attempts, {unpaid_deferrals} deferrals, {paid} paid: {facts:?}");
 }
 
 // ── The race ──────────────────────────────────────────────────────────────

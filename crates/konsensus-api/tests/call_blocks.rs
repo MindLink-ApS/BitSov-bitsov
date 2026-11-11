@@ -672,7 +672,7 @@ async fn callee_grant_resumes_caller_after_unpaid_notice_and_is_bound_to_paid_me
     assert!(calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 60_000).await.is_err());
     assert!(store.is_pending_dispatched(&envelope.id, &peer, &own).await.unwrap());
     let body = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
-    store.store_message_plaintext(&envelope.id, &cipher.encrypt(body.as_bytes()).unwrap()).await.unwrap();
+    store.store_message_plaintext(&envelope.id, &cipher.encrypt(&envelope.id.to_hex(), body.as_bytes()).unwrap()).await.unwrap();
     calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 60_000).await.unwrap();
     let upgraded = store.get_outbox_operation_by_message(&envelope.id).await.unwrap().unwrap();
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&upgraded.recovery).unwrap()["call_block"], serde_json::json!([ID, 0]));

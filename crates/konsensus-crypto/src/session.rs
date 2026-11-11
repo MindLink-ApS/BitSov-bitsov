@@ -24,8 +24,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Key, Nonce as AesNonce};
+use crate::record_cipher::{RecordCipher, LegacyReadPolicy, SESSION_KEY_CONTEXT};
 use async_trait::async_trait;
 use ed25519_dalek::Signer;
 use rand::RngCore;
@@ -50,6 +49,10 @@ pub enum SessionError {
     /// Session already exists with this peer.
     #[error("session already exists with peer {0}")]
     SessionExists(NodeId),
+
+    /// An accepted replacement needs the initiator's ratchet frame before sending.
+    #[error("session recovery handover is pending; retry after confirmation")]
+    HandoverPending,
 
     /// X3DH key agreement failed.
     #[error("key agreement failed: {0}")]
@@ -165,6 +168,8 @@ struct PeerSession {
     /// When this node derived the session, ms since the epoch. Held in memory
     /// only: `None` for a session restored from storage.
     established_at_ms: Option<u64>,
+    /// Local installation or proven session progress. Never persisted.
+    progressed_at: std::time::Instant,
     /// A newer session the peer has not yet proven it holds. Replaces `ratchet`
     /// only on that proof; held in memory only, and overwritten by the next one.
     unconfirmed: Option<DoubleRatchet>,
@@ -203,6 +208,7 @@ impl PeerSession {
         Self {
             ratchet,
             established_at_ms,
+            progressed_at: std::time::Instant::now(),
             unconfirmed: None,
             unconfirmed_initiated: false,
             unconfirmed_since: None,
@@ -234,7 +240,7 @@ fn now_ms() -> Option<u64> {
 /// Domain-separation context for deriving the session-encryption key from the
 /// node's AES master key. This ensures the session-at-rest key is independent
 /// of the key used for `EncryptedStorage` envelope encryption.
-const SESSION_ENCRYPTION_CTX: &str = "konsensus-v2 session-at-rest encryption key";
+const SESSION_ENCRYPTION_CTX: &str = SESSION_KEY_CONTEXT;
 
 /// Manages E2EE sessions with all peers.
 ///
@@ -261,18 +267,25 @@ pub struct SessionManager {
     store: Option<Arc<dyn SessionStore>>,
     /// AES-256-GCM cipher for encrypting session state at rest.
     /// Derived from the node's AES key with domain separation.
-    session_cipher: Aes256Gcm,
+    session_cipher: Arc<RecordCipher>,
 }
 
 impl SessionManager {
     /// Derive the AES-256-GCM cipher for session-at-rest encryption from
     /// the node's AES master key using domain separation.
-    fn derive_session_cipher(identity: &NodeIdentity) -> Aes256Gcm {
-        let derived: [u8; 32] = blake3::derive_key(SESSION_ENCRYPTION_CTX, identity.aes_key());
-        Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived))
+    fn derive_session_cipher(identity: &NodeIdentity) -> Arc<RecordCipher> {
+        Arc::new(RecordCipher::derived(identity.aes_key(), SESSION_ENCRYPTION_CTX, LegacyReadPolicy::default()))
     }
 
-    /// Create a new session manager for the given identity.
+    pub fn record_policy(&self) -> LegacyReadPolicy { self.session_cipher.policy() }
+
+    pub fn with_record_policy(mut self, policy: LegacyReadPolicy) -> Self {
+        self.session_cipher = Arc::new(RecordCipher::derived(self.identity.aes_key(), SESSION_ENCRYPTION_CTX, policy.for_crypto()));
+        self
+    }
+
+    /// Create a v2-only session manager for the given identity.
+    /// Use with_record_policy with a local data directory for a v1 upgrade.
     ///
     /// Generates an initial signed pre-key and a batch of one-time pre-keys.
     pub fn new(identity: Arc<NodeIdentity>) -> Self {
@@ -331,51 +344,15 @@ impl SessionManager {
             }
         };
 
-        // L0b (2026-04-30): the previous code path AES-decrypted the stored
-        // session blob and, on failure, fell through to deserializing the
-        // raw blob bytes as plaintext JSON. An attacker with disk-write
-        // access could rewrite an encrypted blob with attacker-known
-        // ratchet state in plaintext; on next restart the plaintext branch
-        // would load it, then `persist_session` would re-encrypt it under
-        // the legitimate key — laundering the injection. The fallback is
-        // removed entirely. Decryption failure is now a hard "skip this
-        // session" with a warning, and the session re-establishes via the
-        // normal X3DH flow on next contact.
-        //
-        // For one-time migration of legacy plaintext sessions written
-        // before AES-GCM-at-rest landed (ADR-019), a dedicated migration
-        // binary built with `--features legacy-session-migration` AND booted
-        // with `KONSENSUS_LEGACY_SESSION_MIGRATION=1` may import a plaintext
-        // blob ONCE (it is immediately re-persisted encrypted). Both gates
-        // are required:
-        //
-        //   * the cargo feature compiles the plaintext-accepting code IN —
-        //     a default/production build does not contain it at all, so a
-        //     plaintext blob is rejected unconditionally regardless of any
-        //     env var an attacker might set on the process;
-        //   * the env var is a second, per-boot operator opt-in so the
-        //     migration capability is not active just because a migration
-        //     binary happens to be running.
-        //
-        // `allow_legacy_plaintext_migration` is the AND of both gates. In a
-        // default build it is a compile-time `false`, so every plaintext
-        // branch below is dead code the optimizer drops.
-        let allow_legacy_plaintext_migration = legacy_plaintext_migration_enabled();
-        if allow_legacy_plaintext_migration {
-            warn!(
-                "legacy-session-migration build with KONSENSUS_LEGACY_SESSION_MIGRATION=1 — \
-                 plaintext-fallback restore enabled FOR THIS BOOT ONLY. Operator MUST unset \
-                 this env var (and redeploy a default-build binary) after the first \
-                 successful boot. Legacy plaintext sessions are a downgrade-attack vector if \
-                 left enabled; use only for a single legacy migration boot."
-            );
-        }
+        // Plaintext session imports retain the existing build and runtime gates.
+        let allow_legacy_plaintext_migration = legacy_plaintext_migration_enabled()
+            && self.session_cipher.allows_v1();
 
         let mut restored = 0;
         for peer_id in &peer_ids {
             match store.load_session(peer_id).await {
                 Ok(Some(blob)) => {
-                    // Decrypt the stored session state (AES-256-GCM: nonce || ciphertext).
+                    // Read persisted session state using its peer location.
                     // `decrypt_or_migrate_blob` returns the JSON bytes on success, or
                     // `None` to skip the session. In a default (production) build it ONLY
                     // ever returns `Some` for a blob that authenticated under AES-256-GCM;
@@ -404,7 +381,7 @@ impl SessionManager {
                             // gate keeps this branch out of default builds entirely.
                             #[cfg(feature = "legacy-session-migration")]
                             if allow_legacy_plaintext_migration
-                                && self.decrypt_session_blob(&blob).is_err()
+                                && self.decrypt_session_blob(peer_id, &blob).is_err()
                             {
                                 debug!(peer = %peer_id, "re-encrypting legacy plaintext session");
                                 self.persist_session(peer_id).await;
@@ -426,33 +403,19 @@ impl SessionManager {
         restored
     }
 
-    /// Resolve a stored session blob to its JSON bytes during restore.
-    ///
-    /// Returns `Some(json)` for a blob to load, or `None` to skip the session
-    /// (it will re-establish via X3DH on next contact).
-    ///
-    /// # Security
-    ///
-    /// In a default (production) build — i.e. WITHOUT the
-    /// `legacy-session-migration` feature — this function ONLY returns `Some`
-    /// for a blob that authenticated under AES-256-GCM. The plaintext-accepting
-    /// branches are compiled out, so a non-encrypted blob is unconditionally
-    /// rejected (`None`) no matter what `KONSENSUS_LEGACY_SESSION_MIGRATION` is
-    /// set to. This closes the downgrade vector where an attacker with
-    /// disk-write access plants attacker-known ratchet state in plaintext and a
-    /// flipped env var would launder it (L0b / MED-A).
-    ///
-    /// `allow_legacy` is the AND of the build feature and the per-boot env var;
-    /// in a default build it is always `false`.
+    /// Resolve stored session data, retaining the optional plaintext import gates.
     fn decrypt_or_migrate_blob(
         &self,
         peer_id: &NodeId,
         blob: &[u8],
         allow_legacy: bool,
     ) -> Option<Vec<u8>> {
+        if RecordCipher::is_v2(blob) || !self.session_cipher.allows_v1() {
+            return self.decrypt_session_blob(peer_id, blob).ok();
+        }
         // Authenticated path: a valid AES-GCM blob is `nonce(12) || ciphertext`.
         if blob.len() > 12 {
-            match self.decrypt_session_blob(blob) {
+            match self.decrypt_session_blob(peer_id, blob) {
                 Ok(decrypted) => return Some(decrypted),
                 Err(e) => {
                     // Decryption failed. In a default build the only safe action
@@ -516,16 +479,8 @@ impl SessionManager {
         }
     }
 
-    /// Decrypt a session state blob. Expects nonce (12 bytes) || ciphertext.
-    fn decrypt_session_blob(&self, data: &[u8]) -> Result<Vec<u8>, String> {
-        if data.len() < 12 {
-            return Err("session blob too short for nonce".into());
-        }
-        let (nonce_bytes, ciphertext) = data.split_at(12);
-        let nonce = AesNonce::from_slice(nonce_bytes);
-        self.session_cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| format!("session decrypt: {e}"))
+    fn decrypt_session_blob(&self, peer: &NodeId, data: &[u8]) -> Result<Vec<u8>, String> {
+        self.session_cipher.decrypt("sessions", "state_blob", &peer.to_hex(), data)
     }
 
     /// Persist the current session state for a peer.
@@ -542,7 +497,7 @@ impl SessionManager {
         let saved = tokio::spawn(async move {
             let sessions = sessions.write().await;
             let Some(session) = sessions.get(&peer) else { return };
-            match session_blob(&cipher, session) {
+            match session_blob(&cipher, &peer, session) {
                 Ok(encrypted_blob) => {
                     if let Err(e) = store.save_session(&peer, &encrypted_blob).await {
                         warn!(peer = %peer, error = %e, "failed to persist session state");
@@ -809,6 +764,7 @@ impl SessionManager {
                     session.awaiting_confirmation = false;
                 }
             }
+            session.progressed_at = std::time::Instant::now();
         }
         self.persist_session(peer_id).await;
         true
@@ -822,6 +778,18 @@ impl SessionManager {
         }
     }
 
+    /// Mark recovery requested before `boundary` without invalidating a session
+    /// installed, confirmed or proven readable since then. The comparison and
+    /// mark share one write lock, so a queued rejection cannot race recovery. No session
+    /// also needs repair. A newer session returns false and stays usable.
+    pub async fn mark_needs_renegotiation_before(&self, peer_id: &NodeId, boundary: std::time::Instant) -> bool {
+        let mut sessions = self.sessions.write().await;
+        let Some(session) = sessions.get_mut(peer_id) else { return true; };
+        if session.progressed_at > boundary { return false; }
+        session.needs_renegotiation = true;
+        true
+    }
+
     /// Whether we started a replacement of the session with a peer and are waiting for
     /// its answer. Until then the peer may already be on the replacement, so a message
     /// under the session in use would tell it nothing.
@@ -831,7 +799,8 @@ impl SessionManager {
 
     /// Whether a newer session with a peer is held aside, either side's, until the
     /// peer proves it holds it. Until then the two sides can each send, and what the
-    /// acceptor sends is under the session before.
+    /// acceptor would otherwise send is under the session before; application
+    /// encryption is deferred until the replacement is proven.
     pub async fn replacement_pending(&self, peer_id: &NodeId) -> bool {
         self.sessions.read().await.get(peer_id).is_some_and(|session| session.unconfirmed.is_some())
     }
@@ -881,7 +850,9 @@ impl SessionManager {
     ///
     /// Uses the Double Ratchet to derive a per-message key and encrypt.
     /// Returns the ratchet message (header + ciphertext) which should be
-    /// placed in the UKM envelope's `ciphertext` field.
+    /// placed in the UKM envelope's `ciphertext` field. An accepted replacement
+    /// withholds application ciphertext until the initiator proves its new session,
+    /// so callers cannot start payment for a send under the previous session.
     ///
     /// The advanced send chain is saved before the ciphertext is returned, so a
     /// restart can never derive the key of a message that already left. If the save
@@ -900,9 +871,27 @@ impl SessionManager {
         peer_id: &NodeId,
         plaintext: &[u8],
     ) -> Result<RatchetMessage, SessionError> {
+        self.encrypt_for(peer_id, plaintext, false).await
+    }
+
+    /// Recovery probes may test the active session while renegotiation is marked.
+    /// Application sends use `encrypt` and wait for that mark to clear.
+    pub async fn encrypt_recovery_probe(
+        &self, peer_id: &NodeId,
+    ) -> Result<RatchetMessage, SessionError> {
+        self.encrypt_for(peer_id, b"ratchet-init", true).await
+    }
+
+    async fn encrypt_for(
+        &self, peer_id: &NodeId, plaintext: &[u8], recovery_probe: bool,
+    ) -> Result<RatchetMessage, SessionError> {
         let Some(store) = self.store.clone() else {
             let mut sessions = self.sessions.write().await;
             let session = sessions.get_mut(peer_id).ok_or(SessionError::NoSession(*peer_id))?;
+            if (!recovery_probe && session.needs_renegotiation)
+                || (session.unconfirmed.is_some() && !session.unconfirmed_initiated) {
+                return Err(SessionError::HandoverPending);
+            }
             return Ok(session.ratchet.encrypt(plaintext)?);
         };
         let (sessions, cipher, peer, plaintext) =
@@ -910,9 +899,13 @@ impl SessionManager {
         tokio::spawn(async move {
             let mut sessions = sessions.write().await;
             let session = sessions.get_mut(&peer).ok_or(SessionError::NoSession(peer))?;
+            if (!recovery_probe && session.needs_renegotiation)
+                || (session.unconfirmed.is_some() && !session.unconfirmed_initiated) {
+                return Err(SessionError::HandoverPending);
+            }
             let before = session.ratchet.export_state();
             let msg = session.ratchet.encrypt(&plaintext)?;
-            let saved = match session_blob(&cipher, session) {
+            let saved = match session_blob(&cipher, &peer, session) {
                 Ok(blob) => store.save_session(&peer, &blob).await.map_err(|e| e.to_string()),
                 Err(e) => Err(e),
             };
@@ -973,6 +966,7 @@ impl SessionManager {
                 Ok(plaintext) => {
                     // The peer and this session agree, whatever was unreadable before.
                     session.needs_renegotiation = false;
+                    session.progressed_at = std::time::Instant::now();
                     plaintext
                 }
                 Err(error) => {
@@ -1080,28 +1074,13 @@ impl SessionManager {
     }
 }
 
-/// Encrypt session state for storage: nonce (12 bytes) || ciphertext.
-fn seal_session_blob(cipher: &Aes256Gcm, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = AesNonce::from_slice(&nonce_bytes);
-
-    let encrypted = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| format!("session encrypt: {e}"))?;
-
-    let mut result = Vec::with_capacity(12 + encrypted.len());
-    result.extend_from_slice(&nonce_bytes);
-    result.extend_from_slice(&encrypted);
-    Ok(result)
-}
-
 /// The encrypted blob that stores a session's current state.
-fn session_blob(cipher: &Aes256Gcm, session: &PeerSession) -> Result<Vec<u8>, String> {
+fn session_blob(cipher: &RecordCipher, peer: &NodeId, session: &PeerSession) -> Result<Vec<u8>, String> {
     let state = session.ratchet.export_state();
     let json_blob = serde_json::to_vec(&state).map_err(|e| format!("serialize session state: {e}"))?;
     // Encrypt the JSON before persisting (Principle 4)
-    seal_session_blob(cipher, &json_blob).map_err(|e| format!("encrypt session state: {e}"))
+    cipher.encrypt("sessions", "state_blob", &peer.to_hex(), &json_blob)
+        .map_err(|e| format!("encrypt session state: {e}"))
 }
 
 /// Serialize a RatchetMessage to bytes for embedding in a UKM envelope's ciphertext field.

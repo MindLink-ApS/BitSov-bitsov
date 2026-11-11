@@ -113,6 +113,54 @@ impl LightningProvider for SharedMockProvider {
             created_at,
         })
     }
+    async fn forget_pending_invoice(&self, payment_hash: &str) -> Result<bool, LightningError> {
+        let changed = self.db.lock().map_err(err)?.execute(
+            "DELETE FROM invoices WHERE hash=?1 AND recipient=?2 AND payer IS NULL",
+            params![payment_hash, self.owner],
+        ).map_err(err)?;
+        Ok(changed == 1)
+    }
+    async fn purge_expired_pending_invoices(&self, now_unix: u64) -> Result<u32, LightningError> {
+        let db = self.db.lock().map_err(err)?;
+        let mut stmt = db
+            .prepare("SELECT hash, bolt11 FROM invoices WHERE recipient=?1 AND payer IS NULL")
+            .map_err(err)?;
+        let rows = stmt
+            .query_map(params![self.owner], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?;
+        drop(stmt);
+        let mut removed = 0u32;
+        for (hash, bolt11) in rows {
+            let expired = bolt11
+                .parse::<Bolt11Invoice>()
+                .ok()
+                .and_then(|invoice| invoice.expires_at())
+                .is_some_and(|end| end.as_secs() <= now_unix);
+            if !expired { continue; }
+            let changed = db.execute(
+                "DELETE FROM invoices WHERE hash=?1 AND recipient=?2 AND payer IS NULL",
+                params![hash, self.owner],
+            ).map_err(err)?;
+            if changed == 1 { removed += 1; }
+        }
+        Ok(removed)
+    }
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        let db = self.db.lock().map_err(|_| LightningError::Backend("invoice database lock poisoned".into()))?;
+        let mut stmt = db.prepare("SELECT bolt11 FROM invoices WHERE recipient=?1 AND payer IS NULL").map_err(err)?;
+        let rows = stmt.query_map(params![self.owner], |row| row.get::<_, String>(0)).map_err(err)?;
+        rows.map(|row| {
+            let bolt11 = row.map_err(err)?;
+            let invoice = bolt11.parse::<Bolt11Invoice>().map_err(err)?;
+            let expires_at = invoice.expires_at().ok_or_else(|| LightningError::Backend("invalid invoice expiry".into()))?.as_secs();
+            Ok((invoice.payment_hash().to_string(), expires_at))
+        }).collect()
+    }
+
     async fn create_stateless_invoice(
         &self, amount: u64, description: &str, expiry: u32,
     ) -> Result<Invoice, LightningError> {

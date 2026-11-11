@@ -28,9 +28,38 @@ pub enum PaidAcceptance {
     Withdrawn,
 }
 
+/// Active receiver deferrals retained for one payment proof.
+pub const MAX_DEFERRALS_PER_PROOF: i64 = 3;
+/// Active receiver deferrals retained for one sender across payment proofs.
+pub const MAX_DEFERRALS_PER_SENDER: i64 = 12;
+/// Local retention window, matching the default envelope freshness window.
+pub const ENVELOPE_DEFERRAL_TTL_MS: i64 = 5 * 60 * 1000;
+/// Maximum expired rows reclaimed by one maintenance or insertion sweep.
+pub const DEFERRAL_CLEANUP_BATCH: u32 = 256;
+
+pub(crate) fn deferral_now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64).unwrap_or(0)
+}
+
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
+    async fn record_upgrade_envelope(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
+        self.get_message(id).await
+    }
+
+    /// after is the previous RecordRow::scan_after opaque cursor, not its ID.
+    async fn record_upgrade_rows(&self, _table: crate::record_upgrade::RecordTable, _after: Option<&str>, _limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {
+        Err(StorageError::Unsupported("record format upgrade".into()))
+    }
+    async fn record_upgrade_row(&self, _table: crate::record_upgrade::RecordTable, _id: &str) -> Result<Option<crate::record_upgrade::RecordRow>, StorageError> {
+        Err(StorageError::Unsupported("record format reread".into()))
+    }
+    async fn record_upgrade_replace(&self, _table: crate::record_upgrade::RecordTable, _old: &crate::record_upgrade::RecordRow, _new: &crate::record_upgrade::RecordRow) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("record format upgrade".into()))
+    }
+
     async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         let _ = id;
         Err(StorageError::Unsupported("starter newcomer".into()))
@@ -178,6 +207,49 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
 
+    /// Replace a paid envelope explicitly deferred before recipient acceptance.
+    /// Atomically changes its operation, queue and cached plaintext; payment
+    /// identity and accounting stay unchanged. A stale version writes nothing.
+    async fn replace_outbox_envelope(
+        &self,
+        _op: &crate::OutboxOperation,
+        _previous: &MessageId,
+        _envelope: &UkmEnvelope,
+        _plaintext_enc: Option<&[u8]>,
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("outbox envelope replacement".into()))
+    }
+
+    /// Durably fence unreadable bytes before authorizing replacement ciphertext.
+    /// False authorizes nothing: the payment is already consumed or a binding
+    /// conflicts, or an active deferral limit is reached. Exact retries do not
+    /// extend the bounded lifetime. Acceptance removes deferrals for that proof.
+    async fn defer_unreadable_envelope(&self, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("envelope deferral".into()))
+    }
+
+    async fn is_envelope_deferred(&self, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("envelope deferral".into()))
+    }
+
+    /// An unfinished paid direct-message recovery obligation with this peer.
+    /// Requires an active unconsumed positive inbound deferral or an exact positive paid
+    /// outbound operation, modern recipient deferral and active dispatch binding.
+    async fn session_repair_pending(&self, own: &NodeId, peer: &NodeId) -> Result<bool, StorageError> {
+        Ok(self.session_repair_expires_at(own, peer).await?.is_some())
+    }
+
+    /// Latest active repair deadline in Unix milliseconds. Inbound permission
+    /// ends at row expiry; a bound outbound operation grants at most one TTL.
+    async fn session_repair_expires_at(&self, _own: &NodeId, _peer: &NodeId) -> Result<Option<i64>, StorageError> {
+        Err(StorageError::Unsupported("session repair obligation".into()))
+    }
+
+    /// Reclaim at most `max` expired deferrals. Expiry checks do not depend on cleanup.
+    async fn cleanup_expired_deferrals(&self, _now_ms: i64, _max: u32) -> Result<u64, StorageError> {
+        Err(StorageError::Unsupported("envelope deferral cleanup".into()))
+    }
+
     /// Insert once. A duplicate never overwrites the request binding.
     async fn insert_outbox_operation(&self, _op: &crate::OutboxOperation) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
@@ -262,6 +334,14 @@ pub trait Storage: Send + Sync {
     /// Store a UKM envelope.
     async fn store_message(&self, envelope: &UkmEnvelope) -> Result<(), StorageError>;
 
+    /// Classify existing paid replay/receipt state before attempting decryption.
+    /// Call only after full gate validation. `None` requires a readable envelope
+    /// before acceptance; it consumes no new proof or nonce and stores no message.
+    /// Legacy full-message evidence may heal its durable receipt metadata.
+    async fn paid_envelope_status(&self, _envelope: &UkmEnvelope) -> Result<Option<PaidAcceptance>, StorageError> {
+        Err(StorageError::Unsupported("paid_envelope_status".into()))
+    }
+
     /// Commit replay keys and the validated envelope together, or write nothing.
     /// Call only after full payment-gate validation. At-rest wrappers may encrypt
     /// ciphertext; backends compare the validated ID and immutable metadata.
@@ -303,6 +383,13 @@ pub trait Storage: Send + Sync {
     /// Match a non-destructive rejection to an already dispatched outbox entry.
     async fn is_pending_dispatched(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("is_pending_dispatched".into()))
+    }
+
+    /// A dispatched delivery to this peer already reported unreadability.
+    /// This provenance retains the paid liability across later legacy replies;
+    /// it grants neither delivery confirmation nor ciphertext replacement.
+    async fn pending_was_undecryptable(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("pending unreadable delivery".into()))
     }
 
     /// Record one rejection per dispatch, retaining the paid envelope. Terminal
@@ -1183,6 +1270,12 @@ pub trait Storage: Send + Sync {
     /// At most MAX_OPEN_CALLS live rows, including expired ones, oldest first.
     async fn call_live(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         Err(StorageError::Unsupported("call state".into()))
+    }
+
+    /// How many invoice bindings are stored for this peer, call and sequence.
+    /// Callers check this before asking the wallet for another invoice.
+    async fn call_block_invoice_count(&self, _peer: &NodeId, _call_id: &str, _seq: u32) -> Result<u32, StorageError> {
+        Err(StorageError::Unsupported("call block invoice provenance".into()))
     }
 
     /// Bind an invoice hash to the peer and block before publishing it.

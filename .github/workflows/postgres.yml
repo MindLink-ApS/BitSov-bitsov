@@ -101,12 +101,12 @@ jobs:
           cache-workspace-crates: "true"
 
       - name: sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      - name: Enable sccache for Cargo
-        run: |
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - name: Configure Cargo compiler cache
+        run: bash scripts/configure-sccache.sh '${{ steps.sccache.outcome }}'
 
       - name: cargo test (ignored PostgreSQL tests)
         run: |

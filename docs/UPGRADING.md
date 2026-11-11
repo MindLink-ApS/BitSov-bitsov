@@ -11,6 +11,122 @@ first. An older binary refuses a config that has the key set (`[pairing]` reject
 unknown fields); remove the line before downgrading. A config saved with the
 setting off does not contain it.
 
+## Installing a release binary
+
+Release binaries are named `bitsov-<os>-<arch>` (for example
+`bitsov-darwin-aarch64`); this note calls the binary `konsensus`. Verify the
+download, rename it to the path your service runs, make it executable and, on
+macOS, remove the browser's download mark, as in
+[install a signed pre-release binary](QUICKSTART-SIGNET.md#1b-or-install-a-signed-pre-release-binary),
+including its signature check (or `scripts/verify-release.sh` for a download of
+every asset). Use `shasum -a 256 -c SHA256SUMS --ignore-missing` (Linux:
+`sha256sum -c --ignore-missing SHA256SUMS`): without `--ignore-missing` the
+check fails on the other platforms' files. Stage the new binary beside the old
+one and check `./konsensus --version` before you switch.
+
+A running node does not print its release on start. Builds that include #540
+(none signed yet) report it as `node_version` in the owner's
+`GET /api/v1/status`; `version` there and in `/api/v1/health` stays the API
+version, `2`. On rc22 and earlier, check the
+binary with `--version`.
+
+## rc22 → rc23
+
+rc23 includes forward-only storage upgrades and session recovery changes. Stop
+BitSov after ending calls and reconciling pending operations by their existing
+IDs. Take a consistent backup of the complete data directory and, when used,
+the PostgreSQL database. Retain config, wallet/channel, pairing, session and
+operation state together. Do not re-run `init` or rewind a live node to an
+older snapshot after it has written new state.
+
+Stage the future verified signed binary beside rc22 and confirm
+`konsensus 0.3.0-rc23` before switching. Start with the retained config and data;
+leave separately managed Lightning services alone. Correct any mismatch between
+`tier` and `[network].tier`. An existing non-loopback API bind now requires
+`[api].allow_non_loopback_bind = true`; remote access still requires a loopback
+API. Review optional call-media limits and `accept_third_party_tip` before
+adding them: older binaries reject unknown keys. Use `chain-tip` to inspect the
+configured source without changing it or accepting a third-party source.
+
+First start applies migrations **033, 038 and 039** on SQLite and PostgreSQL
+and begins the [encrypted record upgrade](#location-bound-storage-records-after-rc22).
+Keep the completion markers. Inspect aggregate migration and record-upgrade
+logs and investigate unreadable or unwritable fields. Pairing storage remains
+**v8**, which does not establish compatibility with an older binary. Check
+`node_version`, health, identity, contacts, channels and `money_ready` before
+priced work. Resolve `chain_unavailable` by restoring source availability and
+freshness; initial wallet sync alone does not establish payment readiness.
+
+Recovery may hold new sends with `session_handover` and defer an unreadable paid
+envelope. Retain and retry the existing operation ID after recovery; do not
+create a new paid operation to resolve an uncertain result. Mixed rc22/rc23
+deferred messages can stall after **10 attempts**. Reconcile payment and delivery
+on both peers; upgrading neither confirms delivery nor refunds earlier payments.
+Mixed-version and retained-node rehearsals for the complete rc23 candidate
+remain outstanding.
+
+Prefer rolling forward. After rc23 first opens the retained data, do not run
+rc22 or older on it. There is no in-place downgrade for the migrations or record
+format. Crossing migrations 038/039 on SQLite requires restoring pre-upgrade
+`konsensus.db` under a separately established consistent-state recovery plan;
+a database-only rewind beneath newer wallet/channel or session state is not
+supported. PostgreSQL also has no down migration. Never delete migration rows
+or completion markers to make an older binary start. Follow the existing
+[rollback constraints](#rollback-constraints) and the
+[rc23 operator checklist](releases/v0.3.0-rc23.md), including its detailed
+[rollback and recovery steps](releases/v0.3.0-rc23.md#5-rollback-and-recovery).
+This preparation records no rc23 → rc22 rollback rehearsal.
+
+## Location-bound storage records (after rc22)
+
+The encrypted record format is **forward-only**. New writes bind encrypted
+fields in messages, peers, rooms, files, outbox operations and channel/payment
+operations to their table, column and row ID. Cached message plaintext and
+persisted sessions use the same location binding. The background pass converts
+readable fields before persisting a local completion marker. After that marker
+exists, unbound v1 records are refused, including after a restart. The cache and
+session cutoff also remains effective across storage-mode changes.
+
+Fields are converted independently. A corrupt optional message cache is cleared
+so it cannot prevent readable message content from upgrading. Invalid file data
+is retained and still rejected; readable file names and MIME types are upgraded
+so metadata reads and listings continue to work. Other unreadable fields are
+retained for recovery. The log reports table names and aggregate unreadable,
+unwritable and discarded-cache counts, without record IDs or field contents.
+
+SQLite snapshot comparisons account for TEXT/BLOB storage classes. After a
+rejected swap, including a row data or constraint rejection, the pass rereads
+that row once: an unchanged snapshot is reported
+as unwritable rather than retried forever. Such blocked rows are retained and
+may require recovery after cutoff. A changed snapshot or an operational database error
+still defers completion and retries with exponential backoff, from one minute
+to at most one hour; ongoing writes can therefore delay completion. Held call
+messages are included in maintenance while hidden from ordinary message reads.
+
+Retain the latest complete data directory, including the completion markers.
+Do not delete a marker or restore an older database beneath it to re-enable old
+records. Do not run rc22 or an older binary on this data: migration 033 is a
+separate schema fence, and the encrypted record wrapper alone is not a
+binary-version fence. On SQLite, those binaries refuse the database at start
+with `migration 33 was previously applied but is missing in the resolved
+migrations` (sqlx `VersionMissing`). Released PostgreSQL binaries (rc22 and
+older) have no such check: they skip migration versions they don't know and
+start anyway, so never run them on this data. Recover by rolling forward using consistent
+state, following the existing channel and ratchet rollback constraints.
+
+Only the encrypted fields are bound. Plain sibling columns (for example file
+associations and hashes, room creators, and operation state) are outside this
+binding, except for message-envelope fields checked through the message ID.
+Recovery shards and whitelist backups retain their separate existing formats.
+The format version is authenticated in the AAD; no trusted per-record generation
+counter is included. Replaying an older valid ciphertext at the same location
+can still succeed, so this change does not prevent same-record or whole-database
+rollback by an attacker with write access.
+
+Library defaults accept v2 only. Embedders migrating v1 data must explicitly
+supply a data-directory policy to storage, cache and session constructors, run
+the format upgrade, and retain its marker across restarts.
+
 ## rc21 → rc22
 
 An E2EE send now saves its advanced send chain before the ciphertext leaves the
@@ -55,6 +171,35 @@ Rollback from rc22 to rc21: tested on regtest in both id orders. rc21 started on
 the candidate's data, and chat, calls and files passed. The earlier guidance that
 prefers rolling forward stands.
 
+To roll back rc22 → rc21:
+
+1. Get rc21's binary and verify it the same way, against the `SHA256SUMS` of
+   release `v0.3.0-rc21` (same release key). `--version` prints
+   `konsensus 0.3.0-rc21`.
+2. Let calls end. Stop only BitSov.
+3. Keep the data directory, config and encrypted seed as they are. rc22 adds
+   no SQL migration, config key or storage format since rc21, so rc21 reads
+   what rc22 wrote. Do not re-run `init` or restore an older snapshot.
+4. rc21 refuses a `konsensus.toml` key it does not know. If the config was
+   changed after the upgrade, for example for a later build, put back the copy
+   you kept before upgrading first.
+5. Put rc21 at the path your service runs and start it with the same config,
+   data and options.
+6. If you run two nodes that talk to each other, roll back one at a time and
+   let the first reconnect before restarting the second: two nodes that
+   reconnect at nearly the same moment can end up on different sessions (known
+   limit below).
+7. Check as after an upgrade: `/api/v1/health`, contacts and channels, and a
+   message in each direction.
+
+This applies only to data that rc22 or rc21 last ran on. Data a later build
+has used can carry migration 033 and the location-bound record format
+([above](#location-bound-storage-records-after-rc22)). On SQLite, rc22 and
+older refuse a database with migration 033 at start. Released PostgreSQL
+binaries (rc22 and older) do not: they skip migration versions they don't know
+and start anyway. Never run them on a PostgreSQL database that a later build
+has used.
+
 Not included: call cutoff is not yet verified on real hardware, and this release
 does not fix the other open reports.
 
@@ -76,6 +221,11 @@ If messages stop being read after a dropped link:
 Amounts already paid for messages or minutes that were not read are not refunded.
 Tested on regtest on this release and on rc21, by calling the app's host
 functions, not on real hardware.
+
+Also present in rc21 and rc22: after a reconnect, one node can be left without
+an E2EE session. If that node holds the lower id, it stays stuck until a new
+connection. The fix is on main (#514) and not in either signed release; see
+[recovering a stuck E2EE session](operations/e2ee-session-recovery.md).
 
 Follow the [rc22 signing and node checklist](releases/v0.3.0-rc22.md).
 
@@ -106,11 +256,12 @@ the caller's hold consent (`max_hold_msat`); it still counts against the
 grant's budget and available liquidity. A refused closing payment leaves
 the call ended without an owner debit.
 
-PostgreSQL startup now refuses a database whose `_konsensus_migrations`
-rows include a version this binary does not know (`FutureSchema`), before
-it applies anything else or serves. That matches the SQLite
-`VersionMissing` fence. The rc20 binary did not have the check. Do not
-delete migration history to make an older binary start.
+PostgreSQL in rc21 (and rc22) does not refuse a database whose
+`_konsensus_migrations` rows include a version the binary does not know: it
+skips that version and starts. Only SQLite refuses that case
+(`VersionMissing`). The PostgreSQL check (`FutureSchema`) came with #504, on
+main after rc22, and is not in any signed release. Do not run an older binary
+on a newer PostgreSQL schema, and do not delete migration history to make one start.
 
 Follow the [rc21 signing and beta-node checklist](releases/v0.3.0-rc21.md).
 
@@ -123,10 +274,10 @@ notice and call-block invoice provenance) run on first start. They are
 additive and have no down migration. Keep a consistent database backup
 before upgrading. Do not downgrade; roll forward on the migrated database.
 On SQLite, an older binary refuses startup when the database records a
-migration version the binary does not know (`VersionMissing`). The rc20
-PostgreSQL backend had no such check and would start on the newer schema.
-rc21 refuses that case (`FutureSchema`) before applying migrations or
-serving.
+migration version the binary does not know (`VersionMissing`). The
+PostgreSQL backend in rc20, rc21 and rc22 has no such check and would start
+on the newer schema; the check (`FutureSchema`) came with #504, after rc22,
+and is not in any signed release.
 
 Migration **035** ends every in-flight live call;
 restart calls after the upgrade (their replay tombstones are kept and no
@@ -139,10 +290,12 @@ Migration **037** adds invoice-hash bindings to `(peer, call_id, seq)` on
 SQLite and PostgreSQL. It is additive and idempotent, with no down migration.
 Keep a consistent database backup before upgrading. Do not downgrade; roll
 forward. On SQLite, an older binary that does not know version 037 refuses
-the upgraded database (`VersionMissing`). PostgreSQL refuses an applied
-version this binary does not know (`FutureSchema`) and does not start. Do
-not delete migration history or invoice bindings to make an older binary
-start.
+the upgraded database (`VersionMissing`). A released PostgreSQL binary
+(rc22 and older) does not refuse it and would start; only builds that include
+#504 (none signed yet) refuse an applied version they do not know
+(`FutureSchema`). Do not run an
+older binary on the upgraded database, and do not delete migration history
+or invoice bindings to make one start.
 
 ## Call reservations (#460)
 
@@ -712,8 +865,14 @@ confirm `uname -m` is `aarch64`, the service uses `/usr/bin/konsensus` and the
 config is `/var/lib/bitsov/konsensus.toml`. If the Pi still uses a user unit or
 other paths, use that unit's actual account and paths; do not run both services.
 
-After downloading and independently verifying the **published** rc14 Linux
-aarch64 artifact and signed checksums, from its download directory:
+After downloading the **published** rc14 Linux aarch64 artifact, verify it
+before it runs.
+
+Do not run the block below. It makes `./bitsov-linux-aarch64` executable,
+runs that download-directory path, and installs the same path. Verify with
+`bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc` and install
+`bitsov-linux-aarch64` from the seal path the script prints. The home-node
+guide shows that command. The block stays as the record of this rc14 note.
 
 ```sh
 uname -m
@@ -1618,6 +1777,7 @@ selects embedded LDK's chain source; it does not reconfigure an external LND.
 | `[chain]` Bitcoin Core | `backend = "bitcoind"`, `rpc_host`, `rpc_port`, `cookie_file`; alternatively `rpc_user` + `rpc_password_file` | Explicit opt-in; bare host + port and exactly one file-based auth mode. No inline password or credential URL. Replace the Esplora stanza rather than mixing backend keys. |
 | `[chain]` Electrum | `backend = "electrum"`, `server_url`, `operator = "own"` or `"third_party"` | Server URL required; no default/discovery. `operator` defaults to `third_party`, even on loopback/LAN. `own` is the owner's declaration, not proof of validation. |
 | `[remote_access]` | `listen_addr`, `advertised_endpoint`, `mdns` | Off unless a listener is set; `advertised_endpoint` optionally overrides the first auto-discovered endpoint. `[api] listen_addr` must stay loopback. Optional `mdns` build feature advertises only under `--home`; `mdns = false` opts out. Old apps use `pair-ticket --legacy`. Avoid API/P2P/Lightning TCP port collisions. |
+| `[api]` | `allow_non_loopback_bind` | Default false. `listen_addr` must be loopback (`127.0.0.1` or `::1`). `0.0.0.0`, `::`, and LAN addresses fail validation until `allow_non_loopback_bind = true`. The flag does not relax the `[remote_access]` loopback requirement. |
 | `[privacy]` | `peer_exchange = "off"` or `"paid"`, `shareable_peers`, `share_peer_labels` | Off and empty lists. Node-ID allowlists explicitly consent to sharing peers and, separately, their labels. Restart to apply; already issued quotes stay redeemable until expiry. |
 | `[network]` | `advertised_addr`, `stun_server` | Optional; explicit advertised address wins. Discovery uses only owner-set STUN; no default third-party server. |
 | `[calls]` | `stun_listen`, `max_call_minutes`, `media_max_frames_per_second`, `media_max_bytes_per_second`, `media_drop_bulk_over_share` | STUN omitted/off; outgoing paid call cap defaults to 60 minutes, bounded 1–240.; media limits default to 100 packets and 65536 bytes per second, per direction, and the socket closes past them |
