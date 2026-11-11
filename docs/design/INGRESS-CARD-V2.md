@@ -43,7 +43,7 @@ The claim this contract supports, once built: *a peer holding a valid card can t
 `crates/konsensus-core/src/front_door.rs`:
 
 - `:26` Signature domain `bitsov-front-door/v1\0`; `:28` `VERSION = 1`; `:36` whole card at most 16 KiB; `:37` `MAX_ENDPOINT_LEN = 255`.
-- `:183-208` `FrontDoorCard` has one `endpoint: String` and one `reach`, with `deny_unknown_fields`. `:210-228` `FrontDoorFields` likewise.
+- `:183-208` `FrontDoorCard` has one `endpoint: String` and one `reach`, with `deny_unknown_fields`. `:210-228` `FrontDoorFields` (the owner-supplied input) has one `endpoint: String` and **no** `reach` field; `issue_with_key` (`:236-238`) derives `reach` from that single endpoint with `reach_of_endpoint`. v2 issuance keeps this: the owner supplies entries without `reach`, and issuance derives each entry's `reach` from that entry's own `endpoint`, never from another entry or a card-level value.
 - `:266-313` The signature covers canonical JSON of every field except `sig`; `:324-325` any `v` other than 1 is refused as `UnsupportedVersion`.
 
 `crates/konsensus-core/src/introduction.rs`:
@@ -107,30 +107,49 @@ Entries with a reserved `kind` are covered by the signature and count against th
   3. dials the pinned address, and requires the Noise handshake to prove the card's `node_id`.
 - **Attempt cap:** at most one dial per entry, so at most 4 per `open`. **Total deadline:** one deadline for the whole `open`, not renewed per entry (value in §6.5). Each failed or cancelled attempt releases its socket before the next starts.
 - An entry whose handshake proves a different key is a failed entry. The reader moves on and never accepts the other key.
-- A refusal from the right key (for example `Rejected` from a closed mesh) stops the walk: the node answered, and other paths would get the same answer.
+- **Unauthenticated refusals continue the walk.** Today a closed-mesh responder sends `Frame::Disconnect` *before* `HelloAck` (`crates/konsensus-message/src/transport/handshake.rs:401-415`), and the initiator turns any pre-`HelloAck` `Disconnect` into `TransportError::Rejected` (`:320-322`) without having verified the responder's identity binding or Ed25519 key. The expected-key comparison happens only afterwards (`:510-527`), and a wrong key also surfaces as `TransportError::Rejected`. Under Noise_XX the responder's static key is not pinned in advance, so a pre-`HelloAck` `Disconnect` can come from any key, including an on-path party or a different node at that address. The reader therefore treats every refusal that is not authenticated as the card's `node_id` (a pre-`HelloAck` `Disconnect`, a wrong key, a version mismatch, a cookie or edge refusal, a transport error) as a failed entry and moves to the next entry.
+- **Authenticated refusals stop the walk.** Only a refusal that arrives after the reader has verified the identity binding, matched it to the Noise remote static key and matched the node key to the card's `node_id` stops the walk: that node answered, and other paths would get the same answer. Today's wire has no such refusal for a closed mesh, so v2 `open` cannot rely on it. The implementation must split the current single `Rejected` error into at least `RefusedUnauthenticated` and `RefusedByExpectedKey` (names illustrative); whether a responder should send an authenticated refusal (for example a signed refusal or `HelloAck` followed by `Disconnect`) is a wire question outside this contract and is not assumed here.
+- The user-facing outcome after a full walk reports the strongest evidence seen: "refused by this node" only if some entry gave an authenticated refusal; otherwise "could not reach this node", with unauthenticated refusals counted as failures.
 - No fallback outside the list: not to a previously cached endpoint, a STUN result, an older card or any address the signed card does not name.
 
 ### 3.4 Downgrade rule
 
 The risk is not forgery: an old v1 card is genuinely signed by the node and, until it expires (at most 7 days for a front door), still verifies. Presenting it to a reader steers that reader to one endpoint, possibly the one under load. Because Noise still pins the key, the harm is availability, not impersonation.
 
-Rule: **a v2-capable verifier never accepts a v1 card for a `node_id` it knows has published v2.** It knows this from any of:
+Rule: **a v2-capable verifier never accepts a v1 card of either kind (front door or introduction) for a `node_id` while it holds an unexpired downgrade marker for that `node_id`.** Both card kinds are signed by the same node key (`introduction.rs:126-127`: an introduction's `node_id` is the introducer's own key), and a node that issues v2 issues both kinds as v2, so a v2 sighting of either kind marks the node for both.
 
-1. a verified v2 card for that `node_id` in its card cache;
-2. a persisted downgrade marker, `node_id → (highest v2 seq seen, marker expiry)`, written when a v2 card verifies. It survives cache eviction and restart, is bounded in count like the card cache, and expires no earlier than the newest v2 card it records;
-3. optionally, a capability the peer advertises inside an authenticated session (`front_door_card_v2`), which sets the same marker. It is learned only after a connection, so it protects later opens, not the first one.
+**Downgrade marker.** `node_id → marker_expiry`, keyed only by `node_id`. It does not depend on `seq`, so a v2 introduction (which has no `seq`) sets it exactly like a v2 front-door card. It is written when:
 
-Sequence numbers: v1 and v2 front-door cards from one node share one monotonic `seq` space (the existing floor). A v1 card with a `seq` at or below the held v2 `seq` is already stale under today's cache rule; the marker additionally refuses a v1 card with a higher `seq`.
+1. a v2 front-door card verifies (whether or not the card cache stores it);
+2. a v2 introduction verifies, with or without any front-door cache entry for that `node_id`;
+3. optionally, the peer advertises a capability inside an authenticated session (`front_door_card_v2`). This is learned only after a connection, so it protects later opens, not the first one.
 
-Introductions carry no `seq` and live 10 minutes. A v1 introduction is refused only through a marker or cache entry from the same `node_id`'s front-door card.
+The marker check runs before the card cache sees a v1 card, so it applies to every v1 card regardless of its `seq`.
 
-Residual risk, stated plainly: a reader with no prior knowledge of a node cannot tell a stripped v1 card from a node that never upgraded. That first-contact case is limited to availability and ends at the v1 card's expiry or the reader's first v2 sighting.
+**Retention.** The marker must outlive every v1 card that could be replayed against it. A v1 front-door card lives at most `LIFETIME_SECS` (7 days, `front_door.rs:33`) from its signed `issued_at`, with `MAX_SKEW_SECS` (60 s, `:35`) tolerated; a v1 introduction lives 10 minutes. On each v2 sighting the marker is refreshed to
+
+```text
+marker_expiry = max(existing, v2.expires_at, now + LIFETIME_SECS + MAX_SKEW_SECS)
+```
+
+using the verifier's own clock for `now`. It is not tied to the v2 card's expiry: a shorter-lived v2 card (an introduction, or a front-door card nearer its end) does not shorten it. Any v1 card issued at or before the last v2 sighting therefore expires before the marker does. The guarantee is narrowed for one case: a v1 card the node itself issues *after* the reader's last v2 sighting (for example the v1 half of a later transition pair, §3.5) can be accepted once the marker has run out, which requires the reader to have seen no v2 card from that node for a full v1 lifetime.
+
+**Persistence.** Markers are written to disk durably before the v2 card is reported as verified, and reloaded at start-up, so restart and card-cache eviction do not clear them. A marker store that cannot be read at start-up is reported to the owner; until a marker is rewritten, the guarantee for the affected nodes lapses (this is stated, not hidden).
+
+**Bounded table and eviction.** A marker is a 32-byte key plus an 8-byte expiry, so the table bound is set well above the card cache (`MAX_DOWNGRADE_MARKERS`, proposed 65,536, under 3 MiB of raw entries; final value in §6.3). When an insert finds the table full, expired markers are pruned first. If none is expired, the marker with the earliest `marker_expiry` is evicted and the eviction is counted and logged. For the evicted `node_id` the guarantee lapses until its next v2 sighting: this is an explicit narrowing, not a silent one. A refresh of an existing marker never evicts another entry.
+
+**Sequence numbers and cache order.** v1 and v2 front-door cards from one node share one monotonic `seq` space (the existing floor, `handlers/front_door.rs:33-51`). The card cache holds at most one card per `node_id`, of either version, and today's rule (`card_cache.rs:32-50`: an incoming card with `seq <= held.seq` is stale) still governs v1-over-v1 and v2-over-v2. Two additions make the versions compose:
+
+- **Issuers never give a v1 and a v2 card the same `seq`.** A transition pair (§3.5) takes two consecutive values from the floor, v1 first and v2 second, so the v2 card is strictly higher. With either arrival order the v2 card ends up held: v1 then v2 is an ordinary higher-`seq` replacement; v2 then v1 leaves v1 stale and also marker-refused.
+- **A verified v2 card replaces a held v1 card regardless of `seq`.** A held v1 card is never dialable once the v2 marker exists, so keeping it would leave the node unreachable. This covers equal `seq` from a non-conforming issuer and a v2 card from an older pair arriving after a newer v1 card. It never lets a v1 card displace a held v2 card.
+
+Residual risk, stated plainly: a reader with no marker for a node (first contact, or after the marker expired, was evicted or could not be reloaded) cannot tell a stripped v1 card from a node that never upgraded. That case is limited to availability and ends at the v1 card's expiry or the reader's next v2 sighting of either kind.
 
 ### 3.5 Transition
 
 - **Old readers** refuse v2 cards with `UnsupportedVersion` or `Malformed`. They fail closed and show no endpoint.
 - **New readers** accept v1 cards from nodes without a downgrade marker, and dial the single endpoint as today.
-- **Publishing nodes** issue v2 by default once built. During a transition window the node may also issue a paired v1 card with the same `seq` whose `endpoint` equals the first eligible v2 entry, so old readers still reach the owner's preferred path. Whether to issue that pair, and for how long, is decision §6.1.
+- **Publishing nodes** issue v2 by default once built. During a transition window the node may also issue a paired v1 card, one `seq` below its v2 partner (§3.4, never the same `seq`), whose `endpoint` equals the first eligible v2 entry, so old readers still reach the owner's preferred path. Whether to issue that pair, and for how long, is decision §6.1.
 - After the window the node stops issuing v1. Readers keep accepting v1 from nodes without a marker until a later release decides otherwise.
 - No message-wire, federation Hello, cookie or edge change is needed for the card itself. The optional capability in §3.4 uses the existing capability list.
 
@@ -169,19 +188,39 @@ What the forwarding path does and does not give:
 | Reserved `kind` only | card verifies and displays; `open` refuses with no dial |
 | Primary unreachable, second entry live | `open` reaches the same pinned key on entry 2 within the total deadline |
 | Every entry unreachable or slow | `open` fails within the total deadline; at most one dial per entry; no sockets left open |
-| An entry answers with a different key | that entry fails; the walk continues; the other key is never accepted |
-| Right key refuses (closed mesh) | walk stops; no further entries dialed |
+| An entry answers with a different key | that entry fails as an unauthenticated refusal; the walk continues; the other key is never accepted |
+| Unauthenticated refusal: responder sends `Disconnect` before `HelloAck` (today's closed-mesh path), on entry 1, entry 2 live | walk continues to entry 2 and reaches the expected key; the entry 1 outcome is classified unauthenticated, not "refused by this node" |
+| Unauthenticated refusal from a different key: a responder holding another key sends `Disconnect` before `HelloAck` on entry 1 | same as above; nothing about the expected node is recorded from entry 1 |
+| Unauthenticated refusal on every entry | `open` fails as "could not reach this node", not as a closed-mesh refusal; at most one dial per entry |
+| Authenticated refusal: the expected key, verified (identity binding, Noise static key and `node_id` all checked), then refuses | walk stops; no further entries dialed; outcome "refused by this node". Built only if the wire gains an authenticated refusal; until then the classifier unit test asserts that no current error is classified authenticated |
 | Cancellation mid-walk | all sockets and tasks released |
 | DNS answer changes between check and dial | dial uses the pinned address only |
+| DNS: hostname for a `public` entry resolves only to forbidden addresses (loopback, private, link-local, unspecified, IPv4-mapped IPv6 forms), through an injected resolver | entry refused by `dial_allowed`; a dial recorder shows zero connect attempts to any address of that entry |
+| DNS: mixed answer set, allowed address first and forbidden address last (and the reverse order) | whole entry refused; zero connect attempts for that entry, including to the allowed address |
+| DNS: entry 1 fails, entry 2 is a hostname resolving to a forbidden address, entry 3 live | entry 2 refused with zero connect attempts; walk continues to entry 3 |
+| DNS: every entry resolves to a forbidden address | `open` fails; zero connect attempts in total |
 | Mixed fleet: old reader receives v2 | fails closed with a version error; no endpoint dialed |
-| Mixed fleet: new reader receives v1 for a node with a v2 marker | refused, including after restart and after cache eviction |
+| Mixed fleet: new reader receives v1 for a node with a v2 marker | refused, including after restart and after card-cache eviction |
 | Mixed fleet: new reader receives v1 for a node with no marker | accepted; dials the single endpoint as today |
-| v1 with higher `seq` than held v2 | refused by marker |
+| v1 with higher `seq` than held v2 | refused by marker before the card cache is consulted |
+| Marker outlives a short-lived v2 card: v2 card (or v2 introduction) seen, then a v1 front-door card issued just before that sighting, presented after the v2 card expired but before `now + 7 days + skew` (injected clock) | v1 refused |
+| Marker expiry boundary | v1 refused one second before `marker_expiry`; accepted after it (no marker) |
+| Marker survives restart | marker written, process restarted with an empty card cache, v1 card refused |
+| Marker store unreadable at start-up | reported to the owner; no crash; guarantee for affected nodes recorded as lapsed |
+| Downgrade marker table full, some markers expired | expired markers pruned first; no unexpired marker evicted |
+| Downgrade marker table full, none expired | the earliest-expiring marker is evicted and counted; v1 for that evicted node is accepted (documented narrowing); v1 for every retained node still refused; table never exceeds `MAX_DOWNGRADE_MARKERS` |
+| v2 introduction only: reader has no front-door cache entry and no marker, verifies a v2 introduction, then receives a v1 introduction and a v1 front-door card for the same `node_id` | marker written from the introduction; both v1 cards refused, with no front-door cache entry present at any point |
+| Paired v1/v2, v1 arrives first (v1 `seq` N, v2 `seq` N+1) | v2 replaces v1 in the card cache; reader dials v2 entries |
+| Paired v1/v2, v2 arrives first | v2 held; v1 stale and marker-refused; v2 still held afterwards |
+| Equal `seq` from a non-conforming issuer, both arrival orders | v2 held in both orders; v1 never displaces v2; node stays dialable |
+| v2 from an older pair arrives after a newer v1 (v1 `seq` N+2 held, v2 `seq` N+1 arrives) | v2 replaces the held v1; node stays dialable |
 | Paired v1/v2 during transition | v2-capable reader uses v2; old reader reaches the first eligible entry |
-| Downgrade marker table full | bounded; eviction policy documented and tested |
+| Issuer pairing | an issued pair never shares a `seq`; v2 is exactly one above v1; the on-disk floor advances past both |
 | Forwarded path with cookies required | clients behind the forwarder complete handshakes; budget charged to the forwarder address; a client-asserted source has no effect |
 | Edge regression | the existing cookie and edge tests pass unchanged; no `DosEdgeConfig` field or default changed |
-| Mutation: drop per-entry `dial_allowed`, the attempt cap or the downgrade check | at least one test above fails |
+| Mutation: drop per-entry `dial_allowed` | the DNS forbidden-address and mixed-answer rows fail (literal-address shape checks alone must not be what catches it) |
+| Mutation: treat an unauthenticated refusal as walk-stopping | the unauthenticated-refusal rows fail |
+| Mutation: drop the attempt cap, the downgrade check, the marker refresh (tie expiry to the v2 card), or the v2-over-v1 cache rule | at least one test above fails for each |
 
 Record exact heads, configuration and environment with every result.
 
@@ -189,7 +228,7 @@ Record exact heads, configuration and environment with every result.
 
 1. Whether nodes issue a paired v1 card during the transition, and the window length.
 2. Which `kind` values the first version supports. Proposed: `direct` only; an onion service stays an explicit later choice, never a default.
-3. `MAX_ENDPOINTS` (proposed 4) and how the introduction size limit is met with that many entries.
+3. `MAX_ENDPOINTS` (proposed 4) and how the introduction size limit is met with that many entries; `MAX_DOWNGRADE_MARKERS` (proposed 65,536).
 4. Whether v2 links keep the existing `bitsov://front-door#` and `bitsov://introduce#` prefixes or get new ones (clearer error for old readers versus one link format).
 5. The total `open` deadline and whether attempts stay strictly sequential or may start staggered.
 6. Shared-source handling behind a forwarder: option A, B or C in §4. Proposed: C for the first slice.
