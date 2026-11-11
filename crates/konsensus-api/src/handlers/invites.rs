@@ -21,8 +21,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -390,7 +390,9 @@ async fn issue_invite(
     }
 
     let mut nonce = [0u8; 16];
-    OsRng.fill_bytes(&mut nonce);
+    SysRng
+        .try_fill_bytes(&mut nonce)
+        .expect("OS randomness unavailable");
 
     let unsigned = UnsignedBitSovInvite {
         version: SUPPORTED_INVITE_VERSION,

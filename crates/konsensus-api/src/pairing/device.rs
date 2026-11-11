@@ -15,7 +15,7 @@
 //! hardware (macOS offers no attestation to an app outside the App Store). The
 //! owner's one-time console approval is the root of that trust.
 
-use rand::RngCore;
+use rand::{Rng, TryRng};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
@@ -529,7 +529,7 @@ impl PairingService {
         let raw = parse_public_key(&public_key_hex)?;
         let name = clean_name(name)?;
         let mut op_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut op_bytes);
+        rand::rng().fill_bytes(&mut op_bytes);
 
         // Verify before taking the pairing lock: a flood of bad proofs must not
         // hold up every token check on the node.
@@ -644,7 +644,9 @@ impl PairingService {
             let device = crate::sas::device_key(&public_key_hex)
                 .map_err(|e| PairingError::Malformed(e.into()))?;
             let mut nonce = [0; 16];
-            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut nonce)
+                .expect("OS randomness unavailable");
             Some(DeviceSas {
                 nonce,
                 digest: if v2 {
@@ -660,7 +662,7 @@ impl PairingService {
             None
         };
         let mut nonce = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut nonce);
         let op = PendingDeviceKey {
             op_id: hex::encode(op_bytes),
             client_id: client_id.to_string(),
@@ -1419,7 +1421,7 @@ impl PairingService {
                     }
                 }
                 let mut op = [0u8; 12];
-                rand::thread_rng().fill_bytes(&mut op);
+                rand::rng().fill_bytes(&mut op);
                 inner.file.grants.push(SpendGrant {
                     owner_approval: None,
                     op_id: format!("rel-{}", hex::encode(op)),
@@ -1734,7 +1736,7 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         for (peer, window) in [(&a, 60), (&b, 3600)] {
             let mut nonce = [0u8; 16];
-            rand::thread_rng().fill_bytes(&mut nonce);
+            rand::rng().fill_bytes(&mut nonce);
             let intent = RelationIntent {
                 device_key_id: key_id.clone(),
                 peer: peer.clone(),

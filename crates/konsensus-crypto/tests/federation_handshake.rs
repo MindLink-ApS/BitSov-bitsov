@@ -296,7 +296,7 @@ fn x3dh_mitm_on_signed_prekey_rejected() {
 
     // -- Happy path: authentic bundle --
     {
-        let alice_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let alice_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
         let alice_public = X25519PublicKey::from(&alice_secret);
 
         let authentic_bundle = PrekeyBundle {
@@ -314,7 +314,7 @@ fn x3dh_mitm_on_signed_prekey_rejected() {
 
     // -- Attack path: MITM substitutes attacker's signed_prekey --
     {
-        let alice_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let alice_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
         let alice_public = X25519PublicKey::from(&alice_secret);
 
         // Attacker generates their own SPK; they cannot sign it with Bob's key.
@@ -347,7 +347,7 @@ fn x3dh_mitm_on_signed_prekey_rejected() {
 fn x3dh_mitm_with_attacker_self_signed_prekey_rejected() {
     let bob = bob();
 
-    let alice_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let alice_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let alice_public = X25519PublicKey::from(&alice_secret);
 
     // Attacker generates their own Ed25519 key and SPK.

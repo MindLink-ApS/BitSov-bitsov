@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rand::RngCore;
+use rand::Rng;
 use thiserror::Error;
 
 const SNAPSHOT_PREFIX: &str = "scb-";
@@ -110,7 +110,7 @@ fn map_crypto_error(error: konsensus_crypto::scb::ScbCryptoError) -> ScbRotation
 
 fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), ScbRotationError> {
     let mut random = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut random);
+    rand::rng().fill_bytes(&mut random);
     let tmp_path = path.with_extension(format!("tmp-{}", hex::encode(random)));
 
     {
@@ -180,7 +180,7 @@ fn snapshot_name() -> Result<String, ScbRotationError> {
         .map_err(|e| ScbRotationError::Io(std::io::Error::other(e)))?
         .as_millis();
     let mut random = [0u8; 4];
-    rand::thread_rng().fill_bytes(&mut random);
+    rand::rng().fill_bytes(&mut random);
     Ok(format!(
         "{SNAPSHOT_PREFIX}{millis}-{}{SNAPSHOT_SUFFIX}",
         hex::encode(random)

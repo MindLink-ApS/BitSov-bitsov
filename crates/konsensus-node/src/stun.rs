@@ -314,7 +314,7 @@ pub async fn query(server: &str, timeout: Duration, family: ListenerFamily) -> R
     socket.connect(target).await.map_err(|_| QueryError::Unreachable)?;
 
     let mut txid = [0u8; 12];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut txid);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut txid);
     let request = binding_request(&txid);
     let per_try = timeout / TRIES;
     let mut buf = [0u8; 1024];

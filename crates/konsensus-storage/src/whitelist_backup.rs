@@ -21,7 +21,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce as AesNonce,
 };
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::error::StorageError;
@@ -81,7 +81,7 @@ impl WhitelistBackup {
             .map_err(|e| StorageError::Serialization(format!("whitelist backup encode: {e}")))?;
         let cipher = Aes256Gcm::new_from_slice(key).expect("AES-256 key is always 32 bytes");
         let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = AesNonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(nonce, plaintext.as_ref())

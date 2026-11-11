@@ -351,9 +351,9 @@ impl Nonce {
 
     /// Generate a cryptographically random nonce.
     pub fn generate() -> Self {
-        use rand::RngCore;
+        use rand::Rng;
         let mut bytes = [0u8; 24];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         Self(bytes)
     }
 

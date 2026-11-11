@@ -4,7 +4,7 @@ use chacha20poly1305::{
     aead::{Aead, Payload},
     KeyInit, XChaCha20Poly1305, XNonce,
 };
-use rand::RngCore;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use std::io;
 
@@ -33,7 +33,9 @@ impl SealedBlob {
         let bytes = breach_txid.to_byte_array();
         let hint: [u8; 16] = bytes[..16].try_into().unwrap();
         let mut nonce = [0; 24];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut nonce)
+            .expect("OS randomness unavailable");
         let cipher =
             XChaCha20Poly1305::new(&blake3::derive_key("bitsov-tower-blob-v1", &bytes).into());
         let ciphertext = cipher

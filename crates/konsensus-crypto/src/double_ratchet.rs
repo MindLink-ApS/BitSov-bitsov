@@ -200,7 +200,7 @@ impl DoubleRatchet {
         associated_data: Vec<u8>,
     ) -> Result<Self, RatchetError> {
         // Generate initial DH ratchet key pair
-        let dh_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let dh_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
         let dh_public = PublicKey::from(&dh_secret);
 
         // Perform initial DH ratchet step
@@ -417,7 +417,7 @@ impl DoubleRatchet {
         };
 
         // Generate new DH key pair and derive new sending chain
-        let dh_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let dh_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
         let dh_public = PublicKey::from(&dh_secret);
 
         let dh_output = dh_secret.diffie_hellman(remote_pub);
