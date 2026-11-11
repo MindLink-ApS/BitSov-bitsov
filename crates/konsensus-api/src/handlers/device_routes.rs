@@ -372,6 +372,12 @@ pub(crate) fn log_relation_intent_status(
 ) {
     const PATH: &str = "/api/v1/pair/relation-intent";
     if path == PATH && !status.is_success() {
+        // Keep the established rate-limit code and identify its scope separately.
+        let (reason, limit_scope) = match reason {
+            "rate_limited_client" => ("rate_limited", Some("client")),
+            "rate_limited" => ("rate_limited", Some("global")),
+            reason => (reason, None),
+        };
         // This endpoint's ApiError code is the numeric HTTP status; use the
         // same code for middleware/extractor responses that have no JSON code.
         let code = status.as_u16();
@@ -380,6 +386,7 @@ pub(crate) fn log_relation_intent_status(
             status = code,
             code,
             reason,
+            limit_scope,
             "relation intent refused"
         );
     }
@@ -439,6 +446,46 @@ mod tests {
             assert!(
                 !src.contains(&forbidden),
                 "HTTP must not reach `{forbidden}`"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod refusal_scope_tests {
+    use super::log_relation_intent_status;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn refusal_logs_preserve_rate_code_and_identify_limit_scope() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_relation_intent_status(
+                "/api/v1/pair/relation-intent",
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+            );
+            log_relation_intent_status(
+                "/api/v1/pair/relation-intent",
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited_client",
+            );
+        });
+        let captured = std::fs::read_to_string(log.path()).unwrap();
+        for scope in ["global", "client"] {
+            assert!(
+                captured
+                    .lines()
+                    .any(|line| line.contains("reason=\"rate_limited\"")
+                        && line.contains(&format!("limit_scope=\"{scope}\""))),
+                "{captured}"
             );
         }
     }

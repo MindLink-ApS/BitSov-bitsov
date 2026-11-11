@@ -400,3 +400,59 @@ async fn expired_unpaid_reservations_still_block_admission_after_listing() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn open_calls_read_failure_has_fixed_public_wording() {
+    let (state, store) = fixture().await;
+    sqlx::query("DROP TABLE call_state")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let (status, body) = get(
+        &state,
+        &format!("?peer={}", NodeId::from_bytes([11; 32])),
+        Some(common::auth_header(&state)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"],
+        "call state unavailable"
+    );
+    assert!(!body.contains("call_state"), "{body}");
+}
+
+#[tokio::test]
+async fn open_calls_metadata_failure_has_fixed_public_wording() {
+    let (state, store) = fixture().await;
+    let peer = NodeId::from_bytes([11; 32]);
+    store
+        .call_put(
+            &peer,
+            "pending",
+            &entry(
+                Phase::Reserved,
+                Side::Caller,
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap() + 60_000,
+                Some("pending-offer"),
+            ),
+        )
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE outbox_operations")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let (status, body) = get(
+        &state,
+        &format!("?peer={peer}"),
+        Some(common::auth_header(&state)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"],
+        "call state unavailable"
+    );
+    assert!(!body.contains("outbox_operations"), "{body}");
+}
