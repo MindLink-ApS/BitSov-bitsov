@@ -48,9 +48,10 @@ metadata index. No historical channel manager, monitor, or commitment is loaded.
 
 It passes `ensure_fresh_root` through `ensure_recovery_root` until the journal
 designates a verification store; after that, only that marked store is accepted.
-It does not pass `ensure_no_move_home` or `ensure_no_recovery`. Those two refuse
-an open recovery journal, and recover requires the journal that `konsensus
-restore` wrote. Full steps are in [recover](recover.md) and
+It does not pass `ensure_no_move_home` or `ensure_no_recovery`.
+`ensure_no_move_home` refuses a move-home journal. `ensure_no_recovery` refuses
+an open recovery journal. Recover requires the journal that `konsensus restore`
+wrote. Full steps are in [recover](recover.md) and
 [the recovery runbook](../v2/RECOVERY.md).
 
 ## Latest live store, new machine: rebind-instance

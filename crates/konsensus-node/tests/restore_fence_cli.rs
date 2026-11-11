@@ -4,7 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::fd::{AsRawFd, FromRawFd},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     time::{Duration, Instant},
 };
@@ -129,25 +129,133 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
+/// Fields `default_for_tier` roots in the node directory. The mnemonic keeps the
+/// path passed to init; the database, audit log, and backup directory are
+/// canonicalized (`NodeConfig::default_for_tier`).
+const NODE_DIR_FIELDS: &[(&str, &str)] = &[
+    ("identity", "mnemonic_file"),
+    ("storage", "path"),
+    ("backup", "scb_dir"),
+    ("api", "audit_log_path"),
+];
+
+fn toml_table<'a>(value: &'a toml::Value, key: &str) -> &'a toml::Table {
+    value
+        .get(key)
+        .and_then(toml::Value::as_table)
+        .unwrap_or_else(|| panic!("missing [{key}]"))
+}
+
+fn toml_string(table: &toml::Table, key: &str) -> String {
+    table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("missing {key}"))
+        .to_owned()
+}
+
+/// Rebase `path` onto `to_root` by a path-component prefix, never a substring.
+/// Canonical is tried before the lexical root: on macOS `/var/...` is not a
+/// component prefix of `/private/var/...`, so the lexical form cannot cut the
+/// canonical fields in half.
+fn rebase_rooted(path: &Path, from_roots: &[&Path], to_root: &Path) -> PathBuf {
+    for root in from_roots {
+        if let Ok(rest) = path.strip_prefix(root) {
+            return to_root.join(rest);
+        }
+    }
+    panic!(
+        "{} is not under the original node directory",
+        path.display()
+    );
+}
+
+fn lies_under_snapshot(path: &Path, snapshot_root: &Path) -> bool {
+    path.starts_with(snapshot_root)
+}
+
 /// Point the copied config at the snapshot. Init writes absolute paths.
 fn retarget_snapshot(snapshot: &Path, original: &Path) {
     let config = snapshot.join("konsensus.toml");
     let raw = fs::read_to_string(&config).unwrap();
     let snapshot_root = snapshot.canonicalize().unwrap();
-    let snapshot_text = snapshot_root.display().to_string();
+    let original_canonical = original.canonicalize().unwrap();
+    let parsed: toml::Value = toml::from_str(&raw).expect("init config is toml");
+    let from_roots = [original_canonical.as_path(), original];
+    let mut pairs: Vec<(String, PathBuf)> = NODE_DIR_FIELDS
+        .iter()
+        .map(|(table, key)| {
+            let current = toml_string(toml_table(&parsed, table), key);
+            let next = rebase_rooted(Path::new(&current), &from_roots, &snapshot_root);
+            (current, next)
+        })
+        .collect();
+    // Longer full paths first, so one field value cannot split another.
+    pairs.sort_by_key(|left| std::cmp::Reverse(left.0.len()));
     let mut updated = raw;
-    for source in [original.to_path_buf(), original.canonicalize().unwrap()] {
-        updated = updated.replace(&source.display().to_string(), &snapshot_text);
+    for (current, next) in &pairs {
+        assert!(
+            lies_under_snapshot(next, &snapshot_root),
+            "malformed retargeted path {}",
+            next.display()
+        );
+        assert!(
+            updated.contains(current),
+            "config is missing the parsed path {current}"
+        );
+        updated = updated.replacen(current, &next.display().to_string(), 1);
     }
+    let snapshot_text = snapshot_root.display().to_string();
     assert!(
         updated.contains(&snapshot_text),
         "snapshot config must name its own directory"
     );
     assert!(
-        !updated.contains(&original.canonicalize().unwrap().display().to_string()),
+        !updated.contains(&original_canonical.display().to_string()),
         "snapshot config must not keep the original directory"
     );
+    let checked: toml::Value = toml::from_str(&updated).expect("retargeted config is toml");
+    for (table, key) in NODE_DIR_FIELDS {
+        let path = PathBuf::from(toml_string(toml_table(&checked, table), key));
+        assert!(
+            lies_under_snapshot(&path, &snapshot_root),
+            "{table}.{key} = {} is outside {}",
+            path.display(),
+            snapshot_root.display()
+        );
+    }
     fs::write(config, updated).unwrap();
+}
+
+#[test]
+fn retarget_rejects_a_doubled_prefix_the_substring_replace_accepted() {
+    let lexical = Path::new("/var/folders/ab/original");
+    let canonical = Path::new("/private/var/folders/ab/original");
+    let snapshot = Path::new("/private/var/folders/ab/snapshot");
+    let roots = [canonical, lexical];
+    let database = rebase_rooted(&canonical.join("konsensus.db"), &roots, snapshot);
+    let mnemonic = rebase_rooted(&lexical.join("mnemonic.txt"), &roots, snapshot);
+    let backups = rebase_rooted(&canonical.join("backups"), &roots, snapshot);
+    let audit = rebase_rooted(&canonical.join("audit.jsonl"), &roots, snapshot);
+    assert_eq!(database, snapshot.join("konsensus.db"));
+    assert_eq!(mnemonic, snapshot.join("mnemonic.txt"));
+    assert_eq!(backups, snapshot.join("backups"));
+    assert_eq!(audit, snapshot.join("audit.jsonl"));
+    for path in [&database, &mnemonic, &backups, &audit] {
+        assert!(lies_under_snapshot(path, snapshot), "{}", path.display());
+    }
+
+    // Lexical-then-canonical substring replacement produced this path. The old
+    // assertions accepted it: the snapshot root is a substring, and the
+    // original canonical root is no longer present.
+    let doubled = Path::new("/private/private/var/folders/ab/snapshot/konsensus.db");
+    let rendered = doubled.display().to_string();
+    assert!(rendered.contains(&snapshot.display().to_string()));
+    assert!(!rendered.contains(&canonical.display().to_string()));
+    assert!(
+        !lies_under_snapshot(doubled, snapshot),
+        "a doubled /private prefix is not the snapshot root"
+    );
 }
 
 fn snapshot_copy() -> (tempfile::TempDir, tempfile::TempDir) {
