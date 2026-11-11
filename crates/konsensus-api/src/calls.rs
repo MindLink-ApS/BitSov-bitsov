@@ -108,8 +108,12 @@ pub async fn detach_callee_media(store: Store<'_>, peer: &NodeId, call_id: &str,
     let _guard = lock().lock().await;
     let Some(mut entry) = store.call_get(peer, call_id).await? else { return Ok(MediaDetachOutcome::Complete) };
     if entry.side != rules::Side::Callee { return Ok(MediaDetachOutcome::Complete); }
-    // Maintenance owns expiry and its terminal notice; never overwrite overdue Live.
+    // Maintenance owns expiry and its terminal notice; socket loss only closes resume.
     if entry.phase == rules::Phase::Live && now > entry.deadline_ms {
+        if !detach.only_unpaid && entry.paid_until_ms != Some(0) {
+            entry.paid_until_ms = Some(0);
+            store.call_put(peer, call_id, &entry).await?;
+        }
         return Ok(MediaDetachOutcome::PendingExpiry);
     }
     if !((!detach.only_unpaid && entry.phase == rules::Phase::Live)
@@ -988,6 +992,7 @@ pub async fn block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextC
 pub async fn receive_block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextCacheCipher, own: &NodeId, peer: &NodeId,
     id: &konsensus_core::MessageId, paid_until_ms: u64,
 ) -> Result<(), konsensus_storage::StorageError> {
+    if paid_until_ms == 0 { return Ok(()); }
     if !store.is_pending_dispatched(id, peer, own).await? { return Ok(()); }
     let Some(envelope) = store.get_message(id).await? else { return Ok(()) };
     if envelope.kind != konsensus_core::kind::KIND_CALL_BLOCK || envelope.sender != *own

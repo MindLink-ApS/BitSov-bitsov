@@ -1185,8 +1185,8 @@ async fn socket_drop_after_paid_deadline_preserves_unpaid() {
         "admission loss alone never changes a stored Live row");
     detach.only_unpaid = false;
     assert_eq!(detach_callee_media(store.as_ref(), &peer(), CALL, cut, &detach).await.unwrap(), MediaDetachOutcome::PendingExpiry);
-    assert_eq!(store.call_get(&peer(), CALL).await.unwrap(), Some(paid.clone()),
-        "ordinary socket close must leave expiry and its notice to maintenance");
+    assert_eq!(store.call_get(&peer(), CALL).await.unwrap(), Some(CallEntry { paid_until_ms: Some(0), ..paid.clone() }),
+        "ordinary socket close closes resume while leaving expiry and its notice to maintenance");
     let admission = super::PaidCallAdmission::new(store.clone());
     let remote = peer();
     let mut retry = tokio::spawn(async move { admission.media_detached(&remote, CALL, detach).await; });

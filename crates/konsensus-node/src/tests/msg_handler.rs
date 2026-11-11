@@ -3286,6 +3286,50 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     assert_eq!(records[0]["detail"]["amount_msat"], 10_000);
     assert_eq!(records[0]["detail"]["reconciliation_required"], true);
 
+    // An overdue socket cut retains expiry ownership while reconciling a settled renewal.
+    let overdue_id = format!("{:032x}", rand::random::<u128>());
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let live = calls::CallEntry {
+        deadline_ms: now + 30_000, paid_until_ms: Some(now + 20_000), ..paid.clone()
+    };
+    db.call_put(alice.node_id(), &overdue_id, &live).await.unwrap();
+    let settled = signal(404, 10_000, format!(r#"{{"call_id":"{overdue_id}","seq":1}}"#)).await;
+    let media = crate::call_media::CallMediaRouter::new(target.clone(),
+        Arc::new(crate::call_media::PaidCallAdmission::new(db.clone())));
+    let attachment = media.attach(alice.node_id(), &overdue_id, None).await.unwrap();
+    let overdue = calls::CallEntry {
+        deadline_ms: now - 1, paid_until_ms: Some(now - 10_001), ..live
+    };
+    db.call_put(alice.node_id(), &overdue_id, &overdue).await.unwrap();
+    drop(attachment);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if db.call_get(alice.node_id(), &overdue_id).await.unwrap().unwrap().paid_until_ms == Some(0) { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("overdue socket cut closes resume before maintenance");
+    let closed = calls::CallEntry { paid_until_ms: Some(0), ..overdue };
+    assert_eq!(db.call_get(alice.node_id(), &overdue_id).await.unwrap(), Some(closed.clone()));
+    source.send(bob.node_id(), &settled).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert!(db.is_paid_envelope_rejected(&settled).await.unwrap());
+    assert!(db.has_nonce(&settled.nonce).await.unwrap());
+    assert!(!db.is_paid_envelope_accepted(&settled).await.unwrap());
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &overdue_id).await.unwrap(), Some(closed));
+    assert_eq!(media.attach(alice.node_id(), &overdue_id, None).await.err(), Some(konsensus_api::call_media::AttachRefusal::NotAdmitted));
+    source.send(bob.node_id(), &settled).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    let records: Vec<serde_json::Value> = log.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &serde_json::Value| event["event"] == "call.block_overpayment"
+            && event["detail"]["message_id"] == settled.id.to_hex()).collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["detail"]["payment_hash"], hex::encode(settled.payment_proof.payment_hash));
+    assert_eq!(records[0]["detail"]["amount_msat"], 10_000);
+    assert_eq!(records[0]["detail"]["reconciliation_required"], true);
+
     // Media cut after Unpaid expiry retains the reason and audits a settled renewal.
     for socket_drop in [false, true] {
         let unpaid_id = format!("{:032x}", rand::random::<u128>());

@@ -911,7 +911,11 @@ async fn client_detach_stops_renewals_and_unanswered_calls_still_expire() {
         for (app, peer) in [(&*caller, bid), (&*callee, aid)] {
             let ended = app.state.storage.call_get(&peer, call_id).await.unwrap().unwrap();
             assert_eq!(ended.next_block_seq, 1, "no post-cut block admitted");
-            if !cut_callee || peer == bid { assert_eq!(ended.end_reason, Some(HangupReason::Unpaid)); }
+            if cut_callee && peer == aid {
+                assert_eq!(ended.end_reason, Some(HangupReason::Hangup));
+            } else {
+                assert_eq!(ended.end_reason, Some(HangupReason::Unpaid));
+            }
         }
         assert_eq!(lane.a.list_payments(100).await.unwrap().into_iter()
             .filter(|p| p.direction == PaymentDirection::Outgoing && p.amount_msat == PRICE).count(), before,
