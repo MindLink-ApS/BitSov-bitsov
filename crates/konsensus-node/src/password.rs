@@ -62,9 +62,10 @@ pub fn read_password_fd(fd: i32) -> Result<Zeroizing<String>> {
 /// Whether a password descriptor is protected from other OS users.
 ///
 /// A redirected file (`--password-fd 3 3<pw`) or FIFO must pass the same
-/// ownership/mode rule as `--password-file`. A socket's launcher protects the
-/// password. Unsupported types, invalid descriptors, and platforms without
-/// Unix modes return false.
+/// ownership/mode rule as `--password-file`. On Linux and macOS, a socket must
+/// be a connected AF_UNIX stream with a peer UID equal to getuid(). Socket mode
+/// bits are not used. Unsupported types, invalid descriptors, and platforms
+/// without Unix modes return false.
 pub fn descriptor_is_owner_only(fd: i32) -> bool {
     #[cfg(unix)]
     {
@@ -85,11 +86,61 @@ pub fn descriptor_is_owner_only(fd: i32) -> bool {
             return false;
         };
         let file_type = meta.file_type();
-        file_type.is_socket()
-            || ((file_type.is_file() || file_type.is_fifo())
-                && meta.mode() & 0o077 == 0
-                // SAFETY: getuid has no preconditions and cannot fail.
-                && meta.uid() == unsafe { libc::getuid() })
+        if file_type.is_socket() {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                use std::os::fd::AsRawFd;
+
+                let socket = socket2::SockRef::from(&file);
+                if socket.r#type().ok() != Some(socket2::Type::STREAM)
+                    || !socket.peer_addr().is_ok_and(|peer| peer.is_unix())
+                {
+                    return false;
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let mut credentials = libc::ucred {
+                        pid: 0,
+                        uid: 0,
+                        gid: 0,
+                    };
+                    let mut len = std::mem::size_of_val(&credentials) as libc::socklen_t;
+                    // SAFETY: file owns a valid socket descriptor; credentials
+                    // and len are writable and sized for SO_PEERCRED.
+                    let status = unsafe {
+                        libc::getsockopt(
+                            file.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_PEERCRED,
+                            (&mut credentials as *mut libc::ucred).cast(),
+                            &mut len,
+                        )
+                    };
+                    return status == 0
+                        && len as usize == std::mem::size_of_val(&credentials)
+                        // SAFETY: getuid has no preconditions and cannot fail.
+                        && credentials.uid == unsafe { libc::getuid() };
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let mut peer_uid = 0;
+                    let mut peer_gid = 0;
+                    // SAFETY: file owns a valid socket descriptor; the output
+                    // pointers reference writable uid_t and gid_t values.
+                    let status =
+                        unsafe { libc::getpeereid(file.as_raw_fd(), &mut peer_uid, &mut peer_gid) };
+                    return status == 0
+                        // SAFETY: getuid has no preconditions and cannot fail.
+                        && peer_uid == unsafe { libc::getuid() };
+                }
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            return false;
+        }
+        (file_type.is_file() || file_type.is_fifo())
+            && meta.mode() & 0o077 == 0
+            // SAFETY: getuid has no preconditions and cannot fail.
+            && meta.uid() == unsafe { libc::getuid() }
     }
     #[cfg(not(unix))]
     {
@@ -101,6 +152,88 @@ pub fn descriptor_is_owner_only(fd: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_same_uid_unix_stream_socketpair_is_owner_only() {
+        use std::os::fd::AsRawFd;
+
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(descriptor_is_owner_only(reader.as_raw_fd()));
+        assert!(descriptor_is_owner_only(writer.as_raw_fd()));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_same_uid_unix_stream_connection_is_owner_only() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        assert!(descriptor_is_owner_only(client.as_raw_fd()));
+        assert!(descriptor_is_owner_only(server.as_raw_fd()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connected_inet_stream_sockets_are_not_owner_only() {
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+        use std::os::fd::AsRawFd;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        assert!(!descriptor_is_owner_only(client.as_raw_fd()));
+        assert!(!descriptor_is_owner_only(server.as_raw_fd()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connected_inet6_stream_sockets_are_not_owner_only() {
+        use std::net::{Ipv6Addr, TcpListener, TcpStream};
+        use std::os::fd::AsRawFd;
+
+        let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        assert!(!descriptor_is_owner_only(client.as_raw_fd()));
+        assert!(!descriptor_is_owner_only(server.as_raw_fd()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_listening_unix_stream_socket_is_not_owner_only() {
+        use std::os::fd::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(dir.path().join("input.sock")).unwrap();
+        assert!(!descriptor_is_owner_only(listener.as_raw_fd()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_connected_unix_datagram_socket_is_not_owner_only() {
+        use std::os::fd::AsRawFd;
+
+        let (reader, writer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        assert!(!descriptor_is_owner_only(reader.as_raw_fd()));
+        assert!(!descriptor_is_owner_only(writer.as_raw_fd()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unconnected_unix_stream_socket_is_not_owner_only() {
+        use std::os::fd::AsRawFd;
+
+        let socket =
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        assert!(!descriptor_is_owner_only(socket.as_raw_fd()));
+    }
 
     #[cfg(unix)]
     #[test]

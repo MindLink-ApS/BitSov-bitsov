@@ -89,7 +89,10 @@ fn start_log(node: &Node) -> String {
 }
 
 /// Start until the API listens, kill the node, and return everything it printed.
-fn start_log_with(node: &Node, password_input: impl FnOnce(&mut Command)) -> String {
+fn start_log_with<Input>(
+    node: &Node,
+    password_input: impl FnOnce(&mut Command) -> Input,
+) -> String {
     struct Child(std::process::Child);
     impl Drop for Child {
         fn drop(&mut self) {
@@ -100,7 +103,7 @@ fn start_log_with(node: &Node, password_input: impl FnOnce(&mut Command)) -> Str
     let output = tempfile::tempfile().unwrap();
     let mut cmd = bin();
     cmd.args(["start", "--config"]).arg(&node.config);
-    password_input(&mut cmd);
+    let input_guard = password_input(&mut cmd);
     let mut child = Child(
         cmd.stdout(output.try_clone().unwrap())
             .stderr(output.try_clone().unwrap())
@@ -114,6 +117,7 @@ fn start_log_with(node: &Node, password_input: impl FnOnce(&mut Command)) -> Str
         let log = String::from_utf8_lossy(&bytes).into_owned();
         assert!(!log.contains(PASSWORD), "password in output");
         if log.contains("API server listening") {
+            drop(input_guard);
             return log;
         }
         assert!(child.0.try_wait().unwrap().is_none(), "node exited: {log}");
@@ -163,13 +167,14 @@ fn a_password_file_start_follows_the_owner_setting_and_says_which_mode_it_is_in(
 }
 
 /// Stdin as `--password-fd 0`, over a socket pair holding the password.
-fn descriptor_from_a_pipe(cmd: &mut Command) {
+fn descriptor_from_a_pipe(cmd: &mut Command) -> std::os::unix::net::UnixStream {
     use std::io::Write;
     let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
     writer.write_all(PASSWORD.as_bytes()).unwrap();
-    drop(writer);
+    writer.shutdown(std::net::Shutdown::Write).unwrap();
     cmd.args(["--password-fd", "0"])
         .stdin(Stdio::from(std::os::fd::OwnedFd::from(reader)));
+    writer
 }
 
 #[test]
@@ -205,6 +210,28 @@ fn a_descriptor_start_follows_the_setting_and_refuses_a_too_open_redirected_file
             assert!(log.contains("other OS users can read"), "{log}");
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_descriptor_with_a_dropped_peer_keeps_approvals_off_with_the_setting_on() {
+    use std::io::Write;
+
+    let node = initialized_node();
+    set_setting(&node.config, true);
+    let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    writer.write_all(PASSWORD.as_bytes()).unwrap();
+    drop(writer);
+    let log = start_log_with(&node, |cmd| {
+        cmd.args(["--password-fd", "0"])
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(reader)));
+    });
+    assert!(log.contains("seed_password_not_typed"), "{log}");
+    assert!(log.contains("is set but does not apply"), "{log}");
+    assert!(
+        !log.contains("device approvals (Touch ID) enabled"),
+        "{log}"
+    );
 }
 
 #[test]

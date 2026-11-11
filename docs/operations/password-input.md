@@ -160,14 +160,19 @@ What it needs, on every start:
 |---|---|
 | The seed is encrypted, with no `mnemonic.txt` beside it | Off, `seed_not_encrypted` |
 | `--password-file`: a regular file you own, with no group or other permissions (`chmod 600`), not a symlink | `start` refuses to run |
-| `--password-fd`: a pipe or socket from a launcher, or a redirected file passing the same owner-only rule | Off, `seed_password_not_typed` |
+| `--password-fd`: an owner-only regular file or FIFO, or a connected AF_UNIX stream socket whose peer UID equals the node's `getuid()` (Linux and macOS) | Off, `seed_password_not_typed` |
 | The password opens the seed | `start` refuses to run |
 | The machine is not declared as run for someone else (`tier = "cloud"`, `[identity] hosted = true`) | Off, `seed_password_not_typed` |
 
 `--password` on the command line never qualifies, because other OS users can read
 a process's arguments. Use a file or a descriptor. A platform without Unix file
-modes also stays off, because the node cannot check who can read the file. The
-check reads the file's owner and mode bits; it does not read access-control lists
+modes also stays off, because the node cannot check who can read the file. Regular
+files and FIFOs must belong to the node's OS user and have no group or other
+permissions (`mode & 077 == 0`). Sockets use peer credentials instead of mode bits:
+`SO_PEERCRED` on Linux and `getpeereid` on macOS. Internet sockets (AF_INET and
+AF_INET6), listening sockets, datagram sockets, sockets without a connected peer,
+and sockets on other platforms do not qualify. The file/FIFO check reads the
+owner and mode bits; it does not read access-control lists
 that grant more than those bits show (for example `chmod +a` on macOS), so do not
 add any to this file. Refusals keep the reason code `seed_password_not_typed`, so
 existing apps show what they already show. The startup log says which rule
