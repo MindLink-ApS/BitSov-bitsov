@@ -48,10 +48,14 @@ For a payment hash on the receiver's own ledger:
 
 `settled-unused → reserved(conn, deadline) → consumed`, with `reserved → settled-unused` on deadline expiry or a clean refusal.
 
-- **Eligibility** is the existing gate's settlement rule: settled, bound to this recipient, unused, and inside its amount, purpose and expiry terms. A cached `PriceTable` offer is never proof of payment.
+- **Eligibility, existing checks:** what the gate's settlement verification already enforces today: settlement, direction, payment hash, amounts, preimage, exclusion of channel-funding payments, and the recipient. **Proposed additions** (not enforced today; each needs its own implementation and tests): a purpose tag and an expiry window per payment. A cached `PriceTable` offer is never proof of payment.
 - **Reservation is atomic**, done in the same step as the eligibility check, so two connections racing with the same hash admit at most one message.
-- **Binding:** a reservation is keyed by the payment hash **and** the payer's authenticated static key from the Noise session. Knowing a hash is not authority. A hash seen by a third party cannot be reserved by that party.
-- **Consumed** is written only after the full envelope passes the existing gate checks (signature, freshness, nonce) and before dispatch is acknowledged. A crash between reservation and consumption returns the hash to `settled-unused` on restart. It never consumes the hash without a delivered message.
+- **Binding:** knowing a hash is not authority. Keying a reservation on the connection's key alone does not prove who paid. The contract therefore needs a **durable hash-to-payer binding** recorded when the payment settles (from what the payer committed to before paying). A reservation succeeds only when the authenticated static key of the Noise session matches that binding. A hash with no recorded binding is refused in hash-first mode, and the payer uses the legacy path during the transition. If B presents A's unused hash first, it is refused, and A's admission still succeeds afterwards, including across a restart.
+- **Acceptance boundary:** the transition to `consumed` and the durable acceptance of the envelope happen in **one storage transaction**, after the envelope passes the existing gate checks (signature, freshness, nonce) and before any acknowledgement is sent. The recovery outcomes are:
+  - crash before that transaction: the hash returns to `settled-unused` and the envelope was never accepted;
+  - crash after it: the envelope is accepted and the hash is consumed;
+  - acknowledgement lost after it: the sender's retry with the same hash is refused as consumed, with a distinct `already_accepted` result that names the accepted message, so the sender can reconcile instead of paying again.
+  The hash is never consumed without an accepted envelope, and an accepted envelope never leaves the hash reusable.
 - Reservations are bounded per peer and node-wide, and each has a deadline. An abandoned reservation expires. It never blocks the payer's later retry with the same hash.
 
 ## 5. Refusal behaviour
@@ -65,7 +69,10 @@ For a payment hash on the receiver's own ledger:
 | Case | Pass when |
 |---|---|
 | Unknown / unsettled / wrong recipient / consumed hash | 0 envelope deserialiser calls, 0 body record reads, connection closed |
-| Admission record of wrong length or type | refused before decrypt; no allocation that scales with the advertised length |
+| Admission record of wrong length | refused before decryption; no allocation that scales with the advertised length |
+| Admission record of right length, wrong type or version | refused after one bounded authenticated decryption, before any reservation or body read |
+| Unused hash of payer A presented first by B | refused; A's later admission succeeds, also after a restart |
+| Lost acknowledgement after acceptance, then retry | refused as `already_accepted`, naming the accepted message; no second acceptance |
 | Advertised body length or count above limits | refused before any body read |
 | Same hash on two connections at once | exactly one admission succeeds |
 | Hash reserved by a different authenticated payer key | refused |
