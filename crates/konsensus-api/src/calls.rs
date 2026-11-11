@@ -84,17 +84,46 @@ pub async fn call_media_admitted(store: Store<'_>, peer: &NodeId, call_id: &str,
     store.call_get(peer, call_id).await.ok().flatten().is_some_and(|entry| entry.media_admitted(now))
 }
 
-/// End a callee call when its current local media attachment closes.
-/// Preserve paid boundaries and pending evidence for ordinary reconciliation.
-pub async fn detach_callee_media(store: Store<'_>, peer: &NodeId, call_id: &str, now: u64) -> Result<(), konsensus_storage::StorageError> {
+/// A teardown request for one local media attachment generation.
+pub struct MediaDetach {
+    /// Shared with attachment publication; held until the durable write completes.
+    pub generation: std::sync::Arc<tokio::sync::Mutex<u64>>,
+    pub expected_generation: u64,
+    /// Admission loss alone may close an Unpaid resume window, never a Live row.
+    pub only_unpaid: bool,
+}
+
+/// Whether teardown completed or must wait for ordinary expiry maintenance.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MediaDetachOutcome {
+    Complete,
+    PendingExpiry,
+}
+
+/// End a callee call only while its attachment generation is still current.
+/// Preserve pending evidence and replay retention for ordinary reconciliation.
+pub async fn detach_callee_media(store: Store<'_>, peer: &NodeId, call_id: &str, now: u64, detach: &MediaDetach) -> Result<MediaDetachOutcome, konsensus_storage::StorageError> {
+    let generation = detach.generation.lock().await;
+    if *generation != detach.expected_generation { return Ok(MediaDetachOutcome::Complete); }
     let _guard = lock().lock().await;
-    let Some(mut entry) = store.call_get(peer, call_id).await? else { return Ok(()) };
-    if entry.side != rules::Side::Callee || !(entry.phase == rules::Phase::Live
-        || (entry.phase == rules::Phase::Ended && entry.end_reason == Some(rules::HangupReason::Unpaid))) { return Ok(()); }
-    entry.phase = rules::Phase::Ended;
-    entry.end_reason = Some(rules::HangupReason::Hangup);
-    entry.deadline_ms = entry.deadline_ms.max(now.saturating_add(rules::TOMBSTONE_MS));
-    store.call_put(peer, call_id, &entry).await
+    let Some(mut entry) = store.call_get(peer, call_id).await? else { return Ok(MediaDetachOutcome::Complete) };
+    if entry.side != rules::Side::Callee { return Ok(MediaDetachOutcome::Complete); }
+    // Maintenance owns expiry and its terminal notice; never overwrite overdue Live.
+    if entry.phase == rules::Phase::Live && now > entry.deadline_ms {
+        return Ok(MediaDetachOutcome::PendingExpiry);
+    }
+    if !((!detach.only_unpaid && entry.phase == rules::Phase::Live)
+        || (entry.phase == rules::Phase::Ended && entry.end_reason == Some(rules::HangupReason::Unpaid))) { return Ok(MediaDetachOutcome::Complete); }
+    if entry.phase == rules::Phase::Ended {
+        // Zero closes resume without changing Unpaid or its replay deadline.
+        entry.paid_until_ms = Some(0);
+    } else {
+        entry.phase = rules::Phase::Ended;
+        entry.end_reason = Some(rules::HangupReason::Hangup);
+        entry.deadline_ms = entry.deadline_ms.max(now.saturating_add(rules::TOMBSTONE_MS));
+    }
+    store.call_put(peer, call_id, &entry).await?;
+    Ok(MediaDetachOutcome::Complete)
 }
 
 /// End expired calls durably, retaining pending evidence and tombstones.

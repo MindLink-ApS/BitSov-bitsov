@@ -327,6 +327,7 @@ pub struct CallEntry {
     pub deadline_ms: u64,
     pub pending: Option<Pending>,
     /// Last paid boundary; absent until block zero settles.
+    /// Zero on an ended callee marks its Unpaid resume window closed.
     pub paid_until_ms: Option<u64>,
     pub next_block_seq: u32,
     pub end_reason: Option<HangupReason>,
@@ -556,6 +557,9 @@ fn apply_block(entry: CallEntry, seq: u32, now_ms: u64) -> Result<CallEntry, Cal
         return Err(CallRefusal::Sequence);
     }
     let end = match (entry.phase, entry.end_reason) {
+        (Phase::Ended, Some(HangupReason::Unpaid)) if entry.side == Side::Callee && entry.paid_until_ms == Some(0) => {
+            return Err(CallRefusal::UnknownCall);
+        }
         (Phase::Live, _) => entry.deadline_ms,
         (Phase::Ended, Some(HangupReason::Unpaid)) => entry.deadline_ms.saturating_sub(TOMBSTONE_MS),
         _ => return Err(CallRefusal::UnknownCall),
