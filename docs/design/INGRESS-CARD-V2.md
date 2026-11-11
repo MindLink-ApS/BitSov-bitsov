@@ -1,6 +1,6 @@
 # Ingress card v2: contract draft (issue #482)
 
-Status: **draft contract, not implemented.** This document fixes the card format, the dial rule and the test plan for advertising more than one ingress path before any code changes. Nothing here changes the wire, the edge limits, the payment gate or a release. The decisions listed in §6 come before implementation.
+Status: **draft contract, not implemented.** This document fixes the card fields, the dial rule and the test plan for advertising more than one ingress path before any code changes. It does **not** yet fix the introduction v2 byte layout (its signed bytes and link payload): §3.6 proposes one, and decision §6.9 must settle it with golden vectors before implementation. Nothing here changes the wire, the edge limits, the payment gate or a release. The decisions listed in §6 come before implementation.
 
 ## 1. Goal and the claim we may make
 
@@ -73,7 +73,7 @@ Both card kinds get a v2. A v2 card replaces the single `endpoint`/`reach` pair 
 
 - A v2 signature never verifies under a v1 domain and the reverse. A verifier picks the domain from `v` and refuses a card whose `v` it does not support. It never tries a second domain after the first one fails.
 - v2 types are separate structs with `deny_unknown_fields`. A v1 card cannot be read as v2 (missing `endpoints`), and a v2 card cannot be read as v1 (unknown field, and `v != 1`).
-- Whether v2 links keep the existing prefixes or use new ones is decision §6.4.
+- Whether v2 links keep the existing prefixes or use new ones is decision §6.4. The introduction v2 byte layout behind its link is decision §6.9 (§3.6).
 
 ### 3.2 Endpoint entry and bounds
 
@@ -153,6 +153,37 @@ Residual risk, stated plainly: a reader with no marker for a node (first contact
 - After the window the node stops issuing v1. Readers keep accepting v1 from nodes without a marker until a later release decides otherwise.
 - No message-wire, federation Hello, cookie or edge change is needed for the card itself. The optional capability in §3.4 uses the existing capability list.
 
+### 3.6 Introduction v2 bytes (open: decision §6.9)
+
+A v1 introduction is not signed over JSON. It is signed over fixed-order, length-prefixed bytes (`introduction.rs:206-227`), and its link payload is those bytes without the domain tag, followed by the 64-byte signature (`:273-278`, parsed strictly at `:281-313`). §3.2 defines the v2 fields but not how the endpoint list enters these bytes. Two layouts that both satisfy §3.2, for example a one-byte numeric `kind` and a length-prefixed `kind` string, give different signatures and incompatible links. **This draft therefore does not fix the introduction v2 byte layout.** It is decision §6.9, and that decision is complete only when the golden vectors below exist.
+
+Any v2 layout keeps these v1 properties:
+
+- canonical bytes = `bitsov-introduction/v2\0` ‖ body. The signature is Ed25519 (`verify_strict`) over BLAKE3 of the canonical bytes, as in v1 (`:229-231`, `:267`);
+- `v` is the first body byte, so a reader selects the layout from it;
+- the body holds every §3.2 field and every v1 field other than `endpoint`/`reach`, in one fixed order, with the endpoint list in signed order;
+- link payload = body ‖ 64-byte signature, base64url without padding. The parser refuses truncation and trailing bytes, and checks the entry count against `MAX_ENDPOINTS` before it reads any entry.
+
+Proposed layout, for the decision only (not a contract until §6.9 is settled):
+
+| # | Field | Encoding |
+|---|---|---|
+| 1 | `v` | u8, `2` |
+| 2 | `network` | u8 length ‖ UTF-8 bytes (as v1) |
+| 3 | `node_id` | 32 bytes (as v1) |
+| 4 | entry count | u8, `1..=MAX_ENDPOINTS` |
+| 5 | each entry, in list order | `kind`: u8 length (1–16) ‖ ASCII `[a-z0-9-]`; then `endpoint`: u8 length (1–255) ‖ canonical `host:port` bytes; then `reach`: u8 (0 public, 1 local, as v1 `Reach::tag`, `:104`) |
+| 6 | `admission_msat`, `message_msat`, `price_epoch`, `issued_at`, `expires_at` | u64 big-endian each, in this order (as v1) |
+| 7 | `intro_id` | 16 bytes (as v1) |
+
+Why the proposal uses a length-prefixed `kind` string rather than a numeric tag: §3.2 requires a reader to verify, count and display entries whose reserved `kind` it does not support. A string can be carried and re-verified unchanged in both the JSON and the link form. A numeric tag is smaller, but its JSON form would need either a numeric `kind` or a name registry that an older v2 reader lacks. Either choice is acceptable once it is fixed.
+
+Size under the proposal, with today's prefix: four entries, each with a 6-byte `kind` and a 255-byte `endpoint`, on a 7-byte network name give a 1,218-byte payload. That is 1,624 base64url characters, or 1,643 with `bitsov://introduce#`, inside the 2048 cap without lowering `MAX_ENDPOINTS` (§6.3). With 16-byte kinds the figures are 1,258, 1,678 and 1,697. The golden-vector test must also check the JSON form against the same cap.
+
+Old readers: rc23 reads `v` from byte 0 but then applies the v1 layout (`:281-313`). It refuses a v2 link as `Malformed` (truncated, trailing bytes, not UTF-8 or a bad reach byte), or, if the lengths happen to line up, as `UnsupportedVersion` in `verify`. The dial handler parses at `handlers/introduction.rs:316` and verifies at `:322`, before `pin_endpoint` (`:341`). Either way nothing is dialed, which matches §3.5.
+
+Golden vectors required by §6.9 come from a fixed, published test seed (never a real key) and cover three cases: (a) one `direct` entry; (b) four maximum-length entries; (c) one entry with a reserved `kind`. Each vector records the canonical bytes (hex), the BLAKE3 digest, the signature and the link string. The vectors go in this document and in a Rust test that fails if any byte changes.
+
 ## 4. Relay and shared-source handling
 
 An owner-chosen forwarding host (a small VPS or a family member's machine forwarding a TCP port to the node's Noise listener) is the main way to get a second, independently hosted path. It has a cost at the edge.
@@ -199,7 +230,8 @@ What the forwarding path does and does not give:
 | DNS: mixed answer set, allowed address first and forbidden address last (and the reverse order) | whole entry refused; zero connect attempts for that entry, including to the allowed address |
 | DNS: entry 1 fails, entry 2 is a hostname resolving to a forbidden address, entry 3 live | entry 2 refused with zero connect attempts; walk continues to entry 3 |
 | DNS: every entry resolves to a forbidden address | `open` fails; zero connect attempts in total |
-| Mixed fleet: old reader receives v2 | fails closed with a version error; no endpoint dialed |
+| Introduction v2 golden vectors (§3.6) | issuing from the fixed test seed reproduces the recorded canonical bytes, digest, signature and link byte for byte; parsing each link gives back the same card; changing any byte fails verification; a truncated payload, trailing bytes and an entry count above `MAX_ENDPOINTS` are refused, the last before any entry is read |
+| Mixed fleet: old reader receives v2 | fails closed with `Malformed` or `UnsupportedVersion` (§3.5, §3.6); no endpoint dialed |
 | Mixed fleet: new reader receives v1 for a node with a v2 marker | refused, including after restart and after card-cache eviction |
 | Mixed fleet: new reader receives v1 for a node with no marker | accepted; dials the single endpoint as today |
 | v1 with higher `seq` than held v2 | refused by marker before the card cache is consulted |
@@ -234,6 +266,7 @@ Record exact heads, configuration and environment with every result.
 6. Shared-source handling behind a forwarder: option A, B or C in §4. Proposed: C for the first slice.
 7. Whether the home address is advertised at all when a forwarding path exists, and in which position.
 8. Who operates forwarding hosts and how a user is told what a forwarder can see.
+9. The introduction v2 signing and link byte layout (§3.6): adopt the proposed layout or another one, then record the golden vectors. Until then the introduction v2 format is not fixed and no introduction v2 implementation merges.
 
 ## 7. What this does not change
 
