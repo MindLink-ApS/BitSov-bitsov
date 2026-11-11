@@ -547,7 +547,7 @@ pub enum RepairCommand {
 
 #[derive(Subcommand)]
 pub enum ScbCommand {
-    /// Disabled: stale SCB state can lose funds. Use move-home on the current live node.
+    /// Disabled: stale SCB state can lose funds. Use `konsensus move-home` on the current live node, or `konsensus recover` on the owner console after disk loss.
     Restore {
         /// Path to the encrypted backup file (`*.aes`).
         #[arg(long)]

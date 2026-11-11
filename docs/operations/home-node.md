@@ -781,6 +781,9 @@ no first-use authenticity. The setup page and per-box claim-code ceremony are
 separate later onboarding work.
 ## Copied directories and hardware moves (#271)
 
+Choose the command in [restore paths](restore-paths.md). `rebind-instance` does
+not prove freshness.
+
 **Never restore a copied data directory, rsync backup, VM snapshot or SD-card
 image as a running Lightning node.** It may contain revoked commitments:
 broadcasting one can lose the whole channel balance, even before reconnecting

@@ -3,12 +3,14 @@
 //! Assembles the node owner's complete *encrypted* recovery set into a single
 //! authenticated response so they can migrate to self-hosting (or another
 //! operator) with identity and relationships intact. Funds move separately,
-//! with `konsensus move-home` on the healthy source node:
+//! with `konsensus move-home` on the healthy source node. After disk loss, run
+//! `konsensus recover` on the owner console; this bundle is not a channel import:
 //!
 //! - **SCB** (`scb-latest.aes`) — LDK channel-monitor state, encrypted with a
 //!   seed-derived key by the rotation producer
-//!   ([`konsensus_lightning::scb_rotate`]). Kept for a future compatible
-//!   recovery procedure; restoring it is disabled (issue #157). Served as-is.
+//!   ([`konsensus_lightning::scb_rotate`]). `konsensus recover` may read it as a
+//!   metadata index only. Importing it as channel state is disabled (issue #157).
+//!   Served as-is.
 //! - **Whitelist sidecar** — `peers` + `accepted_invites`, freshly sealed at
 //!   request time with the identity AES key
 //!   ([`konsensus_storage::WhitelistBackup`]). Recovers **relationships**.
@@ -24,9 +26,11 @@
 //!   belongs only to the unbuilt ciphertext-only relay tier, never a hosted full
 //!   node. The narrow, honest guarantee here is that the export *response* is
 //!   ciphertext-only.)
-//! - Honest scope: recovers the peer whitelist + accepted invites + LDK channel
-//!   state, **not** message history (`konsensus.db` messages/rooms/calendar/
-//!   content, and pending/outgoing invites, are in neither artifact).
+//! - Honest scope: recovers the peer whitelist + accepted invites. The SCB is an
+//!   encrypted metadata index for `konsensus recover` on the owner console, not
+//!   a channel-state import. It does **not** recover message history
+//!   (`konsensus.db` messages/rooms/calendar/content, and pending/outgoing
+//!   invites, are in neither artifact).
 //! - Gated behind [`ScopedAuth<Admin>`] — bulk export of the relationship graph is a
 //!   different exposure from reading one record, so a loopback-issued token cannot
 //!   reach it; it requires a token proving possession of the node key. Available on
@@ -35,7 +39,7 @@
 //!   encrypted recovery set out. It does NOT by itself make hosted operation
 //!   sovereign (a hosted operator still holds the runtime keys + metadata).
 
-use crate::auth::scoped::{ScopedAuth, Admin};
+use crate::auth::scoped::{Admin, ScopedAuth};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -174,8 +178,8 @@ async fn build_exit_bundle(
         scb_age_seconds,
         manifest: ExitManifest {
             contains: vec![
-                "LDK channel backup (encrypted) — kept for a future recovery procedure; \
-                 restoring it is disabled (issue #157)"
+                "LDK channel backup (encrypted) — metadata index for `konsensus recover` \
+                 on the owner console; importing it as channel state is disabled (issue #157)"
                     .into(),
                 "peer whitelist + accepted invites (encrypted) — who you federate with".into(),
             ],
@@ -197,8 +201,9 @@ async fn build_exit_bundle(
                  your peers: `konsensus whitelist restore --from whitelist-latest.aes`."
                     .into(),
                 "Do NOT restore channels from `scb_latest_b64`: SCB restore is disabled because \
-                 starting stale channel state can lose the whole channel. Keep the file with your \
-                 seed for a future compatible recovery procedure (docs/v2/RECOVERY.md)."
+                 starting stale channel state can lose the whole channel. For a lost disk, run \
+                 `konsensus recover` on the owner console; the file is only a metadata index \
+                 (docs/operations/recover.md)."
                     .into(),
                 "Both files decrypt only with keys derived from your mnemonic — without it the \
                  bundle is inert ciphertext."
@@ -321,6 +326,10 @@ mod tests {
             .does_not_contain
             .iter()
             .any(|s| s.to_lowercase().contains("message history")));
+        let refusal = bundle.manifest.restore_steps.join("\n");
+        assert!(refusal.contains("konsensus recover"), "{refusal}");
+        assert!(refusal.contains("owner console"), "{refusal}");
+        assert!(!refusal.contains("channel peers"), "{refusal}");
     }
 
     /// When a rotated SCB snapshot exists on disk, it is attached verbatim
@@ -347,6 +356,9 @@ mod tests {
             .decode(&scb_b64)
             .expect("valid base64");
         assert_eq!(decoded, scb_bytes, "SCB attached verbatim as ciphertext");
-        assert!(bundle.scb_age_seconds.is_some(), "fresh snapshot has an age");
+        assert!(
+            bundle.scb_age_seconds.is_some(),
+            "fresh snapshot has an age"
+        );
     }
 }
